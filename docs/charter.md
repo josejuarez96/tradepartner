@@ -15,6 +15,8 @@ A personal, local system for researching, testing and paper-trading (then small-
 ## Scope
 - **In:** US equities, long-only, low frequency (daily or slower), no leverage, no options trading. The owner may revisit this through an ADR.
 - **Out:** the utility sector (owner decision). Anything using material non-public information.
+- **Deferred beyond the MVP** (ADR required to enter scope): social and Google Trends data, news-text signals, and the LLM analyst layer. See [roadmap.md](roadmap.md), "MVP scope".
+- **Interface:** the owner interacts through a CLI and a local, read-only dashboard that reads the system's own database. The only write action is a logged override with a reason. See [roadmap.md](roadmap.md), "User experience".
 - ⬜ **Universe:** market-cap and liquidity floor.
 - ⬜ **Cadence:** rebalance frequency and holding periods.
 

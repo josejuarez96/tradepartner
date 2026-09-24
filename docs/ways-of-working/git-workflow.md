@@ -1,6 +1,6 @@
 # Git Workflow
 
-**Status:** Draft v0.1 (pending owner approval in PR #2)
+**Status:** Accepted v1.0 (PR #2, 2026-09-24)
 **Model:** trunk-based development with short-lived branches, and every change goes through a PR. `main` is always green and runnable.
 
 ## The rules in one screen

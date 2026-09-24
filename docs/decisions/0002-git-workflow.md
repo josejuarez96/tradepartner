@@ -1,6 +1,6 @@
 # 0002. Trunk-based git workflow; PR for every change; owner approves every merge
 
-**Status:** Proposed (accepted when PR #2 merges)  ·  **Date:** 2026-09-24  ·  **Issue:** #1
+**Status:** Accepted  ·  **Date:** 2026-09-24  ·  **Issue:** #1
 
 ## Context
 There is one human (the owner) and several AI agents committing. Agents can produce a lot of change quickly. The owner needs a single review point and a clean history. The repo is private on GitHub Free, so server-side branch protection is not available.
