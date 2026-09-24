@@ -1,0 +1,105 @@
+# Git Workflow
+
+**Status:** Draft v0.1 (pending owner approval in PR #2)
+**Model:** trunk-based development with short-lived branches, and every change goes through a PR. `main` is always green and runnable.
+
+## The rules in one screen
+
+1. **Never commit directly to `main`.** This applies to everyone: owner, agents, docs, typos.
+2. **One issue → one branch → one PR.** If there is no issue, create one first. Size-S issues can be a single line.
+3. **Branch from the latest `main`, merge back within about 3 days.** Long-lived branches drift and turn into merge conflicts.
+4. **Push whenever you stop working.** The remote branch is the backup and the handoff point for the next session or agent.
+5. **Open a draft PR early** (after the first meaningful commit), so CI runs and progress is visible.
+6. **Squash-merge only.** The PR title becomes the single commit on `main`, so it must be a Conventional Commit.
+7. **The owner merges.** Agents open PRs and address review comments. They never merge, force-push shared branches, or push to `main`.
+
+## When to create a branch
+
+| Situation | Branch? | Prefix |
+|---|---|---|
+| New capability from a spec/plan task | Yes | `feat/` |
+| Bug fix, including urgent ones | Yes | `fix/` |
+| Docs, specs, plans, ADRs, research reports | Yes | `docs/` or `research/` |
+| Tooling, deps, CI | Yes | `chore/` |
+| Restructure with no behavior change | Yes | `refactor/` |
+| Throwaway experiment ("does this library even work?") | Yes, **never merged** | `spike/` |
+
+**Name format:** `<prefix>/<issue#>-<short-slug>`, for example `feat/14-price-ingestion` or `research/9-insider-disconfirmation`.
+
+**Split the branch** when:
+- the diff exceeds about 400 changed lines (excluding lockfiles and generated files)
+- you find yourself writing "and also…" in the PR description
+- the work touches two unrelated areas
+
+**Spikes:** the code on a `spike/` branch is disposable. Findings are written up in `docs/research/` in a separate `docs/` PR. Then the spike branch is deleted.
+
+## When to commit
+
+- **Commit** after each logical step that leaves the tests passing, such as "add parser" or "add test for holiday edge case". Small commits make bisecting and reviewing easier. They get squashed on merge anyway.
+- **Don't commit** secrets, data files (`data/` is gitignored), notebooks with outputs, or commented-out code.
+
+**Messages** follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): imperative summary`.
+- **Types:** `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `ci`, `perf`, `research`.
+- **Scopes** (grow as modules appear): `data`, `backtest`, `signals`, `risk`, `exec`, `llm`, `journal`, `infra`.
+- **Agent commits** end with a `Co-Authored-By:` trailer.
+
+## When to push
+
+- At the end of every work session, even if the work is incomplete. Keep the PR as a draft.
+- Before asking for review.
+- Before switching to other work.
+- Never with `--force` on a branch someone else (or another agent) is working on. `--force-with-lease` on your own branch after a rebase is fine.
+
+## PR lifecycle
+
+```
+issue → branch → draft PR → CI green → self-review → specialist review agents → ready for review → owner merges → branch auto-deleted
+```
+
+**Before marking a PR ready for review:**
+- [ ] CI is green (`checks` job).
+- [ ] The PR template is filled in: what/why, linked issue (`Closes #n`), how it was verified.
+- [ ] The author has reviewed their own diff on GitHub.
+- [ ] The required specialist reviews have run (see [agents.md](agents.md)):
+  - `quant-auditor` for data, backtest or signal changes
+  - `safety-reviewer` for broker, orders, LLM inputs or secrets
+- [ ] Docs are updated: `STATUS.md`, plan checkboxes, `.env.example`, and an ADR if a decision was made.
+
+**Keeping current:** rebase on `main` if the branch is behind (`git fetch && git rebase origin/main`). Don't merge `main` into feature branches, because `main` has linear history.
+
+## Releases
+
+- Tag `v0.<phase>.0` on `main` when a phase completes, for example `v0.2.0` = data foundation done.
+- Move the `[Unreleased]` entries in `CHANGELOG.md` under the new version in the same PR that closes the phase.
+
+## Parallel agents
+
+- Each agent working in parallel gets its own **git worktree** and branch (`claude --worktree` or the worktree isolation option). Two agents never share a working directory.
+- Parallel agents must work on **non-overlapping files**. If two plan tasks touch the same module, run them one after the other.
+
+## How the rules are enforced
+
+This repo is private on GitHub Free, which **cannot enforce branch protection server-side**. Enforcement is therefore layered:
+
+| Layer | What it blocks | Where |
+|---|---|---|
+| pre-commit hook | Commits on `main`, private keys and secrets (gitleaks), files over 500 KB | `.pre-commit-config.yaml` |
+| pre-push hook | Pushes to `main` | `.pre-commit-config.yaml` (`no-push-to-main`) |
+| Claude Code deny rules | Agents pushing to main, force-pushing, merging PRs, reading `.env` | `.claude/settings.json` |
+| GitHub repo settings | Merge commits and rebase-merge (squash only), stale branches (auto-delete) | Repo settings (applied) |
+| CI | Lint, format, types, tests, hygiene on every PR | `.github/workflows/ci.yml` |
+| **Server-side ruleset** (blocks direct pushes, force-push, deletion; requires PR + green CI) | **Inactive until GitHub Pro** | `.github/rulesets/protect-main.json` |
+
+**Activating the server-side ruleset** after upgrading to GitHub Pro:
+
+```bash
+gh api -X POST repos/josejuarez96/tradepartner/rulesets --input .github/rulesets/protect-main.json
+```
+
+**Local hooks after cloning** (run once per clone; worktrees share the hooks):
+
+```bash
+uv run pre-commit install
+```
+
+**Emergency override:** `git commit --no-verify` exists. Using it on `main` requires a note in the PR or `STATUS.md` explaining why. Agents may never use `--no-verify`.

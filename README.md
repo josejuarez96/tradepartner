@@ -11,7 +11,7 @@ See [docs/STATUS.md](docs/STATUS.md) for the current phase, what's in progress a
 ```bash
 brew install uv            # once
 uv sync                    # creates .venv, installs deps
-uv run pre-commit install  # installs git hooks (blocks commits to main, secret scan, lint)
+uv run pre-commit install  # git hooks: block commit/push to main, secret scan, lint
 uv run pytest
 ```
 
@@ -24,3 +24,6 @@ uv run pytest
 | `src/tradepartner/` | Application code |
 | `tests/` | Tests |
 | `data/` | Local data (gitignored) |
+
+## How we work
+Every change goes through issue → branch → PR → owner merge. See [git workflow](docs/ways-of-working/git-workflow.md), [development process](docs/ways-of-working/development-process.md) and [agents](docs/ways-of-working/agents.md).
