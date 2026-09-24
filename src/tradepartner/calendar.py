@@ -9,6 +9,12 @@ A **session** (a trading day) is represented as `datetime.date`: it denotes
 a calendar day, not an instant. An **instant** (a session's open or close)
 is a tz-aware UTC `datetime.datetime`, per CLAUDE.md's "datetimes are always
 timezone-aware UTC" rule.
+
+The calendar's valid date range is pinned from config
+(`calendar.start`/`calendar.end`), not `exchange_calendars`' default sliding
+window (today - 20y .. today + 1y): an unpinned range rejects any date
+older than ~20 years and drifts with today's date, which is not
+reproducible.
 """
 
 from __future__ import annotations
@@ -18,65 +24,105 @@ from functools import lru_cache
 
 import exchange_calendars as xcals
 import pandas as pd
+from dateutil.relativedelta import relativedelta
+from exchange_calendars.errors import DateOutOfBounds, NotSessionError
+
+from tradepartner.config import get_settings
 
 _CALENDAR_NAME = "XNYS"
 
 
 @lru_cache(maxsize=1)
-def _calendar() -> xcals.ExchangeCalendar:
-    """Build (once) and cache the XNYS calendar."""
-    return xcals.get_calendar(_CALENDAR_NAME)
+def _calendar(start: date, end: date) -> xcals.ExchangeCalendar:
+    """Build (once per distinct `(start, end)`) and cache the XNYS calendar."""
+    return xcals.get_calendar(_CALENDAR_NAME, start=pd.Timestamp(start), end=pd.Timestamp(end))
+
+
+def _get_calendar() -> xcals.ExchangeCalendar:
+    """The XNYS calendar, bounded by the current `calendar.start`/`.end` config."""
+    cfg = get_settings().calendar
+    return _calendar(cfg.start, cfg.end)
+
+
+def _reject_datetime(day: date, *, func: str) -> None:
+    """`datetime` is a subclass of `date`; reject it explicitly so a caller
+    can't accidentally pass an instant where a session (a calendar day) is
+    meant — `pd.Timestamp` would otherwise silently drop the time-of-day.
+    """
+    if isinstance(day, datetime):
+        raise TypeError(f"{func}() expects a date, not a datetime: {day!r}")
 
 
 def _to_utc_datetime(ts: pd.Timestamp) -> datetime:
-    localized = ts.tz_localize(UTC) if ts.tzinfo is None else ts.tz_convert(UTC)
-    result = localized.to_pydatetime()
-    assert isinstance(result, datetime)
-    return result
+    return ts.tz_convert(UTC).to_pydatetime()
 
 
 def _to_date(ts: pd.Timestamp) -> date:
-    result = ts.date()
-    assert isinstance(result, date)
-    return result
+    return ts.date()
 
 
 def is_session(day: date) -> bool:
     """True if `day` is an XNYS trading session."""
-    return bool(_calendar().is_session(pd.Timestamp(day)))
+    return bool(_get_calendar().is_session(pd.Timestamp(day)))
 
 
 def next_session(day: date) -> date:
-    """The first XNYS session strictly after `day`."""
-    return _to_date(_calendar().next_session(pd.Timestamp(day)))
+    """The first XNYS session strictly after `day` (`day` need not itself be a session)."""
+    _reject_datetime(day, func="next_session")
+    following_day = pd.Timestamp(day) + pd.Timedelta(days=1)
+    return _to_date(_get_calendar().date_to_session(following_day, "next"))
 
 
 def previous_session(day: date) -> date:
-    """The last XNYS session strictly before `day`."""
-    return _to_date(_calendar().previous_session(pd.Timestamp(day)))
+    """The last XNYS session strictly before `day` (`day` need not itself be a session)."""
+    _reject_datetime(day, func="previous_session")
+    preceding_day = pd.Timestamp(day) - pd.Timedelta(days=1)
+    return _to_date(_get_calendar().date_to_session(preceding_day, "previous"))
 
 
 def session_open(day: date) -> datetime:
-    """The tz-aware UTC official open of session `day`."""
-    return _to_utc_datetime(_calendar().session_open(pd.Timestamp(day)))
+    """The tz-aware UTC official open of session `day`.
+
+    Raises `ValueError` if `day` is not itself an XNYS session.
+    """
+    _reject_datetime(day, func="session_open")
+    try:
+        ts = _get_calendar().session_open(pd.Timestamp(day))
+    except NotSessionError as exc:
+        raise ValueError(f"not an XNYS session: {day.isoformat()}") from exc
+    return _to_utc_datetime(ts)
 
 
 def session_close(day: date) -> datetime:
-    """The tz-aware UTC official close of session `day`."""
-    return _to_utc_datetime(_calendar().session_close(pd.Timestamp(day)))
+    """The tz-aware UTC official close of session `day`.
+
+    Raises `ValueError` if `day` is not itself an XNYS session.
+    """
+    _reject_datetime(day, func="session_close")
+    try:
+        ts = _get_calendar().session_close(pd.Timestamp(day))
+    except NotSessionError as exc:
+        raise ValueError(f"not an XNYS session: {day.isoformat()}") from exc
+    return _to_utc_datetime(ts)
 
 
 def is_half_day(day: date) -> bool:
     """True if session `day` is an XNYS early-close (half) day."""
-    return bool(pd.Timestamp(day) in _calendar().early_closes)
+    return bool(pd.Timestamp(day) in _get_calendar().early_closes)
 
 
 def last_session_of_month(year: int, month: int) -> date:
     """The last XNYS session in the given calendar month."""
-    cal = _calendar()
+    cal = _get_calendar()
     start = pd.Timestamp(year=year, month=month, day=1)
     end = start + pd.offsets.MonthEnd(0)
-    sessions = cal.sessions_in_range(start, end)
+    try:
+        sessions = cal.sessions_in_range(start, end)
+    except DateOutOfBounds as exc:
+        raise ValueError(
+            f"{year:04d}-{month:02d} is outside the configured calendar range "
+            f"({cal.first_session.date()}..{cal.last_session.date()})"
+        ) from exc
     if len(sessions) == 0:
         raise ValueError(f"no XNYS sessions in {year:04d}-{month:02d}")
     return _to_date(sessions[-1])
@@ -95,15 +141,20 @@ def last_completed_session(as_of: datetime) -> date:
     # unless `ts` is itself a trading minute, in which case it returns the
     # session preceding the one in progress -- exactly "last completed
     # session" semantics, verified against the close boundary itself.
-    return _to_date(_calendar().minute_to_past_session(ts))
+    return _to_date(_get_calendar().minute_to_past_session(ts))
 
 
-def sessions_in_month_window(end_session: date, months: int = 12) -> list[date]:
-    """All XNYS sessions in the `months` calendar months up to and including
-    the month of `end_session`, truncated at `end_session` itself.
+def sessions_in_month_window(end_session: date, months: int) -> list[date]:
+    """Sessions `s` with `end_session - relativedelta(months=months) < s <= end_session`.
+
+    `months` has no default: callers pass it explicitly (e.g.
+    `settings.universe.min_history_months`) so the window length is always a
+    visible config value, never a silently-assumed constant.
     """
-    cal = _calendar()
-    end_month_start = pd.Timestamp(year=end_session.year, month=end_session.month, day=1)
-    start = end_month_start - pd.DateOffset(months=months - 1)
-    sessions = cal.sessions_in_range(start, pd.Timestamp(end_session))
-    return [_to_date(s) for s in sessions]
+    if months < 1:
+        raise ValueError(f"months must be >= 1, got {months}")
+    cal = _get_calendar()
+    start_exclusive = end_session - relativedelta(months=months)
+    start_ts = pd.Timestamp(start_exclusive)
+    sessions = cal.sessions_in_range(start_ts, pd.Timestamp(end_session))
+    return [_to_date(s) for s in sessions if s > start_ts]
