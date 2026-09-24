@@ -35,7 +35,7 @@ Filters apply **in this order**; the top-N cut is last, so the result has exactl
 |---|---|---|---|
 | 1 | Security type: common stock (any listed class); exclude funds and ETFs, SPACs, ADRs and other foreign-issuer receipts, preferreds, warrants, units | `universe.security_types=[common]` | security master classification (see Verify) |
 | 2 | Exchange: NYSE, Nasdaq, NYSE American | `universe.exchanges` | security master (see Verify) |
-| 3 | Sector exclusion: utilities | `universe.exclude_sic_ranges=[[4900,4949],[4960,4999]]` **guarded** | SIC from each filing's header, with the filing's `known_at` |
+| 3 | Sector exclusion: utilities | `universe.exclude_sic_ranges=[[4900,4999]]` **guarded** | SIC from each filing's header, with the filing's `known_at` |
 | 4 | Price: close at T ≥ $5 | `universe.min_price=5` | `PriceSource` |
 | 5 | Liquidity: 20-session median **consolidated** dollar volume ≥ $5M | `universe.min_median_dollar_volume=5_000_000`, `universe.liquidity_window=20` | `PriceSource`; **not usable on an IEX-only feed** (blocked until ADR 0003's Alpaca check resolves) |
 | 6 | History: every session in the 12 calendar months before T (per the XNYS calendar) has a bar | `universe.min_history_months=12` | `PriceSource` + calendar |
@@ -44,7 +44,7 @@ Filters apply **in this order**; the top-N cut is last, so the result has exactl
 
 Names dropped by rules 1, 6 or 7 for **missing data** (unclassifiable type, truncated price history, no or stale shares fact) are counted in the survivorship-gap report (ADR 0003 rule 5) as separate categories, so every exclusion is visible.
 
-Proposed SIC ranges exclude 4950–4959 (sanitary and refuse services, e.g. waste companies), which are not utilities in the owner's sense. **Owner to confirm** the ranges before the first registered hypothesis; until then the default stands.
+The owner confirmed on 2026-09-24 that the exclusion covers the **entire** SIC 4900–4999 division (electric, gas, water, sanitary services and related), with no carve-outs: nothing utilities-adjacent is in scope.
 
 ### Cadence
 

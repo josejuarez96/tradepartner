@@ -14,7 +14,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 
 ## Scope
 - **In:** US equities, long-only, low frequency (daily or slower), no leverage, no options trading. The owner may revisit this through an ADR.
-- **Out:** the utility sector (owner compliance decision; SIC ranges are a guarded setting, proposed 4900–4949 and 4960–4999, changeable only by amending this charter). Anything using material non-public information.
+- **Out:** the utility sector (owner compliance decision; the entire SIC 4900–4999 division, a guarded setting changeable only by amending this charter). Anything using material non-public information.
 - **Deferred beyond the MVP** (ADR required to enter scope): social and Google Trends data, news-text signals, and the LLM analyst layer. See [roadmap.md](roadmap.md), "MVP scope".
 - **Interface:** the owner interacts through a CLI and a local, read-only dashboard that reads the system's own database. The only write action is a logged override with a reason. See [roadmap.md](roadmap.md), "User experience".
 - **Universe** ([ADR 0006](decisions/0006-universe-and-cadence.md)): US common stocks on NYSE, Nasdaq and NYSE American; ranked by market cap with liquidity and price floors, rebuilt point-in-time at each rebalance. The numbers (proposed defaults: top 1000, $5M median dollar volume, $5 price) are config, frozen per hypothesis at pre-registration.
