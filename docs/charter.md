@@ -24,7 +24,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 - Runs locally, for personal use only.
 - Paper trading first. Live capital is about $100 at most until the charter is amended. ⬜ Account type: taxable or retirement.
 - ⬜ **Compliance:** employer personal-trading policy reviewed? (Required before any live trading.)
-- ⬜ **Budget:** monthly ceiling for data, APIs and LLM spend.
+- **Budget:** data-vendor spend is deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md); interim ceiling for all spend is **$0/month** (free tiers only). ⬜ Ceiling for APIs and LLM spend from Phase 3 on.
 - ⬜ **Time:** hours per week the owner can give this.
 
 ## Principles (from the research)

@@ -9,6 +9,10 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Build agents: researcher, spec-critic, implementer, quant-auditor, safety-reviewer, doc-keeper.
 - Draft charter, roadmap, STATUS, trial registry.
 
+### Added (Phase 1)
+- ADR 0003: data and broker access through adapters, local-first, paid vendor deferred to Phase 3.
+- ADR 0004: tooling we own, adopt and avoid, from a 2026-09-24 repo survey; `bt` as a test-only oracle for our engine.
+
 ### Changed
 - Roadmap: MVP scope (12-1 momentum vs SPY/MTUM), deferred items, and a UX slice per phase; charter scope updated to match.
 - The main session may squash-merge a PR when the owner explicitly says to. Subagents never merge.
