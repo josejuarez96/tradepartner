@@ -8,133 +8,140 @@ Nothing in Phases 3–6 can be trusted unless the data underneath answers one qu
 
 ## Users & usage
 
-- **The owner**, once a day, glances at the data-health page (is the store current, are there gaps, how big is the survivorship gap). Once, at the start, the owner runs a recording script with their own keys to produce the scrubbed fixtures the tests use.
+- **The owner**, once a day, glances at the data-health page. Once, at the start, the owner runs a recording script with their own keys to produce the scrubbed fixtures the tests use, and records the source-terms facts.
 - **The scheduler**, once per trading day after the close, runs `tradepartner ingest`.
-- **Phase 3 code** (backtester, signals) reads through the as-of API and never touches adapters directly.
-- **Tests**, on every PR, run the no-look-ahead suite against the fixture universe with no network and no secrets.
+- **Phase 3 code** reads through the as-of API and never touches adapters directly.
+- **Tests**, on every PR, run against the fixture universe with the network disabled.
 
 ## Definitions
 
-- **T** is always a tz-aware UTC timestamp. A rebalance *date* is mapped to T = that session's close via the calendar. Never a bare date.
+- **T** is always a tz-aware UTC timestamp. A rebalance *date* maps to T = that session's close via the calendar. Never a bare date.
 - **`known_at`** is when a fact became knowable to a market participant. **`ingested_at`** is when we stored it. `known_at ≤ ingested_at` always.
-- **Revision**: a later value for the same key is a **new row** with its own `known_at`; rows are never updated in place. "Latest as of T" means the row with the greatest `known_at ≤ T`.
-- **Provenance** on every row: `filing` (from a dated SEC filing; `known_at` = acceptance timestamp), `bar` (per the timing rule), `action` (per the corporate-action rule), or `snapshot` (from a current-only endpoint; `known_at` = fetch time, so it is only valid for T ≥ fetch time).
+- **Revision**: a later value for the same key is a **new row** with its own `known_at`; rows are never updated in place. "Latest as of T" is the row with the greatest `known_at ≤ T`.
+- **Provenance** on every row: `filing` (`known_at` = SEC acceptance timestamp), `bar` (session close), `action` (rule below), `snapshot` (current-only endpoint; `known_at` = fetch time), or `snapshot_static` (a snapshot attribute the config explicitly allows to apply before its fetch time, e.g. a company name or a pre-2019 exchange; counted and shown on the health page).
+- **Raw payload**: the bytes a source returns (JSON, SGML header text, or a downloaded filing file). Fetch functions return raw payloads; parsers turn raw payloads into records. Only parsers are unit-tested; fixtures are recorded raw payloads.
 
 ## Requirements
 
-1. **Store.** A single DuckDB file whose path comes from config. Every fact table has `known_at`, `ingested_at`, `source`, `provenance`. Prices are stored raw OHLCV; corporate actions separately; adjusted series are computed at read time as of T (ADR 0003 rule 1). Ingest opens the file read-write; every other process opens **short-lived `read_only=True`** connections.
-2. **Calendar.** A wrapper over `exchange_calendars` XNYS exposing: is-session, next/previous session, session open and close timestamps, last session of month, last *completed* session as of a timestamp, sessions in a calendar-month window, and half-day detection. No "weekday" logic anywhere.
-3. **Security master.** Keyed by our `security_id`, mapped to CIK and to dated ticker ranges, with exchange, security type, SIC, delisting date and reason, and a `benchmark` flag. Each column's source and `known_at` rule is fixed in "Data / interfaces". Answers "what existed at T" (ADR 0003 rule 3).
-4. **`PriceSource` interface**: `bars()` and `corporate_actions()` (splits, dividends). Two adapters: **fixture** and **Alpaca** (free plan). Each adapter separates *fetch* (thin, untested beyond a smoke test) from *parse* (pure, tested on recorded raw JSON).
-5. **`FilingSource` interface**: company facts (shares outstanding), filing headers (SIC), cover-page tags (title, symbol, exchange, from ~2019), Form 25 delistings, and the current company-tickers snapshot. Two adapters: **fixture** and **EDGAR** via `edgartools` (pinned; cache directory from config; identity from config). Same fetch/parse split.
-6. **`Broker` interface** and an **in-memory fake broker** (submit, cancel, positions, fills; duplicate client order IDs rejected). No risk logic here (Phase 4).
-7. **As-of read API.** `prices_as_of(T)`, `adjusted_prices_as_of(T)`, `facts_as_of(T)`, `securities_as_of(T)`, `listings_as_of(T)`, `universe_as_of(T)`, `survivorship_gap(T)`. Every function takes a tz-aware T and returns only rows with `known_at ≤ T`, choosing the latest revision as of T.
-8. **Ingest job.** `tradepartner ingest [--source alpaca|edgar|all] [--backfill --since DATE] [--dry-run]`. Per-source **atomic** transactions (a failure in one source commits nothing from that source; the other source's commit stands). Idempotent: re-running for the same completed session adds no fact rows. Backfill commits in chunks (per month per source) and is resumable from the last committed chunk. Halts with non-zero exit on **stale** or failed source, leaving the store unchanged except for the `ingestion_runs` row. Retries on DuckDB lock for a configured time, then exits non-zero.
-9. **Staleness** is source-level: the expected latest session is the calendar's last completed session at run time minus a configured settle delay; a source is stale if its reference symbol (config, e.g. SPY) has no bar for that session, or more than a configured share of listed names are missing it.
-10. **Health checks as code.** `tradepartner health [--check]` computes, in a pure `health.py` shared with the dashboard: last successful ingest per source; coverage by session; gaps; survivorship gap; unclassifiable count; liquidity-rule status; and integrity checks (non-null `known_at`, `known_at ≤ ingested_at`, bars only on sessions, no duplicate `(security_id, session, known_at)`, non-overlapping listings, guarded SIC default matches the charter). `--check` exits non-zero on any integrity failure.
-11. **Data-health page.** A Streamlit page rendering `health.py` output. Read-only, short-lived connections.
-12. **Fixture universe** (ADR 0003 rule 4). Checked in as **CSV** (reviewable in diffs), generated by a seeded script; the test asserts content equality on regeneration, not bytes. Required cases: a delisting with truncated history (> N sessions before Form 25), a delisting within N sessions, a split, a split between a shares filing and a rebalance T, a ticker reused by a different company, a restated shares fact (two `known_at` for one period), a stale shares fact (> 400 days), an unclassifiable name, a holiday, a half day, SPY and MTUM as `benchmark` rows with dividends.
-13. **Benchmarks.** SPY and MTUM bars and dividends are ingested and flagged `benchmark`; they are excluded from the universe by type but available to Phase 3 for total return.
-14. **Config.** Pydantic settings. Every threshold from ADR 0006 is a config key with the ADR's default; `universe.exclude_sic_ranges` is **guarded** (test pins it to the charter). Secrets only from `.env`; `.env.example` lists them; nothing needs `.env` unless a real adapter is called.
-15. **`data-validator` agent.** A read-only `.claude/agents/data-validator.md` that runs `tradepartner health --check` and the no-look-ahead suite against a real store and reports. It computes nothing itself (charter principle 3).
+1. **Store.** A single DuckDB file, path from config. Every fact table has `known_at`, `ingested_at`, `source`, `provenance`. Prices raw OHLCV; corporate actions separate; adjusted series computed at read time as of T. Ingest holds the file read-write only while committing a chunk and releases it between chunks; every other process uses **short-lived `read_only=True`** connections and shows a "store busy" state when locked.
+2. **Calendar.** Wrapper over `exchange_calendars` XNYS: is-session, next/previous session, open and close timestamps, last session of month, last *completed* session as of a timestamp, sessions in a calendar-month window, half-day detection. No weekday logic.
+3. **Security master.** A `securities` row is created from the **earliest filing per CIK** in EDGAR's filing index (`known_at` = that filing's acceptance), so companies exist at historical T and delisted names exist at all. Ticker ranges, exchange, SIC, type and delisting come from filings where filings supply them and from `snapshot_static` attributes where they do not (pre-~2019 ticker and exchange). Keyed by `security_id`; adapters never resolve by bare ticker. Benchmarks (SPY, MTUM) are **seeded from config**, not derived from EDGAR (MTUM shares its trust's CIK with other funds).
+4. **Delistings.** Forms **25 and 25-NSE** are both ingested. Each applies only to the **listing whose class title and exchange it names**; a Form 25 followed by a new listing on another exchange within `master.transfer_window_sessions` is a **transfer**, not a delisting. A listing ends on its **last trading session**; `effective_on` is stored for reference (filing date + 10 days per Rule 12d2-2 unless stated).
+5. **Corporate actions.** `PriceSource.corporate_actions()` supplies splits and dividends. **First-seen** row: `known_at` = source announcement time if present, else the close of the session before ex-date. **Any later row that differs** for the same (security, type, ex-date): `known_at = ingested_at`. Never back-dated on revision.
+6. **`PriceSource`** (`bars`, `corporate_actions`) with **fixture** and **Alpaca** adapters. **`FilingSource`** (filing index, company facts, filing headers, cover pages, Form 25/25-NSE, companies snapshot) with **fixture** and **EDGAR** adapters. Real adapters = thin raw-fetch client (`httpx` for EDGAR JSON/SGML/files, `alpaca-py` for Alpaca) + pure parsers; `edgartools` (pinned, cache dir from config) is used only to parse downloaded cover-page iXBRL.
+7. **`Broker` interface** and in-memory **fake broker** (submit, cancel, positions, fills; duplicate client order IDs rejected). No risk logic (Phase 4).
+8. **As-of read API.** `prices_as_of`, `adjusted_prices_as_of(T, include_dividends=False)` (splits only by default; dividends for Phase 3 total return), `facts_as_of`, `securities_as_of`, `listings_as_of`, `universe_as_of`, `survivorship_gap`. All take tz-aware T and return only rows with `known_at ≤ T`, latest revision as of T. **Level rules** (ADR 0006 rules 4 and 8) use the **raw close at T** and adjust shares only for splits with **ex-date ≤ T**, regardless of when the split became known.
+9. **Ingest.** `tradepartner ingest [--source alpaca|edgar|all] [--backfill --since DATE] [--dry-run]`. Per-source atomic chunks (one calendar month per source); a failure commits nothing from that chunk, earlier chunks stand; `--backfill` resumes from the last committed chunk. Idempotent for a completed session. Halts non-zero on stale or failed source, with only the `ingestion_runs` row written for that source. Retries on lock for `store.lock_retry_seconds`, then exits non-zero.
+10. **Staleness** is source-level: expected latest session = calendar's last completed session at run time minus `ingest.settle_delay_minutes`; stale if the reference symbol has no bar for it, or more than `ingest.max_missing_share` of listed names are missing it. On an IEX-only feed (set by the owner in T3), `max_missing_share` and rule 6 thresholds are what the owner recorded, never silently relaxed.
+11. **Health as code.** `tradepartner health [--check]` uses a pure `health.py` shared with the page: last successful ingest per source; coverage; gaps; survivorship gap and its three side categories; unclassifiable count; `snapshot_static` reliance count at the latest T; **delisted names count and list**; liquidity-rule and fill-price settings; integrity rules (non-null `known_at`; `known_at ≤ ingested_at`; bars only on sessions; no duplicate `(security_id, session, known_at)`; non-overlapping listings per security; no bars after a listing's end for delistings; guarded SIC default = charter). `--check` exits non-zero on any failure.
+12. **Page.** Streamlit, rendering `health.py` output, read-only, with the busy state.
+13. **Fixture universe** as CSV, seeded generator, content-equal regeneration. Required cases: delisting with truncated history (> N sessions before the Form 25 filing) and one within N; a **clean merger delisting** (last bar the session before filing; expected *not* missing); a **25-NSE**; a Form 25 on a **non-common class** (common survives); an **exchange transfer**; a **same-company ticker change**; a **ticker reused** by a different company; a **dual-class** company; a split; a split between a shares filing and T; a **split known before T with ex-date after T**; a **revised dividend**; a restated shares fact; a stale shares fact; an unclassifiable name; a `snapshot_static`-only pre-2019 listing; a holiday; a half day; SPY and MTUM as benchmarks with dividends. Generated CSVs are reviewed through the generator and excluded from the 400-line budget.
+14. **Config** (pydantic settings). Every ADR 0006 threshold is a key with its default; `universe.exclude_sic_ranges` is guarded. `universe.liquidity_rule_enabled` **defaults to `false`** and `execution.fill_price` to `close` until the owner's T3 research sets them. Secrets only from `.env`.
+15. **`data-validator` agent**: read-only, runs `health --check` and the suite on the owner's real store, reports; computes nothing itself.
 
 ## Acceptance criteria (testable)
 
 Timing and store
-- [ ] Given any fact table, when queried, then every row has tz-aware UTC `known_at` and `ingested_at`, `known_at ≤ ingested_at`, and non-null `source` and `provenance` (schema test; also a `health --check` rule).
-- [ ] Given a bar for session S, when stored, then `known_at` = XNYS close of S from the calendar (normal day and half day).
-- [ ] Given a bar re-fetched after the settle delay with a different close, when ingested, then a second row exists with `known_at = ingested_at`, and `prices_as_of(T)` returns the first for T before the revision and the second after.
-- [ ] Given a corporate action with no announcement time in the source, when stored, then `known_at` = close of the session before its ex-date (the conservative proxy) and never `ingested_at`; given a backfill of a 2018 split run in 2026, when `adjusted_prices_as_of(2019-01-31 close)` runs, then 2017 prices are adjusted.
-- [ ] Given a restated shares fact, when `facts_as_of(T)` is called for T between the two `known_at` values, then the earlier value is returned; after the second, the later one.
+- [ ] Every fact table row: tz-aware UTC `known_at`, `ingested_at`, `known_at ≤ ingested_at`, non-null `source`, `provenance` in the allowed set (schema test; `health --check` rule).
+- [ ] A bar for session S has `known_at` = XNYS close of S (normal day and half day).
+- [ ] A bar re-fetched with a different close becomes a second row with `known_at = ingested_at`; `prices_as_of` returns each in its interval.
+- [ ] First-seen corporate action without an announcement time: `known_at` = close before ex-date; a **revised** dividend becomes a new row with `known_at = ingested_at`, and `adjusted_prices_as_of(T, include_dividends=True)` uses the old amount before that and the new after.
+- [ ] Backfilled 2018 split in 2026: `adjusted_prices_as_of(2019-01-31 close)` adjusts 2017 prices.
+- [ ] Split known before T with ex-date after T: `universe_as_of(T)` cap uses unadjusted shares and raw close; rule 4 uses the raw close.
+- [ ] Restated shares fact: `facts_as_of(T)` returns the earlier value between the two `known_at`, the later after; facts carry `as_of_date` and `class_member`.
 
 Look-ahead
-- [ ] **Truncation invariance.** For every as-of function including `universe_as_of` and `survivorship_gap`, and for every T in a set of probe timestamps, f(T) on the full fixture store equals f(T) on a store physically truncated to `known_at ≤ T`.
-- [ ] Given the deliberately broken adapter, when the suite runs, then each of its violations is caught by a named check: early `known_at` on bars → the timing check; pre-adjusted prices → the raw-close check against the fixture; ticker-based resolution → the ticker-reuse check; `known_at` after `ingested_at` → the schema check.
-- [ ] Given a rebalance *date*, when any as-of function is called with it, then it raises (T must be a tz-aware timestamp).
+- [ ] **Truncation invariance** for every as-of function including `universe_as_of` and `survivorship_gap`: f(T) on the full fixture store equals f(T) on a store truncated to `known_at ≤ T`, for probe timestamps placed **just before and just after every distinct `known_at`** in the fixture.
+- [ ] The broken adapter's violations (early `known_at`; pre-adjusted prices; ticker-based resolution; `known_at > ingested_at`; back-dated revision) are each caught by a named check.
+- [ ] A bare date passed as T raises.
+- [ ] An autouse test fixture makes `socket.connect` raise; every test passes with it on.
 
 Security master and universe
-- [ ] Given the reused ticker in the fixture, when prices are requested by `security_id`, then only that company's rows are returned.
-- [ ] Given the delisted name, when `universe_as_of(T)` runs after its Form 25 effective date, then it is absent; when `securities_as_of(T)` runs, then it is present with a delisting date.
-- [ ] Given a rebalance T, when `universe_as_of(T)` runs, then every included name satisfies ADR 0006 rules 1–8 in order; the split-between-filing-and-T case yields the split-adjusted cap; the stale-shares case is excluded; the output records which rules were enabled.
-- [ ] Given `universe.liquidity_rule_enabled = false`, when `universe_as_of(T)` runs, then rule 5 is skipped, the output says so, and `health` shows "liquidity rule disabled".
-- [ ] Given each `universe.*` key overridden one at a time, when `universe_as_of(T)` runs, then the membership changes as expected (one test per key). Given `universe.py` and `gap.py`, when an AST check runs, then they contain no numeric literals other than 0, 1 and -1.
-- [ ] Given the fixture, when `survivorship_gap(T)` runs, then count share and size share equal the hand-computed values, per the formula in "Data / interfaces", with the three exclusion categories reported separately.
+- [ ] Reused ticker: prices by `security_id` return only that company's rows. Same-company ticker change: one `security_id`, two listing ranges.
+- [ ] Earliest-filing rule: a fixture company whose only filings are historical has a `securities` row with `known_at` = its first filing's acceptance; `securities_as_of` at a T before any filing returns nothing for it.
+- [ ] `snapshot_static` attributes apply before fetch time only for the columns config allows; `health` reports the reliance count.
+- [ ] Delistings: 25 and 25-NSE both end the named listing; a Form 25 on a preferred class leaves the common listed; a transfer within the window keeps the security in `universe_as_of` on the new exchange; the delisted fixture name is absent from `universe_as_of` after its last session and present in `securities_as_of` with dates.
+- [ ] `universe_as_of(T)`: rules 1–8 in ADR order; dual-class cap summed over classes, both listed classes admitted; split-adjusted cap; stale shares excluded; output records enabled rules and the fill-price setting.
+- [ ] `universe.liquidity_rule_enabled=false` (the default): rule 5 skipped and recorded; `health` shows it.
+- [ ] Each `universe.*` key overridden one at a time changes membership as expected; AST check: `universe.py` and `gap.py` contain no numeric literals other than 0, 1, -1.
+- [ ] `survivorship_gap(T)` matches hand-computed count and size share per the formula; clean merger delisting is *not* missing; the three side categories are reported separately.
 
 Adapters and fixtures
-- [ ] Given recorded EDGAR JSON, when parsed, then filing-derived records have `known_at` = acceptance timestamp and `provenance = filing`; snapshot records have `provenance = snapshot` and `known_at` = the recorded fetch time.
-- [ ] Given recorded Alpaca JSON, when parsed, then bars have `known_at` per the timing rule, closes are unadjusted, and resolution goes through the master by `security_id`.
-- [ ] Given the committed fixtures, when the scrub test runs, then no file contains an API key, secret, email address or the owner's User-Agent string.
-- [ ] Given no `.env`, when the package is imported and all fixture-based tests run, then nothing fails.
+- [ ] EDGAR parsers on recorded payloads: filing-derived records have `known_at` = acceptance and `provenance = filing`; snapshot records `provenance = snapshot` with recorded fetch time; SGML header yields SIC; cover page yields title, symbol, exchange; 25 and 25-NSE yield class title and exchange.
+- [ ] Alpaca parsers on recorded payloads: raw closes, `known_at` per timing rule, actions with the proxy rule, resolution through the master.
+- [ ] Scrub test: no fixture contains a key-shaped string, an email pattern, or a `User-Agent`-shaped string (pattern-based; no `.env` needed).
+- [ ] No `.env`: package imports and all tests pass.
 
 Ingest
-- [ ] Given a store ingested for the last completed session, when `ingest` runs again, then no fact rows change and `ingestion_runs` records `rows_added = 0`.
-- [ ] Given runs on a holiday, a weekend, before the close, and on a half day, when staleness is evaluated, then "expected latest session" is the last completed session in each case (four tests).
-- [ ] Given a stale reference symbol, when `ingest` runs, then exit is non-zero, `ingestion_runs.status = stale`, and no fact rows changed.
-- [ ] Given a source that raises mid-chunk, when `ingest` runs, then that source's chunk is not committed, earlier chunks are, and `--backfill` resumes from the last committed chunk.
-- [ ] Given a reader holding a read-only connection, when `ingest` runs, then it completes; given a writer holding the file, when `ingest` runs, then it retries for the configured time and exits non-zero.
+- [ ] Idempotent re-run for a completed session: no fact rows change; `rows_added = 0`.
+- [ ] Staleness on holiday, weekend, pre-close, half day: expected latest session is the last completed one (four tests).
+- [ ] Stale reference symbol: non-zero exit, `status = stale`, no fact rows changed for that source.
+- [ ] Mid-chunk failure: that chunk not committed, earlier chunks committed, `--backfill` resumes from `chunk_cursor`.
+- [ ] Lock: with a short-lived reader that closes within `lock_retry_seconds`, ingest completes; with a writer that never closes, ingest exits non-zero after the retry window. The page shows "store busy" while a chunk commits.
 
-Health and dashboard
-- [ ] Given the fixture store, when `health --check` runs, then it passes; given a store with an injected duplicate bar or overlapping listing, then it exits non-zero naming the rule.
-- [ ] Given `universe.exclude_sic_ranges` changed from the charter value, when `health --check` runs, then it fails.
-- [ ] Given the fixture store, when the page renders headlessly, then it shows last ingest, coverage, gaps, survivorship gap, unclassifiable count and liquidity-rule status.
+Health and page
+- [ ] `health --check` passes on the fixture store; fails naming the rule on an injected duplicate bar, overlapping listing, bar after a delisting end, or changed SIC default.
+- [ ] Headless render shows every `health.py` metric, including delisted names and `snapshot_static` reliance.
 
-Unattended operation (evidence, not a unit test)
-- [ ] Given the launchd job installed per the runbook, when five consecutive sessions pass, then `ingestion_runs` has five scheduled rows with `status = ok`, shown in the close-out PR.
+Real-store evidence (close-out PR, not unit tests)
+- [ ] `universe_as_of` at a 2020 month-end on the owner's real store is non-empty and includes at least one name later delisted.
+- [ ] Five consecutive scheduled `ingestion_runs` rows with `status = ok`.
 
 ## Out of scope
 
-Signals, backtester, trial registry, cost model (Phase 3). Risk-gated broker wrapper, Alpaca paper adapter, alerts (Phase 4). Paid price vendor (Phase 3 ADR). Intraday data. Fundamentals beyond shares outstanding and SIC. Options, social or news data. Pre-2019 ticker-range history beyond snapshot provenance (ADR 0006 states the limit). Dashboard pages beyond data health.
+Signals, backtester, trial registry, cost model (Phase 3). Risk-gated broker wrapper, Alpaca paper adapter, alerts (Phase 4). Paid vendor (Phase 3 ADR). Intraday data. Fundamentals beyond shares outstanding and SIC. Pre-2019 ticker history beyond `snapshot_static`. Parquet export command is Phase 2 (`tradepartner export`) but automated export at tags is Phase 3 tooling.
 
 ## Data / interfaces
 
 **Tables** (all with `known_at`, `ingested_at`, `source`, `provenance`):
-- `securities(security_id, cik, name, security_type, benchmark)`
-- `listings(security_id, ticker, exchange, valid_from, valid_to)`
-- `classifications(security_id, sic, security_type, rule)` — revisions over time
-- `delistings(security_id, form25_filed_at, effective_on, reason)`
+- `securities(security_id, cik, name, benchmark)`
+- `listings(security_id, ticker, exchange, class_title, valid_from, valid_to)`
+- `classifications(security_id, sic, security_type, rule)`
+- `delistings(security_id, form, class_title, exchange, filed_at, effective_on, last_session, is_transfer)`
 - `prices_daily(security_id, session, open, high, low, close, volume)` raw
 - `corporate_actions(security_id, action_type, ex_date, ratio_or_amount)`
-- `facts(security_id, fact_name, period_end, value, filing_accession)`
+- `facts(security_id, fact_name, as_of_date, class_member, value, filing_accession)`
 - `ingestion_runs(run_id, started_at, finished_at, status, source, mode, rows_added, chunk_cursor, message)`
 
-**Master column sources and `known_at` rules**
+**Master column sources and `known_at`**
 
 | Column | Source | `known_at` | Provenance |
 |---|---|---|---|
-| cik, name | EDGAR company-tickers snapshot | fetch time | snapshot |
-| ticker range, exchange (≥ ~2019) | cover-page `dei:TradingSymbol`, `dei:SecurityExchangeName` | filing acceptance | filing |
-| ticker range, exchange (earlier) | Alpaca assets snapshot + company-tickers snapshot | fetch time | snapshot |
-| SIC | filing SGML header | filing acceptance | filing |
-| security type | rules in ADR 0006 "Verify" (SIC 6770, 20-F/40-F, N-CSR/N-PORT/485BPOS/N-2, title/suffix, price-source asset class) | acceptance of the filing the rule used, else fetch time | filing or snapshot |
-| shares outstanding | XBRL `EntityCommonStockSharesOutstanding` | filing acceptance | filing |
-| delisting | Form 25 | filing acceptance; `effective_on` = filing date + 10 days per Rule 12d2-2 unless the form states otherwise | filing |
-| splits, dividends | `PriceSource.corporate_actions` | source announcement time if present, else close of the session before ex-date | action |
-| bars | `PriceSource.bars` | session close | bar |
+| securities row, cik | earliest filing per CIK in the EDGAR filing index | first acceptance | filing |
+| name | companies snapshot | fetch time, allowed static | snapshot_static |
+| ticker, exchange, class title (≥ ~2019) | cover-page `dei:TradingSymbol`, `dei:SecurityExchangeName`, `dei:Security12bTitle` | acceptance | filing |
+| ticker, exchange (earlier) | Alpaca assets snapshot + companies snapshot | fetch time, allowed static | snapshot_static |
+| SIC | filing SGML header | acceptance | filing |
+| security type | rules per ADR 0006 "Verify" (SIC 6770; 20-F/40-F; F-6; N-CSR/N-PORT/485BPOS/N-2; title/suffix; asset class) | acceptance of the filing used, else fetch time | filing / snapshot_static |
+| shares outstanding | XBRL `EntityCommonStockSharesOutstanding` with cover `as_of_date` and class dimension | acceptance | filing |
+| delisting / transfer | Forms 25 and 25-NSE, per class and exchange | acceptance | filing |
+| splits, dividends | `PriceSource.corporate_actions` | first seen: announcement time else close before ex-date; revisions: `ingested_at` | action |
+| bars | `PriceSource.bars` | session close; revisions: `ingested_at` | bar |
 
-**Survivorship gap** at T (ADR 0003 rule 5): let L = names in `listings_as_of(T)` with `security_type = common` and not `benchmark`. Missing-price set M = names in L with no bar at T, or (for names with a Form 25 at or before T) whose last bar is more than `gap.missing_tail_sessions` before `effective_on`. Count share = |M| / |L|. Size share = Σ(shares × last known close) over M / Σ over L, where names with no close at all contribute zero to the numerator and are also reported as a count. Reported separately, not in M: `unclassifiable` (no type rule matched), `truncated_history` (rule 6 failures), `stale_shares` (rule 7 failures).
+**Survivorship gap** at T: L = listings in `listings_as_of(T)` with `security_type = common`, not benchmark. M = names in L with no bar at T, or, for names whose listing ended at or before T by delisting (not transfer), whose last bar is more than `gap.missing_tail_sessions` before the **last session before the Form 25 filing**. Count share = |M|/|L|. Size share = Σ(shares × last known raw close) over M / Σ over L; names with no close ever contribute zero and are counted. Side categories, reported separately and not in M: `unclassifiable`, `truncated_history` (rule 6), `stale_shares` (rule 7).
 
-**Interfaces** (`src/tradepartner/adapters/`): `PriceSource.bars(security_ids, start, end) -> Iterable[Bar]`, `.corporate_actions(security_ids, start, end) -> Iterable[Action]`; `FilingSource.companies_snapshot()`, `.facts(cik, fact_names)`, `.filing_headers(cik, forms)`, `.cover_pages(cik)`, `.delistings(since)`; `Broker.submit(order)`, `.cancel(order_id)`, `.positions()`, `.fills(since)`.
+**Interfaces** (`src/tradepartner/adapters/`): `PriceSource.bars(ids, start, end)`, `.corporate_actions(ids, start, end)`; `FilingSource.filing_index(since)`, `.companies_snapshot()`, `.facts(cik, names)`, `.filing_headers(cik, forms)`, `.cover_pages(cik)`, `.delistings(since)`; raw clients `alpaca_raw.*`, `edgar_raw.*` return raw payloads; `Broker.submit/cancel/positions/fills`.
 
-**Config keys**: `store.path`, `store.lock_retry_seconds=60`, `ingest.settle_delay_minutes=60`, `ingest.reference_symbol=SPY`, `ingest.max_missing_share=0.05`, `edgar.cache_dir`, `universe.security_types=[common]`, `universe.exchanges=[NYSE,NASDAQ,NYSE_AMERICAN]`, `universe.exclude_sic_ranges=[[4900,4949],[4960,4999]]` (guarded), `universe.min_price=5`, `universe.liquidity_rule_enabled=true`, `universe.min_median_dollar_volume=5_000_000`, `universe.liquidity_window=20`, `universe.min_history_months=12`, `universe.max_shares_age_days=400`, `universe.top_n_by_cap=1000`, `gap.missing_tail_sessions=5`, `gap.count_share_threshold=0.05`.
+**Config keys**: `store.path`, `store.lock_retry_seconds=60`, `ingest.settle_delay_minutes=60`, `ingest.reference_symbol=SPY`, `ingest.max_missing_share=0.05`, `edgar.cache_dir`, `master.transfer_window_sessions=5`, `master.static_columns=[name,ticker,exchange]`, `benchmarks=[SPY,MTUM]`, `execution.fill_price=close`, `universe.security_types=[common]`, `universe.exchanges=[NYSE,NASDAQ,NYSE_AMERICAN]`, `universe.exclude_sic_ranges=[[4900,4949],[4960,4999]]` (guarded), `universe.min_price=5`, `universe.liquidity_rule_enabled=false`, `universe.min_median_dollar_volume=5_000_000`, `universe.liquidity_window=20`, `universe.min_history_months=12`, `universe.max_shares_age_days=400`, `universe.top_n_by_cap=1000`, `gap.missing_tail_sessions=5`, `gap.count_share_threshold=0.05`.
 
-**Env vars** (`.env.example`): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`.
+**Env vars**: `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`.
 
-**CLI:** `tradepartner ingest`, `tradepartner health [--check]`, `tradepartner dashboard`, `tradepartner record-fixtures` (owner-run; writes scrubbed JSON to `tests/fixtures/{alpaca,edgar}/`).
+**CLI**: `tradepartner ingest`, `health [--check]`, `dashboard`, `export` (Parquet of every table), and `python -m tradepartner.cli_record` (owner-run recorder, before the CLI exists).
 
 ## Risks & domain checks
 
-- **Look-ahead:** adapters stamp `known_at`; the as-of API filters; the truncation-invariance test proves the two agree for every function. The broken adapter proves each named check has teeth.
-- **Survivorship:** free prices lack delisted names' history. The gap is bounded, shown, and gates the holdout in Phase 3. It does not block Phase 2.
-- **Adjusted-price rewrites:** raw storage plus read-time adjustment.
-- **Backfilled corporate actions:** the conservative proxy (close before ex-date) prevents `known_at = ingest time` from erasing history.
-- **Ticker reuse:** master keyed by `security_id` and CIK; adapters never resolve by bare ticker.
-- **Secrets:** pydantic settings from `.env`; never logged; fixtures scrubbed and tested.
-- **Terms and opens:** verified in T2 before any real adapter: Alpaca free-plan terms, official auction open vs IEX print, fractional-order behavior at the open, corporate-actions depth, history depth, ticker-reuse behavior of the assets endpoint; EDGAR User-Agent and ~10 req/s. Outcomes set `universe.liquidity_rule_enabled` and the ADR 0006 open-price fallback, both recorded in the T2 research file.
-- **Single writer:** dashboard and CLI reads are short-lived read-only; ingest retries on lock.
+- **Look-ahead:** adapters stamp `known_at`; the as-of API filters; truncation invariance with probes around every `known_at` proves agreement; the broken adapter proves each check has teeth; revisions are never back-dated.
+- **Survivorship:** securities exist from their first filing, so delisted names are in the denominator; the gap is bounded and shown; it gates the holdout in Phase 3.
+- **Adjusted-price rewrites:** raw storage plus read-time adjustment; revised actions get `ingested_at`.
+- **Level-rule timing:** raw close at T and ex-date ≤ T, so a known-but-future split cannot distort cap or the price floor.
+- **Ticker reuse and class confusion:** master keyed by `security_id`; delistings matched by class title and exchange.
+- **Secrets:** pydantic settings; scrub test; fixtures pattern-checked.
+- **Terms and opens:** the owner's T3 research resolves Alpaca terms, auction vs IEX open, fractional-at-open behavior, actions depth, history depth, assets-endpoint reuse, EDGAR rate limit and User-Agent, backfill runtime; it sets `liquidity_rule_enabled`, `execution.fill_price`, `max_missing_share`.
+- **Single writer:** chunked commits release the lock; readers are short-lived; page has a busy state.
 - **Costs:** none. **Order path:** fake broker only. **LLM inputs:** none.
 
 ## Open questions
 
-1. **Pre-2019 ticker ranges** are snapshot provenance. If Phase 3 needs earlier reproducibility, a research brief on 8-K Item 5.03/3.03 ticker-change parsing is the candidate; not in this spec.
-2. **Form 25 effective date**: the +10-day rule is the default; T7 checks whether `edgartools` exposes the stated effective date.
-3. **Backfill runtime**: estimated in T2 from rate limits; if a full 10-year backfill exceeds one overnight run, the plan adds a `--since` default of the last 3 years and documents it.
+1. **Pre-2019 ticker ranges** remain `snapshot_static`. A research brief on 8-K Item 5.03/3.03 parsing is the candidate if Phase 3 needs better; not here.
+2. **Backfill window**: if T3's estimate exceeds one overnight run, `--since` defaults to the last 3 years and the plan says so.
+3. **`edgartools` cover-page parsing**: if it proves unstable, fall back to parsing the iXBRL `dei` tags with the standard library and pin the approach in T11.
