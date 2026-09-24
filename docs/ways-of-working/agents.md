@@ -1,6 +1,6 @@
 # Agents
 
-**Status:** Draft v0.1 (pending owner approval in PR #2)
+**Status:** Accepted v1.0 (PR #2, 2026-09-24)
 
 ## Two kinds of agents: keep them separate
 

@@ -8,3 +8,6 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Ways of working: git workflow, development process, doc map, templates, ADRs 0001–0002.
 - Build agents: researcher, spec-critic, implementer, quant-auditor, safety-reviewer, doc-keeper.
 - Draft charter, roadmap, STATUS, trial registry.
+
+### Changed
+- The main session may squash-merge a PR when the owner explicitly says to. Subagents never merge.
