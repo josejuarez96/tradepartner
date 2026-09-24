@@ -3,6 +3,10 @@
 Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at the end of each phase (`v0.<phase>.0`).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-09-24
+Phases 0 and 1: foundations, charter and decisions.
+
 ### Added
 - Project scaffold: uv + ruff + mypy + pytest, CI, pre-commit, GitHub templates.
 - Ways of working: git workflow, development process, doc map, templates, ADRs 0001–0002.
@@ -17,3 +21,4 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 ### Changed
 - Roadmap: MVP scope (12-1 momentum vs SPY/MTUM), deferred items, and a UX slice per phase; charter scope updated to match.
 - The main session may squash-merge a PR when the owner explicitly says to. Subagents never merge.
+- Phase 2 spec and plan (data foundation), 24 tasks. Phase 1 retro: no stacked PRs, CI on the exact commit, bookkeeping inside the PR.
