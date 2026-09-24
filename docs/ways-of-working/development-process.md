@@ -69,7 +69,7 @@ Not every change needs every document. Size is set on the issue.
 - [ ] There are tests for new behavior. A bug fix starts with a failing test.
 - [ ] CI is green: lint, format, types, tests, hygiene.
 - [ ] There are no TODOs without a linked issue.
-- [ ] Docs are updated: plan checkbox ticked, `STATUS.md`, `CHANGELOG.md` (`[Unreleased]`), and `.env.example` if config changed.
+- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, `STATUS.md` ("Done"), `CHANGELOG.md` (`[Unreleased]`), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
 - [ ] Data code: every stored fact has `known_at`, and `quant-auditor` has passed.
 - [ ] Execution, LLM or secrets code: `safety-reviewer` has passed.
 

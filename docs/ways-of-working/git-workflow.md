@@ -67,6 +67,10 @@ issue → branch → draft PR → CI green → self-review → specialist review
 
 **Keeping current:** rebase on `main` if the branch is behind (`git fetch && git rebase origin/main`). Don't merge `main` into feature branches, because `main` has linear history.
 
+**No stacked PRs.** Don't open a PR whose base is another open PR's branch: when the base squash-merges, GitHub closes or breaks the stacked PR. Wait for the base to merge, then branch from `main`. (Phase 1 retro.)
+
+**CI must have run on the exact commit being merged.** "No checks reported" is not green; wait for the run (`gh pr checks <n> --watch`) after any rebase or force-push. (Phase 1 retro.)
+
 ## Releases
 
 - Tag `v0.<phase>.0` on `main` when a phase completes, for example `v0.2.0` = data foundation done.
