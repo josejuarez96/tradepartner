@@ -10,4 +10,5 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Draft charter, roadmap, STATUS, trial registry.
 
 ### Changed
+- Roadmap: MVP scope (12-1 momentum vs SPY/MTUM), deferred items, and a UX slice per phase; charter scope updated to match.
 - The main session may squash-merge a PR when the owner explicitly says to. Subagents never merge.
