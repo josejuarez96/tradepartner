@@ -8,7 +8,11 @@ the gitignored `data/` directory (see the PR's Open questions).
 
 from __future__ import annotations
 
+from datetime import date
+from pathlib import Path
+
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import Settings
 
@@ -16,7 +20,13 @@ from tradepartner.config import Settings
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate every test from the real shell environment."""
-    for key in ("ALPACA_API_KEY", "ALPACA_API_SECRET", "SEC_EDGAR_USER_AGENT"):
+    for key in (
+        "ALPACA_API_KEY",
+        "ALPACA_API_SECRET",
+        "SEC_EDGAR_USER_AGENT",
+        "TRADEPARTNER_ENV_FILE",
+        "UNIVERSE__EXCLUDE_SIC_RANGES",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -27,10 +37,10 @@ def _settings() -> Settings:
 
 
 def test_settings_construct_with_no_env_file_present(
-    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Import and load succeed with no `.env` present (acceptance criterion)."""
-    monkeypatch.chdir(tmp_path)  # type: ignore[arg-type]
+    monkeypatch.chdir(tmp_path)
     settings = Settings()
     assert settings is not None
     assert settings.store.path == "data/tradepartner.duckdb"
@@ -40,6 +50,12 @@ def test_store_defaults() -> None:
     s = _settings()
     assert s.store.path == "data/tradepartner.duckdb"
     assert s.store.lock_retry_seconds == 60
+
+
+def test_calendar_defaults() -> None:
+    s = _settings()
+    assert s.calendar.start == date(1990, 1, 1)
+    assert s.calendar.end == date(2035, 12, 31)
 
 
 def test_ingest_defaults() -> None:
@@ -80,6 +96,11 @@ def test_execution_fill_price_default_close() -> None:
     assert _settings().execution.fill_price == "close"
 
 
+def test_execution_fill_price_rejects_invalid_value() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, execution={"fill_price": "colse"})
+
+
 def test_universe_defaults() -> None:
     u = _settings().universe
     assert u.security_types == ["common"]
@@ -98,7 +119,14 @@ def test_guarded_sic_exclusion_pinned_to_charter_range() -> None:
 
     Changing this default is a charter amendment, not a routine code change.
     """
-    assert _settings().universe.exclude_sic_ranges == [[4900, 4999]]
+    assert _settings().universe.exclude_sic_ranges == ((4900, 4999),)
+
+
+def test_guarded_sic_exclusion_rejects_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A env override can't silently loosen the guarded SIC exclusion."""
+    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", "[]")
+    with pytest.raises(ValidationError, match="guarded setting; change only by charter amendment"):
+        Settings(_env_file=None)
 
 
 def test_liquidity_rule_disabled_by_default() -> None:
@@ -132,3 +160,36 @@ def test_secrets_absent_from_repr_and_str(monkeypatch: pytest.MonkeyPatch) -> No
         assert "sk-live-abc123" not in blob
         assert "sk-live-secret456" not in blob
         assert "jose@example.com" not in blob
+
+
+# --- .env resolution: anchored to the project root, not the CWD -----------
+
+
+def test_env_file_anchored_to_project_root_not_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A decoy `.env` in an unrelated CWD (e.g. `$HOME` for a launchd job)
+    must never be picked up.
+    """
+    decoy = tmp_path / ".env"
+    decoy.write_text("ALPACA_API_KEY=decoy-should-not-load\n")
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings()
+
+    assert settings.alpaca_api_key is None or (
+        settings.alpaca_api_key.get_secret_value() != "decoy-should-not-load"
+    )
+
+
+def test_env_file_override_via_tradepartner_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom_env = tmp_path / "custom.env"
+    custom_env.write_text("ALPACA_API_KEY=custom-key-999\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(custom_env))
+
+    settings = Settings()
+
+    assert settings.alpaca_api_key is not None
+    assert settings.alpaca_api_key.get_secret_value() == "custom-key-999"
