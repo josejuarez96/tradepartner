@@ -1,6 +1,6 @@
 # 0003. Data and broker access go through adapters; local-first; paid price vendor deferred to Phase 3
 
-**Status:** Proposed  ·  **Date:** 2026-09-24  ·  **Issue:** #5
+**Status:** Accepted  ·  **Date:** 2026-09-24  ·  **Issue:** #5
 
 ## Context
 
@@ -30,7 +30,7 @@ We will define three interfaces in `src/tradepartner/` and put every external sy
 
 ### Rules
 
-**1. Point-in-time storage.** Every stored record carries `known_at` (when the fact became knowable, UTC, tz-aware) and `ingested_at` (when we stored it) plus a source identifier. Prices are stored **raw** (unadjusted closes, volumes) alongside **corporate actions** (splits, dividends, ticker changes, delistings), each with its own `known_at`. Adjusted series are computed at read time "as of T", never stored as truth, because vendors rewrite adjusted history after the fact.
+**1. Point-in-time storage.** Every stored record carries `known_at` (when the fact became knowable, UTC, tz-aware) and `ingested_at` (when we stored it) plus a source identifier. Prices are stored **raw** (unadjusted open, high, low, close, volume; the open is required because execution is at T+1 open per ADR 0006) alongside **corporate actions** (splits, dividends, ticker changes, delistings), each with its own `known_at`. Adjusted series are computed at read time "as of T", never stored as truth, because vendors rewrite adjusted history after the fact.
 
 **2. Canonical timing rule.** A daily bar for session T has `known_at` equal to that session's close on the exchange calendar. A signal computed from session T's close may trade no earlier than session T+1. This rule lives in the core, not in adapters. An adapter whose source cannot supply a real `known_at` applies this rule and says so in its docstring.
 
@@ -55,7 +55,7 @@ Both numbers appear on the Phase 2 data-health page and in every backtest result
 ### Verify before the Phase 2 plan
 
 Unknown as of this ADR and to be checked in the plan, not assumed:
-- Alpaca free plan: historical depth (believed ~2016), IEX-only vs consolidated daily bars, delisted-symbol coverage, corporate-actions depth, dividend data for SPY and MTUM total return, and whether the terms allow local storage. An account and API key are needed even for data.
+- Alpaca free plan: historical depth (believed ~2016), IEX-only vs consolidated daily bars, delisted-symbol coverage, corporate-actions depth, dividend data for SPY and MTUM total return, whether the terms allow local storage, whether the daily **open** is the official opening-auction price or an IEX print, and whether a fractional DAY order submitted before the open joins the opening auction or fills at NBBO afterwards. An account and API key are needed even for data.
 - EDGAR: a declared `User-Agent` with contact details and a rate limit of about 10 requests per second.
 
 ## Consequences
