@@ -1,6 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
+    "ask": [
+      "Bash(gh pr merge:*)"
+    ],
     "allow": [
       "Bash(uv sync:*)",
       "Bash(uv run pytest:*)",
@@ -36,7 +39,6 @@
       "Bash(git commit --no-verify:*)",
       "Bash(git commit -n:*)",
       "Bash(git reset --hard:*)",
-      "Bash(gh pr merge:*)",
       "Bash(gh repo delete:*)",
       "Bash(gh api -X DELETE:*)"
     ]

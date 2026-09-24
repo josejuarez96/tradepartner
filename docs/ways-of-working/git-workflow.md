@@ -11,7 +11,7 @@
 4. **Push whenever you stop working.** The remote branch is the backup and the handoff point for the next session or agent.
 5. **Open a draft PR early** (after the first meaningful commit), so CI runs and progress is visible.
 6. **Squash-merge only.** The PR title becomes the single commit on `main`, so it must be a Conventional Commit.
-7. **The owner merges.** Agents open PRs and address review comments. They never merge, force-push shared branches, or push to `main`.
+7. **The owner approves every merge.** Agents open PRs and address review comments. They never force-push shared branches or push to `main`. The main session may run the squash merge **only when the owner explicitly tells it to merge that specific PR** and CI is green. Subagents never merge.
 
 ## When to create a branch
 
@@ -53,7 +53,7 @@
 ## PR lifecycle
 
 ```
-issue → branch → draft PR → CI green → self-review → specialist review agents → ready for review → owner merges → branch auto-deleted
+issue → branch → draft PR → CI green → self-review → specialist review agents → ready for review → owner merges (or tells the agent to) → branch auto-deleted
 ```
 
 **Before marking a PR ready for review:**
@@ -85,7 +85,7 @@ This repo is private on GitHub Free, which **cannot enforce branch protection se
 |---|---|---|
 | pre-commit hook | Commits on `main`, private keys and secrets (gitleaks), files over 500 KB | `.pre-commit-config.yaml` |
 | pre-push hook | Pushes to `main` | `.pre-commit-config.yaml` (`no-push-to-main`) |
-| Claude Code deny rules | Agents pushing to main, force-pushing, merging PRs, reading `.env` | `.claude/settings.json` |
+| Claude Code permission rules | Agents pushing to main, force-pushing, reading `.env` (deny); `gh pr merge` always prompts for confirmation (ask) | `.claude/settings.json` |
 | GitHub repo settings | Merge commits and rebase-merge (squash only), stale branches (auto-delete) | Repo settings (applied) |
 | CI | Lint, format, types, tests, hygiene on every PR | `.github/workflows/ci.yml` |
 | **Server-side ruleset** (blocks direct pushes, force-push, deletion; requires PR + green CI) | **Inactive until GitHub Pro** | `.github/rulesets/protect-main.json` |

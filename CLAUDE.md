@@ -1,11 +1,11 @@
 # TradePartner: Agent Instructions
 
-Personal, local US-equity trading research system: point-in-time data, honest backtests, paper trading, then a small live account. Owner: Jose (solo). Agents build; the owner reviews and merges.
+Personal, local US-equity trading research system: point-in-time data, honest backtests, paper trading, then a small live account. Owner: Jose (solo). Agents build; the owner reviews and approves merges.
 
 **Start every session by reading [docs/STATUS.md](docs/STATUS.md).** It tells you the phase, what's in progress and what's next.
 
 ## Non-negotiables
-1. **Never commit to or push `main`.** Branch `<type>/<issue#>-<slug>` from the latest main and open a PR. Never merge, force-push shared branches, or use `--no-verify`. See [git-workflow.md](docs/ways-of-working/git-workflow.md).
+1. **Never commit to or push `main`.** Branch `<type>/<issue#>-<slug>` from the latest main and open a PR. Never force-push shared branches or use `--no-verify`. Merge a PR only when the owner explicitly tells you to merge that specific PR (squash, CI green); otherwise never merge. Subagents never merge. See [git-workflow.md](docs/ways-of-working/git-workflow.md).
 2. **No code without an approved plan task** unless the issue is size S, or the branch is `spike/`. See [development-process.md](docs/ways-of-working/development-process.md).
 3. **Stay in scope.** Do the task you were given. Put anything else in a new issue (`gh issue create`), not in this PR.
 4. **Secrets live only in `.env`** (gitignored, and you may not read it). Add new variables to `.env.example`. Never log secrets or send them to an LLM.

@@ -53,7 +53,7 @@ The rules that address it:
 2. **One question per agent run.** Eight gaps means eight briefs and eight runs, possibly in parallel, not one mega-prompt.
 3. **Fixed output shape.** Reports use the [research report template](../templates/research-report.md). A report missing its disconfirmation section is incomplete, and the owner rejects the PR.
 4. **Artifacts, not chat.** Agents write to files in a branch. If a run dies, the partial file is still there.
-5. **Least privilege.** Reviewers are read-only. The researcher can only write to `docs/research/`. No agent can merge, push to `main`, or read `.env` (enforced in `.claude/settings.json`).
+5. **Least privilege.** Reviewers are read-only. The researcher can only write to `docs/research/`. No agent can push to `main` or read `.env` (enforced in `.claude/settings.json`). Subagents never merge. The main session merges only when the owner explicitly says to merge that specific PR, and `gh pr merge` always asks for confirmation.
 6. **Scope lock.** The implementer does exactly one plan task. When it discovers extra work, it opens an issue instead of doing it.
 
 ## Adding or changing an agent

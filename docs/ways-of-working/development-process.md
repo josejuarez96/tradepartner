@@ -39,10 +39,10 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
 | Decide → Spec | ADR status is `Accepted` | Owner |
 | Spec → Plan | Acceptance criteria are testable, out-of-scope is listed, `spec-critic` has run | Owner |
 | Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines | Owner (can be delegated for size M) |
-| Build → Merge | CI is green, PR checklist is complete, specialist reviews are done | Owner merges |
+| Build → Merge | CI is green, PR checklist is complete, specialist reviews are done | Owner merges, or explicitly tells the main session to |
 | Phase → next phase | Phase exit criteria are met, retro is written, release is tagged | Owner |
 
-The owner approves by merging the PR that contains the artifact. Specs, plans and ADRs all land through PRs like code does, so **the approval is recorded in git history.**
+The owner approves by merging the PR that contains the artifact, or by explicitly telling the main session to merge it. Specs, plans and ADRs all land through PRs like code does, so **the approval is recorded in git history.**
 
 ## Right-size the ceremony
 
