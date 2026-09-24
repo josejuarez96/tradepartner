@@ -65,3 +65,13 @@ Oracle and fixture runs are logged in the trial registry with a `synthetic = tru
 - Bad / accepted risks: we maintain our own engine. If the strategy later needs intraday bars, shorting, or event-driven fills, that engine will not be enough and this ADR should be superseded. DuckDB is single-writer, so ingestion and the dashboard must not write concurrently (the dashboard is read-only by design, see roadmap).
 - Reversibility: cheap for adopted libraries; costly for the store schema (which is why it is ours) and moderately costly for the DuckDB choice once data is loaded (mitigated by Parquet exports).
 - Revisit if: the strategy scope leaves daily-bar, long-only rebalancing; a dependency changes license or goes unmaintained for 12 months; or the survey ages past a phase retro without being refreshed.
+
+## Amendment 2026-09-24
+
+Adds three packages to the **We adopt** table above, used starting with Phase 2 data-foundation task T1 ([issue #13](https://github.com/josejuarez96/tradepartner/issues/13)):
+
+| Package | License | Role |
+|---|---|---|
+| `typer` | MIT | CLI (`tradepartner ingest`, `health`, `dashboard`, `export`) |
+| `pydantic-settings` | MIT | loads `Settings` from environment variables and an optional `.env` file |
+| `httpx` | BSD-3-Clause | thin raw-fetch HTTP client for EDGAR (JSON/SGML/files); `alpaca-py` is the Alpaca client |
