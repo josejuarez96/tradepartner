@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Secrets — never commit. Document variables in .env.example instead.
+.env
+.env.*
+!.env.example
+secrets/
+
+# Data — local only. Raw/derived data is reproducible or backed up, never versioned in git.
+data/*
+!data/README.md
+*.db
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.parquet
+logs/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Claude Code personal settings (team settings live in .claude/settings.json)
+.claude/settings.local.json

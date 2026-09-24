@@ -1,0 +1,17 @@
+name: Bug
+description: Something behaves differently than specified
+labels: [type:fix]
+body:
+  - type: textarea
+    id: what
+    attributes: { label: What happened vs what was expected }
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes: { label: Steps / command to reproduce }
+    validations: { required: true }
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Did this affect any logged trade, backtest result, or trial registry entry?

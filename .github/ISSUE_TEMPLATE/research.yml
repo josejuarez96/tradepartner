@@ -1,0 +1,20 @@
+name: Research question
+description: A bounded question for the researcher agent (becomes a research brief)
+labels: [type:research]
+body:
+  - type: textarea
+    id: question
+    attributes: { label: The question (one sentence) }
+    validations: { required: true }
+  - type: textarea
+    id: decision
+    attributes:
+      label: Which decision does this unblock?
+      description: If no decision depends on the answer, don't research it yet.
+    validations: { required: true }
+  - type: textarea
+    id: scope
+    attributes: { label: Scope and exclusions }
+  - type: input
+    id: budget
+    attributes: { label: Budget (max sources / time) }

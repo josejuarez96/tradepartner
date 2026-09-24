@@ -1,0 +1,25 @@
+name: Task / feature
+description: A unit of work that will become one branch and one PR
+labels: [type:feat]
+body:
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: S = < 1 session, no spec needed. M = spec-lite in this issue. L = needs spec + plan docs.
+      options: [S, M, L]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes: { label: What and why }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable, testable statements. "Done when..."
+      value: "- [ ] "
+    validations: { required: true }
+  - type: textarea
+    id: out
+    attributes: { label: Out of scope }
