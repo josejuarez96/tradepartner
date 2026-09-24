@@ -14,6 +14,7 @@ dependencies = [
     "pyarrow>=25.0.1",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
+    "python-dateutil>=2.9.0.post0",
     "streamlit>=1.64.0",
     "typer>=0.27.2",
 ]
@@ -24,6 +25,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=3.8",
+    "pandas-stubs>=3.0.5.260914",
+    "types-python-dateutil>=2.9.0.20260807",
 ]
 
 [build-system]
@@ -41,11 +44,12 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "DTZ"]  # DTZ: no naive dateti
 strict = true
 files = ["src"]
 
-# Libraries with no inline types and no stubs on PyPI. Each is used only
-# behind our own thin wrappers (calendar.py, and later the adapters), so the
-# untyped surface never leaks past this module boundary.
+# Libraries with no inline types and no stubs on PyPI (pandas is covered by
+# the pandas-stubs dev dependency instead). Each is used only behind our own
+# thin wrappers (calendar.py, and later the adapters), so the untyped
+# surface never leaks past this module boundary.
 [[tool.mypy.overrides]]
-module = ["exchange_calendars.*", "pandas.*", "pyarrow.*"]
+module = ["exchange_calendars.*", "pyarrow.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
