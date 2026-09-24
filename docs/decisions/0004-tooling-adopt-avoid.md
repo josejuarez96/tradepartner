@@ -1,12 +1,12 @@
 # 0004. Tooling: what we own, what we adopt, what we avoid
 
-**Status:** Proposed  ·  **Date:** 2026-09-24  ·  **Issue:** #5
+**Status:** Accepted  ·  **Date:** 2026-09-24  ·  **Issue:** #5
 
 ## Context
 
 The [handoff](../research/2026-09-24-initial-research-handoff.md) (D4) listed open-source tools without choosing. The owner wants the system's own logic to be solid and not overly dependent on third-party frameworks. A survey of the candidate repositories was run on 2026-09-24 via the GitHub API; the raw output is committed at [docs/research/2026-09-24-tooling-survey.md](../research/2026-09-24-tooling-survey.md) and the figures below come from it.
 
-The MVP ([roadmap](../roadmap.md)) is provisionally a long-only, monthly-rebalanced, cross-sectional strategy on a daily-bar universe, pending charter acceptance. That is a small problem computationally. The pressure is on correctness and auditability, not speed.
+The MVP ([roadmap](../roadmap.md)) is a long-only, monthly-rebalanced, cross-sectional strategy on a daily-bar universe (ADR 0006). That is a small problem computationally. The pressure is on correctness and auditability, not speed.
 
 ## Options considered
 
@@ -51,7 +51,7 @@ The MVP ([roadmap](../roadmap.md)) is provisionally a long-only, monthly-rebalan
 ### Engine oracle test
 
 The first registered hypothesis (provisionally 12-1 momentum) runs through both our engine and `bt` on the fixture universe, and the two must agree. To make that a fair comparison:
-- both engines use **zero costs, fractional shares** (`integer_positions=False` in `bt`), and the **same lagged signal** (computed from session T's close, traded at session T+1, per ADR 0003 rule 2);
+- both engines use **zero costs, fractional shares** (`integer_positions=False` in `bt`), and the **same lagged signal** (computed from session T's close, filled at the **official open of session T+1**, per ADR 0003 rule 2 and ADR 0006);
 - both receive the **same adjusted-as-of-T price frame**, produced by our store; `bt` never sees raw prices or corporate actions directly;
 - the delisted fixture name is **sold at its last available price on its final session** in both engines; the test asserts this explicitly;
 - the measure is the **maximum absolute relative difference in portfolio equity across all sessions**, and the tolerance is **1e-9**. The tolerance is a constant in the test file, not runtime config; changing it needs review in the PR;
