@@ -1,1 +1,0 @@
-- #70 Per-PR STATUS/CHANGELOG fragments (`scripts/fragments.py`), `scripts/ready_pr.py` and the `/ready-pr` skill: parallel PRs stop conflicting on shared docs; one command readies a PR (PR #71)
