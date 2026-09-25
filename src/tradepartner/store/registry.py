@@ -639,8 +639,17 @@ def write_result(
 ) -> str:
     """Record an `ok` outcome with `stats` and return `"ok"`; or, when the
     store's latest `ingested_at` moved since `open_trial`, record `failed`
-    with `STORE_CHANGED_MESSAGE` and no statistics and return `"failed"`."""
+    with `STORE_CHANGED_MESSAGE` and no statistics and return `"failed"`.
+    Refuses a trial opened without a `data_cutoff`: only refusals lack one."""
     _check_open(conn, handle)
+    cutoff = conn.execute(
+        "SELECT data_cutoff FROM trials WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone()
+    if cutoff is None or cutoff[0] is None:
+        raise RegistryError(
+            f"trial {handle.trial_id} has no data_cutoff; an ok run needs its resolved end "
+            "(it keys the trial's V pair)"
+        )
     if store_max_ingested_at(conn) != handle.store_max_ingested_at:
         _insert_result(conn, handle, "failed", STORE_CHANGED_MESSAGE, ResultStatistics())
         return "failed"

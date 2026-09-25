@@ -369,6 +369,27 @@ def test_open_trial_accepts_a_missing_data_cutoff(
     registry.close_trial(conn, handle, "refused_window", "end after holdout.end")
 
 
+def test_an_ok_result_needs_a_data_cutoff(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A NULL cutoff would merge unrelated trials into one V pair."""
+    _register(conn, settings)
+    handle = registry.open_trial(
+        conn,
+        hypothesis_id=registry.get_hypothesis(conn, "h1").hypothesis_id,
+        kind="in_sample",
+        start_session=_W1[0],
+        end_session=_W1[1],
+        data_cutoff=None,
+        synthetic=False,
+        run_by="test",
+        settings=settings,
+        repo_dir=tmp_path,
+    )
+    with pytest.raises(registry.RegistryError, match="data_cutoff"):
+        registry.write_result(conn, handle, registry.ResultStatistics())
+
+
 def test_a_hard_link_to_the_real_store_is_still_the_real_store(
     real_conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
