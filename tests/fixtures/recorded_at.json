@@ -1,0 +1,21 @@
+{
+  "alpaca/assets_snapshot.json": "2026-09-25T06:31:02+00:00",
+  "alpaca/corporate_actions.json": "2026-09-25T06:31:01+00:00",
+  "alpaca/daily_bars.json": "2026-09-25T06:31:01+00:00",
+  "edgar/company_facts_delisted_25nse.json": "2026-09-25T06:31:01+00:00",
+  "edgar/company_facts_dual_class.json": "2026-09-25T06:31:00+00:00",
+  "edgar/company_facts_plain_issuer.json": "2026-09-25T06:30:59+00:00",
+  "edgar/company_tickers.json": "2026-09-25T06:30:58+00:00",
+  "edgar/filing_delisted_25nse_primary_doc.xml.gz": "2026-09-25T06:31:01+00:00",
+  "edgar/filing_dual_class_goog-20251231.htm.gz": "2026-09-25T06:31:01+00:00",
+  "edgar/filing_index_2024_qtr1.txt": "2026-09-25T06:30:59+00:00",
+  "edgar/filing_plain_issuer_aapl-20250927.htm.gz": "2026-09-25T06:31:00+00:00",
+  "edgar/sgml_header_delisted_25nse.txt": "2026-09-25T06:31:01+00:00",
+  "edgar/sgml_header_dual_class.txt": "2026-09-25T06:31:00+00:00",
+  "edgar/sgml_header_plain_issuer.txt": "2026-09-25T06:31:00+00:00",
+  "edgar/submissions_delisted_25nse.json": "2026-09-25T06:31:01+00:00",
+  "edgar/submissions_dual_class.json": "2026-09-25T06:31:00+00:00",
+  "edgar/submissions_dual_class_001.json": "2026-09-25T06:31:00+00:00",
+  "edgar/submissions_plain_issuer.json": "2026-09-25T06:30:59+00:00",
+  "edgar/submissions_plain_issuer_001.json": "2026-09-25T06:30:59+00:00"
+}
