@@ -18,8 +18,10 @@ for that rule, so this module and `store.db` cannot drift out of sync on
 what counts as valid (issue #30).
 
 Every `symbol` field is canonicalized to upper-case ASCII at construction
-(`_canonical_symbol`), so netting and reconciliation compare one form
-(issue #38).
+(`_canonical_symbol`), so netting and reconciliation compare one case
+form (issue #38). Any structure keyed by symbol (risk limits, a
+reconciler) must key on the same canonical form. Case only: separator
+variants such as `BRK.B` / `BRK-B` are not mapped here.
 """
 
 from __future__ import annotations
