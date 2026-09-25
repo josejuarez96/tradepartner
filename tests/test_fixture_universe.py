@@ -14,13 +14,17 @@ import csv
 import importlib.util
 import re
 import sys
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 
 import duckdb
 import pytest
 from conftest import load_universe_fixtures
+from dateutil.relativedelta import relativedelta
 
+from tradepartner.calendar import is_session, next_session, previous_session, session_close
+from tradepartner.config import MasterConfig, UniverseConfig
 from tradepartner.store import schema
 from tradepartner.store.db import configure_connection
 
@@ -207,3 +211,236 @@ def test_no_bars_on_the_documented_holiday() -> None:
     # 2018-11-22 is Thanksgiving (an XNYS holiday): no security should have a bar then.
     for security_id, days in sessions.items():
         assert "2018-11-22" not in days, f"{security_id} has a bar on the Thanksgiving holiday"
+
+
+# --- Review round 3, SHOULD FIX 9: assert the timing rules using the -------
+# --- calendar directly, not just re-reading the generator's own output. ---
+
+
+def _read_rows(table: str) -> list[dict[str, str]]:
+    with (_FIXTURES_DIR / f"{table}.csv").open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+# The backfilled split is a deliberate exception to the ordinary first-seen
+# rule (its known_at is years after its ex_date, by design -- see
+# test_backfilled_split_known_at_is_years_after_its_ex_date below).
+_BACKFILLED_SPLIT_SECURITY_ID = "SEC_SPLIT_BACKFILLED"
+
+
+def test_every_bar_is_on_a_real_session_with_known_at_matching_session_close() -> None:
+    """A bar's `known_at` must equal `calendar.session_close(session)` --
+    except a *revision* row (a second row for the same `(security_id,
+    session)`), whose `known_at` must instead equal its own `ingested_at`
+    and be later than the original close (spec's bars timing rule; review
+    round 3 item 9)."""
+    rows = _read_rows("prices_daily")
+    groups: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        session = date.fromisoformat(row["session"])
+        assert is_session(session), f"{row['security_id']} has a bar on non-session {session}"
+        groups[(row["security_id"], row["session"])].append(row)
+
+    for (security_id, session_str), group in groups.items():
+        session = date.fromisoformat(session_str)
+        expected_close = session_close(session)
+        ordered = sorted(group, key=lambda r: r["known_at"])
+        original_known_at = datetime.fromisoformat(ordered[0]["known_at"])
+        assert original_known_at == expected_close, (
+            f"{security_id} {session_str}: original bar known_at {original_known_at} "
+            f"!= session_close {expected_close}"
+        )
+        for revision in ordered[1:]:
+            assert revision["known_at"] == revision["ingested_at"], (
+                f"{security_id} {session_str}: revision known_at != ingested_at"
+            )
+            assert datetime.fromisoformat(revision["known_at"]) > expected_close, (
+                f"{security_id} {session_str}: revision known_at is not later than "
+                "the original session close"
+            )
+
+
+def test_first_seen_action_known_at_and_revision_rule() -> None:
+    """First-seen corporate action: `known_at` <= the close of the session
+    before ex-date (an announcement, if present, is always earlier still).
+    A revision (a later row for the same key): `known_at == ingested_at`,
+    later than the first-seen row (spec req 5; review round 3 item 9)."""
+    rows = [
+        r
+        for r in _read_rows("corporate_actions")
+        if r["security_id"] != _BACKFILLED_SPLIT_SECURITY_ID
+    ]
+    groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        groups[(row["security_id"], row["action_type"], row["ex_date"])].append(row)
+
+    for (security_id, action_type, ex_date), group in groups.items():
+        close_before_ex = session_close(previous_session(date.fromisoformat(ex_date)))
+        ordered = sorted(group, key=lambda r: r["known_at"])
+        first_known_at = datetime.fromisoformat(ordered[0]["known_at"])
+        assert first_known_at <= close_before_ex, (
+            f"{security_id} {action_type} {ex_date}: first-seen known_at {first_known_at} "
+            f"is after the close before ex-date {close_before_ex}"
+        )
+        for revision in ordered[1:]:
+            assert revision["known_at"] == revision["ingested_at"], (
+                f"{security_id} {action_type} {ex_date}: revision known_at != ingested_at"
+            )
+            assert datetime.fromisoformat(revision["known_at"]) > first_known_at
+
+
+def test_backfilled_split_known_at_is_years_after_its_ex_date() -> None:
+    """The T6 acceptance case "backfilled 2018 split in 2026": this split's
+    ex_date is 2018, but it was only discovered (known_at) during a 2026
+    backfill run -- the ordinary "close before ex-date" first-seen rule
+    does not apply to it by design (review round 3 SHOULD FIX 10)."""
+    rows = [
+        r
+        for r in _read_rows("corporate_actions")
+        if r["security_id"] == _BACKFILLED_SPLIT_SECURITY_ID
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    known_at = datetime.fromisoformat(row["known_at"])
+    ingested_at = datetime.fromisoformat(row["ingested_at"])
+    ex_date = date.fromisoformat(row["ex_date"])
+    assert ex_date.year == 2018
+    assert known_at.year == 2026
+    assert known_at <= ingested_at
+    assert known_at < ingested_at, "expected a late (non-instant) ingestion for this row"
+
+
+def test_transfer_known_at_ordering_and_valid_from_within_window() -> None:
+    """The exchange-transfer case: the new listing's known_at must be later
+    than the Form 25 filing's known_at, and its valid_from must fall within
+    `master.transfer_window_sessions` of the filing date (spec req 4;
+    review round 3 item 9)."""
+    delistings = [r for r in _read_rows("delistings") if r["security_id"] == "SEC_TRANSFER"]
+    new_listings = [
+        r
+        for r in _read_rows("listings")
+        if r["security_id"] == "SEC_TRANSFER" and r["exchange"] == "NASDAQ"
+    ]
+    assert len(delistings) == 1
+    assert len(new_listings) == 1
+    filing_known_at = datetime.fromisoformat(delistings[0]["known_at"])
+    new_known_at = datetime.fromisoformat(new_listings[0]["known_at"])
+    assert new_known_at > filing_known_at
+
+    filed_date = datetime.fromisoformat(delistings[0]["filed_at"]).date()
+    valid_from = date.fromisoformat(new_listings[0]["valid_from"])
+    sessions_between_filing_and_valid_from = 0
+    day = filed_date
+    while day < valid_from:
+        day = next_session(day)
+        sessions_between_filing_and_valid_from += 1
+    assert sessions_between_filing_and_valid_from <= MasterConfig().transfer_window_sessions
+
+
+def _missing_sessions_in_trailing_window(known_sessions: set[date], end: date, months: int) -> int:
+    """Sessions missing from `known_sessions` in the trailing window the
+    spec's calendar-month-window rule defines: every session `s` with
+    `end - relativedelta(months=months) < s <= end`."""
+    start_exclusive = end - relativedelta(months=months)
+    missing = 0
+    day = start_exclusive
+    while True:
+        day = next_session(day)
+        if day > end:
+            break
+        if day not in known_sessions:
+            missing += 1
+    return missing
+
+
+@pytest.mark.parametrize(
+    "security_id,probe_date",
+    [
+        ("SEC_SPLIT_BETWEEN", date(2019, 1, 28)),
+        ("SEC_SPLIT_FUTURE", date(2018, 11, 23)),
+        ("SEC_DUAL_A", date(2018, 12, 17)),
+        ("SEC_DUAL_B", date(2018, 12, 17)),
+    ],
+)
+def test_documented_probe_has_full_history_and_a_fresh_shares_fact(
+    security_id: str, probe_date: date
+) -> None:
+    """Each of these documented probe T's must see >= universe.min_history_
+    months of contiguous history and a shares fact known before T and no
+    more than universe.max_shares_age_days old (review round 3, MUST FIX 4
+    / item 9)."""
+    probe_session = probe_date if is_session(probe_date) else next_session(probe_date)
+    probe_t = session_close(probe_session)
+
+    bars = [r for r in _read_rows("prices_daily") if r["security_id"] == security_id]
+    known_sessions = {
+        date.fromisoformat(r["session"])
+        for r in bars
+        if datetime.fromisoformat(r["known_at"]) <= probe_t
+    }
+    missing = _missing_sessions_in_trailing_window(
+        known_sessions, probe_session, UniverseConfig().min_history_months
+    )
+    assert missing == 0, f"{security_id}: {missing} missing session(s) in the trailing window"
+
+    facts = [
+        r
+        for r in _read_rows("facts")
+        if r["security_id"] == security_id and datetime.fromisoformat(r["known_at"]) <= probe_t
+    ]
+    assert facts, f"{security_id}: no shares fact known by probe T {probe_t.isoformat()}"
+    freshest = max(facts, key=lambda r: r["as_of_date"])
+    age_days = (probe_session - date.fromisoformat(freshest["as_of_date"])).days
+    assert age_days <= UniverseConfig().max_shares_age_days, (
+        f"{security_id}: freshest shares fact is {age_days} days old at T, "
+        f"exceeding max_shares_age_days={UniverseConfig().max_shares_age_days}"
+    )
+
+
+def test_stale_shares_probe_passes_history_but_fails_freshness() -> None:
+    """SEC_FACTS_STALE's probe T must see full 12-month history (so rule 6
+    passes) while its shares fact is older than max_shares_age_days (so
+    only rule 7 fails) -- review round 3 MUST FIX 3."""
+    security_id = "SEC_FACTS_STALE"
+    facts = [r for r in _read_rows("facts") if r["security_id"] == security_id]
+    assert len(facts) == 1
+    as_of_date = date.fromisoformat(facts[0]["as_of_date"])
+    probe_day = as_of_date + relativedelta(days=UniverseConfig().max_shares_age_days + 30)
+    probe_session = probe_day if is_session(probe_day) else next_session(probe_day)
+    probe_t = session_close(probe_session)
+
+    bars = [r for r in _read_rows("prices_daily") if r["security_id"] == security_id]
+    known_sessions = {
+        date.fromisoformat(r["session"])
+        for r in bars
+        if datetime.fromisoformat(r["known_at"]) <= probe_t
+    }
+    assert probe_session in known_sessions, "expected a bar at the probe session itself"
+    missing = _missing_sessions_in_trailing_window(
+        known_sessions, probe_session, UniverseConfig().min_history_months
+    )
+    assert missing == 0
+
+    age_days = (probe_session - as_of_date).days
+    assert age_days > UniverseConfig().max_shares_age_days
+
+
+def test_boundary_delisting_gap_equals_threshold_exactly() -> None:
+    """The boundary delisting's gap between its last bar and the last
+    session before its Form 25 filing must equal gap.missing_tail_sessions
+    exactly -- not more, not less (review round 3 nit 12)."""
+    from tradepartner.config import GapConfig
+
+    security_id = "SEC_BOUNDARY_DELIST"
+    bars = [r for r in _read_rows("prices_daily") if r["security_id"] == security_id]
+    delistings = [r for r in _read_rows("delistings") if r["security_id"] == security_id]
+    assert len(delistings) == 1
+    last_bar = max(date.fromisoformat(r["session"]) for r in bars)
+    filed_at = datetime.fromisoformat(delistings[0]["filed_at"])
+    last_session_before_filing = previous_session(filed_at.date())
+    gap = 0
+    day = last_bar
+    while day < last_session_before_filing:
+        day = next_session(day)
+        gap += 1
+    assert gap == GapConfig().missing_tail_sessions
