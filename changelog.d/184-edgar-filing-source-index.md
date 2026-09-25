@@ -1,0 +1,2 @@
+### Added
+- `tradepartner.adapters.edgar_source`: `EdgarFilingSource` (`filing_index`, `companies_snapshot`, `.requests`, `.skipped_filers`, `.unstamped_filings`), `SubmissionRecord`, `reduce_submissions`, `quarter_of`, `PARSER_VERSION`; `edgar_raw.cached_filing_path`, `write_atomic`, `bulk_submissions`, `bulk_company_facts`; config `edgar.index_first_year` (1993), `edgar.index_settle_days` (3), `edgar.bulk_stamp_threshold_ciks` (500), `edgar.cover_page_forms`; `tests/adapters/edgar_transport.py` router (T11b, #184).
