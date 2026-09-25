@@ -27,6 +27,7 @@ from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
+from pydantic import SecretStr
 
 from tradepartner.config import Settings, get_settings
 
@@ -42,16 +43,28 @@ class AlpacaCredentialsError(RuntimeError):
     """Raised when `ALPACA_API_KEY` / `ALPACA_API_SECRET` are not configured."""
 
 
+def _non_blank_secret(secret: SecretStr | None) -> str | None:
+    """`secret`'s value, or `None` if it's unset or blank/whitespace-only.
+
+    A `.env` line like `ALPACA_API_KEY=` sets the value to `""`, which is
+    "configured" as far as `SecretStr | None` is concerned but not usable;
+    treat it the same as missing (T2 review round 2, safety-reviewer).
+    """
+    if secret is None:
+        return None
+    value = secret.get_secret_value()
+    return value if value.strip() else None
+
+
 def _credentials(settings: Settings) -> tuple[str, str]:
-    if settings.alpaca_api_key is None or settings.alpaca_api_secret is None:
+    api_key = _non_blank_secret(settings.alpaca_api_key)
+    api_secret = _non_blank_secret(settings.alpaca_api_secret)
+    if api_key is None or api_secret is None:
         raise AlpacaCredentialsError(
             "ALPACA_API_KEY and ALPACA_API_SECRET must be set (see .env.example) "
             "before fetching Alpaca data."
         )
-    return (
-        settings.alpaca_api_key.get_secret_value(),
-        settings.alpaca_api_secret.get_secret_value(),
-    )
+    return api_key, api_secret
 
 
 def _stock_data_client(settings: Settings) -> StockHistoricalDataClient:
@@ -122,10 +135,25 @@ def corporate_actions(
     *,
     settings: Settings | None = None,
 ) -> Any:
-    """Raw corporate-actions payload (splits, dividends, ...) for `symbols`."""
+    """Raw corporate-actions payload (splits, dividends, ...) for `symbols`.
+
+    `CorporateActionsRequest.limit` defaults to `1000` **as a total cap
+    across every page**, not a per-page size: `alpaca-py`'s `_get_marketdata`
+    paging loop shrinks its per-request `limit` as pages accumulate and
+    stops once `1000` results have been returned in total, silently
+    truncating any range with more corporate actions than that (verified
+    against the installed `alpaca-py` 0.44.0 `RESTClient._get_marketdata`
+    source; T2 review round 2, safety-reviewer MUST FIX). Passing
+    `limit=None` here removes the request's `limit` field entirely
+    (`CorporateActionsRequest.to_request_fields()` omits `None` fields), so
+    paging is governed only by `get_corporate_actions`'s own fixed
+    `page_size=1000`/`page_limit=1000` per-page arguments and continues
+    until the API stops returning a `next_page_token` — i.e. it always
+    fetches everything.
+    """
     settings = settings or get_settings()
     client = _corporate_actions_client(settings)
-    request = CorporateActionsRequest(symbols=symbols, start=start, end=end)
+    request = CorporateActionsRequest(symbols=symbols, start=start, end=end, limit=None)
     return client.get_corporate_actions(request)
 
 

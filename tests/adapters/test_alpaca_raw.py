@@ -1,10 +1,12 @@
 """Network smoke test for `adapters.alpaca_raw` against the real Alpaca API.
 
-Skipped by default (and always in CI, which disables the network): set
-`RUN_NETWORK_TESTS=1` and real `ALPACA_API_KEY`/`ALPACA_API_SECRET` in the
-environment/`.env` to run it. This is not a parser test (T12 owns those on
-recorded fixtures) — it only proves the raw client talks to the real API
-and returns JSON-serializable plain dicts/lists, never SDK model objects.
+Skipped unless `RUN_NETWORK_TESTS=1` is set alongside real
+`ALPACA_API_KEY`/`ALPACA_API_SECRET` in the environment/`.env`. This is not
+a parser test (T12 owns those on recorded fixtures) — it only proves the
+raw client talks to the real API and returns JSON-serializable plain
+dicts/lists, never SDK model objects. For offline coverage (mocked SDK
+call, no real network) of the `corporate_actions` paging-limit fix and
+credential errors, see `test_alpaca_raw_offline.py`.
 """
 
 from __future__ import annotations
