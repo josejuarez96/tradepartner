@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import duckdb
 import polars as pl
@@ -842,3 +843,45 @@ class TestListingsAsOf:
     def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
         with pytest.raises(TypeError):
             listings_as_of(fixture_store, date(2020, 1, 15))  # type: ignore[arg-type]
+
+
+def test_dividend_queries_work_on_a_read_only_connection_and_drop_their_view(
+    tmp_path: Path,
+) -> None:
+    """Safety-reviewer NIT on PR #79: the sessions view is registered on the
+    caller's connection, which may be read-only, and must be gone after
+    every call, including one that raises."""
+    path = str(tmp_path / "store.duckdb")
+    conn = duckdb.connect(path)
+    configure_connection(conn)
+    schema.init_schema(conn)
+    known = datetime(2021, 1, 8, 22, tzinfo=UTC)
+    _bar(conn, "SEC_RO", date(2021, 1, 8), 50.0, known_at=known)
+    _action(conn, "SEC_RO", "dividend", date(2021, 1, 11), 5.0, known_at=known)
+    _bar(conn, "SEC_RO_BAD", date(2021, 1, 8), 50.0, known_at=known)
+    conn.close()
+
+    t = datetime(2021, 3, 1, tzinfo=UTC)
+    ro = duckdb.connect(path, read_only=True)
+    try:
+        configure_connection(ro)
+        adjusted = adjusted_prices_as_of(ro, t, include_dividends=True)
+        assert _one(adjusted, session=date(2021, 1, 8), security_id="SEC_RO")[
+            "close"
+        ] == pytest.approx(45.0)
+        assert dropped_dividends_as_of(ro, t).height == 0
+        with pytest.raises(duckdb.CatalogException):
+            ro.execute("SELECT * FROM _asof_xnys_sessions")
+    finally:
+        ro.close()
+
+    rw = duckdb.connect(path)
+    try:
+        configure_connection(rw)
+        _action(rw, "SEC_RO_BAD", "dividend", date(2021, 1, 11), -1.0, known_at=known)
+        with pytest.raises(ValueError, match="SEC_RO_BAD"):
+            adjusted_prices_as_of(rw, t, include_dividends=True)
+        with pytest.raises(duckdb.CatalogException):
+            rw.execute("SELECT * FROM _asof_xnys_sessions")
+    finally:
+        rw.close()
