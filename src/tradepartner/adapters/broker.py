@@ -16,22 +16,42 @@ ADR 0006 cadence: every order is a **DAY** order placed for the T+1 open
 (no other `time_in_force` is modelled), so `Order.time_in_force` is
 restricted to the single literal `"day"`.
 
+**DAY limit-order fill rule (owner decision, T20 review round 2).** A DAY
+limit order is evaluated only once, at its session's official open: it
+fills at the open price if a buy's limit price is >= the open price, or a
+sell's limit price is <= the open price; otherwise it expires unfilled at
+that same session's close. **It never fills intraday.** `FakeBroker`
+(`fake_broker.py`) implements exactly this rule via
+`mark_session_open`/`.mark_session_close`, and the Phase 3 backtester and
+the `bt` oracle must use the identical rule, so fills stay comparable
+across the fake broker, the backtester, and eventually Alpaca paper/live.
+
 Every datetime here (`Order.submitted_at`, `Fill.filled_at`, and the
-`since` parameter `Broker.fills` takes) is tz-aware UTC; a naive datetime
-raises `ValueError` (CLAUDE.md: "Datetimes are always timezone-aware
-UTC"). `Order`, `Fill` and `Position` are frozen (immutable) so a caller
-holding a reference to a submitted order or a reported fill/position can
-never see it mutate out from under them — an adapter that needs a new
-state (e.g. filling an order) constructs a new object rather than editing
-one in place, mirroring the store's "revision is a new row" rule.
+`since` parameter `Broker.fills` takes) must be tz-aware; a naive
+datetime raises `ValueError` (CLAUDE.md: "Datetimes are always
+timezone-aware UTC"). A tz-aware but non-UTC value is accepted and
+normalised to UTC via `require_tz_aware` below, rather than rejected —
+see its docstring. `Order`, `Fill` and `Position` are frozen (immutable)
+so a caller holding a reference to a submitted order or a reported
+fill/position can never see it mutate out from under them — an adapter
+that needs a new state (e.g. filling an order) constructs a new object
+rather than editing one in place, mirroring the store's "revision is a
+new row" rule.
+
+`DuplicateOrderError`, `OrderNotFoundError` and `OrderNotCancellableError`
+live here, not in a specific adapter: every `Broker` implementation must
+raise them under the same conditions (see each abstract method's
+docstring below), because the Phase 4 risk-gated wrapper's idempotency
+and reconciliation logic depends on that contract surviving a swap from
+`FakeBroker` to a real adapter.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -50,16 +70,65 @@ OrderStatus = Literal[
 ]
 
 
-def _require_tz_aware(value: datetime) -> datetime:
-    """Return `value` unchanged, or raise if it is naive.
+class DuplicateOrderError(RuntimeError):
+    """Raised by `Broker.submit` when `order.client_order_id` was already
+    submitted to this broker. The original order and its status are left
+    unchanged. Every `Broker` implementation must raise this on a
+    duplicate id rather than resubmitting or silently no-op'ing."""
 
-    Mirrors `tradepartner.store.db.ensure_tz_aware`'s check, kept local to
-    this module (rather than imported from `store`) so an adapter package
-    never has to import the store to satisfy its own interface — adapters
-    are the boundary (ADR 0003), not a consumer of store internals.
+
+class OrderNotFoundError(LookupError):
+    """Raised by `Broker.cancel`/`.order_status` when `client_order_id`
+    names no order this broker has ever seen."""
+
+
+class OrderNotCancellableError(RuntimeError):
+    """Raised by `Broker.cancel` when the named order is no longer in a
+    cancellable state (e.g. already filled, cancelled, expired or
+    rejected)."""
+
+
+def require_tz_aware(value: datetime) -> datetime:
+    """Return `value` normalised to UTC, or raise `ValueError` if it has
+    no well-defined UTC offset.
+
+    Two things are rejected, both meaning "this instant is not
+    unambiguously defined": a naive datetime (`tzinfo is None`), and the
+    rarer case of a `tzinfo` that is present but whose `utcoffset()`
+    itself returns `None` (a technically-valid but incomplete `tzinfo`
+    implementation). A tz-aware datetime in a *different* zone (e.g.
+    `America/New_York`) is not an error — it names a real instant — so
+    it is normalised via `.astimezone(UTC)` rather than rejected,
+    matching CLAUDE.md's "datetimes are always timezone-aware UTC" by
+    construction instead of by refusing anything not already UTC.
+
+    This is the single tz-aware check shared by `Order.submitted_at`,
+    `Fill.filled_at`, `Broker.fills`'s `since`, and `FakeBroker`'s
+    `mark_session_open`/`.mark_session_close` timestamps, so every
+    adapter enforces the rule the same way.
     """
-    if value.tzinfo is None:
+    if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"must be tz-aware, got a naive datetime: {value!r}")
+    return value.astimezone(UTC)
+
+
+def _reject_float(value: Any) -> Any:
+    """Reject a raw `float` before pydantic's `Decimal` coercion would
+    otherwise build a `Decimal` from the float's imprecise binary
+    representation (e.g. `Decimal(0.1)` has 50+ spurious digits, unlike
+    `Decimal("0.1")`) silently. Callers must pass a `Decimal`, `int`, or
+    a decimal-literal `str` instead. `None` passes through unchanged (an
+    absent optional field, e.g. `Order.limit_price` on a market order)."""
+    if isinstance(value, float):
+        # ValueError, not TypeError: pydantic only converts ValueError (and
+        # AssertionError) raised inside a validator into its own
+        # ValidationError; a TypeError would propagate raw past callers
+        # expecting ValidationError from a failed Order/Fill/Position
+        # construction.
+        raise ValueError(
+            f"must be a Decimal (or int/str), not a float ({value!r}): "
+            "pass Decimal(...) or a string to avoid silent precision loss"
+        )
     return value
 
 
@@ -75,9 +144,9 @@ class Order(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    client_order_id: str
-    security_id: str
-    symbol: str
+    client_order_id: str = Field(min_length=1, max_length=128)
+    security_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
     side: Literal["buy", "sell"]
     qty: Decimal = Field(gt=0)
     order_type: Literal["market", "limit"]
@@ -85,10 +154,15 @@ class Order(BaseModel):
     time_in_force: Literal["day"] = "day"
     submitted_at: datetime
 
+    @field_validator("qty", "limit_price", mode="before")
+    @classmethod
+    def _validate_no_float(cls, value: Any) -> Any:
+        return _reject_float(value)
+
     @field_validator("submitted_at")
     @classmethod
     def _validate_submitted_at(cls, value: datetime) -> datetime:
-        return _require_tz_aware(value)
+        return require_tz_aware(value)
 
     @model_validator(mode="after")
     def _validate_limit_price_matches_order_type(self) -> Order:
@@ -104,15 +178,20 @@ class Fill(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    client_order_id: str
+    client_order_id: str = Field(min_length=1, max_length=128)
     qty: Decimal = Field(gt=0)
     price: Decimal = Field(gt=0)
     filled_at: datetime
 
+    @field_validator("qty", "price", mode="before")
+    @classmethod
+    def _validate_no_float(cls, value: Any) -> Any:
+        return _reject_float(value)
+
     @field_validator("filled_at")
     @classmethod
     def _validate_filled_at(cls, value: datetime) -> datetime:
-        return _require_tz_aware(value)
+        return require_tz_aware(value)
 
 
 class Position(BaseModel):
@@ -128,10 +207,15 @@ class Position(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    security_id: str
-    symbol: str
+    security_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
     qty: Decimal
     avg_price: Decimal
+
+    @field_validator("qty", "avg_price", mode="before")
+    @classmethod
+    def _validate_no_float(cls, value: Any) -> Any:
+        return _reject_float(value)
 
 
 class Broker(ABC):
@@ -141,12 +225,15 @@ class Broker(ABC):
 
     @abstractmethod
     def submit(self, order: Order) -> OrderStatus:
-        """Submit `order`. Raises on a duplicate `client_order_id`."""
+        """Submit `order`. Raises `DuplicateOrderError` if
+        `order.client_order_id` was already submitted."""
 
     @abstractmethod
     def cancel(self, client_order_id: str) -> OrderStatus:
-        """Cancel the order named by `client_order_id`. Raises if it is no
-        longer cancellable (e.g. already filled)."""
+        """Cancel the order named by `client_order_id`. Raises
+        `OrderNotFoundError` if no such order exists, or
+        `OrderNotCancellableError` if it is no longer cancellable (e.g.
+        already filled)."""
 
     @abstractmethod
     def positions(self) -> list[Position]:
@@ -154,8 +241,11 @@ class Broker(ABC):
 
     @abstractmethod
     def fills(self, since: datetime) -> list[Fill]:
-        """Fills with `filled_at >= since`. `since` must be tz-aware."""
+        """Fills with `filled_at >= since`. `since` must be tz-aware (a
+        naive datetime raises `ValueError`); a non-UTC tz-aware value is
+        normalised to UTC (`require_tz_aware`)."""
 
     @abstractmethod
     def order_status(self, client_order_id: str) -> OrderStatus:
-        """The current status of the order named by `client_order_id`."""
+        """The current status of the order named by `client_order_id`.
+        Raises `OrderNotFoundError` if no such order exists."""
