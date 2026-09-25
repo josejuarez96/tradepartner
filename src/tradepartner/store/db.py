@@ -32,6 +32,15 @@ than assumed, shape both functions:
   would never succeed, since the blocker is this same process, not another
   one. Both `open_read_only` and `open_for_write` treat that the same way
   they treat a genuine cross-process file lock: `StoreLockedError`.
+- `information_schema.columns` (which `insert_row`'s per-column-type
+  validation queries) is not scoped to the connection's current database
+  by default: an `ATTACH`ed database with a same-named table contributes
+  rows too, and an unfiltered query can silently pick up the wrong
+  catalog's column type for a same-named column (verified by hand).
+  `_column_types` filters on `current_database()`/`current_schema()` to
+  rule that out, and never caches an empty result (a table that does not
+  exist yet), so a lookup before `schema.init_schema` fails loudly instead
+  of silently skipping every validation forever.
 """
 
 from __future__ import annotations
@@ -110,15 +119,45 @@ def configure_connection(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConn
 
 
 def _column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
-    """`{column_name: duckdb_type_name}` for `table`, cached per connection."""
+    """`{column_name: duckdb_type_name}` for `table`, cached per connection.
+
+    Filters on `table_catalog`/`table_schema` matching the connection's
+    *current* database and schema: without that filter, an `ATTACH`ed
+    database containing a same-named table (e.g. another `prices_daily`)
+    contributes rows to `information_schema.columns` too, and a same-named
+    column from the wrong catalog can silently overwrite the real one when
+    the rows collapse into a `{column: type}` dict (verified by hand: an
+    attached `:memory:` db's `prices_daily.known_at VARCHAR` silently
+    replaced the real `TIMESTAMPTZ` type without this filter).
+
+    Raises `ValueError` if `table` has no columns at all — i.e. it does
+    not exist yet — rather than caching an empty result, which would
+    silently skip every type check for every row inserted before
+    `schema.init_schema` runs.
+    """
     per_table = _column_types_cache.setdefault(conn, {})
     if table not in per_table:
         rows = conn.execute(
-            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?",
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = ? AND table_catalog = current_database() "
+            "AND table_schema = current_schema()",
             [table],
         ).fetchall()
+        if not rows:
+            raise ValueError(f"table {table!r} has no columns; run init_schema first")
         per_table[table] = dict(rows)
     return per_table[table]
+
+
+def forget_column_types(conn: duckdb.DuckDBPyConnection) -> None:
+    """Drop any cached column-type info for `conn`.
+
+    `schema.init_schema` calls this after (re-)creating every table, so a
+    cache populated (or, before the "never cache empty" fix above, a cache
+    that could never be populated) from before the tables existed is never
+    reused once they do.
+    """
+    _column_types_cache.pop(conn, None)
 
 
 def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, Any]) -> None:

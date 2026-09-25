@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import duckdb
 
-from tradepartner.store.db import configure_connection, utc_now
+from tradepartner.store.db import configure_connection, forget_column_types, utc_now
 
 #: Every provenance value used anywhere in the store (spec "Definitions").
 #: No single table allows all of these — see `TABLE_PROVENANCE_VALUES`.
@@ -263,7 +263,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     pins the connection's session timezone to UTC and disables extension
     auto-install/auto-load (`configure_connection`) so a caller that built
     its own raw connection still gets correct `TIMESTAMPTZ` round-tripping
-    and no surprise network access.
+    and no surprise network access, and drops any cached column-type info
+    for `conn` (`store.db.forget_column_types`) so `store.db.insert_row`
+    never reuses type info cached before these tables existed.
 
     Raises `SchemaVersionError` if the store already has a `schema_version`
     row whose version differs from `CURRENT_SCHEMA_VERSION`: this module
@@ -273,6 +275,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     configure_connection(conn)
     for ddl in _TABLE_DDL:
         conn.execute(ddl)
+    forget_column_types(conn)
     result = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
     max_version = result[0] if result is not None else None
     if max_version is None:

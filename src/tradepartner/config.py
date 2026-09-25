@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The only value `universe.exclude_sic_ranges` may take (ADR 0006): the full
@@ -76,12 +76,29 @@ class StoreConfig(BaseModel):
     exception to T4 touching only its own files (`docs/plans/data-
     foundation.md` T1 lists `config.py` as a T1 file) — see that PR's
     "Notes for reviewer" for why it was made here instead of deferred.
+
+    `lock_retry_initial_delay_seconds` and `.lock_retry_max_delay_seconds`
+    must each be strictly positive (a zero or negative delay is not a
+    backoff) and `initial <= max`, or `open_for_write`'s backoff would
+    never actually grow, or would grow from nothing.
+    `lock_retry_seconds` may be zero (a caller that wants "fail
+    immediately, no retry" is a legitimate choice) but not negative.
     """
 
     path: str = "data/tradepartner.duckdb"
-    lock_retry_seconds: int = 60
-    lock_retry_initial_delay_seconds: float = 0.05
-    lock_retry_max_delay_seconds: float = 1.0
+    lock_retry_seconds: int = Field(default=60, ge=0)
+    lock_retry_initial_delay_seconds: float = Field(default=0.05, gt=0)
+    lock_retry_max_delay_seconds: float = Field(default=1.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_lock_retry_backoff_bounds(self) -> StoreConfig:
+        if self.lock_retry_initial_delay_seconds > self.lock_retry_max_delay_seconds:
+            raise ValueError(
+                "lock_retry_initial_delay_seconds "
+                f"({self.lock_retry_initial_delay_seconds}) must be <= "
+                f"lock_retry_max_delay_seconds ({self.lock_retry_max_delay_seconds})"
+            )
+        return self
 
 
 class IngestConfig(BaseModel):

@@ -45,6 +45,16 @@ _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 # store.db's module docstring).
 _TZ_OFFSET_PATTERN = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
 
+# A bare calendar date, nothing else. DuckDB casts a datetime-looking
+# string ("2020-01-02 23:30:00") to DATE without complaint, silently
+# discarding the time-of-day — a session is a calendar day, not an
+# instant (see calendar.py), so a fixture author who pastes a timestamp
+# into a DATE column gets a loud failure here instead.
+_BARE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
+_DATE_TYPE = "DATE"
+
 
 def _blocked_connect(*_args: object, **_kwargs: object) -> None:
     raise OSError(
@@ -85,32 +95,66 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(_env_file=None, store={"path": str(tmp_path / "test_store.duckdb")})
 
 
-def _timestamptz_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
+def _table_column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
+    """`{column_name: duckdb_type_name}` for `table`, freshly queried (no
+    caching here — unlike `store.db._column_types`, this runs once per
+    fixture CSV, not once per row)."""
     rows = conn.execute(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name = ? AND data_type = 'TIMESTAMP WITH TIME ZONE'",
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?",
         [table],
     ).fetchall()
-    return {row[0] for row in rows}
+    return dict(rows)
 
 
-def _assert_timestamptz_cells_carry_offset(csv_path: Path, columns: set[str]) -> None:
-    """Fail loudly if any `columns` cell in `csv_path` lacks an explicit
-    UTC offset or `Z` suffix (empty cells, i.e. NULL, are exempt)."""
-    if not columns:
+def _assert_header_matches_columns(
+    csv_path: Path, table: str, column_types: dict[str, str]
+) -> None:
+    """Fail loudly if any CSV header cell is not an exact, case-sensitive
+    match for one of `table`'s real column names.
+
+    `INSERT ... BY NAME` binds SQL identifiers case-*insensitively*, so a
+    typo'd or wrong-case header (e.g. `KNOWN_AT` for `known_at`) would
+    otherwise bind silently instead of surfacing the mistake.
+    """
+    with csv_path.open(newline="") as fh:
+        header = next(csv.reader(fh), [])
+    unknown = [column for column in header if column not in column_types]
+    if unknown:
+        raise ValueError(
+            f"{csv_path.name}: header column(s) {unknown!r} do not exactly match "
+            f"(case-sensitive) any column of table {table!r}; known columns: "
+            f"{sorted(column_types)}"
+        )
+
+
+def _assert_cell_formats(csv_path: Path, column_types: dict[str, str]) -> None:
+    """Fail loudly if any cell destined for a `TIMESTAMPTZ` column lacks an
+    explicit UTC offset/`Z` suffix, or any cell destined for a `DATE`
+    column is not a bare `YYYY-MM-DD` (empty cells, i.e. NULL, are exempt
+    from both)."""
+    tz_columns = {name for name, kind in column_types.items() if kind == _TIMESTAMPTZ_TYPE}
+    date_columns = {name for name, kind in column_types.items() if kind == _DATE_TYPE}
+    if not tz_columns and not date_columns:
         return
     with csv_path.open(newline="") as fh:
         reader = csv.DictReader(fh)
         for line_no, record in enumerate(reader, start=2):  # header is line 1
-            for column in columns:
+            for column in tz_columns:
                 value = record.get(column) or ""
-                if not value:
-                    continue
-                if not _TZ_OFFSET_PATTERN.search(value):
+                if value and not _TZ_OFFSET_PATTERN.search(value):
                     raise ValueError(
                         f"{csv_path.name}:{line_no} column {column!r} = {value!r} has "
                         "no explicit UTC offset or 'Z' suffix; DuckDB would silently "
                         "interpret it in the session TimeZone rather than reject it"
+                    )
+            for column in date_columns:
+                value = record.get(column) or ""
+                if value and not _BARE_DATE_PATTERN.fullmatch(value):
+                    raise ValueError(
+                        f"{csv_path.name}:{line_no} column {column!r} = {value!r} is not "
+                        "a bare YYYY-MM-DD date; DuckDB would silently accept a "
+                        "datetime-looking value on a DATE column too, discarding the "
+                        "time-of-day"
                     )
 
 
@@ -121,9 +165,10 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
     Columns bind **by CSV header name** (`INSERT ... BY NAME`), so a
     fixture's column order need not match the table's; every cell is read
     as text (`all_varchar=true`) and DuckDB casts it to the target
-    column's real type on insert. Every value destined for a `TIMESTAMPTZ`
-    column is checked for an explicit offset first (see
-    `_assert_timestamptz_cells_carry_offset`).
+    column's real type on insert. Before that, every CSV header cell must
+    exactly match a real column name (`_assert_header_matches_columns`),
+    and every `TIMESTAMPTZ`/`DATE` cell must be in the expected format
+    (`_assert_cell_formats`).
     """
     if not fixtures_dir.is_dir():
         return
@@ -134,8 +179,9 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
                 f"fixture CSV {csv_path.name!r} does not match any store "
                 f"table name (known tables: {schema.TABLE_NAMES})"
             )
-        tz_columns = _timestamptz_columns(conn, table)
-        _assert_timestamptz_cells_carry_offset(csv_path, tz_columns)
+        column_types = _table_column_types(conn, table)
+        _assert_header_matches_columns(csv_path, table, column_types)
+        _assert_cell_formats(csv_path, column_types)
         conn.execute(
             f"INSERT INTO {table} BY NAME SELECT * FROM read_csv(?, header=true, all_varchar=true)",
             [str(csv_path)],

@@ -98,3 +98,45 @@ def test_timestamptz_cell_with_z_suffix_accepted(
 
     (count,) = store_conn.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     assert count == 1
+
+
+def test_header_case_mismatch_raises(tmp_path: Path, store_conn: duckdb.DuckDBPyConnection) -> None:
+    """`INSERT ... BY NAME` binds SQL identifiers case-insensitively, so a
+    wrong-case header like `KNOWN_AT` would otherwise bind silently
+    instead of surfacing what is almost certainly a typo."""
+    fixtures_dir = tmp_path / "universe"
+    fixtures_dir.mkdir()
+    csv_path = fixtures_dir / "prices_daily.csv"
+    csv_path.write_text(
+        "security_id,session,open,high,low,close,volume,KNOWN_AT,ingested_at,source,provenance\n"
+        "S1,2020-01-02,10.0,11.0,9.5,10.5,1000,2020-01-02T21:00:00+00:00,"
+        "2020-01-02T21:00:00+00:00,test,bar\n"
+    )
+
+    with pytest.raises(ValueError, match="do not exactly match"):
+        load_universe_fixtures(store_conn, fixtures_dir)
+
+    (count,) = store_conn.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    assert count == 0
+
+
+def test_datetime_value_in_date_column_raises(
+    tmp_path: Path, store_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """DuckDB casts a datetime-looking string to DATE without complaint,
+    silently discarding the time-of-day; a fixture author who pastes a
+    timestamp into a DATE column gets a loud failure instead."""
+    fixtures_dir = tmp_path / "universe"
+    fixtures_dir.mkdir()
+    csv_path = fixtures_dir / "prices_daily.csv"
+    csv_path.write_text(
+        "security_id,session,open,high,low,close,volume,known_at,ingested_at,source,provenance\n"
+        "S1,2020-01-02 23:30:00,10.0,11.0,9.5,10.5,1000,2020-01-02T21:00:00+00:00,"
+        "2020-01-02T21:00:00+00:00,test,bar\n"
+    )
+
+    with pytest.raises(ValueError, match="not a bare YYYY-MM-DD date"):
+        load_universe_fixtures(store_conn, fixtures_dir)
+
+    (count,) = store_conn.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    assert count == 0

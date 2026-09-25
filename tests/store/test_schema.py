@@ -21,12 +21,14 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import Settings
 from tradepartner.store import schema
 from tradepartner.store.db import (
     StoreLockedError,
     _is_lock_error,
+    configure_connection,
     ensure_tz_aware,
     insert_row,
     open_for_write,
@@ -576,3 +578,80 @@ def test_store_config_lock_retry_backoff_defaults() -> None:
     s = Settings(_env_file=None)
     assert s.store.lock_retry_initial_delay_seconds == pytest.approx(0.05)
     assert s.store.lock_retry_max_delay_seconds == pytest.approx(1.0)
+
+
+def test_store_config_rejects_zero_initial_delay() -> None:
+    """A zero delay is not a backoff (`Field(gt=0)`, third review pass)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"lock_retry_initial_delay_seconds": 0})
+
+
+def test_store_config_rejects_zero_max_delay() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"lock_retry_max_delay_seconds": 0})
+
+
+def test_store_config_rejects_negative_lock_retry_seconds() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, store={"lock_retry_seconds": -1})
+
+
+def test_store_config_allows_zero_lock_retry_seconds() -> None:
+    """Zero means "fail immediately, no retry" -- a legitimate choice,
+    unlike a zero backoff delay."""
+    s = Settings(_env_file=None, store={"lock_retry_seconds": 0})
+    assert s.store.lock_retry_seconds == 0
+
+
+def test_store_config_rejects_initial_delay_greater_than_max_delay() -> None:
+    with pytest.raises(ValidationError, match="must be <="):
+        Settings(
+            _env_file=None,
+            store={
+                "lock_retry_initial_delay_seconds": 2.0,
+                "lock_retry_max_delay_seconds": 1.0,
+            },
+        )
+
+
+# --- column-type cache correctness (T4 review, third pass) --------------
+
+
+def test_insert_row_before_init_schema_raises_clear_error() -> None:
+    """Before `init_schema`, `prices_daily` has no columns at all --
+    `insert_row` must say so plainly, not cache an empty result that would
+    silently skip every type check forever (`_column_types` / third
+    review pass)."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    naive = datetime(2020, 1, 1)  # noqa: DTZ001
+    row = _minimal_row("prices_daily", known_at=naive, ingested_at=_now())
+
+    with pytest.raises(ValueError, match="has no columns; run init_schema first"):
+        insert_row(conn, "prices_daily", row)
+
+    schema.init_schema(conn)
+
+    # The pre-init lookup must not have poisoned the cache with an empty
+    # result: a naive known_at is still rejected after init_schema runs.
+    with pytest.raises(ValueError, match="known_at"):
+        insert_row(conn, "prices_daily", row)
+
+
+def test_column_types_ignore_attached_database_with_same_named_table() -> None:
+    """`_column_types` filters on `current_database()`/`current_schema()`
+    so an `ATTACH`ed database's same-named table with a differently-typed
+    same-named column cannot override the real column type (probed: an
+    unfiltered query returns rows from both catalogs, and collapsing them
+    into a dict silently picks whichever came last)."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+
+    conn.execute("ATTACH ':memory:' AS other")
+    conn.execute("CREATE TABLE other.prices_daily (known_at VARCHAR)")
+
+    naive = datetime(2020, 1, 1)  # noqa: DTZ001
+    row = _minimal_row("prices_daily", known_at=naive, ingested_at=_now())
+    with pytest.raises(ValueError, match="known_at"):
+        insert_row(conn, "prices_daily", row)
