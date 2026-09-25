@@ -118,6 +118,8 @@ class IngestConfig(BaseModel):
 
     settle_delay_minutes: int = 60
     reference_symbol: str = "SPY"
+    # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
+    # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05
 
 
@@ -165,8 +167,26 @@ class MasterConfig(BaseModel):
     static_columns: list[str] = Field(default_factory=lambda: ["name", "ticker", "exchange"])
 
 
+class AlpacaConfig(BaseModel):
+    """Alpaca market-data choices resolved by the owner in T3 (#84).
+
+    `historical_feed`: the free plan returns consolidated SIP history when the request
+    `end` is at least 15 minutes in the past (confirmed 2026-09-25 with the owner's keys;
+    docs/research/2026-09-25-free-data-terms.md). Real-time is IEX-only, so a caller
+    asking for the current session inside that window must use `iex`.
+    """
+
+    historical_feed: Literal["sip", "iex"] = "sip"
+
+
 class ExecutionConfig(BaseModel):
-    """Backtest/paper fill assumptions."""
+    """Backtest/paper fill assumptions.
+
+    `fill_price` stays `close` (T3): Alpaca's daily open is the first valid trade, not the
+    official auction print, on every feed (documented), and fractional orders cannot use
+    OPG and are priced off the NBBO, so they likely fill after the open (inference, #86).
+    Neither live nor paper fills should be expected to match the bar open.
+    """
 
     fill_price: Literal["close", "open"] = "close"
 
@@ -180,7 +200,10 @@ class UniverseConfig(BaseModel):
     # below. Not a tunable parameter; changes only through a charter amendment.
     exclude_sic_ranges: tuple[tuple[int, int], ...] = _GUARDED_EXCLUDE_SIC_RANGES
     min_price: float = 5
-    liquidity_rule_enabled: bool = False
+    # On since T3 (#84): historical bars come from the consolidated SIP feed, so the
+    # 20-session median dollar volume is a real liquidity measure (IEX-only volume,
+    # ~2.5% of the tape, would not have been).
+    liquidity_rule_enabled: bool = True
     min_median_dollar_volume: float = 5_000_000
     liquidity_window: int = 20
     min_history_months: int = 12
@@ -235,6 +258,7 @@ class Settings(BaseSettings):
     edgar: EdgarConfig = Field(default_factory=EdgarConfig)
     master: MasterConfig = Field(default_factory=MasterConfig)
     benchmarks: list[str] = Field(default_factory=lambda: ["SPY", "MTUM"])
+    alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     gap: GapConfig = Field(default_factory=GapConfig)
