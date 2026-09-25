@@ -12,9 +12,11 @@ not counted.
   looks back to the last month-end).
 - **L** (`listed`): securities whose classification at `t` is in
   `universe.security_types`, not a benchmark, with a listing known at `t`
-  active at any session in W. A listing is active from its `valid_from`;
-  a delisted one through its Form 25's filing session, a transferred one
-  through its end session, a listed one open-ended.
+  on one of `universe.exchanges` active at any session in W (an OTC or
+  other off-universe listing is not the population the gap bounds). A
+  listing is active from its `valid_from`; a delisted one through its
+  Form 25's filing session, a transferred one through its end session, a
+  listed one open-ended.
 - **M** (`missing`): names in L whose current listing is still live at
   `session` with no bar at `session` (`no_bar_at_t`), plus names in L
   delisted (not transferred) by a Form 25 filed inside W whose last bar is
@@ -31,9 +33,11 @@ not counted.
 - **Side categories**, reported separately and never in M: universe
   rule 1's `unclassified`/`unclassifiable`, rule 6 (`truncated_history`)
   and rule 7 (`stale_shares`, any rule 7 reason) exclusions from
-  `universe_as_of(conn, t, settings)`, less the names already in M (a
-  listed name with no bar at T also fails rule 6), so each name is
-  counted once.
+  `universe_as_of(conn, t, settings)`, limited to names with a
+  non-benchmark listing on `universe.exchanges` active in W (so filers
+  never listed, or delisted long before, are not counted) and less the
+  names already in M (a listed name with no bar at T also fails rule 6),
+  so each name is counted once.
 
 Every threshold comes from `settings`; this module holds no numeric
 literal but 0, 1 and -1 (spec; tested by AST in T14).
@@ -187,19 +191,22 @@ def survivorship_gap(
         for r in classifications_as_of(conn, t).iter_rows(named=True)
         if r["security_type"] in types
     }
-    listed: set[str] = set()
+    exchanges = settings.universe.exchanges
+    active: set[str] = set()
     current: dict[str, dict[str, Any]] = {}
     for listing in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         sid = listing["security_id"]
-        if sid not in candidates or sid not in common or listing["valid_from"] > session:
+        if sid not in candidates or listing["exchange"] not in exchanges:
+            continue
+        if listing["valid_from"] > session:
             continue
         end = _active_end(listing)
         if end is None or end >= low:
-            listed.add(sid)
+            active.add(sid)
         held = current.get(sid)
         if held is None or listing["valid_from"] > held["valid_from"]:
             current[sid] = listing
-    ids = sorted(listed)
+    ids = sorted(active & common)
 
     bars = _last_bars(conn, t, session, ids)
     shares, _ = latest_shares_as_of(conn, t, ids)
@@ -251,7 +258,7 @@ def survivorship_gap(
     side: dict[str, list[str]] = {"unclassifiable": [], "history": [], "shares": []}
     in_m = {r["security_id"] for r in missing}
     for r in exclusions:
-        if r["security_id"] in in_m:
+        if r["security_id"] in in_m or r["security_id"] not in active:
             continue
         if r["rule_name"] == "security_type" and r["reason"] in MISSING_DATA_REASONS:
             side["unclassifiable"].append(r["security_id"])

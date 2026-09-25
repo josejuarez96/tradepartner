@@ -144,6 +144,13 @@ class _Store:
         )
 
 
+def _as_store(conn: duckdb.DuckDBPyConnection) -> _Store:
+    """A `_Store` over an existing connection, to add names to it."""
+    store = _Store.__new__(_Store)
+    store.conn = conn
+    return store
+
+
 @pytest.fixture
 def june() -> Iterator[duckdb.DuckDBPyConnection]:
     """The hand-computed store. Value = shares x last raw close.
@@ -211,6 +218,25 @@ def test_missing_rows_carry_the_evidence(june: duckdb.DuckDBPyConnection) -> Non
     assert rows["D"]["value"] == pytest.approx(1_000)
     assert rows["I"]["last_bar"] is None
     assert rows["I"]["value"] == 0.0
+
+
+def test_off_universe_exchange_listing_is_outside_l(june: duckdb.DuckDBPyConnection) -> None:
+    # An OTC common name with no bars is not the population the gap bounds.
+    _Store.security(_as_store(june), "K", exchange="OTC", shares=1_000)
+    gap = survivorship_gap(june, T_JUNE, _settings())
+    assert "K" not in gap.listed
+    assert gap.count_share == pytest.approx(3 / 7)
+
+
+def test_unclassifiable_counts_only_names_listed_in_w(june: duckdb.DuckDBPyConnection) -> None:
+    store = _as_store(june)
+    store.security("U1", security_type="unclassifiable", bars=(date(2019, 5, 1), date(2019, 6, 28)))
+    store.security("U2", security_type="unclassifiable", bars=(date(2019, 5, 1), date(2019, 5, 1)))
+    store.form_25("U2", date(2019, 5, 15))
+    gap = survivorship_gap(june, T_JUNE, _settings())
+    assert "U1" in gap.unclassifiable
+    assert "U2" not in gap.unclassifiable
+    assert not {"U1", "U2"} & set(gap.listed)
 
 
 def test_boundary_tail_equal_to_the_threshold_is_not_missing(
