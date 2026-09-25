@@ -106,6 +106,26 @@ def _table_column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str
     return dict(rows)
 
 
+def _not_null_varchar_columns(conn: duckdb.DuckDBPyConnection, table: str) -> list[str]:
+    """The `VARCHAR` columns of `table` that are `NOT NULL`.
+
+    Passed as `read_csv`'s `force_not_null` so a CSV cell destined for one
+    of these columns round-trips as an empty string rather than `NULL`
+    (verified by hand: DuckDB's `read_csv` treats *both* an unquoted and a
+    quoted-empty field as `NULL` by default, regardless of `all_varchar`,
+    which would otherwise trip the column's `NOT NULL` constraint even
+    though the schema itself uses `''` — never `NULL` — as its sentinel
+    for e.g. `facts.class_member`'s undimensioned case; see
+    `store/schema.py`'s comment on that column and issue #28).
+    """
+    rows = conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = ? AND data_type = 'VARCHAR' AND is_nullable = 'NO'",
+        [table],
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def _assert_header_matches_columns(
     csv_path: Path, table: str, column_types: dict[str, str]
 ) -> None:
@@ -168,7 +188,10 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
     column's real type on insert. Before that, every CSV header cell must
     exactly match a real column name (`_assert_header_matches_columns`),
     and every `TIMESTAMPTZ`/`DATE` cell must be in the expected format
-    (`_assert_cell_formats`).
+    (`_assert_cell_formats`). Every `VARCHAR NOT NULL` column is passed to
+    `read_csv`'s `force_not_null` (`_not_null_varchar_columns`) so an
+    empty cell for one of those columns loads as `''`, matching the
+    schema's own sentinel convention, instead of `NULL`.
     """
     if not fixtures_dir.is_dir():
         return
@@ -182,9 +205,11 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
         column_types = _table_column_types(conn, table)
         _assert_header_matches_columns(csv_path, table, column_types)
         _assert_cell_formats(csv_path, column_types)
+        force_not_null = _not_null_varchar_columns(conn, table)
         conn.execute(
-            f"INSERT INTO {table} BY NAME SELECT * FROM read_csv(?, header=true, all_varchar=true)",
-            [str(csv_path)],
+            f"INSERT INTO {table} BY NAME SELECT * FROM "
+            "read_csv(?, header=true, all_varchar=true, force_not_null=?)",
+            [str(csv_path), force_not_null],
         )
 
 
