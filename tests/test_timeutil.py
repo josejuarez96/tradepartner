@@ -4,7 +4,7 @@ rule."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -31,3 +31,22 @@ def test_non_utc_aware_input_normalized_to_same_instant_in_utc() -> None:
     assert result == value
     assert result.tzinfo is UTC
     assert result.utcoffset() == timedelta(0)
+
+
+class _NoOffset(tzinfo):
+    """A tzinfo whose `utcoffset()` is None: naive under Python's rules."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return None
+
+
+def test_tzinfo_without_utcoffset_is_rejected_as_naive() -> None:
+    value = datetime(2024, 1, 1, 12, 0, 0, tzinfo=_NoOffset())
+    with pytest.raises(ValueError, match="known_at must be tz-aware"):
+        ensure_tz_aware_utc(value, field_name="known_at")

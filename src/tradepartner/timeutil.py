@@ -16,11 +16,13 @@ from datetime import UTC, datetime
 
 
 def ensure_tz_aware_utc(value: datetime, *, field_name: str) -> datetime:
-    """Raise `ValueError` if `value` is naive; otherwise return it
+    """Raise `ValueError` if `value` is naive (no `tzinfo`, or a `tzinfo`
+    whose `utcoffset()` is `None`, which Python also treats as naive and
+    `astimezone` would read as host-local time); otherwise return it
     normalized to UTC (`.astimezone(UTC)`), so two values built from
     equivalent instants in different tzinfos always compare and print the
     same way.
     """
-    if value.tzinfo is None:
+    if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be tz-aware, got a naive datetime: {value!r}")
     return value.astimezone(UTC)

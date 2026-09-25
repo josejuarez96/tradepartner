@@ -13,6 +13,7 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 ### Changed
 - Process: multi-team orchestration. Any number of chat windows build in parallel as registered teams, each in its own clone; work is claimed on GitHub issues through `scripts/team.py` with a deterministic tiebreak; plans list chains; CI fails a PR whose issue is unclaimed or whose plan task has two open PRs; model tiers documented (#36).
 - Process: `scripts/team.py start <name>` sets up a team directory outside the repo in one step; `register` refuses to overwrite another team's `.team`; sessions touch only their own directory (#40).
+- `store.db.ensure_tz_aware` and the broker value objects share one tz-aware UTC check, `tradepartner.timeutil.ensure_tz_aware_utc`, which also rejects a `tzinfo` with no UTC offset; `ensure_tz_aware` now returns the value converted to UTC (#30).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
