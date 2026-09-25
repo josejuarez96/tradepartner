@@ -73,6 +73,7 @@ from tradepartner.store.asof import (
     adjusted_prices_as_of,
     dropped_dividends_as_of,
     listings_as_of,
+    prices_as_of,
 )
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delistings import listing_ends_as_of
@@ -182,6 +183,10 @@ class StoreProvider:
         return adjusted_prices_as_of(
             self._at(t), t, wanted, include_dividends=include_dividends, settings=self.settings
         )
+
+    def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t, wanted = check_t(t), _ids(ids)
+        return prices_as_of(self._at(t), t, wanted)
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
