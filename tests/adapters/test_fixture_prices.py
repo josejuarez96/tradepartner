@@ -277,6 +277,12 @@ class TestTimingRules:
             2019, 3, 11, 20, 0, tzinfo=UTC
         )
 
+    def test_announcement_after_the_proxy_is_capped_at_the_proxy(self) -> None:
+        late = datetime(2019, 2, 14, 21, 0, tzinfo=UTC)  # the ex-date close
+        assert action_first_seen_known_at(date(2019, 2, 14), announced_at=late) == session_close(
+            date(2019, 2, 13)
+        )
+
     def test_announcement_time_wins_over_the_proxy(self) -> None:
         announced = datetime(2018, 11, 15, 16, 0, tzinfo=timezone(timedelta(hours=-5)))
         result = action_first_seen_known_at(date(2019, 2, 14), announced_at=announced)
@@ -783,9 +789,25 @@ class TestFixtureContract:
         with pytest.raises(FixtureContractError, match="announced_at"):
             FixturePriceSource(fixtures)
 
-    def test_announcement_after_the_proxy_is_honoured(self, tmp_path: Path) -> None:
-        # A late announcement (after the close before ex-date) is stamped at
-        # the announcement, later than the proxy: never earlier than knowable.
+    def test_announcement_after_the_proxy_is_capped_at_the_proxy(self, tmp_path: Path) -> None:
+        # quant-auditor on #115: a stamp after the close before ex-date would
+        # leave post-split raw bars unadjusted (a phantom return), and the
+        # action is public before its ex-date anyway, so the proxy caps it.
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(
+                    announced_at="2019-03-04T21:00:00+00:00",
+                    known_at="2019-03-01T21:00:00+00:00",
+                )
+            ],
+        )
+        (action,) = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
+        assert action.known_at == datetime(2019, 3, 1, 21, 0, tzinfo=UTC)
+
+    def test_first_seen_action_stamped_at_a_late_announcement_is_refused(
+        self, tmp_path: Path
+    ) -> None:
         fixtures = _write_fixture_dir(
             tmp_path,
             actions=[
@@ -796,8 +818,33 @@ class TestFixtureContract:
                 )
             ],
         )
-        (action,) = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
-        assert action.known_at == datetime(2019, 3, 4, 21, 0, tzinfo=UTC)
+        with pytest.raises(FixtureContractError, match="proxy"):
+            FixturePriceSource(fixtures)
+
+    def test_first_seen_action_a_microsecond_before_the_proxy_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        fixtures = _write_fixture_dir(
+            tmp_path, actions=[_action_row(known_at="2019-03-01T20:59:59.999999+00:00")]
+        )
+        with pytest.raises(FixtureContractError, match="look-ahead"):
+            FixturePriceSource(fixtures)
+
+    def test_revision_that_changes_announced_at_is_refused(self, tmp_path: Path) -> None:
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(),
+                _action_row(
+                    ratio_or_amount=0.12,
+                    announced_at="2019-02-15T21:00:00+00:00",
+                    known_at="2019-03-15T20:00:00+00:00",
+                    ingested_at="2019-03-15T20:00:00+00:00",
+                ),
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="announced_at"):
+            FixturePriceSource(fixtures)
 
     def test_naive_announced_at_in_a_fixture_is_refused(self, tmp_path: Path) -> None:
         fixtures = _write_fixture_dir(

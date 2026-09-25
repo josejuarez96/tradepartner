@@ -183,8 +183,10 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 
 # announced_at is the source's announcement time, NULL when the source
 # gives none (issue #83). A first-seen row's known_at equals announced_at
-# when set, else the close of the session before ex_date (spec req 5);
-# the adapters enforce that, the table only stores it.
+# capped at the close of the session before ex_date, else that close
+# (spec req 5); revisions carry it forward unchanged. The adapters enforce
+# that, the table only stores it. It is evidence for the stamp, never a
+# time to filter on: as-of reads use known_at only.
 _CREATE_CORPORATE_ACTIONS = f"""
 CREATE TABLE IF NOT EXISTS corporate_actions (
     security_id VARCHAR NOT NULL,

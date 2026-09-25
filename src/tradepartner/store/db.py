@@ -182,7 +182,8 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
 
     Other column types are passed through unchecked; DuckDB's own
     conversion errors cover those. `None` is bound as NULL for any column:
-    a nullable one (`corporate_actions.announced_at`, #83) stores it, and
+    a nullable one (`corporate_actions.announced_at` #83,
+    `ingestion_runs.finished_at`) stores it, and
     the schema's `NOT NULL` constraints refuse it everywhere else.
 
     `TIMESTAMPTZ` values are normalized to UTC (via `ensure_tz_aware`)

@@ -32,13 +32,14 @@ in ingest order (`ingested_at`, then `known_at`):
    the XNYS close of its session, so a bar on a non-session is refused too.
    A first-seen action has `known_at` equal to
    `prices.action_first_seen_known_at(ex_date, announced_at=...)`: its
-   `announced_at` if the row has one, else exactly the first-seen proxy.
-   A stamp earlier than the proxy with no `announced_at` is look-ahead and
-   refused (issue #83). `announced_at` is optional per row (an empty cell)
-   but the column is required.
+   `announced_at` capped at the first-seen proxy if the row has one, else
+   exactly the proxy. A stamp earlier than the proxy with no `announced_at`
+   is look-ahead and refused (issue #83). `announced_at` is optional per
+   row (an empty cell) but the column is required.
 3. Every later row for the same key must be what `prices.revision_of`
    produces from the row before it at that row's `ingested_at`: values that
    differ, and `known_at` equal to its own `ingested_at` (never back-dated).
+   An action revision carries the previous row's `announced_at` unchanged.
 """
 
 from __future__ import annotations
@@ -228,8 +229,9 @@ def _check_action_first_seen(row: _Row[CorporateAction]) -> None:
     if action.announced_at is not None:
         raise FixtureContractError(
             f"{row.where}: first-seen action known_at {action.known_at.isoformat()} is not "
-            f"its announced_at {expected.isoformat()}; an announced action is stamped at "
-            "its announcement"
+            f"{expected.isoformat()}, its announced_at {action.announced_at.isoformat()} "
+            "capped at the first-seen proxy (close before ex-date "
+            f"{action.ex_date.isoformat()})"
         )
     when = "before" if action.known_at < expected else "after"
     raise FixtureContractError(
@@ -264,6 +266,17 @@ def _check_history[RecordT: (Bar, CorporateAction)](
                 raise FixtureContractError(
                     f"{current.where}: revision of {key(current.record)} has values identical "
                     f"to {previous.where}; an unchanged re-fetch is not a new row"
+                )
+            if (
+                isinstance(current.record, CorporateAction)
+                and isinstance(previous.record, CorporateAction)
+                and current.record.announced_at != previous.record.announced_at
+            ):
+                raise FixtureContractError(
+                    f"{current.where}: revision of {key(current.record)} changes announced_at "
+                    f"from {previous.record.announced_at!r} to "
+                    f"{current.record.announced_at!r}; the announcement fixed the first-seen "
+                    "stamp and is carried forward unchanged"
                 )
             if expected.known_at != current.record.known_at:
                 raise FixtureContractError(

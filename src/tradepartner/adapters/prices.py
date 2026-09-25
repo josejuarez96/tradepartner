@@ -18,7 +18,8 @@ Three things live here, and nothing else:
     bars, `known_at` = session close).
   - `action_first_seen_known_at(ex_date, announced_at=None)`: the source's
     announcement time if it gives one, else the close of the last session
-    before `ex_date` (spec req 5, the "first-seen proxy").
+    before `ex_date` (spec req 5, the "first-seen proxy"); a later
+    announcement is capped at the proxy.
   - `announcement_date_known_at(day)`: the announcement time for a source
     that gives only a declaration date: the close of the first session
     strictly after it (spec req 5).
@@ -229,14 +230,20 @@ def action_first_seen_known_at(ex_date: date, *, announced_at: datetime | None =
     """`known_at` for a corporate action seen for the first time (spec req 5):
     `announced_at` if the source supplies one (normalized to UTC; a naive
     value raises `ValueError`), else the close of the last XNYS session
-    strictly before `ex_date`.
+    strictly before `ex_date` (the proxy).
+
+    An announcement later than the proxy is capped at the proxy: raw bars
+    from the ex-date on already reflect the action, so a later stamp would
+    leave them unadjusted (a phantom return), and an action is public
+    before its ex-date.
 
     `ex_date` need not itself be a session. A `datetime` raises `TypeError`.
     """
     _require_date(ex_date, field_name="ex_date")
+    proxy = session_close(previous_session(ex_date))
     if announced_at is not None:
-        return ensure_tz_aware_utc(announced_at, field_name="announced_at")
-    return session_close(previous_session(ex_date))
+        return min(ensure_tz_aware_utc(announced_at, field_name="announced_at"), proxy)
+    return proxy
 
 
 def announcement_date_known_at(day: date) -> datetime:
@@ -246,7 +253,8 @@ def announcement_date_known_at(day: date) -> datetime:
     A same-day stamp would be look-ahead for an announcement released after
     that day's close, and a date carries no time to rule that out, so the
     announcement counts as knowable only at the next close. `day` need not
-    be a session. A `datetime` raises `TypeError`.
+    be a session. A `datetime` raises `TypeError`. The first-seen stamp
+    still caps it at the proxy (`action_first_seen_known_at`).
     """
     _require_date(day, field_name="day")
     return session_close(next_session(day))
