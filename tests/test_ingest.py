@@ -401,6 +401,40 @@ def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[An
     assert _counts(read)["prices_daily"] == 0
 
 
+class _Counted(FixtureFilingSource):
+    """The attributes the real EDGAR adapter exposes (T11b, T11c) (#172)."""
+
+    unstamped_filings: Any = ("a", "b")
+    unstamped_facts: Any = ("c",)
+    skipped_filers: Any = ("d", "e", "f")
+
+
+@pytest.mark.parametrize("skipped", [("d", "e", "f"), 3])
+def test_edgar_run_message_carries_the_adapter_counts(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]], skipped: Any
+) -> None:
+    filings = _filings(cls=_Counted)
+    filings.skipped_filers = skipped  # type: ignore[attr-defined]
+    result = _run(settings, filings=filings, source="edgar")
+    counts = "unstamped: 2 filings, 1 facts; skipped filers: 3"
+    assert result.runs[0].status == OK
+    assert result.runs[0].message.endswith(counts)
+    assert read("SELECT message FROM ingestion_runs")[0][0].endswith(counts)
+
+
+def test_edgar_run_message_names_only_the_counts_the_source_exposes(settings: Settings) -> None:
+    class OnlyFacts(FixtureFilingSource):
+        unstamped_facts = ("c",)
+
+    message = _run(settings, filings=_filings(cls=OnlyFacts), source="edgar").runs[0].message
+    assert message.endswith("; unstamped: 1 facts")
+
+
+def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:
+    message = _run(settings, source="edgar").runs[0].message
+    assert "unstamped" not in message and "skipped" not in message
+
+
 def test_prices_before_any_master_fails_rather_than_fetching_nothing(settings: Settings) -> None:
     result = _run(settings, source="alpaca")
     assert result.runs[-1].status == FAILED

@@ -1,0 +1,1 @@
+- #172 EDGAR run row message ends with the adapter's unstamped-filing, unstamped-fact and skipped-filer counts when the source exposes them (duck-typed, count or collection); fixture sources unchanged

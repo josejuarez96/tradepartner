@@ -52,7 +52,9 @@ is fetching is stored, not refused as look-ahead.
 
 **Run messages** are stored with every configured secret value redacted,
 control characters replaced and the length capped at
-`ingest.max_message_chars`: an exception's text comes from a server.
+`ingest.max_message_chars`: an exception's text comes from a server. The
+EDGAR message ends with the adapter's unstamped-filing, unstamped-fact and
+skipped-filer counts when the source exposes them (#172).
 """
 
 from __future__ import annotations
@@ -342,7 +344,28 @@ def _ingest_filings(
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
-    return added, message
+    return added, message + _source_counts(filings)
+
+
+def _source_counts(filings: FilingSource) -> str:
+    """`"; unstamped: N filings, M facts; skipped filers: K"`, naming only the
+    attributes `filings` exposes, so rows the EDGAR adapter (T11b, T11c) left
+    out stay visible in the run row (#172). Duck-typed: each attribute is a
+    count or a collection; a fixture source has none and adds nothing."""
+
+    def count(attribute: str) -> int | None:
+        value = getattr(filings, attribute, None)
+        return value if value is None or isinstance(value, int) else len(value)
+
+    unstamped = [
+        f"{n} {what}"
+        for what in ("filings", "facts")
+        if (n := count(f"unstamped_{what}")) is not None
+    ]
+    parts = [f"unstamped: {', '.join(unstamped)}"] if unstamped else []
+    if (skipped := count("skipped_filers")) is not None:
+        parts.append(f"skipped filers: {skipped}")
+    return "".join(f"; {part}" for part in parts)
 
 
 def _build_filings(
