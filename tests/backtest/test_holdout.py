@@ -140,6 +140,21 @@ def test_end_after_holdout_end_is_refused_window_even_with_the_spend_flag() -> N
     assert "holdout.end" in decision.message
 
 
+@pytest.mark.parametrize(
+    "window",
+    [
+        Window(date(2024, 1, 2), date(2024, 1, 20)),  # inside the holdout, no month end
+        Window(date(2023, 6, 1), date(2024, 1, 15)),  # month ends only before the holdout
+    ],
+)
+def test_holdout_window_with_no_holdout_rebalance_session_is_refused_window(
+    window: Window,
+) -> None:
+    decision = _decide(window, SPEND, SPEND_REASON, gap_series={})
+    assert decision.outcome == "refused_window"
+    assert decision.kind is None
+
+
 def test_start_after_end_is_refused_window() -> None:
     decision = _decide(Window(date(2020, 12, 31), date(2020, 1, 31)))
     assert decision.outcome == "refused_window"
@@ -151,7 +166,7 @@ def test_start_after_end_is_refused_window() -> None:
 @pytest.mark.parametrize(
     "window",
     [
-        Window(date(2023, 6, 1), date(2024, 1, 1)),
+        Window(date(2023, 6, 1), date(2024, 1, 31)),
         Window(date(2026, 8, 31), date(2026, 8, 31)),
         HOLDOUT,
     ],
@@ -183,6 +198,7 @@ def test_spend_flag_on_an_in_sample_window_is_an_ordinary_in_sample_run() -> Non
     assert decision.outcome == "run"
     assert decision.kind == "in_sample"
     assert decision.holdout_reason is None
+    assert "--spend-holdout ignored" in decision.message
 
 
 def test_a_prior_family_spend_marks_repeat() -> None:
@@ -309,6 +325,32 @@ def test_threshold_comes_from_the_frozen_parameters() -> None:
     )
     decision = decide(HOLDOUT, strict, SPEND, SPEND_REASON, _gap(0.01), ())
     assert decision.outcome == "refused_gap"
+
+
+@pytest.mark.parametrize("threshold", [-0.01, 1.0, 2.0, math.nan, math.inf])
+def test_frozen_refuses_a_threshold_outside_a_share(threshold: float) -> None:
+    with pytest.raises(ValueError, match="finite share"):
+        Frozen(
+            hypothesis_id=1,
+            in_sample_start=date(2017, 1, 31),
+            holdout_start=date(2024, 1, 1),
+            holdout_end=date(2026, 8, 31),
+            gap_count_share_threshold=threshold,
+        )
+
+
+@pytest.mark.parametrize(
+    ("in_sample_start", "holdout_start", "holdout_end"),
+    [
+        (date(2024, 1, 1), date(2024, 1, 1), date(2026, 8, 31)),
+        (date(2017, 1, 31), date(2026, 8, 31), date(2024, 1, 1)),
+    ],
+)
+def test_frozen_refuses_misordered_dates(
+    in_sample_start: date, holdout_start: date, holdout_end: date
+) -> None:
+    with pytest.raises(ValueError, match="frozen dates"):
+        Frozen(1, in_sample_start, holdout_start, holdout_end, 0.05)
 
 
 # --- frozen parameters from the registry -------------------------------------

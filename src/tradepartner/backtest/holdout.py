@@ -64,6 +64,18 @@ class Frozen:
     holdout_end: date
     gap_count_share_threshold: float
 
+    def __post_init__(self) -> None:
+        if not self.in_sample_start < self.holdout_start <= self.holdout_end:
+            raise ValueError(
+                f"frozen dates must satisfy in_sample_start ({self.in_sample_start}) < "
+                f"holdout.start ({self.holdout_start}) <= holdout.end ({self.holdout_end})"
+            )
+        threshold = self.gap_count_share_threshold
+        if not (math.isfinite(threshold) and 0 <= threshold < 1):
+            raise ValueError(
+                f"{GAP_THRESHOLD_KEY} must be a finite share in [0, 1), got {threshold}"
+            )
+
     @classmethod
     def from_hypothesis(cls, hypothesis: HypothesisRecord) -> Frozen:
         """Read the decision inputs from a `hypotheses` row and its frozen params."""
@@ -187,7 +199,9 @@ def decide(
 
     `gap_series` maps rebalance sessions to the survivorship-gap count share
     read at their close, or is `None` before any read. `prior_spends` are the
-    family's holdout trials before this one. Raises `ValueError` when a
+    family's holdout trials **excluding this one**: a caller that opened this
+    trial as `holdout` before reading `family_holdout_spends` drops its own id,
+    or every first spend reads as a repeat. Raises `ValueError` when a
     series is given but misses a rebalance session of the window.
     """
     refusal = _window_refusal(window, frozen)
@@ -195,9 +209,16 @@ def decide(
         return Decision("refused_window", None, refusal)
 
     if not window_touches_holdout(window, frozen):
-        return Decision("run", "in_sample", "in-sample run")
+        ignored = "; --spend-holdout ignored" if flags.spend_holdout else ""
+        return Decision("run", "in_sample", f"in-sample run{ignored}")
 
     holdout = f"[{frozen.holdout_start}, {frozen.holdout_end}]"
+    if not any(frozen.holdout_start <= s <= frozen.holdout_end for s in gap_sessions(window)):
+        return Decision(
+            "refused_window",
+            None,
+            f"window touches the holdout {holdout} but reaches none of its rebalance sessions",
+        )
     if not flags.spend_holdout:
         return Decision(
             "refused_holdout",
