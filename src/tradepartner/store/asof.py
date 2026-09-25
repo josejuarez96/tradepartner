@@ -111,7 +111,8 @@ weekdays). Past that, after a long ingest gap or a relisting, a close
 weeks or years old would silently mis-size the factor, or fail the whole
 query if it is at or below the amount, so the dividend is left unapplied
 (`NULL` factor) instead and `dropped_dividends_as_of` reports it, along
-with any dividend that has no prior bar at all, for `health` to count.
+with any dividend that has no prior bar at all or whose prior bar or
+ex-date lies outside the configured calendar, for `health` to count.
 If a split and a dividend share the same `ex_date`, the dividend's
 `prior_close` is still the **raw**, pre-split close of the prior session
 (the `ASOF JOIN` reads from
@@ -170,7 +171,6 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
-from functools import lru_cache
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -369,22 +369,33 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
             ASOF LEFT JOIN latest_bars pb
                 ON pb.security_id = la.security_id AND pb.session < la.ex_date
         ),
+        calendar_bounds AS (
+            SELECT MIN(session) AS first_session, MAX(session) AS last_session
+            FROM {_SESSIONS_VIEW}
+        ),
         -- A dividend's gap: XNYS sessions in [prior_session, ex_date),
         -- i.e. the index of the last session before ex_date minus that
         -- of the last session before prior_session (-1 if none), so the
-        -- prior session itself is a gap of 1.
+        -- prior session itself is a gap of 1. NULL when either date is
+        -- outside the configured calendar, where there is no index to
+        -- count with (a pre-calendar bar would otherwise count as if it
+        -- were on the first session).
         event_gap AS (
             SELECT
                 ep.*,
-                CASE WHEN ep.action_type = 'dividend' AND ep.prior_session IS NOT NULL
+                CASE WHEN ep.action_type = 'dividend'
+                    AND ep.prior_session >= cb.first_session
+                    AND ep.ex_date <= cb.last_session
                     THEN xe.idx - COALESCE(xp.idx, -1)
                 END AS gap_sessions
             FROM event_prior ep
+            CROSS JOIN calendar_bounds cb
             ASOF LEFT JOIN {_SESSIONS_VIEW} xe ON xe.session < ep.ex_date
             ASOF LEFT JOIN {_SESSIONS_VIEW} xp ON xp.session < ep.prior_session
         ),
-        -- Each event's own factor; NULL for a dividend with no prior bar
-        -- or one more than `max_prior_close_gap_sessions` sessions back.
+        -- Each event's own factor; NULL for a dividend with no prior bar,
+        -- one more than `max_prior_close_gap_sessions` sessions back, or
+        -- one outside the calendar (gap NULL).
         event_factor AS (
             SELECT
                 *,
@@ -428,16 +439,24 @@ def _adjusted_params(
     return _adjusted_ctes(action_types, bars_filter, actions_filter), params
 
 
-@lru_cache(maxsize=1)
+#: `(sessions, frame)` for the last `calendar.all_sessions()` tuple seen.
+#: Checked by identity: that tuple is itself cached per calendar range, and
+#: hashing ~11k dates on every call (an `lru_cache` key) costs ~0.5 ms.
+_sessions_frame_cache: tuple[tuple[date, ...], pl.DataFrame] | None = None
+
+
 def _sessions_frame(sessions: tuple[date, ...]) -> pl.DataFrame:
-    """`sessions` as an `(idx, session)` frame, `idx` 0-based ascending.
-    Built once per calendar range (`calendar.all_sessions` returns the
-    same tuple while the range is unchanged)."""
-    return (
-        pl.DataFrame({"session": sessions}, schema={"session": pl.Date})
-        .with_row_index("idx")
-        .with_columns(pl.col("idx").cast(pl.Int64))
-    )
+    """`sessions` as an `(idx, session)` frame, `idx` 0-based ascending,
+    built once per `calendar.all_sessions()` tuple."""
+    global _sessions_frame_cache
+    if _sessions_frame_cache is None or _sessions_frame_cache[0] is not sessions:
+        frame = (
+            pl.DataFrame({"session": sessions}, schema={"session": pl.Date})
+            .with_row_index("idx")
+            .with_columns(pl.col("idx").cast(pl.Int64))
+        )
+        _sessions_frame_cache = (sessions, frame)
+    return _sessions_frame_cache[1]
 
 
 _NO_SESSIONS = pl.DataFrame(schema={"idx": pl.Int64, "session": pl.Date})
@@ -575,11 +594,21 @@ def dropped_dividends_as_of(
     """Dividends known by `t` with `ex_date <= t` that `adjusted_prices_as_of(
     ..., include_dividends=True)` leaves unapplied because it has no usable
     prior close (#72): one row per `(security_id, ex_date)`, sorted by
-    both, with `ratio_or_amount`, `prior_session` and `gap_sessions` (both
-    `NULL` when no prior bar is known) and `reason`, either
-    `"no_prior_bar"` or `"stale_prior_bar"` (more than `settings.adjust.
-    max_prior_close_gap_sessions` XNYS sessions before the ex-date). For
-    `health` to count; `settings` defaults to `get_settings()`.
+    both, with `ratio_or_amount`, `prior_session`, `gap_sessions` and
+    `reason`, one of:
+
+    - `"no_prior_bar"`: no bar before the ex-date is known at `t`
+      (`prior_session` and `gap_sessions` are `NULL`);
+    - `"outside_calendar_range"`: the prior bar or the ex-date falls
+      outside `calendar.start`..`calendar.end`, so the gap cannot be
+      counted (`gap_sessions` is `NULL`);
+    - `"stale_prior_bar"`: more than `settings.adjust.
+      max_prior_close_gap_sessions` XNYS sessions before the ex-date.
+
+    For `health` to count; `settings` defaults to `get_settings()`.
+    Raises `ValueError` on the same invalid data `adjusted_prices_as_of`
+    does (e.g. a negative dividend amount), so the two never disagree on
+    what is a drop and what is bad data.
     """
     t = _validate_t(t)
     common_ctes, params = _adjusted_params(t, security_ids, settings, include_dividends=True)
@@ -591,11 +620,15 @@ def dropped_dividends_as_of(
             ratio_or_amount,
             prior_session,
             gap_sessions,
-            CASE WHEN prior_session IS NULL THEN 'no_prior_bar' ELSE 'stale_prior_bar' END
-                AS reason
+            CASE
+                WHEN prior_session IS NULL THEN 'no_prior_bar'
+                WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
+                ELSE 'stale_prior_bar'
+            END AS reason
         FROM event_factor
         WHERE action_type = 'dividend' AND factor IS NULL
         ORDER BY security_id, ex_date
     """
     with _sessions_registered(conn, include_dividends=True):
+        _raise_on_invalid_factor(conn, common_ctes, params)
         return conn.execute(sql, params).pl()
