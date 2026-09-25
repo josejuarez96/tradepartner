@@ -10,6 +10,7 @@ page's only reader and needs no Streamlit.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -334,10 +335,12 @@ def test_render_detailed_trial_shows_every_element(
     assert "log" in text.lower()
     assert "N at run time" in text
 
-    charts = at.get("arrow_vega_lite_chart")
-    assert len(charts) >= 3  # equity, drawdowns, turnover and costs
+    charts = at.get("vega_lite_chart")
+    assert len(charts) == 4  # equity, drawdowns, turnover, costs
+    equity_spec = json.loads(charts[0].proto.spec)
+    assert equity_spec["encoding"]["y"]["scale"] == {"type": "log"}
+    assert equity_spec["encoding"]["color"]["field"] == "series"
 
-    frames = {tuple(df.value.columns) for df in at.dataframe}
     dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
     assert set(dsr["basis"]) == {"raw", "excess_spy"}
     for column in ("stored N", "stored V", "stored SR*", "today N", "today V", "today SR*"):
@@ -351,10 +354,26 @@ def test_render_detailed_trial_shows_every_element(
 
     metrics = next(df.value for df in at.dataframe if "metric" in df.value.columns)
     assert {"strategy @ 15.0 bps", "strategy @ 30.0 bps"} <= set(metrics.columns)
-    assert frames  # at least one table rendered
 
     assert "in_sample" in text
-    assert "not spent" in text.lower()
+    spends = next(df.value for df in at.dataframe if "holdout_reason" in df.value.columns)
+    assert set(spends["trial_id"]) == {seeded.refused, seeded.holdout}
+
+
+def test_render_family_with_no_holdout_spend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path = tmp_path / "one.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
+        _ok_trial(conn, seed_settings, h1, 0.2, 0.05, details=True)
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert "holdout not spent in family `momentum`" in _text(at).lower()
+    dsr = next(df.value for df in at.dataframe if "today DSR" in df.value.columns)
+    assert list(dsr["today label"]) == ["psr", "psr"]
 
 
 def test_render_refused_trial_shows_state_and_message(

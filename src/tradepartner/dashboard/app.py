@@ -41,6 +41,7 @@ import duckdb
 import streamlit as st
 
 from tradepartner.config import Settings, get_settings
+from tradepartner.dashboard import backtest_page
 from tradepartner.store.db import StoreLockedError, open_read_only
 
 
@@ -150,6 +151,7 @@ def render_health_placeholder(conn: duckdb.DuckDBPyConnection) -> None:
 
 _PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "Data health": render_health_placeholder,
+    "Backtest": backtest_page.render,
 }
 
 
