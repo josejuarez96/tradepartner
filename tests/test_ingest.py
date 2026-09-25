@@ -45,6 +45,7 @@ from tradepartner.ingest import (
     OK,
     STALE,
     IngestResult,
+    _add_rows,
     expected_session,
     fact_rows,
     ingest_session,
@@ -52,6 +53,7 @@ from tradepartner.ingest import (
 from tradepartner.store.asof import facts_as_of, prices_as_of
 from tradepartner.store.classify import build_classifications
 from tradepartner.store.master import build_master
+from tradepartner.store.schema import init_schema
 
 ACME = "0000000001"  # one class, NYSE
 DUAL = "0000000002"  # Class A and Class B, NASDAQ
@@ -647,3 +649,89 @@ def test_run_messages_are_redacted_cleaned_and_capped(
         assert secret not in message and "owner@example.com" not in message
         assert "[redacted]" in message and "\x1b" not in message
         assert len(message) == 200
+
+
+# --- filed-row revisions, decided per key (quant-auditor re-audit on #164) --
+
+
+def _store() -> duckdb.DuckDBPyConnection:
+    conn = duckdb.connect(":memory:")
+    init_schema(conn)
+    return conn
+
+
+def _classification(sic: int, known_at: datetime, ingested_at: datetime) -> dict[str, Any]:
+    return {
+        "security_id": ACME,
+        "sic": sic,
+        "security_type": "common",
+        "rule": "common_default",
+        "known_at": known_at,
+        "ingested_at": ingested_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _security(name: str, known_at: datetime, ingested_at: datetime) -> dict[str, Any]:
+    return {
+        "security_id": ACME,
+        "cik": ACME,
+        "name": name,
+        "benchmark": False,
+        "known_at": known_at,
+        "ingested_at": ingested_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+T1, T2, T3 = _at(2019, 1, 2), _at(2019, 2, 1), _at(2019, 3, 1)
+
+
+@pytest.mark.parametrize(
+    ("table", "make", "old", "restated", "kept"),
+    [
+        ("classifications", _classification, 3571, 3572, 7372),
+        ("securities", _security, "Acme", "Acme Restated", "Acme Two"),
+    ],
+)
+def test_a_restated_older_row_neither_ties_nor_fails(
+    table: str, make: Callable[..., dict[str, Any]], old: Any, restated: Any, kept: Any
+) -> None:
+    conn = _store()
+    first = [make(old, T1, NOW), make(kept, T2, NOW)]
+    assert _add_rows(conn, table, first, ingested_at=NOW, current=False) == 2
+    later = NOW + timedelta(days=1)
+    again = [make(restated, T1, later), make(kept, T2, later)]
+    for _ in range(2):  # the restated history adds nothing, now and on re-run
+        assert _add_rows(conn, table, again, ingested_at=later, current=False) == 0
+    column = "sic" if table == "classifications" else "name"
+    read = conn.execute(f"SELECT {column} FROM {table} ORDER BY known_at").fetchall()
+    assert read[-1] == (kept,)
+
+
+def test_a_late_filing_behind_a_stored_revision_is_one_row_at_ingested_at() -> None:
+    conn = _store()
+    _add_rows(conn, "securities", [_security("A", T1, NOW)], ingested_at=NOW, current=False)
+    one = NOW + timedelta(days=1)
+    _add_rows(conn, "securities", [_security("B", T1, one)], ingested_at=one, current=False)
+    two = NOW + timedelta(days=2)
+    late = [_security("B", T1, two), _security("C", T3, two)]  # C@T3 < the stored B@one
+    assert _add_rows(conn, "securities", late, ingested_at=two, current=False) == 1
+    assert (
+        _add_rows(conn, "securities", late, ingested_at=two + timedelta(hours=1), current=False)
+        == 0
+    )
+    rows = conn.execute("SELECT name, known_at FROM securities ORDER BY known_at").fetchall()
+    assert rows == [("A", T1), ("B", one), ("C", two)]
+
+
+def test_fact_class_uses_the_classification_known_at_acceptance(settings: Settings) -> None:
+    # A class classified common only after the fact was accepted cannot take it.
+    source = _filings()
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    early = _fact(ACME, "", 1, f"{ACME}-18-000009", _at(2018, 3, 1) - timedelta(days=1))
+    rows, unmatched = fact_rows([early], master, classes, ingested_at=NOW)
+    assert rows == () and unmatched == (early,)

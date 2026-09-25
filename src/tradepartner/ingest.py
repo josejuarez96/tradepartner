@@ -30,10 +30,11 @@ only if it changes what an as-of read returns:
   unchanged is skipped; different is a new row at `known_at = ingested_at`,
   never back-dated, and an action keeps the stored `announced_at`.
 - *Filed* rows (master, delistings, classifications, facts: `known_at` is a
-  filing acceptance or fetch time) are skipped when the latest stored row
-  for their key as of their `known_at` has the same values. A row whose
-  `known_at` already holds different values is a revision, stamped at
-  `ingested_at` unless the latest row already has its values.
+  filing acceptance or fetch time) keep their `known_at` only when it is
+  later than every stored row of their key and changes the view. Stored
+  history is never rewritten: if the key's latest row still differs from
+  the builder's latest (a restatement, a late filing, A -> B -> A), one row
+  with the builder's latest values is stamped at `ingested_at`.
 
 The price side fetches bars for the expected session and actions with
 `ex_date` from the first of its month to it, so revisions within the month
@@ -369,7 +370,8 @@ def fact_rows(
 ) -> tuple[tuple[Row, ...], tuple[FactRecord, ...]]:
     """`facts` rows for `records`, and the records no security could take.
 
-    Candidates are the CIK's **common** classes (latest classification);
+    Candidates are the CIK's **common** classes, by the classification in
+    force at the fact's acceptance (no later knowledge picks the class);
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
@@ -379,14 +381,23 @@ def fact_rows(
     class's shares. Raises `ValueError` for a record accepted after
     `ingested_at`.
     """
-    latest: dict[str, Row] = {}
+    kinds: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for row in sorted(classes.classifications, key=lambda r: r["known_at"]):
-        latest[row["security_id"]] = row
-    common: dict[str, list[str]] = defaultdict(list)
+        kinds[row["security_id"]].append((row["known_at"], row["security_type"]))
+    by_cik: dict[str, list[str]] = defaultdict(list)
     for row in master.securities:
-        kind = latest.get(row["security_id"], {}).get("security_type")
-        if not row["benchmark"] and kind == "common":
-            common[row["cik"]].append(row["security_id"])
+        if not row["benchmark"]:
+            by_cik[row["cik"]].append(row["security_id"])
+
+    def common_at(cik: str, t: datetime) -> list[str]:
+        """The CIK's classes classified `common` by the latest row known at `t`."""
+        out = []
+        for sid in by_cik.get(cik, []):
+            known = [kind for at, kind in kinds[sid] if at <= t]
+            if known and known[-1] == "common":
+                out.append(sid)
+        return out
+
     letters: dict[str, set[str]] = defaultdict(set)
     for row in master.listings:
         match = _TITLE_CLASS.search((row["class_title"] or "").lower())
@@ -401,7 +412,7 @@ def fact_rows(
                 f"{record.accession}: accepted_at {record.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        ids = common.get(record.cik, [])
+        ids = common_at(record.cik, record.accepted_at)
         member = _MEMBER_CLASS.search(record.class_member)
         if member:
             ids = [sid for sid in ids if member.group(1) in letters[sid]]
@@ -578,28 +589,24 @@ def _add_rows(
     for stored_rows in history.values():
         stored_rows.sort(key=lambda r: r["known_at"])
 
-    incoming = sorted(rows, key=lambda r: (key(r), r["known_at"]))
-    if current:  # the source's latest record per key is its value now
-        incoming = list({key(r): r for r in incoming}.values())
-    last_of = {key(r): r for r in incoming}
+    incoming: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in sorted(rows, key=lambda r: (key(r), r["known_at"])):
+        incoming[key(row)].append(row)
     added = 0
-    for row in incoming:
-        past = history[key(row)]
-        if current:
-            new = _current(row, past, ingested_at, same)
+    for row_key, built in incoming.items():
+        past = history[row_key]
+        if current:  # the source's latest record per key is its value now
+            new_rows = _current(built[-1], past, ingested_at, same)
         else:
-            new = _filed(row, past, same, last=row is last_of[key(row)])
-        if new is None:
-            continue
-        if new["known_at"] > ingested_at:
-            raise ValueError(
-                f"{table} {key(new)}: known_at {new['known_at'].isoformat()} is after "
-                f"ingested_at {ingested_at.isoformat()}; it is not knowable yet"
-            )
-        insert_row(conn, table, new)
-        past.append(new)
-        past.sort(key=lambda r: r["known_at"])
-        added += 1
+            new_rows = _filed(built, past, ingested_at, same)
+        for new in new_rows:
+            if new["known_at"] > ingested_at:
+                raise ValueError(
+                    f"{table} {row_key}: known_at {new['known_at'].isoformat()} is after "
+                    f"ingested_at {ingested_at.isoformat()}; it is not knowable yet"
+                )
+            insert_row(conn, table, new)
+            added += 1
     return added
 
 
@@ -608,36 +615,47 @@ _Same = Callable[[Mapping[str, Any], Mapping[str, Any]], bool]
 
 def _current(
     row: Mapping[str, Any], past: list[Row], ingested_at: datetime, same: _Same
-) -> Row | None:
+) -> list[Row]:
     """The revision rule of `adapters.prices.revision_of`, over rows."""
     if not past:
-        return dict(row)
+        return [dict(row)]
     latest = past[-1]
     if same(row, latest):
-        return None
+        return []
     if ingested_at <= latest["known_at"]:
         raise ValueError(f"revision at {ingested_at.isoformat()} would be back-dated")
     revised = {**row, "known_at": ingested_at}
     if "announced_at" in latest:
         revised["announced_at"] = latest["announced_at"]
-    return revised
+    return [revised]
 
 
-def _filed(row: Mapping[str, Any], past: list[Row], same: _Same, *, last: bool) -> Row | None:
-    """A filed row, unless the stored view at its `known_at` already has it.
+def _filed(
+    built: Sequence[Mapping[str, Any]], past: list[Row], ingested_at: datetime, same: _Same
+) -> list[Row]:
+    """The rows to add for one key, given the builder's rows for it
+    (oldest first) and the stored ones.
 
-    If a stored row already holds this `known_at` with other values, the
-    row is a revision stamped at `ingested_at`. For the builder's latest row
-    of the key (`last`) that is judged against the store's latest row, so
-    A -> B -> A is three rows; an older row of the key is a no-op once any
-    stored row from its `known_at` on has its values, so re-runs add nothing.
+    A builder row keeps its own `known_at` only if that is later than every
+    stored row of the key and the view just before it differs: history
+    already stored is never rewritten or back-dated. Then, if the latest
+    row still differs from the builder's latest, one row with the builder's
+    latest values is stamped at `ingested_at` (a restatement, a late filing
+    behind a stored revision, or A -> B -> A). At most one row per key is
+    stamped per run, so no two rows tie on a `known_at`, and a re-run over
+    the same builder output adds nothing.
     """
-    at = row["known_at"]
-    if any(p["known_at"] == at for p in past):
-        later = [p for p in past if p["known_at"] >= at]
-        done = same(row, past[-1]) if last else any(same(row, p) for p in later)
-        return None if done else {**row, "known_at": row["ingested_at"]}
-    view = [p for p in past if p["known_at"] <= at]
-    if view and same(row, view[-1]):
-        return None
-    return dict(row)
+    added: list[Row] = []
+    newest = past[-1]["known_at"] if past else None
+    for row in built:
+        if newest is not None and row["known_at"] <= newest:
+            continue
+        view = (past + added)[-1] if past or added else None
+        if view is None or not same(row, view):
+            added.append(dict(row))
+    final, latest = built[-1], (past + added)[-1]
+    if not same(final, latest):
+        if ingested_at <= latest["known_at"]:
+            raise ValueError(f"revision at {ingested_at.isoformat()} would be back-dated")
+        added.append({**final, "known_at": ingested_at, "ingested_at": ingested_at})
+    return added
