@@ -3,8 +3,9 @@ literal other than 0, 1 and -1 (spec req 14 acceptance; plan T14).
 
 Every threshold in them comes from `settings.universe` / `settings.gap`.
 `-1` parses as a unary minus on the constant `1`, so it needs no entry.
-`gap.py` is T15's; until that module exists its case is skipped, and the
-check applies with no change here once it lands.
+`gap.py` is T15's; its case skips while the module is absent and T15's
+plan box is open, and fails if the box is ticked but the module is not at
+the planned path.
 """
 
 from __future__ import annotations
@@ -14,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).resolve().parents[1] / "src" / "tradepartner"
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src" / "tradepartner"
+PLAN = ROOT / "docs" / "plans" / "data-foundation.md"
 ALLOWED = {0, 1}
 
 
@@ -33,6 +36,7 @@ def numeric_literals(source: str) -> set[int | float | complex]:
 def test_module_has_no_numeric_literals_but_0_1_minus_1(module: str) -> None:
     path = SRC / module
     if module == "gap.py" and not path.exists():
+        assert "- [x] **T15:" not in PLAN.read_text(), "T15 is done but gap.py is missing"
         pytest.skip("gap.py lands with T15")
     assert numeric_literals(path.read_text()) <= ALLOWED
 

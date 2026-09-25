@@ -113,6 +113,7 @@ def _excluded(u: Universe) -> dict[str, tuple[int, str]]:
 
 
 def _assert_case(before: Universe, after: Universe, case: Case) -> None:
+    assert case.admitted or case.removed, "a case must expect a change"
     assert _members(after) - _members(before) == case.admitted
     removed = _members(before) - _members(after)
     assert {sid: _excluded(after)[sid] for sid in removed} == case.removed
