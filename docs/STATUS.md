@@ -18,6 +18,7 @@
 - Phase 2 T5: fixture-universe generator and CSVs covering every spec req 13 case (PR #31)
 - #30 Shared tz-aware UTC check `tradepartner.timeutil.ensure_tz_aware_utc` used by `store.db` and `adapters.broker` (PR #41)
 - #43 `insert_row` binds the UTC-normalized `TIMESTAMPTZ` value (one canonical form); `ensure_tz_aware_utc` raises `ValueError` (not `OverflowError`) near `datetime.min`/`datetime.max`
+- #53 Plan amendment: T21a dashboard shell split out of T21, depends only on T4; T21 now depends on T18 and T21a (PR #TBD)
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
