@@ -1,0 +1,1 @@
+- #208 `tests/test_health.py` coverage expectations updated for the three fixture securities #111 added (`SEC_DIV_CANCELLED`, `SEC_SPLIT_REDATED`, `SEC_SPLIT_REDATED_NOID`, all live common at 2020-06-30); main green again
