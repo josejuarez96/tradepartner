@@ -79,8 +79,21 @@ class TestExchange:
             ("NYSE American LLC", "NYSE_AMERICAN"),
             ("NYSE MKT LLC", "NYSE_AMERICAN"),
             ("American Stock Exchange", "NYSE_AMERICAN"),
+            ("NYSE Alternext US LLC", "NYSE_AMERICAN"),
             ("NYSEArca", "NYSE_ARCA"),
             ("NYSE Arca, Inc.", "NYSE_ARCA"),
+            # Other venues never collapse onto NYSE or NASDAQ (review findings).
+            ("NYSENAT", "NYSE_NATIONAL"),
+            ("NYSE National, Inc.", "NYSE_NATIONAL"),
+            ("CHX", "NYSE_CHICAGO"),
+            ("NYSE Chicago, Inc.", "NYSE_CHICAGO"),
+            ("NYSETEXAS", "NYSETEXAS"),
+            ("Phlx", "NASDAQ_PHLX"),
+            ("Nasdaq PHLX LLC", "NASDAQ_PHLX"),
+            ("BX", "NASDAQ_BX"),
+            ("NASDAQ OMX BX, Inc.", "NASDAQ_BX"),
+            ("CboeBZX", "CBOE_BZX"),
+            ("Cboe BZX Exchange, Inc.", "CBOE_BZX"),
             ("CBOE", "CBOE"),
             ("OTC", "OTC"),
             ("Some Other Venue", "SOME_OTHER_VENUE"),
@@ -141,6 +154,11 @@ class TestFilingIndex:
         assert len(stamped | unstamped) == _text("filing_index_2024_qtr1.txt").count("edgar/data/")
         row = next(r for r in parsed.unstamped if r.accession == "0001683168-24-000531")
         assert (row.cik, row.form, row.filed_on) == ("0001133116", "1-A", date(2024, 1, 30))
+
+    def test_malformed_data_row_raises(self) -> None:
+        text = _text("filing_index_2024_qtr1.txt") + "10-K garbled edgar/data/1/x.txt\n"
+        with pytest.raises(ValueError, match="does not parse"):
+            parse_filing_index(text, {})
 
     def test_every_row_is_parsed(self) -> None:
         parsed = parse_filing_index(_text("filing_index_2024_qtr1.txt"), {})
@@ -221,6 +239,38 @@ class TestSgmlHeader:
         )
         assert parse_sgml_header(text).sic is None
 
+    def test_document_text_after_the_header_is_ignored(self) -> None:
+        # The fetched range runs into the filer's documents; a forged block
+        # there must not replace the header's issuer.
+        text = _text("sgml_header_plain_issuer.txt") + (
+            "\nSUBJECT COMPANY:\n\tCENTRAL INDEX KEY:\t0000999999\n"
+        )
+        assert parse_sgml_header(text).cik == APPLE
+
+    def test_truncated_header_raises(self) -> None:
+        text = _text("sgml_header_plain_issuer.txt")[:700]
+        with pytest.raises(ValueError, match="truncated"):
+            parse_sgml_header(text)
+
+    def test_several_issuers_need_a_cik(self) -> None:
+        text = _text("sgml_header_plain_issuer.txt").replace(
+            "</SEC-HEADER>",
+            "FILER:\n\tCOMPANY DATA:\n\t\tCENTRAL INDEX KEY:\t\t0000000042\n"
+            "\t\tSTANDARD INDUSTRIAL CLASSIFICATION:\tREAL ESTATE [6798]\n</SEC-HEADER>",
+        )
+        with pytest.raises(ValueError, match="2 issuers"):
+            parse_sgml_header(text)
+        assert parse_sgml_header(text, cik="42").sic == 6798
+        assert parse_sgml_header(text, cik=APPLE).sic == 3571
+        with pytest.raises(ValueError, match="no issuer"):
+            parse_sgml_header(text, cik="7")
+
+    def test_repeated_fall_back_hour_takes_the_later_instant(self) -> None:
+        text = _text("sgml_header_plain_issuer.txt").replace(
+            "<ACCEPTANCE-DATETIME>20251031060126", "<ACCEPTANCE-DATETIME>20251102013000"
+        )
+        assert parse_sgml_header(text).accepted_at == datetime(2025, 11, 2, 6, 30, tzinfo=UTC)
+
     def test_missing_acceptance_raises(self) -> None:
         text = _text("sgml_header_plain_issuer.txt").replace(
             "<ACCEPTANCE-DATETIME>20251031060126\n", ""
@@ -284,6 +334,121 @@ class TestCoverPage:
             accepted_at=datetime(2025, 10, 31, 10, 1, 26, tzinfo=UTC),
         )
         assert parsed.cover.listings
+
+
+def _context(context_id: str, dims: dict[str, str] | None = None, *, instant: bool = False) -> str:
+    segment = ""
+    if dims:
+        members = "".join(
+            f'<xbrldi:explicitMember dimension="{d}">{m}</xbrldi:explicitMember>'
+            for d, m in dims.items()
+        )
+        segment = f"<xbrli:segment>{members}</xbrli:segment>"
+    period = (
+        "<xbrli:instant>2024-01-31</xbrli:instant>"
+        if instant
+        else "<xbrli:startDate>2023-01-01</xbrli:startDate>"
+        "<xbrli:endDate>2023-12-31</xbrli:endDate>"
+    )
+    return (
+        f'<xbrli:context id="{context_id}"><xbrli:entity>'
+        f'<xbrli:identifier scheme="http://www.sec.gov/CIK">0000092122</xbrli:identifier>'
+        f"{segment}</xbrli:entity><xbrli:period>{period}</xbrli:period></xbrli:context>"
+    )
+
+
+_CLASS = {"us-gaap:StatementClassOfStockAxis": "us-gaap:CommonStockMember"}
+
+
+def _ixbrl(contexts: str, facts: str) -> bytes:
+    return (
+        '<html xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"><body><div style="display:none">'
+        f"<ix:header><ix:resources>{contexts}</ix:resources></ix:header></div>{facts}</body></html>"
+    ).encode()
+
+
+def _nn(name: str, context: str, value: str, extra: str = "") -> str:
+    return f'<ix:nonNumeric name="dei:{name}" contextRef="{context}"{extra}>{value}</ix:nonNumeric>'
+
+
+def _shares(context: str, value: str, extra: str = "") -> str:
+    return (
+        f'<ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" contextRef="{context}" '
+        f'unitRef="shares" decimals="INF"{extra}>{value}</ix:nonFraction>'
+    )
+
+
+def _cover(document: bytes) -> Any:
+    return parse_cover_page(
+        document,
+        accession="0000092122-24-000001",
+        accepted_at=datetime(2024, 2, 1, 21, 0, tzinfo=UTC),
+    )
+
+
+class TestCoverPageFailClosed:
+    def test_co_registrant_contexts_are_not_the_filers(self) -> None:
+        document = _ixbrl(
+            _context("c2", _CLASS)
+            + _context("s1", instant=True)
+            + _context("s2", {"dei:LegalEntityAxis": "so:SubsidiaryMember"}, instant=True)
+            + _context("x2", {**_CLASS, "dei:LegalEntityAxis": "so:SubsidiaryMember"}),
+            _nn("Security12bTitle", "c2", "Common Stock")
+            + _nn("TradingSymbol", "c2", "SO")
+            + _nn("SecurityExchangeName", "c2", "NYSE")
+            + _nn("Security12bTitle", "x2", "Series A Notes")
+            + _nn("TradingSymbol", "x2", "SUBX")
+            + _nn("SecurityExchangeName", "x2", "NYSE")
+            + _shares("s1", "1090000000")
+            + _shares("s2", "30537500"),
+        )
+        parsed = _cover(document)
+        assert [f.value for f in parsed.facts] == [1_090_000_000]
+        assert [i.ticker for i in parsed.cover.listings] == ["SO"]
+        assert parsed.other_contexts == ("s2", "x2")
+
+    def test_two_classes_in_one_context_raise(self) -> None:
+        document = _ixbrl(
+            _context("c1"),
+            _nn("Security12bTitle", "c1", "Class A")
+            + _nn("TradingSymbol", "c1", "AAA")
+            + _nn("SecurityExchangeName", "c1", "NYSE")
+            + _nn("Security12bTitle", "c1", "Class B")
+            + _nn("TradingSymbol", "c1", "BBB"),
+        )
+        with pytest.raises(ValueError, match="two values"):
+            _cover(document)
+
+    def test_repeated_identical_fact_is_kept_once(self) -> None:
+        facts = _shares("s1", "5000") + _shares("s1", "5000")
+        parsed = _cover(_ixbrl(_context("s1", instant=True), facts))
+        assert [f.value for f in parsed.facts] == [5000]
+
+    @pytest.mark.parametrize("missing", ["Security12bTitle", "SecurityExchangeName"])
+    def test_symbol_without_title_or_exchange_raises(self, missing: str) -> None:
+        facts = {
+            "Security12bTitle": _nn("Security12bTitle", "c2", "Common Stock"),
+            "TradingSymbol": _nn("TradingSymbol", "c2", "SO"),
+            "SecurityExchangeName": _nn("SecurityExchangeName", "c2", "NYSE"),
+        }
+        del facts[missing]
+        with pytest.raises(ValueError, match="lacks a title or exchange"):
+            _cover(_ixbrl(_context("c2", _CLASS), "".join(facts.values())))
+
+    def test_failed_format_raises(self) -> None:
+        document = _ixbrl(
+            _context("s1", instant=True), _shares("s1", "5.822", ' format="ixt:bogus" scale="6"')
+        )
+        with pytest.raises(ValueError, match="EntityCommonStockSharesOutstanding"):
+            _cover(document)
+
+    def test_non_cik_entity_raises(self) -> None:
+        document = _ixbrl(
+            _context("s1", instant=True).replace("http://www.sec.gov/CIK", "urn:other"),
+            _shares("s1", "5000"),
+        )
+        with pytest.raises(ValueError, match="not a CIK"):
+            _cover(document)
 
 
 class TestDelisting:
