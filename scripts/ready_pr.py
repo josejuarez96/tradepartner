@@ -231,7 +231,9 @@ def ready(
     poll_s: int = CI_POLL_S,
 ) -> int:
     pr = r.pr(number)
-    say = print
+
+    def say(msg: str) -> None:
+        print(msg, flush=True)
 
     # 1. right branch, clean tree
     branch = r.git("rev-parse", "--abbrev-ref", "HEAD")
