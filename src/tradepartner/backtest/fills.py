@@ -83,8 +83,8 @@ def apply_trades(
     targets is sold whole; a partial sell or a buy is the weight difference times equity.
     Sells first, then buys in `security_id` order, each buy capped by the cash left and
     sized so notional plus cost fits in it; when cash runs short (after a missed sell, or
-    costs), the names last in that order are the ones underfilled. A trim whose cost is at
-    least its notional is skipped (a name leaving the targets is still sold whole), and
+    costs), the names last in that order are the ones underfilled. A trim or a buy whose cost
+    is at least its notional is skipped (a name leaving the targets is still sold whole), and
     cash is checked once all sells are done. Names whose trade is exactly zero are not
     orders. Raises `ValueError` for negative cash or positions, negative targets, or a
     traded name with a bar in the marking frame but none in `raw_frame`.
@@ -148,8 +148,11 @@ def apply_trades(
         notional = buy_notional_after_costs(
             min(deltas[sid], cash), per_side_bps, commissions, price=price[1]
         )
-        if notional <= 0:
-            continue
+        if (
+            notional <= 0
+            or trade_cost(notional, notional / price[1], per_side_bps, commissions) >= notional
+        ):
+            continue  # a buy that costs at least its notional is not an order
         cost = trade(sid, notional, price)
         cash = cash - notional - cost
         held[sid] = held.get(sid, 0.0) + notional

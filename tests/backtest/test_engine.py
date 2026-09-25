@@ -497,6 +497,22 @@ class TestApplyTrades:
         assert "A" not in result.positions
         assert result.cash >= 0.0
 
+    def test_a_buy_that_costs_more_than_its_notional_is_skipped(self) -> None:
+        """$1.01 left and a $1 order fee: buying $0.01 would pay $1 for it."""
+        result = apply_trades(
+            {},
+            1.01,
+            {"B": 1.0},
+            self.FRAME,
+            self.RAW,
+            F0,
+            fill_price="close",
+            per_side_bps=0.0,
+            commissions=Commissions(per_share=0.0, per_order=1.0),
+        )
+        assert result.trades == ()
+        assert result.cash == 1.01
+
     def test_a_buy_is_sized_after_costs(self) -> None:
         result = apply_trades(
             {},
