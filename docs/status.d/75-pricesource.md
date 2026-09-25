@@ -1,1 +1,0 @@
-- Phase 2 T7: `PriceSource` interface, price-side timing rules and fixture adapter that refuses fixture rows breaking a timing rule (#75, PR #81). Early action stamps are not checkable from the stored layout, see #83
