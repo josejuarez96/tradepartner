@@ -1395,9 +1395,11 @@ def _write_readme(path: Path, cases: list[dict[str, str]]) -> None:
             "- Most 2018-dated listings here use `provenance=filing` for ticker/exchange "
             "even though the spec's master column-sources table calls pre-~2019 ticker/"
             "exchange `snapshot_static`; this is a deliberate simplification (only "
-            "`SEC_STATIC_PRE2019` exercises the `snapshot_static` case on purpose). See "
-            "[issue #35](https://github.com/josejuarez96/tradepartner/issues/35) for the "
-            "follow-up this creates for T6/T10's truncation-invariance rule.",
+            "`SEC_STATIC_PRE2019` exercises the `snapshot_static` case on purpose). Per "
+            "the owner's decision on "
+            "[issue #35](https://github.com/josejuarez96/tradepartner/issues/35), a "
+            "`snapshot_static` row is invisible to as-of reads before its own `known_at`, "
+            "so PRE9 is unlisted at any T before 2020-01-15.",
         ]
     )
     path.write_text("\n".join(lines) + "\n")
