@@ -35,10 +35,21 @@ uv run python scripts/ready_pr.py <pr-number>
 From your team directory, with the PR's branch checked out and a clean tree. It:
 merges `origin/main` in (no rebase, no force-push), auto-resolves a STATUS/CHANGELOG
 conflict only when both sides purely inserted bullets at the same spot (keeps both; a deleted
-or edited line stops it), runs ruff, mypy, the fragment check and pytest,
+or edited line stops it), runs the local checks,
 verifies the template and reviews, pushes, waits for CI on that exact commit, then marks the
 PR ready. Expect the wait: CI takes a few minutes. `--dry-run` runs everything up to the
 push; it still commits the merge of `main` locally, which is what you want anyway.
+
+What runs locally:
+
+| Check | When |
+|---|---|
+| ruff check, ruff format --check, mypy, fragment check | always |
+| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `pyproject.toml` or `uv.lock` |
+
+A docs, fragment or process PR skips the local pytest run (the command prints a note). CI runs
+the full suite on every PR regardless, so it stays the gate. `--tests` forces the local run;
+`--no-tests` skips it.
 
 ## When it says NOT READY
 

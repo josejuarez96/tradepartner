@@ -388,3 +388,67 @@ def test_ci_failure_leaves_the_pr_a_draft() -> None:
     r = FakeRunner(checks_after=["pending", "pending"])
     with pytest.raises(ready_pr.ReadyError, match="timeout"):
         ready_pr.ready(r, 69, poll_s=0, timeout_s=0)
+
+
+def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
+    for code in (
+        ["src/tradepartner/store/asof.py"],
+        ["tests/test_team.py"],
+        ["scripts/ready_pr.py"],
+        ["pyproject.toml"],
+        ["uv.lock"],
+        ["docs/STATUS.md", "src/tradepartner/x.py"],
+    ):
+        assert ready_pr.tests_needed(code), code
+    for docs in (
+        [],
+        ["docs/plans/phase-2.md", "docs/status.d/78-x.md", "changelog.d/78-x.md"],
+        ["CLAUDE.md", ".claude/skills/ready-pr/SKILL.md", "README.md"],
+        ["docs/src/notes.md", "srcfile.txt", "pyproject.toml.bak", "sub/uv.lock"],
+    ):
+        assert not ready_pr.tests_needed(docs), docs
+
+
+def _ran_pytest(r: FakeRunner) -> bool:
+    return any("pytest" in c for c in r.checks_run)
+
+
+def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None:
+    docs_only = ["docs/plans/p.md", "docs/status.d/69-x.md", "changelog.d/69-x.md"]
+    code = FakeRunner()
+    assert ready_pr.ready(code, 69, dry_run=True) == 0
+    assert _ran_pytest(code)
+    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", "-q"]
+
+    docs = FakeRunner(touched=docs_only, comments=())
+    assert ready_pr.ready(docs, 69, dry_run=True) == 0
+    assert not _ran_pytest(docs)
+    assert [c[-1] for c in docs.checks_run] == [".", ".", "mypy", "check"]
+
+    forced = FakeRunner(touched=docs_only, comments=())
+    assert ready_pr.ready(forced, 69, dry_run=True, run_tests=True) == 0
+    assert _ran_pytest(forced)
+
+    skipped = FakeRunner()
+    assert ready_pr.ready(skipped, 69, dry_run=True, run_tests=False) == 0
+    assert not _ran_pytest(skipped)
+
+
+def test_pytest_decision_is_printed(capsys: pytest.CaptureFixture[str]) -> None:
+    ready_pr.ready(
+        FakeRunner(touched=["docs/a.md", "docs/status.d/69-x.md", "changelog.d/69-x.md"]),
+        69,
+        dry_run=True,
+    )
+    assert "skipping local pytest" in capsys.readouterr().out
+    ready_pr.ready(FakeRunner(), 69, dry_run=True, run_tests=False)
+    assert "--no-tests" in capsys.readouterr().out
+
+
+def test_cli_tests_flags_are_exclusive() -> None:
+    p = ready_pr.build_parser()
+    assert p.parse_args(["5"]).tests is None
+    assert p.parse_args(["5", "--tests"]).tests is True
+    assert p.parse_args(["5", "--no-tests"]).tests is False
+    with pytest.raises(SystemExit):
+        p.parse_args(["5", "--tests", "--no-tests"])
