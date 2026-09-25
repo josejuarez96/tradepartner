@@ -283,6 +283,7 @@ def test_raw_prices_equal_the_as_of_read(store: Store, t: datetime) -> None:
         want = prices_as_of(conn, t, ids)
     assert got.equals(want)
     assert _ids(got) == set(ids)
+    assert (got["known_at"] <= t).all()
 
 
 def test_raw_prices_take_the_bar_revision_at_its_known_at(store: Store) -> None:
