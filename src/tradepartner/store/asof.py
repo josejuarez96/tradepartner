@@ -26,11 +26,14 @@ cost of an earlier version of this module: `.pl()` converts DuckDB's
 result directly into Arrow-backed polars columns without ever
 materializing per-row Python objects.
 
-**A bare `date` (or a naive `datetime`) passed as `t` raises `TypeError`.**
-T is always an instant, never a calendar day on its own (spec
-"Definitions": "Never a bare date."); `t` must also be tz-aware
-(`tradepartner.store.db.ensure_tz_aware`, reused here rather than
-duplicated).
+**A bare `date` passed as `t` raises `TypeError`; a naive `datetime`
+raises `ValueError`.** T is always an instant, never a calendar day on its
+own (spec "Definitions": "Never a bare date."): `_validate_t` rejects
+anything that is not a `datetime` instance at all (a `date` is not a
+`datetime` -- `datetime` is a *subclass* of `date`, not the reverse, so a
+plain `date` fails `isinstance(t, datetime)`) with `TypeError`, then hands
+a genuine `datetime` to `tradepartner.timeutil.ensure_tz_aware_utc`, which
+raises `ValueError` if it is naive and otherwise normalizes it to UTC.
 
 **`listings_as_of` and issue #35.** Spec req 8 says, literally, "All [as-of
 functions] take tz-aware T and return only rows with `known_at <= T`" --
@@ -73,20 +76,61 @@ combined rule: "Backfilled 2018 split in 2026:
 `SEC_SPLIT_BACKFILLED`'s split has `known_at` 2018-03-14 and `ex_date`
 2018-03-15, both `<= ` the probe T (2019-01-31 close), even though it was
 only `ingested_at` in a 2026 backfill run; `ingested_at` never gates this
-rule. For each raw bar at `session`, every split with `ex_date > session`
-and `ex_date <= t` contributes a `1 / ratio` price factor (a split makes
-the pre-split share price look artificially high on the old scale, so
-historical closes are divided down to the post-split scale); every
+rule.
+
+**"Effective" is exchange-local, not UTC (`_EXCHANGE_TZ`).** `ex_date` is a
+calendar `DATE`; `t` is a UTC instant. A split's `ex_date` is the XNYS
+session it takes effect on, which is an America/New_York-local concept:
+comparing `ex_date <= t`'s *UTC* calendar date is wrong near the UTC/ET
+day boundary. For example `t = 2019-02-14T01:00Z` is `2019-02-13T20:00`
+America/New_York -- still the *day before* a `2019-02-14` ex-date, even
+though `t`'s UTC date already reads `2019-02-14`. `t_session` is therefore
+computed as `t.astimezone(_EXCHANGE_TZ).date()`, not `t.date()`.
+
+For each raw bar at `session`, every split with `ex_date > session` and
+`ex_date <= t_session` contributes a `1 / ratio` price factor (a split
+makes the pre-split share price look artificially high on the old scale,
+so historical closes are divided down to the post-split scale); every
 dividend (only when `include_dividends=True`) with `ex_date > session` and
-`ex_date <= t` contributes a `1 - amount / prior_close` factor, where
-`prior_close` is the **raw** close of the XNYS session immediately
-preceding that dividend's `ex_date` (a standard ex-dividend
-back-adjustment; if that prior session's bar is not itself known at `t`,
-the dividend's factor is skipped rather than guessed). Only
-`open`/`high`/`low`/`close` are adjusted; `volume` is left raw (out of
-scope here -- no acceptance criterion in this task requires an
+`ex_date <= t_session` contributes a `1 - amount / prior_close` factor.
+`prior_close` is the raw close of the **latest bar known at `t` with
+`session < ex_date`** for that security, found with a DuckDB `ASOF JOIN`
+(a range join on the nearest `session` below `ex_date`) rather than a
+lookup of the exact XNYS session immediately before `ex_date`: an earlier
+version of this function skipped a dividend's factor entirely whenever
+that one specific session's bar was not itself known at `t` (e.g. a real
+ingest gap), even though an earlier bar was known and would have been the
+obviously-correct fallback. The `ASOF JOIN` picks that earlier bar
+instead of dropping the dividend's factor. If a split and a dividend
+share the same `ex_date`, the dividend's `prior_close` is still the
+**raw**, pre-split close of the prior session (the `ASOF JOIN` reads from
+`latest_bars`, never from an already-adjusted series) -- this matches the
+standard convention that a dividend amount is quoted against the
+pre-split price level on its own ex-date, and is simplest to reason
+about, since `adjusted_prices_as_of` never adjusts a series and then reads
+back from its own output.
+
+Only `open`/`high`/`low`/`close` are adjusted; `volume` is left raw (out
+of scope here -- no acceptance criterion in this task requires an
 adjusted-volume convention, and the spec's "Data / interfaces" table
 documents `prices_daily` volume as raw only).
+
+**Every event's factor must be positive and finite, or this raises
+`ValueError`.** A split `ratio_or_amount` of `0` divides by zero (DuckDB
+returns `inf`, not an error, for `1.0 / 0.0`); a dividend `amount >=
+prior_close` makes `1 - amount / prior_close` zero or negative, and
+DuckDB's `LN()` (used by the cumulative-factor window function below)
+*raises* on a non-positive input rather than returning `-inf`/`NaN`. Both
+are bad store data, not "no factor" (`NULL`, which a dividend with no
+known prior bar can legitimately produce and which this function treats
+as "no adjustment from this event", not an error). Before ever computing
+`LN()`, a dedicated query checks every non-`NULL` event factor for
+`factor > 0 AND isfinite(factor)`; the first violation found raises
+`ValueError` naming the `security_id`, `ex_date` and the offending
+`ratio_or_amount`/`factor`, rather than letting a raw DuckDB
+`OutOfRangeException` (for the `LN(0)`/`LN(negative)` case) or a silently
+wrong `inf`-adjusted price series (for the zero-ratio case) reach the
+caller.
 
 **Why this runs as one SQL statement, not a Python loop per bar.** Every
 step -- the latest-revision-as-of-`t` filter for both `prices_daily` and
@@ -95,38 +139,27 @@ security (a running product of an event's factor and every later event's,
 expressed as `EXP(SUM(LN(factor)) OVER (PARTITION BY security_id ORDER BY
 ex_date DESC))` so it is a plain window aggregate, not a recursive query),
 and attaching that cumulative factor to each bar -- happens inside one
-query. Attaching uses DuckDB's `ASOF LEFT JOIN` (a range-join operator:
-`ON b.security_id = c.security_id AND b.session < c.ex_date` finds, per
-bar, the nearest event with a later `ex_date` -- and because that event's
-own factor already IS the cumulative product of itself and everything
-after it, this single match is the bar's correct total factor, with no
-correlated subquery). The final `SELECT` multiplies
-`open`/`high`/`low`/`close` by that factor directly in SQL. The one piece
-that cannot live in SQL -- "the XNYS session immediately before this
-`ex_date`" is a trading-calendar fact, not something the store's own
-tables encode -- is precomputed in Python **once per call** (not once per
-bar, not once per event) via `_prior_session`, a `functools.cache`-wrapped
-wrapper around `tradepartner.calendar.previous_session`: the same small
-set of dividend `ex_date`s recurs across every probe of a
-truncation-invariance suite, and the trading-calendar lookup underneath
-(`get_settings()` under the hood) is too costly to repeat needlessly, so
-caching it makes every call after the first one free. The precomputed
-`{ex_date: prior_session}` map is handed to the query as a small literal
-values list and joined in, rather than looked up per row.
+query (plus the small validation query above, which shares the same CTEs).
+Attaching uses DuckDB's `ASOF LEFT JOIN` (the same range-join operator used
+for the dividend `prior_close` lookup: `ON b.security_id = c.security_id
+AND b.session < c.ex_date` finds, per bar, the nearest event with a later
+`ex_date` -- and because that event's own factor already IS the cumulative
+product of itself and everything after it, this single match is the bar's
+correct total factor, with no correlated subquery). The final `SELECT`
+multiplies `open`/`high`/`low`/`close` by that factor directly in SQL.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime
-from functools import cache
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
 
-from tradepartner import calendar as trading_calendar
-from tradepartner.store.db import ensure_tz_aware
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Natural key (excluding `known_at`) each table's rows are keyed by for
 #: "latest revision as of T" purposes, and the `ORDER BY` each function
@@ -140,25 +173,40 @@ _PRICE_KEY: tuple[str, ...] = ("security_id", "session")
 _FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "as_of_date", "class_member")
 _LISTING_KEY: tuple[str, ...] = ("security_id", "ticker", "exchange", "valid_from")
 
+#: The exchange's local timezone -- see this module's docstring ("Effective
+#: is exchange-local, not UTC") for why `ex_date <= t` is compared in this
+#: timezone's calendar date, not `t`'s UTC calendar date.
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
+
 
 def _validate_t(t: datetime) -> datetime:
     """Reject anything that is not a tz-aware `datetime` (spec: "a bare
-    date passed as T raises"; `date` is a `datetime` superclass, so
-    `isinstance` alone would wrongly accept one -- checked explicitly)."""
+    date passed as T raises"). `datetime` is a *subclass* of `date`, so
+    `isinstance(t, datetime)` correctly rejects a plain `date` (which is
+    not a `datetime`) while still accepting every `datetime` -- checked
+    explicitly here rather than assumed. A naive `datetime` is rejected by
+    `ensure_tz_aware_utc` with `ValueError`; a tz-aware one is normalized
+    to UTC.
+    """
     if not isinstance(t, datetime):
         raise TypeError(f"T must be a tz-aware datetime, not {type(t).__name__}: {t!r}")
-    return ensure_tz_aware(t, field="T")
+    return ensure_tz_aware_utc(t, field_name="T")
 
 
 def _security_filter(security_ids: Sequence[str] | None, params: list[Any]) -> str:
     """`"AND security_id IN (?, ?, ...)"` (appending placeholders' values to
-    `params` in the order they'll be bound) or `""` if `security_ids` is
-    `None`. Callers that need the filter more than once in the same query
-    call this once per occurrence, appending to the same `params` list in
-    the order the clauses appear in the SQL text (DuckDB binds `?`
+    `params` in the order they'll be bound), `"AND FALSE"` if
+    `security_ids` is an empty sequence (an empty `IN ()` is a DuckDB
+    syntax error, and the correct answer to "restrict to no securities" is
+    "no rows", not "no filter"), or `""` if `security_ids` is `None`.
+    Callers that need the filter more than once in the same query call
+    this once per occurrence, appending to the same `params` list in the
+    order the clauses appear in the SQL text (DuckDB binds `?`
     positionally)."""
     if security_ids is None:
         return ""
+    if not security_ids:
+        return "AND FALSE"
     params.extend(security_ids)
     placeholders = ", ".join("?" for _ in security_ids)
     return f"AND security_id IN ({placeholders})"
@@ -176,8 +224,10 @@ def _latest_as_of(
     tuple among rows with `known_at <= t`, the one with the greatest
     `known_at` (spec "Definitions" > Revision).
 
-    `security_ids`, when given, restricts to those `security_id` values;
-    every table this is called for has a `security_id` column.
+    `security_ids`, when given, restricts to those `security_id` values
+    (an empty sequence restricts to none, returning an empty frame with
+    the right schema -- see `_security_filter`); every table this is
+    called for has a `security_id` column.
     """
     partition = ", ".join(key_columns)
     params: list[Any] = [t]
@@ -242,83 +292,24 @@ def listings_as_of(
     return _latest_as_of(conn, "listings", _LISTING_KEY, t, security_ids)
 
 
-@cache
-def _prior_session(ex_date: date) -> date:
-    """The XNYS session immediately before `ex_date`, cached: this module's
-    docstring explains why -- the same small set of dividend `ex_date`s
-    recurs across every probe of a truncation-invariance suite, and
-    `tradepartner.calendar.previous_session` (via `get_settings()`) is too
-    costly to call fresh every time when the answer for a given `ex_date`
-    never changes."""
-    return trading_calendar.previous_session(ex_date)
+def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> str:
+    """The CTEs `adjusted_prices_as_of` shares between its validation query
+    (checks `event_factor` before anything calls `LN()` on it) and its main
+    query (adds the cumulative-factor window and the `ASOF JOIN` to bars).
 
-
-def adjusted_prices_as_of(
-    conn: duckdb.DuckDBPyConnection,
-    t: datetime,
-    security_ids: Sequence[str] | None = None,
-    *,
-    include_dividends: bool = False,
-) -> pl.DataFrame:
-    """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
-    `close` adjusted for every split known by `t` with `ex_date <= t` (and,
-    when `include_dividends=True`, every such dividend) -- see this
-    module's docstring for the adjustment methodology and why this issues
-    one SQL statement rather than a Python loop per bar. `volume` is left
-    raw. Column order matches `prices_as_of`; sorted by `(security_id,
-    session)`.
+    `action_types` is `"'split'"` or `"'split', 'dividend'"` (always a
+    literal, never user input); `bars_filter`/`actions_filter` are each
+    `_security_filter`'s output for that CTE's own `?` placeholders.
     """
-    t = _validate_t(t)
-
-    # `ex_date` is a calendar `DATE`; `t` is an instant. Corporate-action
-    # timestamps in this store (announcement time or close-before-ex-date)
-    # fall on the same UTC calendar date as the session they describe, so
-    # comparing `ex_date <= t.date()` is the "has this ex-date's session
-    # already happened by T" test this module's docstring describes.
-    t_session = t.date()
-
-    action_types = "'split', 'dividend'" if include_dividends else "'split'"
-
-    # Precomputed once per call (not once per bar, not once per event): the
-    # distinct dividend ex_dates that could matter at this t, mapped to
-    # their preceding trading session via the cached `_prior_session`.
-    prior_session_by_ex_date: dict[date, date] = {}
-    if include_dividends:
-        div_params: list[Any] = [t, t_session]
-        div_security_filter = _security_filter(security_ids, div_params)
-        ex_dates = conn.execute(
-            f"""
-            SELECT DISTINCT ex_date FROM corporate_actions
-            WHERE action_type = 'dividend' AND known_at <= ? AND ex_date <= ?
-            {div_security_filter}
-            """,
-            div_params,
-        ).fetchall()
-        prior_session_by_ex_date = {ex_date: _prior_session(ex_date) for (ex_date,) in ex_dates}
-
-    if prior_session_by_ex_date:
-        values_rows = ", ".join(
-            f"(DATE '{ex_date.isoformat()}', DATE '{prior_session.isoformat()}')"
-            for ex_date, prior_session in prior_session_by_ex_date.items()
-        )
-    else:
-        values_rows = "(NULL::DATE, NULL::DATE)"
-
-    params: list[Any] = [t]
-    bars_security_filter = _security_filter(security_ids, params)
-    params.append(t)
-    params.append(t_session)
-    actions_security_filter = _security_filter(security_ids, params)
-
-    sql = f"""
-        WITH latest_bars AS (
+    return f"""
+        latest_bars AS (
             SELECT * EXCLUDE (_rn) FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY security_id, session ORDER BY known_at DESC
                 ) AS _rn
                 FROM prices_daily
                 WHERE known_at <= ?
-                {bars_security_filter}
+                {bars_filter}
             )
             WHERE _rn = 1
         ),
@@ -330,35 +321,97 @@ def adjusted_prices_as_of(
                 FROM corporate_actions
                 WHERE known_at <= ? AND ex_date <= ?
                   AND action_type IN ({action_types})
-                {actions_security_filter}
+                {actions_filter}
             )
             WHERE _rn = 1
         ),
-        prior_sessions(ex_date, prior_session) AS (
-            SELECT * FROM (VALUES {values_rows}) AS v(ex_date, prior_session)
-            WHERE ex_date IS NOT NULL
-        ),
+        -- Each event's own factor. `pb` (the ASOF-joined nearest bar with
+        -- session < ex_date) is only read by the dividend branch; for a
+        -- split row it is harmlessly present but unused. See this
+        -- module's docstring on why this is an ASOF JOIN rather than an
+        -- exact lookup of "the" prior XNYS session.
         event_factor AS (
             SELECT
                 la.security_id,
                 la.ex_date,
+                la.action_type,
+                la.ratio_or_amount,
                 CASE la.action_type
                     WHEN 'split' THEN 1.0 / la.ratio_or_amount
                     ELSE 1.0 - la.ratio_or_amount / pb.close
                 END AS factor
             FROM latest_actions la
-            LEFT JOIN prior_sessions ps
-                ON la.action_type = 'dividend' AND ps.ex_date = la.ex_date
-            LEFT JOIN latest_bars pb
-                ON la.action_type = 'dividend'
-               AND pb.security_id = la.security_id
-               AND pb.session = ps.prior_session
-        ),
+            ASOF LEFT JOIN latest_bars pb
+                ON pb.security_id = la.security_id AND pb.session < la.ex_date
+        )
+    """
+
+
+def adjusted_prices_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+    *,
+    include_dividends: bool = False,
+) -> pl.DataFrame:
+    """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
+    `close` adjusted for every split known by `t` with `ex_date <= t`
+    (exchange-local date, `_EXCHANGE_TZ`) and, when `include_dividends=
+    True`, every such dividend -- see this module's docstring for the
+    adjustment methodology, the validation this performs before computing
+    any cumulative factor, and why this issues SQL statements sharing one
+    set of CTEs rather than a Python loop per bar. `volume` is left raw.
+    Column order matches `prices_as_of`; sorted by `(security_id,
+    session)`.
+
+    Raises `ValueError` if any known, effective event's own factor is
+    non-positive or non-finite (a split `ratio_or_amount` of `0`, or a
+    dividend `amount >= prior_close`).
+    """
+    t = _validate_t(t)
+    t_session = t.astimezone(_EXCHANGE_TZ).date()
+
+    action_types = "'split', 'dividend'" if include_dividends else "'split'"
+
+    params: list[Any] = [t]
+    bars_filter = _security_filter(security_ids, params)
+    params.append(t)
+    params.append(t_session)
+    actions_filter = _security_filter(security_ids, params)
+
+    common_ctes = _adjusted_ctes(action_types, bars_filter, actions_filter)
+
+    bad_rows = conn.execute(
+        f"""
+        WITH {common_ctes}
+        SELECT security_id, ex_date, ratio_or_amount, factor
+        FROM event_factor
+        WHERE factor IS NOT NULL AND NOT (factor > 0 AND isfinite(factor))
+        ORDER BY security_id, ex_date
+        LIMIT 1
+        """,
+        params,
+    ).fetchall()
+    if bad_rows:
+        security_id, ex_date, ratio_or_amount, factor = bad_rows[0]
+        raise ValueError(
+            "corporate action produces a non-positive or non-finite adjustment factor: "
+            f"security_id={security_id!r} ex_date={ex_date!r} "
+            f"ratio_or_amount={ratio_or_amount!r} factor={factor!r}"
+        )
+
+    sql = f"""
+        WITH {common_ctes},
         -- Cumulative factor per security: the product of this event's own
         -- factor and every later event's (spec: a split or dividend
         -- adjusts every bar before its ex-date, and multiple later events
         -- compound). Expressed as EXP(SUM(LN(...))) so it is a plain
-        -- window aggregate, not a recursive query.
+        -- window aggregate, not a recursive query. ORDER BY ex_date DESC
+        -- is load-bearing: it accumulates from the latest event backward,
+        -- so each event's cum_factor is "itself and everything after it";
+        -- ASC would accumulate the wrong direction (see
+        -- tests/store/test_asof.py's compounding test, which asserts
+        -- distinct expected factors per date range and fails under ASC).
         cum AS (
             SELECT security_id, ex_date,
                 EXP(SUM(LN(factor)) OVER (
