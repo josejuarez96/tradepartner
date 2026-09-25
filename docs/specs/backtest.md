@@ -83,9 +83,9 @@ Registry and holdout
 - [ ] Code version, dirty flag and the store's max `ingested_at` at open are recorded.
 
 Look-ahead
-- [ ] **Truncation invariance** of the full run: for every rebalance session T_i in the fixture range, `run(end=T_i)` on the full store equals `run(end=T_i)` with the data connection factory yielding `TruncatedStore.at(close(T_i))` (`tests/lookahead/harness.py`) and the registry connection the untruncated fixture store: equity, weights, rebalances.
-- [ ] **Prefix invariance**: `run(end=T_i)` equals the prefix through T_i of `run(end=T_n)`.
-- [ ] A synthetic store with a bar revision and a dividend revision known after T_i leaves `run(end=T_i)` unchanged and changes `run(end=T_{i+1})` (the harness has teeth).
+- [x] **Truncation invariance** of the full run: for every rebalance session T_i in the fixture range, `run(end=T_i)` on the full store equals `run(end=T_i)` with the data connection factory yielding `TruncatedStore.at(close(T_i))` (`tests/lookahead/harness.py`) and the registry connection the untruncated fixture store: equity, weights, rebalances.
+- [x] **Prefix invariance**: `run(end=T_i)` equals the prefix through T_i of `run(end=T_n)`.
+- [x] A synthetic store with a bar revision and a dividend revision known after T_i leaves `run(end=T_i)` unchanged and changes `run(end=T_{i+1})` (the harness has teeth).
 - [ ] AST check (one test, T38): nothing under `src/tradepartner/backtest/` imports `tradepartner.adapters`; and (T30) nothing under `src/` imports `bt`, `ffn` or `yfinance`.
 
 Oracle
