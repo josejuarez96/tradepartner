@@ -111,6 +111,20 @@ def is_half_day(day: date) -> bool:
     return bool(pd.Timestamp(day) in _get_calendar().early_closes)
 
 
+@lru_cache(maxsize=1)
+def _all_sessions(start: date, end: date) -> tuple[date, ...]:
+    """Every session of the `(start, end)` calendar, ascending, built once."""
+    return tuple(_to_date(s) for s in _calendar(start, end).sessions)
+
+
+def all_sessions() -> tuple[date, ...]:
+    """Every XNYS session in the configured `calendar.start`..`calendar.end`
+    range, ascending. Cached per range; the same tuple object is returned
+    while the range is unchanged."""
+    cfg = get_settings().calendar
+    return _all_sessions(cfg.start, cfg.end)
+
+
 def last_session_of_month(year: int, month: int) -> date:
     """The last XNYS session in the given calendar month."""
     cal = _get_calendar()

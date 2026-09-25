@@ -197,6 +197,22 @@ class UniverseConfig(BaseModel):
         return value
 
 
+class AdjustConfig(BaseModel):
+    """Price-adjustment rules for `store.asof.adjusted_prices_as_of`.
+
+    `max_prior_close_gap_sessions` is not in the spec's "Config keys" list;
+    added for issue #72. A dividend's factor `1 - amount / prior_close`
+    takes `prior_close` from the latest bar known at T before the ex-date.
+    That bar counts only if it is among the N XNYS sessions immediately
+    before the ex-date (1 = the prior session itself); otherwise the
+    dividend is left unapplied and reported by `dropped_dividends_as_of`,
+    rather than sized against a close from weeks or years earlier. Must be
+    positive: zero would drop every dividend.
+    """
+
+    max_prior_close_gap_sessions: int = Field(default=5, gt=0)
+
+
 class GapConfig(BaseModel):
     """Survivorship-gap reporting thresholds."""
 
@@ -222,6 +238,7 @@ class Settings(BaseSettings):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     gap: GapConfig = Field(default_factory=GapConfig)
+    adjust: AdjustConfig = Field(default_factory=AdjustConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)

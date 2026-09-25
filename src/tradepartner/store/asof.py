@@ -8,7 +8,9 @@ Rows are never updated in place, so "latest revision" is always a query,
 never a stored flag.
 
 Only four of the six as-of functions the spec lists live here:
-`prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`.
+`prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`,
+plus `dropped_dividends_as_of`, which reports the dividends
+`adjusted_prices_as_of` leaves unapplied (#72).
 `securities_as_of`, `universe_as_of` and `survivorship_gap` are later plan
 tasks (T8, T13, T15) and are out of scope for this module.
 
@@ -101,12 +103,18 @@ version of this function skipped a dividend's factor entirely whenever
 that one specific session's bar was not itself known at `t` (e.g. a real
 ingest gap), even though an earlier bar was known and would have been the
 obviously-correct fallback. The `ASOF JOIN` picks that earlier bar
-instead of dropping the dividend's factor. This fallback has no
-staleness bound yet -- an arbitrarily old prior bar is used rather than
-none at all if that is the only one known; see issue #72 for the
-follow-up. If a split and a dividend
-share the same `ex_date`, the dividend's `prior_close` is still the
-**raw**, pre-split close of the prior session (the `ASOF JOIN` reads from
+instead of dropping the dividend's factor. The fallback is bounded
+(issue #72): the prior bar counts only if it is among the
+`adjust.max_prior_close_gap_sessions` XNYS sessions immediately before the
+ex-date (the gap is counted over `calendar.all_sessions`, never
+weekdays). Past that, after a long ingest gap or a relisting, a close
+weeks or years old would silently mis-size the factor, or fail the whole
+query if it is at or below the amount, so the dividend is left unapplied
+(`NULL` factor) instead and `dropped_dividends_as_of` reports it, along
+with any dividend that has no prior bar at all, for `health` to count.
+If a split and a dividend share the same `ex_date`, the dividend's
+`prior_close` is still the **raw**, pre-split close of the prior session
+(the `ASOF JOIN` reads from
 `latest_bars`, never from an already-adjusted series) -- this matches the
 standard convention that a dividend amount is quoted against the
 pre-split price level on its own ex-date, and is simplest to reason
@@ -159,14 +167,18 @@ multiplies `open`/`high`/`low`/`close` by that factor directly in SQL.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from datetime import date, datetime
+from functools import lru_cache
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
 
+from tradepartner.calendar import all_sessions
+from tradepartner.config import Settings, get_settings
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Natural key (excluding `known_at`) each table's rows are keyed by for
@@ -185,6 +197,10 @@ _LISTING_KEY: tuple[str, ...] = ("security_id", "ticker", "exchange", "valid_fro
 #: is exchange-local, not UTC") for why `ex_date <= t` is compared in this
 #: timezone's calendar date, not `t`'s UTC calendar date.
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
+
+#: Name of the temporary view `_sessions_registered` exposes the XNYS
+#: sessions under, for a dividend's prior-close gap (#72).
+_SESSIONS_VIEW = "_asof_xnys_sessions"
 
 
 def _validate_t(t: datetime) -> datetime:
@@ -307,7 +323,10 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
 
     `action_types` is `"'split'"` or `"'split', 'dividend'"` (always a
     literal, never user input); `bars_filter`/`actions_filter` are each
-    `_security_filter`'s output for that CTE's own `?` placeholders.
+    `_security_filter`'s output for that CTE's own `?` placeholders. Build
+    all three, and the bind parameters in placeholder order, with
+    `_adjusted_params`; run the queries inside `_sessions_registered`,
+    which provides the `_SESSIONS_VIEW` the gap CTE reads.
     """
     return f"""
         latest_bars AS (
@@ -333,26 +352,113 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
             )
             WHERE _rn = 1
         ),
-        -- Each event's own factor. `pb` (the ASOF-joined nearest bar with
-        -- session < ex_date) is only read by the dividend branch; for a
-        -- split row it is harmlessly present but unused. See this
-        -- module's docstring on why this is an ASOF JOIN rather than an
-        -- exact lookup of "the" prior XNYS session.
-        event_factor AS (
+        -- `pb` (the ASOF-joined nearest bar with session < ex_date) is
+        -- only read by the dividend branch; for a split row it is
+        -- harmlessly present but unused. See this module's docstring on
+        -- why this is an ASOF JOIN rather than an exact lookup of "the"
+        -- prior XNYS session, and on the staleness bound (#72).
+        event_prior AS (
             SELECT
                 la.security_id,
                 la.ex_date,
                 la.action_type,
                 la.ratio_or_amount,
-                CASE la.action_type
-                    WHEN 'split' THEN 1.0 / la.ratio_or_amount
-                    ELSE 1.0 - la.ratio_or_amount / pb.close
-                END AS factor
+                pb.session AS prior_session,
+                pb.close AS prior_close
             FROM latest_actions la
             ASOF LEFT JOIN latest_bars pb
                 ON pb.security_id = la.security_id AND pb.session < la.ex_date
+        ),
+        -- A dividend's gap: XNYS sessions in [prior_session, ex_date),
+        -- i.e. the index of the last session before ex_date minus that
+        -- of the last session before prior_session (-1 if none), so the
+        -- prior session itself is a gap of 1.
+        event_gap AS (
+            SELECT
+                ep.*,
+                CASE WHEN ep.action_type = 'dividend' AND ep.prior_session IS NOT NULL
+                    THEN xe.idx - COALESCE(xp.idx, -1)
+                END AS gap_sessions
+            FROM event_prior ep
+            ASOF LEFT JOIN {_SESSIONS_VIEW} xe ON xe.session < ep.ex_date
+            ASOF LEFT JOIN {_SESSIONS_VIEW} xp ON xp.session < ep.prior_session
+        ),
+        -- Each event's own factor; NULL for a dividend with no prior bar
+        -- or one more than `max_prior_close_gap_sessions` sessions back.
+        event_factor AS (
+            SELECT
+                *,
+                CASE
+                    WHEN action_type = 'split' THEN 1.0 / ratio_or_amount
+                    WHEN gap_sessions <= ? THEN 1.0 - ratio_or_amount / prior_close
+                END AS factor
+            FROM event_gap
         )
     """
+
+
+def _adjusted_params(
+    t: datetime,
+    security_ids: Sequence[str] | None,
+    settings: Settings | None,
+    *,
+    include_dividends: bool,
+) -> tuple[str, list[Any]]:
+    """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
+    `t` and the bars filter (`latest_bars`), `t`, `t_session` and the
+    actions filter (`latest_actions`), and `max_prior_close_gap_sessions`
+    (`event_factor`). `t` must already be validated.
+
+    The gap limit only matters for a dividend, so a splits-only query
+    binds `0` and never loads settings (`get_settings()` rereads the
+    environment on every call).
+    """
+    t_session = t.astimezone(_EXCHANGE_TZ).date()
+    action_types = "'split', 'dividend'" if include_dividends else "'split'"
+    max_gap = 0
+    if include_dividends:
+        max_gap = (settings or get_settings()).adjust.max_prior_close_gap_sessions
+
+    params: list[Any] = [t]
+    bars_filter = _security_filter(security_ids, params)
+    params.append(t)
+    params.append(t_session)
+    actions_filter = _security_filter(security_ids, params)
+    params.append(max_gap)
+    return _adjusted_ctes(action_types, bars_filter, actions_filter), params
+
+
+@lru_cache(maxsize=1)
+def _sessions_frame(sessions: tuple[date, ...]) -> pl.DataFrame:
+    """`sessions` as an `(idx, session)` frame, `idx` 0-based ascending.
+    Built once per calendar range (`calendar.all_sessions` returns the
+    same tuple while the range is unchanged)."""
+    return (
+        pl.DataFrame({"session": sessions}, schema={"session": pl.Date})
+        .with_row_index("idx")
+        .with_columns(pl.col("idx").cast(pl.Int64))
+    )
+
+
+_NO_SESSIONS = pl.DataFrame(schema={"idx": pl.Int64, "session": pl.Date})
+
+
+@contextmanager
+def _sessions_registered(
+    conn: duckdb.DuckDBPyConnection, *, include_dividends: bool
+) -> Iterator[None]:
+    """Expose the XNYS sessions to SQL as `_SESSIONS_VIEW` for the
+    duration of the block, then drop the view. Registering a polars frame
+    costs well under a millisecond, where binding the ~11k sessions as a
+    list parameter cost ~5 ms per statement. Only a dividend's gap reads
+    it, so a splits-only query registers an empty frame. Works on a
+    read-only connection (a registered frame is a temporary view)."""
+    frame = _sessions_frame(all_sessions()) if include_dividends else _NO_SESSIONS
+    conn.register(_SESSIONS_VIEW, frame)
+    try:
+        yield
+    finally:
+        conn.unregister(_SESSIONS_VIEW)
 
 
 def adjusted_prices_as_of(
@@ -361,6 +467,7 @@ def adjusted_prices_as_of(
     security_ids: Sequence[str] | None = None,
     *,
     include_dividends: bool = False,
+    settings: Settings | None = None,
 ) -> pl.DataFrame:
     """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
     `close` adjusted for every split known by `t` with `ex_date <= t`
@@ -372,23 +479,30 @@ def adjusted_prices_as_of(
     Column order matches `prices_as_of`; sorted by `(security_id,
     session)`.
 
+    A dividend whose prior bar is more than `settings.adjust.
+    max_prior_close_gap_sessions` XNYS sessions before its ex-date (or
+    that has no prior bar at all) is left unapplied; `dropped_dividends_
+    as_of` lists those. `settings` defaults to `get_settings()`.
+
     Raises `ValueError` if any known, effective event's own factor is
     non-positive or non-finite (a split `ratio_or_amount` of `0`, or a
-    dividend `amount >= prior_close`).
+    dividend `amount >= prior_close`), or a dividend amount is negative.
     """
     t = _validate_t(t)
-    t_session = t.astimezone(_EXCHANGE_TZ).date()
+    common_ctes, params = _adjusted_params(
+        t, security_ids, settings, include_dividends=include_dividends
+    )
+    with _sessions_registered(conn, include_dividends=include_dividends):
+        _raise_on_invalid_factor(conn, common_ctes, params)
+        return conn.execute(_adjusted_select(common_ctes), params).pl()
 
-    action_types = "'split', 'dividend'" if include_dividends else "'split'"
 
-    params: list[Any] = [t]
-    bars_filter = _security_filter(security_ids, params)
-    params.append(t)
-    params.append(t_session)
-    actions_filter = _security_filter(security_ids, params)
-
-    common_ctes = _adjusted_ctes(action_types, bars_filter, actions_filter)
-
+def _raise_on_invalid_factor(
+    conn: duckdb.DuckDBPyConnection, common_ctes: str, params: list[Any]
+) -> None:
+    """Raise `ValueError` naming the first event whose own factor is
+    non-positive or non-finite, or the first negative dividend amount
+    (see this module's docstring), before anything calls `LN()`."""
     bad_rows = conn.execute(
         f"""
         WITH {common_ctes}
@@ -409,7 +523,10 @@ def adjusted_prices_as_of(
             f"ratio_or_amount={ratio_or_amount!r} factor={factor!r}"
         )
 
-    sql = f"""
+
+def _adjusted_select(common_ctes: str) -> str:
+    """`adjusted_prices_as_of`'s main query over `common_ctes`."""
+    return f"""
         WITH {common_ctes},
         -- Cumulative factor per security: the product of this event's own
         -- factor and every later event's (spec: a split or dividend
@@ -446,4 +563,39 @@ def adjusted_prices_as_of(
             ON b.security_id = c.security_id AND b.session < c.ex_date
         ORDER BY b.security_id, b.session
     """
-    return conn.execute(sql, params).pl()
+
+
+def dropped_dividends_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Dividends known by `t` with `ex_date <= t` that `adjusted_prices_as_of(
+    ..., include_dividends=True)` leaves unapplied because it has no usable
+    prior close (#72): one row per `(security_id, ex_date)`, sorted by
+    both, with `ratio_or_amount`, `prior_session` and `gap_sessions` (both
+    `NULL` when no prior bar is known) and `reason`, either
+    `"no_prior_bar"` or `"stale_prior_bar"` (more than `settings.adjust.
+    max_prior_close_gap_sessions` XNYS sessions before the ex-date). For
+    `health` to count; `settings` defaults to `get_settings()`.
+    """
+    t = _validate_t(t)
+    common_ctes, params = _adjusted_params(t, security_ids, settings, include_dividends=True)
+    sql = f"""
+        WITH {common_ctes}
+        SELECT
+            security_id,
+            ex_date,
+            ratio_or_amount,
+            prior_session,
+            gap_sessions,
+            CASE WHEN prior_session IS NULL THEN 'no_prior_bar' ELSE 'stale_prior_bar' END
+                AS reason
+        FROM event_factor
+        WHERE action_type = 'dividend' AND factor IS NULL
+        ORDER BY security_id, ex_date
+    """
+    with _sessions_registered(conn, include_dividends=True):
+        return conn.execute(sql, params).pl()

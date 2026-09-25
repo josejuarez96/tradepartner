@@ -39,6 +39,7 @@ from lookahead.harness import TruncatedStore, probe_timestamps
 from tradepartner.store import schema
 from tradepartner.store.asof import (
     adjusted_prices_as_of,
+    dropped_dividends_as_of,
     facts_as_of,
     listings_as_of,
     prices_as_of,
@@ -295,6 +296,56 @@ def test_dividend_prior_close_uses_bar_known_at_t() -> None:
         row = after_revision.filter(pl.col("session") == s1).row(0, named=True)
         # factor = 1 - 5.0 / 80.0 = 0.9375 (revised s2 close)
         assert row["close"] == pytest.approx(100.0 * 0.9375)
+    finally:
+        conn.close()
+
+
+def test_backfilled_prior_bar_does_not_rescue_a_stale_dividend_early() -> None:
+    """Issue #72: a dividend whose only known prior bar is stale is dropped
+    until the missing prior-session bar is backfilled; the backfill's own
+    `known_at` (after the ex-date) gates the rescue, never its `session`.
+    Checked with the harness for both the adjusted prices and the drop
+    report, plus direct assertions either side of the backfill. This is
+    `dropped_dividends_as_of`'s invariance test: no fixture dividend is
+    ever dropped, so a fixture-wide run would compare empty frames only."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    sid = "SEC_STALE_THEN_BACKFILLED"
+    try:
+        # 2021-06-01 is 7 XNYS sessions before the 2021-06-10 ex-date.
+        _bar(conn, sid, date(2021, 6, 1), 40.0, known_at=datetime(2021, 6, 1, 21, tzinfo=UTC))
+        _action(
+            conn, sid, "dividend", date(2021, 6, 10), 2.0, known_at=datetime(2021, 6, 8, tzinfo=UTC)
+        )
+        # The 2021-06-09 bar arrives in a later backfill.
+        _bar(conn, sid, date(2021, 6, 9), 50.0, known_at=datetime(2021, 6, 20, tzinfo=UTC))
+
+        truncated_store = TruncatedStore(conn)
+        try:
+            for t in probe_timestamps(conn):
+                for func, kwargs in (
+                    (adjusted_prices_as_of, {"include_dividends": True}),
+                    (dropped_dividends_as_of, {}),
+                ):
+                    full = func(conn, t, **kwargs)
+                    result = func(truncated_store.at(t), t, **kwargs)
+                    assert full.equals(result), f"{func.__name__} disagreed at T={t!r}"
+        finally:
+            truncated_store.close()
+
+        before = datetime(2021, 6, 15, tzinfo=UTC)
+        after = datetime(2021, 6, 21, tzinfo=UTC)
+        june1 = pl.col("session") == date(2021, 6, 1)
+        assert dropped_dividends_as_of(conn, before)["reason"].to_list() == ["stale_prior_bar"]
+        assert adjusted_prices_as_of(conn, before, include_dividends=True).filter(june1)[
+            "close"
+        ].item() == pytest.approx(40.0)
+        assert dropped_dividends_as_of(conn, after).height == 0
+        # factor = 1 - 2.0 / 50.0 = 0.96
+        assert adjusted_prices_as_of(conn, after, include_dividends=True).filter(june1)[
+            "close"
+        ].item() == pytest.approx(40.0 * 0.96)
     finally:
         conn.close()
 
