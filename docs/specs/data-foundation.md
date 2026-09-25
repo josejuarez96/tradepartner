@@ -18,7 +18,7 @@ Nothing in Phases 3–6 can be trusted unless the data underneath answers one qu
 - **T** is always a tz-aware UTC timestamp. A rebalance *date* maps to T = that session's close via the calendar. Never a bare date.
 - **`known_at`** is when a fact became knowable to a market participant. **`ingested_at`** is when we stored it. `known_at ≤ ingested_at` always.
 - **Revision**: a later value for the same key is a **new row** with its own `known_at`; rows are never updated in place. "Latest as of T" is the row with the greatest `known_at ≤ T`.
-- **Provenance** on every row: `filing` (`known_at` = SEC acceptance timestamp), `bar` (session close), `action` (rule below), `snapshot` (current-only endpoint; `known_at` = fetch time), or `snapshot_static` (a snapshot attribute the config explicitly allows to apply before its fetch time, e.g. a company name or a pre-2019 exchange; counted and shown on the health page).
+- **Provenance** on every row: `filing` (`known_at` = SEC acceptance timestamp), `bar` (session close), `action` (rule below), `snapshot` (current-only endpoint; `known_at` = fetch time), or `snapshot_static` (a snapshot attribute the config explicitly allows to apply before its fetch time, e.g. a company name or a pre-2019 exchange; counted and shown on the health page). The row itself is still visible only once `known_at <= T`, so the exemption covers columns of a row a reader already sees, never an earlier read (#35).
 - **Raw payload**: the bytes a source returns (JSON, SGML header text, or a downloaded filing file). Fetch functions return raw payloads; parsers turn raw payloads into records. Only parsers are unit-tested; fixtures are recorded raw payloads.
 
 ## Requirements
@@ -59,7 +59,7 @@ Look-ahead
 Security master and universe
 - [ ] Reused ticker: prices by `security_id` return only that company's rows. Same-company ticker change: one `security_id`, two listing ranges.
 - [ ] Earliest-filing rule: a fixture company whose only filings are historical has a `securities` row with `known_at` = its first filing's acceptance; `securities_as_of` at a T before any filing returns nothing for it.
-- [ ] `snapshot_static` attributes apply before fetch time only for the columns config allows; `health` reports the reliance count.
+- [ ] `snapshot_static` attributes apply before fetch time only for the columns config allows; `health` reports the reliance count. As-of reads and the truncation harness give `snapshot_static` rows no exemption: before its `known_at` the row is invisible (#35).
 - [ ] Delistings: 25 and 25-NSE both end the named listing; a Form 25 on a preferred class leaves the common listed; a transfer within the window keeps the security in `universe_as_of` on the new exchange once the new listing is known, and shows it delisted at a T before that; the delisted fixture name is absent from `universe_as_of` after its last session and present in `securities_as_of` with dates.
 - [ ] `universe_as_of(T)`: rules 1–8 in ADR order; dual-class cap summed over classes, both listed classes admitted; split-adjusted cap; stale shares excluded; output records enabled rules and the fill-price setting.
 - [ ] `universe.liquidity_rule_enabled=false` (when set; the default is `true` since T3): rule 5 skipped and recorded; `health` shows it.
