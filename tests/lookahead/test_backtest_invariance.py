@@ -10,10 +10,21 @@ session T_i of the fixture range:
   are compared whole, at every cost level.
 - **Prefix invariance**: `run(end=T_i)` equals the prefix through T_i of
   `run(end=T_n)`.
-- **Teeth**: on a synthetic copy of the store, a bar revision and a dividend
-  revision, each known after close(T_i), leave `run(end=T_i)` unchanged and change
-  `run(end=T_{i+1})`. Each revision is checked alone, so either one reaching the
-  earlier run would fail.
+- **Teeth**: on a synthetic copy of the store, three revisions each known an hour
+  after close(T_i) leave `run(end=T_i)` unchanged and change `run(end=T_{i+1})`: a
+  bar revision at T_i on a held name, a dividend revision with ex-date T_i on a name
+  held across it (only the `known_at` filter keeps it out of the earlier run; the
+  ex-date filter does not), and a dividend revision with ex-date inside step i. Each
+  is checked alone, so any one reaching the earlier run fails.
+
+**Seeded revisions.** The fixture's own revisions (SEC_SPLIT_BACKFILLED's bar,
+SEC_DIV_REVISED's dividend) are on names the strategy never holds. So the store every
+test runs on (`_store`) adds, at `SEEDED_SESSIONS` and for each of `SEEDED_IDS` (every
+name the run holds in 2018-2019), a bar revision at T_k, a dividend first seen before
+its ex-date and restated after close(T_k), and a dividend first seen only after
+close(T_k) (late), all known an hour after close(T_k). The truncation walk then crosses
+revision-type facts (a row dated at or before T but known after it) on held names,
+which `test_the_run_is_not_vacuous` checks.
 
 The frozen settings are the defaults except `strategy.top_fraction = 0.5`, so the
 fixture's small universe (at most six names) yields several targets per rebalance
@@ -37,7 +48,7 @@ from lookahead.harness import TruncatedStore
 from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.calendar import next_session
+from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
@@ -52,8 +63,17 @@ COST_LEVELS = (0.0, 15.0)
 
 #: The teeth case's T_i: a 2019 rebalance where the run holds three names.
 T_TEETH = date(2019, 1, 31)
-#: When the synthetic revisions become known: after close(T_TEETH), before the next close.
+#: When a synthetic revision becomes known: an hour after close(T), before the next close.
 REVISION_DELAY = timedelta(hours=1)
+
+#: Names seeded with revisions: every name the run holds in 2018-2019.
+SEEDED_IDS = ("SEC_DUAL_A", "SEC_DUAL_B", "SEC_SPLIT_BETWEEN", "SEC_SPLIT_FUTURE", "SEC_TRANSFER")
+#: Rebalances seeded with revisions; the teeth case's T_i and T_{i+1} are left alone.
+SEEDED_SESSIONS = tuple(
+    t
+    for t in rebalance_sessions(date(2018, 6, 1), date(2019, 11, 30))
+    if t not in (T_TEETH, date(2019, 2, 28))
+)
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
@@ -70,12 +90,28 @@ def _frozen() -> Settings:
     return Settings(_env_file=None, strategy={"top_fraction": 0.5})
 
 
-def _fixture_conn() -> duckdb.DuckDBPyConnection:
+def _store() -> duckdb.DuckDBPyConnection:
+    """The fixture universe plus the seeded revisions (module docstring)."""
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
     load_universe_fixtures(conn, UNIVERSE_DIR)
+    for t_k in SEEDED_SESSIONS:
+        revised_at = read_time(t_k) + REVISION_DELAY
+        restated_ex = _sessions_before(t_k, 5)
+        late_ex = _sessions_before(t_k, 3)
+        for sid in SEEDED_IDS:
+            _revise_bar(conn, sid, t_k, revised_at, factor=1.02)
+            _dividend(conn, sid, restated_ex, 0.2, session_close(previous_session(restated_ex)))
+            _dividend(conn, sid, restated_ex, 0.3, revised_at)
+            _dividend(conn, sid, late_ex, 0.25, revised_at)
     return conn
+
+
+def _sessions_before(day: date, n: int) -> date:
+    for _ in range(n):
+        day = previous_session(day)
+    return day
 
 
 def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry.TrialHandle:
@@ -141,7 +177,7 @@ class Fixture:
 
 @pytest.fixture(scope="module")
 def fixture() -> Iterator[Fixture]:
-    conn = _fixture_conn()
+    conn = _store()
     settings = _frozen()
     try:
         yield Fixture(
@@ -200,8 +236,13 @@ def test_the_run_is_not_vacuous(fixture: Fixture, full_runs: dict[date, Results]
     assert len(fixture.sessions) > 40
     assert max(row.n_targets for row in result.rebalances) >= 3
     assert sum(row.turnover > 0 for row in result.rebalances) >= 10
-    # A name with a fill-session bar missing (SEC_WINDOW_DELIST after its last bar).
-    assert any(row.n_missing_fill for row in result.rebalances)
+    # The walk crosses seeded revisions on held names: at most seeded T_k a seeded
+    # name is held at the close whose bar is revised, and late dividends are counted.
+    revised_and_held = [
+        t_k for t_k in SEEDED_SESSIONS if set(_held_at_close(result, t_k)) & set(SEEDED_IDS)
+    ]
+    assert len(revised_and_held) >= len(SEEDED_SESSIONS) - 2
+    assert sum(row.n_late_dividends for row in result.rebalances) >= 5
 
 
 def test_truncation_invariance_at_every_rebalance(
@@ -235,16 +276,20 @@ def _held_at_close(result: BacktestResult, session: date) -> list[str]:
 
 
 def _revise_bar(
-    conn: duckdb.DuckDBPyConnection, sid: str, session: date, known_at: datetime
+    conn: duckdb.DuckDBPyConnection,
+    sid: str,
+    session: date,
+    known_at: datetime,
+    factor: float = 1.1,
 ) -> None:
-    """A second `prices_daily` row for (sid, session), every price 10% higher."""
+    """A second `prices_daily` row for (sid, session), every price times `factor`."""
     [row] = (
-        prices_as_of(conn, read_time(session), [sid])
+        prices_as_of(conn, session_close(session), [sid])
         .filter(pl.col("session") == session)
         .iter_rows(named=True)
     )
     for column in ("open", "high", "low", "close"):
-        row[column] = row[column] * 1.1
+        row[column] = row[column] * factor
     row.update(known_at=known_at, ingested_at=known_at, provenance="bar")
     insert_row(conn, "prices_daily", row)
 
@@ -269,6 +314,11 @@ def _dividend(
     )
 
 
+def _step_frame(result: BacktestResult, start: date) -> pl.DataFrame:
+    [frame] = [f.frame for f in result.marking_frames if f.start == start]
+    return frame
+
+
 def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
     fixture: Fixture, full_runs: dict[date, Results]
 ) -> None:
@@ -282,37 +332,49 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
     # The bar revision hits a name held at close(T_i): carrying it to F_i reads that close.
     held = _held_at_close(base, t_i)
     assert held, f"nothing held at close({t_i})"
-    # The dividend hits a name held through step i, ex-date inside (F_i, T_{i+1}].
+    # The ex-T_i dividend hits a name held at the close before T_i and at T_i. At
+    # close(T_i) its ex-date filter admits it, so only `known_at` keeps the revision out.
+    entitled = sorted(set(held) & set(_held_at_close(base, previous_session(t_i))))
+    assert entitled, f"nothing held across {t_i}"
+    # The in-step dividend hits a name held through step i, ex-date inside (F_i, T_{i+1}].
     fill = fill_session(t_i)
     targets = sorted(full_runs[t_next][COST_LEVELS[-1]].targets[fill])
     assert targets, f"no targets filled on {fill}"
-    ex_date = next_session(fill)
-    assert ex_date <= t_next
+    in_step_ex = next_session(fill)
+    assert in_step_ex <= t_next
+    first_seen = session_close(previous_session(t_i)) - REVISION_DELAY
 
-    def store(*, revise_bar: bool, revise_dividend: bool) -> duckdb.DuckDBPyConnection:
-        conn = _fixture_conn()
+    def store(revision: str | None) -> duckdb.DuckDBPyConnection:
+        conn = _store()
         # First seen before T_i in every variant, so only the revision differs.
-        _dividend(conn, targets[0], ex_date, 0.5, read_time(t_i) - timedelta(days=1))
-        if revise_bar:
+        _dividend(conn, entitled[0], t_i, 0.5, first_seen)
+        _dividend(conn, targets[0], in_step_ex, 0.5, first_seen)
+        if revision == "bar at T_i":
             _revise_bar(conn, held[0], t_i, revised_at)
-        if revise_dividend:
-            _dividend(conn, targets[0], ex_date, 2.5, revised_at)
+        elif revision == "dividend ex T_i":
+            _dividend(conn, entitled[0], t_i, 2.5, revised_at)
+        elif revision == "dividend in step i":
+            _dividend(conn, targets[0], in_step_ex, 2.5, revised_at)
         return conn
 
-    plain = store(revise_bar=False, revise_dividend=False)
+    plain = store(None)
     try:
         want_i = fixture.run(t_i, conn=plain)
         want_next = fixture.run(t_next, conn=plain)
     finally:
         plain.close()
-    for revision in ("bar", "dividend"):
-        conn = store(revise_bar=revision == "bar", revise_dividend=revision == "dividend")
+    for revision in ("bar at T_i", "dividend ex T_i", "dividend in step i"):
+        conn = store(revision)
         try:
-            _assert_same(fixture.run(t_i, conn=conn), want_i, f"{revision} revision, run to {t_i}")
+            _assert_same(fixture.run(t_i, conn=conn), want_i, f"{revision}, run to {t_i}")
             got_next = fixture.run(t_next, conn=conn)
         finally:
             conn.close()
         for level in COST_LEVELS:
-            assert got_next[level].equity != want_next[level].equity, (
-                f"the {revision} revision known at {revised_at} did not change run(end={t_next})"
-            )
+            got, want = got_next[level], want_next[level]
+            if revision == "dividend ex T_i":
+                # Ex-date before the step's carry: only pre-ex adjusted levels move.
+                changed = not _step_frame(got, t_i).equals(_step_frame(want, t_i))
+            else:
+                changed = got.equity != want.equity
+            assert changed, f"{revision} known at {revised_at} did not change run(end={t_next})"
