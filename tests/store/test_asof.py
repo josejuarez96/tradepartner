@@ -9,22 +9,35 @@ also passed (applied), the backfilled-2018-split acceptance criterion, a
 revised dividend, a restated shares fact, and "a bare date passed as T
 raises". Every as-of function returns a `polars.DataFrame` (this module's
 docstring); `_one` filters one down to a single named row for assertions.
+
+Audit round 1 additions (PR #69): exchange-local `ex_date <= T` at the
+UTC/ET day boundary, invalid (non-positive/non-finite) adjustment factors
+raising `ValueError`, a dividend's prior-close ASOF fallback when the
+exact prior session's bar is missing, the ASOF-join boundary (a bar *on*
+the ex-date is raw), a compounding case sensitive to the cumulative
+window's direction, and `security_ids=[]` returning an empty frame. These
+use a `synthetic_store` (schema only, no CSV fixture data) via `_bar`/
+`_action` so the scenario's exact numbers are controlled directly, rather
+than hunting for a fixture case that happens to fit.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, date, datetime
 
 import duckdb
 import polars as pl
 import pytest
 
+from tradepartner.store import schema
 from tradepartner.store.asof import (
     adjusted_prices_as_of,
     facts_as_of,
     listings_as_of,
     prices_as_of,
 )
+from tradepartner.store.db import configure_connection, insert_row
 
 
 def _one(df: pl.DataFrame, **match: object) -> dict[str, object]:
@@ -36,6 +49,76 @@ def _one(df: pl.DataFrame, **match: object) -> dict[str, object]:
         filtered = filtered.filter(pl.col(key) == value)
     assert filtered.height == 1, f"expected exactly one match for {match}, got {filtered}"
     return filtered.row(0, named=True)
+
+
+@pytest.fixture
+def synthetic_store() -> Iterator[duckdb.DuckDBPyConnection]:
+    """A fresh in-memory store with the schema applied and no fixture data
+    loaded, for tests that need exact control over a scenario's numbers
+    rather than a CSV fixture case that happens to fit."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _bar(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    session: date,
+    close: float,
+    *,
+    known_at: datetime,
+) -> None:
+    """Insert one `prices_daily` row with `open = high = low = close`
+    (these tests only ever assert on `close`) and `ingested_at =
+    known_at`."""
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": security_id,
+            "session": session,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "bar",
+        },
+    )
+
+
+def _action(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    action_type: str,
+    ex_date: date,
+    ratio_or_amount: float,
+    *,
+    known_at: datetime,
+) -> None:
+    """Insert one `corporate_actions` row with `ingested_at = known_at`."""
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": security_id,
+            "action_type": action_type,
+            "ex_date": ex_date,
+            "ratio_or_amount": ratio_or_amount,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "action",
+        },
+    )
 
 
 class TestPricesAsOf:
@@ -74,6 +157,17 @@ class TestPricesAsOf:
     def test_naive_datetime_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
         with pytest.raises(ValueError):
             prices_as_of(fixture_store, datetime(2019, 1, 31, 21, 0, 0))  # noqa: DTZ001
+
+    def test_empty_security_ids_returns_empty_frame_with_schema(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # NIT 7: security_ids=[] must not build "IN ()" (a DuckDB syntax
+        # error) -- it means "restrict to no securities", i.e. no rows,
+        # with the normal prices_daily column schema still intact.
+        t = datetime(2019, 1, 31, 21, 0, 0, tzinfo=UTC)
+        rows = prices_as_of(fixture_store, t, security_ids=[])
+        assert rows.height == 0
+        assert rows.columns == prices_as_of(fixture_store, t, security_ids=["SEC_SPY"]).columns
 
 
 class TestAdjustedPricesAsOf:
@@ -193,6 +287,218 @@ class TestAdjustedPricesAsOf:
     def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
         with pytest.raises(TypeError):
             adjusted_prices_as_of(fixture_store, date(2019, 1, 31))  # type: ignore[arg-type]
+
+    def test_empty_security_ids_returns_empty_frame_with_schema(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        t = datetime(2019, 1, 31, 21, 0, 0, tzinfo=UTC)
+        rows = adjusted_prices_as_of(fixture_store, t, security_ids=[])
+        assert rows.height == 0
+        assert (
+            rows.columns
+            == adjusted_prices_as_of(fixture_store, t, security_ids=["SEC_SPY"]).columns
+        )
+
+    def test_ex_date_compared_in_exchange_local_time_not_applied_before_open(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Audit round 1, finding 1. SEC_SPLIT_FUTURE's split has ex_date
+        # 2019-02-14. T = 2019-02-14T01:00Z is 2019-02-13T20:00
+        # America/New_York (EST, UTC-5 in February) -- still the day
+        # *before* the ex-date in the exchange's own calendar, even though
+        # T's UTC date already reads 2019-02-14. Comparing against T's UTC
+        # date (the bug) would wrongly apply the split here.
+        t = datetime(2019, 2, 14, 1, 0, 0, tzinfo=UTC)
+        raw = _one(
+            prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_FUTURE"]),
+            session=date(2018, 6, 1),
+        )
+        adjusted = _one(
+            adjusted_prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_FUTURE"]),
+            session=date(2018, 6, 1),
+        )
+        assert adjusted["close"] == pytest.approx(float(raw["close"]))
+
+    def test_ex_date_compared_in_exchange_local_time_applied_after_open(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Same split; T = 2019-02-14T15:00Z is 2019-02-14T10:00
+        # America/New_York -- now the ex-date itself in exchange-local
+        # time, so the split is effective.
+        t = datetime(2019, 2, 14, 15, 0, 0, tzinfo=UTC)
+        raw = _one(
+            prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_FUTURE"]),
+            session=date(2018, 6, 1),
+        )
+        adjusted = _one(
+            adjusted_prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_FUTURE"]),
+            session=date(2018, 6, 1),
+        )
+        assert adjusted["close"] == pytest.approx(float(raw["close"]) / 4.0)
+
+    def test_bar_on_ex_date_itself_is_raw_prior_session_is_adjusted(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Audit round 1, finding 4(a): the ASOF-join boundary is strict
+        # (`session < ex_date`), so the bar dated exactly on the ex-date
+        # is never adjusted for that event, while the immediately
+        # preceding session's bar is. SEC_SPLIT_BACKFILLED's split has
+        # ex_date 2018-03-15; its own fixture bars already show the real
+        # price drop across that boundary (raw close 70.91 on 2018-03-14,
+        # 35.16 on 2018-03-15 -- roughly a 2x split), which this asserts
+        # against directly rather than just checking "unchanged".
+        t = datetime(2019, 1, 31, 21, 0, 0, tzinfo=UTC)
+        on_ex_date = _one(
+            adjusted_prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_BACKFILLED"]),
+            session=date(2018, 3, 15),
+        )
+        raw_on_ex_date = _one(
+            prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_BACKFILLED"]),
+            session=date(2018, 3, 15),
+        )
+        assert on_ex_date["close"] == pytest.approx(float(raw_on_ex_date["close"]))
+
+        prior_session = _one(
+            adjusted_prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_BACKFILLED"]),
+            session=date(2018, 3, 14),
+        )
+        raw_prior_session = _one(
+            prices_as_of(fixture_store, t, security_ids=["SEC_SPLIT_BACKFILLED"]),
+            session=date(2018, 3, 14),
+        )
+        assert prior_session["close"] == pytest.approx(float(raw_prior_session["close"]) / 2.0)
+
+
+class TestAdjustedPricesAsOfSynthetic:
+    """Audit round 1 findings 2, 3 and 4(b): scenarios that need exact
+    control over the numbers, built directly on a `synthetic_store` rather
+    than hunted for in the CSV fixture."""
+
+    def test_dividend_at_or_above_prior_close_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Finding 2. A dividend amount >= the prior close makes
+        # `1 - amount / prior_close` zero or negative -- DuckDB's LN()
+        # (used by the cumulative-factor window) raises on that input
+        # rather than returning -inf/NaN, so this must be caught and
+        # turned into a clean ValueError before LN() ever runs.
+        _bar(
+            synthetic_store,
+            "SEC_BAD_DIV",
+            date(2021, 1, 4),
+            close=10.0,
+            known_at=datetime(2021, 1, 4, 21, 0, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            "SEC_BAD_DIV",
+            "dividend",
+            date(2021, 1, 5),
+            10.0,  # amount == prior close -> factor exactly 0
+            known_at=datetime(2021, 1, 4, 22, 0, tzinfo=UTC),
+        )
+        t = datetime(2021, 2, 1, tzinfo=UTC)
+        with pytest.raises(ValueError, match="SEC_BAD_DIV"):
+            adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+
+    def test_zero_split_ratio_raises(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
+        # Finding 2. A split ratio_or_amount of 0 divides by zero; DuckDB
+        # returns `inf` for that (no error), which would otherwise
+        # silently poison every earlier bar's adjusted price with `inf`.
+        _bar(
+            synthetic_store,
+            "SEC_BAD_SPLIT",
+            date(2021, 1, 4),
+            close=10.0,
+            known_at=datetime(2021, 1, 4, 21, 0, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            "SEC_BAD_SPLIT",
+            "split",
+            date(2021, 1, 5),
+            0.0,
+            known_at=datetime(2021, 1, 4, 22, 0, tzinfo=UTC),
+        )
+        t = datetime(2021, 2, 1, tzinfo=UTC)
+        with pytest.raises(ValueError, match="SEC_BAD_SPLIT"):
+            adjusted_prices_as_of(synthetic_store, t)
+
+    def test_dividend_prior_close_falls_back_to_latest_known_bar_before_ex_date(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Finding 3. No bar exists on 2021-01-08 (the session that would
+        # immediately precede the 2021-01-11 ex-date if it were present);
+        # the only known bar before the ex-date is from 2021-01-04. The
+        # ASOF join must fall back to that bar rather than dropping the
+        # dividend's factor entirely.
+        _bar(
+            synthetic_store,
+            "SEC_GAP_DIV",
+            date(2021, 1, 4),
+            close=50.0,
+            known_at=datetime(2021, 1, 4, 21, 0, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            "SEC_GAP_DIV",
+            "dividend",
+            date(2021, 1, 11),
+            5.0,
+            known_at=datetime(2021, 1, 10, 21, 0, tzinfo=UTC),
+        )
+        t = datetime(2021, 2, 1, tzinfo=UTC)
+        adjusted = _one(
+            adjusted_prices_as_of(synthetic_store, t, include_dividends=True),
+            session=date(2021, 1, 4),
+        )
+        # factor = 1 - 5.0 / 50.0 = 0.9
+        assert adjusted["close"] == pytest.approx(50.0 * 0.9)
+
+    def test_two_splits_and_a_dividend_compound_in_the_right_direction(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Finding 4(b). Sessions s1 < s2 < s3 < s4; split1 (ratio 2) at
+        # ex_date s2, split2 (ratio 3) at ex_date s3, a dividend (amount
+        # 2.0, against the raw close at s3 = 20.0 via the ASOF prior-close
+        # join, factor 1 - 2/20 = 0.9) at ex_date s4. Expected factors:
+        # s1 (before every event): 1/2 * 1/3 * 0.9 = 0.15
+        # s2 (after split1, before split2): 1/3 * 0.9 = 0.3
+        # s3 (after split2, before the dividend): 0.9
+        # s4 (on the dividend's own ex-date): 1.0 (raw)
+        # These four expected values are only reproduced by accumulating
+        # the cumulative-factor window from the *latest* ex_date backward
+        # (`ORDER BY ex_date DESC`); accumulating forward (`ASC`) computes
+        # a materially different, wrong number for every bar except the
+        # last, so this fails loudly under that regression.
+        s1, s2, s3, s4 = date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6), date(2021, 1, 7)
+        sid = "SEC_COMPOUND"
+        _bar(synthetic_store, sid, s1, close=1000.0, known_at=datetime(2021, 1, 4, 21, tzinfo=UTC))
+        _bar(synthetic_store, sid, s2, close=50.0, known_at=datetime(2021, 1, 5, 21, tzinfo=UTC))
+        _bar(synthetic_store, sid, s3, close=20.0, known_at=datetime(2021, 1, 6, 21, tzinfo=UTC))
+        _bar(synthetic_store, sid, s4, close=25.0, known_at=datetime(2021, 1, 7, 21, tzinfo=UTC))
+        _action(
+            synthetic_store, sid, "split", s2, 2.0, known_at=datetime(2021, 1, 4, 22, tzinfo=UTC)
+        )
+        _action(
+            synthetic_store, sid, "split", s3, 3.0, known_at=datetime(2021, 1, 5, 22, tzinfo=UTC)
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            s4,
+            2.0,
+            known_at=datetime(2021, 1, 6, 22, tzinfo=UTC),
+        )
+
+        t = datetime(2021, 2, 1, tzinfo=UTC)
+        adjusted = adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+
+        assert _one(adjusted, session=s1)["close"] == pytest.approx(1000.0 * 0.15)
+        assert _one(adjusted, session=s2)["close"] == pytest.approx(50.0 * 0.3)
+        assert _one(adjusted, session=s3)["close"] == pytest.approx(20.0 * 0.9)
+        assert _one(adjusted, session=s4)["close"] == pytest.approx(25.0)
 
 
 class TestFactsAsOf:

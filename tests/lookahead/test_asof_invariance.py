@@ -12,11 +12,18 @@ Python-side sort needed.
 
 `universe_as_of` and `survivorship_gap` are later tasks (T13, T15) and are
 not exercised here.
+
+Audit round 1 additions (PR #69): a synthetic-store case with a REVISED
+split (finding 5 -- a missing `corporate_actions.known_at` filter can't be
+caught by the fixture alone, since none of its splits are revised), and a
+harness meta-test (NIT 9) proving a function that ignores `known_at`
+entirely fails the invariance assertion.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from datetime import UTC, date, datetime
 from typing import Any
 
 import duckdb
@@ -24,12 +31,14 @@ import polars as pl
 import pytest
 
 from lookahead.harness import TruncatedStore, probe_timestamps
+from tradepartner.store import schema
 from tradepartner.store.asof import (
     adjusted_prices_as_of,
     facts_as_of,
     listings_as_of,
     prices_as_of,
 )
+from tradepartner.store.db import configure_connection, insert_row
 
 AsOfFunc = Callable[..., pl.DataFrame]
 
@@ -72,3 +81,154 @@ def test_adjusted_prices_as_of_invariant_under_truncation(
     _assert_invariant_over_every_probe(
         fixture_store, truncated, adjusted_prices_as_of, include_dividends=include_dividends
     )
+
+
+def _bar(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    session: date,
+    close: float,
+    *,
+    known_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": security_id,
+            "session": session,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "bar",
+        },
+    )
+
+
+def _action(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    action_type: str,
+    ex_date: date,
+    ratio_or_amount: float,
+    *,
+    known_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": security_id,
+            "action_type": action_type,
+            "ex_date": ex_date,
+            "ratio_or_amount": ratio_or_amount,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "action",
+        },
+    )
+
+
+def test_revised_split_invariant_under_truncation() -> None:
+    """Audit round 1, finding 5: the fixture store has no *revised* split
+    (a second row for the same `(security_id, action_type, ex_date)` with
+    a later `known_at`), so a bug that dropped `latest_actions`'
+    `known_at <= t` filter in `adjusted_prices_as_of` would not be caught
+    by the main invariance test at all -- `ROW_NUMBER() ... ORDER BY
+    known_at DESC` would still pick a single "latest" row per key even
+    with no `WHERE known_at <= t`, and every fixture split only has one
+    row, so there is nothing for a missing filter to get wrong. This
+    builds a synthetic store with a split whose revision is known
+    *after* its own ex-date, at a different ratio, and runs the harness
+    over it -- reproducing the mechanism T6's docstring in `harness.py`
+    describes.
+    """
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    try:
+        security_id = "SEC_REVISED_SPLIT"
+        ex_date = date(2021, 3, 3)
+        _bar(
+            conn,
+            security_id,
+            date(2021, 3, 1),
+            100.0,
+            known_at=datetime(2021, 3, 1, 21, tzinfo=UTC),
+        )
+        _bar(
+            conn,
+            security_id,
+            date(2021, 3, 2),
+            100.0,
+            known_at=datetime(2021, 3, 2, 21, tzinfo=UTC),
+        )
+        _bar(
+            conn, security_id, date(2021, 3, 3), 50.0, known_at=datetime(2021, 3, 3, 21, tzinfo=UTC)
+        )
+        _bar(
+            conn, security_id, date(2021, 3, 4), 50.0, known_at=datetime(2021, 3, 4, 21, tzinfo=UTC)
+        )
+        # First-seen: ratio 2.0, known the session before the ex-date.
+        _action(
+            conn,
+            security_id,
+            "split",
+            ex_date,
+            2.0,
+            known_at=datetime(2021, 3, 2, 22, tzinfo=UTC),
+        )
+        # A later-discovered revision, known *after* the ex-date, at a
+        # different ratio -- exactly the shape a missing known_at filter
+        # would get wrong.
+        _action(
+            conn,
+            security_id,
+            "split",
+            ex_date,
+            4.0,
+            known_at=datetime(2021, 3, 10, 12, tzinfo=UTC),
+        )
+
+        truncated_store = TruncatedStore(conn)
+        try:
+            for t in probe_timestamps(conn):
+                full = adjusted_prices_as_of(conn, t)
+                result = adjusted_prices_as_of(truncated_store.at(t), t)
+                assert full.equals(result), f"disagreed at T={t!r}"
+        finally:
+            truncated_store.close()
+    finally:
+        conn.close()
+
+
+def _leaky_prices_as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> pl.DataFrame:
+    """A deliberately broken as-of function: it takes `t` but never
+    filters by it. Used only by `test_harness_catches_a_function_that_
+    ignores_known_at` (NIT 9) to prove the harness itself has teeth --
+    if this function passed the invariance check, the harness would not
+    be testing anything.
+    """
+    del t  # deliberately unused: the whole point is that this ignores T
+    return conn.execute("SELECT * FROM prices_daily ORDER BY security_id, session").pl()
+
+
+def test_harness_catches_a_function_that_ignores_known_at(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    """NIT 9: the harness must be able to fail. `_leaky_prices_as_of`
+    ignores `known_at <= t` entirely, so at an early probe (most of the
+    fixture's rows not yet "truncated in") it must disagree between the
+    untruncated store and the truncated one -- proving a real look-ahead
+    bug would be caught, not just that a correct implementation passes.
+    """
+    t = probe_timestamps(fixture_store, ("prices_daily",))[0]
+    full = _leaky_prices_as_of(fixture_store, t)
+    result = _leaky_prices_as_of(truncated.at(t), t)
+    assert not full.equals(result), "a function that ignores known_at should fail this check"
