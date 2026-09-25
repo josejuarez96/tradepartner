@@ -41,7 +41,7 @@ import math
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import cache
 from itertools import pairwise
 
@@ -84,12 +84,22 @@ def _by_key(history: Sequence[Ingested]) -> dict[tuple[object, ...], list[Ingest
 
 
 def check_early_known_at(history: Sequence[Ingested]) -> list[str]:
-    """First-seen records stamped before they were knowable."""
+    """First-seen records stamped before they were knowable. A replacement
+    action (#108: first seen in the same ingest as a cancel of the same
+    security and type) revises a known event, so it is knowable at that
+    ingest, not at a first-seen proxy."""
+    cancel_ingests = {
+        (i.record.security_id, i.record.action_type, i.ingested_at)
+        for i in history
+        if isinstance(i.record, CorporateAction) and i.record.cancelled
+    }
     findings = []
     for key, group in _by_key(history).items():
         record = group[0].record
         if isinstance(record, Bar):
             expected = _bar_known_at(record.session)
+        elif (record.security_id, record.action_type, group[0].ingested_at) in cancel_ingests:
+            expected = group[0].ingested_at
         else:
             expected = action_first_seen_known_at(record.ex_date, announced_at=record.announced_at)
         if record.known_at < expected:
@@ -105,7 +115,10 @@ def _split_windows(
 ) -> tuple[list[tuple[CorporateAction, list[Bar], Bar]], list[CorporateAction]]:
     """For each split: every version of the last bar before its ex-date, the
     first-seen bar of the first session on or after it; plus the splits
-    without bars on both sides."""
+    without bars on both sides or cancelled. A split is taken at its latest
+    revision (#108): a re-dated split drops the price on its final ex-date,
+    not the first one, and a split whose latest revision is cancelled never
+    drops it, so it cannot be tested and is reported with the skipped."""
     versions: defaultdict[str, dict[date, list[Bar]]] = defaultdict(dict)
     splits = []
     for group in _by_key(history).values():
@@ -115,9 +128,14 @@ def _split_windows(
                 i.record for i in group if isinstance(i.record, Bar)
             ]
         elif record.action_type is ActionType.SPLIT:
-            splits.append(record)
+            latest = group[-1].record
+            if isinstance(latest, CorporateAction):
+                splits.append(latest)
     windows, skipped = [], []
     for split in splits:
+        if split.cancelled:
+            skipped.append(split)
+            continue
         sessions = versions[split.security_id]
         before = [d for d in sessions if d < split.ex_date]
         after = [d for d in sessions if d >= split.ex_date]
@@ -129,7 +147,8 @@ def _split_windows(
 
 
 def unexamined_splits(history: Sequence[Ingested]) -> list[CorporateAction]:
-    """Splits `check_prices_unadjusted` cannot test (no bars on both sides)."""
+    """Splits `check_prices_unadjusted` cannot test (no bars on both sides,
+    or cancelled at their latest revision)."""
     return _split_windows(history)[1]
 
 
@@ -289,8 +308,35 @@ def test_broken_adapter_violation_is_caught_by_its_named_check(violation: Violat
 
 
 def test_every_fixture_split_is_examined() -> None:
+    """Every fixture split but the id-less key `SEC_SPLIT_REDATED_NOID`
+    cancels when it re-dates the split (#108), which never drops a price."""
     history = fixture_history(FixturePriceSource(UNIVERSE_DIR), security_ids())
-    assert unexamined_splits(history) == []
+    unexamined = unexamined_splits(history)
+    assert [(s.security_id, s.cancelled) for s in unexamined] == [("SEC_SPLIT_REDATED_NOID", True)]
+
+
+def test_idless_redate_moved_later_is_not_early() -> None:
+    """A replacement stamped at its ingest, before the proxy of a later new
+    ex-date, is on time (quant-auditor round 2 on #111, finding 4)."""
+    ingested = datetime(2019, 3, 6, 22, 0, tzinfo=UTC)
+    first = CorporateAction(
+        "SEC_A",
+        ActionType.SPLIT,
+        date(2019, 3, 5),
+        2.0,
+        datetime(2019, 3, 4, 21, 0, tzinfo=UTC),
+        "t",
+    )
+    cancel = replace(first, known_at=ingested, cancelled=True)
+    replacement = replace(first, ex_date=date(2019, 3, 20), known_at=ingested)
+    history = [
+        Ingested(first, first.known_at),
+        Ingested(cancel, ingested),
+        Ingested(replacement, ingested),
+    ]
+    assert check_early_known_at(history) == []
+    early = replace(replacement, known_at=ingested - timedelta(hours=1))
+    assert check_early_known_at([*history[:2], Ingested(early, ingested)]) != []
 
 
 def test_announced_at_after_ingested_at_is_caught() -> None:

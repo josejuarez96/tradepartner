@@ -9,7 +9,10 @@ Reads three CSVs from a fixture directory (the T5 universe in
   it raises `UnknownSecurityIdError`, and a price or action row for an id
   not in it is refused at load time.
 - `prices_daily.csv` and `corporate_actions.csv` (optional; absent means no
-  rows): the records, in the store's own column layout.
+  rows): the records, in the store's own column layout. The actions'
+  `source_action_id` and `cancelled` columns (#108) are optional too: an
+  empty or absent id means the source gave none, an absent `cancelled`
+  means `FALSE`.
 
 **Replay, not snapshot.** A real source returns today's values; ingest
 (T16) turns a changed value into a revision with `prices.revision_of`. A
@@ -17,7 +20,9 @@ fixture is a recording of every record the source produced over time, each
 already stamped, so this adapter returns **every** row in range, first-seen
 records and revisions alike, sorted by natural key then `known_at`.
 `ingested_at` and `provenance` are read only to check the contract below;
-they are not part of the returned records.
+they are not part of the returned records. An action's natural key is its
+identity (`CorporateAction.key`): the source's id when present, so a
+re-dated action is checked as a revision of the same event.
 
 **The fixture contract, enforced when the adapter is built.** A fixture that
 breaks a timing rule would make every downstream look-ahead test vouch for
@@ -35,11 +40,24 @@ in ingest order (`ingested_at`, then `known_at`):
    `announced_at` capped at the first-seen proxy if the row has one, else
    exactly the proxy. A stamp earlier than the proxy with no `announced_at`
    is look-ahead and refused (issue #83). `announced_at` is optional per
-   row (an empty cell) but the column is required.
+   row (an empty cell) but the column is required. A first-seen action
+   cannot be cancelled.
+   **Replacements** (#108) are the exception: a first-seen action ingested
+   together with a cancel of another key for the same security and type
+   (same `ingested_at`) replaces that key, as in an id-less re-date or a
+   switch from an id-less key to a source id. It revises an event already
+   known, so it is stamped `known_at == ingested_at`, never at a proxy. This
+   is deliberately broad: an unrelated action first seen in the same ingest
+   as a cancel is stamped late, never early.
 3. Every later row for the same key must be what `prices.revision_of`
    produces from the row before it at that row's `ingested_at`: values that
    differ, and `known_at` equal to its own `ingested_at` (never back-dated).
    An action revision carries the previous row's `announced_at` unchanged.
+   A re-date or a cancellation is such a revision.
+4. An action with a source id may not share `(security_id, action_type,
+   ex_date)` with an id-less action unless that id-less key was cancelled at
+   or before the id row's `known_at`, and that key is never revived after
+   its cancel: otherwise both apply as two events at some `t`.
 """
 
 from __future__ import annotations
@@ -112,6 +130,13 @@ def _parse_date(value: str, *, column: str, where: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise FixtureContractError(f"{where}: {column} {value!r} is not a YYYY-MM-DD date") from exc
+
+
+def _parse_bool(value: str, *, column: str, where: str) -> bool:
+    """`TRUE`/`FALSE` in either case, as the generator and DuckDB write them."""
+    if value.upper() in ("TRUE", "FALSE"):
+        return value.upper() == "TRUE"
+    raise FixtureContractError(f"{where}: {column} {value!r} is not TRUE or FALSE")
 
 
 def _read_csv(path: Path, required: Sequence[str]) -> list[tuple[str, dict[str, str]]]:
@@ -194,6 +219,10 @@ def _load_actions(path: Path, known_ids: frozenset[str]) -> list[_Row[CorporateA
                     if row["announced_at"]
                     else None
                 ),
+                source_action_id=row.get("source_action_id") or None,
+                cancelled=_parse_bool(
+                    row.get("cancelled", "FALSE"), column="cancelled", where=where
+                ),
             )
         except (TypeError, ValueError) as exc:
             if isinstance(exc, FixtureContractError):
@@ -219,10 +248,48 @@ def _check_bar_first_seen(row: _Row[Bar]) -> None:
         )
 
 
-def _check_action_first_seen(row: _Row[CorporateAction]) -> None:
-    """Contract rule 2 for actions: stamped exactly at its `announced_at`
-    if it has one, else exactly at the first-seen proxy."""
+def _cancel_ingests(rows: list[_Row[CorporateAction]]) -> set[tuple[str, str, datetime]]:
+    """`(security_id, action_type, ingested_at)` of every cancel row, to
+    recognise a replacement written in the same ingest (contract rule 2)."""
+    return {
+        (r.record.security_id, r.record.action_type.value, r.ingested_at)
+        for r in rows
+        if r.record.cancelled
+    }
+
+
+def _action_first_seen_check(
+    cancel_ingests: set[tuple[str, str, datetime]],
+) -> Callable[[_Row[CorporateAction]], None]:
+    """Contract rule 2 for actions, given the ingests that cancelled a key."""
+
+    def check(row: _Row[CorporateAction]) -> None:
+        _check_action_first_seen(row, cancel_ingests)
+
+    return check
+
+
+def _check_action_first_seen(
+    row: _Row[CorporateAction], cancel_ingests: set[tuple[str, str, datetime]]
+) -> None:
+    """Contract rule 2 for actions: not cancelled; a replacement stamped at
+    its own `ingested_at`; any other first-seen row stamped exactly at its
+    `announced_at` (capped at the first-seen proxy) if it has one, else
+    exactly at the proxy."""
     action = row.record
+    if action.cancelled:
+        raise FixtureContractError(
+            f"{row.where}: first-seen action {action.key} is cancelled; a cancel only "
+            "revises an action already recorded"
+        )
+    if (action.security_id, action.action_type.value, row.ingested_at) in cancel_ingests:
+        if action.known_at != row.ingested_at:
+            raise FixtureContractError(
+                f"{row.where}: action {action.key} replaces a key cancelled in the same "
+                f"ingest ({row.ingested_at.isoformat()}), so it revises a known event and "
+                f"must be stamped at that ingested_at, not {action.known_at.isoformat()}"
+            )
+        return
     expected = action_first_seen_known_at(action.ex_date, announced_at=action.announced_at)
     if action.known_at == expected:
         return
@@ -291,6 +358,43 @@ def _check_history[RecordT: (Bar, CorporateAction)](
     )
 
 
+def _check_id_against_idless(rows: list[_Row[CorporateAction]]) -> None:
+    """Contract rule 4: an id row may share `(security_id, action_type,
+    ex_date)` with an id-less key only once that key is cancelled as of the
+    id row's `known_at` (its first cancel known at or before it), and an
+    id-less key an id row shares is never revived after that cancel.
+    Otherwise both apply as two events at some `t`."""
+    idless: defaultdict[tuple[str, str, date], list[CorporateAction]] = defaultdict(list)
+    for row in rows:
+        action = row.record
+        if action.source_action_id is None:
+            idless[(action.security_id, action.action_type.value, action.ex_date)].append(action)
+    for history in idless.values():
+        history.sort(key=lambda a: a.known_at)
+    for row in rows:
+        action = row.record
+        if action.source_action_id is None or action.cancelled:
+            continue
+        shared = (action.security_id, action.action_type.value, action.ex_date)
+        if shared not in idless:
+            continue
+        history = idless[shared]
+        cancel_at = next((a.known_at for a in history if a.cancelled), None)
+        if cancel_at is None or cancel_at > action.known_at:
+            raise FixtureContractError(
+                f"{row.where}: action with source id {action.source_action_id!r} shares "
+                f"{shared} with an id-less action that is not cancelled by its known_at "
+                f"{action.known_at.isoformat()}; both would apply as two events"
+            )
+        revived = [a for a in history if a.known_at > cancel_at and not a.cancelled]
+        if revived:
+            raise FixtureContractError(
+                f"{row.where}: the id-less action {shared} this source id "
+                f"{action.source_action_id!r} replaced is revived at "
+                f"{revived[0].known_at.isoformat()}; both would apply as two events"
+            )
+
+
 class FixturePriceSource(PriceSource):
     """`PriceSource` over a fixture directory; see the module docstring for
     what it reads and the contract it enforces on construction."""
@@ -315,7 +419,22 @@ class FixturePriceSource(PriceSource):
         for bar in _check_history(bar_rows, lambda b: b.key, _check_bar_first_seen):
             self._bars[bar.security_id].append(bar)
         self._actions: defaultdict[str, list[CorporateAction]] = defaultdict(list)
-        for action in _check_history(action_rows, lambda a: a.key, _check_action_first_seen):
+        actions = _check_history(
+            action_rows, lambda a: a.key, _action_first_seen_check(_cancel_ingests(action_rows))
+        )
+        _check_id_against_idless(action_rows)
+        # Returned in the documented order, not identity order: an id key
+        # and an ex-date key do not sort together.
+        actions.sort(
+            key=lambda a: (
+                a.security_id,
+                a.action_type.value,
+                a.ex_date,
+                a.known_at,
+                a.source_action_id or "",
+            )
+        )
+        for action in actions:
             self._actions[action.security_id].append(action)
 
     def _resolve(self, security_ids: Sequence[str], start: date, end: date) -> list[str]:
@@ -346,7 +465,9 @@ class FixturePriceSource(PriceSource):
     ) -> list[CorporateAction]:
         """Every recorded action (first-seen and revisions) for
         `security_ids` with `start <= ex_date <= end`, sorted by
-        `(security_id, action_type, ex_date, known_at)`."""
+        `(security_id, action_type, ex_date, known_at)`. Every revision of a
+        re-dated action is filtered on its own `ex_date`, so a range can
+        hold one revision of an event and not another."""
         return [
             action
             for security_id in self._resolve(security_ids, start, end)

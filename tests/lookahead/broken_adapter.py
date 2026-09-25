@@ -99,7 +99,8 @@ def fixture_history(
 ) -> list[Ingested]:
     """`source`'s bars and actions for `ids`, each paired with the
     `ingested_at` the fixture CSVs record for it (matched on natural key and
-    `known_at`). A record the CSVs do not hold raises `KeyError`."""
+    `known_at`; an action's natural key is its identity). A record the CSVs
+    do not hold raises `KeyError`."""
     log: dict[tuple[object, ...], datetime] = {}
     for row in _read_csv(universe_dir / "prices_daily.csv"):
         key = ("bar", row["security_id"], date.fromisoformat(row["session"]))
@@ -107,11 +108,16 @@ def fixture_history(
             row["ingested_at"]
         )
     for row in _read_csv(universe_dir / "corporate_actions.csv"):
-        action_key = (
-            "action",
-            row["security_id"],
-            row["action_type"],
-            date.fromisoformat(row["ex_date"]),
+        # The action's identity, as `CorporateAction.key` builds it (#108).
+        action_key: tuple[object, ...] = (
+            ("action", row["security_id"], "source_action_id", row["source_action_id"])
+            if row["source_action_id"]
+            else (
+                "action",
+                row["security_id"],
+                row["action_type"],
+                date.fromisoformat(row["ex_date"]),
+            )
         )
         log[(*action_key, datetime.fromisoformat(row["known_at"]))] = datetime.fromisoformat(
             row["ingested_at"]

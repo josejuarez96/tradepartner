@@ -191,7 +191,10 @@ def test_timestamp_and_date_cell_formats() -> None:
         ("classifications", ("security_id", "rule", "known_at")),
         ("delistings", ("security_id", "form", "class_title", "exchange", "filed_at", "known_at")),
         ("prices_daily", ("security_id", "session", "known_at")),
-        ("corporate_actions", ("security_id", "action_type", "ex_date", "known_at")),
+        (
+            "corporate_actions",
+            ("security_id", "action_type", "ex_date", "source_action_id", "known_at"),
+        ),
         ("facts", ("security_id", "fact_name", "as_of_date", "class_member", "known_at")),
     ],
 )
@@ -304,17 +307,38 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
     row carries one, else exactly the close of the session before ex-date
     (issue #83: an earlier stamp with no announcement is look-ahead).
     A revision (a later row for the same key): `known_at == ingested_at`,
-    later than the first-seen row (spec req 5; review round 3 item 9)."""
+    later than the first-seen row (spec req 5; review round 3 item 9).
+    Rows group by action identity (#108): the source id when present, so
+    a re-date is a revision; a first-seen row is never a cancellation. A
+    replacement (first seen in the same ingest as a cancel for the same
+    security and type) is stamped at its `ingested_at`, never earlier."""
     rows = _read_rows("corporate_actions")
+    cancel_ingests = {
+        (r["security_id"], r["action_type"], r["ingested_at"])
+        for r in rows
+        if r["cancelled"] == "TRUE"
+    }
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
-        groups[(row["security_id"], row["action_type"], row["ex_date"])].append(row)
+        if row["source_action_id"]:
+            identity = (row["security_id"], "source_action_id", row["source_action_id"])
+        else:
+            identity = (row["security_id"], row["action_type"], row["ex_date"])
+        groups[identity].append(row)
 
     for (security_id, action_type, ex_date), group in groups.items():
-        close_before_ex = session_close(previous_session(date.fromisoformat(ex_date)))
         ordered = sorted(group, key=lambda r: r["known_at"])
+        first_ex_date = date.fromisoformat(ordered[0]["ex_date"])
+        close_before_ex = session_close(previous_session(first_ex_date))
+        assert ordered[0]["cancelled"] == "FALSE", f"{security_id}: first-seen row is cancelled"
         first_known_at = datetime.fromisoformat(ordered[0]["known_at"])
-        announced = ordered[0]["announced_at"]
+        first = ordered[0]
+        if (first["security_id"], first["action_type"], first["ingested_at"]) in cancel_ingests:
+            assert first["known_at"] == first["ingested_at"], (
+                f"{security_id} {action_type} {ex_date}: replacement not stamped at its ingest"
+            )
+            continue
+        announced = first["announced_at"]
         expected = datetime.fromisoformat(announced) if announced else close_before_ex
         assert first_known_at == expected, (
             f"{security_id} {action_type} {ex_date}: first-seen known_at {first_known_at} "

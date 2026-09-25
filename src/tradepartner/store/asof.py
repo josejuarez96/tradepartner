@@ -60,8 +60,8 @@ truncation-invariance tests exercise this directly.
 
 **Adjustment methodology (`adjusted_prices_as_of`).** A split or dividend
 adjusts a bar at `session` only when it is **both** known
-(`known_at <= t`, latest revision per `(security_id, action_type, ex_date)`
-among rows known at `t`) **and already effective** (`ex_date <= t`) --
+(`known_at <= t`, latest revision per action identity among rows known at
+`t`, not cancelled) **and already effective** (`ex_date <= t`) --
 per spec req 8: "Level rules ... adjust shares only for splits with
 ex-date <= T, regardless of when the split became known" and the
 acceptance line "Split known before T with ex-date after T: ... rule 4
@@ -77,6 +77,16 @@ combined rule: "Backfilled 2018 split in 2026:
 2018-03-15, both `<= ` the probe T (2019-01-31 close), even though it was
 only `ingested_at` in a 2026 backfill run; `ingested_at` never gates this
 rule.
+
+**Action identity, re-dates and cancellations (#108).** An action's
+identity is `(security_id, source_action_id)` when the source gave an id,
+else `(security_id, action_type, ex_date)` (`source_action_id = ''`). A
+re-dated action is a later revision of the same identity with a new
+`ex_date`, so the old ex-date applies until the re-date's `known_at` and
+the new one after, never both. A latest revision with `cancelled` set
+removes the event. Both filters, and `ex_date <= t`, run on the latest
+revision as of `t`: filtering first would let an older revision stand in
+for a newer one that re-dated the event past `t` or cancelled it.
 
 **"Effective" is exchange-local, not UTC (`_EXCHANGE_TZ`).** `ex_date` is a
 calendar `DATE`; `t` is a UTC instant. A split's `ex_date` is the XNYS
@@ -183,13 +193,25 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 #: "latest revision as of T" purposes, and the `ORDER BY` each function
 #: sorts its result by -- the columns the schema's own
 #: `UNIQUE (..., known_at)` constraint names minus `known_at` itself.
-#: `corporate_actions`'s key (`security_id, action_type, ex_date`) is not
-#: listed here: `adjusted_prices_as_of` inlines its own latest-revision CTE
-#: for that table rather than calling `_latest_as_of` (see this module's
-#: docstring on why it runs as one SQL statement).
+#: `corporate_actions`'s identity (#108) is not a plain column list, so it
+#: is not listed here: it is `_ACTION_IDENTITY_PARTITION`, used by
+#: `live_actions_as_of` and by the latest-revision CTE that
+#: `adjusted_prices_as_of` inlines (see this module's docstring on why it
+#: runs as one SQL statement).
 _PRICE_KEY: tuple[str, ...] = ("security_id", "session")
 _FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "as_of_date", "class_member")
 _LISTING_KEY: tuple[str, ...] = ("security_id", "ticker", "exchange", "valid_from")
+
+#: `PARTITION BY` for an action's identity (#108): the source's id when it
+#: gave one, else `(action_type, ex_date)`. Every reader of
+#: `corporate_actions` picks the latest revision over this partition, and
+#: only then filters on type, ex-date and `cancelled`.
+_ACTION_IDENTITY_PARTITION = """
+    security_id,
+    source_action_id,
+    CASE WHEN source_action_id = '' THEN action_type END,
+    CASE WHEN source_action_id = '' THEN ex_date END
+"""
 
 #: The exchange's local timezone -- see this module's docstring ("Effective
 #: is exchange-local, not UTC") for why `ex_date <= t` is compared in this
@@ -269,6 +291,38 @@ def _latest_as_of(
     return conn.execute(sql, params).pl()
 
 
+def live_actions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """The `corporate_actions` events known at `t`: per identity (#108) the
+    latest revision with `known_at <= t`, dropped if that revision is
+    cancelled, sorted by `(security_id, action_type, ex_date)`. A re-dated
+    event appears once, at its latest ex-date; no ex-date filter is applied.
+
+    `t` must be tz-aware (a bare date raises `TypeError`); `security_ids`
+    as in `_latest_as_of`.
+    """
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    security_filter = _security_filter(security_ids, params)
+    sql = f"""
+        SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY {_ACTION_IDENTITY_PARTITION}
+                ORDER BY known_at DESC
+            ) AS _rn
+            FROM corporate_actions
+            WHERE known_at <= ?
+            {security_filter}
+        )
+        WHERE _rn = 1 AND NOT cancelled
+        ORDER BY security_id, action_type, ex_date, source_action_id
+    """
+    return conn.execute(sql, params).pl()
+
+
 def prices_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -338,17 +392,23 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
             )
             WHERE _rn = 1
         ),
+        -- Latest revision per action identity (#108): the source's id when
+        -- it gave one, else (action_type, ex_date). The ex-date, type and
+        -- cancelled filters apply to that latest revision, never before
+        -- choosing it: a re-date into the future, or a cancel, must retire
+        -- an older revision rather than leave it standing.
         latest_actions AS (
             SELECT * EXCLUDE (_rn) FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY security_id, action_type, ex_date ORDER BY known_at DESC
+                    PARTITION BY {_ACTION_IDENTITY_PARTITION}
+                    ORDER BY known_at DESC
                 ) AS _rn
                 FROM corporate_actions
-                WHERE known_at <= ? AND ex_date <= ?
-                  AND action_type IN ({action_types})
+                WHERE known_at <= ?
                 {actions_filter}
             )
-            WHERE _rn = 1
+            WHERE _rn = 1 AND NOT cancelled AND ex_date <= ?
+              AND action_type IN ({action_types})
         ),
         -- `pb` (the ASOF-joined nearest bar with session < ex_date) is
         -- only read by the dividend branch; for a split row it is
@@ -414,8 +474,8 @@ def _adjusted_params(
     include_dividends: bool,
 ) -> tuple[str, list[Any]]:
     """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
-    `t` and the bars filter (`latest_bars`), `t`, `t_session` and the
-    actions filter (`latest_actions`), and `max_prior_close_gap_sessions`
+    `t` and the bars filter (`latest_bars`), `t`, the actions filter and
+    `t_session` (`latest_actions`), and `max_prior_close_gap_sessions`
     (`event_factor`). `t` must already be validated.
 
     The gap limit only matters for a dividend, so a splits-only query
@@ -431,8 +491,8 @@ def _adjusted_params(
     params: list[Any] = [t]
     bars_filter = _security_filter(security_ids, params)
     params.append(t)
-    params.append(t_session)
     actions_filter = _security_filter(security_ids, params)
+    params.append(t_session)
     params.append(max_gap)
     return _adjusted_ctes(action_types, bars_filter, actions_filter), params
 
