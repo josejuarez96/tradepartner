@@ -17,7 +17,7 @@ import pytest
 
 from tradepartner.config import Settings
 from tradepartner.store.db import insert_row
-from tradepartner.universe import RULES, Universe, universe_as_of
+from tradepartner.universe import MISSING_DATA_REASONS, RULES, Universe, universe_as_of
 
 UNIVERSE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe"
 
@@ -252,3 +252,109 @@ def test_universe_module_has_no_numeric_literals_but_0_1_minus_1() -> None:
         and not isinstance(node.value, bool)
     }
     assert literals <= {0, 1, -1}
+
+
+def _insert_shares(
+    conn: duckdb.DuckDBPyConnection, security_id: str, class_member: str, value: float
+) -> None:
+    known = datetime(2019, 3, 1, 21, 0, tzinfo=UTC)
+    insert_row(
+        conn,
+        "facts",
+        {
+            "security_id": security_id,
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2019, 2, 28),
+            "class_member": class_member,
+            "value": value,
+            "filing_accession": "",
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_class_row_wins_over_a_total_and_is_never_summed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # quant-auditor on #136: a total and a class value on one security.
+    _insert_shares(fixture_store, "SEC_SPLIT_BETWEEN", "", 99_000_000)
+    _insert_shares(fixture_store, "SEC_SPLIT_BETWEEN", "ClassA", 16_000_000)
+    row = _member(universe_as_of(fixture_store, T_LATE, _settings()), "SEC_SPLIT_BETWEEN")
+    assert row["shares"] == pytest.approx(16_000_000)
+
+
+def test_two_class_rows_on_one_security_are_ambiguous(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert_shares(fixture_store, "SEC_SPLIT_BETWEEN", "ClassA", 16_000_000)
+    _insert_shares(fixture_store, "SEC_SPLIT_BETWEEN", "ClassB", 2_000_000)
+    excluded = _excluded(universe_as_of(fixture_store, T_LATE, _settings()))
+    assert excluded["SEC_SPLIT_BETWEEN"] == (7, "shares", "ambiguous_shares")
+
+
+def test_company_cap_counts_a_class_that_fails_liquidity(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # quant-auditor on #136: size is the company's; tradability is the
+    # class's. SEC_DUAL_B fails liquidity (its dollar volume is lower), but
+    # still counts toward the company's cap; only SEC_DUAL_A is admitted.
+    session = date(2018, 12, 17)
+    a_close, b_close = _raw_close("SEC_DUAL_A", session), _raw_close("SEC_DUAL_B", session)
+    both = universe_as_of(fixture_store, T_DUAL, _settings())
+    dv_a = both.members.filter(both.members["security_id"] == "SEC_DUAL_A")
+    assert dv_a.height == 1
+    threshold = _median_dollar_volume("SEC_DUAL_B", session) * 1.01
+    assert _median_dollar_volume("SEC_DUAL_A", session) >= threshold
+    u = universe_as_of(fixture_store, T_DUAL, _settings(min_median_dollar_volume=threshold))
+    assert _excluded(u)["SEC_DUAL_B"][:2] == (5, "liquidity")
+    row = _member(u, "SEC_DUAL_A")
+    assert row["company_cap"] == pytest.approx(10_000_000 * a_close + 4_000_000 * b_close)
+
+
+def _median_dollar_volume(security_id: str, session: date) -> float:
+    with (UNIVERSE_DIR / "prices_daily.csv").open(newline="") as fh:
+        rows = [
+            r
+            for r in csv.DictReader(fh)
+            if r["security_id"] == security_id and r["session"] <= session.isoformat()
+        ]
+    rows.sort(key=lambda r: r["session"])
+    last = rows[-20:]
+    values = sorted(float(r["close"]) * float(r["volume"]) for r in last)
+    mid = len(values) // 2
+    return (values[mid - 1] + values[mid]) / 2
+
+
+def test_no_bar_at_t_is_missing_history_not_price(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # SEC_TRUNC_DELIST: last bar 2018-05-25, Form 25 known only 2018-06-14.
+    t = datetime(2018, 6, 5, 20, 0, tzinfo=UTC)
+    excluded = _excluded(universe_as_of(fixture_store, t, _settings(min_price=1e9)))
+    assert excluded["SEC_TRUNC_DELIST"] == (6, "history", "missing_bars")
+
+
+def test_transfer_is_a_member_on_the_new_exchange_once_known(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    u = universe_as_of(fixture_store, datetime(2018, 11, 2, 20, 0, tzinfo=UTC), _settings())
+    assert _member(u, "SEC_TRANSFER")["exchange"] == "NASDAQ"
+
+
+def test_form_25_nse_ends_the_listing(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    u = universe_as_of(fixture_store, datetime(2018, 9, 28, 20, 0, tzinfo=UTC), _settings())
+    assert _excluded(u)["SEC_25NSE"] == (2, "exchange", "delisted")
+
+
+def test_missing_data_reasons_are_the_rule_1_6_7_kinds() -> None:
+    assert {
+        "unclassified",
+        "unclassifiable",
+        "missing_bars",
+        "no_shares",
+        "stale_shares",
+        "ambiguous_shares",
+    } == MISSING_DATA_REASONS

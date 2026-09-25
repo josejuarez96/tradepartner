@@ -15,9 +15,10 @@ reported once, under the first rule it fails:
    continue, so nothing enters a name on its way out.
 3. `sector`: the classification's SIC is outside every guarded
    `universe.exclude_sic_ranges` range. A missing SIC passes.
-4. `price`: the raw close of the latest bar on or before the session is at
-   least `universe.min_price` (spec "Level rules": raw close, never
-   adjusted).
+4. `price`: the raw close at the session is at least `universe.min_price`
+   (spec "Level rules": raw close, never adjusted). A name with no bar at
+   the session passes here and fails rule 6, so the gap report counts it
+   as missing data rather than as a price exclusion.
 5. `liquidity`: the median raw close x raw volume over the bars in the
    last `universe.liquidity_window` sessions is at least
    `universe.min_median_dollar_volume`. Skipped, and recorded as disabled,
@@ -25,16 +26,24 @@ reported once, under the first rule it fails:
 6. `history`: every XNYS session in the `universe.min_history_months`
    calendar months up to and including the session has a bar.
 7. `shares`: the latest `shares_outstanding` fact known at `t` is at most
-   `universe.max_shares_age_days` old at the session.
-8. `size`: companies (one `cik`) ranked by market cap, the top
-   `universe.top_n_by_cap` kept, and every class of a kept company that
-   passed rules 1-7 admitted. A class's cap is its shares, adjusted for
-   every split known at `t` with `as_of_date < ex_date <= session`, times
-   its raw close; a company's cap sums its classes that passed rules 1-7.
-   Ties rank by `cik`.
+   `universe.max_shares_age_days` old at the session. Rows sharing that
+   `as_of_date` are never summed: the one row with a class member wins
+   over an undimensioned total (`''`); two class-member rows on one
+   security are `ambiguous_shares`.
+8. `size`: companies (one `cik`) with a class that passed rules 1-7,
+   ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
+   their classes that passed rules 1-7 admitted. A class's cap is its
+   shares, adjusted for every split known at `t` with
+   `as_of_date < ex_date <= session`, times its raw close at the session.
+   A company's cap sums **every** class that passed rules 1-3, has a bar
+   at the session and passes rule 7: size is the company's, tradability
+   (rules 4-6) the class's, so a class failing liquidity or history does
+   not shrink its company (ADR 0006: "summed over all classes"). Ties rank
+   by `cik`.
 
 Rules 1, 6 and 7 are the missing-data exclusions the survivorship-gap
-report (T15) counts; each exclusion's `reason` says which kind it was.
+report (T15) counts: their reasons are `MISSING_DATA_REASONS`. Rule 1's
+other reasons (`etf`, `preferred`, ...) are not missing data.
 Every threshold comes from `settings.universe`; this module holds no
 numeric literal but 0, 1 and -1 (spec; tested by AST).
 
@@ -75,6 +84,18 @@ RULES: tuple[str, ...] = (
 
 #: The store's `fact_name` for shares outstanding (see the module docstring).
 SHARES_FACT = "shares_outstanding"
+
+#: Exclusion reasons that mean missing data (rules 1, 6, 7), for T15.
+MISSING_DATA_REASONS: frozenset[str] = frozenset(
+    {
+        "unclassified",
+        "unclassifiable",
+        "missing_bars",
+        "no_shares",
+        "stale_shares",
+        "ambiguous_shares",
+    }
+)
 
 _ACTION_KEY = ("security_id", "action_type", "ex_date")
 
@@ -227,11 +248,12 @@ def universe_as_of(
     for row in prices_as_of(conn, t, alive).iter_rows(named=True):
         if row["session"] <= session:
             bars[row["security_id"]][row["session"]] = (row["close"], row["volume"])
-    close = {sid: bars[sid][max(bars[sid])][0] for sid in alive if bars[sid]}
+    sized = list(alive)  # passed rules 1-3: the classes a company's cap may sum
+    close = {sid: bars[sid][session][0] for sid in alive if session in bars[sid]}
     apply(
         "price",
         {
-            sid: "no_bar" if sid not in close else "min_price" if close[sid] < cfg.min_price else ""
+            sid: "min_price" if close.get(sid, cfg.min_price) < cfg.min_price else ""
             for sid in alive
         },
     )
@@ -252,17 +274,29 @@ def universe_as_of(
         {sid: "" if all(s in bars[sid] for s in history) else "missing_bars" for sid in alive},
     )
 
-    latest_shares: dict[str, tuple[date, float]] = {}
-    for row in facts_as_of(conn, t, alive).iter_rows(named=True):
+    latest: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in facts_as_of(conn, t, sized).iter_rows(named=True):
         if row["fact_name"] != SHARES_FACT:
             continue
-        held = latest_shares.get(row["security_id"])
-        if held is None or row["as_of_date"] > held[0]:
-            latest_shares[row["security_id"]] = (row["as_of_date"], row["value"])
-        elif row["as_of_date"] == held[0]:
-            latest_shares[row["security_id"]] = (held[0], held[1] + row["value"])
+        held = latest[row["security_id"]]
+        if held and row["as_of_date"] < held[0]["as_of_date"]:
+            continue
+        if held and row["as_of_date"] > held[0]["as_of_date"]:
+            held.clear()
+        held.append(row)
+    latest_shares: dict[str, tuple[date, float]] = {}
+    ambiguous: set[str] = set()
+    for sid, rows in latest.items():
+        classed = [r for r in rows if r["class_member"]]
+        chosen = classed or rows
+        if len(chosen) != 1:
+            ambiguous.add(sid)
+            continue
+        latest_shares[sid] = (chosen[0]["as_of_date"], chosen[0]["value"])
 
     def shares_reason(sid: str) -> str:
+        if sid in ambiguous:
+            return "ambiguous_shares"
         if sid not in latest_shares:
             return "no_shares"
         age = (session - latest_shares[sid][0]).days
@@ -270,18 +304,21 @@ def universe_as_of(
 
     apply("shares", {sid: shares_reason(sid) for sid in alive})
 
-    splits = _split_factors(conn, t, alive, session)
+    splits = _split_factors(conn, t, sized, session)
+    capped = [sid for sid in sized if sid in close and not shares_reason(sid)]
     shares: dict[str, float] = {}
-    for sid in alive:
+    for sid in capped:
         as_of, value = latest_shares[sid]
         for ex_date, ratio in splits.get(sid, []):
             if ex_date > as_of:
                 value *= ratio
         shares[sid] = value
     company_cap: dict[str, float] = defaultdict(float)
-    for sid in alive:
+    for sid in capped:
         company_cap[securities[sid]["cik"]] += shares[sid] * close[sid]
-    ranked = sorted(company_cap, key=lambda cik: (-company_cap[cik], cik))
+    ranked = sorted(
+        {securities[sid]["cik"] for sid in alive}, key=lambda cik: (-company_cap[cik], cik)
+    )
     rank = {cik: position + 1 for position, cik in enumerate(ranked)}
     kept = set(ranked[: cfg.top_n_by_cap])
     apply("size", {sid: "" if securities[sid]["cik"] in kept else "top_n_by_cap" for sid in alive})

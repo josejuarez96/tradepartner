@@ -5,6 +5,8 @@ the store truncated to `known_at <= T`, at a probe just before and just
 after every distinct `known_at` in the fixture. Members and exclusions are
 compared whole, so a rule that read a row from after T (a later split, a
 restated fact, a delisting filed later) shows up as a difference.
+`top_n_by_cap=1` so the rule-8 cut runs at every probe (the fixture has
+far fewer than 1,000 companies).
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ def truncated(fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedSto
 def test_universe_as_of_invariant_under_truncation(
     fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
 ) -> None:
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None, universe={"top_n_by_cap": 1})
     members_seen = 0
     for t in probe_timestamps(fixture_store):
         full = universe_as_of(fixture_store, t, settings)
