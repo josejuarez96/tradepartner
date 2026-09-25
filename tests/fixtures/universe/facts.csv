@@ -1,0 +1,7 @@
+security_id,fact_name,as_of_date,class_member,value,filing_accession,known_at,ingested_at,source,provenance
+KAPPA_A,shares_outstanding,2019-02-03,ClassA,5000000,0001000012-19-000010,2019-02-06T20:00:00+00:00,2019-02-06T22:00:00+00:00,edgar,filing
+KAPPA_B,shares_outstanding,2019-02-03,ClassB,20000000,0001000012-19-000010,2019-02-06T20:00:00+00:00,2019-02-06T22:00:00+00:00,edgar,filing
+SPLIT2,shares_outstanding,2019-04-08,common,8000000,0001000014-19-000005,2019-04-11T20:00:00+00:00,2019-04-11T22:00:00+00:00,edgar,filing
+REST1,shares_outstanding,2019-01-30,common,12000000,0001000017-19-000010,2019-02-06T20:00:00+00:00,2019-02-06T22:00:00+00:00,edgar,filing
+REST1,shares_outstanding,2019-01-30,common,11750000,0001000017-19-000045,2019-03-28T20:00:00+00:00,2019-03-28T22:00:00+00:00,edgar,filing
+STALE1,shares_outstanding,2018-02-04,common,6000000,0001000018-18-000003,2018-02-14T20:00:00+00:00,2018-02-14T22:00:00+00:00,edgar,filing

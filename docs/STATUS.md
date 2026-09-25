@@ -13,12 +13,13 @@
 - Phase 2 T1: config, dependencies, calendar (PR #17)
 - Phase 2 T4: store schema, db layer, shared test loader (PR #20)
 - Phase 2 T2: raw-fetch clients (Alpaca, EDGAR) and fixture recorder, with secret/email/User-Agent scrub (PR #21)
+- Phase 2 T5: fixture universe (CSV) and generator, every spec req 13 case (PR TBD, issue #25)
 
 ## In progress
 - **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts
 
 ## Next up
-1. T5 (fixture universe) and T20 (fake broker) in parallel via `implementer`
+1. T6 (as-of primitives and truncation-invariance harness) and T20 (fake broker) in parallel via `implementer`
 2. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
 3. Decide whether to upgrade to GitHub Pro to enforce the `main` ruleset server-side
 

@@ -215,7 +215,7 @@ def test_known_at_round_trips_as_utc(fixture_store: duckdb.DuckDBPyConnection) -
     row = _minimal_row("prices_daily", known_at=now, ingested_at=now)
     insert_row(fixture_store, "prices_daily", row)
     (known_at,) = fixture_store.execute(  # type: ignore[misc]
-        "SELECT known_at FROM prices_daily"
+        "SELECT known_at FROM prices_daily WHERE security_id = 'S1'"
     ).fetchone()
     assert known_at.tzinfo is not None
     assert known_at.utcoffset() == timedelta(0)
@@ -237,7 +237,9 @@ def test_insert_row_rejects_naive_known_at(fixture_store: duckdb.DuckDBPyConnect
     row = _minimal_row("prices_daily", known_at=naive, ingested_at=_now())
     with pytest.raises(ValueError, match="known_at"):
         insert_row(fixture_store, "prices_daily", row)
-    (count,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    (count,) = fixture_store.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM prices_daily WHERE security_id = 'S1'"
+    ).fetchone()
     assert count == 0
 
 
@@ -286,7 +288,9 @@ def test_insert_row_accepts_valid_date_for_date_column(
 ) -> None:
     row = _minimal_row("prices_daily", known_at=_now(), ingested_at=_now())
     insert_row(fixture_store, "prices_daily", row)
-    (count,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    (count,) = fixture_store.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM prices_daily WHERE security_id = 'S1'"
+    ).fetchone()
     assert count == 1
 
 
@@ -364,7 +368,9 @@ def test_bar_with_later_known_at_is_a_new_row_not_rejected(
     revised["ingested_at"] = now + timedelta(days=1)
     revised["close"] = 99.0
     insert_row(fixture_store, "prices_daily", revised)
-    (count,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    (count,) = fixture_store.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM prices_daily WHERE security_id = 'S1'"
+    ).fetchone()
     assert count == 2
 
 
