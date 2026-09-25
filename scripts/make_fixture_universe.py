@@ -61,15 +61,12 @@ _SOURCE_ALPACA = "alpaca"
 _SOURCE_CONFIG = "config"
 
 # `facts.class_member` is `NOT NULL DEFAULT ''` (schema.py: '' is the
-# sentinel for an undimensioned fact). The CSV fixture loader
-# (`tests/conftest.py::load_universe_fixtures`) inserts via DuckDB's
-# `read_csv(..., all_varchar=true)`, which treats *both* an unquoted and a
-# quoted empty cell as NULL (confirmed by hand) -- so an explicit '' cannot
-# round-trip through this CSV path and would trip the NOT NULL constraint.
-# "NONE" is used here as a placeholder instead; see
-# https://github.com/josejuarez96/tradepartner/issues/28 for the loader gap
-# and tests/fixtures/universe/README.md for the note to later readers.
-_UNDIMENSIONED_CLASS_MEMBER = "NONE"
+# sentinel for an undimensioned fact). This round-trips correctly through
+# the CSV fixture loader (`tests/conftest.py::load_universe_fixtures`)
+# since issue #28's fix: `read_csv`'s `force_not_null` is passed for every
+# `VARCHAR NOT NULL` column, so a quoted-empty cell here loads as `''`
+# rather than `NULL`.
+_UNDIMENSIONED_CLASS_MEMBER = ""
 
 _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "securities": (
@@ -1027,12 +1024,6 @@ def _write_readme(path: Path, cases: list[dict[str, str]]) -> None:
             "",
             "## Notes for readers",
             "",
-            '- `facts.class_member` uses the placeholder `"NONE"` for every '
-            "undimensioned fact here, not the production `''` sentinel documented in "
-            "`schema.py` — DuckDB's CSV loader (`tests/conftest.py::load_universe_fixtures`) "
-            "turns a quoted-empty cell into `NULL` regardless, which would trip the "
-            "`NOT NULL` constraint. See "
-            "[issue #28](https://github.com/josejuarez96/tradepartner/issues/28).",
             "- Every `security_id`, listing and classification not called out in a case "
             "row above still exists to carry that case's bars/actions/facts; this table "
             "lists only the rows that make each req 13 case identifiable.",

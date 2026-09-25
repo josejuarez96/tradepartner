@@ -30,6 +30,5 @@ timestamps that exercise it, for T6-T15 authors.
 
 ## Notes for readers
 
-- `facts.class_member` uses the placeholder `"NONE"` for every undimensioned fact here, not the production `''` sentinel documented in `schema.py` — DuckDB's CSV loader (`tests/conftest.py::load_universe_fixtures`) turns a quoted-empty cell into `NULL` regardless, which would trip the `NOT NULL` constraint. See [issue #28](https://github.com/josejuarez96/tradepartner/issues/28).
 - Every `security_id`, listing and classification not called out in a case row above still exists to carry that case's bars/actions/facts; this table lists only the rows that make each req 13 case identifiable.
 - SPY and MTUM are both seeded on exchange `NYSE` for simplicity; the real listings are NYSE Arca, which is not in `universe.exchanges`.

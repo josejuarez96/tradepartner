@@ -1,5 +1,5 @@
 security_id,fact_name,as_of_date,class_member,value,filing_accession,known_at,ingested_at,source,provenance
-SEC_FACTS_RESTATED,shares_outstanding,2019-01-16,NONE,1000000,,2019-01-24T20:30:00+00:00,2019-01-24T20:40:00+00:00,edgar,filing
-SEC_FACTS_RESTATED,shares_outstanding,2019-01-16,NONE,1050000,,2019-03-29T20:30:00+00:00,2019-03-29T20:40:00+00:00,edgar,filing
-SEC_FACTS_STALE,shares_outstanding,2019-02-01,NONE,2000000,,2019-02-08T20:30:00+00:00,2019-02-08T20:40:00+00:00,edgar,filing
-SEC_SPLIT_BETWEEN,shares_outstanding,2018-10-29,NONE,5000000,,2018-10-29T20:30:00+00:00,2018-10-29T20:40:00+00:00,edgar,filing
+SEC_FACTS_RESTATED,shares_outstanding,2019-01-16,,1000000,,2019-01-24T20:30:00+00:00,2019-01-24T20:40:00+00:00,edgar,filing
+SEC_FACTS_RESTATED,shares_outstanding,2019-01-16,,1050000,,2019-03-29T20:30:00+00:00,2019-03-29T20:40:00+00:00,edgar,filing
+SEC_FACTS_STALE,shares_outstanding,2019-02-01,,2000000,,2019-02-08T20:30:00+00:00,2019-02-08T20:40:00+00:00,edgar,filing
+SEC_SPLIT_BETWEEN,shares_outstanding,2018-10-29,,5000000,,2018-10-29T20:30:00+00:00,2018-10-29T20:40:00+00:00,edgar,filing
