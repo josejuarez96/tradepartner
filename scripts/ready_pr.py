@@ -19,10 +19,11 @@ Steps, in order (each one stops the run with a reason on failure):
    it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
 4. Local checks: ruff check, ruff format --check, mypy and the fragment check always;
-   pytest only when the diff touches code, tests, scripts or dependencies (``src/``,
-   ``tests/``, ``scripts/``, ``pyproject.toml``, ``uv.lock``). CI runs the full suite on
-   every PR either way, so it stays the gate. ``--tests`` forces the local run,
-   ``--no-tests`` skips it.
+   pytest only when the diff touches code, tests, scripts, dependencies or CI (``src/``,
+   ``tests/``, ``scripts/``, ``.github/``, ``pyproject.toml``, ``uv.lock``,
+   ``.python-version``).
+   CI applies the same rule on PRs (``--tests-needed``) and runs the full suite on every
+   push to main. ``--tests`` forces the local run, ``--no-tests`` skips it.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
@@ -35,6 +36,8 @@ Usage::
     uv run python scripts/ready_pr.py 69 --dry-run            # stop before pushing
     uv run python scripts/ready_pr.py 70 --allow-shared-files # process PRs only
     uv run python scripts/ready_pr.py 69 --tests              # force local pytest
+    git diff --name-only origin/main...HEAD | python3 scripts/ready_pr.py --tests-needed
+                                                   # prints yes/no; CI gates its Tests step on it
 """
 
 from __future__ import annotations
@@ -132,9 +135,10 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "python", "scripts/fragments.py", "check"),
 )
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
-# A diff touching any of these runs pytest locally; anything else leaves it to CI.
-TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/")
-TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock")
+# A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
+# (pushes to main always run the full suite).
+TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
+TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
 CI_POLL_S = 20
 
@@ -355,7 +359,10 @@ def ready(
         _merge_main(r, main_ref, say)
 
     # 3. fragments and shared lists
-    touched = r.git("diff", "--name-only", f"{main_ref}...HEAD").splitlines()
+    # --no-renames: a file moved out of src/ must list its old path too.
+    touched = r.git(
+        "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", f"{main_ref}...HEAD"
+    ).splitlines()
     deleted = r.git("diff", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD").splitlines()
     if not allow_shared_files:
         added: list[str] = []
@@ -391,9 +398,9 @@ def ready(
     if run_tests is None:
         run_tests = tests_needed(touched)
         if not run_tests:
-            say("skipping local pytest: no code, test, script or dependency changes; CI runs it")
+            say("skipping local pytest: no code, test, script, dependency or CI changes")
     elif not run_tests:
-        say("skipping local pytest (--no-tests); CI runs it")
+        say("skipping local pytest (--no-tests); CI still runs it if the diff touches code")
     if run_tests:
         checks.append(PYTEST_CHECK)
     for cmd in checks:
@@ -587,7 +594,14 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pr", type=int, help="pull request number (its branch must be checked out)")
+    parser.add_argument(
+        "pr", type=int, nargs="?", help="pull request number (its branch must be checked out)"
+    )
+    parser.add_argument(
+        "--tests-needed",
+        action="store_true",
+        help="read changed paths from stdin, print yes if pytest must run, else no (for CI)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="stop before pushing")
     parser.add_argument(
         "--allow-shared-files",
@@ -608,7 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="tests",
         action="store_const",
         const=False,
-        help="skip local pytest (CI still runs the full suite)",
+        help="skip local pytest (CI still runs it when the diff touches code)",
     )
     parser.add_argument("--no-wait", action="store_true", help="push but do not wait for CI")
     parser.add_argument("--timeout-min", type=int, default=CI_TIMEOUT_S // 60)
@@ -616,7 +630,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.tests_needed:
+        paths = [line.strip() for line in sys.stdin if line.strip()]
+        print("yes" if tests_needed(paths) else "no")
+        return 0
+    if args.pr is None:
+        parser.error("the following arguments are required: pr")
     root = Path(
         subprocess.run(
             ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True

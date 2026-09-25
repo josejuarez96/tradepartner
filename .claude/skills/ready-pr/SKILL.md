@@ -45,11 +45,11 @@ What runs locally:
 | Check | When |
 |---|---|
 | ruff check, ruff format --check, mypy, fragment check | always |
-| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `pyproject.toml` or `uv.lock` |
+| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version` |
 
-A docs, fragment or process PR skips the local pytest run (the command prints a note). CI runs
-the full suite on every PR regardless, so it stays the gate. `--tests` forces the local run;
-`--no-tests` skips it.
+A docs, fragment or process PR skips the local pytest run (the command prints a note), and CI
+skips it on that PR too, by the same rule (`ready_pr.py --tests-needed`). Every push to main
+still runs the full suite. `--tests` forces the local run; `--no-tests` skips it.
 
 ## When it says NOT READY
 

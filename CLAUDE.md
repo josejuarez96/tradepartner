@@ -27,7 +27,7 @@ uv run python scripts/team.py start <name>  # new session: own directory + regis
 uv run python scripts/team.py status      # who holds what, ready frontier
 uv run python scripts/team.py claim T5    # or an issue number; release to give back
 ```
-Run lint, format and mypy before every push, and pytest too when the change touches `src/`, `tests/`, `scripts/`, `pyproject.toml` or `uv.lock`. CI runs the full suite on every PR.
+Run lint, format and mypy before every push, and pytest too when the change touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version`. CI applies the same pytest rule on PRs and runs the full suite on every push to main.
 
 ## Code standards
 - Python 3.12, `src/tradepartner/` layout, type hints everywhere (mypy strict), docstrings on public functions.
