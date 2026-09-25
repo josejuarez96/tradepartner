@@ -13,12 +13,17 @@ Two layers, like the other pages: `load_health_view` reads everything
 through the connection it is given (the shell's single read-only
 connection) and needs no Streamlit; `render` draws it.
 
-**Per-session series.** For each session in the chosen window, the bars
-known at `t` dated that session (`rows`), and the coverage population then:
-live common and benchmark names (`health`'s coverage rule, with each name's
-current listing at that session, as known at `t`), how many of them have
-no bar, and that share. This is ingest's staleness check (spec req 10)
-replayed over the window with what the store knows now.
+**Per-session series.** For each session s in the chosen window, from rows
+known at `t`: the bars dated s (`rows`, revisions included), and the coverage
+population then (`live`): common and benchmark names whose current listing at
+s (latest `valid_from` on or before s) was live at s, i.e. listed, or ended
+(delisted or transferred) with its `end_session` on or after s (a transfer
+with no end yet counts as live, as in `health`); how many of them have no bar
+at s (`missing`), and that share. This is ingest's staleness check (spec req
+10) replayed over the window with what the store knows now. Unlike `health`'s
+coverage at the latest session, a name delisted *later* is live on the
+sessions before its end, so a bar it lacked then shows as missing. One bars
+query and one sweep over the listings serve the whole window.
 
 **As of / last updated / stale.** "As of" is the latest `known_at` in any
 fact table at or before `t`; "last updated" the latest finish of an `ok`
@@ -42,9 +47,9 @@ import streamlit as st
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import theme
-from tradepartner.health import HealthReport, _coverage, _current_from, health_report
-from tradepartner.store.classify import classifications_as_of
-from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.health import HealthReport, health_report
+from tradepartner.store.classify import COMMON, classifications_as_of
+from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 
@@ -66,6 +71,7 @@ class HealthView:
 
     report: HealthReport
     series: pl.DataFrame
+    window: tuple[date, date] | None
     threshold: float
     as_of: datetime | None
     last_updated: datetime | None
@@ -83,29 +89,52 @@ def _window_sessions(window: tuple[date, date], last: date) -> list[date]:
     return list(sessions[bisect.bisect_left(sessions, first) : bisect.bisect_right(sessions, end)])
 
 
+def _live_at(listing: dict[str, Any], session: date) -> bool:
+    if listing["status"] == LISTED:
+        return True
+    end = listing["end_session"]
+    if end is None:
+        return bool(listing["status"] == TRANSFERRED)
+    return bool(end >= session)
+
+
 def _series(
     conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, sessions: list[date]
 ) -> pl.DataFrame:
     if not sessions:
         return pl.DataFrame(schema=_SERIES_SCHEMA)
-    counts = dict(
-        conn.execute(
-            """
-            SELECT session, count(*) FROM prices_daily
-            WHERE known_at <= ? AND session BETWEEN ? AND ? GROUP BY session
-            """,
-            [t, sessions[0], sessions[-1]],
-        ).fetchall()
-    )
-    listings = listing_ends_as_of(conn, t, settings)
+    rows_on: dict[date, int] = {}
+    with_bar: dict[date, set[str]] = {}
+    for session, sid in conn.execute(
+        """
+        SELECT session, security_id FROM prices_daily
+        WHERE known_at <= ? AND session BETWEEN ? AND ?
+        """,
+        [t, sessions[0], sessions[-1]],
+    ).fetchall():
+        rows_on[session] = rows_on.get(session, 0) + 1
+        with_bar.setdefault(session, set()).add(sid)
     securities, classes = securities_as_of(conn, t), classifications_as_of(conn, t)
-    rows = []
+    eligible = set(securities.filter(pl.col("benchmark"))["security_id"].to_list())
+    eligible |= set(classes.filter(pl.col("security_type") == COMMON)["security_id"].to_list())
+    listings = (
+        listing_ends_as_of(conn, t, settings)
+        .filter(pl.col("security_id").is_in(sorted(eligible)))
+        .sort("valid_from", "security_id")
+        .to_dicts()
+    )
+    current: dict[str, dict[str, Any]] = {}
+    next_listing = 0
+    out = []
     for session in sessions:
-        cov = _coverage(conn, t, session, _current_from(listings, session), securities, classes)
-        live, missing = len(cov.live), len(cov.missing)
-        share = missing / live if live else 0.0
-        rows.append((session, int(counts.get(session, 0)), live, missing, share))
-    return pl.DataFrame(rows, schema=_SERIES_SCHEMA, orient="row")
+        while next_listing < len(listings) and listings[next_listing]["valid_from"] <= session:
+            current[listings[next_listing]["security_id"]] = listings[next_listing]
+            next_listing += 1
+        live = {sid for sid, listing in current.items() if _live_at(listing, session)}
+        missing = len(live - with_bar.get(session, set()))
+        share = missing / len(live) if live else 0.0
+        out.append((session, rows_on.get(session, 0), len(live), missing, share))
+    return pl.DataFrame(out, schema=_SERIES_SCHEMA, orient="row")
 
 
 def _as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:
@@ -129,15 +158,18 @@ def load_health_view(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     settings: Settings,
-    window: tuple[date, date],
+    window: tuple[date, date] | None,
 ) -> HealthView:
     """The health report at `t` and the per-session series over `window` (clipped to
-    the last completed session), read through `conn` only."""
+    the last completed session; no series when None), read through `conn` only."""
     report = health_report(conn, t, settings)
     finished = [i.last_ok_finished_at for i in report.ingests if i.last_ok_finished_at]
     return HealthView(
         report=report,
-        series=_series(conn, t, settings, _window_sessions(window, report.session)),
+        series=_series(
+            conn, t, settings, [] if window is None else _window_sessions(window, report.session)
+        ),
+        window=window,
         threshold=settings.ingest.max_missing_share,
         as_of=_as_of(conn, t),
         last_updated=max(finished, default=None),
@@ -157,8 +189,11 @@ def _default_window(session: date) -> tuple[date, date]:
 
 def _header(view: HealthView) -> None:
     st.caption(f"as of {_when(view.as_of)} · last updated {_when(view.last_updated)}")
-    if view.stale_sessions:
-        theme.status_badge(f"stale: {view.stale_sessions} sessions", "warning")
+    if view.stale_sessions is None:
+        theme.status_badge("no bars yet", "warning")
+    elif view.stale_sessions:
+        plural = "" if view.stale_sessions == 1 else "s"
+        theme.status_badge(f"stale: {view.stale_sessions} session{plural}", "warning")
 
 
 def _kpis(view: HealthView) -> None:
@@ -167,7 +202,7 @@ def _kpis(view: HealthView) -> None:
     tiles = st.columns(4)
     tiles[0].metric(
         "Coverage",
-        f"{cov.share:.1%}",
+        f"{cov.share:.1%}" if cov.live else "n/a",
         help=f"{len(cov.live) - len(cov.missing)} of {len(cov.live)} live names "
         f"have a bar on {cov.session}",
     )
@@ -184,8 +219,7 @@ def _hero(view: HealthView, palette: theme.Palette) -> None:
     with st.container(border=True):
         st.subheader("Missing share per session")
         st.caption(f"Dashed line: ingest.max_missing_share = {view.threshold:.1%}")
-        if view.series.is_empty():
-            st.caption("No sessions in the chosen window.")
+        if _no_chart(view):
             return
         base = alt.Chart(view.series.to_pandas())
         bars = base.mark_bar(**theme.bar_mark(palette)).encode(
@@ -207,11 +241,23 @@ def _hero(view: HealthView, palette: theme.Palette) -> None:
         st.altair_chart(theme.style(bars + rule, palette), theme=None, width="stretch")
 
 
+def _no_chart(view: HealthView) -> bool:
+    """Say why there is nothing to plot, if so: a page never draws an empty frame."""
+    if view.window is None:
+        st.caption("Pick an end date for the window.")
+    elif view.series.is_empty():
+        st.caption("No sessions in the chosen window.")
+    elif not (view.series["rows"].sum() or view.series["live"].sum()):
+        st.caption("No bars or live names in the chosen window.")
+    else:
+        return False
+    return True
+
+
 def _bars_card(view: HealthView, palette: theme.Palette) -> None:
     with st.container(border=True):
         st.subheader("Bars per session")
-        if view.series.is_empty():
-            st.caption("No sessions in the chosen window.")
+        if _no_chart(view):
             return
         chart = (
             alt.Chart(view.series.to_pandas())
@@ -305,11 +351,9 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     picked = controls.date_input(
         "Window", value=_default_window(last_completed_session(t)), key="health_window"
     )
-    window = tuple(picked) if isinstance(picked, tuple | list) else (picked, picked)
-    if len(window) != 2:
-        st.caption("Pick an end date for the window.")
-        return
-    view = load_health_view(conn, t, settings, (window[0], window[1]))
+    picked_dates = list(picked) if isinstance(picked, tuple | list) else [picked]
+    window = (picked_dates[0], picked_dates[1]) if len(picked_dates) == 2 else None
+    view = load_health_view(conn, t, settings, window)
     with controls:
         _header(view)
     palette = theme.palette()

@@ -87,7 +87,6 @@ def _text(at: AppTest) -> str:
     parts += [h.value for h in at.subheader]
     parts += [f"{m.label} {m.value}" for m in at.metric]
     parts += [e.value for kind in (at.info, at.warning, at.error, at.success) for e in kind]
-    parts += [str(b.proto) for b in at.get("badge")]
     return "\n".join(str(p) for p in parts)
 
 
@@ -134,11 +133,54 @@ def test_series_rows_and_missing_share(store_path: Path) -> None:
     assert row["missing_share"] == pytest.approx(expected)
 
 
+def _write(store_path: Path, sql: str, params: list[Any]) -> None:
+    with duckdb.connect(str(store_path)) as conn:
+        configure_connection(conn)
+        conn.execute(sql, params)
+
+
+def _rows_on(view: health_page.HealthView, session: date) -> dict[str, Any]:
+    [row] = view.series.filter(view.series["session"] == session).to_dicts()
+    return row
+
+
 def test_series_reads_only_bars_known_at_t(store_path: Path) -> None:
-    early = session_close(LAST) - timedelta(hours=1)  # before the last session's bars
+    day = date(2020, 6, 29)
+    late = T + timedelta(days=1)
+    # A revision of an existing bar, first known after T.
+    _write(
+        store_path,
+        """
+        INSERT INTO prices_daily
+        SELECT security_id, session, open, high, low, close + 1, volume, ?, ?, source, provenance
+        FROM prices_daily WHERE session = ? ORDER BY security_id LIMIT 1
+        """,
+        [late, late, day],
+    )
+    settings = _settings(store_path)
     with _connect(store_path) as conn:
-        view = health_page.load_health_view(conn, early, _settings(store_path), WINDOW)
-    assert LAST not in view.series["session"].to_list()
+        at_t = health_page.load_health_view(conn, T, settings, WINDOW)
+        after = health_page.load_health_view(conn, late + timedelta(hours=1), settings, WINDOW)
+    assert _rows_on(after, day)["rows"] == _rows_on(at_t, day)["rows"] + 1
+
+
+def test_a_name_delisted_later_is_live_before_its_end(store_path: Path) -> None:
+    """SEC_WINDOW_DELIST is delisted at T (last bar 2019-06-24) but was live in June 2019:
+    a bar it lacks then is missing."""
+    day, window = date(2019, 6, 5), (date(2019, 6, 3), date(2019, 6, 7))
+    settings = _settings(store_path)
+    with _connect(store_path) as conn:
+        before = _rows_on(health_page.load_health_view(conn, T, settings, window), day)
+    _write(
+        store_path,
+        "DELETE FROM prices_daily WHERE security_id = ? AND session = ?",
+        ["SEC_WINDOW_DELIST", day],
+    )
+    with _connect(store_path) as conn:
+        after = _rows_on(health_page.load_health_view(conn, T, settings, window), day)
+    assert after["live"] == before["live"]
+    assert after["missing"] == before["missing"] + 1
+    assert after["rows"] == before["rows"] - 1
 
 
 def test_as_of_last_updated_and_staleness(store_path: Path) -> None:
@@ -219,6 +261,7 @@ def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path:
     at = _app(monkeypatch, store_path, now=later)
     assert not at.exception
     assert "stale: 4 sessions" in _text(at)
+    assert ":orange-badge[" in _text(at)
     assert "stale:" not in _text(_app(monkeypatch, store_path))
 
 
@@ -231,6 +274,19 @@ def test_render_empty_store_has_no_warning(monkeypatch: pytest.MonkeyPatch, tmp_
     assert not at.exception
     assert not (at.warning or at.info or at.error)
     assert "never" in _text(at)
+    assert "no bars yet" in _text(at)
+    assert not at.get("arrow_vega_lite_chart")  # no empty chart frames
+
+
+def test_a_half_picked_window_keeps_the_rest_of_the_page(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    at = _app(monkeypatch, store_path)
+    at.date_input(key="health_window").set_value((date(2020, 6, 1),)).run()
+    assert not at.exception
+    text = _text(at)
+    assert "as of" in text and "Integrity checks" in text
+    assert "Pick an end date" in text
 
 
 def test_page_reads_only_through_the_shells_connection(
