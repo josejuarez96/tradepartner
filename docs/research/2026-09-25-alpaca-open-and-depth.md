@@ -83,8 +83,11 @@ All three probes are **owner-run with keys**. They use the free plan's SIP histo
 ```python
 from datetime import date
 from tradepartner.adapters import alpaca_raw
+
 SYMS = ["AAPL", "KO", "MNST", "ISRG", "NVDA", "TSLA", "GE"]
-out = {y: alpaca_raw.corporate_actions(SYMS, date(y, 1, 1), date(y, 12, 31)) for y in range(2016, 2026)}
+out = {
+    y: alpaca_raw.corporate_actions(SYMS, date(y, 1, 1), date(y, 12, 31)) for y in range(2016, 2026)
+}
 ```
 If a year errors with a range or limit message, split it into quarters and record the error text verbatim. The wrapper already passes `limit=None`, so the 1,000-row cap does not apply.
 
