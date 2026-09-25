@@ -1,0 +1,164 @@
+Description:           Master Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    March 31, 2024
+Comments:              <scrubbed>
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+
+
+
+
+Form Type   Company Name                                                  CIK         Date Filed  File Name
+---------------------------------------------------------------------------------------------------------------------------------------------
+1                24X National Exchange LLC                                     1931336     2024-02-06  edgar/data/1931336/9999999997-24-000391.txt         
+1-A              AC Partners, Inc.                                             1133116     2024-01-30  edgar/data/1133116/0001683168-24-000531.txt         
+10-K             Alphabet Inc.                                                 1652044     2024-01-31  edgar/data/1652044/0001652044-24-000022.txt         
+10-K             KLX Energy Services Holdings, Inc.                            1738827     2024-03-08  edgar/data/1738827/0001738827-24-000038.txt         
+10-Q             Apple Inc.                                                    320193      2024-02-02  edgar/data/320193/0000320193-24-000006.txt          
+13F-HR           Alphabet Inc.                                                 1652044     2024-02-09  edgar/data/1652044/0001652044-24-000034.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-02  edgar/data/1652044/0001950047-24-000063.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-03  edgar/data/1652044/0001950047-24-000115.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-03  edgar/data/1652044/0001950047-24-000118.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-10  edgar/data/1652044/0001973141-24-000026.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-11  edgar/data/1652044/0001973141-24-000028.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-17  edgar/data/1652044/0001950047-24-000351.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-17  edgar/data/1652044/0001950047-24-000352.txt         
+144              Alphabet Inc.                                                 1652044     2024-01-30  edgar/data/1652044/0001921094-24-000080.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-07  edgar/data/1652044/0001950047-24-000722.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-07  edgar/data/1652044/0001950047-24-000723.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-12  edgar/data/1652044/0001973141-24-000102.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-20  edgar/data/1652044/0001950047-24-001142.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-21  edgar/data/1652044/0001950047-24-001225.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-21  edgar/data/1652044/0001950047-24-001228.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-26  edgar/data/1652044/0001950047-24-001413.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-26  edgar/data/1652044/0001950047-24-001414.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-27  edgar/data/1652044/0001950047-24-001463.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-27  edgar/data/1652044/0001950047-24-001467.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-28  edgar/data/1652044/0001950047-24-001501.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-28  edgar/data/1652044/0001950047-24-001502.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-29  edgar/data/1652044/0001921094-24-000278.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-29  edgar/data/1652044/0001950047-24-001547.txt         
+144              Alphabet Inc.                                                 1652044     2024-02-29  edgar/data/1652044/0001950047-24-001564.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-06  edgar/data/1652044/0001950047-24-001950.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-06  edgar/data/1652044/0001950047-24-001951.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-08  edgar/data/1652044/0001950047-24-002099.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-12  edgar/data/1652044/0001973141-24-000171.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-14  edgar/data/1652044/0001968582-24-000222.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-14  edgar/data/1652044/0001968582-24-000223.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-14  edgar/data/1652044/0001968582-24-000224.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-18  edgar/data/1652044/0001973141-24-000184.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-20  edgar/data/1652044/0001950047-24-002573.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-20  edgar/data/1652044/0001950047-24-002574.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-27  edgar/data/1652044/0001950047-24-002720.txt         
+144              Alphabet Inc.                                                 1652044     2024-03-28  edgar/data/1652044/0001921094-24-000486.txt         
+144              Apple Inc.                                                    320193      2024-02-29  edgar/data/320193/0001921094-24-000276.txt          
+25-NSE           Apple Inc.                                                    320193      2024-01-17  edgar/data/320193/0001354457-24-000017.txt          
+3                Alphabet Inc.                                                 1652044     2024-02-29  edgar/data/1652044/0001415889-24-005874.txt         
+3                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000032.txt          
+3                KLX Energy Services Holdings, Inc.                            1738827     2024-03-08  edgar/data/1738827/0001738827-24-000033.txt         
+3/A              KLX Energy Services Holdings, Inc.                            1738827     2024-03-08  edgar/data/1738827/0001738827-24-000036.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-02  edgar/data/1652044/0001209191-24-000150.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-03  edgar/data/1652044/0001209191-24-000278.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-04  edgar/data/1652044/0001209191-24-000683.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-04  edgar/data/1652044/0001209191-24-000702.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-10  edgar/data/1652044/0001209191-24-001401.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-12  edgar/data/1652044/0001209191-24-001498.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-17  edgar/data/1652044/0001209191-24-001796.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-26  edgar/data/1652044/0001209191-24-002324.txt         
+4                Alphabet Inc.                                                 1652044     2024-01-30  edgar/data/1652044/0001209191-24-002451.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-01  edgar/data/1652044/0001209191-24-002588.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-08  edgar/data/1652044/0001209191-24-002998.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-09  edgar/data/1652044/0001209191-24-003059.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-09  edgar/data/1652044/0001209191-24-003063.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-09  edgar/data/1652044/0001209191-24-003065.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-09  edgar/data/1652044/0001209191-24-003067.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001209191-24-003209.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001209191-24-003227.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-22  edgar/data/1652044/0001209191-24-003823.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-22  edgar/data/1652044/0001209191-24-003845.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-23  edgar/data/1652044/0001209191-24-003905.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-27  edgar/data/1652044/0001209191-24-004023.txt         
+4                Alphabet Inc.                                                 1652044     2024-02-29  edgar/data/1652044/0001209191-24-004133.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-04  edgar/data/1652044/0001209191-24-004226.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-06  edgar/data/1652044/0001209191-24-004611.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-08  edgar/data/1652044/0001209191-24-004707.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-08  edgar/data/1652044/0001209191-24-004710.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-12  edgar/data/1652044/0001209191-24-004784.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-19  edgar/data/1652044/0001209191-24-004957.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-20  edgar/data/1652044/0001209191-24-005015.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-26  edgar/data/1652044/0001209191-24-005083.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-26  edgar/data/1652044/0001209191-24-005086.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-26  edgar/data/1652044/0001209191-24-005090.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-26  edgar/data/1652044/0001209191-24-005092.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-26  edgar/data/1652044/0001209191-24-005094.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-26  edgar/data/1652044/0001209191-24-005096.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-29  edgar/data/1652044/0001209191-24-005132.txt         
+4                Alphabet Inc.                                                 1652044     2024-03-29  edgar/data/1652044/0001209191-24-005134.txt         
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000015.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000016.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000017.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000018.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000019.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000020.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000021.txt          
+4                Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0000320193-24-000022.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000033.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000034.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000035.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000036.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000037.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000038.txt          
+4                Apple Inc.                                                    320193      2024-03-01  edgar/data/320193/0000320193-24-000039.txt          
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0000950170-24-010936.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000008.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000009.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000010.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000011.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000012.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000014.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000016.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000018.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-02-02  edgar/data/1738827/0001738827-24-000019.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-03-04  edgar/data/1738827/0001738827-24-000025.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-03-08  edgar/data/1738827/0001738827-24-000034.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-03-13  edgar/data/1738827/0000905148-24-000931.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-03-15  edgar/data/1738827/0001738827-24-000040.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-03-15  edgar/data/1738827/0001738827-24-000042.txt         
+4                KLX Energy Services Holdings, Inc.                            1738827     2024-03-15  edgar/data/1738827/0001738827-24-000044.txt         
+5                Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001209191-24-003215.txt         
+5                Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001209191-24-003260.txt         
+5                Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001209191-24-003267.txt         
+5                Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001209191-24-003289.txt         
+8-K              Alphabet Inc.                                                 1652044     2024-01-30  edgar/data/1652044/0001652044-24-000014.txt         
+8-K              Alphabet Inc.                                                 1652044     2024-02-08  edgar/data/1652044/0001652044-24-000032.txt         
+8-K              Apple Inc.                                                    320193      2024-02-01  edgar/data/320193/0000320193-24-000005.txt          
+8-K              Apple Inc.                                                    320193      2024-02-28  edgar/data/320193/0001140361-24-010155.txt          
+8-K              KLX Energy Services Holdings, Inc.                            1738827     2024-02-26  edgar/data/1738827/0001738827-24-000023.txt         
+8-K              KLX Energy Services Holdings, Inc.                            1738827     2024-03-06  edgar/data/1738827/0001738827-24-000027.txt         
+8-K              KLX Energy Services Holdings, Inc.                            1738827     2024-03-06  edgar/data/1738827/0001738827-24-000030.txt         
+ARS              KLX Energy Services Holdings, Inc.                            1738827     2024-03-25  edgar/data/1738827/0001193125-24-076625.txt         
+CORRESP          Apple Inc.                                                    320193      2024-03-20  edgar/data/320193/0000320193-24-000042.txt          
+DEF 14A          Apple Inc.                                                    320193      2024-01-11  edgar/data/320193/0001308179-24-000010.txt          
+DEF 14A          KLX Energy Services Holdings, Inc.                            1738827     2024-03-25  edgar/data/1738827/0001193125-24-076605.txt         
+DEFA14A          Apple Inc.                                                    320193      2024-01-11  edgar/data/320193/0001308179-24-000011.txt          
+DEFA14A          KLX Energy Services Holdings, Inc.                            1738827     2024-03-25  edgar/data/1738827/0001193125-24-076616.txt         
+IRANNOTICE       Alphabet Inc.                                                 1652044     2024-01-31  edgar/data/1652044/0001652044-24-000024.txt         
+PRE 14A          KLX Energy Services Holdings, Inc.                            1738827     2024-03-12  edgar/data/1738827/0001193125-24-065009.txt         
+PX14A6G          Apple Inc.                                                    320193      2024-01-22  edgar/data/320193/0001214659-24-001028.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-01  edgar/data/320193/0001096906-24-000145.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-01  edgar/data/320193/0001096906-24-000147.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-01  edgar/data/320193/0001096906-24-000148.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-01  edgar/data/320193/0001096906-24-000149.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-02  edgar/data/320193/0001096906-24-000151.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-05  edgar/data/320193/0001096906-24-000156.txt          
+PX14A6G          Apple Inc.                                                    320193      2024-02-09  edgar/data/320193/0001096906-24-000181.txt          
+SC 13G/A         Alphabet Inc.                                                 1652044     2024-02-01  edgar/data/1652044/0001086364-24-006080.txt         
+SC 13G/A         Alphabet Inc.                                                 1652044     2024-02-12  edgar/data/1652044/0001086364-24-006965.txt         
+SC 13G/A         Alphabet Inc.                                                 1652044     2024-02-12  edgar/data/1652044/0001193125-24-032286.txt         
+SC 13G/A         Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001104659-24-020000.txt         
+SC 13G/A         Alphabet Inc.                                                 1652044     2024-02-13  edgar/data/1652044/0001104659-24-020001.txt         
+SC 13G/A         Alphabet Inc.                                                 1652044     2024-02-14  edgar/data/1652044/0001193125-24-036532.txt         
+SC 13G/A         Apple Inc.                                                    320193      2024-02-12  edgar/data/320193/0001086364-24-006980.txt          
+SC 13G/A         Apple Inc.                                                    320193      2024-02-13  edgar/data/320193/0001104659-24-020009.txt          
+SC 13G/A         Apple Inc.                                                    320193      2024-02-14  edgar/data/320193/0001193125-24-036431.txt          
+SC 13G/A         KLX Energy Services Holdings, Inc.                            1738827     2024-02-13  edgar/data/1738827/0001214659-24-002479.txt         
+SD               Apple Inc.                                                    320193      2024-03-27  edgar/data/320193/0001140361-24-015633.txt          
+UPLOAD           Apple Inc.                                                    320193      2024-03-06  edgar/data/320193/0000000000-24-002512.txt          

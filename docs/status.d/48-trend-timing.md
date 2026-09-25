@@ -1,0 +1,1 @@
+- #48 Research G3: independent evidence on trend timing graded MIXED, at best marginal; the closest-transfer out-of-sample, net-of-cost test (Zakamulin 2014, S&P 1930–2012, 0.5% one-way) finds at most a +7% Sharpe gain with lower return and no significance (PR #82, [report](research/2026-09-25-trend-timing.md))

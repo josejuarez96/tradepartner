@@ -1,0 +1,1 @@
+- #49 Research G4: combining published anomaly signals, graded MIXED; relative net-of-cost benefit over a single signal, absolute large/mid-cap edge near zero since 2003, long-only untested; report INCOMPLETE (abstract-level sources) ([report](research/2026-09-25-g4-signal-combination.md))

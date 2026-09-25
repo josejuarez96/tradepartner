@@ -25,14 +25,17 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import duckdb
 import polars as pl
 import pytest
 
+from tradepartner.config import AdjustConfig, Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import (
     adjusted_prices_as_of,
+    dropped_dividends_as_of,
     facts_as_of,
     listings_as_of,
     prices_as_of,
@@ -528,6 +531,262 @@ class TestAdjustedPricesAsOfSynthetic:
         assert _one(adjusted, session=s4)["close"] == pytest.approx(25.0)
 
 
+def _gap_settings(max_gap: int) -> Settings:
+    """Settings with `adjust.max_prior_close_gap_sessions = max_gap`, no `.env`."""
+    return Settings(_env_file=None, adjust=AdjustConfig(max_prior_close_gap_sessions=max_gap))
+
+
+class TestDividendPriorCloseStaleness:
+    """Issue #72: the dividend prior-close ASOF fallback is bounded by
+    `adjust.max_prior_close_gap_sessions`, counted in XNYS sessions. A
+    prior bar further back leaves the dividend unapplied (NULL factor) and
+    `dropped_dividends_as_of` reports it."""
+
+    T = datetime(2021, 3, 1, tzinfo=UTC)
+
+    def _gap_scenario(self, conn: duckdb.DuckDBPyConnection, amount: float = 5.0) -> None:
+        # Only known bar before the 2021-01-11 ex-date is 2021-01-04. XNYS
+        # sessions in [01-04, 01-11): 04, 05, 06, 07, 08 -> gap of 5.
+        _bar(conn, "SEC_GAP", date(2021, 1, 4), 50.0, known_at=datetime(2021, 1, 4, 21, tzinfo=UTC))
+        _bar(
+            conn, "SEC_GAP", date(2021, 1, 11), 45.0, known_at=datetime(2021, 1, 11, 21, tzinfo=UTC)
+        )
+        _action(
+            conn,
+            "SEC_GAP",
+            "dividend",
+            date(2021, 1, 11),
+            amount,
+            known_at=datetime(2021, 1, 8, 21, tzinfo=UTC),
+        )
+
+    def test_prior_bar_exactly_at_the_limit_is_used(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._gap_scenario(synthetic_store)
+        adjusted = adjusted_prices_as_of(
+            synthetic_store, self.T, include_dividends=True, settings=_gap_settings(5)
+        )
+        assert _one(adjusted, session=date(2021, 1, 4))["close"] == pytest.approx(50.0 * 0.9)
+        dropped = dropped_dividends_as_of(synthetic_store, self.T, settings=_gap_settings(5))
+        assert dropped.height == 0
+
+    def test_prior_bar_one_session_past_the_limit_is_not_used(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._gap_scenario(synthetic_store)
+        adjusted = adjusted_prices_as_of(
+            synthetic_store, self.T, include_dividends=True, settings=_gap_settings(4)
+        )
+        assert _one(adjusted, session=date(2021, 1, 4))["close"] == pytest.approx(50.0)
+        dropped = dropped_dividends_as_of(synthetic_store, self.T, settings=_gap_settings(4))
+        row = _one(dropped, security_id="SEC_GAP")
+        assert row["ex_date"] == date(2021, 1, 11)
+        assert row["prior_session"] == date(2021, 1, 4)
+        assert row["gap_sessions"] == 5
+        assert row["reason"] == "stale_prior_bar"
+
+    def test_stale_prior_close_below_amount_does_not_raise(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # The stale close (50.0) is below the amount: used as-is it would
+        # make the factor negative and fail the whole query. Once it is
+        # out of bounds the dividend is dropped instead.
+        self._gap_scenario(synthetic_store, amount=60.0)
+        adjusted = adjusted_prices_as_of(
+            synthetic_store, self.T, include_dividends=True, settings=_gap_settings(4)
+        )
+        assert _one(adjusted, session=date(2021, 1, 4))["close"] == pytest.approx(50.0)
+
+    def test_gap_counts_xnys_sessions_not_weekdays(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # 2021-01-18 is MLK Day (XNYS closed). Sessions in [01-14, 01-19):
+        # 14, 15 -> gap 2. Counting weekdays would give 3 and drop it.
+        sid = "SEC_HOLIDAY"
+        _bar(
+            synthetic_store,
+            sid,
+            date(2021, 1, 14),
+            20.0,
+            known_at=datetime(2021, 1, 14, 21, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(2021, 1, 19),
+            1.0,
+            known_at=datetime(2021, 1, 15, 21, tzinfo=UTC),
+        )
+        adjusted = adjusted_prices_as_of(
+            synthetic_store, self.T, include_dividends=True, settings=_gap_settings(2)
+        )
+        assert _one(adjusted, session=date(2021, 1, 14))["close"] == pytest.approx(19.0)
+
+    def test_dividend_with_no_prior_bar_is_reported(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "SEC_NO_PRIOR"
+        _bar(
+            synthetic_store,
+            sid,
+            date(2021, 1, 11),
+            45.0,
+            known_at=datetime(2021, 1, 11, 21, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(2021, 1, 11),
+            1.0,
+            known_at=datetime(2021, 1, 8, 21, tzinfo=UTC),
+        )
+        row = _one(dropped_dividends_as_of(synthetic_store, self.T), security_id=sid)
+        assert row["reason"] == "no_prior_bar"
+        assert row["prior_session"] is None
+        assert row["gap_sessions"] is None
+
+    def test_dropped_dividends_respects_known_at_and_ex_date(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Before the dividend is known, and after it is known but before
+        # its ex-date, it is not a drop: it does not apply yet at all.
+        self._gap_scenario(synthetic_store)
+        cfg = _gap_settings(4)
+        before_known = datetime(2021, 1, 8, 20, tzinfo=UTC)
+        before_ex = datetime(2021, 1, 10, 12, tzinfo=UTC)
+        assert dropped_dividends_as_of(synthetic_store, before_known, settings=cfg).height == 0
+        assert dropped_dividends_as_of(synthetic_store, before_ex, settings=cfg).height == 0
+
+    def test_dropped_dividends_filters_security_ids(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._gap_scenario(synthetic_store)
+        cfg = _gap_settings(4)
+        assert dropped_dividends_as_of(synthetic_store, self.T, ["OTHER"], settings=cfg).height == 0
+        assert dropped_dividends_as_of(synthetic_store, self.T, [], settings=cfg).height == 0
+        assert (
+            dropped_dividends_as_of(synthetic_store, self.T, ["SEC_GAP"], settings=cfg).height == 1
+        )
+
+    def test_immediately_prior_session_is_a_gap_of_one(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "SEC_GAP_ONE"
+        _bar(
+            synthetic_store,
+            sid,
+            date(2021, 1, 8),
+            50.0,
+            known_at=datetime(2021, 1, 8, 21, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(2021, 1, 11),
+            5.0,
+            known_at=datetime(2021, 1, 8, 22, tzinfo=UTC),
+        )
+        adjusted = adjusted_prices_as_of(
+            synthetic_store, self.T, include_dividends=True, settings=_gap_settings(1)
+        )
+        assert _one(adjusted, session=date(2021, 1, 8))["close"] == pytest.approx(45.0)
+
+    def test_prior_bar_before_calendar_start_is_dropped_not_undercounted(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Quant-auditor on PR #79: the calendar starts 1990-01-02, so a
+        # 1985 bar has no session index. It must not count as if it were
+        # on the first calendar session (gap 2 here).
+        sid = "SEC_PRE_CALENDAR"
+        _bar(
+            synthetic_store,
+            sid,
+            date(1985, 6, 3),
+            50.0,
+            known_at=datetime(1985, 6, 3, 21, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(1990, 1, 4),
+            1.0,
+            known_at=datetime(1990, 1, 3, 21, tzinfo=UTC),
+        )
+        t = datetime(1990, 2, 1, tzinfo=UTC)
+        adjusted = adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+        assert _one(adjusted, session=date(1985, 6, 3))["close"] == pytest.approx(50.0)
+        row = _one(dropped_dividends_as_of(synthetic_store, t), security_id=sid)
+        assert row["reason"] == "outside_calendar_range"
+        assert row["gap_sessions"] is None
+
+    def test_ex_date_before_calendar_start_is_outside_range(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "SEC_PRE_CALENDAR_EX"
+        _bar(
+            synthetic_store,
+            sid,
+            date(1989, 6, 2),
+            50.0,
+            known_at=datetime(1989, 6, 2, 21, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(1989, 6, 5),
+            1.0,
+            known_at=datetime(1989, 6, 2, 22, tzinfo=UTC),
+        )
+        row = _one(dropped_dividends_as_of(synthetic_store, self.T), security_id=sid)
+        assert row["reason"] == "outside_calendar_range"
+
+    def test_ex_date_after_calendar_end_is_outside_range(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # The calendar ends 2035-12-31; a 2036 ex-date must not be counted
+        # against the last configured session.
+        sid = "SEC_POST_CALENDAR"
+        _bar(
+            synthetic_store,
+            sid,
+            date(2035, 12, 31),
+            50.0,
+            known_at=datetime(2035, 12, 31, 22, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(2036, 1, 2),
+            1.0,
+            known_at=datetime(2035, 12, 31, 23, tzinfo=UTC),
+        )
+        t = datetime(2036, 2, 1, tzinfo=UTC)
+        row = _one(dropped_dividends_as_of(synthetic_store, t), security_id=sid)
+        assert row["reason"] == "outside_calendar_range"
+
+    def test_dropped_dividends_raises_on_negative_amount_like_adjusted(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Quant-auditor NIT: a negative amount is bad data, not a drop;
+        # both functions must agree and raise.
+        self._gap_scenario(synthetic_store, amount=-1.0)
+        with pytest.raises(ValueError, match="SEC_GAP"):
+            dropped_dividends_as_of(synthetic_store, self.T, settings=_gap_settings(4))
+
+    def test_dropped_dividends_bare_date_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        with pytest.raises(TypeError):
+            dropped_dividends_as_of(synthetic_store, date(2021, 3, 1))  # type: ignore[arg-type]
+
+
 class TestFactsAsOf:
     def test_restated_shares_fact_returns_earlier_then_later_value(
         self, fixture_store: duckdb.DuckDBPyConnection
@@ -584,3 +843,45 @@ class TestListingsAsOf:
     def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
         with pytest.raises(TypeError):
             listings_as_of(fixture_store, date(2020, 1, 15))  # type: ignore[arg-type]
+
+
+def test_dividend_queries_work_on_a_read_only_connection_and_drop_their_view(
+    tmp_path: Path,
+) -> None:
+    """Safety-reviewer NIT on PR #79: the sessions view is registered on the
+    caller's connection, which may be read-only, and must be gone after
+    every call, including one that raises."""
+    path = str(tmp_path / "store.duckdb")
+    conn = duckdb.connect(path)
+    configure_connection(conn)
+    schema.init_schema(conn)
+    known = datetime(2021, 1, 8, 22, tzinfo=UTC)
+    _bar(conn, "SEC_RO", date(2021, 1, 8), 50.0, known_at=known)
+    _action(conn, "SEC_RO", "dividend", date(2021, 1, 11), 5.0, known_at=known)
+    _bar(conn, "SEC_RO_BAD", date(2021, 1, 8), 50.0, known_at=known)
+    conn.close()
+
+    t = datetime(2021, 3, 1, tzinfo=UTC)
+    ro = duckdb.connect(path, read_only=True)
+    try:
+        configure_connection(ro)
+        adjusted = adjusted_prices_as_of(ro, t, include_dividends=True)
+        assert _one(adjusted, session=date(2021, 1, 8), security_id="SEC_RO")[
+            "close"
+        ] == pytest.approx(45.0)
+        assert dropped_dividends_as_of(ro, t).height == 0
+        with pytest.raises(duckdb.CatalogException):
+            ro.execute("SELECT * FROM _asof_xnys_sessions")
+    finally:
+        ro.close()
+
+    rw = duckdb.connect(path)
+    try:
+        configure_connection(rw)
+        _action(rw, "SEC_RO_BAD", "dividend", date(2021, 1, 11), -1.0, known_at=known)
+        with pytest.raises(ValueError, match="SEC_RO_BAD"):
+            adjusted_prices_as_of(rw, t, include_dividends=True)
+        with pytest.raises(duckdb.CatalogException):
+            rw.execute("SELECT * FROM _asof_xnys_sessions")
+    finally:
+        rw.close()

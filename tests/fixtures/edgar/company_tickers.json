@@ -1,0 +1,1246 @@
+{
+  "data": [
+    [
+      1045810,
+      "NVIDIA CORP",
+      "NVDA",
+      "Nasdaq"
+    ],
+    [
+      320193,
+      "Apple Inc.",
+      "AAPL",
+      "Nasdaq"
+    ],
+    [
+      1652044,
+      "Alphabet Inc.",
+      "GOOGL",
+      "Nasdaq"
+    ],
+    [
+      789019,
+      "MICROSOFT CORP",
+      "MSFT",
+      "Nasdaq"
+    ],
+    [
+      1018724,
+      "AMAZON COM INC",
+      "AMZN",
+      "Nasdaq"
+    ],
+    [
+      1326801,
+      "Meta Platforms, Inc.",
+      "META",
+      "Nasdaq"
+    ],
+    [
+      1730168,
+      "Broadcom Inc.",
+      "AVGO",
+      "Nasdaq"
+    ],
+    [
+      1318605,
+      "Tesla, Inc.",
+      "TSLA",
+      "Nasdaq"
+    ],
+    [
+      723125,
+      "MICRON TECHNOLOGY INC",
+      "MU",
+      "Nasdaq"
+    ],
+    [
+      1067983,
+      "BERKSHIRE HATHAWAY INC",
+      "BRK-B",
+      "NYSE"
+    ],
+    [
+      59478,
+      "ELI LILLY & Co",
+      "LLY",
+      "NYSE"
+    ],
+    [
+      2488,
+      "ADVANCED MICRO DEVICES INC",
+      "AMD",
+      "Nasdaq"
+    ],
+    [
+      19617,
+      "JPMORGAN CHASE & CO",
+      "JPM",
+      "NYSE"
+    ],
+    [
+      104169,
+      "Walmart Inc.",
+      "WMT",
+      "Nasdaq"
+    ],
+    [
+      1403161,
+      "VISA INC.",
+      "V",
+      "NYSE"
+    ],
+    [
+      937966,
+      "ASML HOLDING NV",
+      "ASML",
+      "Nasdaq"
+    ],
+    [
+      2115436,
+      "ExxonMobil Holdings Corp",
+      "XOM",
+      "NYSE"
+    ],
+    [
+      200406,
+      "JOHNSON & JOHNSON",
+      "JNJ",
+      "NYSE"
+    ],
+    [
+      50863,
+      "INTEL CORP",
+      "INTC",
+      "Nasdaq"
+    ],
+    [
+      1141391,
+      "Mastercard Inc",
+      "MA",
+      "NYSE"
+    ],
+    [
+      1551152,
+      "AbbVie Inc.",
+      "ABBV",
+      "NYSE"
+    ],
+    [
+      1341439,
+      "ORACLE CORP",
+      "ORCL",
+      "NYSE"
+    ],
+    [
+      1321655,
+      "Palantir Technologies Inc.",
+      "PLTR",
+      "Nasdaq"
+    ],
+    [
+      858877,
+      "CISCO SYSTEMS, INC.",
+      "CSCO",
+      "Nasdaq"
+    ],
+    [
+      93410,
+      "CHEVRON CORP",
+      "CVX",
+      "NYSE"
+    ],
+    [
+      909832,
+      "COSTCO WHOLESALE CORP /NEW",
+      "COST",
+      "Nasdaq"
+    ],
+    [
+      70858,
+      "BANK OF AMERICA CORP /DE/",
+      "BAC",
+      "NYSE"
+    ],
+    [
+      707549,
+      "LAM RESEARCH CORP",
+      "LRCX",
+      "Nasdaq"
+    ],
+    [
+      21344,
+      "COCA COLA CO",
+      "KO",
+      "NYSE"
+    ],
+    [
+      310158,
+      "Merck & Co., Inc.",
+      "MRK",
+      "NYSE"
+    ],
+    [
+      6951,
+      "APPLIED MATERIALS INC /DE",
+      "AMAT",
+      "Nasdaq"
+    ],
+    [
+      18230,
+      "CATERPILLAR INC",
+      "CAT",
+      "NYSE"
+    ],
+    [
+      1973239,
+      "ARM HOLDINGS PLC /UK",
+      "ARM",
+      "Nasdaq"
+    ],
+    [
+      1571996,
+      "Dell Technologies Inc.",
+      "DELL",
+      "NYSE"
+    ],
+    [
+      1089113,
+      "HSBC HOLDINGS PLC",
+      "HSBC",
+      "NYSE"
+    ],
+    [
+      80424,
+      "PROCTER & GAMBLE Co",
+      "PG",
+      "NYSE"
+    ],
+    [
+      731766,
+      "UNITEDHEALTH GROUP INC",
+      "UNH",
+      "NYSE"
+    ],
+    [
+      40545,
+      "GENERAL ELECTRIC CO",
+      "GE",
+      "NYSE"
+    ],
+    [
+      895421,
+      "MORGAN STANLEY",
+      "MS",
+      "NYSE"
+    ],
+    [
+      1327567,
+      "Palo Alto Networks Inc",
+      "PANW",
+      "Nasdaq"
+    ],
+    [
+      354950,
+      "HOME DEPOT, INC.",
+      "HD",
+      "NYSE"
+    ],
+    [
+      2070829,
+      "Contemporary Amperex Technology Co., Limited/ADR",
+      "CYATY",
+      "OTC"
+    ],
+    [
+      1065280,
+      "NETFLIX INC",
+      "NFLX",
+      "Nasdaq"
+    ],
+    [
+      1413329,
+      "Philip Morris International Inc.",
+      "PM",
+      "NYSE"
+    ],
+    [
+      1577552,
+      "Alibaba Group Holding Ltd",
+      "BABA",
+      "NYSE"
+    ],
+    [
+      1000275,
+      "ROYAL BANK OF CANADA",
+      "RY",
+      "NYSE"
+    ],
+    [
+      886982,
+      "GOLDMAN SACHS GROUP INC",
+      "GS",
+      "NYSE"
+    ],
+    [
+      2023554,
+      "Sandisk Corp",
+      "SNDK",
+      "Nasdaq"
+    ],
+    [
+      1114448,
+      "NOVARTIS AG",
+      "NVS",
+      "NYSE"
+    ],
+    [
+      1306965,
+      "Shell plc",
+      "SHEL",
+      "NYSE"
+    ],
+    [
+      901832,
+      "ASTRAZENECA PLC",
+      "AZN",
+      "NYSE"
+    ],
+    [
+      67088,
+      "MITSUBISHI UFJ FINANCIAL GROUP INC",
+      "MUFG",
+      "NYSE"
+    ],
+    [
+      101829,
+      "RTX Corp",
+      "RTX",
+      "NYSE"
+    ],
+    [
+      1596532,
+      "Arista Networks, Inc.",
+      "ANET",
+      "NYSE"
+    ],
+    [
+      1535527,
+      "CrowdStrike Holdings, Inc.",
+      "CRWD",
+      "Nasdaq"
+    ],
+    [
+      1996810,
+      "GE Vernova Inc.",
+      "GEV",
+      "NYSE"
+    ],
+    [
+      72971,
+      "WELLS FARGO & COMPANY/MN",
+      "WFC",
+      "NYSE"
+    ],
+    [
+      97476,
+      "TEXAS INSTRUMENTS INC",
+      "TXN",
+      "Nasdaq"
+    ],
+    [
+      97745,
+      "THERMO FISHER SCIENTIFIC INC.",
+      "TMO",
+      "NYSE"
+    ],
+    [
+      319201,
+      "KLA CORP",
+      "KLAC",
+      "Nasdaq"
+    ],
+    [
+      1000184,
+      "SAP SE",
+      "SAP",
+      "NYSE"
+    ],
+    [
+      1835632,
+      "Marvell Technology, Inc.",
+      "MRVL",
+      "Nasdaq"
+    ],
+    [
+      1094517,
+      "TOYOTA MOTOR CORP/",
+      "TM",
+      "NYSE"
+    ],
+    [
+      831001,
+      "CITIGROUP INC",
+      "C",
+      "NYSE"
+    ],
+    [
+      811809,
+      "BHP Group Ltd",
+      "BHP",
+      "NYSE"
+    ],
+    [
+      318154,
+      "AMGEN INC",
+      "AMGN",
+      "Nasdaq"
+    ],
+    [
+      51143,
+      "INTERNATIONAL BUSINESS MACHINES CORP",
+      "IBM",
+      "NYSE"
+    ],
+    [
+      1707925,
+      "LINDE PLC",
+      "LIN",
+      "Nasdaq"
+    ],
+    [
+      891478,
+      "Banco Santander, S.A.",
+      "SAN",
+      "NYSE"
+    ],
+    [
+      804328,
+      "QUALCOMM INC/DE",
+      "QCOM",
+      "Nasdaq"
+    ],
+    [
+      1137789,
+      "Seagate Technology Holdings plc",
+      "STX",
+      "Nasdaq"
+    ],
+    [
+      4962,
+      "AMERICAN EXPRESS CO",
+      "AXP",
+      "NYSE"
+    ],
+    [
+      820313,
+      "AMPHENOL CORP /DE/",
+      "APH",
+      "NYSE"
+    ],
+    [
+      947263,
+      "TORONTO DOMINION BANK",
+      "TD",
+      "NYSE"
+    ],
+    [
+      879764,
+      "TotalEnergies SE",
+      "TTE",
+      "NYSE"
+    ],
+    [
+      732712,
+      "VERIZON COMMUNICATIONS INC",
+      "VZ",
+      "NYSE"
+    ],
+    [
+      1594805,
+      "SHOPIFY INC.",
+      "SHOP",
+      "Nasdaq"
+    ],
+    [
+      1108524,
+      "Salesforce, Inc.",
+      "CRM",
+      "NYSE"
+    ],
+    [
+      882095,
+      "GILEAD SCIENCES, INC.",
+      "GILD",
+      "Nasdaq"
+    ],
+    [
+      315189,
+      "DEERE & CO",
+      "DE",
+      "NYSE"
+    ],
+    [
+      6281,
+      "ANALOG DEVICES INC",
+      "ADI",
+      "Nasdaq"
+    ],
+    [
+      887028,
+      "RIO TINTO LTD",
+      "RTNTF",
+      "OTC"
+    ],
+    [
+      1800,
+      "ABBOTT LABORATORIES",
+      "ABT",
+      "NYSE"
+    ],
+    [
+      1744489,
+      "Walt Disney Co",
+      "DIS",
+      "NYSE"
+    ],
+    [
+      77476,
+      "PEPSICO INC",
+      "PEP",
+      "Nasdaq"
+    ],
+    [
+      63908,
+      "MCDONALDS CORP",
+      "MCD",
+      "NYSE"
+    ],
+    [
+      316709,
+      "SCHWAB CHARLES CORP",
+      "SCHW",
+      "NYSE"
+    ],
+    [
+      1001838,
+      "SOUTHERN COPPER CORP/",
+      "SCCO",
+      "NYSE"
+    ],
+    [
+      2012383,
+      "BlackRock, Inc.",
+      "BLK",
+      "NYSE"
+    ],
+    [
+      353278,
+      "NOVO NORDISK A S",
+      "NVO",
+      "NYSE"
+    ],
+    [
+      1283699,
+      "T-Mobile US, Inc.",
+      "TMUS",
+      "Nasdaq"
+    ],
+    [
+      732717,
+      "AT&T INC.",
+      "T",
+      "NYSE"
+    ],
+    [
+      1551182,
+      "Eaton Corp plc",
+      "ETN",
+      "NYSE"
+    ],
+    [
+      766704,
+      "WELLTOWER INC.",
+      "WELL",
+      "NYSE"
+    ],
+    [
+      106040,
+      "WESTERN DIGITAL CORP",
+      "WDC",
+      "Nasdaq"
+    ],
+    [
+      1022837,
+      "SUMITOMO MITSUI FINANCIAL GROUP, INC.",
+      "SMFG",
+      "NYSE"
+    ],
+    [
+      753308,
+      "NEXTERA ENERGY INC",
+      "NEE",
+      "NYSE"
+    ],
+    [
+      100885,
+      "UNION PACIFIC CORP",
+      "UNP",
+      "NYSE"
+    ],
+    [
+      47710,
+      "HITACHI LTD",
+      "HTHIY",
+      "OTC"
+    ],
+    [
+      863064,
+      "RIO TINTO PLC",
+      "RIO",
+      "NYSE"
+    ],
+    [
+      78003,
+      "PFIZER INC",
+      "PFE",
+      "NYSE"
+    ],
+    [
+      842180,
+      "BANCO BILBAO VIZCAYA ARGENTARIA, S.A.",
+      "BBVA",
+      "NYSE"
+    ],
+    [
+      1158838,
+      "ADVANTEST CORP",
+      "ATEYY",
+      "OTC"
+    ],
+    [
+      12927,
+      "BOEING CO",
+      "BA",
+      "NYSE"
+    ],
+    [
+      1381197,
+      "Interactive Brokers Group, Inc.",
+      "IBKR",
+      "Nasdaq"
+    ],
+    [
+      313616,
+      "DANAHER CORP /DE/",
+      "DHR",
+      "NYSE"
+    ],
+    [
+      1668717,
+      "Anheuser-Busch InBev SA/NV",
+      "BUD",
+      "NYSE"
+    ],
+    [
+      1163165,
+      "CONOCOPHILLIPS",
+      "COP",
+      "NYSE"
+    ],
+    [
+      1610520,
+      "UBS Group AG",
+      "UBS",
+      "NYSE"
+    ],
+    [
+      946770,
+      "DEUTSCHE TELEKOM AG",
+      "DTEGY",
+      "OTC"
+    ],
+    [
+      1393818,
+      "Blackstone Inc.",
+      "BX",
+      "NYSE"
+    ],
+    [
+      1035267,
+      "INTUITIVE SURGICAL INC",
+      "ISRG",
+      "Nasdaq"
+    ],
+    [
+      109198,
+      "TJX COMPANIES INC /DE/",
+      "TJX",
+      "NYSE"
+    ],
+    [
+      1830056,
+      "Siemens Energy AG/ADR",
+      "SMERY",
+      "OTC"
+    ],
+    [
+      1543151,
+      "Uber Technologies, Inc",
+      "UBER",
+      "NYSE"
+    ],
+    [
+      1373715,
+      "ServiceNow, Inc.",
+      "NOW",
+      "NYSE"
+    ],
+    [
+      24741,
+      "CORNING INC /NY",
+      "GLW",
+      "NYSE"
+    ],
+    [
+      313838,
+      "Sony Group Corp",
+      "SONY",
+      "NYSE"
+    ],
+    [
+      217410,
+      "UNILEVER PLC",
+      "UL",
+      "NYSE"
+    ],
+    [
+      1164727,
+      "NEWMONT Corp /DE/",
+      "NEM",
+      "NYSE"
+    ],
+    [
+      1119639,
+      "PETROBRAS - PETROLEO BRASILEIRO SA",
+      "PBR",
+      "NYSE"
+    ],
+    [
+      875320,
+      "VERTEX PHARMACEUTICALS INC / MA",
+      "VRTX",
+      "Nasdaq"
+    ],
+    [
+      1335730,
+      "MIZUHO FINANCIAL GROUP INC",
+      "MFG",
+      "NYSE"
+    ],
+    [
+      1045609,
+      "Prologis, Inc.",
+      "PLD",
+      "NYSE"
+    ],
+    [
+      896159,
+      "Chubb Ltd",
+      "CB",
+      "NYSE"
+    ],
+    [
+      1262039,
+      "Fortinet, Inc.",
+      "FTNT",
+      "Nasdaq"
+    ],
+    [
+      14272,
+      "BRISTOL MYERS SQUIBB CO",
+      "BMY",
+      "NYSE"
+    ],
+    [
+      1477333,
+      "Cloudflare, Inc.",
+      "NET",
+      "NYSE"
+    ],
+    [
+      927628,
+      "CAPITAL ONE FINANCIAL CORP",
+      "COF",
+      "NYSE"
+    ],
+    [
+      927971,
+      "BANK OF MONTREAL /CAN/",
+      "BMO",
+      "NYSE"
+    ],
+    [
+      76334,
+      "Parker-Hannifin Corp",
+      "PH",
+      "NYSE"
+    ],
+    [
+      1075531,
+      "Booking Holdings Inc.",
+      "BKNG",
+      "Nasdaq"
+    ],
+    [
+      1144967,
+      "HDFC BANK LTD",
+      "HDB",
+      "NYSE"
+    ],
+    [
+      936468,
+      "LOCKHEED MARTIN CORP",
+      "LMT",
+      "NYSE"
+    ],
+    [
+      1303523,
+      "British American Tobacco p.l.c.",
+      "BTI",
+      "NYSE"
+    ],
+    [
+      80661,
+      "PROGRESSIVE CORP/OH/",
+      "PGR",
+      "NYSE"
+    ],
+    [
+      1640147,
+      "Snowflake Inc.",
+      "SNOW",
+      "NYSE"
+    ],
+    [
+      64040,
+      "S&P Global Inc.",
+      "SPGI",
+      "NYSE"
+    ],
+    [
+      1122411,
+      "ASE Technology Holding Co., Ltd.",
+      "ASX",
+      "NYSE"
+    ],
+    [
+      1613103,
+      "Medtronic plc",
+      "MDT",
+      "NYSE"
+    ],
+    [
+      9631,
+      "BANK OF NOVA SCOTIA",
+      "BNS",
+      "NYSE"
+    ],
+    [
+      764180,
+      "ALTRIA GROUP, INC.",
+      "MO",
+      "NYSE"
+    ],
+    [
+      1737806,
+      "PDD Holdings Inc.",
+      "PDD",
+      "Nasdaq"
+    ],
+    [
+      1467373,
+      "Accenture plc",
+      "ACN",
+      "NYSE"
+    ],
+    [
+      1510295,
+      "Marathon Petroleum Corp",
+      "MPC",
+      "NYSE"
+    ],
+    [
+      64803,
+      "CVS HEALTH Corp",
+      "CVS",
+      "NYSE"
+    ],
+    [
+      1035002,
+      "VALERO ENERGY CORP/TX",
+      "VLO",
+      "NYSE"
+    ],
+    [
+      1783879,
+      "Robinhood Markets, Inc.",
+      "HOOD",
+      "Nasdaq"
+    ],
+    [
+      313807,
+      "BP PLC",
+      "BP",
+      "NYSE"
+    ],
+    [
+      60667,
+      "LOWES COMPANIES INC",
+      "LOW",
+      "NYSE"
+    ],
+    [
+      1751008,
+      "AppLovin Corp",
+      "APP",
+      "Nasdaq"
+    ],
+    [
+      829224,
+      "STARBUCKS CORP",
+      "SBUX",
+      "Nasdaq"
+    ],
+    [
+      8670,
+      "AUTOMATIC DATA PROCESSING INC",
+      "ADP",
+      "Nasdaq"
+    ],
+    [
+      895728,
+      "ENBRIDGE INC",
+      "ENB",
+      "NYSE"
+    ],
+    [
+      831259,
+      "FREEPORT-MCMORAN INC",
+      "FCX",
+      "NYSE"
+    ],
+    [
+      310764,
+      "STRYKER CORP",
+      "SYK",
+      "NYSE"
+    ],
+    [
+      1101239,
+      "EQUINIX INC",
+      "EQIX",
+      "Nasdaq"
+    ],
+    [
+      1534701,
+      "Phillips 66",
+      "PSX",
+      "NYSE"
+    ],
+    [
+      1045520,
+      "CANADIAN IMPERIAL BANK OF COMMERCE /CAN/",
+      "CM",
+      "NYSE"
+    ],
+    [
+      927653,
+      "MCKESSON CORP",
+      "MCK",
+      "NYSE"
+    ],
+    [
+      1039765,
+      "ING GROEP NV",
+      "ING",
+      "NYSE"
+    ],
+    [
+      1390777,
+      "Bank of New York Mellon Corp",
+      "BNY",
+      "NYSE"
+    ],
+    [
+      1639920,
+      "Spotify Technology S.A.",
+      "SPOT",
+      "NYSE"
+    ],
+    [
+      2809,
+      "AGNICO EAGLE MINES LTD",
+      "AEM",
+      "NYSE"
+    ],
+    [
+      1121404,
+      "Sanofi",
+      "SNY",
+      "Nasdaq"
+    ],
+    [
+      1131399,
+      "GSK plc",
+      "GSK",
+      "NYSE"
+    ],
+    [
+      1103838,
+      "ICICI BANK LTD",
+      "IBN",
+      "NYSE"
+    ],
+    [
+      1169486,
+      "TOKIO MARINE HOLDINGS, INC.",
+      "TKOMY",
+      "OTC"
+    ],
+    [
+      1140625,
+      "EQUINOR ASA",
+      "EQNR",
+      "NYSE"
+    ],
+    [
+      1017413,
+      "CANADIAN NATURAL RESOURCES Ltd",
+      "CNQ",
+      "NYSE"
+    ],
+    [
+      92122,
+      "SOUTHERN CO",
+      "SO",
+      "NYSE"
+    ],
+    [
+      1674101,
+      "Vertiv Holdings Co",
+      "VRT",
+      "NYSE"
+    ],
+    [
+      1050915,
+      "QUANTA SERVICES, INC.",
+      "PWR",
+      "NYSE"
+    ],
+    [
+      1156375,
+      "CME GROUP INC.",
+      "CME",
+      "Nasdaq"
+    ],
+    [
+      1559720,
+      "Airbnb, Inc.",
+      "ABNB",
+      "Nasdaq"
+    ],
+    [
+      1466258,
+      "Trane Technologies plc",
+      "TT",
+      "NYSE"
+    ],
+    [
+      860730,
+      "HCA Healthcare, Inc.",
+      "HCA",
+      "NYSE"
+    ],
+    [
+      796343,
+      "ADOBE INC.",
+      "ADBE",
+      "Nasdaq"
+    ],
+    [
+      1868275,
+      "Constellation Energy Corp",
+      "CEG",
+      "Nasdaq"
+    ],
+    [
+      2039784,
+      "Midea Group Co., Ltd./ADR",
+      "MGCLY",
+      "OTC"
+    ],
+    [
+      40533,
+      "GENERAL DYNAMICS CORP",
+      "GD",
+      "NYSE"
+    ],
+    [
+      1132597,
+      "Itau Unibanco Holding S.A.",
+      "ITUB",
+      "NYSE"
+    ],
+    [
+      36104,
+      "US BANCORP DE",
+      "USB",
+      "NYSE"
+    ],
+    [
+      1099590,
+      "MERCADOLIBRE INC",
+      "MELI",
+      "Nasdaq"
+    ],
+    [
+      1404912,
+      "KKR & Co. Inc.",
+      "KKR",
+      "NYSE"
+    ],
+    [
+      713676,
+      "PNC FINANCIAL SERVICES GROUP, INC.",
+      "PNC",
+      "NYSE"
+    ],
+    [
+      1326160,
+      "Duke Energy CORP",
+      "DUK",
+      "NYSE"
+    ],
+    [
+      1048286,
+      "MARRIOTT INTERNATIONAL INC /MD/",
+      "MAR",
+      "Nasdaq"
+    ],
+    [
+      4281,
+      "Howmet Aerospace Inc.",
+      "HWM",
+      "NYSE"
+    ],
+    [
+      1107457,
+      "INFINEON TECHNOLOGIES AG",
+      "IFNNY",
+      "OTC"
+    ],
+    [
+      1561550,
+      "Datadog, Inc.",
+      "DDOG",
+      "Nasdaq"
+    ],
+    [
+      833444,
+      "Johnson Controls International plc",
+      "JCI",
+      "NYSE"
+    ],
+    [
+      865752,
+      "Monster Beverage Corp",
+      "MNST",
+      "Nasdaq"
+    ],
+    [
+      1156039,
+      "Elevance Health, Inc.",
+      "ELV",
+      "NYSE"
+    ],
+    [
+      107263,
+      "WILLIAMS COMPANIES, INC.",
+      "WMB",
+      "NYSE"
+    ],
+    [
+      2098326,
+      "Sany Heavy Industries Co., Ltd./ADR",
+      "SNHIY",
+      "OTC"
+    ],
+    [
+      66740,
+      "3M CO",
+      "MMM",
+      "NYSE"
+    ],
+    [
+      32604,
+      "EMERSON ELECTRIC CO",
+      "EMR",
+      "NYSE"
+    ],
+    [
+      1571949,
+      "Intercontinental Exchange, Inc.",
+      "ICE",
+      "NYSE"
+    ],
+    [
+      277948,
+      "CSX CORP",
+      "CSX",
+      "Nasdaq"
+    ],
+    [
+      1738827,
+      "KLX Energy Services Holdings, Inc.",
+      "KLXE",
+      "Nasdaq"
+    ],
+    [
+      884394,
+      "SPDR S&P 500 ETF TRUST",
+      "SPY",
+      "NYSE"
+    ],
+    [
+      1652044,
+      "Alphabet Inc.",
+      "GOOG",
+      "Nasdaq"
+    ],
+    [
+      1652044,
+      "Alphabet Inc.",
+      "GOOGM",
+      "Nasdaq"
+    ],
+    [
+      1652044,
+      "Alphabet Inc.",
+      "GOOGN",
+      "Nasdaq"
+    ],
+    [
+      1738827,
+      "KLX Energy Services Holdings, Inc.",
+      "KLXER",
+      "Nasdaq"
+    ]
+  ],
+  "fields": [
+    "cik",
+    "name",
+    "ticker",
+    "exchange"
+  ]
+}
