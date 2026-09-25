@@ -311,7 +311,7 @@ def test_page_is_in_the_shell_navigation(
     store_path, _ = seeded_store
     at = _app(monkeypatch, store_path)
     assert not at.exception
-    assert at.sidebar.radio[0].options == ["Data health", "Backtest"]
+    assert at.sidebar.radio[0].options == ["Data health", "Backtest", "Trial registry"]
 
 
 def test_render_detailed_trial_shows_every_element(
