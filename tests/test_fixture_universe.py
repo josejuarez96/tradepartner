@@ -96,7 +96,9 @@ def test_delisting_with_truncated_history_exceeds_gap_threshold(
     (filed_at,) = _q(fixture_store, "SELECT filed_at FROM delistings WHERE security_id = 'TRUNC1'")[
         0
     ]
-    reference_session = tp_calendar.previous_session(filed_at.date())
+    # `last_completed_session`, not a bare `.date()` cast, per store/schema.py's
+    # module docstring: the filing is an instant, not a date.
+    reference_session = tp_calendar.last_completed_session(filed_at)
     gap = 0
     cursor = last_bar
     while cursor < reference_session:
@@ -114,7 +116,7 @@ def test_delisting_within_gap_threshold_is_not_missing(
     (filed_at,) = _q(fixture_store, "SELECT filed_at FROM delistings WHERE security_id = 'NEARN1'")[
         0
     ]
-    reference_session = tp_calendar.previous_session(filed_at.date())
+    reference_session = tp_calendar.last_completed_session(filed_at)
     gap = 0
     cursor = last_bar
     while cursor < reference_session:
@@ -132,7 +134,7 @@ def test_clean_merger_last_bar_is_session_before_filing(
     (filed_at,) = _q(fixture_store, "SELECT filed_at FROM delistings WHERE security_id = 'MRGR1'")[
         0
     ]
-    assert last_bar == tp_calendar.previous_session(filed_at.date())
+    assert last_bar == tp_calendar.last_completed_session(filed_at)
 
 
 def test_form_25_nse_present(fixture_store: duckdb.DuckDBPyConnection) -> None:
@@ -365,6 +367,46 @@ def test_benchmarks_seeded_with_bars_and_dividends(
             [security_id],
         )[0]
         assert dividend_count > 0
+
+
+def test_control_group_satisfies_universe_rules_6_and_7_at_a_shared_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """PLAIN1, PLAIN2 and CTRL1 (a control group that later delists) each
+    have a bar on *every* session in the 12 calendar months before, and a
+    shares_outstanding fact aged <= max_shares_age_days as of, a shared T —
+    i.e. rules 6 and 7 (ADR 0006) are jointly satisfiable, not just
+    structurally present. A first draft gave every case's own bars a tight
+    window around its own event only, with no security anywhere satisfying
+    both rules at once — `universe_as_of` would have been empty at every T
+    (quant-auditor finding, PR #34). This guards against that regressing.
+    """
+    t = tp_calendar.last_session_of_month(2019, 3)
+    history = tp_calendar.sessions_in_month_window(t, get_settings().universe.min_history_months)
+    for security_id in ("PLAIN1", "PLAIN2", "CTRL1"):
+        sessions = {
+            row[0]
+            for row in _q(
+                fixture_store,
+                "SELECT session FROM prices_daily WHERE security_id = ?",
+                [security_id],
+            )
+        }
+        missing = [session for session in history if session not in sessions]
+        assert not missing, f"{security_id} is missing bars for {missing[:5]}..."
+        (known_at,) = _q(
+            fixture_store,
+            "SELECT MAX(known_at) FROM facts WHERE security_id = ? AND known_at <= ?",
+            [security_id, tp_calendar.session_close(t)],
+        )[0]
+        assert known_at is not None
+        age_days = (t - known_at.date()).days
+        assert age_days <= get_settings().universe.max_shares_age_days
+    # CTRL1 delists after T, so it can leave the universe in a later probe.
+    (filed_at,) = _q(fixture_store, "SELECT filed_at FROM delistings WHERE security_id = 'CTRL1'")[
+        0
+    ]
+    assert filed_at.date() > t
 
 
 # --- (d) bars sit only on real sessions, known_at is the calendar close ----

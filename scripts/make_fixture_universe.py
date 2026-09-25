@@ -345,9 +345,20 @@ class Universe:
                     writer.writerow([_fmt(row.get(c)) for c in header])
 
 
-def _dt(day: date, hour: int = 20, minute: int = 0) -> datetime:
-    """An acceptance/fetch instant on `day`, tz-aware UTC. `hour`/`minute`
-    default to a plausible after-close EDGAR acceptance time."""
+def _dt(day: date, hour: int = 18, minute: int = 30) -> datetime:
+    """An acceptance/fetch instant on `day`, tz-aware UTC.
+
+    Defaults to 18:30 UTC — mid-afternoon US Eastern in both DST states
+    (13:30/14:30 ET) and, crucially, always *before* that session's close
+    (20:00 UTC in summer, 21:00 UTC in winter). A default of "the close" or
+    later would make `tp_calendar.last_completed_session(filed_at)` treat
+    the filing's own session as already completed in summer but not in
+    winter — the exact bare-date-cast trap `store/schema.py`'s module
+    docstring warns `delistings.py` (T8b) away from, just reached through
+    the *time* component instead of a date cast. A safely pre-close instant
+    makes `last_completed_session(filed_at) == previous_session(filed_at.date())`
+    always, regardless of season.
+    """
     return datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
 
 
@@ -367,8 +378,14 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
     # still land every date this file's comments and the fixture README
     # name; only the *volume* of otherwise-unused filler bars was cut.
 
-    # --- Two plain, uneventful commons: statistical filler and a control
-    # group for later tasks' universe/as-of tests. ---------------------
+    # --- The universe-rule control group: continuous bars (valid_from ==
+    # first bar, no dangling "listed but no data" period) covering *every*
+    # session in the 12 calendar months before, and several month-ends
+    # after, idx252 — so `universe_as_of` rules 1-8 (min_history_months=12,
+    # max_shares_age_days=400 kept fresh by two facts) can actually admit
+    # these names at more than one T. Two plain commons plus CTRL1, which
+    # later delists cleanly (proves a name can qualify, then leave the
+    # universe, exactly as T13/T15 need). ---------------------------------
     for sid, cik, name, ticker, exch, sic, price in (
         ("PLAIN1", "0001000001", "Plain Consolidated Inc", "PLN1", "NASDAQ", 7372, 40.0),
         ("PLAIN2", "0001000002", "Plain Industries Corp", "PLN2", "NYSE", 3674, 65.0),
@@ -376,36 +393,64 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
         u.security(sid, cik, name, known_at=_dt(s[0]))
         u.listing(sid, ticker, exch, s[0], known_at=_dt(s[0]))
         u.classification(sid, "common", "sic_default", known_at=_dt(s[0]), sic=sic)
-        u.bars(sid, s[0:150], price)
+        u.bars(sid, s[0:330], price)
+        for fact_idx, value in ((0, 6_000_000), (260, 6_100_000)):
+            u.fact(
+                sid,
+                "shares_outstanding",
+                s[fact_idx] - timedelta(days=3),
+                value,
+                known_at=_dt(s[fact_idx]),
+                class_member="common",
+                filing_accession=f"{cik}-19-00000{fact_idx // 100 + 1}",
+            )
+
+    u.security("CTRL1", "0001000021", "Control Group Delisted Co", known_at=_dt(s[0]))
+    u.listing("CTRL1", "CTRL", "NASDAQ", s[0], known_at=_dt(s[0]))
+    u.classification("CTRL1", "common", "sic_default", known_at=_dt(s[0]), sic=2836)
+    u.bars("CTRL1", s[0:330], 24.0)
+    u.fact(
+        "CTRL1",
+        "shares_outstanding",
+        s[200] - timedelta(days=3),
+        5_500_000,
+        known_at=_dt(s[200]),
+        class_member="common",
+        filing_accession="0001000021-19-000001",
+    )
+    u.delisting("CTRL1", "25", "Common Stock", "NASDAQ", _dt(s[330]))
 
     # --- Delisting with truncated history (last bar > gap.missing_tail_
-    # sessions before the last session before the Form 25 filing). ----
-    u.security("TRUNC1", "0001000003", "Truncated Holdings Inc", known_at=_dt(s[0]))
-    u.listing("TRUNC1", "TRNC", "NASDAQ", s[0], known_at=_dt(s[0]))
-    u.classification("TRUNC1", "common", "sic_default", known_at=_dt(s[0]), sic=2836)
-    u.bars("TRUNC1", s[0:150], 22.0)
+    # sessions before the last session before the Form 25 filing). Bars
+    # are a short window ending exactly at the last-bar index the gap
+    # arithmetic below depends on (idx149) — no case here needs a longer
+    # history, so valid_from matches the window's own start. -------------
+    u.security("TRUNC1", "0001000003", "Truncated Holdings Inc", known_at=_dt(s[120]))
+    u.listing("TRUNC1", "TRNC", "NASDAQ", s[120], known_at=_dt(s[120]))
+    u.classification("TRUNC1", "common", "sic_default", known_at=_dt(s[120]), sic=2836)
+    u.bars("TRUNC1", s[120:150], 22.0)
     u.delisting("TRUNC1", "25", "Common Stock", "NASDAQ", _dt(s[179]))
 
     # --- Delisting within N (not missing). -----------------------------
-    u.security("NEARN1", "0001000004", "Near Merger Co", known_at=_dt(s[0]))
-    u.listing("NEARN1", "NEAR", "NYSE", s[0], known_at=_dt(s[0]))
-    u.classification("NEARN1", "common", "sic_default", known_at=_dt(s[0]), sic=2836)
-    u.bars("NEARN1", s[0:150], 18.0)
+    u.security("NEARN1", "0001000004", "Near Merger Co", known_at=_dt(s[120]))
+    u.listing("NEARN1", "NEAR", "NYSE", s[120], known_at=_dt(s[120]))
+    u.classification("NEARN1", "common", "sic_default", known_at=_dt(s[120]), sic=2836)
+    u.bars("NEARN1", s[120:150], 18.0)
     u.delisting("NEARN1", "25", "Common Stock", "NYSE", _dt(s[153]))
 
     # --- Clean merger: last bar the session before the filing (not
     # missing, per spec req 13). ----------------------------------------
-    u.security("MRGR1", "0001000005", "Merger Target Inc", known_at=_dt(s[0]))
-    u.listing("MRGR1", "MRGR", "NYSE", s[0], known_at=_dt(s[0]))
-    u.classification("MRGR1", "common", "sic_default", known_at=_dt(s[0]), sic=2836)
-    u.bars("MRGR1", s[0:150], 51.0)
+    u.security("MRGR1", "0001000005", "Merger Target Inc", known_at=_dt(s[120]))
+    u.listing("MRGR1", "MRGR", "NYSE", s[120], known_at=_dt(s[120]))
+    u.classification("MRGR1", "common", "sic_default", known_at=_dt(s[120]), sic=2836)
+    u.bars("MRGR1", s[120:150], 51.0)
     u.delisting("MRGR1", "25", "Common Stock", "NYSE", _dt(s[150]))
 
     # --- Form 25-NSE. -----------------------------------------------------
-    u.security("NSE1", "0001000006", "NSE Exit Corp", known_at=_dt(s[0]))
-    u.listing("NSE1", "NSEX", "NYSE_AMERICAN", s[0], known_at=_dt(s[0]))
-    u.classification("NSE1", "common", "sic_default", known_at=_dt(s[0]), sic=3663)
-    u.bars("NSE1", s[0:200], 12.0)
+    u.security("NSE1", "0001000006", "NSE Exit Corp", known_at=_dt(s[170]))
+    u.listing("NSE1", "NSEX", "NYSE_AMERICAN", s[170], known_at=_dt(s[170]))
+    u.classification("NSE1", "common", "sic_default", known_at=_dt(s[170]), sic=3663)
+    u.bars("NSE1", s[170:200], 12.0)
     u.delisting("NSE1", "25-NSE", "Common Stock", "NYSE_AMERICAN", _dt(s[200]))
 
     # --- Form 25 on a non-common class; the common survives. ------------
@@ -413,7 +458,11 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
     u.listing("ZETA_COM", "ZETA", "NASDAQ", s[0], known_at=_dt(s[0]), class_title="Common Stock")
     u.classification("ZETA_COM", "common", "sic_default", known_at=_dt(s[0]), sic=6022)
     # Extends well past ZETA_PFD's idx-300 delisting (proves the common
-    # survives) and covers idx226 (2018-11-23, the half day).
+    # survives) and covers idx226 (2018-11-23, the half day). No Form 25 of
+    # its own — ZETA_COM simply has no *recorded* bars past idx340 in this
+    # fixture (a documented data-coverage boundary, not a delisting); it is
+    # not part of the rule-6/7 control group (PLAIN1/PLAIN2/CTRL1 above),
+    # so it should not be picked as a `universe_as_of` probe at a late T.
     u.bars("ZETA_COM", s[0:340], 30.0)
     u.security("ZETA_PFD", "0001000007", "Zeta Capital Inc", known_at=_dt(s[0]))
     u.listing(
@@ -433,27 +482,29 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
     # (a probe T between the two known_at values sees "delisted"; T7/T8b
     # will exercise the derivation). Bars are continuous under one
     # security_id across the move. ---------------------------------------
-    u.security("XFER1", "0001000008", "Transfer Systems Inc", known_at=_dt(s[0]))
-    u.listing("XFER1", "XFR", "NYSE", s[0], known_at=_dt(s[0]))
-    u.classification("XFER1", "common", "sic_default", known_at=_dt(s[0]), sic=3577)
+    u.security("XFER1", "0001000008", "Transfer Systems Inc", known_at=_dt(s[350]))
+    # valid_from matches the first recorded bar: no case here needs earlier
+    # history, so the listing does not claim data this fixture does not have.
+    u.listing("XFER1", "XFR", "NYSE", s[350], known_at=_dt(s[350]))
+    u.classification("XFER1", "common", "sic_default", known_at=_dt(s[350]), sic=3577)
     u.bars("XFER1", s[350:430], 44.0)
     u.delisting("XFER1", "25", "Common Stock", "NYSE", _dt(s[400]))
     u.listing("XFER1", "XFR", "NASDAQ", s[403], known_at=tp_calendar.session_close(s[408]))
 
     # --- Same-company ticker change: one security_id, two listings on the
     # same exchange. --------------------------------------------------------
-    u.security("TIKR1", "0001000009", "Ticker Change Co", known_at=_dt(s[0]))
-    u.listing("TIKR1", "OLDT", "NASDAQ", s[0], known_at=_dt(s[0]))
-    u.classification("TIKR1", "common", "sic_default", known_at=_dt(s[0]), sic=5961)
+    u.security("TIKR1", "0001000009", "Ticker Change Co", known_at=_dt(s[470]))
+    u.listing("TIKR1", "OLDT", "NASDAQ", s[470], known_at=_dt(s[470]))
+    u.classification("TIKR1", "common", "sic_default", known_at=_dt(s[470]), sic=5961)
     u.bars("TIKR1", s[470:540], 27.0)
     u.listing("TIKR1", "NEWT", "NASDAQ", s[500], known_at=_dt(s[500]))
 
     # --- Ticker reused by a different company: different security_id and
     # cik, non-overlapping listing windows. --------------------------------
-    u.security("REUSE_OLD", "0001000010", "Reuse Old Corp", known_at=_dt(s[0]))
-    u.listing("REUSE_OLD", "DUPL", "NASDAQ", s[0], known_at=_dt(s[0]))
-    u.classification("REUSE_OLD", "common", "sic_default", known_at=_dt(s[0]), sic=2860)
-    u.bars("REUSE_OLD", s[0:120], 9.0)
+    u.security("REUSE_OLD", "0001000010", "Reuse Old Corp", known_at=_dt(s[90]))
+    u.listing("REUSE_OLD", "DUPL", "NASDAQ", s[90], known_at=_dt(s[90]))
+    u.classification("REUSE_OLD", "common", "sic_default", known_at=_dt(s[90]), sic=2860)
+    u.bars("REUSE_OLD", s[90:120], 9.0)
     u.delisting("REUSE_OLD", "25", "Common Stock", "NASDAQ", _dt(s[120]))
     u.security("REUSE_NEW", "0001000011", "Reuse New Inc", known_at=_dt(s[600]))
     u.listing("REUSE_NEW", "DUPL", "NASDAQ", s[600], known_at=_dt(s[600]))
@@ -467,13 +518,16 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
         "KAPPA_A", "KAPA", "NASDAQ", s[0], known_at=_dt(s[0]), class_title="Class A Common Stock"
     )
     u.classification("KAPPA_A", "common", "sic_default", known_at=_dt(s[0]), sic=7812)
-    u.bars("KAPPA_A", s[0:150], 80.0)
+    # Extends past the facts' idx-275 known_at (12 months of trailing bars
+    # are present by then too), so a combined-class market cap is
+    # computable at a T in [275, 299] — not just structurally present.
+    u.bars("KAPPA_A", s[0:300], 80.0)
     u.security("KAPPA_B", "0001000012", "Kappa Media Inc", known_at=_dt(s[0]))
     u.listing(
         "KAPPA_B", "KAPB", "NASDAQ", s[0], known_at=_dt(s[0]), class_title="Class B Common Stock"
     )
     u.classification("KAPPA_B", "common", "sic_default", known_at=_dt(s[0]), sic=7812)
-    u.bars("KAPPA_B", s[0:150], 76.0)
+    u.bars("KAPPA_B", s[0:300], 76.0)
     u.fact(
         "KAPPA_A",
         "shares_outstanding",
@@ -501,10 +555,14 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
     u.action("SPLIT1", "split", s[300], 2.0)
 
     # --- A split between a shares filing and a later month-end T. --------
-    u.security("SPLIT2", "0001000014", "Split Mid Corp", known_at=_dt(s[0]))
-    u.listing("SPLIT2", "MID2", "NASDAQ", s[0], known_at=_dt(s[0]))
-    u.classification("SPLIT2", "common", "sic_default", known_at=_dt(s[0]), sic=3841)
-    u.bars("SPLIT2", s[300:380], 60.0, splits={s[350]: 1.5})
+    u.security("SPLIT2", "0001000014", "Split Mid Corp", known_at=_dt(s[100]))
+    u.listing("SPLIT2", "MID2", "NASDAQ", s[100], known_at=_dt(s[100]))
+    u.classification("SPLIT2", "common", "sic_default", known_at=_dt(s[100]), sic=3841)
+    # s[100:390] covers every session in the 12 calendar months before
+    # idx374 (2019-06-28, the T `tests/test_fixture_universe.py` and the
+    # README use for this case: idx374-252=idx122 is inside this window)
+    # through past both the split (idx350) and T itself.
+    u.bars("SPLIT2", s[100:390], 60.0, splits={s[350]: 1.5})
     u.fact(
         "SPLIT2",
         "shares_outstanding",
@@ -518,16 +576,28 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
 
     # --- A split known before T with ex-date after T (explicit early
     # announcement time, not the close-before-ex-date default). ----------
-    u.security("SPLIT3", "0001000015", "Split Future Corp", known_at=_dt(s[0]))
-    u.listing("SPLIT3", "FUT3", "NYSE", s[0], known_at=_dt(s[0]))
-    u.classification("SPLIT3", "common", "sic_default", known_at=_dt(s[0]), sic=2911)
-    u.bars("SPLIT3", s[520:630], 88.0, splits={s[600]: 4.0})
+    u.security("SPLIT3", "0001000015", "Split Future Corp", known_at=_dt(s[300]))
+    u.listing("SPLIT3", "FUT3", "NYSE", s[300], known_at=_dt(s[300]))
+    u.classification("SPLIT3", "common", "sic_default", known_at=_dt(s[300]), sic=2911)
+    # s[300:630] covers every session in the 12 calendar months before
+    # idx564 (2020-03-31, T) — idx564-252=idx312 is inside this window —
+    # through past the ex-date (idx600).
+    u.bars("SPLIT3", s[300:630], 88.0, splits={s[600]: 4.0})
+    u.fact(
+        "SPLIT3",
+        "shares_outstanding",
+        s[500] - timedelta(days=3),
+        9_000_000,
+        known_at=_dt(s[500]),
+        class_member="common",
+        filing_accession="0001000015-20-000002",
+    )
     u.action("SPLIT3", "split", s[600], 4.0, known_at=_dt(s[550], hour=12, minute=30))
 
     # --- A revised dividend: second row's known_at is its ingested_at. ---
-    u.security("DIVR1", "0001000016", "Dividend Revision Inc", known_at=_dt(s[0]))
-    u.listing("DIVR1", "DIVR", "NASDAQ", s[0], known_at=_dt(s[0]))
-    u.classification("DIVR1", "common", "sic_default", known_at=_dt(s[0]), sic=6021)
+    u.security("DIVR1", "0001000016", "Dividend Revision Inc", known_at=_dt(s[200]))
+    u.listing("DIVR1", "DIVR", "NASDAQ", s[200], known_at=_dt(s[200]))
+    u.classification("DIVR1", "common", "sic_default", known_at=_dt(s[200]), sic=6021)
     u.bars("DIVR1", s[200:280], 33.0)
     original_known_at = tp_calendar.session_close(s[249])
     u.action("DIVR1", "dividend", s[250], 0.20, known_at=original_known_at)
@@ -546,9 +616,9 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
     )
 
     # --- A restated shares fact: same as_of_date, two known_at values. ---
-    u.security("REST1", "0001000017", "Restatement Corp", known_at=_dt(s[0]))
-    u.listing("REST1", "REST", "NASDAQ", s[0], known_at=_dt(s[0]))
-    u.classification("REST1", "common", "sic_default", known_at=_dt(s[0]), sic=3576)
+    u.security("REST1", "0001000017", "Restatement Corp", known_at=_dt(s[240]))
+    u.listing("REST1", "REST", "NASDAQ", s[240], known_at=_dt(s[240]))
+    u.classification("REST1", "common", "sic_default", known_at=_dt(s[240]), sic=3576)
     u.bars("REST1", s[240:340], 47.0)
     shares_as_of = s[270]
     u.fact(
@@ -572,11 +642,17 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
 
     # --- A stale shares fact: no newer fact, aged past
     # universe.max_shares_age_days by a later month-end T (2019-08-30,
-    # 567 days after known_at — see README). -------------------------------
+    # 562 days after known_at — see README). -------------------------------
     u.security("STALE1", "0001000018", "Stale Data Holdings", known_at=_dt(s[0]))
     u.listing("STALE1", "STAL", "NYSE", s[0], known_at=_dt(s[0]))
     u.classification("STALE1", "common", "sic_default", known_at=_dt(s[0]), sic=3670)
+    # Two windows, not one contiguous s[0:430]: bars near the start (context
+    # for the stale fact itself, idx30) and s[160:430] (every session in the
+    # 12 calendar months before idx418 = 2019-08-30, T, through T) — an
+    # explicit, documented gap between them rather than ~100 filler rows
+    # nothing here reads.
     u.bars("STALE1", s[0:60], 21.0)
+    u.bars("STALE1", s[160:430], 21.0)
     u.fact(
         "STALE1",
         "shares_outstanding",
@@ -591,9 +667,13 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
     u.security("UNCL1", "0001000019", "Unclassifiable Ventures", known_at=_dt(s[0]))
     u.listing("UNCL1", "UNCL", "NASDAQ", s[0], known_at=_dt(s[0]))
     u.classification(
-        "UNCL1", "unclassifiable", "unclassifiable", known_at=_dt(s[0]), provenance="snapshot"
+        "UNCL1",
+        "unclassifiable",
+        "unclassifiable",
+        known_at=_dt(s[0]),
+        provenance="snapshot_static",
     )
-    u.bars("UNCL1", s[0:150], 17.0)
+    u.bars("UNCL1", s[0:40], 17.0)
 
     # --- A snapshot_static-only pre-2019 listing. --------------------------
     pre_2019 = date(2017, 3, 1)
@@ -608,14 +688,22 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
         provenance="snapshot_static",
     )
     u.classification("STAT1", "common", "sic_default", known_at=_dt(s[0]), sic=5411)
-    u.bars("STAT1", s[0:150], 38.0)
+    u.bars("STAT1", s[0:40], 38.0)
 
     # --- Benchmarks: seeded from config, not derived from EDGAR. ----------
     for sid, cik, name, ticker, price in (
         ("SPY", "0000900001", "SPDR S&P 500 ETF Trust (fixture)", "SPY", 250.0),
         ("MTUM", "0000900002", "iShares MSCI USA Momentum Factor ETF (fixture)", "MTUM", 90.0),
     ):
-        u.security(sid, cik, name, known_at=_dt(s[0]), benchmark=True, provenance="snapshot_static")
+        u.security(
+            sid,
+            cik,
+            name,
+            known_at=_dt(s[0]),
+            benchmark=True,
+            source="config",
+            provenance="snapshot_static",
+        )
         u.listing(
             sid,
             ticker,
@@ -625,8 +713,15 @@ def generate(out_dir: Path = FIXTURES_DIR, *, seed: int = SEED) -> None:
             source="config",
             provenance="snapshot_static",
         )
-        u.classification(sid, "fund", "benchmark_seed", known_at=_dt(s[0]), source="config")
-        window = s[0:400]
+        u.classification(
+            sid,
+            "fund",
+            "benchmark_seed",
+            known_at=_dt(s[0]),
+            source="config",
+            provenance="snapshot_static",
+        )
+        window = s[0:150]
         u.bars(sid, window, price)
         for i in range(60, len(window), 63):
             ex = window[i]
