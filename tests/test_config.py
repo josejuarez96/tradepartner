@@ -418,3 +418,14 @@ def test_phase3_rates_and_thresholds_reject_bad_values(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{section: override})
+
+
+def test_misspelt_phase3_env_var_fails_loudly_naming_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`COSTS__PER_SIDE_BP` (typo) must fail closed with the key in the error, not load
+    the 15 bp default. Loading `Settings` then fails for every job, secrets included,
+    so the message has to point straight at the bad key."""
+    monkeypatch.setenv("COSTS__PER_SIDE_BP", "0")
+    with pytest.raises(ValidationError, match="per_side_bp"):
+        Settings(_env_file=None)
