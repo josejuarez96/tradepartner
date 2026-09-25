@@ -172,6 +172,18 @@ def test_gap_defaults() -> None:
     assert s.gap.count_share_threshold == pytest.approx(0.05)
 
 
+def test_adjust_defaults() -> None:
+    assert _settings().adjust.max_prior_close_gap_sessions == 5
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_adjust_max_prior_close_gap_sessions_rejects_non_positive(value: int) -> None:
+    """Zero sessions would reject every prior close, even the session right
+    before the ex-date, silently dropping every dividend (#72)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, adjust={"max_prior_close_gap_sessions": value})
+
+
 def test_secrets_default_to_none() -> None:
     s = _settings()
     assert s.alpaca_api_key is None
