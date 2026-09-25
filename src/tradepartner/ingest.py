@@ -399,7 +399,11 @@ def _source_counts(filings: FilingSource) -> str:
     of the run's one `filing_index` call, and `unstamped_facts` accumulates
     over every `facts` call on the source instance, never reset per CIK.
     The counts sit before the variable-length benchmarks list so
-    `ingest.max_message_chars` never cuts them off."""
+    `ingest.max_message_chars` never cuts them off. `filings` arrives
+    wrapped in `_Recorded` (T17's fetch pass), so the counts are read from
+    the adapter underneath, never from the proxy (#194)."""
+    while isinstance(filings, _Recorded):
+        filings = filings._source
 
     def count(attribute: str) -> int | None:
         value = getattr(filings, attribute, None)
