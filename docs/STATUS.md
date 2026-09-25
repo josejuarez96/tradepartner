@@ -16,7 +16,7 @@
 - #36 Multi-team orchestration: `scripts/team.py` (register, claim, release, status, check-claims), [teams.md](ways-of-working/teams.md), plan chains, model tiers, CI `claims` job (PR #37). Duplicate T5/T20 work from two unsynchronised windows cleaned up (#34 → #31, #26 → #27, both parked)
 - Phase 2 T20: `Broker` interface and in-memory fake broker, no risk logic (PR #27)
 - Phase 2 T5: fixture-universe generator and CSVs covering every spec req 13 case (PR #31)
-- Phase 2 T6: as-of primitives and truncation-invariance harness (PR #TBD)
+- Phase 2 T6: as-of primitives and truncation-invariance harness (PR #69)
 
 ## Teams
 Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: registered teams are `atlas` (main clone), `orion` (holds #22 / T5, PR #31), and `creed` (completed T20 via PR #27).
