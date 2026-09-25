@@ -278,6 +278,28 @@ class TestBars:
         with pytest.raises(ValueError):
             parse_bars(payload, resolver.resolve)
 
+    @pytest.mark.parametrize("trades", [False, 1.5, -1, "10"])
+    def test_bad_trade_count_raises(self, resolver: ListingResolver, trades: object) -> None:
+        payload = {
+            "feed": "sip",
+            "bars": {
+                "KO": [
+                    {
+                        "t": "2020-08-03T04:00:00Z",
+                        "o": 50,
+                        "h": 51,
+                        "l": 49,
+                        "c": 50.5,
+                        "v": 0,
+                        "n": trades,
+                        "vw": 50.2,
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError, match="trade count"):
+            parse_bars(payload, resolver.resolve)
+
     def test_repeated_bar_raises(self, resolver: ListingResolver) -> None:
         row = {
             "t": "2020-08-03T04:00:00Z",
@@ -454,6 +476,24 @@ class TestAlpacaPriceSource:
             ["SEC_A"], date(2020, 8, 31), date(2020, 9, 30)
         )
         assert recorded.calls[-1][1] == ["NEW", "OLD"]
+
+    def test_actions_window_is_padded_on_both_sides(self) -> None:
+        recorded = _Recorded()
+        self._source(recorded).corporate_actions(["SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31))
+        assert recorded.calls[-1][2:] == (date(2020, 5, 3), date(2020, 11, 29))
+
+    def test_reports_reset_on_every_call(self) -> None:
+        recorded = _Recorded()
+        source = self._source(recorded)
+        source.bars(["SEC_AAPL"], date(2020, 8, 3), date(2020, 9, 30))
+        assert source.last_bars_report is not None
+        assert source.bars([], date(2020, 8, 3), date(2020, 9, 30)) == []
+        assert source.last_bars_report is None
+        source.corporate_actions(["SEC_AAPL"], date(2020, 8, 3), date(2020, 9, 30))
+        assert source.last_actions_report is not None
+        with pytest.raises(UnknownSecurityIdError):
+            source.corporate_actions(["NOPE"], date(2020, 8, 3), date(2020, 9, 30))
+        assert source.last_actions_report is None
 
     def test_reports_of_the_last_call_are_kept(self) -> None:
         recorded = _Recorded()

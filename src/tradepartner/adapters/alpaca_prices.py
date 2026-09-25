@@ -37,15 +37,21 @@ because every record still carries its own `known_at`.
   one before its ex-date, so an action whose ex-date coincides with a
   ticker change belongs to the security under its old symbol.
 
-**Extended hours.** Alpaca's SIP daily volume includes extended-hours
-trades (free-data-terms research, S1), while a bar is stamped at the
-16:00 close per the spec; the gap is an open owner question on PR #139.
+**Extended hours.** Extended-hours prints do not move a daily bar's open
+or close (free-data-terms research, row 2e), but SIP daily volume includes
+them, while a bar is stamped at the 16:00 close per the spec: its volume
+can hold up to four hours of later trades. Open owner question on PR #139.
 
 **Actions window.** Alpaca filters corporate actions on `process_date`,
 which can trail the ex-date by weeks (#101). `AlpacaPriceSource` asks for
 actions processed up to `alpaca.actions_process_lag_days` after the end
-of the ex-date window, and for the symbols held from the session before
-its start (an action resolves on that session), then filters on ex-date.
+of the ex-date window, and from the same lag before its start (in case an
+action is processed before its ex-date), for the symbols held from the
+session before its start (an action resolves on that session), then
+filters on ex-date. An action not yet processed when its ex-date is first
+queried is not returned then, so incremental ingest (T16) must re-query
+ex-dates in `[today - lag, today]` on every run; an unchanged action is a
+no-op under `prices.revision_of`.
 
 **Raw closes.** `alpaca_raw.daily_bars` always asks for `adjustment=raw`
 (ADR 0003 rule 1); prices here are the payload's values, unadjusted.
@@ -284,7 +290,10 @@ def parse_bars(payload: Mapping[str, Any], resolve: Resolve) -> BarsParse:
             if security_id is None:
                 unresolved.append((symbol, session))
                 continue
-            if _is_int_zero(row["v"]) and _is_int_zero(row["n"]):
+            trades = row["n"]
+            if isinstance(trades, bool) or not isinstance(trades, int) or trades < 0:
+                raise ValueError(f"{symbol} {session}: trade count must be an int, got {trades!r}")
+            if _is_int_zero(row["v"]) and trades == 0:
                 placeholders.append((security_id, session))
                 continue
             bars.append(
@@ -425,6 +434,7 @@ class AlpacaPriceSource(PriceSource):
         return ids, symbols
 
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+        self.last_bars_report = None
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
             return []
@@ -435,13 +445,14 @@ class AlpacaPriceSource(PriceSource):
     def corporate_actions(
         self, security_ids: Sequence[str], start: date, end: date
     ) -> list[CorporateAction]:
+        self.last_actions_report = None
         check_request(security_ids, start, end)
         symbols_from = previous_session(start)  # an action resolves on the session before it
         ids, symbols = self._plan(security_ids, start, end, symbols_from=symbols_from)
         if not symbols:
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
-        payload = self._fetch_actions(symbols, start, end + self._lag)
+        payload = self._fetch_actions(symbols, start - self._lag, end + self._lag)
         parsed = parse_corporate_actions(payload, self._resolver.resolve)
         self.last_actions_report = parsed
         return [a for a in parsed.actions if a.security_id in ids and start <= a.ex_date <= end]
