@@ -211,7 +211,8 @@ def carry_to_fill(
             raise ValueError(f"no bar for {sid} on its last mark {mark.isoformat()}")
         base = _check_price(sid, mark, "close", closes[mark])
         target_bar = _last_at_or_before(series, fill_session)
-        assert target_bar is not None  # the bar on `mark` is at or before it
+        if target_bar is None:  # unreachable: the bar on `mark` is at or before it
+            raise ValueError(f"no bar for {sid} at or before {fill_session.isoformat()}")
         if target_bar.session == fill_session:
             target = _fill_value(sid, target_bar, fill_price)
         else:
@@ -234,6 +235,8 @@ def stitched_returns(steps: Sequence[StepFrame]) -> pl.DataFrame:
     last stitched level L at session h: the level at the step's anchor bar a is
     L * close(a) / close(h), both closes from the current frame, so the index stays
     continuous even across steps whose frames did not carry the name.
+    `close_return` is against the frame's previous bar, which may have no stitched row
+    (a late bar); consumers such as `bt` should use the level columns.
 
     Raises `ValueError` if a step's `start` is not before its `end`, if the steps are
     not contiguous and ascending, if a frame lacks the bar on a name's last stitched
