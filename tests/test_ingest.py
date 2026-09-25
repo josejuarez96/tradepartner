@@ -23,6 +23,7 @@ from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
     CoverPage,
+    DelistingFiling,
     FactRecord,
     FilingHeader,
     FilingIndexEntry,
@@ -49,6 +50,7 @@ from tradepartner.ingest import (
     ingest_session,
 )
 from tradepartner.store.asof import facts_as_of, prices_as_of
+from tradepartner.store.classify import build_classifications
 from tradepartner.store.master import build_master
 
 ACME = "0000000001"  # one class, NYSE
@@ -67,9 +69,21 @@ def _at(year: int, month: int, day: int) -> datetime:
 
 
 def _filings(
-    fetched_at: datetime = FETCHED_AT, cls: type[FixtureFilingSource] = FixtureFilingSource
+    fetched_at: datetime = FETCHED_AT,
+    cls: type[FixtureFilingSource] = FixtureFilingSource,
+    *,
+    acme_title: str = "Common Stock",
+    acme_extra: tuple[CoverListing, ...] = (),
+    dual_listings: tuple[CoverListing, ...] | None = None,
+    delistings: Sequence[DelistingFiling] = (),
+    extra_facts: Sequence[FactRecord] = (),
 ) -> FixtureFilingSource:
+    dual = dual_listings or (
+        CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
+        CoverListing("Class B Common Stock", "DUB", "NASDAQ"),
+    )
     return cls(
+        delistings=delistings,
         index=[
             FilingIndexEntry(ACME, "Acme Corp", "10-K", f"{ACME}-18-000001", _at(2018, 3, 1)),
             FilingIndexEntry(DUAL, "Dual Corp", "10-K", f"{DUAL}-18-000001", _at(2018, 3, 2)),
@@ -79,16 +93,13 @@ def _filings(
                 ACME,
                 f"{ACME}-19-000001",
                 _at(2019, 3, 1),
-                (CoverListing("Common Stock", "ACME", "NYSE"),),
+                (CoverListing(acme_title, "ACME", "NYSE"), *acme_extra),
             ),
             CoverPage(
                 DUAL,
                 f"{DUAL}-19-000001",
                 _at(2019, 3, 4),
-                (
-                    CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
-                    CoverListing("Class B Common Stock", "DUB", "NASDAQ"),
-                ),
+                dual,
             ),
         ],
         headers=[
@@ -99,6 +110,7 @@ def _filings(
             _fact(ACME, "", 5_000_000, f"{ACME}-19-000001", _at(2019, 3, 1)),
             _fact(DUAL, "us-gaap:CommonClassAMember", 9_000_000, f"{DUAL}-19-1", _at(2019, 3, 4)),
             _fact(DUAL, "us-gaap:CommonClassBMember", 1_000_000, f"{DUAL}-19-1", _at(2019, 3, 4)),
+            *extra_facts,
         ],
         snapshot=[CompanySnapshotEntry(SPY_TRUST, "SPDR S&P 500", "SPY", "NYSE_ARCA", fetched_at)],
     )
@@ -449,11 +461,17 @@ def test_a_writer_that_never_closes_fails_after_the_retry_window(settings: Setti
 # --- facts: XBRL concept to store fact, class member to security ------------
 
 
-def test_fact_rows_map_the_concept_and_each_class_member(settings: Settings) -> None:
-    source = _filings()
+def _fact_rows(
+    settings: Settings, source: FixtureFilingSource
+) -> tuple[tuple[dict[str, Any], ...], tuple[FactRecord, ...]]:
     master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
     records = [f for cik in (ACME, DUAL) for f in source.facts(cik, list(FACT_NAMES))]
-    rows, unmatched = fact_rows(records, master, ingested_at=NOW)
+    return fact_rows(records, master, classes, ingested_at=NOW)
+
+
+def test_fact_rows_map_the_concept_and_each_class_member(settings: Settings) -> None:
+    rows, unmatched = _fact_rows(settings, _filings())
     got = {(r["security_id"], r["class_member"], r["value"]) for r in rows}
     assert got == {
         (ACME, "", 5_000_000),
@@ -466,11 +484,40 @@ def test_fact_rows_map_the_concept_and_each_class_member(settings: Settings) -> 
 
 
 def test_an_undimensioned_fact_of_a_multi_class_company_is_unmatched(settings: Settings) -> None:
-    source = _filings()
-    master = build_master(source, settings, ingested_at=NOW)
     total = _fact(DUAL, "", 10_000_000, f"{DUAL}-19-1", _at(2019, 3, 4))
-    rows, unmatched = fact_rows([total], master, ingested_at=NOW)
-    assert rows == () and unmatched == (total,)
+    rows, unmatched = _fact_rows(settings, _filings(extra_facts=[total]))
+    assert DUAL not in {r["security_id"] for r in rows if r["class_member"] == ""}
+    assert unmatched == (total,)
+
+
+def test_a_listed_preferred_never_takes_the_common_shares(settings: Settings) -> None:
+    # quant-auditor on #164: a bank-style CIK, common plus a listed preferred.
+    pref = CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE")
+    rows, unmatched = _fact_rows(settings, _filings(acme_extra=(pref,)))
+    assert [(r["security_id"], r["value"]) for r in rows if r["class_member"] == ""] == [
+        (ACME, 5_000_000)
+    ]
+    assert unmatched == ()
+
+
+def test_a_fact_for_an_unlisted_class_is_unmatched(settings: Settings) -> None:
+    # quant-auditor on #164: only Class B is listed (Nike-style); Class A's
+    # shares must not land on it.
+    only_b = (CoverListing("Class B Common Stock", "DUB", "NASDAQ"),)
+    rows, unmatched = _fact_rows(settings, _filings(dual_listings=only_b))
+    dual = [(r["security_id"], r["class_member"]) for r in rows if r["security_id"] != ACME]
+    assert dual == [(DUAL, "us-gaap:CommonClassBMember")]
+    assert [u.class_member for u in unmatched] == ["us-gaap:CommonClassAMember"]
+
+
+def test_a_class_member_needs_a_matching_title_even_for_one_class(settings: Settings) -> None:
+    member = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", _at(2019, 3, 1))
+    _, unmatched = _fact_rows(settings, _filings(extra_facts=[member]))
+    assert member in unmatched
+    matched = _fact_rows(
+        settings, _filings(acme_title="Class A Common Stock", extra_facts=[member])
+    )
+    assert (ACME, 7) in {(r["security_id"], r["value"]) for r in matched[0]}
 
 
 def test_shares_reach_the_as_of_read(settings: Settings) -> None:
@@ -490,3 +537,113 @@ def test_a_filing_accepted_after_the_run_clock_fails_the_chunk(
     assert [(r.source, r.status) for r in result.runs] == [("edgar", FAILED)]
     assert "after" in result.runs[0].message
     assert _counts(read)["securities"] == 0
+
+
+def test_a_filing_accepted_while_the_run_fetches_is_stored(settings: Settings) -> None:
+    # quant-auditor on #164: ingested_at is read after the sources return.
+    start = datetime(2019, 3, 4, 20, 0, tzinfo=UTC)  # before DUAL's cover page (20:30)
+    ticks = iter([start, NOW, NOW, NOW])
+    result = ingest_session(
+        settings, prices=_Prices(), filings=_filings(), source="edgar", clock=lambda: next(ticks)
+    )
+    assert result.ok
+
+
+def test_a_filed_value_that_reverts_is_a_third_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # quant-auditor on #164: A -> B -> A at one known_at stays visible as A.
+    def name() -> list[tuple[Any, ...]]:
+        return read(
+            f"SELECT name, known_at FROM securities WHERE security_id = '{ACME}' ORDER BY known_at"
+        )
+
+    def renamed(to: str) -> FixtureFilingSource:
+        source = _filings()
+        source._index = [
+            FilingIndexEntry(
+                e.cik, to if e.cik == ACME else e.company_name, e.form, e.accession, e.accepted_at
+            )
+            for e in source._index
+        ]
+        return source
+
+    _run(settings, source="edgar")
+    one, two = NOW + timedelta(days=1), NOW + timedelta(days=2)
+    _run(settings, filings=renamed("Acme Renamed"), now=one, source="edgar")
+    _run(settings, filings=renamed("Acme Corp"), now=two, source="edgar")
+    _run(settings, filings=renamed("Acme Corp"), now=two + timedelta(hours=1), source="edgar")
+    assert [n for n, _ in name()] == ["Acme Corp", "Acme Renamed", "Acme Corp"]
+    assert [k for _, k in name()][1:] == [one, two]
+
+
+def test_a_revised_action_keeps_the_stored_announcement(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    ex = date(2019, 6, 14)
+    announced = datetime(2019, 5, 1, 20, 0, tzinfo=UTC)
+    first = CorporateAction(
+        ACME, ActionType.DIVIDEND, ex, 0.10, announced, "alpaca", announced_at=announced
+    )
+    revised = CorporateAction(
+        ACME, ActionType.DIVIDEND, ex, 0.12, action_first_seen_known_at(ex), "alpaca"
+    )
+    _run(settings, _Prices(actions=[first]))
+    _run(settings, _Prices(actions=[revised]), now=NOW + timedelta(days=1))
+    assert read("SELECT announced_at FROM corporate_actions ORDER BY known_at") == [
+        (announced,),
+        (announced,),
+    ]
+
+
+def _delisting(effective_on: date) -> DelistingFiling:
+    return DelistingFiling(
+        ACME, "25", "Common Stock", "NYSE", f"{ACME}-19-000025", _at(2019, 6, 20), effective_on
+    )
+
+
+@pytest.mark.parametrize(
+    ("effective_on", "fetched"), [(date(2019, 6, 30), True), (date(2019, 6, 27), False)]
+)
+def test_a_delisted_name_is_fetched_until_effective_but_never_counted(
+    settings: Settings, effective_on: date, fetched: bool
+) -> None:
+    prices = _Prices(missing={ACME})
+    result = _run(settings, prices, filings=_filings(delistings=[_delisting(effective_on)]))
+    assert result.ok  # ACME's missing bar does not count toward staleness
+    bars_call = next(c for c in prices.calls if c[0] == "bars")
+    assert (ACME in bars_call[1]) is fetched
+    assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+def test_a_listed_preferred_is_not_in_the_staleness_denominator(settings: Settings) -> None:
+    pref = CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE")
+    prices = _Prices(missing={f"{ACME}:6-00pct-series-a-preferred-stock"})
+    result = _run(settings, prices, filings=_filings(acme_extra=(pref,)))
+    assert result.ok, result.runs[-1].message
+
+
+def test_run_messages_are_redacted_cleaned_and_capped(
+    tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    secret = "sk-sentinel-4f2a"
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        ingest={"max_message_chars": 200},
+        alpaca_api_secret=secret,
+        sec_edgar_user_agent="Owner owner@example.com",
+    )
+
+    class Leaky(_Prices):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            raise RuntimeError(f"auth {secret} ua Owner owner@example.com\x1b[31m" + "x" * 5000)
+
+    result = ingest_session(settings, prices=Leaky(), filings=_filings(), clock=lambda: NOW)
+    stored = read("SELECT message FROM ingestion_runs WHERE source = 'alpaca'")[0][0]
+    for message in (stored, result.runs[-1].message):
+        assert secret not in message and "owner@example.com" not in message
+        assert "[redacted]" in message and "\x1b" not in message
+        assert len(message) == 200

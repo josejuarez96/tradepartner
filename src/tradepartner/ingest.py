@@ -37,7 +37,21 @@ only if it changes what an as-of read returns:
 
 The price side fetches bars for the expected session and actions with
 `ex_date` from the first of its month to it, so revisions within the month
-are seen; the chunk cursor is the session.
+are seen; the chunk cursor is the session. A revision to an earlier month's
+action, or an action announced before its ex-date, is stored only once its
+ex-date falls in a fetched window (or by the backfill, T17): never early,
+but a live read can see less than a later backfill stamped at the same T.
+The staleness denominator counts only common and benchmark listings, so a
+preferred or note with no bar never makes a run stale.
+
+**`ingested_at`** for the EDGAR chunk is read from `clock` after every
+filing call has returned (the builders run twice over one recorded set of
+answers: once to fetch, once to stamp), so a filing accepted while the run
+is fetching is stored, not refused as look-ahead.
+
+**Run messages** are stored with every configured secret value redacted,
+control characters replaced and the length capped at
+`ingest.max_message_chars`: an exception's text comes from a server.
 """
 
 from __future__ import annotations
@@ -47,16 +61,28 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import duckdb
 
-from tradepartner.adapters.filings import FactRecord, FilingSource
+from tradepartner.adapters.filings import (
+    CompanySnapshotEntry,
+    CoverPage,
+    DelistingFiling,
+    FactRecord,
+    FilingHeader,
+    FilingIndexEntry,
+    FilingSource,
+)
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session
 from tradepartner.config import Settings
-from tradepartner.store.classify import build_classifications
+from tradepartner.store.classify import (
+    ClassificationBuild,
+    build_classifications,
+    classifications_as_of,
+)
 from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import (
     DELISTED,
@@ -65,7 +91,7 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
-from tradepartner.store.master import MasterBuild, build_master
+from tradepartner.store.master import MasterBuild, build_master, securities_as_of
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
@@ -158,7 +184,7 @@ def ingest_session(
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     work: dict[str, Callable[[duckdb.DuckDBPyConnection], tuple[int, str]]] = {
-        "edgar": lambda conn: _ingest_filings(conn, settings, filings, now),
+        "edgar": lambda conn: _ingest_filings(conn, settings, filings, clock),
         "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now),
     }
     runs: list[SourceRun] = []
@@ -180,31 +206,52 @@ def _run_source(
     dry_run: bool,
 ) -> SourceRun:
     run_id = uuid.uuid4().hex
+
+    def outcome(status: str, rows: int, message: str) -> SourceRun:
+        return SourceRun(name, status, rows, cursor, _clean(message, settings))
+
     try:
         with open_for_write(settings) as conn:
             init_schema(conn)
             rows, message = work(conn)
             if dry_run:
                 raise _DryRun(rows, message)
-            run = SourceRun(name, OK, rows, cursor, message)
+            run = outcome(OK, rows, message)
             _write_run(conn, run_id, now, clock(), run)
         return run
     except _DryRun as dry:
-        return SourceRun(name, OK, dry.rows, cursor, f"dry run: {dry}")
+        return outcome(OK, dry.rows, f"dry run: {dry}")
     except StoreLockedError as exc:
-        return SourceRun(name, LOCKED, 0, cursor, str(exc))
+        return outcome(LOCKED, 0, str(exc))
     except _Stale as exc:
-        run = SourceRun(name, STALE, 0, cursor, str(exc))
+        run = outcome(STALE, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts with a run row
-        run = SourceRun(name, FAILED, 0, cursor, f"{type(exc).__name__}: {exc}")
+        run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
     if not dry_run:
         try:
             with open_for_write(settings) as conn:
                 init_schema(conn)
                 _write_run(conn, run_id, now, clock(), run)
         except StoreLockedError as exc:
-            return SourceRun(name, run.status, 0, cursor, f"{run.message}; run row: {exc}")
+            return outcome(run.status, 0, f"{run.message}; run row: {exc}")
     return run
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _clean(message: str, settings: Settings) -> str:
+    """`message` with configured secrets redacted, control characters
+    replaced by a space, and cut to `ingest.max_message_chars`."""
+    for secret in (
+        settings.alpaca_api_key,
+        settings.alpaca_api_secret,
+        settings.sec_edgar_user_agent,
+    ):
+        value = secret.get_secret_value().strip() if secret is not None else ""
+        if value:
+            message = message.replace(value, "[redacted]")
+    return _CONTROL.sub(" ", message)[: settings.ingest.max_message_chars]
 
 
 def _write_run(
@@ -234,15 +281,52 @@ def _write_run(
 # --- the EDGAR chunk --------------------------------------------------------
 
 
+#: `ingested_at` for the fetch pass: later than any record, so no builder refuses one.
+_FETCH_PASS = datetime(9000, 1, 1, tzinfo=UTC)
+
+
+class _Recorded(FilingSource):
+    """`source`, with each answer recorded so a second build reads the same."""
+
+    def __init__(self, source: FilingSource) -> None:
+        self._source = source
+        self._answers: dict[tuple[Any, ...], Any] = {}
+
+    def _ask(self, method: str, *args: Any) -> Any:
+        key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
+        if key not in self._answers:
+            self._answers[key] = getattr(self._source, method)(*args)
+        return self._answers[key]
+
+    def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
+        return list(self._ask("filing_index", since))
+
+    def companies_snapshot(self) -> list[CompanySnapshotEntry]:
+        return list(self._ask("companies_snapshot"))
+
+    def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+        return list(self._ask("facts", cik, list(names)))
+
+    def filing_headers(self, cik: str, forms: Sequence[str]) -> list[FilingHeader]:
+        return list(self._ask("filing_headers", cik, list(forms)))
+
+    def cover_pages(self, cik: str) -> list[CoverPage]:
+        return list(self._ask("cover_pages", cik))
+
+    def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
+        return list(self._ask("delistings", since))
+
+
 def _ingest_filings(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, filings: FilingSource, now: datetime
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    filings: FilingSource,
+    clock: Callable[[], datetime],
 ) -> tuple[int, str]:
-    master = build_master(filings, settings, ingested_at=now)
-    delistings = build_delistings(filings.delistings(), master, ingested_at=now)
-    classes = build_classifications(filings, master, settings, ingested_at=now)
-    ciks = sorted({row["cik"] for row in master.securities if not row["benchmark"]})
-    records = [record for cik in ciks for record in filings.facts(cik, list(FACT_NAMES))]
-    facts, unmatched = fact_rows(records, master, ingested_at=now)
+    recorded = _Recorded(filings)
+    _build_filings(recorded, settings, _FETCH_PASS)
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
     added = 0
     for table, rows in (
         ("securities", master.securities),
@@ -260,25 +344,49 @@ def _ingest_filings(
     return added, message
 
 
+def _build_filings(
+    filings: FilingSource, settings: Settings, ingested_at: datetime
+) -> tuple[MasterBuild, Any, ClassificationBuild, tuple[Row, ...], tuple[FactRecord, ...]]:
+    master = build_master(filings, settings, ingested_at=ingested_at)
+    delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
+    classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
+    ciks = sorted({row["cik"] for row in master.securities if not row["benchmark"]})
+    records = [record for cik in ciks for record in filings.facts(cik, list(FACT_NAMES))]
+    facts, unmatched = fact_rows(records, master, classes, ingested_at=ingested_at)
+    return master, delistings, classes, facts, unmatched
+
+
 _MEMBER_CLASS = re.compile(r"Class([A-Z])(?![a-z])")
 _TITLE_CLASS = re.compile(r"\bclass ([a-z])\b")
 
 
 def fact_rows(
-    records: Iterable[FactRecord], master: MasterBuild, *, ingested_at: datetime
+    records: Iterable[FactRecord],
+    master: MasterBuild,
+    classes: ClassificationBuild,
+    *,
+    ingested_at: datetime,
 ) -> tuple[tuple[Row, ...], tuple[FactRecord, ...]]:
     """`facts` rows for `records`, and the records no security could take.
 
-    A CIK with one non-benchmark security takes all its facts. With several,
-    a fact goes to the one class whose listing title names the member's
-    class letter (`us-gaap:CommonClassBMember` -> "Class B Common Stock"),
-    and an undimensioned total is unmatched: it is no one class's shares.
-    Raises `ValueError` for a record accepted after `ingested_at`.
+    Candidates are the CIK's **common** classes (latest classification);
+    a listed preferred, warrant or note never takes shares. A fact whose
+    member names a class letter (`us-gaap:CommonClassBMember`) goes to the
+    one common class whose listing title names that letter ("Class B Common
+    Stock"), and is unmatched if none does (an unlisted class). Any other
+    fact (undimensioned, or a member with no letter) goes to the sole common
+    class, and is unmatched when there are several: a total is no one
+    class's shares. Raises `ValueError` for a record accepted after
+    `ingested_at`.
     """
-    by_cik: dict[str, list[str]] = defaultdict(list)
+    latest: dict[str, Row] = {}
+    for row in sorted(classes.classifications, key=lambda r: r["known_at"]):
+        latest[row["security_id"]] = row
+    common: dict[str, list[str]] = defaultdict(list)
     for row in master.securities:
-        if not row["benchmark"]:
-            by_cik[row["cik"]].append(row["security_id"])
+        kind = latest.get(row["security_id"], {}).get("security_type")
+        if not row["benchmark"] and kind == "common":
+            common[row["cik"]].append(row["security_id"])
     letters: dict[str, set[str]] = defaultdict(set)
     for row in master.listings:
         match = _TITLE_CLASS.search((row["class_title"] or "").lower())
@@ -293,9 +401,9 @@ def fact_rows(
                 f"{record.accession}: accepted_at {record.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        ids = by_cik.get(record.cik, [])
+        ids = common.get(record.cik, [])
         member = _MEMBER_CLASS.search(record.class_member)
-        if len(ids) != 1 and member:
+        if member:
             ids = [sid for sid in ids if member.group(1) in letters[sid]]
         if record.fact_name not in FACT_NAMES or len(ids) != 1:
             unmatched.append(record)
@@ -370,8 +478,9 @@ def _ingest_prices(
 def _price_names(
     conn: duckdb.DuckDBPyConnection, now: datetime, session: date, settings: Settings
 ) -> tuple[set[str], set[str], str | None]:
-    """Names to fetch, listed names (the staleness denominator) and the
-    reference symbol's `security_id`, from each security's current listing."""
+    """Names to fetch, listed common and benchmark names (the staleness
+    denominator) and the reference symbol's `security_id`, from each
+    security's current listing."""
     current: dict[str, Row] = {}
     for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
         held = current.get(row["security_id"])
@@ -379,16 +488,25 @@ def _price_names(
             held is None or row["valid_from"] > held["valid_from"]
         ):
             current[row["security_id"]] = row
+    kinds = {
+        row["security_id"]: row["security_type"]
+        for row in classifications_as_of(conn, now).iter_rows(named=True)
+    }
+    benchmarks = {
+        row["security_id"]
+        for row in securities_as_of(conn, now).iter_rows(named=True)
+        if row["benchmark"]
+    }
     fetch: set[str] = set()
     listed: set[str] = set()
     reference = None
     for sid, row in current.items():
         status, end = row["status"], row["end_session"]
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= session))
-        if live:
+        if live and (sid in benchmarks or kinds.get(sid) == "common"):
             listed.add(sid)
-            if row["ticker"] == settings.ingest.reference_symbol:
-                reference = sid
+        if live and row["ticker"] == settings.ingest.reference_symbol:
+            reference = sid
         effective = row["effective_on"]
         if live or (status == DELISTED and effective is not None and effective >= session):
             fetch.add(sid)
@@ -463,10 +581,14 @@ def _add_rows(
     incoming = sorted(rows, key=lambda r: (key(r), r["known_at"]))
     if current:  # the source's latest record per key is its value now
         incoming = list({key(r): r for r in incoming}.values())
+    last_of = {key(r): r for r in incoming}
     added = 0
     for row in incoming:
         past = history[key(row)]
-        new = _current(row, past, ingested_at, same) if current else _filed(row, past, same)
+        if current:
+            new = _current(row, past, ingested_at, same)
+        else:
+            new = _filed(row, past, same, last=row is last_of[key(row)])
         if new is None:
             continue
         if new["known_at"] > ingested_at:
@@ -501,13 +623,21 @@ def _current(
     return revised
 
 
-def _filed(row: Mapping[str, Any], past: list[Row], same: _Same) -> Row | None:
-    """A filed row, unless the stored view at its `known_at` already has it."""
-    view = [p for p in past if p["known_at"] <= row["known_at"]]
+def _filed(row: Mapping[str, Any], past: list[Row], same: _Same, *, last: bool) -> Row | None:
+    """A filed row, unless the stored view at its `known_at` already has it.
+
+    If a stored row already holds this `known_at` with other values, the
+    row is a revision stamped at `ingested_at`. For the builder's latest row
+    of the key (`last`) that is judged against the store's latest row, so
+    A -> B -> A is three rows; an older row of the key is a no-op once any
+    stored row from its `known_at` on has its values, so re-runs add nothing.
+    """
+    at = row["known_at"]
+    if any(p["known_at"] == at for p in past):
+        later = [p for p in past if p["known_at"] >= at]
+        done = same(row, past[-1]) if last else any(same(row, p) for p in later)
+        return None if done else {**row, "known_at": row["ingested_at"]}
+    view = [p for p in past if p["known_at"] <= at]
     if view and same(row, view[-1]):
         return None
-    if not any(p["known_at"] == row["known_at"] for p in past):
-        return dict(row)
-    if same(row, past[-1]):
-        return None
-    return {**row, "known_at": row["ingested_at"]}
+    return dict(row)
