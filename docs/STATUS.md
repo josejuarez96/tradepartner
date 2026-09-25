@@ -21,12 +21,12 @@ Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: registe
 
 ## In progress
 - **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts
-- **Owner cleanup (agents are blocked from this):** remove stopped worktrees `.claude/worktrees/creed`, `.claude/worktrees/agent-aee102ec0271d2d42` (team creed, done with T20), and two others (one is locked); delete remote branches `feat/25-fixture-universe`, `feat/24-fake-broker`, and local branch `feat/23-fake-broker`
+- **Owner cleanup (agents are blocked from this):** remove stopped worktrees `.claude/worktrees/creed`, `.claude/worktrees/agent-aee102ec0271d2d42`, `.claude/worktrees/agent-a129ea15457cc0456`, `.claude/worktrees/agent-a45566833d1de69d7`, `.claude/worktrees/agent-ab09d798989cbab99` (locked), `.claude/worktrees/agent-ae7801cf88e3ca4a3` (team creed, done with T20); delete remote branches `feat/25-fixture-universe`, `feat/24-fake-broker`, and local branch `feat/23-fake-broker`
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
 Copied from `team.py status` on 2026-09-24. Claim through the tool, never from this list.
 1. T5 (issue #22, held by orion, PR #31): rebase, run the required reviews, mark ready
-2. Unclaimed issues: #28, #29, #30, #32, #35 (all `size:S`), #38 (symbol-case canonicalization, type:feat). #33 is a Phase 4 idea, leave it
+2. Unclaimed issues: #28, #29, #30, #35 (`size:S`), #32 (type:fix), #38 (symbol-case canonicalization, type:feat). #33 is a Phase 4 idea, leave it
 3. After T5 merges: T6, then T7 and T8 in parallel (see plan chains)
 4. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
 5. Decide whether to upgrade to GitHub Pro to enforce the `main` ruleset server-side
