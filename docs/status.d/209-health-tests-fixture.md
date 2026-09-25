@@ -1,1 +1,1 @@
-- #209 Main green again after a merge race: T18's health coverage tests now expect #108's three fixture securities (`SEC_DIV_CANCELLED`, `SEC_SPLIT_REDATED`, `SEC_SPLIT_REDATED_NOID`) among the live names at 2020-06-30 (PR #210)
+- #209 Main green again after a merge race: T18's health coverage tests now expect #108's three fixture securities (`SEC_DIV_CANCELLED`, `SEC_SPLIT_REDATED`, `SEC_SPLIT_REDATED_NOID`) among the live names at 2020-06-30 (PR #211)
