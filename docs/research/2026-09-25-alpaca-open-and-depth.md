@@ -64,9 +64,9 @@ All pages were seen on 2026-09-25.
 - Whether wholesalers enter queued whole-share DAY market orders into the primary opening auction. **Not documented** (live test only).
 - Which NBBO snapshot prices a queued fractional order: the submission-time pre-market quote, or the quote at release after the open.
 - The typical gap, in basis points, between Alpaca fills and (a) the official open or (b) the SIP first-trade bar open. No source quantifies either. The only example is FDT S20: XOM bar open 118.54 vs auction 118.89, and that is bar vs auction, not a fill.
-- GE's 1-for-8 reverse split effective 2021-08-02 comes from a search summary. It was not read in a GE 8-K. It is marked "verify" in the probe table.
+- GE's 1-for-8 reverse split effective 2021-08-02 comes from a search summary. It was not read in a GE 8-K. It is marked "verify" in the probe table. Probe 1 found Alpaca carries the same date and ratio; that is agreement between two secondary sources, still not the 8-K.
 - The SEC `company_tickers_exchange.json` path suggested in Probe 2 was not fetched this session.
-- The date field that Alpaca's corporate-actions `start`/`end` filter applies to (ex-date, record date or process date) is not documented in anything read here. Probe 1 records it.
+- ~~The date field that Alpaca's corporate-actions `start`/`end` filter applies to is not documented.~~ Resolved by Probe 1: it is `process_date` (see "Probe 1 results").
 
 ## Follow-up questions (not answered here)
 - Does Alpaca Elite or Smart Routing change routing for DAY market orders at the open? S24 mentions Elite's "Smart Routing rules" but does not describe them.
@@ -161,6 +161,29 @@ If a year errors with a range or limit message, split it into quarters and recor
 | Any order does not fill by 09:31 | A paper queue or release delay | Record it; it affects the pre-open rebalance timing assumption |
 
 **Paper is simulated.** It shows how the *paper stage* will behave. It cannot show whether live whole-share DAY orders get auction prices (2d, 2f, 2g), and it omits price improvement (S27). A small live test with the same parameters is the only way to answer the live question: for example 5 sessions × 1 share plus $5 notional, in one or two names. Whether to run it is **the owner's decision**. `execution.fill_price` stays `close` until the owner decides.
+
+## Probe 1 results (owner run, 2026-09-25, #101)
+
+Run with the owner's keys by team interlac on 2026-09-25 07:39 UTC, with the owner's permission: `scripts/probe_ca_depth.py` on branch `spike/101-probe-1-ca-depth` (commit 002f7c9; spike code, not merged). It makes the ten calls above, saves raw payloads outside the repo, and grades them offline. Raw payloads are kept by the owner, not in git.
+
+**Verdict: complete back to 2016. ADR 0003's 2016 adjustment backfill horizon stands.** Every check below passes in every year from 2016 to 2025.
+
+| Year | Symbol | Event | Alpaca ex-date and ratio | Result |
+|---|---|---|---|---|
+| 2016 | MNST | 3-for-1 split | 2016-11-10, 3 | matches |
+| 2017 | ISRG | 3-for-1 split | 2017-10-06, 3 | matches |
+| 2020 | AAPL | 4-for-1 split | 2020-08-31, 4 | matches |
+| 2020 | TSLA | 5-for-1 split | 2020-08-31, 5 | matches (ground truth from memory) |
+| 2021 | NVDA | 4-for-1 split | 2021-07-20, 4 | matches |
+| 2021 | GE | 1-for-8 reverse split | 2021-08-02, 1/8 | matches (ground truth from a search summary) |
+| 2022 | TSLA | 3-for-1 split | 2022-08-25, 3 | matches (ground truth from memory) |
+| 2023 | GE | GEHC spin-off, 1 per 3 | 2023-01-04, `new_rate` 0.33333 | matches; Alpaca rounds rates to 5 decimals |
+| 2024 | NVDA | 10-for-1 split | 2024-06-10, 10 | matches |
+
+- **Cash dividends:** AAPL and KO return exactly 4 per year in every year 2016 to 2025. TSLA (negative control) returns none.
+- **Events not in the ground truth, all real:** GE→WAB spin-off 2019-02-25 (`new_rate` 0.005371), GE→GEV spin-off 2024-04-02 (1 per 4), and NVDA's cash acquisition of MLNX (2020-04-27). The query returns mergers where a requested symbol is the acquirer, not only the acquiree.
+- **The `start`/`end` window filters on `process_date`.** Every returned event has its `process_date` inside the requested year; some `ex_date`s fall outside it. Example: a GE dividend with ex-date 2020-12-18 and process date 2021-01-25 comes back in the 2021 query, not 2020. Consequence for ingest (T12): a window chosen by ex-date misses events processed after it ends. Pad the window past its end, or query by process date and filter on ex-date.
+- **Payload fields are thinner before 2020.** Events from 2016 to 2019 carry only `ex_date` and `process_date`. From 2020 they also carry `record_date`, `payable_date` and, for splits, `due_bill_redemption_date`. No event in any year has a declaration or announcement date. Consequence for #83: an `announced_at` column (option 1) could never be filled from Alpaca, only from another source such as EDGAR 8-Ks.
 
 ## Sources
 Sources S1 to S20 are in [2026-09-25-free-data-terms.md](2026-09-25-free-data-terms.md) (cited as FDT Sn). All new sources were seen on 2026-09-25.
