@@ -5,9 +5,11 @@ on:
   push:
     branches: [main]
 
+# PR branches cancel superseded runs. Main never does, so every merge gets a completed run
+# (#198): one group per commit, since a shared group would still drop a pending run.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   checks:
