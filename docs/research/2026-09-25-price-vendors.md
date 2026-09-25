@@ -1,15 +1,22 @@
 # Research Report: Survivorship-bias-free US daily price vendors for an individual (G8)
 
-**Brief:** #46  ·  **Date:** 2026-09-25  ·  **Status:** INCOMPLETE (source budget of 12 spent; see "UNVERIFIED items")  ·  **Agent/model:** research agent, team banshee, claude-opus-5-5
+**Brief:** #46  ·  **Date:** 2026-09-25  ·  **Status:** INCOMPLETE. Two passes are done and both budgets are spent. The priority 1–5 items still open are listed under "UNVERIFIED items".  ·  **Agent/model:** research agent, team banshee, claude-opus-5-5
 
 All prices were retrieved on **2026-09-25**. Vendor prices change, so re-check them before the ADR.
 
 ## Answer
 **Verdict:** MIXED  ·  **Confidence:** medium on prices and plan terms; low on how complete the delisted coverage really is
 
-Four vendors say in their own docs or pricing pages that an individual can buy US daily prices that include delisted names. **Norgate** Platinum costs $630/yr, with delisted names back to 1990; Diamond costs $787.50/yr and goes back to 1950. **EODHD** costs $199/yr with "Delisted Data" included, but for names delisted before 2018 it has EOD prices only. **Massive (formerly Polygon)** says its data is free of survivorship bias, but only in a search snippet I did not fetch; its 20+ year plan costs $199/month. **Sharadar** SEP covers 1998 onward, but I could not see its price. **Tiingo** ($300/yr) supports delisted tickers "that have not yet been recycled", so its coverage is partial by its own description. **Alpaca**'s docs say nothing about delisted names, and forum reports say inactive symbols return no bars. **CRSP** is licensed only to academic, government and practitioner institutions, not individuals.
+Four vendors state in their own docs or pricing pages that an individual can buy US daily prices that include delisted names:
 
-No vendor's delisted coverage is independently **verified**: every "yes" is the vendor's own claim. None of the vendors documents when a corporate action became known. Their adjusted series are recomputed backwards, so they are not point-in-time. Every paid licence I could read limits use to personal or internal use. The two licences with readable post-cancellation terms (Norgate and Sharadar via QuantRocket) require you to delete local copies when the subscription ends.
+- **Norgate:** Platinum is USD 630/yr with delisted names back to 1990. Diamond is USD 787.50/yr, back to 1950. The data app is Windows-only.
+- **Sharadar SEP:** the Prices plan is $39/mo for full history (history from 1998). A 5-year plan costs $9/mo.
+- **EODHD:** $199/yr includes "Delisted Data". Names delisted before 2018 have EOD prices only.
+- **Massive (formerly Polygon):** "delisted tickers keep their full history". The 20+ year plan costs $199/mo.
+
+**Tiingo** ($300/yr) supports delisted tickers "that have not yet been recycled", so its coverage is partial by its own account. **Alpaca**'s docs say nothing about delisted names. **CRSP** is licensed only to institutions.
+
+Nobody has independently **verified** any vendor's delisted coverage. No vendor records when a corporate action became known. Every adjusted series examined is restated backwards: Sharadar, EODHD and Massive say so explicitly, and Norgate is not documented. Every licence I read is for personal use only. Norgate and Tiingo require you to delete all local data when the subscription ends, and so does Sharadar when bought through QuantRocket. Massive's and EODHD's storage terms were not read.
 
 ## Evidence
 
@@ -17,100 +24,138 @@ No vendor's delisted coverage is independently **verified**: every "yes" is the 
 
 | Vendor | Delisted coverage (grade) | Adjustment method | Point-in-time corporate actions | History depth | Price (retrieved 2026-09-25) | Licence / local storage | API / bulk |
 |---|---|---|---|---|---|---|---|
-| **Norgate** | **Claimed.** Platinum and Diamond: "Delisted Securities Back to 1990" (Platinum) / "Back to 1950" (Diamond) [S1]. US delisted coverage "essentially complete back to late 1992"; delisted symbols carry a "-YYYYMM" suffix [S2] | Four modes: "Unadjusted (raw), Adjusted for Capital Reconstructions, … and Special Distributions, … Special Distributions and Normal Distributions - aka Total Return" [S2] | nv. No known-at date for actions is documented [S2 silent] | Platinum "Back to 1990"; Diamond "Back to 1950" [S1] | Platinum $346.50/6 mo, **$630/12 mo**; Diamond $433.13/6 mo, **$787.50/12 mo**. Gold ($360/yr, 20 yrs) and Silver ($270/yr, 10 yrs) have **no** delisted names [S1]. Currency conflict: the fetched page reads USD, but a search snippet read "AUD 346.50 / AUD 630" (UNVERIFIED) | Exported data and backups must be deleted after the subscription expires; no exceptions [search snippet of norgatedata.com/faq.php, not fetched: **UNVERIFIED**]. Redistribution terms: nv | Python package on PyPI [S2]. OS requirements: nv (see Follow-up questions) |
-| **Sharadar (SEP) / Nasdaq Data Link** | **Claimed.** "No survivorship bias: includes active and delisted tickers" [S3]. Search snippet: ">21,000 active and delisted tickers … history to the year 1998" (UNVERIFIED) | Search snippet of Sharadar's blog: closeadj is "adjusted for stock splits, stock dividends, cash dividends and spinoffs" (**UNVERIFIED**, not fetched). There is also a separate ACTIONS table (snippet) | Marketing snippet says "point-in-time ready" (**UNVERIFIED**, Tier 3 wording) | Prices "1998 - present" [S3] | **nv.** QuantRocket shows prices only after login [S3]. The Nasdaq Data Link page did not render | Via QuantRocket: no redistribution, and "within thirty (30) days of termination, you will delete from all computer systems…all copies of the Services Data" [S3]. Professional users "must purchase Sharadar data from Nasdaq Data Link" [S3]. Direct Nasdaq Data Link terms: nv | nv (Nasdaq Data Link page did not render) |
-| **CRSP** | Delisted coverage **not evaluated**. The product is not sold to individuals: "designed for and delivered to licensees at academic institutions, government agencies, and investment practitioners" [S4] | nv [S4 silent] | nv | "Over 100 Years of Research Quality Data" [S4] | Not listed; "Request Subscription Information" [S4] | Institutional licence only [S4] | "Flat File Format 2.0 (CIZ)" [S4] |
-| **Tiingo** | **Claimed, partial by the vendor's own statement.** "Tiingo supports delisted data for tickers that have not yet been recycled." PermaTicker and delisted support are still future work: the guide "will be expanded as we ready to expand our API into permatickers and delisted ticker support" [S5] | Search snippet of Tiingo EOD docs: adjOpen/adjHigh/adjLow/adjClose/adjVolume, divCash, splitFactor on the ex-date (**UNVERIFIED**, not fetched) | nv | "30+ Years" [S6] | Power "$30/month" or "$300/year"; Business "$50/month (or $499/year)" [S6] | "Internal Use Only: you may only use the data for your own personal use and you may not display or share the data with another person or organization" [S6]. Storage after cancellation: nv | REST API with 10,000 requests/hour on Power [S6]. Search snippet: daily supported_tickers.zip (UNVERIFIED) |
-| **Massive (formerly Polygon.io)** | **Claimed (snippet only).** Search snippet of massive.com/stocks: "free of survivorship bias — delisted tickers keep their full history" (**UNVERIFIED**, not fetched) | Aggregate bars are split-adjusted by default; "adjusted=false" gives raw bars. Nothing is dividend-adjusted. The vendor advises "Store the unadjusted prices if you are keeping a permanent record" because adjusted series are recomputed retroactively [S8] | **No.** Adjusted series change retroactively with each new split [S8]. Search snippet: corporate actions "dating back to 2008" (UNVERIFIED) | Starter 5 yrs, Developer 10 yrs, Advanced "20+ years" [S7] | Starter $29/mo; Developer $79/mo; **Advanced $199/mo** (20+ yrs); annual billing saves 20% [S7] | Plans marked "Individual use" and "Non-pros only" [S7]. Storage and redistribution terms: nv | REST API. Search snippet: S3 flat files (UNVERIFIED which plans include them) |
-| **EODHD** | **Claimed, tiered.** "Delisted Data" is included in both the $19.99 and $99.99 plans [S9]. Depth depends on when the name delisted: "After 2018" = EOD, fundamentals, dividends, splits; "Before 2018" = EOD only. The vendor says to "contact our support team" to confirm coverage for a specific ticker [S10]. Search snippet: "26,000+ US stock tickers (mostly from Jan 2000)" delisted (UNVERIFIED) | "Adjusted Data" is included [S9]. Search snippet: adjusted_close covers splits and dividends, OHLC are raw, and adjusted closes "are recomputed, not stored" (**UNVERIFIED**) | Not point-in-time: adjusted values are recomputed (snippet, UNVERIFIED). Delisted names are found with `delisted=1` on the Exchange Symbol List; renames go through Symbol Change History (US only) [S10] | "Major US Companies: from 1985"; "US Stocks … from earliest available" [S9] | EOD All World **$19.99/mo, $199.00/yr**; All-In-One $99.99/mo, $999.90/yr [S9] | "Personal use"; commercial use needs a separate plan [S9]. Storage and redistribution: nv | 100,000 calls/day, 1,000/min [S9]. Bulk: nv |
-| **Alpaca** | **Absent (not documented).** The docs are silent on delisted symbols [S11, S12]. Tier 3 forum reports say inactive symbols return no bars (see Disconfirmation) | `adjustment`: "raw" (default), "split", "dividend", "spin-off", "all" [S12] | Partial: `asof` maps symbols across renames (e.g. FB to META) [S12]. No known-at date for actions is documented | nv (ADR 0003 believes ~2016) | Free: IEX is "the only feed that can be used without a subscription" [S11]. SIP plan price: nv | nv | REST API. Feeds are sip, iex, boats, otc [S12] |
+| **Norgate** | **Claimed.** Platinum: "Delisted Securities Back to 1990". Diamond: "Back to 1950" [S1]. US coverage "essentially complete back to late 1992"; delisted symbols get a "-YYYYMM" suffix [S2] | Four modes: "Unadjusted (raw), Adjusted for Capital Reconstructions, … and Special Distributions, … Special Distributions and Normal Distributions - aka Total Return" [S2] | nv. No known-at date for actions is documented [S2] | Platinum "Back to 1990"; Diamond "Back to 1950" [S1] | Platinum $346.50/6 mo, **$630/12 mo**. Diamond $433.13/6 mo, **$787.50/12 mo** [S1]. US Stocks packages are "priced in US Dollars" [S20]. Gold and Silver have no delisted names [S1] | Personal use only: "our data service can only be licensed for personal use by individuals. There is no alternative business/commercial licensing" [S14]. Rights "may not be transferred to another party" (cl. 3(i)) [S19]. "Following any expiration of a Subscription the Licensee must delete all Content and Information related to that subscription" (cl. 21) [S19]. Backups "must be deleted" [S14]. Two machines; a VM counts as one [S14]. Australian law (cl. 23) [S19] | Python package [S2]. **Windows only:** "NDU will only work under Windows. However, you can run NDU indirectly on a Mac via Windows virtualization software … UTM, VMWare Fusion …, VirtualBox …, Parallels Desktop" [S21]. Requires ".NET Framework v.4.8" [S18]. Planned move to .NET10 "in late 2026 or early 2027", Windows 10+ only [S21] |
+| **Sharadar (SEP)** | **Claimed.** "No survivorship bias: includes active and delisted tickers" [S3] | closeadj adjusted "for stock splits and cash dividends and spinoffs"; closeunadj is not [S16] | **No.** "Adjustments are applied on a backwards basis. This means today's adjusted price will always equal the price traded in the market" [S16]. The "point-in-time ready" wording from pass 1 was **dropped**: it did not appear on any fetched page | Prices "1998 - present" [S3]. Plans come in 5 years, 10 years or Full History [S22] | Direct from Sharadar: **Prices "$9/mo" (5 Years) or "$39/mo" (Full History)**. Bundle $29/mo (5 yrs) or "$69/month ($499/year)" full history. "Annual options available"; Prices annual figure nv [S22]. Nasdaq Data Link price: nv | Direct: "Personal Use License" under sharadar.com/terms [S22]; the terms themselves are nv. Via QuantRocket: no redistribution, and delete "within thirty (30) days of termination" [S3]. Professional users "must purchase Sharadar data from Nasdaq Data Link" [S3]. Direct Nasdaq Data Link terms: nv | API and "Bulk downloads" [S22] |
+| **CRSP** | Delisted coverage **not evaluated**; not sold to individuals: "delivered to licensees at academic institutions, government agencies, and investment practitioners" [S4] | nv | nv | "Over 100 Years" [S4] | Not listed [S4] | Institutional only [S4] | "Flat File Format 2.0 (CIZ)" [S4] |
+| **Tiingo** | **Claimed, partial by the vendor's own statement.** "supports delisted data for tickers that have not yet been recycled". PermaTicker and delisted support are still future work [S5] | Provides both unadjusted and adjusted (adjOpen/High/Low/Close/Volume) prices, following "the standard method set forth by 'The Center for Research in Security Prices' (CRSP)". divCash is dated on the "exDate"; splitFactor is "the factor used to adjust prices when a company splits, reverse splits, or pays a distribution" [S17] | Ex-date only [S17]. No known-at date documented | "30+ Years" [S6]. Start date per ticker is "the earliest date we have price data available" [S17] | Power "$30/month" or "$300/year"; Business "$50/month (or $499/year)" [S6] | "Internal Use Only" [S6]. On paid plans: "you may persist Tiingo Data in storage solely to the extent permitted by that Paid Plan". "Upon the expiration, cancellation, or termination of the Paid Plan…you must promptly and permanently delete all Tiingo Data from every system". Starter (free) plan: "you may not write, save, archive, back up, or otherwise retain Tiingo Data in any persistent or durable storage". Redistribution "only available upon special request and permission, and comes with additional fees" [S24] | REST API, 10,000 requests/hour on Power [S6]. supported_tickers.zip is a daily **ticker list**, not a price bulk file [S17]. No price bulk download documented |
+| **Massive (formerly Polygon.io)** | **Claimed.** "delisted tickers keep their full history, so backtests see the market as it actually was" [S13] | Aggregate bars split-adjusted by default; `adjusted=false` gives raw bars. No dividend adjustment. The vendor advises "Store the unadjusted prices if you are keeping a permanent record" [S8] | **No.** Adjusted series are recomputed retroactively [S8]. Corporate actions: "splits, dividends, and IPOs — back to 2008" [S13] | Starter 5 yrs, Developer 10 yrs, Advanced "20+ years" [S7]. Tick data "since 2003" [S13] | Starter $29/mo; Developer $79/mo; **Advanced $199/mo**; annual billing saves 20% [S7] | "Individual use", "Non-pros only" [S7]. Storage and redistribution terms: **nv** | REST API. S3 flat files on Starter, Developer, Advanced and Business; **not** on the free tier [S13] |
+| **EODHD** | **Claimed, tiered.** "Delisted Data" is included in both the $19.99 and $99.99 plans [S9]. Names delisted "After 2018" have EOD, fundamentals, dividends and splits; "Before 2018": EOD only. The vendor says to "contact our support team" to confirm coverage per ticker [S10]. The "26,000+ delisted US tickers" figure from pass 1 was **dropped**: it was not on any fetched page | adjusted_close: "Closing price adjusted for both splits and dividends". "The OHLC fields are **raw**" [S15] | **No.** "Adjusted closes are recomputed, not stored. Every new dividend re-scales the whole history behind it" [S15] | "Major US Companies: from 1985" [S9]. "The oldest US common stocks start January 2, 1962" [S15] | EOD All World **$19.99/mo, $199.00/yr**; All-In-One $99.99/mo, $999.90/yr [S9] | "Personal use"; commercial use needs a separate plan [S9]. Storage and redistribution: **nv** | 100,000 calls/day [S9]. A Bulk API for "entire exchanges on single dates" exists [S15]; which plans include it: nv |
+| **Alpaca** | **Absent (not documented).** The docs say nothing about delisted names [S11, S12]. The FAQ only says "Make sure the asset is active. Check the `status` field" [S23] | `adjustment`: "raw" (default), "split", "dividend", "spin-off", "all" [S12] | Partial: `asof` maps symbols across renames [S12]. No known-at date for actions | **nv.** Neither the FAQ [S23] nor the reference [S12] states a start date | Free plan is IEX-only for recent data [S11]; "to query any SIP trades or quotes in the last 15 minutes, you need the Algo Trader Plus subscription" [S23]. Algo Trader Plus price: **nv** (a search snippet says $99/mo; UNVERIFIED) | nv | REST API; feeds sip, iex, boats, otc [S12] |
 
 ### Evidence rows (template format)
 
 | Claim | Source | Tier | Key figure (quoted) | OOS / post-pub? | Net of costs? |
 |---|---|---|---|---|---|
-| Norgate delisted names only in Platinum and Diamond | S1 | 1 (vendor pricing page) | "Delisted Securities Back to 1990" / "Back to 1950"; Platinum 12 months = $630, Diamond = $787.50 | n/a | n/a |
-| Norgate delisted coverage is complete from late 1992 | S2 | 1 (vendor FAQ) | "essentially complete back to late 1992" | n/a | n/a |
-| Sharadar includes delisted names; licence requires deletion | S3 | 1 (authorised reseller's pricing and terms page) | "No survivorship bias: includes active and delisted tickers"; delete "within thirty (30) days of termination" | n/a | n/a |
-| CRSP not sold to individuals | S4 | 1 (vendor product page) | "delivered to licensees at academic institutions, government agencies, and investment practitioners" | n/a | n/a |
-| Tiingo delisted coverage excludes recycled tickers | S5 | 1 (vendor docs) | "supports delisted data for tickers that have not yet been recycled" | n/a | n/a |
-| Tiingo price and licence | S6 | 1 (vendor pricing page) | "$30/month" or "$300/year"; "Internal Use Only" | n/a | n/a |
-| Massive price and history depth | S7 | 1 (vendor pricing page) | Advanced "$199/month", "20+ years"; "Non-pros only" | n/a | n/a |
-| Massive: no dividend adjustment; adjusted series restated | S8 | 1 (vendor knowledge base) | "Store the unadjusted prices if you are keeping a permanent record" | n/a | n/a |
-| EODHD price and plans that include delisted names | S9 | 1 (vendor pricing page) | "$199.00 /year"; "Delisted Data" included | n/a | n/a |
-| EODHD pre-2018 delisted names are EOD only | S10 | 1 (vendor docs) | "Before 2018": EOD only | n/a | n/a |
-| Alpaca free feed is IEX only | S11 | 1 (vendor docs) | IEX "the only feed that can be used without a subscription" | n/a | n/a |
-| Alpaca adjustment options | S12 | 1 (vendor API reference) | "raw" (default), "split", "dividend", "spin-off", "all" | n/a | n/a |
+| Norgate delisted names only in Platinum and Diamond | S1 | 1 | "Delisted Securities Back to 1990" / "Back to 1950"; $630 / $787.50 per 12 months | n/a | n/a |
+| Norgate US packages priced in USD | S20 | 1 | "priced in US Dollars" | n/a | n/a |
+| Norgate delisted coverage is complete from late 1992 | S2 | 1 | "essentially complete back to late 1992" | n/a | n/a |
+| Norgate requires deletion when the subscription expires | S19, S14 | 1 | "must delete all Content and Information related to that subscription" (cl. 21) | n/a | n/a |
+| Norgate data app is Windows-only | S21 | 1 | "NDU will only work under Windows" | n/a | n/a |
+| Sharadar direct pricing | S22 | 1 | Prices "$9/mo" (5 Years) / "$39/mo" (Full History) | n/a | n/a |
+| Sharadar adjustment is backward and restated | S16 | 1 | "Adjustments are applied on a backwards basis" | n/a | n/a |
+| Sharadar includes delisted names; reseller licence requires deletion | S3 | 1 (reseller) | "includes active and delisted tickers"; delete "within thirty (30) days" | n/a | n/a |
+| CRSP not sold to individuals | S4 | 1 | "delivered to licensees at academic institutions, government agencies, and investment practitioners" | n/a | n/a |
+| Tiingo delisted coverage excludes recycled tickers | S5 | 1 | "not yet been recycled" | n/a | n/a |
+| Tiingo adjusts by the CRSP method | S17 | 1 | "the standard method set forth by … (CRSP)" | n/a | n/a |
+| Tiingo requires deletion on cancellation | S24 | 1 | "must promptly and permanently delete all Tiingo Data from every system" | n/a | n/a |
+| Massive claims no survivorship bias; corporate actions from 2008 | S13 | 1 (vendor product page) | "delisted tickers keep their full history"; "back to 2008" | n/a | n/a |
+| Massive: no dividend adjustment; adjusted series restated | S8 | 1 | "Store the unadjusted prices if you are keeping a permanent record" | n/a | n/a |
+| EODHD adjusted_close is recomputed | S15 | 1 | "Adjusted closes are recomputed, not stored" | n/a | n/a |
+| EODHD pre-2018 delisted names are EOD only | S10 | 1 | "Before 2018": EOD only | n/a | n/a |
+| Alpaca free plan restricts recent SIP data | S23 | 1 | "last 15 minutes … need the Algo Trader Plus subscription" | n/a | n/a |
 
-The template's OOS and costs columns do not apply to a vendor survey. Note the tier boundary: the handoff §6.1 classes vendor *marketing* as Tier 3. This brief allows vendor docs, ToS and pricing pages as Tier 1. Survivorship claims are therefore graded **claimed**, never **verified**, because the only source for each is the vendor itself.
+The template's OOS and costs columns do not apply to a vendor survey. On tiers: handoff §6.1 counts vendor *marketing* as Tier 3, while this brief counts vendor docs, ToS and pricing pages as Tier 1. Survivorship statements therefore stay at **claimed**, because their only source is the vendor.
 
 ### Grade definitions used for delisting coverage
-- **Verified:** the vendor documents delisted coverage, **and** an independent Tier 1 source or our own data test confirms it. No vendor reached this grade within budget.
+- **Verified:** the vendor documents delisted coverage, **and** an independent Tier 1 source or our own data test confirms it. No vendor reached this grade.
 - **Claimed:** the vendor documents or states delisted coverage, with no independent confirmation.
 - **Absent:** the vendor does not document delisted coverage, or documents that it lacks it.
 
-## Disconfirmation
-- **Searches run** (7 of the 17 searches):
-  1. Norgate: "Norgate Data delisted missing data error problem survivorship complaint forum".
-  2. Sharadar: "Sharadar SEP data errors bad split adjustment missing delisted tickers closeadj problem".
-  3. Tiingo: "Tiingo delisted data missing recycled ticker survivorship bias adjClose wrong".
-  4. Massive/Polygon: "Polygon.io delisted tickers missing aggregates wrong split adjustment data quality complaints".
-  5. EODHD: "EODHD delisted stocks data quality incorrect adjusted close missing history reddit".
-  6. Alpaca: "Alpaca market data delisted symbols not available historical bars survivorship".
-  7. Norgate licence: "Norgate Data licence agreement personal use data retained after subscription expires redistribution".
+Pass 2 changed only one grade basis: Massive is still **claimed**, but the claim is now cited from a fetched page (S13) instead of a search snippet.
 
-  CRSP was not searched because it is not available to individuals.
-- **What was found against.** All of these are Tier 3 flags to verify, not evidence. They come from search-result snippets; none was fetched.
-  - **Norgate:** nothing against found. The results were reviews and tutorials, and all were favourable.
-  - **Sharadar:** a GitHub issue ([flabber1835/stocker #237](https://github.com/flabber1835/stocker/issues/237)) reports a stale cash-distribution value shared by ACTIONS and the SEP total-return adjustment, "a common-mode vendor error that internal Sharadar corroboration cannot detect". Flag: check dividend adjustments against a second source.
-  - **Tiingo:** the vendor's own doc (S5) is the main disconfirmation: recycled tickers lose their delisted history, and permaTicker support is described as future work. A Tier 3 note (via the sp500-data README snippet) describes the general problem of recycled tickers silently resolving to the wrong company.
-  - **Massive/Polygon:** GitHub issues [polygon-io/issues #311](https://github.com/polygon-io/issues/issues/311) ("Incorrect stock splits for certain tickers") and [#111](https://github.com/polygon-io/issues/issues/111) ("Multiple stocks missing splits or have bad splits"; snippet cites an erroneous CPRT split on 2017-04-10). A Medium review ([Yolo Trading](https://medium.com/@yolotrading/a-complete-review-of-the-polygon-io-api-everything-you-wanted-to-know-c79e992a74ff)) says Polygon is "not recommended if you need data on delisted tickers", that "delisted_utc" is often missing on inactive tickers, and that SPY dividends from 2020 are missing. A Substack post, "Massive Problems (Part 1)", also exists but was not read. This directly contradicts the vendor's survivorship claim, and the dates of these reports are unknown.
-  - **EODHD:** no user reports found. The vendor's own doc limits pre-2018 delisted names to EOD only and asks users to contact support to confirm coverage per ticker (S10).
-  - **Alpaca:** forum threads ["Get Historical Data for Inactive Stocks"](https://forum.alpaca.markets/t/get-historical-data-for-inactive-stocks/10097) and ["Delisted tickers"](https://forum.alpaca.markets/t/delisted-tickers/18227) report that symbols from `list_assets(status='inactive')` return no historical bars. A 2023-era forum thread reports the `adjustment` parameter not working. Both are consistent with grading Alpaca **absent**.
+## Disconfirmation
+- **Searches run in pass 1** (7):
+  - Norgate complaints.
+  - Sharadar errors.
+  - Tiingo delisted and recycled tickers.
+  - Polygon data quality.
+  - EODHD data quality.
+  - Alpaca delisted symbols.
+  - Norgate licence retention.
+
+  CRSP was not searched because it is not available to individuals. Pass 2 ran no new disconfirmation searches; its budget went to closing unverified cells.
+- **What was found against.** The user reports below are Tier 3 flags to verify; none was fetched. The vendor-doc items are marked as such.
+  - **Norgate:** no user complaints found. Vendor-doc risks: the data app is Windows-only, so on a Mac it needs a VM, which counts toward the two-machine limit. A platform move to .NET10 "in late 2026 or early 2027" will need Windows 10+ [S21]. Licensed data must be deleted at expiry [S19].
+  - **Sharadar:** a GitHub issue ([flabber1835/stocker #237](https://github.com/flabber1835/stocker/issues/237)) reports a stale cash-distribution value shared by ACTIONS and the SEP total-return adjustment, "a common-mode vendor error that internal Sharadar corroboration cannot detect". Also, pass 1's "point-in-time ready" wording could not be found on a fetched page and was dropped.
+  - **Tiingo:** the vendor's own doc limits delisted coverage to non-recycled tickers [S5]. A Tier 3 README snippet describes recycled tickers silently resolving to the wrong company.
+  - **Massive/Polygon:** GitHub issues [polygon-io/issues #311](https://github.com/polygon-io/issues/issues/311) (incorrect splits) and [#111](https://github.com/polygon-io/issues/issues/111) (missing or bad splits; an erroneous CPRT split on 2017-04-10). A [Medium review](https://medium.com/@yolotrading/a-complete-review-of-the-polygon-io-api-everything-you-wanted-to-know-c79e992a74ff) says Polygon is "not recommended if you need data on delisted tickers" and reports missing SPY dividends from 2020. Together these contradict the vendor's S13 claim. The dates of the reports are unknown.
+  - **EODHD:** no user reports found. The vendor limits pre-2018 delisted names to EOD only and asks users to confirm coverage per ticker with support [S10]. The "26,000+" figure is not on its pages.
+  - **Alpaca:** forum threads (["Get Historical Data for Inactive Stocks"](https://forum.alpaca.markets/t/get-historical-data-for-inactive-stocks/10097), ["Delisted tickers"](https://forum.alpaca.markets/t/delisted-tickers/18227)) report that inactive symbols return no bars.
 
 ## Caveats & gaps
-- **No independent verification.** Every "claimed" grade rests on the vendor's word. Only a data test can move a vendor to "verified": pull a sample of known delistings (e.g. from our own EDGAR Form 25 table) and check that each has bars up to its last session.
-- **Adjusted prices are not point-in-time at any vendor examined.** Massive and EODHD say explicitly that adjusted series are recomputed as new actions arrive. No vendor documents an announcement or known-at timestamp for corporate actions. Ex-dates are the most any of them gives.
-- **Currency conflict for Norgate:** the fetched pricing page reads USD, but a search snippet showed AUD for the same figures. Norgate is an Australian company. At the time of writing, USD 630 vs AUD 630 is roughly a 35% difference.
-- **History depth vs. delisted depth differ.** EODHD's delisted names before 2018 have EOD only. Norgate's delisted names are "essentially complete" from late 1992, not 1990. Sharadar starts in 1998.
-- **Licence post-cancellation:** Norgate (snippet only) and Sharadar-via-QuantRocket (S3) both require deleting local data when the subscription ends. The other vendors' storage terms were not read.
-- Five fetch attempts returned no usable content and are not counted as sources: data.nasdaq.com/databases/SEP (not rendered), sharadar.com (no SEP details), the Sharadar datasheet PDF (unreadable), and two crsp.org URLs (redirected).
-- Issue #46's `team:banshee` label was not checked, because this agent had no shell. The brief text came from the orchestrator's message.
+- **No independent verification.** Every "claimed" grade rests on the vendor's word. Only a data test can move a vendor to "verified".
+- **Adjusted prices are not point-in-time.** Sharadar [S16], EODHD [S15] and Massive [S8] say explicitly that adjusted series are restated backwards. Tiingo documents ex-dates only [S17]. No vendor documents announcement or known-at timestamps.
+- **Norgate currency resolved.** US packages are priced in USD [S20]. Pass 1's AUD snippet matches the Australian packages, which are priced in AUD (search snippet).
+- **Depth differs by coverage type.** EODHD's delisted names before 2018 have EOD only [S10]. Norgate's delisted coverage is "essentially complete" from late 1992 [S2]. Sharadar starts in 1998 [S3]. Massive's corporate actions start in 2008 [S13]. Sharadar's $9/mo plan is 5 years only [S22].
+- **Licences end with deletion.** Norgate [S19], Tiingo [S24] and Sharadar via QuantRocket [S3] all require deleting local data after the subscription ends. Tiingo's free Starter plan forbids any persistent storage [S24].
+- Fetch attempts that returned nothing usable, not counted as sources:
+  - Pass 1 (5): data.nasdaq.com/databases/SEP, sharadar.com, the Sharadar datasheet PDF, and two crsp.org redirects.
+  - Pass 2 (1): tiingo.com/about/terms returned 404.
 
 ## UNVERIFIED items
-- Norgate: price currency (USD vs AUD), the post-expiry deletion rule (snippet only), redistribution terms, OS requirements, and point-in-time behaviour of corporate actions.
-- Sharadar: price for non-professional users, Nasdaq Data Link direct licence terms, closeadj definition (snippet), the "point-in-time ready" claim (snippet), the ">21,000 tickers" figure (snippet), and API/bulk delivery.
-- CRSP: delisted coverage and adjustment method (not evaluated because individual access is unavailable).
-- Tiingo: adjustment fields (snippet), storage after cancellation, and bulk download (snippet).
-- Massive: the survivorship claim (snippet), corporate actions from 2008 (snippet), which plans include flat files, and licence storage and redistribution terms.
-- EODHD: the "26,000+ US delisted tickers" figure (snippet), adjusted_close definition (snippet), storage and redistribution terms, and bulk download.
-- Alpaca: history start date, SIP plan price, licence and storage terms, and delisted coverage (docs silent; forum only).
+Still open after pass 2:
+- **Sharadar:** the Prices plan annual price; the direct licence (sharadar.com/terms) on storage and deletion; Nasdaq Data Link price and licence terms.
+- **Massive:** storage and redistribution terms (ToS not read).
+- **EODHD:** storage and redistribution terms; which plans include the Bulk API.
+- **Alpaca:** history start date for daily bars; the Algo Trader Plus price (a snippet says $99/mo); licence and storage terms.
+- **Norgate:** whether the adjusted series are restated backwards (not documented on the fetched pages); an explicit redistribution clause (cl. 3(i) covers transfer of licence rights only).
+- **CRSP:** delisted coverage and adjustment method (low priority; not sold to individuals).
 
 ## Follow-up questions (not answered here)
-1. Does Norgate's data access (Norgate Data Updater) run on macOS? The owner's machine is macOS. Tier 3 knowledge says the updater is Windows-only (UNVERIFIED). The ADR would need this answered.
-2. What is Norgate's billing currency, and what is the exact redistribution clause in its EULA (norgatedata.com/subscribe/eula.php)?
-3. What does Sharadar SEP cost a non-professional buying directly on Nasdaq Data Link vs via QuantRocket, and do the direct terms also require deletion on termination?
-4. Does Massive's delisted coverage hold up in a sample test, given the Tier 3 reports against it? Which plan includes flat files?
-5. A test for each shortlisted vendor: take N Form 25 delistings from the local EDGAR store and check that bars exist up to the final session. This is the only route to a "verified" grade.
-6. Can corporate-action known-at timestamps be sourced separately (e.g. 8-K filings), given that no vendor provides them?
-7. Do Tiingo, Massive and EODHD let a subscriber keep locally stored data after cancelling?
+1. Is running Norgate's Windows-only updater in a VM on the owner's Mac acceptable? Does its planned .NET10 move change that?
+2. A test for each shortlisted vendor: take N Form 25 delistings from the local EDGAR store and check that bars exist up to the final session. This is the only route to a "verified" grade.
+3. Can corporate-action known-at timestamps be sourced separately (e.g. 8-K filings), given that no vendor provides them?
+4. Given that most licences require deletion at cancellation, how should the Parquet export and tagged backtest artefacts (ADR 0003) handle vendor data?
+5. Does Massive's delisted coverage survive a sample test, given the Tier 3 reports against it?
 
 ## Sources
 Retrieved 2026-09-25. Tier per the brief's source rules (vendor docs, ToS and pricing pages count as Tier 1).
 
-- **S1** Norgate Data, US Stock Market Packages: https://norgatedata.com/stockmarketpackages.php (Tier 1)
-- **S2** Norgate Data, Data Package FAQ: https://norgatedata.com/data-package-faq.php (Tier 1)
-- **S3** QuantRocket, Sharadar Data Pricing (authorised reseller; includes licence terms): https://www.quantrocket.com/pricing/data/sharadar/ (Tier 1, reseller)
+Pass 1:
+- **S1** Norgate, US Stock Market Packages: https://norgatedata.com/stockmarketpackages.php (Tier 1)
+- **S2** Norgate, Data Package FAQ: https://norgatedata.com/data-package-faq.php (Tier 1)
+- **S3** QuantRocket, Sharadar Data Pricing (authorised reseller; licence terms): https://www.quantrocket.com/pricing/data/sharadar/ (Tier 1, reseller)
 - **S4** Morningstar Indexes / CRSP, CRSP US Stock Databases: https://indexes.morningstar.com/research-data-products/crsp-us-stock-databases (Tier 1)
 - **S5** Tiingo, Symbology documentation: https://www.tiingo.com/documentation/appendix/symbology (Tier 1)
 - **S6** Tiingo, Pricing: https://www.tiingo.com/about/pricing (Tier 1)
 - **S7** Massive, Pricing: https://massive.com/pricing (Tier 1)
-- **S8** Massive, "Is Massive's stock data adjusted for splits or dividends?": https://massive.com/knowledge-base/article/is-massives-stock-data-adjusted-for-splits-or-dividends (Tier 1)
+- **S8** Massive KB, "Is Massive's stock data adjusted for splits or dividends?": https://massive.com/knowledge-base/article/is-massives-stock-data-adjusted-for-splits-or-dividends (Tier 1)
 - **S9** EODHD, Pricing: https://eodhd.com/pricing (Tier 1)
 - **S10** EODHD, Delisted Stock Companies Data: https://eodhd.com/financial-apis/delisted-stock-companies-data-2 (Tier 1)
 - **S11** Alpaca, Historical Stock Data: https://docs.alpaca.markets/us/docs/historical-stock-data-1 (Tier 1)
 - **S12** Alpaca, Historical bars API reference: https://docs.alpaca.markets/us/reference/stockbars (Tier 1)
 
-Search-snippet references (not fetched, flags only, UNVERIFIED): https://norgatedata.com/faq.php, https://data.nasdaq.com/databases/SEP, https://sharadar.com/blog/posts/sharadar-stock-prices-fund-prices-and-adjustments, https://www.tiingo.com/documentation/end-of-day, https://massive.com/stocks, https://eodhd.com/financial-apis/api-for-historical-data-and-volumes, plus the Tier 3 links in Disconfirmation.
+Pass 2:
+- **S13** Massive, Stock Market API product page: https://massive.com/stocks (Tier 1, vendor product page)
+- **S14** Norgate, Subscription & Licensing FAQ: https://norgatedata.com/faq.php (Tier 1)
+- **S15** EODHD, End-of-Day Historical Data API docs: https://eodhd.com/financial-apis/api-for-historical-data-and-volumes (Tier 1)
+- **S16** Sharadar, "Sharadar Stock Prices, Fund Prices and Adjustments" (2026-07-29): https://sharadar.com/blog/posts/sharadar-stock-prices-fund-prices-and-adjustments (Tier 1, vendor doc)
+- **S17** Tiingo, End-of-Day API documentation: https://www.tiingo.com/documentation/end-of-day (Tier 1)
+- **S18** Norgate, System Requirements: https://norgatedata.com/system-requirements.php (Tier 1)
+- **S19** Norgate, End User Licence Agreement: https://norgatedata.com/subscribe/eula.php (Tier 1)
+- **S20** Norgate, Subscription prices: https://norgatedata.com/prices.php (Tier 1)
+- **S21** Norgate, Norgate Data Updater FAQ: https://norgatedata.com/ndu-faq.php (Tier 1)
+- **S22** Sharadar, Subscribe: https://sharadar.com/subscribe (Tier 1)
+- **S23** Alpaca, Market Data FAQ: https://docs.alpaca.markets/us/docs/market-data-faq (Tier 1)
+- **S24** Tiingo, Terms of Use: https://app.tiingo.com/tos/ (Tier 1)
 
-**Budget used:** 12 of 12 sources (fetched and cited); 17 of 20 searches; 5 further fetch attempts returned no usable content.
+Search-snippet references (not fetched, flags only, UNVERIFIED): the Alpaca $99/mo figure (alpaca.markets/data, apis.io); the Norgate AUD pricing for Australian packages; plus the Tier 3 links in Disconfirmation.
+
+## Pass 2 note
+The owner authorised a second budget of 12 sources and 20 searches on 2026-09-25.
+
+**Used in pass 2:** 12 of 12 sources (S13–S24); 6 of 20 searches; 1 further fetch returned 404.
+
+**Cumulative:** 24 sources; 23 searches.
+
+**Closed in pass 2:**
+- Massive: survivorship claim, corporate-actions depth, which plans include flat files.
+- Norgate: FAQ deletion clause, billing currency, macOS/OS requirements, EULA transfer and deletion clauses.
+- EODHD: adjusted_close definition; its Bulk API exists.
+- Sharadar: closeadj definition, direct price, bulk downloads.
+- Tiingo: adjusted fields, storage and deletion terms, redistribution, bulk (ticker list only).
+- Alpaca: free-plan SIP restriction.
+
+**Dropped as unsupported:**
+- The Sharadar "point-in-time ready" wording.
+- The EODHD "26,000+ delisted US tickers" figure.
