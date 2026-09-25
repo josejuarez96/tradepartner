@@ -3,6 +3,7 @@
 **Updated:** 2026-09-24 · **Phase:** 2, Data foundation · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Done
+Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/fragments.py show` (#70).
 - Repo scaffold: uv / ruff / mypy / pytest, CI, pre-commit, GitHub templates, labels ([initial commit](https://github.com/josejuarez96/tradepartner/commits/main))
 - #1 Ways of working: git workflow, process, docs, agents, draft charter (PR #2, merged). The main session may merge a PR when the owner explicitly says to
 

@@ -7,6 +7,7 @@ Start with [STATUS.md](STATUS.md) to see where things stand now, then the [chart
 ```
 docs/
 ├── STATUS.md             ← living: current phase, in progress, next, blocked, decisions needed
+├── status.d/             ← one Done line per open PR, folded into STATUS.md by doc-keeper
 ├── charter.md            ← why, success/stop criteria, scope, constraints (changes only via ADR)
 ├── roadmap.md            ← phases with exit criteria
 ├── architecture.md       ← (Phase 1+) living system overview: components, data flow
@@ -31,7 +32,7 @@ docs/
 | **STATUS** | Where are we right now? | Always exists | Living; updated every session | n/a |
 | **Architecture** | How do the pieces fit today? | Phase 1+ | Living; updated when structure changes | n/a |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
-| **CHANGELOG** | What changed, per version? | Every feat/fix PR | Append | n/a |
+| **CHANGELOG** | What changed, per version? | Every feat/fix PR | Fragment in `changelog.d/`, folded by doc-keeper | n/a |
 
 ## Rules
 

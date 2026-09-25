@@ -13,7 +13,7 @@ Closes #
 ## Review checklist
 - [ ] Scope matches the plan task — nothing extra
 - [ ] No secrets, data files, or notebooks with outputs committed
-- [ ] Docs updated (STATUS.md, spec/plan checkboxes, `.env.example`, ADR if a decision was made)
+- [ ] Docs updated (STATUS/CHANGELOG fragment via `scripts/fragments.py add`, spec/plan checkboxes, `.env.example`, ADR if a decision was made)
 - [ ] Touches data/backtest/signals → `quant-auditor` run, findings addressed
 - [ ] Touches broker/orders/LLM inputs/secrets → `safety-reviewer` run, findings addressed
 

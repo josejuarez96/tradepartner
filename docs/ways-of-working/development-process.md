@@ -70,7 +70,8 @@ Not every change needs every document. Size is set on the issue.
 - [ ] There are tests for new behavior. A bug fix starts with a failing test.
 - [ ] CI is green: lint, format, types, tests, hygiene.
 - [ ] There are no TODOs without a linked issue.
-- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, `STATUS.md` ("Done"), `CHANGELOG.md` (`[Unreleased]`), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
+- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, one STATUS "Done" line and one CHANGELOG bullet as **fragments** (`uv run python scripts/fragments.py add <issue> ...`, never an edit to `STATUS.md` or `CHANGELOG.md` themselves; #70), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
+- [ ] The PR was marked ready by `/ready-pr` (`scripts/ready_pr.py`), which ran the checks, verified the template and the specialist reviews, and waited for CI on the merged commit.
 - [ ] Data code: every stored fact has `known_at`, and `quant-auditor` has passed.
 - [ ] Execution, LLM or secrets code: `safety-reviewer` has passed.
 
@@ -97,7 +98,7 @@ These come straight from the research handoff. They are process rules, not just 
 **End of session:**
 1. Commit and push.
 2. Update the draft PR description with the current state.
-3. Update `docs/STATUS.md` if anything changed: done, blocked, or a new decision needed. Append lines; never edit "Next up" to reserve work.
+3. Record what changed: your Done line and CHANGELOG bullet as fragments (`scripts/fragments.py add`); a new blocker or decision needed as a line under STATUS "Blocked" or "Decisions needed" (those short lists rarely collide). Never edit "Next up" or the frontier snapshot to reserve work.
 4. Stopping for good on an item: `uv run python scripts/team.py release` it, with a handoff comment on the issue.
 
 `STATUS.md` replaces ad-hoc handoff documents. It always tells you where things stand in two minutes of reading.

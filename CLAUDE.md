@@ -49,4 +49,4 @@ Run lint, format, mypy and pytest before every push.
 | Doc types and templates | [docs/README.md](docs/README.md) |
 
 ## Before opening or readying a PR
-Fill in the PR template completely. Run `quant-auditor` if the PR touches data, backtests or signals. Run `safety-reviewer` if it touches the broker, orders, secrets or LLM inputs. Update `docs/STATUS.md` if the project state changed.
+Fill in the PR template completely. Run `quant-auditor` if the PR touches data, backtests or signals. Run `safety-reviewer` if it touches the broker, orders, secrets or LLM inputs. Record your Done line and CHANGELOG bullet as fragments (`uv run python scripts/fragments.py add <issue> ...`), never by editing `STATUS.md` or `CHANGELOG.md`. Then `/ready-pr` (`uv run python scripts/ready_pr.py <pr>`): it merges main in, runs every check, waits for CI and marks the PR ready. Never mark ready by hand, never merge.
