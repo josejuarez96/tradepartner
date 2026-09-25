@@ -1,0 +1,113 @@
+[
+  {
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "options_late_close",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "ARCA",
+    "fractionable": true,
+    "id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "State Street SPDR S&P 500 ETF Trust",
+    "shortable": true,
+    "status": "active",
+    "symbol": "SPY",
+    "tradable": true
+  },
+  {
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "BATS",
+    "fractionable": true,
+    "id": "7ee08127-b9fa-4ba4-a45e-902bc5f17f30",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "iShares MSCI USA Momentum Factor ETF",
+    "shortable": true,
+    "status": "active",
+    "symbol": "MTUM",
+    "tradable": true
+  },
+  {
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "NASDAQ",
+    "fractionable": true,
+    "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "Apple Inc. Common Stock",
+    "shortable": true,
+    "status": "active",
+    "symbol": "AAPL",
+    "tradable": true
+  },
+  {
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "NASDAQ",
+    "fractionable": true,
+    "id": "b6d1aa75-5c9c-4353-a305-9e2caa1925ab",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "Microsoft Corporation Common Stock",
+    "shortable": true,
+    "status": "active",
+    "symbol": "MSFT",
+    "tradable": true
+  },
+  {
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "NYSE",
+    "fractionable": true,
+    "id": "3795cafe-fd54-4f66-a31e-66774be875ca",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "Coca-Cola Company",
+    "shortable": true,
+    "status": "active",
+    "symbol": "KO",
+    "tradable": true
+  }
+]

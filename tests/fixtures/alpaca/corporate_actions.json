@@ -1,0 +1,54 @@
+{
+  "cash_dividends": [
+    {
+      "cusip": "037833100",
+      "ex_date": "2020-08-07",
+      "foreign": false,
+      "id": "d09386ae-0c2b-4280-8aa0-295e545354b1",
+      "payable_date": "2020-08-13",
+      "process_date": "2020-08-13",
+      "rate": 0.82,
+      "record_date": "2020-08-10",
+      "special": false,
+      "symbol": "AAPL"
+    },
+    {
+      "cusip": "594918104",
+      "ex_date": "2020-08-19",
+      "foreign": false,
+      "id": "3e6a0486-e4ce-4338-838b-eb053c12e2f4",
+      "payable_date": "2020-09-10",
+      "process_date": "2020-09-10",
+      "rate": 0.51,
+      "record_date": "2020-08-20",
+      "special": false,
+      "symbol": "MSFT"
+    },
+    {
+      "cusip": "46432F396",
+      "ex_date": "2020-09-23",
+      "foreign": false,
+      "id": "7540bde9-9641-4464-97f1-f09cf4290950",
+      "payable_date": "2020-09-29",
+      "process_date": "2020-09-29",
+      "rate": 0.239494,
+      "record_date": "2020-09-24",
+      "special": false,
+      "symbol": "MTUM"
+    }
+  ],
+  "forward_splits": [
+    {
+      "cusip": "037833100",
+      "due_bill_redemption_date": "2020-09-01",
+      "ex_date": "2020-08-31",
+      "id": "d209b6c2-9231-474c-a80e-1a79dacadbb2",
+      "new_rate": 4,
+      "old_rate": 1,
+      "payable_date": "2020-08-28",
+      "process_date": "2020-08-31",
+      "record_date": "2020-08-24",
+      "symbol": "AAPL"
+    }
+  ]
+}

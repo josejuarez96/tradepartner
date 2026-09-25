@@ -138,7 +138,7 @@ def test_universe_defaults() -> None:
     assert u.security_types == ["common"]
     assert u.exchanges == ["NYSE", "NASDAQ", "NYSE_AMERICAN"]
     assert u.min_price == 5
-    assert u.liquidity_rule_enabled is False
+    assert u.liquidity_rule_enabled is True
     assert u.min_median_dollar_volume == 5_000_000
     assert u.liquidity_window == 20
     assert u.min_history_months == 12
@@ -161,15 +161,36 @@ def test_guarded_sic_exclusion_rejects_env_override(monkeypatch: pytest.MonkeyPa
         Settings(_env_file=None)
 
 
-def test_liquidity_rule_disabled_by_default() -> None:
-    """Stays false until the owner's T3 research sets it (spec req 14)."""
-    assert _settings().universe.liquidity_rule_enabled is False
+def test_liquidity_rule_enabled_since_t3() -> None:
+    """T3 (#84) turned it on: SIP history makes dollar volume a real measure."""
+    assert _settings().universe.liquidity_rule_enabled is True
+
+
+def test_alpaca_historical_feed_defaults_to_sip_and_rejects_others() -> None:
+    assert _settings().alpaca.historical_feed == "sip"
+    assert (
+        Settings(_env_file=None, alpaca={"historical_feed": "iex"}).alpaca.historical_feed == "iex"
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca={"historical_feed": "otc"})
 
 
 def test_gap_defaults() -> None:
     s = _settings()
     assert s.gap.missing_tail_sessions == 5
     assert s.gap.count_share_threshold == pytest.approx(0.05)
+
+
+def test_adjust_defaults() -> None:
+    assert _settings().adjust.max_prior_close_gap_sessions == 5
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_adjust_max_prior_close_gap_sessions_rejects_non_positive(value: int) -> None:
+    """Zero sessions would reject every prior close, even the session right
+    before the ex-date, silently dropping every dividend (#72)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, adjust={"max_prior_close_gap_sessions": value})
 
 
 def test_secrets_default_to_none() -> None:

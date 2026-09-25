@@ -268,3 +268,13 @@ def test_sessions_in_month_window_one_month() -> None:
 def test_sessions_in_month_window_months_below_one_raises() -> None:
     with pytest.raises(ValueError, match="months must be >= 1"):
         tp_calendar.sessions_in_month_window(date(2025, 7, 31), months=0)
+
+
+def test_all_sessions_skips_holidays_and_spans_the_pinned_range() -> None:
+    sessions = tp_calendar.all_sessions()
+    assert sessions[0] == date(1990, 1, 2)  # first session in the pinned range
+    assert sessions[-1] == tp_calendar.previous_session(date(2036, 1, 1))
+    assert date(2021, 1, 18) not in sessions  # MLK Day
+    assert date(2021, 1, 15) in sessions
+    assert list(sessions) == sorted(set(sessions))
+    assert tp_calendar.all_sessions() is sessions
