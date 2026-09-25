@@ -42,6 +42,7 @@ from tradepartner.store.asof import (
     dropped_dividends_as_of,
     facts_as_of,
     listings_as_of,
+    live_actions_as_of,
     prices_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
@@ -94,7 +95,7 @@ def test_snapshot_static_listing_invariant_under_truncation_without_exemption(
     assert visible == [0, 0, 1]
 
 
-@pytest.mark.parametrize("func", [prices_as_of, facts_as_of, listings_as_of])
+@pytest.mark.parametrize("func", [prices_as_of, facts_as_of, listings_as_of, live_actions_as_of])
 def test_as_of_function_invariant_under_truncation(
     fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, func: AsOfFunc
 ) -> None:
