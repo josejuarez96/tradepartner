@@ -7,6 +7,7 @@ The real ``gh`` wrapper is a thin shell and is exercised by using the tool.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -437,3 +438,56 @@ def test_status_lists_claims_frontier_loose_issues_and_parked(
     assert "#28" in out and "titled as T8b: needs its task label" in out
     assert "PARKED PRS" in out
     assert "BLOCKED PLAN TASKS: T8b, T10" in out
+
+
+# ── prune ───────────────────────────────────────────────────────────────────────
+
+
+def _td(name: str, idle_h: float, *, dirty: bool = False, registered: bool = True) -> team.TeamDir:
+    return team.TeamDir(name, Path("/t") / name, 1_000_000.0 - idle_h * 3600, dirty, registered)
+
+
+def test_prune_candidates_keeps_active_recent_dirty_and_unregistered() -> None:
+    dirs = [
+        _td("old", 30),
+        _td("busy", 30),
+        _td("fresh", 2),
+        _td("messy", 30, dirty=True),
+        _td("stray", 30, registered=False),
+        _td("older", 100),
+    ]
+    remove, skipped = team.prune_candidates(dirs, {"busy"}, now=1_000_000.0, hours=6)
+    assert [d.name for d in remove] == ["old", "older"]
+    reasons = {d.name: why for d, why in skipped}
+    assert "claim" in reasons["busy"]
+    assert "2.0h" in reasons["fresh"]
+    assert "uncommitted" in reasons["messy"]
+    assert ".team" in reasons["stray"]
+
+
+def test_prune_dry_run_by_default_and_removes_with_yes(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (root / ".gitignore").write_text(".team\n")  # as in the real repo
+    _init_repo(root)
+    git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "add", ".gitignore"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "ignore .team"], check=True)
+    gh = FakeGitHub()
+    team.cmd_start(gh, root, "guilo", ref="HEAD")
+    team.cmd_start(gh, root, "busy", ref="HEAD")
+    gh.issues[7] = team.Issue(7, "x", ("team:busy",))
+    base = root.parent / f"{root.name}-teams"
+    old = 1_000.0
+    for p in [base / "guilo", *(base / "guilo").iterdir()]:
+        os.utime(p, (old, old))
+
+    assert team.cmd_prune(gh, root, hours=6) == 0
+    out = capsys.readouterr().out
+    assert "would remove guilo" in out and "keep    busy" in out and "dry run" in out
+    assert (base / "guilo").is_dir()
+
+    assert team.cmd_prune(gh, root, hours=6, yes=True) == 0
+    assert not (base / "guilo").exists()
+    assert (base / "busy").is_dir()
+    assert "removed 1" in capsys.readouterr().out
