@@ -23,10 +23,40 @@ tz-awareness. `tradepartner.store.db.insert_row` validates that in Python,
 by column type, before any row reaches these tables.
 
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
-EXISTS`, and the `schema_version` bookkeeping row is inserted only once.
-If a store already has a `schema_version` row that disagrees with
-`CURRENT_SCHEMA_VERSION`, `init_schema` raises `SchemaVersionError` rather
-than silently operating against a shape it does not know about.
+EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
+If a store records a version this code has no path from (anything other
+than 2 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+`SchemaVersionError` rather than silently operating against a shape it
+does not know about.
+
+Schema versions (the Phase 3 spec req 9 says "version 2" for the
+registry; #83 took version 2 first, so the registry is version 3):
+
+- **Version 1**: the Phase 2 fact tables, `ingestion_runs` and
+  `schema_version` (`TABLE_NAMES`). No migration: a version-1 store raises
+  `SchemaVersionError` and is rebuilt (#83).
+- **Version 2** (#83): adds `corporate_actions.announced_at`.
+- **Version 3** (#117): adds the eight trial-registry tables
+  (`REGISTRY_TABLE_NAMES`). The migration from version 2 is additive: it
+  creates the registry tables and appends a version-3 row to
+  `schema_version`; no fact table, `ingestion_runs` row or existing
+  `schema_version` row changes. It runs on any writable connection that
+  calls `init_schema`. A read-only connection never migrates: on a
+  version-2 (or empty) store it raises `RegistryNotInitialised`, which the
+  read-only dashboard pages turn into a "registry not initialised" state.
+- **A later fact-table DDL change goes to version 4**, with its own
+  migration and a note here, never a silent edit of the DDL below.
+
+Registry tables are not fact tables: like `ingestion_runs` they carry no
+`known_at`/`ingested_at`/`source`/`provenance` columns, and they are kept
+out of `TABLE_NAMES` so the look-ahead harness (which truncates every
+`TABLE_NAMES` fact table by `known_at`) is untouched. They are
+append-only by contract (`store.registry` exposes inserts and reads
+only); the only schema-level backstops are the primary keys (one
+`trial_results` row per trial) and `CHECK`s on the spec's enumerated
+columns (`trials.kind`, `trial_results.status`, `owner_decisions.kind`).
+No foreign keys are declared, as for the fact tables; ids are assigned by
+`store.registry`, not by a sequence.
 
 Design decisions (not pinned by the spec text, recorded here because
 they shape this DDL):
@@ -80,9 +110,9 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "facts": ("filing",),
 }
 
-#: The schema version `init_schema` records on first run. Bump and add a
-#: migration note here (not silent DDL edits) if the shape of a table
-#: changes after data has been loaded.
+#: The schema version `init_schema` records on a fresh store and migrates
+#: a version-2 store to. Bump and add a migration note (not silent DDL
+#: edits) if the shape of a table changes after data has been loaded.
 #:
 #: Migration notes:
 #: - 2 (issue #83): `corporate_actions.announced_at TIMESTAMPTZ` (nullable),
@@ -90,13 +120,28 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #:   the proxy is checkable. No store had ingested data at version 1, so
 #:   there is no migration code: a version-1 store raises
 #:   `SchemaVersionError`; rebuild it.
-CURRENT_SCHEMA_VERSION = 2
+#: - 3 (issue #117, Phase 3 T31): the eight trial-registry tables
+#:   (`REGISTRY_TABLE_NAMES`). Additive migration from version 2: the
+#:   registry tables are created and a version-3 row appended; nothing else
+#:   changes (module docstring, "Schema versions").
+CURRENT_SCHEMA_VERSION = 3
+
+#: The last version without the registry, the only one `init_schema`
+#: migrates from (fact tables as of #83).
+_PRE_REGISTRY_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
-    """The store's `schema_version` table records a version other than
-    `CURRENT_SCHEMA_VERSION` — this code does not know that shape and
-    refuses to operate on it rather than guessing."""
+    """The store's `schema_version` table records a version this code has
+    no migration from — it does not know that shape and refuses to
+    operate on it rather than guessing."""
+
+
+class RegistryNotInitialised(RuntimeError):
+    """A read-only connection opened a store without the trial registry
+    (a version-2 store, or one never initialised). Read-only
+    connections never migrate; any writing command's `init_schema` call
+    does."""
 
 
 def _common_fact_columns(provenance_values: tuple[str, ...]) -> str:
@@ -270,8 +315,225 @@ _TABLE_DDL: tuple[str, ...] = (
 )
 
 
+# Trial registry (schema version 3; Phase 3 spec "Data / interfaces" >
+# Tables). Not fact tables: no known_at, like ingestion_runs. Every JSON
+# payload is VARCHAR because extension auto-load is disabled
+# (`configure_connection`), so the json extension is never available.
+_CREATE_HYPOTHESES = """
+CREATE TABLE IF NOT EXISTS hypotheses (
+    hypothesis_id BIGINT NOT NULL PRIMARY KEY,
+    slug VARCHAR NOT NULL,
+    family VARCHAR NOT NULL,
+    title VARCHAR NOT NULL,
+    doc_path VARCHAR NOT NULL,
+    doc_sha256 VARCHAR NOT NULL,
+    params_json VARCHAR NOT NULL,
+    params_sha256 VARCHAR NOT NULL,
+    in_sample_start DATE NOT NULL,
+    holdout_start DATE NOT NULL,
+    holdout_end DATE NOT NULL,
+    registered_at TIMESTAMPTZ NOT NULL,
+    registered_by VARCHAR NOT NULL
+)
+"""
+
+# No CHECK on the window: a refused window (start after end, or outside
+# the in-sample range) is still a trial and must be recorded. code_dirty
+# is NULL when code_version is 'unknown' (outside a git checkout);
+# store_max_ingested_at is NULL on a store with no fact rows. The two
+# session columns hold the requested window dates as given; data_cutoff
+# (the close of the end session) is NULL when the requested end cannot
+# be resolved on the trading calendar, so that refusal still leaves a
+# trials row.
+_CREATE_TRIALS = """
+CREATE TABLE IF NOT EXISTS trials (
+    trial_id BIGINT NOT NULL PRIMARY KEY,
+    hypothesis_id BIGINT NOT NULL,
+    kind VARCHAR NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    start_session DATE NOT NULL,
+    end_session DATE NOT NULL,
+    data_cutoff TIMESTAMPTZ,
+    store_max_ingested_at TIMESTAMPTZ,
+    code_version VARCHAR NOT NULL,
+    code_dirty BOOLEAN,
+    synthetic BOOLEAN NOT NULL,
+    holdout_repeat BOOLEAN NOT NULL DEFAULT FALSE,
+    holdout_reason VARCHAR,
+    gap_override_reason VARCHAR,
+    run_by VARCHAR NOT NULL,
+    note VARCHAR,
+    CHECK (kind IN ('in_sample', 'holdout', 'tracking'))
+)
+"""
+
+# One row per trial: a trial's outcome is this row, never an update of
+# `trials`. The statistics are NULL on any status other than ok.
+_CREATE_TRIAL_RESULTS = """
+CREATE TABLE IF NOT EXISTS trial_results (
+    trial_id BIGINT NOT NULL PRIMARY KEY,
+    finished_at TIMESTAMPTZ NOT NULL,
+    status VARCHAR NOT NULL,
+    message VARCHAR,
+    n_trials INTEGER,
+    sharpe_variance DOUBLE,
+    sr_star DOUBLE,
+    psr_zero DOUBLE,
+    dsr DOUBLE,
+    sharpe_variance_excess DOUBLE,
+    sr_star_excess DOUBLE,
+    psr_zero_excess DOUBLE,
+    dsr_excess DOUBLE,
+    dsr_basis VARCHAR,
+    red_flag BOOLEAN,
+    gap_max_count_share DOUBLE,
+    gap_max_size_share DOUBLE,
+    CHECK (status IN ('ok', 'failed', 'refused_window', 'refused_holdout', 'refused_gap'))
+)
+"""
+
+# value is NULL where a metric does not apply (`*_excess_spy` for SPY).
+_CREATE_TRIAL_METRICS = """
+CREATE TABLE IF NOT EXISTS trial_metrics (
+    trial_id BIGINT NOT NULL,
+    series VARCHAR NOT NULL,
+    cost_per_side_bps DOUBLE NOT NULL,
+    metric VARCHAR NOT NULL,
+    value DOUBLE,
+    UNIQUE (trial_id, series, cost_per_side_bps, metric)
+)
+"""
+
+_CREATE_TRIAL_REBALANCES = """
+CREATE TABLE IF NOT EXISTS trial_rebalances (
+    trial_id BIGINT NOT NULL,
+    cost_per_side_bps DOUBLE NOT NULL,
+    session DATE NOT NULL,
+    fill_session DATE NOT NULL,
+    n_universe INTEGER NOT NULL,
+    n_static_listings INTEGER NOT NULL,
+    n_targets INTEGER NOT NULL,
+    turnover DOUBLE NOT NULL,
+    cost_paid DOUBLE NOT NULL,
+    gap_count_share DOUBLE,
+    gap_size_share DOUBLE,
+    n_missing_fill INTEGER NOT NULL,
+    n_delisting_exits INTEGER NOT NULL,
+    n_stale_exits INTEGER NOT NULL,
+    n_excluded_no_history INTEGER NOT NULL,
+    n_dropped_dividends INTEGER NOT NULL,
+    n_late_dividends INTEGER NOT NULL,
+    UNIQUE (trial_id, cost_per_side_bps, session)
+)
+"""
+
+# cash is NULL for a benchmark series, which holds no cash account.
+_CREATE_TRIAL_EQUITY = """
+CREATE TABLE IF NOT EXISTS trial_equity (
+    trial_id BIGINT NOT NULL,
+    series VARCHAR NOT NULL,
+    cost_per_side_bps DOUBLE NOT NULL,
+    session DATE NOT NULL,
+    equity DOUBLE NOT NULL,
+    cash DOUBLE,
+    UNIQUE (trial_id, series, cost_per_side_bps, session)
+)
+"""
+
+# Base cost level only (targets are identical across levels). fill_price
+# and shares are NULL for a missing fill.
+_CREATE_TRIAL_WEIGHTS = """
+CREATE TABLE IF NOT EXISTS trial_weights (
+    trial_id BIGINT NOT NULL,
+    fill_session DATE NOT NULL,
+    security_id VARCHAR NOT NULL,
+    target_weight DOUBLE NOT NULL,
+    fill_price DOUBLE,
+    shares DOUBLE,
+    UNIQUE (trial_id, fill_session, security_id)
+)
+"""
+
+_CREATE_OWNER_DECISIONS = """
+CREATE TABLE IF NOT EXISTS owner_decisions (
+    decision_id BIGINT NOT NULL PRIMARY KEY,
+    made_at TIMESTAMPTZ NOT NULL,
+    kind VARCHAR NOT NULL,
+    hypothesis_id BIGINT,
+    trial_id BIGINT,
+    values_json VARCHAR NOT NULL,
+    reason VARCHAR NOT NULL,
+    CHECK (kind IN ('gap_signoff', 'gap_override', 'holdout_spend'))
+)
+"""
+
+#: The trial-registry tables added at schema version 3, disjoint from
+#: `TABLE_NAMES` so the look-ahead harness never sees them.
+REGISTRY_TABLE_NAMES: tuple[str, ...] = (
+    "hypotheses",
+    "trials",
+    "trial_results",
+    "trial_metrics",
+    "trial_rebalances",
+    "trial_equity",
+    "trial_weights",
+    "owner_decisions",
+)
+
+_REGISTRY_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_HYPOTHESES,
+    _CREATE_TRIALS,
+    _CREATE_TRIAL_RESULTS,
+    _CREATE_TRIAL_METRICS,
+    _CREATE_TRIAL_REBALANCES,
+    _CREATE_TRIAL_EQUITY,
+    _CREATE_TRIAL_WEIGHTS,
+    _CREATE_OWNER_DECISIONS,
+)
+
+
+def _is_read_only(conn: duckdb.DuckDBPyConnection) -> bool:
+    """Whether `conn`'s current database is attached read-only."""
+    result = conn.execute(
+        "SELECT readonly FROM duckdb_databases() WHERE database_name = current_database()"
+    ).fetchone()
+    return bool(result[0]) if result is not None else False
+
+
+def _max_version(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """The highest recorded schema version, or None if there is none (no
+    `schema_version` table, or an empty one)."""
+    exists = conn.execute(
+        "SELECT COUNT(*) FROM duckdb_tables() "
+        "WHERE database_name = current_database() AND schema_name = current_schema() "
+        "AND table_name = 'schema_version'"
+    ).fetchone()
+    if exists is None or exists[0] == 0:
+        return None
+    result = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    return result[0] if result is not None else None
+
+
+def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
+    """The read-only path of `init_schema`: no DDL, only a version check."""
+    max_version = _max_version(conn)
+    if max_version == CURRENT_SCHEMA_VERSION:
+        return
+    if max_version is None or max_version == _PRE_REGISTRY_VERSION:
+        found = "no schema" if max_version is None else f"schema version {max_version}"
+        raise RegistryNotInitialised(
+            f"store has {found}; the trial registry needs version "
+            f"{CURRENT_SCHEMA_VERSION}, and a read-only connection does not migrate "
+            "(run any writing command to migrate the store)"
+        )
+    raise SchemaVersionError(
+        f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
+    )
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create every store table if it does not already exist.
+    """Create every store table if it does not already exist, migrating a
+    version-2 store to version 3.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -281,23 +543,33 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     for `conn` (`store.db.forget_column_types`) so `store.db.insert_row`
     never reuses type info cached before these tables existed.
 
-    Raises `SchemaVersionError` if the store already has a `schema_version`
-    row whose version differs from `CURRENT_SCHEMA_VERSION`: this module
-    has no migration logic, so operating on a store shaped for a different
-    version would silently corrupt or misinterpret it.
+    On a writable connection: a fresh store gets every table and one
+    `schema_version` row for `CURRENT_SCHEMA_VERSION`; a version-2 store
+    gets the registry tables and an appended version-3 row, and nothing
+    else changes (module docstring, "Schema versions").
+
+    On a read-only connection no DDL runs: a version-3 store passes, and a
+    version-2 or uninitialised store raises `RegistryNotInitialised`.
+
+    Raises `SchemaVersionError` if the store records any other version:
+    this module has no migration from it, so operating on a store shaped
+    for a different version would silently corrupt or misinterpret it.
     """
     configure_connection(conn)
-    for ddl in _TABLE_DDL:
+    if _is_read_only(conn):
+        _check_read_only(conn)
+        forget_column_types(conn)
+        return
+    max_version = _max_version(conn)
+    if max_version not in (None, _PRE_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION):
+        raise SchemaVersionError(
+            f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
+        )
+    for ddl in _TABLE_DDL + _REGISTRY_TABLE_DDL:
         conn.execute(ddl)
     forget_column_types(conn)
-    result = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    max_version = result[0] if result is not None else None
-    if max_version is None:
+    if max_version != CURRENT_SCHEMA_VERSION:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             [CURRENT_SCHEMA_VERSION, utc_now()],
-        )
-    elif max_version != CURRENT_SCHEMA_VERSION:
-        raise SchemaVersionError(
-            f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
         )

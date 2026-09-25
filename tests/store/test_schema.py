@@ -156,9 +156,10 @@ def test_corporate_actions_has_a_nullable_announced_at(
     assert not not_null
 
 
-def test_schema_version_is_2() -> None:
-    """Version 2 adds `corporate_actions.announced_at` (issue #83)."""
-    assert schema.CURRENT_SCHEMA_VERSION == 2
+def test_announced_at_arrived_at_schema_version_2() -> None:
+    """Version 2 adds `corporate_actions.announced_at` (issue #83); the
+    registry (version 3, #117) migrates only from it."""
+    assert schema._PRE_REGISTRY_VERSION == 2
 
 
 def test_ingestion_runs_is_not_a_fact_table(fixture_store: duckdb.DuckDBPyConnection) -> None:
