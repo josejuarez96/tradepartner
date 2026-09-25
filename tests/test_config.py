@@ -1,9 +1,9 @@
 """Tests for tradepartner.config.
 
-Every default asserted here mirrors the "Config keys" list in
-docs/specs/data-foundation.md. `store.path` and `edgar.cache_dir` are not
-given explicit defaults in the spec; this task picks conservative ones under
-the gitignored `data/` directory (see the PR's Open questions).
+Every default asserted here mirrors the "Config keys" lists in
+docs/specs/data-foundation.md and docs/specs/backtest.md (Phase 3, T30).
+`store.path` and `edgar.cache_dir` are not given explicit defaults in the
+spec; T1 picked conservative ones under the gitignored `data/` directory.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "SEC_EDGAR_USER_AGENT",
         "TRADEPARTNER_ENV_FILE",
         "UNIVERSE__EXCLUDE_SIC_RANGES",
+        "HOLDOUT__START",
+        "HOLDOUT__END",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -246,3 +248,184 @@ def test_env_file_override_via_tradepartner_env_file(
 
     assert settings.alpaca_api_key is not None
     assert settings.alpaca_api_key.get_secret_value() == "custom-key-999"
+
+
+# --- Phase 3 keys (docs/specs/backtest.md "Config keys", T30) ---
+
+
+def test_hypotheses_families_default() -> None:
+    assert _settings().hypotheses.families == ["momentum", "oracle"]
+
+
+def test_hypotheses_family_outside_the_list_rejected() -> None:
+    """Families are enumerated so N cannot be reset by renaming a family."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, hypotheses={"families": ["momentum", "value"]})
+
+
+def test_strategy_defaults() -> None:
+    s = _settings().strategy
+    assert s.formation_months == 12
+    assert s.skip_months == 1
+    assert s.top_fraction == pytest.approx(0.10)
+    assert s.weighting == "equal"
+    assert s.signal_total_return is True
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"weighting": "cap"},
+        {"top_fraction": 0.0},
+        {"top_fraction": 1.5},
+        {"skip_months": -1},
+        {"formation_months": 1, "skip_months": 1},
+    ],
+)
+def test_strategy_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, strategy=override)
+
+
+def test_costs_defaults() -> None:
+    c = _settings().costs
+    assert c.per_side_bps == pytest.approx(15.0)
+    assert c.commission_per_share == pytest.approx(0.0)
+    assert c.commission_per_order == pytest.approx(0.0)
+    assert c.sensitivity_per_side_bps == [0.0, 30.0, 60.0, 100.0]
+
+
+def test_costs_negative_sensitivity_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={"sensitivity_per_side_bps": [0, -5, 30]})
+
+
+@pytest.mark.parametrize("field", ["per_side_bps", "commission_per_share", "commission_per_order"])
+def test_costs_negative_component_rejected(field: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={field: -1})
+
+
+def test_holdout_null_by_default() -> None:
+    """No defaults: every hypothesis file names both dates (spec open question 2)."""
+    h = _settings().holdout
+    assert h.start is None
+    assert h.end is None
+
+
+def test_holdout_end_before_start_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            holdout={"start": date(2024, 1, 1), "end": date(2023, 12, 31)},
+        )
+
+
+def test_holdout_accepts_ordered_window() -> None:
+    s = Settings(_env_file=None, holdout={"start": date(2024, 1, 1), "end": date(2026, 9, 30)})
+    assert s.holdout.start == date(2024, 1, 1)
+    assert s.holdout.end == date(2026, 9, 30)
+
+
+def test_backtest_defaults() -> None:
+    b = _settings().backtest
+    assert b.initial_capital == pytest.approx(100_000.0)
+    assert b.cash_rate == pytest.approx(0.0)
+    assert b.delisting_exit == "last_close"
+    assert b.stale_exit_sessions == 5
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"initial_capital": 0},
+        {"delisting_exit": "zero"},
+        {"stale_exit_sessions": 0},
+    ],
+)
+def test_backtest_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, backtest=override)
+
+
+def test_metrics_defaults() -> None:
+    m = _settings().metrics
+    assert m.risk_free_rate == pytest.approx(0.0)
+    assert m.red_flag_excess_cagr_pp == pytest.approx(3.0)
+
+
+def test_metrics_has_no_periods_per_year() -> None:
+    """`MONTHS_PER_YEAR = 12` is a derived constant (ADR 0006), not a key."""
+    assert "periods_per_year" not in type(_settings().metrics).model_fields
+
+
+def test_env_example_names_no_holdout_key() -> None:
+    """`holdout.*` is never listed in `.env.example` (spec, Config keys)."""
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    assert "HOLDOUT__" not in env_example.read_text(encoding="utf-8").upper()
+
+
+@pytest.mark.parametrize("level", [float("nan"), float("inf")])
+def test_costs_non_finite_sensitivity_rejected(level: float) -> None:
+    """A NaN level would silently turn that level's results into NaN."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={"sensitivity_per_side_bps": [0, level]})
+
+
+@pytest.mark.parametrize("field", ["per_side_bps", "commission_per_share", "commission_per_order"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_costs_non_finite_component_rejected(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={field: value})
+
+
+@pytest.mark.parametrize("families", [[], ["momentum", "momentum"]])
+def test_hypotheses_families_empty_or_duplicate_rejected(families: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, hypotheses={"families": families})
+
+
+@pytest.mark.parametrize(
+    ("section", "override"),
+    [
+        ("hypotheses", {"familes": ["momentum"]}),
+        ("strategy", {"top_fracton": 0.2}),
+        ("costs", {"per_side_bp": 0}),
+        ("holdout", {"stat": "2024-01-01"}),
+        ("backtest", {"initial_capitol": 1.0}),
+        ("metrics", {"red_flag": 1.0}),
+    ],
+)
+def test_phase3_sections_reject_unknown_keys(section: str, override: dict[str, object]) -> None:
+    """A typo in a pinned key must fail, not fall back to the default (spec req 10)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{section: override})
+
+
+@pytest.mark.parametrize(
+    ("section", "override"),
+    [
+        ("metrics", {"red_flag_excess_cagr_pp": -1.0}),
+        ("metrics", {"red_flag_excess_cagr_pp": float("nan")}),
+        ("metrics", {"risk_free_rate": float("nan")}),
+        ("backtest", {"cash_rate": float("inf")}),
+        ("backtest", {"initial_capital": float("inf")}),
+        ("strategy", {"top_fraction": float("nan")}),
+    ],
+)
+def test_phase3_rates_and_thresholds_reject_bad_values(
+    section: str, override: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{section: override})
+
+
+def test_misspelt_phase3_env_var_fails_loudly_naming_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`COSTS__PER_SIDE_BP` (typo) must fail closed with the key in the error, not load
+    the 15 bp default. Loading `Settings` then fails for every job, secrets included,
+    so the message has to point straight at the bad key."""
+    monkeypatch.setenv("COSTS__PER_SIDE_BP", "0")
+    with pytest.raises(ValidationError, match="per_side_bp"):
+        Settings(_env_file=None)
