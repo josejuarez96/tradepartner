@@ -512,11 +512,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.loop <= 0:
         once()
         return 0
-    while True:  # a transient gh or git failure must not end the loop
+    while True:  # a transient gh, git or file error must not end the loop
         try:
             once()
-        except SystemExit as exc:
-            print(f"skipped this round: {exc}", flush=True)
+        except (SystemExit, Exception) as exc:  # keep the loop alive, report the round
+            print(f"skipped this round: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(args.loop)
 
 
