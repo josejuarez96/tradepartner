@@ -2,9 +2,10 @@
 
 A single `pydantic-settings` `Settings` object, read from environment
 variables and an optional `.env` file (never required; `uv run pytest` must
-pass with no `.env` present). Every threshold named in the data-foundation
-spec's "Config keys" list and ADR 0006 is a field here with the documented
-default — never hardcoded elsewhere (CLAUDE.md code standards).
+pass with no `.env` present). Every threshold named in the "Config keys"
+lists of the data-foundation and backtest specs and in ADR 0006 is a field
+here with the documented default — never hardcoded elsewhere (CLAUDE.md code
+standards).
 
 `universe.exclude_sic_ranges` is **guarded**: it is a compliance exclusion
 (ADR 0006), not a tunable parameter. A validator rejects any value other
@@ -243,6 +244,110 @@ class GapConfig(BaseModel):
     count_share_threshold: float = 0.05
 
 
+# --- Phase 3: backtest engine and trial registry (docs/specs/backtest.md, T30) ---
+
+# The enumerated hypothesis families (spec "Config keys"). Trials are counted per family
+# for the deflated Sharpe, so a family cannot be invented by config: adding one is a
+# reviewed code change here. `oracle` is refused on the real store (registry, T31b).
+HypothesisFamily = Literal["momentum", "oracle"]
+_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
+
+
+class HypothesesConfig(BaseModel):
+    """Hypothesis families, the unit for counting trials (spec domain rule 1)."""
+
+    families: list[HypothesisFamily] = Field(default_factory=lambda: list(_HYPOTHESIS_FAMILIES))
+
+
+class StrategyConfig(BaseModel):
+    """12-1 momentum signal and portfolio rules (spec req 3; handoff H1).
+
+    `formation_months` must exceed `skip_months`, or the formation window is empty.
+    `top_fraction` is a share of ranked names in (0, 1].
+    """
+
+    formation_months: int = Field(default=12, gt=0)
+    skip_months: int = Field(default=1, ge=0)
+    top_fraction: float = Field(default=0.10, gt=0, le=1)
+    weighting: Literal["equal"] = "equal"
+    signal_total_return: bool = True
+
+    @model_validator(mode="after")
+    def _validate_formation_window(self) -> StrategyConfig:
+        if self.formation_months <= self.skip_months:
+            raise ValueError(
+                f"formation_months ({self.formation_months}) must be greater than "
+                f"skip_months ({self.skip_months})"
+            )
+        return self
+
+
+class CostsConfig(BaseModel):
+    """Per-trade cost model (spec req 6).
+
+    `per_side_bps` is a placeholder until Phase 4 paper fills recalibrate it (spec open
+    question 3); the sensitivity ladder's 100 bp is about the per-dollar cost Novy-Marx &
+    Velikov (2016) imply for 12-1 momentum, via G1. Commissions are zero at Alpaca; the
+    keys exist for other brokers. Every value is non-negative: a negative cost would pay
+    the strategy to trade.
+    """
+
+    per_side_bps: float = Field(default=15.0, ge=0)
+    commission_per_share: float = Field(default=0.0, ge=0)
+    commission_per_order: float = Field(default=0.0, ge=0)
+    sensitivity_per_side_bps: list[float] = Field(default_factory=lambda: [0.0, 30.0, 60.0, 100.0])
+
+    @field_validator("sensitivity_per_side_bps")
+    @classmethod
+    def _validate_sensitivity_non_negative(cls, value: list[float]) -> list[float]:
+        negative = [level for level in value if level < 0]
+        if negative:
+            raise ValueError(f"sensitivity levels must be non-negative, got {negative}")
+        return value
+
+
+class HoldoutConfig(BaseModel):
+    """The locked holdout window. No defaults: every hypothesis file names both dates,
+    and a run takes them from the frozen hypothesis, never from live `Settings` (spec
+    req 10). Deliberately absent from `.env.example`.
+    """
+
+    start: date | None = None
+    end: date | None = None
+
+    @model_validator(mode="after")
+    def _validate_window_order(self) -> HoldoutConfig:
+        if self.start is not None and self.end is not None and self.end < self.start:
+            raise ValueError(f"holdout end ({self.end}) is before its start ({self.start})")
+        return self
+
+
+class BacktestConfig(BaseModel):
+    """Engine settings (spec reqs 4 and 5).
+
+    `initial_capital` is scale-free with fractional shares but sizes per-order
+    commissions. `delisting_exit=last_close` is the ADR 0004 oracle convention.
+    `stale_exit_sessions` mirrors `gap.missing_tail_sessions` (spec open question 4).
+    """
+
+    initial_capital: float = Field(default=100_000.0, gt=0)
+    cash_rate: float = 0.0
+    delisting_exit: Literal["last_close"] = "last_close"
+    stale_exit_sessions: int = Field(default=5, gt=0)
+
+
+class MetricsConfig(BaseModel):
+    """Metric settings (spec reqs 7 and 15).
+
+    No `periods_per_year`: `MONTHS_PER_YEAR = 12` is a constant derived from the ADR 0006
+    monthly cadence. `red_flag_excess_cagr_pp` marks a trial for a look-ahead and cost
+    audit; it is a reported flag, never a gate (spec open question 6).
+    """
+
+    risk_free_rate: float = 0.0
+    red_flag_excess_cagr_pp: float = 3.0
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -263,6 +368,12 @@ class Settings(BaseSettings):
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     gap: GapConfig = Field(default_factory=GapConfig)
     adjust: AdjustConfig = Field(default_factory=AdjustConfig)
+    hypotheses: HypothesesConfig = Field(default_factory=HypothesesConfig)
+    strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    costs: CostsConfig = Field(default_factory=CostsConfig)
+    holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
