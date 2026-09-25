@@ -166,3 +166,17 @@ def test_analyze_end_to_end(tmp_path: Path) -> None:
     report = po.analyze(tmp_path)
     assert "probe106-20260928-KO-F" in report
     assert "at pre-open ask: 1" in report
+
+
+def test_live_enum_and_real_live_client_refused() -> None:
+    from alpaca.common.enums import BaseURL
+    from alpaca.trading.client import TradingClient
+
+    class Fake:
+        _base_url = BaseURL.TRADING_LIVE
+
+    with pytest.raises(SystemExit):
+        po.require_paper(Fake())
+    with pytest.raises(SystemExit):
+        po.require_paper(TradingClient(api_key="x", secret_key="y", paper=False))
+    po.require_paper(TradingClient(api_key="x", secret_key="y", paper=True))

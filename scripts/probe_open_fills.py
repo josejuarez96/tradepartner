@@ -223,7 +223,8 @@ def submit(root: Path, *, include_opg: bool, now: datetime) -> None:
     client = _paper_client()
     day = root / session.isoformat()
     day.mkdir(parents=True, exist_ok=True)
-    results = []
+    path = day / "submitted.json"
+    results: list[Any] = _read(path) or []
     for p in order_plan(session, include_opg=include_opg):
         req = MarketOrderRequest(
             symbol=p.symbol,
@@ -234,16 +235,17 @@ def submit(root: Path, *, include_opg: bool, now: datetime) -> None:
             extended_hours=False,
             client_order_id=p.client_order_id,
         )
-        local = datetime.now(UTC).isoformat()
+        entry: dict[str, Any] = {"planned": p.__dict__, "local_submit": datetime.now(UTC)}
         try:
-            resp: Any = client.submit_order(req)
-            results.append({"planned": p.__dict__, "local_submit": local, "response": dict(resp)})
-            print(f"{p.client_order_id}: {resp.get('status')}")
+            entry["response"] = client.submit_order(req)
         except Exception as exc:
-            results.append({"planned": p.__dict__, "local_submit": local, "error": repr(exc)})
-            print(f"{p.client_order_id}: {type(exc).__name__}")
-    prior = _read(day / "submitted.json") or []
-    _write(day / "submitted.json", prior + results)
+            entry["error"] = repr(exc)
+        # Record each order as soon as it is placed, so an interrupt leaves no order untracked.
+        results.append(entry)
+        _write(path, results)
+        resp = entry.get("response")
+        shown = resp.get("status") if isinstance(resp, dict) else entry.get("error")
+        print(f"{p.client_order_id}: {shown}")
 
 
 def collect(root: Path, session: date, now: datetime) -> None:
