@@ -24,6 +24,8 @@ The block below is the only part the registry parses. Rules (`backtest/hypothesi
   `adjust.*`, `master.*`, `gap.*`, `metrics.*`, `benchmarks`, `alpaca.historical_feed`.
   Frozen keys it leaves out take the live config values at registration and are
   printed with the rest. Any other key is refused.
+- Keep other fenced blocks out of the parameter block; its first bare ``` line closes it.
+- Re-registering an older version of the file is refused: runs use the latest registration.
 
 ```toml hypothesis
 slug = "<slug>"

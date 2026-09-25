@@ -18,9 +18,13 @@ names; the live `Settings` fill the rest at registration. The merged values are
 validated through `Settings` and stored in their JSON form (floats for float keys,
 ISO strings for dates), so `15` and `15.0` in a file hash the same.
 
-**A run reads the frozen values back** with `load_frozen`, which overlays them on the
-live `Settings` without reading the environment again, so no environment variable can
-move a registered hypothesis's holdout or threshold. It refuses a stored parameter
+**A run reads the frozen values back** with `load_frozen` from the slug's latest
+registration. It passes every setting explicitly (the frozen values over a full dump of
+the live `Settings`), and explicit values take priority over the environment, so no
+environment variable can move a registered hypothesis's holdout or threshold. Because
+runs take the latest registration, `register` refuses to re-register a file whose
+record is an older one (a file reverted to an earlier version): what it would report
+is not what would run. It refuses a stored parameter
 set whose hash no longer matches, or whose keys differ from today's frozen list (a
 new config key in a frozen section makes every older hypothesis unrunnable until it
 is re-registered, rather than letting the live value in silently).
@@ -185,7 +189,9 @@ def parse_file(path: Path) -> HypothesisFile:
 
 
 def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
-    """`settings` with `params` (dotted keys) set, validated, the environment unread."""
+    """`settings` with `params` (dotted keys) set and validated. Every field is passed
+    explicitly, so the environment and `.env` (which `Settings.__init__` still reads)
+    cannot override any of them."""
     values = settings.model_dump()
     for key, value in params.items():
         section, _, field = key.partition(".")
@@ -225,11 +231,12 @@ def register(
 
     An unchanged file with unchanged live values returns the existing record; a changed
     file or frozen set is a new hypothesis (the registry decides both, and refuses a
-    family outside `hypotheses.families`).
+    family outside `hypotheses.families`). Refuses a file whose record is not the
+    slug's latest registration, since `load_frozen` would run the latest one instead.
     """
     settings = settings if settings is not None else get_settings()
     parsed = parse_file(path)
-    return registry.register_hypothesis(
+    record = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
         family=parsed.family,
@@ -243,6 +250,14 @@ def register(
         registered_by=registered_by,
         settings=settings,
     )
+    latest = registry.get_hypothesis(conn, parsed.slug)
+    if latest.hypothesis_id != record.hypothesis_id:
+        raise HypothesisFileError(
+            f"{path}: matches registration {record.hypothesis_id} of {parsed.slug!r}, "
+            f"which is not the latest ({latest.hypothesis_id}); runs use the latest. "
+            "Change the file (a new hypothesis) or use a new slug"
+        )
+    return record
 
 
 def load_frozen(

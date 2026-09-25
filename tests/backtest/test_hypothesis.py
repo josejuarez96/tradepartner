@@ -284,6 +284,23 @@ def test_changed_file_gives_a_new_hypothesis(
     assert second.params_sha256 == first.params_sha256
 
 
+def test_reverting_to_an_older_registration_is_refused(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """`load_frozen` runs the latest registration of a slug, so re-registering an
+    older file must not report the older record as what will run."""
+    path = _copy(tmp_path)
+    original = path.read_text()
+    first = _register(conn, path, settings)
+    path.write_text(original.replace("top_fraction = 0.10", "top_fraction = 0.20"))
+    second = _register(conn, path, settings)
+    path.write_text(original)
+    with pytest.raises(HypothesisFileError, match="not the latest"):
+        _register(conn, path, settings)
+    assert second.hypothesis_id > first.hypothesis_id
+    assert hypothesis.load_frozen(conn, SLUG, settings=settings).strategy.top_fraction == 0.20
+
+
 def test_different_live_settings_give_a_new_hypothesis(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
