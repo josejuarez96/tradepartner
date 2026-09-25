@@ -54,6 +54,24 @@ Any number of Claude Code chat windows may build in parallel; each one is a **te
 
 Start a window on Opus 5.5 by default. Escalate to Fable only for the second row, and say so in the PR description when you did.
 
+## Parallelism inside a team
+
+A team window may run several subagents at once **inside its own claimed scope**, and nowhere else (#73). Speed comes from doing independent things at the same time, never from more hands on one file.
+
+| Situation | Run in parallel | One at a time |
+|---|---|---|
+| Several claimed tasks | One `implementer` per task, each in its own worktree, when the tasks' file lists are disjoint | Tasks that touch the same module |
+| One task being built | Read-only helpers next to the one implementer: `Explore` for codebase questions, `spec-critic` on the design, `researcher` on a bounded question the task raised | Writing code: **one writer per branch**. Two agents editing one branch, even different files, race on commits and the working tree |
+| A diff ready for review | `quant-auditor`, `safety-reviewer` and `/code-review` on the **same commit**, then triage all findings together | Re-review after fixes (new commit, same fan-out) |
+| Fixes from a review | One implementer applies them | Never a fixer per finding on one branch |
+
+What stays true regardless of how many agents run:
+- Subagents never claim, release, mark ready or merge. The window does those, through `scripts/team.py` and `/ready-pr`.
+- Work outside the claim becomes an issue, not an extra agent.
+- New agent types land only through a PR the owner merges (see "Adding or changing an agent"). A window does not invent one mid-task.
+- A subagent cannot spawn subagents; the platform removes that tool from them. Depth is one level, breadth is the window's call within these rows.
+- Parallelism is bounded by the plan's dependency graph. When the frontier is one task, one window is enough; the rest pick research, decision or docs issues ([teams.md](teams.md), Picking work).
+
 ## Guardrails against agents "running wild"
 
 What went wrong in the trading-research conversation:
