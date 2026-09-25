@@ -9,6 +9,9 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Phase 2 T2: thin raw-fetch clients for Alpaca (`alpaca_raw`) and SEC EDGAR (`edgar_raw`), returning JSON-serializable raw payloads only; the owner-run fixture recorder (`cli_record`) with a scrub pass for secrets/emails/`User-Agent` headers; the scrub pattern test; network smoke tests for both clients (#21).
 - Phase 2 T20: abstract `Broker` interface (`submit`/`cancel`/`positions`/`fills`) and an in-memory `FakeBroker` with duplicate-`client_order_id` rejection, explicit cancel/fill state transitions and net position aggregation; no risk logic (#27).
 - Phase 2 T5: deterministic fixture-universe generator (`scripts/make_fixture_universe.py`) and its committed CSVs covering every spec req 13 case (delistings incl. truncated/window/clean/25-NSE/transfer, dual-class, ticker changes and reuse, splits, revised dividend, restated/stale shares, unclassifiable name, pre-2019 static listing, holiday/half day, SPY/MTUM benchmarks), with `tests/fixtures/universe/README.md` mapping each case to its rows (#22).
+- Broker-level tests: an aware timestamp that overflows once converted to UTC raises `ValueError` naming the field from `Order`/`Fill`, and `FakeBroker.submit`/`simulate_fill` fail closed with no order, fill or position recorded (#57).
+- Research G8: survivorship-bias-free US daily price vendors for an individual (Norgate, Sharadar, CRSP, Tiingo, Massive, EODHD, Alpaca), with a cited comparison table and disconfirmation log (`docs/research/2026-09-25-price-vendors.md`) (#46).
+- Phase 2 T21a: Streamlit dashboard shell (`tradepartner.dashboard.app`): one short-lived read-only store connection per render handed to the selected page, "no store yet", "store busy" and "store unreadable" states, sidebar navigation with an empty data-health placeholder for T21 (#66).
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -16,6 +19,8 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Process: `scripts/team.py start <name>` sets up a team directory outside the repo in one step; `register` refuses to overwrite another team's `.team`; sessions touch only their own directory (#40).
 - Tooling: owner cockpit, `scripts/cockpit.py`, renders one local HTML page from GitHub claims and PRs, the plan on `origin/main`, the roadmap and local Claude Code session logs: teams with activity state, tokens and models, claims and PR state, roadmap phase, plan by chain, unclaimed queue (#65).
 - `store.db.ensure_tz_aware` and the broker value objects share one tz-aware UTC check, `tradepartner.timeutil.ensure_tz_aware_utc`, which also rejects a `tzinfo` with no UTC offset; `ensure_tz_aware` now returns the value converted to UTC (#30).
+- Plan: Phase 2 gains T21a, a Streamlit dashboard shell (app entry, read-only connection, busy state, navigation) that depends only on T4; T21 (data-health page) now depends on T18 and T21a instead of T19, and T19 (CLI) also depends on T21a, so UX work can start early (#53).
+- Process: the teams picking order includes any unclaimed sized issue (research issues with an owner-approved brief, ADR and spec/plan drafts, not only `size:S`), naming the agent and model tier for each; an issue with no size label is not ready to claim (#55).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.

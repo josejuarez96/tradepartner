@@ -13,9 +13,9 @@ Closes #
 ## Review checklist
 - [ ] Scope matches the plan task — nothing extra
 - [ ] No secrets, data files, or notebooks with outputs committed
-- [ ] Docs updated (STATUS.md, spec/plan checkboxes, `.env.example`, ADR if a decision was made)
-- [ ] Touches data/backtest/signals → `quant-auditor` run, findings addressed
-- [ ] Touches broker/orders/LLM inputs/secrets → `safety-reviewer` run, findings addressed
+- [ ] Docs updated (STATUS/CHANGELOG fragment via `scripts/fragments.py add`, spec/plan checkboxes, `.env.example`, ADR if a decision was made)
+- [ ] Touches data/backtest/signals → `quant-auditor` run, findings addressed, verdict posted as a PR comment (`quant-auditor: PASS` / `PASS WITH FIXES`)
+- [ ] Touches broker/orders/LLM inputs/secrets → `safety-reviewer` run, findings addressed, verdict posted as a PR comment (`safety-reviewer: PASS` / `PASS WITH FIXES`)
 
 ## Notes for reviewer
 <!-- Risks, open questions, things you're unsure about -->

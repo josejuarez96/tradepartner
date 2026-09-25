@@ -3,6 +3,7 @@
 **Updated:** 2026-09-24 · **Phase:** 2, Data foundation · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Done
+Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/fragments.py show` (#70).
 - Repo scaffold: uv / ruff / mypy / pytest, CI, pre-commit, GitHub templates, labels ([initial commit](https://github.com/josejuarez96/tradepartner/commits/main))
 - #1 Ways of working: git workflow, process, docs, agents, draft charter (PR #2, merged). The main session may merge a PR when the owner explicitly says to
 
@@ -18,6 +19,11 @@
 - Phase 2 T5: fixture-universe generator and CSVs covering every spec req 13 case (PR #31)
 - #30 Shared tz-aware UTC check `tradepartner.timeutil.ensure_tz_aware_utc` used by `store.db` and `adapters.broker` (PR #41)
 - #43 `insert_row` binds the UTC-normalized `TIMESTAMPTZ` value (one canonical form); `ensure_tz_aware_utc` raises `ValueError` (not `OverflowError`) near `datetime.min`/`datetime.max`
+- #53 Plan amendment: T21a dashboard shell split out of T21, depends only on T4; T21 now depends on T18 and T21a, T19 also on T21a (PR #62)
+- #57 Broker-level tests: a UTC-overflowing timestamp raises `ValueError` from `Order`/`Fill` and fails closed in `FakeBroker.submit`/`simulate_fill` (PR #63). Clock-failure exception design split to #64
+- #46 Research G8: price-vendor comparison for the Phase 3 vendor ADR, delisted coverage graded claimed/absent, report marked INCOMPLETE with open items ([report](research/2026-09-25-price-vendors.md))
+- Phase 2 T21a: Streamlit dashboard shell with one read-only connection per render, no-store / busy / unreadable states and a health-page placeholder (#66, PR #67)
+- #55 Teams picking order: step 3 now covers any unclaimed sized issue (size:S, type:research with an owner-approved brief via `researcher`, type:decision/type:docs drafts via Fable and `spec-critic`); unsized issues are not claimable (PR #56)
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
@@ -29,7 +35,7 @@ Live board: `uv run python scripts/team.py status`. Cockpit page: `uv run python
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
 Copied from `team.py status` on 2026-09-24. Claim through the tool, never from this list.
-1. T5 (issue #22, held by orion, PR #31): rebase, run the required reviews, mark ready
+1. T5 (issue #22, held by orion, PR #31): merged 2026-09-24; snapshot otherwise unchanged, refresh with the next fold
 2. Unclaimed issues: #28, #29, #30, #35 (`size:S`), #32 (type:fix), #38 (symbol-case canonicalization, type:feat). #33 is a Phase 4 idea, leave it
 3. After T5 merges: T6, then T7 and T8 in parallel (see plan chains)
 4. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
