@@ -1,0 +1,1 @@
+- Phase 3 T31: trial-registry schema at version 2, eight `REGISTRY_TABLE_NAMES` tables disjoint from `TABLE_NAMES`, additive migration from version 1 on any write open, `RegistryNotInitialised` on a read-only open of a version-1 store (#117)
