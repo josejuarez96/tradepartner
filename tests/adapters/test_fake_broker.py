@@ -4,14 +4,17 @@ Covers: abstractness, idempotent `submit` on a repeated `client_order_id`
 (including against an open or cancelled original), `cancel`/`simulate_fill`
 transitions and their error cases, fill/positions accounting (fill order,
 not submission order; exact netting; short positions), state isolation
-from returned collections, and input validation (quantity, price, side,
-symbol, tz-aware timestamps normalized to UTC).
+from returned collections, input validation (quantity, price, side,
+symbol, tz-aware timestamps normalized to UTC), and, at the broker level,
+an aware timestamp that overflows once converted to UTC (issue #43)
+raising `ValueError` (not `OverflowError`) from `Order`/`Fill`
+construction and from `FakeBroker.submit`/`simulate_fill`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -493,6 +496,94 @@ def test_naive_clock_raises_on_simulate_fill_path() -> None:
     # The naive `filled_at` makes `Fill` construction raise before any
     # fill/position state is recorded and before the order's status changes
     # — it is still OPEN, so a following `cancel` succeeds.
+    cancelled = broker.cancel(order.client_order_id)
+    assert cancelled.status is OrderStatus.CANCELLED
+    assert broker.fills() == []
+    assert broker.positions() == {}
+
+
+# An aware datetime whose UTC-converted value overflows `datetime`'s
+# representable range (issue #43): near `datetime.min` with a positive
+# offset, and near `datetime.max` with a negative offset.
+_OVERFLOWING_DATETIMES = [
+    datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))),
+    datetime.max.replace(tzinfo=timezone(timedelta(hours=-5))),
+]
+
+
+@pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
+def test_utc_overflow_raises_value_error_on_order(overflowing: datetime) -> None:
+    with pytest.raises(ValueError, match="submitted_at") as excinfo:
+        Order(
+            client_order_id="co-1",
+            symbol="AAPL",
+            side=Side.BUY,
+            quantity=1,
+            price=1.0,
+            status=OrderStatus.OPEN,
+            submitted_at=overflowing,
+        )
+    assert not isinstance(excinfo.value, OverflowError)
+
+
+@pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
+def test_utc_overflow_raises_value_error_on_fill(overflowing: datetime) -> None:
+    with pytest.raises(ValueError, match="filled_at") as excinfo:
+        Fill(
+            client_order_id="co-1",
+            symbol="AAPL",
+            side=Side.BUY,
+            quantity=1,
+            price=1.0,
+            filled_at=overflowing,
+        )
+    assert not isinstance(excinfo.value, OverflowError)
+
+
+def test_utc_overflow_clock_raises_on_submit_and_leaves_id_free() -> None:
+    # Mirrors test_naive_clock_raises_on_submit, but with a clock value
+    # that is tz-aware and still overflows once converted to UTC.
+    mode = ["overflowing"]
+
+    def clock() -> datetime:
+        return _OVERFLOWING_DATETIMES[0] if mode[0] == "overflowing" else T0
+
+    broker = FakeBroker(clock=clock)
+    with pytest.raises(ValueError, match="submitted_at"):
+        broker.submit(make_request())
+
+    assert broker.fills() == []
+    assert broker.positions() == {}
+
+    # The earlier failed submit never recorded a partial order (it raised
+    # while constructing the `Order`, before `self._orders` was touched),
+    # so the same client_order_id can be resubmitted once the clock is good.
+    mode[0] = "good"
+    order = broker.submit(make_request())
+    assert order.client_order_id == "co-1"
+    assert order.status is OrderStatus.FILLED
+
+
+def test_utc_overflow_clock_raises_on_simulate_fill_path() -> None:
+    # Mirrors test_naive_clock_raises_on_simulate_fill_path: the submit
+    # clock tick is good so the order is recorded as OPEN, and the
+    # simulate_fill tick overflows.
+    mode = ["good"]
+
+    def clock() -> datetime:
+        return T0 if mode[0] == "good" else _OVERFLOWING_DATETIMES[1]
+
+    broker = FakeBroker(clock=clock, auto_fill=False)
+    order = broker.submit(make_request())
+    assert order.status is OrderStatus.OPEN
+
+    mode[0] = "overflowing"
+    with pytest.raises(ValueError, match="filled_at"):
+        broker.simulate_fill(order.client_order_id)
+
+    # The overflowing `filled_at` makes `Fill` construction raise before
+    # any fill/position state is recorded and before the order's status
+    # changes -- it is still OPEN, so a following `cancel` succeeds.
     cancelled = broker.cancel(order.client_order_id)
     assert cancelled.status is OrderStatus.CANCELLED
     assert broker.fills() == []
