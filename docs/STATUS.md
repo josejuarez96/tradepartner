@@ -20,6 +20,7 @@
 - #43 `insert_row` binds the UTC-normalized `TIMESTAMPTZ` value (one canonical form); `ensure_tz_aware_utc` raises `ValueError` (not `OverflowError`) near `datetime.min`/`datetime.max`
 - #53 Plan amendment: T21a dashboard shell split out of T21, depends only on T4; T21 now depends on T18 and T21a, T19 also on T21a (PR #62)
 - #57 Broker-level tests: a UTC-overflowing timestamp raises `ValueError` from `Order`/`Fill` and fails closed in `FakeBroker.submit`/`simulate_fill` (PR #63). Clock-failure exception design split to #64
+- #46 Research G8: price-vendor comparison for the Phase 3 vendor ADR, delisted coverage graded claimed/absent, report marked INCOMPLETE with open items ([report](research/2026-09-25-price-vendors.md))
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
