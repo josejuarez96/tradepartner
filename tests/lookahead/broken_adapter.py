@@ -2,13 +2,16 @@
 "Look-ahead": "the broken adapter proves each check has teeth"; plan T10).
 
 `BrokenPriceSource(violation)` replays the fixture universe like
-`FixturePriceSource`, with exactly one of the five violations the spec names
-injected:
+`FixturePriceSource`, with exactly one violation injected: the five the spec
+names, plus an adjusted re-fetch as a second form of pre-adjusted prices:
 
 - `EARLY_KNOWN_AT`: SEC_SPLIT_PLAIN's bars are stamped at the session
   open, and its split a week before the proxy with no announcement (#83).
 - `PRE_ADJUSTED_PRICES`: every bar before a split's ex-date comes back
   already split-adjusted, as a vendor's adjusted feed would.
+- `PRE_ADJUSTED_ON_REFETCH`: first fetches are raw, but a later re-fetch
+  from an adjusted feed rewrites every pre-split bar as a correctly stamped
+  revision (quant-auditor on #126: the likelier real failure).
 - `TICKER_RESOLUTION`: an id the adapter does not know is looked up as a
   ticker in `listings.csv` instead of raising `UnknownSecurityIdError`.
 - `KNOWN_AT_AFTER_INGESTED_AT`: SEC_SPLIT_PLAIN's last bar was fetched an
@@ -28,7 +31,7 @@ from __future__ import annotations
 import csv
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from functools import cache
 from pathlib import Path
@@ -65,6 +68,7 @@ class Violation(StrEnum):
 
     EARLY_KNOWN_AT = "early_known_at"
     PRE_ADJUSTED_PRICES = "pre_adjusted_prices"
+    PRE_ADJUSTED_ON_REFETCH = "pre_adjusted_on_refetch"
     TICKER_RESOLUTION = "ticker_resolution"
     KNOWN_AT_AFTER_INGESTED_AT = "known_at_after_ingested_at"
     BACK_DATED_REVISION = "back_dated_revision"
@@ -103,8 +107,13 @@ def fixture_history(
             row["ingested_at"]
         )
     for row in _read_csv(universe_dir / "corporate_actions.csv"):
-        key = ("action", row["security_id"], row["action_type"], date.fromisoformat(row["ex_date"]))
-        log[(*key, datetime.fromisoformat(row["known_at"]))] = datetime.fromisoformat(
+        action_key = (
+            "action",
+            row["security_id"],
+            row["action_type"],
+            date.fromisoformat(row["ex_date"]),
+        )
+        log[(*action_key, datetime.fromisoformat(row["known_at"]))] = datetime.fromisoformat(
             row["ingested_at"]
         )
     history = [
@@ -123,7 +132,7 @@ def _early_known_at(history: list[Ingested]) -> list[Ingested]:
         record = item.record
         if record.security_id == _EARLY_ID and isinstance(record, Bar):
             record = replace(record, known_at=session_open(record.session))
-        elif record.security_id == _EARLY_ID:
+        elif record.security_id == _EARLY_ID and isinstance(record, CorporateAction):
             proxy = action_first_seen_known_at(record.ex_date)
             record = replace(record, known_at=proxy - timedelta(days=7), announced_at=None)
         out.append(Ingested(record, item.ingested_at))
@@ -155,6 +164,20 @@ def _pre_adjusted_prices(history: list[Ingested]) -> list[Ingested]:
     return out
 
 
+#: When the adjusted re-fetch runs: after every fixture `known_at`.
+_REFETCH_AT = datetime(2026, 2, 2, 21, 0, tzinfo=UTC)
+
+
+def _pre_adjusted_on_refetch(history: list[Ingested]) -> list[Ingested]:
+    adjusted = _pre_adjusted_prices(history)
+    revisions = [
+        Ingested(replace(new.record, known_at=_REFETCH_AT), _REFETCH_AT)
+        for old, new in zip(history, adjusted, strict=True)
+        if new.record != old.record
+    ]
+    return history + revisions
+
+
 def _known_at_after_ingested_at(history: list[Ingested]) -> list[Ingested]:
     last = max(
         (i for i in history if isinstance(i.record, Bar) and i.record.security_id == _EARLY_ID),
@@ -183,6 +206,7 @@ def _back_dated_revision(history: list[Ingested]) -> list[Ingested]:
 _INJECT: dict[Violation, Callable[[list[Ingested]], list[Ingested]]] = {
     Violation.EARLY_KNOWN_AT: _early_known_at,
     Violation.PRE_ADJUSTED_PRICES: _pre_adjusted_prices,
+    Violation.PRE_ADJUSTED_ON_REFETCH: _pre_adjusted_on_refetch,
     Violation.TICKER_RESOLUTION: lambda history: history,
     Violation.KNOWN_AT_AFTER_INGESTED_AT: _known_at_after_ingested_at,
     Violation.BACK_DATED_REVISION: _back_dated_revision,
