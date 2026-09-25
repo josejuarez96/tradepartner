@@ -3,7 +3,12 @@
 `StoreProvider` answers every `DataProvider` method from the as-of API
 (`store.asof`, `store.master`, `store.delistings`, `universe.universe_as_of`,
 `gap.survivorship_gap`), passing the trial's **frozen** `Settings` into every
-call, so the live environment can never change a run. It never touches an
+call. One setting still escapes: `tradepartner.calendar` reads `calendar.*`
+from the live environment (`get_settings()`), and the calendar bounds feed
+the dividend adjustment and the gap's session counts. Until the calendar
+takes settings, construction refuses frozen settings whose `calendar`
+differs from the live one, so a changed calendar cannot silently change a
+run; it fails it instead. It never touches an
 adapter: nothing under `backtest/` imports `tradepartner.adapters` (tested).
 Reads are restricted to the ids the engine passes (members, holdings and
 benchmarks), never the whole store.
@@ -20,7 +25,8 @@ instead of failing it.
 
 **The handle.** Construction takes a `TrialHandle` (a plain id is refused:
 ADR 0005, no id, no run) and checks it once against `registry_connect`
-(default `connect`): the handle's `trials` row must be in that store. T40
+(default `connect`, with the same lock retry): the handle's `trials` row
+must be in that store and have no result row yet. T40
 passes a truncated data store as `connect` and the untruncated fixture
 store as `registry_connect`.
 
@@ -37,7 +43,12 @@ single as-of function and are built from `store.asof` reads:
 
 `benchmark_ids(t)` maps each benchmark security known at `t`
 (`securities.benchmark`) to the ticker of its current listing (`SPY`,
-`MTUM`).
+`MTUM`), keeping only the frozen `benchmarks` names.
+
+A security's **current listing** is the one with the latest `valid_from` on
+or before `t`'s session; between two rows with the same `valid_from` the
+first in `listings_as_of` order wins, the same rule `universe_as_of` uses,
+so the static count and benchmark tickers agree with the universe.
 """
 
 from __future__ import annotations
@@ -55,7 +66,7 @@ import polars as pl
 from tradepartner import gap as gap_module
 from tradepartner.backtest.provider import GapReading, check_t
 from tradepartner.calendar import last_completed_session
-from tradepartner.config import Settings
+from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
 from tradepartner.store.asof import (
     _latest_as_of,
@@ -95,23 +106,34 @@ class StoreProvider:
             raise TypeError(
                 f"a StoreProvider needs a TrialHandle from registry.open_trial, got {handle!r}"
             )
-        with (registry_connect or connect)() as conn:
-            registry._check_trial_row(conn, handle)
+        live_calendar = get_settings().calendar
+        if frozen_settings.calendar != live_calendar:
+            raise ValueError(
+                f"the live calendar settings ({live_calendar!r}) differ from the trial's frozen "
+                f"ones ({frozen_settings.calendar!r}); tradepartner.calendar reads the live "
+                "ones, so this run would not use its frozen calendar"
+            )
         self._connect = connect
         self.handle = handle
         self.settings = frozen_settings
+        stack, conn = self._open(registry_connect or connect)
+        with stack:
+            registry._check_open(conn, handle)
         self._step: ExitStack | None = None
         self._step_t: datetime | None = None
         self._conn: duckdb.DuckDBPyConnection | None = None
 
     # --- connections ---------------------------------------------------------
 
-    def _open(self) -> tuple[ExitStack, duckdb.DuckDBPyConnection]:
+    def _open(self, connect: Connect | None = None) -> tuple[ExitStack, duckdb.DuckDBPyConnection]:
+        """A connection from `connect` (default the step factory), retried
+        while a writer holds the lock, up to `store.lock_retry_seconds`."""
+        factory = connect or self._connect
         deadline = time.monotonic() + self.settings.store.lock_retry_seconds
         while True:
             stack = ExitStack()
             try:
-                return stack, stack.enter_context(self._connect())
+                return stack, stack.enter_context(factory())
             except StoreLockedError:
                 stack.close()
                 if time.monotonic() >= deadline:
@@ -169,9 +191,11 @@ class StoreProvider:
         t = check_t(t)
         conn = self._at(t)
         benchmarks = securities_as_of(conn, t).filter(pl.col("benchmark"))["security_id"].to_list()
+        names = set(self.settings.benchmarks)
         out: dict[str, str] = {}
         for row in self._current_listings(conn, t, benchmarks).values():
-            out[row["ticker"]] = row["security_id"]
+            if row["ticker"] in names:
+                out[row["ticker"]] = row["security_id"]
         return dict(sorted(out.items()))
 
     def survivorship_gap(self, t: datetime) -> GapReading:
@@ -221,6 +245,6 @@ class StoreProvider:
             if row["valid_from"] > session:
                 continue
             seen = current.get(row["security_id"])
-            if seen is None or row["valid_from"] >= seen["valid_from"]:
+            if seen is None or row["valid_from"] > seen["valid_from"]:
                 current[row["security_id"]] = row
         return current

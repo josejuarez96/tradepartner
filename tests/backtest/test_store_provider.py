@@ -54,11 +54,25 @@ def _settings(path: Path, **universe: Any) -> Settings:
     return Settings(_env_file=None, store={"path": str(path)}, universe=universe)
 
 
+@pytest.fixture(autouse=True)
+def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # The provider compares the frozen calendar with the live settings; keep
+    # the live ones free of any `.env`.
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+
+
 class Store:
-    def __init__(self, path: Path, handle: registry.TrialHandle, settings: Settings) -> None:
+    def __init__(
+        self,
+        path: Path,
+        handle: registry.TrialHandle,
+        settings: Settings,
+        closed: registry.TrialHandle,
+    ) -> None:
         self.path = path
         self.handle = handle
         self.settings = settings
+        self.closed = closed
         self.opened = 0
         self.open_now = 0
 
@@ -113,6 +127,23 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Store:
                 "provenance": "action",
             },
         )
+        # And one that is not late: first known 2019-03-04, ex-date after
+        # the 2019-02-28 rebalance.
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "SEC_DUAL_B",
+                "action_type": "dividend",
+                "ex_date": date(2019, 3, 5),
+                "ratio_or_amount": 0.04,
+                "announced_at": None,
+                "known_at": datetime(2019, 3, 4, 21, 0, tzinfo=UTC),
+                "ingested_at": datetime(2019, 3, 4, 21, 10, tzinfo=UTC),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
     finally:
         conn.close()
     # Registry calls get another "real store" path, so this temp store may
@@ -144,7 +175,19 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Store:
             run_by="test",
             settings=registry_settings,
         )
-    return Store(path, handle, settings)
+        closed = registry.open_trial(
+            conn,
+            hypothesis_id=hypothesis.hypothesis_id,
+            kind="in_sample",
+            start_session=date(2018, 10, 31),
+            end_session=date(2019, 7, 31),
+            data_cutoff=datetime(2019, 7, 31, 20, tzinfo=UTC),
+            synthetic=True,
+            run_by="test",
+            settings=registry_settings,
+        )
+        registry.close_trial(conn, closed, "failed", "closed for the test")
+    return Store(path, handle, settings, closed)
 
 
 def _ids(frame: pl.DataFrame) -> set[str]:
@@ -200,6 +243,9 @@ def test_benchmark_ids_from_securities_benchmark(store: Store) -> None:
     with store.provider() as provider:
         assert provider.benchmark_ids(T_JAN) == {"MTUM": "SEC_MTUM", "SPY": "SEC_SPY"}
         assert provider.benchmark_ids(datetime(2017, 6, 30, 20, tzinfo=UTC)) == {}
+    only_spy = Settings(_env_file=None, store={"path": str(store.path)}, benchmarks=["SPY"])
+    with store.provider(only_spy) as provider:
+        assert provider.benchmark_ids(T_JAN) == {"SPY": "SEC_SPY"}
 
 
 def test_gap_equals_survivorship_gap(store: Store) -> None:
@@ -233,13 +279,14 @@ def test_dropped_dividends_equal_the_as_of_read(store: Store) -> None:
 
 
 def test_late_dividends(store: Store) -> None:
-    ids = ["SEC_DUAL_A", "SEC_DIV_REVISED"]
+    ids = ["SEC_DUAL_A", "SEC_DUAL_B", "SEC_DIV_REVISED"]
     with store.provider() as provider:
         late = provider.late_dividends(T_FEB, T_MAR, ids)
         not_yet = provider.late_dividends(T_JAN, T_FEB, ids)
         other_ids = provider.late_dividends(T_FEB, T_MAR, ["SEC_DIV_REVISED"])
     # First known 2019-03-05 for an ex-date before 2019-02-28. The revised
-    # dividend was first known before T_FEB, so its revision is not late.
+    # dividend was first known before T_FEB, so its revision is not late,
+    # and SEC_DUAL_B's goes ex after 2019-02-28, so it is not late either.
     assert late.select("security_id", "ex_date", "ratio_or_amount").rows() == [
         ("SEC_DUAL_A", date(2019, 1, 15), 0.05)
     ]
@@ -344,6 +391,32 @@ def test_unknown_handle_refused(store: Store, tmp_path: Path) -> None:
         )
 
 
+def test_closed_trial_refused(store: Store) -> None:
+    with pytest.raises(registry.TrialAlreadyClosed):
+        StoreProvider(store.connect, store.closed, store.settings)
+
+
+def test_calendar_differing_from_the_live_one_refused(store: Store) -> None:
+    frozen = Settings(
+        _env_file=None, store={"path": str(store.path)}, calendar={"start": date(2012, 1, 3)}
+    )
+    with pytest.raises(ValueError, match="calendar"):
+        StoreProvider(store.connect, store.handle, frozen)
+
+
+def test_handle_check_retries_under_a_write_lock(store: Store) -> None:
+    attempts: list[str] = []
+
+    def locked_once() -> AbstractContextManager[duckdb.DuckDBPyConnection]:
+        attempts.append("open")
+        if len(attempts) == 1:
+            raise StoreLockedError("locked for writing by another process")
+        return open_read_only(store.settings)
+
+    with StoreProvider(locked_once, store.handle, store.settings):
+        assert len(attempts) == 2
+
+
 def test_plain_integer_is_not_a_handle(store: Store) -> None:
     with pytest.raises(TypeError, match="TrialHandle"):
         StoreProvider(store.connect, store.handle.trial_id, store.settings)  # type: ignore[arg-type]
@@ -377,12 +450,16 @@ def test_nothing_under_backtest_imports_adapters() -> None:
     offenders = []
     for path in sorted(BACKTEST_DIR.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
+        package = ["tradepartner", *path.relative_to(BACKTEST_DIR.parent).parent.parts]
         for node in ast.walk(tree):
             names: list[str] = []
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names = [node.module, *(f"{node.module}.{a.name}" for a in node.names)]
+            elif isinstance(node, ast.ImportFrom):
+                # Resolve a relative import (`from ..adapters import x`).
+                base = package[: len(package) - node.level + 1] if node.level else []
+                module = ".".join([*base, *([node.module] if node.module else [])])
+                names = [module, *(f"{module}.{a.name}" for a in node.names)]
             if any(
                 n == "tradepartner.adapters" or n.startswith("tradepartner.adapters.")
                 for n in names
