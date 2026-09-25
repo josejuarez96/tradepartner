@@ -56,6 +56,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import lxml.etree  # type: ignore[import-untyped]
 import lxml.html  # type: ignore[import-untyped]
 
 from tradepartner.adapters.filings import (
@@ -80,15 +81,24 @@ _COVER_CONCEPTS = frozenset(
 
 
 def _fail_closed[**P, R](parse: Callable[P, R]) -> Callable[P, R]:
-    """Re-raise a malformed payload's `KeyError`, `IndexError`, `TypeError`
-    or `decimal.InvalidOperation` as `ValueError`, so every parser fails
+    """Re-raise a malformed payload's `KeyError`, `IndexError`, `TypeError`,
+    `AttributeError`, `decimal.InvalidOperation` or XML/HTML parse error as
+    `ValueError`, so every parser fails
     with one exception type and never returns a partial record."""
 
     @functools.wraps(parse)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return parse(*args, **kwargs)
-        except (KeyError, IndexError, TypeError, InvalidOperation) as error:
+        except (
+            KeyError,
+            IndexError,
+            TypeError,
+            AttributeError,
+            InvalidOperation,
+            ET.ParseError,
+            lxml.etree.LxmlError,
+        ) as error:
             raise ValueError(f"{parse.__name__}: malformed payload: {error!r}") from error
 
     return wrapper
@@ -162,8 +172,9 @@ _EXCHANGES: dict[str, str] = {
 
 def normalize_exchange(raw: str) -> str:
     """The exchange code config uses for `raw`, from an exact-name table;
-    any other venue becomes its upper-case slug ("NYSE National, Inc." ->
-    `NYSE_NATIONAL_INC`)."""
+    any other name becomes its upper-case slug ("Nasdaq Global Select
+    Market" -> `NASDAQ_GLOBAL_SELECT_MARKET`), which matches no listing, so
+    ingest should report codes outside the table."""
     text = " ".join(re.sub(r"[.,]", " ", raw.upper()).split())
     return _EXCHANGES.get(text) or re.sub(r"[^A-Z0-9]+", "_", text).strip("_")
 

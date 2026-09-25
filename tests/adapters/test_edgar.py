@@ -387,6 +387,14 @@ def _cover(document: bytes) -> Any:
 
 
 class TestCoverPageFailClosed:
+    def test_empty_document_raises_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            _cover(b"")
+
+    def test_wrong_shape_facts_raise_value_error(self) -> None:
+        with pytest.raises(ValueError, match="malformed"):
+            parse_company_facts({"cik": 1, "facts": []}, [SHARES], {})
+
     def test_co_registrant_contexts_are_not_the_filers(self) -> None:
         document = _ixbrl(
             _context("c2", _CLASS)
@@ -468,6 +476,15 @@ class TestDelisting:
         )
         assert filing.accepted_at == datetime(2026, 9, 24, 14, 8, 40, tzinfo=UTC)
         assert filing.effective_on is None
+
+    def test_malformed_xml_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="malformed"):
+            parse_delisting(
+                "<notificationOfRemoval><issuer>",
+                form="25",
+                accession="0001354457-26-000904",
+                accepted_at=datetime(2026, 9, 24, 14, 8, 40, tzinfo=UTC),
+            )
 
     def test_other_form_raises(self) -> None:
         with pytest.raises(ValueError, match="10-K"):
