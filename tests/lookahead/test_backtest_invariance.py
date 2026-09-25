@@ -243,6 +243,13 @@ def test_the_run_is_not_vacuous(fixture: Fixture, full_runs: dict[date, Results]
     ]
     assert len(revised_and_held) >= len(SEEDED_SESSIONS) - 2
     assert sum(row.n_late_dividends for row in result.rebalances) >= 5
+    # And a restated seeded dividend is held across its ex-date.
+    entitled = [
+        t_k
+        for t_k in SEEDED_SESSIONS
+        if set(_held_at_close(result, previous_session(_sessions_before(t_k, 5)))) & set(SEEDED_IDS)
+    ]
+    assert len(entitled) >= len(SEEDED_SESSIONS) - 2
 
 
 def test_truncation_invariance_at_every_rebalance(
