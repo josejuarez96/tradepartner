@@ -9,10 +9,15 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Phase 2 T2: thin raw-fetch clients for Alpaca (`alpaca_raw`) and SEC EDGAR (`edgar_raw`), returning JSON-serializable raw payloads only; the owner-run fixture recorder (`cli_record`) with a scrub pass for secrets/emails/`User-Agent` headers; the scrub pattern test; network smoke tests for both clients (#21).
 - Phase 2 T20: abstract `Broker` interface (`submit`/`cancel`/`positions`/`fills`) and an in-memory `FakeBroker` with duplicate-`client_order_id` rejection, explicit cancel/fill state transitions and net position aggregation; no risk logic (#27).
 - Phase 2 T5: deterministic fixture-universe generator (`scripts/make_fixture_universe.py`) and its committed CSVs covering every spec req 13 case (delistings incl. truncated/window/clean/25-NSE/transfer, dual-class, ticker changes and reuse, splits, revised dividend, restated/stale shares, unclassifiable name, pre-2019 static listing, holiday/half day, SPY/MTUM benchmarks), with `tests/fixtures/universe/README.md` mapping each case to its rows (#22).
+- Broker-level tests: an aware timestamp that overflows once converted to UTC raises `ValueError` naming the field from `Order`/`Fill`, and `FakeBroker.submit`/`simulate_fill` fail closed with no order, fill or position recorded (#57).
 - Phase 2 T6: as-of read primitives (`prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`) returning the latest revision as of a tz-aware T, with a bare date or naive datetime rejected; the truncation-invariance harness (`tests/lookahead/harness.py`) and its invariance suite over every distinct `known_at` in the fixture (#39).
 
 ### Changed
+- `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
 - Process: multi-team orchestration. Any number of chat windows build in parallel as registered teams, each in its own clone; work is claimed on GitHub issues through `scripts/team.py` with a deterministic tiebreak; plans list chains; CI fails a PR whose issue is unclaimed or whose plan task has two open PRs; model tiers documented (#36).
+- Process: `scripts/team.py start <name>` sets up a team directory outside the repo in one step; `register` refuses to overwrite another team's `.team`; sessions touch only their own directory (#40).
+- `store.db.ensure_tz_aware` and the broker value objects share one tz-aware UTC check, `tradepartner.timeutil.ensure_tz_aware_utc`, which also rejects a `tzinfo` with no UTC offset; `ensure_tz_aware` now returns the value converted to UTC (#30).
+- Plan: Phase 2 gains T21a, a Streamlit dashboard shell (app entry, read-only connection, busy state, navigation) that depends only on T4; T21 (data-health page) now depends on T18 and T21a instead of T19, and T19 (CLI) also depends on T21a, so UX work can start early (#53).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.

@@ -13,7 +13,7 @@ Personal, local US-equity trading research system: point-in-time data, honest ba
 6. **Point-in-time data.** Every stored fact has a `known_at` (UTC, tz-aware) timestamp. No look-ahead. Include delisted securities.
 7. **Every backtest run is logged** in the trial registry. Never touch the holdout without an explicit flag.
 8. **When unsure, stop and ask.** Write open questions in the PR or spec. Don't guess at requirements.
-9. **Claim before you build.** `uv run python scripts/team.py claim <Tn|issue#>` before any branch. GitHub holds the claim; STATUS.md is a snapshot. "Held by another team" means pick something else. One session per working directory (your own worktree or clone); `spike/` branches are exempt. Never `release --force` or `--owner-task` unless Jose says so. See [teams.md](docs/ways-of-working/teams.md).
+9. **Claim before you build.** `uv run python scripts/team.py claim <Tn|issue#>` before any branch. GitHub holds the claim; STATUS.md is a snapshot. "Held by another team" means pick something else. New session: `uv run python scripts/team.py start <name>` once, then work only inside the directory it prints. Never enter another team's directory or the main checkout, not even to look. `spike/` branches are exempt from claims. Never `release --force` or `--owner-task` unless Jose says so. See [teams.md](docs/ways-of-working/teams.md).
 
 ## Commands
 ```bash
@@ -23,6 +23,7 @@ uv run ruff check . && uv run ruff format .  # lint + format
 uv run mypy                               # types (strict, src/)
 uv run pre-commit run --all-files         # all hooks
 uv add <pkg> / uv add --dev <pkg>         # deps (only if the plan lists them)
+uv run python scripts/team.py start <name>  # new session: own directory + register, once
 uv run python scripts/team.py status      # who holds what, ready frontier
 uv run python scripts/team.py claim T5    # or an issue number; release to give back
 ```

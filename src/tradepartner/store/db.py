@@ -23,7 +23,9 @@ than assumed, shape both functions:
   naive value as a UTC instant. `utc_now`, `ensure_tz_aware` and
   `insert_row` are how this module enforces "datetimes are always
   timezone-aware UTC" (CLAUDE.md) in Python before a value ever reaches a
-  table.
+  table. `ensure_tz_aware` delegates to the shared
+  `tradepartner.timeutil.ensure_tz_aware_utc` (issue #30) so this module and
+  `adapters.broker` cannot drift out of sync on what counts as valid.
 - DuckDB's Python client shares **one database instance per file path per
   process**: a second `duckdb.connect()` call to the same path from the
   *same* process, opened in a different `read_only` mode than an already-open
@@ -56,6 +58,7 @@ from typing import Any
 import duckdb
 
 from tradepartner.config import Settings
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 # Backoff bounds between lock-acquisition attempts (`open_for_write` reads
 # these from config: `store.lock_retry_initial_delay_seconds` and
@@ -88,16 +91,18 @@ def utc_now() -> datetime:
 
 
 def ensure_tz_aware(value: datetime, *, field: str) -> datetime:
-    """Return `value` unchanged, or raise `ValueError` if it is naive.
+    """Return `value` normalized to UTC, or raise `ValueError` if it is
+    naive.
 
     DuckDB itself does not reject a naive datetime bound to a `TIMESTAMPTZ`
     parameter (verified: it silently stores it as an instant in the
     connection's session `TimeZone`), so this is the enforcement point for
-    "datetimes are always timezone-aware UTC".
+    "datetimes are always timezone-aware UTC". Delegates to the shared
+    `tradepartner.timeutil.ensure_tz_aware_utc` (issue #30); this name and
+    signature are kept as a thin wrapper since other in-flight code imports
+    them.
     """
-    if value.tzinfo is None:
-        raise ValueError(f"{field} must be tz-aware, got a naive datetime: {value!r}")
-    return value
+    return ensure_tz_aware_utc(value, field_name=field)
 
 
 def configure_connection(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
@@ -178,10 +183,18 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
     Other column types are passed through unchecked; DuckDB's own
     conversion errors cover those.
 
+    `TIMESTAMPTZ` values are normalized to UTC (via `ensure_tz_aware`)
+    before being bound, so a value's original tzinfo (whatever it was)
+    never reaches DuckDB — a stored instant always round-trips from one
+    canonical form, not the caller's original offset (issue #43). The
+    caller's `row` Mapping itself is never mutated; a new list of values is
+    built for the bind.
+
     `table` is always a name from `tradepartner.store.schema.TABLE_NAMES`
     supplied by our own code, never external input.
     """
     column_types = _column_types(conn, table)
+    bound_values: list[Any] = []
     for field, value in row.items():
         col_type = column_types.get(field)
         if col_type == _TIMESTAMPTZ_TYPE:
@@ -190,7 +203,7 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
                     f"{table}.{field} is TIMESTAMPTZ; expected a tz-aware datetime, "
                     f"got {type(value).__name__}: {value!r}"
                 )
-            ensure_tz_aware(value, field=f"{table}.{field}")
+            value = ensure_tz_aware(value, field=f"{table}.{field}")
         elif col_type == _DATE_TYPE and (
             not isinstance(value, date) or isinstance(value, datetime)
         ):
@@ -198,9 +211,10 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
                 f"{table}.{field} is DATE; expected a date (not a datetime), "
                 f"got {type(value).__name__}: {value!r}"
             )
+        bound_values.append(value)
     columns = ", ".join(row.keys())
     placeholders = ", ".join("?" for _ in row)
-    conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", list(row.values()))
+    conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", bound_values)
 
 
 def _is_lock_error(exc: duckdb.IOException) -> bool:

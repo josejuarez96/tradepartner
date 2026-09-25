@@ -9,9 +9,12 @@ I/O so it can be unit-tested; every GitHub call goes through the ``GitHub`` prot
 Plans are read from ``origin/main`` (after a fetch), never from the working tree, so a
 checkbox ticked inside an unmerged PR does not make the next task look ready.
 
-Usage (from the team's working directory: its own worktree of this repo, or its own clone)::
+Usage. A new session runs ``start`` once from the main checkout, then works only inside the
+directory it prints (a git worktree outside the repo, so other teams' files stay out of view)::
 
-    uv run python scripts/team.py register <name>
+    uv run python scripts/team.py start <name>        # creates ../<repo>-teams/<name>, registers
+    cd <printed path>
+    uv run python scripts/team.py register <name>     # only for a clone you set up by hand
     uv run python scripts/team.py whoami
     uv run python scripts/team.py status
     uv run python scripts/team.py claim T5             # plan task
@@ -35,6 +38,7 @@ from typing import Protocol
 
 TEAM_FILE = ".team"
 TEAM_ENV = "TRADEPARTNER_TEAM"
+TEAMS_DIR_ENV = "TRADEPARTNER_TEAMS_DIR"
 PLAN_REF_ENV = "TRADEPARTNER_PLAN_REF"
 DEFAULT_PLAN_REF = "origin/main"
 TEAM_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
@@ -344,6 +348,18 @@ def repo_root() -> Path:
     return Path(_git(None, "rev-parse", "--show-toplevel")).resolve()
 
 
+def main_root() -> Path:
+    """Root of the main clone, also from inside one of its worktrees."""
+    common = _git(None, "rev-parse", "--git-common-dir")
+    return (Path.cwd() / common).resolve().parent
+
+
+def teams_dir(main: Path) -> Path:
+    """Where team directories go: a sibling of the main clone, never inside it."""
+    override = os.environ.get(TEAMS_DIR_ENV)
+    return Path(override).expanduser() if override else main.parent / f"{main.name}-teams"
+
+
 def current_team(root: Path) -> str | None:
     path = root / TEAM_FILE
     from_file = path.read_text().strip() if path.exists() else None
@@ -399,14 +415,63 @@ def plan_ref_from_env() -> str | None:
 # ── commands ────────────────────────────────────────────────────────────────────
 
 
-def cmd_register(gh: GitHub, root: Path, name: str) -> int:
+def _validate_name(name: str) -> None:
     if not TEAM_NAME_RE.match(name):
         raise SystemExit("team name must match ^[a-z][a-z0-9-]{0,19}$ (e.g. atlas, team-b)")
-    (root / TEAM_FILE).write_text(name + "\n")
+
+
+def _name_in_use(gh: GitHub, name: str) -> list[int]:
+    return [i.number for i in gh.list_issues(f"{TEAM_LABEL_PREFIX}{name}")]
+
+
+def cmd_register(gh: GitHub, root: Path, name: str, *, force: bool = False) -> int:
+    """Mark this working directory as team ``name``. Never takes over another team's directory."""
+    _validate_name(name)
+    path = root / TEAM_FILE
+    existing = path.read_text().strip() if path.exists() else None
+    if existing and existing != name and not force:
+        raise SystemExit(
+            f"{root} already belongs to team '{existing}'. Do not register here. Run "
+            f"`scripts/team.py start {name}` to get your own directory (or --force if you are "
+            "sure this directory is abandoned)."
+        )
+    path.write_text(name + "\n")
     gh.ensure_label(f"{TEAM_LABEL_PREFIX}{name}", TEAM_LABEL_COLOR, f"Claimed by team {name}")
     print(
         f"registered team '{name}' in {root / TEAM_FILE}; label {TEAM_LABEL_PREFIX}{name} ensured"
     )
+    return 0
+
+
+def cmd_start(
+    gh: GitHub, main: Path, name: str, *, ref: str = DEFAULT_PLAN_REF, reuse: bool = False
+) -> int:
+    """Create a team's own working directory outside the repo and register it, in one step."""
+    _validate_name(name)
+    path = teams_dir(main) / name
+    if path.exists():
+        raise SystemExit(
+            f"{path} already exists. Another session may be using it. Pick a different name, "
+            "or remove that directory if you know it is abandoned (`git worktree remove`)."
+        )
+    held = _name_in_use(gh, name)
+    if held and not reuse:
+        raise SystemExit(
+            f"team '{name}' holds open issues {held}; a live session is probably using that "
+            "name. Pick another, or pass --reuse if you are continuing that team's work."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if ref.startswith("origin/"):
+            _git(main, "fetch", "-q", "origin")
+        _git(main, "worktree", "add", "--detach", str(path), ref)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"git worktree add failed: {exc.stderr.strip()}") from None
+    (path / TEAM_FILE).write_text(name + "\n")
+    gh.ensure_label(f"{TEAM_LABEL_PREFIX}{name}", TEAM_LABEL_COLOR, f"Claimed by team {name}")
+    print(f"team '{name}' is set up at {path} (detached at {ref})")
+    print(f"cd {path}")
+    print("then: uv run python scripts/team.py status   (and work only inside this directory)")
     return 0
 
 
@@ -744,8 +809,20 @@ def build_parser() -> argparse.ArgumentParser:
         prog="team.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("register", help="name this clone's team and create its label")
+    p = sub.add_parser(
+        "start", help="create this team's own directory outside the repo and register it"
+    )
     p.add_argument("name")
+    p.add_argument(
+        "--reuse", action="store_true", help="continue a team name that holds open issues"
+    )
+    p = sub.add_parser(
+        "register", help="name an existing directory's team (a clone you made yourself)"
+    )
+    p.add_argument("name")
+    p.add_argument(
+        "--force", action="store_true", help="take over a directory that belongs to another team"
+    )
     sub.add_parser("whoami", help="print this clone's team")
     sub.add_parser("status", help="lanes board: claims, ready frontier, loose issues, parked PRs")
     p = sub.add_parser("claim", help="claim a plan task (T5) or an issue (28)")
@@ -772,8 +849,10 @@ def main(argv: Sequence[str] | None = None, gh: GitHub | None = None) -> int:
     root = repo_root()
     ref = plan_ref_from_env()
     match args.command:
+        case "start":
+            return cmd_start(gh, main_root(), args.name, reuse=args.reuse)
         case "register":
-            return cmd_register(gh, root, args.name)
+            return cmd_register(gh, root, args.name, force=args.force)
         case "whoami":
             print(require_team(root))
             return 0

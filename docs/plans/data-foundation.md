@@ -10,7 +10,7 @@ Design choices: DuckDB file, raw OHLCV, read-time adjustment ([ADR 0003](../deci
 
 **All runtime dependencies are added in T1** so no later task touches `pyproject.toml`/`uv.lock` (except T19's `[project.scripts]`): `pydantic`, `pydantic-settings`, `exchange_calendars`, `typer`, `httpx`, `duckdb`, `pyarrow`, `polars`, `edgartools` (exact pin), `alpaca-py` (exact pin), `streamlit`. Per-module `ignore_missing_imports` set in T1.
 
-Package layout: `src/tradepartner/{config.py, calendar.py, cli_record.py, store/{schema,db,asof,master,classify}.py, adapters/{__init__,prices,filings,broker,fixture_prices,fixture_filings,fake_broker,alpaca_raw,edgar_raw,alpaca_prices,edgar}.py, universe.py, gap.py, health.py, ingest.py, backfill.py, cli.py, dashboard/health_page.py}`; `tests/conftest.py` owns the fixture-store loader and the no-network fixture.
+Package layout: `src/tradepartner/{config.py, calendar.py, cli_record.py, store/{schema,db,asof,master,classify}.py, adapters/{__init__,prices,filings,broker,fixture_prices,fixture_filings,fake_broker,alpaca_raw,edgar_raw,alpaca_prices,edgar}.py, universe.py, gap.py, health.py, ingest.py, backfill.py, cli.py, dashboard/{__init__,app,health_page}.py}`; `tests/conftest.py` owns the fixture-store loader and the no-network fixture.
 
 ## Tasks
 
@@ -35,13 +35,14 @@ Each task = one branch = one PR (~≤400 lines; generated fixture CSVs excluded)
 - [ ] **T16: Single-session ingest.** Files: `src/tradepartner/ingest.py` · Tests: `tests/test_ingest.py` (idempotent re-run; staleness on holiday, weekend, pre-close, half day; stale → non-zero and unchanged; per-source atomic chunk; lock retry with a closing reader and with a persistent writer) · Depends on: T11, T12 · Review: quant-auditor, safety-reviewer. Runs in parallel with T13–T15.
 - [ ] **T17: Backfill and resume.** Files: `src/tradepartner/backfill.py` · Tests: `tests/test_backfill.py` (monthly chunks per source; mid-chunk failure leaves earlier chunks; resume from `chunk_cursor`; lock released between chunks) · Depends on: T16 · Review: quant-auditor.
 - [ ] **T18: Health metrics.** Files: `src/tradepartner/health.py` · Tests: `tests/test_health.py` (each metric on the fixture store incl. delisted names and static reliance; each integrity rule fails on an injected violation incl. bar-after-delisting; guarded SIC) · Depends on: T15, T17 · Review: quant-auditor.
-- [ ] **T19: CLI.** Files: `src/tradepartner/cli.py`, `pyproject.toml` (`[project.scripts]` only) · Tests: `tests/test_cli.py` (`ingest`, `health --check` exit codes, `dashboard` launches, `export` writes Parquet per table) · Depends on: T18 · Review: safety-reviewer (no secrets in output).
+- [ ] **T19: CLI.** Files: `src/tradepartner/cli.py`, `pyproject.toml` (`[project.scripts]` only) · Tests: `tests/test_cli.py` (`ingest`, `health --check` exit codes, `dashboard` launches, `export` writes Parquet per table) · Depends on: T18, T21a · Review: safety-reviewer (no secrets in output).
 - [x] **T20: `Broker` interface and fake broker.** Files: `src/tradepartner/adapters/{broker,fake_broker}.py` · Tests: `tests/adapters/test_fake_broker.py` · Depends on: T4 · Review: safety-reviewer. Runs in parallel with T5–T19.
-- [ ] **T21: Data-health page.** Files: `src/tradepartner/dashboard/{__init__,health_page}.py` · Tests: `tests/dashboard/test_health_page.py` (headless render shows every metric; read-only connections; busy state when locked) · Depends on: T19 · Review: `/code-review`.
+- [ ] **T21a: Dashboard shell.** Files: `src/tradepartner/dashboard/{__init__,app}.py` (Streamlit app entry; short-lived read-only connection via `store.db`; "store busy" state when the store is locked; "no store yet" state when the file does not exist; navigation with an empty health-page placeholder in `app.py`, which T21 points at `health_page.py`) · Tests: `tests/dashboard/test_app.py` (headless render; read-only connection; busy state when locked; no-store state) · Depends on: T4 · Review: `/code-review`. Runs in parallel with T5–T20, so UX work starts early (#53).
+- [ ] **T21: Data-health page.** Files: `src/tradepartner/dashboard/health_page.py`, `src/tradepartner/dashboard/app.py` (navigation entry only) · Tests: `tests/dashboard/test_health_page.py` (headless render shows every metric; reads only through the shell's read-only connection) · Depends on: T18, T21a · Review: `/code-review`.
 - [ ] **T22: Scheduling runbook and unattended evidence.** Files: `docs/runbooks/scheduling.md` (launchd plist; PATH for `uv`; working dir and `.env`; sleep vs power-off; logs; TCC) · Tests: none; evidence = five consecutive scheduled `ok` runs, collected by the owner · Depends on: T19 · Review: safety-reviewer. Runs in parallel with T21.
 - [ ] **T23: `data-validator` agent and close-out.** Files: `.claude/agents/data-validator.md`, `docs/ways-of-working/agents.md`, `docs/STATUS.md`, `CHANGELOG.md`, this plan · Tests: agent runs `health --check` and the suite on the owner's real store; PR includes that report, the T22 evidence, and the real-store 2020 universe check (non-empty, includes a later-delisted name) · Depends on: T21, T22 · Review: quant-auditor on the report.
 
-**Parallel lanes** (separate worktrees, non-overlapping files): T1 → {T2, T4}; T2 → T3 (owner); T4 → {T5, T20}; T5 → T6 → {T7, T8}; T8 → T8b → T9; {T7, T8b} → T10; {T3, T9} → T11; {T3, T7, T8b} → T12; {T9, T10} → T13 → {T14, T15}; {T11, T12} → T16 → T17; {T15, T17} → T18 → T19 → {T21, T22} → T23.
+**Parallel lanes** (separate worktrees, non-overlapping files): T1 → {T2, T4}; T2 → T3 (owner); T4 → {T5, T20, T21a}; T5 → T6 → {T7, T8}; T8 → T8b → T9; {T7, T8b} → T10; {T3, T9} → T11; {T3, T7, T8b} → T12; {T9, T10} → T13 → {T14, T15}; {T11, T12} → T16 → T17; {T15, T17} → T18; {T18, T21a} → {T19, T21}; T19 → T22; {T21, T22} → T23.
 
 ## Chains (for team claims)
 
@@ -54,8 +55,9 @@ Dependent tasks one team should keep, in order. A chain is a preference, not a l
 | master | T8 → T8b → T9 | T6 merged |
 | parsers | T11, T12 (parallel) | T3 (owner) plus T9 for T11; T7 and T8b for T12 |
 | rules | T13 → T14, T15 | T9 and T10 merged |
-| pipeline | T16 → T17 → T18 → T19 | T11 and T12 merged (T18 also needs T15) |
-| close-out | T21, T22 → T23 | T19 merged |
+| ux | T21a → T21 | T4 merged (T21 also waits for T18 from the pipeline chain) |
+| pipeline | T16 → T17 → T18 → T19 | T11 and T12 merged (T18 also needs T15; T19 also needs T21a) |
+| close-out | T22 → T23 | T19 merged (T23 also waits for T21) |
 | fixes | open `size:S` issues with no `team:` label | any time |
 
 ## Verification

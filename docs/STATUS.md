@@ -16,9 +16,14 @@
 - #36 Multi-team orchestration: `scripts/team.py` (register, claim, release, status, check-claims), [teams.md](ways-of-working/teams.md), plan chains, model tiers, CI `claims` job (PR #37). Duplicate T5/T20 work from two unsynchronised windows cleaned up (#34 → #31, #26 → #27, both parked)
 - Phase 2 T20: `Broker` interface and in-memory fake broker, no risk logic (PR #27)
 - Phase 2 T5: fixture-universe generator and CSVs covering every spec req 13 case (PR #31)
+- #30 Shared tz-aware UTC check `tradepartner.timeutil.ensure_tz_aware_utc` used by `store.db` and `adapters.broker` (PR #41)
+- #43 `insert_row` binds the UTC-normalized `TIMESTAMPTZ` value (one canonical form); `ensure_tz_aware_utc` raises `ValueError` (not `OverflowError`) near `datetime.min`/`datetime.max`
+- #53 Plan amendment: T21a dashboard shell split out of T21, depends only on T4; T21 now depends on T18 and T21a, T19 also on T21a (PR #62)
+- #57 Broker-level tests: a UTC-overflowing timestamp raises `ValueError` from `Order`/`Fill` and fails closed in `FakeBroker.submit`/`simulate_fill` (PR #63). Clock-failure exception design split to #64
 - Phase 2 T6: as-of primitives and truncation-invariance harness (PR #69)
 
 ## Teams
+New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
 Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: registered teams are `atlas` (main clone), `orion` (holds #22 / T5, PR #31), and `creed` (completed T20 via PR #27).
 
 ## In progress
