@@ -43,7 +43,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 ## Session protocol (replaces the generic one for build sessions)
 
 **Start**
-1. Read `docs/STATUS.md`.
+1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the Done entries not folded in yet.
 2. `uv run python scripts/team.py status`: who holds what, the ready frontier, loose issues, parked PRs.
 3. `uv run python scripts/team.py claim <Tn | issue#>`. If it says the item is held by another team, pick the next one. **Never** start anyway.
 4. Branch as the claim output suggests (`<prefix>/<issue#>-<slug>` from `origin/main`), then work as usual: `implementer` subagents in their own worktrees, tests first, draft PR early.
@@ -55,7 +55,8 @@ Team directories live **outside the repo** on purpose: a session that lists file
 
 **End**
 1. Push; update the draft PR description with the current state.
-2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after a rebase), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas.
+1. Done with the task: `/ready-pr` (runs `uv run python scripts/ready_pr.py <pr>`): merges `main` in, runs the checks, verifies the template and the specialist reviews, waits for CI on that commit and marks the PR ready. It never merges. Do not mark a PR ready by hand.
+2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after bringing `main` in with `/ready-pr`), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas.
 
 ## The claim protocol, exactly
 
@@ -84,11 +85,13 @@ Chains are a preference, not a lock. Every task is still claimed individually.
 
 ## Shared files: how N PRs avoid conflicts
 
-Every PR touches `docs/STATUS.md`, `CHANGELOG.md` and one plan checkbox. To keep rebases trivial:
+Until 2026-09-25 every PR appended one line to `docs/STATUS.md` ("Done") and one to `CHANGELOG.md` (`[Unreleased]`) at the same anchor. Git cannot merge two insertions at one spot, so every merge to `main` conflicted every other open PR, and each team looped: merge main, resolve, push, wait for CI, main moves, repeat (#70). The fix is that a PR **adds files, never lines**:
 
-- **Append one line** to STATUS "Done" and to CHANGELOG `[Unreleased]`. Tick only your checkbox. Do not reorder, rewrite or "tidy" neighbouring lines.
-- **STATUS's "Ready frontier snapshot" is written only by `doc-keeper`** (and by the PR that changes the process). It is a copy of `status` output, not a place to reserve or advertise work.
-- **Rebase on `main` right before marking ready**, and again after any merge that touched those files. Resolve append conflicts by keeping both lines.
+- **Bookkeeping is a fragment.** `uv run python scripts/fragments.py add <issue> --slug <slug> --status "<Done line>" --added "<CHANGELOG bullet>"` writes `docs/status.d/<issue>-<slug>.md` and `changelog.d/<issue>-<slug>.md`. New files never conflict. Do not edit `STATUS.md`'s "Done" list or `CHANGELOG.md`'s `[Unreleased]` directly; `ready_pr.py` refuses a PR that does (`--allow-shared-files` is for process PRs only). Reading STATUS: `uv run python scripts/fragments.py show` prints the pending entries.
+- **Folding.** `uv run python scripts/fragments.py fold` moves every fragment into the two files in issue order and deletes it. `doc-keeper` runs it on the branch it is invoked on: a PR that edits those files for another reason (a plan amendment, a retro, the phase-close PR), or a fold PR **the owner asks for** when STATUS has gone stale, roughly every ten merges. Agents never open a fold PR on their own: a per-merge bookkeeping PR is what the Phase 1 retro banned. `ready_pr.py` recognises a fold (it deletes fragment files) and lets it through; doc-keeper's snapshot refresh in the same PR passes with `--allow-shared-files`.
+- **Plan checkboxes.** Tick only your checkbox. Different lines merge cleanly, and the CI `claims` job already stops two PRs from building one task.
+- **STATUS's "Ready frontier snapshot" and "Teams" are written only by `doc-keeper`** (and by the PR that changes the process). They are copies of `status` output, not a place to reserve or advertise work.
+- **Bring `main` in with a merge, not a rebase**, right before marking ready: `ready_pr.py` does it. A merge needs no force-push, so a branch two teams have pushed stays safe, and the squash merge flattens it anyway. The only conflict it resolves on its own is two lists of added bullets in the shared files (both sides kept); anything else stops and tells you.
 - **Code files: only those your plan task names.** If another team's open PR touches one of them, one of you waits; `status` shows open PRs per issue.
 
 ## CI guard

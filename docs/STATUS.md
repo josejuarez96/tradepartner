@@ -3,6 +3,7 @@
 **Updated:** 2026-09-24 · **Phase:** 2, Data foundation · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Done
+Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/fragments.py show` (#70).
 - Repo scaffold: uv / ruff / mypy / pytest, CI, pre-commit, GitHub templates, labels ([initial commit](https://github.com/josejuarez96/tradepartner/commits/main))
 - #1 Ways of working: git workflow, process, docs, agents, draft charter (PR #2, merged). The main session may merge a PR when the owner explicitly says to
 
@@ -34,7 +35,7 @@ Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: registe
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
 Copied from `team.py status` on 2026-09-24. Claim through the tool, never from this list.
-1. T5 (issue #22, held by orion, PR #31): rebase, run the required reviews, mark ready
+1. T5 (issue #22, held by orion, PR #31): merged 2026-09-24; snapshot otherwise unchanged, refresh with the next fold
 2. Unclaimed issues: #28, #29, #30, #35 (`size:S`), #32 (type:fix), #38 (symbol-case canonicalization, type:feat). #33 is a Phase 4 idea, leave it
 3. After T5 merges: T6, then T7 and T8 in parallel (see plan chains)
 4. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
