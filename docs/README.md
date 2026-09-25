@@ -10,6 +10,7 @@ docs/
 ├── status.d/             ← one Done line per open PR, folded into STATUS.md by doc-keeper
 ├── charter.md            ← why, success/stop criteria, scope, constraints (changes only via ADR)
 ├── roadmap.md            ← phases with exit criteria
+├── work-map.toml         ← living: one plain-English what/why per task, issue, report, ADR; read by the cockpit
 ├── architecture.md       ← (Phase 1+) living system overview: components, data flow
 ├── ways-of-working/      ← how we build: git, process, agents
 ├── decisions/            ← ADRs: NNNN-<slug>.md, append-only
@@ -33,10 +34,12 @@ docs/
 | **Architecture** | How do the pieces fit today? | Phase 1+ | Living; updated when structure changes | n/a |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
 | **CHANGELOG** | What changed, per version? | Every feat/fix PR | Fragment in `changelog.d/`, folded by doc-keeper | n/a |
+| **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | When an issue, research brief, ADR, spec or plan is opened | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
 
 ## Rules
 
 - **Link, don't copy.** Specs link to research and ADRs, and plans link to specs. Never paste the same content into two places.
 - **Frozen docs stay frozen.** Fixing a typo is fine. Changing the substance means writing a new doc that supersedes the old one.
 - **Dates are absolute** (`2026-09-24`), never "last week".
+- **Every piece of work gets a work-map entry.** When you open an issue or a research brief, add `[issue.<n>]` (or `[research.<stem>]`, `[adr.<nnnn>]`, `[task.<id>]`) to [work-map.toml](work-map.toml): one sentence on what it is, one on why it matters on the way to the MVP, and `unblocks` for the decision or task it feeds. The cockpit (`uv run python scripts/cockpit.py`) reads it and lists what is missing.
 - **Keep CLAUDE.md short.** It's loaded into every agent session, so it holds rules and pointers, not specs.

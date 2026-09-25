@@ -97,12 +97,73 @@ __COCKPIT_REFRESH__
   ul.plain li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
   .empty { color: var(--muted); font-size: 13px; }
   footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+
+  .phases { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .phase .sent { font-size: 13px; margin-top: 8px; line-height: 1.45; }
+  .phase .badge { display: inline-block; font: 500 10px "IBM Plex Mono", monospace; letter-spacing: .06em; padding: 1px 6px; border-radius: 999px; background: var(--accent); color: #fff; margin-left: 6px; vertical-align: 1px; }
+  .phase.future { opacity: .85; }
+  .phase details { margin-top: 8px; font-size: 12px; }
+  .phase summary { cursor: pointer; color: var(--muted); }
+  ul.crit { list-style: none; padding: 0; margin: 6px 0 0; display: flex; flex-direction: column; gap: 5px; }
+  ul.crit li { display: flex; gap: 6px; align-items: baseline; }
+  ul.crit .mark { font-family: "IBM Plex Mono", monospace; flex: none; }
+  ul.crit li.c-done { color: var(--good); }
+  ul.crit li.c-missing_adr .mark { color: var(--bad); }
+  ul.crit li.c-needs_owner .mark { color: var(--warn); }
+  .graph-tools { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; font-size: 13px; margin-bottom: 10px; }
+  .graph-tools label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .graph-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 10px; }
+  svg#graph { display: block; }
+  .node rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.3; cursor: pointer; transition: opacity .15s; }
+  .node text { pointer-events: none; fill: var(--ink); }
+  .node .lbl { font: 500 12px "IBM Plex Mono", ui-monospace, monospace; }
+  .node .ttl { font: 400 11px "IBM Plex Sans", system-ui, sans-serif; fill: var(--muted); }
+  .node.state-done rect { fill: var(--good-soft); stroke: var(--good); }
+  .node.state-done .lbl { fill: var(--good); }
+  .node.state-in_review rect { fill: var(--accent-soft); stroke: var(--accent); }
+  .node.state-in_review .lbl { fill: var(--accent); }
+  .node.state-in_progress rect { fill: var(--warn-soft); stroke: var(--warn); }
+  .node.state-in_progress .lbl { fill: var(--warn); }
+  .node.state-ready rect { stroke: var(--accent); stroke-dasharray: 5 3; }
+  .node.state-blocked rect { stroke-dasharray: 2 3; }
+  .node.state-blocked text { fill: var(--muted); }
+  .node.kind-phase rect { stroke-width: 2.5; }
+  .node.kind-phase .lbl { font-size: 13px; }
+  .node.state-current rect { fill: var(--accent-soft); stroke: var(--accent); }
+  .node.state-future rect { stroke: var(--muted); }
+  .node.dim { opacity: .22; }
+  .node.selected rect { stroke-width: 3.5; }
+  .edge { fill: none; stroke: var(--line); stroke-width: 1.4; transition: opacity .15s; }
+  .edge.unblocks { stroke-dasharray: 5 4; }
+  .edge.phase { stroke-width: 2.5; stroke: var(--muted); }
+  .edge.dim { opacity: .1; }
+  .edge.lit { stroke: var(--accent); stroke-width: 2.2; }
+  .arrowhead { fill: var(--muted); }
+  .detail { margin-top: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-height: 60px; }
+  .detail h3 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+  .detail p { margin: 8px 0; font-size: 14px; }
+  .detail .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; font-family: "IBM Plex Mono", monospace; display: block; margin-bottom: 2px; }
+  .detail .chips { margin: 0 0 8px; }
+  .linkish { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+  a { color: var(--accent); }
+  .legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--line); vertical-align: -2px; margin-right: 4px; background: var(--surface); }
+  .legend .sw.done { background: var(--good-soft); border-color: var(--good); }
+  .legend .sw.in_review { background: var(--accent-soft); border-color: var(--accent); }
+  .legend .sw.in_progress { background: var(--warn-soft); border-color: var(--warn); }
+  .legend .sw.ready { border-color: var(--accent); border-style: dashed; }
+  .legend .sw.blocked { border-style: dotted; }
+  .owner-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .owner-groups .card h3 { margin: 0; font-size: 14px; }
+  .status-word { font-size: 12px; color: var(--muted); }
+  details.fold > summary { cursor: pointer; font-size: 14px; font-weight: 600; margin-bottom: 10px; list-style: none; }
+  details.fold > summary::before { content: "▸ "; color: var(--muted); }
+  details.fold[open] > summary::before { content: "▾ "; }
 </style>
 
 <main>
   <header>
     <div>
-      <div class="eyebrow">TradePartner · build cockpit</div>
+      <div class="eyebrow">TradePartner · work map</div>
       <h1 id="title">Cockpit</h1>
     </div>
     <div class="sub" id="meta"></div>
@@ -113,8 +174,35 @@ __COCKPIT_REFRESH__
   </section>
 
   <section>
-    <h2>Roadmap</h2>
-    <div class="strip-wrap"><div class="strip" id="roadmap"></div></div>
+    <h2>How far to the MVP</h2>
+    <p class="sub" id="mvp-sub"></p>
+    <div class="phases" id="phases"></div>
+  </section>
+
+  <section>
+    <h2>The web of work</h2>
+    <p class="sub">Every open piece of work and what it feeds. Left to right is the order things have to happen. Solid arrows are hard dependencies from the plan; dashed arrows are "this informs that" links from <code>docs/work-map.toml</code>; thick arrows join the phases. Click anything for the plain-English version. The map is wide: scroll it sideways, or tick "fit to width".</p>
+    <div class="graph-tools">
+      <label><input type="checkbox" id="hide-done"> hide finished work</label>
+      <label><input type="checkbox" id="fit-width"> fit to width (overview, small text)</label>
+      <span class="legend">
+        <span><i class="sw done"></i>merged</span> <span><i class="sw in_review"></i>in review</span> <span><i class="sw in_progress"></i>being built</span> <span><i class="sw ready"></i>ready to pick up</span> <span><i class="sw blocked"></i>waiting on others</span> <span><i class="sw"></i>not started</span>
+      </span>
+    </div>
+    <div class="graph-wrap"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <div class="detail" id="detail"></div>
+    <p class="sub" id="map-missing"></p>
+  </section>
+
+  <section>
+    <h2>Research in flight</h2>
+    <p class="sub">Each question, where it stands, and the decision it feeds. A report is frozen once merged; INCOMPLETE means its budget ran out with items still open.</p>
+    <div class="table-wrap"><table id="research-table"></table></div>
+  </section>
+
+  <section>
+    <h2>Waiting on you</h2>
+    <div class="owner-groups" id="owner"></div>
   </section>
 
   <section>
@@ -131,13 +219,6 @@ __COCKPIT_REFRESH__
     </div>
   </section>
 
-  <section>
-    <h2>Tokens by team</h2>
-    <p class="sub">All sessions on this machine whose working directory is this repo or a team directory, attributed to the team directory each session worked in. One count per API request. Cache reads dominate and are the cheap part. The main checkout counts every session ever run there, including before teams existed; pass <code>--since</code> to cut that off.</p>
-    <div class="bars" id="bars"></div>
-    <div class="table-wrap"><table id="tokens-table"></table></div>
-  </section>
-
   <section class="two">
     <div>
       <h2>Unclaimed queue</h2>
@@ -151,7 +232,16 @@ __COCKPIT_REFRESH__
     </div>
   </section>
 
-  <footer>Refresh: <code>uv run python scripts/cockpit.py</code> then reopen <code>data/cockpit/cockpit.html</code>. Live board: <code>uv run python scripts/team.py status</code>.</footer>
+  <section>
+    <details class="fold">
+      <summary>Tokens by team</summary>
+      <p class="sub">All sessions on this machine whose working directory is this repo or a team directory, attributed to the team directory each session worked in. One count per API request. Cache reads dominate and are the cheap part. The main checkout counts every session ever run there, including before teams existed; pass <code>--since</code> to cut that off.</p>
+      <div class="bars" id="bars"></div>
+      <div class="table-wrap"><table id="tokens-table"></table></div>
+    </details>
+  </section>
+
+  <footer>Refresh: <code>uv run python scripts/cockpit.py</code> then reopen <code>data/cockpit/cockpit.html</code>. Live board: <code>uv run python scripts/team.py status</code>. Plain-English entries: <code>docs/work-map.toml</code>.</footer>
 </main>
 
 <script id="cockpit-data" type="application/json">__COCKPIT_DATA__</script>
@@ -172,31 +262,246 @@ __COCKPIT_REFRESH__
   document.getElementById('title').textContent = 'Phase ' + (ph.phase == null ? '?' : ph.phase) + ' · ' + (ph.phase_name || '');
   document.getElementById('meta').textContent = 'snapshot ' + now.toLocaleString() + ' · last tag ' + (ph.last_tag || '?') + ' · active < ' + D.thresholds.active_minutes + 'm, idle < ' + D.thresholds.idle_minutes + 'm' + (D.thresholds.since ? ' · sessions since ' + D.thresholds.since : '');
 
-  // tiles
+  // ── plain-English vocabulary
+  var WORD = { done: 'merged', in_review: 'in review', in_progress: 'being built', ready: 'ready to pick up', blocked: 'waiting on others', open: 'not started', current: 'happening now', future: 'later' };
+  var KIND = { phase: 'phase', task: 'plan task', issue: 'issue', research: 'research question', decision: 'decision to make', docs: 'spec or plan to write', adr: 'decision record', plan: 'plan', spec: 'spec' };
+  var G = D.graph || { nodes: [], edges: [], missing_map_entries: [] };
+  var nodeById = {}; G.nodes.forEach(function (n) { nodeById[n.id] = n; });
+  var fullPreds = {}, fullSuccs = {};
+  G.nodes.forEach(function (n) { fullPreds[n.id] = []; fullSuccs[n.id] = []; });
+  G.edges.forEach(function (e) { if (nodeById[e.from] && nodeById[e.to]) { fullSuccs[e.from].push(e.to); fullPreds[e.to].push(e.from); } });
+  function word(state) { return WORD[state] || state; }
+  function trunc(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  function stateClass(state) { return { done: 'pass', in_review: 'owner', in_progress: 'idle', ready: 'owner', blocked: 'inactive', open: 'inactive', current: 'owner', future: 'inactive' }[state] || 'inactive'; }
+  function prPill(p) { return pill(p.ci, 'PR #' + p.number + ' ' + (p.draft ? 'draft' : 'ready') + ' · CI ' + p.ci); }
+
+  // ── tiles
   var teams = D.teams || [];
   var counts = { active: 0, idle: 0, inactive: 0 };
   teams.forEach(function (t) { counts[t.state] = (counts[t.state] || 0) + 1; });
-  var ready = (D.plan.tasks || []).filter(function (t) { return t.state === 'ready' && !t.owner; }).length;
+  var prog = D.progress || [];
+  var mvpPhases = prog.filter(function (p) { return p.mvp; });
+  var cur = prog.filter(function (p) { return p.state === 'current'; })[0];
+  var curIdx = cur ? mvpPhases.map(function (p) { return p.phase; }).indexOf(cur.phase) : -1;
+  var inReview = G.nodes.filter(function (n) { return n.state === 'in_review'; }).length;
+  var research = G.nodes.filter(function (n) { return n.kind === 'research' && n.state !== 'done'; }).length;
+  var owner = D.owner || { decisions: [], tasks: [], ready_prs: [] };
+  var decisions = G.nodes.filter(function (n) { return n.kind === 'decision'; }).length;
+  var ownerCount = owner.tasks.length + owner.ready_prs.length + owner.decisions.length + decisions;
   var tiles = [
-    [counts.active, 'teams active'], [counts.idle, 'teams idle'], [counts.inactive, 'teams inactive'],
-    [D.plan.done + ' / ' + D.plan.total, 'plan tasks merged'], [ready, 'tasks ready, unclaimed'],
-    [(D.open_prs || []).length, 'open PRs'], [(D.unclaimed || []).length, 'unclaimed issues'],
-    [fmt(teams.reduce(function (a, t) { return a + t.tokens_total; }, 0)), 'tokens, all teams']
+    [curIdx >= 0 ? (curIdx + 1) + ' of ' + mvpPhases.length : '?', 'MVP phases: where we are'],
+    [cur && cur.planned ? cur.counts.done + ' / ' + cur.total : '—', (cur ? 'phase ' + cur.phase : 'current phase') + ' tasks merged'],
+    [inReview, 'pieces in review'],
+    [research, 'research questions open'],
+    [ownerCount, 'things waiting on you'],
+    [counts.active, 'agents working right now'],
+    [(D.unclaimed || []).length, 'unclaimed issues']
   ];
   var tilesEl = document.getElementById('tiles');
   tiles.forEach(function (x) { var t = el('div', 'tile'); t.appendChild(el('div', 'v num', String(x[0]))); t.appendChild(el('div', 'l', x[1])); tilesEl.appendChild(t); });
 
-  // roadmap
-  var rm = document.getElementById('roadmap');
-  (D.roadmap || []).forEach(function (p) {
-    var cls = ph.phase == null ? '' : (p.phase < ph.phase ? 'done' : (p.phase === ph.phase ? 'current' : ''));
-    var box = el('div', 'phase ' + cls);
-    box.appendChild(el('div', 'n', 'Phase ' + p.phase + (cls === 'done' ? ' · done' : cls === 'current' ? ' · now' : '')));
+  // ── how far to the MVP
+  var mvp = D.mvp || {};
+  document.getElementById('mvp-sub').textContent = (mvp.summary ? mvp.summary + ' ' : '') + (mvp.first_phase != null ? 'Phases ' + mvp.first_phase + ' to ' + mvp.last_phase + ' build it; the phases after are beyond the MVP.' : '');
+  function phaseSentence(p) {
+    if (p.state === 'done') return 'Finished.';
+    if (p.planned) {
+      var c = p.counts, parts = [c.done + ' of ' + p.total + ' tasks merged'];
+      if (c.in_review) parts.push(c.in_review + ' in review');
+      if (c.in_progress) parts.push(c.in_progress + ' being built');
+      if (c.ready) parts.push(c.ready + ' ready to pick up');
+      if (c.blocked) parts.push(c.blocked + ' waiting on others');
+      if (c.open) parts.push(c.open + ' not started');
+      return parts.join(', ') + '.';
+    }
+    if (p.spec_issue) return 'Not broken into tasks yet, so there is no honest percentage. The spec and plan are issue #' + p.spec_issue.number + (p.spec_issue.holder ? ', held by ' + p.spec_issue.holder : ', unclaimed') + '.';
+    return 'Not planned yet.';
+  }
+  var phasesEl = document.getElementById('phases');
+  prog.forEach(function (p) {
+    var box = el('div', 'phase ' + p.state);
+    var n = el('div', 'n', 'Phase ' + p.phase + (p.state === 'done' ? ' · done' : p.state === 'current' ? ' · now' : '') + (p.note ? ' · ' + p.note : ''));
+    if (p.mvp) n.appendChild(el('span', 'badge', 'MVP'));
+    box.appendChild(n);
     box.appendChild(el('div', 'name', p.name));
     box.title = p.goal;
-    if (cls === 'current') { var bar = el('div', 'bar'); var fill = el('i'); fill.style.width = (D.plan.total ? Math.round(100 * D.plan.done / D.plan.total) : 0) + '%'; bar.appendChild(fill); box.appendChild(bar); box.appendChild(el('div', 'n num', D.plan.done + ' of ' + D.plan.total + ' tasks merged')); }
-    rm.appendChild(box);
+    var pct = p.planned ? Math.round(100 * p.counts.done / p.total) : (p.state === 'done' ? 100 : 0);
+    var bar = el('div', 'bar'); var fill = el('i'); fill.style.width = pct + '%'; bar.appendChild(fill); box.appendChild(bar);
+    var wm = nodeById['phase:' + p.phase];
+    if (wm && wm.what) box.appendChild(el('div', 'sent', wm.what));
+    box.appendChild(el('div', 'sent num', phaseSentence(p)));
+    var det = el('details'); det.appendChild(el('summary', null, 'What "done" means for this phase'));
+    var ul = el('ul', 'crit');
+    p.criteria.forEach(function (c) {
+      var li = el('li', 'c-' + c.state);
+      li.appendChild(el('span', 'mark', c.state === 'done' ? '✓' : c.state === 'missing_adr' ? '✗' : '☐'));
+      li.appendChild(el('span', null, c.text + (c.state === 'needs_owner' ? ' (you confirm this)' : c.state === 'missing_adr' ? ' (decision record missing)' : '')));
+      ul.appendChild(li);
+    });
+    det.appendChild(ul); box.appendChild(det);
+    phasesEl.appendChild(box);
   });
+
+  // ── the web: layered layout, no library
+  var NW = 170, NH = 46, GX = 64, GY = 14;
+  function layoutGraph(nodes, edges) {
+    var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
+    var preds = {}, succs = {};
+    nodes.forEach(function (n) { preds[n.id] = []; succs[n.id] = []; });
+    edges.forEach(function (e) { if (byId[e.from] && byId[e.to]) { succs[e.from].push(e.to); preds[e.to].push(e.from); } });
+    var depth = {}, visiting = {};
+    function d(id) {
+      if (depth[id] != null) return depth[id];
+      if (visiting[id]) return 0;
+      visiting[id] = true;
+      var m = 0; preds[id].forEach(function (p) { m = Math.max(m, d(p) + 1); });
+      depth[id] = m; return m;
+    }
+    nodes.forEach(function (n) { d(n.id); });
+    // A node with no prerequisites sits just left of the first thing it feeds, not in column 0.
+    nodes.forEach(function (n) { if (!preds[n.id].length && succs[n.id].length) depth[n.id] = Math.min.apply(null, succs[n.id].map(function (x) { return depth[x]; })) - 1; });
+    var layers = [];
+    nodes.forEach(function (n) { var k = depth[n.id]; (layers[k] = layers[k] || []).push(n.id); });
+    for (var i = 0; i < layers.length; i++) layers[i] = layers[i] || [];
+    var pos = {};
+    layers.forEach(function (L) { L.forEach(function (id, i) { pos[id] = i; }); });
+    function bary(id, nb) { var ns = nb[id]; if (!ns.length) return pos[id]; var s = 0; ns.forEach(function (x) { s += pos[x]; }); return s / ns.length; }
+    for (var sweep = 0; sweep < 6; sweep++) {
+      var down = sweep % 2 === 0;
+      for (var k = 0; k < layers.length; k++) {
+        var li = down ? k : layers.length - 1 - k, L = layers[li], nb = down ? preds : succs, b = {};
+        L.forEach(function (id) { b[id] = bary(id, nb); });
+        L.sort(function (a, c) { return b[a] - b[c] || pos[a] - pos[c]; });
+        L.forEach(function (id, i) { pos[id] = i; });
+      }
+    }
+    var tallest = Math.max.apply(null, layers.map(function (L) { return L.length; }).concat([1]));
+    var height = tallest * (NH + GY) - GY, xy = {};
+    layers.forEach(function (L, li) {
+      var off = (height - (L.length * (NH + GY) - GY)) / 2;
+      L.forEach(function (id, i) { xy[id] = { x: li * (NW + GX), y: off + i * (NH + GY) }; });
+    });
+    return { xy: xy, width: Math.max(1, layers.length * (NW + GX) - GX), height: Math.max(1, height), preds: preds, succs: succs };
+  }
+  var svgNS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) { var e = document.createElementNS(svgNS, tag); Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); }); return e; }
+  var selected = null, layoutNow = null;
+  function drawGraph() {
+    var hideDone = document.getElementById('hide-done').checked;
+    var nodes = G.nodes.filter(function (n) { return !(hideDone && n.state === 'done' && n.kind !== 'phase'); });
+    var ids = {}; nodes.forEach(function (n) { ids[n.id] = true; });
+    var edges = G.edges.filter(function (e) { return ids[e.from] && ids[e.to]; });
+    var L = layoutGraph(nodes, edges); layoutNow = L;
+    var svg = document.getElementById('graph'); while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var pad = 10, W = L.width + 2 * pad, H = L.height + 2 * pad;
+    svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', (-pad) + ' ' + (-pad) + ' ' + W + ' ' + H);
+    var defs = svgEl('defs'); var marker = svgEl('marker', { id: 'arrow', viewBox: '0 0 10 10', refX: '10', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' });
+    marker.appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', class: 'arrowhead' })); defs.appendChild(marker); svg.appendChild(defs);
+    var eg = svgEl('g');
+    edges.forEach(function (e) {
+      var a = L.xy[e.from], b = L.xy[e.to], x1 = a.x + NW, y1 = a.y + NH / 2, x2 = b.x, y2 = b.y + NH / 2, cx = Math.max(24, (x2 - x1) / 2);
+      eg.appendChild(svgEl('path', { d: 'M' + x1 + ' ' + y1 + ' C' + (x1 + cx) + ' ' + y1 + ' ' + (x2 - cx) + ' ' + y2 + ' ' + x2 + ' ' + y2, class: 'edge ' + e.kind, 'marker-end': 'url(#arrow)', 'data-from': e.from, 'data-to': e.to }));
+    });
+    svg.appendChild(eg);
+    var ng = svgEl('g');
+    nodes.forEach(function (n) {
+      var p = L.xy[n.id];
+      var g = svgEl('g', { class: 'node kind-' + n.kind + ' state-' + n.state, transform: 'translate(' + p.x + ',' + p.y + ')', 'data-id': n.id });
+      g.appendChild(svgEl('rect', { width: NW, height: NH, rx: n.kind === 'phase' ? 14 : 7 }));
+      var t1 = svgEl('text', { x: 10, y: 18, class: 'lbl' }); t1.textContent = n.label + (n.holder ? ' · ' + n.holder : n.kind === 'phase' && n.mvp ? ' · MVP' : '');
+      var t2 = svgEl('text', { x: 10, y: 35, class: 'ttl' }); t2.textContent = trunc(n.title, 27);
+      var tip = svgEl('title'); tip.textContent = n.label + ': ' + n.title + ' — ' + word(n.state);
+      g.appendChild(t1); g.appendChild(t2); g.appendChild(tip);
+      g.addEventListener('click', function () { select(n.id); });
+      ng.appendChild(g);
+    });
+    svg.appendChild(ng);
+    highlight(selected && ids[selected] ? selected : null);
+  }
+  function highlight(id) {
+    var svg = document.getElementById('graph'), L = layoutNow, keep = {};
+    if (id) { keep[id] = true; (L.preds[id] || []).forEach(function (x) { keep[x] = true; }); (L.succs[id] || []).forEach(function (x) { keep[x] = true; }); }
+    svg.querySelectorAll('.node').forEach(function (g) { var nid = g.getAttribute('data-id'); g.classList.toggle('dim', !!id && !keep[nid]); g.classList.toggle('selected', nid === id); });
+    svg.querySelectorAll('.edge').forEach(function (p) { var on = !id || p.getAttribute('data-from') === id || p.getAttribute('data-to') === id; p.classList.toggle('dim', !on); p.classList.toggle('lit', !!id && on); });
+  }
+  function nodeRef(id) { var n = nodeById[id]; var s = el('span', 'linkish', n ? n.label + ' ' + trunc(n.title, 40) : id); s.addEventListener('click', function () { select(id); }); return s; }
+  function select(id) {
+    selected = id; highlight(id);
+    var n = nodeById[id], box = document.getElementById('detail'); box.innerHTML = '';
+    if (!n) return;
+    box.appendChild(el('h3', null, n.label + ' · ' + n.title));
+    var chips = el('div', 'chips');
+    chips.appendChild(pill('inactive', KIND[n.kind] || n.kind));
+    chips.appendChild(pill(stateClass(n.state), word(n.state)));
+    if (n.holder) chips.appendChild(pill('idle', 'held by ' + n.holder));
+    if (n.owner) chips.appendChild(pill('owner', 'owner task: needs your keys'));
+    (n.prs || []).forEach(function (p) { chips.appendChild(prPill(p)); });
+    if (n.report_status) chips.appendChild(pill(n.report_status === 'COMPLETE' ? 'pass' : 'pending', 'report ' + n.report_status.toLowerCase()));
+    if (n.doc_status) chips.appendChild(pill(n.doc_status === 'Accepted' ? 'pass' : 'pending', n.doc_status.toLowerCase()));
+    (n.labels || []).forEach(function (l) { chips.appendChild(pill('inactive', l)); });
+    box.appendChild(chips);
+    var what = el('p'); what.appendChild(el('span', 'k', 'What it is'));
+    what.appendChild(document.createTextNode(n.what || 'No plain-English entry yet. Add [' + n.id.replace(':', '.') + '] to docs/work-map.toml.'));
+    box.appendChild(what);
+    if (n.why) { var why = el('p'); why.appendChild(el('span', 'k', 'Why it matters')); why.appendChild(document.createTextNode(n.why)); box.appendChild(why); }
+    var pr = fullPreds[id] || [], su = fullSuccs[id] || [];
+    if (pr.length) { var a = el('p'); a.appendChild(el('span', 'k', 'Needs first')); pr.forEach(function (x, i) { if (i) a.appendChild(document.createTextNode(' · ')); a.appendChild(nodeRef(x)); }); box.appendChild(a); }
+    if (su.length) { var b = el('p'); b.appendChild(el('span', 'k', 'Feeds into')); su.forEach(function (x, i) { if (i) b.appendChild(document.createTextNode(' · ')); b.appendChild(nodeRef(x)); }); box.appendChild(b); }
+    if (n.url) { var lk = el('p'); var aEl = el('a', null, n.kind === 'task' || n.issue && !/blob/.test(n.url) ? 'Open issue #' + n.issue + ' on GitHub' : 'Open the document on GitHub'); aEl.href = n.url; aEl.target = '_blank'; aEl.rel = 'noopener'; lk.appendChild(aEl); box.appendChild(lk); }
+  }
+  document.getElementById('hide-done').addEventListener('change', drawGraph);
+  function fitWidth() { var svg = document.getElementById('graph'); var on = document.getElementById('fit-width').checked; svg.style.width = on ? '100%' : ''; svg.style.height = on ? 'auto' : ''; }
+  document.getElementById('fit-width').addEventListener('change', fitWidth);
+  drawGraph();
+  var det0 = document.getElementById('detail');
+  det0.appendChild(el('p', 'empty', 'Click a box to see what it is, why it matters, what it needs and what it feeds.'));
+  var missing = G.missing_map_entries || [], unknown = G.unknown_map_entries || [];
+  var mapMsg = missing.length ? 'No plain-English entry yet for: ' + missing.join(', ') + '. Add them to docs/work-map.toml.' : 'Every piece of work has a plain-English entry in docs/work-map.toml.';
+  if (unknown.length) mapMsg += ' Map ids that match nothing (closed, renamed or misspelled): ' + unknown.join(', ') + '.';
+  document.getElementById('map-missing').textContent = mapMsg;
+
+  // ── research in flight
+  var rt = document.getElementById('research-table');
+  var rh = el('thead'), rhr = el('tr');
+  ['question', 'where it stands', 'feeds into', 'who'].forEach(function (h) { rhr.appendChild(el('th', null, h)); });
+  rh.appendChild(rhr); rt.appendChild(rh);
+  var rb = el('tbody');
+  var researchNodes = G.nodes.filter(function (n) { return n.kind === 'research'; }).sort(function (a, b) { return (a.state === 'done') - (b.state === 'done') || a.label.localeCompare(b.label); });
+  if (!researchNodes.length) { var tr0 = el('tr'); tr0.appendChild(el('td', 'empty', 'no research open')); rb.appendChild(tr0); }
+  researchNodes.forEach(function (n) {
+    var tr = el('tr');
+    var q = el('td'); q.appendChild(el('div', null, n.what || n.title)); var qs = el('div', 'status-word', n.label + ' · ' + n.title); q.appendChild(qs); tr.appendChild(q);
+    var st = el('td');
+    var text = n.report_status ? 'report merged, ' + n.report_status.toLowerCase() : n.state === 'in_review' ? 'report written, waiting for review' : n.state === 'in_progress' ? 'being researched' : n.state === 'open' ? 'unclaimed, nobody on it' : word(n.state);
+    st.appendChild(pill(n.report_status === 'INCOMPLETE' ? 'pending' : stateClass(n.state), text));
+    (n.prs || []).forEach(function (p) { st.appendChild(document.createTextNode(' ')); st.appendChild(prPill(p)); });
+    tr.appendChild(st);
+    var fd = el('td'); (fullSuccs[n.id] || []).forEach(function (x, i) { if (i) fd.appendChild(document.createTextNode(' · ')); fd.appendChild(nodeRef(x)); }); if (!(fullSuccs[n.id] || []).length) fd.appendChild(el('span', 'empty', 'nothing recorded')); tr.appendChild(fd);
+    tr.appendChild(el('td', 'mono', n.holder || '—'));
+    rb.appendChild(tr);
+  });
+  rt.appendChild(rb);
+
+  // ── waiting on you
+  var ownerEl = document.getElementById('owner');
+  function ownerCard(title, items, emptyText) {
+    var c = el('div', 'card'); c.appendChild(el('h3', null, title));
+    var ul = el('ul', 'plain');
+    if (!items.length) ul.appendChild(el('li', 'empty', emptyText));
+    items.forEach(function (li) { ul.appendChild(li); });
+    c.appendChild(ul); ownerEl.appendChild(c);
+  }
+  ownerCard('Plan tasks only you can run', owner.tasks.map(function (t) {
+    var li = el('li'); li.appendChild(nodeRef('task:' + t.id)); li.appendChild(pill(stateClass(t.state), word(t.state)));
+    var n = nodeById['task:' + t.id]; (n && n.prs || []).forEach(function (p) { li.appendChild(prPill(p)); }); return li;
+  }), 'none right now');
+  ownerCard('Pull requests ready to merge', owner.ready_prs.map(function (p) {
+    var li = el('li'); li.appendChild(el('span', 'mono', '#' + p.number)); li.appendChild(el('span', null, p.title)); li.appendChild(pill(p.ci, 'CI ' + p.ci)); return li;
+  }), 'nothing ready; drafts are still with their teams');
+  var decisionItems = G.nodes.filter(function (n) { return n.kind === 'decision'; }).map(function (n) {
+    var li = el('li'); li.appendChild(nodeRef(n.id)); li.appendChild(pill(stateClass(n.state), n.state === 'open' ? 'unclaimed: an agent can draft it' : word(n.state))); return li;
+  }).concat(owner.decisions.map(function (t) { var li = el('li'); li.appendChild(el('span', null, t)); li.appendChild(pill('owner', 'from STATUS')); return li; }));
+  ownerCard('Decisions to make', decisionItems, 'no open decisions');
 
   // teams
   var order = { active: 0, idle: 1, inactive: 2 };

@@ -4,7 +4,12 @@
 Sources, all read-only:
 - GitHub via ``gh``: open issues (claims), open and merged PRs, CI state, team labels.
 - The plan on ``origin/main`` through ``scripts/team.py`` (tasks, readiness, chains).
-- ``docs/roadmap.md`` (phases) and ``docs/STATUS.md`` (current phase, last tag).
+- ``docs/roadmap.md`` (phases, exit criteria, MVP range) and ``docs/STATUS.md`` (current
+  phase, last tag, decisions needed from the owner).
+- ``docs/research/*.md`` report headers, ``docs/decisions/*.md`` ADR headers, ``docs/specs``.
+- ``docs/work-map.toml``: curated plain-English ``what`` / ``why`` per piece of work and the
+  cross-cutting ``unblocks`` links. Together these become the work map: a graph of phases,
+  plan tasks, issues, research, decisions and their edges, plus per-phase distance to the MVP.
 - Local Claude Code session logs under ``~/.claude/projects/`` for per-team token usage,
   models and last activity. Usage is de-duplicated per API request, because one response
   is logged once per content block. Only counts and team names leave the logs.
@@ -14,6 +19,7 @@ Usage::
     uv run python scripts/cockpit.py                # writes data/cockpit/cockpit.html + .json
     uv run python scripts/cockpit.py --active-minutes 10 --idle-minutes 60 --out data/cockpit
     uv run python scripts/cockpit.py --loop 60     # regenerate every 60 s; the page reloads itself
+    uv run python scripts/cockpit.py --docs-root . # read docs/ (work map etc.) from this checkout
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import os
 import re
 import sys
 import time
+import tomllib
 from collections import Counter
 from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field
@@ -46,7 +53,26 @@ def _load_team_module() -> Any:
 
 team = _load_team_module()
 
-ROADMAP_ROW_RE = re.compile(r"^\| \*\*(\d+): ([^*]+)\*\* \| ([^|]+) \|")
+ROADMAP_ROW_RE = re.compile(
+    r"^\| \*\*(\d+): ([^*]+)\*\*(?: \*\(([^)]*)\)\*)? \| ([^|]+) \| ([^|]*)\|"
+)
+MVP_RANGE_RE = re.compile(r"^## MVP scope \(what Phases (\d+)\D+(\d+) build\)", re.M)
+ADR_LINK_RE = re.compile(r"\]\([^)]*decisions/(\d{4})-[\w-]+\.md\)")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])(?<!vs\.)(?<!e\.g\.)(?<!i\.e\.)\s+(?=[A-Z*`(])")
+MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+H1_RE = re.compile(r"^# (.+)$", re.M)
+RESEARCH_HEADER_RE = re.compile(
+    r"\*\*Brief:\*\*\s*(?P<brief>.*?)\s*·\s*\*\*Date:\*\*\s*(?P<date>\S+)\s*·\s*"
+    r"\*\*Status:\*\*\s*(?P<status>[A-Z]+)"
+)
+ADR_TITLE_RE = re.compile(r"^# (\d{4})\. (.+)$", re.M)
+DOC_STATUS_RE = re.compile(r"\*\*Status:\*\*\s*(\w+)")
+DOC_ISSUE_RE = re.compile(r"\*\*Issue:\*\*\s*#(\d+)")
+DOC_PHASE_RE = re.compile(r"\(Phase (\d+)\)")
+TITLE_PHASE_RE = re.compile(r"\bPhase (\d+)\b")
+WORK_MAP_KINDS = ("phase", "task", "issue", "research", "adr", "plan", "spec")
+STATE_ORDER = ("done", "in_review", "in_progress", "ready", "blocked", "open")
+DECIDED_STATUSES = ("Accepted", "Superseded")
 STATUS_HEADER_RE = re.compile(
     r"\*\*Phase:\*\* (?P<phase>\d+), (?P<name>[^·]+?) · \*\*Last tag:\*\* (?P<tag>\S+)"
 )
@@ -63,16 +89,121 @@ USAGE_KEYS = (
 # ── pure parsing ────────────────────────────────────────────────────────────────
 
 
+def strip_markdown(text: str) -> str:
+    """Links become their text; bold and italic markers go; backticks stay."""
+    return MD_LINK_RE.sub(r"\1", text).replace("**", "").replace("*", "").strip()
+
+
+def split_criteria(cell: str) -> list[dict[str, Any]]:
+    """One roadmap exit-criteria cell into sentences, each with the ADRs it links to."""
+    out = []
+    for raw in SENTENCE_SPLIT_RE.split(cell.strip()):
+        raw = raw.strip()
+        if not raw:
+            continue
+        adrs = sorted(set(ADR_LINK_RE.findall(raw)))
+        out.append({"text": strip_markdown(raw), "adrs": adrs})
+    return out
+
+
 def parse_roadmap(text: str) -> list[dict[str, Any]]:
-    """Phase rows from docs/roadmap.md: number, name, goal."""
+    """Phase rows from docs/roadmap.md: number, name, note, goal and exit criteria."""
     phases = []
     for line in text.splitlines():
         m = ROADMAP_ROW_RE.match(line)
         if m:
             phases.append(
-                {"phase": int(m.group(1)), "name": m.group(2).strip(), "goal": m.group(3).strip()}
+                {
+                    "phase": int(m.group(1)),
+                    "name": m.group(2).strip(),
+                    "note": (m.group(3) or "").strip(),
+                    "goal": m.group(4).strip(),
+                    "criteria": split_criteria(m.group(5)),
+                }
             )
     return phases
+
+
+def parse_mvp(text: str) -> dict[str, Any]:
+    """The MVP phase range and its first paragraph, from the roadmap's "MVP scope" section."""
+    m = MVP_RANGE_RE.search(text)
+    if not m:
+        return {"first_phase": None, "last_phase": None, "summary": ""}
+    rest = text[m.end() :].strip().split("\n\n", 1)[0]
+    return {
+        "first_phase": int(m.group(1)),
+        "last_phase": int(m.group(2)),
+        "summary": strip_markdown(" ".join(rest.split())),
+    }
+
+
+def parse_status_decisions(text: str) -> list[str]:
+    """Bullets under STATUS's "Decisions needed from owner", minus the "none" placeholders."""
+    out: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            in_section = line.lower().startswith("## decisions needed")
+            continue
+        if in_section and line.startswith("- "):
+            item = line[2:].strip()
+            if not item.lower().startswith("none"):
+                out.append(strip_markdown(item))
+    return out
+
+
+def parse_research_report(text: str, stem: str) -> dict[str, Any]:
+    """Title, status and brief of one docs/research file; status None when it has no header."""
+    h1 = H1_RE.search(text)
+    title = re.sub(r"^Research Report:\s*", "", h1.group(1).strip()) if h1 else stem
+    m = RESEARCH_HEADER_RE.search(text)
+    if not m:
+        return {"id": stem, "title": title, "status": None, "date": None, "brief_issue": None}
+    issue = re.search(r"#(\d+)", m.group("brief"))
+    return {
+        "id": stem,
+        "title": title,
+        "status": m.group("status"),
+        "date": m.group("date"),
+        "brief_issue": int(issue.group(1)) if issue else None,
+    }
+
+
+def parse_doc_header(text: str, stem: str) -> dict[str, Any]:
+    """Number (ADRs), title, status, issue and phase of an ADR, spec or plan file."""
+    adr = ADR_TITLE_RE.search(text)
+    h1 = H1_RE.search(text)
+    title = adr.group(2).strip() if adr else (h1.group(1).strip() if h1 else stem)
+    title = re.sub(r"^(Spec|Plan):\s*", "", title)
+    status = DOC_STATUS_RE.search(text)
+    issue = DOC_ISSUE_RE.search(text)
+    phase = DOC_PHASE_RE.search(title)
+    return {
+        "id": adr.group(1) if adr else stem,
+        "title": DOC_PHASE_RE.sub("", title).strip(),
+        "status": status.group(1) if status else None,
+        "issue": int(issue.group(1)) if issue else None,
+        "phase": int(phase.group(1)) if phase else None,
+    }
+
+
+def load_work_map(text: str) -> dict[str, dict[str, Any]]:
+    """docs/work-map.toml as ``{"kind:key": {what, why, unblocks}}``; bad kinds raise."""
+    out: dict[str, dict[str, Any]] = {}
+    for kind, entries in tomllib.loads(text).items():
+        if kind not in WORK_MAP_KINDS:
+            raise ValueError(f"work map: unknown kind {kind!r}, expected one of {WORK_MAP_KINDS}")
+        for key, entry in entries.items():
+            unblocks = [str(u) for u in entry.get("unblocks", [])]
+            for u in unblocks:
+                if u.split(":", 1)[0] not in WORK_MAP_KINDS or ":" not in u:
+                    raise ValueError(f"work map: {kind}.{key} unblocks {u!r} is not kind:key")
+            out[f"{kind}:{key}"] = {
+                "what": str(entry.get("what", "")).strip(),
+                "why": str(entry.get("why", "")).strip(),
+                "unblocks": unblocks,
+            }
+    return out
 
 
 def parse_status_header(text: str) -> dict[str, Any]:
@@ -115,6 +246,285 @@ def task_state(task: Any, by_id: dict[str, Any], holders: dict[str, str]) -> str
     if team.is_ready(task, by_id):
         return "ready"
     return "blocked"
+
+
+def phase_state(phase: int, current: int | None) -> str:
+    """done · current · future relative to STATUS's current phase."""
+    if current is None:
+        return "future"
+    return "done" if phase < current else "current" if phase == current else "future"
+
+
+def in_mvp(phase: int, mvp: dict[str, Any]) -> bool:
+    """Whether a phase falls inside the roadmap's MVP range."""
+    first, last = mvp.get("first_phase"), mvp.get("last_phase")
+    return first is not None and last is not None and first <= phase <= last
+
+
+def issue_kind(labels: Iterable[str]) -> str:
+    """research · decision · docs · issue, from the type label."""
+    for lb in labels:
+        if lb == "type:research":
+            return "research"
+        if lb == "type:decision":
+            return "decision"
+        if lb == "type:docs":
+            return "docs"
+    return "issue"
+
+
+def build_graph(
+    *,
+    roadmap: list[dict[str, Any]],
+    current_phase: int | None,
+    mvp: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    prs: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    adrs: list[dict[str, Any]],
+    docs: list[dict[str, Any]],
+    work_map: dict[str, dict[str, Any]],
+    repo_url: str = "",
+) -> dict[str, Any]:
+    """The work map: nodes (phases, tasks, issues, research, ADRs, specs, plans) and edges.
+
+    A plan task folds in every open issue carrying its label (the lowest is canonical) and
+    their open PRs; a research report folds into its brief issue while that issue is open.
+    A PR marked ready puts its node in review; a draft PR leaves it in progress. Edges: plan
+    ``depends_on``; work-map ``unblocks``; ADRs linked from a phase's exit criteria; a plan's
+    sink tasks, spec and plan to their phase; phase to next phase (an optional phase is
+    bypassed). Also returns the node ids with no map entry and the map ids naming no node.
+    """
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, str]] = []
+    prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    for p in prs:
+        if p.get("issue") is not None:
+            prs_by_issue.setdefault(p["issue"], []).append(p)
+
+    def add(node_id: str, **fields: Any) -> dict[str, Any]:
+        entry = work_map.get(node_id, {})
+        node = {
+            "id": node_id,
+            "kind": node_id.split(":", 1)[0],
+            "what": entry.get("what", ""),
+            "why": entry.get("why", ""),
+            "holder": None,
+            "issue": None,
+            "prs": [],
+            "url": "",
+            **fields,
+        }
+        nodes[node_id] = node
+        return node
+
+    def edge(src: str, dst: str, kind: str) -> None:
+        edges.append({"from": src, "to": dst, "kind": kind})
+
+    def pr_state(issue_nos: Iterable[int], fallback: str) -> str:
+        open_prs = [p for n in issue_nos for p in prs_by_issue.get(n, [])]
+        if any(not p["draft"] for p in open_prs):
+            return "in_review"
+        if open_prs and fallback in ("ready", "blocked", "open"):
+            return "in_progress"
+        return fallback
+
+    for p in roadmap:
+        add(
+            f"phase:{p['phase']}",
+            label=f"Phase {p['phase']}",
+            title=p["name"],
+            state=phase_state(p["phase"], current_phase),
+            note=p["note"],
+            mvp=in_mvp(p["phase"], mvp),
+        )
+        for c in p["criteria"]:
+            for a in c["adrs"]:
+                edge(f"adr:{a}", f"phase:{p['phase']}", "gate")
+    last_required: str | None = None
+    for p in roadmap:
+        pid = f"phase:{p['phase']}"
+        if last_required:
+            edge(last_required, pid, "phase")
+        if not p["note"]:
+            last_required = pid
+
+    issues_of_task: dict[str, list[int]] = {}
+    for i in issues:
+        for tid in team.tasks_of(i["labels"]):
+            issues_of_task.setdefault(tid, []).append(i["number"])
+    for t in tasks:
+        nos = sorted(issues_of_task.get(t["id"], []))
+        issue_no = nos[0] if nos else None
+        state = t["state"] if t["state"] == "done" else pr_state(nos, t["state"])
+        add(
+            f"task:{t['id']}",
+            label=t["id"],
+            title=t["title"],
+            state=state,
+            owner=t["owner"],
+            holder=t["holder"],
+            issue=issue_no,
+            prs=[p for n in nos for p in prs_by_issue.get(n, [])],
+            phase=t["phase"],
+            url=f"{repo_url}/issues/{issue_no}" if issue_no and repo_url else "",
+        )
+        for dep in t["depends_on"]:
+            edge(f"task:{dep}", f"task:{t['id']}", "depends")
+    has_dependent = {d["from"] for d in edges if d["kind"] == "depends"}
+    for t in tasks:
+        if f"task:{t['id']}" not in has_dependent and t["phase"] is not None:
+            edge(f"task:{t['id']}", f"phase:{t['phase']}", "gate")
+
+    folded_tasks = {n for nos in issues_of_task.values() for n in nos}
+    open_by_number = {i["number"]: i for i in issues}
+    reports_by_issue: dict[int, dict[str, Any]] = {}
+    for r in reports:  # the first report citing an open brief folds into it; others stand alone
+        if r["brief_issue"] in open_by_number:
+            reports_by_issue.setdefault(r["brief_issue"], r)
+    folded_reports = {r["id"] for r in reports_by_issue.values()}
+    for i in issues:
+        if i["number"] in folded_tasks:
+            continue
+        holder = team.team_of(i["labels"])
+        report = reports_by_issue.get(i["number"])
+        add(
+            f"issue:{i['number']}",
+            kind=issue_kind(i["labels"]),
+            label=f"#{i['number']}",
+            title=i["title"],
+            state=pr_state([i["number"]], "in_progress" if holder else "open"),
+            holder=holder,
+            issue=i["number"],
+            prs=prs_by_issue.get(i["number"], []),
+            labels=[lb for lb in i["labels"] if lb.startswith(("type:", "size:", "phase:"))],
+            report_status=report["status"] if report else None,
+            url=f"{repo_url}/issues/{i['number']}" if repo_url else "",
+        )
+    for r in reports:
+        if r["id"] in folded_reports:
+            continue
+        add(
+            f"research:{r['id']}",
+            label="report",
+            title=r["title"],
+            state="done",
+            report_status=r["status"],
+            issue=r["brief_issue"],
+            url=f"{repo_url}/blob/main/docs/research/{r['id']}.md" if repo_url else "",
+        )
+    for a in adrs:
+        add(
+            f"adr:{a['id']}",
+            label=f"ADR {a['id']}",
+            title=a["title"],
+            state="done" if a["status"] in DECIDED_STATUSES else "in_review",
+            doc_status=a["status"],
+            issue=a["issue"],
+            url=f"{repo_url}/blob/main/docs/decisions/{a['file']}" if repo_url else "",
+        )
+    for d in docs:
+        node_id = f"{d['kind']}:{d['id']}"
+        add(
+            node_id,
+            label=d["kind"],
+            title=d["title"],
+            state="done",
+            doc_status=d["status"],
+            issue=d["issue"],
+            phase=d["phase"],
+            url=f"{repo_url}/blob/main/docs/{d['kind']}s/{d['id']}.md" if repo_url else "",
+        )
+        if d["phase"] is not None:
+            edge(node_id, f"phase:{d['phase']}", "gate")
+
+    for node_id, entry in work_map.items():
+        for target in entry["unblocks"]:
+            if node_id in nodes and target in nodes:
+                edge(node_id, target, "unblocks")
+    seen: set[tuple[str, str]] = set()
+    kept = []
+    for e in edges:
+        key = (e["from"], e["to"])
+        if e["from"] in nodes and e["to"] in nodes and key not in seen:
+            seen.add(key)
+            kept.append(e)
+    missing = sorted(n for n in nodes if n not in work_map)
+    unknown = sorted(
+        {k for k in work_map if k not in nodes}
+        | {u for entry in work_map.values() for u in entry["unblocks"] if u not in nodes}
+    )
+    return {
+        "nodes": list(nodes.values()),
+        "edges": kept,
+        "missing_map_entries": missing,
+        "unknown_map_entries": unknown,
+    }
+
+
+def phase_progress(
+    roadmap: list[dict[str, Any]],
+    current_phase: int | None,
+    mvp: dict[str, Any],
+    graph_nodes: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    adrs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Per phase: task counts by state, the spec issue when unplanned, exit criteria states."""
+    accepted = {a["id"] for a in adrs if a["status"] in DECIDED_STATUSES}
+    out = []
+    for p in roadmap:
+        n = p["phase"]
+        counts = dict.fromkeys(STATE_ORDER, 0)
+        for node in graph_nodes:
+            if node["kind"] == "task" and node.get("phase") == n:
+                counts[node["state"]] = counts.get(node["state"], 0) + 1
+        total = sum(counts.values())
+        spec_issue = next(
+            (
+                i
+                for i in issues
+                if issue_kind(i["labels"]) == "docs"
+                and (m := TITLE_PHASE_RE.search(i["title"]))
+                and int(m.group(1)) == n
+            ),
+            None,
+        )
+        state = phase_state(n, current_phase)
+        criteria = []
+        for c in p["criteria"]:
+            if state == "done" or (c["adrs"] and all(a in accepted for a in c["adrs"])):
+                cstate = "done"
+            elif c["adrs"]:
+                cstate = "missing_adr"
+            else:
+                cstate = "needs_owner"
+            criteria.append({**c, "state": cstate})
+        out.append(
+            {
+                "phase": n,
+                "name": p["name"],
+                "note": p["note"],
+                "goal": strip_markdown(p["goal"]),
+                "state": state,
+                "mvp": in_mvp(n, mvp),
+                "planned": total > 0,
+                "counts": counts,
+                "total": total,
+                "spec_issue": (
+                    {
+                        "number": spec_issue["number"],
+                        "title": spec_issue["title"],
+                        "holder": team.team_of(spec_issue["labels"]),
+                    }
+                    if spec_issue
+                    else None
+                ),
+                "criteria": criteria,
+            }
+        )
+    return out
 
 
 # ── session logs ────────────────────────────────────────────────────────────────
@@ -304,6 +714,10 @@ class GhExtra(team.GhCli):
             for p in json.loads(raw)
         ]
 
+    def repo_url(self) -> str:
+        """The repository's web URL, for issue and document links."""
+        return str(json.loads(self._run("repo", "view", "--json", "url"))["url"])
+
     def team_labels(self) -> list[str]:
         raw = self._run("label", "list", "--limit", "200", "--json", "name")
         return sorted(
@@ -337,10 +751,32 @@ def collect(
     idle_min: int,
     ref: str | None = team.DEFAULT_PLAN_REF,
     since: str | None = None,
+    docs_root: Path | None = None,
 ) -> dict[str, Any]:
-    status_text = main.joinpath("docs", "STATUS.md").read_text()
-    roadmap = parse_roadmap(main.joinpath("docs", "roadmap.md").read_text())
+    """Everything the page shows. ``docs_root`` (default ``main``) is the checkout whose
+    ``docs/`` are read; plans still come from ``ref``."""
+    docs_dir = (docs_root or main) / "docs"
+    status_text = docs_dir.joinpath("STATUS.md").read_text()
+    roadmap_text = docs_dir.joinpath("roadmap.md").read_text()
+    roadmap = parse_roadmap(roadmap_text)
+    mvp = parse_mvp(roadmap_text)
     header = parse_status_header(status_text)
+    reports = [
+        parse_research_report(p.read_text(), p.stem)
+        for p in sorted((docs_dir / "research").glob("*.md"))
+    ]
+    adrs = [
+        {**parse_doc_header(p.read_text(), p.stem), "file": p.name}
+        for p in sorted((docs_dir / "decisions").glob("[0-9]*.md"))
+    ]
+    docs = [
+        {**parse_doc_header(p.read_text(), p.stem), "kind": kind}
+        for kind in ("spec", "plan")
+        for p in sorted((docs_dir / f"{kind}s").glob("*.md"))
+    ]
+    map_file = docs_dir / "work-map.toml"
+    work_map = load_work_map(map_file.read_text()) if map_file.is_file() else {}
+    repo_url = gh.repo_url()
     plans = team.read_plans(main, ref)
     tasks = [
         t for text, name in ((v, k) for k, v in plans.items()) for t in team.parse_plan(text, name)
@@ -438,16 +874,44 @@ def collect(
             "state": task_state(t, by_id, holders),
             "holder": holders.get(t.id),
             "plan": t.plan,
+            "phase": t.phase,
         }
         for t in tasks
     ]
     done = sum(1 for t in tasks if t.done)
     unclaimed = [i for i in issues if not team.team_of(i["labels"])]
+    graph = build_graph(
+        roadmap=roadmap,
+        current_phase=header["phase"],
+        mvp=mvp,
+        tasks=plan_tasks,
+        issues=issues,
+        prs=prs,
+        reports=reports,
+        adrs=adrs,
+        docs=docs,
+        work_map=work_map,
+        repo_url=repo_url,
+    )
+    progress = phase_progress(roadmap, header["phase"], mvp, graph["nodes"], issues, adrs)
     return {
         "generated_at": now.isoformat(),
         "thresholds": {"active_minutes": active_min, "idle_minutes": idle_min, "since": since},
+        "repo_url": repo_url,
         "phase": header,
         "roadmap": roadmap,
+        "mvp": mvp,
+        "progress": progress,
+        "graph": graph,
+        "owner": {
+            "decisions": parse_status_decisions(status_text),
+            "tasks": [
+                t
+                for t in plan_tasks
+                if t["owner"] and t["state"] in ("ready", "in_progress", "in_review")
+            ],
+            "ready_prs": [p for p in prs if not p["draft"]],
+        },
         "plan": {"tasks": plan_tasks, "chains": chains, "done": done, "total": len(tasks)},
         "teams": teams,
         "unclaimed": unclaimed,
@@ -484,8 +948,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--loop", type=int, default=0, help="regenerate every N seconds until killed"
     )
+    parser.add_argument(
+        "--docs-root",
+        default=None,
+        help="checkout whose docs/ to read (default: the main clone); plans come from origin/main",
+    )
     args = parser.parse_args(argv)
     main_dir = team.main_root()
+    docs_root = Path(args.docs_root).resolve() if args.docs_root else None
     out = (main_dir / args.out) if not Path(args.out).is_absolute() else Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -498,6 +968,7 @@ def main(argv: list[str] | None = None) -> int:
             args.active_minutes,
             args.idle_minutes,
             since=args.since,
+            docs_root=docs_root,
         )
         (out / "cockpit.json").write_text(json.dumps(data, indent=2, default=str))
         (out / "cockpit.html").write_text(render(data, refresh_seconds=args.loop))
