@@ -1,10 +1,12 @@
 """Network smoke test for `adapters.edgar_raw` against the real SEC EDGAR API.
 
-Skipped by default (and always in CI, which disables the network): set
-`RUN_NETWORK_TESTS=1` and a real `SEC_EDGAR_USER_AGENT` in the
-environment/`.env` to run it. Not a parser test (T11 owns those on
-recorded fixtures) — it only proves the raw client talks to the real API,
-respects the throttle, and returns plain JSON/text, never a parsed record.
+Skipped unless `RUN_NETWORK_TESTS=1` is set alongside a real
+`SEC_EDGAR_USER_AGENT` in the environment/`.env`. Not a parser test (T11
+owns those on recorded fixtures) — it only proves the raw client talks to
+the real API, respects the throttle, and returns plain JSON/text, never a
+parsed record. For offline coverage of the throttle/retry/credential/
+path-safety behavior (mocked transport, no real network), see
+`test_edgar_raw_offline.py`.
 """
 
 from __future__ import annotations
