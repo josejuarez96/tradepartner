@@ -1,0 +1,2 @@
+### Added
+- `tradepartner.ingest`: `ingest_session`, `expected_session`, `fact_rows` (XBRL `EntityCommonStockSharesOutstanding` → `shares_outstanding` on common classes only, class member → security by class letter), `IngestResult`/`SourceRun` with `ok`, `stale`, `failed`, `locked` statuses; `ingest.max_message_chars` (default 2000) caps stored run messages, which are also redacted of configured secrets (T16, #157).
