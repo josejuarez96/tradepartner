@@ -23,7 +23,9 @@ than assumed, shape both functions:
   naive value as a UTC instant. `utc_now`, `ensure_tz_aware` and
   `insert_row` are how this module enforces "datetimes are always
   timezone-aware UTC" (CLAUDE.md) in Python before a value ever reaches a
-  table.
+  table. `ensure_tz_aware` delegates to the shared
+  `tradepartner.timeutil.ensure_tz_aware_utc` (issue #30) so this module and
+  `adapters.broker` cannot drift out of sync on what counts as valid.
 - DuckDB's Python client shares **one database instance per file path per
   process**: a second `duckdb.connect()` call to the same path from the
   *same* process, opened in a different `read_only` mode than an already-open
@@ -56,6 +58,7 @@ from typing import Any
 import duckdb
 
 from tradepartner.config import Settings
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 # Backoff bounds between lock-acquisition attempts (`open_for_write` reads
 # these from config: `store.lock_retry_initial_delay_seconds` and
@@ -88,16 +91,18 @@ def utc_now() -> datetime:
 
 
 def ensure_tz_aware(value: datetime, *, field: str) -> datetime:
-    """Return `value` unchanged, or raise `ValueError` if it is naive.
+    """Return `value` normalized to UTC, or raise `ValueError` if it is
+    naive.
 
     DuckDB itself does not reject a naive datetime bound to a `TIMESTAMPTZ`
     parameter (verified: it silently stores it as an instant in the
     connection's session `TimeZone`), so this is the enforcement point for
-    "datetimes are always timezone-aware UTC".
+    "datetimes are always timezone-aware UTC". Delegates to the shared
+    `tradepartner.timeutil.ensure_tz_aware_utc` (issue #30); this name and
+    signature are kept as a thin wrapper since other in-flight code imports
+    them.
     """
-    if value.tzinfo is None:
-        raise ValueError(f"{field} must be tz-aware, got a naive datetime: {value!r}")
-    return value
+    return ensure_tz_aware_utc(value, field_name=field)
 
 
 def configure_connection(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:

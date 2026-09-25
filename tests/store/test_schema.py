@@ -236,6 +236,13 @@ def test_ensure_tz_aware_accepts_aware_datetime() -> None:
     assert ensure_tz_aware(now, field="known_at") == now
 
 
+def test_ensure_tz_aware_normalizes_non_utc_aware_datetime_to_utc() -> None:
+    non_utc = datetime(2020, 1, 1, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = ensure_tz_aware(non_utc, field="known_at")
+    assert result == non_utc
+    assert result.tzinfo is UTC
+
+
 def test_insert_row_rejects_naive_known_at(fixture_store: duckdb.DuckDBPyConnection) -> None:
     (before,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     naive = datetime(2020, 1, 1)  # noqa: DTZ001
