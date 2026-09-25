@@ -190,6 +190,34 @@ def _split_factors(
     return out
 
 
+def latest_shares_as_of(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ids: list[str]
+) -> tuple[dict[str, tuple[date, float]], set[str]]:
+    """Per security, `(as_of_date, value)` of its latest `shares_outstanding`
+    fact known at `t` (rule 7's selection), and the ids whose latest
+    `as_of_date` is ambiguous (two class-member rows)."""
+    latest: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in facts_as_of(conn, t, ids).iter_rows(named=True):
+        if row["fact_name"] != SHARES_FACT:
+            continue
+        held = latest[row["security_id"]]
+        if held and row["as_of_date"] < held[0]["as_of_date"]:
+            continue
+        if held and row["as_of_date"] > held[0]["as_of_date"]:
+            held.clear()
+        held.append(row)
+    shares: dict[str, tuple[date, float]] = {}
+    ambiguous: set[str] = set()
+    for sid, rows in latest.items():
+        classed = [r for r in rows if r["class_member"]]
+        chosen = classed or rows
+        if len(chosen) != 1:
+            ambiguous.add(sid)
+            continue
+        shares[sid] = (chosen[0]["as_of_date"], chosen[0]["value"])
+    return shares, ambiguous
+
+
 def universe_as_of(
     conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
 ) -> Universe:
@@ -274,25 +302,7 @@ def universe_as_of(
         {sid: "" if all(s in bars[sid] for s in history) else "missing_bars" for sid in alive},
     )
 
-    latest: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in facts_as_of(conn, t, sized).iter_rows(named=True):
-        if row["fact_name"] != SHARES_FACT:
-            continue
-        held = latest[row["security_id"]]
-        if held and row["as_of_date"] < held[0]["as_of_date"]:
-            continue
-        if held and row["as_of_date"] > held[0]["as_of_date"]:
-            held.clear()
-        held.append(row)
-    latest_shares: dict[str, tuple[date, float]] = {}
-    ambiguous: set[str] = set()
-    for sid, rows in latest.items():
-        classed = [r for r in rows if r["class_member"]]
-        chosen = classed or rows
-        if len(chosen) != 1:
-            ambiguous.add(sid)
-            continue
-        latest_shares[sid] = (chosen[0]["as_of_date"], chosen[0]["value"])
+    latest_shares, ambiguous = latest_shares_as_of(conn, t, sized)
 
     def shares_reason(sid: str) -> str:
         if sid in ambiguous:
