@@ -56,9 +56,9 @@ team = _load_team_module()
 ROADMAP_ROW_RE = re.compile(
     r"^\| \*\*(\d+): ([^*]+)\*\*(?: \*\(([^)]*)\)\*)? \| ([^|]+) \| ([^|]*)\|"
 )
-MVP_RANGE_RE = re.compile(r"^## MVP scope \(what Phases (\d+)\D(\d+) build\)", re.M)
+MVP_RANGE_RE = re.compile(r"^## MVP scope \(what Phases (\d+)\D+(\d+) build\)", re.M)
 ADR_LINK_RE = re.compile(r"\]\([^)]*decisions/(\d{4})-[\w-]+\.md\)")
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`(])")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])(?<!vs\.)(?<!e\.g\.)(?<!i\.e\.)\s+(?=[A-Z*`(])")
 MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 H1_RE = re.compile(r"^# (.+)$", re.M)
 RESEARCH_HEADER_RE = re.compile(
@@ -72,6 +72,7 @@ DOC_PHASE_RE = re.compile(r"\(Phase (\d+)\)")
 TITLE_PHASE_RE = re.compile(r"\bPhase (\d+)\b")
 WORK_MAP_KINDS = ("phase", "task", "issue", "research", "adr", "plan", "spec")
 STATE_ORDER = ("done", "in_review", "in_progress", "ready", "blocked", "open")
+DECIDED_STATUSES = ("Accepted", "Superseded")
 STATUS_HEADER_RE = re.compile(
     r"\*\*Phase:\*\* (?P<phase>\d+), (?P<name>[^·]+?) · \*\*Last tag:\*\* (?P<tag>\S+)"
 )
@@ -255,6 +256,7 @@ def phase_state(phase: int, current: int | None) -> str:
 
 
 def in_mvp(phase: int, mvp: dict[str, Any]) -> bool:
+    """Whether a phase falls inside the roadmap's MVP range."""
     first, last = mvp.get("first_phase"), mvp.get("last_phase")
     return first is not None and last is not None and first <= phase <= last
 
@@ -287,10 +289,12 @@ def build_graph(
 ) -> dict[str, Any]:
     """The work map: nodes (phases, tasks, issues, research, ADRs, specs, plans) and edges.
 
-    A plan task folds in its canonical issue and open PRs; a research report folds into its
-    brief issue while that issue is open. Edges: plan ``depends_on``; work-map ``unblocks``;
-    ADRs named in a phase's exit criteria; a plan's sink tasks, spec and plan to their phase;
-    phase to next phase (an optional phase is bypassed). Returns the ids with no map entry.
+    A plan task folds in every open issue carrying its label (the lowest is canonical) and
+    their open PRs; a research report folds into its brief issue while that issue is open.
+    A PR marked ready puts its node in review; a draft PR leaves it in progress. Edges: plan
+    ``depends_on``; work-map ``unblocks``; ADRs linked from a phase's exit criteria; a plan's
+    sink tasks, spec and plan to their phase; phase to next phase (an optional phase is
+    bypassed). Also returns the node ids with no map entry and the map ids naming no node.
     """
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, str]] = []
@@ -318,8 +322,13 @@ def build_graph(
     def edge(src: str, dst: str, kind: str) -> None:
         edges.append({"from": src, "to": dst, "kind": kind})
 
-    def pr_state(issue_no: int | None, fallback: str) -> str:
-        return "in_review" if issue_no is not None and prs_by_issue.get(issue_no) else fallback
+    def pr_state(issue_nos: Iterable[int], fallback: str) -> str:
+        open_prs = [p for n in issue_nos for p in prs_by_issue.get(n, [])]
+        if any(not p["draft"] for p in open_prs):
+            return "in_review"
+        if open_prs and fallback in ("ready", "blocked", "open"):
+            return "in_progress"
+        return fallback
 
     for p in roadmap:
         add(
@@ -341,13 +350,14 @@ def build_graph(
         if not p["note"]:
             last_required = pid
 
-    issue_of_task: dict[str, int] = {}
+    issues_of_task: dict[str, list[int]] = {}
     for i in issues:
         for tid in team.tasks_of(i["labels"]):
-            issue_of_task[tid] = min(issue_of_task.get(tid, i["number"]), i["number"])
+            issues_of_task.setdefault(tid, []).append(i["number"])
     for t in tasks:
-        issue_no = issue_of_task.get(t["id"])
-        state = t["state"] if t["state"] == "done" else pr_state(issue_no, t["state"])
+        nos = sorted(issues_of_task.get(t["id"], []))
+        issue_no = nos[0] if nos else None
+        state = t["state"] if t["state"] == "done" else pr_state(nos, t["state"])
         add(
             f"task:{t['id']}",
             label=t["id"],
@@ -356,7 +366,7 @@ def build_graph(
             owner=t["owner"],
             holder=t["holder"],
             issue=issue_no,
-            prs=prs_by_issue.get(issue_no, []) if issue_no is not None else [],
+            prs=[p for n in nos for p in prs_by_issue.get(n, [])],
             phase=t["phase"],
             url=f"{repo_url}/issues/{issue_no}" if issue_no and repo_url else "",
         )
@@ -367,9 +377,13 @@ def build_graph(
         if f"task:{t['id']}" not in has_dependent and t["phase"] is not None:
             edge(f"task:{t['id']}", f"phase:{t['phase']}", "gate")
 
-    folded_tasks = {n for n in issue_of_task.values()}
+    folded_tasks = {n for nos in issues_of_task.values() for n in nos}
     open_by_number = {i["number"]: i for i in issues}
-    reports_by_issue = {r["brief_issue"]: r for r in reports if r["brief_issue"] in open_by_number}
+    reports_by_issue: dict[int, dict[str, Any]] = {}
+    for r in reports:  # the first report citing an open brief folds into it; others stand alone
+        if r["brief_issue"] in open_by_number:
+            reports_by_issue.setdefault(r["brief_issue"], r)
+    folded_reports = {r["id"] for r in reports_by_issue.values()}
     for i in issues:
         if i["number"] in folded_tasks:
             continue
@@ -380,7 +394,7 @@ def build_graph(
             kind=issue_kind(i["labels"]),
             label=f"#{i['number']}",
             title=i["title"],
-            state=pr_state(i["number"], "in_progress" if holder else "open"),
+            state=pr_state([i["number"]], "in_progress" if holder else "open"),
             holder=holder,
             issue=i["number"],
             prs=prs_by_issue.get(i["number"], []),
@@ -389,7 +403,7 @@ def build_graph(
             url=f"{repo_url}/issues/{i['number']}" if repo_url else "",
         )
     for r in reports:
-        if r["brief_issue"] in open_by_number:
+        if r["id"] in folded_reports:
             continue
         add(
             f"research:{r['id']}",
@@ -405,7 +419,7 @@ def build_graph(
             f"adr:{a['id']}",
             label=f"ADR {a['id']}",
             title=a["title"],
-            state="done" if a["status"] == "Accepted" else "in_review",
+            state="done" if a["status"] in DECIDED_STATUSES else "in_review",
             doc_status=a["status"],
             issue=a["issue"],
             url=f"{repo_url}/blob/main/docs/decisions/{a['file']}" if repo_url else "",
@@ -437,7 +451,16 @@ def build_graph(
             seen.add(key)
             kept.append(e)
     missing = sorted(n for n in nodes if n not in work_map)
-    return {"nodes": list(nodes.values()), "edges": kept, "missing_map_entries": missing}
+    unknown = sorted(
+        {k for k in work_map if k not in nodes}
+        | {u for entry in work_map.values() for u in entry["unblocks"] if u not in nodes}
+    )
+    return {
+        "nodes": list(nodes.values()),
+        "edges": kept,
+        "missing_map_entries": missing,
+        "unknown_map_entries": unknown,
+    }
 
 
 def phase_progress(
@@ -449,7 +472,7 @@ def phase_progress(
     adrs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Per phase: task counts by state, the spec issue when unplanned, exit criteria states."""
-    accepted = {a["id"] for a in adrs if a["status"] == "Accepted"}
+    accepted = {a["id"] for a in adrs if a["status"] in DECIDED_STATUSES}
     out = []
     for p in roadmap:
         n = p["phase"]
@@ -692,6 +715,7 @@ class GhExtra(team.GhCli):
         ]
 
     def repo_url(self) -> str:
+        """The repository's web URL, for issue and document links."""
         return str(json.loads(self._run("repo", "view", "--json", "url"))["url"])
 
     def team_labels(self) -> list[str]:
@@ -881,7 +905,11 @@ def collect(
         "graph": graph,
         "owner": {
             "decisions": parse_status_decisions(status_text),
-            "tasks": [t for t in plan_tasks if t["owner"] and t["state"] != "done"],
+            "tasks": [
+                t
+                for t in plan_tasks
+                if t["owner"] and t["state"] in ("ready", "in_progress", "in_review")
+            ],
             "ready_prs": [p for p in prs if not p["draft"]],
         },
         "plan": {"tasks": plan_tasks, "chains": chains, "done": done, "total": len(tasks)},

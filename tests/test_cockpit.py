@@ -237,6 +237,14 @@ def test_parse_roadmap_criteria_note_and_mvp() -> None:
         "The MVP is a plain quant system, tracked against SPY inside the same system."
     )
     assert cockpit.parse_mvp("no such section")["first_phase"] is None
+    loose = cockpit.parse_mvp("## MVP scope (what Phases 2 to 4 build)\n\nx.\n")
+    assert (loose["first_phase"], loose["last_phase"]) == (2, 4)
+    kept = cockpit.split_criteria("Equity curve vs. SPY is shown. Then e.g. `x` runs. Done")
+    assert [c["text"] for c in kept] == [
+        "Equity curve vs. SPY is shown.",
+        "Then e.g. `x` runs.",
+        "Done",
+    ]
 
 
 def test_parse_status_decisions_skips_none() -> None:
@@ -395,14 +403,14 @@ def _graph() -> dict[str, object]:
 def test_build_graph_nodes_states_and_folding() -> None:
     g = _graph()
     by_id = {n["id"]: n for n in g["nodes"]}
-    # A plan task folds in its canonical issue and open PR; an open PR means "in review".
+    # A plan task folds in its canonical issue and open PR; a draft PR is still "being built".
     t5 = by_id["task:T5"]
-    assert t5["state"] == "in_review" and t5["issue"] == 22 and t5["holder"] == "orion"
+    assert t5["state"] == "in_progress" and t5["issue"] == 22 and t5["holder"] == "orion"
     assert [p["number"] for p in t5["prs"]] == [31] and t5["url"] == "https://gh/x/y/issues/22"
     assert "issue:22" not in by_id
     assert by_id["task:T4"]["state"] == "done" and by_id["task:T6"]["state"] == "blocked"
     assert by_id["task:T3"]["owner"] is True and by_id["task:T3"]["state"] == "ready"
-    # Issues are typed by label; a research report folds into its open brief issue.
+    # Issues are typed by label; a ready PR means "in review"; a report folds into its open brief.
     assert by_id["issue:49"]["kind"] == "research" and by_id["issue:49"]["state"] == "in_review"
     assert by_id["issue:49"]["report_status"] == "COMPLETE" and "research:g4-report" not in by_id
     assert by_id["issue:51"]["kind"] == "docs" and by_id["issue:51"]["state"] == "open"
@@ -425,6 +433,82 @@ def test_build_graph_nodes_states_and_folding() -> None:
     # Words come from the map; ids without an entry are listed.
     assert by_id["task:T5"]["what"] == "A fixture universe." and by_id["task:T4"]["what"] == ""
     assert "task:T4" in g["missing_map_entries"] and "task:T5" not in g["missing_map_entries"]
+    assert g["unknown_map_entries"] == []
+
+
+def test_build_graph_reports_unknown_map_ids_and_reclaimed_tasks() -> None:
+    roadmap = cockpit.parse_roadmap(ROADMAP_FULL)
+    tasks = [
+        {
+            "id": "T5",
+            "title": "Universe",
+            "owner": False,
+            "depends_on": [],
+            "state": "ready",
+            "holder": "orion",
+            "plan": "p",
+            "phase": 2,
+        },
+    ]
+    # T5 was claimed twice: #22 (parked draft) and #95 (live, ready PR). Both fold into the task.
+    issues = [
+        {"number": 22, "title": "T5", "updated": "", "labels": ["task:T5"]},
+        {"number": 95, "title": "T5", "updated": "", "labels": ["team:orion", "task:T5"]},
+    ]
+    prs = [
+        {
+            "number": 31,
+            "title": "old",
+            "branch": "feat/22-x",
+            "draft": True,
+            "updated": "",
+            "ci": "pass",
+            "labels": ["parked"],
+            "issue": 22,
+        },
+        {
+            "number": 96,
+            "title": "new",
+            "branch": "feat/95-x",
+            "draft": False,
+            "updated": "",
+            "ci": "pending",
+            "labels": [],
+            "issue": 95,
+        },
+    ]
+    wm = cockpit.load_work_map('[task.T8B]\nwhat = "typo"\nunblocks = ["issue:404"]\n')
+    g = cockpit.build_graph(
+        roadmap=roadmap,
+        current_phase=2,
+        mvp=cockpit.parse_mvp(ROADMAP_FULL),
+        tasks=tasks,
+        issues=issues,
+        prs=prs,
+        reports=[],
+        adrs=[],
+        docs=[],
+        work_map=wm,
+    )
+    by_id = {n["id"]: n for n in g["nodes"]}
+    assert by_id["task:T5"]["issue"] == 22 and by_id["task:T5"]["state"] == "in_review"
+    assert [p["number"] for p in by_id["task:T5"]["prs"]] == [31, 96]
+    assert "issue:95" not in by_id and "issue:22" not in by_id
+    assert g["unknown_map_entries"] == ["issue:404", "task:T8B"]
+    # A parked draft alone leaves a released task at its plan state.
+    g2 = cockpit.build_graph(
+        roadmap=roadmap,
+        current_phase=2,
+        mvp=cockpit.parse_mvp(ROADMAP_FULL),
+        tasks=[{**tasks[0], "holder": None}],
+        issues=issues[:1],
+        prs=prs[:1],
+        reports=[],
+        adrs=[],
+        docs=[],
+        work_map={},
+    )
+    assert {n["id"]: n["state"] for n in g2["nodes"]}["task:T5"] == "in_progress"
 
 
 def test_build_graph_edges() -> None:
@@ -459,7 +543,7 @@ def test_phase_progress_counts_spec_issue_and_criteria() -> None:
     by_phase = {p["phase"]: p for p in prog}
     p2 = by_phase[2]
     assert p2["state"] == "current" and p2["planned"] and p2["total"] == 4 and p2["mvp"]
-    assert p2["counts"]["done"] == 1 and p2["counts"]["in_review"] == 1
+    assert p2["counts"]["done"] == 1 and p2["counts"]["in_progress"] == 1  # T5: draft PR
     assert p2["counts"]["blocked"] == 1 and p2["counts"]["ready"] == 1
     assert [c["state"] for c in p2["criteria"]] == ["needs_owner", "needs_owner"]
     p3 = by_phase[3]

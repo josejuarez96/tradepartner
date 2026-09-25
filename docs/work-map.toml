@@ -138,6 +138,15 @@ why = "The system must run without anyone watching."
 what = "The data-validator agent and the phase close-out report on the owner's real store."
 why = "Phase 2 ends when the real store passes the same checks the fixtures do."
 
+[issue.94]
+what = "Second pass on the signal-combination question, reading the full texts the first pass could only skim."
+why = "Settles whether Phase 3 should plan for multi-signal hypotheses; the first report is INCOMPLETE."
+unblocks = ["issue:51"]
+
+[issue.90]
+what = "Fold the pending status and changelog fragments into STATUS.md and CHANGELOG.md, and refresh the snapshot sections."
+why = "Keeps the human-readable status current; the board and this page stay the live sources."
+
 [issue.86]
 what = "Measure how far back Alpaca corporate actions go, the real missing-bar share, and how fractional orders behave at the open."
 why = "Three facts T3 could not settle; the last one matters for Phase 4 execution modelling."
@@ -147,11 +156,6 @@ unblocks = ["phase:4"]
 what = "Decide whether stored corporate actions need an announced_at column to catch a too-early known_at."
 why = "Without it a look-ahead stamp on a dividend or split is invisible to the checks."
 unblocks = ["task:T12", "task:T18"]
-
-[issue.72]
-what = "Cap how stale a prior close may be when sizing a dividend adjustment."
-why = "A years-old close silently mis-sizes returns after an ingest gap."
-unblocks = ["task:T18"]
 
 [issue.52]
 what = "Write the decision record that says what an LLM may do here: nothing, advise, or veto."
@@ -167,16 +171,6 @@ unblocks = ["phase:3"]
 what = "What the IRS says about wash sales and holding periods for a monthly-rebalanced account."
 why = "Decides the account type before any live money."
 unblocks = ["phase:6"]
-
-[issue.49]
-what = "Does combining several signals beat one signal, out of sample and after costs?"
-why = "Decides whether Phase 3 plans for multi-signal hypotheses or stays with momentum alone."
-unblocks = ["issue:51"]
-
-[issue.48]
-what = "Do independent studies find that simple trend timing helps after costs?"
-why = "Decides whether a trend overlay is a candidate second hypothesis."
-unblocks = ["issue:51"]
 
 [issue.47]
 what = "What has long-only monthly momentum returned since 2010 after costs, and is it fading?"
@@ -216,6 +210,16 @@ unblocks = ["adr:0004"]
 what = "What Alpaca's free plan and EDGAR actually permit and return, from primary sources."
 why = "Fixes the SIP feed and liquidity-rule settings the parsers rely on."
 unblocks = ["task:T11", "task:T12"]
+
+[research.2026-09-25-g4-signal-combination]
+what = "Does combining several published signals beat one signal for a long-only retail portfolio, after costs?"
+why = "Decides whether Phase 3 plans for multi-signal hypotheses; pass 1 read abstracts only, pass 2 is issue #94."
+unblocks = ["issue:51"]
+
+[research.2026-09-25-trend-timing]
+what = "Do independent studies find that simple trend-timing rules help after costs? Mixed: strongest support and strongest critique each summarised."
+why = "Decides whether a trend overlay is a candidate second hypothesis in Phase 3."
+unblocks = ["issue:51"]
 
 [research.2026-09-25-price-vendors]
 what = "Which price vendors offer survivorship-bias-free US daily data to an individual, and at what cost."

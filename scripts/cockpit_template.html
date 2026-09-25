@@ -455,8 +455,10 @@ __COCKPIT_REFRESH__
   drawGraph();
   var det0 = document.getElementById('detail');
   det0.appendChild(el('p', 'empty', 'Click a box to see what it is, why it matters, what it needs and what it feeds.'));
-  var missing = G.missing_map_entries || [];
-  document.getElementById('map-missing').textContent = missing.length ? 'No plain-English entry yet for: ' + missing.join(', ') + '. Add them to docs/work-map.toml.' : 'Every piece of work has a plain-English entry in docs/work-map.toml.';
+  var missing = G.missing_map_entries || [], unknown = G.unknown_map_entries || [];
+  var mapMsg = missing.length ? 'No plain-English entry yet for: ' + missing.join(', ') + '. Add them to docs/work-map.toml.' : 'Every piece of work has a plain-English entry in docs/work-map.toml.';
+  if (unknown.length) mapMsg += ' Map ids that match nothing (closed, renamed or misspelled): ' + unknown.join(', ') + '.';
+  document.getElementById('map-missing').textContent = mapMsg;
 
   // ── research in flight
   var rt = document.getElementById('research-table');
