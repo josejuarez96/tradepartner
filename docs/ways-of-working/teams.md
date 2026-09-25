@@ -56,7 +56,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 **End**
 1. Push; update the draft PR description with the current state.
 1. Done with the task: `/ready-pr` (runs `uv run python scripts/ready_pr.py <pr>`): merges `main` in, runs the checks, verifies the template and the specialist reviews, waits for CI on that commit and marks the PR ready. It never merges. Do not mark a PR ready by hand.
-2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after bringing `main` in with `/ready-pr`), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas.
+2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after bringing `main` in with `/ready-pr`), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas. If the window is done for good, say so there; the owner prunes its directory when convenient.
 
 ## The claim protocol, exactly
 
@@ -109,6 +109,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - `uv run python scripts/team.py status` from any clone shows every team's claims.
 - **Merge order matters:** merging the head of a chain widens the frontier for everyone. Prefer merging chain heads first.
 - Labels of retired teams are harmless; delete them when convenient.
+- **Directories of retired teams are pruned ad hoc, never automatically.** A team may take another claim later, so its directory stays while it is touched. When the disk or the board looks cluttered: `uv run python scripts/team.py prune` prints which directories have no open claim and have been idle for six hours or more (`--hours` to change); `--yes` removes them with `git worktree remove` and prunes the worktree list. Directories with uncommitted changes are listed and skipped, never removed (#167). Agents never run it.
 - Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
 - You are not a role in the tool. You merge, you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 

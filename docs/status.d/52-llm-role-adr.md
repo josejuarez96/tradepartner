@@ -1,1 +1,0 @@
-- #52 ADR 0008 (Proposed): no LLM in the runtime until Phase 5; advisory memo is the only authority without a new ADR (batch job, owner-only reader, probability scored never consumed, overrides linked to memos); veto needs a pre-registered test over the forward record (PR #96)

@@ -1,1 +1,0 @@
-- #35 Owner decision: `snapshot_static` rows get no as-of or truncation exemption (strict `known_at`, as merged in #69); tests at a 2018 T and around PRE9's `known_at`, spec and `asof.py` record the rule

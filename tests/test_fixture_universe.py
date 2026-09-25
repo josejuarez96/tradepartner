@@ -153,6 +153,8 @@ _DATE_COLUMNS = {
 }
 _TZ_COLUMNS_COMMON = {"known_at", "ingested_at"}
 _EXTRA_TZ_COLUMNS = {"delistings": {"filed_at"}}
+#: Nullable timestamp columns: an empty cell is NULL, a set one needs an offset.
+_NULLABLE_TZ_COLUMNS = {"corporate_actions": {"announced_at"}}
 
 
 def test_timestamp_and_date_cell_formats() -> None:
@@ -167,6 +169,11 @@ def test_timestamp_and_date_cell_formats() -> None:
             for column in tz_columns:
                 value = row.get(column) or ""
                 assert _TZ_OFFSET_PATTERN.search(value), (
+                    f"{table}.csv:{i} column {column} = {value!r} missing UTC offset"
+                )
+            for column in _NULLABLE_TZ_COLUMNS.get(table, set()):
+                value = row[column]
+                assert not value or _TZ_OFFSET_PATTERN.search(value), (
                     f"{table}.csv:{i} column {column} = {value!r} missing UTC offset"
                 )
             for column in date_columns:
@@ -296,8 +303,9 @@ def test_every_bar_is_on_a_real_session_with_known_at_matching_session_close() -
 
 
 def test_first_seen_action_known_at_and_revision_rule() -> None:
-    """First-seen corporate action: `known_at` <= the close of the session
-    before ex-date (an announcement, if present, is always earlier still).
+    """First-seen corporate action: `known_at == announced_at` when the
+    row carries one, else exactly the close of the session before ex-date
+    (issue #83: an earlier stamp with no announcement is look-ahead).
     A revision (a later row for the same key): `known_at == ingested_at`,
     later than the first-seen row (spec req 5; review round 3 item 9).
     Rows group by action identity (#108): the source id when present, so
@@ -330,9 +338,11 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
                 f"{security_id} {action_type} {ex_date}: replacement not stamped at its ingest"
             )
             continue
-        assert first_known_at <= close_before_ex, (
+        announced = first["announced_at"]
+        expected = datetime.fromisoformat(announced) if announced else close_before_ex
+        assert first_known_at == expected, (
             f"{security_id} {action_type} {ex_date}: first-seen known_at {first_known_at} "
-            f"is after the close before ex-date {close_before_ex}"
+            f"is not {'announced_at' if announced else 'the close before ex-date'} {expected}"
         )
         for revision in ordered[1:]:
             assert revision["known_at"] == revision["ingested_at"], (
