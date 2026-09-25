@@ -3,11 +3,14 @@
 Two layers:
 - a pattern-based walk over `tests/fixtures/**` (no `.env` needed; must
   pass whether the directory is absent, empty, or holds real recordings).
-  It applies the same scope the scrubber itself uses: the "key-shaped"/
-  Alpaca-key-prefix content checks only look at JSON string *values*
-  (parsed, not the raw serialized text), while the email/User-Agent checks
-  scan the whole file text regardless of format (T2 review round 2,
-  safety-reviewer MUST FIX);
+  For a JSON file, the "key-shaped"/Alpaca-key-prefix content checks only
+  look at parsed string *values* (not the raw serialized text); for a
+  non-JSON (plain-text) file, they run over the whole file text instead,
+  since `scrub_text` scrubs whole lines rather than JSON values and there
+  is no narrower "value" to scope to (round 3, safety-reviewer -- round 2
+  had left non-JSON files unchecked for these two patterns). The email/
+  User-Agent/Authorization/Alpaca-header-line checks scan the whole file
+  text regardless of format either way;
 - unit tests of `cli_record.scrub_json`/`.scrub_text` against synthetic
   payloads: a fake key, an email, a User-Agent header, an Authorization
   header, a secret embedded mid-string, and a real us-gaap XBRL concept
@@ -21,13 +24,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tradepartner.cli_record import (
     ALPACA_KEY_PREFIX_PATTERN,
     EMAIL_PATTERN,
     KEY_SHAPED_PATTERN,
     SCRUBBED,
+    SENSITIVE_HEADER_LINE_PATTERN,
     USER_AGENT_HEADER_PATTERN,
-    USER_AGENT_LINE_PATTERN,
     scrub_json,
     scrub_text,
 )
@@ -65,24 +70,34 @@ def _parsed_json_or_none(text: str) -> Any | None:
 def _assert_file_is_scrubbed(path: Path) -> None:
     text = path.read_text(encoding="utf-8", errors="ignore")
 
-    # Whole-file-text checks: email addresses and User-Agent headers/lines
+    # Whole-file-text checks: email addresses and sensitive-header lines
     # can appear in either JSON or plain-text payloads, and matching them
     # against raw text carries no real false-positive risk.
     assert not EMAIL_PATTERN.search(text), f"email address in {path}"
     assert not USER_AGENT_HEADER_PATTERN.search(text), f"unscrubbed User-Agent header in {path}"
-    assert not USER_AGENT_LINE_PATTERN.search(text), f"unscrubbed User-Agent line in {path}"
+    assert not SENSITIVE_HEADER_LINE_PATTERN.search(text), (
+        f"unscrubbed User-Agent/Authorization/Alpaca-key header line in {path}"
+    )
 
-    # JSON-string-value-only checks: scanning raw serialized text for a
-    # "key-shaped" token risks both false positives (e.g. a camelCase XBRL
-    # concept name split across "key"/token-looking substrings) and
-    # missing the real per-value boundary the scrubber itself uses.
     parsed = _parsed_json_or_none(text)
     if parsed is not None:
+        # JSON-string-value-only: scanning raw serialized text for a
+        # "key-shaped" token risks both false positives (e.g. a camelCase
+        # XBRL concept name split across "key"/token-looking substrings)
+        # and missing the real per-value boundary `scrub_json` uses.
         for value in _iter_json_strings(parsed):
             assert not KEY_SHAPED_PATTERN.search(value), f"key-shaped string in {path}: {value!r}"
             assert not ALPACA_KEY_PREFIX_PATTERN.search(value), (
                 f"Alpaca-style key prefix in {path}: {value!r}"
             )
+    else:
+        # Non-JSON (plain text): `scrub_text` scrubs matched spans across
+        # each whole line rather than a bounded JSON "value", so there's no
+        # narrower scope to check against -- run both patterns over the
+        # whole file text instead (round 3, safety-reviewer MUST FIX: round
+        # 2 left text fixtures unchecked for these two).
+        assert not KEY_SHAPED_PATTERN.search(text), f"key-shaped string in {path}"
+        assert not ALPACA_KEY_PREFIX_PATTERN.search(text), f"Alpaca-style key prefix in {path}"
 
 
 # --- walking test over tests/fixtures/** ------------------------------------
@@ -98,6 +113,18 @@ def test_iter_fixture_files_returns_empty_for_a_nonexistent_root(tmp_path: Path)
     missing_dir = tmp_path / "does-not-exist"
     assert not missing_dir.exists()
     assert _iter_fixture_files(root=missing_dir) == []
+
+
+def test_walk_fails_on_an_unscrubbed_alpaca_key_prefix_in_a_text_fixture(tmp_path: Path) -> None:
+    """Round 2 only ran the key-shaped/Alpaca-prefix checks against parsed JSON
+    string values, so a leaked key in a *non*-JSON fixture (SGML header,
+    full-index excerpt, ...) would have passed silently. `scrub_text` itself
+    already scrubs this shape; the walk test now checks the same thing."""
+    fixture_file = tmp_path / "sgml_header_example.txt"
+    fixture_file.write_text("SEC-DOCUMENT\nOWNER-ID: PKTESTKEY0123456789AB\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="Alpaca-style key prefix"):
+        _assert_file_is_scrubbed(fixture_file)
 
 
 # --- unit tests of the scrub functions themselves ---------------------------
@@ -201,6 +228,26 @@ def test_scrub_text_scrubs_matching_lines_only() -> None:
     assert lines[2] == SCRUBBED
     assert lines[3] == "10-K  Example Corp  0000320193  2024-01-05  edgar/data/example.txt"
     assert count == 2
+
+
+def test_scrub_text_scrubs_authorization_and_apca_header_lines() -> None:
+    """`scrub_text`'s sensitive-header-line pattern matches the same field
+    names as `scrub_json`'s `_SENSITIVE_HEADER_KEYS` (round 3,
+    safety-reviewer): not just `User-Agent`."""
+    text = (
+        "Authorization: Bearer short-token\n"
+        "APCA-API-KEY-ID: short\n"
+        "apca-api-secret-key=also-short\n"
+        "10-K  Example Corp  0000320193  2024-01-05  edgar/data/example.txt\n"
+    )
+    scrubbed, count = scrub_text(text, secrets=[])
+    lines = scrubbed.splitlines()
+
+    assert lines[0] == SCRUBBED
+    assert lines[1] == SCRUBBED
+    assert lines[2] == SCRUBBED
+    assert lines[3] == "10-K  Example Corp  0000320193  2024-01-05  edgar/data/example.txt"
+    assert count == 3
 
 
 def test_key_management_personnel_compensation_does_not_trip_the_walk_test(

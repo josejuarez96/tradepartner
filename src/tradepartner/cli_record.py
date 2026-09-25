@@ -59,8 +59,14 @@ KEY_SHAPED_PATTERN = re.compile(
 )
 # A `User-Agent` header left un-scrubbed in serialized JSON.
 USER_AGENT_HEADER_PATTERN = re.compile(r'(?i)"user-agent"\s*:\s*"(?!<scrubbed>)[^"]*"')
-# A `User-Agent: ...`/`User-Agent=...` line in a plain-text payload.
-USER_AGENT_LINE_PATTERN = re.compile(r"(?im)^\s*user-agent\s*[:=].*")
+# A `User-Agent:`/`Authorization:`/`APCA-API-KEY-ID:`/`APCA-API-SECRET-KEY:`
+# line (`:` or `=`) in a plain-text payload -- the same field names
+# `_SENSITIVE_HEADER_KEYS` below scrubs wholly in JSON, for a payload where
+# they show up as request/response header text instead (round 3,
+# safety-reviewer).
+SENSITIVE_HEADER_LINE_PATTERN = re.compile(
+    r"(?im)^\s*(?:user-agent|authorization|apca-api-(?:key-id|secret-key))\s*[:=].*"
+)
 
 # Field names whose *entire* value is inherently secret, regardless of its
 # shape -- unlike the content patterns above, which scrub only the matched
@@ -160,10 +166,12 @@ def _scrub_json_value(
 def scrub_text(text: str, *, secrets: Iterable[str]) -> tuple[str, int]:
     """Line-by-line text scrub for non-JSON payloads (SGML header, full-index).
 
-    A `User-Agent: ...`/`User-Agent=...` line (any leading whitespace) is
-    replaced wholly. Every other line only has the matched span of each
-    configured secret, email address, Alpaca-style key prefix, or
-    key-shaped token replaced. Returns `(scrubbed, replacement_count)`.
+    A `User-Agent:`/`Authorization:`/`APCA-API-KEY-ID:`/
+    `APCA-API-SECRET-KEY:` line (`:` or `=`, any leading whitespace) is
+    replaced wholly, matching `scrub_json`'s `_SENSITIVE_HEADER_KEYS` set.
+    Every other line only has the matched span of each configured secret,
+    email address, Alpaca-style key prefix, or key-shaped token replaced.
+    Returns `(scrubbed, replacement_count)`.
     """
     secrets_pattern = _secrets_pattern(secrets)
     total = 0
@@ -176,7 +184,7 @@ def scrub_text(text: str, *, secrets: Iterable[str]) -> tuple[str, int]:
 
 
 def _scrub_text_line(line: str, secrets_pattern: re.Pattern[str] | None) -> tuple[str, int]:
-    scrubbed, n = USER_AGENT_LINE_PATTERN.subn(SCRUBBED, line)
+    scrubbed, n = SENSITIVE_HEADER_LINE_PATTERN.subn(SCRUBBED, line)
     if n:
         return scrubbed, n
     return _scrub_content(line, secrets_pattern)
