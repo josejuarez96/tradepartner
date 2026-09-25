@@ -279,6 +279,26 @@ def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
         want = prices_as_of(conn, T_MAR, ids)
     assert got.equals(want)
     assert _ids(got) == set(ids)
+    # Unadjusted: the 3:1 split on SEC_SPLIT_BETWEEN (ex-date 2019-01-11) leaves the
+    # raw close of the session before it untouched, where the adjusted frame divides it.
+    split_eve = (pl.col("security_id") == "SEC_SPLIT_BETWEEN") & (
+        pl.col("session") == date(2019, 1, 10)
+    )
+    assert got.filter(split_eve)["close"].item() == 58.39
+
+
+def test_raw_prices_exclude_a_revision_not_yet_known(store: Store) -> None:
+    """No look-ahead: SEC_SPLIT_BACKFILLED's 2018-06-01 bar is revised on
+    2018-06-15T20:00Z; a read before that instant sees the original close."""
+    ids = ["SEC_SPLIT_BACKFILLED"]
+    revised_at = datetime(2018, 6, 15, 20, 0, tzinfo=UTC)
+    bar = pl.col("session") == date(2018, 6, 1)
+    with store.provider() as provider:
+        before = provider.raw_prices(datetime(2018, 6, 8, 20, 0, tzinfo=UTC), ids)
+        after = provider.raw_prices(revised_at, ids)
+    assert before.filter(bar)["close"].item() == 38.45
+    assert after.filter(bar)["close"].item() == 40.37
+    assert before.filter(bar).height == after.filter(bar).height == 1
 
 
 def test_dropped_dividends_equal_the_as_of_read(store: Store) -> None:
