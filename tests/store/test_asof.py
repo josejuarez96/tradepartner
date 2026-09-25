@@ -401,6 +401,33 @@ class TestAdjustedPricesAsOfSynthetic:
         with pytest.raises(ValueError, match="SEC_BAD_DIV"):
             adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
 
+    def test_negative_dividend_amount_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Audit round 2, finding 2. A negative dividend amount makes
+        # `1 - amount / prior_close` a positive, finite number greater
+        # than 1 (it would *raise* the adjusted price), so the
+        # factor > 0 AND isfinite(factor) check alone lets it through --
+        # a negative dividend is simply bad data and needs its own check.
+        _bar(
+            synthetic_store,
+            "SEC_NEGATIVE_DIV",
+            date(2021, 1, 4),
+            close=10.0,
+            known_at=datetime(2021, 1, 4, 21, 0, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            "SEC_NEGATIVE_DIV",
+            "dividend",
+            date(2021, 1, 5),
+            -1.0,
+            known_at=datetime(2021, 1, 4, 22, 0, tzinfo=UTC),
+        )
+        t = datetime(2021, 2, 1, tzinfo=UTC)
+        with pytest.raises(ValueError, match="SEC_NEGATIVE_DIV"):
+            adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+
     def test_zero_split_ratio_raises(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
         # Finding 2. A split ratio_or_amount of 0 divides by zero; DuckDB
         # returns `inf` for that (no error), which would otherwise

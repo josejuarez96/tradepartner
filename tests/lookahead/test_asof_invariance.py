@@ -18,6 +18,11 @@ split (finding 5 -- a missing `corporate_actions.known_at` filter can't be
 caught by the fixture alone, since none of its splits are revised), and a
 harness meta-test (NIT 9) proving a function that ignores `known_at`
 entirely fails the invariance assertion.
+
+Audit round 2 addition (finding 1): a synthetic-store case with a
+*revised bar* (not a revised corporate action) feeding a dividend's
+prior-close ASOF-join lookup, catching a mutation that points that join
+at raw `prices_daily` instead of the point-in-time `latest_bars` CTE.
 """
 
 from __future__ import annotations
@@ -204,6 +209,92 @@ def test_revised_split_invariant_under_truncation() -> None:
                 assert full.equals(result), f"disagreed at T={t!r}"
         finally:
             truncated_store.close()
+    finally:
+        conn.close()
+
+
+def _build_revised_bar_dividend_store() -> duckdb.DuckDBPyConnection:
+    """A synthetic store for `test_dividend_prior_close_invariant_under_
+    truncation` and `test_dividend_prior_close_uses_bar_known_at_t`
+    (audit round 2, finding 1): bars on `s1` and `s2`, a dividend with
+    `ex_date = s3` known before `s3`, and a *revision* of `s2`'s close
+    known after `s3` with a clearly different value. Nothing before this
+    exercised a revision of the specific bar the dividend's `ASOF JOIN`
+    prior-close lookup reads from.
+    """
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    security_id = "SEC_DIV_PRIOR_CLOSE_REVISED"
+    s1, s2, s3 = date(2021, 5, 3), date(2021, 5, 4), date(2021, 5, 7)
+    _bar(conn, security_id, s1, 100.0, known_at=datetime(2021, 5, 3, 21, tzinfo=UTC))
+    _bar(conn, security_id, s2, 50.0, known_at=datetime(2021, 5, 4, 21, tzinfo=UTC))
+    # A revision of s2's close, known well after the dividend's ex_date,
+    # at a clearly different value than the original.
+    _bar(conn, security_id, s2, 80.0, known_at=datetime(2021, 5, 12, 12, tzinfo=UTC))
+    _action(
+        conn,
+        security_id,
+        "dividend",
+        s3,
+        5.0,
+        known_at=datetime(2021, 5, 6, 21, tzinfo=UTC),
+    )
+    return conn
+
+
+def test_dividend_prior_close_invariant_under_truncation() -> None:
+    """Audit round 2, finding 1: nothing before this checked that the
+    dividend prior-close `ASOF JOIN` reads from `latest_bars` (point in
+    time) rather than raw `prices_daily` (always the latest revision,
+    regardless of T) -- a store with only one revision per bar, like the
+    main fixture, can't distinguish the two, since there is nothing for a
+    missing known_at filter to get wrong.
+    """
+    conn = _build_revised_bar_dividend_store()
+    try:
+        truncated_store = TruncatedStore(conn)
+        try:
+            for t in probe_timestamps(conn):
+                full = adjusted_prices_as_of(conn, t, include_dividends=True)
+                result = adjusted_prices_as_of(truncated_store.at(t), t, include_dividends=True)
+                assert full.equals(result), f"disagreed at T={t!r}"
+        finally:
+            truncated_store.close()
+    finally:
+        conn.close()
+
+
+def test_dividend_prior_close_uses_bar_known_at_t() -> None:
+    """Direct assertion companion to the invariance test above: s1's
+    adjusted close uses the *original* s2 close (50.0) before the
+    revision's known_at, and the *revised* s2 close (80.0) after it.
+
+    This was verified by hand to fail if `asof.py`'s `event_factor` CTE
+    ASOF-joins the dividend's prior-close lookup against raw
+    `prices_daily` instead of `latest_bars` (both closes become visible
+    at every T once `prices_daily` itself has the row, so the "before the
+    revision's known_at" case would wrongly see 80.0 too) -- that mutation
+    was applied locally, confirmed to make this test fail, and reverted;
+    it is not committed.
+    """
+    conn = _build_revised_bar_dividend_store()
+    try:
+        s1 = date(2021, 5, 3)
+
+        before_revision = adjusted_prices_as_of(
+            conn, datetime(2021, 5, 8, tzinfo=UTC), include_dividends=True
+        )
+        row = before_revision.filter(pl.col("session") == s1).row(0, named=True)
+        # factor = 1 - 5.0 / 50.0 = 0.9 (original s2 close)
+        assert row["close"] == pytest.approx(100.0 * 0.9)
+
+        after_revision = adjusted_prices_as_of(
+            conn, datetime(2021, 5, 13, tzinfo=UTC), include_dividends=True
+        )
+        row = after_revision.filter(pl.col("session") == s1).row(0, named=True)
+        # factor = 1 - 5.0 / 80.0 = 0.9375 (revised s2 close)
+        assert row["close"] == pytest.approx(100.0 * 0.9375)
     finally:
         conn.close()
 
