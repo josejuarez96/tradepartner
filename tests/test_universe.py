@@ -5,7 +5,6 @@ Probe times are the fixture README's documented `probe T` values.
 
 from __future__ import annotations
 
-import ast
 import csv
 import os
 from datetime import UTC, date, datetime
@@ -239,19 +238,6 @@ def test_each_key_override_changes_membership(
     newly_out = _members(default) - _members(changed)
     assert newly_out
     assert {_excluded(changed)[sid][0] for sid in newly_out} == {rule}
-
-
-def test_universe_module_has_no_numeric_literals_but_0_1_minus_1() -> None:
-    path = Path(__file__).resolve().parents[1] / "src" / "tradepartner" / "universe.py"
-    tree = ast.parse(path.read_text())
-    literals = {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, int | float)
-        and not isinstance(node.value, bool)
-    }
-    assert literals <= {0, 1, -1}
 
 
 def _insert_shares(

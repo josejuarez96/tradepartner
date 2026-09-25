@@ -1,0 +1,2 @@
+### Added
+- Backtest page: `tradepartner.dashboard.backtest_page` (`load_trial_view`, `drawdowns`, `render`) under the shell's "Backtest" entry; shows base-level equity (log), drawdowns, turnover and cost bars, metrics at every cost level, stored and today's DSR on the `raw` and `excess_spy` bases, per-rebalance counts, kind/synthetic/holdout-repeat/red-flag/refused/failed/unfinished states and family holdout spends; "registry not initialised" on a version-2 store (T43, #147).
