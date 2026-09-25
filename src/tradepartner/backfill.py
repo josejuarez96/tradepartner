@@ -58,7 +58,7 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     SourceRun,
-    _action_row,
+    _add_actions,
     _add_rows,
     _bar_row,
     _clean,
@@ -248,15 +248,7 @@ def _price_chunk(
                 where="AND session BETWEEN ? AND ?",
                 params=[first, last],
             )
-            added += _add_rows(
-                conn,
-                "corporate_actions",
-                [_action_row(action, ingested_at) for action in actions],
-                ingested_at=ingested_at,
-                current=True,
-                where="AND ex_date BETWEEN ? AND ?",
-                params=[first, last],
-            )
+            added += _add_actions(conn, prices, actions, window, ingested_at=ingested_at)
             message = (
                 f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
                 f"{len(missing)} of {len(listed)} listed names without a bar"

@@ -50,7 +50,7 @@ from tradepartner.ingest import (
     fact_rows,
     ingest_session,
 )
-from tradepartner.store.asof import facts_as_of, prices_as_of
+from tradepartner.store.asof import facts_as_of, live_actions_as_of, prices_as_of
 from tradepartner.store.classify import build_classifications
 from tradepartner.store.master import build_master
 from tradepartner.store.schema import init_schema
@@ -312,6 +312,24 @@ def test_a_revised_dividend_keeps_its_announcement_and_is_stamped_at_ingest(
     _run(settings, _Prices(actions=[dividend(0.12)]), now=later)
     rows = read("SELECT ratio_or_amount, known_at FROM corporate_actions ORDER BY known_at")
     assert rows == [(0.10, action_first_seen_known_at(ex)), (0.12, later)]
+
+
+def test_a_re_dated_action_is_one_event_after_ingest(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #181: the same Alpaca id on a new ex-date is a revision, not a second split.
+    def split(ex: date) -> CorporateAction:
+        known = action_first_seen_known_at(ex)
+        return CorporateAction(
+            ACME, ActionType.SPLIT, ex, 2.0, known, "alpaca", source_action_id="a1"
+        )
+
+    _run(settings, _Prices(actions=[split(date(2019, 6, 14))]))
+    later = NOW + timedelta(days=1)
+    _run(settings, _Prices(actions=[split(date(2019, 6, 21))]), now=later)
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        live = live_actions_as_of(conn, later)
+    assert live.select("ex_date", "source_action_id").rows() == [(date(2019, 6, 21), "a1")]
 
 
 # --- staleness (spec req 10) ------------------------------------------------

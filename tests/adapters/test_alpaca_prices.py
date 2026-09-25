@@ -350,6 +350,23 @@ class TestCorporateActions:
         assert aapl.ratio_or_amount == 0.82
         assert aapl.known_at == action_first_seen_known_at(date(2020, 8, 7))
 
+    def test_source_action_id_is_alpacas_id(self, resolver: ListingResolver) -> None:
+        parsed = parse_corporate_actions(_json("corporate_actions.json"), resolver.resolve)
+        ids = {(a.security_id, a.ex_date): a.source_action_id for a in parsed.actions}
+        assert ids[("SEC_AAPL", date(2020, 8, 7))] == "d09386ae-0c2b-4280-8aa0-295e545354b1"
+        assert all(ids.values())  # every recorded action carries an id (#108)
+
+    def test_an_action_without_an_id_has_none(self, resolver: ListingResolver) -> None:
+        payload = {"cash_dividends": [{"symbol": "AAPL", "ex_date": "2020-08-07", "rate": 0.82}]}
+        [action] = parse_corporate_actions(payload, resolver.resolve).actions
+        assert action.source_action_id is None
+
+    @pytest.mark.parametrize("bad", [7, "", "   "])
+    def test_a_malformed_id_raises(self, resolver: ListingResolver, bad: object) -> None:
+        row = {"symbol": "AAPL", "ex_date": "2020-08-07", "rate": 0.82, "id": bad}
+        with pytest.raises((ValueError, TypeError)):
+            parse_corporate_actions({"cash_dividends": [row]}, resolver.resolve)
+
     def test_reverse_split_ratio(self, resolver: ListingResolver) -> None:
         payload = {
             "reverse_splits": [
