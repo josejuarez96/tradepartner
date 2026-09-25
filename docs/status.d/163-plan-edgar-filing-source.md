@@ -1,1 +1,1 @@
-- #163 plan amendment: T11b and T11c add the EDGAR `FilingSource` adapter to the data-foundation plan; T19 now depends on T11c (PR pending; follow-ups #172 #173 #174)
+- #163 plan amendment: T11b and T11c add the EDGAR `FilingSource` adapter to the data-foundation plan; T19 now depends on T11c (PR #177; follow-ups #172 #173 #174)
