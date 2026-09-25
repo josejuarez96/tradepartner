@@ -83,7 +83,13 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #: The schema version `init_schema` records on first run. Bump and add a
 #: migration note here (not silent DDL edits) if the shape of a table
 #: changes after data has been loaded.
-CURRENT_SCHEMA_VERSION = 1
+#:
+#: Migration notes:
+#: - 2 (#108): `corporate_actions` gains `source_action_id` and `cancelled`,
+#:   and its UNIQUE key gains `source_action_id`. No data had been ingested
+#:   at v1, so there is no migration code; a v1 store raises
+#:   `SchemaVersionError`.
+CURRENT_SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -174,14 +180,23 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 )
 """
 
+# An action's identity (#108) is `(security_id, source_action_id)` when the
+# source gives a stable id, else `(security_id, action_type, ex_date)`, so a
+# re-dated action (same id, new ex_date) is a revision of one event, not a
+# second event. source_action_id uses '' for "the source gave no id", not
+# NULL, for the same UNIQUE reason as facts.class_member below. A revision
+# with cancelled = TRUE withdraws the event from its known_at on; that also
+# retires the old key of an id-less re-date.
 _CREATE_CORPORATE_ACTIONS = f"""
 CREATE TABLE IF NOT EXISTS corporate_actions (
     security_id VARCHAR NOT NULL,
     action_type VARCHAR NOT NULL,
     ex_date DATE NOT NULL,
     ratio_or_amount DOUBLE NOT NULL,
+    source_action_id VARCHAR NOT NULL DEFAULT '',
+    cancelled BOOLEAN NOT NULL DEFAULT FALSE,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["corporate_actions"])},
-    UNIQUE (security_id, action_type, ex_date, known_at)
+    UNIQUE (security_id, action_type, ex_date, source_action_id, known_at)
 )
 """
 

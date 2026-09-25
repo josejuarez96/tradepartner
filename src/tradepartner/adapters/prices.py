@@ -22,7 +22,9 @@ Three things live here, and nothing else:
   - `revision_of(incoming, stored, ingested_at=...)`: a later record that
     differs from the stored one for the same key becomes a new record with
     `known_at = ingested_at`; identical values are a no-op; a revision is
-    never back-dated (spec req 5 and "Definitions" > Revision).
+    never back-dated (spec req 5 and "Definitions" > Revision). For an
+    action the key is the source's id when it gives one, so a re-date or a
+    cancellation is a revision too (#108).
 - **The interface.** `PriceSource` resolves by `security_id` only, never by
   ticker (spec req 3: "adapters never resolve by bare ticker"). An id the
   source does not know raises `UnknownSecurityIdError` for the whole call,
@@ -163,7 +165,13 @@ class CorporateAction:
     Validated on construction: `action_type` coerced to `ActionType` (an
     unknown string raises `ValueError`), `ex_date` a `date`, a split ratio
     positive and finite, a dividend amount non-negative and finite,
-    `known_at` tz-aware (normalized to UTC).
+    `known_at` tz-aware (normalized to UTC), `source_action_id` `None` or a
+    non-empty identifier, `cancelled` a `bool`.
+
+    `source_action_id` is the source's own stable id for the event, when it
+    gives one; it decides the record's identity (`key`), so a re-dated
+    action is a revision of one event (#108). `cancelled` marks a revision
+    that withdraws the event.
     """
 
     security_id: str
@@ -172,10 +180,16 @@ class CorporateAction:
     ratio_or_amount: float
     known_at: datetime
     source: str
+    source_action_id: str | None = None
+    cancelled: bool = False
 
     def __post_init__(self) -> None:
         _require_identifier(self.security_id, field_name="security_id")
         _require_identifier(self.source, field_name="source")
+        if self.source_action_id is not None:
+            _require_identifier(self.source_action_id, field_name="source_action_id")
+        if not isinstance(self.cancelled, bool):
+            raise TypeError(f"cancelled must be a bool, got {self.cancelled!r}")
         _require_date(self.ex_date, field_name="ex_date")
         action_type = ActionType(self.action_type)
         object.__setattr__(self, "action_type", action_type)
@@ -190,14 +204,24 @@ class CorporateAction:
         )
 
     @property
-    def key(self) -> tuple[str, str, date]:
-        """The natural key a revision is matched on:
-        `(security_id, action_type, ex_date)`."""
+    def key(self) -> tuple[str, str, str] | tuple[str, str, date]:
+        """The identity a revision is matched on (#108):
+        `(security_id, "source_action_id", source_action_id)` when the
+        source gives an id, else `(security_id, action_type, ex_date)`."""
+        if self.source_action_id is not None:
+            return (self.security_id, "source_action_id", self.source_action_id)
         return (self.security_id, self.action_type.value, self.ex_date)
 
     def same_values(self, other: CorporateAction) -> bool:
-        """True if `other` carries the same `ratio_or_amount`."""
-        return self.ratio_or_amount == other.ratio_or_amount
+        """True if `other` carries the same type, ex-date, `ratio_or_amount`
+        and `cancelled` (type and ex-date matter only under an id key, where
+        they are values rather than part of the key)."""
+        return (self.action_type, self.ex_date, self.ratio_or_amount, self.cancelled) == (
+            other.action_type,
+            other.ex_date,
+            other.ratio_or_amount,
+            other.cancelled,
+        )
 
 
 def bar_known_at(session: date) -> datetime:
@@ -245,18 +269,24 @@ def revision_of(
     - `stored is None` (first seen): `incoming` unchanged; its `known_at`
       is already the first-seen stamp, and must not be after `ingested_at`
       (a bar fetched mid-session is stamped at a close that has not
-      happened yet: storing it would serve a partial bar as final).
+      happened yet: storing it would serve a partial bar as final). A
+      cancelled action cannot be first seen: there is nothing to cancel.
     - Same values as `stored`: `None`, meaning nothing to write.
     - Different values: `incoming` with `known_at = ingested_at`.
 
     Raises `ValueError` if `ingested_at` is naive, if a first-seen record's
-    `known_at` is after `ingested_at`, if the two records do not share a
+    `known_at` is after `ingested_at` or it is a cancelled action, if the two records do not share a
     type and natural key, or if `ingested_at` is not strictly
     after `stored.known_at` (the revision would be back-dated to, or tie
     with, the value it replaces).
     """
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     if stored is None:
+        if isinstance(incoming, CorporateAction) and incoming.cancelled:
+            raise ValueError(
+                f"{incoming.key} is a cancelled action seen for the first time; a cancel "
+                "only revises an action already stored"
+            )
         if incoming.known_at > ingested_at:
             raise ValueError(
                 f"{incoming.key} is stamped known_at {incoming.known_at.isoformat()}, after "

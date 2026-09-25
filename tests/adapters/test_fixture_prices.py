@@ -723,12 +723,21 @@ class TestRoundTrip:
     set to `known_at` (the earliest legal value), so it is the one column
     excluded from the comparison."""
 
-    IDS = ("SEC_SPLIT_BACKFILLED", "SEC_DIV_REVISED", "SEC_SPLIT_FUTURE")
+    IDS = (
+        "SEC_SPLIT_BACKFILLED",
+        "SEC_DIV_REVISED",
+        "SEC_SPLIT_FUTURE",
+        "SEC_SPLIT_REDATED",
+        "SEC_DIV_CANCELLED",
+    )
     PROBES = (
         datetime(2018, 6, 15, 19, 59, 59, tzinfo=UTC),  # before the bar revision
         datetime(2019, 1, 31, 21, 0, tzinfo=UTC),  # backfilled-split probe T
         datetime(2019, 3, 25, 20, 59, 59, tzinfo=UTC),  # before the dividend revision
         datetime(2019, 3, 25, 21, 0, tzinfo=UTC),  # at the dividend revision
+        datetime(2019, 6, 12, 20, 59, 59, tzinfo=UTC),  # before the split re-date (#108)
+        datetime(2019, 6, 12, 21, 0, tzinfo=UTC),  # at the split re-date
+        datetime(2019, 9, 20, 21, 0, tzinfo=UTC),  # at the dividend cancel
         datetime(2030, 1, 1, tzinfo=UTC),
     )
 
@@ -764,6 +773,8 @@ class TestRoundTrip:
                     "action_type": action.action_type.value,
                     "ex_date": action.ex_date,
                     "ratio_or_amount": action.ratio_or_amount,
+                    "source_action_id": action.source_action_id or "",
+                    "cancelled": action.cancelled,
                     "known_at": action.known_at,
                     "ingested_at": action.known_at,
                     "source": action.source,
@@ -779,7 +790,7 @@ class TestRoundTrip:
         self, adapter_store: duckdb.DuckDBPyConnection, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:
         for table in ("prices_daily", "corporate_actions"):
-            sql = f"SELECT COUNT(*) FROM {table} WHERE security_id IN (?, ?, ?)"
+            sql = f"SELECT COUNT(*) FROM {table} WHERE security_id IN (?, ?, ?, ?, ?)"
             assert (
                 adapter_store.execute(sql, list(self.IDS)).fetchone()
                 == fixture_store.execute(sql, list(self.IDS)).fetchone()

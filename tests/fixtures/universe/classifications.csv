@@ -2,6 +2,7 @@ security_id,sic,security_type,rule,known_at,ingested_at,source,provenance
 SEC_25NSE,7372,common,common_default,2018-03-02T20:30:00+00:00,2018-03-02T20:40:00+00:00,edgar,filing
 SEC_BOUNDARY_DELIST,7372,common,common_default,2018-04-03T20:30:00+00:00,2018-04-03T20:40:00+00:00,edgar,filing
 SEC_CLEAN_MERGER,7372,common,common_default,2018-01-31T20:30:00+00:00,2018-01-31T20:40:00+00:00,edgar,filing
+SEC_DIV_CANCELLED,7372,common,common_default,2019-07-03T20:30:00+00:00,2019-07-03T20:40:00+00:00,edgar,filing
 SEC_DIV_REVISED,7372,common,common_default,2018-11-02T20:30:00+00:00,2018-11-02T20:40:00+00:00,edgar,filing
 SEC_DUAL_A,7372,common,common_default,2016-12-23T20:30:00+00:00,2016-12-23T20:40:00+00:00,edgar,filing
 SEC_DUAL_B,7372,common,common_default,2016-12-23T20:30:00+00:00,2016-12-23T20:40:00+00:00,edgar,filing
@@ -15,6 +16,7 @@ SEC_SPLIT_BACKFILLED,7372,common,common_default,2016-12-23T20:30:00+00:00,2016-1
 SEC_SPLIT_BETWEEN,7372,common,common_default,2016-12-23T20:30:00+00:00,2016-12-23T20:40:00+00:00,edgar,filing
 SEC_SPLIT_FUTURE,7372,common,common_default,2016-12-23T20:30:00+00:00,2016-12-23T20:40:00+00:00,edgar,filing
 SEC_SPLIT_PLAIN,7372,common,common_default,2018-08-06T20:30:00+00:00,2018-08-06T20:40:00+00:00,edgar,filing
+SEC_SPLIT_REDATED,7372,common,common_default,2019-04-02T20:30:00+00:00,2019-04-02T20:40:00+00:00,edgar,filing
 SEC_SPY,,etf,benchmark_config,2018-01-02T21:00:00+00:00,2018-01-02T21:10:00+00:00,config,snapshot_static
 SEC_STATIC_PRE2019,7372,common,common_default,2016-12-02T20:30:00+00:00,2016-12-02T20:40:00+00:00,edgar,filing
 SEC_TICKCHANGE,7372,common,common_default,2018-06-04T20:30:00+00:00,2018-06-04T20:40:00+00:00,edgar,filing

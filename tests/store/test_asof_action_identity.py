@@ -11,14 +11,14 @@ on. Each scenario runs on a schema-only store so its numbers are exact.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import duckdb
 import polars as pl
 import pytest
 
 from tradepartner.store import schema
-from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of, prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
 
 SID = "SEC_X"
@@ -197,3 +197,42 @@ class TestCancelledAction:
         assert dropped_dividends_as_of(store, _t(5, 22), [SID]).height == 1
         _action(store, "dividend", date(2021, 1, 4), 2.0, known_at=_t(5, 23), cancelled=True)
         assert dropped_dividends_as_of(store, _t(6, 22), [SID]).height == 0
+
+
+class TestFixtureCases:
+    """The req 13 fixture cases for #108 (`tests/fixtures/universe/README.md`)."""
+
+    @staticmethod
+    def _ratio(conn: duckdb.DuckDBPyConnection, sid: str, t: datetime, session: date) -> float:
+        raw = _closes(prices_as_of(conn, t, [sid]))[session]
+        adjusted = _closes(adjusted_prices_as_of(conn, t, [sid], include_dividends=True))
+        return adjusted[session] / raw
+
+    def test_redated_split_applies_once_at_each_probe(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "SEC_SPLIT_REDATED"
+        # Old ex-date 2019-06-10 passed, re-date (known 2019-06-12 21:00) not yet known.
+        before = datetime(2019, 6, 12, 20, 59, 59, tzinfo=UTC)
+        assert self._ratio(fixture_store, sid, before, date(2019, 6, 7)) == pytest.approx(0.5)
+        assert self._ratio(fixture_store, sid, before, date(2019, 6, 10)) == pytest.approx(1.0)
+        # Re-date known, new ex-date 2019-06-17 not yet effective: nothing applies.
+        after_redate = datetime(2019, 6, 12, 21, 0, tzinfo=UTC)
+        assert self._ratio(fixture_store, sid, after_redate, date(2019, 6, 7)) == pytest.approx(1.0)
+        # Both ex-dates past: halved once, and only before the new ex-date.
+        later = datetime(2019, 7, 1, 21, 0, tzinfo=UTC)
+        assert self._ratio(fixture_store, sid, later, date(2019, 6, 7)) == pytest.approx(0.5)
+        assert self._ratio(fixture_store, sid, later, date(2019, 6, 14)) == pytest.approx(0.5)
+        assert self._ratio(fixture_store, sid, later, date(2019, 6, 17)) == pytest.approx(1.0)
+
+    def test_cancelled_dividend_stops_applying_at_the_cancel(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "SEC_DIV_CANCELLED"
+        cancel = datetime(2019, 9, 20, 21, 0, tzinfo=UTC)
+        before = cancel - timedelta(microseconds=1)
+        prior_close = _closes(prices_as_of(fixture_store, before, [sid]))[date(2019, 9, 13)]
+        assert self._ratio(fixture_store, sid, before, date(2019, 9, 13)) == pytest.approx(
+            1 - 0.40 / prior_close
+        )
+        assert self._ratio(fixture_store, sid, cancel, date(2019, 9, 13)) == pytest.approx(1.0)

@@ -9,7 +9,10 @@ Reads three CSVs from a fixture directory (the T5 universe in
   it raises `UnknownSecurityIdError`, and a price or action row for an id
   not in it is refused at load time.
 - `prices_daily.csv` and `corporate_actions.csv` (optional; absent means no
-  rows): the records, in the store's own column layout.
+  rows): the records, in the store's own column layout. The actions'
+  `source_action_id` and `cancelled` columns (#108) are optional too: an
+  empty or absent id means the source gave none, an absent `cancelled`
+  means `FALSE`.
 
 **Replay, not snapshot.** A real source returns today's values; ingest
 (T16) turns a changed value into a revision with `prices.revision_of`. A
@@ -17,7 +20,9 @@ fixture is a recording of every record the source produced over time, each
 already stamped, so this adapter returns **every** row in range, first-seen
 records and revisions alike, sorted by natural key then `known_at`.
 `ingested_at` and `provenance` are read only to check the contract below;
-they are not part of the returned records.
+they are not part of the returned records. An action's natural key is its
+identity (`CorporateAction.key`): the source's id when present, so a
+re-dated action is checked as a revision of the same event.
 
 **The fixture contract, enforced when the adapter is built.** A fixture that
 breaks a timing rule would make every downstream look-ahead test vouch for
@@ -34,10 +39,11 @@ in ingest order (`ingested_at`, then `known_at`):
    (`prices.action_first_seen_known_at` with no announcement): the proxy
    itself, or an earlier announcement. A stamp before the proxy cannot be
    checked further, because the stored layout carries no announcement time
-   to compare it with (issue #83).
+   to compare it with (issue #83). A first-seen action cannot be cancelled.
 3. Every later row for the same key must be what `prices.revision_of`
    produces from the row before it at that row's `ingested_at`: values that
    differ, and `known_at` equal to its own `ingested_at` (never back-dated).
+   A re-date or a cancellation is such a revision.
 """
 
 from __future__ import annotations
@@ -104,6 +110,13 @@ def _parse_date(value: str, *, column: str, where: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise FixtureContractError(f"{where}: {column} {value!r} is not a YYYY-MM-DD date") from exc
+
+
+def _parse_bool(value: str, *, column: str, where: str) -> bool:
+    """`TRUE`/`FALSE` in either case, as the generator and DuckDB write them."""
+    if value.upper() in ("TRUE", "FALSE"):
+        return value.upper() == "TRUE"
+    raise FixtureContractError(f"{where}: {column} {value!r} is not TRUE or FALSE")
 
 
 def _read_csv(path: Path, required: Sequence[str]) -> list[tuple[str, dict[str, str]]]:
@@ -181,6 +194,10 @@ def _load_actions(path: Path, known_ids: frozenset[str]) -> list[_Row[CorporateA
                 ratio_or_amount=float(row["ratio_or_amount"]),
                 known_at=known_at,
                 source=row["source"],
+                source_action_id=row.get("source_action_id") or None,
+                cancelled=_parse_bool(
+                    row.get("cancelled", "FALSE"), column="cancelled", where=where
+                ),
             )
         except (TypeError, ValueError) as exc:
             if isinstance(exc, FixtureContractError):
@@ -207,9 +224,14 @@ def _check_bar_first_seen(row: _Row[Bar]) -> None:
 
 
 def _check_action_first_seen(row: _Row[CorporateAction]) -> None:
-    """Contract rule 2 for actions: stamped at or before the first-seen
-    proxy (the proxy itself, or an earlier announcement)."""
+    """Contract rule 2 for actions: not cancelled, and stamped at or before
+    the first-seen proxy (the proxy itself, or an earlier announcement)."""
     action = row.record
+    if action.cancelled:
+        raise FixtureContractError(
+            f"{row.where}: first-seen action {action.key} is cancelled; a cancel only "
+            "revises an action already recorded"
+        )
     proxy = action_first_seen_known_at(action.ex_date)
     if action.known_at > proxy:
         raise FixtureContractError(
@@ -282,7 +304,19 @@ class FixturePriceSource(PriceSource):
         for bar in _check_history(bar_rows, lambda b: b.key, _check_bar_first_seen):
             self._bars[bar.security_id].append(bar)
         self._actions: defaultdict[str, list[CorporateAction]] = defaultdict(list)
-        for action in _check_history(action_rows, lambda a: a.key, _check_action_first_seen):
+        actions = _check_history(action_rows, lambda a: a.key, _check_action_first_seen)
+        # Returned in the documented order, not identity order: an id key
+        # and an ex-date key do not sort together.
+        actions.sort(
+            key=lambda a: (
+                a.security_id,
+                a.action_type.value,
+                a.ex_date,
+                a.known_at,
+                a.source_action_id or "",
+            )
+        )
+        for action in actions:
             self._actions[action.security_id].append(action)
 
     def _resolve(self, security_ids: Sequence[str], start: date, end: date) -> list[str]:
@@ -313,7 +347,9 @@ class FixturePriceSource(PriceSource):
     ) -> list[CorporateAction]:
         """Every recorded action (first-seen and revisions) for
         `security_ids` with `start <= ex_date <= end`, sorted by
-        `(security_id, action_type, ex_date, known_at)`."""
+        `(security_id, action_type, ex_date, known_at)`. Every revision of a
+        re-dated action is filtered on its own `ex_date`, so a range can
+        hold one revision of an event and not another."""
         return [
             action
             for security_id in self._resolve(security_ids, start, end)

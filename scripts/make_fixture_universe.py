@@ -146,6 +146,8 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "action_type",
         "ex_date",
         "ratio_or_amount",
+        "source_action_id",
+        "cancelled",
         "known_at",
         "ingested_at",
         "source",
@@ -486,6 +488,8 @@ class Rows:
         known_at: datetime,
         source: str = _SOURCE_ALPACA,
         ingested_delay: timedelta = timedelta(minutes=10),
+        source_action_id: str = "",
+        cancelled: bool = False,
     ) -> None:
         self.corporate_actions.append(
             {
@@ -493,6 +497,8 @@ class Rows:
                 "action_type": action_type,
                 "ex_date": ex_date,
                 "ratio_or_amount": ratio_or_amount,
+                "source_action_id": source_action_id,
+                "cancelled": cancelled,
                 "known_at": known_at,
                 "ingested_at": known_at + ingested_delay,
                 "source": source,
@@ -1057,6 +1063,8 @@ def _split_backfilled_and_bar_revision(rows: Rows) -> None:
             "action_type": "split",
             "ex_date": ex_date,
             "ratio_or_amount": 2.0,
+            "source_action_id": "",
+            "cancelled": False,
             "known_at": known_at,
             "ingested_at": ingested_at,
             "source": _SOURCE_ALPACA,
@@ -1136,6 +1144,91 @@ def _revised_dividend(rows: Rows) -> None:
         f"ex_date {ex_date}: first-seen known_at {first_known_at.isoformat()} amount 0.10; "
         f"revision known_at = ingested_at = {revision_known_at.isoformat()} amount 0.12",
         "n/a",
+    )
+
+
+def _redated_split(rows: Rows) -> None:
+    """#108: the source moves a split to a later ex-date after the first
+    one has passed. Both rows carry the source's id, so the second is a
+    revision of the same event (`known_at = ingested_at`), and the split
+    applies once: at the old ex-date until the re-date is known, at the new
+    one after. The raw bars jump on the true (new) ex-date."""
+    start = _session_on_or_after(date(2019, 5, 1))
+    first_ex_date = _session_on_or_after(date(2019, 6, 10))
+    new_ex_date = _session_on_or_after(date(2019, 6, 17))
+    first_known_at = session_close(previous_session(first_ex_date))
+    redated_at = session_close(nth_session_after(first_ex_date, 2)) + timedelta(hours=1)
+    source_action_id = "fixture-redated-split"
+    security_id, cik, ticker = "SEC_SPLIT_REDATED", "CIK0001000020", "RDAT"
+    filing_known = _filing_acceptance(nth_session_before(start, 20))
+
+    rows.security(security_id, cik, "Redated Split Co", filing_known)
+    rows.listing(security_id, ticker, "NYSE", start, filing_known)
+    rows.classification(security_id, "common", "common_default", filing_known)
+    rows.bars(security_id, sessions_between(start, _FIXTURE_END), start_price=80.0, seed=23)
+    rows.action(
+        security_id,
+        "split",
+        first_ex_date,
+        2.0,
+        known_at=first_known_at,
+        source_action_id=source_action_id,
+    )
+    rows.action(
+        security_id,
+        "split",
+        new_ex_date,
+        2.0,
+        known_at=redated_at,
+        ingested_delay=timedelta(0),
+        source_action_id=source_action_id,
+    )
+    rows.apply_split(security_id, new_ex_date, 2.0)
+    rows.case(
+        "Re-dated split: same source id, ex-date moved after the first one "
+        "passed; applies once (#108)",
+        security_id,
+        ticker,
+        f"first ex_date {first_ex_date} known_at {first_known_at.isoformat()}; "
+        f"re-dated to {new_ex_date} at known_at = ingested_at = {redated_at.isoformat()}",
+        f"{first_ex_date} close (old ex-date applies), {new_ex_date} close (new ex-date "
+        "applies, old one retired)",
+    )
+
+
+def _cancelled_dividend(rows: Rows) -> None:
+    """#108: a dividend with no source id is withdrawn after its ex-date. A
+    `cancelled` revision of the same key removes it from its `known_at` on
+    (the same row retires the old key of an id-less re-date)."""
+    start = _session_on_or_after(date(2019, 8, 1))
+    ex_date = _session_on_or_after(date(2019, 9, 16))
+    first_known_at = session_close(previous_session(ex_date))
+    cancelled_at = session_close(nth_session_after(ex_date, 4)) + timedelta(hours=1)
+    security_id, cik, ticker = "SEC_DIV_CANCELLED", "CIK0001000021", "DCAN"
+    filing_known = _filing_acceptance(nth_session_before(start, 20))
+
+    rows.security(security_id, cik, "Cancelled Dividend Co", filing_known)
+    rows.listing(security_id, ticker, "NASDAQ", start, filing_known)
+    rows.classification(security_id, "common", "common_default", filing_known)
+    rows.bars(security_id, sessions_between(start, _FIXTURE_END), start_price=40.0, seed=24)
+    rows.action(security_id, "dividend", ex_date, 0.40, known_at=first_known_at)
+    rows.action(
+        security_id,
+        "dividend",
+        ex_date,
+        0.40,
+        known_at=cancelled_at,
+        ingested_delay=timedelta(0),
+        cancelled=True,
+    )
+    rows.case(
+        "Cancelled dividend: no source id, withdrawn after its ex-date by a "
+        "cancelled revision (#108)",
+        security_id,
+        ticker,
+        f"ex_date {ex_date}: first-seen known_at {first_known_at.isoformat()} amount 0.40; "
+        f"cancelled at known_at = ingested_at = {cancelled_at.isoformat()}",
+        f"just before and after {cancelled_at.isoformat()}",
     )
 
 
@@ -1421,6 +1514,8 @@ def build_rows() -> Rows:
     _split_known_before_t_ex_after_t(rows)
     _split_backfilled_and_bar_revision(rows)
     _revised_dividend(rows)
+    _redated_split(rows)
+    _cancelled_dividend(rows)
     _restated_shares_fact(rows)
     _stale_shares_fact(rows)
     _unclassifiable_name(rows)
@@ -1463,7 +1558,7 @@ def write_fixtures(output_dir: Path) -> None:
         output_dir / "corporate_actions.csv",
         "corporate_actions",
         rows.corporate_actions,
-        ("security_id", "action_type", "ex_date", "known_at"),
+        ("security_id", "action_type", "ex_date", "source_action_id", "known_at"),
     )
     _write_csv(
         output_dir / "facts.csv",

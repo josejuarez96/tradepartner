@@ -1,0 +1,1 @@
+- #108 Corporate action identity: `corporate_actions` gains `source_action_id` and `cancelled` (schema v2), so a re-dated action (same source id, new ex-date) is a revision that applies once, and a cancelled revision withdraws an event; as-of reads pick the latest revision per identity before filtering on ex-date (PR #111)

@@ -751,9 +751,18 @@ def test_corporate_actions_carry_source_action_id_and_cancelled(
     columns = {row[1]: row for row in info}
     _, _, id_type, id_not_null, id_default, _ = columns["source_action_id"]
     assert id_type == "VARCHAR" and id_not_null and id_default == "''"
-    _, _, cancelled_type, cancelled_not_null, cancelled_default, _ = columns["cancelled"]
+    _, _, cancelled_type, cancelled_not_null, _, _ = columns["cancelled"]
     assert cancelled_type == "BOOLEAN" and cancelled_not_null
-    assert str(cancelled_default).lower() == "false"
+
+    now = _now()
+    insert_row(
+        fixture_store,
+        "corporate_actions",
+        _minimal_row("corporate_actions", known_at=now, ingested_at=now),
+    )
+    assert fixture_store.execute(
+        "SELECT source_action_id, cancelled FROM corporate_actions WHERE security_id = 'S1'"
+    ).fetchall() == [("", False)]
 
 
 def test_schema_version_is_bumped_for_action_identity() -> None:
