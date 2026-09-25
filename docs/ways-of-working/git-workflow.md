@@ -57,7 +57,7 @@ issue → branch → draft PR → CI green → self-review → specialist review
 ```
 
 **Before marking a PR ready for review:**
-- [ ] CI is green (`checks` job).
+- [ ] CI is green (`checks` job) and the `claims` job passes: the branch's issue carries your `team:` label and no other open PR builds the same plan task ([teams.md](teams.md)).
 - [ ] The PR template is filled in: what/why, linked issue (`Closes #n`), how it was verified.
 - [ ] The author has reviewed their own diff on GitHub.
 - [ ] The required specialist reviews have run (see [agents.md](agents.md)):
@@ -76,9 +76,10 @@ issue → branch → draft PR → CI green → self-review → specialist review
 - Tag `v0.<phase>.0` on `main` when a phase completes, for example `v0.2.0` = data foundation done.
 - Move the `[Unreleased]` entries in `CHANGELOG.md` under the new version in the same PR that closes the phase.
 
-## Parallel agents
+## Parallel agents and teams
 
-- Each agent working in parallel gets its own **git worktree** and branch (`claude --worktree` or the worktree isolation option). Two agents never share a working directory.
+- Each orchestrator chat window is a **team** with its **own clone**. Claims, the ready frontier, shared-file rules and the CI guard are in [teams.md](teams.md). No branch without `uv run python scripts/team.py claim`.
+- Within a team, each subagent working in parallel gets its own **git worktree** and branch (`claude --worktree` or the worktree isolation option). Two agents never share a working directory.
 - Parallel agents must work on **non-overlapping files**. If two plan tasks touch the same module, run them one after the other.
 
 ## How the rules are enforced
@@ -92,6 +93,7 @@ This repo is private on GitHub Free, which **cannot enforce branch protection se
 | Claude Code permission rules | Agents pushing to main, force-pushing, reading `.env` (deny); `gh pr merge` always prompts for confirmation (ask) | `.claude/settings.json` |
 | GitHub repo settings | Merge commits and rebase-merge (squash only), stale branches (auto-delete) | Repo settings (applied) |
 | CI | Lint, format, types, tests, hygiene on every PR | `.github/workflows/ci.yml` |
+| CI `claims` job | A PR whose issue is unclaimed; two open PRs for one plan task | `scripts/team.py check-claims`, `.github/workflows/ci.yml` |
 | **Server-side ruleset** (blocks direct pushes, force-push, deletion; requires PR + green CI) | **Inactive until GitHub Pro** | `.github/rulesets/protect-main.json` |
 
 **Activating the server-side ruleset** after upgrading to GitHub Pro:

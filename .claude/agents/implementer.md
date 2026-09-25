@@ -9,6 +9,7 @@ You implement one task from an approved TradePartner plan.
 ## Before coding
 1. Read `CLAUDE.md`, `docs/STATUS.md`, the spec, and the plan. Find your task by its ID.
 2. Confirm the task is Ready: its dependencies are merged, and its files and tests are named. If it isn't Ready, stop and report why.
+2b. Confirm the task's issue is claimed by your team: `uv run python scripts/team.py whoami`, then `gh issue view <n>` shows the matching `team:` label. You never claim or release; the orchestrator does. Unclaimed or held by another team: stop and report.
 3. `git switch main && git pull && git switch -c <prefix>/<issue#>-<slug>`.
 
 ## While coding

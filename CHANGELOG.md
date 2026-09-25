@@ -8,6 +8,9 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Phase 2 T4: DuckDB store schema for every table in the data-foundation spec (common `known_at`/`ingested_at`/`source`/`provenance` columns, provenance and timing `CHECK` constraints, uniqueness per revision), idempotent `init_schema`, `store.db` read-only/write-with-retry connection layer (`StoreLockedError`, tz-aware validation), `adapters/__init__.py`, and the shared `tests/conftest.py` (autouse no-network fixture, `fixture_store`, `settings`) (#19).
 - Phase 2 T2: thin raw-fetch clients for Alpaca (`alpaca_raw`) and SEC EDGAR (`edgar_raw`), returning JSON-serializable raw payloads only; the owner-run fixture recorder (`cli_record`) with a scrub pass for secrets/emails/`User-Agent` headers; the scrub pattern test; network smoke tests for both clients (#21).
 
+### Changed
+- Process: multi-team orchestration. Any number of chat windows build in parallel as registered teams, each in its own clone; work is claimed on GitHub issues through `scripts/team.py` with a deterministic tiebreak; plans list chains; CI fails a PR whose issue is unclaimed or whose plan task has two open PRs; model tiers documented (#36).
+
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
 

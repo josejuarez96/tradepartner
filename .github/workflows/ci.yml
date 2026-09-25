@@ -29,3 +29,13 @@ jobs:
         run: uv run mypy
       - name: Tests
         run: uv run pytest
+
+  claims:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: One team and one open PR per plan task
+        run: python3 scripts/team.py check-claims --pr ${{ github.event.pull_request.number }}

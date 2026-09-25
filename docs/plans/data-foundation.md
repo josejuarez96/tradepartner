@@ -43,6 +43,21 @@ Each task = one branch = one PR (~≤400 lines; generated fixture CSVs excluded)
 
 **Parallel lanes** (separate worktrees, non-overlapping files): T1 → {T2, T4}; T2 → T3 (owner); T4 → {T5, T20}; T5 → T6 → {T7, T8}; T8 → T8b → T9; {T7, T8b} → T10; {T3, T9} → T11; {T3, T7, T8b} → T12; {T9, T10} → T13 → {T14, T15}; {T11, T12} → T16 → T17; {T15, T17} → T18 → T19 → {T21, T22} → T23.
 
+## Chains (for team claims)
+
+Dependent tasks one team should keep, in order. A chain is a preference, not a lock: every task is still claimed one at a time with `scripts/team.py claim` ([teams.md](../ways-of-working/teams.md)). Chains that wait on another chain's head cannot start until it merges, so the ready frontier is narrow early in the phase; merge chain heads first.
+
+| Chain | Tasks | Starts when |
+|---|---|---|
+| universe | T5 → T6 → T7 → T10 | now (T5 parked in PR #31, issue #22) |
+| broker | T20 | now (parked in PR #27, issue #23) |
+| master | T8 → T8b → T9 | T6 merged |
+| parsers | T11, T12 (parallel) | T3 (owner) plus T9 for T11; T7 and T8b for T12 |
+| rules | T13 → T14, T15 | T9 and T10 merged |
+| pipeline | T16 → T17 → T18 → T19 | T11 and T12 merged (T18 also needs T15) |
+| close-out | T21, T22 → T23 | T19 merged |
+| fixes | open `size:S` issues with no `team:` label | any time |
+
 ## Verification
 
 End to end, on a clean checkout:

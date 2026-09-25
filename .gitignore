@@ -42,3 +42,6 @@ logs/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# Team identity for multi-window orchestration (see docs/ways-of-working/teams.md)
+.team

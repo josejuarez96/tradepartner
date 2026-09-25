@@ -35,10 +35,24 @@ Six agents. That is deliberately few: each one owns a job the main session does 
 Research:  owner writes brief (issue) ──► researcher ──► report PR ──► owner reads, decides
 Decide:    main session drafts ADR ──► spec-critic ──► owner merges
 Spec/Plan: main session drafts ──► spec-critic ──► owner merges
-Build:     implementer × N (parallel worktrees, non-overlapping tasks) ──► draft PRs
+Build:     team claims task (scripts/team.py) ──► implementer × N (parallel worktrees, non-overlapping tasks) ──► draft PRs
 Review:    /code-review + quant-auditor and/or safety-reviewer (by paths touched) ──► owner merges
 Record:    doc-keeper
 ```
+
+## Orchestrator windows and model tiers
+
+Any number of Claude Code chat windows may build in parallel; each one is a **team** ([teams.md](teams.md)). The window itself is the orchestrator: it claims work, spawns the agents below, triages reviews and reports to the owner. Pick the model by how far a wrong judgment propagates, not by habit.
+
+| Work | Model | Why |
+|---|---|---|
+| Orchestrator window during Build and Review | **Opus 5.5** | Claims, delegation and review triage: capable, and cheaper than Fable |
+| Spec, plan and ADR drafting; phase retros; cross-team conflict resolution; changes to the ways-of-working docs | **Fable 5.1** | Errors here land in every later PR |
+| `implementer` | Sonnet (roster) | One scoped task with a plan line and tests |
+| `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer` | Opus (roster) | Judgment-heavy, read-only or doc-only |
+| `doc-keeper` | Haiku (roster) | Mechanical |
+
+Start a window on Opus 5.5 by default. Escalate to Fable only for the second row, and say so in the PR description when you did.
 
 ## Guardrails against agents "running wild"
 
