@@ -15,7 +15,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -650,6 +650,68 @@ def test_insert_row_before_init_schema_raises_clear_error() -> None:
     # result: a naive known_at is still rejected after init_schema runs.
     with pytest.raises(ValueError, match="known_at"):
         insert_row(conn, "prices_daily", row)
+
+
+# --- canonical UTC binding (issue #43) -----------------------------------
+
+
+def test_insert_row_binds_normalized_utc_value(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-UTC aware `known_at` is normalized to UTC before it is bound
+    to the `INSERT`, not passed through as the caller's original tzinfo —
+    one canonical form (issue #43). Verified two ways: the caller's `row`
+    dict is left untouched, and the actual value handed to
+    `DuckDBPyConnection.execute` has `tzinfo is UTC`."""
+    eastern = timezone(timedelta(hours=-5))
+    non_utc_known_at = datetime(2020, 1, 1, 7, 0, 0, tzinfo=eastern)
+    row = _minimal_row("prices_daily", known_at=non_utc_known_at, ingested_at=_now())
+    original_known_at = row["known_at"]
+
+    captured: dict[str, list[object]] = {}
+    connection_cls = type(fixture_store)
+    real_execute = connection_cls.execute
+
+    def spy_execute(self: duckdb.DuckDBPyConnection, sql: str, params: object = None) -> object:
+        if params is not None and sql.startswith("INSERT INTO prices_daily"):
+            captured["columns"] = list(row.keys())
+            captured["params"] = list(params)  # type: ignore[arg-type]
+        return real_execute(self, sql, params) if params is not None else real_execute(self, sql)
+
+    monkeypatch.setattr(connection_cls, "execute", spy_execute)
+
+    insert_row(fixture_store, "prices_daily", row)
+
+    # The caller's Mapping must not be mutated in place.
+    assert row["known_at"] is original_known_at
+    assert row["known_at"].tzinfo == eastern  # type: ignore[union-attr]
+
+    assert "params" in captured
+    idx = captured["columns"].index("known_at")
+    bound_known_at = captured["params"][idx]
+    assert isinstance(bound_known_at, datetime)
+    assert bound_known_at.tzinfo is UTC
+    assert bound_known_at == non_utc_known_at  # same instant
+
+    # And the instant actually stored matches the original instant.
+    (stored,) = fixture_store.execute(  # type: ignore[misc]
+        "SELECT known_at FROM prices_daily WHERE security_id = ? AND session = ?",
+        [row["security_id"], row["session"]],
+    ).fetchone()
+    assert stored == non_utc_known_at
+
+
+def test_insert_row_raises_value_error_not_overflow_error_on_utc_overflow(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """An overflowing `TIMESTAMPTZ` value (e.g. a far-future sentinel with
+    a non-zero offset) must surface as `ValueError` naming `table.field`,
+    not the underlying `OverflowError` (issue #43)."""
+    overflowing = datetime.max.replace(tzinfo=timezone(timedelta(hours=-5)))
+    row = _minimal_row("prices_daily", known_at=overflowing, ingested_at=_now())
+    with pytest.raises(ValueError, match=r"prices_daily\.known_at") as exc_info:
+        insert_row(fixture_store, "prices_daily", row)
+    assert not isinstance(exc_info.value, OverflowError)
 
 
 def test_column_types_ignore_attached_database_with_same_named_table() -> None:

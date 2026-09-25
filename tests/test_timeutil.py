@@ -33,6 +33,33 @@ def test_non_utc_aware_input_normalized_to_same_instant_in_utc() -> None:
     assert result.utcoffset() == timedelta(0)
 
 
+def test_overflow_near_datetime_min_with_positive_offset_raises_value_error() -> None:
+    # A positive UTC offset pushes datetime.min further negative once
+    # converted to UTC, which OverflowError's underlying C implementation
+    # cannot represent; this must surface as a ValueError naming the field,
+    # not an OverflowError.
+    near_min = datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5)))
+    with pytest.raises(ValueError, match="valid_from") as exc_info:
+        ensure_tz_aware_utc(near_min, field_name="valid_from")
+    assert "out of" in str(exc_info.value) or "range" in str(exc_info.value)
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, OverflowError)
+
+
+def test_overflow_near_datetime_max_with_negative_offset_raises_value_error() -> None:
+    near_max = datetime.max.replace(tzinfo=timezone(timedelta(hours=-5)))
+    with pytest.raises(ValueError, match="valid_to") as exc_info:
+        ensure_tz_aware_utc(near_max, field_name="valid_to")
+    assert isinstance(exc_info.value.__cause__, OverflowError)
+
+
+def test_aware_datetime_max_with_utc_tzinfo_passes_unchanged() -> None:
+    value = datetime.max.replace(tzinfo=UTC)
+    result = ensure_tz_aware_utc(value, field_name="valid_to")
+    assert result == value
+    assert result.tzinfo is UTC
+
+
 class _NoOffset(tzinfo):
     """A tzinfo whose `utcoffset()` is None: naive under Python's rules."""
 
