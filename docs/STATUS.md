@@ -17,16 +17,16 @@
 - Phase 2 T20: `Broker` interface and in-memory fake broker, no risk logic (PR #27)
 
 ## Teams
-Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: `atlas` (the main clone) holds #36; no other team registered. The two windows that produced parked PRs #31 (T5) and #27 (T20) were stopped during the cleanup; whichever team re-claims issue #22 / #23 continues those branches after a rebase.
+Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: registered teams are `atlas` (main clone), `orion` (holds #22 / T5, PR #31), and `creed` (completed T20 via PR #27).
 
 ## In progress
 - **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts
-- **Owner cleanup (agents are blocked from this):** remove the four stopped worktrees under `.claude/worktrees/` (`git worktree remove <path>`, one is locked) and delete remote branches `feat/25-fixture-universe`, `feat/24-fake-broker`
+- **Owner cleanup (agents are blocked from this):** remove stopped worktrees `.claude/worktrees/creed`, `.claude/worktrees/agent-aee102ec0271d2d42` (team creed, done with T20), and two others (one is locked); delete remote branches `feat/25-fixture-universe`, `feat/24-fake-broker`, and local branch `feat/23-fake-broker`
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
 Copied from `team.py status` on 2026-09-24. Claim through the tool, never from this list.
-1. T5 (issue #22, parked PR #31) and T20 (issue #23, parked PR #27): re-claim, rebase, run the required reviews, mark ready
-2. Unclaimed fixes filed by the stopped teams: #28, #29, #30, #32, #35 (all `size:S`). #33 is a Phase 4 idea, leave it
+1. T5 (issue #22, held by orion, PR #31): rebase, run the required reviews, mark ready
+2. Unclaimed issues: #28, #29, #30, #32, #35 (all `size:S`), #38 (symbol-case canonicalization, type:feat). #33 is a Phase 4 idea, leave it
 3. After T5 merges: T6, then T7 and T8 in parallel (see plan chains)
 4. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
 5. Decide whether to upgrade to GitHub Pro to enforce the `main` ruleset server-side
