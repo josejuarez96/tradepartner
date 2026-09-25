@@ -30,14 +30,16 @@ in ingest order (`ingested_at`, then `known_at`):
    (see `prices.Bar` / `prices.CorporateAction`).
 2. A first-seen bar has `known_at` equal to `prices.bar_known_at(session)`,
    the XNYS close of its session, so a bar on a non-session is refused too.
-   A first-seen action has `known_at` at or before the first-seen proxy
-   (`prices.action_first_seen_known_at` with no announcement): the proxy
-   itself, or an earlier announcement. A stamp before the proxy cannot be
-   checked further, because the stored layout carries no announcement time
-   to compare it with (issue #83).
+   A first-seen action has `known_at` equal to
+   `prices.action_first_seen_known_at(ex_date, announced_at=...)`: its
+   `announced_at` capped at the first-seen proxy if the row has one, else
+   exactly the proxy. A stamp earlier than the proxy with no `announced_at`
+   is look-ahead and refused (issue #83). `announced_at` is optional per
+   row (an empty cell) but the column is required.
 3. Every later row for the same key must be what `prices.revision_of`
    produces from the row before it at that row's `ingested_at`: values that
    differ, and `known_at` equal to its own `ingested_at` (never back-dated).
+   An action revision carries the previous row's `announced_at` unchanged.
 """
 
 from __future__ import annotations
@@ -68,7 +70,13 @@ _ACTIONS_CSV = "corporate_actions.csv"
 
 _COMMON_COLUMNS = ("security_id", "known_at", "ingested_at", "source", "provenance")
 _PRICES_COLUMNS = (*_COMMON_COLUMNS, "session", "open", "high", "low", "close", "volume")
-_ACTIONS_COLUMNS = (*_COMMON_COLUMNS, "action_type", "ex_date", "ratio_or_amount")
+_ACTIONS_COLUMNS = (
+    *_COMMON_COLUMNS,
+    "action_type",
+    "ex_date",
+    "ratio_or_amount",
+    "announced_at",
+)
 
 #: `bar_known_at` builds a pandas timestamp per call; the fixture has ~900
 #: distinct sessions across ~11k bars, so memoize it for the load.
@@ -181,6 +189,11 @@ def _load_actions(path: Path, known_ids: frozenset[str]) -> list[_Row[CorporateA
                 ratio_or_amount=float(row["ratio_or_amount"]),
                 known_at=known_at,
                 source=row["source"],
+                announced_at=(
+                    _parse_instant(row["announced_at"], column="announced_at", where=where)
+                    if row["announced_at"]
+                    else None
+                ),
             )
         except (TypeError, ValueError) as exc:
             if isinstance(exc, FixtureContractError):
@@ -207,17 +220,26 @@ def _check_bar_first_seen(row: _Row[Bar]) -> None:
 
 
 def _check_action_first_seen(row: _Row[CorporateAction]) -> None:
-    """Contract rule 2 for actions: stamped at or before the first-seen
-    proxy (the proxy itself, or an earlier announcement)."""
+    """Contract rule 2 for actions: stamped exactly at its `announced_at`
+    if it has one, else exactly at the first-seen proxy."""
     action = row.record
-    proxy = action_first_seen_known_at(action.ex_date)
-    if action.known_at > proxy:
+    expected = action_first_seen_known_at(action.ex_date, announced_at=action.announced_at)
+    if action.known_at == expected:
+        return
+    if action.announced_at is not None:
         raise FixtureContractError(
-            f"{row.where}: first-seen action known_at {action.known_at.isoformat()} is after "
-            f"the first-seen proxy {proxy.isoformat()} (close before ex-date "
-            f"{action.ex_date.isoformat()}); a first-seen action is stamped at its "
-            "announcement or at the proxy, never later"
+            f"{row.where}: first-seen action known_at {action.known_at.isoformat()} is not "
+            f"{expected.isoformat()}, its announced_at {action.announced_at.isoformat()} "
+            "capped at the first-seen proxy (close before ex-date "
+            f"{action.ex_date.isoformat()})"
         )
+    when = "before" if action.known_at < expected else "after"
+    raise FixtureContractError(
+        f"{row.where}: first-seen action known_at {action.known_at.isoformat()} is {when} "
+        f"the first-seen proxy {expected.isoformat()} (close before ex-date "
+        f"{action.ex_date.isoformat()}) and the row has no announced_at; without an "
+        "announcement the stamp is the proxy exactly (an earlier one is look-ahead, #83)"
+    )
 
 
 def _check_history[RecordT: (Bar, CorporateAction)](
@@ -244,6 +266,17 @@ def _check_history[RecordT: (Bar, CorporateAction)](
                 raise FixtureContractError(
                     f"{current.where}: revision of {key(current.record)} has values identical "
                     f"to {previous.where}; an unchanged re-fetch is not a new row"
+                )
+            if (
+                isinstance(current.record, CorporateAction)
+                and isinstance(previous.record, CorporateAction)
+                and current.record.announced_at != previous.record.announced_at
+            ):
+                raise FixtureContractError(
+                    f"{current.where}: revision of {key(current.record)} changes announced_at "
+                    f"from {previous.record.announced_at!r} to "
+                    f"{current.record.announced_at!r}; the announcement fixed the first-seen "
+                    "stamp and is carried forward unchanged"
                 )
             if expected.known_at != current.record.known_at:
                 raise FixtureContractError(

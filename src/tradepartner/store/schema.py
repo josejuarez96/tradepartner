@@ -83,7 +83,14 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #: The schema version `init_schema` records on first run. Bump and add a
 #: migration note here (not silent DDL edits) if the shape of a table
 #: changes after data has been loaded.
-CURRENT_SCHEMA_VERSION = 1
+#:
+#: Migration notes:
+#: - 2 (issue #83): `corporate_actions.announced_at TIMESTAMPTZ` (nullable),
+#:   the source's announcement time, so a first-seen `known_at` earlier than
+#:   the proxy is checkable. No store had ingested data at version 1, so
+#:   there is no migration code: a version-1 store raises
+#:   `SchemaVersionError`; rebuild it.
+CURRENT_SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -174,12 +181,19 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 )
 """
 
+# announced_at is the source's announcement time, NULL when the source
+# gives none (issue #83). A first-seen row's known_at equals announced_at
+# capped at the close of the session before ex_date, else that close
+# (spec req 5); revisions carry it forward unchanged. The adapters enforce
+# that, the table only stores it. It is evidence for the stamp, never a
+# time to filter on: as-of reads use known_at only.
 _CREATE_CORPORATE_ACTIONS = f"""
 CREATE TABLE IF NOT EXISTS corporate_actions (
     security_id VARCHAR NOT NULL,
     action_type VARCHAR NOT NULL,
     ex_date DATE NOT NULL,
     ratio_or_amount DOUBLE NOT NULL,
+    announced_at TIMESTAMPTZ,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["corporate_actions"])},
     UNIQUE (security_id, action_type, ex_date, known_at)
 )
