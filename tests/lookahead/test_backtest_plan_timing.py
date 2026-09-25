@@ -23,6 +23,14 @@ plan on the full store:
   whose signal frame alone is read at the next rebalance fails it on a store with a
   revised T_{k-1} month-end bar, and the unpatched engine passes on that same store.
 
+**What the main check sees on the plain fixture store.** A late read changes a compared
+field only if the data it reaches differs: a late universe or gap read is caught (the
+cut store has no bars after T_k); a late signal-frame read is caught only where an
+anchor bar is revised after the read, i.e. by teeth (b) at `T_TEETH`; a late
+`static_listing_count` read goes unseen, because the fixture's static-listing count
+never changes between rebalances. The spec asks for exactly this ("detects one that
+changes a compared plan field"; quant-auditor on PR #215).
+
 Helpers are copied from `test_backtest_invariance.py` (T40) rather than imported, so
 T40's file and `harness.py` stay unchanged. The store is the plain fixture universe:
 this check needs no seeded revisions.
@@ -235,16 +243,20 @@ def _fields(view: PlanView, name: str) -> set[Any]:
 
 
 def test_benchmarks_are_never_plan_inputs(fixture: Fixture) -> None:
-    """The exemption is safe only if no benchmark is a universe member (so neither the
-    signal frame nor the static-listing count reads one; the gap drops them by flag)."""
+    """The exemption is safe only if no exempted security is a universe member (so
+    neither the signal frame nor the static-listing count reads one; the gap drops them
+    by flag). Checked against the view's own key: every security flagged `benchmark`
+    in the untruncated store, whether or not it is known yet or named in settings."""
+    query = "SELECT security_id FROM securities WHERE benchmark"
+    exempted = {sid for (sid,) in fixture.conn.execute(query).fetchall()}
+    assert exempted
     seen = 0
     with fixture.provider(fixture.conn) as provider:
         for t_k in fixture.sessions[:-1]:
             t = read_time(t_k)
-            benchmarks = set(provider.benchmark_ids(t).values())
             members = set(provider.universe(t).members["security_id"].to_list())
-            assert not benchmarks & members, f"benchmark in the universe at {t_k}"
-            seen += bool(benchmarks)
+            assert not exempted & members, f"exempted security in the universe at {t_k}"
+            seen += bool(provider.benchmark_ids(t))
     assert seen >= 20  # SPY and MTUM are known from 2018: the exemption is exercised
 
 
