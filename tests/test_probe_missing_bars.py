@@ -178,5 +178,31 @@ def test_analyze_end_to_end(tmp_path: Path) -> None:
     (tmp_path / "bars" / "batch_0000.json").write_text(json.dumps(payload))
     report = pm.analyze(tmp_path)
     assert "Max share: 0.5000" in report
-    assert "placeholder bars counted as missing: 1" in report
+    assert "Zero-volume placeholder rows: 1" in report
     assert "provisional" in report
+
+
+def test_expected_from_first_row_of_any_kind() -> None:
+    # "LATE" has a placeholder on S[0] and first trades on S[2]: listed, not an IPO.
+    present = {"A": set(S), "LATE": {S[2], S[3]}, "NEW": {S[2], S[3]}}
+    rows = {"A": set(S), "LATE": set(S), "NEW": {S[2], S[3]}}
+    stats = pm.missing_stats(["A", "LATE", "NEW"], present, S, first_seen=rows)
+    assert stats.probable_ipo == ["NEW"]
+    by_day = {r.session: r for r in stats.rows}
+    assert (by_day[S[0]].expected, by_day[S[0]].missing) == (2, 1)
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [
+        ("Inflection Point Acquisition Corp. VII Units", "unit"),
+        ("JAB Acquisition Corp I Warrants", "warrant"),
+        ("Foo Corp Rights", "right"),
+        ("Bar Bank 6.5% Series A Preferred Stock", "preferred"),
+        ("Baz 5.25% Senior Notes due 2031", "notes"),
+        ("Apple Inc. Common Stock", "common-like"),
+        ("Taiwan Semiconductor American Depositary Shares", "common-like"),
+    ],
+)
+def test_instrument_kind(name: str, kind: str) -> None:
+    assert pm.instrument_kind(name) == kind

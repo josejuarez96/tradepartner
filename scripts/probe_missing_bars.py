@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from collections import Counter
@@ -83,6 +84,32 @@ def window_sessions(today: date, n: int = WINDOW_SESSIONS, gap: int = WINDOW_GAP
     return sorted(out)
 
 
+_KINDS = [
+    ("unit", re.compile(r"\bunits?\b", re.I)),
+    ("warrant", re.compile(r"\bwarrants?\b", re.I)),
+    ("right", re.compile(r"\brights?\b", re.I)),
+    ("preferred", re.compile(r"\bpreferred\b", re.I)),
+    ("notes", re.compile(r"\bnotes?\b|\bdebentures?\b", re.I)),
+]
+
+
+def instrument_kind(name: str) -> str:
+    """Rough instrument type from the asset name; "common-like" when none matches.
+
+    Name keywords only (Alpaca's asset has no security-type field). ETFs, trusts
+    and ADRs stay common-like; the real universe filter is T13's job.
+    """
+    for kind, pattern in _KINDS:
+        if pattern.search(name):
+            return kind
+    return "common-like"
+
+
+def all_rows(bars: Mapping[str, Iterable[Mapping[str, Any]]]) -> dict[str, set[date]]:
+    """Sessions with any bar row, placeholders included, per symbol."""
+    return {sym: {bar_session(b) for b in rows} for sym, rows in bars.items()}
+
+
 @dataclass(frozen=True)
 class SessionRow:
     session: date
@@ -115,13 +142,20 @@ class MissingStats:
 
 
 def missing_stats(
-    listed: Iterable[str], present: Mapping[str, set[date]], window: list[date], top: int = 10
+    listed: Iterable[str],
+    present: Mapping[str, set[date]],
+    window: list[date],
+    top: int = 10,
+    *,
+    first_seen: Mapping[str, set[date]] | None = None,
 ) -> MissingStats:
     """The protocol's E_s / M_s count over `window`.
 
-    A symbol with no bar in the window is "never traded" and leaves E. A symbol
-    whose first bar is after the window start is a probable IPO and is expected
-    only from its first bar on.
+    A symbol is expected from its first row in the window: `first_seen` (any
+    row, placeholders included) when given, else `present`. A symbol with no
+    such row is "never traded" and leaves E; one whose first row is after the
+    window start is a probable IPO. Without `first_seen`, a listed name that
+    simply did not trade on the first session reads as an IPO (run 1 of #106).
     """
     in_window = set(window)
     expected = Counter[date]()
@@ -130,10 +164,11 @@ def missing_stats(
     never, ipo = [], []
     for sym in sorted(set(listed)):
         days = present.get(sym, set()) & in_window
-        if not days:
+        seen = (first_seen.get(sym, set()) if first_seen is not None else days) & in_window
+        if not seen:
             never.append(sym)
             continue
-        first = min(days)
+        first = min(seen)
         if first > window[0]:
             ipo.append(sym)
         for s in window:
@@ -296,64 +331,96 @@ def fetch_live(run_dir: Path, now: datetime) -> None:
     _fetch_batches(live_dir, listed, call)
 
 
+def _section(
+    title: str,
+    stats: MissingStats,
+    status: Mapping[str, tuple[Any, Any]],
+    live: tuple[date, int, int, list[str]] | None,
+    current: float,
+) -> list[str]:
+    out = [f"## {title}", ""]
+    out += ["| Session | Expected | Missing | Share |", "|---|---|---|---|"]
+    out += [f"| {r.session} | {r.expected} | {r.missing} | {r.share:.4f} |" for r in stats.rows]
+    out += ["", f"- Median share: {stats.median_share:.4f}"]
+    out.append(f"- Max share: {stats.max_share:.4f} on {stats.max_session}")
+    out.append(f"- Never traded (no row in window, not in E): {len(stats.never_traded)}")
+    out.append(f"- Probable IPOs (first row after window start): {len(stats.probable_ipo)}")
+    if stats.top_missing:
+        out += ["", "| Symbol | Sessions missing | Status | Tradable |", "|---|---|---|---|"]
+        for sym, n in stats.top_missing:
+            st, tr = status.get(sym, (None, None))
+            out.append(f"| {sym} | {n} | {st} | {tr} |")
+    live_value: float | None = None
+    if live is not None:
+        session, e, m, gone = live
+        live_value = m / e if e else 0.0
+        out += ["", f"- Live case {session}: expected {e}, missing {m}, share {live_value:.4f}"]
+        if gone:
+            out.append(f"- Live missing (first 20): {', '.join(gone[:20])}")
+    rec = tightening(stats.max_share, live_value, current)
+    note = " (provisional: no live case)" if rec.provisional else ""
+    verdict = f"tighten to {rec.value:.3f}" if rec.tighten else f"keep {current}; investigate first"
+    out += ["", f"- Tightening rule: candidate {rec.candidate:.3f}{note}; {verdict}", ""]
+    return out
+
+
 def analyze(run_dir: Path) -> str:
-    """The probe report for a saved run, as Markdown."""
+    """The probe report for a saved run, as Markdown: three readings of "missing".
+
+    A counts only absent rows (the source did not deliver the session). B also
+    counts zero-volume placeholders (the protocol with #104's rule). C is B on
+    common-like names only. Every reading takes a name as expected from its
+    first row of any kind, so a listed name that did not trade is not an IPO.
+    """
     from tradepartner.config import get_settings
 
     current = get_settings().ingest.max_missing_share
     assets = _assets(run_dir)
     status = {a["symbol"]: (a.get("status"), a.get("tradable")) for a in assets}
+    names = {a["symbol"]: str(a.get("name") or "") for a in assets}
     listed = listed_symbols(assets)
+    common = [s for s in listed if instrument_kind(names[s]) == "common-like"]
     window = [date.fromisoformat(d) for d in json.loads((run_dir / "window.json").read_text())]
     bars, feeds, errors = _load_bars(run_dir / "bars")
-    present = present_sessions(bars)
+    rows_any, real = all_rows(bars), present_sessions(bars)
     placeholders = sum(is_placeholder(b) for rows in bars.values() for b in rows)
-    stats = missing_stats(listed, present, window)
+    kinds = Counter(instrument_kind(names[s]) for s in listed)
+
+    live_session: date | None = None
+    l_any: dict[str, set[date]] = {}
+    l_real: dict[str, set[date]] = {}
+    live_dir = run_dir / "live"
+    live_note = ""
+    if (live_dir / "meta.json").exists():
+        meta = json.loads((live_dir / "meta.json").read_text())
+        live_session = date.fromisoformat(meta["session"])
+        lbars, _, lerrors = _load_bars(live_dir)
+        l_any, l_real = all_rows(lbars), present_sessions(lbars)
+        live_note = f"{live_session}, fetched {meta['fetched_at']}, batch errors {len(lerrors)}"
 
     out = [f"# #106: missing-bar share on SIP daily bars ({run_dir.name})", ""]
     out.append(f"- Window: {window[0]} to {window[-1]} ({len(window)} XNYS sessions)")
     out.append(f"- Listed (active, tradable, NYSE/Nasdaq/NYSE American today): {len(listed)}")
+    out.append(f"- By name: {', '.join(f'{k} {n}' for k, n in kinds.most_common())}")
     out.append(f"- Feed echo: {sorted(set(feeds))}; batch errors: {len(errors)}")
-    out.append(f"- Never traded in window (not in E): {len(stats.never_traded)}")
-    out.append(f"- Probable IPOs (first bar after window start): {len(stats.probable_ipo)}")
-    out.append(f"- Zero-volume placeholder bars counted as missing: {placeholders}")
-    out += ["", "| Session | Expected | Missing | Share |", "|---|---|---|---|"]
-    out += [f"| {r.session} | {r.expected} | {r.missing} | {r.share:.4f} |" for r in stats.rows]
-    out += ["", f"- Median share: {stats.median_share:.4f}"]
-    out.append(f"- Max share: {stats.max_share:.4f} on {stats.max_session}")
-    out += ["", "Top missing symbols:", "", "| Symbol | Sessions missing | Status | Tradable |"]
-    out.append("|---|---|---|---|")
-    for sym, n in stats.top_missing:
-        st, tr = status.get(sym, (None, None))
-        out.append(f"| {sym} | {n} | {st} | {tr} |")
-    if stats.never_traded:
-        out += ["", f"Never traded (first 20): {', '.join(stats.never_traded[:20])}"]
-
-    live: float | None = None
-    live_dir = run_dir / "live"
-    if (live_dir / "meta.json").exists():
-        meta = json.loads((live_dir / "meta.json").read_text())
-        session = date.fromisoformat(meta["session"])
-        lbars, _, lerrors = _load_bars(live_dir)
-        e, m, gone = live_share(listed, present_sessions(lbars), session, set(stats.never_traded))
-        live = m / e if e else 0.0
-        out += ["", f"## Live case: {session}, fetched {meta['fetched_at']}", ""]
-        out.append(f"- Expected {e}, missing {m}, share {live:.4f} (batch errors {len(lerrors)})")
-        out.append(f"- Missing (first 20): {', '.join(gone[:20])}")
-
-    rec = tightening(stats.max_share, live, current)
-    out += ["", "## Tightening rule", ""]
+    out.append(f"- Zero-volume placeholder rows: {placeholders}")
+    out.append(f"- Live case: {live_note or 'not run'}")
     out.append(f"- Current `ingest.max_missing_share`: {current}")
-    out.append(
-        f"- Candidate: {rec.candidate:.3f}"
-        + (" (provisional: no live case)" if rec.provisional else "")
-    )
-    if rec.tighten:
-        out.append(f"- Suggest tightening to {rec.value:.3f} (owner sets the value)")
-    else:
-        out.append(f"- Keep {current}; investigate the top missing symbols first")
+    out.append("")
+    readings = [
+        ("A. No bar row (placeholders count as present)", listed, rows_any, l_any),
+        ("B. No traded bar (placeholders count as missing)", listed, real, l_real),
+        ("C. As B, common-like names only", common, real, l_real),
+    ]
+    for title, names_, present, lpresent in readings:
+        stats = missing_stats(names_, present, window, first_seen=rows_any)
+        live = None
+        if live_session is not None:
+            e, m, gone = live_share(names_, lpresent, live_session, set(stats.never_traded))
+            live = (live_session, e, m, gone)
+        out += _section(title, stats, status, live, current)
     if errors:
-        out += ["", "## Errors (verbatim)", "", "```", *errors, "```"]
+        out += ["## Errors (verbatim)", "", "```", *errors, "```"]
     return "\n".join(out) + "\n"
 
 
