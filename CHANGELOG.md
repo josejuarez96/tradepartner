@@ -3,6 +3,8 @@
 Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at the end of each phase (`v0.<phase>.0`).
 
 ## [Unreleased]
+### Added
+- Phase 2 T1: pydantic settings with every ADR 0006 threshold (guarded SIC exclusion), pinned XNYS calendar wrapper, all Phase 2 runtime dependencies (#17).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.

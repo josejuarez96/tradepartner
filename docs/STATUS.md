@@ -10,11 +10,13 @@
 - #7 Charter accepted; ADRs 0005 (objective, benchmarks, stop criteria) and 0006 (universe, cadence) (PR #9)
 - #8 Phase 2 spec and plan (PR #11). #12 Phase 1 retro, v0.1.0 tagged
 
+- Phase 2 T1: config, dependencies, calendar (PR #17)
+
 ## In progress
-- [Phase 2 plan](plans/data-foundation.md) T1: config, dependencies, calendar (`implementer`, draft PR pending)
+- none
 
 ## Next up
-1. Review and merge T1; then T2 (raw clients and recorder) and T4 (store) in parallel
+1. T2 (raw clients and recorder) and T4 (store) in parallel via `implementer`
 2. **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts
 3. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
 4. Decide whether to upgrade to GitHub Pro to enforce the `main` ruleset server-side
