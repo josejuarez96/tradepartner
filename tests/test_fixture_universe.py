@@ -200,6 +200,36 @@ def test_no_unique_key_violations(table: str, unique_cols: tuple[str, ...]) -> N
         seen.add(key)
 
 
+def test_no_security_trades_before_its_earliest_listing() -> None:
+    """For every security, the earliest listing `valid_from` must be <= its
+    first bar session -- a security cannot have a priced bar before it was
+    listed (review round 4, SHOULD FIX 2). No case here is exempted: every
+    security's earliest listing is meant to land on or before its first bar."""
+    listings = _read_rows("listings")
+    bars = _read_rows("prices_daily")
+
+    earliest_listing: dict[str, date] = {}
+    for row in listings:
+        valid_from = date.fromisoformat(row["valid_from"])
+        security_id = row["security_id"]
+        if security_id not in earliest_listing or valid_from < earliest_listing[security_id]:
+            earliest_listing[security_id] = valid_from
+
+    first_bar: dict[str, date] = {}
+    for row in bars:
+        session = date.fromisoformat(row["session"])
+        security_id = row["security_id"]
+        if security_id not in first_bar or session < first_bar[security_id]:
+            first_bar[security_id] = session
+
+    for security_id, first_session in first_bar.items():
+        assert security_id in earliest_listing, f"{security_id} has bars but no listing"
+        assert earliest_listing[security_id] <= first_session, (
+            f"{security_id}: earliest listing valid_from {earliest_listing[security_id]} "
+            f"is after its first bar session {first_session}"
+        )
+
+
 def test_no_bars_on_the_documented_holiday() -> None:
     with (_FIXTURES_DIR / "prices_daily.csv").open(newline="") as fh:
         reader = csv.DictReader(fh)
@@ -222,9 +252,11 @@ def _read_rows(table: str) -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
-# The backfilled split is a deliberate exception to the ordinary first-seen
-# rule (its known_at is years after its ex_date, by design -- see
-# test_backfilled_split_known_at_is_years_after_its_ex_date below).
+# The backfilled split's corporate_actions row: its known_at follows the
+# ordinary first-seen rule (close before ex-date, asserted in
+# test_first_seen_action_known_at_and_revision_rule below like every other
+# case), but it was not ingested until years later, in a 2026 backfill run
+# -- see test_backfilled_split_known_at_is_close_before_ex_date_ingested_late.
 _BACKFILLED_SPLIT_SECURITY_ID = "SEC_SPLIT_BACKFILLED"
 
 
@@ -265,11 +297,7 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
     before ex-date (an announcement, if present, is always earlier still).
     A revision (a later row for the same key): `known_at == ingested_at`,
     later than the first-seen row (spec req 5; review round 3 item 9)."""
-    rows = [
-        r
-        for r in _read_rows("corporate_actions")
-        if r["security_id"] != _BACKFILLED_SPLIT_SECURITY_ID
-    ]
+    rows = _read_rows("corporate_actions")
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[(row["security_id"], row["action_type"], row["ex_date"])].append(row)
@@ -289,11 +317,16 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
             assert datetime.fromisoformat(revision["known_at"]) > first_known_at
 
 
-def test_backfilled_split_known_at_is_years_after_its_ex_date() -> None:
-    """The T6 acceptance case "backfilled 2018 split in 2026": this split's
-    ex_date is 2018, but it was only discovered (known_at) during a 2026
-    backfill run -- the ordinary "close before ex-date" first-seen rule
-    does not apply to it by design (review round 3 SHOULD FIX 10)."""
+def test_backfilled_split_known_at_is_close_before_ex_date_ingested_late() -> None:
+    """The T6 acceptance case "backfilled 2018 split in 2026": per spec req
+    5, a first-seen action with no announcement has known_at = the close of
+    the session before ex-date, *regardless of when it was ingested* -- so
+    this split's known_at is in 2018 like any other first-seen action, and
+    only its ingested_at (a 2026 backfill run discovering it late) is years
+    later. known_at must also be no later than the 2019-01-31 probe close,
+    so that probe's adjusted_prices_as_of sees the split (review round 4
+    MUST FIX 1; this inverts the previous round's known_at-in-2026
+    assertion, which violated req 5)."""
     rows = [
         r
         for r in _read_rows("corporate_actions")
@@ -305,9 +338,18 @@ def test_backfilled_split_known_at_is_years_after_its_ex_date() -> None:
     ingested_at = datetime.fromisoformat(row["ingested_at"])
     ex_date = date.fromisoformat(row["ex_date"])
     assert ex_date.year == 2018
-    assert known_at.year == 2026
+
+    expected_known_at = session_close(previous_session(ex_date))
+    assert known_at == expected_known_at
+
+    assert ingested_at.year == 2026
     assert known_at <= ingested_at
     assert known_at < ingested_at, "expected a late (non-instant) ingestion for this row"
+
+    probe_day = date(2019, 1, 31)
+    probe_session = probe_day if is_session(probe_day) else next_session(probe_day)
+    probe_t = session_close(probe_session)
+    assert known_at <= probe_t
 
 
 def test_transfer_known_at_ordering_and_valid_from_within_window() -> None:

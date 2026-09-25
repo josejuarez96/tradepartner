@@ -175,6 +175,14 @@ def _session_on_or_after(day: date) -> date:
     return day if is_session(day) else next_session(day)
 
 
+# The first real XNYS session on or after `_GLOBAL_START` (2017-01-02 is the
+# New Year's Day holiday observance, not a session): used for every listing
+# `valid_from` that shares `_GLOBAL_START` as its bar-history start, so no
+# security's listing predates its own first bar session (review round 4,
+# nit 4).
+_GLOBAL_START_SESSION = _session_on_or_after(_GLOBAL_START)
+
+
 def sessions_between(start: date, end: date) -> list[date]:
     """Every XNYS session `s` with `start <= s <= end` (inclusive), by
     calendar date rather than a fixed count -- used so several entities can
@@ -202,6 +210,20 @@ def nth_session_before(day: date, n: int) -> date:
     for _ in range(n):
         d = previous_session(d)
     return d
+
+
+def _sessions_gap(start: date, end: date) -> int:
+    """Number of sessions strictly after `start` up to and including `end`
+    -- the same gap definition
+    `tests/test_fixture_universe.py::test_boundary_delisting_gap_equals_threshold_exactly`
+    uses -- so a README gap count is always computed from the data instead
+    of hardcoded (review round 4, nit 3)."""
+    gap = 0
+    day = start
+    while day < end:
+        day = next_session(day)
+        gap += 1
+    return gap
 
 
 def _dt(day: date, hour: int, minute: int = 0, second: int = 0) -> datetime:
@@ -539,7 +561,7 @@ def _truncated_delisting(rows: Rows) -> None:
     rows.bars(security_id, bar_sessions, start_price=40.0, seed=1)
     rows.delisting(security_id, "25", "Common Stock", "NYSE", filed_at)
     last_session_before_filing = previous_session(filing_session)
-    gap = _GAP_THRESHOLD + 8
+    gap = _sessions_gap(last_bar, last_session_before_filing)
     rows.case(
         "Truncated-history delisting (req 13)",
         security_id,
@@ -562,7 +584,10 @@ def _within_window_delisting(rows: Rows) -> None:
     filing_session = nth_session_after(last_bar, gap_sessions + 1)
     filed_at = _filing_acceptance(filing_session)
     security_id, cik, ticker = "SEC_WINDOW_DELIST", "CIK0001000002", "WNDX"
-    listing_start = _session_on_or_after(date(2018, 1, 2))
+    # The listing's valid_from must equal the first bar session (`start`,
+    # i.e. `_GLOBAL_START_SESSION`), not an unrelated later date -- no
+    # security may trade before it is listed (review round 4, SHOULD FIX 2).
+    listing_start = _GLOBAL_START_SESSION
     filing_known = _filing_acceptance(nth_session_before(start, 5))
 
     bar_sessions = sessions_between(start, last_bar)
@@ -696,7 +721,7 @@ def _dual_class(rows: Rows) -> None:
         class_a_id,
         class_a_ticker,
         "NYSE",
-        _GLOBAL_START,
+        _GLOBAL_START_SESSION,
         filing_known,
         class_title="Class A Common Stock",
     )
@@ -709,7 +734,7 @@ def _dual_class(rows: Rows) -> None:
         class_b_id,
         class_b_ticker,
         "NYSE",
-        _GLOBAL_START,
+        _GLOBAL_START_SESSION,
         filing_known,
         class_title="Class B Common Stock",
     )
@@ -793,7 +818,7 @@ def _exchange_transfer(rows: Rows) -> None:
 
     bar_sessions = sessions_between(_GLOBAL_START, _FIXTURE_END)
     rows.security(security_id, cik, "Transfer Co", filing_known)
-    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START, filing_known)
+    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START_SESSION, filing_known)
     rows.classification(security_id, "common", "common_default", filing_known)
     rows.bars(security_id, bar_sessions, start_price=30.0, seed=8)
     rows.delisting(security_id, "25", "Common Stock", "NYSE", filed_at)
@@ -921,7 +946,7 @@ def _split_between_filing_and_t(rows: Rows) -> None:
 
     bar_sessions = sessions_between(_GLOBAL_START, _FIXTURE_END)
     rows.security(security_id, cik, "Split Between Filing Co", filing_known)
-    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START, filing_known)
+    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START_SESSION, filing_known)
     rows.classification(security_id, "common", "common_default", filing_known)
     rows.bars(security_id, bar_sessions, start_price=60.0, seed=13, floor=_MIN_PRICE * 3 * 2)
     rows.fact(security_id, "shares_outstanding", filing_session, 5_000_000, shares_known_at)
@@ -952,7 +977,7 @@ def _split_known_before_t_ex_after_t(rows: Rows) -> None:
 
     bar_sessions = sessions_between(_GLOBAL_START, _FIXTURE_END)
     rows.security(security_id, cik, "Split Future Co", filing_known)
-    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START, filing_known)
+    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START_SESSION, filing_known)
     rows.classification(security_id, "common", "common_default", filing_known)
     rows.bars(security_id, bar_sessions, start_price=90.0, seed=14, floor=_MIN_PRICE * 4 * 2)
     rows.action(security_id, "split", ex_date, 4.0, known_at=announced_at)
@@ -998,22 +1023,29 @@ def _split_known_before_t_ex_after_t(rows: Rows) -> None:
 def _split_backfilled_and_bar_revision(rows: Rows) -> None:
     """The two T6 acceptance cases the spec names explicitly (review round
     3, SHOULD FIX 10): a split whose ex-date is 2018 but which is only
-    `known_at`/`ingested_at` in 2026 (a backfill run discovers it very
-    late -- "Backfilled 2018 split in 2026: adjusted_prices_as_of(2019-01-31
-    close) adjusts 2017 prices"), and a re-fetched bar revision (a second
-    row for the same session with a different close, `known_at =
-    ingested_at`, well after the original bar's `known_at`)."""
+    *ingested* in 2026 -- a backfill run discovers it very late (a 2026
+    `ingested_at`), but its `known_at` still follows the ordinary
+    first-seen rule (req 5: the close of the session before ex-date,
+    regardless of when it was ingested), so the late discovery shows up
+    only in `ingested_at`, never `known_at` (review round 4, MUST FIX 1;
+    was previously known_at also in 2026, which violated req 5). "Backfilled
+    2018 split in 2026: adjusted_prices_as_of(2019-01-31 close) adjusts 2017
+    prices", and a re-fetched bar revision (a second row for the same
+    session with a different close, `known_at = ingested_at`, well after
+    the original bar's `known_at`)."""
     ex_date = _session_on_or_after(date(2018, 3, 15))
     probe_session = _session_on_or_after(date(2019, 1, 31))
     probe_t = session_close(probe_session)
     security_id, cik, ticker = "SEC_SPLIT_BACKFILLED", "CIK0001000014", "BKFL"
     filing_known = _filing_acceptance(nth_session_before(_GLOBAL_START, 5))
-    known_at = _dt(date(2026, 1, 15), 20, 30)
-    ingested_at = _dt(date(2026, 1, 20), 9, 0)  # a late ingestion, days after known_at
+    # First-seen action, no announcement: known_at = close of the session
+    # before ex-date (req 5), regardless of how late it was ingested.
+    known_at = session_close(previous_session(ex_date))
+    ingested_at = _dt(date(2026, 1, 20), 9, 0)  # a late 2026 backfill discovery
 
     bar_sessions = sessions_between(_GLOBAL_START, _FIXTURE_END)
     rows.security(security_id, cik, "Backfilled Split Co", filing_known)
-    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START, filing_known)
+    rows.listing(security_id, ticker, "NYSE", _GLOBAL_START_SESSION, filing_known)
     rows.classification(security_id, "common", "common_default", filing_known)
     rows.bars(security_id, bar_sessions, start_price=60.0, seed=15, floor=_MIN_PRICE * 2 * 3)
     rows.corporate_actions.append(
@@ -1030,18 +1062,21 @@ def _split_backfilled_and_bar_revision(rows: Rows) -> None:
     )
     rows.apply_split(security_id, ex_date, 2.0)
     rows.case(
-        "Backfilled 2018 split, known_at/ingested_at both in 2026 (spec T6 "
-        "acceptance criterion, review round 3 SHOULD FIX 10)",
+        "Backfilled 2018 split: known_at at the close before ex-date (2018, "
+        "the ordinary first-seen rule), ingested_at years later in a 2026 "
+        "backfill run (spec T6 acceptance criterion, review round 3 SHOULD "
+        "FIX 10, review round 4 MUST FIX 1)",
         security_id,
         ticker,
         f"bars from {_GLOBAL_START} through {_FIXTURE_END}; split ex_date {ex_date}, "
-        f"known_at {known_at.isoformat()}, ingested_at {ingested_at.isoformat()} "
-        "(a late ingestion, days after known_at) -- raw close drops by 2x on ex-date "
-        "regardless of when it became known",
+        f"known_at {known_at.isoformat()} (close of the session before ex-date), "
+        f"ingested_at {ingested_at.isoformat()} (a late 2026 backfill discovery -- "
+        "the late discovery shows only in ingested_at, never known_at) -- raw close "
+        "drops by 2x on ex-date regardless of when it became known",
         f"probe T = {probe_t.isoformat()} (close of {probe_session}, a 2019 rebalance date): "
-        "adjusted_prices_as_of(T, include_dividends=False) should adjust the 2017/2018 raw "
-        "closes for this split once it is in the store, even though it was only backfilled "
-        "in 2026",
+        "known_at is well before T, so adjusted_prices_as_of(T, include_dividends=False) "
+        "should adjust the 2017/2018 raw closes for this split even though it was only "
+        "ingested in 2026",
     )
 
     revised_session = _session_on_or_after(date(2018, 6, 1))
