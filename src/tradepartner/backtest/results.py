@@ -3,16 +3,23 @@
 `write_results` turns the engine's per-level `BacktestResult`s into registry rows, in
 the caller's write transaction and only through `store.registry`:
 
-1. **Refuse bad input before any write**: the base level (`costs.per_side_bps`) and a
-   0 bp level must both be present (`cost_drag` is gross minus net CAGR, and gross is
-   the 0 bp run), every result's own level must match its key, and both benchmarks
-   (`SPY`, `MTUM`) must have equity rows.
+1. **Refuse bad input before any write**: `params` must be the trial's frozen
+   `Settings` (its frozen keys hash to the trial's `params_sha256`), because the base
+   level, the risk-free rate and the red-flag threshold come from it and
+   `family_sharpes` reads the frozen base level; the base level (`costs.per_side_bps`)
+   and a 0 bp level must both be present (`cost_drag` is gross minus net CAGR, and
+   gross is the 0 bp run); every result's own level must match its key; and both
+   benchmarks (`SPY`, `MTUM`) must have equity rows.
 2. **Metrics** (req 7): per series (`strategy`, `SPY`, `MTUM`) and level, from month
    returns (equity at close(T_{i+1}) over equity at close(T_i), minus one, over the
    rebalance sessions of the run), the benchmarks at the same level, the 0 bp run of
    the same series as gross, every session's equity for drawdown, and the strategy's
-   one-sided turnover per rebalance. A benchmark is bought once at F_0 and never
-   rebalanced, so its turnover is 0.
+   one-sided turnover per rebalance. "Gross" is gross of the per-side bps only: the
+   0 bp run still pays `costs.commission_per_share` and `commission_per_order`, which
+   are the same at every level (req 6; both 0 at Alpaca), so with nonzero commissions
+   `cost_drag` leaves them out. A benchmark is bought once at F_0 and never
+   rebalanced, so its turnover is 0; the strategy's first rebalance includes its
+   initial buy.
 3. **Detail rows**: metrics, equity per level, weights at the base level only (targets
    are the same at every level), rebalances per level.
 4. **Result row** (req 8, 15): N and the per-basis pair Sharpes from `family_sharpes`
@@ -35,6 +42,7 @@ from itertools import pairwise
 import duckdb
 
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult
+from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.metrics import (
     DeflatedSharpe,
     Series,
@@ -64,8 +72,17 @@ GROSS_LEVEL = 0.0
 FamilySharpesFn = Callable[..., FamilySharpes]
 
 
+def _check_frozen(handle: TrialHandle, params: Settings) -> None:
+    """Refuse `params` that are not the trial's frozen `Settings`."""
+    if registry.params_sha256(frozen_params_of(params)) != handle.params_sha256:
+        raise ValueError(
+            f"params are not trial {handle.trial_id}'s frozen settings (their frozen keys "
+            "hash differently); pass the Settings the trial was opened with"
+        )
+
+
 def _check(results: Mapping[float, BacktestResult], params: Settings) -> None:
-    """Every refusal, before any row is written."""
+    """Every refusal on the results, before any row is written."""
     for level, result in results.items():
         if result.cost_per_side_bps != level:
             raise ValueError(
@@ -184,9 +201,11 @@ def write_results(
     `"ok"`, or `"failed"` when the store changed during the run (module docstring).
 
     `results` is the engine's output keyed by per-side bps; `params` is the trial's
-    frozen `Settings`. Raises `ValueError` before any write when a level or benchmark is
-    missing. Runs in the caller's write transaction.
+    frozen `Settings`. Raises `ValueError` before any write when `params` are not those
+    frozen settings, or a level or benchmark is missing. Runs in the caller's write
+    transaction.
     """
+    _check_frozen(handle, params)
     rows = metric_rows(results, params)
     base_level = params.costs.per_side_bps
     base = results[base_level]

@@ -19,11 +19,11 @@ import duckdb
 import numpy as np
 import polars as pl
 import pytest
-from tradepartner.backtest.results import write_results
 
 from backtest.fake_provider import FakeProvider
 from tradepartner.backtest import results as results_module
 from tradepartner.backtest.engine import BacktestResult, run
+from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.metrics import (
     EXCESS_SPY_KEYS,
     METRIC_KEYS,
@@ -32,6 +32,7 @@ from tradepartner.backtest.metrics import (
     series_metrics,
 )
 from tradepartner.backtest.provider import GapReading
+from tradepartner.backtest.results import write_results
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import Settings
@@ -47,6 +48,7 @@ BASE, LEVELS = 15.0, (0.0, 15.0, 30.0)
 BENCHMARKS = {"SPY": "S", "MTUM": "M"}
 NAMES = ("A", "B", "C", "D", "E")
 _CUTOFF = datetime(2024, 10, 1, tzinfo=UTC)
+HOLDOUT = (date(2025, 1, 2), date(2025, 12, 31))
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -54,6 +56,7 @@ def _settings(tmp_path: Path, **overrides: Any) -> Settings:
         "store": {"path": str(tmp_path / "real_store.duckdb")},
         "strategy": {"top_fraction": 0.4},
         "costs": {"per_side_bps": BASE, "sensitivity_per_side_bps": [0.0, 30.0]},
+        "holdout": {"start": HOLDOUT[0], "end": HOLDOUT[1]},
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -112,10 +115,10 @@ def _register(
         title=f"{slug} title",
         doc_path=f"docs/hypotheses/{slug}.md",
         doc_sha256="d" * 64,
-        params={"costs.per_side_bps": BASE, "strategy.top_fraction": 0.4},
+        params=frozen_params_of(settings),
         in_sample_start=START,
-        holdout_start=date(2025, 1, 2),
-        holdout_end=date(2025, 12, 31),
+        holdout_start=HOLDOUT[0],
+        holdout_end=HOLDOUT[1],
         registered_by="owner",
         settings=settings,
     )
@@ -369,9 +372,9 @@ class TestResultRow:
                 )
             }
         )
-        _register(conn, settings)
-        handle = _open(conn, settings, tmp_path)
-        write_results(conn, handle, _run(settings, handle), flagged)
+        _register(conn, flagged)
+        handle = _open(conn, flagged, tmp_path)
+        write_results(conn, handle, _run(flagged, handle), flagged)
         base = _metrics(conn, handle.trial_id, "strategy", BASE)
         assert _result_row(conn, handle.trial_id)["red_flag"] is red_flag(base, flagged)
         assert _result_row(conn, handle.trial_id)["red_flag"] is (threshold_pp < 0)
@@ -451,7 +454,9 @@ class TestTrialCount:
         assert row["dsr_excess"] == pytest.approx(excess.dsr)
 
     @pytest.mark.parametrize(
-        "kwargs", [{"synthetic": True}, {"kind": "holdout"}], ids=["synthetic", "holdout"]
+        "kwargs",
+        [{"synthetic": True}, {"kind": "holdout"}, {"kind": "tracking"}],
+        ids=["synthetic", "holdout", "tracking"],
     )
     def test_uncounted_run_stores_the_family_n_and_changes_nothing(
         self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, kwargs: dict[str, Any]
@@ -480,6 +485,27 @@ class TestTrialCount:
         assert row["dsr_basis"] == "psr"
         assert row["dsr"] == pytest.approx(row["psr_zero"])
 
+    def test_holdout_run_is_deflated_by_the_in_sample_pairs(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """With two in-sample pairs, a holdout run stores N = 2 and takes SR* from their
+        V, without adding its own Sharpe to V (quant-auditor on #206, note 4)."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        first, _, _ = _trial(conn, settings, tmp_path)
+        second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        holdout, _, _ = _trial(conn, settings, tmp_path, seed=11, kind="holdout")
+        pairs = [
+            _metrics(conn, h.trial_id, "strategy", BASE)["sharpe_monthly"] for h in (first, second)
+        ]
+        base = _metrics(conn, holdout.trial_id, "strategy", BASE)
+        expected = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=pairs)  # type: ignore[arg-type]
+        row = _result_row(conn, holdout.trial_id)
+        assert row["n_trials"] == 2
+        assert row["dsr_basis"] == "dsr"
+        assert row["sr_star"] == pytest.approx(expected.sr_star)
+        assert row["dsr"] == pytest.approx(expected.dsr)
+
 
 class TestRefusals:
     """Bad inputs are refused before any row is written."""
@@ -496,6 +522,22 @@ class TestRefusals:
             write_results(conn, handle, results, settings)
         for table in ("trial_metrics", "trial_equity", "trial_weights", "trial_rebalances"):
             assert _count(conn, table, handle.trial_id) == 0
+
+    def test_settings_other_than_the_trials_frozen_ones_are_refused(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """The base level, risk-free rate and red-flag threshold must be the frozen ones
+        `family_sharpes` reads (quant-auditor on #206, finding 1)."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        live = settings.model_copy(
+            update={"metrics": settings.metrics.model_copy(update={"risk_free_rate": 0.02})}
+        )
+        with pytest.raises(ValueError, match="frozen"):
+            write_results(conn, handle, results, live)
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
 
     def test_missing_benchmark_is_refused(
         self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
