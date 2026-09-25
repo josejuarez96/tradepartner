@@ -665,7 +665,8 @@ def test_insert_row_binds_normalized_utc_value(
     `DuckDBPyConnection.execute` has `tzinfo is UTC`."""
     eastern = timezone(timedelta(hours=-5))
     non_utc_known_at = datetime(2020, 1, 1, 7, 0, 0, tzinfo=eastern)
-    row = _minimal_row("prices_daily", known_at=non_utc_known_at, ingested_at=_now())
+    non_utc_ingested_at = _now().astimezone(ZoneInfo("Asia/Tokyo"))
+    row = _minimal_row("prices_daily", known_at=non_utc_known_at, ingested_at=non_utc_ingested_at)
     original_known_at = row["known_at"]
 
     captured: dict[str, list[object]] = {}
@@ -692,6 +693,10 @@ def test_insert_row_binds_normalized_utc_value(
     assert isinstance(bound_known_at, datetime)
     assert bound_known_at.tzinfo is UTC
     assert bound_known_at == non_utc_known_at  # same instant
+    bound_ingested_at = captured["params"][captured["columns"].index("ingested_at")]
+    assert isinstance(bound_ingested_at, datetime)
+    assert bound_ingested_at.tzinfo is UTC
+    assert bound_ingested_at == non_utc_ingested_at
 
     # And the instant actually stored matches the original instant.
     (stored,) = fixture_store.execute(  # type: ignore[misc]
