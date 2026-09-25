@@ -62,6 +62,7 @@ DELISTED_AT_END = (
     "SEC_WINDOW_DELIST",
 )
 LIVE_AT_END = (
+    "SEC_DIV_CANCELLED",
     "SEC_DIV_REVISED",
     "SEC_DUAL_A",
     "SEC_DUAL_B",
@@ -73,6 +74,8 @@ LIVE_AT_END = (
     "SEC_SPLIT_BETWEEN",
     "SEC_SPLIT_FUTURE",
     "SEC_SPLIT_PLAIN",
+    "SEC_SPLIT_REDATED",
+    "SEC_SPLIT_REDATED_NOID",
     "SEC_SPY",
     "SEC_STATIC_PRE2019",
     "SEC_TICKCHANGE",
@@ -295,7 +298,7 @@ def test_coverage_on_fixture_store_is_complete(
     assert cov.share == 1.0
     assert cov.first_bar == date(2017, 1, 3)
     assert cov.last_bar == date(2020, 6, 30)
-    assert cov.names_with_bars == 23
+    assert cov.names_with_bars == 26
 
 
 def test_coverage_names_a_live_name_without_a_bar_at_the_session(
@@ -307,7 +310,7 @@ def test_coverage_names_a_live_name_without_a_bar_at_the_session(
     )
     cov = coverage(fixture_store, T_END, settings)
     assert cov.missing == ("SEC_DUAL_B",)
-    assert cov.share == pytest.approx(14 / 15)
+    assert cov.share == pytest.approx((len(LIVE_AT_END) - 1) / len(LIVE_AT_END))
 
 
 def test_coverage_counts_common_and_benchmark_names_only(
