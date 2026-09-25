@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 
 from tradepartner import calendar as tp_calendar
+from tradepartner.config import Settings
 
 
 def test_no_weekday_logic_in_source() -> None:
@@ -278,3 +281,87 @@ def test_all_sessions_skips_holidays_and_spans_the_pinned_range() -> None:
     assert date(2021, 1, 15) in sessions
     assert list(sessions) == sorted(set(sessions))
     assert tp_calendar.all_sessions() is sessions
+
+
+# --- the calendar range is read from config once per config state (#154) ----
+
+
+def _count_settings_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    reads = [0]
+    real = tp_calendar.get_settings
+
+    def counting() -> Settings:
+        reads[0] += 1
+        return real()
+
+    monkeypatch.setattr(tp_calendar, "get_settings", counting)
+    return reads
+
+
+def test_session_helpers_do_not_rebuild_settings_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`get_settings()` costs ~5 ms (env + dotenv parse); the helpers are called
+    thousands of times per backtest, so an unchanged config is read once."""
+    reads = _count_settings_reads(monkeypatch)
+    tp_calendar._calendar_bounds.cache_clear()
+    day = date(2024, 1, 2)
+    for _ in range(50):
+        tp_calendar.is_session(day)
+        tp_calendar.next_session(day)
+        tp_calendar.previous_session(day)
+        tp_calendar.last_session_of_month(2024, 1)
+        tp_calendar.all_sessions()
+    assert reads[0] == 1
+
+
+def test_environment_change_to_the_range_takes_effect(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert tp_calendar.all_sessions()[0] < date(2000, 1, 1)
+    monkeypatch.setenv("CALENDAR__START", "2000-01-01")
+    assert tp_calendar.all_sessions()[0] == date(2000, 1, 3)
+    monkeypatch.delenv("CALENDAR__START")
+    assert tp_calendar.all_sessions()[0] < date(2000, 1, 1)
+
+
+def test_env_file_change_to_the_range_takes_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    env_file = tmp_path / "calendar.env"
+    env_file.write_text("CALENDAR__END=2030-12-31\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env_file))
+    assert tp_calendar.all_sessions()[-1] == date(2030, 12, 31)
+    env_file.write_text("CALENDAR__END=2031-12-31\n# edited\n")
+    assert tp_calendar.all_sessions()[-1] == date(2031, 12, 31)
+    env_file.unlink()
+    assert tp_calendar.all_sessions()[-1] > date(2031, 12, 31)
+
+
+def test_env_file_variable_reference_change_takes_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`.env` values expand `${VAR}` from the environment, so any variable counts."""
+    env_file = tmp_path / "calendar.env"
+    env_file.write_text("CALENDAR__END=${TP_TEST_END}\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env_file))
+    monkeypatch.setenv("TP_TEST_END", "2030-12-31")
+    assert tp_calendar.all_sessions()[-1] == date(2030, 12, 31)
+    monkeypatch.setenv("TP_TEST_END", "2031-12-31")
+    assert tp_calendar.all_sessions()[-1] == date(2031, 12, 31)
+
+
+def test_env_file_swapped_with_same_size_and_mtime_takes_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`cp -p` or a restore can keep size and mtime while changing the content."""
+    env_file = tmp_path / "calendar.env"
+    env_file.write_text("CALENDAR__END=2030-12-31\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env_file))
+    assert tp_calendar.all_sessions()[-1] == date(2030, 12, 31)
+    before = env_file.stat()
+    replacement = tmp_path / "replacement.env"
+    replacement.write_text("CALENDAR__END=2032-12-31\n")
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    replacement.replace(env_file)
+    after = env_file.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert tp_calendar.all_sessions()[-1] == date(2032, 12, 31)
