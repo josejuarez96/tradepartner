@@ -26,7 +26,7 @@ from tradepartner.backtest.provider import DataProvider, GapReading
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.config import Settings
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of, prices_as_of
 from tradepartner.store.db import (
     StoreLockedError,
     configure_connection,
@@ -265,6 +265,18 @@ def test_adjusted_prices_equal_the_as_of_read(store: Store, include_dividends: b
         want = adjusted_prices_as_of(
             conn, T_MAR, ids, include_dividends=include_dividends, settings=store.settings
         )
+    assert got.equals(want)
+    assert _ids(got) == set(ids)
+
+
+def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
+    """`raw_prices` is `prices_as_of`: unadjusted bars known at `t`, latest revision,
+    restricted to `ids` (#199; the method T37b added to the protocol)."""
+    ids = ["SEC_SPLIT_BETWEEN", "SEC_DIV_REVISED", "SEC_SPY"]
+    with store.provider() as provider:
+        got = provider.raw_prices(T_MAR, ids)
+    with store.direct() as conn:
+        want = prices_as_of(conn, T_MAR, ids)
     assert got.equals(want)
     assert _ids(got) == set(ids)
 
