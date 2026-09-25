@@ -1,2 +1,0 @@
-### Added
-- Phase 3 T33: `tradepartner.backtest.costs`: `trade_cost` (per-side bps + per-share + per-order, no charge for a zero trade), `Commissions`, `buy_notional_after_costs` (notional scaled by 1/(1 + rate), commissions taken off, never leaves cash negative whichever order it is debited), `sensitivity_levels` (base plus ladder, sorted, unique); tests on a hand-computed three-trade fixture and an AST literal check (#123).

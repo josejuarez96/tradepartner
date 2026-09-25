@@ -1,2 +1,0 @@
-### Added
-- Delistings (T8b, #105): `store/delistings.py` with `build_delistings`/`write_delistings`, `delistings_as_of`, and `listing_ends_as_of` (pure `derive_listing_ends`): a Form 25 ends the latest listing on its exchange, is a transfer once a listing on another exchange is known within `master.transfer_window_sessions` of the filing session, else delisted with the end at the last bar known at T

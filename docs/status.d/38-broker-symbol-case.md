@@ -1,1 +1,0 @@
-- #38 Broker symbols canonicalized to upper-case ASCII in `OrderRequest`/`Order`/`Fill`/`Position`, so `aapl` and `AAPL` net as one position; non-ASCII symbols rejected
