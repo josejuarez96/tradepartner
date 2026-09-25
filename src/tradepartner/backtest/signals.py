@@ -53,15 +53,17 @@ def momentum_12_1(
     formation_months: int,
     skip_months: int,
     *,
-    security_ids: Collection[str] | None = None,
+    security_ids: Collection[str],
 ) -> MomentumSignal:
     """Momentum scores at `t_session` from `frame` (`security_id`, `session`, `close`).
 
-    `security_ids` names the names to score (the universe at `t`); by default every
-    name in the frame. A requested name with no bar at all is excluded like one missing
-    a single bar. Raises `ValueError` if `t_session` is not the last session of its
-    month, if `formation_months <= skip_months` or `skip_months < 0`, if a bar is
-    duplicated, or if a close used is not positive and finite.
+    `security_ids` names the names to score: the universe at `t`, required because the
+    frame also carries holdings that may have left the universe (ADR 0006). A requested
+    name with no bar at all is excluded like one missing a single bar.
+
+    Raises `ValueError` if `t_session` is not the last session of its month, if
+    `formation_months <= skip_months` or `skip_months < 0`, if a bar is duplicated or
+    has a null field, or if a close used is not positive and finite.
     """
     if skip_months < 0 or formation_months <= skip_months:
         raise ValueError(
@@ -79,15 +81,13 @@ def momentum_12_1(
     )
     if bars.select(pl.struct("security_id", "session").is_duplicated().any()).item():
         raise ValueError("frame has a duplicate (security_id, session) bar")
+    if bars.null_count().sum_horizontal().item() > 0:
+        raise ValueError("frame has a null security_id, session or close in a month-end bar")
 
     closes: dict[tuple[str, date], float] = {
         (sid, session): close for sid, session, close in bars.iter_rows()
     }
-    names = (
-        sorted(set(security_ids))
-        if security_ids is not None
-        else sorted(set(visible.get_column("security_id").to_list()))
-    )
+    names = sorted(set(security_ids))
     scores: dict[str, float] = {}
     excluded: list[str] = []
     for sid in names:
