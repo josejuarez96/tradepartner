@@ -252,6 +252,22 @@ class TestTimingRules:
         # Ex-date that is not itself a session: still the last session before it.
         assert action_first_seen_known_at(date(2018, 12, 15)) == session_close(date(2018, 12, 14))
 
+    def test_proxy_after_a_half_day_is_the_early_close(self) -> None:
+        # Monday 2018-11-26 follows the 2018-11-23 half day (13:00 ET).
+        assert action_first_seen_known_at(date(2018, 11, 26)) == datetime(
+            2018, 11, 23, 18, 0, tzinfo=UTC
+        )
+
+    def test_proxy_across_the_spring_dst_change(self) -> None:
+        # Clocks moved forward on Sunday 2019-03-10: Friday's 16:00 ET close is
+        # 21:00 UTC, Monday's is 20:00 UTC.
+        assert action_first_seen_known_at(date(2019, 3, 11)) == datetime(
+            2019, 3, 8, 21, 0, tzinfo=UTC
+        )
+        assert action_first_seen_known_at(date(2019, 3, 12)) == datetime(
+            2019, 3, 11, 20, 0, tzinfo=UTC
+        )
+
     def test_announcement_time_wins_over_the_proxy(self) -> None:
         announced = datetime(2018, 11, 15, 16, 0, tzinfo=timezone(timedelta(hours=-5)))
         result = action_first_seen_known_at(date(2019, 2, 14), announced_at=announced)
@@ -272,6 +288,13 @@ class TestRevisionRule:
     def test_first_seen_record_is_returned_unchanged(self) -> None:
         bar = _make_bar()
         assert revision_of(bar, None, ingested_at=self.T_INGEST) is bar
+
+    def test_first_seen_record_not_yet_knowable_is_rejected(self) -> None:
+        # Fetched mid-session: stamped at a close that has not happened yet.
+        bar = _make_bar(known_at=datetime(2019, 3, 1, 21, 0, tzinfo=UTC))
+        with pytest.raises(ValueError, match="not knowable yet"):
+            revision_of(bar, None, ingested_at=datetime(2019, 3, 1, 18, 0, tzinfo=UTC))
+        assert revision_of(bar, None, ingested_at=bar.known_at) is bar
 
     def test_identical_values_are_a_no_op(self) -> None:
         stored = _make_bar()
@@ -638,6 +661,36 @@ class TestFixtureContract:
             ],
         )
         with pytest.raises(FixtureContractError, match="back-dated"):
+            FixturePriceSource(fixtures)
+
+    def test_first_seen_action_stamped_after_the_proxy_is_refused(self, tmp_path: Path) -> None:
+        # Proxy for ex-date 2019-03-04 is the 2019-03-01 close (21:00 UTC).
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(
+                    known_at="2019-03-04T21:00:00+00:00", ingested_at="2019-03-04T21:10:00+00:00"
+                )
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="first-seen proxy"):
+            FixturePriceSource(fixtures)
+
+    def test_first_seen_action_announced_before_the_proxy_loads(self, tmp_path: Path) -> None:
+        fixtures = _write_fixture_dir(
+            tmp_path, actions=[_action_row(known_at="2019-02-15T21:00:00+00:00")]
+        )
+        (action,) = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
+        assert action.known_at == datetime(2019, 2, 15, 21, 0, tzinfo=UTC)
+
+    def test_missing_column_is_refused_with_file_context(self, tmp_path: Path) -> None:
+        fixtures = _write_fixture_dir(tmp_path)
+        _write_csv(
+            fixtures / "prices_daily.csv",
+            [c for c in _PRICES_HEADER if c != "ingested_at"],
+            [{k: v for k, v in _bar_row().items() if k != "ingested_at"}],
+        )
+        with pytest.raises(FixtureContractError, match=r"prices_daily\.csv:1: .*ingested_at"):
             FixturePriceSource(fixtures)
 
     def test_revision_with_identical_values_is_refused(self, tmp_path: Path) -> None:

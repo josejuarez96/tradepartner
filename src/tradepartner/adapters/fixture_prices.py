@@ -30,9 +30,11 @@ in ingest order (`ingested_at`, then `known_at`):
    (see `prices.Bar` / `prices.CorporateAction`).
 2. A first-seen bar has `known_at` equal to `prices.bar_known_at(session)`,
    the XNYS close of its session, so a bar on a non-session is refused too.
-   A first-seen action may carry any `known_at`: the proxy
-   (`prices.action_first_seen_known_at`) or an earlier or later
-   announcement time the recording does not otherwise distinguish.
+   A first-seen action has `known_at` at or before the first-seen proxy
+   (`prices.action_first_seen_known_at` with no announcement): the proxy
+   itself, or an earlier announcement. A stamp before the proxy cannot be
+   checked further, because the stored layout carries no announcement time
+   to compare it with (issue #83).
 3. Every later row for the same key must be what `prices.revision_of`
    produces from the row before it at that row's `ingested_at`: values that
    differ, and `known_at` equal to its own `ingested_at` (never back-dated).
@@ -54,6 +56,7 @@ from tradepartner.adapters.prices import (
     CorporateAction,
     PriceSource,
     UnknownSecurityIdError,
+    action_first_seen_known_at,
     bar_known_at,
     check_request,
     revision_of,
@@ -62,6 +65,10 @@ from tradepartner.adapters.prices import (
 _SECURITIES_CSV = "securities.csv"
 _PRICES_CSV = "prices_daily.csv"
 _ACTIONS_CSV = "corporate_actions.csv"
+
+_COMMON_COLUMNS = ("security_id", "known_at", "ingested_at", "source", "provenance")
+_PRICES_COLUMNS = (*_COMMON_COLUMNS, "session", "open", "high", "low", "close", "volume")
+_ACTIONS_COLUMNS = (*_COMMON_COLUMNS, "action_type", "ex_date", "ratio_or_amount")
 
 #: `bar_known_at` builds a pandas timestamp per call; the fixture has ~900
 #: distinct sessions across ~11k bars, so memoize it for the load.
@@ -99,14 +106,16 @@ def _parse_date(value: str, *, column: str, where: str) -> date:
         raise FixtureContractError(f"{where}: {column} {value!r} is not a YYYY-MM-DD date") from exc
 
 
-def _read_csv(path: Path) -> list[tuple[str, dict[str, str]]]:
+def _read_csv(path: Path, required: Sequence[str]) -> list[tuple[str, dict[str, str]]]:
     """`(where, row)` pairs for every data row, `where` = `file:line`
-    (the header is line 1)."""
+    (the header is line 1). A header missing any `required` column is
+    refused up front rather than surfacing later as a bare `KeyError`."""
     with path.open(newline="") as fh:
-        return [
-            (f"{path.name}:{line_no}", row)
-            for line_no, row in enumerate(csv.DictReader(fh), start=2)
-        ]
+        reader = csv.DictReader(fh)
+        missing = [column for column in required if column not in (reader.fieldnames or [])]
+        if missing:
+            raise FixtureContractError(f"{path.name}:1: header is missing column(s) {missing}")
+        return [(f"{path.name}:{line_no}", row) for line_no, row in enumerate(reader, start=2)]
 
 
 def _check_common(
@@ -134,7 +143,7 @@ def _check_common(
 
 def _load_bars(path: Path, known_ids: frozenset[str]) -> list[_Row[Bar]]:
     rows: list[_Row[Bar]] = []
-    for where, row in _read_csv(path):
+    for where, row in _read_csv(path, _PRICES_COLUMNS):
         known_at, ingested_at = _check_common(
             row, provenance="bar", known_ids=known_ids, where=where
         )
@@ -160,7 +169,7 @@ def _load_bars(path: Path, known_ids: frozenset[str]) -> list[_Row[Bar]]:
 
 def _load_actions(path: Path, known_ids: frozenset[str]) -> list[_Row[CorporateAction]]:
     rows: list[_Row[CorporateAction]] = []
-    for where, row in _read_csv(path):
+    for where, row in _read_csv(path, _ACTIONS_COLUMNS):
         known_at, ingested_at = _check_common(
             row, provenance="action", known_ids=known_ids, where=where
         )
@@ -197,10 +206,24 @@ def _check_bar_first_seen(row: _Row[Bar]) -> None:
         )
 
 
+def _check_action_first_seen(row: _Row[CorporateAction]) -> None:
+    """Contract rule 2 for actions: stamped at or before the first-seen
+    proxy (the proxy itself, or an earlier announcement)."""
+    action = row.record
+    proxy = action_first_seen_known_at(action.ex_date)
+    if action.known_at > proxy:
+        raise FixtureContractError(
+            f"{row.where}: first-seen action known_at {action.known_at.isoformat()} is after "
+            f"the first-seen proxy {proxy.isoformat()} (close before ex-date "
+            f"{action.ex_date.isoformat()}); a first-seen action is stamped at its "
+            "announcement or at the proxy, never later"
+        )
+
+
 def _check_history[RecordT: (Bar, CorporateAction)](
     rows: list[_Row[RecordT]],
     key: Callable[[RecordT], Hashable],
-    check_first_seen: Callable[[_Row[RecordT]], None] | None,
+    check_first_seen: Callable[[_Row[RecordT]], None],
 ) -> list[RecordT]:
     """Contract rules 2 and 3 over every key's rows in ingest order; returns
     the records sorted by natural key then `known_at`."""
@@ -209,8 +232,7 @@ def _check_history[RecordT: (Bar, CorporateAction)](
         by_key[key(row.record)].append(row)
     for history in by_key.values():
         history.sort(key=lambda r: (r.ingested_at, r.record.known_at))
-        if check_first_seen is not None:
-            check_first_seen(history[0])
+        check_first_seen(history[0])
         for previous, current in pairwise(history):
             try:
                 expected = revision_of(
@@ -247,7 +269,9 @@ class FixturePriceSource(PriceSource):
                 f"{securities_path} is missing; the fixture price source resolves "
                 f"security_ids from {_SECURITIES_CSV}"
             )
-        self._known_ids = frozenset(row["security_id"] for _, row in _read_csv(securities_path))
+        self._known_ids = frozenset(
+            row["security_id"] for _, row in _read_csv(securities_path, ("security_id",))
+        )
 
         prices_path = fixtures_dir / _PRICES_CSV
         bar_rows = _load_bars(prices_path, self._known_ids) if prices_path.is_file() else []
@@ -258,7 +282,7 @@ class FixturePriceSource(PriceSource):
         for bar in _check_history(bar_rows, lambda b: b.key, _check_bar_first_seen):
             self._bars[bar.security_id].append(bar)
         self._actions: defaultdict[str, list[CorporateAction]] = defaultdict(list)
-        for action in _check_history(action_rows, lambda a: a.key, None):
+        for action in _check_history(action_rows, lambda a: a.key, _check_action_first_seen):
             self._actions[action.security_id].append(action)
 
     def _resolve(self, security_ids: Sequence[str], start: date, end: date) -> list[str]:

@@ -243,17 +243,25 @@ def revision_of(
     """Apply the revision rule to a freshly fetched record (spec req 5).
 
     - `stored is None` (first seen): `incoming` unchanged; its `known_at`
-      is already the first-seen stamp.
+      is already the first-seen stamp, and must not be after `ingested_at`
+      (a bar fetched mid-session is stamped at a close that has not
+      happened yet: storing it would serve a partial bar as final).
     - Same values as `stored`: `None`, meaning nothing to write.
     - Different values: `incoming` with `known_at = ingested_at`.
 
-    Raises `ValueError` if `ingested_at` is naive, if the two records do
-    not share a type and natural key, or if `ingested_at` is not strictly
+    Raises `ValueError` if `ingested_at` is naive, if a first-seen record's
+    `known_at` is after `ingested_at`, if the two records do not share a
+    type and natural key, or if `ingested_at` is not strictly
     after `stored.known_at` (the revision would be back-dated to, or tie
     with, the value it replaces).
     """
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     if stored is None:
+        if incoming.known_at > ingested_at:
+            raise ValueError(
+                f"{incoming.key} is stamped known_at {incoming.known_at.isoformat()}, after "
+                f"ingested_at {ingested_at.isoformat()}; it is not knowable yet"
+            )
         return incoming
     if type(incoming) is not type(stored) or incoming.key != stored.key:
         raise ValueError(
