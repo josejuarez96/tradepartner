@@ -17,17 +17,20 @@ so a run to T_n is exactly the prefix of a longer run.
 
 **Exits** (req 5), decided from step i's read after the fill, on the names still held:
 
-- *Delisting*: the name has listing rows at the read and none is `listed` (a transfer
-  whose new listing is known keeps a `listed` row, so it is held through). It is sold
-  at its last close on its final session, the latest `end_session` of its ended
-  listings (its last bar in the marking frame when none has one).
+- *Delisting*: the name's current listing at the read (latest `valid_from`) is not
+  `listed` (a transfer whose new listing is known is current and `listed`, so it is
+  held through). It is sold at its last close on its final session, that listing's
+  `end_session` (its last bar in the marking frame when it has none); bars printed
+  after it (an OTC tail) are not marked.
 - *Stale*: otherwise, no bar in the marking frame on the last
   `backtest.stale_exit_sessions` sessions through T_{i+1}; sold at its last bar's close.
 
 The sale is booked at that session, or at F_i when the session is earlier (the step
 that read the exit is the first that can book it; the name's value was frozen at that
-close since, so only the cost moves). It pays `per_side_bps` and commissions, at most
-the proceeds; the position is zero from that session on and the proceeds sit in cash.
+close since, so only the cost moves). Either way only the cost is booked before the read
+that decided the exit: the value sold is the close already marked. It pays
+`per_side_bps` and commissions, at most the proceeds; the position is zero from that
+session on and the proceeds sit in cash.
 Exit notional and costs are added to the row's `turnover` and `cost_paid`.
 
 **Benchmarks** (req 3): each series from `benchmark_ids` at close(T_0) is bought with
@@ -178,18 +181,26 @@ def _plan(provider: DataProvider, params: Settings, session: date) -> _Plan:
     )
 
 
-def _ended(listing_ends: pl.DataFrame) -> dict[str, date | None]:
-    """Securities whose listing rows at the read are all ended (none `listed`), each with
-    its final session: the latest `end_session` among them, None when none has one."""
-    listed: set[str] = set()
-    ended: dict[str, date | None] = {}
-    for sid, status, end in listing_ends.select("security_id", "status", "end_session").iter_rows():
-        if status == _LISTED:
-            listed.add(sid)
+def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
+    """Securities whose current listing at the read has ended, each with its final
+    session (`end_session`, None when it has none).
+
+    The current listing is the row with the latest `valid_from` on or before `session`,
+    as in `universe._current_listings`: a filing ends only the listing it names, so an
+    earlier listing left behind by a ticker change stays `listed` and must not decide.
+    A known transfer's current listing is the new, `listed` one. Rows without
+    `valid_from` (one listing per security) are taken as they are.
+    """
+    dated = "valid_from" in listing_ends.columns
+    current: dict[str, tuple[date | None, str, date | None]] = {}
+    for row in listing_ends.iter_rows(named=True):
+        valid_from = row["valid_from"] if dated else None
+        if valid_from is not None and valid_from > session:
             continue
-        known = ended.get(sid)
-        ended[sid] = end if known is None or (end is not None and end > known) else known
-    return {sid: end for sid, end in ended.items() if sid not in listed}
+        held = current.get(row["security_id"])
+        if held is None or (valid_from is not None and (held[0] is None or valid_from > held[0])):
+            current[row["security_id"]] = (valid_from, row["status"], row["end_session"])
+    return {sid: end for sid, (_, status, end) in current.items() if status != _LISTED}
 
 
 def _exits(
@@ -456,7 +467,7 @@ def run(
         marked = sorted({*ids, *benchmarks.values()})
         frame = provider.adjusted_prices(t, marked, True)
         raw = provider.raw_prices(t, marked)
-        ended = _ended(provider.listing_ends(t, ids))
+        ended = _ended(provider.listing_ends(t, ids), step_end)
         dropped = provider.dropped_dividends(t, ids)
         ever_held = sorted({sid for book in books for sid in book.held_on})
         late = provider.late_dividends(t_prev, t, ever_held)

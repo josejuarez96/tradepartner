@@ -225,6 +225,38 @@ class TestDelistingExit:
     def test_status_constant_matches_the_store(self) -> None:
         assert engine._LISTED == delistings.LISTED
 
+    def test_after_a_ticker_change_the_current_listing_decides(self) -> None:
+        # The pre-change listing is never ended by the filing and stays `listed`.
+        skip = [("X", s) for s in SESSIONS if s > self.END]
+        listing = [
+            ("X", date(2015, 1, 2), delistings.LISTED, None, date(2015, 1, 2)),
+            ("X", date(2018, 6, 1), delistings.DELISTED, self.END, date(2024, 2, 20)),
+        ]
+        exiting = _run(_provider(skip=skip, x_until=T0, listing_rows=listing), _no_stale())
+        twin = _run(_provider(skip=skip, x_until=T0), _no_stale())
+        _assert_exit(exiting[LEVEL], twin[LEVEL], "X", self.END, T1)
+        row = _row(exiting[LEVEL], T0)
+        assert (row.n_delisting_exits, row.n_stale_exits) == (1, 0)
+
+    def test_bars_after_the_final_session_do_not_delay_the_exit(self) -> None:
+        # An OTC tail: the vendor keeps printing bars after the listing ended.
+        listing = [("X", date(2010, 1, 4), delistings.DELISTED, self.END, date(2024, 2, 20))]
+        exiting = _run(_provider(x_until=T0, listing_rows=listing), _params())[LEVEL]
+        twin = _run(_provider(x_until=T0), _no_stale())[LEVEL]
+        assert _row(exiting, T0).n_delisting_exits == 1
+        # From the final session on, X is the cash its close there raised, not its tail.
+        value = _value(twin, "X", self.END)
+        proceeds = value * (1 - LEVEL / 10_000)
+        ours, theirs = _strategy(exiting), _strategy(twin)
+        for session in _steps(self.END, T1):
+            twin_equity, twin_cash = theirs[session]
+            assert twin_cash is not None
+            assert ours[session][1] == pytest.approx(twin_cash + proceeds, rel=1e-12)
+            assert ours[session][0] == pytest.approx(
+                twin_equity - _value(twin, "X", session) + proceeds, rel=1e-12
+            )
+            assert _value(exiting, "X", session) == 0.0
+
 
 class TestTransfer:
     OLD, NEW = date(2010, 1, 4), date(2024, 2, 16)
