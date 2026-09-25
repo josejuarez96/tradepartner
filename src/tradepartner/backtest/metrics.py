@@ -111,10 +111,21 @@ def _kurtosis(x: FloatArray) -> float:
     return float(np.mean(d**4)) / (m2 * m2)
 
 
+def _require_finite(name: str, x: FloatArray) -> None:
+    """empyrical skips NaN while the month still counts toward `n_months`, which
+    flatters CAGR; refuse any non-finite value instead."""
+    if not bool(np.all(np.isfinite(x))):
+        raise ValueError(f"{name} must be finite, got a NaN or infinite value")
+
+
 def _require_variance(name: str, x: FloatArray) -> None:
-    """A constant series has no Sharpe, skew or kurtosis; refuse it rather than let a
-    NaN or a division by zero reach the stored metrics and the DSR."""
-    if float(np.ptp(x)) == 0:
+    """A constant series has no Sharpe, skew or kurtosis. That includes a series that
+    differs from a constant only by rounding noise (its standard deviation is within
+    one float epsilon of its scale), whose Sharpe would be arbitrary. Refuse it rather
+    than let a NaN, a division by zero or a meaningless Sharpe reach the stored
+    metrics and the DSR."""
+    scale = max(1.0, abs(float(np.mean(x))))
+    if float(np.std(x)) <= float(np.finfo(np.float64).eps) * scale:
         raise ValueError(f"{name} has zero variance: Sharpe, skew and kurtosis are undefined")
 
 
@@ -151,17 +162,29 @@ def series_metrics(
     if n < 2:
         raise ValueError(f"need at least 2 monthly returns for a Sharpe ratio, got {n}")
     equity = _array(daily_equity)
+    gross, spy, mtum = _array(gross_monthly), _array(spy_monthly), _array(mtum_monthly)
+    turnover_values = _array(turnover)
+    for name, values in (
+        ("monthly", net),
+        ("gross_monthly", gross),
+        ("spy_monthly", spy),
+        ("mtum_monthly", mtum),
+        ("daily_equity", equity),
+        ("turnover", turnover_values),
+    ):
+        _require_finite(name, values)
     if len(equity) == 0 or bool(np.any(equity <= 0)):
         raise ValueError("daily_equity must be non-empty and strictly positive")
 
-    gross, spy, mtum = _array(gross_monthly), _array(spy_monthly), _array(mtum_monthly)
     ex_spy, ex_mtum = net - spy, net - mtum
+    _require_variance("monthly", net)
+    if series != "SPY":
+        _require_variance("monthly minus spy_monthly", ex_spy)
     rf_monthly = (1 + risk_free_rate) ** (1 / MONTHS_PER_YEAR) - 1
     cagr = _cagr(net)
     sharpe_monthly = _monthly_sharpe(net, rf_monthly)
     daily_returns = equity[1:] / equity[:-1] - 1
 
-    _require_variance("monthly", net)
     out: dict[str, float | None] = {
         "cagr": cagr,
         "vol_annual": _annualized_std(net),
@@ -169,7 +192,7 @@ def series_metrics(
         "sharpe_annual": sharpe_monthly * math.sqrt(MONTHS_PER_YEAR),
         "sharpe_monthly_excess_spy": None,
         "max_drawdown": float(empyrical.max_drawdown(daily_returns)) if len(daily_returns) else 0.0,
-        "turnover_monthly": float(np.mean(_array(turnover))) if len(turnover) else 0.0,
+        "turnover_monthly": float(np.mean(turnover_values)) if len(turnover_values) else 0.0,
         "cost_drag": _cagr(gross) - cagr,
         "excess_cagr_spy": cagr - _cagr(spy),
         "excess_cagr_mtum": cagr - _cagr(mtum),
@@ -182,7 +205,6 @@ def series_metrics(
         "n_months": float(n),
     }
     if series != "SPY":
-        _require_variance("monthly minus spy_monthly", ex_spy)
         out["sharpe_monthly_excess_spy"] = _monthly_sharpe(ex_spy)
         out["skew_monthly_excess_spy"] = _skew(ex_spy)
         out["kurtosis_monthly_excess_spy"] = _kurtosis(ex_spy)
@@ -264,6 +286,8 @@ def deflated_sharpe(
     n_months = metrics["n_months"]
     if sharpe is None or skew is None or kurtosis is None or n_months is None:
         raise ValueError(f"basis {basis} needs {sharpe_key}, {skew_key}, {kurtosis_key}")
+    _require_finite(f"{basis} basis inputs", _array([sharpe, skew, kurtosis, n_months]))
+    _require_finite("pair_sharpes", _array(pair_sharpes))
     months = int(n_months)
     psr_zero = probabilistic_sharpe(sharpe, 0.0, months, skew, kurtosis)
     if len(pair_sharpes) < 2:
@@ -276,8 +300,13 @@ def deflated_sharpe(
 
 def red_flag(metrics: Mapping[str, float | None], settings: Settings) -> bool:
     """True when base-level `excess_cagr_spy` is strictly above the configured
-    threshold (spec req 15). A prompt for a look-ahead and cost audit, never a gate."""
+    threshold (spec req 15). A prompt for a look-ahead and cost audit, never a gate.
+
+    The threshold is converted to a fraction (divided, not the excess multiplied), so an
+    excess exactly at the threshold is not flagged: 7 / 100 is the same double as 0.07,
+    while 0.07 * 100 is 7.000000000000001.
+    """
     excess = metrics["excess_cagr_spy"]
     if excess is None:
         raise ValueError("excess_cagr_spy is required for the red flag")
-    return excess * PERCENT_POINTS_PER_UNIT > settings.metrics.red_flag_excess_cagr_pp
+    return excess > settings.metrics.red_flag_excess_cagr_pp / PERCENT_POINTS_PER_UNIT

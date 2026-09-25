@@ -367,7 +367,7 @@ def test_metrics_module_has_no_stray_numeric_literals() -> None:
         (node.lineno, node.value)
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant)
-        and isinstance(node.value, int | float)
+        and isinstance(node.value, int | float | complex)
         and not isinstance(node.value, bool)
         and node.value not in ALLOWED_LITERALS
     ]
@@ -412,3 +412,75 @@ def test_spy_series_equal_to_itself_is_fine() -> None:
     )
     assert m["tracking_error_spy"] == 0.0
     assert m["sharpe_monthly_excess_spy"] is None
+
+
+NAN, INF = float("nan"), float("inf")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"monthly": [0.02, NAN, 0.03, 0.005]},
+        {"gross_monthly": [0.021, INF, 0.031, 0.006]},
+        {"spy_monthly": [0.01, NAN, 0.02, 0.0]},
+        {"mtum_monthly": [0.015, -0.015, -INF, 0.002]},
+        {"daily_equity": [100.0, NAN, 101.0]},
+        {"daily_equity": [100.0, INF, 101.0]},
+        {"turnover": [1.0, NAN]},
+    ],
+)
+def test_non_finite_inputs_refused(override: dict[str, list[float]]) -> None:
+    """empyrical skips NaN while n_months still counts the month, which flatters CAGR
+    (quant-auditor, PR #128); refuse instead."""
+    kwargs: dict[str, object] = {
+        "monthly": NET,
+        "gross_monthly": GROSS,
+        "daily_equity": DAILY_EQUITY,
+        "turnover": TURNOVER,
+        "spy_monthly": SPY,
+        "mtum_monthly": MTUM,
+        "risk_free_rate": 0.0,
+    }
+    kwargs.update(override)
+    with pytest.raises(ValueError, match="finite"):
+        series_metrics("strategy", **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("pairs", [[0.1, NAN, 0.2], [0.1, INF]])
+def test_non_finite_pair_sharpes_refused(pairs: list[float]) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        deflated_sharpe(_ref_metrics(), "raw", n_trials=20, pair_sharpes=pairs)
+
+
+def test_non_finite_basis_inputs_refused() -> None:
+    m = _ref_metrics()
+    m["skew_monthly"] = NAN
+    with pytest.raises(ValueError, match="finite"):
+        deflated_sharpe(m, "raw", n_trials=20, pair_sharpes=PAIRS_V_001)
+
+
+def test_rounding_noise_excess_series_refused_as_zero_variance() -> None:
+    """A strategy equal to SPY through a different arithmetic path leaves ~1e-17 noise
+    as its excess; its Sharpe would be arbitrary and could push DSR(excess) toward 1."""
+    spy = [0.1 + 0.2, -0.02, 0.02, 0.01]
+    net = [0.3, -0.02 + 1e-18, 0.02, 0.01]
+    assert spy[0] != net[0]  # 0.1 + 0.2 != 0.3 in binary floating point
+    with pytest.raises(ValueError, match="zero variance"):
+        series_metrics(
+            "strategy",
+            monthly=net,
+            gross_monthly=net,
+            daily_equity=DAILY_EQUITY,
+            turnover=TURNOVER,
+            spy_monthly=spy,
+            mtum_monthly=MTUM,
+            risk_free_rate=0.0,
+        )
+
+
+def test_red_flag_exactly_at_the_threshold_is_not_flagged() -> None:
+    """0.07 * 100 == 7.000000000000001 in floating point; strictly above means 7 pp
+    against a 7 pp threshold must not flag."""
+    s = Settings(_env_file=None, metrics={"red_flag_excess_cagr_pp": 7.0})
+    assert red_flag({"excess_cagr_spy": 0.07}, s) is False
+    assert red_flag({"excess_cagr_spy": 0.0700001}, s) is True
