@@ -53,7 +53,9 @@ is fetching is stored, not refused as look-ahead.
 
 **Run messages** are stored with every configured secret value redacted,
 control characters replaced and the length capped at
-`ingest.max_message_chars`: an exception's text comes from a server.
+`ingest.max_message_chars`: an exception's text comes from a server. The
+EDGAR message carries the adapter's unstamped-filing, unstamped-fact and
+skipped-filer counts when the source exposes them (#172).
 """
 
 from __future__ import annotations
@@ -379,10 +381,46 @@ def _ingest_filings(
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
-        f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts; "
+        f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
+        f"{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _source_counts(filings: FilingSource) -> str:
+    """`"; unstamped: N filings, M facts; skipped filers: K"`, naming only the
+    attributes `filings` exposes, so rows the EDGAR adapter (T11b, T11c) left
+    out stay visible in the run row (#172). Duck-typed: each attribute is a
+    count or a collection; a fixture source has none and adds nothing.
+
+    Read once, after both builds, from the unwrapped source. The contract
+    this relies on: `unstamped_filings` and `skipped_filers` hold the result
+    of the run's one `filing_index` call, and `unstamped_facts` accumulates
+    over every `facts` call on the source instance, never reset per CIK.
+    The counts sit before the variable-length benchmarks list so
+    `ingest.max_message_chars` never cuts them off. `filings` arrives
+    wrapped in `_Recorded` (T17's fetch pass), so the counts are read from
+    the adapter underneath, never from the proxy (#194). The adapter must
+    hold them as plain attributes set during the fetch pass, never as
+    properties that fetch: this read runs after the pass is frozen, inside
+    the write transaction."""
+    while isinstance(filings, _Recorded):
+        filings = filings._source
+
+    def count(attribute: str) -> int | None:
+        value = getattr(filings, attribute, None)
+        return None if value is None else int(value if isinstance(value, int) else len(value))
+
+    unstamped = [
+        f"{n} {what}"
+        for what in ("filings", "facts")
+        if (n := count(f"unstamped_{what}")) is not None
+    ]
+    parts = [f"unstamped: {', '.join(unstamped)}"] if unstamped else []
+    if (skipped := count("skipped_filers")) is not None:
+        parts.append(f"skipped filers: {skipped}")
+    return "".join(f"; {part}" for part in parts)
 
 
 def _build_filings(
