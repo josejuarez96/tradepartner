@@ -29,7 +29,25 @@ jobs:
         run: uv run ruff format --check .
       - name: Types
         run: uv run mypy
+      # A PR that touches no code, tests, scripts, deps or CI skips pytest (same rule as
+      # ready_pr.py). Gated per step, not with `paths:`, so `checks` still reports. Fails
+      # closed: a failed diff fails the step, an empty diff or anything but "no" runs tests.
+      - name: Test scope
+        id: scope
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          needed=yes
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git -c core.quotePath=false diff --no-renames --name-only "origin/$BASE_REF...HEAD")
+            if [ -n "$files" ]; then
+              needed=$(printf '%s\n' "$files" | python3 scripts/ready_pr.py --tests-needed)
+            fi
+          fi
+          echo "Tests needed: $needed"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
       - name: Tests
+        if: steps.scope.outputs.needed != 'no'
         run: uv run pytest
 
   claims:

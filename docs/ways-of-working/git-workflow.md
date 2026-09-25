@@ -92,7 +92,7 @@ This repo is private on GitHub Free, which **cannot enforce branch protection se
 | pre-push hook | Pushes to `main` | `.pre-commit-config.yaml` (`no-push-to-main`) |
 | Claude Code permission rules | Agents pushing to main, force-pushing, reading `.env` (deny); `gh pr merge` always prompts for confirmation (ask) | `.claude/settings.json` |
 | GitHub repo settings | Merge commits and rebase-merge (squash only), stale branches (auto-delete) | Repo settings (applied) |
-| CI | Lint, format, types, tests, hygiene on every PR | `.github/workflows/ci.yml` |
+| CI | Lint, format, types, hygiene on every PR; tests when the PR touches code, tests, scripts, deps or CI, and on every push to main | `.github/workflows/ci.yml` |
 | CI `claims` job | A PR whose issue is unclaimed; two open PRs for one plan task | `scripts/team.py check-claims`, `.github/workflows/ci.yml` |
 | **Server-side ruleset** (blocks direct pushes, force-push, deletion; requires PR + green CI) | **Inactive until GitHub Pro** | `.github/rulesets/protect-main.json` |
 

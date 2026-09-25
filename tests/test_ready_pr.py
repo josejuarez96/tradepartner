@@ -214,7 +214,7 @@ class FakeRunner:
                 return "\n".join(self.files)
             case ("diff", "--name-only", "--diff-filter=D", _):
                 return "\n".join(self.deleted)
-            case ("diff", "--name-only", _):
+            case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", _):
                 return "\n".join(self.touched)
             case ("show", spec):
                 return self.main_files[spec.split(":", 1)[1]]
@@ -397,6 +397,9 @@ def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
         ["scripts/ready_pr.py"],
         ["pyproject.toml"],
         ["uv.lock"],
+        [".github/workflows/ci.yml"],
+        [".github/pull_request_template.md"],
+        [".python-version"],
         ["docs/STATUS.md", "src/tradepartner/x.py"],
     ):
         assert ready_pr.tests_needed(code), code
@@ -452,3 +455,37 @@ def test_cli_tests_flags_are_exclusive() -> None:
     assert p.parse_args(["5", "--no-tests"]).tests is False
     with pytest.raises(SystemExit):
         p.parse_args(["5", "--tests", "--no-tests"])
+
+
+def test_cli_tests_needed_reads_paths_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CI pipes `git diff --name-only` in and gates its Tests step on the answer."""
+    import io
+
+    for stdin, answer in (
+        ("docs/plans/phase-2.md\nchangelog.d/78-x.md\n", "no"),
+        ("docs/STATUS.md\nsrc/tradepartner/x.py\n", "yes"),
+        ("", "no"),
+    ):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+        assert ready_pr.main(["--tests-needed"]) == 0
+        assert capsys.readouterr().out.strip() == answer, stdin
+
+
+def test_cli_needs_a_pr_unless_tests_needed() -> None:
+    with pytest.raises(SystemExit):
+        ready_pr.main([])
+
+
+def test_touched_paths_list_both_sides_of_a_rename() -> None:
+    """A file moved out of `src/` must still count as touching `src/`: git's default
+    rename detection would list only the new path. Non-ASCII paths come unquoted."""
+    r = FakeRunner()
+    ready_pr.ready(r, 69, dry_run=True)
+    diffs = [c for c in r.calls if "diff" in c and "--diff-filter=U" not in c]
+    touched = [c for c in diffs if "--diff-filter=D" not in c]
+    assert touched, r.calls
+    for call in touched:
+        assert "--no-renames" in call, call
+        assert call[1:3] == ("-c", "core.quotePath=false"), call
