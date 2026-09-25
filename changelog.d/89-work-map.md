@@ -1,2 +1,0 @@
-### Added
-- Cockpit work map (#89): `docs/work-map.toml` holds one plain-English what/why per phase, task, issue, research report, ADR, spec and plan plus `unblocks` links; `scripts/cockpit.py` parses research and ADR headers, roadmap exit criteria and the MVP range, builds the graph and per-phase progress, and takes `--docs-root`; the page adds How far to the MVP, The web of work, Research in flight and Waiting on you above the team cards

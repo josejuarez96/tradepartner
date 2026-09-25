@@ -1,1 +1,0 @@
-- #51 Phase 3 spec and plan: backtest engine, cost model, locked holdout, trial registry, deflated Sharpe, `bt` oracle, backtest page and trial-registry view ([spec](specs/backtest.md), [plan](plans/backtest.md))

@@ -1,0 +1,2 @@
+### Added
+- Phase 3 T37: `tradepartner.backtest.provider` (`DataProvider` protocol, `GapReading`, `check_t`), `tradepartner.backtest.schedule` (`rebalance_sessions`, `fill_session`, `read_time`), `tradepartner.backtest.valuation` (`value_positions`, `carry_to_fill`, `stitched_returns`, `StepFrame`) and `tests/backtest/fake_provider.py`; a split and a dividend inside a month checked end to end through `adjusted_prices_as_of` against a hand share count (#140).

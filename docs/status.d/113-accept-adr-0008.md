@@ -1,1 +1,0 @@
-- #113 Owner accepted ADR 0008 (LLM role) as written: strategy code makes the recommendations, the LLM is at most an advisory memo to the owner over point-in-time inputs; wider authority stays open for a later ADR (point 9). Closes the #52 owner decision

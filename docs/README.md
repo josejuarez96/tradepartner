@@ -17,6 +17,7 @@ docs/
 ├── research/             ← briefs' answers: YYYY-MM-DD-<slug>.md + trial-registry.md
 ├── specs/                ← what & why per feature: <feature>.md
 ├── plans/                ← how per feature: <feature>.md (tasks → PRs)
+├── hypotheses/           ← pre-registered backtest hypotheses: <slug>.md, frozen once registered
 ├── retros/               ← phase-N.md
 └── templates/            ← copy these; don't edit in place
 ```
@@ -32,6 +33,7 @@ docs/
 | **Plan** (the "build document") | How do we build it: ordered tasks, one PR each | After the spec is approved | Checkboxes are ticked as PRs merge. Frozen at the end | [plan](templates/plan.md) |
 | **STATUS** | Where are we right now? | Always exists | Living; updated every session | n/a |
 | **Architecture** | How do the pieces fit today? | Phase 1+ | Living; updated when structure changes | n/a |
+| **Hypothesis** | What exactly are we testing, with which parameters and holdout, and what would retire it? | Before any backtest run of a new idea | **Frozen** once registered: any edit is a new hypothesis | [hypothesis](templates/hypothesis.md) |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
 | **CHANGELOG** | What changed, per version? | Every feat/fix PR | Fragment in `changelog.d/`, folded by doc-keeper | n/a |
 | **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | When an issue, research brief, ADR, spec or plan is opened | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |

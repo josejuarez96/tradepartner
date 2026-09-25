@@ -1,1 +1,0 @@
-- Phase 2 T10: no-look-ahead suite (`tests/lookahead/test_suite.py`) with five named checks over an adapter's ingest history; the fixture price adapter passes all five and `BrokenPriceSource` is caught for each violation by exactly its named check (#125)
