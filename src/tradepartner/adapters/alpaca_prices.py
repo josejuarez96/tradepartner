@@ -13,7 +13,13 @@ rows (`security_id`, `ticker`, `valid_from`):
 - a ticker reused by another company belongs to whichever span started
   most recently on or before the session, so an old company's bars stop
   resolving once the new company's listing starts;
-- two spans of one ticker starting on the same day are ambiguous and raise.
+- two spans of one ticker starting on the same day are ambiguous and raise;
+- a span is **contested** when its ticker is later taken by another
+  security that arrived at it through a rename (Roundhill's `META` ETF,
+  then Facebook's `FB` -> `META`). Alpaca serves a renamed company's history
+  under its new symbol as well (#104), so rows under that ticker on the old
+  holder's dates may be the renamed company's. They resolve to nothing and
+  are reported, never assigned; `contested_spans` lists them.
 
 The resolver is a key mapping built from the master, like the delisting
 resolution in `store.delistings`; it never makes a record visible early,
@@ -30,6 +36,16 @@ because every record still carries its own `known_at`.
   `announced_at = None`. An action resolves on that same session, the last
   one before its ex-date, so an action whose ex-date coincides with a
   ticker change belongs to the security under its old symbol.
+
+**Extended hours.** Alpaca's SIP daily volume includes extended-hours
+trades (free-data-terms research, S1), while a bar is stamped at the
+16:00 close per the spec; the gap is an open owner question on PR #139.
+
+**Actions window.** Alpaca filters corporate actions on `process_date`,
+which can trail the ex-date by weeks (#101). `AlpacaPriceSource` asks for
+actions processed up to `alpaca.actions_process_lag_days` after the end
+of the ex-date window, and for the symbols held from the session before
+its start (an action resolves on that session), then filters on ex-date.
 
 **Raw closes.** `alpaca_raw.daily_bars` always asks for `adjustment=raw`
 (ADR 0003 rule 1); prices here are the payload's values, unadjusted.
@@ -49,16 +65,19 @@ raises, so ingest can never mix feeds for a security unnoticed
   reverse, ratio `new_rate / old_rate`) and cash dividends (`rate`) are
   `CorporateAction`s.
 
-A malformed payload raises `ValueError`, never a partial record.
+A malformed payload raises `ValueError`, never a partial record: a
+missing field, a non-numeric, boolean, non-finite or non-positive rate, a
+repeated key, or a placeholder whose zeros are not integers.
 """
 
 from __future__ import annotations
 
 import functools
+import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -73,6 +92,7 @@ from tradepartner.adapters.prices import (
     check_request,
 )
 from tradepartner.calendar import is_session, previous_session
+from tradepartner.config import Settings, get_settings
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _FEEDS = frozenset({"sip", "iex"})
@@ -84,14 +104,14 @@ Resolve = Callable[[str, date], str | None]
 
 
 def _fail_closed[**P, R](parse: Callable[P, R]) -> Callable[P, R]:
-    """Re-raise a malformed payload's `KeyError`, `IndexError`, `TypeError`
-    or `AttributeError` as `ValueError` naming the parser."""
+    """Re-raise a malformed payload's `KeyError`, `IndexError`, `TypeError`,
+    `AttributeError` or `ArithmeticError` as `ValueError` naming the parser."""
 
     @functools.wraps(parse)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return parse(*args, **kwargs)
-        except (KeyError, IndexError, TypeError, AttributeError) as error:
+        except (KeyError, IndexError, TypeError, AttributeError, ArithmeticError) as error:
             raise ValueError(f"{parse.__name__}: malformed payload: {error!r}") from error
 
     return wrapper
@@ -126,6 +146,12 @@ class ListingResolver:
         self._by_security: dict[str, list[TickerSpan]] = defaultdict(list)
         for security_id, rows in by_security.items():
             rows.sort()
+            for (day, ticker), (next_day, next_ticker) in itertools.pairwise(rows):
+                if day == next_day and ticker != next_ticker:
+                    raise ValueError(
+                        f"{security_id} lists {ticker!r} and {next_ticker!r} "
+                        f"from the same day {day}"
+                    )
             index = 0
             while index < len(rows):
                 start, ticker = rows[index]
@@ -136,6 +162,29 @@ class ListingResolver:
                 span = TickerSpan(security_id, ticker, start, end)
                 self._by_ticker[ticker].append(span)
                 self._by_security[security_id].append(span)
+        self._contested = frozenset(
+            span
+            for spans in self._by_ticker.values()
+            for span in spans
+            if any(
+                other.security_id != span.security_id
+                and other.start > span.start
+                and self._renamed_into(other)
+                for other in spans
+            )
+        )
+
+    def _renamed_into(self, span: TickerSpan) -> bool:
+        """True if `span`'s security traded under another ticker before it."""
+        return any(
+            earlier.start < span.start and earlier.ticker != span.ticker
+            for earlier in self._by_security[span.security_id]
+        )
+
+    @property
+    def contested_spans(self) -> tuple[TickerSpan, ...]:
+        """Spans whose rows are not assigned (see the module docstring)."""
+        return tuple(sorted(self._contested, key=lambda s: (s.ticker, s.start)))
 
     def resolve(self, ticker: str, session: date) -> str | None:
         """The security trading under `ticker` on `session`, or `None`."""
@@ -143,9 +192,12 @@ class ListingResolver:
         if not live:
             return None
         latest = max(span.start for span in live)
-        owners = {span.security_id for span in live if span.start == latest}
+        winners = [span for span in live if span.start == latest]
+        owners = {span.security_id for span in winners}
         if len(owners) > 1:
             raise ValueError(f"ticker {ticker!r} on {session} is ambiguous: {sorted(owners)}")
+        if any(span in self._contested for span in winners):
+            return None
         return owners.pop()
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
@@ -184,6 +236,32 @@ def _session_of(stamp: str) -> date:
     return session
 
 
+def _is_int_zero(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+
+def _require_unique(keys: Sequence[tuple[Any, ...]], what: str) -> None:
+    for key, following in itertools.pairwise(keys):
+        if key == following:
+            raise ValueError(f"payload repeats the {what} {key}")
+
+
+def _rate(row: Mapping[str, Any], field: str, *, positive: bool) -> float:
+    """A real, finite rate from `row` (not a bool or string); split rates
+    must be positive, a dividend non-negative."""
+    value = row[field]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field} must be a number, got {value!r}")
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{field} must be finite, got {value!r}")
+    if number < 0 or (positive and number == 0):
+        raise ValueError(
+            f"{field} must be {'positive' if positive else 'non-negative'}, got {value!r}"
+        )
+    return number
+
+
 @dataclass(frozen=True)
 class BarsParse:
     bars: tuple[Bar, ...]
@@ -206,7 +284,7 @@ def parse_bars(payload: Mapping[str, Any], resolve: Resolve) -> BarsParse:
             if security_id is None:
                 unresolved.append((symbol, session))
                 continue
-            if row["v"] == 0 and row["n"] == 0:
+            if _is_int_zero(row["v"]) and _is_int_zero(row["n"]):
                 placeholders.append((security_id, session))
                 continue
             bars.append(
@@ -223,6 +301,7 @@ def parse_bars(payload: Mapping[str, Any], resolve: Resolve) -> BarsParse:
                 )
             )
     bars.sort(key=lambda b: (b.security_id, b.session))
+    _require_unique([b.key for b in bars], "bar")
     return BarsParse(tuple(bars), tuple(unresolved), tuple(placeholders))
 
 
@@ -250,9 +329,13 @@ def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> Act
         elif category in _DIVIDEND_CATEGORIES:
             action_type = ActionType.DIVIDEND
         else:
+            if not isinstance(rows, list):
+                raise ValueError(f"category {category!r} is not a list")
             if rows:
                 unsupported.append(category)
             continue
+        if not isinstance(rows, list):
+            raise ValueError(f"category {category!r} is not a list")
         for row in rows:
             ex_date = date.fromisoformat(row["ex_date"])
             security_id = resolve(row["symbol"], previous_session(ex_date))
@@ -260,9 +343,11 @@ def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> Act
                 unresolved.append((row["symbol"], ex_date))
                 continue
             if action_type is ActionType.SPLIT:
-                value = float(row["new_rate"]) / float(row["old_rate"])
+                value = _rate(row, "new_rate", positive=True) / _rate(
+                    row, "old_rate", positive=True
+                )
             else:
-                value = float(row["rate"])
+                value = _rate(row, "rate", positive=False)
             actions.append(
                 CorporateAction(
                     security_id=security_id,
@@ -274,6 +359,7 @@ def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> Act
                 )
             )
     actions.sort(key=lambda a: (a.security_id, a.action_type.value, a.ex_date))
+    _require_unique([a.key for a in actions], "action")
     return ActionsParse(tuple(actions), tuple(unresolved), tuple(unsupported))
 
 
@@ -303,8 +389,10 @@ class AlpacaPriceSource(PriceSource):
 
     A row served under a symbol outside that symbol's span (Alpaca serves
     a renamed company's history under both symbols, #104) resolves to no
-    requested span and is left out; so is a placeholder bar. Callers that
-    need those reports use the parsers directly. `fetch_bars` and
+    requested span and is left out; so is a placeholder bar. The parse
+    reports of the latest call stay on `last_bars_report` and
+    `last_actions_report` (unresolved rows, placeholders, unsupported
+    categories such as spin-offs), for ingest to count or refuse. `fetch_bars` and
     `fetch_actions` default to `alpaca_raw` (network, owner's keys); tests
     pass recorded payloads.
     """
@@ -315,13 +403,17 @@ class AlpacaPriceSource(PriceSource):
         *,
         fetch_bars: FetchBars = _default_fetch_bars,
         fetch_actions: FetchActions = _default_fetch_actions,
+        settings: Settings | None = None,
     ) -> None:
         self._resolver = resolver
         self._fetch_bars = fetch_bars
         self._fetch_actions = fetch_actions
+        self._lag = timedelta(days=(settings or get_settings()).alpaca.actions_process_lag_days)
+        self.last_bars_report: BarsParse | None = None
+        self.last_actions_report: ActionsParse | None = None
 
     def _plan(
-        self, security_ids: Sequence[str], start: date, end: date
+        self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
     ) -> tuple[set[str], list[str]]:
         ids = set(check_request(security_ids, start, end))
         unknown = sorted(i for i in ids if not self._resolver.knows(i))
@@ -329,22 +421,27 @@ class AlpacaPriceSource(PriceSource):
             raise UnknownSecurityIdError(
                 f"unknown security_id(s) {unknown}; resolve tickers through the security master"
             )
-        symbols = sorted({s for i in ids for s in self._resolver.symbols(i, start, end)})
+        symbols = sorted({s for i in ids for s in self._resolver.symbols(i, symbols_from, end)})
         return ids, symbols
 
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
-        ids, symbols = self._plan(security_ids, start, end)
+        ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
             return []
         parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolver.resolve)
+        self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
 
     def corporate_actions(
         self, security_ids: Sequence[str], start: date, end: date
     ) -> list[CorporateAction]:
-        ids, symbols = self._plan(security_ids, start, end)
+        check_request(security_ids, start, end)
+        symbols_from = previous_session(start)  # an action resolves on the session before it
+        ids, symbols = self._plan(security_ids, start, end, symbols_from=symbols_from)
         if not symbols:
             return []
-        payload = self._fetch_actions(symbols, start, end)
+        # Alpaca's window is on process_date, which trails the ex-date.
+        payload = self._fetch_actions(symbols, start, end + self._lag)
         parsed = parse_corporate_actions(payload, self._resolver.resolve)
+        self.last_actions_report = parsed
         return [a for a in parsed.actions if a.security_id in ids and start <= a.ex_date <= end]

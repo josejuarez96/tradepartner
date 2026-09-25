@@ -30,6 +30,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
+from tradepartner.config import Settings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca"
 
@@ -95,6 +96,52 @@ class TestResolver:
         )
         assert resolver.resolve("XX", date(2020, 1, 2)) == "SEC_X"
         assert resolver.symbols("SEC_X", START, date(2020, 1, 2)) == ["XX"]
+
+    def test_one_security_two_tickers_same_day_raises(self) -> None:
+        with pytest.raises(ValueError, match="same day"):
+            ListingResolver([_listing("SEC_X", "AA", START), _listing("SEC_X", "BB", START)])
+
+    def test_ticker_taken_through_a_rename_is_contested(self) -> None:
+        # Roundhill's ETF traded as META before Facebook renamed FB -> META;
+        # Alpaca serves Facebook's history under META too (#104).
+        resolver = ListingResolver(
+            [
+                _listing("SEC_ROUNDHILL", "META", date(2021, 6, 30)),
+                _listing("SEC_FB", "FB", START),
+                _listing("SEC_FB", "META", date(2022, 6, 9)),
+            ]
+        )
+        assert resolver.resolve("META", date(2021, 9, 1)) is None
+        assert resolver.resolve("META", date(2022, 7, 1)) == "SEC_FB"
+        assert resolver.resolve("FB", date(2021, 9, 1)) == "SEC_FB"
+        [span] = resolver.contested_spans
+        assert (span.security_id, span.ticker) == ("SEC_ROUNDHILL", "META")
+        payload = {
+            "feed": "sip",
+            "bars": {
+                "META": [
+                    {
+                        "t": "2021-09-01T04:00:00Z",
+                        "o": 380,
+                        "h": 385,
+                        "l": 378,
+                        "c": 382.0,
+                        "v": 9_000_000,
+                        "n": 90_000,
+                        "vw": 381.0,
+                    }
+                ]
+            },
+        }
+        parsed = parse_bars(payload, resolver.resolve)
+        assert not parsed.bars
+        assert parsed.unresolved == (("META", date(2021, 9, 1)),)
+
+    def test_plain_reuse_is_not_contested(self) -> None:
+        resolver = ListingResolver(
+            [_listing("SEC_OLD", "REUSE", START), _listing("SEC_NEW", "REUSE", date(2022, 3, 1))]
+        )
+        assert resolver.contested_spans == ()
 
     def test_symbols_over_a_range(self) -> None:
         resolver = ListingResolver(
@@ -210,6 +257,41 @@ class TestBars:
         with pytest.raises(ValueError, match="session"):
             parse_bars(payload, resolver.resolve)
 
+    def test_boolean_zeros_are_not_a_placeholder(self, resolver: ListingResolver) -> None:
+        payload = {
+            "feed": "sip",
+            "bars": {
+                "KO": [
+                    {
+                        "t": "2020-08-03T04:00:00Z",
+                        "o": 50,
+                        "h": 51,
+                        "l": 49,
+                        "c": 50.5,
+                        "v": False,
+                        "n": False,
+                        "vw": 50.2,
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError):
+            parse_bars(payload, resolver.resolve)
+
+    def test_repeated_bar_raises(self, resolver: ListingResolver) -> None:
+        row = {
+            "t": "2020-08-03T04:00:00Z",
+            "o": 50,
+            "h": 51,
+            "l": 49,
+            "c": 50.5,
+            "v": 100,
+            "n": 10,
+            "vw": 50.2,
+        }
+        with pytest.raises(ValueError, match="repeats"):
+            parse_bars({"feed": "sip", "bars": {"KO": [row, dict(row)]}}, resolver.resolve)
+
     def test_malformed_bar_raises_value_error(self, resolver: ListingResolver) -> None:
         payload = {"feed": "sip", "bars": {"KO": [{"t": "2020-08-03T04:00:00Z", "o": 50}]}}
         with pytest.raises(ValueError, match="malformed"):
@@ -280,6 +362,38 @@ class TestCorporateActions:
         )
         assert {symbol for symbol, _ in parsed.unresolved} == {"AAPL"}
 
+    @pytest.mark.parametrize(
+        ("row", "match"),
+        [
+            ({"old_rate": 0, "new_rate": 4}, "positive"),
+            ({"old_rate": 1, "new_rate": 10**400}, "malformed|finite"),
+            ({"old_rate": -2, "new_rate": -1}, "positive"),
+            ({"old_rate": True, "new_rate": 4}, "number"),
+            ({"old_rate": "1", "new_rate": 4}, "number"),
+        ],
+    )
+    def test_bad_split_rates_raise(
+        self, resolver: ListingResolver, row: dict[str, object], match: str
+    ) -> None:
+        payload = {"forward_splits": [{"symbol": "AAPL", "ex_date": "2020-08-31", **row}]}
+        with pytest.raises(ValueError, match=match):
+            parse_corporate_actions(payload, resolver.resolve)
+
+    @pytest.mark.parametrize("rate", [True, -0.5, float("nan"), "0.82"])
+    def test_bad_dividend_rates_raise(self, resolver: ListingResolver, rate: object) -> None:
+        payload = {"cash_dividends": [{"symbol": "AAPL", "ex_date": "2020-08-07", "rate": rate}]}
+        with pytest.raises(ValueError):
+            parse_corporate_actions(payload, resolver.resolve)
+
+    def test_repeated_action_raises(self, resolver: ListingResolver) -> None:
+        row = {"symbol": "AAPL", "ex_date": "2020-08-07", "rate": 0.82}
+        with pytest.raises(ValueError, match="repeats"):
+            parse_corporate_actions({"cash_dividends": [row, dict(row)]}, resolver.resolve)
+
+    def test_category_that_is_not_a_list_raises(self, resolver: ListingResolver) -> None:
+        with pytest.raises(ValueError, match="not a list"):
+            parse_corporate_actions({"next_page_token": "abc"}, resolver.resolve)
+
     def test_malformed_action_raises_value_error(self, resolver: ListingResolver) -> None:
         with pytest.raises(ValueError, match="malformed"):
             parse_corporate_actions({"forward_splits": [{"symbol": "AAPL"}]}, resolver.resolve)
@@ -296,15 +410,61 @@ class _Recorded:
         return _json("daily_bars.json")
 
     def actions(self, symbols: list[str], start: date, end: date) -> Any:
+        # Like Alpaca, the window filters on process_date, not ex_date (#101).
         self.calls.append(("actions", symbols, start, end))
-        return _json("corporate_actions.json")
+        return {
+            category: [
+                row for row in rows if start <= date.fromisoformat(row["process_date"]) <= end
+            ]
+            for category, rows in _json("corporate_actions.json").items()
+        }
+
+
+def _settings(**alpaca: object) -> Settings:
+    return Settings(_env_file=None, alpaca=alpaca)  # type: ignore[call-arg]
 
 
 class TestAlpacaPriceSource:
-    def _source(self, recorded: _Recorded) -> AlpacaPriceSource:
+    def _source(
+        self, recorded: _Recorded, listings: list[dict[str, object]] = LISTINGS, **alpaca: object
+    ) -> AlpacaPriceSource:
         return AlpacaPriceSource(
-            ListingResolver(LISTINGS), fetch_bars=recorded.bars, fetch_actions=recorded.actions
+            ListingResolver(listings),
+            fetch_bars=recorded.bars,
+            fetch_actions=recorded.actions,
+            settings=_settings(**alpaca),
         )
+
+    def test_actions_processed_after_the_window_are_kept(self) -> None:
+        # MSFT's dividend goes ex 2020-08-19 but is processed 2020-09-10.
+        recorded = _Recorded()
+        actions = self._source(recorded).corporate_actions(
+            ["SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+        )
+        assert [(a.security_id, a.ex_date) for a in actions] == [("SEC_MSFT", date(2020, 8, 19))]
+        assert recorded.calls[-1][3] == date(2020, 11, 29)  # end + 90 days
+        # With no lag the process-date window misses it: the defect the lag fixes.
+        unpadded = self._source(_Recorded(), actions_process_lag_days=0)
+        assert unpadded.corporate_actions(["SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)) == []
+
+    def test_actions_fetch_the_symbol_held_the_session_before_start(self) -> None:
+        listings = [_listing("SEC_A", "OLD", START), _listing("SEC_A", "NEW", date(2020, 8, 31))]
+        recorded = _Recorded()
+        self._source(recorded, listings).corporate_actions(
+            ["SEC_A"], date(2020, 8, 31), date(2020, 9, 30)
+        )
+        assert recorded.calls[-1][1] == ["NEW", "OLD"]
+
+    def test_reports_of_the_last_call_are_kept(self) -> None:
+        recorded = _Recorded()
+        source = self._source(
+            recorded, listings=[*LISTINGS[1:], _listing("SEC_AAPL", "AAPL", date(2020, 9, 1))]
+        )
+        source.bars(["SEC_AAPL"], date(2020, 8, 3), date(2020, 9, 30))
+        assert source.last_bars_report is not None
+        assert ("AAPL", date(2020, 8, 31)) in source.last_bars_report.unresolved
+        source.corporate_actions(["SEC_AAPL"], date(2020, 9, 1), date(2020, 9, 30))
+        assert source.last_actions_report is not None
 
     def test_bars_by_security_id_in_range(self) -> None:
         recorded = _Recorded()
