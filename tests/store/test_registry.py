@@ -13,6 +13,7 @@ decision rows; code version and dirty flag.
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import statistics
 import subprocess
@@ -90,7 +91,7 @@ def _open(
 ) -> registry.TrialHandle:
     return registry.open_trial(
         conn,
-        slug=slug,
+        hypothesis_id=registry.get_hypothesis(conn, slug).hypothesis_id,
         kind=kind,
         start_session=window[0],
         end_session=window[1],
@@ -265,13 +266,86 @@ def test_open_trial_records_every_field_and_ids_increase(
     )
 
 
-def test_open_trial_refuses_an_unregistered_slug(
+def test_open_trial_refuses_an_unknown_hypothesis_id(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
-    with pytest.raises(registry.UnknownHypothesis):
-        _open(conn, settings, tmp_path, slug="ghost")
+    with pytest.raises(registry.UnknownHypothesis, match="42"):
+        registry.open_trial(
+            conn,
+            hypothesis_id=42,
+            kind="in_sample",
+            start_session=_W1[0],
+            end_session=_W1[1],
+            data_cutoff=_T0,
+            synthetic=False,
+            run_by="test",
+            settings=settings,
+            repo_dir=tmp_path,
+        )
     (count,) = conn.execute("SELECT COUNT(*) FROM trials").fetchone()  # type: ignore[misc]
     assert count == 0
+
+
+def test_open_trial_runs_the_named_registration_not_the_latest_for_the_slug(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """File A, edited to B, reverted to A: the run is recorded under A."""
+    a = _register(conn, settings)
+    b = _register(conn, settings, params=_params(20.0))
+    again = _register(conn, settings)
+    assert again.hypothesis_id == a.hypothesis_id
+    assert registry.get_hypothesis(conn, "h1").hypothesis_id == b.hypothesis_id
+    handle = registry.open_trial(
+        conn,
+        hypothesis_id=again.hypothesis_id,
+        kind="in_sample",
+        start_session=_W1[0],
+        end_session=_W1[1],
+        data_cutoff=_T0,
+        synthetic=False,
+        run_by="test",
+        settings=settings,
+        repo_dir=tmp_path,
+    )
+    assert (handle.hypothesis_id, handle.params_sha256) == (a.hypothesis_id, a.params_sha256)
+    assert registry.get_hypothesis_by_id(conn, a.hypothesis_id).params == _params()
+
+
+def test_a_slug_cannot_move_to_another_family(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _register(conn, settings)
+    with pytest.raises(registry.RegistryError, match="cannot move"):
+        _register(conn, settings, family="oracle", params=_params(20.0))
+
+
+def test_identical_file_with_a_different_window_is_refused(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _register(conn, settings)
+    with pytest.raises(registry.RegistryError, match="holdout_end"):
+        registry.register_hypothesis(
+            conn,
+            slug="h1",
+            family="momentum",
+            title="h1 title",
+            doc_path="docs/hypotheses/h1.md",
+            doc_sha256="d" * 64,
+            params=_params(),
+            in_sample_start=date(2016, 1, 29),
+            holdout_start=date(2023, 1, 3),
+            holdout_end=date(2026, 12, 31),
+            registered_by="owner",
+            settings=settings,
+        )
+
+
+def test_window_params_must_agree_with_the_window_columns(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _register(conn, settings, params=_params(**{"holdout.start": "2023-01-03"}))
+    with pytest.raises(registry.RegistryError, match=r"holdout\.start"):
+        _register(conn, settings, slug="h2", params=_params(**{"holdout.start": "2024-01-02"}))
 
 
 def test_open_trial_accepts_a_missing_data_cutoff(
@@ -282,7 +356,7 @@ def test_open_trial_accepts_a_missing_data_cutoff(
     _register(conn, settings)
     handle = registry.open_trial(
         conn,
-        slug="h1",
+        hypothesis_id=registry.get_hypothesis(conn, "h1").hypothesis_id,
         kind="in_sample",
         start_session=_W1[0],
         end_session=date(2099, 12, 31),
@@ -293,6 +367,23 @@ def test_open_trial_accepts_a_missing_data_cutoff(
         repo_dir=tmp_path,
     )
     registry.close_trial(conn, handle, "refused_window", "end after holdout.end")
+
+
+def test_a_hard_link_to_the_real_store_is_still_the_real_store(
+    real_conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(real_conn, settings)
+    real_conn.close()
+    link = tmp_path / "alias.duckdb"
+    os.link(settings.store.path, link)
+    aliased = duckdb.connect(str(link))
+    try:
+        with pytest.raises(registry.RealStoreRefused):
+            _open(aliased, settings, tmp_path, synthetic=True)
+        with pytest.raises(registry.RealStoreRefused):
+            _register(aliased, settings, slug="o", family="oracle")
+    finally:
+        aliased.close()
 
 
 def test_synthetic_refused_on_the_real_store_and_accepted_on_a_temp_file(
@@ -450,6 +541,23 @@ def test_detail_rows_reject_a_datetime_session(
         registry.write_equity(conn, handle, [registry.EquityRow("strategy", 15.0, _T0, 1.0, 0.0)])
 
 
+def test_a_rolled_back_handle_is_refused_even_after_its_id_is_reused(
+    tmp_path: Path, settings: Settings
+) -> None:
+    conn = _connect(tmp_path / "rollback.duckdb")
+    _register(conn, settings)
+    conn.begin()
+    stale = _open(conn, settings, tmp_path)
+    conn.rollback()
+    with pytest.raises(registry.RegistryError, match="rolled back"):
+        registry.close_trial(conn, stale, "failed")
+    fresh = _open(conn, settings, tmp_path)
+    assert fresh.trial_id == stale.trial_id
+    with pytest.raises(registry.RegistryError, match="rolled back"):
+        registry.close_trial(conn, stale, "failed")
+    registry.close_trial(conn, fresh, "failed", "its own outcome")
+
+
 def test_a_handle_from_another_store_is_refused(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
@@ -574,6 +682,40 @@ def test_family_sharpes_counts_a_pending_trial_as_the_latest_of_its_pair(
     result = registry.family_sharpes(conn, "momentum", pending=pending)
     assert result.n_trials == 3
     assert result.raw == (0.2, 0.5)
+
+
+def test_requested_windows_that_resolve_alike_are_one_pair(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Starts on 2018-01-02 and 2018-01-31 both resolve to the January
+    month-end session; with one data_cutoff they are reruns of one pair."""
+    _register(conn, settings)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, window=(date(2018, 1, 2), _W1[1]))
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, window=(date(2018, 1, 31), date(2022, 12, 31)))
+    _ok_trial(conn, settings, tmp_path, 0.2, 0.02, window=_W2)
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, result.raw) == (3, (0.3, 0.2))
+
+
+def test_family_sharpes_refuses_a_nan_sharpe(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    _ok_trial(conn, settings, tmp_path, float("nan"), 0.01)
+    with pytest.raises(registry.RegistryError, match="finite"):
+        registry.family_sharpes(conn, "momentum")
+
+
+def test_family_sharpes_refuses_a_pending_handle_from_another_store(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    other = _connect(tmp_path / "other.duckdb")
+    _register(other, settings)
+    foreign = _open(other, settings, tmp_path)
+    _register(conn, settings)
+    _open(conn, settings, tmp_path)
+    with pytest.raises(registry.RegistryError, match="another store"):
+        registry.family_sharpes(conn, "momentum", pending=foreign)
 
 
 def test_family_sharpes_reads_the_base_level_of_each_hypothesis(

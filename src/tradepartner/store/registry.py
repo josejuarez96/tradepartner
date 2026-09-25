@@ -10,19 +10,27 @@ transaction, so they increase in the order trials were opened.
 
 **Trial handle.** `open_trial` is the only constructor of `TrialHandle`
 (ADR 0005: no id, no run). A handle remembers the database file it was
-opened on, and every write refuses a handle from another store.
+opened on and its trial's `started_at`, and every write refuses a handle
+whose `trials` row is not in this store. Commit `open_trial` in its own
+write chunk before any other work: a rolled-back open leaves a handle
+with no row, which every later write refuses.
 
 **Real store.** The connection's database file is the real store when it
-resolves to `settings.store.path`. There, `register_hypothesis` refuses
-`family="oracle"` and `open_trial` refuses `synthetic=True`, so no test or
-oracle trial can reach the owner's registry (spec "Definitions" > Trial).
+is the same file as `settings.store.path` (file identity, so a hard link,
+symlink, relative path or case variant is still the real store). There,
+`register_hypothesis` refuses `family="oracle"` and `open_trial` refuses
+`synthetic=True`, so no test or oracle trial can reach the owner's
+registry (spec "Definitions" > Trial).
 
 **Parameters.** A hypothesis's frozen parameters are a flat mapping of
 dotted config keys to JSON values (`{"costs.per_side_bps": 15.0, ...}`).
 The registry stores them as `canonical_params_json` and hashes that text
 (`params_sha256`), so one parameter set has one hash whoever computes it.
+Values hash as written: `15` and `15.0` differ, so the caller normalizes
+types (floats for float keys, ISO strings for dates) before registering.
 `costs.per_side_bps` is required: it is the trial's base cost level, the
-level N, V and DSR use (spec req 6).
+level N, V and DSR use (spec req 6). A slug stays in the family it was
+first registered in, so moving it cannot reset N or hide holdout spends.
 
 **Result rows.** `close_trial` records any outcome other than `ok`
 (`failed` and the three refusals), with no statistics. `write_result`
@@ -37,7 +45,10 @@ Detail rows (`write_metrics`, `write_equity`, `write_weights`,
 `ok`, non-synthetic, `in_sample` trials of a family and returns, per basis,
 the monthly Sharpe of the latest such trial (highest id) per distinct
 (parameter hash, window) pair, read from the base-level `strategy` rows of
-`trial_metrics`. Only `sharpe_monthly` and `sharpe_monthly_excess_spy` are
+`trial_metrics`. The window is the **resolved** one: the first rebalance
+session (last XNYS session of a month, ADR 0006) on or after the requested
+start, and `data_cutoff`, so requested dates that resolve to the same
+sessions are one pair and cannot shrink V. Only `sharpe_monthly` and `sharpe_monthly_excess_spy` are
 read. A trial still being written can be counted as the latest of its pair
 with `pending=`, so a run's own N and V include it.
 """
@@ -46,6 +57,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import statistics
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
@@ -58,6 +70,7 @@ from typing import Any, Final, Literal
 import duckdb
 import pyarrow as pa
 
+from tradepartner.calendar import last_session_of_month
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
@@ -88,7 +101,7 @@ class RealStoreRefused(RegistryError):
 
 
 class UnknownHypothesis(RegistryError):
-    """No hypothesis is registered under the slug."""
+    """No hypothesis is registered under the slug or id."""
 
 
 class TrialAlreadyClosed(RegistryError):
@@ -122,6 +135,8 @@ class TrialHandle:
         "family",
         "hypothesis_id",
         "kind",
+        "params_sha256",
+        "started_at",
         "store_max_ingested_at",
         "synthetic",
         "trial_id",
@@ -130,8 +145,10 @@ class TrialHandle:
     trial_id: int
     hypothesis_id: int
     family: str
+    params_sha256: str
     kind: str
     synthetic: bool
+    started_at: datetime
     store_max_ingested_at: datetime | None
     database: str | None
 
@@ -289,7 +306,9 @@ def params_sha256(params: Mapping[str, Any]) -> str:
 def code_version(repo_dir: Path | None = None) -> tuple[str, bool | None]:
     """`(commit, dirty)` of the git checkout holding `repo_dir` (default: this
     module's own checkout); `("unknown", None)` outside a checkout. Untracked
-    files count as dirty: an uncommitted module changes what runs."""
+    files count as dirty: an uncommitted module changes what runs. Assumes
+    the editable install `uv sync` makes; a non-editable install inside a
+    checkout would report that checkout's commit, not the installed code."""
     cwd = repo_dir if repo_dir is not None else Path(__file__).resolve().parent
     try:
         head = _git(cwd, "rev-parse", "HEAD")
@@ -322,8 +341,15 @@ def _database_path(conn: duckdb.DuckDBPyConnection) -> str | None:
 
 
 def _is_real_store(conn: duckdb.DuckDBPyConnection, settings: Settings) -> bool:
+    """Whether `conn`'s file is `settings.store.path`, by file identity when
+    both exist (a hard link resolves to its own path), else by path."""
     path = _database_path(conn)
-    return path is not None and path == str(Path(settings.store.path).expanduser().resolve())
+    if path is None:
+        return False
+    real = Path(settings.store.path).expanduser()
+    if real.exists() and Path(path).exists():
+        return os.path.samefile(path, real)
+    return path == str(real.resolve())
 
 
 def _next_id(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> int:
@@ -339,14 +365,38 @@ def _has_result(conn: duckdb.DuckDBPyConnection, trial_id: int) -> bool:
     )
 
 
-def _check_open(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> None:
-    """Refuse a handle from another store, or one whose trial is closed."""
+def _check_trial_row(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> None:
+    """Refuse a handle whose `trials` row is not in this store: another
+    store's handle, or one whose open was rolled back (its id may since
+    belong to another trial, so the row must match `started_at` too)."""
     if handle.database != _database_path(conn):
         raise RegistryError(
             f"trial {handle.trial_id} was opened on another store ({handle.database!r})"
         )
+    row = conn.execute(
+        "SELECT started_at FROM trials WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone()
+    if row is None or row[0] != handle.started_at:
+        raise RegistryError(
+            f"trial {handle.trial_id} has no matching trials row in this store "
+            "(was its open_trial rolled back?)"
+        )
+
+
+def _check_open(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> None:
+    """Refuse a handle without its `trials` row, or whose trial is closed."""
+    _check_trial_row(conn, handle)
     if _has_result(conn, handle.trial_id):
         raise TrialAlreadyClosed(f"trial {handle.trial_id} already has its result row")
+
+
+def _first_rebalance_on_or_after(day: date) -> date:
+    """The first last-session-of-month on or after `day` (ADR 0006)."""
+    month_end = last_session_of_month(day.year, day.month)
+    if month_end >= day:
+        return month_end
+    year, month = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+    return last_session_of_month(year, month)
 
 
 # --- hypotheses ------------------------------------------------------------
@@ -371,10 +421,12 @@ def register_hypothesis(
 
     The same slug, file hash and parameter hash return the existing record
     instead of a second row, so re-registering an unchanged file cannot
-    make a new hypothesis. A changed file or parameter set is a new one.
-    Refuses a family outside `settings.hypotheses.families`, parameters
-    without a numeric `costs.per_side_bps`, and `family="oracle"` on the
-    real store.
+    make a new hypothesis; its family and window must then match the stored
+    row. A changed file or parameter set is a new one, in the slug's
+    original family. Refuses a family outside `settings.hypotheses.families`,
+    parameters without a numeric `costs.per_side_bps`, `holdout.start`,
+    `holdout.end` or `in_sample_start` params that disagree with the window
+    arguments, and `family="oracle"` on the real store.
     """
     settings = settings if settings is not None else get_settings()
     if family not in settings.hypotheses.families:
@@ -386,6 +438,24 @@ def register_hypothesis(
     base = params.get(BASE_COST_KEY)
     if isinstance(base, bool) or not isinstance(base, int | float) or not math.isfinite(base):
         raise RegistryError(f"params must name a finite numeric {BASE_COST_KEY!r}")
+    window = {
+        "in_sample_start": in_sample_start,
+        "holdout_start": holdout_start,
+        "holdout_end": holdout_end,
+    }
+    for key, column in _WINDOW_PARAM_KEYS.items():
+        if key in params and params[key] != window[column].isoformat():
+            raise RegistryError(
+                f"params {key}={params[key]!r} disagrees with {column}={window[column]}"
+            )
+    families = conn.execute(
+        "SELECT DISTINCT family FROM hypotheses WHERE slug = ?", [slug]
+    ).fetchall()
+    if families and families != [(family,)]:
+        raise RegistryError(
+            f"slug {slug!r} is registered in family {families[0][0]!r}; "
+            f"it cannot move to {family!r}"
+        )
     params_json = canonical_params_json(params)
     params_hash = params_sha256(params)
     existing = conn.execute(
@@ -394,7 +464,14 @@ def register_hypothesis(
         [slug, doc_sha256, params_hash],
     ).fetchone()
     if existing is not None:
-        return _hypothesis_where(conn, "hypothesis_id = ?", existing[0])
+        record = get_hypothesis_by_id(conn, existing[0])
+        for column, value in window.items():
+            if getattr(record, column) != value:
+                raise RegistryError(
+                    f"{slug!r} is registered with {column}={getattr(record, column)}, "
+                    f"not {value}, for the same file and parameters"
+                )
+        return record
     hypothesis_id = _next_id(conn, "hypotheses", "hypothesis_id")
     insert_row(
         conn,
@@ -415,7 +492,7 @@ def register_hypothesis(
             "registered_by": registered_by,
         },
     )
-    return _hypothesis_where(conn, "hypothesis_id = ?", hypothesis_id)
+    return get_hypothesis_by_id(conn, hypothesis_id)
 
 
 def get_hypothesis(conn: duckdb.DuckDBPyConnection, slug: str) -> HypothesisRecord:
@@ -428,7 +505,24 @@ def get_hypothesis(conn: duckdb.DuckDBPyConnection, slug: str) -> HypothesisReco
     )
 
 
+def get_hypothesis_by_id(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> HypothesisRecord:
+    """The registration with `hypothesis_id`; `UnknownHypothesis` if none."""
+    return _hypothesis_where(
+        conn,
+        "hypothesis_id = ?",
+        hypothesis_id,
+        missing=f"no hypothesis has id {hypothesis_id}",
+    )
+
+
 _HYPOTHESIS_COLUMNS: Final = tuple(f.name for f in fields(HypothesisRecord))
+
+#: Params keys that restate a window column; when present they must agree.
+_WINDOW_PARAM_KEYS: Final = {
+    "in_sample_start": "in_sample_start",
+    "holdout.start": "holdout_start",
+    "holdout.end": "holdout_end",
+}
 
 
 def _hypothesis_where(
@@ -449,7 +543,7 @@ def _hypothesis_where(
 def open_trial(
     conn: duckdb.DuckDBPyConnection,
     *,
-    slug: str,
+    hypothesis_id: int,
     kind: TrialKind,
     start_session: date,
     end_session: date,
@@ -463,23 +557,30 @@ def open_trial(
     settings: Settings | None = None,
     repo_dir: Path | None = None,
 ) -> TrialHandle:
-    """Insert a `trials` row for the latest registration of `slug` and return
-    its handle. This is the moment a run becomes a trial (spec "Definitions").
+    """Insert a `trials` row for hypothesis `hypothesis_id` and return its
+    handle. This is the moment a run becomes a trial (spec "Definitions").
+    The caller names the exact registration (the one matching the file it
+    loaded), never "the latest for a slug", so a run is recorded under the
+    parameters it runs; the handle carries their `params_sha256`.
 
     `start_session`/`end_session` are the requested window as given, and
     `data_cutoff` may be None when the requested end has no session close;
     the window rules are checked afterwards (spec req 11), so a refusal is
     still a trial. Captures the code version (`repo_dir`, default this
     checkout) and the store's latest `ingested_at`. Refuses
-    `synthetic=True` on the real store.
+    `synthetic=True` on the real store. Commit it in its own write chunk
+    (module docstring, "Trial handle").
     """
     settings = settings if settings is not None else get_settings()
-    hypothesis = get_hypothesis(conn, slug)
+    hypothesis = get_hypothesis_by_id(conn, hypothesis_id)
     if synthetic and _is_real_store(conn, settings):
         raise RealStoreRefused("a synthetic trial is refused on the real store")
     version, dirty = code_version(repo_dir)
     max_ingested = store_max_ingested_at(conn)
-    trial_id = _next_id(conn, "trials", "trial_id")
+    trial_id = max(
+        _next_id(conn, "trials", "trial_id"), _next_id(conn, "trial_results", "trial_id")
+    )
+    started_at = utc_now()
     insert_row(
         conn,
         "trials",
@@ -487,7 +588,7 @@ def open_trial(
             "trial_id": trial_id,
             "hypothesis_id": hypothesis.hypothesis_id,
             "kind": kind,
-            "started_at": utc_now(),
+            "started_at": started_at,
             "start_session": start_session,
             "end_session": end_session,
             "data_cutoff": data_cutoff,
@@ -506,8 +607,10 @@ def open_trial(
         trial_id=trial_id,
         hypothesis_id=hypothesis.hypothesis_id,
         family=hypothesis.family,
+        params_sha256=hypothesis.params_sha256,
         kind=kind,
         synthetic=synthetic,
+        started_at=started_at,
         store_max_ingested_at=max_ingested,
         database=_database_path(conn),
     )
@@ -673,11 +776,14 @@ def family_sharpes(
     """N and the per-basis Sharpes for V over `family` (module docstring).
 
     `pending` counts a trial that has its metrics but no result row yet as
-    `ok`, when it is itself a non-synthetic `in_sample` trial of `family`.
-    Raises `RegistryError` when a counted trial lacks a base-level Sharpe.
+    `ok`, when it is itself a non-synthetic `in_sample` trial of `family`
+    and its `trials` row is in this store. Raises `RegistryError` when a
+    counted trial lacks a finite base-level Sharpe.
     """
+    if pending is not None:
+        _check_trial_row(conn, pending)
     counted = conn.execute(
-        "SELECT t.trial_id, h.params_json, h.params_sha256, t.start_session, t.end_session "
+        "SELECT t.trial_id, h.params_json, h.params_sha256, t.start_session, t.data_cutoff "
         "FROM trials t JOIN hypotheses h USING (hypothesis_id) "
         "LEFT JOIN trial_results r USING (trial_id) "
         "WHERE h.family = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
@@ -685,10 +791,10 @@ def family_sharpes(
         "ORDER BY t.trial_id",
         [family, pending.trial_id if pending is not None else None],
     ).fetchall()
-    latest: dict[tuple[str, date, date], tuple[int, float]] = {}
-    for trial_id, params_json, params_hash, start, end in counted:
+    latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
+    for trial_id, params_json, params_hash, start, cutoff in counted:
         base = float(json.loads(params_json)[BASE_COST_KEY])
-        latest[(params_hash, start, end)] = (trial_id, base)
+        latest[(params_hash, _first_rebalance_on_or_after(start), cutoff)] = (trial_id, base)
     chosen = sorted(latest.values())
     return FamilySharpes(
         n_trials=len(counted),
@@ -708,15 +814,17 @@ def _base_sharpes(
             "AND metric = ? AND cost_per_side_bps = ?",
             [trial_id, metric, base],
         ).fetchone()
-        if row is None or row[0] is None:
-            raise RegistryError(f"trial {trial_id} has no base-level {metric} for strategy")
+        if row is None or row[0] is None or not math.isfinite(row[0]):
+            raise RegistryError(f"trial {trial_id} has no finite base-level {metric} for strategy")
         values.append(float(row[0]))
     return tuple(values)
 
 
 def family_holdout_spends(conn: duckdb.DuckDBPyConnection, family: str) -> list[HoldoutSpend]:
     """Every `holdout` trial in `family`, oldest first, whatever its outcome:
-    a holdout run that failed or crashed has still looked (domain rule 3)."""
+    a holdout run that failed, crashed or was refused still counts as a
+    spend (conservative; domain rule 3). A caller that reads spends to set
+    `holdout_repeat` does so in the same write chunk as its `open_trial`."""
     rows = conn.execute(
         "SELECT t.trial_id, t.hypothesis_id, h.slug, t.started_at, t.synthetic, "
         f"t.holdout_reason, COALESCE(r.status, '{UNFINISHED}') "
