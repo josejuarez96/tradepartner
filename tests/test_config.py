@@ -67,7 +67,21 @@ def test_ingest_defaults() -> None:
 
 def test_edgar_defaults() -> None:
     s = _settings()
-    assert s.edgar.cache_dir == "data/edgar_cache"
+    # Anchored to the project root (T2 review round 2), not a bare relative
+    # path: must be absolute and end with data/edgar_cache regardless of CWD.
+    assert Path(s.edgar.cache_dir).is_absolute()
+    assert Path(s.edgar.cache_dir) == Path(__file__).resolve().parents[1] / "data" / "edgar_cache"
+    assert s.edgar.requests_per_second == pytest.approx(10.0)
+    assert s.edgar.retry_backoff_seconds == pytest.approx(1.0)
+    assert s.edgar.request_timeout_seconds == pytest.approx(30.0)
+    assert s.edgar.header_bytes == 4096
+
+
+def test_edgar_cache_dir_independent_of_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert Path(_settings().edgar.cache_dir).is_absolute()
 
 
 def test_master_defaults() -> None:

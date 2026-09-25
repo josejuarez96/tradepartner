@@ -52,6 +52,18 @@ def _default_env_file() -> Path:
     return Path(__file__).resolve().parents[2] / ".env"
 
 
+def _default_edgar_cache_dir() -> str:
+    """`data/edgar_cache`, anchored to the project root the same way `.env` is.
+
+    A relative default would resolve against the process's current working
+    directory, which breaks the moment `cli_record`/ingest run from a
+    different directory (e.g. a scheduled job run from `$HOME`); T2 review
+    round 2 (safety-reviewer) flagged this after `download_filing_file`
+    started writing there.
+    """
+    return str(Path(__file__).resolve().parents[2] / "data" / "edgar_cache")
+
+
 class CalendarConfig(BaseModel):
     """XNYS calendar bounds.
 
@@ -110,9 +122,20 @@ class IngestConfig(BaseModel):
 
 
 class EdgarConfig(BaseModel):
-    """SEC EDGAR access, incl. `edgartools`' local cache."""
+    """SEC EDGAR access, incl. `edgartools`' local cache.
 
-    cache_dir: str = "data/edgar_cache"
+    `requests_per_second`/`retry_backoff_seconds`/`request_timeout_seconds`/
+    `header_bytes` were added in T2 review round 2 (safety-reviewer SHOULD
+    FIX): `adapters/edgar_raw.py`'s throttle, retry backoff, HTTP timeout
+    and SGML-header slice size were hardcoded module constants; CLAUDE.md
+    requires thresholds to come from config.
+    """
+
+    cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
+    requests_per_second: float = 10.0
+    retry_backoff_seconds: float = 1.0
+    request_timeout_seconds: float = 30.0
+    header_bytes: int = 4096
 
 
 class MasterConfig(BaseModel):
