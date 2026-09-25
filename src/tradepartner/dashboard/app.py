@@ -21,11 +21,8 @@ This module is deliberately split into two layers:
   selected page *inside* that connection's `with` block, passing the
   connection to the page so a page never has to open its own.
 
-Navigation is a placeholder for now: a single "Data health" entry
-(`render_health_placeholder`, which takes the shared connection and does
-nothing with it). T21's only changes to this file are: add
-`health_page.py`, and repoint `_PAGES["Data health"]` at
-`health_page.render`; nothing else here changes.
+Navigation maps each entry to a page's `render(conn)`: "Data health"
+(`health_page`, T21), "Backtest" (T43) and "Trial registry" (T44).
 """
 
 from __future__ import annotations
@@ -41,7 +38,7 @@ import duckdb
 import streamlit as st
 
 from tradepartner.config import Settings, get_settings
-from tradepartner.dashboard import backtest_page, trials_page
+from tradepartner.dashboard import backtest_page, health_page, trials_page
 from tradepartner.store.db import StoreLockedError, open_read_only
 
 
@@ -140,17 +137,8 @@ def render_unreadable(settings: Settings, detail: str) -> None:
     st.error(f"The store at `{settings.store.path}` could not be read: {detail}")
 
 
-def render_health_placeholder(conn: duckdb.DuckDBPyConnection) -> None:
-    """Empty placeholder for the data-health page.
-
-    T21 replaces the body of this function with a call into
-    `health_page.render(conn)`; the navigation entry itself
-    (`_PAGES["Data health"]`) is the only other line T21 needs to touch.
-    """
-
-
 _PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
-    "Data health": render_health_placeholder,
+    "Data health": health_page.render,
     "Backtest": backtest_page.render,
     "Trial registry": trials_page.render,
 }
