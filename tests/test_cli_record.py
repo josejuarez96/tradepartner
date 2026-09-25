@@ -9,6 +9,8 @@ message.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tradepartner import cli_record
@@ -153,3 +155,43 @@ def test_trim_company_tickers_keeps_sample_and_recorded_rows() -> None:
         "fields": ["x"],
         "data": [[1]],
     }
+
+
+def test_accessions_in_company_facts_collects_every_accn() -> None:
+    payload = {
+        "facts": {
+            "dei": {"A": {"units": {"shares": [{"accn": "1-1", "val": 1}, {"accn": "1-2"}]}}},
+            "us-gaap": {"B": {"units": {"USD": [{"accn": "1-1"}, {"val": 3}]}}},
+        }
+    }
+    assert cli_record.accessions_in_company_facts(payload) == {"1-1", "1-2"}
+    assert cli_record.accessions_in_company_facts({"facts": "nope"}) == set()
+
+
+def test_trim_submissions_page_keeps_wanted_rows_across_every_column() -> None:
+    page = {
+        "accessionNumber": ["a", "b", "c"],
+        "acceptanceDateTime": ["ta", "tb", "tc"],
+        "form": ["10-K", "8-K", "10-Q"],
+        "filingCount": 3,
+    }
+    out = cli_record.trim_submissions_page(page, accessions=["c", "a", "zzz"])
+    assert out == {
+        "accessionNumber": ["a", "c"],
+        "acceptanceDateTime": ["ta", "tc"],
+        "form": ["10-K", "10-Q"],
+        "filingCount": 3,
+    }
+    assert cli_record.trim_submissions_page({"x": 1}, accessions=["a"]) == {"x": 1}
+
+
+def test_recorded_at_notes_utc_time_per_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_record, "FIXTURES_ROOT", tmp_path)
+    monkeypatch.setattr(cli_record, "_recorded_at", {})
+    target = tmp_path / "alpaca" / "x.json"
+    target.parent.mkdir()
+    cli_record._write_json(target, {"k": "v"}, secrets=[])
+    assert list(cli_record._recorded_at) == ["alpaca/x.json"]
+    assert cli_record._recorded_at["alpaca/x.json"].endswith("+00:00")

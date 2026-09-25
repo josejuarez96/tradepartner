@@ -118,6 +118,8 @@ class IngestConfig(BaseModel):
 
     settle_delay_minutes: int = 60
     reference_symbol: str = "SPY"
+    # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
+    # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05
 
 
@@ -181,8 +183,9 @@ class ExecutionConfig(BaseModel):
     """Backtest/paper fill assumptions.
 
     `fill_price` stays `close` (T3): Alpaca's daily open is the first valid trade, not the
-    official auction print, on every feed, and fractional orders cannot use OPG and fill
-    at the NBBO after the open, so neither live nor paper fills match the bar open.
+    official auction print, on every feed (documented), and fractional orders cannot use
+    OPG and are priced off the NBBO, so they likely fill after the open (inference, #86).
+    Neither live nor paper fills should be expected to match the bar open.
     """
 
     fill_price: Literal["close", "open"] = "close"
