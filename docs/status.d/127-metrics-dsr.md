@@ -1,0 +1,1 @@
+- Phase 3 T32: `backtest/metrics.py`, every req 7 key via `empyrical` where it exists, PSR and deflated Sharpe on the `raw` and `excess_spy` bases (spec reference values reproduced to 1e-6), red flag (#127, PR #128)
