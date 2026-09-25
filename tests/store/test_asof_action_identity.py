@@ -20,6 +20,7 @@ import pytest
 from tradepartner.store import schema
 from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of, prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
+from tradepartner.universe import _split_factors
 
 SID = "SEC_X"
 #: 2021-01-04 .. 2021-01-15 are all XNYS sessions (no holiday in that span).
@@ -90,6 +91,11 @@ def _closes(df: pl.DataFrame) -> dict[date, float]:
 
 def _t(day: int, hour: int, minute: int = 0) -> datetime:
     return datetime(2021, 1, day, hour, minute, tzinfo=UTC)
+
+
+def _close(session: date) -> datetime:
+    """21:00 UTC on `session`, the XNYS close in January."""
+    return datetime(session.year, session.month, session.day, 21, 0, tzinfo=UTC)
 
 
 class TestRedatedAction:
@@ -271,3 +277,34 @@ class TestFixtureCases:
         later = datetime(2019, 11, 1, 21, 0, tzinfo=UTC)
         assert self._ratio(fixture_store, sid, later, date(2019, 10, 11)) == pytest.approx(0.5)
         assert self._ratio(fixture_store, sid, later, date(2019, 10, 18)) == pytest.approx(1.0)
+
+
+class TestSplitFactors:
+    """`universe._split_factors` feeds rule 8's share adjustment and the
+    survivorship gap's size share; it reads actions by identity too
+    (quant-auditor round 2 on #111, finding 1)."""
+
+    def test_split_redated_by_id_counts_once_at_its_new_ex_date(
+        self, store: duckdb.DuckDBPyConnection
+    ) -> None:
+        _action(
+            store, "split", SESSIONS[3], 2.0, known_at=_close(SESSIONS[1]), source_action_id="A1"
+        )
+        _action(
+            store, "split", SESSIONS[4], 2.0, known_at=_close(SESSIONS[2]), source_action_id="A1"
+        )
+        factors = _split_factors(store, _close(SESSIONS[6]), [SID], SESSIONS[6])
+        assert factors == {SID: [(SESSIONS[4], 2.0)]}
+
+    def test_cancelled_split_is_not_counted(self, store: duckdb.DuckDBPyConnection) -> None:
+        _action(store, "split", SESSIONS[3], 2.0, known_at=_close(SESSIONS[0]))
+        _action(store, "split", SESSIONS[3], 2.0, known_at=_close(SESSIONS[1]), cancelled=True)
+        assert _split_factors(store, _close(SESSIONS[6]), [SID], SESSIONS[6]) == {}
+
+    def test_split_counts_before_its_cancel_is_known(
+        self, store: duckdb.DuckDBPyConnection
+    ) -> None:
+        _action(store, "split", SESSIONS[3], 2.0, known_at=_close(SESSIONS[0]))
+        _action(store, "split", SESSIONS[3], 2.0, known_at=_close(SESSIONS[7]), cancelled=True)
+        factors = _split_factors(store, _close(SESSIONS[6]), [SID], SESSIONS[6])
+        assert factors == {SID: [(SESSIONS[3], 2.0)]}

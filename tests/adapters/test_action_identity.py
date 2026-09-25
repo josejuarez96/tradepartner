@@ -263,6 +263,36 @@ class TestReplacementRows:
         with pytest.raises(FixtureContractError, match="id-less"):
             FixturePriceSource(fixtures)
 
+    def test_id_row_known_before_the_idless_cancel_is_refused(self, tmp_path: Path) -> None:
+        # Quant-auditor round 2, finding 2a: first seen in a later ingest,
+        # the id row keeps the first-seen proxy stamp (2019-03-01 close),
+        # before the 2019-03-06 cancel, so both are live in between.
+        fixtures = _fixture(
+            tmp_path,
+            [
+                *self._cancel_old_key(),
+                _row(source_action_id="A1", ingested_at="2019-03-15T22:00:00+00:00"),
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="id-less"):
+            FixturePriceSource(fixtures)
+
+    def test_idless_key_revived_after_an_id_row_replaced_it_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Finding 2b: an un-cancel of the id-less key makes both live again.
+        revived = "2019-03-20T22:00:00+00:00"
+        fixtures = _fixture(
+            tmp_path,
+            [
+                *self._cancel_old_key(),
+                _row(source_action_id="A1", known_at=self.CANCEL_AT, ingested_at=self.CANCEL_AT),
+                _row(known_at=revived, ingested_at=revived),
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="revive"):
+            FixturePriceSource(fixtures)
+
     def test_id_row_replacing_a_cancelled_idless_key_loads(self, tmp_path: Path) -> None:
         fixtures = _fixture(
             tmp_path,

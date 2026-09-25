@@ -65,7 +65,12 @@ import polars as pl
 
 from tradepartner.calendar import last_completed_session, previous_session, sessions_in_month_window
 from tradepartner.config import Settings, get_settings
-from tradepartner.store.asof import _latest_as_of, _validate_t, facts_as_of, prices_as_of
+from tradepartner.store.asof import (
+    _validate_t,
+    facts_as_of,
+    live_actions_as_of,
+    prices_as_of,
+)
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
@@ -97,7 +102,6 @@ MISSING_DATA_REASONS: frozenset[str] = frozenset(
     }
 )
 
-_ACTION_KEY = ("security_id", "action_type", "ex_date")
 
 _MEMBER_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
@@ -181,8 +185,10 @@ def _split_factors(
     conn: duckdb.DuckDBPyConnection, t: datetime, ids: list[str], session: date
 ) -> dict[str, list[tuple[date, float]]]:
     """Per security, `(ex_date, ratio)` of every split known at `t` with
-    `ex_date <= session`."""
-    actions = _latest_as_of(conn, "corporate_actions", _ACTION_KEY, t, ids)
+    `ex_date <= session`: the latest revision per action identity, so a
+    re-dated split counts once at its latest ex-date and a cancelled one
+    not at all (#108)."""
+    actions = live_actions_as_of(conn, t, ids)
     out: dict[str, list[tuple[date, float]]] = defaultdict(list)
     for row in actions.iter_rows(named=True):
         if row["action_type"] == "split" and row["ex_date"] <= session:

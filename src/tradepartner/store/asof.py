@@ -193,13 +193,25 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 #: "latest revision as of T" purposes, and the `ORDER BY` each function
 #: sorts its result by -- the columns the schema's own
 #: `UNIQUE (..., known_at)` constraint names minus `known_at` itself.
-#: `corporate_actions`'s identity (#108) is not listed here:
-#: `adjusted_prices_as_of` inlines its own latest-revision CTE
-#: for that table rather than calling `_latest_as_of` (see this module's
-#: docstring on why it runs as one SQL statement).
+#: `corporate_actions`'s identity (#108) is not a plain column list, so it
+#: is not listed here: it is `_ACTION_IDENTITY_PARTITION`, used by
+#: `live_actions_as_of` and by the latest-revision CTE that
+#: `adjusted_prices_as_of` inlines (see this module's docstring on why it
+#: runs as one SQL statement).
 _PRICE_KEY: tuple[str, ...] = ("security_id", "session")
 _FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "as_of_date", "class_member")
 _LISTING_KEY: tuple[str, ...] = ("security_id", "ticker", "exchange", "valid_from")
+
+#: `PARTITION BY` for an action's identity (#108): the source's id when it
+#: gave one, else `(action_type, ex_date)`. Every reader of
+#: `corporate_actions` picks the latest revision over this partition, and
+#: only then filters on type, ex-date and `cancelled`.
+_ACTION_IDENTITY_PARTITION = """
+    security_id,
+    source_action_id,
+    CASE WHEN source_action_id = '' THEN action_type END,
+    CASE WHEN source_action_id = '' THEN ex_date END
+"""
 
 #: The exchange's local timezone -- see this module's docstring ("Effective
 #: is exchange-local, not UTC") for why `ex_date <= t` is compared in this
@@ -275,6 +287,38 @@ def _latest_as_of(
         )
         WHERE _rn = 1
         ORDER BY {partition}
+    """
+    return conn.execute(sql, params).pl()
+
+
+def live_actions_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """The `corporate_actions` events known at `t`: per identity (#108) the
+    latest revision with `known_at <= t`, dropped if that revision is
+    cancelled, sorted by `(security_id, action_type, ex_date)`. A re-dated
+    event appears once, at its latest ex-date; no ex-date filter is applied.
+
+    `t` must be tz-aware (a bare date raises `TypeError`); `security_ids`
+    as in `_latest_as_of`.
+    """
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    security_filter = _security_filter(security_ids, params)
+    sql = f"""
+        SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY {_ACTION_IDENTITY_PARTITION}
+                ORDER BY known_at DESC
+            ) AS _rn
+            FROM corporate_actions
+            WHERE known_at <= ?
+            {security_filter}
+        )
+        WHERE _rn = 1 AND NOT cancelled
+        ORDER BY security_id, action_type, ex_date, source_action_id
     """
     return conn.execute(sql, params).pl()
 
@@ -356,11 +400,7 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
         latest_actions AS (
             SELECT * EXCLUDE (_rn) FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY
-                        security_id,
-                        source_action_id,
-                        CASE WHEN source_action_id = '' THEN action_type END,
-                        CASE WHEN source_action_id = '' THEN ex_date END
+                    PARTITION BY {_ACTION_IDENTITY_PARTITION}
                     ORDER BY known_at DESC
                 ) AS _rn
                 FROM corporate_actions

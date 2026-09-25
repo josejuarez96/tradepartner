@@ -56,7 +56,8 @@ in ingest order (`ingested_at`, then `known_at`):
    A re-date or a cancellation is such a revision.
 4. An action with a source id may not share `(security_id, action_type,
    ex_date)` with an id-less action unless that id-less key was cancelled at
-   or before the id row's ingest: otherwise both apply as two events.
+   or before the id row's `known_at`, and that key is never revived after
+   its cancel: otherwise both apply as two events at some `t`.
 """
 
 from __future__ import annotations
@@ -359,29 +360,38 @@ def _check_history[RecordT: (Bar, CorporateAction)](
 
 def _check_id_against_idless(rows: list[_Row[CorporateAction]]) -> None:
     """Contract rule 4: an id row may share `(security_id, action_type,
-    ex_date)` with an id-less key only once that key is cancelled, at or
-    before the id row's ingest."""
-    cancelled_at: dict[tuple[str, str, date], datetime] = {}
-    idless_keys: set[tuple[str, str, date]] = set()
+    ex_date)` with an id-less key only once that key is cancelled as of the
+    id row's `known_at` (its first cancel known at or before it), and an
+    id-less key an id row shares is never revived after that cancel.
+    Otherwise both apply as two events at some `t`."""
+    idless: defaultdict[tuple[str, str, date], list[CorporateAction]] = defaultdict(list)
     for row in rows:
         action = row.record
         if action.source_action_id is None:
-            key = (action.security_id, action.action_type.value, action.ex_date)
-            idless_keys.add(key)
-            if action.cancelled:
-                cancelled_at[key] = row.ingested_at
+            idless[(action.security_id, action.action_type.value, action.ex_date)].append(action)
+    for history in idless.values():
+        history.sort(key=lambda a: a.known_at)
     for row in rows:
         action = row.record
-        if action.source_action_id is None:
+        if action.source_action_id is None or action.cancelled:
             continue
         shared = (action.security_id, action.action_type.value, action.ex_date)
-        if shared in idless_keys and not (
-            shared in cancelled_at and cancelled_at[shared] <= row.ingested_at
-        ):
+        if shared not in idless:
+            continue
+        history = idless[shared]
+        cancel_at = next((a.known_at for a in history if a.cancelled), None)
+        if cancel_at is None or cancel_at > action.known_at:
             raise FixtureContractError(
                 f"{row.where}: action with source id {action.source_action_id!r} shares "
-                f"{shared} with an id-less action that is not cancelled by this ingest; "
-                "both would apply as two events"
+                f"{shared} with an id-less action that is not cancelled by its known_at "
+                f"{action.known_at.isoformat()}; both would apply as two events"
+            )
+        revived = [a for a in history if a.known_at > cancel_at and not a.cancelled]
+        if revived:
+            raise FixtureContractError(
+                f"{row.where}: the id-less action {shared} this source id "
+                f"{action.source_action_id!r} replaced is revived at "
+                f"{revived[0].known_at.isoformat()}; both would apply as two events"
             )
 
 
