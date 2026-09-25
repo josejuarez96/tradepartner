@@ -139,7 +139,9 @@ class FakeProvider:
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t = self._record("listing_ends", t, ids=ids)
-        return _latest(_for_ids(_known(self.listing_ends_rows, t), ids), ["security_id"])
+        # One row per listing: keyed by `valid_from` when a test gives several listings.
+        key = ["security_id", *(["valid_from"] if "valid_from" in self.listing_ends_rows else [])]
+        return _latest(_for_ids(_known(self.listing_ends_rows, t), ids), key)
 
     def benchmark_ids(self, t: datetime) -> Mapping[str, str]:
         self._record("benchmark_ids", t)

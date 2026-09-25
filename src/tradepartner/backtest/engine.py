@@ -13,8 +13,31 @@ cost level is evaluated from that one read set:
 
 The rebalance row for T_i records that plan, the fill on F_i and the dividends step i
 read. No plan is made at the last rebalance T_n: its fill falls after the data cutoff,
-so a run to T_n is exactly the prefix of a longer run. Delisting and stale exits and
-the benchmark series are T37c; their counters are zero here.
+so a run to T_n is exactly the prefix of a longer run.
+
+**Exits** (req 5), decided from step i's read after the fill, on the names still held:
+
+- *Delisting*: the name's current listing at the read (latest `valid_from`) is not
+  `listed` (a transfer whose new listing is known is current and `listed`, so it is
+  held through). It is sold at its last close on its final session, that listing's
+  `end_session` (its last bar in the marking frame when it has none); bars printed
+  after it (an OTC tail) are not marked.
+- *Stale*: otherwise, no bar in the marking frame on the last
+  `backtest.stale_exit_sessions` sessions through T_{i+1}; sold at its last bar's close.
+
+The sale is booked at that session, or at F_i when the session is earlier (the step
+that read the exit is the first that can book it; the name's value was frozen at that
+close since, so only the cost moves). Either way only the cost is booked before the read
+that decided the exit: the value sold is the close already marked. It pays
+`per_side_bps` and commissions, at most the proceeds; the position is zero from that
+session on and the proceeds sit in cash.
+Exit notional and costs are added to the row's `turnover` and `cost_paid`.
+
+**Benchmarks** (req 3): each series from `benchmark_ids` at close(T_0) is bought with
+the initial capital at F_0's fill price, sized after costs (the only trade), and then
+carried and valued through every step's marking frame, which includes the benchmark
+ids, so dividends are reinvested exactly as for the strategy. Equity rows carry the
+series name and no cash.
 """
 
 from __future__ import annotations
@@ -27,7 +50,7 @@ from datetime import date
 
 import polars as pl
 
-from tradepartner.backtest.costs import Commissions
+from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
 from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.portfolio import target_weights
 from tradepartner.backtest.provider import DataProvider, GapReading
@@ -44,6 +67,8 @@ from tradepartner.config import Settings
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 
 STRATEGY_SERIES = "strategy"
+#: `store.delistings.LISTED`, the status of a listing that has not ended.
+_LISTED = "listed"
 
 _POSITION_SCHEMA = {"security_id": pl.Utf8, "session": pl.Date, "value": pl.Float64}
 
@@ -81,6 +106,28 @@ class _Plan:
 
 
 @dataclass
+class _Holding:
+    """One benchmark's buy-and-hold state at one cost level; `marked_at` is None until
+    the buy at F_0."""
+
+    security_id: str
+    cash: float
+    value: float = 0.0
+    marked_at: date | None = None
+
+
+@dataclass(frozen=True)
+class _Exit:
+    """A forced sale: booked at the close of `session`, worth `value` there."""
+
+    security_id: str
+    session: date
+    value: float
+    cost: float
+    stale: bool
+
+
+@dataclass
 class _Book:
     """One cost level's state between steps."""
 
@@ -88,6 +135,7 @@ class _Book:
     cash: float
     positions: dict[str, float] = field(default_factory=dict)
     marked_at: dict[str, date] = field(default_factory=dict)
+    benchmarks: dict[str, _Holding] = field(default_factory=dict)
     held_on: dict[str, set[date]] = field(default_factory=dict)
     equity: list[EquityRow] = field(default_factory=list)
     rebalances: list[RebalanceRow] = field(default_factory=list)
@@ -133,6 +181,132 @@ def _plan(provider: DataProvider, params: Settings, session: date) -> _Plan:
     )
 
 
+def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
+    """Securities whose current listing at the read has ended, each with its final
+    session (`end_session`, None when it has none).
+
+    The current listing is the row with the latest `valid_from` on or before `session`,
+    as in `universe._current_listings`: a filing ends only the listing it names, so an
+    earlier listing left behind by a ticker change stays `listed` and must not decide.
+    A known transfer's current listing is the new, `listed` one. Rows without
+    `valid_from` (one listing per security) are taken as they are.
+    """
+    dated = "valid_from" in listing_ends.columns
+    current: dict[str, tuple[date | None, str, date | None]] = {}
+    for row in listing_ends.iter_rows(named=True):
+        valid_from = row["valid_from"] if dated else None
+        if valid_from is not None and valid_from > session:
+            continue
+        held = current.get(row["security_id"])
+        if held is None or (valid_from is not None and (held[0] is None or valid_from > held[0])):
+            current[row["security_id"]] = (valid_from, row["status"], row["end_session"])
+    return {sid: end for sid, (_, status, end) in current.items() if status != _LISTED}
+
+
+def _exits(
+    book: _Book,
+    positions: Mapping[str, float],
+    values: pl.DataFrame,
+    reads: tuple[pl.DataFrame, pl.DataFrame, dict[str, date | None]],
+    fill: date,
+    end: date,
+    params: Settings,
+) -> list[_Exit]:
+    """The delisting and stale exits of `positions` at one cost level (module docstring)."""
+    frame, raw, ended = reads
+    last_bars = dict(
+        frame.filter(pl.col("session") <= end)
+        .group_by("security_id")
+        .agg(pl.col("session").max())
+        .iter_rows()
+    )
+    rows = values.select("security_id", "session", "value").iter_rows()
+    at = {(sid, session): value for sid, session, value in rows}
+    commissions = Commissions.from_config(params.costs)
+    exits: list[_Exit] = []
+    for sid in sorted(positions):
+        last = last_bars.get(sid)
+        if sid in ended:
+            final, stale = ended[sid] or last, False
+        elif last is not None and len(_sessions(last, end)) > params.backtest.stale_exit_sessions:
+            final, stale = last, True
+        else:
+            continue
+        session = fill if final is None else min(max(final, fill), end)
+        value = at[(sid, session)]
+        raw_close = _last_close(raw, sid, session)
+        if raw_close is None:
+            raise ValueError(f"{sid} has no raw bar at or before {session.isoformat()} to exit at")
+        cost = trade_cost(value, value / raw_close, book.level, commissions)
+        exits.append(_Exit(sid, session, value, min(cost, value), stale))
+    return exits
+
+
+def _last_close(raw: pl.DataFrame, sid: str, session: date) -> float | None:
+    rows = raw.filter((pl.col("security_id") == sid) & (pl.col("session") <= session))
+    return None if rows.is_empty() else float(rows.sort("session")["close"][-1])
+
+
+def _book_exits(values: pl.DataFrame, exits: Sequence[_Exit]) -> pl.DataFrame:
+    """`values` with each exited position zero from its exit session on."""
+    if not exits:
+        return values
+    booked = pl.DataFrame(
+        [(e.security_id, e.session) for e in exits],
+        schema={"security_id": pl.Utf8, "exit_on": pl.Date},
+        orient="row",
+    )
+    return (
+        values.join(booked, on="security_id", how="left")
+        .with_columns(
+            pl.when(pl.col("exit_on").is_not_null() & (pl.col("session") >= pl.col("exit_on")))
+            .then(0.0)
+            .otherwise(pl.col("value"))
+            .alias("value")
+        )
+        .drop("exit_on")
+        .sort("security_id", "session")
+    )
+
+
+def _benchmark_step(
+    book: _Book, plan: _Plan, end: date, frame: pl.DataFrame, raw: pl.DataFrame, params: Settings
+) -> None:
+    """Buy (at F_0) or carry each benchmark, then value it through `end`."""
+    fill_price = params.execution.fill_price
+    for name, holding in book.benchmarks.items():
+        sid = holding.security_id
+        if holding.marked_at is None:
+            raw_price = _price_on(raw, sid, plan.fill_session, fill_price)
+            if _price_on(frame, sid, plan.fill_session, fill_price) is None or raw_price is None:
+                raise ValueError(
+                    f"benchmark {name} ({sid}) has no bar on {plan.fill_session.isoformat()}"
+                )
+            commissions = Commissions.from_config(params.costs)
+            notional = buy_notional_after_costs(
+                holding.cash, book.level, commissions, price=raw_price
+            )
+            cost = trade_cost(notional, notional / raw_price, book.level, commissions)
+            holding.cash = holding.cash - notional - cost
+            positions = {sid: notional}
+        else:
+            positions = carry_to_fill(
+                {sid: holding.value},
+                frame,
+                plan.session,
+                plan.fill_session,
+                fill_price=fill_price,
+                marked_at={sid: holding.marked_at},
+            )
+        values = value_positions(
+            positions, frame, plan.fill_session, fill_price=fill_price, through=end
+        )
+        for session, value, marked in values.select("session", "value", "marked_at").iter_rows():
+            equity = math.fsum([holding.cash, value])
+            book.equity.append(EquityRow(name, book.level, session, equity, None))
+            holding.value, holding.marked_at = value, marked
+
+
 def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     """Whether `sid` was held at the close before its ex-date (entitled to the dividend)."""
     return previous_session(ex_date) in book.held_on.get(sid, set())
@@ -145,9 +319,10 @@ def _step(
     frame: pl.DataFrame,
     raw: pl.DataFrame,
     dividends: tuple[pl.DataFrame, pl.DataFrame],
+    ended: dict[str, date | None],
     params: Settings,
 ) -> None:
-    """Carry, fill and value one cost level through step (T_i, T_{i+1}]."""
+    """Carry, fill, value and exit one cost level through step (T_i, T_{i+1}]."""
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -171,10 +346,19 @@ def _step(
     values = value_positions(
         fill.positions, frame, plan.fill_session, fill_price=fill_price, through=end
     )
+    exits = _exits(
+        book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params
+    )
+    values = _book_exits(values, exits)
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
+    cash = fill.cash
     for session in _sessions(plan.fill_session, end):
-        equity = math.fsum([fill.cash, totals.get(session, 0.0)])
-        book.equity.append(EquityRow(STRATEGY_SERIES, book.level, session, equity, fill.cash))
+        proceeds = [e.value - e.cost for e in exits if e.session == session]
+        cash = math.fsum([cash, *proceeds])
+        equity = math.fsum([cash, totals.get(session, 0.0)])
+        book.equity.append(EquityRow(STRATEGY_SERIES, book.level, session, equity, cash))
+    before = math.fsum([book.cash, *carried.values()])
+    exited = math.fsum(e.value for e in exits)
 
     dropped, late = dividends
     n_late = sum(
@@ -188,7 +372,7 @@ def _step(
         for sid, ex in dropped.select("security_id", "ex_date").iter_rows()
     )
 
-    book.cash = fill.cash
+    book.cash = cash
     last = values.filter(pl.col("session") == end)
     book.positions = {
         sid: value for sid, value in last.select("security_id", "value").iter_rows() if value > 0
@@ -203,7 +387,7 @@ def _step(
     for sid, weight in sorted(plan.targets.items()):
         raw_price = fill_prices.get(sid)
         if raw_price is None and sid not in fill.missing:
-            raw_price = _raw_price(raw, sid, plan.fill_session, fill_price)
+            raw_price = _price_on(raw, sid, plan.fill_session, fill_price)
         # Shares are the dollar value at the fill (not at the close) over the raw price.
         shares = None if raw_price is None else fill.positions.get(sid, 0.0) / raw_price
         book.weights.append(WeightRow(plan.fill_session, sid, weight, raw_price, shares))
@@ -215,13 +399,13 @@ def _step(
             n_universe=plan.n_universe,
             n_static_listings=plan.n_static_listings,
             n_targets=len(plan.targets),
-            turnover=fill.turnover,
-            cost_paid=fill.cost_paid,
+            turnover=fill.turnover + (exited / (2 * before) if before > 0 else 0.0),
+            cost_paid=math.fsum([fill.cost_paid, *(e.cost for e in exits)]),
             gap_count_share=plan.gap.count_share,
             gap_size_share=plan.gap.size_share,
             n_missing_fill=len(fill.missing),
-            n_delisting_exits=0,
-            n_stale_exits=0,
+            n_delisting_exits=sum(not e.stale for e in exits),
+            n_stale_exits=sum(e.stale for e in exits),
             n_excluded_no_history=plan.n_excluded_no_history,
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
@@ -229,9 +413,9 @@ def _step(
     )
 
 
-def _raw_price(raw: pl.DataFrame, sid: str, session: date, fill_price: str) -> float | None:
-    """The raw fill price of a target name that needed no trade, if it has a bar."""
-    rows = raw.filter((pl.col("security_id") == sid) & (pl.col("session") == session))
+def _price_on(frame: pl.DataFrame, sid: str, session: date, fill_price: str) -> float | None:
+    """`sid`'s `fill_price` field on `session` in `frame`, None without a bar there."""
+    rows = frame.filter((pl.col("security_id") == sid) & (pl.col("session") == session))
     return None if rows.is_empty() else float(rows[fill_price].item())
 
 
@@ -261,17 +445,29 @@ def run(
         raise ValueError(f"need at least two rebalance sessions in [{start}, {end}]")
 
     capital = params.backtest.initial_capital
-    books = [_Book(level=level, cash=capital) for level in levels]
+    plan = _plan(provider, params, sessions[0])
+    benchmarks = dict(sorted(provider.benchmark_ids(read_time(sessions[0])).items()))
+    books = [
+        _Book(
+            level=level,
+            cash=capital,
+            benchmarks={name: _Holding(sid, capital) for name, sid in benchmarks.items()},
+        )
+        for level in levels
+    ]
     for book in books:
         book.equity.append(EquityRow(STRATEGY_SERIES, book.level, sessions[0], capital, capital))
-    plan = _plan(provider, params, sessions[0])
+        for name in benchmarks:
+            book.equity.append(EquityRow(name, book.level, sessions[0], capital, None))
     frames: list[StepFrame] = []
     targets: dict[date, Mapping[str, float]] = {}
     for index, step_end in enumerate(sessions[1:], start=1):
         t, t_prev = read_time(step_end), read_time(plan.session)
         ids = sorted({*plan.targets, *(sid for book in books for sid in book.positions)})
-        frame = provider.adjusted_prices(t, ids, True)
-        raw = provider.raw_prices(t, ids)
+        marked = sorted({*ids, *benchmarks.values()})
+        frame = provider.adjusted_prices(t, marked, True)
+        raw = provider.raw_prices(t, marked)
+        ended = _ended(provider.listing_ends(t, ids), step_end)
         dropped = provider.dropped_dividends(t, ids)
         ever_held = sorted({sid for book in books for sid in book.held_on})
         late = provider.late_dividends(t_prev, t, ever_held)
@@ -279,7 +475,8 @@ def run(
         frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
         targets[plan.fill_session] = dict(plan.targets)
         for book in books:
-            _step(book, plan, step_end, frame, raw, (dropped, late), params)
+            _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)
+            _benchmark_step(book, plan, step_end, frame, raw, params)
         if next_plan is not None:
             plan = next_plan
 
