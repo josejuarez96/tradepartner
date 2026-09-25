@@ -28,7 +28,9 @@ callers omit it and get the module's shared, lazily-built client.
 from __future__ import annotations
 
 import math
+import os
 import re
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -351,6 +353,38 @@ def filing_sgml_header(
     return response.text
 
 
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write `data` to `path` through a temp file in the same directory and
+    `os.replace`, so a reader never sees a half-written cache file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def cached_filing_path(
+    cik: str, accession: str, filename: str, *, settings: Settings | None = None
+) -> Path:
+    """Where `download_filing_file` keeps one filing file under `edgar.cache_dir`.
+
+    Pure: validates `accession` and `filename` and checks the resolved path
+    stays inside the cache directory; touches neither disk nor network.
+    """
+    _validate_accession(accession)
+    _validate_relative_filename(filename)
+    settings = settings or get_settings()
+    cache_dir = Path(settings.edgar.cache_dir).resolve()
+    dest = (cache_dir / str(int(cik)) / accession.replace("-", "") / filename).resolve()
+    if not dest.is_relative_to(cache_dir):
+        raise InvalidFilingReferenceError(f"resolved path escapes edgar.cache_dir: {dest}")
+    return dest
+
+
 def download_filing_file(
     cik: str,
     accession: str,
@@ -363,23 +397,73 @@ def download_filing_file(
 
     Used by `edgartools` (T11) to parse a downloaded cover page's iXBRL;
     this function only fetches and caches the bytes, never parses them.
-    `accession` and `filename` are validated first (see
-    `_validate_accession`/`_validate_relative_filename`), and the resolved
-    destination is checked to still be inside `edgar.cache_dir` before
-    anything is written.
+    `accession` and `filename` are validated first (`cached_filing_path`),
+    before anything else, so a file already sitting at an unsafe target is
+    never returned. A file already present is returned without a request (a
+    filing never changes); a new one is written atomically.
     """
-    _validate_accession(accession)
-    _validate_relative_filename(filename)
     settings = settings or get_settings()
+    dest = cached_filing_path(cik, accession, filename, settings=settings)
+    if dest.is_file():
+        return dest
     accession_nodash = accession.replace("-", "")
     url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_nodash}/{filename}"
     response = _get(url, settings=settings, client=client)
-
-    cache_dir = Path(settings.edgar.cache_dir).resolve()
-    dest = (cache_dir / str(int(cik)) / accession_nodash / filename).resolve()
-    if not dest.is_relative_to(cache_dir):
-        raise InvalidFilingReferenceError(f"resolved path escapes edgar.cache_dir: {dest}")
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(response.content)
+    write_atomic(dest, response.content)
     return dest
+
+
+def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client | None) -> Path:
+    """Stream `url` to `dest` behind the throttle and `User-Agent`, one retry
+    on a rate-limit status as `_get` does, through a temp file and `os.replace`."""
+    headers = {"User-Agent": _user_agent(settings)}
+    http_client = (
+        client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(2):
+        _LIMITER.wait(1.0 / settings.edgar.requests_per_second)
+        timeout = settings.edgar.request_timeout_seconds
+        with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
+            if response.status_code in _RETRY_STATUS_CODES and attempt == 0:
+                time.sleep(_retry_backoff_seconds(response, settings))
+                continue
+            response.raise_for_status()
+            fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as file:
+                    for chunk in response.iter_bytes():
+                        file.write(chunk)
+                os.replace(tmp, dest)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+            return dest
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def bulk_submissions(
+    *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> Path:
+    """The nightly `submissions.zip` (every CIK's submissions and older pages,
+    rebuilt about 03:00 ET), streamed to `edgar.cache_dir/bulk/submissions.zip`."""
+    settings = settings or get_settings()
+    return _stream_to(
+        "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip",
+        Path(settings.edgar.cache_dir) / "bulk" / "submissions.zip",
+        settings=settings,
+        client=client,
+    )
+
+
+def bulk_company_facts(
+    *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> Path:
+    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`."""
+    settings = settings or get_settings()
+    return _stream_to(
+        "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
+        Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip",
+        settings=settings,
+        client=client,
+    )

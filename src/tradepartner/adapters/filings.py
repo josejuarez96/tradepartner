@@ -159,7 +159,11 @@ class FilingSource(abc.ABC):
 
     @abc.abstractmethod
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
-        """Every filing in the index, any form, any filer."""
+        """Every filing of every issuer CIK in the index, all their forms.
+
+        An issuer CIK has at least one `master.issuer_forms` filing other
+        than a Form 25 or 25-NSE; other filers (insiders, funds, exchanges)
+        are dropped. A 25-NSE sits under its subject company only."""
 
     @abc.abstractmethod
     def companies_snapshot(self) -> list[CompanySnapshotEntry]:

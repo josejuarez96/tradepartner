@@ -149,6 +149,14 @@ class EdgarConfig(BaseModel):
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
     max_retry_after_seconds: float = Field(default=120.0, gt=0)
+    # T11b (#163): the EDGAR `FilingSource`. The full index starts in 1993; a
+    # quarter's raw index is cached only once fetched this many days after its
+    # Eastern-time end; above this many CIKs to stamp, stamping reads the nightly
+    # `submissions.zip` instead of per-CIK submissions.
+    index_first_year: int = Field(default=1993, ge=1993)
+    index_settle_days: int = Field(default=3, ge=0)
+    bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
+    cover_page_forms: list[str] = Field(default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"])
 
 
 class MasterConfig(BaseModel):

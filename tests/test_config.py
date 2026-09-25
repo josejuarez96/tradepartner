@@ -80,6 +80,25 @@ def test_edgar_defaults() -> None:
     assert s.edgar.max_retry_after_seconds == pytest.approx(120.0)
 
 
+def test_edgar_filing_source_defaults() -> None:
+    """T11b's keys: index scan start, quarter settle days, bulk-stamp threshold
+    and the periodic forms whose cover pages are read."""
+    s = _settings()
+    assert s.edgar.index_first_year == 1993
+    assert s.edgar.index_settle_days == 3
+    assert s.edgar.bulk_stamp_threshold_ciks == 500
+    assert s.edgar.cover_page_forms == ["10-K", "10-Q", "20-F", "40-F"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("index_first_year", 1992), ("index_settle_days", -1), ("bulk_stamp_threshold_ciks", 0)],
+)
+def test_edgar_filing_source_keys_reject_nonsense(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={field: value})
+
+
 def test_edgar_cache_dir_independent_of_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

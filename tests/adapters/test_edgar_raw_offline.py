@@ -11,7 +11,7 @@ safety-reviewer MUST FIX).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -391,3 +391,133 @@ def test_download_filing_file_rejects_unsafe_filenames(tmp_path: Path, filename:
             settings=_settings(cache_dir=tmp_path),
             client=_mock_client(handler),
         )
+
+
+# --- the file cache (T11b) --------------------------------------------------
+
+
+def test_a_traversal_filename_raises_even_when_a_file_sits_at_its_target(tmp_path: Path) -> None:
+    """Validation runs before the present-file early return."""
+    cache = tmp_path / "cache"
+    (tmp_path / "secret.txt").write_text("not for you")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be made for an unsafe filename")
+
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.download_filing_file(
+            "320193",
+            "0000320193-24-000123",
+            "../../../secret.txt",
+            settings=_settings(cache_dir=cache),
+            client=_mock_client(handler),
+        )
+
+
+def test_a_present_file_is_returned_without_a_request(tmp_path: Path) -> None:
+    settings = _settings(cache_dir=tmp_path)
+    path = edgar_raw.cached_filing_path(
+        "320193", "0000320193-24-000123", "a.htm", settings=settings
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"cached")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("a cached filing file must not be fetched again")
+
+    got = edgar_raw.download_filing_file(
+        "320193", "0000320193-24-000123", "a.htm", settings=settings, client=_mock_client(handler)
+    )
+    assert got == path and got.read_bytes() == b"cached"
+
+
+def test_cached_filing_path_is_pure_and_validates(tmp_path: Path) -> None:
+    settings = _settings(cache_dir=tmp_path)
+    path = edgar_raw.cached_filing_path(
+        "320193", "0000320193-24-000123", "a.htm", settings=settings
+    )
+    assert path == (tmp_path / "320193" / "000032019324000123" / "a.htm").resolve()
+    assert not path.parent.exists()
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.cached_filing_path("320193", "bad", "a.htm", settings=settings)
+
+
+def test_a_download_replaces_a_temp_file_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replaced: list[tuple[Path, Path]] = []
+    real_replace = edgar_raw.os.replace
+
+    def spy(src: str, dst: Path) -> None:
+        assert Path(src).exists() and not Path(dst).exists()
+        replaced.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(edgar_raw.os, "replace", spy)
+    dest = edgar_raw.download_filing_file(
+        "320193",
+        "0000320193-24-000123",
+        "a.htm",
+        settings=_settings(cache_dir=tmp_path),
+        client=_mock_client(lambda request: httpx.Response(200, content=b"body")),
+    )
+    [(src, dst)] = replaced
+    assert dst == dest and src.parent == dest.parent and src != dest
+    assert dest.read_bytes() == b"body"
+    assert list(dest.parent.iterdir()) == [dest]
+
+
+@pytest.mark.parametrize(
+    ("fetch", "url_tail", "name"),
+    [
+        (edgar_raw.bulk_submissions, "bulkdata/submissions.zip", "submissions.zip"),
+        (edgar_raw.bulk_company_facts, "xbrl/companyfacts.zip", "companyfacts.zip"),
+    ],
+)
+def test_bulk_zips_stream_into_the_cache_dir_after_one_retry(
+    tmp_path: Path, fetch: Callable[..., Path], url_tail: str, name: str
+) -> None:
+    served: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(str(request.url))
+        assert request.headers["User-Agent"] == "TradePartner test-agent"
+        if len(served) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, content=b"PK zip bytes")
+
+    path = fetch(
+        settings=_settings(cache_dir=tmp_path, retry_backoff_seconds=0.001),
+        client=_mock_client(handler),
+    )
+    assert path == tmp_path / "bulk" / name and path.read_bytes() == b"PK zip bytes"
+    assert len(served) == 2 and served[0].endswith(url_tail)
+    assert [p.name for p in path.parent.iterdir()] == [name]
+
+
+def test_a_failed_bulk_download_leaves_no_file(tmp_path: Path) -> None:
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(404)),
+        )
+    assert list((tmp_path / "bulk").iterdir()) == []
+
+
+class _BrokenStream(httpx.SyncByteStream):
+    def __iter__(self) -> Iterator[bytes]:
+        yield b"PK first chunk"
+        raise httpx.ReadError("connection reset mid-stream")
+
+
+def test_a_bulk_download_failing_mid_stream_keeps_the_previous_zip(tmp_path: Path) -> None:
+    previous = tmp_path / "bulk" / "submissions.zip"
+    previous.parent.mkdir()
+    previous.write_bytes(b"yesterday's zip")
+    with pytest.raises(httpx.ReadError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(200, stream=_BrokenStream())),
+        )
+    assert previous.read_bytes() == b"yesterday's zip"
+    assert list(previous.parent.iterdir()) == [previous]
