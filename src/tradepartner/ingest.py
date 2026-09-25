@@ -53,7 +53,7 @@ is fetching is stored, not refused as look-ahead.
 **Run messages** are stored with every configured secret value redacted,
 control characters replaced and the length capped at
 `ingest.max_message_chars`: an exception's text comes from a server. The
-EDGAR message ends with the adapter's unstamped-filing, unstamped-fact and
+EDGAR message carries the adapter's unstamped-filing, unstamped-fact and
 skipped-filer counts when the source exposes them (#172).
 """
 
@@ -341,17 +341,25 @@ def _ingest_filings(
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
-        f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts; "
+        f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
+        f"{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
-    return added, message + _source_counts(filings)
+    return added, message
 
 
 def _source_counts(filings: FilingSource) -> str:
     """`"; unstamped: N filings, M facts; skipped filers: K"`, naming only the
     attributes `filings` exposes, so rows the EDGAR adapter (T11b, T11c) left
     out stay visible in the run row (#172). Duck-typed: each attribute is a
-    count or a collection; a fixture source has none and adds nothing."""
+    count or a collection; a fixture source has none and adds nothing.
+
+    Read once, after both builds, from the unwrapped source. The contract
+    this relies on: `unstamped_filings` and `skipped_filers` hold the result
+    of the run's one `filing_index` call, and `unstamped_facts` accumulates
+    over every `facts` call on the source instance, never reset per CIK.
+    The counts sit before the variable-length benchmarks list so
+    `ingest.max_message_chars` never cuts them off."""
 
     def count(attribute: str) -> int | None:
         value = getattr(filings, attribute, None)
