@@ -9,6 +9,8 @@ message.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tradepartner import cli_record
@@ -102,3 +104,94 @@ def test_prefer_root_document_leaves_a_root_level_document_unchanged() -> None:
 def test_flatten_fixture_filename_replaces_every_slash() -> None:
     assert cli_record._flatten_fixture_filename("a/b/c.xml") == "a__b__c.xml"
     assert cli_record._flatten_fixture_filename("primary_doc.xml") == "primary_doc.xml"
+
+
+# --- T3 size trimming (#84) ---------------------------------------------------
+
+
+def test_trim_company_facts_keeps_dei_and_share_concepts_only() -> None:
+    payload = {
+        "cik": 1,
+        "entityName": "X",
+        "facts": {
+            "dei": {"EntityCommonStockSharesOutstanding": {"units": {}}, "EntityPublicFloat": {}},
+            "us-gaap": {
+                "CommonStockSharesOutstanding": {"units": {}},
+                "WeightedAverageNumberOfSharesOutstandingBasic": {},
+                "Revenues": {"units": {}},
+                "Assets": {},
+            },
+            "ffd": {"Something": {}},
+        },
+    }
+    out = cli_record.trim_company_facts(payload)
+    assert out["cik"] == 1 and out["entityName"] == "X"
+    assert out["facts"]["dei"] == payload["facts"]["dei"]
+    assert set(out["facts"]["us-gaap"]) == {
+        "CommonStockSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+    }
+    assert "ffd" not in out["facts"]
+    assert payload["facts"]["us-gaap"].get("Revenues")  # input untouched
+    assert cli_record.trim_company_facts({"no": "facts"}) == {"no": "facts"}
+
+
+def test_trim_company_tickers_keeps_sample_and_recorded_rows() -> None:
+    rows = [
+        [i, f"C{i}", f"T{i}", "NYSE"] for i in range(cli_record.COMPANY_TICKERS_SAMPLE_ROWS + 50)
+    ]
+    rows.append([320193, "Apple", "AAPL", "Nasdaq"])
+    rows.append([999, "Coke", "KO", "NYSE"])
+    rows.append([998, "Other", "ZZZ", "NYSE"])
+    payload = {"fields": ["cik", "name", "ticker", "exchange"], "data": rows}
+    out = cli_record.trim_company_tickers(payload, ciks=["0000320193"], symbols=["ko"])
+    kept = out["data"]
+    assert len(kept) == cli_record.COMPANY_TICKERS_SAMPLE_ROWS + 2
+    assert kept[-2][2] == "AAPL" and kept[-1][2] == "KO"
+    assert out["fields"] == payload["fields"]
+    assert cli_record.trim_company_tickers(
+        {"fields": ["x"], "data": [[1]]}, ciks=[], symbols=[]
+    ) == {
+        "fields": ["x"],
+        "data": [[1]],
+    }
+
+
+def test_accessions_in_company_facts_collects_every_accn() -> None:
+    payload = {
+        "facts": {
+            "dei": {"A": {"units": {"shares": [{"accn": "1-1", "val": 1}, {"accn": "1-2"}]}}},
+            "us-gaap": {"B": {"units": {"USD": [{"accn": "1-1"}, {"val": 3}]}}},
+        }
+    }
+    assert cli_record.accessions_in_company_facts(payload) == {"1-1", "1-2"}
+    assert cli_record.accessions_in_company_facts({"facts": "nope"}) == set()
+
+
+def test_trim_submissions_page_keeps_wanted_rows_across_every_column() -> None:
+    page = {
+        "accessionNumber": ["a", "b", "c"],
+        "acceptanceDateTime": ["ta", "tb", "tc"],
+        "form": ["10-K", "8-K", "10-Q"],
+        "filingCount": 3,
+    }
+    out = cli_record.trim_submissions_page(page, accessions=["c", "a", "zzz"])
+    assert out == {
+        "accessionNumber": ["a", "c"],
+        "acceptanceDateTime": ["ta", "tc"],
+        "form": ["10-K", "10-Q"],
+        "filingCount": 3,
+    }
+    assert cli_record.trim_submissions_page({"x": 1}, accessions=["a"]) == {"x": 1}
+
+
+def test_recorded_at_notes_utc_time_per_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_record, "FIXTURES_ROOT", tmp_path)
+    monkeypatch.setattr(cli_record, "_recorded_at", {})
+    target = tmp_path / "alpaca" / "x.json"
+    target.parent.mkdir()
+    cli_record._write_json(target, {"k": "v"}, secrets=[])
+    assert list(cli_record._recorded_at) == ["alpaca/x.json"]
+    assert cli_record._recorded_at["alpaca/x.json"].endswith("+00:00")

@@ -12,7 +12,13 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Broker-level tests: an aware timestamp that overflows once converted to UTC raises `ValueError` naming the field from `Order`/`Fill`, and `FakeBroker.submit`/`simulate_fill` fail closed with no order, fill or position recorded (#57).
 - Research G8: survivorship-bias-free US daily price vendors for an individual (Norgate, Sharadar, CRSP, Tiingo, Massive, EODHD, Alpaca), with a cited comparison table and disconfirmation log (`docs/research/2026-09-25-price-vendors.md`) (#46).
 - Phase 2 T21a: Streamlit dashboard shell (`tradepartner.dashboard.app`): one short-lived read-only store connection per render handed to the selected page, "no store yet", "store busy" and "store unreadable" states, sidebar navigation with an empty data-health placeholder for T21 (#66).
-- Research G1 report: post-2010 long-only 12-1 momentum, net of costs, and post-publication weakening. Graded MIXED, with candidate Phase 3 magnitude, drawdown and cost inputs (#47).
+- Phase 2 T6: as-of read primitives (`prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`) returning the latest revision as of a tz-aware T, with a bare date or naive datetime rejected; the truncation-invariance harness (`tests/lookahead/harness.py`) and its invariance suite over every distinct `known_at` in the fixture (#39).
+- Research G3: independent (non-Faber) evidence on simple trend-timing rules, out of sample and net of costs, graded MIXED from full texts, with a transfer table for a long-only monthly US overlay and a disconfirmation log (`docs/research/2026-09-25-trend-timing.md`) (#48).
+- Research G4 report: signal combination out of sample and net of costs, graded MIXED, with candidate Phase 3 inputs (single vs multi-signal, signal cap, fixed weights, turnover controls, t > 3 hurdle) (#49).
+- ADR 0007: clock and other system faults in the broker path halt rather than reject; `ClockError` type and pre-submit clock check specified for Phase 4 (#64)
+- Tooling: owner cockpit, `scripts/cockpit.py`, renders one local HTML page from GitHub claims and PRs, the plan on `origin/main`, the roadmap and local Claude Code session logs: teams with activity state, tokens and models, claims and PR state, roadmap phase, plan by chain, unclaimed queue; `--loop N` regenerates every N seconds and the page reloads itself (#65).
+- Phase 2 T7: `PriceSource` interface (`adapters/prices.py`) with validated `Bar`/`CorporateAction` records and the timing rules as pure functions (`bar_known_at`, `action_first_seen_known_at`, `revision_of`: revisions stamped at ingest, never back-dated); `FixturePriceSource` replays the fixture universe by `security_id` only and enforces the timing contract at load (#75).
+- Phase 2 T3: recorded Alpaca and EDGAR fixtures (scrubbed, trimmed and gzipped to stay under 500 KB), `AlpacaConfig.historical_feed` (default `sip`, confirmed on the free plan), `alpaca_raw.daily_bars` takes its default feed from config, free-data terms research report (#84).
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -20,6 +26,13 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Process: `scripts/team.py start <name>` sets up a team directory outside the repo in one step; `register` refuses to overwrite another team's `.team`; sessions touch only their own directory (#40).
 - `store.db.ensure_tz_aware` and the broker value objects share one tz-aware UTC check, `tradepartner.timeutil.ensure_tz_aware_utc`, which also rejects a `tzinfo` with no UTC offset; `ensure_tz_aware` now returns the value converted to UTC (#30).
 - Plan: Phase 2 gains T21a, a Streamlit dashboard shell (app entry, read-only connection, busy state, navigation) that depends only on T4; T21 (data-health page) now depends on T18 and T21a instead of T19, and T19 (CLI) also depends on T21a, so UX work can start early (#53).
+- Process: the teams picking order includes any unclaimed sized issue (research issues with an owner-approved brief, ADR and spec/plan drafts, not only `size:S`), naming the agent and model tier for each; an issue with no size label is not ready to claim (#55).
+- Process: bookkeeping is a fragment file per PR (`docs/status.d/`, `changelog.d/`, folded by doc-keeper), never an edit to STATUS.md or CHANGELOG.md; `scripts/ready_pr.py` merges main in, resolves append conflicts, runs checks and reviews, waits for CI and marks the PR ready; `/ready-pr` skill (#70)
+- Process: `scripts/ready_pr.py` skips the local pytest run for docs, fragment and process PRs (no `src/`, `tests/`, `scripts/`, `pyproject.toml` or `uv.lock` change); `--tests` forces it, `--no-tests` skips it; CI still runs the full suite on every PR (#78)
+- `universe.liquidity_rule_enabled` now defaults to `true`: SIP history makes median dollar volume a real liquidity measure (#84).
+
+### Fixed
+- `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.

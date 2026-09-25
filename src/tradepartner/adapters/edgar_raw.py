@@ -268,6 +268,27 @@ def submissions(
     return response.json()
 
 
+_SUBMISSIONS_PAGE_PATTERN = re.compile(r"CIK\d{10}-submissions-\d{3}\.json")
+
+
+def submissions_page(
+    name: str, *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> Any:
+    """One older submissions page, named in `submissions()["filings"]["files"][i]["name"]`.
+
+    The main payload holds only the most recent ~1,000 filings; older ones, with their
+    `acceptanceDateTime`, live in these pages (T3, #84). `name` is validated so it cannot
+    carry a path into the URL.
+    """
+    if not _SUBMISSIONS_PAGE_PATTERN.fullmatch(name):
+        raise InvalidFilingReferenceError(
+            f"submissions page must look like CIK0000320193-submissions-001.json, got {name!r}"
+        )
+    settings = settings or get_settings()
+    response = _get(f"https://data.sec.gov/submissions/{name}", settings=settings, client=client)
+    return response.json()
+
+
 def company_facts(
     cik: str, *, settings: Settings | None = None, client: httpx.Client | None = None
 ) -> Any:

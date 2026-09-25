@@ -21,6 +21,8 @@ jobs:
         run: uv sync --locked
       - name: Hygiene (pre-commit hooks)
         run: SKIP=no-commit-to-branch,ruff-check,ruff-format uv run pre-commit run --all-files
+      - name: Fragments (STATUS/CHANGELOG entries are well-formed files)
+        run: python3 scripts/fragments.py check
       - name: Lint
         run: uv run ruff check .
       - name: Format

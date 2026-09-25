@@ -51,3 +51,10 @@ def test_filing_index_quarter_returns_text() -> None:
 
     assert isinstance(text, str)
     assert len(text) > 0
+
+
+def test_submissions_page_rejects_a_name_that_is_not_a_page() -> None:
+    """The page name flows into a URL, so only the documented shape is accepted (T3)."""
+    for bad in ["../secret.json", "CIK0000320193.json", "CIK0000320193-submissions-1.json", ""]:
+        with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+            edgar_raw.submissions_page(bad)

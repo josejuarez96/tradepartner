@@ -19,11 +19,12 @@ non-zero with a clear message when secrets are missing").
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import re
 import sys
 from collections.abc import Iterable, Mapping
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,12 @@ ALPACA_FIXTURES_DIR = FIXTURES_ROOT / "alpaca"
 EDGAR_FIXTURES_DIR = FIXTURES_ROOT / "edgar"
 
 SCRUBBED = "<scrubbed>"
+RECORDED_AT_FILE = FIXTURES_ROOT / "recorded_at.json"
+# `{relative fixture path: UTC ISO time}` written once at the end of a run. The time is
+# taken when the payload is written, seconds after its fetch, so it is an upper bound on
+# the fetch time: the right `known_at` for snapshot-provenance records (spec line 70,
+# "recorded fetch time"), never earlier than the truth (quant-auditor, #87).
+_recorded_at: dict[str, str] = {}
 
 # --- scrub patterns (also imported by tests/test_fixture_scrub.py, so the
 # walking test and this module's own scrubbing stay in lockstep) -----------
@@ -229,16 +236,121 @@ def _missing_secret_names(settings: Settings) -> list[str]:
     return missing
 
 
+def _note_recorded(path: Path) -> None:
+    _recorded_at[str(path.relative_to(FIXTURES_ROOT))] = (
+        datetime.now(UTC).replace(microsecond=0).isoformat()
+    )
+
+
 def _write_json(path: Path, payload: Any, *, secrets: Iterable[str]) -> None:
     scrubbed, count = scrub_json(payload, secrets=secrets)
     path.write_text(json.dumps(scrubbed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _note_recorded(path)
     print(f"cli_record: scrubbed {count} value(s) in {path.name}")
 
 
 def _write_text(path: Path, text: str, *, secrets: Iterable[str]) -> None:
     scrubbed, count = scrub_text(text, secrets=secrets)
     path.write_text(scrubbed, encoding="utf-8")
+    _note_recorded(path)
     print(f"cli_record: scrubbed {count} value(s) in {path.name}")
+
+
+def _write_text_gz(path: Path, text: str, *, secrets: Iterable[str]) -> None:
+    """Scrub, then write gzip-compressed (`path` already ends in `.gz`)."""
+    scrubbed, count = scrub_text(text, secrets=secrets)
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        fh.write(scrubbed)
+    _note_recorded(path)
+    print(f"cli_record: scrubbed {count} value(s) in {path.name} (gzip)")
+
+
+def accessions_in_company_facts(payload: Any) -> set[str]:
+    """Every `accn` referenced by any fact in a (trimmed) company-facts payload. Pure."""
+    out: set[str] = set()
+    facts = payload.get("facts", {}) if isinstance(payload, dict) else {}
+    if not isinstance(facts, dict):
+        return out
+    for concepts in facts.values():
+        if not isinstance(concepts, dict):
+            continue
+        for concept in concepts.values():
+            units = concept.get("units", {}) if isinstance(concept, dict) else {}
+            for entries in units.values():
+                for entry in entries if isinstance(entries, list) else []:
+                    accn = entry.get("accn") if isinstance(entry, dict) else None
+                    if accn:
+                        out.add(str(accn))
+    return out
+
+
+def trim_submissions_page(page: Any, *, accessions: Iterable[str]) -> Any:
+    """Keep only the rows (column-array index positions) whose accession is wanted. Pure.
+
+    A submissions page is `{"accessionNumber": [...], "acceptanceDateTime": [...], ...}`
+    with one entry per filing in every column; rows are kept in their original order.
+    """
+    if not isinstance(page, dict) or not isinstance(page.get("accessionNumber"), list):
+        return page
+    wanted = set(accessions)
+    keep = [i for i, accn in enumerate(page["accessionNumber"]) if accn in wanted]
+    return {
+        key: [col[i] for i in keep if i < len(col)] if isinstance(col, list) else col
+        for key, col in page.items()
+    }
+
+
+def trim_company_facts(payload: Any) -> Any:
+    """Keep `dei` whole and only share-count concepts elsewhere; other keys untouched.
+
+    Pure. Drops nothing the master/universe code reads (spec master table); the full
+    payload is 2-8 MB per filer, the trimmed one under ~200 KB.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("facts"), dict):
+        return payload
+    facts: dict[str, Any] = {}
+    for namespace, concepts in payload["facts"].items():
+        if not isinstance(concepts, dict):
+            continue
+        if namespace in COMPANY_FACTS_KEEP_NAMESPACES:
+            facts[namespace] = concepts
+            continue
+        kept = {
+            name: value
+            for name, value in concepts.items()
+            if any(s in name for s in COMPANY_FACTS_KEEP_CONCEPT_SUBSTRINGS)
+        }
+        if kept:
+            facts[namespace] = kept
+    return {**payload, "facts": facts}
+
+
+def trim_company_tickers(payload: Any, *, ciks: Iterable[str], symbols: Iterable[str]) -> Any:
+    """Keep rows for the recorded CIKs and symbols plus the first sample rows.
+
+    Pure. The snapshot is `{"fields": [...], "data": [[...], ...]}`; the original
+    row order is kept so the sample is the same on every run.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return payload
+    fields = payload.get("fields") or []
+    try:
+        cik_i, ticker_i = fields.index("cik"), fields.index("ticker")
+    except ValueError:
+        return payload
+    want_ciks = {int(c) for c in ciks}
+    want_symbols = {s.upper() for s in symbols}
+    rows = payload["data"]
+    kept = [
+        row
+        for i, row in enumerate(rows)
+        if i < COMPANY_TICKERS_SAMPLE_ROWS
+        or (
+            len(row) > max(cik_i, ticker_i)
+            and (row[cik_i] in want_ciks or str(row[ticker_i]).upper() in want_symbols)
+        )
+    ]
+    return {**payload, "data": kept}
 
 
 # --- the fixed recording plan ------------------------------------------------
@@ -269,6 +381,22 @@ EDGAR_FILING_INDEX_QUARTER = (2024, 1)
 ALPACA_SYMBOLS = ["SPY", "MTUM", "AAPL", "MSFT", "KO"]
 ALPACA_START = date(2020, 8, 1)
 ALPACA_END = date(2020, 9, 30)
+
+# Fixture size cap (pre-commit `check-added-large-files`, 500 KB). The raw EDGAR
+# payloads are far bigger: a company-facts file lists every XBRL concept a filer
+# ever reported (2-8 MB), the companies snapshot lists ~10k companies (900 KB),
+# and a 10-K primary document is 1.5-2.6 MB with `dei:` cover tags spread across
+# the whole file (so it cannot be truncated). T3 recorded them at those sizes.
+# Rules, applied before scrubbing and writing:
+# - company facts keep the `dei` namespace whole plus the share-count concepts
+#   the master and universe need (spec master table: shares from company facts
+#   with `as_of_date` and class dimension); other concepts are dropped;
+# - the companies snapshot keeps every row for a recorded CIK or symbol plus
+#   the first `COMPANY_TICKERS_SAMPLE_ROWS` rows for shape;
+# - filing documents are written gzip-compressed (`.gz`), whole.
+COMPANY_FACTS_KEEP_NAMESPACES: tuple[str, ...] = ("dei",)
+COMPANY_FACTS_KEEP_CONCEPT_SUBSTRINGS: tuple[str, ...] = ("SharesOutstanding", "SharesIssued")
+COMPANY_TICKERS_SAMPLE_ROWS = 200
 
 # Cap on the recorded full-index excerpt: the real per-quarter `form.idx`
 # lists every SEC filing that quarter (tens of thousands of lines); only a
@@ -330,7 +458,11 @@ def _line_has_cik(line: str, wanted: set[str]) -> bool:
 def _record_edgar(settings: Settings, secrets: list[str]) -> None:
     year, qtr = EDGAR_FILING_INDEX_QUARTER
 
-    tickers = edgar_raw.company_tickers(settings=settings)
+    tickers = trim_company_tickers(
+        edgar_raw.company_tickers(settings=settings),
+        ciks=EDGAR_CIKS.values(),
+        symbols=ALPACA_SYMBOLS,
+    )
     _write_json(EDGAR_FIXTURES_DIR / "company_tickers.json", tickers, secrets=secrets)
 
     index_text = edgar_raw.filing_index_quarter(year, qtr, settings=settings)
@@ -341,8 +473,21 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
         submissions = edgar_raw.submissions(cik, settings=settings)
         _write_json(EDGAR_FIXTURES_DIR / f"submissions_{label}.json", submissions, secrets=secrets)
 
-        facts = edgar_raw.company_facts(cik, settings=settings)
+        facts = trim_company_facts(edgar_raw.company_facts(cik, settings=settings))
         _write_json(EDGAR_FIXTURES_DIR / f"company_facts_{label}.json", facts, secrets=secrets)
+
+        # Older filings (and their acceptance times) live in paged files; keep only the
+        # rows the trimmed facts reference, so T11 never has to fall back to `filed`.
+        wanted = accessions_in_company_facts(facts)
+        for page_ref in submissions.get("filings", {}).get("files", []):
+            name = str(page_ref.get("name", ""))
+            page = trim_submissions_page(
+                edgar_raw.submissions_page(name, settings=settings), accessions=wanted
+            )
+            suffix = name.rsplit("-", 1)[-1].removesuffix(".json")
+            _write_json(
+                EDGAR_FIXTURES_DIR / f"submissions_{label}_{suffix}.json", page, secrets=secrets
+            )
 
         picked = _pick_filing(submissions, _FORM_PREFERENCE[label])
         if picked is None:
@@ -361,8 +506,10 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
             cik, accession, root_document, settings=settings
         )
         fixture_name = _flatten_fixture_filename(root_document)
-        _write_text(
-            EDGAR_FIXTURES_DIR / f"filing_{label}_{fixture_name}",
+        for stale in EDGAR_FIXTURES_DIR.glob(f"filing_{label}_*"):
+            stale.unlink()  # the document name changes per filing; keep exactly one per label
+        _write_text_gz(
+            EDGAR_FIXTURES_DIR / f"filing_{label}_{fixture_name}.gz",
             downloaded.read_text(encoding="utf-8", errors="replace"),
             secrets=secrets,
         )
@@ -402,6 +549,7 @@ def main() -> int:
     secrets = _configured_secrets(settings)
     _record_edgar(settings, secrets)
     _record_alpaca(settings, secrets)
+    RECORDED_AT_FILE.write_text(json.dumps(_recorded_at, indent=2, sort_keys=True) + "\n")
 
     print(f"cli_record: wrote fixtures under {FIXTURES_ROOT}")
     return 0

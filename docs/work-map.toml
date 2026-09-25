@@ -1,0 +1,270 @@
+# Work map: plain-English notes the cockpit shows for every piece of work.
+#
+# One table per node. Kinds: phase, task, issue, research, adr, plan, spec.
+#   [task.T7]      a plan task            [issue.49]   a GitHub issue (not a plan task)
+#   [research.<file stem>]  a report in docs/research   [adr.0003]  a decision record
+#   [phase.3]      a roadmap phase        [plan.<stem>] / [spec.<stem>]  a plan or spec file
+# Fields: what (one sentence, what it is), why (why it matters on the way to the MVP),
+# unblocks (optional list of node ids, "kind:key", that this piece feeds).
+# Plan dependencies, claims, PRs and roadmap exit criteria are read from their sources;
+# only the words and the cross-cutting "unblocks" links live here.
+# Add an entry when you open an issue or a research brief. The page lists the ids it is missing.
+
+[phase.0]
+what = "Repository, tooling and the rules for how agents and the owner work together."
+why = "Everything after it assumes one plan, one branch per task and a reviewed PR for every change."
+
+[phase.1]
+what = "The charter and the first decisions: what success means, which stocks, which data adapters."
+why = "Building without these would mean guessing at the target."
+
+[phase.2]
+what = "A local point-in-time store of prices and filings, plus the adapters that fill it."
+why = "An honest backtest needs data that only knows what was knowable at the time. This is the MVP's foundation."
+
+[phase.3]
+what = "A backtester with realistic costs, a locked holdout and a registry of every trial."
+why = "The MVP's first hypothesis, monthly momentum, gets tested here. Without the registry we cannot tell luck from skill."
+
+[phase.4]
+what = "Unattended paper trading with risk rules, a kill switch and a full decision journal."
+why = "Six months of clean paper runs is the MVP's finish line."
+
+[phase.5]
+what = "An optional LLM memo beside each signal, only if a decision record grants it that role."
+why = "Deferred: no evidence yet that it adds predictive value."
+
+[phase.6]
+what = "A small live account, about $100, under exactly the paper-trading rules."
+why = "The first real money, only after the MVP has proven the process."
+
+[task.T1]
+what = "Configuration keys, dependency pins and a real trading calendar."
+why = "Every threshold lives in config and every date comes from the exchange calendar, never from weekdays."
+
+[task.T2]
+what = "Thin clients that fetch raw Alpaca and EDGAR payloads, and a recorder that saves scrubbed copies as test fixtures."
+why = "Tests never touch the network; they replay these recordings."
+
+[task.T3]
+what = "The owner runs the recorder with real keys and writes down what the free data sources actually allow and return."
+why = "Sets the config values the parsers and the liquidity rule depend on; agents cannot do it without keys."
+
+[task.T4]
+what = "The DuckDB schema, the database layer and the shared loader tests use to build a store from CSV."
+why = "Every stored fact carries a known_at timestamp from here on."
+
+[task.T5]
+what = "A hand-built universe of fictional securities covering every tricky case: splits, delistings, ticker reuse, dual classes."
+why = "The no-look-ahead tests need every edge case present, on purpose."
+
+[task.T6]
+what = "Read functions that answer 'what was known as of time T', with a harness proving that truncating the store to T changes nothing."
+why = "This is the mechanism that makes look-ahead impossible rather than merely discouraged."
+
+[task.T7]
+what = "The PriceSource interface and its fixture-backed implementation."
+why = "Every price provider, free or paid, plugs in through this one door."
+
+[task.T8]
+what = "The FilingSource interface, its fixture implementation, and the security master that tracks which company a ticker meant on a given day."
+why = "Tickers get reused; the master keeps identities straight through time."
+
+[task.T8b]
+what = "Delistings and exchange transfers, derived from filings at read time."
+why = "The MVP universe must include companies that later vanished, or the backtest flatters itself."
+
+[task.T9]
+what = "Classifying each security as common stock, ETF, ADR, preferred and so on, from filing evidence."
+why = "The universe is common stocks only; the rule needs a point-in-time type per listing."
+
+[task.T10]
+what = "The no-look-ahead test suite, and a deliberately broken adapter that each check must catch."
+why = "Proves the guard rails bite before real data arrives."
+
+[task.T11]
+what = "Parsers that turn recorded EDGAR payloads into stored facts with provenance."
+why = "Real filings feed the security master and the universe rules."
+
+[task.T12]
+what = "Parsers that turn recorded Alpaca payloads into stored bars and corporate actions."
+why = "Real prices for the backtest, stamped with when they became known."
+
+[task.T13]
+what = "The universe rules: exchange, type, market-cap rank, liquidity, price floor, all as of T."
+why = "The MVP strategy trades exactly this list, rebuilt each month-end without hindsight."
+
+[task.T14]
+what = "One override test per universe config key and a check that no threshold is hardcoded."
+why = "Config-driven thresholds are a non-negotiable; this proves it."
+
+[task.T15]
+what = "The survivorship gap: how many names the universe should contain that the data lacks."
+why = "Phase 4's entry gate: the owner signs off on this number before paper trading."
+
+[task.T16]
+what = "Ingest one session's data from every source, idempotently, with staleness checks."
+why = "The daily job that keeps the store current without an operator."
+
+[task.T17]
+what = "Backfill history in monthly chunks and resume after a failure."
+why = "Years of history arrive in pieces; a crash must not mean starting over."
+
+[task.T18]
+what = "Health metrics and integrity rules over the store."
+why = "The data-health page and the daily job both read these."
+
+[task.T19]
+what = "The tradepartner command line: ingest, health, dashboard, export."
+why = "What the scheduler calls; the owner's main way to run the system."
+
+[task.T20]
+what = "The Broker interface and an in-memory fake broker with no risk logic."
+why = "Paper and live brokers plug in here later; risk rules stay outside every broker."
+
+[task.T21a]
+what = "The Streamlit dashboard shell with a read-only database connection and empty states."
+why = "The product's own UI, started early so pages land as their data does."
+
+[task.T21]
+what = "The data-health page: coverage, gaps, last update, delisted names present."
+why = "Phase 2's exit requires the owner to see data health, not just trust it."
+
+[task.T22]
+what = "A runbook for scheduling the daily job on macOS, with evidence of unattended runs."
+why = "The system must run without anyone watching."
+
+[task.T23]
+what = "The data-validator agent and the phase close-out report on the owner's real store."
+why = "Phase 2 ends when the real store passes the same checks the fixtures do."
+
+[issue.94]
+what = "Second pass on the signal-combination question, reading the full texts the first pass could only skim."
+why = "Settles whether Phase 3 should plan for multi-signal hypotheses; the first report is INCOMPLETE."
+unblocks = ["issue:51"]
+
+[issue.90]
+what = "Fold the pending status and changelog fragments into STATUS.md and CHANGELOG.md, and refresh the snapshot sections."
+why = "Keeps the human-readable status current; the board and this page stay the live sources."
+
+[issue.86]
+what = "Measure how far back Alpaca corporate actions go, the real missing-bar share, and how fractional orders behave at the open."
+why = "Three facts T3 could not settle; the last one matters for Phase 4 execution modelling."
+unblocks = ["phase:4"]
+
+[issue.83]
+what = "Decide whether stored corporate actions need an announced_at column to catch a too-early known_at."
+why = "Without it a look-ahead stamp on a dividend or split is invisible to the checks."
+unblocks = ["task:T12", "task:T18"]
+
+[issue.52]
+what = "Write the decision record that says what an LLM may do here: nothing, advise, or veto."
+why = "A Phase 1 exit criterion still open; it decides whether Phase 5 exists at all."
+unblocks = ["phase:5"]
+
+[issue.51]
+what = "Write the Phase 3 spec and plan: backtester, holdout, trial registry."
+why = "Phase 3 cannot start, or be measured, until it is broken into tasks."
+unblocks = ["phase:3"]
+
+[issue.50]
+what = "What the IRS says about wash sales and holding periods for a monthly-rebalanced account."
+why = "Decides the account type before any live money."
+unblocks = ["phase:6"]
+
+[issue.47]
+what = "What has long-only monthly momentum returned since 2010 after costs, and is it fading?"
+why = "Sets the expected magnitude and stop thresholds for the MVP's first hypothesis."
+unblocks = ["issue:51"]
+
+[issue.38]
+what = "Normalise ticker case before netting positions against the broker."
+why = "A real broker adapter that treats aapl and AAPL as two positions would mis-reconcile."
+unblocks = ["phase:4"]
+
+[issue.35]
+what = "Decide how snapshot_static listings behave under the truncation test."
+why = "T10's harness needs one answer for rows allowed to apply before their fetch time."
+unblocks = ["task:T10"]
+
+[issue.33]
+what = "The Broker interface needs account balance and open-orders queries for Phase 4."
+why = "Risk checks and crash recovery cannot work without them."
+unblocks = ["phase:4"]
+
+[issue.89]
+what = "Turn the cockpit into a work map: every open piece of work, how it connects, and distance to the MVP, in plain English."
+why = "The owner steers many agents at once and needs one page that says where the whole project stands."
+
+[research.2026-09-24-initial-research-handoff]
+what = "The planning conversation's findings and open questions, graded by evidence."
+why = "Source of the G1 to G8 research questions and the Phase 1 decisions."
+unblocks = ["phase:1"]
+
+[research.2026-09-24-tooling-survey]
+what = "Raw GitHub numbers on candidate backtesting and data libraries."
+why = "Input to the tooling decision record."
+unblocks = ["adr:0004"]
+
+[research.2026-09-25-free-data-terms]
+what = "What Alpaca's free plan and EDGAR actually permit and return, from primary sources."
+why = "Fixes the SIP feed and liquidity-rule settings the parsers rely on."
+unblocks = ["task:T11", "task:T12"]
+
+[research.2026-09-25-g4-signal-combination]
+what = "Does combining several published signals beat one signal for a long-only retail portfolio, after costs?"
+why = "Decides whether Phase 3 plans for multi-signal hypotheses; pass 1 read abstracts only, pass 2 is issue #94."
+unblocks = ["issue:51"]
+
+[research.2026-09-25-trend-timing]
+what = "Do independent studies find that simple trend-timing rules help after costs? Mixed: strongest support and strongest critique each summarised."
+why = "Decides whether a trend overlay is a candidate second hypothesis in Phase 3."
+unblocks = ["issue:51"]
+
+[research.2026-09-25-price-vendors]
+what = "Which price vendors offer survivorship-bias-free US daily data to an individual, and at what cost."
+why = "Feeds the price-vendor decision due at the start of Phase 3; still has open items."
+unblocks = ["phase:3"]
+
+[research.trial-registry]
+what = "The log of every backtest run, successes and failures alike."
+why = "Counts the trials so the deflated Sharpe can discount for multiple testing."
+
+[adr.0001]
+what = "Python with uv, ruff, mypy and pytest."
+why = "One toolchain every agent uses."
+unblocks = ["phase:0"]
+
+[adr.0002]
+what = "Trunk-based git: a PR for every change, the owner approves every merge."
+why = "Keeps main always releasable with many agents pushing."
+unblocks = ["phase:0"]
+
+[adr.0003]
+what = "All data and broker access goes through adapters; local first; the paid vendor decision waits for Phase 3."
+why = "Lets fixtures stand in for every external source in tests."
+
+[adr.0004]
+what = "Which tools we own, adopt and avoid."
+why = "Stops each task re-deciding libraries."
+
+[adr.0005]
+what = "The objective, the benchmarks and when to stop."
+why = "Defines the MVP's finish line and its failure conditions."
+
+[adr.0006]
+what = "The universe and the monthly cadence."
+why = "Defines exactly which stocks the MVP trades, and when."
+
+[adr.0007]
+what = "Clock failures halt the system instead of rejecting orders."
+why = "A broken clock must never look like a legitimate rejection."
+unblocks = ["phase:4"]
+
+[plan.data-foundation]
+what = "The Phase 2 build document: 25 tasks, one PR each, grouped in chains."
+why = "What the ready frontier is computed from."
+
+[spec.data-foundation]
+what = "What Phase 2 builds and how we know it is done."
+why = "The acceptance criteria every Phase 2 task answers to."

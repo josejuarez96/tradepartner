@@ -56,31 +56,31 @@
 issue → branch → draft PR → CI green → self-review → specialist review agents → ready for review → owner merges (or tells the agent to) → branch auto-deleted
 ```
 
-**Before marking a PR ready for review:**
+**Before marking a PR ready for review:** run `/ready-pr` (`uv run python scripts/ready_pr.py <pr>`). It checks every item below the same way for every team, waits for CI on the exact commit, and marks the PR ready. Marking ready by hand is not the process.
 - [ ] CI is green (`checks` job) and the `claims` job passes: the branch's issue carries your `team:` label and no other open PR builds the same plan task ([teams.md](teams.md)).
 - [ ] The PR template is filled in: what/why, linked issue (`Closes #n`), how it was verified.
 - [ ] The author has reviewed their own diff on GitHub.
 - [ ] The required specialist reviews have run (see [agents.md](agents.md)):
   - `quant-auditor` for data, backtest or signal changes
   - `safety-reviewer` for broker, orders, LLM inputs or secrets
-- [ ] Docs are updated: `STATUS.md`, plan checkboxes, `.env.example`, and an ADR if a decision was made.
+- [ ] Docs are updated: a STATUS/CHANGELOG fragment (`scripts/fragments.py add`, never the shared files themselves), plan checkboxes, `.env.example`, and an ADR if a decision was made.
 
-**Keeping current:** rebase on `main` if the branch is behind (`git fetch && git rebase origin/main`). Don't merge `main` into feature branches, because `main` has linear history.
+**Keeping current:** `ready_pr.py` merges `origin/main` into the branch (`git merge origin/main`). Merging, not rebasing, means no force-push, which matters once a branch has been pushed by more than one team. `main` keeps its linear history regardless, because the PR is squash-merged. A rebase is still fine on a branch only you have pushed.
 
 **No stacked PRs.** Don't open a PR whose base is another open PR's branch: when the base squash-merges, GitHub closes or breaks the stacked PR. Wait for the base to merge, then branch from `main`. (Phase 1 retro.)
 
-**CI must have run on the exact commit being merged.** "No checks reported" is not green; wait for the run (`gh pr checks <n> --watch`) after any rebase or force-push. (Phase 1 retro.)
+**CI must have run on the exact commit being merged.** "No checks reported" is not green; wait for the run (`gh pr checks <n> --watch`) after any merge of `main`, rebase or force-push; `ready_pr.py` does this wait for you. (Phase 1 retro.)
 
 ## Releases
 
 - Tag `v0.<phase>.0` on `main` when a phase completes, for example `v0.2.0` = data foundation done.
-- Move the `[Unreleased]` entries in `CHANGELOG.md` under the new version in the same PR that closes the phase.
+- Fold the pending fragments (`uv run python scripts/fragments.py fold`) and move the `[Unreleased]` entries in `CHANGELOG.md` under the new version in the same PR that closes the phase.
 
 ## Parallel agents and teams
 
 - Each orchestrator session is a **team** in its **own working directory** (a worktree of this repo, or a clone). Claims, the ready frontier, shared-file rules and the CI guard are in [teams.md](teams.md). No branch without `uv run python scripts/team.py claim` (`spike/` branches excepted).
 - Within a team, each subagent working in parallel gets its own **git worktree** and branch (`claude --worktree` or the worktree isolation option). Two agents never share a working directory.
-- Parallel agents must work on **non-overlapping files**. If two plan tasks touch the same module, run them one after the other.
+- Parallel agents must work on **non-overlapping files**. If two plan tasks touch the same module, run them one after the other. What may run alongside a single implementer (read-only helpers, reviewers) is in [agents.md](agents.md#parallelism-inside-a-team).
 
 ## How the rules are enforced
 

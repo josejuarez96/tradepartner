@@ -1,0 +1,135 @@
+<SEC-DOCUMENT>0001354457-26-000904.txt : 20260924
+<SEC-HEADER>0001354457-26-000904.hdr.sgml : 20260924
+<ACCEPTANCE-DATETIME>20260924100840
+ACCESSION NUMBER:		0001354457-26-000904
+CONFORMED SUBMISSION TYPE:	25-NSE
+PUBLIC DOCUMENT COUNT:		2
+FILED AS OF DATE:		20260924
+DATE AS OF CHANGE:		20260924
+EFFECTIVENESS DATE:		20260924
+
+SUBJECT COMPANY:	
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			KLX Energy Services Holdings, Inc.
+		CENTRAL INDEX KEY:			0001738827
+		STANDARD INDUSTRIAL CLASSIFICATION:	OIL, GAS FIELD SERVICES, NBC [1389]
+		ORGANIZATION NAME:           	01 Energy & Transportation
+		EIN:				364904146
+		FISCAL YEAR END:			1231
+
+	FILING VALUES:
+		FORM TYPE:		25-NSE
+		SEC ACT:		1934 Act
+		SEC FILE NUMBER:	001-38609
+		FILM NUMBER:		261402559
+
+	BUSINESS ADDRESS:	
+		STREET 1:		3040 POST OAK BOULEVARD
+		STREET 2:		15TH FLOOR
+		CITY:			HOUSTON
+		STATE:			TX
+		ZIP:			77056
+		BUSINESS PHONE:		(832) 844-1015
+
+	MAIL ADDRESS:	
+		STREET 1:		3040 POST OAK BOULEVARD
+		STREET 2:		15TH FLOOR
+		CITY:			HOUSTON
+		STATE:			TX
+		ZIP:			77056
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	KLX Energy Services Inc.
+		DATE OF NAME CHANGE:	20180426
+
+FILED BY:		
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			Nasdaq Stock Market LLC
+		CENTRAL INDEX KEY:			0001354457
+		ORGANIZATION NAME:           	
+		EIN:				521165937
+		STATE OF INCORPORATION:			DE
+		FISCAL YEAR END:			1231
+
+	FILING VALUES:
+		FORM TYPE:		25-NSE
+
+	BUSINESS ADDRESS:	
+		STREET 1:		One Liberty Plaza
+		CITY:			New York
+		STATE:			NY
+		ZIP:			10006
+		BUSINESS PHONE:		301-978-4144
+
+	MAIL ADDRESS:	
+		STREET 1:		Office of General Counsel
+		STREET 2:		805 King Farm Blvd.
+		CITY:			ROCKVILLE
+		STATE:			MD
+		ZIP:			20850
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	The Nasdaq Stock Market LLC
+		DATE OF NAME CHANGE:	20060224
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>25-NSE
+<SEQUENCE>1
+<FILENAME>primary_doc.xml
+<TEXT>
+<XML>
+<?xml version="1.0"?>
+<notificationOfRemoval>
+
+    <schemaVersion>X0203</schemaVersion>
+
+    <exchange>
+        <cik>0001354457</cik>
+        <entityName>Nasdaq Stock Market LLC</entityName>
+    </exchange>
+
+    <issuer>
+        <cik>0001738827</cik>
+        <entityName>KLX Energy Services Holdings, Inc.</entityName>
+        <fileNumber>001-38609</fileNumber>
+        <address>
+            <street1>1300 CORPORATE CENTER WAY</street1>
+            <street2></street2>
+            <city>WELLINGTON</city>
+            <stateOrCountryCode>FL</stateOrCountryCode>
+            <stateOrCountry>FLORIDA</stateOrCountry>
+            <zipCode>33414</zipCode>
+        </address>
+        <telephoneNumber>561 791 5421</telephoneNumber>
+    </issuer>
+
+    <descriptionClassSecurity>rights</descriptionClassSecurity>
+
+    <ruleProvision>17 CFR 240.12d2-2(a)(2)</ruleProvision>
+
+    <signatureData>
+        <signatureName>Tara Petta</signatureName>
+        <signatureTitle>AVP</signatureTitle>
+        <signatureDate>2026-09-24</signatureDate>
+    </signatureData>
+</notificationOfRemoval>
+</XML>
+</TEXT>
+</DOCUMENT>
+<DOCUMENT>
+<TYPE>EX-99.25
+<SEQUENCE>2
+<FILENAME>klxerform25.txt
+<TEXT>
+Klxer-form25
+
+
+
+
+
+
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>
