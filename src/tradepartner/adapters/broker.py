@@ -11,11 +11,11 @@ order placement without passing deterministic risk rules").
 
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
-raises `ValueError` at construction, matching the convention in
-`store/db.ensure_tz_aware` rather than inventing a new one, and any
-tz-aware value that isn't already UTC is normalized to UTC. This module has
-no dependency on `store`, so the check is duplicated here rather than
-shared across layers — tracked for a future cleanup in issue #30.
+raises `ValueError` at construction, and any tz-aware value that isn't
+already UTC is normalized to UTC. This uses the shared
+`tradepartner.timeutil.ensure_tz_aware_utc`, the single enforcement point
+for that rule, so this module and `store.db` cannot drift out of sync on
+what counts as valid (issue #30).
 """
 
 from __future__ import annotations
@@ -23,19 +23,10 @@ from __future__ import annotations
 import abc
 import math
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 
-
-def _ensure_tz_aware_utc(value: datetime, *, field_name: str) -> datetime:
-    """Raise `ValueError` if `value` is naive; otherwise return it
-    normalized to UTC (`.astimezone(UTC)`), so two value objects built from
-    equivalent instants in different tzinfos always compare and print the
-    same way.
-    """
-    if value.tzinfo is None:
-        raise ValueError(f"{field_name} must be tz-aware, got a naive datetime: {value!r}")
-    return value.astimezone(UTC)
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 
 def _validate_identifier(value: str, *, field_name: str) -> str:
@@ -200,7 +191,7 @@ class Order:
         object.__setattr__(
             self,
             "submitted_at",
-            _ensure_tz_aware_utc(self.submitted_at, field_name="submitted_at"),
+            ensure_tz_aware_utc(self.submitted_at, field_name="submitted_at"),
         )
 
 
@@ -230,7 +221,7 @@ class Fill:
         object.__setattr__(self, "quantity", quantity)
         object.__setattr__(self, "price", price)
         object.__setattr__(
-            self, "filled_at", _ensure_tz_aware_utc(self.filled_at, field_name="filled_at")
+            self, "filled_at", ensure_tz_aware_utc(self.filled_at, field_name="filled_at")
         )
 
 
