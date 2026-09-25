@@ -1,0 +1,1 @@
+- #167 `team.py prune`: owner-run, ad hoc removal of idle team directories with no open claim (dry run by default, `--yes` to remove, dirty trees skipped); teams.md rule (PR pending)
