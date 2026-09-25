@@ -1,0 +1,1 @@
+- Phase 3 T38: `StoreProvider` (`backtest/store_provider.py`): the engine's `DataProvider` over the as-of API with the trial's frozen `Settings`, one read-only connection per step (closed at the next step, `end_step`/`close`), lock retries for `store.lock_retry_seconds`, handle checked once against `registry_connect`; nothing under `backtest/` imports adapters (#170, PR #TBD)
