@@ -183,10 +183,18 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
     Other column types are passed through unchecked; DuckDB's own
     conversion errors cover those.
 
+    `TIMESTAMPTZ` values are normalized to UTC (via `ensure_tz_aware`)
+    before being bound, so a value's original tzinfo (whatever it was)
+    never reaches DuckDB — a stored instant always round-trips from one
+    canonical form, not the caller's original offset (issue #43). The
+    caller's `row` Mapping itself is never mutated; a new list of values is
+    built for the bind.
+
     `table` is always a name from `tradepartner.store.schema.TABLE_NAMES`
     supplied by our own code, never external input.
     """
     column_types = _column_types(conn, table)
+    bound_values: list[Any] = []
     for field, value in row.items():
         col_type = column_types.get(field)
         if col_type == _TIMESTAMPTZ_TYPE:
@@ -195,7 +203,7 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
                     f"{table}.{field} is TIMESTAMPTZ; expected a tz-aware datetime, "
                     f"got {type(value).__name__}: {value!r}"
                 )
-            ensure_tz_aware(value, field=f"{table}.{field}")
+            value = ensure_tz_aware(value, field=f"{table}.{field}")
         elif col_type == _DATE_TYPE and (
             not isinstance(value, date) or isinstance(value, datetime)
         ):
@@ -203,9 +211,10 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
                 f"{table}.{field} is DATE; expected a date (not a datetime), "
                 f"got {type(value).__name__}: {value!r}"
             )
+        bound_values.append(value)
     columns = ", ".join(row.keys())
     placeholders = ", ".join("?" for _ in row)
-    conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", list(row.values()))
+    conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", bound_values)
 
 
 def _is_lock_error(exc: duckdb.IOException) -> bool:

@@ -22,7 +22,19 @@ def ensure_tz_aware_utc(value: datetime, *, field_name: str) -> datetime:
     normalized to UTC (`.astimezone(UTC)`), so two values built from
     equivalent instants in different tzinfos always compare and print the
     same way.
+
+    A value close to `datetime.min`/`datetime.max` with a non-zero UTC
+    offset can shift past the representable range once converted to UTC
+    (e.g. `datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5)))`), which
+    `.astimezone(UTC)` raises as `OverflowError`; this re-raises that as a
+    `ValueError` naming `field_name`, so callers only ever see one
+    exception type for an invalid value (issue #43).
     """
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be tz-aware, got a naive datetime: {value!r}")
-    return value.astimezone(UTC)
+    try:
+        return value.astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError(
+            f"{field_name}={value!r} is out of the range representable in UTC"
+        ) from exc
