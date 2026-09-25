@@ -363,3 +363,58 @@ def test_env_example_names_no_holdout_key() -> None:
     """`holdout.*` is never listed in `.env.example` (spec, Config keys)."""
     env_example = Path(__file__).resolve().parents[1] / ".env.example"
     assert "HOLDOUT__" not in env_example.read_text(encoding="utf-8").upper()
+
+
+@pytest.mark.parametrize("level", [float("nan"), float("inf")])
+def test_costs_non_finite_sensitivity_rejected(level: float) -> None:
+    """A NaN level would silently turn that level's results into NaN."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={"sensitivity_per_side_bps": [0, level]})
+
+
+@pytest.mark.parametrize("field", ["per_side_bps", "commission_per_share", "commission_per_order"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_costs_non_finite_component_rejected(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={field: value})
+
+
+@pytest.mark.parametrize("families", [[], ["momentum", "momentum"]])
+def test_hypotheses_families_empty_or_duplicate_rejected(families: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, hypotheses={"families": families})
+
+
+@pytest.mark.parametrize(
+    ("section", "override"),
+    [
+        ("hypotheses", {"familes": ["momentum"]}),
+        ("strategy", {"top_fracton": 0.2}),
+        ("costs", {"per_side_bp": 0}),
+        ("holdout", {"stat": "2024-01-01"}),
+        ("backtest", {"initial_capitol": 1.0}),
+        ("metrics", {"red_flag": 1.0}),
+    ],
+)
+def test_phase3_sections_reject_unknown_keys(section: str, override: dict[str, object]) -> None:
+    """A typo in a pinned key must fail, not fall back to the default (spec req 10)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{section: override})
+
+
+@pytest.mark.parametrize(
+    ("section", "override"),
+    [
+        ("metrics", {"red_flag_excess_cagr_pp": -1.0}),
+        ("metrics", {"red_flag_excess_cagr_pp": float("nan")}),
+        ("metrics", {"risk_free_rate": float("nan")}),
+        ("backtest", {"cash_rate": float("inf")}),
+        ("backtest", {"initial_capital": float("inf")}),
+        ("strategy", {"top_fraction": float("nan")}),
+    ],
+)
+def test_phase3_rates_and_thresholds_reject_bad_values(
+    section: str, override: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{section: override})

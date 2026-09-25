@@ -29,9 +29,9 @@ from __future__ import annotations
 import os
 from datetime import date
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The only value `universe.exclude_sic_ranges` may take (ADR 0006): the full
@@ -252,11 +252,31 @@ class GapConfig(BaseModel):
 HypothesisFamily = Literal["momentum", "oracle"]
 _HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 
+# Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
+# `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
+# silently to the default, and a NaN or infinite value must fail rather than turn a
+# result into NaN.
+_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False)
+
 
 class HypothesesConfig(BaseModel):
-    """Hypothesis families, the unit for counting trials (spec domain rule 1)."""
+    """Hypothesis families, the unit for counting trials (spec domain rule 1).
 
-    families: list[HypothesisFamily] = Field(default_factory=lambda: list(_HYPOTHESIS_FAMILIES))
+    Non-empty and without duplicates, so the enumeration stays a plain list of names.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    families: list[HypothesisFamily] = Field(
+        default_factory=lambda: list(_HYPOTHESIS_FAMILIES), min_length=1
+    )
+
+    @field_validator("families")
+    @classmethod
+    def _validate_families_unique(cls, value: list[HypothesisFamily]) -> list[HypothesisFamily]:
+        if len(set(value)) != len(value):
+            raise ValueError(f"families must not repeat, got {value}")
+        return value
 
 
 class StrategyConfig(BaseModel):
@@ -265,6 +285,8 @@ class StrategyConfig(BaseModel):
     `formation_months` must exceed `skip_months`, or the formation window is empty.
     `top_fraction` is a share of ranked names in (0, 1].
     """
+
+    model_config = _PHASE3_MODEL_CONFIG
 
     formation_months: int = Field(default=12, gt=0)
     skip_months: int = Field(default=1, ge=0)
@@ -292,18 +314,14 @@ class CostsConfig(BaseModel):
     the strategy to trade.
     """
 
+    model_config = _PHASE3_MODEL_CONFIG
+
     per_side_bps: float = Field(default=15.0, ge=0)
     commission_per_share: float = Field(default=0.0, ge=0)
     commission_per_order: float = Field(default=0.0, ge=0)
-    sensitivity_per_side_bps: list[float] = Field(default_factory=lambda: [0.0, 30.0, 60.0, 100.0])
-
-    @field_validator("sensitivity_per_side_bps")
-    @classmethod
-    def _validate_sensitivity_non_negative(cls, value: list[float]) -> list[float]:
-        negative = [level for level in value if level < 0]
-        if negative:
-            raise ValueError(f"sensitivity levels must be non-negative, got {negative}")
-        return value
+    sensitivity_per_side_bps: list[Annotated[float, Field(ge=0)]] = Field(
+        default_factory=lambda: [0.0, 30.0, 60.0, 100.0]
+    )
 
 
 class HoldoutConfig(BaseModel):
@@ -311,6 +329,8 @@ class HoldoutConfig(BaseModel):
     and a run takes them from the frozen hypothesis, never from live `Settings` (spec
     req 10). Deliberately absent from `.env.example`.
     """
+
+    model_config = _PHASE3_MODEL_CONFIG
 
     start: date | None = None
     end: date | None = None
@@ -330,6 +350,8 @@ class BacktestConfig(BaseModel):
     `stale_exit_sessions` mirrors `gap.missing_tail_sessions` (spec open question 4).
     """
 
+    model_config = _PHASE3_MODEL_CONFIG
+
     initial_capital: float = Field(default=100_000.0, gt=0)
     cash_rate: float = 0.0
     delisting_exit: Literal["last_close"] = "last_close"
@@ -344,8 +366,10 @@ class MetricsConfig(BaseModel):
     audit; it is a reported flag, never a gate (spec open question 6).
     """
 
+    model_config = _PHASE3_MODEL_CONFIG
+
     risk_free_rate: float = 0.0
-    red_flag_excess_cagr_pp: float = 3.0
+    red_flag_excess_cagr_pp: float = Field(default=3.0, ge=0)
 
 
 class Settings(BaseSettings):
