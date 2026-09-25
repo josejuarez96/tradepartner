@@ -401,6 +401,51 @@ def test_one_source_only(settings: Settings, read: Callable[[str], list[tuple[An
     assert _counts(read)["prices_daily"] == 0
 
 
+class _Counted(FixtureFilingSource):
+    """Sets the attributes the real EDGAR adapter exposes (T11b, T11c) only
+    inside its calls, as the adapter does: `filing_index` resets its two,
+    `facts` adds one unstamped fact per CIK asked (#172)."""
+
+    skipped: Any = 3
+
+    def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
+        self.unstamped_filings = ["a", "b"]
+        self.skipped_filers = type(self).skipped
+        return super().filing_index(since)
+
+    def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+        self.unstamped_facts = [*getattr(self, "unstamped_facts", []), cik]
+        return super().facts(cik, names)
+
+
+@pytest.mark.parametrize("skipped", [("d", "e", "f"), 3])
+def test_edgar_run_message_carries_the_adapter_counts(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]], skipped: Any
+) -> None:
+    class Counted(_Counted):
+        pass
+
+    Counted.skipped = skipped
+    result = _run(settings, filings=_filings(cls=Counted), source="edgar")
+    counts = "; unstamped: 2 filings, 2 facts; skipped filers: 3; missing benchmarks:"
+    assert result.runs[0].status == OK
+    assert counts in result.runs[0].message
+    assert counts in read("SELECT message FROM ingestion_runs")[0][0]
+
+
+def test_edgar_run_message_names_only_the_counts_the_source_exposes(settings: Settings) -> None:
+    class OnlyFacts(FixtureFilingSource):
+        unstamped_facts = ("c",)
+
+    message = _run(settings, filings=_filings(cls=OnlyFacts), source="edgar").runs[0].message
+    assert " facts; unstamped: 1 facts; missing benchmarks:" in message
+
+
+def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:
+    message = _run(settings, source="edgar").runs[0].message
+    assert "unstamped" not in message and "skipped" not in message
+
+
 def test_prices_before_any_master_fails_rather_than_fetching_nothing(settings: Settings) -> None:
     result = _run(settings, source="alpaca")
     assert result.runs[-1].status == FAILED
