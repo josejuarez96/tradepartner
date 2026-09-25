@@ -19,6 +19,9 @@ Three things live here, and nothing else:
   - `action_first_seen_known_at(ex_date, announced_at=None)`: the source's
     announcement time if it gives one, else the close of the last session
     before `ex_date` (spec req 5, the "first-seen proxy").
+  - `announcement_date_known_at(day)`: the announcement time for a source
+    that gives only a declaration date: the close of the first session
+    strictly after it (spec req 5).
   - `revision_of(incoming, stored, ingested_at=...)`: a later record that
     differs from the stored one for the same key becomes a new record with
     `known_at = ingested_at`; identical values are a no-op; a revision is
@@ -46,7 +49,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import overload
 
-from tradepartner.calendar import previous_session, session_close
+from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 
@@ -163,7 +166,12 @@ class CorporateAction:
     Validated on construction: `action_type` coerced to `ActionType` (an
     unknown string raises `ValueError`), `ex_date` a `date`, a split ratio
     positive and finite, a dividend amount non-negative and finite,
-    `known_at` tz-aware (normalized to UTC).
+    `known_at` and `announced_at` (if set) tz-aware (normalized to UTC).
+
+    `announced_at` is the source's announcement time, `None` when it gives
+    none (issue #83). It fixes a first-seen record's `known_at` (see
+    `action_first_seen_known_at`) and is not one of the values a revision
+    compares.
     """
 
     security_id: str
@@ -172,6 +180,7 @@ class CorporateAction:
     ratio_or_amount: float
     known_at: datetime
     source: str
+    announced_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.security_id, field_name="security_id")
@@ -188,6 +197,12 @@ class CorporateAction:
         object.__setattr__(
             self, "known_at", ensure_tz_aware_utc(self.known_at, field_name="known_at")
         )
+        if self.announced_at is not None:
+            object.__setattr__(
+                self,
+                "announced_at",
+                ensure_tz_aware_utc(self.announced_at, field_name="announced_at"),
+            )
 
     @property
     def key(self) -> tuple[str, str, date]:
@@ -222,6 +237,19 @@ def action_first_seen_known_at(ex_date: date, *, announced_at: datetime | None =
     if announced_at is not None:
         return ensure_tz_aware_utc(announced_at, field_name="announced_at")
     return session_close(previous_session(ex_date))
+
+
+def announcement_date_known_at(day: date) -> datetime:
+    """`announced_at` for a source that gives only an announcement date
+    (spec req 5): the XNYS close of the first session strictly after `day`.
+
+    A same-day stamp would be look-ahead for an announcement released after
+    that day's close, and a date carries no time to rule that out, so the
+    announcement counts as knowable only at the next close. `day` need not
+    be a session. A `datetime` raises `TypeError`.
+    """
+    _require_date(day, field_name="day")
+    return session_close(next_session(day))
 
 
 @overload

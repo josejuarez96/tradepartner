@@ -29,6 +29,7 @@ from tradepartner.adapters.prices import (
     PriceSource,
     UnknownSecurityIdError,
     action_first_seen_known_at,
+    announcement_date_known_at,
     bar_known_at,
     revision_of,
 )
@@ -201,8 +202,16 @@ class TestCorporateActions:
     def test_announced_split_is_known_before_the_proxy(self, source: FixturePriceSource) -> None:
         (split,) = source.corporate_actions(["SEC_SPLIT_FUTURE"], FAR_PAST, FAR_FUTURE)
         assert split.ex_date == date(2019, 2, 14)
-        assert split.known_at == datetime(2018, 11, 15, 21, 0, tzinfo=UTC)
+        assert split.announced_at == datetime(2018, 11, 15, 21, 0, tzinfo=UTC)
+        assert split.known_at == split.announced_at
         assert split.known_at < action_first_seen_known_at(split.ex_date)
+
+    def test_unannounced_actions_carry_no_announcement(self, source: FixturePriceSource) -> None:
+        actions = source.corporate_actions(
+            ["SEC_SPLIT_PLAIN", "SEC_DIV_REVISED"], FAR_PAST, FAR_FUTURE
+        )
+        assert actions
+        assert all(a.announced_at is None for a in actions)
 
     def test_revised_dividend_is_a_second_record_never_back_dated(
         self, source: FixturePriceSource
@@ -280,6 +289,24 @@ class TestTimingRules:
                 date(2019, 2, 14),
                 announced_at=datetime(2018, 11, 15, 16, 0),  # noqa: DTZ001
             )
+
+    def test_date_only_announcement_is_known_at_the_next_session_close(self) -> None:
+        # A declaration dated Thursday 2018-11-15 may come out after that
+        # day's close, so it is knowable only at Friday's close.
+        assert announcement_date_known_at(date(2018, 11, 15)) == session_close(date(2018, 11, 16))
+
+    def test_date_only_announcement_on_a_weekend_waits_for_monday(self) -> None:
+        assert announcement_date_known_at(date(2019, 3, 9)) == session_close(date(2019, 3, 11))
+
+    def test_date_only_announcement_before_a_half_day_is_the_early_close(self) -> None:
+        # Wednesday 2018-11-21, then Thanksgiving, then the 13:00 ET half day.
+        assert announcement_date_known_at(date(2018, 11, 21)) == datetime(
+            2018, 11, 23, 18, 0, tzinfo=UTC
+        )
+
+    def test_date_only_announcement_rejects_a_datetime(self) -> None:
+        with pytest.raises(TypeError):
+            announcement_date_known_at(datetime(2018, 11, 15, tzinfo=UTC))
 
 
 class TestRevisionRule:
@@ -446,6 +473,27 @@ class TestRecordValidation:
     def test_a_zero_dividend_is_allowed(self) -> None:
         assert _make_action(action_type=ActionType.DIVIDEND, ratio_or_amount=0.0)
 
+    def test_announced_at_defaults_to_none(self) -> None:
+        assert _make_action().announced_at is None
+
+    def test_naive_announced_at_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="announced_at"):
+            _make_action(announced_at=datetime(2019, 2, 15, 16, 0))  # noqa: DTZ001
+
+    def test_announced_at_is_normalized_to_utc(self) -> None:
+        eastern = timezone(timedelta(hours=-5))
+        action = _make_action(announced_at=datetime(2019, 2, 15, 16, 0, tzinfo=eastern))
+        assert action.announced_at == datetime(2019, 2, 15, 21, 0, tzinfo=UTC)
+        assert action.announced_at is not None
+        assert action.announced_at.tzinfo == UTC
+
+    def test_announced_at_is_not_a_value_for_revisions(self) -> None:
+        # A re-fetch that only adds an announcement time is not a revision:
+        # the first-seen stamp is already fixed.
+        stored = _make_action()
+        incoming = _make_action(announced_at=datetime(2019, 2, 15, 21, 0, tzinfo=UTC))
+        assert incoming.same_values(stored)
+
 
 _SECURITIES_HEADER = [
     "security_id",
@@ -475,6 +523,7 @@ _ACTIONS_HEADER = [
     "action_type",
     "ex_date",
     "ratio_or_amount",
+    "announced_at",
     "known_at",
     "ingested_at",
     "source",
@@ -506,6 +555,7 @@ def _action_row(**overrides: object) -> dict[str, object]:
         "action_type": "dividend",
         "ex_date": "2019-03-04",
         "ratio_or_amount": 0.1,
+        "announced_at": "",
         "known_at": "2019-03-01T21:00:00+00:00",
         "ingested_at": "2019-03-01T21:10:00+00:00",
         "source": "alpaca",
@@ -678,10 +728,88 @@ class TestFixtureContract:
 
     def test_first_seen_action_announced_before_the_proxy_loads(self, tmp_path: Path) -> None:
         fixtures = _write_fixture_dir(
-            tmp_path, actions=[_action_row(known_at="2019-02-15T21:00:00+00:00")]
+            tmp_path,
+            actions=[
+                _action_row(
+                    announced_at="2019-02-15T21:00:00+00:00",
+                    known_at="2019-02-15T21:00:00+00:00",
+                )
+            ],
         )
         (action,) = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
         assert action.known_at == datetime(2019, 2, 15, 21, 0, tzinfo=UTC)
+        assert action.announced_at == action.known_at
+
+    def test_first_seen_action_stamped_before_the_proxy_without_announcement_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Issue #83: with no announcement, anything earlier than the proxy
+        # is look-ahead (the action visible before it was knowable).
+        fixtures = _write_fixture_dir(
+            tmp_path, actions=[_action_row(known_at="2019-02-15T21:00:00+00:00")]
+        )
+        with pytest.raises(FixtureContractError, match=r"corporate_actions\.csv:2: .*proxy"):
+            FixturePriceSource(fixtures)
+
+    def test_first_seen_action_stamped_before_its_announcement_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(
+                    announced_at="2019-02-15T21:00:00+00:00",
+                    known_at="2019-02-14T21:00:00+00:00",
+                )
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="announced_at"):
+            FixturePriceSource(fixtures)
+
+    def test_first_seen_action_stamped_after_its_announcement_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # known_at must equal announced_at; the proxy is not a fallback once
+        # the source gave an announcement time.
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(
+                    announced_at="2019-02-15T21:00:00+00:00",
+                    known_at="2019-03-01T21:00:00+00:00",
+                )
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="announced_at"):
+            FixturePriceSource(fixtures)
+
+    def test_announcement_after_the_proxy_is_honoured(self, tmp_path: Path) -> None:
+        # A late announcement (after the close before ex-date) is stamped at
+        # the announcement, later than the proxy: never earlier than knowable.
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(
+                    announced_at="2019-03-04T21:00:00+00:00",
+                    known_at="2019-03-04T21:00:00+00:00",
+                    ingested_at="2019-03-04T21:10:00+00:00",
+                )
+            ],
+        )
+        (action,) = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
+        assert action.known_at == datetime(2019, 3, 4, 21, 0, tzinfo=UTC)
+
+    def test_naive_announced_at_in_a_fixture_is_refused(self, tmp_path: Path) -> None:
+        fixtures = _write_fixture_dir(
+            tmp_path,
+            actions=[
+                _action_row(
+                    announced_at="2019-02-15T21:00:00", known_at="2019-02-15T21:00:00+00:00"
+                )
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="announced_at"):
+            FixturePriceSource(fixtures)
 
     def test_missing_column_is_refused_with_file_context(self, tmp_path: Path) -> None:
         fixtures = _write_fixture_dir(tmp_path)
@@ -764,6 +892,7 @@ class TestRoundTrip:
                     "action_type": action.action_type.value,
                     "ex_date": action.ex_date,
                     "ratio_or_amount": action.ratio_or_amount,
+                    "announced_at": action.announced_at,
                     "known_at": action.known_at,
                     "ingested_at": action.known_at,
                     "source": action.source,

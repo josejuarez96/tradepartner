@@ -181,7 +181,9 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
       calendar date belongs).
 
     Other column types are passed through unchecked; DuckDB's own
-    conversion errors cover those.
+    conversion errors cover those. `None` is bound as NULL for any column:
+    a nullable one (`corporate_actions.announced_at`, #83) stores it, and
+    the schema's `NOT NULL` constraints refuse it everywhere else.
 
     `TIMESTAMPTZ` values are normalized to UTC (via `ensure_tz_aware`)
     before being bound, so a value's original tzinfo (whatever it was)
@@ -197,7 +199,9 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
     bound_values: list[Any] = []
     for field, value in row.items():
         col_type = column_types.get(field)
-        if col_type == _TIMESTAMPTZ_TYPE:
+        if value is None:
+            pass
+        elif col_type == _TIMESTAMPTZ_TYPE:
             if not isinstance(value, datetime):
                 raise TypeError(
                     f"{table}.{field} is TIMESTAMPTZ; expected a tz-aware datetime, "
