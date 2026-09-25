@@ -27,7 +27,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
 )
 from tradepartner.backfill import month_windows
-from tradepartner.ingest import _add_actions
+from tradepartner.ingest import _add_actions, _replay_actions, _replay_plan
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.schema import init_schema
 
@@ -99,8 +99,17 @@ def _run(
     window: tuple[date, date],
     at: datetime,
 ) -> int:
-    actions = source.corporate_actions([SID], *window)
-    return _add_actions(conn, source, actions, window, ingested_at=at)
+    actions, covered = _replay(conn, source, source.corporate_actions([SID], *window), window)
+    return _add_actions(conn, actions, window, ingested_at=at, covered=covered)
+
+
+def _replay(
+    conn: duckdb.DuckDBPyConnection,
+    source: PriceSource,
+    actions: list[CorporateAction],
+    window: tuple[date, date],
+) -> tuple[list[CorporateAction], tuple[date, date]]:
+    return _replay_actions(source, actions, window, _replay_plan(conn, actions, window))
 
 
 def _live(conn: duckdb.DuckDBPyConnection, t: datetime) -> list[tuple[date, str, float]]:
@@ -248,6 +257,65 @@ def test_a_rerun_of_every_revision_adds_nothing(conn: duckdb.DuckDBPyConnection)
     assert _live(conn, T2) == [(ex, "a1", 3.0)]
 
 
+def test_two_ids_on_one_id_less_key_cancel_it_once(conn: duckdb.DuckDBPyConnection) -> None:
+    # A regular and a special dividend on one ex-date, first stored without ids.
+    ex = date(2019, 6, 14)
+    div = ActionType.DIVIDEND
+    _run(conn, _Replay([_action(ex, kind=div, value=0.1)]), JUNE, T0)
+    both = [
+        _action(ex, kind=div, value=0.1, source_id="a1"),
+        _action(ex, kind=div, value=0.5, source_id="a2"),
+    ]
+    assert _run(conn, _Replay(both), JUNE, T1) == 3
+    assert _rows(conn)[1:] == [(ex, "", True, T1), (ex, "a1", False, T1), (ex, "a2", False, T1)]
+    assert _live(conn, T1) == [(ex, "a1", 0.1), (ex, "a2", 0.5)]
+    assert _run(conn, _Replay(both), JUNE, T2) == 0
+
+
+def test_an_id_less_key_that_gains_an_id_and_a_new_ex_date_is_one_event(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    old, new = date(2019, 6, 14), date(2019, 6, 21)
+    _run(conn, _Replay([_action(old)]), JUNE, T0)
+    assert _run(conn, _Replay([_action(new, source_id="a1")]), JUNE, T1) == 2
+    assert _rows(conn)[1:] == [(old, "", True, T1), (new, "a1", False, T1)]
+    assert _live(conn, T1) == [(new, "a1", 2.0)]
+
+
+def test_an_id_less_re_date_across_months_is_not_paired(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # A documented limit: an id-less key is only looked for inside the window,
+    # so a re-date out of it leaves both keys live. Alpaca gives ids.
+    old, new = date(2019, 5, 30), date(2019, 6, 3)
+    _run(conn, _Replay([_action(old)]), MAY, T0)
+    assert _run(conn, _Replay([_action(new)]), JUNE, T1) == 1
+    assert _live(conn, T1) == [(old, "", 2.0), (new, "", 2.0)]
+
+
+def test_a_store_changed_since_the_replay_was_planned_fails_the_write(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # The replay was planned over June only; meanwhile a1 was stored in May.
+    _run(conn, _Replay([_action(date(2019, 5, 20), source_id="a1")]), MAY, T0)
+    june = [_action(date(2019, 6, 3), source_id="a1")]
+    with pytest.raises(ValueError, match="re-run"):
+        _add_actions(conn, june, JUNE, ingested_at=T1, covered=JUNE)
+    assert len(_rows(conn)) == 1
+
+
+def test_a_replayed_revision_not_yet_known_is_not_applied(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    ex = date(2019, 6, 14)
+    base = _action(ex, source_id="a1")
+    _run(conn, _Replay([base]), JUNE, T0)
+    source = _Replay([base, replace(base, ratio_or_amount=3.0, known_at=T2)])
+    assert _run(conn, source, JUNE, T1) == 0
+    assert _run(conn, source, JUNE, T2) == 1
+    assert _rows(conn)[-1][3] == T2
+
+
 # --- the fixture universe's own cases ----------------------------------------
 
 
@@ -262,9 +330,10 @@ def test_replaying_the_fixture_month_by_month_leaves_its_live_events(
     at = datetime(2026, 1, 1, tzinfo=UTC)
     for first, last in month_windows(date(2017, 1, 1), date(2020, 6, 30)):
         at += timedelta(seconds=1)
-        _add_actions(
-            conn, source, source.corporate_actions(ids, first, last), (first, last), ingested_at=at
+        actions, covered = _replay(
+            conn, source, source.corporate_actions(ids, first, last), (first, last)
         )
+        _add_actions(conn, actions, (first, last), ingested_at=at, covered=covered)
     recording = duckdb.connect(":memory:")
     init_schema(recording)
     load_universe_fixtures(recording, UNIVERSE_DIR)
@@ -276,8 +345,10 @@ def test_replaying_the_fixture_month_by_month_leaves_its_live_events(
     assert "SEC_DIV_CANCELLED" not in set(want["security_id"])
     # And again: nothing new.
     for first, last in month_windows(date(2017, 1, 1), date(2020, 6, 30)):
-        actions = source.corporate_actions(ids, first, last)
-        assert _add_actions(conn, source, actions, (first, last), ingested_at=at) == 0
+        actions, covered = _replay(
+            conn, source, source.corporate_actions(ids, first, last), (first, last)
+        )
+        assert _add_actions(conn, actions, (first, last), ingested_at=at, covered=covered) == 0
 
 
 def _fixture_ids() -> list[tuple[str]]:
