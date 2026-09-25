@@ -19,6 +19,7 @@ non-zero with a clear message when secrets are missing").
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import re
 import sys
@@ -241,6 +242,67 @@ def _write_text(path: Path, text: str, *, secrets: Iterable[str]) -> None:
     print(f"cli_record: scrubbed {count} value(s) in {path.name}")
 
 
+def _write_text_gz(path: Path, text: str, *, secrets: Iterable[str]) -> None:
+    """Scrub, then write gzip-compressed (`path` already ends in `.gz`)."""
+    scrubbed, count = scrub_text(text, secrets=secrets)
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        fh.write(scrubbed)
+    print(f"cli_record: scrubbed {count} value(s) in {path.name} (gzip)")
+
+
+def trim_company_facts(payload: Any) -> Any:
+    """Keep `dei` whole and only share-count concepts elsewhere; other keys untouched.
+
+    Pure. Drops nothing the master/universe code reads (spec master table); the full
+    payload is 2-8 MB per filer, the trimmed one under ~200 KB.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("facts"), dict):
+        return payload
+    facts: dict[str, Any] = {}
+    for namespace, concepts in payload["facts"].items():
+        if not isinstance(concepts, dict):
+            continue
+        if namespace in COMPANY_FACTS_KEEP_NAMESPACES:
+            facts[namespace] = concepts
+            continue
+        kept = {
+            name: value
+            for name, value in concepts.items()
+            if any(s in name for s in COMPANY_FACTS_KEEP_CONCEPT_SUBSTRINGS)
+        }
+        if kept:
+            facts[namespace] = kept
+    return {**payload, "facts": facts}
+
+
+def trim_company_tickers(payload: Any, *, ciks: Iterable[str], symbols: Iterable[str]) -> Any:
+    """Keep rows for the recorded CIKs and symbols plus the first sample rows.
+
+    Pure. The snapshot is `{"fields": [...], "data": [[...], ...]}`; the original
+    row order is kept so the sample is the same on every run.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return payload
+    fields = payload.get("fields") or []
+    try:
+        cik_i, ticker_i = fields.index("cik"), fields.index("ticker")
+    except ValueError:
+        return payload
+    want_ciks = {int(c) for c in ciks}
+    want_symbols = {s.upper() for s in symbols}
+    rows = payload["data"]
+    kept = [
+        row
+        for i, row in enumerate(rows)
+        if i < COMPANY_TICKERS_SAMPLE_ROWS
+        or (
+            len(row) > max(cik_i, ticker_i)
+            and (row[cik_i] in want_ciks or str(row[ticker_i]).upper() in want_symbols)
+        )
+    ]
+    return {**payload, "data": kept}
+
+
 # --- the fixed recording plan ------------------------------------------------
 
 # Chosen so T11's parsers see: a plain issuer, a dual-class issuer (cover
@@ -269,6 +331,22 @@ EDGAR_FILING_INDEX_QUARTER = (2024, 1)
 ALPACA_SYMBOLS = ["SPY", "MTUM", "AAPL", "MSFT", "KO"]
 ALPACA_START = date(2020, 8, 1)
 ALPACA_END = date(2020, 9, 30)
+
+# Fixture size cap (pre-commit `check-added-large-files`, 500 KB). The raw EDGAR
+# payloads are far bigger: a company-facts file lists every XBRL concept a filer
+# ever reported (2-8 MB), the companies snapshot lists ~10k companies (900 KB),
+# and a 10-K primary document is 1.5-2.6 MB with `dei:` cover tags spread across
+# the whole file (so it cannot be truncated). T3 recorded them at those sizes.
+# Rules, applied before scrubbing and writing:
+# - company facts keep the `dei` namespace whole plus the share-count concepts
+#   the master and universe need (spec master table: shares from company facts
+#   with `as_of_date` and class dimension); other concepts are dropped;
+# - the companies snapshot keeps every row for a recorded CIK or symbol plus
+#   the first `COMPANY_TICKERS_SAMPLE_ROWS` rows for shape;
+# - filing documents are written gzip-compressed (`.gz`), whole.
+COMPANY_FACTS_KEEP_NAMESPACES: tuple[str, ...] = ("dei",)
+COMPANY_FACTS_KEEP_CONCEPT_SUBSTRINGS: tuple[str, ...] = ("SharesOutstanding", "SharesIssued")
+COMPANY_TICKERS_SAMPLE_ROWS = 200
 
 # Cap on the recorded full-index excerpt: the real per-quarter `form.idx`
 # lists every SEC filing that quarter (tens of thousands of lines); only a
@@ -330,7 +408,11 @@ def _line_has_cik(line: str, wanted: set[str]) -> bool:
 def _record_edgar(settings: Settings, secrets: list[str]) -> None:
     year, qtr = EDGAR_FILING_INDEX_QUARTER
 
-    tickers = edgar_raw.company_tickers(settings=settings)
+    tickers = trim_company_tickers(
+        edgar_raw.company_tickers(settings=settings),
+        ciks=EDGAR_CIKS.values(),
+        symbols=ALPACA_SYMBOLS,
+    )
     _write_json(EDGAR_FIXTURES_DIR / "company_tickers.json", tickers, secrets=secrets)
 
     index_text = edgar_raw.filing_index_quarter(year, qtr, settings=settings)
@@ -341,7 +423,7 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
         submissions = edgar_raw.submissions(cik, settings=settings)
         _write_json(EDGAR_FIXTURES_DIR / f"submissions_{label}.json", submissions, secrets=secrets)
 
-        facts = edgar_raw.company_facts(cik, settings=settings)
+        facts = trim_company_facts(edgar_raw.company_facts(cik, settings=settings))
         _write_json(EDGAR_FIXTURES_DIR / f"company_facts_{label}.json", facts, secrets=secrets)
 
         picked = _pick_filing(submissions, _FORM_PREFERENCE[label])
@@ -361,8 +443,8 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
             cik, accession, root_document, settings=settings
         )
         fixture_name = _flatten_fixture_filename(root_document)
-        _write_text(
-            EDGAR_FIXTURES_DIR / f"filing_{label}_{fixture_name}",
+        _write_text_gz(
+            EDGAR_FIXTURES_DIR / f"filing_{label}_{fixture_name}.gz",
             downloaded.read_text(encoding="utf-8", errors="replace"),
             secrets=secrets,
         )
@@ -400,6 +482,8 @@ def main() -> int:
     EDGAR_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
 
     secrets = _configured_secrets(settings)
+    for stale in EDGAR_FIXTURES_DIR.glob("filing_*"):
+        stale.unlink()  # a re-run must not leave an older document beside the new one
     _record_edgar(settings, secrets)
     _record_alpaca(settings, secrets)
 

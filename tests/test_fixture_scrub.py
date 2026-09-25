@@ -20,6 +20,7 @@ Two layers:
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Any
@@ -67,8 +68,16 @@ def _parsed_json_or_none(text: str) -> Any | None:
         return None
 
 
+def _fixture_text(path: Path) -> str:
+    """A fixture's text; `.gz` filing documents are decompressed first (T3)."""
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
+            return fh.read()
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
 def _assert_file_is_scrubbed(path: Path) -> None:
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    text = _fixture_text(path)
 
     # Whole-file-text checks: email addresses and sensitive-header lines
     # can appear in either JSON or plain-text payloads, and matching them

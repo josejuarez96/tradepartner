@@ -31,12 +31,17 @@ from pydantic import SecretStr
 
 from tradepartner.config import Settings, get_settings
 
-# Alpaca's free market-data plan is believed IEX-only (ADR 0003 "Verify
-# before the Phase 2 plan"); T3 confirms this against the owner's real
-# account and may promote it to a `Settings` field. Until then, callers can
-# override `feed=` explicitly, and every raw-bars payload records the feed
-# actually used so a recording or a caller never has to guess.
-DEFAULT_FEED = DataFeed.IEX
+# T3 (#84) confirmed with the owner's keys that the free plan returns SIP
+# history for past date ranges (real-time stays IEX-only). The default feed
+# now comes from `settings.alpaca.historical_feed`; callers can still pass
+# `feed=` explicitly, and every raw-bars payload records the feed actually
+# used so a recording or a caller never has to guess.
+_FEEDS = {"sip": DataFeed.SIP, "iex": DataFeed.IEX}
+
+
+def default_feed(settings: Settings | None = None) -> DataFeed:
+    """The configured historical feed (`settings.alpaca.historical_feed`)."""
+    return _FEEDS[(settings or get_settings()).alpaca.historical_feed]
 
 
 class AlpacaCredentialsError(RuntimeError):
@@ -103,17 +108,19 @@ def daily_bars(
     start: date,
     end: date,
     *,
-    feed: DataFeed = DEFAULT_FEED,
+    feed: DataFeed | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Raw, unadjusted daily bars for `symbols` over `[start, end]`.
 
     Returns `{"feed": <feed used>, "bars": <raw payload>}` so the feed that
     produced the bars travels with them (spec: "expose the feed used").
-    Always `adjustment=raw` per ADR 0003 rule 1 (adjustment happens at read
-    time in the store, never at the source).
+    `feed=None` means the configured `alpaca.historical_feed`. Always
+    `adjustment=raw` per ADR 0003 rule 1 (adjustment happens at read time
+    in the store, never at the source).
     """
     settings = settings or get_settings()
+    feed = feed or default_feed(settings)
     client = _stock_data_client(settings)
     start_utc, end_utc = _session_bounds_utc(start, end)
     request = StockBarsRequest(

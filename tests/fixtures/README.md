@@ -30,24 +30,28 @@ a `key`/`secret`-labeled token replaced, leaving the rest of the string
 intact. `tests/test_fixture_scrub.py` independently re-checks every file
 here against the same patterns.
 
-As of this PR, `tests/fixtures/{alpaca,edgar}/` are still **empty**: T2
-builds the clients and the recorder; T3 (the owner, with real keys) runs
-it and commits the output in a follow-up PR.
+Recorded by the owner on 2026-09-25 (T3, #84). Facts learned while recording, and the
+config values they set, are in
+[docs/research/2026-09-25-free-data-terms.md](../../docs/research/2026-09-25-free-data-terms.md).
 
-**Notes for whoever runs T3:**
-- `assets_snapshot.json` is fetched through `TradingClient(paper=True)`
-  (`alpaca_raw._trading_client`). A **live-only** Alpaca key pair will
-  fail that call with an auth/permission error even though
-  `daily_bars.json`/`corporate_actions.json` (market data, account-type
-  agnostic) succeed — if that happens, it's expected, not a bug; open an
-  issue if the recorder should instead try both base URLs.
-- `daily_bars.json` is fetched with `feed=DataFeed.IEX` by default
-  (`alpaca_raw.DEFAULT_FEED`) — ADR 0003's working assumption that the
-  free plan is IEX-only, not yet confirmed. If T3 finds the account
-  actually gets SIP or another feed, note that here and consider whether
-  `daily_bars`'s default should change.
+**Size rules** (pre-commit rejects files over 500 KB; the raw payloads were 0.9-7.7 MB):
+- `company_facts_<label>.json` keeps the `dei` namespace whole plus every concept whose
+  name contains `SharesOutstanding` or `SharesIssued`; all other concepts are dropped
+  (`cli_record.trim_company_facts`). Parsers that need another concept extend that list
+  and the owner re-records.
+- `company_tickers.json` keeps the first 200 rows plus every row for a recorded CIK or
+  symbol (`cli_record.trim_company_tickers`).
+- `filing_<label>_<document>.gz` is the whole primary document, gzip-compressed: the
+  `dei:` cover tags are spread across the file, so it cannot be truncated. Read it with
+  `gzip.open(path, "rt")`; `tests/test_fixture_scrub.py` decompresses before checking.
 
-## What T3 will record
+**Feed:** `daily_bars.json` records the feed it was fetched with in its `feed` key. The
+free plan returns SIP history for past date ranges (probed 2026-09-25), so
+`alpaca.historical_feed` defaults to `sip` and `alpaca_raw.daily_bars` uses it unless a
+caller passes `feed=`. A recording made before that change says `iex`; either is a valid
+raw payload, and parsers must read the key rather than assume.
+
+## What is recorded
 
 ### `tests/fixtures/alpaca/`
 
@@ -61,14 +65,14 @@ it and commits the output in a follow-up PR.
 
 | File | Source call | Notes |
 |---|---|---|
-| `company_tickers.json` | `edgar_raw.company_tickers()` | Full current ticker/exchange snapshot. |
+| `company_tickers.json` | `edgar_raw.company_tickers()` | Current ticker/exchange snapshot, sampled (see size rules). |
 | `filing_index_<year>_qtr<n>.txt` | `edgar_raw.filing_index_quarter(year, qtr)` | The real full-index file for one quarter is every SEC filing that quarter; the recorder keeps only the header rows plus the lines naming the three CIKs below, so the fixture stays small. |
 | `submissions_plain_issuer.json` | `edgar_raw.submissions(cik)` | Apple Inc. (CIK 0000320193) — a straightforward single-class issuer. |
 | `submissions_dual_class.json` | `edgar_raw.submissions(cik)` | Alphabet Inc. (CIK 0001652044) — dual-class (GOOGL/GOOG). |
 | `submissions_delisted_25nse.json` | `edgar_raw.submissions(cik)` | KLX Energy Services Holdings, Inc. (CIK 0001738827) — has a real Form 25-NSE delisting notice on file as of 2026-09-24; confirm it still resolves before recording, since EDGAR's current-filings feed changes over time. |
-| `company_facts_<label>.json` | `edgar_raw.company_facts(cik)` | XBRL company facts for each of the three CIKs above. |
+| `company_facts_<label>.json` | `edgar_raw.company_facts(cik)` | XBRL company facts for each of the three CIKs above, trimmed to `dei` and share-count concepts (see size rules). |
 | `sgml_header_<label>.txt` | `edgar_raw.filing_sgml_header(cik, accession)` | First 4 KB of one filing per CIK (the 25-NSE for the delisted case; a recent 10-K otherwise), chosen automatically by the recorder from that CIK's own filing history. |
-| `filing_<label>_<document>` | `edgar_raw.download_filing_file(cik, accession, filename)` | The primary document of that same filing, downloaded and then copied here scrubbed (the raw client itself caches to `edgar.cache_dir`, which is gitignored — this copy is what T11's tests read). For an XBRL-only form (e.g. 25-NSE) whose `primaryDocument` points at an XSL-rendered view like `xslF25X02/primary_doc.xml`, the recorder fetches the raw root-level copy (`primary_doc.xml`) instead; any remaining `/` in the fixture filename is flattened to `__`. |
+| `filing_<label>_<document>.gz` | `edgar_raw.download_filing_file(cik, accession, filename)` | The primary document of that same filing, downloaded and then copied here scrubbed (the raw client itself caches to `edgar.cache_dir`, which is gitignored — this copy is what T11's tests read). For an XBRL-only form (e.g. 25-NSE) whose `primaryDocument` points at an XSL-rendered view like `xslF25X02/primary_doc.xml`, the recorder fetches the raw root-level copy (`primary_doc.xml`) instead; any remaining `/` in the fixture filename is flattened to `__`. |
 
 CIKs and form choices were picked against live EDGAR on 2026-09-24 (see
 `src/tradepartner/cli_record.py`); if the owner running T3 finds one no

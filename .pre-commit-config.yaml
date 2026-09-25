@@ -14,7 +14,9 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: end-of-file-fixer
+        exclude: ^tests/fixtures/(alpaca|edgar)/   # recorded raw payloads stay byte-exact (T3)
       - id: trailing-whitespace
+        exclude: ^tests/fixtures/(alpaca|edgar)/
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.21.2
     hooks:

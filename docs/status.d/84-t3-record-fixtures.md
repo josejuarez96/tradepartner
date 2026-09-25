@@ -1,0 +1,1 @@
+- Phase 2 T3 (owner): fixtures recorded from Alpaca and EDGAR with real keys and scrubbed; free plan confirmed to return SIP history, so `alpaca.historical_feed=sip` and `universe.liquidity_rule_enabled=true`; `fill_price` stays `close`; source terms and backfill estimate in [research](research/2026-09-25-free-data-terms.md) (#84, PR pending)
