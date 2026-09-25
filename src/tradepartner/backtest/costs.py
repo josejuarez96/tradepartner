@@ -37,6 +37,11 @@ def trade_cost(
 ) -> float:
     """Cost of one trade of `notional` dollars and `shares` shares (both magnitudes).
 
+    `shares` is the share count at the **raw** fill price (notional / raw price), as
+    reported shares are defined in spec req 2, not a count derived from an adjusted-as-of-t
+    price: after a reverse split the adjusted count is larger or smaller than the shares
+    actually traded, and the per-share commission would be wrong.
+
     A trade of zero notional and zero shares is not an order and costs nothing, so the
     per-order commission is not charged for it.
     """
@@ -62,8 +67,8 @@ def buy_notional_after_costs(
     With no commissions this is `cash / (1 + per-side rate)` (req 4). A per-share
     commission depends on the share count, hence `price`; a per-order commission comes
     off the top. Returns 0 when `cash` does not cover the per-order commission. The
-    result is stepped down one ulp at a time while rounding would leave cash negative,
-    whichever order the caller subtracts notional and cost in.
+    result is stepped down, by at least one ulp of `cash`, while rounding would leave
+    cash negative, whichever order the caller subtracts notional and cost in.
     """
     if cash < 0:
         raise ValueError(f"cash must be non-negative, got {cash}")
@@ -73,20 +78,31 @@ def buy_notional_after_costs(
     if available <= 0:
         return 0.0
     notional = available / (1 + per_side_bps / BPS_PER_UNIT + commissions.per_share / price)
-    while notional > 0 and _overspends(cash, notional, price, per_side_bps, commissions):
-        notional = math.nextafter(notional, 0)
+    # Each step removes at least one ulp of `cash` (the scale of the rounding error), so
+    # the loop ends after a few steps even when `notional` itself is tiny.
+    while notional > 0:
+        overshoot = _overshoot(cash, notional, price, per_side_bps, commissions)
+        if overshoot <= 0:
+            break
+        notional = max(notional - max(overshoot, math.ulp(cash)), 0.0)
     return notional
 
 
-def _overspends(
+def _overshoot(
     cash: float, notional: float, price: float, per_side_bps: float, commissions: Commissions
-) -> bool:
-    """True if paying `notional` plus its cost from `cash` goes negative in any order."""
+) -> float:
+    """How far paying `notional` plus its cost overdraws `cash`, in the worst of the
+    orders a caller might debit them in; zero or negative means it fits."""
     cost = trade_cost(notional, notional / price, per_side_bps, commissions)
-    return notional + cost > cash or cash - notional - cost < 0 or cash - cost - notional < 0
+    return max(notional + cost - cash, -(cash - notional - cost), -(cash - cost - notional))
 
 
 def sensitivity_levels(settings: Settings) -> list[float]:
-    """Base `costs.per_side_bps` plus every `costs.sensitivity_per_side_bps`, sorted, unique."""
+    """Base `costs.per_side_bps` plus every `costs.sensitivity_per_side_bps`, sorted, unique.
+
+    The base is always `settings.costs.per_side_bps`, never a position in this list (with
+    the defaults, the first level is 0 bp and the base is 15 bp). N, V, DSR and the red flag
+    use the base level only (req 6).
+    """
     costs = settings.costs
     return sorted({costs.per_side_bps, *costs.sensitivity_per_side_bps})

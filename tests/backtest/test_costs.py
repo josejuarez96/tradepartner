@@ -8,6 +8,7 @@ differently, so the oracle runs at zero cost and the cost model is tested here.
 from __future__ import annotations
 
 import ast
+import time
 from pathlib import Path
 
 import pytest
@@ -145,3 +146,31 @@ def test_costs_module_has_no_stray_numeric_literals() -> None:
         and node.value not in ALLOWED_LITERALS
     ]
     assert stray == []
+
+
+@pytest.mark.parametrize("excess", [1e-15, 1e-12, 2.7e-15, 1e-9, 1e-6])
+@pytest.mark.parametrize("per_order", [1.0, 0.35, 7.0])
+def test_cash_just_above_the_order_fee_terminates_and_never_overspends(
+    excess: float, per_order: float
+) -> None:
+    """Cash a sliver above `per_order` (quant-auditor, PR #124): the rounding guard must
+    step on the scale of `cash`, not of the tiny notional, or it loops ~1e12 times."""
+    c = Commissions(per_share=0.005, per_order=per_order)
+    cash = per_order + excess
+    started = time.monotonic()
+    notional = buy_notional_after_costs(cash, 100.0, c, price=50.0)
+    assert time.monotonic() - started < 1.0
+    assert notional >= 0.0
+    if notional > 0:
+        cost = trade_cost(notional, notional / 50.0, 100.0, c)
+        assert cash - notional - cost >= 0.0
+        assert cash - cost - notional >= 0.0
+
+
+def test_levels_always_contain_the_base_wherever_it_sorts() -> None:
+    """The base is `settings.costs.per_side_bps`, never a position in the list: with the
+    defaults, `levels[0]` is 0 bp, not the 15 bp base."""
+    s = Settings(_env_file=None)
+    levels = sensitivity_levels(s)
+    assert s.costs.per_side_bps in levels
+    assert levels[0] != s.costs.per_side_bps
