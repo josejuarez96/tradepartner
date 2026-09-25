@@ -1,0 +1,1 @@
+- #48 Research G3: independent evidence on trend timing graded MIXED; the closest-transfer out-of-sample, net-of-cost test (Zakamulin 2014) is negative; report INCOMPLETE, abstract-level only ([report](research/2026-09-25-trend-timing.md))
