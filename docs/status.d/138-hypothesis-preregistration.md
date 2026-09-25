@@ -1,0 +1,1 @@
+- Phase 3 T35: hypothesis template (`docs/templates/hypothesis.md`) and pre-registration (`backtest/hypothesis.py`): one `toml hypothesis` block per file, required keys and a closed frozen list enforced, file values over live `Settings` validated and stored in JSON form, `load_frozen` reads them back without the environment and refuses a hash or key-set mismatch (#138)

@@ -143,6 +143,25 @@ def test_fact_table_has_common_columns(
     assert columns["ingested_at"][2].upper().startswith("TIMESTAMP")
 
 
+def test_corporate_actions_has_a_nullable_announced_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Issue #83: the source's announcement time is stored next to
+    `known_at`, so a first-seen stamp earlier than the proxy is checkable."""
+    info = fixture_store.execute("PRAGMA table_info('corporate_actions')").fetchall()
+    columns = {row[1]: row for row in info}
+    assert "announced_at" in columns
+    _, _, col_type, not_null, _, _ = columns["announced_at"]
+    assert col_type.upper().startswith("TIMESTAMP")
+    assert not not_null
+
+
+def test_announced_at_arrived_at_schema_version_2() -> None:
+    """Version 2 adds `corporate_actions.announced_at` (issue #83); the
+    registry (version 3, #117) migrates only from it."""
+    assert schema._PRE_REGISTRY_VERSION == 2
+
+
 def test_ingestion_runs_is_not_a_fact_table(fixture_store: duckdb.DuckDBPyConnection) -> None:
     """`ingestion_runs` has the spec's exact columns and none of the four
     common fact-table columns (it is not a fact table)."""
@@ -251,6 +270,30 @@ def test_insert_row_rejects_naive_known_at(fixture_store: duckdb.DuckDBPyConnect
         insert_row(fixture_store, "prices_daily", row)
     (after,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     assert after == before
+
+
+def test_insert_row_stores_none_as_null_in_a_nullable_timestamptz_column(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`announced_at` is nullable (#83): `None` binds as NULL."""
+    row = {
+        **_minimal_row("corporate_actions", known_at=_now(), ingested_at=_now()),
+        "security_id": "S_NULL",
+        "announced_at": None,
+    }
+    insert_row(fixture_store, "corporate_actions", row)
+    (announced,) = fixture_store.execute(  # type: ignore[misc]
+        "SELECT announced_at FROM corporate_actions WHERE security_id = 'S_NULL'"
+    ).fetchone()
+    assert announced is None
+
+
+def test_insert_row_none_in_a_not_null_timestamptz_column_is_refused(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    row = _minimal_row("prices_daily", known_at=None, ingested_at=_now())  # type: ignore[arg-type]
+    with pytest.raises(duckdb.ConstraintException, match="known_at"):
+        insert_row(fixture_store, "prices_daily", row)
 
 
 def test_insert_row_rejects_naive_ingested_at(fixture_store: duckdb.DuckDBPyConnection) -> None:

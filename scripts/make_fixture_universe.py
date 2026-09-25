@@ -146,6 +146,7 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "action_type",
         "ex_date",
         "ratio_or_amount",
+        "announced_at",
         "known_at",
         "ingested_at",
         "source",
@@ -484,6 +485,7 @@ class Rows:
         ratio_or_amount: float,
         *,
         known_at: datetime,
+        announced_at: datetime | None = None,
         source: str = _SOURCE_ALPACA,
         ingested_delay: timedelta = timedelta(minutes=10),
     ) -> None:
@@ -493,6 +495,7 @@ class Rows:
                 "action_type": action_type,
                 "ex_date": ex_date,
                 "ratio_or_amount": ratio_or_amount,
+                "announced_at": announced_at,
                 "known_at": known_at,
                 "ingested_at": known_at + ingested_delay,
                 "source": source,
@@ -983,7 +986,9 @@ def _split_known_before_t_ex_after_t(rows: Rows) -> None:
     rows.listing(security_id, ticker, "NYSE", _GLOBAL_START_SESSION, filing_known)
     rows.classification(security_id, "common", "common_default", filing_known)
     rows.bars(security_id, bar_sessions, start_price=90.0, seed=14, floor=_MIN_PRICE * 4 * 2)
-    rows.action(security_id, "split", ex_date, 4.0, known_at=announced_at)
+    rows.action(
+        security_id, "split", ex_date, 4.0, known_at=announced_at, announced_at=announced_at
+    )
     rows.apply_split(security_id, ex_date, 4.0)
 
     shares_as_of = _session_on_or_after(date(2018, 5, 1))
@@ -1057,6 +1062,7 @@ def _split_backfilled_and_bar_revision(rows: Rows) -> None:
             "action_type": "split",
             "ex_date": ex_date,
             "ratio_or_amount": 2.0,
+            "announced_at": None,
             "known_at": known_at,
             "ingested_at": ingested_at,
             "source": _SOURCE_ALPACA,
