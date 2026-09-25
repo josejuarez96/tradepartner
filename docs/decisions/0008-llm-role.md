@@ -1,6 +1,6 @@
 # 0008. LLM role: none in the MVP, advisory memo at most, never a number and never an order
 
-**Status:** Proposed  ·  **Date:** 2026-09-25  ·  **Issue:** #52
+**Status:** Accepted  ·  **Date:** 2026-09-25  ·  **Issue:** #52
 
 ## Context
 
