@@ -7,14 +7,16 @@ it: the owner does that on the real store after merge (T45b).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
-from tradepartner.backtest import hypothesis
+from tradepartner.backtest import hypothesis, schedule
+from tradepartner.calendar import last_session_of_month
 from tradepartner.config import Settings
 
 H1_PATH = Path(__file__).resolve().parents[2] / "docs" / "hypotheses" / "h1-momentum-12-1.md"
 SLUG = "h1-momentum-12-1"
+LAST_IN_SAMPLE_REBALANCE = date(2023, 12, 29)
 
 
 def test_h1_file_parses_with_slug_family_and_dates() -> None:
@@ -48,6 +50,10 @@ def test_h1_file_records_owner_answers_and_spec_defaults() -> None:
     assert params["costs.commission_per_share"] == 0.0
     assert params["costs.commission_per_order"] == 0.0
     assert params["costs.sensitivity_per_side_bps"] == [0.0, 30.0, 60.0, 100.0]
+    # The three optional frozen keys the file's prose relies on.
+    assert params["universe.top_n_by_cap"] == 1000
+    assert params["execution.fill_price"] == "close"
+    assert params["alpaca.historical_feed"] == "sip"
 
 
 def test_h1_frozen_set_builds_over_default_settings() -> None:
@@ -57,3 +63,23 @@ def test_h1_frozen_set_builds_over_default_settings() -> None:
     assert frozen["holdout.start"] == "2024-01-01"
     assert frozen["holdout.end"] == "2026-09-30"
     assert frozen["strategy.top_fraction"] == 0.10
+    assert frozen["universe.top_n_by_cap"] == 1000
+    assert frozen["execution.fill_price"] == "close"
+    assert frozen["alpaca.historical_feed"] == "sip"
+
+
+def test_h1_power_arithmetic_counts() -> None:
+    """The session counts the file's power arithmetic states, on the XNYS calendar."""
+    parsed = hypothesis.parse_file(H1_PATH)
+    assert parsed.in_sample_start == last_session_of_month(2017, 1)
+    # Spec req 11: the in-sample default window ends at the last rebalance before holdout.start.
+    before_holdout = schedule.rebalance_sessions(
+        parsed.in_sample_start, parsed.holdout_start - timedelta(days=1)
+    )
+    assert before_holdout[-1] == LAST_IN_SAMPLE_REBALANCE
+    assert len(before_holdout) == 84
+    # The holdout window itself holds 33 month-ends; the pinned holdout run starts one
+    # rebalance earlier so that January 2024 belongs to a window (34 sessions, 33 returns).
+    assert len(schedule.rebalance_sessions(parsed.holdout_start, parsed.holdout_end)) == 33
+    assert len(schedule.rebalance_sessions(LAST_IN_SAMPLE_REBALANCE, parsed.holdout_end)) == 34
+    assert parsed.holdout_end == last_session_of_month(2026, 9)
