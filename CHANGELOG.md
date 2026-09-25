@@ -17,7 +17,7 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Process: `scripts/team.py start <name>` sets up a team directory outside the repo in one step; `register` refuses to overwrite another team's `.team`; sessions touch only their own directory (#40).
 - `store.db.ensure_tz_aware` and the broker value objects share one tz-aware UTC check, `tradepartner.timeutil.ensure_tz_aware_utc`, which also rejects a `tzinfo` with no UTC offset; `ensure_tz_aware` now returns the value converted to UTC (#30).
 - Plan: Phase 2 gains T21a, a Streamlit dashboard shell (app entry, read-only connection, busy state, navigation) that depends only on T4; T21 (data-health page) now depends on T18 and T21a instead of T19, and T19 (CLI) also depends on T21a, so UX work can start early (#53).
-- Process: the teams picking order includes any unclaimed sized issue (research briefs, ADR and spec/plan drafts, not only `size:S`), naming the agent and model tier for each; an issue with no size label is not ready to claim (#55).
+- Process: the teams picking order includes any unclaimed sized issue (research issues with an owner-approved brief, ADR and spec/plan drafts, not only `size:S`), naming the agent and model tier for each; an issue with no size label is not ready to claim (#55).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
