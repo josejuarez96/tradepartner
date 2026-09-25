@@ -1,0 +1,1 @@
+- #193 `StoreProvider.raw_prices` (`prices_as_of` on the step connection): T37b (#159) added it to `DataProvider` and T38 (#175) merged without it, so `StoreProvider` was not a `DataProvider` and `engine.run` failed at its first step
