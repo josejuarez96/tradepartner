@@ -205,3 +205,69 @@ class TestFixtureContract:
             writer.writerow({k: v for k, v in _row().items() if k in header})
         (action,) = FixturePriceSource(tmp_path).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
         assert (action.source_action_id, action.cancelled) == (None, False)
+
+
+class TestReplacementRows:
+    """Audit findings 1 and 2 on PR #111: a row that replaces a cancelled
+    key in the same ingest revises a known event, so it is stamped at its
+    `ingested_at`, never at a first-seen proxy."""
+
+    CANCEL_AT = "2019-03-06T22:00:00+00:00"
+
+    def _cancel_old_key(self) -> list[dict[str, str]]:
+        return [
+            _row(),
+            _row(cancelled="TRUE", known_at=self.CANCEL_AT, ingested_at=self.CANCEL_AT),
+        ]
+
+    def test_idless_redate_stamped_at_the_new_proxy_is_refused(self, tmp_path: Path) -> None:
+        # Moved to 2019-03-05 in the 2019-03-06 ingest: its proxy (the
+        # 2019-03-04 close) predates the ingest, which is look-ahead.
+        fixtures = _fixture(
+            tmp_path,
+            [
+                *self._cancel_old_key(),
+                _row(
+                    ex_date="2019-03-05",
+                    known_at="2019-03-04T21:00:00+00:00",
+                    ingested_at=self.CANCEL_AT,
+                ),
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="replaces"):
+            FixturePriceSource(fixtures)
+
+    def test_idless_redate_stamped_at_ingest_loads_even_after_its_proxy(
+        self, tmp_path: Path
+    ) -> None:
+        fixtures = _fixture(
+            tmp_path,
+            [
+                *self._cancel_old_key(),
+                _row(ex_date="2019-03-05", known_at=self.CANCEL_AT, ingested_at=self.CANCEL_AT),
+            ],
+        )
+        actions = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
+        assert len(actions) == 3
+
+    def test_id_row_sharing_a_live_idless_key_is_refused(self, tmp_path: Path) -> None:
+        fixtures = _fixture(
+            tmp_path,
+            [
+                _row(),
+                _row(source_action_id="A1", ingested_at="2019-03-06T22:00:00+00:00"),
+            ],
+        )
+        with pytest.raises(FixtureContractError, match="id-less"):
+            FixturePriceSource(fixtures)
+
+    def test_id_row_replacing_a_cancelled_idless_key_loads(self, tmp_path: Path) -> None:
+        fixtures = _fixture(
+            tmp_path,
+            [
+                *self._cancel_old_key(),
+                _row(source_action_id="A1", known_at=self.CANCEL_AT, ingested_at=self.CANCEL_AT),
+            ],
+        )
+        actions = FixturePriceSource(fixtures).corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)
+        assert [a.source_action_id for a in actions].count("A1") == 1

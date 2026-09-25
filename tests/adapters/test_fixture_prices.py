@@ -728,6 +728,7 @@ class TestRoundTrip:
         "SEC_DIV_REVISED",
         "SEC_SPLIT_FUTURE",
         "SEC_SPLIT_REDATED",
+        "SEC_SPLIT_REDATED_NOID",
         "SEC_DIV_CANCELLED",
     )
     PROBES = (
@@ -738,6 +739,7 @@ class TestRoundTrip:
         datetime(2019, 6, 12, 20, 59, 59, tzinfo=UTC),  # before the split re-date (#108)
         datetime(2019, 6, 12, 21, 0, tzinfo=UTC),  # at the split re-date
         datetime(2019, 9, 20, 21, 0, tzinfo=UTC),  # at the dividend cancel
+        datetime(2019, 10, 18, 22, 0, tzinfo=UTC),  # at the id-less split re-date
         datetime(2030, 1, 1, tzinfo=UTC),
     )
 
@@ -790,7 +792,7 @@ class TestRoundTrip:
         self, adapter_store: duckdb.DuckDBPyConnection, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:
         for table in ("prices_daily", "corporate_actions"):
-            sql = f"SELECT COUNT(*) FROM {table} WHERE security_id IN (?, ?, ?, ?, ?)"
+            sql = f"SELECT COUNT(*) FROM {table} WHERE security_id IN (?, ?, ?, ?, ?, ?)"
             assert (
                 adapter_store.execute(sql, list(self.IDS)).fetchone()
                 == fixture_store.execute(sql, list(self.IDS)).fetchone()

@@ -782,3 +782,17 @@ def test_two_source_ids_may_share_an_ex_date_and_known_at(
     row = _minimal_row("corporate_actions", known_at=now, ingested_at=now)
     with pytest.raises(duckdb.ConstraintException):
         insert_row(fixture_store, "corporate_actions", {**row, "source_action_id": "D1"})
+
+
+def test_one_id_has_one_row_per_known_at(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    """Audit finding 3 on PR #111: under an id identity the store itself
+    refuses two revisions at one `known_at`, whatever their ex-dates."""
+    now = _now()
+    row = _minimal_row("corporate_actions", known_at=now, ingested_at=now)
+    insert_row(fixture_store, "corporate_actions", {**row, "source_action_id": "A1"})
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            fixture_store,
+            "corporate_actions",
+            {**row, "source_action_id": "A1", "ex_date": date(2020, 1, 9)},
+        )

@@ -188,6 +188,26 @@ class TestCancelledAction:
         assert closes[date(2021, 1, 8)] == pytest.approx(50.0)
         assert closes[date(2021, 1, 12)] == pytest.approx(50.0)
 
+    def test_idless_redate_to_an_earlier_date_applies_once_and_not_early(
+        self, store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Audit finding 1 on PR #111: known for ex 2021-01-13, moved on
+        # 2021-01-15 to 2021-01-07. The replacement row is stamped at the
+        # ingest, so before it nothing knew of 01-07.
+        _action(store, "split", date(2021, 1, 13), 2.0, known_at=_t(12, 21))
+        _action(store, "split", date(2021, 1, 13), 2.0, known_at=_t(15, 22), cancelled=True)
+        _action(store, "split", date(2021, 1, 7), 2.0, known_at=_t(15, 22))
+
+        early = _closes(adjusted_prices_as_of(store, _t(8, 22), [SID]))
+        assert early[date(2021, 1, 6)] == pytest.approx(100.0)
+        between = _closes(adjusted_prices_as_of(store, _t(14, 22), [SID]))
+        assert between[date(2021, 1, 12)] == pytest.approx(50.0)
+        assert between[date(2021, 1, 6)] == pytest.approx(50.0)
+        after = _closes(adjusted_prices_as_of(store, _t(15, 22), [SID]))
+        assert after[date(2021, 1, 6)] == pytest.approx(50.0)
+        assert after[date(2021, 1, 7)] == pytest.approx(100.0)
+        assert after[date(2021, 1, 12)] == pytest.approx(100.0)
+
     def test_cancelled_dividend_is_not_reported_as_dropped(
         self, store: duckdb.DuckDBPyConnection
     ) -> None:
@@ -236,3 +256,18 @@ class TestFixtureCases:
             1 - 0.40 / prior_close
         )
         assert self._ratio(fixture_store, sid, cancel, date(2019, 9, 13)) == pytest.approx(1.0)
+
+    def test_idless_redate_to_an_earlier_date_is_not_seen_early(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "SEC_SPLIT_REDATED_NOID"
+        # First known for ex 2019-10-21; at 2019-10-18 22:00 re-dated to the
+        # already-past 2019-10-14 (cancel + replacement in one ingest).
+        redate = datetime(2019, 10, 18, 22, 0, tzinfo=UTC)
+        before = redate - timedelta(microseconds=1)
+        assert self._ratio(fixture_store, sid, before, date(2019, 10, 11)) == pytest.approx(1.0)
+        assert self._ratio(fixture_store, sid, redate, date(2019, 10, 11)) == pytest.approx(0.5)
+        assert self._ratio(fixture_store, sid, redate, date(2019, 10, 14)) == pytest.approx(1.0)
+        later = datetime(2019, 11, 1, 21, 0, tzinfo=UTC)
+        assert self._ratio(fixture_store, sid, later, date(2019, 10, 11)) == pytest.approx(0.5)
+        assert self._ratio(fixture_store, sid, later, date(2019, 10, 18)) == pytest.approx(1.0)

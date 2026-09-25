@@ -1196,6 +1196,50 @@ def _redated_split(rows: Rows) -> None:
     )
 
 
+def _redated_split_without_id(rows: Rows) -> None:
+    """#108 audit: an id-less split re-dated to an *earlier* ex-date after
+    the first was known. The ingest that sees it writes a cancel for the old
+    key and a replacement row for the new one, both stamped at that ingest:
+    before it nothing knew the earlier date, and the split never applies
+    twice. The raw bars jump on the true (new) ex-date."""
+    start = _session_on_or_after(date(2019, 9, 3))
+    first_ex_date = _session_on_or_after(date(2019, 10, 21))
+    new_ex_date = _session_on_or_after(date(2019, 10, 14))
+    first_known_at = session_close(previous_session(first_ex_date))
+    # Re-dated the evening the first ex-date became known: the new ex-date
+    # is already past, the old one not yet effective.
+    redated_at = first_known_at + timedelta(hours=2)
+    security_id, cik, ticker = "SEC_SPLIT_REDATED_NOID", "CIK0001000022", "RDNI"
+    filing_known = _filing_acceptance(nth_session_before(start, 20))
+
+    rows.security(security_id, cik, "Redated Split No Id Co", filing_known)
+    rows.listing(security_id, ticker, "NYSE", start, filing_known)
+    rows.classification(security_id, "common", "common_default", filing_known)
+    rows.bars(security_id, sessions_between(start, _FIXTURE_END), start_price=90.0, seed=25)
+    rows.action(security_id, "split", first_ex_date, 2.0, known_at=first_known_at)
+    for ex_date, cancelled in ((first_ex_date, True), (new_ex_date, False)):
+        rows.action(
+            security_id,
+            "split",
+            ex_date,
+            2.0,
+            known_at=redated_at,
+            ingested_delay=timedelta(0),
+            cancelled=cancelled,
+        )
+    rows.apply_split(security_id, new_ex_date, 2.0)
+    rows.case(
+        "Re-dated split, no source id: moved to an earlier ex-date; cancel of the "
+        "old key plus a replacement, both at the re-dating ingest (#108)",
+        security_id,
+        ticker,
+        f"first ex_date {first_ex_date} known_at {first_known_at.isoformat()}; "
+        f"cancelled and replaced by ex_date {new_ex_date} at known_at = ingested_at = "
+        f"{redated_at.isoformat()}",
+        f"just before and after {redated_at.isoformat()}",
+    )
+
+
 def _cancelled_dividend(rows: Rows) -> None:
     """#108: a dividend with no source id is withdrawn after its ex-date. A
     `cancelled` revision of the same key removes it from its `known_at` on
@@ -1515,6 +1559,7 @@ def build_rows() -> Rows:
     _split_backfilled_and_bar_revision(rows)
     _revised_dividend(rows)
     _redated_split(rows)
+    _redated_split_without_id(rows)
     _cancelled_dividend(rows)
     _restated_shares_fact(rows)
     _stale_shares_fact(rows)

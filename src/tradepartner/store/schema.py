@@ -86,9 +86,10 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #:
 #: Migration notes:
 #: - 2 (#108): `corporate_actions` gains `source_action_id` and `cancelled`,
-#:   and its UNIQUE key gains `source_action_id`. No data had been ingested
-#:   at v1, so there is no migration code; a v1 store raises
-#:   `SchemaVersionError`.
+#:   its UNIQUE key gains `source_action_id`, and the unique index
+#:   `corporate_actions_identity` holds one row per identity per
+#:   `known_at`. No data had been ingested at v1, so there is no migration
+#:   code; a v1 store raises `SchemaVersionError`.
 CURRENT_SCHEMA_VERSION = 2
 
 
@@ -186,7 +187,8 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 # second event. source_action_id uses '' for "the source gave no id", not
 # NULL, for the same UNIQUE reason as facts.class_member below. A revision
 # with cancelled = TRUE withdraws the event from its known_at on; that also
-# retires the old key of an id-less re-date.
+# retires the old key of an id-less re-date, whose replacement row is
+# stamped at its ingested_at (spec req 5).
 _CREATE_CORPORATE_ACTIONS = f"""
 CREATE TABLE IF NOT EXISTS corporate_actions (
     security_id VARCHAR NOT NULL,
@@ -197,6 +199,20 @@ CREATE TABLE IF NOT EXISTS corporate_actions (
     cancelled BOOLEAN NOT NULL DEFAULT FALSE,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["corporate_actions"])},
     UNIQUE (security_id, action_type, ex_date, source_action_id, known_at)
+)
+"""
+
+# One row per identity per known_at (#108), so "the latest revision" is never
+# a tie. The table's UNIQUE cannot say this for an id identity, where two
+# rows with one id and one known_at could differ in ex_date; DuckDB has no
+# partial index, so the id-less parts collapse to '' when an id is present.
+_CREATE_CORPORATE_ACTIONS_IDENTITY_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS corporate_actions_identity ON corporate_actions (
+    security_id,
+    source_action_id,
+    (CASE WHEN source_action_id = '' THEN action_type ELSE '' END),
+    (CASE WHEN source_action_id = '' THEN CAST(ex_date AS VARCHAR) ELSE '' END),
+    known_at
 )
 """
 
@@ -265,6 +281,7 @@ _TABLE_DDL: tuple[str, ...] = (
     _CREATE_DELISTINGS,
     _CREATE_PRICES_DAILY,
     _CREATE_CORPORATE_ACTIONS,
+    _CREATE_CORPORATE_ACTIONS_IDENTITY_INDEX,
     _CREATE_FACTS,
     _CREATE_INGESTION_RUNS,
     _CREATE_SCHEMA_VERSION,

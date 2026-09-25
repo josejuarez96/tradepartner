@@ -40,10 +40,20 @@ in ingest order (`ingested_at`, then `known_at`):
    itself, or an earlier announcement. A stamp before the proxy cannot be
    checked further, because the stored layout carries no announcement time
    to compare it with (issue #83). A first-seen action cannot be cancelled.
+   **Replacements** (#108) are the exception: a first-seen action ingested
+   together with a cancel of another key for the same security and type
+   (same `ingested_at`) replaces that key, as in an id-less re-date or a
+   switch from an id-less key to a source id. It revises an event already
+   known, so it is stamped `known_at == ingested_at`, never at a proxy. This
+   is deliberately broad: an unrelated action first seen in the same ingest
+   as a cancel is stamped late, never early.
 3. Every later row for the same key must be what `prices.revision_of`
    produces from the row before it at that row's `ingested_at`: values that
    differ, and `known_at` equal to its own `ingested_at` (never back-dated).
    A re-date or a cancellation is such a revision.
+4. An action with a source id may not share `(security_id, action_type,
+   ex_date)` with an id-less action unless that id-less key was cancelled at
+   or before the id row's ingest: otherwise both apply as two events.
 """
 
 from __future__ import annotations
@@ -223,15 +233,47 @@ def _check_bar_first_seen(row: _Row[Bar]) -> None:
         )
 
 
-def _check_action_first_seen(row: _Row[CorporateAction]) -> None:
-    """Contract rule 2 for actions: not cancelled, and stamped at or before
-    the first-seen proxy (the proxy itself, or an earlier announcement)."""
+def _cancel_ingests(rows: list[_Row[CorporateAction]]) -> set[tuple[str, str, datetime]]:
+    """`(security_id, action_type, ingested_at)` of every cancel row, to
+    recognise a replacement written in the same ingest (contract rule 2)."""
+    return {
+        (r.record.security_id, r.record.action_type.value, r.ingested_at)
+        for r in rows
+        if r.record.cancelled
+    }
+
+
+def _action_first_seen_check(
+    cancel_ingests: set[tuple[str, str, datetime]],
+) -> Callable[[_Row[CorporateAction]], None]:
+    """Contract rule 2 for actions, given the ingests that cancelled a key."""
+
+    def check(row: _Row[CorporateAction]) -> None:
+        _check_action_first_seen(row, cancel_ingests)
+
+    return check
+
+
+def _check_action_first_seen(
+    row: _Row[CorporateAction], cancel_ingests: set[tuple[str, str, datetime]]
+) -> None:
+    """Contract rule 2 for actions: not cancelled; a replacement stamped at
+    its own `ingested_at`; any other first-seen row stamped at or before the
+    first-seen proxy (the proxy itself, or an earlier announcement)."""
     action = row.record
     if action.cancelled:
         raise FixtureContractError(
             f"{row.where}: first-seen action {action.key} is cancelled; a cancel only "
             "revises an action already recorded"
         )
+    if (action.security_id, action.action_type.value, row.ingested_at) in cancel_ingests:
+        if action.known_at != row.ingested_at:
+            raise FixtureContractError(
+                f"{row.where}: action {action.key} replaces a key cancelled in the same "
+                f"ingest ({row.ingested_at.isoformat()}), so it revises a known event and "
+                f"must be stamped at that ingested_at, not {action.known_at.isoformat()}"
+            )
+        return
     proxy = action_first_seen_known_at(action.ex_date)
     if action.known_at > proxy:
         raise FixtureContractError(
@@ -280,6 +322,34 @@ def _check_history[RecordT: (Bar, CorporateAction)](
     )
 
 
+def _check_id_against_idless(rows: list[_Row[CorporateAction]]) -> None:
+    """Contract rule 4: an id row may share `(security_id, action_type,
+    ex_date)` with an id-less key only once that key is cancelled, at or
+    before the id row's ingest."""
+    cancelled_at: dict[tuple[str, str, date], datetime] = {}
+    idless_keys: set[tuple[str, str, date]] = set()
+    for row in rows:
+        action = row.record
+        if action.source_action_id is None:
+            key = (action.security_id, action.action_type.value, action.ex_date)
+            idless_keys.add(key)
+            if action.cancelled:
+                cancelled_at[key] = row.ingested_at
+    for row in rows:
+        action = row.record
+        if action.source_action_id is None:
+            continue
+        shared = (action.security_id, action.action_type.value, action.ex_date)
+        if shared in idless_keys and not (
+            shared in cancelled_at and cancelled_at[shared] <= row.ingested_at
+        ):
+            raise FixtureContractError(
+                f"{row.where}: action with source id {action.source_action_id!r} shares "
+                f"{shared} with an id-less action that is not cancelled by this ingest; "
+                "both would apply as two events"
+            )
+
+
 class FixturePriceSource(PriceSource):
     """`PriceSource` over a fixture directory; see the module docstring for
     what it reads and the contract it enforces on construction."""
@@ -304,7 +374,10 @@ class FixturePriceSource(PriceSource):
         for bar in _check_history(bar_rows, lambda b: b.key, _check_bar_first_seen):
             self._bars[bar.security_id].append(bar)
         self._actions: defaultdict[str, list[CorporateAction]] = defaultdict(list)
-        actions = _check_history(action_rows, lambda a: a.key, _check_action_first_seen)
+        actions = _check_history(
+            action_rows, lambda a: a.key, _action_first_seen_check(_cancel_ingests(action_rows))
+        )
+        _check_id_against_idless(action_rows)
         # Returned in the documented order, not identity order: an id key
         # and an ex-date key do not sort together.
         actions.sort(

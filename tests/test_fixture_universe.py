@@ -301,8 +301,15 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
     A revision (a later row for the same key): `known_at == ingested_at`,
     later than the first-seen row (spec req 5; review round 3 item 9).
     Rows group by action identity (#108): the source id when present, so
-    a re-date is a revision; a first-seen row is never a cancellation."""
+    a re-date is a revision; a first-seen row is never a cancellation. A
+    replacement (first seen in the same ingest as a cancel for the same
+    security and type) is stamped at its `ingested_at`, never earlier."""
     rows = _read_rows("corporate_actions")
+    cancel_ingests = {
+        (r["security_id"], r["action_type"], r["ingested_at"])
+        for r in rows
+        if r["cancelled"] == "TRUE"
+    }
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         if row["source_action_id"]:
@@ -317,6 +324,12 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
         close_before_ex = session_close(previous_session(first_ex_date))
         assert ordered[0]["cancelled"] == "FALSE", f"{security_id}: first-seen row is cancelled"
         first_known_at = datetime.fromisoformat(ordered[0]["known_at"])
+        first = ordered[0]
+        if (first["security_id"], first["action_type"], first["ingested_at"]) in cancel_ingests:
+            assert first["known_at"] == first["ingested_at"], (
+                f"{security_id} {action_type} {ex_date}: replacement not stamped at its ingest"
+            )
+            continue
         assert first_known_at <= close_before_ex, (
             f"{security_id} {action_type} {ex_date}: first-seen known_at {first_known_at} "
             f"is after the close before ex-date {close_before_ex}"
