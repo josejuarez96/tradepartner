@@ -16,6 +16,10 @@ already UTC is normalized to UTC. This uses the shared
 `tradepartner.timeutil.ensure_tz_aware_utc`, the single enforcement point
 for that rule, so this module and `store.db` cannot drift out of sync on
 what counts as valid (issue #30).
+
+Every `symbol` field is canonicalized to upper-case ASCII at construction
+(`_canonical_symbol`), so netting and reconciliation compare one form
+(issue #38).
 """
 
 from __future__ import annotations
@@ -41,6 +45,20 @@ def _validate_identifier(value: str, *, field_name: str) -> str:
             f"{field_name} must be non-empty with no leading/trailing whitespace, got {value!r}"
         )
     return value
+
+
+def _canonical_symbol(value: str) -> str:
+    """Validate `value` as an identifier and return its canonical form:
+    ASCII, upper case (issue #38). Without this, `"aapl"` and `"AAPL"`
+    net as two positions and would not match the broker's own records in
+    reconciliation. Non-ASCII is rejected because upper-casing is not a
+    safe canonical form for it (`"ß".upper()` is `"SS"`; full-width
+    `"\\uff21\\uff21\\uff30\\uff2c"` renders like `"AAPL"` but compares unequal).
+    """
+    value = _validate_identifier(value, field_name="symbol")
+    if not value.isascii():
+        raise ValueError(f"symbol must be ASCII, got {value!r}")
+    return value.upper()
 
 
 def _validate_positive_finite(value: float, *, field_name: str) -> float:
@@ -89,7 +107,7 @@ def _validate_order_fields(
     what counts as a valid quantity/price/side/identifier.
     """
     client_order_id = _validate_identifier(client_order_id, field_name="client_order_id")
-    symbol = _validate_identifier(symbol, field_name="symbol")
+    symbol = _canonical_symbol(symbol)
     side = _coerce_side(side)
     quantity = _validate_positive_finite(quantity, field_name="quantity")
     price = _validate_positive_finite(price, field_name="price")
@@ -240,7 +258,7 @@ class Position:
     quantity: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "symbol", _validate_identifier(self.symbol, field_name="symbol"))
+        object.__setattr__(self, "symbol", _canonical_symbol(self.symbol))
 
 
 class Broker(abc.ABC):

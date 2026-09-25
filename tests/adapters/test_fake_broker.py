@@ -5,7 +5,8 @@ Covers: abstractness, idempotent `submit` on a repeated `client_order_id`
 transitions and their error cases, fill/positions accounting (fill order,
 not submission order; exact netting; short positions), state isolation
 from returned collections, input validation (quantity, price, side,
-symbol, tz-aware timestamps normalized to UTC), and, at the broker level,
+symbol, tz-aware timestamps normalized to UTC), symbol case
+canonicalization so `aapl` and `AAPL` net as one position (issue #38), and, at the broker level,
 an aware timestamp that overflows once converted to UTC (issue #43)
 raising `ValueError` (not `OverflowError`) from `Order`/`Fill`
 construction and from `FakeBroker.submit`/`simulate_fill`.
@@ -395,6 +396,60 @@ def test_symbol_must_be_non_empty() -> None:
 def test_symbol_must_not_have_surrounding_whitespace() -> None:
     with pytest.raises(ValueError, match="symbol"):
         make_request(symbol=" AAPL")
+
+
+# --- Symbol canonicalization (issue #38) -----------------------------------
+
+
+@pytest.mark.parametrize("raw", ["aapl", "Aapl", "AAPL"])
+def test_symbol_is_canonicalized_to_upper_case_on_every_value_object(raw: str) -> None:
+    assert make_request(symbol=raw).symbol == "AAPL"
+    assert Position(symbol=raw, quantity=1).symbol == "AAPL"
+    order = Order(
+        client_order_id="co-1",
+        symbol=raw,
+        side=Side.BUY,
+        quantity=1,
+        price=1.0,
+        status=OrderStatus.OPEN,
+        submitted_at=T0,
+    )
+    assert order.symbol == "AAPL"
+    fill = Fill(
+        client_order_id="co-1", symbol=raw, side=Side.BUY, quantity=1, price=1.0, filled_at=T0
+    )
+    assert fill.symbol == "AAPL"
+
+
+def test_symbols_differing_only_in_case_net_into_one_position() -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="co-1", symbol="aapl", side=Side.BUY, quantity=10))
+    broker.submit(make_request(client_order_id="co-2", symbol="AAPL", side=Side.SELL, quantity=4))
+
+    positions = broker.positions()
+    assert list(positions) == ["AAPL"]
+    assert positions["AAPL"] == Position(symbol="AAPL", quantity=6)
+    assert {fill.symbol for fill in broker.fills()} == {"AAPL"}
+
+
+def test_symbols_differing_only_in_case_net_to_zero_and_disappear() -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="co-1", symbol="msft", side=Side.BUY, quantity=5))
+    broker.submit(make_request(client_order_id="co-2", symbol="MSFT", side=Side.SELL, quantity=5))
+
+    assert broker.positions() == {}
+
+
+def test_share_class_separator_is_kept_when_canonicalizing() -> None:
+    assert make_request(symbol="brk.b").symbol == "BRK.B"
+
+
+@pytest.mark.parametrize("raw", ["ÄAPL", "straße", "\uff21\uff21\uff30\uff2c"])
+def test_non_ascii_symbol_is_rejected(raw: str) -> None:
+    """Upper-casing is only a well-defined canonical form for ASCII: `"ß".upper()`
+    is `"SS"` and full-width letters look like ASCII but compare unequal."""
+    with pytest.raises(ValueError, match="symbol"):
+        make_request(symbol=raw)
 
 
 def test_client_order_id_must_not_have_surrounding_whitespace() -> None:
