@@ -76,6 +76,42 @@ def test_late_dividends_are_known_in_the_window_with_ex_date_at_or_before_t_prev
     assert late.select("security_id", "ex_date").rows() == [("A", date(2024, 1, 10))]
 
 
+def test_a_revised_dividend_first_known_earlier_is_not_late() -> None:
+    """Late means first known in (t_prev, t] (spec req 5), not merely revised there."""
+    first_known = session_close(date(2024, 1, 12))
+    revised = session_close(date(2024, 2, 5))
+    dividends = pl.DataFrame(
+        {
+            "security_id": ["A", "A"],
+            "ex_date": [date(2024, 1, 10), date(2024, 1, 10)],
+            "ratio_or_amount": [0.5, 0.55],
+            "known_at": [first_known, revised],
+        }
+    )
+    provider = FakeProvider(
+        prices=_provider().prices, members={}, benchmarks={}, dividends=dividends
+    )
+    assert provider.late_dividends(T_JAN, T_FEB, ["A"]).is_empty()
+    # Seen from a window that contains the first sighting, it is late, at its latest revision.
+    late = provider.late_dividends(session_close(date(2024, 1, 11)), T_FEB, ["A"])
+    assert late.select("ex_date", "ratio_or_amount").rows() == [(date(2024, 1, 10), 0.55)]
+
+
+def test_two_revisions_with_the_same_known_at_are_refused() -> None:
+    prices = pl.DataFrame(
+        {
+            "security_id": ["A", "A"],
+            "session": [JAN, JAN],
+            "open": [1.0, 2.0],
+            "close": [1.0, 2.0],
+            "known_at": [T_JAN, T_JAN],
+        }
+    )
+    provider = FakeProvider(prices=prices, members={}, benchmarks={})
+    with pytest.raises(ValueError, match="same known_at"):
+        provider.adjusted_prices(T_FEB, ["A"], include_dividends=False)
+
+
 def test_every_call_is_recorded_with_its_t() -> None:
     provider = _provider()
     provider.universe(T_JAN)

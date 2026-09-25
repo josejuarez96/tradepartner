@@ -51,8 +51,11 @@ def _known(frame: pl.DataFrame, t: datetime) -> pl.DataFrame:
 
 
 def _latest(frame: pl.DataFrame, key: list[str]) -> pl.DataFrame:
-    """The latest-`known_at` row per `key`, sorted by `key`."""
-    return frame.sort("known_at").unique(subset=key, keep="last", maintain_order=True).sort(key)
+    """The latest-`known_at` row per `key`, sorted by `key`. Two rows for one key with
+    the same `known_at` have no latest, so they are refused."""
+    if frame.select(pl.struct(*key, "known_at").is_duplicated().any()).item():
+        raise ValueError(f"two rows for one {key} share the same known_at")
+    return frame.sort(*key, "known_at").unique(subset=key, keep="last").sort(key)
 
 
 def _for_ids(frame: pl.DataFrame, ids: Sequence[str]) -> pl.DataFrame:
@@ -149,10 +152,13 @@ class FakeProvider:
         t = self._record("late_dividends", t, ids=ids, t_prev=t_prev)
         t_prev = check_t(t_prev, name="t_prev")
         prev_session = last_completed_session(t_prev)
-        rows = _for_ids(_known(self.dividends, t), ids).filter(
-            (pl.col("known_at") > t_prev) & (pl.col("ex_date") <= prev_session)
-        )
-        return _latest(rows, ["security_id", "ex_date"])
+        key = ["security_id", "ex_date"]
+        known = _for_ids(_known(self.dividends, t), ids)
+        first_known = known.group_by(key).agg(pl.col("known_at").min().alias("first_known_at"))
+        late_keys = first_known.filter(
+            (pl.col("first_known_at") > t_prev) & (pl.col("ex_date") <= prev_session)
+        ).select(key)
+        return _latest(known.join(late_keys, on=key, how="semi"), key)
 
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         self._record("static_listing_count", t, ids=ids)

@@ -9,7 +9,7 @@ handed decides every ratio.
 - `value_positions`: dollar values bought at the fill price on F_i, marked to the close
   of every XNYS session from F_i through T_{i+1}.
 - `carry_to_fill`: the drifted value at close(T_i), priced forward to F_i's fill price by
-  the next step's frame (the carry between steps).
+  the next step's frame from the session it was last marked at (the carry between steps).
 - `stitched_returns`: one price index per name for the `bt` oracle, each session's ratio
   taken from the frame of the step that contains it.
 
@@ -28,11 +28,16 @@ from typing import Any, Literal, get_args
 
 import polars as pl
 
-from tradepartner.calendar import all_sessions, is_session
+from tradepartner.calendar import all_sessions, is_session, next_session
 
 FillPrice = Literal["close", "open"]
 
-_VALUE_SCHEMA: dict[str, Any] = {"security_id": pl.Utf8, "session": pl.Date, "value": pl.Float64}
+_VALUE_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "session": pl.Date,
+    "value": pl.Float64,
+    "marked_at": pl.Date,
+}
 _STITCHED_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "session": pl.Date,
@@ -125,13 +130,14 @@ def value_positions(
     through: date,
 ) -> pl.DataFrame:
     """Dollar value of each position at the close of every session in
-    `[fill_session, through]`: `security_id`, `session`, `value`.
+    `[fill_session, through]`: `security_id`, `session`, `value`, and `marked_at`, the
+    session of the bar the value is marked at (the next step's `carry_to_fill` needs it).
 
     `positions` are dollar values at the fill on `fill_session`, bought at its `open` or
     `close` (`fill_price`); at session s a position is worth value * close(s) / P(fill).
     A name with no bar on `fill_session` (an unsold holding whose fill was missed) is
-    marked from its last close before it. A name with no bar on a session keeps its
-    last mark. Bars after `through` are ignored.
+    marked from its last close before it, as `carry_to_fill` left it. A name with no bar
+    on a session keeps its last mark. Bars after `through` are ignored.
 
     Raises `ValueError` for a negative or non-finite position, a duplicate or null bar,
     a price used that is not positive and finite, a held name with no bar at or before
@@ -141,7 +147,7 @@ def value_positions(
     _check_positions(positions)
     sessions = _sessions(fill_session, through)
     bars = _bars(marking_frame, set(positions))
-    rows: list[tuple[str, date, float]] = []
+    rows: list[tuple[str, date, float, date]] = []
     for sid in sorted(positions):
         series = bars.get(sid, [])
         base_bar = _last_at_or_before(series, fill_session)
@@ -152,12 +158,12 @@ def value_positions(
         else:
             base = _check_price(sid, base_bar.session, "close", base_bar.close)
         closes = {bar.session: bar.close for bar in series}
-        value = positions[sid]
+        value, marked_at = positions[sid], base_bar.session
         for session in sessions:
             if session in closes:
                 close = _check_price(sid, session, "close", closes[session])
-                value = positions[sid] * close / base
-            rows.append((sid, session, value))
+                value, marked_at = positions[sid] * close / base, session
+            rows.append((sid, session, value, marked_at))
     return pl.DataFrame(rows, schema=_VALUE_SCHEMA, orient="row")
 
 
@@ -168,36 +174,49 @@ def carry_to_fill(
     fill_session: date,
     *,
     fill_price: FillPrice,
+    marked_at: Mapping[str, date],
 ) -> dict[str, float]:
     """Dollar values at close(`rebalance_session`) priced forward to the fill price on
-    `fill_session`, by `marking_frame` (the next step's frame, which may restate the
-    earlier close, so a split known only later still cancels).
+    `fill_session` by `marking_frame`, the next step's frame (req 2's carry).
 
-    A name with no bar on `rebalance_session` is priced from its last close before it;
-    one with no bar on `fill_session` keeps its value (last mark). Raises `ValueError`
-    for a name with no bar at or before `rebalance_session`, or a `fill_session` that
-    is not after it.
+    Each value was last marked at session `marked_at[sid]` by the previous frame; the
+    carry is value * P(target) / close(marked_at) with both prices from this frame, so a
+    split known only now cancels and a bar that arrived late between the last mark and
+    the fill is counted once. The target is the fill price on `fill_session`, or, with
+    no bar there, the close of the name's last bar before it (its last mark).
+
+    Raises `ValueError` if `fill_session` is not the session after `rebalance_session`,
+    if a name has no `marked_at` or one after `rebalance_session`, or if this frame has
+    no bar on a name's `marked_at` session (a retracted bar the value was marked at).
     """
     _check_fill_price(fill_price)
     _check_positions(positions)
-    if fill_session <= rebalance_session:
+    if fill_session != next_session(rebalance_session):
         raise ValueError(
-            f"fill_session {fill_session.isoformat()} must be after "
+            f"fill_session {fill_session.isoformat()} is not the next session after "
             f"rebalance_session {rebalance_session.isoformat()}"
         )
     bars = _bars(marking_frame, set(positions))
     carried: dict[str, float] = {}
     for sid in sorted(positions):
+        mark = marked_at.get(sid)
+        if mark is None or mark > rebalance_session:
+            raise ValueError(
+                f"{sid} needs a marked_at session at or before {rebalance_session.isoformat()}, "
+                f"got {mark}"
+            )
         series = bars.get(sid, [])
-        base_bar = _last_at_or_before(series, rebalance_session)
-        if base_bar is None:
-            raise ValueError(f"no bar for {sid} at or before {rebalance_session.isoformat()}")
-        base = _check_price(sid, base_bar.session, "close", base_bar.close)
-        fill_bar = _last_at_or_before(series, fill_session)
-        if fill_bar is None or fill_bar.session != fill_session:
-            carried[sid] = positions[sid]
-            continue
-        carried[sid] = positions[sid] * _fill_value(sid, fill_bar, fill_price) / base
+        closes = {bar.session: bar.close for bar in series}
+        if mark not in closes:
+            raise ValueError(f"no bar for {sid} on its last mark {mark.isoformat()}")
+        base = _check_price(sid, mark, "close", closes[mark])
+        target_bar = _last_at_or_before(series, fill_session)
+        assert target_bar is not None  # the bar on `mark` is at or before it
+        if target_bar.session == fill_session:
+            target = _fill_value(sid, target_bar, fill_price)
+        else:
+            target = _check_price(sid, target_bar.session, "close", target_bar.close)
+        carried[sid] = positions[sid] * target / base
     return carried
 
 
@@ -209,14 +228,16 @@ def stitched_returns(steps: Sequence[StepFrame]) -> pl.DataFrame:
     bar), comes from the frame of the step that contains s, the previous bar being the
     name's last bar in that same frame. So index ratios inside one step reproduce that
     frame's ratios, and a revision in a later frame never reaches an earlier step. A
-    name is anchored at its last bar at or before the first step's start that has it:
-    the index there is that frame's close, and it continues from the stitched level
-    at that session in later steps. A name that drops out of the frames and returns is
-    re-anchored at the returning frame's close, so no ratio is defined across the gap.
-    A name whose first bar falls inside a step starts there with no `close_return`.
+    name seen for the first time is anchored at its last bar at or before that step's
+    start, the index there being the frame's close; a name whose first bar falls inside
+    the step starts there with no `close_return`. A name seen before continues from its
+    last stitched level L at session h: the level at the step's anchor bar a is
+    L * close(a) / close(h), both closes from the current frame, so the index stays
+    continuous even across steps whose frames did not carry the name.
 
     Raises `ValueError` if a step's `start` is not before its `end`, if the steps are
-    not contiguous and ascending, or on a bad bar (as `value_positions`).
+    not contiguous and ascending, if a frame lacks the bar on a name's last stitched
+    session (a retracted bar), or on a bad bar (as `value_positions`).
     """
     for index, step in enumerate(steps):
         if step.start >= step.end:
@@ -227,30 +248,40 @@ def stitched_returns(steps: Sequence[StepFrame]) -> pl.DataFrame:
             raise ValueError(
                 "steps must be contiguous and ascending: each starts where the last ends"
             )
-    levels: dict[str, dict[date, float]] = {}
+    last_level: dict[str, tuple[date, float]] = {}
     rows: list[tuple[str, date, float | None, float, float | None]] = []
     for step in steps:
         for sid, series in _bars(step.frame).items():
             inside = [bar for bar in series if step.start < bar.session <= step.end]
             if not inside:
                 continue
-            history = levels.setdefault(sid, {})
+            closes = {bar.session: bar.close for bar in series}
             anchor_bar = _last_at_or_before(series, step.start)
-            if anchor_bar is None:
-                first = inside[0]
-                close = _check_price(sid, first.session, "close", first.close)
-                rows.append((sid, first.session, first.open, close, None))
-                history[first.session] = close
-                prev_close, prev_level, inside = close, close, inside[1:]
-            else:
+            if sid in last_level:
+                h, level_h = last_level[sid]
+                if h not in closes or anchor_bar is None:
+                    raise ValueError(
+                        f"frame for the step ending {step.end.isoformat()} has no bar for "
+                        f"{sid} on {h.isoformat()}, its last stitched session"
+                    )
                 prev_close = _check_price(sid, anchor_bar.session, "close", anchor_bar.close)
-                prev_level = history.get(anchor_bar.session, prev_close)
+                prev_level = level_h * prev_close / _check_price(sid, h, "close", closes[h])
+            elif anchor_bar is None:
+                first = inside[0]
+                prev_close = prev_level = _check_price(sid, first.session, "close", first.close)
+                rows.append((sid, first.session, first.open, prev_close, None))
+                last_level[sid] = (first.session, prev_level)
+                inside = inside[1:]
+            else:
+                prev_close = prev_level = _check_price(
+                    sid, anchor_bar.session, "close", anchor_bar.close
+                )
             for bar in inside:
                 close = _check_price(sid, bar.session, "close", bar.close)
                 ratio = close / prev_close
                 level = prev_level * ratio
                 open_level = None if bar.open is None else prev_level * bar.open / prev_close
                 rows.append((sid, bar.session, open_level, level, ratio - 1))
-                history[bar.session] = level
+                last_level[sid] = (bar.session, level)
                 prev_close, prev_level = close, level
     return pl.DataFrame(rows, schema=_STITCHED_SCHEMA, orient="row").sort("security_id", "session")

@@ -209,7 +209,24 @@ def test_bars_outside_the_window_are_ignored() -> None:
 def test_no_positions_gives_an_empty_frame_with_the_schema() -> None:
     result = value_positions({}, _frame([]), F0, fill_price="close", through=D2)
     assert result.is_empty()
-    assert result.schema == {"security_id": pl.Utf8, "session": pl.Date, "value": pl.Float64}
+    assert result.schema == {
+        "security_id": pl.Utf8,
+        "session": pl.Date,
+        "value": pl.Float64,
+        "marked_at": pl.Date,
+    }
+
+
+def test_marked_at_is_the_session_of_the_bar_behind_each_value() -> None:
+    frame = _frame([("A", T0, 1.0, 9.0), ("A", D2, 11.0, 11.0), ("A", D6, 12.0, 12.0)])
+    result = value_positions({"A": 90.0}, frame, F0, fill_price="close", through=D7)
+    assert result.select("session", "marked_at").rows() == [
+        (F0, T0),  # missed fill: still marked at the last close before F0
+        (D2, D2),
+        (D5, D2),
+        (D6, D6),
+        (D7, D6),
+    ]
 
 
 def test_a_zero_position_stays_zero() -> None:
@@ -251,43 +268,89 @@ def test_unknown_fill_price_is_refused() -> None:
 
 
 class TestCarryToFill:
-    """The drifted value at close(T_i) priced forward to F_i by step i's frame (req 2)."""
+    """The drifted value at close(T_i) priced forward to F_i by the next frame (req 2)."""
 
     def test_close_and_open_fills(self) -> None:
         frame = _frame([("A", T0, 9.0, 10.0), ("A", F0, 11.0, 12.0)])
-        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="close") == {
+        marked = {"A": T0}
+        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="close", marked_at=marked) == {
             "A": pytest.approx(120.0)
         }
-        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="open") == {
+        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="open", marked_at=marked) == {
             "A": pytest.approx(110.0)
         }
 
     def test_no_bar_on_the_fill_session_keeps_the_last_mark(self) -> None:
         frame = _frame([("A", T0, 9.0, 10.0)])
-        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="open") == {"A": 100.0}
+        assert carry_to_fill(
+            {"A": 100.0}, frame, T0, F0, fill_price="open", marked_at={"A": T0}
+        ) == {"A": 100.0}
 
-    def test_no_bar_on_the_rebalance_session_prices_from_the_last_close_before_it(self) -> None:
+    def test_a_value_marked_before_the_rebalance_session_is_priced_from_that_mark(self) -> None:
         frame = _frame([("A", date(2024, 1, 29), 1.0, 10.0), ("A", F0, 1.0, 15.0)])
-        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="close") == {
-            "A": pytest.approx(150.0)
+        assert carry_to_fill(
+            {"A": 100.0}, frame, T0, F0, fill_price="close", marked_at={"A": date(2024, 1, 29)}
+        ) == {"A": pytest.approx(150.0)}
+
+    def test_a_late_bar_between_the_mark_and_the_fill_is_counted_once(self) -> None:
+        """The previous frame marked A at 01-29 (no T_0 bar yet); this frame has a late
+        T_0 bar. The move 01-29 -> T_0 -> F_0 is priced once, from the mark."""
+        frame = _frame([("A", date(2024, 1, 29), 1.0, 10.0), ("A", T0, 1.0, 11.0)])
+        marked = {"A": date(2024, 1, 29)}
+        # No F_0 bar: the value moves to the late T_0 close, its new last mark.
+        assert carry_to_fill({"A": 100.0}, frame, T0, F0, fill_price="close", marked_at=marked) == {
+            "A": pytest.approx(110.0)
         }
+        with_fill = _frame([*frame.rows(), ("A", F0, 12.0, 13.0)])
+        assert carry_to_fill(
+            {"A": 100.0}, with_fill, T0, F0, fill_price="open", marked_at=marked
+        ) == {"A": pytest.approx(120.0)}
+
+    def test_chained_with_value_positions_telescopes_to_the_frame_ratio(self) -> None:
+        """Carry then value within one frame: close(s) / close(mark), whatever the fill."""
+        frame = _frame(
+            [
+                ("A", date(2024, 1, 29), 1.0, 10.0),
+                ("A", T0, 1.0, 11.0),
+                ("A", F0, 12.0, 13.0),
+                ("A", D2, 1.0, 14.0),
+            ]
+        )
+        marked = {"A": date(2024, 1, 29)}
+        for fill_price in ("close", "open"):
+            carried = carry_to_fill(
+                {"A": 100.0}, frame, T0, F0, fill_price=fill_price, marked_at=marked
+            )
+            valued = value_positions(carried, frame, F0, fill_price=fill_price, through=D2)
+            assert _values(valued, "A")[D2] == pytest.approx(140.0)
 
     def test_a_split_known_at_the_later_read_cancels(self) -> None:
-        """Step i+1's frame restates the pre-split close, so the carry has no jump."""
+        """The next frame restates the pre-split close, so the carry has no jump."""
         restated = _frame([("A", T0, 50.0, 50.0), ("A", F0, 51.0, 51.0)])
-        assert carry_to_fill({"A": 1000.0}, restated, T0, F0, fill_price="close") == {
-            "A": pytest.approx(1020.0)
-        }
+        assert carry_to_fill(
+            {"A": 1000.0}, restated, T0, F0, fill_price="close", marked_at={"A": T0}
+        ) == {"A": pytest.approx(1020.0)}
 
-    def test_no_bar_at_or_before_the_rebalance_session_raises(self) -> None:
-        frame = _frame([("A", F0, 1.0, 1.0)])
-        with pytest.raises(ValueError, match="no bar"):
-            carry_to_fill({"A": 1.0}, frame, T0, F0, fill_price="close")
+    def test_a_retracted_mark_bar_raises(self) -> None:
+        """The value was marked at T_0 but this frame no longer has that bar."""
+        frame = _frame([("A", date(2024, 1, 29), 1.0, 10.0), ("A", F0, 1.0, 1.0)])
+        with pytest.raises(ValueError, match="last mark"):
+            carry_to_fill({"A": 1.0}, frame, T0, F0, fill_price="close", marked_at={"A": T0})
 
-    def test_fill_session_must_follow_the_rebalance_session(self) -> None:
+    def test_marked_at_must_be_given_and_not_after_the_rebalance_session(self) -> None:
+        frame = _frame([("A", T0, 1.0, 1.0), ("A", F0, 1.0, 1.0)])
+        with pytest.raises(ValueError, match="marked_at"):
+            carry_to_fill({"A": 1.0}, frame, T0, F0, fill_price="close", marked_at={})
+        with pytest.raises(ValueError, match="marked_at"):
+            carry_to_fill({"A": 1.0}, frame, T0, F0, fill_price="close", marked_at={"A": F0})
+
+    def test_fill_session_must_be_the_next_session(self) -> None:
         frame = _frame([("A", T0, 1.0, 1.0)])
-        with pytest.raises(ValueError, match="after"):
-            carry_to_fill({"A": 1.0}, frame, F0, T0, fill_price="close")
+        marked = {"A": T0}
+        with pytest.raises(ValueError, match="next session"):
+            carry_to_fill({"A": 1.0}, frame, F0, T0, fill_price="close", marked_at=marked)
+        with pytest.raises(ValueError, match="next session"):
+            carry_to_fill({"A": 1.0}, frame, T0, D2, fill_price="close", marked_at=marked)
 
 
 class TestStitchedReturns:
@@ -345,6 +408,42 @@ class TestStitchedReturns:
         assert result["session"].to_list() == [self.M1]
         assert result["close"].to_list() == pytest.approx([11.0])
         assert result["open"].to_list() == pytest.approx([10.5])
+
+    def test_a_later_step_never_changes_an_earlier_one(self) -> None:
+        """Prefix invariance: stitching fewer steps gives the same rows up to their end,
+        even when the later frame corrects an earlier bar (T_1 close 110 -> 100)."""
+        step0, step1 = self._steps()
+        corrected = step1.frame.with_columns(
+            pl.when((pl.col("security_id") == "A") & (pl.col("session") == T1))
+            .then(pl.lit(100.0))
+            .otherwise(pl.col("close"))
+            .alias("close")
+        )
+        full = stitched_returns([step0, StepFrame(start=T1, end=self.T2, frame=corrected)])
+        prefix = stitched_returns([step0])
+        assert full.filter(pl.col("session") <= T1).equals(prefix)
+
+    def test_the_index_is_continuous_across_steps_whose_frames_lack_the_name(self) -> None:
+        """A sold then re-bought name continues from its last level, priced across the
+        gap by the frame it returns in."""
+        step0 = StepFrame(
+            start=T0, end=T1, frame=_frame([("A", T0, 1.0, 10.0), ("A", T1, 1.0, 12.0)])
+        )
+        step1 = StepFrame(start=T1, end=self.T2, frame=_frame([("B", self.M1, 1.0, 1.0)]))
+        t3 = date(2024, 4, 30)
+        returning = _frame([("A", T1, 1.0, 12.0), ("A", self.T2, 1.0, 15.0), ("A", t3, 1.0, 18.0)])
+        step2 = StepFrame(start=self.T2, end=t3, frame=returning)
+        result = stitched_returns([step0, step1, step2]).filter(pl.col("security_id") == "A")
+        assert result.select("session", "close").rows() == [
+            (T1, pytest.approx(12.0)),
+            (t3, pytest.approx(18.0)),
+        ]
+
+    def test_a_frame_missing_the_last_stitched_bar_raises(self) -> None:
+        step0, _ = self._steps()
+        retracted = _frame([("A", F0, 1.0, 51.0), ("A", self.M1, 1.0, 56.0)])
+        with pytest.raises(ValueError, match="last stitched session"):
+            stitched_returns([step0, StepFrame(start=T1, end=self.T2, frame=retracted)])
 
     def test_steps_must_be_contiguous_and_ascending(self) -> None:
         step0, step1 = self._steps()
