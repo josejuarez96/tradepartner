@@ -35,7 +35,7 @@ import duckdb
 import polars as pl
 import pytest
 
-from lookahead.harness import TruncatedStore, probe_timestamps
+from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from tradepartner.store import schema
 from tradepartner.store.asof import (
     adjusted_prices_as_of,
@@ -71,6 +71,27 @@ def _assert_invariant_over_every_probe(
         full = func(fixture_store, t, **kwargs)
         result = func(truncated.at(t), t, **kwargs)
         assert full.equals(result), f"{func.__name__} disagreed at T={t!r}"
+
+
+def test_snapshot_static_listing_invariant_under_truncation_without_exemption(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    """Issue #35, owner decision (b): the harness truncates `snapshot_static`
+    rows like any other, and `listings_as_of` agrees at probes just before
+    and after PRE9's own `known_at` and at a 2018 T inside its valid range."""
+    known_at = datetime(2020, 1, 15, 14, 0, tzinfo=UTC)
+    probes = [
+        datetime(2018, 6, 29, 21, 0, tzinfo=UTC),
+        known_at - PROBE_EPSILON,
+        known_at + PROBE_EPSILON,
+    ]
+    ids = ["SEC_STATIC_PRE2019"]
+    visible = []
+    for t in probes:
+        full = listings_as_of(fixture_store, t, security_ids=ids)
+        assert full.equals(listings_as_of(truncated.at(t), t, security_ids=ids)), t
+        visible.append(full.height)
+    assert visible == [0, 0, 1]
 
 
 @pytest.mark.parametrize("func", [prices_as_of, facts_as_of, listings_as_of])

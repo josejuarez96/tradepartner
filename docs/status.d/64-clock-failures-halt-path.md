@@ -1,1 +1,0 @@
-- #64 ADR 0007: clock faults in the broker path take the halt path, never the rejection path; rejection is an allowlist, `ClockError` (not a `ValueError`) plus a pre-submit clock check, implemented in the Phase 4 wrapper task (PR #76)

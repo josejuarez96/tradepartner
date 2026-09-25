@@ -3,7 +3,8 @@
 Covers the "Timing and store" acceptance criteria in
 docs/specs/data-foundation.md that name `prices_as_of`,
 `adjusted_prices_as_of` and `facts_as_of` directly, plus `listings_as_of`'s
-issue #35 behavior: latest revision as of T, bar revision, a split known
+issue #35 behavior (owner decision: strict `known_at`): latest revision as
+of T, bar revision, a split known
 before T with ex-date after T (not applied) versus once its ex-date has
 also passed (applied), the backfilled-2018-split acceptance criterion, a
 revised dividend, a restated shares fact, and "a bare date passed as T
@@ -839,6 +840,17 @@ class TestListingsAsOf:
         listing = _one(after_rows, security_id="SEC_STATIC_PRE2019")
         assert listing["ticker"] == "PRE9"
         assert listing["valid_from"] == date(2017, 1, 3)
+
+    def test_snapshot_static_listing_invisible_inside_its_valid_range_before_known_at(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Issue #35, owner decision (b): no snapshot_static exemption. At a
+        # 2018 T, PRE9's listing is already "valid" (valid_from 2017-01-03)
+        # and its bars are known, but the listing row itself is not.
+        t = datetime(2018, 6, 29, 21, 0, tzinfo=UTC)
+        assert listings_as_of(fixture_store, t, security_ids=["SEC_STATIC_PRE2019"]).height == 0
+        bars = prices_as_of(fixture_store, t, security_ids=["SEC_STATIC_PRE2019"])
+        assert bars.height > 0
 
     def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
         with pytest.raises(TypeError):

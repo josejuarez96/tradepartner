@@ -37,28 +37,26 @@ plain `date` fails `isinstance(t, datetime)`) with `TypeError`, then hands
 a genuine `datetime` to `tradepartner.timeutil.ensure_tz_aware_utc`, which
 raises `ValueError` if it is naive and otherwise normalizes it to UTC.
 
-**`listings_as_of` and issue #35.** Spec req 8 says, literally, "All [as-of
-functions] take tz-aware T and return only rows with `known_at <= T`" --
-with no carve-out for any particular provenance. `listings_as_of` applies
-that literally: a `snapshot_static` listing (fixture ticker `PRE9`,
-`known_at` 2020-01-15, `valid_from` 2017-01-03) is invisible before its own
-`known_at`, exactly like a `filing` or `snapshot` row would be, even though
-its `valid_from` is years earlier. The spec's own definitions list
-`snapshot_static` as "a snapshot attribute the config explicitly allows to
-apply before its fetch time" -- but that exception is about which
-*columns* a later consumer (T8's security master, T8's
-`master.static_columns` config) is allowed to treat as valid before their
-`known_at`, once it already knows about the row. It is not a claim that the
-row itself becomes visible to an as-of read before its own `known_at`; a
-consumer that has not yet been told a fact cannot apply it early. See
-[issue #35](https://github.com/josejuarez96/tradepartner/issues/35) for the
-tracked follow-up this raises for T8's `securities_as_of`/master code,
-which will need to decide, separately, whether *its* read of a
-`snapshot_static` row's `valid_from` may predate that row's own
-`known_at` once the row is already visible. `tests/lookahead/harness.py`'s
-`TruncatedStore` also truncates `listings` uniformly with every other
-table, so the truncation-invariance test on `listings_as_of` exercises this
-directly.
+**`listings_as_of` and issue #35 (owner decision: strict `known_at`).**
+Spec req 8 says, literally, "All [as-of functions] take tz-aware T and
+return only rows with `known_at <= T`" -- with no carve-out for any
+particular provenance. `listings_as_of` applies that literally: a
+`snapshot_static` listing (fixture ticker `PRE9`, `known_at` 2020-01-15,
+`valid_from` 2017-01-03) is invisible before its own `known_at`, exactly
+like a `filing` or `snapshot` row would be, even at a T inside its valid
+range. The owner chose this (option (b) on
+[issue #35](https://github.com/josejuarez96/tradepartner/issues/35)) over
+a config-gated exemption that would apply such rows from `valid_from`: a
+current snapshot lists survivors only, so the exemption would add
+survivorship bias, and a row's `valid_from` can predate the IPO. The
+consequence is accepted: pre-2019 `snapshot_static` listings are unknown
+before their snapshot fetch, so early backfill coverage is thin. The spec's
+`snapshot_static` exception governs which *columns* a consumer may treat
+as valid before `known_at` once it already sees the row; it never makes a
+row visible early, and no consumer may read `listings` directly to get
+around this. `tests/lookahead/harness.py`'s `TruncatedStore` truncates
+`listings` uniformly with every other table (no exemption), so the
+truncation-invariance tests exercise this directly.
 
 **Adjustment methodology (`adjusted_prices_as_of`).** A split or dividend
 adjusts a bar at `session` only when it is **both** known
@@ -309,8 +307,8 @@ def listings_as_of(
     exchange, valid_from)`, the latest revision as of `t`.
 
     Applies `known_at <= t` literally to every row regardless of
-    provenance, including `snapshot_static` -- see this module's docstring
-    and issue #35.
+    provenance, including `snapshot_static` (owner decision on issue #35)
+    -- see this module's docstring.
     """
     t = _validate_t(t)
     return _latest_as_of(conn, "listings", _LISTING_KEY, t, security_ids)
