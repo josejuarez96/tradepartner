@@ -18,7 +18,11 @@ Steps, in order (each one stops the run with a reason on failure):
    the shared lists ("## Done" in ``STATUS.md``, "[Unreleased]" in ``CHANGELOG.md``) unless
    it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
-4. Local checks: ruff check, ruff format --check, mypy, pytest.
+4. Local checks: ruff check, ruff format --check, mypy and the fragment check always;
+   pytest only when the diff touches code, tests, scripts or dependencies (``src/``,
+   ``tests/``, ``scripts/``, ``pyproject.toml``, ``uv.lock``). CI runs the full suite on
+   every PR either way, so it stays the gate. ``--tests`` forces the local run,
+   ``--no-tests`` skips it.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
@@ -30,6 +34,7 @@ Usage::
     uv run python scripts/ready_pr.py 69
     uv run python scripts/ready_pr.py 69 --dry-run            # stop before pushing
     uv run python scripts/ready_pr.py 70 --allow-shared-files # process PRs only
+    uv run python scripts/ready_pr.py 69 --tests              # force local pytest
 """
 
 from __future__ import annotations
@@ -125,8 +130,11 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "format", "--check", "."),
     ("uv", "run", "mypy"),
     ("uv", "run", "python", "scripts/fragments.py", "check"),
-    ("uv", "run", "pytest", "-q"),
 )
+PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
+# A diff touching any of these runs pytest locally; anything else leaves it to CI.
+TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/")
+TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock")
 CI_TIMEOUT_S = 25 * 60
 CI_POLL_S = 20
 
@@ -302,6 +310,11 @@ def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
     return [f"{p}<slug>.md" for p in need if not any(d.startswith(p) for d in diff_names)]
 
 
+def tests_needed(paths: Sequence[str]) -> bool:
+    """Whether the diff can make pytest fail: it touches code, tests, scripts or deps."""
+    return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
+
+
 # ── the flow ────────────────────────────────────────────────────────────────────
 
 
@@ -311,6 +324,7 @@ def ready(
     *,
     dry_run: bool = False,
     allow_shared_files: bool = False,
+    run_tests: bool | None = None,
     wait: bool = True,
     timeout_s: int = CI_TIMEOUT_S,
     poll_s: int = CI_POLL_S,
@@ -372,8 +386,17 @@ def ready(
                 + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
             )
 
-    # 4. local checks
-    for cmd in LOCAL_CHECKS:
+    # 4. local checks; pytest only when the diff can fail it (None = decide from the paths)
+    checks = list(LOCAL_CHECKS)
+    if run_tests is None:
+        run_tests = tests_needed(touched)
+        if not run_tests:
+            say("skipping local pytest: no code, test, script or dependency changes; CI runs it")
+    elif not run_tests:
+        say("skipping local pytest (--no-tests); CI runs it")
+    if run_tests:
+        checks.append(PYTEST_CHECK)
+    for cmd in checks:
         say(f"$ {' '.join(cmd)}")
         if not r.run_check(cmd):
             raise ReadyError(f"local check failed: {' '.join(cmd)}")
@@ -571,6 +594,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="let this PR edit STATUS.md / CHANGELOG.md directly (process PRs only)",
     )
+    tests = parser.add_mutually_exclusive_group()
+    tests.add_argument(
+        "--tests",
+        dest="tests",
+        action="store_const",
+        const=True,
+        default=None,
+        help="run pytest locally even if the diff touches no code, tests, scripts or deps",
+    )
+    tests.add_argument(
+        "--no-tests",
+        dest="tests",
+        action="store_const",
+        const=False,
+        help="skip local pytest (CI still runs the full suite)",
+    )
     parser.add_argument("--no-wait", action="store_true", help="push but do not wait for CI")
     parser.add_argument("--timeout-min", type=int, default=CI_TIMEOUT_S // 60)
     return parser
@@ -589,6 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.pr,
             dry_run=args.dry_run,
             allow_shared_files=args.allow_shared_files,
+            run_tests=args.tests,
             wait=not args.no_wait,
             timeout_s=args.timeout_min * 60,
         )

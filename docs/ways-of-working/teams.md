@@ -49,7 +49,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 4. Branch as the claim output suggests (`<prefix>/<issue#>-<slug>` from `origin/main`), then work as usual: `implementer` subagents in their own worktrees, tests first, draft PR early.
 
 **During**
-- One `implementer` per claimed task. Run several in parallel only on tasks with disjoint files.
+- One `implementer` per claimed task, one writer per branch. Run several in parallel only on tasks with disjoint files. Read-only helpers and the reviewers may run alongside; the table in [agents.md](agents.md#parallelism-inside-a-team) says what goes in parallel and what does not.
 - An implementer never claims or releases; it checks that its issue carries the team label and stops if not.
 - Anything you notice outside your task becomes an issue (`gh issue create`), unclaimed, for any team to pick up.
 
