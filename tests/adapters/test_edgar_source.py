@@ -349,3 +349,33 @@ def test_entries_are_filing_index_entries(settings: Settings) -> None:
     entries = _source(settings, _router()).filing_index()
     assert all(isinstance(e, FilingIndexEntry) for e in entries)
     assert entries == sorted(entries, key=lambda e: (e.accepted_at, e.accession, e.cik))
+
+
+def test_a_corrupt_cache_file_is_fetched_again(settings: Settings) -> None:
+    first = _source(settings, _router()).filing_index()
+    cache = Path(settings.edgar.cache_dir)
+    index = cache / "index" / "2024-QTR1.idx.gz"
+    data = bytearray(index.read_bytes())
+    data[10] ^= 0xFF  # the first deflate byte: zlib.error, not a gzip OSError
+    index.write_bytes(bytes(data))
+    [stamps] = (cache / "stamps").glob(f"*/{ALPHABET}.json")
+    stamps.write_text(stamps.read_text().replace("+00:00", ""))  # naive instants
+    router = _router()
+    assert _source(settings, router).filing_index() == first
+    assert "https://www.sec.gov/Archives/edgar/full-index/2024/QTR1/form.idx" in router.urls
+    assert "CIK0001652044.json" in _submission_urls(router)
+
+
+def test_quarters_and_settling_follow_eastern_time(settings: Settings) -> None:
+    # 2026-10-01T02:00Z is 2026-09-30 22:00 ET: Q3 is still the open quarter,
+    # so Q4 is never asked for (an unrouted URL would fail the test).
+    _source(settings, _router(), clock=datetime(2026, 10, 1, 2, tzinfo=UTC)).filing_index()
+    # 2026-10-04T02:00Z is 2026-10-03 22:00 ET: Q3 settles only at 2026-10-04 00:00 ET.
+    router = _router(last=(2026, 4), overrides={(2026, 4): 404})
+    _source(settings, router, clock=datetime(2026, 10, 4, 2, tzinfo=UTC)).filing_index()
+    assert "2026-QTR3" not in _cached_quarters(settings)
+    later = datetime(2026, 10, 4, 4, 1, tzinfo=UTC)
+    _source(
+        settings, _router(last=(2026, 4), overrides={(2026, 4): 404}), clock=later
+    ).filing_index()
+    assert "2026-QTR3" in _cached_quarters(settings)

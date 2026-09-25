@@ -11,7 +11,7 @@ safety-reviewer MUST FIX).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -502,3 +502,22 @@ def test_a_failed_bulk_download_leaves_no_file(tmp_path: Path) -> None:
             client=_mock_client(lambda request: httpx.Response(404)),
         )
     assert list((tmp_path / "bulk").iterdir()) == []
+
+
+class _BrokenStream(httpx.SyncByteStream):
+    def __iter__(self) -> Iterator[bytes]:
+        yield b"PK first chunk"
+        raise httpx.ReadError("connection reset mid-stream")
+
+
+def test_a_bulk_download_failing_mid_stream_keeps_the_previous_zip(tmp_path: Path) -> None:
+    previous = tmp_path / "bulk" / "submissions.zip"
+    previous.parent.mkdir()
+    previous.write_bytes(b"yesterday's zip")
+    with pytest.raises(httpx.ReadError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(200, stream=_BrokenStream())),
+        )
+    assert previous.read_bytes() == b"yesterday's zip"
+    assert list(previous.parent.iterdir()) == [previous]

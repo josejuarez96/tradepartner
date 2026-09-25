@@ -35,6 +35,7 @@ from __future__ import annotations
 import gzip
 import json
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -72,7 +73,7 @@ _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
 Quarter = tuple[int, int]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SubmissionRecord:
     """One filing reduced from a submissions payload. `accepted_at` is `None`
     only for an accession cached as unstampable."""
@@ -217,7 +218,7 @@ class EdgarFilingSource(FilingSource):
         path = self._cache / "index" / f"{quarter[0]}-QTR{quarter[1]}.idx.gz"
         try:
             return gzip.decompress(path.read_bytes()).decode("utf-8")
-        except (OSError, EOFError, UnicodeDecodeError):
+        except (OSError, EOFError, UnicodeDecodeError, zlib.error):
             pass  # absent, truncated or corrupt: fetch it again
         try:
             text = edgar_raw.filing_index_quarter(
@@ -310,7 +311,13 @@ class EdgarFilingSource(FilingSource):
                 return {}
             return {
                 accession: SubmissionRecord(
-                    accession, form, doc, ixbrl, datetime.fromisoformat(at) if at else None
+                    accession,
+                    form,
+                    doc,
+                    ixbrl,
+                    ensure_tz_aware_utc(datetime.fromisoformat(at), field_name="stamp")
+                    if at
+                    else None,
                 )
                 for accession, (form, doc, ixbrl, at) in data["records"].items()
             }
