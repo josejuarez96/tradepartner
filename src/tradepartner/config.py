@@ -175,9 +175,15 @@ class AlpacaConfig(BaseModel):
     `end` is at least 15 minutes in the past (confirmed 2026-09-25 with the owner's keys;
     docs/research/2026-09-25-free-data-terms.md). Real-time is IEX-only, so a caller
     asking for the current session inside that window must use `iex`.
+
+    `actions_process_lag_days`: Alpaca's corporate-actions `start`/`end` filter on
+    `process_date`, which can trail the ex-date by weeks (a GE dividend: ex 2020-12-18,
+    processed 2021-01-25; #101 probe 1). `AlpacaPriceSource` asks for actions processed up
+    to this many calendar days after the end of an ex-date window, then filters on ex-date.
     """
 
     historical_feed: Literal["sip", "iex"] = "sip"
+    actions_process_lag_days: int = Field(default=90, ge=0)
 
 
 class ExecutionConfig(BaseModel):
