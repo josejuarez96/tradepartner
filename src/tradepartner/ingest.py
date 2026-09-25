@@ -363,7 +363,7 @@ def _source_counts(filings: FilingSource) -> str:
 
     def count(attribute: str) -> int | None:
         value = getattr(filings, attribute, None)
-        return value if value is None or isinstance(value, int) else len(value)
+        return None if value is None else int(value if isinstance(value, int) else len(value))
 
     unstamped = [
         f"{n} {what}"
