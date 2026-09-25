@@ -759,7 +759,8 @@ def _add_actions(
 
     Per identity the source's latest record known by `ingested_at` is its
     value now, under the revision rule of `_current` (a replayed revision
-    recorded later waits for a later run). If a source id has stored rows
+    recorded later waits for a later run; a stored identity with no such
+    record is left as it is). If a source id has stored rows
     with an ex-date outside `covered` (the store changed after the replay
     was planned), nothing is written: `ValueError`, re-run. A cancel of an
     identity never stored adds nothing.
@@ -794,7 +795,10 @@ def _add_actions(
     incoming: dict[_Identity, Row] = {}
     for identity, recs in records.items():
         known = [r for r in recs if r["known_at"] <= ingested_at]
-        incoming[identity] = (known or recs)[-1]
+        if known:
+            incoming[identity] = known[-1]
+        elif identity not in history:
+            incoming[identity] = recs[-1]  # first seen but not knowable yet: refused below
 
     def live(identity: _Identity) -> Row | None:
         past = history.get(identity)
@@ -845,7 +849,7 @@ def _add_actions(
     for row in unpaired:
         appeared[(row["security_id"], row["action_type"])].append(row)
     for group, old_rows in gone.items():
-        if len(old_rows) == 1 and len(appeared.get(group, [])) == 1 and group not in cancelled:
+        if len(old_rows) == 1 and len(appeared.get(group, [])) == 1:
             new_rows.append(_cancel(old_rows[0], ingested_at))
             cancelled.add(group)
 

@@ -316,6 +316,33 @@ def test_a_replayed_revision_not_yet_known_is_not_applied(
     assert _rows(conn)[-1][3] == T2
 
 
+def test_a_stored_action_is_not_revised_by_a_record_not_yet_known(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    ex = date(2019, 6, 14)
+    _run(conn, _Replay([_action(ex, source_id="a1")]), JUNE, T0)
+    later = _action(ex, source_id="a1", value=3.0, known_at=T2)
+    assert _run(conn, _Replay([later]), JUNE, T1) == 0
+    assert _live(conn, T1) == [(ex, "a1", 2.0)]
+
+
+def test_an_adoption_does_not_block_a_re_date_in_the_same_group(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # Two id-less dividends; one gains an id in place, the other gains an id
+    # and moves: each stays one event.
+    div = ActionType.DIVIDEND
+    kept, moved, to = date(2019, 6, 3), date(2019, 6, 10), date(2019, 6, 17)
+    _run(conn, _Replay([_action(d, kind=div, value=0.1) for d in (kept, moved)]), JUNE, T0)
+    now = [
+        _action(kept, kind=div, value=0.1, source_id="a1"),
+        _action(to, kind=div, value=0.1, source_id="a2"),
+    ]
+    assert _run(conn, _Replay(now), JUNE, T1) == 4
+    assert _live(conn, T1) == [(kept, "a1", 0.1), (to, "a2", 0.1)]
+    assert _run(conn, _Replay(now), JUNE, T2) == 0
+
+
 # --- the fixture universe's own cases ----------------------------------------
 
 
