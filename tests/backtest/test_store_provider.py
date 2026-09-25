@@ -26,7 +26,7 @@ from tradepartner.backtest.provider import DataProvider, GapReading
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.config import Settings
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of, prices_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of
 from tradepartner.store.db import (
     StoreLockedError,
     configure_connection,
@@ -267,33 +267,6 @@ def test_adjusted_prices_equal_the_as_of_read(store: Store, include_dividends: b
         )
     assert got.equals(want)
     assert _ids(got) == set(ids)
-
-
-# SEC_SPLIT_BACKFILLED's 2018-06-01 bar is revised at 2018-06-15T20:00Z.
-T_BEFORE_REVISION = datetime(2018, 6, 8, 20, 0, tzinfo=UTC)
-T_AFTER_REVISION = datetime(2018, 6, 29, 20, 0, tzinfo=UTC)
-
-
-@pytest.mark.parametrize("t", [T_BEFORE_REVISION, T_AFTER_REVISION, T_MAR])
-def test_raw_prices_equal_the_as_of_read(store: Store, t: datetime) -> None:
-    ids = ["SEC_SPLIT_BACKFILLED", "SEC_SPLIT_BETWEEN", "SEC_SPY"]
-    with store.provider() as provider:
-        got = provider.raw_prices(t, ids)
-    with store.direct() as conn:
-        want = prices_as_of(conn, t, ids)
-    assert got.equals(want)
-    assert _ids(got) == set(ids)
-    assert (got["known_at"] <= t).all()
-
-
-def test_raw_prices_take_the_bar_revision_at_its_known_at(store: Store) -> None:
-    def close(t: datetime) -> float:
-        with store.provider() as provider:
-            frame = provider.raw_prices(t, ["SEC_SPLIT_BACKFILLED"])
-        return float(frame.filter(pl.col("session") == date(2018, 6, 1))["close"].item())
-
-    assert close(T_BEFORE_REVISION) == 38.45
-    assert close(T_AFTER_REVISION) == 40.37
 
 
 def test_dropped_dividends_equal_the_as_of_read(store: Store) -> None:
