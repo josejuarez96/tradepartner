@@ -736,3 +736,40 @@ def test_column_types_ignore_attached_database_with_same_named_table() -> None:
     row = _minimal_row("prices_daily", known_at=naive, ingested_at=_now())
     with pytest.raises(ValueError, match="known_at"):
         insert_row(conn, "prices_daily", row)
+
+
+# --- corporate action identity (#108) ---------------------------------
+
+
+def test_corporate_actions_carry_source_action_id_and_cancelled(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`source_action_id` uses `''` for "no id" (the `class_member`
+    convention, so UNIQUE still bites for id-less rows) and `cancelled`
+    defaults to false."""
+    info = fixture_store.execute("PRAGMA table_info('corporate_actions')").fetchall()
+    columns = {row[1]: row for row in info}
+    _, _, id_type, id_not_null, id_default, _ = columns["source_action_id"]
+    assert id_type == "VARCHAR" and id_not_null and id_default == "''"
+    _, _, cancelled_type, cancelled_not_null, cancelled_default, _ = columns["cancelled"]
+    assert cancelled_type == "BOOLEAN" and cancelled_not_null
+    assert str(cancelled_default).lower() == "false"
+
+
+def test_schema_version_is_bumped_for_action_identity() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 2
+
+
+def test_two_source_ids_may_share_an_ex_date_and_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A regular and a special dividend on one ex-date are two events."""
+    now = _now()
+    for source_action_id in ("D1", "D2"):
+        row = _minimal_row("corporate_actions", known_at=now, ingested_at=now)
+        insert_row(
+            fixture_store, "corporate_actions", {**row, "source_action_id": source_action_id}
+        )
+    row = _minimal_row("corporate_actions", known_at=now, ingested_at=now)
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "corporate_actions", {**row, "source_action_id": "D1"})
