@@ -101,7 +101,10 @@ version of this function skipped a dividend's factor entirely whenever
 that one specific session's bar was not itself known at `t` (e.g. a real
 ingest gap), even though an earlier bar was known and would have been the
 obviously-correct fallback. The `ASOF JOIN` picks that earlier bar
-instead of dropping the dividend's factor. If a split and a dividend
+instead of dropping the dividend's factor. This fallback has no
+staleness bound yet -- an arbitrarily old prior bar is used rather than
+none at all if that is the only one known; see issue #72 for the
+follow-up. If a split and a dividend
 share the same `ex_date`, the dividend's `prior_close` is still the
 **raw**, pre-split close of the prior session (the `ASOF JOIN` reads from
 `latest_bars`, never from an already-adjusted series) -- this matches the
@@ -125,12 +128,17 @@ are bad store data, not "no factor" (`NULL`, which a dividend with no
 known prior bar can legitimately produce and which this function treats
 as "no adjustment from this event", not an error). Before ever computing
 `LN()`, a dedicated query checks every non-`NULL` event factor for
-`factor > 0 AND isfinite(factor)`; the first violation found raises
-`ValueError` naming the `security_id`, `ex_date` and the offending
-`ratio_or_amount`/`factor`, rather than letting a raw DuckDB
-`OutOfRangeException` (for the `LN(0)`/`LN(negative)` case) or a silently
-wrong `inf`-adjusted price series (for the zero-ratio case) reach the
-caller.
+`factor > 0 AND isfinite(factor)`, **and separately** rejects any
+dividend with a negative `ratio_or_amount` even though `1 - (negative) /
+prior_close` is itself a perfectly positive, finite number greater than
+`1` (a dividend that *raises* the price is not a validation failure the
+factor-sign check alone can see -- a negative dividend amount is simply
+bad data). The first violation found raises `ValueError` naming the
+`security_id`, `ex_date` and the offending `ratio_or_amount`/`factor`,
+rather than letting a raw DuckDB `OutOfRangeException` (for the
+`LN(0)`/`LN(negative)` case) or a silently wrong `inf`-adjusted price
+series (for the zero-ratio case) or a silently wrong price-inflating
+series (for the negative-dividend case) reach the caller.
 
 **Why this runs as one SQL statement, not a Python loop per bar.** Every
 step -- the latest-revision-as-of-`t` filter for both `prices_daily` and
@@ -386,7 +394,8 @@ def adjusted_prices_as_of(
         WITH {common_ctes}
         SELECT security_id, ex_date, ratio_or_amount, factor
         FROM event_factor
-        WHERE factor IS NOT NULL AND NOT (factor > 0 AND isfinite(factor))
+        WHERE (factor IS NOT NULL AND NOT (factor > 0 AND isfinite(factor)))
+           OR (action_type = 'dividend' AND ratio_or_amount < 0)
         ORDER BY security_id, ex_date
         LIMIT 1
         """,
