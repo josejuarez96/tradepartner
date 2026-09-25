@@ -21,7 +21,7 @@
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
-Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: registered teams are `atlas` (main clone), `orion` (holds #22 / T5, PR #31), and `creed` (completed T20 via PR #27).
+Live board: `uv run python scripts/team.py status`. Cockpit page: `uv run python scripts/cockpit.py` then open `data/cockpit/cockpit.html` (#65). Snapshot 2026-09-24: registered teams are `atlas` (main clone), `orion` (holds #22 / T5, PR #31), and `creed` (completed T20 via PR #27).
 
 ## In progress
 - **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts

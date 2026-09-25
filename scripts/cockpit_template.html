@@ -1,0 +1,300 @@
+<title>TradePartner Cockpit</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #F6F7F4; --surface: #FFFFFF; --ink: #1C2026; --muted: #5A6470; --line: #D6DAD3;
+    --accent: #0F6F8E; --accent-soft: #DCEFF5;
+    --good: #2C7A4B; --good-soft: #DDF0E3;
+    --warn: #B0741C; --warn-soft: #F8EBD2;
+    --bad: #B23F36; --bad-soft: #F7DEDB;
+    --code-bg: #EEF1EC;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161A; --surface: #1A2027; --ink: #E7EAED; --muted: #9AA5B1; --line: #303841;
+      --accent: #5FB4D2; --accent-soft: #163341; --good: #6CC08F; --good-soft: #17301F;
+      --warn: #D9A650; --warn-soft: #3A2E15; --bad: #E07B73; --bad-soft: #3B1F1D; --code-bg: #0E1215;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161A; --surface: #1A2027; --ink: #E7EAED; --muted: #9AA5B1; --line: #303841;
+    --accent: #5FB4D2; --accent-soft: #163341; --good: #6CC08F; --good-soft: #17301F;
+    --warn: #D9A650; --warn-soft: #3A2E15; --bad: #E07B73; --bad-soft: #3B1F1D; --code-bg: #0E1215;
+    color-scheme: dark;
+  }
+  body { background: var(--bg); color: var(--ink); font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 15px; line-height: 1.5; padding-inline: 16px; padding-block: 8px 56px; }
+  main { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 36px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; padding-block: 24px 12px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 26px; font-weight: 600; margin: 0; }
+  h2 { font-size: 18px; font-weight: 600; margin: 0 0 10px; }
+  .eyebrow, .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+  .eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .sub { color: var(--muted); font-size: 13px; }
+  code { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: .9em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .tile .v { font-size: 26px; font-weight: 600; line-height: 1.1; }
+  .tile .l { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .strip { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; }
+  .phase { border-radius: 6px; padding: 10px 12px; border: 1px solid var(--line); background: var(--surface); min-width: 0; }
+  .phase .n { font-size: 12px; color: var(--muted); }
+  .phase .name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .phase.done { background: var(--good-soft); border-color: var(--good); }
+  .phase.current { background: var(--accent-soft); border-color: var(--accent); }
+  .phase .bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  .phase .bar i { display: block; height: 100%; background: var(--accent); }
+  .strip-wrap { overflow-x: auto; }
+  .strip-wrap .strip { min-width: 720px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .card.inactive { opacity: .72; }
+  .card .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card .name { font-weight: 600; font-size: 17px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font: 500 12px "IBM Plex Mono", monospace; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .pill.active { background: var(--good-soft); color: var(--good); }
+  .pill.idle { background: var(--warn-soft); color: var(--warn); }
+  .pill.inactive { background: var(--code-bg); color: var(--muted); }
+  .pill.owner { background: var(--accent-soft); color: var(--accent); }
+  .pill.pass { background: var(--good-soft); color: var(--good); }
+  .pill.fail { background: var(--bad-soft); color: var(--bad); }
+  .pill.pending { background: var(--warn-soft); color: var(--warn); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .claim { border-top: 1px solid var(--line); padding-top: 8px; font-size: 13px; }
+  .claim .t { font-weight: 500; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+
+  .chains { display: flex; flex-direction: column; gap: 10px; }
+  .chain { display: grid; grid-template-columns: 110px 1fr; gap: 10px; align-items: center; }
+  .chain .cn { font-family: "IBM Plex Mono", monospace; font-size: 13px; color: var(--muted); }
+  .cells { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cell { border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; font: 500 12px "IBM Plex Mono", monospace; background: var(--surface); display: inline-flex; gap: 6px; align-items: baseline; }
+  .cell .who { font-family: "IBM Plex Sans", sans-serif; font-weight: 400; color: var(--muted); }
+  .cell.done { background: var(--good-soft); border-color: var(--good); color: var(--good); }
+  .cell.in_progress { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+  .cell.ready { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .cell.blocked { color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+  .bars { display: grid; grid-template-columns: 110px 1fr auto; gap: 6px 10px; align-items: center; font-size: 13px; }
+  .bars .track { height: 14px; background: var(--code-bg); border-radius: 3px; overflow: hidden; }
+  .bars .track i { display: block; height: 100%; background: var(--accent); border-radius: 0 3px 3px 0; }
+  .table-wrap { overflow-x: auto; margin-top: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+  td.num, th.num { text-align: right; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  ul.plain { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+  ul.plain li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .empty { color: var(--muted); font-size: 13px; }
+  footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+</style>
+
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">TradePartner · build cockpit</div>
+      <h1 id="title">Cockpit</h1>
+    </div>
+    <div class="sub" id="meta"></div>
+  </header>
+
+  <section>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section>
+    <h2>Roadmap</h2>
+    <div class="strip-wrap"><div class="strip" id="roadmap"></div></div>
+  </section>
+
+  <section>
+    <h2>Teams</h2>
+    <p class="sub" id="teams-sub"></p>
+    <div class="cards" id="teams"></div>
+  </section>
+
+  <section>
+    <h2>Plan by chain</h2>
+    <div class="chains" id="chains"></div>
+    <div class="legend">
+      <span>✓ done</span><span>● in progress (holder shown)</span><span>○ ready, unclaimed</span><span>· blocked</span><span>⚿ owner task</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tokens by team</h2>
+    <p class="sub">All sessions on this machine whose working directory is this repo or a team directory, attributed to the team directory each session worked in. One count per API request. Cache reads dominate and are the cheap part. The main checkout counts every session ever run there, including before teams existed; pass <code>--since</code> to cut that off.</p>
+    <div class="bars" id="bars"></div>
+    <div class="table-wrap"><table id="tokens-table"></table></div>
+  </section>
+
+  <section class="two">
+    <div>
+      <h2>Unclaimed queue</h2>
+      <ul class="plain" id="queue"></ul>
+    </div>
+    <div>
+      <h2>Pull requests</h2>
+      <ul class="plain" id="prs"></ul>
+      <h2 style="margin-top:18px">Recently merged</h2>
+      <ul class="plain" id="merged"></ul>
+    </div>
+  </section>
+
+  <footer>Refresh: <code>uv run python scripts/cockpit.py</code> then reopen <code>data/cockpit/cockpit.html</code>. Live board: <code>uv run python scripts/team.py status</code>.</footer>
+</main>
+
+<script id="cockpit-data" type="application/json">__COCKPIT_DATA__</script>
+<script>
+(function () {
+  var D = JSON.parse(document.getElementById('cockpit-data').textContent);
+  var now = new Date(D.generated_at);
+
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function fmt(n) { n = Number(n) || 0; if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'; if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'; return String(n); }
+  function ago(iso) { if (!iso) return 'never'; var s = (now - new Date(iso)) / 1000; if (s < 90) return Math.round(s) + 's ago'; if (s < 5400) return Math.round(s / 60) + 'm ago'; if (s < 172800) return (s / 3600).toFixed(1) + 'h ago'; return Math.round(s / 86400) + 'd ago'; }
+  function shortModel(m) { return String(m).replace(/^claude-/, '').replace(/-\d{8}$/, ''); }
+  function pill(cls, text) { return el('span', 'pill ' + cls, text); }
+  function shortDir(d) { return d ? d.replace(/^\/Users\/[^/]+\/Projects\//, '~/Projects/') : '(no directory found)'; }
+
+  // header
+  var ph = D.phase || {};
+  document.getElementById('title').textContent = 'Phase ' + (ph.phase == null ? '?' : ph.phase) + ' · ' + (ph.phase_name || '');
+  document.getElementById('meta').textContent = 'snapshot ' + now.toLocaleString() + ' · last tag ' + (ph.last_tag || '?') + ' · active < ' + D.thresholds.active_minutes + 'm, idle < ' + D.thresholds.idle_minutes + 'm' + (D.thresholds.since ? ' · sessions since ' + D.thresholds.since : '');
+
+  // tiles
+  var teams = D.teams || [];
+  var counts = { active: 0, idle: 0, inactive: 0 };
+  teams.forEach(function (t) { counts[t.state] = (counts[t.state] || 0) + 1; });
+  var ready = (D.plan.tasks || []).filter(function (t) { return t.state === 'ready' && !t.owner; }).length;
+  var tiles = [
+    [counts.active, 'teams active'], [counts.idle, 'teams idle'], [counts.inactive, 'teams inactive'],
+    [D.plan.done + ' / ' + D.plan.total, 'plan tasks merged'], [ready, 'tasks ready, unclaimed'],
+    [(D.open_prs || []).length, 'open PRs'], [(D.unclaimed || []).length, 'unclaimed issues'],
+    [fmt(teams.reduce(function (a, t) { return a + t.tokens_total; }, 0)), 'tokens, all teams']
+  ];
+  var tilesEl = document.getElementById('tiles');
+  tiles.forEach(function (x) { var t = el('div', 'tile'); t.appendChild(el('div', 'v num', String(x[0]))); t.appendChild(el('div', 'l', x[1])); tilesEl.appendChild(t); });
+
+  // roadmap
+  var rm = document.getElementById('roadmap');
+  (D.roadmap || []).forEach(function (p) {
+    var cls = ph.phase == null ? '' : (p.phase < ph.phase ? 'done' : (p.phase === ph.phase ? 'current' : ''));
+    var box = el('div', 'phase ' + cls);
+    box.appendChild(el('div', 'n', 'Phase ' + p.phase + (cls === 'done' ? ' · done' : cls === 'current' ? ' · now' : '')));
+    box.appendChild(el('div', 'name', p.name));
+    box.title = p.goal;
+    if (cls === 'current') { var bar = el('div', 'bar'); var fill = el('i'); fill.style.width = (D.plan.total ? Math.round(100 * D.plan.done / D.plan.total) : 0) + '%'; bar.appendChild(fill); box.appendChild(bar); box.appendChild(el('div', 'n num', D.plan.done + ' of ' + D.plan.total + ' tasks merged')); }
+    rm.appendChild(box);
+  });
+
+  // teams
+  var order = { active: 0, idle: 1, inactive: 2 };
+  teams.sort(function (a, b) { return (order[a.state] - order[b.state]) || (b.last_seen || '').localeCompare(a.last_seen || ''); });
+  document.getElementById('teams-sub').textContent = teams.length + ' teams seen in labels, team files or session logs. A team with no directory and no claims is a retired name.';
+  var teamsEl = document.getElementById('teams');
+  teams.forEach(function (t) {
+    var c = el('div', 'card ' + t.state);
+    var top = el('div', 'top'); top.appendChild(el('div', 'name', t.name));
+    var right = el('div', 'chips');
+    if (t.owner_session) right.appendChild(pill('owner', 'your session'));
+    right.appendChild(pill(t.state, (t.state === 'active' ? '● ' : t.state === 'idle' ? '◐ ' : '○ ') + t.state));
+    top.appendChild(right); c.appendChild(top);
+    var kv = el('dl', 'kv');
+    function row(k, v) { kv.appendChild(el('dt', null, k)); kv.appendChild(el('dd', 'num', v)); }
+    row('last seen', ago(t.last_seen) + (t.sessions ? '' : ' · GitHub only, no session log on this machine'));
+    row('directory', shortDir(t.dir));
+    row('sessions', t.sessions + ' · ' + t.requests + ' requests');
+    row('tokens', fmt(t.tokens_total) + ' total · ' + fmt(t.tokens.output_tokens) + ' out · ' + fmt(t.tokens.cache_read_input_tokens) + ' cache read');
+    row('models', t.models.length ? t.models.map(shortModel).join(', ') : '—');
+    c.appendChild(kv);
+    if (!t.claims.length) c.appendChild(el('div', 'claim empty', 'no claims'));
+    t.claims.forEach(function (cl) {
+      var box = el('div', 'claim');
+      box.appendChild(el('div', 't', '#' + cl.number + (cl.tasks.length ? ' · ' + cl.tasks.join(', ') : '') + ' · ' + cl.title));
+      var chips = el('div', 'chips');
+      if (!cl.prs.length) chips.appendChild(pill('inactive', 'no PR yet'));
+      cl.prs.forEach(function (p) { chips.appendChild(pill(p.ci, 'PR #' + p.number + ' ' + (p.draft ? 'draft' : 'ready') + ' · CI ' + p.ci)); });
+      box.appendChild(chips); c.appendChild(box);
+    });
+    teamsEl.appendChild(c);
+  });
+
+  // chains
+  var byId = {}; (D.plan.tasks || []).forEach(function (t) { byId[t.id] = t; });
+  var placed = {};
+  var chainsEl = document.getElementById('chains');
+  function cell(t) {
+    var mark = t.state === 'done' ? '✓' : t.state === 'in_progress' ? '●' : t.state === 'ready' ? '○' : '·';
+    var c = el('span', 'cell ' + t.state, (t.owner ? '⚿ ' : '') + mark + ' ' + t.id);
+    if (t.holder) c.appendChild(el('span', 'who', t.holder));
+    c.title = t.title + ' — ' + t.state.replace('_', ' ') + (t.depends_on.length ? ' · depends on ' + t.depends_on.join(', ') : '');
+    return c;
+  }
+  function chainRow(name, ids) {
+    var r = el('div', 'chain'); r.appendChild(el('div', 'cn', name));
+    var cells = el('div', 'cells');
+    ids.forEach(function (id) { if (byId[id]) { cells.appendChild(cell(byId[id])); placed[id] = true; } });
+    r.appendChild(cells); chainsEl.appendChild(r);
+  }
+  (D.plan.chains || []).forEach(function (ch) { chainRow(ch.name, ch.tasks); });
+  var rest = (D.plan.tasks || []).filter(function (t) { return !placed[t.id]; }).map(function (t) { return t.id; });
+  if (rest.length) chainRow('other', rest);
+
+  // tokens
+  var barsEl = document.getElementById('bars');
+  var max = Math.max.apply(null, teams.map(function (t) { return t.tokens_total; }).concat([1]));
+  teams.slice().sort(function (a, b) { return b.tokens_total - a.tokens_total; }).forEach(function (t) {
+    barsEl.appendChild(el('div', 'mono', t.name));
+    var track = el('div', 'track'); var fill = el('i'); fill.style.width = Math.max(1, Math.round(100 * t.tokens_total / max)) + '%'; track.appendChild(fill); barsEl.appendChild(track);
+    barsEl.appendChild(el('div', 'num', fmt(t.tokens_total)));
+  });
+  var tbl = document.getElementById('tokens-table');
+  var thead = el('thead'); var hr = el('tr');
+  ['team', 'sessions', 'requests', 'input', 'cache read', 'cache write', 'output', 'total'].forEach(function (h, i) { hr.appendChild(el('th', i ? 'num' : '', h)); });
+  thead.appendChild(hr); tbl.appendChild(thead);
+  var tb = el('tbody');
+  teams.forEach(function (t) {
+    var tr = el('tr'); tr.appendChild(el('td', 'mono', t.name));
+    [t.sessions, t.requests, t.tokens.input_tokens, t.tokens.cache_read_input_tokens, t.tokens.cache_creation_input_tokens, t.tokens.output_tokens, t.tokens_total].forEach(function (v) { tr.appendChild(el('td', 'num', Number(v).toLocaleString())); });
+    tb.appendChild(tr);
+  });
+  tbl.appendChild(tb);
+
+  // queue
+  var sizeRank = { 'size:S': 0, 'size:M': 1, 'size:L': 2 };
+  var q = document.getElementById('queue');
+  var unclaimed = (D.unclaimed || []).slice().sort(function (a, b) {
+    function r(i) { var s = i.labels.filter(function (l) { return l in sizeRank; })[0]; return s ? sizeRank[s] : 3; }
+    return r(a) - r(b) || a.number - b.number;
+  });
+  if (!unclaimed.length) q.appendChild(el('li', 'empty', 'nothing unclaimed'));
+  unclaimed.forEach(function (i) {
+    var li = el('li'); li.appendChild(el('span', 'mono', '#' + i.number));
+    li.appendChild(el('span', null, i.title));
+    i.labels.filter(function (l) { return /^(size|type):/.test(l); }).forEach(function (l) { li.appendChild(pill(l.indexOf('size:') === 0 ? 'inactive' : 'owner', l)); });
+    q.appendChild(li);
+  });
+
+  // PRs
+  var prs = document.getElementById('prs');
+  if (!(D.open_prs || []).length) prs.appendChild(el('li', 'empty', 'no open PRs'));
+  (D.open_prs || []).forEach(function (p) {
+    var li = el('li'); li.appendChild(el('span', 'mono', '#' + p.number)); li.appendChild(el('span', null, p.title));
+    li.appendChild(pill(p.ci, 'CI ' + p.ci)); li.appendChild(pill(p.draft ? 'inactive' : 'owner', p.draft ? 'draft' : 'ready for you'));
+    if (p.labels.indexOf('parked') >= 0) li.appendChild(pill('idle', 'parked'));
+    prs.appendChild(li);
+  });
+  var mg = document.getElementById('merged');
+  (D.merged || []).forEach(function (p) { var li = el('li'); li.appendChild(el('span', 'mono', '#' + p.number)); li.appendChild(el('span', null, p.title)); li.appendChild(el('span', 'sub', ago(p.merged))); mg.appendChild(li); });
+})();
+</script>

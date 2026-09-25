@@ -14,6 +14,7 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
 - Process: multi-team orchestration. Any number of chat windows build in parallel as registered teams, each in its own clone; work is claimed on GitHub issues through `scripts/team.py` with a deterministic tiebreak; plans list chains; CI fails a PR whose issue is unclaimed or whose plan task has two open PRs; model tiers documented (#36).
 - Process: `scripts/team.py start <name>` sets up a team directory outside the repo in one step; `register` refuses to overwrite another team's `.team`; sessions touch only their own directory (#40).
+- Tooling: owner cockpit, `scripts/cockpit.py`, renders one local HTML page from GitHub claims and PRs, the plan on `origin/main`, the roadmap and local Claude Code session logs: teams with activity state, tokens and models, claims and PR state, roadmap phase, plan by chain, unclaimed queue (#65).
 - `store.db.ensure_tz_aware` and the broker value objects share one tz-aware UTC check, `tradepartner.timeutil.ensure_tz_aware_utc`, which also rejects a `tzinfo` with no UTC offset; `ensure_tz_aware` now returns the value converted to UTC (#30).
 
 ## [0.1.0] - 2026-09-24
