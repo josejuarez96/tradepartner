@@ -75,6 +75,7 @@ def test_edgar_defaults() -> None:
     assert s.edgar.retry_backoff_seconds == pytest.approx(1.0)
     assert s.edgar.request_timeout_seconds == pytest.approx(30.0)
     assert s.edgar.header_bytes == 4096
+    assert s.edgar.max_retry_after_seconds == pytest.approx(120.0)
 
 
 def test_edgar_cache_dir_independent_of_cwd(
@@ -82,6 +83,23 @@ def test_edgar_cache_dir_independent_of_cwd(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     assert Path(_settings().edgar.cache_dir).is_absolute()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "requests_per_second",
+        "retry_backoff_seconds",
+        "request_timeout_seconds",
+        "header_bytes",
+        "max_retry_after_seconds",
+    ],
+)
+def test_edgar_thresholds_reject_zero(field: str) -> None:
+    """Every `edgar.*` throttle/timeout/backoff threshold is `gt=0`: zero or
+    negative would either hang or hot-loop `adapters.edgar_raw`."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={field: 0})
 
 
 def test_master_defaults() -> None:

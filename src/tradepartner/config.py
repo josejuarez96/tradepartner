@@ -128,14 +128,20 @@ class EdgarConfig(BaseModel):
     `header_bytes` were added in T2 review round 2 (safety-reviewer SHOULD
     FIX): `adapters/edgar_raw.py`'s throttle, retry backoff, HTTP timeout
     and SGML-header slice size were hardcoded module constants; CLAUDE.md
-    requires thresholds to come from config.
+    requires thresholds to come from config. `max_retry_after_seconds` was
+    added in round 3 (safety-reviewer MUST FIX): an SEC response naming an
+    unreasonably large (or non-finite) `Retry-After` must not make
+    `edgar_raw` sleep for that long, or at all, on a NaN/infinite value.
+    Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
+    is nonsensical and would either hang or hot-loop `edgar_raw`.
     """
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = 10.0
-    retry_backoff_seconds: float = 1.0
-    request_timeout_seconds: float = 30.0
-    header_bytes: int = 4096
+    requests_per_second: float = Field(default=10.0, gt=0)
+    retry_backoff_seconds: float = Field(default=1.0, gt=0)
+    request_timeout_seconds: float = Field(default=30.0, gt=0)
+    header_bytes: int = Field(default=4096, gt=0)
+    max_retry_after_seconds: float = Field(default=120.0, gt=0)
 
 
 class MasterConfig(BaseModel):
