@@ -2,22 +2,23 @@
 
 Fetches a small, fixed list of real raw payloads from Alpaca and SEC EDGAR
 through `adapters/alpaca_raw.py` and `adapters/edgar_raw.py`, **scrubs**
-every payload (secrets, email addresses, key-shaped tokens, `User-Agent`
-headers), and writes the result as JSON or text under
-`tests/fixtures/{alpaca,edgar}/`. T11/T12's parsers are tested against
-these recordings; CI never calls this module or the network (spec
+every payload (secrets, email addresses, key-shaped tokens, `User-Agent`/
+`Authorization`/Alpaca-key headers), and writes the result as JSON or text
+under `tests/fixtures/{alpaca,edgar}/`. T11/T12's parsers are tested
+against these recordings; CI never calls this module or the network (spec
 "Users & usage": "Once, at the start, the owner runs a recording script
 with their own keys").
 
 Run by the owner (plan task T3) with real `ALPACA_API_KEY` /
 `ALPACA_API_SECRET` / `SEC_EDGAR_USER_AGENT` set. Exits non-zero with a
-message naming every missing secret, before any network call, so the owner
-sees exactly what to set (spec req: "recorder must exit non-zero with a
-clear message when secrets are missing").
+message naming every missing (or blank) secret, before any network call,
+so the owner sees exactly what to set (spec req: "recorder must exit
+non-zero with a clear message when secrets are missing").
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import sys
@@ -25,6 +26,8 @@ from collections.abc import Iterable, Mapping
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+from pydantic import SecretStr
 
 from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.config import Settings, get_settings
@@ -43,104 +46,191 @@ EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # alnum run (ADR 0003 "Verify"/T3: exact format confirmed against the
 # owner's real keys, but the prefix convention is documented by Alpaca).
 ALPACA_KEY_PREFIX_PATTERN = re.compile(r"\b(?:PK|AK)[A-Za-z0-9]{16,}\b")
-# "key" or "secret" (any case), a little punctuation, then a 20+ char token
-# -- catches `"api_key": "..."`, `secret=...`, etc. without needing to know
-# the surrounding structure.
-KEY_SHAPED_PATTERN = re.compile(r"(?i)(?:key|secret)[^A-Za-z0-9]{0,5}[A-Za-z0-9/+_=-]{20,}")
+# A real label ("api_key", "secret_key", "secret", "token" -- word-bounded,
+# so "KeyManagementPersonnelCompensation" -- a real us-gaap XBRL concept
+# name that showed up in a real company-facts payload -- never matches),
+# a separator, then a 20+ char token. Narrower than an earlier version that
+# matched any "key"/"secret" substring immediately followed by 20+ alnum
+# chars, which also matched inside ordinary camelCase identifiers and
+# base64 image data (T2 review round 2, safety-reviewer MUST FIX).
+KEY_SHAPED_PATTERN = re.compile(
+    r"\b(?:api[_-]?key|secret[_-]?key|secret|token)[\"'=:\s]{1,5}[A-Za-z0-9/+_=-]{20,}",
+    re.IGNORECASE,
+)
 # A `User-Agent` header left un-scrubbed in serialized JSON.
 USER_AGENT_HEADER_PATTERN = re.compile(r'(?i)"user-agent"\s*:\s*"(?!<scrubbed>)[^"]*"')
-# A dict key naming itself a key/secret, e.g. `alpaca_api_key`, `secret_token`.
+# A `User-Agent: ...`/`User-Agent=...` line in a plain-text payload.
+USER_AGENT_LINE_PATTERN = re.compile(r"(?im)^\s*user-agent\s*[:=].*")
+
+# Field names whose *entire* value is inherently secret, regardless of its
+# shape -- unlike the content patterns above, which scrub only the matched
+# span within an otherwise-kept string.
+_SENSITIVE_HEADER_KEYS = frozenset(
+    {"authorization", "apca-api-key-id", "apca-api-secret-key", "user-agent"}
+)
 _KEY_LIKE_FIELD_NAME = re.compile(r"(?i)key|secret")
-# A bare token value (no separator needed) long enough to plausibly be one.
 _TOKEN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9/+_=-]{20,}$")
 
-
-def _looks_secret(value: str) -> bool:
-    return bool(
-        EMAIL_PATTERN.search(value)
-        or ALPACA_KEY_PREFIX_PATTERN.search(value)
-        or KEY_SHAPED_PATTERN.search(value)
-    )
+_CONTENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    EMAIL_PATTERN,
+    ALPACA_KEY_PREFIX_PATTERN,
+    KEY_SHAPED_PATTERN,
+)
 
 
-def scrub_json(value: Any, *, secrets: Iterable[str]) -> Any:
-    """Recursively replace secret-shaped values in a JSON-like structure.
+def _secrets_pattern(secrets: Iterable[str]) -> re.Pattern[str] | None:
+    """One alternation matching any of `secrets` as a substring, longest first.
 
-    Any string is replaced with `"<scrubbed>"` if it exactly equals one of
-    `secrets`; sits under a `User-Agent` (case-insensitive) key; sits under
-    a key naming itself `key`/`secret` (e.g. `alpaca_api_key`) and looks
-    like a bare token; or itself contains an email address, an
-    Alpaca-style key prefix, or a `key`/`secret`-adjacent token. Dicts and
+    Longest-first so a secret that happens to be a prefix of another
+    configured secret doesn't get matched (and only partially scrubbed)
+    before the longer one is tried.
+    """
+    values = sorted({s for s in secrets if s}, key=len, reverse=True)
+    if not values:
+        return None
+    return re.compile("|".join(re.escape(v) for v in values))
+
+
+def _scrub_content(value: str, secrets_pattern: re.Pattern[str] | None) -> tuple[str, int]:
+    """Replace only the matched span of every secret/email/key-shaped/Alpaca-prefix
+    hit in `value` (never the whole string) with `"<scrubbed>"`; return `(result, count)`.
+    """
+    count = 0
+    if secrets_pattern is not None:
+        value, n = secrets_pattern.subn(SCRUBBED, value)
+        count += n
+    for pattern in _CONTENT_PATTERNS:
+        value, n = pattern.subn(SCRUBBED, value)
+        count += n
+    return value, count
+
+
+def scrub_json(value: Any, *, secrets: Iterable[str]) -> tuple[Any, int]:
+    """Recursively scrub a JSON-like structure; returns `(scrubbed, replacement_count)`.
+
+    A string under a sensitive header key (`Authorization`,
+    `APCA-API-KEY-ID`, `APCA-API-SECRET-KEY`, `User-Agent`,
+    case-insensitive) or a `key`/`secret`-named field holding a bare token
+    is replaced *wholly*, since by construction the entire value is
+    secret. Every other string only has the matched span of each
+    configured secret, email address, Alpaca-style key prefix, or
+    key-shaped token replaced -- surrounding text is preserved. Dicts and
     lists are walked; every other type (numbers, bools, `None`) passes
     through unchanged.
     """
-    secret_values = {s for s in secrets if s}
-    return _scrub_json_value(value, secret_values, key=None)
+    secrets_pattern = _secrets_pattern(secrets)
+    return _scrub_json_value(value, secrets_pattern, key=None)
 
 
-def _scrub_json_value(value: Any, secret_values: set[str], *, key: str | None) -> Any:
+def _scrub_whole_if_changed(value: str) -> tuple[str, int]:
+    return (value, 0) if value == SCRUBBED else (SCRUBBED, 1)
+
+
+def _scrub_json_value(
+    value: Any, secrets_pattern: re.Pattern[str] | None, *, key: str | None
+) -> tuple[Any, int]:
     if isinstance(value, Mapping):
-        return {k: _scrub_json_value(v, secret_values, key=k) for k, v in value.items()}
+        count = 0
+        result: dict[Any, Any] = {}
+        for k, v in value.items():
+            result[k], n = _scrub_json_value(v, secrets_pattern, key=k)
+            count += n
+        return result, count
     if isinstance(value, list):
-        return [_scrub_json_value(v, secret_values, key=key) for v in value]
+        count = 0
+        result_list = []
+        for v in value:
+            scrubbed_v, n = _scrub_json_value(v, secrets_pattern, key=key)
+            result_list.append(scrubbed_v)
+            count += n
+        return result_list, count
     if isinstance(value, str):
-        if key is not None and key.strip().lower() == "user-agent":
-            return SCRUBBED
+        if key is not None and key.strip().lower() in _SENSITIVE_HEADER_KEYS:
+            return _scrub_whole_if_changed(value)
         if (
             key is not None
             and _KEY_LIKE_FIELD_NAME.search(key)
             and _TOKEN_VALUE_PATTERN.match(value)
         ):
-            return SCRUBBED
-        if value in secret_values or _looks_secret(value):
-            return SCRUBBED
-        return value
-    return value
+            return _scrub_whole_if_changed(value)
+        return _scrub_content(value, secrets_pattern)
+    return value, 0
 
 
-def scrub_text(text: str, *, secrets: Iterable[str]) -> str:
+def scrub_text(text: str, *, secrets: Iterable[str]) -> tuple[str, int]:
     """Line-by-line text scrub for non-JSON payloads (SGML header, full-index).
 
-    Each line is replaced wholesale with `"<scrubbed>"` if it equals a
-    secret verbatim or matches one of the same patterns `scrub_json` uses;
-    every other line is left untouched.
+    A `User-Agent: ...`/`User-Agent=...` line (any leading whitespace) is
+    replaced wholly. Every other line only has the matched span of each
+    configured secret, email address, Alpaca-style key prefix, or
+    key-shaped token replaced. Returns `(scrubbed, replacement_count)`.
     """
-    secret_values = {s for s in secrets if s}
-    lines = text.splitlines(keepends=True)
-    return "".join(_scrub_line(line, secret_values) for line in lines)
+    secrets_pattern = _secrets_pattern(secrets)
+    total = 0
+    out_lines = []
+    for line in text.splitlines(keepends=True):
+        scrubbed_line, n = _scrub_text_line(line, secrets_pattern)
+        out_lines.append(scrubbed_line)
+        total += n
+    return "".join(out_lines), total
 
 
-def _scrub_line(line: str, secret_values: set[str]) -> str:
-    ending = line[len(line.rstrip("\r\n")) :]
-    stripped = line.rstrip("\r\n")
-    if stripped in secret_values or _looks_secret(stripped):
-        return f"{SCRUBBED}{ending}"
-    return line
+def _scrub_text_line(line: str, secrets_pattern: re.Pattern[str] | None) -> tuple[str, int]:
+    scrubbed, n = USER_AGENT_LINE_PATTERN.subn(SCRUBBED, line)
+    if n:
+        return scrubbed, n
+    return _scrub_content(line, secrets_pattern)
+
+
+def _non_blank_secret(secret: SecretStr | None) -> str | None:
+    """`secret`'s value, or `None` if it's unset or blank/whitespace-only."""
+    if secret is None:
+        return None
+    value = secret.get_secret_value()
+    return value if value.strip() else None
 
 
 def _configured_secrets(settings: Settings) -> list[str]:
-    values = [settings.alpaca_api_key, settings.alpaca_api_secret, settings.sec_edgar_user_agent]
-    return [v.get_secret_value() for v in values if v is not None]
+    """Every real secret value to scrub as a substring, plus derived forms.
+
+    Includes the HTTP Basic `base64("key:secret")` form of the Alpaca
+    credential pair, in case a payload ever carries an `Authorization:
+    Basic ...` value built from them (T2 review round 2, safety-reviewer
+    MUST FIX) -- on top of the `Authorization`-header-name scrub in
+    `scrub_json`, which catches it regardless of content.
+    """
+    api_key = _non_blank_secret(settings.alpaca_api_key)
+    api_secret = _non_blank_secret(settings.alpaca_api_secret)
+    user_agent = _non_blank_secret(settings.sec_edgar_user_agent)
+
+    values = [v for v in (api_key, api_secret, user_agent) if v is not None]
+    if api_key is not None and api_secret is not None:
+        basic = base64.b64encode(f"{api_key}:{api_secret}".encode()).decode()
+        values.append(basic)
+    return values
 
 
 def _missing_secret_names(settings: Settings) -> list[str]:
     missing = []
-    if settings.alpaca_api_key is None:
+    if _non_blank_secret(settings.alpaca_api_key) is None:
         missing.append("ALPACA_API_KEY")
-    if settings.alpaca_api_secret is None:
+    if _non_blank_secret(settings.alpaca_api_secret) is None:
         missing.append("ALPACA_API_SECRET")
-    if settings.sec_edgar_user_agent is None:
+    if _non_blank_secret(settings.sec_edgar_user_agent) is None:
         missing.append("SEC_EDGAR_USER_AGENT")
     return missing
 
 
 def _write_json(path: Path, payload: Any, *, secrets: Iterable[str]) -> None:
-    scrubbed = scrub_json(payload, secrets=secrets)
+    scrubbed, count = scrub_json(payload, secrets=secrets)
     path.write_text(json.dumps(scrubbed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"cli_record: scrubbed {count} value(s) in {path.name}")
 
 
 def _write_text(path: Path, text: str, *, secrets: Iterable[str]) -> None:
-    path.write_text(scrub_text(text, secrets=secrets), encoding="utf-8")
+    scrubbed, count = scrub_text(text, secrets=secrets)
+    path.write_text(scrubbed, encoding="utf-8")
+    print(f"cli_record: scrubbed {count} value(s) in {path.name}")
 
 
 # --- the fixed recording plan ------------------------------------------------
@@ -193,6 +283,28 @@ def _pick_filing(
     return None
 
 
+def _prefer_root_document(document: str) -> str:
+    """Prefer the raw filing-root document over an XSL-rendered view.
+
+    EDGAR's `primaryDocument` for XBRL-only forms (e.g. 25-NSE) often
+    points at a viewer path like `xslF25X02/primary_doc.xml`; the same
+    file also exists as raw XML directly at the filing root. Using the
+    root copy avoids downloading (and needing to flatten) a nested path
+    (T2 review round 2, safety-reviewer MUST FIX).
+    """
+    if "/" in document:
+        return document.rsplit("/", 1)[-1]
+    return document
+
+
+def _flatten_fixture_filename(document: str) -> str:
+    """`document`, with any path separator replaced so it's safe as a single
+    filename under `tests/fixtures/edgar/` (defense in depth alongside
+    `_prefer_root_document`, in case some other form's primary document is
+    ever nested)."""
+    return document.replace("/", "__")
+
+
 def _truncate_filing_index(text: str, ciks: Iterable[str]) -> str:
     """Header lines plus any line naming one of `ciks` (unpadded, as `form.idx` shows it)."""
     wanted = {str(int(cik)) for cik in ciks}
@@ -232,15 +344,17 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
             )
             continue
         accession, primary_document = picked
+        root_document = _prefer_root_document(primary_document)
 
         header = edgar_raw.filing_sgml_header(cik, accession, settings=settings)
         _write_text(EDGAR_FIXTURES_DIR / f"sgml_header_{label}.txt", header, secrets=secrets)
 
         downloaded = edgar_raw.download_filing_file(
-            cik, accession, primary_document, settings=settings
+            cik, accession, root_document, settings=settings
         )
+        fixture_name = _flatten_fixture_filename(root_document)
         _write_text(
-            EDGAR_FIXTURES_DIR / f"filing_{label}_{primary_document}",
+            EDGAR_FIXTURES_DIR / f"filing_{label}_{fixture_name}",
             downloaded.read_text(encoding="utf-8", errors="replace"),
             secrets=secrets,
         )
@@ -255,6 +369,9 @@ def _record_alpaca(settings: Settings, secrets: list[str]) -> None:
     )
     _write_json(ALPACA_FIXTURES_DIR / "corporate_actions.json", actions, secrets=secrets)
 
+    # `assets_snapshot` uses `TradingClient(paper=True)`: a live-only key
+    # pair will fail this call even though `daily_bars`/`corporate_actions`
+    # succeed (see tests/fixtures/README.md).
     assets = alpaca_raw.assets_snapshot(ALPACA_SYMBOLS, settings=settings)
     _write_json(ALPACA_FIXTURES_DIR / "assets_snapshot.json", assets, secrets=secrets)
 
