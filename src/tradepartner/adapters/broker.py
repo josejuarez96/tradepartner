@@ -12,32 +12,93 @@ order placement without passing deterministic risk rules").
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
 raises `ValueError` at construction, matching the convention in
-`store/db.ensure_tz_aware` rather than inventing a new one.
+`store/db.ensure_tz_aware` rather than inventing a new one, and any
+tz-aware value that isn't already UTC is normalized to UTC. This module has
+no dependency on `store`, so the check is duplicated here rather than
+shared across layers — tracked for a future cleanup in issue #30.
 """
 
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
-from datetime import datetime
+import math
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 
 
-def _ensure_tz_aware(value: datetime, *, field_name: str) -> datetime:
-    """Return `value` unchanged, or raise `ValueError` if it is naive.
-
-    Mirrors `store.db.ensure_tz_aware`: this module has no store
-    dependency, so the same one-line check is repeated here rather than
-    importing across layers for a single guard.
+def _ensure_tz_aware_utc(value: datetime, *, field_name: str) -> datetime:
+    """Raise `ValueError` if `value` is naive; otherwise return it
+    normalized to UTC (`.astimezone(UTC)`), so two value objects built from
+    equivalent instants in different tzinfos always compare and print the
+    same way.
     """
     if value.tzinfo is None:
         raise ValueError(f"{field_name} must be tz-aware, got a naive datetime: {value!r}")
+    return value.astimezone(UTC)
+
+
+def _validate_identifier(value: str, *, field_name: str) -> str:
+    """Raise `ValueError` if `value` is empty, or differs from its own
+    `.strip()` — a padded id like `"co-1 "` must not silently defeat
+    dedupe or symbol matching.
+    """
+    if not value or value != value.strip():
+        raise ValueError(
+            f"{field_name} must be non-empty with no leading/trailing whitespace, got {value!r}"
+        )
     return value
 
 
+def _validate_positive_finite(value: float, *, field_name: str) -> float:
+    """Raise `ValueError` unless `value` is a finite, positive, non-bool
+    real number. `nan <= 0` and `inf <= 0` are both `False`, so a plain
+    `value <= 0` check alone lets NaN/infinity through; `bool` is a
+    subclass of `int` and must be rejected explicitly too.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field_name} must be a real number, got {value!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive, finite number, got {value!r}")
+    return float(value)
+
+
+def _coerce_side(value: Side) -> Side:
+    """Return `value` unchanged if it's already a `Side`; otherwise try to
+    coerce it (e.g. the plain string `"buy"`) into one, raising
+    `ValueError` if it doesn't match any member. Without this, a caller
+    that passes a bare string satisfies the dataclass constructor (Python
+    does not enforce type hints at runtime) and `fill.side is Side.BUY`
+    silently evaluates to `False` for every fill — a buy would book as a
+    short sell in `positions()`.
+    """
+    if isinstance(value, Side):
+        return value
+    try:
+        return Side(value)
+    except ValueError as exc:
+        allowed = [member.value for member in Side]
+        raise ValueError(f"side must be one of {allowed}, got {value!r}") from exc
+
+
+def _validate_order_fields(
+    *, client_order_id: str, symbol: str, side: Side, quantity: float, price: float
+) -> tuple[str, str, Side, float, float]:
+    """Shared validation for the fields common to `OrderRequest`, `Order`
+    and `Fill`, so the three value objects cannot drift out of sync on
+    what counts as a valid quantity/price/side/identifier.
+    """
+    client_order_id = _validate_identifier(client_order_id, field_name="client_order_id")
+    symbol = _validate_identifier(symbol, field_name="symbol")
+    side = _coerce_side(side)
+    quantity = _validate_positive_finite(quantity, field_name="quantity")
+    price = _validate_positive_finite(price, field_name="price")
+    return client_order_id, symbol, side, quantity, price
+
+
 class Side(StrEnum):
-    """The explicit two-value side of an order (acceptance criterion 5:
-    "side is an explicit enum")."""
+    """The side of an order, as an explicit two-value enum rather than a
+    free-form string."""
 
     BUY = "buy"
     SELL = "sell"
@@ -55,17 +116,17 @@ class OrderStatus(StrEnum):
 class DuplicateClientOrderIdError(Exception):
     """Raised when `submit` is called with a `client_order_id` that has
     already been submitted. The original order is left unchanged and no
-    second order is created (acceptance criterion 2)."""
+    second order is created."""
 
 
 class UnknownOrderError(Exception):
-    """Raised by `cancel` when no order with the given `client_order_id`
-    has ever been submitted (acceptance criterion 3)."""
+    """Raised by `cancel` (or `FakeBroker.simulate_fill`) when no order
+    with the given `client_order_id` has ever been submitted."""
 
 
 class OrderNotOpenError(Exception):
     """Raised by `cancel` when the order exists but is already `FILLED` or
-    `CANCELLED` (acceptance criterion 3: "not silently ignored")."""
+    `CANCELLED` — the caller is never silently ignored."""
 
 
 @dataclass(frozen=True)
@@ -86,14 +147,18 @@ class OrderRequest:
     price: float
 
     def __post_init__(self) -> None:
-        if not self.client_order_id:
-            raise ValueError("client_order_id must be non-empty")
-        if not self.symbol:
-            raise ValueError("symbol must be non-empty")
-        if self.quantity <= 0:
-            raise ValueError(f"quantity must be positive, got {self.quantity!r}")
-        if self.price <= 0:
-            raise ValueError(f"price must be positive, got {self.price!r}")
+        client_order_id, symbol, side, quantity, price = _validate_order_fields(
+            client_order_id=self.client_order_id,
+            symbol=self.symbol,
+            side=self.side,
+            quantity=self.quantity,
+            price=self.price,
+        )
+        object.__setattr__(self, "client_order_id", client_order_id)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "quantity", quantity)
+        object.__setattr__(self, "price", price)
 
 
 @dataclass(frozen=True)
@@ -110,13 +175,29 @@ class Order:
     submitted_at: datetime
 
     def __post_init__(self) -> None:
-        _ensure_tz_aware(self.submitted_at, field_name="submitted_at")
+        client_order_id, symbol, side, quantity, price = _validate_order_fields(
+            client_order_id=self.client_order_id,
+            symbol=self.symbol,
+            side=self.side,
+            quantity=self.quantity,
+            price=self.price,
+        )
+        object.__setattr__(self, "client_order_id", client_order_id)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "quantity", quantity)
+        object.__setattr__(self, "price", price)
+        object.__setattr__(
+            self,
+            "submitted_at",
+            _ensure_tz_aware_utc(self.submitted_at, field_name="submitted_at"),
+        )
 
 
 @dataclass(frozen=True)
 class Fill:
     """One execution record. `FakeBroker` produces exactly one `Fill` per
-    filled order — no partial fills (acceptance criterion 4)."""
+    filled order — no partial fills."""
 
     client_order_id: str
     symbol: str
@@ -126,27 +207,39 @@ class Fill:
     filled_at: datetime
 
     def __post_init__(self) -> None:
-        if not self.client_order_id:
-            raise ValueError("client_order_id must be non-empty")
-        if not self.symbol:
-            raise ValueError("symbol must be non-empty")
-        if self.quantity <= 0:
-            raise ValueError(f"quantity must be positive, got {self.quantity!r}")
-        _ensure_tz_aware(self.filled_at, field_name="filled_at")
+        client_order_id, symbol, side, quantity, price = _validate_order_fields(
+            client_order_id=self.client_order_id,
+            symbol=self.symbol,
+            side=self.side,
+            quantity=self.quantity,
+            price=self.price,
+        )
+        object.__setattr__(self, "client_order_id", client_order_id)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "quantity", quantity)
+        object.__setattr__(self, "price", price)
+        object.__setattr__(
+            self, "filled_at", _ensure_tz_aware_utc(self.filled_at, field_name="filled_at")
+        )
 
 
 @dataclass(frozen=True)
 class Position:
     """Net quantity held in one symbol, aggregated from fills (buy adds,
     sell subtracts). `Broker.positions()` never reports a zero-quantity
-    symbol — see `fake_broker.py` for where that's enforced."""
+    symbol — a symbol that nets to zero is absent from the result rather
+    than present with `quantity=0` (see `fake_broker.py` for where that's
+    enforced). This is a net-position model only: a sell with no prior
+    long books a negative (short) quantity, since no risk logic here
+    prevents it (Phase 4 concern).
+    """
 
     symbol: str
-    quantity: float = field(default=0.0)
+    quantity: float
 
     def __post_init__(self) -> None:
-        if not self.symbol:
-            raise ValueError("symbol must be non-empty")
+        object.__setattr__(self, "symbol", _validate_identifier(self.symbol, field_name="symbol"))
 
 
 class Broker(abc.ABC):
@@ -162,7 +255,15 @@ class Broker(abc.ABC):
     def submit(self, request: OrderRequest) -> Order:
         """Submit an order. Raises `DuplicateClientOrderIdError` if
         `request.client_order_id` has already been submitted; the
-        pre-existing order is left unchanged."""
+        pre-existing order is left unchanged.
+
+        A real (non-fake) implementation must dedupe `client_order_id`
+        against the broker's own persisted order state (e.g. by querying
+        the broker for an existing order with that id), not just against
+        this process's in-memory state — `FakeBroker` dedupes in memory
+        only, which is sufficient for tests but not a model for a real
+        adapter's crash-recovery behavior.
+        """
 
     @abc.abstractmethod
     def cancel(self, client_order_id: str) -> Order:
@@ -177,4 +278,4 @@ class Broker(abc.ABC):
 
     @abc.abstractmethod
     def fills(self) -> list[Fill]:
-        """Every fill produced so far, in submission order."""
+        """Every fill produced so far, in fill order."""
