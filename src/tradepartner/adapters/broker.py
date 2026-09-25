@@ -39,11 +39,13 @@ def _ensure_tz_aware_utc(value: datetime, *, field_name: str) -> datetime:
 
 
 def _validate_identifier(value: str, *, field_name: str) -> str:
-    """Raise `ValueError` if `value` is empty, or differs from its own
-    `.strip()` — a padded id like `"co-1 "` must not silently defeat
-    dedupe or symbol matching.
+    """Raise `ValueError` if `value` isn't a `str`, is empty, or differs
+    from its own `.strip()` — a padded id like `"co-1 "` must not silently
+    defeat dedupe or symbol matching. A non-`str` (e.g. an `int`) is checked
+    explicitly, matching the other validators in this module, rather than
+    left to raise `AttributeError` from `.strip()`.
     """
-    if not value or value != value.strip():
+    if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(
             f"{field_name} must be non-empty with no leading/trailing whitespace, got {value!r}"
         )
@@ -54,11 +56,18 @@ def _validate_positive_finite(value: float, *, field_name: str) -> float:
     """Raise `ValueError` unless `value` is a finite, positive, non-bool
     real number. `nan <= 0` and `inf <= 0` are both `False`, so a plain
     `value <= 0` check alone lets NaN/infinity through; `bool` is a
-    subclass of `int` and must be rejected explicitly too.
+    subclass of `int` and must be rejected explicitly too. An `int` too
+    large to convert to `float` (e.g. `10**400`) makes `math.isfinite`
+    raise `OverflowError` rather than return `False`; that's caught and
+    raised as the same `ValueError` as any other non-finite value.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"{field_name} must be a real number, got {value!r}")
-    if not math.isfinite(value) or value <= 0:
+    try:
+        is_finite = math.isfinite(value)
+    except OverflowError:
+        is_finite = False
+    if not is_finite or value <= 0:
         raise ValueError(f"{field_name} must be a positive, finite number, got {value!r}")
     return float(value)
 
@@ -125,8 +134,9 @@ class UnknownOrderError(Exception):
 
 
 class OrderNotOpenError(Exception):
-    """Raised by `cancel` when the order exists but is already `FILLED` or
-    `CANCELLED` — the caller is never silently ignored."""
+    """Raised by `cancel` (or `FakeBroker.simulate_fill`) when the order
+    exists but is already `FILLED` or `CANCELLED` — the caller is never
+    silently ignored."""
 
 
 @dataclass(frozen=True)

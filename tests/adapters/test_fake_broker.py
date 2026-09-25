@@ -319,6 +319,14 @@ def test_quantity_rejects_bool() -> None:
         make_request(quantity=True)  # type: ignore[arg-type]
 
 
+def test_quantity_huge_int_raises_value_error_not_overflow_error() -> None:
+    # math.isfinite raises OverflowError (not a bool) on an int too large to
+    # convert to float; that must surface as the same ValueError as any
+    # other invalid quantity, not leak as an unhandled OverflowError.
+    with pytest.raises(ValueError, match="quantity"):
+        make_request(quantity=10**400)
+
+
 @pytest.mark.parametrize("bad_quantity", [0, -5, float("nan"), float("inf")])
 def test_quantity_must_be_positive_finite_on_fill(bad_quantity: float) -> None:
     with pytest.raises(ValueError, match="quantity"):
@@ -391,6 +399,14 @@ def test_client_order_id_must_not_have_surrounding_whitespace() -> None:
         make_request(client_order_id="co-1 ")
 
 
+def test_client_order_id_non_str_raises_value_error_not_attribute_error() -> None:
+    # A non-str id (e.g. a plain int) used to reach `.strip()` and raise
+    # AttributeError instead of the ValueError every other invalid field
+    # raises.
+    with pytest.raises(ValueError, match="client_order_id"):
+        make_request(client_order_id=123)  # type: ignore[arg-type]
+
+
 def test_side_string_is_coerced_and_nets_correctly() -> None:
     broker, _ = make_broker()
     request = OrderRequest(
@@ -433,20 +449,54 @@ def test_naive_datetime_raises_on_fill() -> None:
 
 
 def test_naive_clock_raises_on_submit() -> None:
-    broker = FakeBroker(clock=lambda: datetime(2026, 1, 5, 15, 0))  # noqa: DTZ001  # naive
+    # A closure driven by a mutable mode holder, so the same broker instance
+    # can be switched from a naive clock to a good (tz-aware) one between
+    # calls — `make_clock` always advances from a fixed tz-aware start and
+    # can't be flipped to naive, so it doesn't fit here.
+    mode = ["naive"]
+
+    def clock() -> datetime:
+        return datetime(2026, 1, 5, 15, 0) if mode[0] == "naive" else T0  # noqa: DTZ001
+
+    broker = FakeBroker(clock=clock)
     with pytest.raises(ValueError, match="tz-aware"):
         broker.submit(make_request())
+
+    # Switch to a good clock: resubmitting the same client_order_id then
+    # succeeds, because the earlier failed submit never recorded a partial
+    # order (it raised while constructing the `Order`, before `self._orders`
+    # was touched).
+    mode[0] = "good"
+    order = broker.submit(make_request())
+    assert order.client_order_id == "co-1"
+    assert order.status is OrderStatus.FILLED
 
 
 def test_naive_clock_raises_on_simulate_fill_path() -> None:
-    broker = FakeBroker(
-        clock=lambda: datetime(2026, 1, 5, 15, 0),  # noqa: DTZ001  # naive
-        auto_fill=False,
-    )
-    # submit itself constructs an Order with the naive submitted_at, so it
-    # raises before an order is ever recorded as open.
+    # First call (submit) returns a tz-aware datetime so the order is
+    # recorded as OPEN; the second call (simulate_fill) returns a naive one,
+    # so the failure is actually exercised inside `simulate_fill` rather
+    # than inside `submit`.
+    mode = ["good"]
+
+    def clock() -> datetime:
+        return T0 if mode[0] == "good" else datetime(2026, 1, 5, 15, 0, 1)  # noqa: DTZ001
+
+    broker = FakeBroker(clock=clock, auto_fill=False)
+    order = broker.submit(make_request())
+    assert order.status is OrderStatus.OPEN
+
+    mode[0] = "bad"
     with pytest.raises(ValueError, match="tz-aware"):
-        broker.submit(make_request())
+        broker.simulate_fill(order.client_order_id)
+
+    # The naive `filled_at` makes `Fill` construction raise before any
+    # fill/position state is recorded and before the order's status changes
+    # — it is still OPEN, so a following `cancel` succeeds.
+    cancelled = broker.cancel(order.client_order_id)
+    assert cancelled.status is OrderStatus.CANCELLED
+    assert broker.fills() == []
+    assert broker.positions() == {}
 
 
 def test_non_utc_clock_is_normalized_to_utc() -> None:
