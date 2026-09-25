@@ -49,8 +49,8 @@ range. The owner chose this (option (b) on
 a config-gated exemption that would apply such rows from `valid_from`: a
 current snapshot lists survivors only, so the exemption would add
 survivorship bias, and a row's `valid_from` can predate the IPO. The
-consequence is accepted: pre-2019 `snapshot_static` listings (and seeded
-benchmark rows) are unknown before their snapshot fetch. The spec's
+consequence is accepted: pre-2019 `snapshot_static` listings are unknown
+before their snapshot fetch, so early backfill coverage is thin. The spec's
 `snapshot_static` exception governs which *columns* a consumer may treat
 as valid before `known_at` once it already sees the row; it never makes a
 row visible early, and no consumer may read `listings` directly to get
