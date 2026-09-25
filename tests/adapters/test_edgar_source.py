@@ -56,6 +56,22 @@ EXCHANGE_LINE = index_line("25-NSE", "Nasdaq Stock Market LLC", 1354457, "2026-0
 MISSING_LINE = index_line("8-K", "Apple Inc.", 320193, "2026-09-24", MISSING)
 
 
+KLX_AT = "2026-09-24T14:08:40"
+
+
+def _payload(cik: int, *filings: tuple[str, str, str]) -> dict[str, object]:
+    """A synthetic submissions payload: (accession, form, acceptance in UTC)."""
+    accessions, forms, stamps = zip(*filings, strict=True)
+    columns = {
+        "accessionNumber": list(accessions),
+        "form": list(forms),
+        "primaryDocument": ["doc.htm"] * len(filings),
+        "isInlineXBRL": [0] * len(filings),
+        "acceptanceDateTime": [f"{at}.000Z" for at in stamps],
+    }
+    return {"cik": str(cik), "name": "Synthetic", "filings": {"recent": columns}}
+
+
 def _router(
     last: tuple[int, int] = (2026, 3), overrides: dict[tuple[int, int], str | int] | None = None
 ) -> EdgarRouter:
@@ -125,16 +141,9 @@ def test_the_exchange_copy_is_dropped_even_when_the_exchange_is_an_issuer(
     exchange_10k = index_line("10-K", "Nasdaq Stock Market LLC", 1354457, "2024-02-20", ten_k)
     recorded = (FIXTURES / "filing_index_2024_qtr1.txt").read_text()
     router = _router(overrides={(2024, 1): recorded + exchange_10k})
-    columns = {
-        "accessionNumber": [ten_k, KLX_25NSE],
-        "form": ["10-K", "25-NSE"],
-        "primaryDocument": ["a.htm", "primary_doc.xml"],
-        "isInlineXBRL": [1, 0],
-        "acceptanceDateTime": ["2024-02-20T21:00:00.000Z", "2026-09-24T14:08:40.000Z"],
-    }
     router.add(
         f"{SUBMISSIONS_URL}CIK0001354457.json",
-        {"cik": "1354457", "name": "Nasdaq Stock Market LLC", "filings": {"recent": columns}},
+        _payload(1354457, (ten_k, "10-K", "2024-02-20T21:00:00"), (KLX_25NSE, "25-NSE", KLX_AT)),
     )
     entries = _source(settings, router).filing_index()
     assert [(e.cik, e.form) for e in entries if e.cik == "0001354457"] == [("0001354457", "10-K")]
@@ -379,3 +388,42 @@ def test_quarters_and_settling_follow_eastern_time(settings: Settings) -> None:
         settings, _router(last=(2026, 4), overrides={(2026, 4): 404}), clock=later
     ).filing_index()
     assert "2026-QTR3" in _cached_quarters(settings)
+
+
+def test_a_self_filed_form_25_stays_under_every_cik_that_lists_it(settings: Settings) -> None:
+    """A parent's own Form 25 naming a co-registrant: only a 25-NSE's filer
+    copy is dropped (quant-auditor, owner decision on #184)."""
+    form_25 = "0001111111-26-000001"
+    lines = (
+        index_line("10-K", "Parent Corp", 1111111, "2026-08-03", "0001111111-26-000000"),
+        index_line("25", "Parent Corp", 1111111, "2026-09-01", form_25),
+        index_line("25", "Parent Finance LLC", 2222222, "2026-09-01", form_25),
+    )
+    router = _router(overrides={(2026, 3): _synthetic(KLX_LINE, *lines)})
+    at = "2026-09-01T20:00:00"
+    router.add(
+        f"{SUBMISSIONS_URL}CIK0001111111.json",
+        _payload(
+            1111111, ("0001111111-26-000000", "10-K", "2026-08-03T20:00:00"), (form_25, "25", at)
+        ),
+    )
+    router.add(f"{SUBMISSIONS_URL}CIK0002222222.json", _payload(2222222, (form_25, "25", at)))
+    entries = _source(settings, router).filing_index()
+    assert sorted(e.cik for e in entries if e.accession == form_25) == ["0001111111", "0002222222"]
+
+
+def test_a_company_seen_only_through_its_delisting_is_kept(settings: Settings) -> None:
+    """A CIK with no issuer form but named as the subject of an exchange's
+    25-NSE is an issuer; the exchange, as filer, is not."""
+    gone = "0001354457-26-000905"
+    lines = (
+        index_line("25-NSE", "Gone Corp", 3333333, "2026-09-24", gone),
+        index_line("25-NSE", "Nasdaq Stock Market LLC", 1354457, "2026-09-24", gone),
+    )
+    router = _router(overrides={(2026, 3): _synthetic(KLX_LINE, *lines)})
+    router.add(f"{SUBMISSIONS_URL}CIK0003333333.json", _payload(3333333, (gone, "25-NSE", KLX_AT)))
+    source = _source(settings, router)
+    entries = source.filing_index()
+    assert [(e.cik, e.form) for e in entries if e.accession == gone] == [("0003333333", "25-NSE")]
+    assert "0001354457" not in {e.cik for e in entries}
+    assert source.skipped_filers == 3

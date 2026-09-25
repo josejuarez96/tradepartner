@@ -6,10 +6,14 @@ fetch, what to keep and what to cache under `edgar.cache_dir`.
 
 **Scale.** The full index lists about a million filers over 1993 onward, so
 `filing_index` keeps only issuer CIKs: those with at least one
-`master.issuer_forms` row other than a Form 25 or 25-NSE. It keeps all their
-rows (classification reads the other forms) and counts the other filers on
-`.skipped_filers`. The quarterly indexes are read twice (issuers first, then
-their rows), so no more than one quarter's full text is parsed at a time.
+`master.issuer_forms` row other than a Form 25 or 25-NSE, or named as the
+subject (not the filer) of a Form 25 or 25-NSE, so a company seen only
+through its delisting is not lost. It keeps all their rows (classification
+reads the other forms) and counts the other filers on `.skipped_filers`.
+The exchange's own copy of a 25-NSE is dropped; a Form 25, which the issuer
+files itself, stays under every CIK that lists it. The quarterly indexes
+are read twice (issuers first, then their rows), so no more than one
+quarter's full text is parsed at a time.
 
 **Caches.** A quarter's raw `form.idx` is cached, gzipped, only when fetched
 `edgar.index_settle_days` or more after its Eastern-time end; younger
@@ -69,6 +73,8 @@ PARSER_VERSION = 1
 
 _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
+#: Filed by the exchange, so the filer's own copy is not a delisting of the filer.
+_EXCHANGE_FORMS = frozenset({"25-NSE", "25-NSE/A"})
 
 Quarter = tuple[int, int]
 
@@ -175,6 +181,8 @@ class EdgarFilingSource(FilingSource):
                 issuers.add(row.cik)
             if row.form in _DELISTING_FORMS:
                 delisting_ciks.setdefault(row.accession, set()).add(row.cik)
+                if not _filed_by(row):
+                    issuers.add(row.cik)  # the subject of a delisting
         self.skipped_filers = len(filers - issuers)
 
         kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
@@ -182,8 +190,8 @@ class EdgarFilingSource(FilingSource):
             if row.cik not in issuers:
                 continue
             if (
-                row.form in _DELISTING_FORMS
-                and int(row.accession[:10]) == int(row.cik)
+                row.form in _EXCHANGE_FORMS
+                and _filed_by(row)
                 and len(delisting_ciks[row.accession]) > 1
             ):
                 continue  # the exchange's copy of a 25-NSE; the subject company keeps it
@@ -362,6 +370,11 @@ class EdgarFilingSource(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         _t11c()
+
+
+def _filed_by(row: UnstampedFiling) -> bool:
+    """Whether `row` is listed under the CIK that submitted it (the accession prefix)."""
+    return int(row.accession[:10]) == int(row.cik)
 
 
 def _t11c() -> NoReturn:
