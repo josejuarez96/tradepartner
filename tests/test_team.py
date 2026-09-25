@@ -205,7 +205,7 @@ def test_claim_creates_issue_comments_and_labels(
     assert {"task:T5", "type:feat", "phase:2", "team:atlas"} <= set(issue.labels)
     assert {"task:T5", "type:feat", "phase:2", "team:atlas"} <= gh.labels
     assert gh.comments[issue.number] == ["claim: team:atlas"]
-    assert "git switch -c feat/100-fixture-universe-csv-and" in capsys.readouterr().out
+    assert "git switch -c feat/100-fixture-universe-csv-and origin/main" in capsys.readouterr().out
 
 
 def test_claim_refuses_unready_owner_and_done_tasks(root: Path) -> None:

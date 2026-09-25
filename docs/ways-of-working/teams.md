@@ -12,7 +12,7 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 | Term | Meaning |
 |---|---|
-| **Team** | One orchestrator chat window plus **one clone** of the repo. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who merges. The window he types in is a team like any other. |
+| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who merges. The session he types in is a team like any other. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
 | **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
@@ -20,19 +20,23 @@ This document adds the missing layer so that **any number of Claude Code windows
 | **Chain** | Consecutive dependent tasks that one team should keep (listed per plan). |
 | **Parked** | Label on a green PR whose team stopped. Re-claim its issue and continue the branch. |
 
-## Set up a team (once per window)
+## Set up a team (once per session)
+
+**In this repo, from a new Claude Code session (VS Code or terminal).** The session first takes a working directory nobody else uses, then registers:
 
 ```bash
-git clone git@github.com:josejuarez96/tradepartner.git ~/Projects/tradepartner-<name>
-cd ~/Projects/tradepartner-<name>
-uv sync && uv run pre-commit install
-uv run python scripts/team.py register <name>      # writes .team (gitignored), creates label team:<name>
+git worktree add --detach .claude/worktrees/<name> origin/main   # or Claude Code's EnterWorktree tool
+cd .claude/worktrees/<name>
+uv run python scripts/team.py register <name>      # writes .team here (gitignored), creates label team:<name>
 ```
 
-- **One clone per team, always.** Two windows in one directory collide on `.claude/worktrees/` and on `.team`.
-- Names are short and lowercase (`atlas`, `team-b`). A window that is closed for good keeps its name; the next window may reuse it or pick a new one.
-- Subagent worktrees under `.claude/worktrees/` inherit the clone's team: the tool finds `.team` through the worktree's common git dir.
-- Everything else (permissions, hooks, agents) comes with the clone from `.claude/settings.json` and `.pre-commit-config.yaml`.
+The main checkout (`~/Projects/tradepartner`) is a working directory like any other; whichever session registered there owns it. A **separate clone** (`git clone … ~/Projects/tradepartner-<name>`, then `uv sync && uv run pre-commit install && register <name>`) works the same and is only needed for a second VS Code window.
+
+- **One session per working directory, always.** Two sessions in one directory switch branches under each other. `.team` marks whose directory it is.
+- Names are short and lowercase (`atlas`, `team-b`). A session that is closed for good keeps its name; the next session may reuse it or pick a new one.
+- Implementer subagents get their own worktrees and are told the team name by the orchestrator; they verify the issue's `team:` label and never claim themselves.
+- Branch from `origin/main`, not a local `main`: `git fetch origin && git switch -c <branch> origin/main` (the claim output prints this). A worktree cannot check out `main` while the main checkout has it.
+- Hooks and permissions are shared through the repo (`.pre-commit-config.yaml`, `.claude/settings.json`).
 
 ## Session protocol (replaces the generic one for build sessions)
 
@@ -40,7 +44,7 @@ uv run python scripts/team.py register <name>      # writes .team (gitignored), 
 1. Read `docs/STATUS.md`.
 2. `uv run python scripts/team.py status`: who holds what, the ready frontier, loose issues, parked PRs.
 3. `uv run python scripts/team.py claim <Tn | issue#>`. If it says the item is held by another team, pick the next one. **Never** start anyway.
-4. Branch as the claim output suggests (`<prefix>/<issue#>-<slug>` from the latest `main`), then work as usual: `implementer` subagents in their own worktrees, tests first, draft PR early.
+4. Branch as the claim output suggests (`<prefix>/<issue#>-<slug>` from `origin/main`), then work as usual: `implementer` subagents in their own worktrees, tests first, draft PR early.
 
 **During**
 - One `implementer` per claimed task. Run several in parallel only on tasks with disjoint files.
@@ -102,7 +106,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 ## Never
 
 - Start from STATUS "Next up" without a claim.
-- Share a clone between windows, or run two orchestrators in one directory.
+- Run two sessions in one working directory.
 - Touch a branch, PR or issue that another team currently **holds** (a released or parked one is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
 - Merge. The owner merges, or explicitly tells one main session to (git-workflow rule 7).

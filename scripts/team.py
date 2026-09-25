@@ -9,7 +9,7 @@ I/O so it can be unit-tested; every GitHub call goes through the ``GitHub`` prot
 Plans are read from ``origin/main`` (after a fetch), never from the working tree, so a
 checkbox ticked inside an unmerged PR does not make the next task look ready.
 
-Usage (from a team's clone or one of its worktrees)::
+Usage (from the team's working directory: its own worktree of this repo, or its own clone)::
 
     uv run python scripts/team.py register <name>
     uv run python scripts/team.py whoami
@@ -336,9 +336,12 @@ def _git(root: Path | None, *args: str) -> str:
 
 
 def repo_root() -> Path:
-    """The main clone's root, also when called from inside one of its worktrees."""
-    common = _git(None, "rev-parse", "--git-common-dir")
-    return (Path.cwd() / common).resolve().parent
+    """Root of the current working directory's checkout: a worktree or the main clone.
+
+    A team is one session in one working directory, so ``.team`` lives at this root. Git
+    refs (``origin/main``, the plans) are shared with the main clone through the common dir.
+    """
+    return Path(_git(None, "rev-parse", "--show-toplevel")).resolve()
 
 
 def current_team(root: Path) -> str | None:
@@ -559,7 +562,7 @@ def cmd_claim(
         gh.add_labels(issue.number, [team_label])
     _set_parked(gh, issue.number, parked=False)
     print(f"claimed #{issue.number} '{issue.title}' for team {team}")
-    print(f"branch: git switch main && git pull && git switch -c {suggest_branch(issue)}")
+    print(f"branch: git fetch origin && git switch -c {suggest_branch(issue)} origin/main")
     return 0
 
 
