@@ -73,8 +73,12 @@ Team directories live **outside the repo** on purpose: a session that lists file
 In this order:
 1. The next task in the chain you are already on. Context carries over and the files are yours already.
 2. Any task on the ready frontier.
-3. Any unclaimed `size:S` issue (fixes and follow-ups other teams filed).
-4. Nothing ready: **do not invent work.** Report to the owner. Parallelism is bounded by the plan's dependency graph, not by the number of windows; another window only helps once the frontier widens.
+3. Any unclaimed issue with a size label, smallest first. That includes:
+   - `size:S` fixes and follow-ups other teams filed;
+   - `type:research` issues, which are written briefs: claim one, run the `researcher` agent on it (Opus), one issue per run, report PR to `docs/research/`;
+   - `type:decision` and `type:docs` issues (ADR, spec or plan drafts): Fable-tier per agents.md, `spec-critic` before ready, owner accepts by merging.
+   An issue with no size label is not ready to claim; ask the owner to size it.
+4. Nothing left: **do not invent work.** Report to the owner. Parallelism is bounded by the plan's dependency graph, not by the number of windows; another window only helps once the frontier widens.
 
 Chains are a preference, not a lock. Every task is still claimed individually.
 
