@@ -13,10 +13,13 @@ always read with no `since`, so delisted names exist at every historical T.
 **One `security_id` per listed class** (see `store/schema.py`). The CIK's
 first security is `primary_security_id(cik)` (the CIK itself). Cover pages
 (`dei:Security12bTitle`, `TradingSymbol`, `SecurityExchangeName`) are walked
-in acceptance order; each listed class matches an existing class by a
-ticker it currently trades under, else by its title up to the first comma
-(so a reworded par-value clause is the same class). The first class on the
-earliest cover page is the primary; any later unmatched class becomes
+in acceptance order; each listed class matches an existing class by its
+title up to the first comma (so a reworded par-value clause is the same
+class), else by a ticker it currently trades under, and no class takes two
+items of one page unless it is the same ticker on a second exchange. Title
+first means two classes that swap tickers keep their own ids. The primary
+is the first common-equity class (`_COMMON_WORDS`) on the earliest cover
+page, else its first class; any later unmatched class becomes
 `<cik>:<title-slug>`, with a `securities` row known at the cover page that
 first names it. A class whose ticker and title both change on one cover
 page is read as a new class: a documented limit, not a guess.
@@ -28,16 +31,20 @@ does not. `valid_from` is the XNYS session on or after the acceptance's
 New York date; `known_at` is the acceptance.
 
 **Snapshot listings** (pre-~2019 names have no cover page). A companies
-snapshot entry attaches to the class currently trading under its ticker, or
-to the primary of a CIK with no cover page and exactly one snapshot entry;
-anything else is returned in `unmatched_snapshot` rather than guessed. When
+snapshot entry attaches to the class trading under its ticker on the cover
+pages known at its `fetched_at` (never later ones), or to the primary of a
+CIK with no cover page yet and one ticker in that fetch; anything else is
+returned in `unmatched_snapshot` rather than guessed. When
 `master.static_columns` includes both `ticker` and `exchange`, the row is
 `snapshot_static` and `valid_from` is the class's first session, but only
 where no cover page covers that span and the class's earliest cover-page
 listing has the snapshot's ticker and exchange (a changed ticker leaves the
 earlier one unknown: reported, not written). Otherwise the row is
 `snapshot`, valid from the fetch session, and only for a class with no
-cover page. `known_at` is always the fetch time.
+cover page. `known_at` is always the fetch time. Only the earliest fetch
+writes a class's static span. A name delisted before the snapshot and
+before cover pages has no listing at all: it is returned in
+`unlisted_securities` so health and the survivorship gap can count it.
 
 **Issue #35 is open.** Whether a `snapshot_static` row may be read before
 its own `known_at` is an owner decision. This module writes the honest
@@ -92,6 +99,10 @@ class MasterBuild:
     listings: tuple[Row, ...]
     unmatched_snapshot: tuple[CompanySnapshotEntry, ...]
     missing_benchmarks: tuple[str, ...]
+    unlisted_securities: tuple[str, ...] = ()
+
+
+_Pairs = frozenset[tuple[str, str]]
 
 
 @dataclass
@@ -99,8 +110,23 @@ class _Class:
     security_id: str
     known_at: datetime
     titles: set[str] = field(default_factory=set)
-    pairs: set[tuple[str, str]] = field(default_factory=set)
-    first_listing: tuple[str, str, date] | None = None
+    pairs: _Pairs = frozenset()  # (ticker, exchange) on the latest cover page showing it
+    history: list[tuple[datetime, _Pairs]] = field(default_factory=list)
+    first_listing: tuple[str, str, date, datetime] | None = None  # + the row's known_at
+    static_written: bool = False
+
+    def pairs_at(self, t: datetime) -> _Pairs:
+        """The pairs this class showed on the latest cover page known at `t`."""
+        shown: _Pairs = frozenset()
+        for known_at, pairs in self.history:
+            if known_at <= t:
+                shown = pairs
+        return shown
+
+    def first_listing_at(self, t: datetime) -> tuple[str, str, date] | None:
+        if self.first_listing is None or self.first_listing[3] > t:
+            return None
+        return self.first_listing[:3]
 
 
 def primary_security_id(cik: str) -> str:
@@ -108,9 +134,18 @@ def primary_security_id(cik: str) -> str:
     return cik
 
 
+#: Title words that mark a common-equity class, preferred as a CIK's primary.
+_COMMON_WORDS = ("common", "ordinary", "capital stock")
+
+
 def _norm_title(title: str) -> str:
     head = title.lower().split(",", 1)[0]
     return " ".join(re.sub(r"[^a-z0-9%]+", " ", head).split())
+
+
+def _is_common(title: str) -> bool:
+    norm = _norm_title(title)
+    return any(word in norm for word in _COMMON_WORDS)
 
 
 def _session_on_or_after(day: date) -> date:
@@ -202,20 +237,26 @@ class _Builder:
             known_at = max(page.accepted_at, first.accepted_at)
             valid_from = _session_of(page.accepted_at)
             shown: dict[str, set[tuple[str, str]]] = defaultdict(set)
-            for item in page.listings:
-                cls = _match(classes, item)
+            claimed: dict[str, str] = {}  # security_id -> ticker it took on this page
+            items = list(page.listings)
+            if not classes:  # the primary is the first common class, else the first
+                items.sort(key=lambda item: not _is_common(item.title))
+            for item in items:
+                cls = _match(classes, item, claimed)
                 if cls is None:
                     cls = self._new_class(first, item, classes, known_at)
+                claimed[cls.security_id] = item.ticker
                 cls.titles.add(_norm_title(item.title))
                 pair = (item.ticker, item.exchange)
                 shown[cls.security_id].add(pair)
                 if pair not in cls.pairs:
                     self.listing(cls.security_id, *pair, item.title, valid_from, known_at)
                     if cls.first_listing is None:
-                        cls.first_listing = (item.ticker, item.exchange, valid_from)
+                        cls.first_listing = (item.ticker, item.exchange, valid_from, known_at)
             for cls in classes:
                 if cls.security_id in shown:
-                    cls.pairs = shown[cls.security_id]
+                    cls.pairs = frozenset(shown[cls.security_id])
+                    cls.history.append((known_at, cls.pairs))
         if not classes:
             classes.append(_Class(primary_security_id(cik), first.accepted_at))
         return classes
@@ -239,21 +280,30 @@ class _Builder:
         return cls
 
     def snapshot(self, classes: list[_Class], entries: list[CompanySnapshotEntry]) -> None:
+        """Attach snapshot entries (sorted by fetch time) using only what the
+        cover pages showed by each entry's `fetched_at`, so a row's presence
+        never depends on a filing accepted after its own `known_at`."""
         for entry in entries:
-            cls = next((c for c in classes if any(t == entry.ticker for t, _ in c.pairs)), None)
-            if cls is None and len(classes) == 1 and not classes[0].pairs and len(entries) == 1:
-                cls = classes[0]
+            t = entry.fetched_at
+            listed = [c for c in classes if c.pairs_at(t)]
+            cls = next((c for c in listed if entry.ticker in {k for k, _ in c.pairs_at(t)}), None)
+            same_fetch = sum(1 for e in entries if e.fetched_at == t)
+            if cls is None and not listed and same_fetch == 1:
+                cls = classes[0]  # a CIK with no cover page yet and one ticker
             if cls is None:
                 self.unmatched.append(entry)
                 continue
-            if cls.first_listing is None:
+            if self.static and cls.static_written:
+                continue  # the earliest fetch already covered the span before cover pages
+            first_listing = cls.first_listing_at(t)
+            if first_listing is None:
                 if self.static:
                     start, provenance = _session_of(cls.known_at), "snapshot_static"
                 else:
-                    start, provenance = _session_of(entry.fetched_at), "snapshot"
+                    start, provenance = _session_of(t), "snapshot"
                 self._snapshot_listing(cls, entry, start, provenance)
             elif self.static:
-                ticker, exchange, first_from = cls.first_listing
+                ticker, exchange, first_from = first_listing
                 if (ticker, exchange) != (entry.ticker, entry.exchange):
                     self.unmatched.append(entry)
                 elif _session_of(cls.known_at) < first_from:
@@ -262,6 +312,7 @@ class _Builder:
     def _snapshot_listing(
         self, cls: _Class, entry: CompanySnapshotEntry, start: date, provenance: str
     ) -> None:
+        cls.static_written = cls.static_written or provenance == "snapshot_static"
         self.listing(
             cls.security_id,
             entry.ticker,
@@ -301,12 +352,20 @@ class _Builder:
         )
 
 
-def _match(classes: list[_Class], item: CoverListing) -> _Class | None:
-    for cls in classes:
-        if any(ticker == item.ticker for ticker, _ in cls.pairs):
-            return cls
+def _match(classes: list[_Class], item: CoverListing, claimed: dict[str, str]) -> _Class | None:
+    """The existing class `item` belongs to: the class already holding this
+    ticker and title on this page (a second exchange), else an unclaimed
+    class by title, else an unclaimed class by current ticker. Title comes
+    first so two classes swapping tickers keep their own `security_id`."""
     title = _norm_title(item.title)
-    return next((cls for cls in classes if title in cls.titles), None)
+    for cls in classes:
+        if claimed.get(cls.security_id) == item.ticker and title in cls.titles:
+            return cls
+    free = [cls for cls in classes if cls.security_id not in claimed]
+    by_title = next((cls for cls in free if title in cls.titles), None)
+    return by_title or next(
+        (cls for cls in free if item.ticker in {ticker for ticker, _ in cls.pairs}), None
+    )
 
 
 def build_master(source: FilingSource, settings: Settings, *, ingested_at: datetime) -> MasterBuild:
@@ -328,10 +387,12 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
 
     snapshot: dict[tuple[str, str, str], CompanySnapshotEntry] = {}
     for snap in source.companies_snapshot():  # earliest fetch wins per (cik, ticker, exchange)
-        snapshot.setdefault((snap.cik, snap.ticker, snap.exchange), snap)
+        key = (snap.cik, snap.ticker, snap.exchange)
+        if key not in snapshot or snap.fetched_at < snapshot[key].fetched_at:
+            snapshot[key] = snap
     benchmarks = set(settings.benchmarks)
     by_cik: dict[str, list[CompanySnapshotEntry]] = defaultdict(list)
-    for snap in sorted(snapshot.values(), key=lambda e: (e.cik, e.ticker, e.exchange)):
+    for snap in sorted(snapshot.values(), key=lambda e: (e.cik, e.fetched_at, e.ticker)):
         if snap.ticker not in benchmarks:
             by_cik[snap.cik].append(snap)
 
@@ -354,11 +415,15 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         else:
             missing.append(ticker)
 
+    listed = {row["security_id"] for row in builder.listings}
     return MasterBuild(
         securities=tuple(builder.securities),
         listings=tuple(builder.listings),
         unmatched_snapshot=tuple(builder.unmatched),
         missing_benchmarks=tuple(missing),
+        unlisted_securities=tuple(
+            row["security_id"] for row in builder.securities if row["security_id"] not in listed
+        ),
     )
 
 

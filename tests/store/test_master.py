@@ -52,6 +52,11 @@ REUSE_2 = "0000000006"  # REUSE again from 2022, a different company
 DUAL = "0000000007"  # Class A + Class C, preferred added later
 PRE = "0000000008"  # pre-2019 filer, no cover pages, in the snapshot
 STEADY = "0000000009"  # 10-K from 2012, cover pages from 2019, same ticker
+SWAP = "0000000010"  # two classes swap tickers between cover pages
+PREF = "0000000011"  # earliest cover page lists the preferred before the common
+MULTI = "0000000012"  # one class listed on two exchanges
+EARLY = "0000000013"  # snapshot fetched before a cover page that changes the ticker
+EARLY_FETCH = datetime(2018, 6, 1, 14, 0, tzinfo=UTC)
 SPY_TRUST = "0000884394"
 ISHARES = "0001100663"
 
@@ -76,8 +81,10 @@ def _cover(cik: str, accepted_at: datetime, *listings: tuple[str, str, str]) -> 
     )
 
 
-def _snap(cik: str, name: str, ticker: str, exchange: str) -> CompanySnapshotEntry:
-    return CompanySnapshotEntry(cik, name, ticker, exchange, FETCHED_AT)
+def _snap(
+    cik: str, name: str, ticker: str, exchange: str, fetched_at: datetime = FETCHED_AT
+) -> CompanySnapshotEntry:
+    return CompanySnapshotEntry(cik, name, ticker, exchange, fetched_at)
 
 
 def _source() -> FixtureFilingSource:
@@ -97,6 +104,10 @@ def _source() -> FixtureFilingSource:
             _filing(DUAL, "Dual Holdings", "10-K", _at(2015, 2, 2)),
             _filing(PRE, "Pre Static Inc", "10-K", _at(2010, 3, 1)),
             _filing(STEADY, "Steady Inc", "10-K", _at(2012, 3, 1)),
+            _filing(SWAP, "Swap Corp", "10-K", _at(2018, 2, 1)),
+            _filing(PREF, "Pref Corp", "10-K", _at(2018, 2, 2)),
+            _filing(MULTI, "Multi Corp", "10-K", _at(2018, 2, 5)),
+            _filing(EARLY, "Early Corp", "10-K", _at(2017, 3, 1)),
         ],
         cover_pages=[
             _cover(TICK, _at(2019, 3, 1), ("Common Stock, par value $0.01", "TCKA", "NYSE")),
@@ -118,6 +129,31 @@ def _source() -> FixtureFilingSource:
                 ("6% Preferred Stock", "DUP", "NYSE"),
             ),
             _cover(STEADY, _at(2019, 3, 4), ("Common Stock", "STDY", "NYSE")),
+            _cover(
+                SWAP,
+                _at(2019, 2, 1),
+                ("Class A Common Stock", "ZZ", "NYSE"),
+                ("Class B Common Stock", "ZB", "NYSE"),
+            ),
+            _cover(
+                SWAP,
+                _at(2022, 2, 1),
+                ("Class A Common Stock", "ZA", "NYSE"),
+                ("Class B Common Stock", "ZZ", "NYSE"),
+            ),
+            _cover(
+                PREF,
+                _at(2019, 2, 4),
+                ("Depositary Shares, each 1/1000th of a Series A Preferred", "PFA", "NYSE"),
+                ("Common Stock", "PFC", "NYSE"),
+            ),
+            _cover(
+                MULTI,
+                _at(2019, 2, 5),
+                ("Common Stock", "MLT", "NASDAQ"),
+                ("Common Stock", "MLT", "NYSE"),
+            ),
+            _cover(EARLY, _at(2019, 3, 1), ("Common Stock", "ERLB", "NYSE")),
         ],
         snapshot=[
             _snap(ACME, "ACME CORP", "ACME", "NYSE"),
@@ -125,6 +161,8 @@ def _source() -> FixtureFilingSource:
             _snap(DUAL, "DUAL HOLDINGS", "DUA", "NASDAQ"),
             _snap(PRE, "PRE STATIC INC", "PRE", "NYSE"),
             _snap(STEADY, "STEADY INC", "STDY", "NYSE"),
+            _snap(EARLY, "EARLY CORP", "ERLA", "NYSE", EARLY_FETCH),
+            _snap(EARLY, "EARLY CORP", "ERLB", "NYSE"),
             _snap(SPY_TRUST, "SPDR S&P 500 ETF TRUST", "SPY", "NYSE"),
             _snap(ISHARES, "iShares Trust", "MTUM", "NYSE"),
         ],
@@ -263,6 +301,31 @@ class TestDualClass:
         assert known == _at(2020, 2, 3)
         assert securities_as_of(store, _at(2020, 2, 3) - PROBE_EPSILON, [dup_id]).height == 0
 
+    def test_swapped_tickers_stay_with_their_classes(
+        self, store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Auditor SHOULD FIX 1: ZZ moves from Class A to Class B. Matching by
+        # ticker first would hand B's ZZ to A and splice two price series.
+        class_a = _listings(store, primary_security_id(SWAP))
+        assert [r["ticker"] for r in class_a] == ["ZZ", "ZA"]
+        zz_2022 = listings_as_of(store, INGESTED_AT).filter(
+            (pl.col("ticker") == "ZZ") & (pl.col("valid_from") == date(2022, 2, 1))
+        )
+        (class_b,) = zz_2022["security_id"].to_list()
+        assert class_b != primary_security_id(SWAP)
+        assert [r["ticker"] for r in _listings(store, class_b)] == ["ZB", "ZZ"]
+
+    def test_primary_is_the_common_class(self, store: duckdb.DuckDBPyConnection) -> None:
+        # Auditor SHOULD FIX 3: the preferred is listed first on the page.
+        (row,) = _listings(store, primary_security_id(PREF))
+        assert row["ticker"] == "PFC"
+
+    def test_one_class_on_two_exchanges(self, store: duckdb.DuckDBPyConnection) -> None:
+        rows = securities_as_of(store, INGESTED_AT).filter(pl.col("cik") == MULTI)
+        assert rows.height == 1
+        exchanges = {r["exchange"] for r in _listings(store, primary_security_id(MULTI))}
+        assert exchanges == {"NASDAQ", "NYSE"}
+
     def test_class_ids_are_distinct(self, store: duckdb.DuckDBPyConnection) -> None:
         tickers = listings_as_of(store, INGESTED_AT).filter(pl.col("ticker").is_in(["DUA", "DUC"]))
         assert tickers["security_id"].n_unique() == 2
@@ -307,6 +370,21 @@ class TestStaticReliance:
             if row["security_id"] == TICK and row["provenance"] != "filing"
         ]
         assert tick_static == []
+
+    def test_snapshot_matched_as_of_its_fetch(self, store: duckdb.DuckDBPyConnection) -> None:
+        # Auditor NIT 4: the 2018 fetch saw ERLA before any cover page; the
+        # 2019 cover page's ERLB must not change what that fetch wrote, and
+        # the later ERLB fetch adds no second static span.
+        rows = _listings(store, primary_security_id(EARLY))
+        assert [(r["ticker"], r["provenance"], r["valid_from"]) for r in rows] == [
+            ("ERLA", "snapshot_static", date(2017, 3, 1)),
+            ("ERLB", "filing", date(2019, 3, 1)),
+        ]
+
+    def test_unlisted_securities_are_reported(self, built: MasterBuild) -> None:
+        # Auditor SHOULD FIX 2: delisted before the snapshot and before
+        # cover pages, so no listing; reported for the survivorship gap.
+        assert built.unlisted_securities == (primary_security_id(OLDCO),)
 
     def test_strict_known_at_hides_static_row_before_fetch(
         self, store: duckdb.DuckDBPyConnection
