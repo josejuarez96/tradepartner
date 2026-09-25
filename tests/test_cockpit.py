@@ -158,5 +158,7 @@ def test_activity_state_thresholds() -> None:
 
 def test_render_embeds_data_and_escapes_script_close() -> None:
     html = cockpit.render({"generated_at": "x", "note": "</script><b>"})
-    assert "__COCKPIT_DATA__" not in html
+    assert "__COCKPIT_DATA__" not in html and "__COCKPIT_REFRESH__" not in html
     assert "</script><b>" not in html and "<\\/script>" in html
+    assert 'http-equiv="refresh"' not in html
+    assert '<meta http-equiv="refresh" content="60">' in cockpit.render({}, refresh_seconds=60)

@@ -13,6 +13,7 @@ Usage::
 
     uv run python scripts/cockpit.py                # writes data/cockpit/cockpit.html + .json
     uv run python scripts/cockpit.py --active-minutes 10 --idle-minutes 60 --out data/cockpit
+    uv run python scripts/cockpit.py --loop 60     # regenerate every 60 s; the page reloads itself
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field
@@ -459,9 +461,11 @@ def collect(
 TEMPLATE = (HERE / "cockpit_template.html").read_text
 
 
-def render(data: dict[str, Any]) -> str:
+def render(data: dict[str, Any], refresh_seconds: int = 0) -> str:
+    """Embed the data; with ``refresh_seconds`` the page reloads itself at that interval."""
     payload = json.dumps(data, default=str).replace("</", "<\\/")
-    return TEMPLATE().replace("__COCKPIT_DATA__", payload)
+    meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds > 0 else ""
+    return TEMPLATE().replace("__COCKPIT_DATA__", payload).replace("__COCKPIT_REFRESH__", meta)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -477,27 +481,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--since", default=None, help="ignore sessions last active before this ISO time"
     )
+    parser.add_argument(
+        "--loop", type=int, default=0, help="regenerate every N seconds until killed"
+    )
     args = parser.parse_args(argv)
     main_dir = team.main_root()
-    data = collect(
-        GhExtra(),
-        main_dir,
-        Path(args.projects_dir),
-        datetime.now(UTC),
-        args.active_minutes,
-        args.idle_minutes,
-        since=args.since,
-    )
     out = (main_dir / args.out) if not Path(args.out).is_absolute() else Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "cockpit.json").write_text(json.dumps(data, indent=2, default=str))
-    (out / "cockpit.html").write_text(render(data))
-    active = sum(1 for t in data["teams"] if t["state"] == "active")
-    print(
-        f"wrote {out / 'cockpit.html'}  teams={len(data['teams'])} active={active} "
-        f"plan={data['plan']['done']}/{data['plan']['total']} open_prs={len(data['open_prs'])}"
-    )
-    return 0
+
+    def once() -> None:
+        data = collect(
+            GhExtra(),
+            main_dir,
+            Path(args.projects_dir),
+            datetime.now(UTC),
+            args.active_minutes,
+            args.idle_minutes,
+            since=args.since,
+        )
+        (out / "cockpit.json").write_text(json.dumps(data, indent=2, default=str))
+        (out / "cockpit.html").write_text(render(data, refresh_seconds=args.loop))
+        active = sum(1 for t in data["teams"] if t["state"] == "active")
+        print(
+            f"{datetime.now(UTC).strftime('%H:%M:%S')} wrote {out / 'cockpit.html'}  "
+            f"teams={len(data['teams'])} active={active} "
+            f"plan={data['plan']['done']}/{data['plan']['total']} open_prs={len(data['open_prs'])}",
+            flush=True,
+        )
+
+    if args.loop <= 0:
+        once()
+        return 0
+    while True:  # a transient gh or git failure must not end the loop
+        try:
+            once()
+        except SystemExit as exc:
+            print(f"skipped this round: {exc}", flush=True)
+        time.sleep(args.loop)
 
 
 if __name__ == "__main__":
