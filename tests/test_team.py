@@ -228,6 +228,17 @@ def test_start_refuses_a_name_that_holds_open_issues(root: Path) -> None:
     assert team.cmd_start(gh, root, "orion", ref="HEAD", reuse=True) == 0
 
 
+def test_names_are_lowercased_not_refused(root: Path) -> None:
+    _init_repo(root)
+    gh = FakeGitHub()
+    assert team.cmd_start(gh, root, "Centurion ", ref="HEAD") == 0
+    path = root.parent / f"{root.name}-teams" / "centurion"
+    assert (path / team.TEAM_FILE).read_text().strip() == "centurion"
+    assert "team:centurion" in gh.labels
+    with pytest.raises(SystemExit, match="must match"):
+        team.cmd_start(gh, root, "7up", ref="HEAD")
+
+
 def test_register_never_overwrites_another_teams_directory(root: Path) -> None:
     gh = FakeGitHub()
     with pytest.raises(SystemExit, match="already belongs to team 'atlas'"):

@@ -415,9 +415,12 @@ def plan_ref_from_env() -> str | None:
 # ── commands ────────────────────────────────────────────────────────────────────
 
 
-def _validate_name(name: str) -> None:
+def _validate_name(name: str) -> str:
+    """Lowercase and validate a team name; case carries no meaning, so it is not an error."""
+    name = name.strip().lower()
     if not TEAM_NAME_RE.match(name):
         raise SystemExit("team name must match ^[a-z][a-z0-9-]{0,19}$ (e.g. atlas, team-b)")
+    return name
 
 
 def _name_in_use(gh: GitHub, name: str) -> list[int]:
@@ -426,7 +429,7 @@ def _name_in_use(gh: GitHub, name: str) -> list[int]:
 
 def cmd_register(gh: GitHub, root: Path, name: str, *, force: bool = False) -> int:
     """Mark this working directory as team ``name``. Never takes over another team's directory."""
-    _validate_name(name)
+    name = _validate_name(name)
     path = root / TEAM_FILE
     existing = path.read_text().strip() if path.exists() else None
     if existing and existing != name and not force:
@@ -447,7 +450,7 @@ def cmd_start(
     gh: GitHub, main: Path, name: str, *, ref: str = DEFAULT_PLAN_REF, reuse: bool = False
 ) -> int:
     """Create a team's own working directory outside the repo and register it, in one step."""
-    _validate_name(name)
+    name = _validate_name(name)
     path = teams_dir(main) / name
     if path.exists():
         raise SystemExit(
