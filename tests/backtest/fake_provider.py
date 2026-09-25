@@ -5,7 +5,8 @@ Every frame carries a `known_at` column and each read keeps only rows with
 `known_at <= t`, latest revision per key, so a test models a late correction or a
 restatement by adding a row with a later `known_at`. The fake does no adjustment: a
 test supplies adjusted bars directly (`prices`, and `dividend_prices` for
-`include_dividends=True` reads, defaulting to `prices`).
+`include_dividends=True` reads, defaulting to `prices`) and raw bars in `raw`
+(defaulting to `prices`).
 """
 
 from __future__ import annotations
@@ -75,6 +76,7 @@ class FakeProvider:
     members: Mapping[date, Sequence[str]]
     benchmarks: Mapping[str, str]
     dividend_prices: pl.DataFrame | None = None
+    raw: pl.DataFrame | None = None
     listing_ends_rows: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(schema=_LISTING_ENDS_SCHEMA)
     )
@@ -128,6 +130,11 @@ class FakeProvider:
             if include_dividends and self.dividend_prices is not None
             else self.prices
         )
+        return _latest(_for_ids(_known(source, t), ids), ["security_id", "session"])
+
+    def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t = self._record("raw_prices", t, ids=ids)
+        source = self.raw if self.raw is not None else self.prices
         return _latest(_for_ids(_known(source, t), ids), ["security_id", "session"])
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:

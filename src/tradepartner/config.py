@@ -122,6 +122,10 @@ class IngestConfig(BaseModel):
     # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
     # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05
+    # Not in the spec's key list; added in T16 (safety-reviewer): an ingest run's stored
+    # failure message is server-supplied text, capped so a large error page cannot fill
+    # `ingestion_runs.message` and the page that shows it.
+    max_message_chars: int = Field(default=2000, gt=0)
 
 
 class EdgarConfig(BaseModel):

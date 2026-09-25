@@ -21,6 +21,7 @@ directory it prints (a git worktree outside the repo, so other teams' files stay
     uv run python scripts/team.py claim 28             # existing issue
     uv run python scripts/team.py release T5 --park    # hand a green PR to the next team
     uv run python scripts/team.py check-claims --pr 31
+    uv run python scripts/team.py prune [--hours 6] [--yes]   # owner: drop idle retired team dirs
 """
 
 from __future__ import annotations
@@ -29,8 +30,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -739,6 +742,100 @@ def cmd_status(gh: GitHub, root: Path, *, ref: str | None = None) -> int:
     return 0
 
 
+# ── prune (owner-run, ad hoc) ───────────────────────────────────────────────────
+
+PRUNE_DEFAULT_HOURS = 6
+PRUNE_IGNORE = frozenset({".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+
+
+@dataclass(frozen=True)
+class TeamDir:
+    name: str
+    path: Path
+    newest_mtime: float  # newest top-level entry, ignoring caches and the venv
+    dirty: bool  # uncommitted changes
+    registered: bool  # has a .team file
+
+
+def prune_candidates(
+    dirs: Sequence[TeamDir], active: Iterable[str], *, now: float, hours: float
+) -> tuple[list[TeamDir], list[tuple[TeamDir, str]]]:
+    """Split team directories into (remove, skipped-with-reason). Pure.
+
+    Removed only when the team holds no open claim, the directory has been idle longer
+    than ``hours``, it is a registered team directory and it has no uncommitted changes.
+    A team between claims keeps its directory as long as it keeps touching it.
+    """
+    active_set = set(active)
+    remove: list[TeamDir] = []
+    skipped: list[tuple[TeamDir, str]] = []
+    for d in sorted(dirs, key=lambda d: d.name):
+        idle_h = (now - d.newest_mtime) / 3600
+        if d.name in active_set:
+            skipped.append((d, "holds an open claim"))
+        elif not d.registered:
+            skipped.append((d, "no .team file; not a team directory"))
+        elif d.dirty:
+            skipped.append((d, "uncommitted changes; look before removing by hand"))
+        elif idle_h < hours:
+            skipped.append((d, f"touched {idle_h:.1f}h ago (< {hours:g}h)"))
+        else:
+            remove.append(d)
+    return remove, skipped
+
+
+def scan_team_dirs(base: Path) -> list[TeamDir]:
+    """Read every directory under the teams dir into a ``TeamDir`` (I/O only, no decisions)."""
+    out: list[TeamDir] = []
+    if not base.is_dir():
+        return out
+    for path in sorted(p for p in base.iterdir() if p.is_dir()):
+        entries = [e for e in path.iterdir() if e.name not in PRUNE_IGNORE]
+        newest = max([path.stat().st_mtime, *(e.stat().st_mtime for e in entries)])
+        try:
+            dirty = bool(_git(path, "status", "--porcelain"))
+        except subprocess.CalledProcessError:
+            dirty = True  # not a working git checkout: treat as needing a look
+        out.append(TeamDir(path.name, path, newest, dirty, (path / TEAM_FILE).is_file()))
+    return out
+
+
+def active_teams(gh: GitHub) -> set[str]:
+    """Teams holding at least one open claimed issue (by label)."""
+    return {t for issue in gh.list_issues() for t in team_labels_of(issue.labels)}
+
+
+def cmd_prune(
+    gh: GitHub, main: Path, *, hours: float = PRUNE_DEFAULT_HOURS, yes: bool = False
+) -> int:
+    """Owner-run, ad hoc: remove idle team directories whose team holds no claim."""
+    base = teams_dir(main)
+    remove, skipped = prune_candidates(
+        scan_team_dirs(base), active_teams(gh), now=time.time(), hours=hours
+    )
+    for d, why in skipped:
+        print(f"keep    {d.name:<14} {why}")
+    if not remove:
+        print("nothing to prune")
+        return 0
+    for d in remove:
+        idle_h = (time.time() - d.newest_mtime) / 3600
+        label = "remove" if yes else "would remove"
+        print(f"{label:<13}{d.name:<14} idle {idle_h:.0f}h  {d.path}")
+    if not yes:
+        noun = "directory" if len(remove) == 1 else "directories"
+        print(f"dry run: {len(remove)} {noun}; pass --yes to remove")
+        return 0
+    for d in remove:
+        try:
+            _git(main, "worktree", "remove", "--force", str(d.path))
+        except subprocess.CalledProcessError:
+            shutil.rmtree(d.path, ignore_errors=True)
+    _git(main, "worktree", "prune")
+    print(f"removed {len(remove)}; run this again after the next batch of teams finishes")
+    return 0
+
+
 def cmd_check_claims(gh: GitHub, pr_number: int) -> int:
     """CI guard for one PR.
 
@@ -838,6 +935,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", default="", help="required with --force")
     p = sub.add_parser("check-claims", help="CI guard for one PR")
     p.add_argument("--pr", type=int, required=True)
+    p = sub.add_parser("prune", help="owner, ad hoc: remove idle team dirs with no open claim")
+    p.add_argument("--hours", type=float, default=PRUNE_DEFAULT_HOURS, help="idle threshold")
+    p.add_argument("--yes", action="store_true", help="remove; without it, print the plan")
     return parser
 
 
@@ -851,6 +951,8 @@ def main(argv: Sequence[str] | None = None, gh: GitHub | None = None) -> int:
     match args.command:
         case "start":
             return cmd_start(gh, main_root(), args.name, reuse=args.reuse)
+        case "prune":
+            return cmd_prune(gh, main_root(), hours=args.hours, yes=args.yes)
         case "register":
             return cmd_register(gh, root, args.name, force=args.force)
         case "whoami":
