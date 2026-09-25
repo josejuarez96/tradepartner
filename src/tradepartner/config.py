@@ -52,6 +52,18 @@ def _default_env_file() -> Path:
     return Path(__file__).resolve().parents[2] / ".env"
 
 
+def _default_edgar_cache_dir() -> str:
+    """`data/edgar_cache`, anchored to the project root the same way `.env` is.
+
+    A relative default would resolve against the process's current working
+    directory, which breaks the moment `cli_record`/ingest run from a
+    different directory (e.g. a scheduled job run from `$HOME`); T2 review
+    round 2 (safety-reviewer) flagged this after `download_filing_file`
+    started writing there.
+    """
+    return str(Path(__file__).resolve().parents[2] / "data" / "edgar_cache")
+
+
 class CalendarConfig(BaseModel):
     """XNYS calendar bounds.
 
@@ -110,9 +122,26 @@ class IngestConfig(BaseModel):
 
 
 class EdgarConfig(BaseModel):
-    """SEC EDGAR access, incl. `edgartools`' local cache."""
+    """SEC EDGAR access, incl. `edgartools`' local cache.
 
-    cache_dir: str = "data/edgar_cache"
+    `requests_per_second`/`retry_backoff_seconds`/`request_timeout_seconds`/
+    `header_bytes` were added in T2 review round 2 (safety-reviewer SHOULD
+    FIX): `adapters/edgar_raw.py`'s throttle, retry backoff, HTTP timeout
+    and SGML-header slice size were hardcoded module constants; CLAUDE.md
+    requires thresholds to come from config. `max_retry_after_seconds` was
+    added in round 3 (safety-reviewer MUST FIX): an SEC response naming an
+    unreasonably large (or non-finite) `Retry-After` must not make
+    `edgar_raw` sleep for that long, or at all, on a NaN/infinite value.
+    Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
+    is nonsensical and would either hang or hot-loop `edgar_raw`.
+    """
+
+    cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
+    requests_per_second: float = Field(default=10.0, gt=0)
+    retry_backoff_seconds: float = Field(default=1.0, gt=0)
+    request_timeout_seconds: float = Field(default=30.0, gt=0)
+    header_bytes: int = Field(default=4096, gt=0)
+    max_retry_after_seconds: float = Field(default=120.0, gt=0)
 
 
 class MasterConfig(BaseModel):

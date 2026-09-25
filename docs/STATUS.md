@@ -11,16 +11,16 @@
 - #8 Phase 2 spec and plan (PR #11). #12 Phase 1 retro, v0.1.0 tagged
 
 - Phase 2 T1: config, dependencies, calendar (PR #17)
-- Phase 2 T4: store schema, db layer, shared test loader (PR TBD, issue #19)
+- Phase 2 T4: store schema, db layer, shared test loader (PR #20)
+- Phase 2 T2: raw-fetch clients (Alpaca, EDGAR) and fixture recorder, with secret/email/User-Agent scrub (PR #21)
 
 ## In progress
-- T2 (raw clients and recorder) via `implementer`
+- **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts
 
 ## Next up
-1. T5 (fixture universe) and T20 (fake broker), unblocked now that T4 is done, in parallel via `implementer`
-2. **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts (depends on T2)
-3. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
-4. Decide whether to upgrade to GitHub Pro to enforce the `main` ruleset server-side
+1. T5 (fixture universe) and T20 (fake broker) in parallel via `implementer`
+2. Remaining handoff §12 decisions (risk rules, execution, logging schema, LLM role) become ADRs in the phase that needs them; G1–G8 research likewise (G8 at Phase 3 start)
+3. Decide whether to upgrade to GitHub Pro to enforce the `main` ruleset server-side
 
 ## Blocked
 - none
