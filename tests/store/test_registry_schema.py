@@ -12,6 +12,7 @@ still pass.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -100,6 +101,20 @@ def _fact_table_snapshot(conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
         rows = conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall()
         snapshot[table] = (ddl, constraints, rows)
     return snapshot
+
+
+#: SHA-256 of `"".join(schema._TABLE_DDL)` as Phase 2 shipped it (version 1).
+_V1_DDL_SHA256 = "4e38b87e7e55fa352b47b762fde086db49bd6c1418a4915bc8047af0ffd16295"
+
+
+def test_version_1_ddl_is_pinned() -> None:
+    """Stores on disk were built from this DDL. A fact-table change goes to
+    schema version 3 with its own migration, never an edit here (spec req 9)."""
+    digest = hashlib.sha256("".join(schema._TABLE_DDL).encode()).hexdigest()
+    assert digest == _V1_DDL_SHA256, (
+        "version-1 DDL changed: bump to schema version 3 and add a migration "
+        "instead of editing the version-1 tables"
+    )
 
 
 @pytest.fixture
@@ -272,6 +287,17 @@ def test_registry_valid_rows_insert(table: str) -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     _insert(conn, table, _VALID_ROWS[table])
+
+
+def test_trials_row_without_a_resolvable_cutoff_inserts() -> None:
+    """A refused run whose requested end is off the trading calendar is still
+    a trial: its row must insert with no `data_cutoff`."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    row = dict(_VALID_ROWS["trials"])
+    row["end_session"] = "2099-12-31"
+    row["data_cutoff"] = None
+    _insert(conn, "trials", row)
 
 
 def test_trial_results_holds_one_row_per_trial() -> None:

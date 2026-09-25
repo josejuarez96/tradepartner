@@ -320,7 +320,11 @@ CREATE TABLE IF NOT EXISTS hypotheses (
 # No CHECK on the window: a refused window (start after end, or outside
 # the in-sample range) is still a trial and must be recorded. code_dirty
 # is NULL when code_version is 'unknown' (outside a git checkout);
-# store_max_ingested_at is NULL on a store with no fact rows.
+# store_max_ingested_at is NULL on a store with no fact rows. The two
+# session columns hold the requested window dates as given; data_cutoff
+# (the close of the end session) is NULL when the requested end cannot
+# be resolved on the trading calendar, so that refusal still leaves a
+# trials row.
 _CREATE_TRIALS = """
 CREATE TABLE IF NOT EXISTS trials (
     trial_id BIGINT NOT NULL PRIMARY KEY,
@@ -329,7 +333,7 @@ CREATE TABLE IF NOT EXISTS trials (
     started_at TIMESTAMPTZ NOT NULL,
     start_session DATE NOT NULL,
     end_session DATE NOT NULL,
-    data_cutoff TIMESTAMPTZ NOT NULL,
+    data_cutoff TIMESTAMPTZ,
     store_max_ingested_at TIMESTAMPTZ,
     code_version VARCHAR NOT NULL,
     code_dirty BOOLEAN,
