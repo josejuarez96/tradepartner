@@ -75,3 +75,17 @@ Adds three packages to the **We adopt** table above, used starting with Phase 2 
 | `typer` | MIT | CLI (`tradepartner ingest`, `health`, `dashboard`, `export`) |
 | `pydantic-settings` | MIT | loads `Settings` from environment variables and an optional `.env` file |
 | `httpx` | BSD-3-Clause | thin raw-fetch HTTP client for EDGAR (JSON/SGML/files); `alpaca-py` is the Alpaca client |
+
+## Amendment 2026-09-25
+
+Phase 3 plan task T30 ([issue #116](https://github.com/josejuarez96/tradepartner/issues/116)) settles the two open points above for the [backtest spec](../specs/backtest.md).
+
+**Metrics library: `empyrical-reloaded` (Apache 2.0), pinned `==0.5.12`, runtime.** `quantstats` is not adopted. The reasons:
+- `empyrical-reloaded` is a small set of pure functions over a returns series. The spec's metrics module (req 7) calls them one key at a time, and deflated Sharpe stays our own code as decided above.
+- Its runtime closure is small: numpy, pandas, scipy and bottleneck, plus `peewee`, which it declares but our code never imports.
+- `quantstats` is built around tear-sheet reports and plotting, which the dashboard does not need, and it brings a larger dependency set.
+- It ships no type stubs, so mypy treats `empyrical.*` as `ignore_missing_imports`. Only `backtest/metrics.py` calls it.
+
+**`bt` stays dev-only, pinned `==1.2.3`.** It brings `ffn` and `yfinance` into the dev environment as transitive dependencies. None of the three may be imported under `src/`, and `tests/test_no_forbidden_imports.py` enforces that with an AST check. This keeps `yfinance` out of runtime code, as the **We avoid** list requires.
+
+**Oracle comparison under `open` fills.** The engine oracle test above says both engines fill at the official open of session T+1 and agree on equity. Under `execution.fill_price=close`, the default since T3, every session is compared. Under `open`, `bt` receives the stitched open-price series and **only fill sessions are compared**. The two engines mark positions between fills from different series (open vs close), so non-fill sessions are not comparable. Everything else stays as above: the same adjusted-as-of-T stitched frame, zero costs and fractional shares. Backtest spec req 14 records the same rule.
