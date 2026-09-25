@@ -12,23 +12,28 @@ function; the CLI and the page pass the current time. `t` must be a tz-aware
 **Metrics.** The spec names them; where it does not define one, the definition
 here is this module's and is stated once:
 
-- **Last ingest per source** (`last_ingests`): from `ingestion_runs` started at
-  or before `t`, per source (`ingest.SOURCES` first, then any other source in
+- **Last ingest per source** (`last_ingests`): from `ingestion_runs` rows
+  known at `t`, i.e. finished at or before `t` (ingest writes a run's row when
+  the run ends), per source (`ingest.SOURCES` first, then any other source in
   the table, alphabetically): the finish time and cursor of the last `ok` run,
   and the status, start and message of the latest run of any status. A source
   that never ran shows `None`s.
-- **Coverage** (`coverage`): the securities whose current listing (latest
-  `valid_from` on or before `session`, as universe rule 2 reads it) is live at
-  `session`, i.e. listed, or transferred with its end on or after `session`;
-  how many of them have a bar for `session` known at `t`, the ones that do not,
-  and the share (0.0 when no name is live). Also the first and last bar session
-  in the store and how many securities have any bar, all known at `t`.
+- **Coverage** (`coverage`): the population of ingest's staleness check
+  (spec req 10): securities whose current listing (latest `valid_from` on or
+  before `session`) is live at `session`, i.e. listed, or transferred with its
+  end on or after `session`, and that are classified `common` or are a
+  benchmark; how many of them have a bar for `session` known at `t`, the ones
+  that do not, and the share (0.0 when no name is live). Also the first and
+  last bar session in the store and how many securities have any bar, all
+  known at `t`.
 - **Gaps** (`bar_gaps`): interior holes in each security's bar history known at
   `t` up to `session`: XNYS sessions between its first and last bar with no bar.
   One row per security with at least one hole: first and last bar, bar count,
   missing sessions and the longest run of consecutive missing sessions. A
   trailing absence (no bar since some session) is not a gap here; coverage and
-  the survivorship gap report it.
+  the survivorship gap report it. The history is not split at listing
+  boundaries, so a security delisted and later relisted shows the break between
+  its two listings as one gap.
 - **Survivorship gap** with its three side categories: `gap.survivorship_gap`
   at `t`, unchanged.
 - **Unclassifiable** (`unclassifiable`): securities known at `t` whose latest
@@ -59,9 +64,14 @@ derived at `t`, as the data is read.
   configured calendar range.
 - `no_duplicate_bars`: no two bars share `(security_id, session, known_at)`.
 - `non_overlapping_listings`: per security, ordered by `valid_from`, no two
-  listings start on the same session and no delisted or transferred listing
-  ends on or after the next listing's `valid_from`. A listing with no Form 25
-  is superseded by the next one (a ticker change), as the as-of reads treat it.
+  listings start on the same session, and no listing ended by a Form 25 was
+  filed on more than `master.transfer_window_sessions` sessions after the next
+  listing started (both lines live at once: a dual listing, or a filing or
+  listing resolved to the wrong security). The filing session is the raw fact
+  to test: the derived end of a delisted or transferred listing is clipped
+  before the next listing's start by construction (spec req 4). A listing with
+  no Form 25 is superseded by the next one (a ticker change), as the as-of
+  reads treat it.
 - `no_bars_after_delisting`: no bar known at `t` for a delisted listing's
   security dated after the delisting's `effective_on` and before the
   security's next listing, if any. The derived end of a delisted listing is its
@@ -93,12 +103,20 @@ from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
 from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
-from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
+from tradepartner.store.delistings import (
+    DELISTED,
+    LISTED,
+    TRANSFERRED,
+    _filing_session,
+    _window,
+    listing_ends_as_of,
+)
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
-from tradepartner.universe import _current_listings
 
 STATIC = "snapshot_static"
+#: The classification ingest's staleness check counts, with benchmarks.
+_COMMON = "common"
 
 KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
@@ -140,7 +158,7 @@ _OVERLAP_SCHEMA: dict[str, Any] = {
     "exchange": pl.Utf8,
     "valid_from": pl.Date,
     "status": pl.Utf8,
-    "end_session": pl.Date,
+    "filing_session": pl.Date,
     "next_ticker": pl.Utf8,
     "next_exchange": pl.Utf8,
     "next_valid_from": pl.Date,
@@ -297,35 +315,42 @@ def health_report(
     conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
-    defaults to `get_settings()` and is passed to every derived read."""
+    defaults to `get_settings()` and is passed to every derived read. Listing
+    ends, securities and classifications are read once and shared."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
+    session = last_completed_session(t)
+    listings = listing_ends_as_of(conn, t, settings)
+    current = _current_from(listings, session)
+    securities = securities_as_of(conn, t)
+    classes = classifications_as_of(conn, t)
     return HealthReport(
         t=t,
-        session=last_completed_session(t),
+        session=session,
         ingests=last_ingests(conn, t),
-        coverage=coverage(conn, t, settings),
+        coverage=_coverage(conn, t, session, current, securities, classes),
         gaps=bar_gaps(conn, t),
         survivorship=survivorship_gap(conn, t, settings),
-        unclassifiable=unclassifiable(conn, t),
-        static_reliance=static_reliance(conn, t, settings),
-        delisted=delisted_names(conn, t, settings),
+        unclassifiable=_unclassifiable(securities, classes),
+        static_reliance=_static_reliance(securities, classes, current),
+        delisted=_delisted_names(current),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
         },
-        integrity=integrity_checks(conn, t, settings),
+        integrity=_integrity_checks(conn, t, settings, listings),
     )
 
 
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
-    """Per source, the last `ok` run and the latest run started at or
-    before `t`; `ingest.SOURCES` first, then any other source."""
+    """Per source, the last `ok` run and the latest run whose row is known at
+    `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
+    source."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE started_at <= ?
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ?
         ORDER BY started_at, run_id
         """,
         [t],
@@ -353,20 +378,56 @@ def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestSt
     return tuple(out)
 
 
+def _current_from(listings: pl.DataFrame, session: date) -> dict[str, dict[str, Any]]:
+    """Per security, its listing with the latest `valid_from` on or before
+    `session` (universe rule 2's current listing), from `listing_ends_as_of`."""
+    current: dict[str, dict[str, Any]] = {}
+    for row in listings.iter_rows(named=True):
+        if row["valid_from"] > session:
+            continue
+        held = current.get(row["security_id"])
+        if held is None or row["valid_from"] > held["valid_from"]:
+            current[row["security_id"]] = row
+    return current
+
+
 def _is_live(listing: dict[str, Any], session: date) -> bool:
     status, end = listing["status"], listing["end_session"]
     if status == LISTED:
         return True
-    return status == TRANSFERRED and end is not None and end >= session
+    return status == TRANSFERRED and (end is None or end >= session)
 
 
 def coverage(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -> Coverage:
-    """Bars at the last completed session for the names live then, from rows
-    known at `t` (module docstring)."""
+    """Bars at the last completed session for the live common and benchmark
+    names then, from rows known at `t` (module docstring)."""
     t = _validate_t(t)
     session = last_completed_session(t)
-    current = _current_listings(conn, t, session, settings)
-    live = tuple(sorted(sid for sid, row in current.items() if _is_live(row, session)))
+    current = _current_from(listing_ends_as_of(conn, t, settings), session)
+    return _coverage(
+        conn, t, session, current, securities_as_of(conn, t), classifications_as_of(conn, t)
+    )
+
+
+def _coverage(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    current: dict[str, dict[str, Any]],
+    securities: pl.DataFrame,
+    classes: pl.DataFrame,
+) -> Coverage:
+    benchmarks = {r["security_id"] for r in securities.iter_rows(named=True) if r["benchmark"]}
+    common = {
+        r["security_id"] for r in classes.iter_rows(named=True) if r["security_type"] == _COMMON
+    }
+    live = tuple(
+        sorted(
+            sid
+            for sid, row in current.items()
+            if _is_live(row, session) and (sid in benchmarks or sid in common)
+        )
+    )
     with_bar = {
         sid
         for (sid,) in conn.execute(
@@ -394,43 +455,52 @@ def coverage(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -
     )
 
 
+_SESSIONS_VIEW = "_health_sessions"
+
+
 def bar_gaps(conn: duckdb.DuckDBPyConnection, t: datetime) -> BarGaps:
     """Interior bar holes per security, from bars known at `t` up to the last
-    completed session (module docstring). Bars on a non-session are left to
-    the `bars_on_sessions` rule."""
+    completed session (module docstring), computed in DuckDB against the
+    session index. Bars on a non-session are left to `bars_on_sessions`."""
     t = _validate_t(t)
     session = last_completed_session(t)
-    bars = conn.execute(
-        """
-        SELECT DISTINCT security_id, session FROM prices_daily
-        WHERE known_at <= ? AND session <= ?
-        """,
-        [t, session],
-    ).pl()
     sessions = all_sessions()
     index = pl.DataFrame(
-        {"session": sessions, "_idx": range(len(sessions))},
-        schema={"session": pl.Date, "_idx": pl.Int64},
+        {"session": sessions, "idx": range(len(sessions))},
+        schema={"session": pl.Date, "idx": pl.Int64},
     )
-    holes = (
-        bars.join(index, on="session", how="inner")
-        .sort("security_id", "_idx")
-        .with_columns(
-            _hole=(pl.col("_idx").diff().over("security_id") - 1).fill_null(0).cast(pl.Int64)
-        )
-    )
-    rows = (
-        holes.group_by("security_id")
-        .agg(
-            first_bar=pl.col("session").min(),
-            last_bar=pl.col("session").max(),
-            bars=pl.len().cast(pl.Int64),
-            missing_sessions=pl.col("_hole").sum(),
-            longest_run=pl.col("_hole").max(),
-        )
-        .filter(pl.col("missing_sessions") > 0)
-        .sort("security_id")
-    )
+    conn.register(_SESSIONS_VIEW, index.to_arrow())
+    try:
+        found = conn.execute(
+            f"""
+            WITH bars AS (
+                SELECT DISTINCT p.security_id, p.session, s.idx
+                FROM prices_daily p JOIN {_SESSIONS_VIEW} s ON p.session = s.session
+                WHERE p.known_at <= ? AND p.session <= ?
+            ), holes AS (
+                SELECT security_id, session, coalesce(
+                    idx - lag(idx) OVER (PARTITION BY security_id ORDER BY idx) - 1, 0
+                ) AS hole
+                FROM bars
+            )
+            SELECT security_id, min(session), max(session), count(*), sum(hole), max(hole)
+            FROM holes GROUP BY security_id HAVING sum(hole) > 0 ORDER BY security_id
+            """,
+            [t, session],
+        ).fetchall()
+    finally:
+        conn.unregister(_SESSIONS_VIEW)
+    rows = [
+        {
+            "security_id": sid,
+            "first_bar": first,
+            "last_bar": last,
+            "bars": int(bars),
+            "missing_sessions": int(missing),
+            "longest_run": int(longest),
+        }
+        for sid, first, last, bars, missing, longest in found
+    ]
     return BarGaps(rows=pl.DataFrame(rows, schema=_GAP_SCHEMA))
 
 
@@ -438,14 +508,15 @@ def unclassifiable(conn: duckdb.DuckDBPyConnection, t: datetime) -> Unclassifiab
     """Securities known at `t` classified `unclassifiable`, or with no
     classification row known at `t`."""
     t = _validate_t(t)
-    known = set(securities_as_of(conn, t)["security_id"].to_list())
-    classes = {
-        r["security_id"]: r["security_type"]
-        for r in classifications_as_of(conn, t).iter_rows(named=True)
-    }
+    return _unclassifiable(securities_as_of(conn, t), classifications_as_of(conn, t))
+
+
+def _unclassifiable(securities: pl.DataFrame, classes: pl.DataFrame) -> Unclassifiable:
+    known = set(securities["security_id"].to_list())
+    kinds = {r["security_id"]: r["security_type"] for r in classes.iter_rows(named=True)}
     return Unclassifiable(
-        unclassifiable=tuple(sorted(sid for sid in known if classes.get(sid) == UNCLASSIFIABLE)),
-        unclassified=tuple(sorted(known - set(classes))),
+        unclassifiable=tuple(sorted(sid for sid in known if kinds.get(sid) == UNCLASSIFIABLE)),
+        unclassified=tuple(sorted(known - set(kinds))),
     )
 
 
@@ -455,21 +526,24 @@ def static_reliance(
     """Securities whose `securities` row, current listing or classification
     as of `t` has `provenance = snapshot_static` (module docstring)."""
     t = _validate_t(t)
-    session = last_completed_session(t)
-    securities = securities_as_of(conn, t)
+    current = _current_from(listing_ends_as_of(conn, t, settings), last_completed_session(t))
+    return _static_reliance(securities_as_of(conn, t), classifications_as_of(conn, t), current)
+
+
+def _static_reliance(
+    securities: pl.DataFrame, classes: pl.DataFrame, current: dict[str, dict[str, Any]]
+) -> StaticReliance:
     known = set(securities["security_id"].to_list())
     static: dict[str, set[str]] = {
         "securities": {
             r["security_id"] for r in securities.iter_rows(named=True) if r["provenance"] == STATIC
         },
         "listings": {
-            sid
-            for sid, row in _current_listings(conn, t, session, settings).items()
-            if sid in known and row["provenance"] == STATIC
+            sid for sid, row in current.items() if sid in known and row["provenance"] == STATIC
         },
         "classifications": {
             r["security_id"]
-            for r in classifications_as_of(conn, t).iter_rows(named=True)
+            for r in classes.iter_rows(named=True)
             if r["security_id"] in known and r["provenance"] == STATIC
         },
     }
@@ -485,7 +559,12 @@ def delisted_names(
 ) -> DelistedNames:
     """Securities whose current listing is delisted at `t`, sorted by id."""
     t = _validate_t(t)
-    session = last_completed_session(t)
+    return _delisted_names(
+        _current_from(listing_ends_as_of(conn, t, settings), last_completed_session(t))
+    )
+
+
+def _delisted_names(current: dict[str, dict[str, Any]]) -> DelistedNames:
     rows = [
         {
             "security_id": sid,
@@ -497,7 +576,7 @@ def delisted_names(
             "end_session": row["end_session"],
             "effective_on": row["effective_on"],
         }
-        for sid, row in sorted(_current_listings(conn, t, session, settings).items())
+        for sid, row in sorted(current.items())
         if row["status"] == DELISTED
     ]
     return DelistedNames(frame=pl.DataFrame(rows, schema=_DELISTED_SCHEMA))
@@ -508,7 +587,13 @@ def integrity_checks(
 ) -> tuple[IntegrityCheck, ...]:
     """Every rule in `INTEGRITY_RULES`, in that order (module docstring)."""
     t = _validate_t(t)
-    listings = listing_ends_as_of(conn, t, settings)
+    return _integrity_checks(conn, t, settings, listing_ends_as_of(conn, t, settings))
+
+
+def _integrity_checks(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, listings: pl.DataFrame
+) -> tuple[IntegrityCheck, ...]:
+    window = settings.master.transfer_window_sessions
     violations: dict[str, pl.DataFrame] = {
         KNOWN_AT_NOT_NULL: _count_per_table(conn, "known_at IS NULL"),
         KNOWN_AT_NOT_AFTER_INGESTED_AT: _count_per_table(conn, "known_at > ingested_at"),
@@ -516,7 +601,7 @@ def integrity_checks(
         PROVENANCE_ALLOWED: _bad_provenance(conn),
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
-        NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings),
+        NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
     }
@@ -582,14 +667,18 @@ def _by_security(listings: pl.DataFrame) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
-def _overlapping_listings(listings: pl.DataFrame) -> pl.DataFrame:
+def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for sid, ordered in sorted(_by_security(listings).items()):
         for current, following in pairwise(ordered):
-            end = current["end_session"]
+            filed = current["delisting_filed_at"]
+            filing_session = None if filed is None else _filing_session(filed)
             same_start = current["valid_from"] == following["valid_from"]
-            ends_late = current["status"] != LISTED and end is not None
-            if same_start or (ends_late and end >= following["valid_from"]):
+            filed_late = (
+                filing_session is not None
+                and following["valid_from"] < _window(filing_session, window_sessions)[0]
+            )
+            if same_start or filed_late:
                 rows.append(
                     {
                         "security_id": sid,
@@ -597,7 +686,7 @@ def _overlapping_listings(listings: pl.DataFrame) -> pl.DataFrame:
                         "exchange": current["exchange"],
                         "valid_from": current["valid_from"],
                         "status": current["status"],
-                        "end_session": end,
+                        "filing_session": filing_session,
                         "next_ticker": following["ticker"],
                         "next_exchange": following["exchange"],
                         "next_valid_from": following["valid_from"],

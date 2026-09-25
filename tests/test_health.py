@@ -77,7 +77,6 @@ LIVE_AT_END = (
     "SEC_STATIC_PRE2019",
     "SEC_TICKCHANGE",
     "SEC_TRANSFER",
-    "SEC_UNCLASSIFIABLE",
 )
 
 
@@ -260,6 +259,21 @@ def test_last_ingests_reports_last_ok_and_latest_run_per_source(
     assert alpaca.latest_message == "SPY missing"
 
 
+def test_last_ingests_ignores_a_run_not_finished_at_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A run row is written when the run ends, so it is known at finished_at.
+    day1 = datetime(2020, 6, 29, 22, 0, tzinfo=UTC)
+    day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
+    _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
+    _run(fixture_store, "a2", "alpaca", "failed", day2, message="boom")
+    _, alpaca = last_ingests(fixture_store, day2 + timedelta(minutes=2))
+    assert alpaca.latest_status == "ok"
+    assert alpaca.last_ok_cursor == "2020-06-29"
+    _, alpaca = last_ingests(fixture_store, day2 + timedelta(minutes=5))
+    assert alpaca.latest_status == "failed"
+
+
 def test_last_ingests_keeps_an_unknown_source_after_the_known_ones(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -293,7 +307,21 @@ def test_coverage_names_a_live_name_without_a_bar_at_the_session(
     )
     cov = coverage(fixture_store, T_END, settings)
     assert cov.missing == ("SEC_DUAL_B",)
-    assert cov.share == pytest.approx(15 / 16)
+    assert cov.share == pytest.approx(14 / 15)
+
+
+def test_coverage_counts_common_and_benchmark_names_only(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # Same population as ingest's staleness check: a live unclassifiable
+    # name with no bar is not a coverage miss.
+    fixture_store.execute(
+        "DELETE FROM prices_daily WHERE security_id = 'SEC_UNCLASSIFIABLE' AND session = ?",
+        [date(2020, 6, 30)],
+    )
+    cov = coverage(fixture_store, T_END, settings)
+    assert "SEC_UNCLASSIFIABLE" not in cov.live
+    assert cov.missing == ()
 
 
 def test_coverage_ignores_bars_known_after_t(
@@ -508,6 +536,57 @@ def test_overlapping_listing_fails_its_rule(fixture_store: duckdb.DuckDBPyConnec
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
     check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
     assert check.violations["security_id"].to_list() == ["SEC_DUAL_A"]
+
+
+def test_listing_live_after_the_next_one_started_fails_its_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # BKFL lists on NASDAQ from 2018-06-01 while its NYSE line runs on
+    # until a Form 25 filed 2019-01-10: seven months of two live listings,
+    # far outside `master.transfer_window_sessions`. The derived end of
+    # the NYSE line stops before the NASDAQ start, so only the filing
+    # session shows the overlap.
+    listed = datetime(2018, 6, 1, 21, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_SPLIT_BACKFILLED",
+            "ticker": "BKFL",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": date(2018, 6, 1),
+            "known_at": listed,
+            "ingested_at": listed,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    filed = datetime(2019, 1, 10, 21, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "delistings",
+        {
+            "security_id": "SEC_SPLIT_BACKFILLED",
+            "form": "25",
+            "class_title": "Common Stock",
+            "exchange": "NYSE",
+            "filed_at": filed,
+            "effective_on": date(2019, 1, 20),
+            "known_at": filed,
+            "ingested_at": filed,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    [row] = check.violations.to_dicts()
+    assert row["security_id"] == "SEC_SPLIT_BACKFILLED"
+    assert (row["exchange"], row["next_exchange"]) == ("NYSE", "NASDAQ")
+    assert row["filing_session"] == date(2019, 1, 10)
+    assert row["next_valid_from"] == date(2018, 6, 1)
 
 
 def test_ticker_change_and_transfer_are_not_overlaps(
