@@ -24,7 +24,6 @@ Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/f
 - #46 Research G8: price-vendor comparison for the Phase 3 vendor ADR, delisted coverage graded claimed/absent, report marked INCOMPLETE with open items ([report](research/2026-09-25-price-vendors.md))
 - Phase 2 T21a: Streamlit dashboard shell with one read-only connection per render, no-store / busy / unreadable states and a health-page placeholder (#66, PR #67)
 - #55 Teams picking order: step 3 now covers any unclaimed sized issue (size:S, type:research with an owner-approved brief via `researcher`, type:decision/type:docs drafts via Fable and `spec-critic`); unsized issues are not claimable (PR #56)
-- Phase 2 T6: as-of primitives and truncation-invariance harness (PR #69)
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
