@@ -1,1 +1,0 @@
-- #47 Research G1: post-2010 long-only momentum, net of costs. Graded MIXED; the prior for net excess over the benchmark is centred near 0 (PR #61, [report](research/2026-09-25-g1-momentum-post-2010.md))

@@ -1,2 +1,0 @@
-### Added
-- Phase 3 T30: `Settings` gains `hypotheses` (enumerated `families`), `strategy`, `costs` (non-negative sensitivity ladder), `holdout` (`start`/`end` null by default, end before start rejected), `backtest` and `metrics` (no `periods_per_year`) with the backtest spec defaults; `empyrical-reloaded==0.5.12` (runtime) and `bt==1.2.3` (dev) pinned; `tests/test_no_forbidden_imports.py` keeps `bt`, `ffn` and `yfinance` out of `src/`; ADR 0004 amendment records the metrics choice and the fill-session-only oracle comparison under `open` fills (#116).
