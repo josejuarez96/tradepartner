@@ -343,9 +343,9 @@ def test_identical_file_with_a_different_window_is_refused(
 def test_window_params_must_agree_with_the_window_columns(
     conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    _register(conn, settings, params=_params(**{"holdout.start": "2023-01-03"}))
+    _register(conn, settings, params={**_params(), "holdout.start": "2023-01-03"})
     with pytest.raises(registry.RegistryError, match=r"holdout\.start"):
-        _register(conn, settings, slug="h2", params=_params(**{"holdout.start": "2024-01-02"}))
+        _register(conn, settings, slug="h2", params={**_params(), "holdout.start": "2024-01-02"})
 
 
 def test_open_trial_accepts_a_missing_data_cutoff(
