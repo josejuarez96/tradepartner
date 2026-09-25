@@ -20,7 +20,8 @@ Steps, in order (each one stops the run with a reason on failure):
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
 4. Local checks: ruff check, ruff format --check, mypy and the fragment check always;
    pytest only when the diff touches code, tests, scripts, dependencies or CI (``src/``,
-   ``tests/``, ``scripts/``, ``.github/workflows/``, ``pyproject.toml``, ``uv.lock``).
+   ``tests/``, ``scripts/``, ``.github/``, ``pyproject.toml``, ``uv.lock``,
+   ``.python-version``).
    CI applies the same rule on PRs (``--tests-needed``) and runs the full suite on every
    push to main. ``--tests`` forces the local run, ``--no-tests`` skips it.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
@@ -136,8 +137,8 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
 # A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
 # (pushes to main always run the full suite).
-TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/workflows/")
-TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock")
+TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
+TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
 CI_POLL_S = 20
 
@@ -358,7 +359,10 @@ def ready(
         _merge_main(r, main_ref, say)
 
     # 3. fragments and shared lists
-    touched = r.git("diff", "--name-only", f"{main_ref}...HEAD").splitlines()
+    # --no-renames: a file moved out of src/ must list its old path too.
+    touched = r.git(
+        "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", f"{main_ref}...HEAD"
+    ).splitlines()
     deleted = r.git("diff", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD").splitlines()
     if not allow_shared_files:
         added: list[str] = []

@@ -45,7 +45,7 @@ What runs locally:
 | Check | When |
 |---|---|
 | ruff check, ruff format --check, mypy, fragment check | always |
-| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/workflows/`, `pyproject.toml` or `uv.lock` |
+| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version` |
 
 A docs, fragment or process PR skips the local pytest run (the command prints a note), and CI
 skips it on that PR too, by the same rule (`ready_pr.py --tests-needed`). Every push to main
