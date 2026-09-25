@@ -59,14 +59,14 @@ All pages were seen on 2026-09-25.
 ## UNVERIFIED items
 - That S13 (TermsAndConditions.pdf, metadata 2021-08-31) is the current version of the terms.
 - Whether a free account can actually query `feed=sip` history (see the feed conflict above).
-- Exact first date of Alpaca daily bars. How complete 2016 is.
-- Alpaca corporate-actions depth. Whether delisted or inactive symbols return bars (the price-vendors report cites forum threads saying they do not).
+- Exact first date of Alpaca daily bars. How complete 2016 is. *First bar 2016-01-04 for SPY and KO ([#104 probe](2026-09-25-alpaca-delisted-bars.md)); completeness of 2016 across all names not measured.*
+- Alpaca corporate-actions depth. Whether delisted or inactive symbols return bars (the price-vendors report cites forum threads saying they do not). *Corporate-actions depth: complete to 2016 (#101, [Probe 1](2026-09-25-alpaca-open-and-depth.md)). Delisted names: SIP bars returned for 8 of 8 probed ([#104 probe](2026-09-25-alpaca-delisted-bars.md)).*
 - EDGAR index file names and extensions (`form.idx`, `master.idx`, `.gz`/`.zip` variants, `form.YYYYMMDD.idx` daily naming). These are from memory and were not quoted from S14.
 - How many listed names lack an IEX trade on a normal day. There is no Tier 1 figure.
 
 ## Follow-up questions (not answered here)
 - Do the Alpaca Customer Agreement or the exchange agreements add market-data clauses for Basic users?
-- Delisted-symbol bar coverage on Alpaca (covered in part by the price-vendors report).
+- Delisted-symbol bar coverage on Alpaca (covered in part by the price-vendors report). *Sample answer in the [#104 probe](2026-09-25-alpaca-delisted-bars.md).*
 - Backfill runtime at 200 requests per minute (named in the spec's "Terms and opens" line, but not asked in this brief).
 - The size of the typical gap between the IEX open, the first SIP trade and the primary auction, measured empirically.
 
