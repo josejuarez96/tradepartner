@@ -15,8 +15,14 @@ source, `edgar` then `alpaca`, halting at the first chunk that is not `ok`:
   short-lived read-only connection, the source is called with no
   connection open, and the write lock is taken only to commit the month:
   another process can use the store between chunks and while a month is
-  being fetched. A month is stale if the reference symbol lacks a bar on
-  any of its sessions.
+  being fetched. The store is read as of the clock when the month starts,
+  and rows are stamped with the clock once its fetch returns. A month is
+  stale if the reference symbol lacks a bar on any of its sessions, or if
+  more than `ingest.max_missing_share` of the listed common and benchmark
+  names live through the month have no bar in it.
+
+The EDGAR chunk is fetched with no store connection open (a recording
+pass) and committed in one short write transaction.
 
 Each chunk writes one `ingestion_runs` row with mode `backfill`. A month's
 `chunk_cursor` is `since=<since>;through=<last day of the window>`, so a
@@ -24,6 +30,9 @@ re-run with the same `since` **resumes** the day after the latest `ok`
 chunk: a failed month is fetched again, committed months are not. Rows are
 written by `ingest`'s rules (only what changes an as-of read), so a
 repeated window, or a daily run over a backfilled session, adds nothing.
+Resume freezes committed months: a listing a later EDGAR run adds for an
+earlier month (a better snapshot match, #35) gets its bars only from a
+backfill with a new, earlier `since`.
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings
 from tradepartner.ingest import (
+    _FETCH_PASS,
     FAILED,
     LOCKED,
     OK,
@@ -52,16 +62,20 @@ from tradepartner.ingest import (
     _action_row,
     _add_rows,
     _bar_row,
+    _build_filings,
     _clean,
     _ingest_filings,
     _record_only,
+    _Recorded,
     _run_source,
     _Stale,
     _write_run,
     expected_session,
 )
+from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
+from tradepartner.store.master import securities_as_of
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -100,15 +114,17 @@ def backfill(
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     runs: list[SourceRun] = []
     if source in ("all", "edgar"):
+        recorded = _Recorded(filings)
         run = _run_source(
             "edgar",
-            lambda conn: _ingest_filings(conn, settings, filings, clock),
+            lambda conn: _ingest_filings(conn, settings, recorded, clock),
             settings,
             now,
             clock,
             f"since={since.isoformat()}",
             dry_run=False,
             mode=BACKFILL,
+            prepare=lambda: _build_filings(recorded, settings, _FETCH_PASS),
         )
         runs.append(run)
         if run.status != OK:
@@ -122,7 +138,7 @@ def backfill(
             )
             return IngestResult((*runs, run))
         for window in month_windows(start, expected_session(now, settings)):
-            run = _price_chunk(settings, prices, since, window, now, clock)
+            run = _price_chunk(settings, prices, since, window, clock)
             runs.append(run)
             if run.status != OK:
                 break
@@ -141,7 +157,9 @@ def _read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
         try:
             reader = open_read_only(settings)
             conn = reader.__enter__()
-        except StoreLockedError:
+        except StoreLockedError as exc:
+            if isinstance(exc.__cause__, duckdb.ConnectionException):
+                raise  # this process holds the file: waiting never helps
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise
@@ -183,36 +201,49 @@ def _price_chunk(
     prices: PriceSource,
     since: date,
     window: tuple[date, date],
-    now: datetime,
     clock: Callable[[], datetime],
 ) -> SourceRun:
+    """One month. The store is read as of the clock when the month starts
+    (after the EDGAR chunk committed) and rows are stamped with the clock
+    after the fetch returns, so a revision is never dated before it was
+    fetched."""
     first, last = window
     run_id, cursor = uuid.uuid4().hex, _cursor(since, last)
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
 
     def outcome(status: str, rows: int, message: str) -> SourceRun:
         return SourceRun("alpaca", status, rows, cursor, _clean(message, settings))
 
     try:
         with _read(settings) as conn:
-            ids, reference = _window_names(conn, now, window, settings)
+            ids, listed, reference = _window_names(conn, started, window, settings)
         symbol = settings.ingest.reference_symbol
         if reference is None:
             raise LookupError(f"reference symbol {symbol} has no listing in {first}..{last}")
         bars = [b for b in prices.bars(ids, first, last) if first <= b.session <= last]
         actions = prices.corporate_actions(ids, first, last)
+        ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")
         have = {bar.session for bar in bars if bar.security_id == reference}
         days = (first + timedelta(days=n) for n in range((last - first).days + 1))
         gaps = [day for day in days if is_session(day) and day not in have]
         if gaps:
             shown = ", ".join(day.isoformat() for day in gaps[:10])
             raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {shown}")
+        with_bars = {bar.security_id for bar in bars}
+        missing = sorted(set(listed) - with_bars)
+        share, limit = len(missing) / len(listed), settings.ingest.max_missing_share
+        if share > limit:
+            raise _Stale(
+                f"{len(missing)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
+                f"have no bar in {first}..{last}: {', '.join(missing[:10])}"
+            )
         with open_for_write(settings) as conn:
             init_schema(conn)
             added = _add_rows(
                 conn,
                 "prices_daily",
-                [_bar_row(bar, now) for bar in bars],
-                ingested_at=now,
+                [_bar_row(bar, ingested_at) for bar in bars],
+                ingested_at=ingested_at,
                 current=True,
                 where="AND session BETWEEN ? AND ?",
                 params=[first, last],
@@ -220,15 +251,18 @@ def _price_chunk(
             added += _add_rows(
                 conn,
                 "corporate_actions",
-                [_action_row(action, now) for action in actions],
-                ingested_at=now,
+                [_action_row(action, ingested_at) for action in actions],
+                ingested_at=ingested_at,
                 current=True,
                 where="AND ex_date BETWEEN ? AND ?",
                 params=[first, last],
             )
-            message = f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names"
+            message = (
+                f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
+                f"{len(missing)} of {len(listed)} listed names without a bar"
+            )
             run = outcome(OK, added, message)
-            _write_run(conn, run_id, now, clock(), run, BACKFILL)
+            _write_run(conn, run_id, started, clock(), run, BACKFILL)
         return run
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
@@ -236,35 +270,52 @@ def _price_chunk(
         run = outcome(STALE, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts with a run row
         run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
-    return _record_only(settings, run_id, now, clock, run, BACKFILL)
+    return _record_only(settings, run_id, started, clock, run, BACKFILL)
 
 
 def _window_names(
     conn: duckdb.DuckDBPyConnection,
-    now: datetime,
+    t: datetime,
     window: tuple[date, date],
     settings: Settings,
-) -> tuple[list[str], str | None]:
-    """Securities with a listing live at some point in `window`, and the
-    reference symbol's `security_id`, from listings known at `now`.
+) -> tuple[list[str], list[str], str | None]:
+    """From listings known at `t`: securities with a listing live at some
+    point in `window` (to fetch), the listed common and benchmark names live
+    through the whole window (the staleness denominator), and the reference
+    symbol's `security_id`.
 
     A listing counts from its `valid_from`; a delisted or transferred one
     still counts while its end session (last bar known) or `effective_on`
     is inside or after the window, or while no end is known yet.
     """
     first, last = window
+    kinds = {
+        row["security_id"]: row["security_type"]
+        for row in classifications_as_of(conn, t).iter_rows(named=True)
+    }
+    benchmarks = {
+        row["security_id"]
+        for row in securities_as_of(conn, t).iter_rows(named=True)
+        if row["benchmark"]
+    }
     ids: set[str] = set()
+    listed: set[str] = set()
     reference = None
-    for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
+    for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         if row["valid_from"] > last:
             continue
-        status, end, effective = row["status"], row["end_session"], row["effective_on"]
+        sid, status = row["security_id"], row["status"]
+        end, effective = row["end_session"], row["effective_on"]
         ended = status in (DELISTED, TRANSFERRED) and (
             end is not None and end < first and (effective is None or effective < first)
         )
         if ended or status not in (LISTED, DELISTED, TRANSFERRED):
             continue
-        ids.add(row["security_id"])
-        if row["ticker"] == settings.ingest.reference_symbol and status == LISTED:
-            reference = row["security_id"]
-    return sorted(ids), reference
+        ids.add(sid)
+        live = status == LISTED or (status == TRANSFERRED and (end is None or end >= last))
+        counted = sid in benchmarks or kinds.get(sid) == "common"
+        if status == LISTED and row["valid_from"] <= first and counted:
+            listed.add(sid)
+        if live and row["ticker"] == settings.ingest.reference_symbol:
+            reference = sid
+    return sorted(ids), sorted(listed), reference

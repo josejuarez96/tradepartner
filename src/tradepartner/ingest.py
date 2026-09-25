@@ -6,7 +6,8 @@ minus `ingest.settle_delay_minutes` (`expected_session`). Sources run in
 order, `edgar` then `alpaca` (the price side fetches the names the master
 lists), and the run **halts** at the first source that is not `ok`.
 
-**One atomic chunk per source.** Each source's rows are written inside one
+**One atomic chunk per source.** EDGAR is fetched with no store connection
+open (a recording pass), then each source's rows are written inside one
 `store.db.open_for_write` transaction, which retries the lock for
 `store.lock_retry_seconds` and releases it when the chunk ends. A failure
 anywhere in the chunk rolls all of it back; an earlier source's committed
@@ -184,13 +185,20 @@ def ingest_session(
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
+    recorded = _Recorded(filings)
     work: dict[str, Callable[[duckdb.DuckDBPyConnection], tuple[int, str]]] = {
-        "edgar": lambda conn: _ingest_filings(conn, settings, filings, clock),
-        "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now),
+        "edgar": lambda conn: _ingest_filings(conn, settings, recorded, clock),
+        "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now, clock),
+    }
+    prepare: dict[str, Callable[[], object] | None] = {
+        "edgar": lambda: _build_filings(recorded, settings, _FETCH_PASS),
+        "alpaca": None,
     }
     runs: list[SourceRun] = []
     for name in SOURCES if source == "all" else (source,):
-        run = _run_source(name, work[name], settings, now, clock, cursor, dry_run)
+        run = _run_source(
+            name, work[name], settings, now, clock, cursor, dry_run, prepare=prepare[name]
+        )
         runs.append(run)
         if run.status != OK:
             break
@@ -206,13 +214,18 @@ def _run_source(
     cursor: str,
     dry_run: bool,
     mode: str = MODE,
+    prepare: Callable[[], object] | None = None,
 ) -> SourceRun:
+    """One chunk: `prepare` (fetching, no store connection open), then
+    `work` inside one write transaction with the run row."""
     run_id = uuid.uuid4().hex
 
     def outcome(status: str, rows: int, message: str) -> SourceRun:
         return SourceRun(name, status, rows, cursor, _clean(message, settings))
 
     try:
+        if prepare is not None:
+            prepare()
         with open_for_write(settings) as conn:
             init_schema(conn)
             rows, message = work(conn)
@@ -455,16 +468,24 @@ def fact_rows(
 
 
 def _ingest_prices(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, prices: PriceSource, now: datetime
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    prices: PriceSource,
+    now: datetime,
+    clock: Callable[[], datetime],
 ) -> tuple[int, str]:
     session = expected_session(now, settings)
     symbol = settings.ingest.reference_symbol
-    fetch, listed, reference = _price_names(conn, now, session, settings)
+    # Read the store as of now, after the EDGAR chunk committed (its snapshot
+    # rows are stamped at their fetch time, which can be after the run began).
+    read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
+    fetch, listed, reference = _price_names(conn, read_at, session, settings)
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
     actions = prices.corporate_actions(ids, session.replace(day=1), session)
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
     have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")

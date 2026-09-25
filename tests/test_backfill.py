@@ -19,8 +19,9 @@ from typing import Any
 
 import duckdb
 import pytest
-from test_ingest import ACME, DUAL, DUAL_B, NOW, SPY, _filings
+from test_ingest import ACME, DUAL, DUAL_B, NOW, SPY, _at, _filings
 
+from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling
 from tradepartner.adapters.prices import (
     ActionType,
     Bar,
@@ -56,9 +57,11 @@ class _History(PriceSource):
     during: dict[date, Callable[[], None]] = field(default_factory=dict)
     actions: list[CorporateAction] = field(default_factory=list)
     calls: list[tuple[str, date, date]] = field(default_factory=list)
+    fetched: dict[date, set[str]] = field(default_factory=dict)
 
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
         self.calls.append(("bars", start, end))
+        self.fetched[start.replace(day=1)] = set(security_ids)
         if start.replace(day=1) in self.during:
             self.during[start.replace(day=1)]()
         c = self.close
@@ -94,11 +97,24 @@ def _backfill(
     *,
     since: date = SINCE,
     now: datetime = NOW,
+    filings: Any = None,
+    clock: Callable[[], datetime] | None = None,
     **kwargs: Any,
 ) -> Any:
     return backfill(
-        settings, prices=prices, filings=_filings(), since=since, clock=lambda: now, **kwargs
+        settings,
+        prices=prices,
+        filings=filings if filings is not None else _filings(),
+        since=since,
+        clock=clock if clock is not None else (lambda: now),
+        **kwargs,
     )
+
+
+def _ticking(start: datetime, step: timedelta) -> Callable[[], datetime]:
+    """A clock that moves `step` forward on every call."""
+    ticks = iter(start + step * n for n in range(1_000_000))
+    return lambda: next(ticks)
 
 
 def _read(settings: Settings, sql: str) -> list[tuple[Any, ...]]:
@@ -326,3 +342,95 @@ def test_a_writer_that_finishes_within_the_retry_window_is_waited_for(settings: 
         assert _backfill(patient, _History(), source="alpaca").ok
     finally:
         proc.wait(timeout=10)
+
+
+# --- quant-auditor on #171 ---------------------------------------------------
+
+
+def test_names_are_read_after_the_edgar_chunk_even_with_a_fresh_snapshot(
+    settings: Settings,
+) -> None:
+    # The snapshot (and so SPY's listing) is fetched after the run began.
+    ticks = iter([NOW] + [NOW + timedelta(minutes=30)] * 1000)
+    filings = _filings(fetched_at=NOW + timedelta(minutes=10))
+    result = _backfill(settings, _History(), filings=filings, clock=lambda: next(ticks))
+    assert result.ok, result.runs[-1].message
+
+
+def test_the_daily_run_also_reads_after_the_edgar_chunk(settings: Settings) -> None:
+    ticks = iter([NOW] + [NOW + timedelta(minutes=30)] * 1000)
+    result = ingest_session(
+        settings,
+        prices=_History(),
+        filings=_filings(fetched_at=NOW + timedelta(minutes=10)),
+        clock=lambda: next(ticks),
+    )
+    assert result.ok, result.runs[-1].message
+
+
+def test_revisions_are_stamped_when_each_month_was_fetched(settings: Settings) -> None:
+    _backfill(settings, _History(close=20.0))
+    start = NOW + timedelta(days=1)
+    _backfill(
+        settings,
+        _History(close=21.0),
+        since=date(2019, 4, 11),
+        clock=_ticking(start, timedelta(minutes=1)),
+        source="alpaca",
+    )
+    stamps = _read(
+        settings,
+        "SELECT date_trunc('month', session), min(known_at), max(known_at) "
+        "FROM prices_daily WHERE close = 21.0 GROUP BY 1 ORDER BY 1",
+    )
+    assert len(stamps) == 3
+    # One stamp per month, strictly later month by month, never the run start.
+    assert all(lo == hi and lo > start for _, lo, hi in stamps)
+    assert stamps[0][1] < stamps[1][1] < stamps[2][1]
+
+
+def test_a_failure_inside_the_commit_rolls_the_month_back(settings: Settings) -> None:
+    # An action stamped after the run's clock is refused by the writer after
+    # May's bars are inserted: the transaction must drop those bars too.
+    ex = date(2019, 5, 15)
+    future = CorporateAction(ACME, ActionType.DIVIDEND, ex, 0.1, NOW + timedelta(days=1), "alpaca")
+    result = _backfill(settings, _History(actions=[future]))
+    assert result.runs[-1].status == FAILED and "not knowable" in result.runs[-1].message
+    assert _read(settings, "SELECT max(session) FROM prices_daily") == [(date(2019, 4, 30),)]
+
+
+def test_a_delisted_name_is_fetched_through_its_effective_month_only(settings: Settings) -> None:
+    form_25 = DelistingFiling(
+        ACME, "25", "Common Stock", "NYSE", f"{ACME}-19-000025", _at(2019, 5, 6), date(2019, 5, 16)
+    )
+    prices = _History(gaps={(ACME, s) for s in _sessions(date(2019, 5, 17), date(2019, 6, 30))})
+    result = _backfill(settings, prices, filings=_filings(delistings=[form_25]))
+    assert result.ok, result.runs[-1].message
+    assert [ACME in prices.fetched[m] for m in sorted(prices.fetched)] == [True, True, False]
+
+
+def test_a_transferred_name_is_fetched_under_one_security_id(settings: Settings) -> None:
+    form_25 = DelistingFiling(
+        ACME, "25", "Common Stock", "NYSE", f"{ACME}-19-000025", _at(2019, 5, 6), date(2019, 5, 16)
+    )
+    moved = CoverPage(
+        ACME,
+        f"{ACME}-19-000030",
+        _at(2019, 5, 8),
+        (CoverListing("Common Stock", "ACME", "NASDAQ"),),
+    )
+    filings = _filings(delistings=[form_25])
+    filings._cover_pages = sorted(
+        [*filings._cover_pages, moved], key=lambda e: (e.accepted_at, e.accession)
+    )
+    prices = _History()
+    assert _backfill(settings, prices, filings=filings).ok
+    assert all(ACME in ids for ids in prices.fetched.values())
+
+
+def test_a_month_with_too_many_names_missing_is_stale(settings: Settings) -> None:
+    # One of four listed names (25%) returns nothing for May: over 5%.
+    prices = _History(gaps={(ACME, s) for s in _sessions(date(2019, 5, 1), date(2019, 5, 31))})
+    result = _backfill(settings, prices)
+    assert result.runs[-1].status == STALE and ACME in result.runs[-1].message
+    assert _read(settings, "SELECT max(session) FROM prices_daily") == [(date(2019, 4, 30),)]
