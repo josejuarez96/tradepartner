@@ -513,7 +513,7 @@ _OVERFLOWING_DATETIMES = [
 
 @pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
 def test_utc_overflow_raises_value_error_on_order(overflowing: datetime) -> None:
-    with pytest.raises(ValueError, match="submitted_at") as excinfo:
+    with pytest.raises(ValueError, match=r"submitted_at=.*out of the range") as excinfo:
         Order(
             client_order_id="co-1",
             symbol="AAPL",
@@ -523,12 +523,12 @@ def test_utc_overflow_raises_value_error_on_order(overflowing: datetime) -> None
             status=OrderStatus.OPEN,
             submitted_at=overflowing,
         )
-    assert not isinstance(excinfo.value, OverflowError)
+    assert isinstance(excinfo.value.__cause__, OverflowError)
 
 
 @pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
 def test_utc_overflow_raises_value_error_on_fill(overflowing: datetime) -> None:
-    with pytest.raises(ValueError, match="filled_at") as excinfo:
+    with pytest.raises(ValueError, match=r"filled_at=.*out of the range") as excinfo:
         Fill(
             client_order_id="co-1",
             symbol="AAPL",
@@ -537,19 +537,20 @@ def test_utc_overflow_raises_value_error_on_fill(overflowing: datetime) -> None:
             price=1.0,
             filled_at=overflowing,
         )
-    assert not isinstance(excinfo.value, OverflowError)
+    assert isinstance(excinfo.value.__cause__, OverflowError)
 
 
-def test_utc_overflow_clock_raises_on_submit_and_leaves_id_free() -> None:
+@pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
+def test_utc_overflow_clock_raises_on_submit_and_leaves_id_free(overflowing: datetime) -> None:
     # Mirrors test_naive_clock_raises_on_submit, but with a clock value
     # that is tz-aware and still overflows once converted to UTC.
     mode = ["overflowing"]
 
     def clock() -> datetime:
-        return _OVERFLOWING_DATETIMES[0] if mode[0] == "overflowing" else T0
+        return overflowing if mode[0] == "overflowing" else T0
 
     broker = FakeBroker(clock=clock)
-    with pytest.raises(ValueError, match="submitted_at"):
+    with pytest.raises(ValueError, match=r"submitted_at=.*out of the range"):
         broker.submit(make_request())
 
     assert broker.fills() == []
@@ -564,21 +565,22 @@ def test_utc_overflow_clock_raises_on_submit_and_leaves_id_free() -> None:
     assert order.status is OrderStatus.FILLED
 
 
-def test_utc_overflow_clock_raises_on_simulate_fill_path() -> None:
+@pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
+def test_utc_overflow_clock_raises_on_simulate_fill_path(overflowing: datetime) -> None:
     # Mirrors test_naive_clock_raises_on_simulate_fill_path: the submit
     # clock tick is good so the order is recorded as OPEN, and the
     # simulate_fill tick overflows.
     mode = ["good"]
 
     def clock() -> datetime:
-        return T0 if mode[0] == "good" else _OVERFLOWING_DATETIMES[1]
+        return T0 if mode[0] == "good" else overflowing
 
     broker = FakeBroker(clock=clock, auto_fill=False)
     order = broker.submit(make_request())
     assert order.status is OrderStatus.OPEN
 
     mode[0] = "overflowing"
-    with pytest.raises(ValueError, match="filled_at"):
+    with pytest.raises(ValueError, match=r"filled_at=.*out of the range"):
         broker.simulate_fill(order.client_order_id)
 
     # The overflowing `filled_at` makes `Fill` construction raise before
