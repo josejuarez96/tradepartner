@@ -1,1 +1,1 @@
-- Phase 3 T30: backtest config (`hypotheses`, `strategy`, `costs`, `holdout` null by default, `backtest`, `metrics`), `empyrical-reloaded==0.5.12` runtime and `bt==1.2.3` dev, AST guard against `bt`/`ffn`/`yfinance` under `src/`, ADR 0004 amendment (#116, PR #PR)
+- Phase 3 T30: backtest config (`hypotheses`, `strategy`, `costs`, `holdout` null by default, `backtest`, `metrics`), `empyrical-reloaded==0.5.12` runtime and `bt==1.2.3` dev, AST guard against `bt`/`ffn`/`yfinance` under `src/`, ADR 0004 amendment (#116, PR #120)
