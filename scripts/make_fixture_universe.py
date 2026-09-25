@@ -613,7 +613,7 @@ def _within_window_delisting(rows: Rows) -> None:
         "also T5's one delisted name with a universe-rule-passing history (review round 3)",
         security_id,
         ticker,
-        f"bars from {start} (>= universe.min_history_months before probe T); "
+        f"bars from {listing_start} (>= universe.min_history_months before probe T); "
         f"last bar {last_bar}, Form 25 filed {filed_at.date()} "
         f"(last session before filing {last_session_before_filing}, "
         f"gap <= gap.missing_tail_sessions={_GAP_THRESHOLD}); "
@@ -784,7 +784,8 @@ def _dual_class(rows: Rows) -> None:
         "classes plus one preferred (req 13; review round 3 MUST FIX 5)",
         f"{class_a_id}, {class_b_id}, {preferred_id}",
         f"{class_a_ticker}, {class_b_ticker}, {preferred_ticker}",
-        f"cik {cik}; bars from {_GLOBAL_START} through {_FIXTURE_END} for both common classes",
+        f"cik {cik}; bars from {_GLOBAL_START_SESSION} through {_FIXTURE_END} "
+        "for both common classes",
         f"probe T = {probe_t.isoformat()} (close of {_session_on_or_after(date(2018, 12, 17))}): "
         "expected to pass universe rule 1 with both common classes admitted and cap "
         f"summed over {class_a_id} (10,000,000 sh, class_member=ClassA) and "
@@ -838,7 +839,8 @@ def _exchange_transfer(rows: Rows) -> None:
         "Exchange transfer: Form 25 + new listing within master.transfer_window_sessions (req 13)",
         security_id,
         ticker,
-        f"bars from {_GLOBAL_START} through {_FIXTURE_END}; Form 25 filed {filed_at.date()} "
+        f"bars from {_GLOBAL_START_SESSION} through {_FIXTURE_END}; "
+        f"Form 25 filed {filed_at.date()} "
         f"(known_at {filed_at.isoformat()}); new NASDAQ listing valid_from {new_valid_from}, "
         f"known_at {new_known_at.isoformat()} (a filing-acceptance instant, review round 3 "
         "item 11); shares fact as_of "
@@ -957,7 +959,8 @@ def _split_between_filing_and_t(rows: Rows) -> None:
         "also passes universe rules 6/7 (review round 3 MUST FIX 4)",
         security_id,
         ticker,
-        f"bars from {_GLOBAL_START} through {_FIXTURE_END}; shares fact as_of {filing_session} "
+        f"bars from {_GLOBAL_START_SESSION} through {_FIXTURE_END}; "
+        f"shares fact as_of {filing_session} "
         f"(known_at {shares_known_at.isoformat()}); 3-for-1 split ex_date {ex_date} "
         f"(known_at {split_known_at.isoformat()}), raw close drops by 3x on ex-date",
         f"probe T = {probe_t.isoformat()} (close of {probe_session}): after both the shares "
@@ -993,7 +996,7 @@ def _split_known_before_t_ex_after_t(rows: Rows) -> None:
         "also passes universe rules 6/7 (review round 3 MUST FIX 4)",
         security_id,
         ticker,
-        f"bars from {_GLOBAL_START} through {_FIXTURE_END}; split announced "
+        f"bars from {_GLOBAL_START_SESSION} through {_FIXTURE_END}; split announced "
         f"{announced_at.isoformat()}, ex_date {ex_date} (after probe T), raw close "
         "drops by 4x on ex-date; shares fact as_of "
         f"{shares_as_of}, known_at {shares_known.isoformat()}",
@@ -1007,7 +1010,7 @@ def _split_known_before_t_ex_after_t(rows: Rows) -> None:
         security_id,
         ticker,
         f"{holiday.isoformat()} (Thanksgiving) falls inside {security_id}'s bar range "
-        f"{_GLOBAL_START}..{_FIXTURE_END} and has no prices_daily row",
+        f"{_GLOBAL_START_SESSION}..{_FIXTURE_END} and has no prices_daily row",
         "n/a",
     )
     rows.case(
@@ -1068,7 +1071,7 @@ def _split_backfilled_and_bar_revision(rows: Rows) -> None:
         "FIX 10, review round 4 MUST FIX 1)",
         security_id,
         ticker,
-        f"bars from {_GLOBAL_START} through {_FIXTURE_END}; split ex_date {ex_date}, "
+        f"bars from {_GLOBAL_START_SESSION} through {_FIXTURE_END}; split ex_date {ex_date}, "
         f"known_at {known_at.isoformat()} (close of the session before ex-date), "
         f"ingested_at {ingested_at.isoformat()} (a late 2026 backfill discovery -- "
         "the late discovery shows only in ingested_at, never known_at) -- raw close "
@@ -1367,7 +1370,8 @@ def _write_readme(path: Path, cases: list[dict[str, str]]) -> None:
         "timestamps that exercise it, for T6-T15 authors.",
         "",
         f"Shared conventions: securities needing a universe-rule-passing history run bars "
-        f"from `{_GLOBAL_START.isoformat()}`; every surviving (non-delisted) name's bars run "
+        f"from `{_GLOBAL_START_SESSION.isoformat()}`; "
+        "every surviving (non-delisted) name's bars run "
         f"through `{_FIXTURE_END.isoformat()}` (the common fixture end session), so no two "
         "survivors quietly stop on different dates.",
         "",
