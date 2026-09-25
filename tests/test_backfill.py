@@ -451,3 +451,32 @@ def test_a_name_delisted_after_the_month_still_counts_toward_its_staleness(
         "since=2019-04-10;through=2019-05-31",
     )
     assert ACME in result.runs[-1].message
+
+
+def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
+    secret = "sk-sentinel-backfill"
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        alpaca_api_key=secret,
+    )
+
+    class Leaky(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            raise RuntimeError(f"401 for key {secret}")
+
+    result = _backfill(settings, Leaky())
+    stored = _read(settings, "SELECT message FROM ingestion_runs WHERE source = 'alpaca'")
+    assert result.runs[-1].status == FAILED
+    assert all(secret not in m for (m,) in stored) and "[redacted]" in stored[0][0]
+
+
+def test_the_edgar_commit_never_reaches_the_source() -> None:
+    from tradepartner.ingest import _prefetch, _Recorded
+
+    recorded = _Recorded(_filings())
+    _prefetch(recorded, Settings(_env_file=None))
+    with pytest.raises(RuntimeError, match="after the fetch pass"):
+        recorded.facts(ACME, ["SomethingNew"])

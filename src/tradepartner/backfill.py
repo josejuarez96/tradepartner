@@ -51,7 +51,6 @@ from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings
 from tradepartner.ingest import (
-    _FETCH_PASS,
     FAILED,
     LOCKED,
     OK,
@@ -62,9 +61,9 @@ from tradepartner.ingest import (
     _action_row,
     _add_rows,
     _bar_row,
-    _build_filings,
     _clean,
     _ingest_filings,
+    _prefetch,
     _record_only,
     _Recorded,
     _run_source,
@@ -124,7 +123,7 @@ def backfill(
             f"since={since.isoformat()}",
             dry_run=False,
             mode=BACKFILL,
-            prepare=lambda: _build_filings(recorded, settings, _FETCH_PASS),
+            prepare=lambda: _prefetch(recorded, settings),
         )
         runs.append(run)
         if run.status != OK:

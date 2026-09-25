@@ -191,7 +191,7 @@ def ingest_session(
         "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now, clock),
     }
     prepare: dict[str, Callable[[], object] | None] = {
-        "edgar": lambda: _build_filings(recorded, settings, _FETCH_PASS),
+        "edgar": lambda: _prefetch(recorded, settings),
         "alpaca": None,
     }
     runs: list[SourceRun] = []
@@ -315,15 +315,20 @@ _FETCH_PASS = datetime(9000, 1, 1, tzinfo=UTC)
 
 
 class _Recorded(FilingSource):
-    """`source`, with each answer recorded so a second build reads the same."""
+    """`source`, with each answer recorded so a second build reads the same.
+    Once `frozen` (after the fetch pass), a question not already answered
+    raises instead of reaching the source, so no fetch runs under the lock."""
 
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._answers: dict[tuple[Any, ...], Any] = {}
+        self.frozen = False
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
         if key not in self._answers:
+            if self.frozen:
+                raise RuntimeError(f"filing source asked {key!r} after the fetch pass")
             self._answers[key] = getattr(self._source, method)(*args)
         return self._answers[key]
 
@@ -344,6 +349,13 @@ class _Recorded(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
+
+
+def _prefetch(recorded: _Recorded, settings: Settings) -> None:
+    """The fetch pass: every filing question, with no store connection open;
+    then `recorded` answers only from what it holds."""
+    _build_filings(recorded, settings, _FETCH_PASS)
+    recorded.frozen = True
 
 
 def _ingest_filings(
