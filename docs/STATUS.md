@@ -14,6 +14,7 @@
 - Phase 2 T4: store schema, db layer, shared test loader (PR #20)
 - Phase 2 T2: raw-fetch clients (Alpaca, EDGAR) and fixture recorder, with secret/email/User-Agent scrub (PR #21)
 - #36 Multi-team orchestration: `scripts/team.py` (register, claim, release, status, check-claims), [teams.md](ways-of-working/teams.md), plan chains, model tiers, CI `claims` job (PR #37). Duplicate T5/T20 work from two unsynchronised windows cleaned up (#34 → #31, #26 → #27, both parked)
+- Phase 2 T20: `Broker` interface and in-memory fake broker, no risk logic (PR #27)
 
 ## Teams
 Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-24: `atlas` (the main clone) holds #36; no other team registered. The two windows that produced parked PRs #31 (T5) and #27 (T20) were stopped during the cleanup; whichever team re-claims issue #22 / #23 continues those branches after a rebase.
