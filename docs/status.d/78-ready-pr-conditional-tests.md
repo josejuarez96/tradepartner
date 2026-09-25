@@ -1,0 +1,1 @@
+- #78 `ready_pr.py` runs pytest locally only when the diff touches src/, tests/, scripts/ or dependencies; `--tests` / `--no-tests` override; CI stays the gate (PR #80)
