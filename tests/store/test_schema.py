@@ -214,8 +214,12 @@ def test_known_at_round_trips_as_utc(fixture_store: duckdb.DuckDBPyConnection) -
     now = _now()
     row = _minimal_row("prices_daily", known_at=now, ingested_at=now)
     insert_row(fixture_store, "prices_daily", row)
+    # `fixture_store` may already carry other securities' bars (T5's fixture
+    # universe), so select this row by its own key rather than the whole
+    # table.
     (known_at,) = fixture_store.execute(  # type: ignore[misc]
-        "SELECT known_at FROM prices_daily"
+        "SELECT known_at FROM prices_daily WHERE security_id = ? AND session = ? AND known_at = ?",
+        [row["security_id"], row["session"], now],
     ).fetchone()
     assert known_at.tzinfo is not None
     assert known_at.utcoffset() == timedelta(0)
@@ -233,12 +237,13 @@ def test_ensure_tz_aware_accepts_aware_datetime() -> None:
 
 
 def test_insert_row_rejects_naive_known_at(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    (before,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     naive = datetime(2020, 1, 1)  # noqa: DTZ001
     row = _minimal_row("prices_daily", known_at=naive, ingested_at=_now())
     with pytest.raises(ValueError, match="known_at"):
         insert_row(fixture_store, "prices_daily", row)
-    (count,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
-    assert count == 0
+    (after,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    assert after == before
 
 
 def test_insert_row_rejects_naive_ingested_at(fixture_store: duckdb.DuckDBPyConnection) -> None:
@@ -284,10 +289,11 @@ def test_insert_row_rejects_datetime_for_date_column(
 def test_insert_row_accepts_valid_date_for_date_column(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
+    (before,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     row = _minimal_row("prices_daily", known_at=_now(), ingested_at=_now())
     insert_row(fixture_store, "prices_daily", row)
-    (count,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
-    assert count == 1
+    (after,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    assert after == before + 1
 
 
 # --- CHECK / UNIQUE constraints ----------------------------------------
@@ -356,6 +362,7 @@ def test_bar_with_later_known_at_is_a_new_row_not_rejected(
 ) -> None:
     """A revision (later `known_at`, same session) is a *new* row, per spec
     "Definitions" > Revision — the unique key includes `known_at`."""
+    (before,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     now = _now()
     row = _minimal_row("prices_daily", known_at=now, ingested_at=now)
     insert_row(fixture_store, "prices_daily", row)
@@ -364,8 +371,8 @@ def test_bar_with_later_known_at_is_a_new_row_not_rejected(
     revised["ingested_at"] = now + timedelta(days=1)
     revised["close"] = 99.0
     insert_row(fixture_store, "prices_daily", revised)
-    (count,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
-    assert count == 2
+    (after,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
+    assert after == before + 2
 
 
 # --- lock-error detection -----------------------------------------------
