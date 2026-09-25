@@ -192,6 +192,63 @@ def test_retry_after_header_honored_over_configured_backoff(
     assert backoff_sleeps == [pytest.approx(7.0)]
 
 
+@pytest.mark.parametrize("retry_after", ["nan", "inf", "1e9"])
+def test_retry_after_rejects_non_finite_or_too_large_values(
+    monkeypatch: pytest.MonkeyPatch, retry_after: str
+) -> None:
+    """A `nan`/`inf` `Retry-After` (non-finite) or one exceeding
+    `edgar.max_retry_after_seconds` (`1e9` seconds is over 31 years) must
+    raise instead of sleeping for it."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": retry_after})
+
+    with pytest.raises(edgar_raw.RetryAfterTooLargeError):
+        edgar_raw.company_tickers(settings=_settings(), client=_mock_client(handler))
+
+
+def test_retry_after_within_the_cap_is_still_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, headers={"Retry-After": "100"})
+        return httpx.Response(200, json={"ok": True})
+
+    edgar_raw.company_tickers(
+        settings=_settings(max_retry_after_seconds=120.0), client=_mock_client(handler)
+    )
+
+    backoff_sleeps = [s for s in slept if s > 1.0]
+    assert backoff_sleeps == [pytest.approx(100.0)]
+
+
+def test_retry_after_unparseable_falls_back_to_configured_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # RFC 9110's HTTP-date form: valid per spec, just not a number.
+            return httpx.Response(503, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+        return httpx.Response(200, json={"ok": True})
+
+    edgar_raw.company_tickers(
+        settings=_settings(retry_backoff_seconds=2.5), client=_mock_client(handler)
+    )
+
+    backoff_sleeps = [s for s in slept if s > 1.0]
+    assert backoff_sleeps == [pytest.approx(2.5)]
+
+
 # --- credentials -------------------------------------------------------
 
 
@@ -282,3 +339,55 @@ def test_download_filing_file_creates_nested_subdirectory(tmp_path: Path) -> Non
     ).resolve()
     assert dest == expected
     assert dest.read_bytes() == b"<xml>rendered</xml>"
+
+
+@pytest.mark.parametrize(
+    "accession",
+    [
+        "not-a-real-accession",
+        "0000320193-24-0001234",  # one digit too many in the last group
+        "0000320193-24-000123\n0000320193-24-000123",  # embedded newline
+        "0000320193-24-000123 ",  # trailing space
+    ],
+)
+def test_download_filing_file_rejects_accession_via_fullmatch(
+    tmp_path: Path, accession: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be made for an invalid accession")
+
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.download_filing_file(
+            "320193",
+            accession,
+            "primary_doc.xml",
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(handler),
+        )
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "",  # empty
+        "/",  # no real segment
+        "a/.",  # final segment is "."
+        ".",  # final (only) segment is "."
+        "a/../b",  # ".." segment
+        "primary?doc.xml",  # forbidden char: ?
+        "primary#doc.xml",  # forbidden char: #
+        "a\\b",  # forbidden char: backslash
+    ],
+)
+def test_download_filing_file_rejects_unsafe_filenames(tmp_path: Path, filename: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be made for an unsafe filename")
+
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.download_filing_file(
+            "320193",
+            "0000320193-24-000123",
+            filename,
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(handler),
+        )

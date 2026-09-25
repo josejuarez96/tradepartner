@@ -13,9 +13,11 @@ roughly `edgar.requests_per_second` (default 10) requests/second.
 module's shared client (a simple token/timestamp limiter, `threading.Lock`
 -guarded: it remembers the last request time and sleeps off the remainder
 of the interval); `_get` retries once, after a backoff (`Retry-After` if
-the response sends one, else `edgar.retry_backoff_seconds`), on
-`403`/`429`/`503` (SEC uses `403` for rate limiting too, alongside the
-more standard `429`/`503`).
+the response sends one and it's a finite, non-negative number no larger
+than `edgar.max_retry_after_seconds` -- else `edgar.retry_backoff_seconds`
+-- a response naming `nan`, `inf`, or an absurdly large value raises
+instead of sleeping for it), on `403`/`429`/`503` (SEC uses `403` for
+rate limiting too, alongside the more standard `429`/`503`).
 
 Every public function takes an optional `client: httpx.Client` so tests
 can inject an `httpx.MockTransport`-backed client without any real
@@ -25,10 +27,11 @@ callers omit it and get the module's shared, lazily-built client.
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -37,7 +40,12 @@ from pydantic import SecretStr
 from tradepartner.config import Settings, get_settings
 
 _RETRY_STATUS_CODES = frozenset({403, 429, 503})
-_ACCESSION_PATTERN = re.compile(r"^\d{10}-\d{2}-\d{6}$")
+# `.fullmatch()`, so no anchors needed: a partial/embedded match (or a
+# trailing-newline edge case `^...$` can admit) can never slip through.
+_ACCESSION_PATTERN = re.compile(r"\d{10}-\d{2}-\d{6}")
+# Characters SEC's own URLs and common filesystems treat specially and
+# that have no business in a `primaryDocument`/downloaded filename.
+_FORBIDDEN_FILENAME_CHARS = frozenset("?#\\")
 
 
 class EdgarCredentialsError(RuntimeError):
@@ -46,6 +54,10 @@ class EdgarCredentialsError(RuntimeError):
 
 class InvalidFilingReferenceError(ValueError):
     """Raised when an accession number or filename fails path-safety validation."""
+
+
+class RetryAfterTooLargeError(RuntimeError):
+    """Raised when a `Retry-After` response header exceeds `edgar.max_retry_after_seconds`."""
 
 
 def _non_blank_secret(secret: SecretStr | None) -> str | None:
@@ -127,14 +139,36 @@ def _user_agent(settings: Settings) -> str:
 
 def _retry_backoff_seconds(response: httpx.Response, settings: Settings) -> float:
     """`Retry-After` if the response sent one (seconds, integer per RFC 9110's
-    common case), else `edgar.retry_backoff_seconds`."""
+    common case), else `edgar.retry_backoff_seconds`.
+
+    Raises `RetryAfterTooLargeError` -- rather than sleeping for it -- if
+    the header names a non-finite value (`nan`/`inf`; `math.isfinite`) or
+    a finite one larger than `edgar.max_retry_after_seconds`: an SEC
+    response is not a trustworthy source for "sleep for however long it
+    says", and a value like `1e9` would otherwise hang this process for
+    over 31 years. A header that doesn't parse as a number at all (e.g.
+    the RFC 9110 HTTP-date form) is treated as absent, falling back to
+    `edgar.retry_backoff_seconds`.
+    """
     retry_after = response.headers.get("Retry-After")
-    if retry_after is not None:
-        try:
-            return max(float(retry_after), 0.0)
-        except ValueError:
-            pass
-    return settings.edgar.retry_backoff_seconds
+    if retry_after is None:
+        return settings.edgar.retry_backoff_seconds
+
+    try:
+        seconds = float(retry_after)
+    except ValueError:
+        return settings.edgar.retry_backoff_seconds
+
+    if not math.isfinite(seconds):
+        raise RetryAfterTooLargeError(
+            f"Retry-After={retry_after!r} is not a finite number of seconds"
+        )
+    if seconds > settings.edgar.max_retry_after_seconds:
+        raise RetryAfterTooLargeError(
+            f"Retry-After={seconds}s exceeds edgar.max_retry_after_seconds="
+            f"{settings.edgar.max_retry_after_seconds}s"
+        )
+    return max(seconds, 0.0)
 
 
 def _get(
@@ -171,23 +205,42 @@ def _validate_accession(accession: str) -> None:
     """`accession` must be a real EDGAR accession number, e.g. `0000320193-24-000123`.
 
     Guards against it flowing into a URL/filesystem path unvalidated (T2
-    review round 2, safety-reviewer MUST FIX).
+    review round 2, safety-reviewer MUST FIX). `.fullmatch()` (round 3):
+    the pattern itself carries no `^`/`$` anchors, since `fullmatch`
+    already requires the whole string to match -- `$` alone can admit a
+    trailing newline, which `fullmatch` cannot.
     """
-    if not _ACCESSION_PATTERN.match(accession):
+    if not _ACCESSION_PATTERN.fullmatch(accession):
         raise InvalidFilingReferenceError(
             f"accession must look like 0000320193-24-000123, got {accession!r}"
         )
 
 
 def _validate_relative_filename(filename: str) -> None:
-    """`filename` must be a relative path with no `..` segment.
+    """`filename` must be a safe relative path.
 
     EDGAR's `primaryDocument` can be nested (e.g. `xslF25X02/primary_doc.xml`
     for an XBRL-only form like 25-NSE), so a bare "no slashes" rule is too
-    strict; what must never happen is escaping the destination directory.
+    strict; what must never happen is escaping the destination directory,
+    resolving to nothing, or containing a character SEC's own URLs and
+    common filesystems treat specially. Rejects (round 3, safety-reviewer
+    MUST FIX): an empty filename; one with no real segment (e.g. `"/"` or
+    `""`, split on `/`); one whose final segment is exactly `.` (worth
+    rejecting explicitly -- `pathlib` would otherwise silently normalize
+    `"a/."` to `"a"`, masking a malformed input rather than refusing it);
+    a `..` segment; an absolute path; or any of `? # \\` anywhere in it.
     """
-    candidate = PurePosixPath(filename)
-    if candidate.is_absolute() or ".." in candidate.parts:
+    if not filename:
+        raise InvalidFilingReferenceError("filing filename must not be empty")
+    if any(char in filename for char in _FORBIDDEN_FILENAME_CHARS):
+        raise InvalidFilingReferenceError(f"unsafe filing filename: {filename!r}")
+    if filename.startswith("/"):
+        raise InvalidFilingReferenceError(f"unsafe filing filename: {filename!r}")
+
+    segments = filename.split("/")
+    if not any(segments):
+        raise InvalidFilingReferenceError(f"unsafe filing filename: {filename!r}")
+    if segments[-1] == "." or ".." in segments:
         raise InvalidFilingReferenceError(f"unsafe filing filename: {filename!r}")
 
 
