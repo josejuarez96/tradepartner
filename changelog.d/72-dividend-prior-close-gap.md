@@ -1,0 +1,2 @@
+### Fixed
+- `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, or `no_prior_bar`) for health; `calendar.all_sessions` added (#72).
