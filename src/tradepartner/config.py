@@ -66,10 +66,22 @@ class CalendarConfig(BaseModel):
 
 
 class StoreConfig(BaseModel):
-    """Point-in-time DuckDB store location and single-writer locking."""
+    """Point-in-time DuckDB store location and single-writer locking.
+
+    `lock_retry_initial_delay_seconds`/`.lock_retry_max_delay_seconds` are
+    not in the spec's "Config keys" list; added here (T4, PR #20 review)
+    so `store.db.open_for_write`'s lock-acquisition backoff is a config
+    value rather than a hardcoded constant, per CLAUDE.md's "Thresholds
+    and limits come from config, never hardcoded." A minimal, deliberate
+    exception to T4 touching only its own files (`docs/plans/data-
+    foundation.md` T1 lists `config.py` as a T1 file) — see that PR's
+    "Notes for reviewer" for why it was made here instead of deferred.
+    """
 
     path: str = "data/tradepartner.duckdb"
     lock_retry_seconds: int = 60
+    lock_retry_initial_delay_seconds: float = 0.05
+    lock_retry_max_delay_seconds: float = 1.0
 
 
 class IngestConfig(BaseModel):
