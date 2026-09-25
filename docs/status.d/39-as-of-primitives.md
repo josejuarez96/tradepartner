@@ -1,0 +1,1 @@
+- Phase 2 T6: as-of primitives and truncation-invariance harness (PR #69)
