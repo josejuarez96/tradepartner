@@ -1,0 +1,1 @@
+- #201 Spec req 13 and plan T40b: a plan-read timing check (windowed runs on a test-only benchmark-exempt cut at read_time(T_k), both _plan call sites, teeth for a late plan read and a late signal read) catches a fill made from a later rebalance's read, which truncation and prefix invariance alone cannot; T45 now depends on T40b (owner decisions 2026-09-25)
