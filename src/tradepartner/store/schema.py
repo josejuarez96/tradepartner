@@ -25,25 +25,27 @@ by column type, before any row reaches these tables.
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
 EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
 If a store records a version this code has no path from (anything other
-than 1 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+than 2 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
 `SchemaVersionError` rather than silently operating against a shape it
 does not know about.
 
-Schema versions (Phase 3 spec req 9):
+Schema versions (the Phase 3 spec req 9 says "version 2" for the
+registry; #83 took version 2 first, so the registry is version 3):
 
-- **Version 1**: the fact tables, `ingestion_runs` and `schema_version`
-  (`TABLE_NAMES`), exactly as Phase 2 shipped them.
-- **Version 2**: adds the eight trial-registry tables
-  (`REGISTRY_TABLE_NAMES`). The migration from version 1 is additive:
-  it creates the registry tables and appends a version-2 row to
+- **Version 1**: the Phase 2 fact tables, `ingestion_runs` and
+  `schema_version` (`TABLE_NAMES`). No migration: a version-1 store raises
+  `SchemaVersionError` and is rebuilt (#83).
+- **Version 2** (#83): adds `corporate_actions.announced_at`.
+- **Version 3** (#117): adds the eight trial-registry tables
+  (`REGISTRY_TABLE_NAMES`). The migration from version 2 is additive: it
+  creates the registry tables and appends a version-3 row to
   `schema_version`; no fact table, `ingestion_runs` row or existing
   `schema_version` row changes. It runs on any writable connection that
   calls `init_schema`. A read-only connection never migrates: on a
-  version-1 (or empty) store it raises `RegistryNotInitialised`, which the
+  version-2 (or empty) store it raises `RegistryNotInitialised`, which the
   read-only dashboard pages turn into a "registry not initialised" state.
-- **A later fact-table DDL change goes to version 3**, with its own
-  migration and a note here, never a silent edit of the version-1 or
-  version-2 DDL below.
+- **A later fact-table DDL change goes to version 4**, with its own
+  migration and a note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
 `known_at`/`ingested_at`/`source`/`provenance` columns, and they are kept
@@ -109,13 +111,24 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 }
 
 #: The schema version `init_schema` records on a fresh store and migrates
-#: a version-1 store to. Bump and add a migration note to the module
-#: docstring (not silent DDL edits) if the shape of a table changes after
-#: data has been loaded: a fact-table change is version 3.
-CURRENT_SCHEMA_VERSION = 2
+#: a version-2 store to. Bump and add a migration note (not silent DDL
+#: edits) if the shape of a table changes after data has been loaded.
+#:
+#: Migration notes:
+#: - 2 (issue #83): `corporate_actions.announced_at TIMESTAMPTZ` (nullable),
+#:   the source's announcement time, so a first-seen `known_at` earlier than
+#:   the proxy is checkable. No store had ingested data at version 1, so
+#:   there is no migration code: a version-1 store raises
+#:   `SchemaVersionError`; rebuild it.
+#: - 3 (issue #117, Phase 3 T31): the eight trial-registry tables
+#:   (`REGISTRY_TABLE_NAMES`). Additive migration from version 2: the
+#:   registry tables are created and a version-3 row appended; nothing else
+#:   changes (module docstring, "Schema versions").
+CURRENT_SCHEMA_VERSION = 3
 
-#: The Phase 2 schema version, the only one `init_schema` migrates from.
-_VERSION_1 = 1
+#: The last version without the registry, the only one `init_schema`
+#: migrates from (fact tables as of #83).
+_PRE_REGISTRY_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -125,8 +138,8 @@ class SchemaVersionError(RuntimeError):
 
 
 class RegistryNotInitialised(RuntimeError):
-    """A read-only connection opened a store without the version-2 trial
-    registry (a version-1 store, or one never initialised). Read-only
+    """A read-only connection opened a store without the trial registry
+    (a version-2 store, or one never initialised). Read-only
     connections never migrate; any writing command's `init_schema` call
     does."""
 
@@ -213,12 +226,19 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 )
 """
 
+# announced_at is the source's announcement time, NULL when the source
+# gives none (issue #83). A first-seen row's known_at equals announced_at
+# capped at the close of the session before ex_date, else that close
+# (spec req 5); revisions carry it forward unchanged. The adapters enforce
+# that, the table only stores it. It is evidence for the stamp, never a
+# time to filter on: as-of reads use known_at only.
 _CREATE_CORPORATE_ACTIONS = f"""
 CREATE TABLE IF NOT EXISTS corporate_actions (
     security_id VARCHAR NOT NULL,
     action_type VARCHAR NOT NULL,
     ex_date DATE NOT NULL,
     ratio_or_amount DOUBLE NOT NULL,
+    announced_at TIMESTAMPTZ,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["corporate_actions"])},
     UNIQUE (security_id, action_type, ex_date, known_at)
 )
@@ -295,7 +315,7 @@ _TABLE_DDL: tuple[str, ...] = (
 )
 
 
-# Trial registry (schema version 2; Phase 3 spec "Data / interfaces" >
+# Trial registry (schema version 3; Phase 3 spec "Data / interfaces" >
 # Tables). Not fact tables: no known_at, like ingestion_runs. Every JSON
 # payload is VARCHAR because extension auto-load is disabled
 # (`configure_connection`), so the json extension is never available.
@@ -447,7 +467,7 @@ CREATE TABLE IF NOT EXISTS owner_decisions (
 )
 """
 
-#: The trial-registry tables added at schema version 2, disjoint from
+#: The trial-registry tables added at schema version 3, disjoint from
 #: `TABLE_NAMES` so the look-ahead harness never sees them.
 REGISTRY_TABLE_NAMES: tuple[str, ...] = (
     "hypotheses",
@@ -499,7 +519,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
     max_version = _max_version(conn)
     if max_version == CURRENT_SCHEMA_VERSION:
         return
-    if max_version is None or max_version == _VERSION_1:
+    if max_version is None or max_version == _PRE_REGISTRY_VERSION:
         found = "no schema" if max_version is None else f"schema version {max_version}"
         raise RegistryNotInitialised(
             f"store has {found}; the trial registry needs version "
@@ -513,7 +533,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-1 store to version 2.
+    version-2 store to version 3.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -524,12 +544,12 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     never reuses type info cached before these tables existed.
 
     On a writable connection: a fresh store gets every table and one
-    `schema_version` row for `CURRENT_SCHEMA_VERSION`; a version-1 store
-    gets the registry tables and an appended version-2 row, and nothing
+    `schema_version` row for `CURRENT_SCHEMA_VERSION`; a version-2 store
+    gets the registry tables and an appended version-3 row, and nothing
     else changes (module docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-2 store passes, and a
-    version-1 or uninitialised store raises `RegistryNotInitialised`.
+    On a read-only connection no DDL runs: a version-3 store passes, and a
+    version-2 or uninitialised store raises `RegistryNotInitialised`.
 
     Raises `SchemaVersionError` if the store records any other version:
     this module has no migration from it, so operating on a store shaped
@@ -541,7 +561,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         forget_column_types(conn)
         return
     max_version = _max_version(conn)
-    if max_version not in (None, _VERSION_1, CURRENT_SCHEMA_VERSION):
+    if max_version not in (None, _PRE_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
             f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
         )
