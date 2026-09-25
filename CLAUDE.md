@@ -2,7 +2,7 @@
 
 Personal, local US-equity trading research system: point-in-time data, honest backtests, paper trading, then a small live account. Owner: Jose (solo). Agents build; the owner reviews and approves merges.
 
-**Start every session by reading [docs/STATUS.md](docs/STATUS.md).** It tells you the phase, what's in progress and what's next.
+**Start every session by reading [docs/STATUS.md](docs/STATUS.md)**, then run `uv run python scripts/team.py status`. STATUS tells you the phase; the board tells you who holds what and what is ready.
 
 ## Non-negotiables
 1. **Never commit to or push `main`.** Branch `<type>/<issue#>-<slug>` from the latest main and open a PR. Never force-push shared branches or use `--no-verify`. Merge a PR only when the owner explicitly tells you to merge that specific PR (squash, CI green); otherwise never merge. Subagents never merge. See [git-workflow.md](docs/ways-of-working/git-workflow.md).
@@ -13,6 +13,7 @@ Personal, local US-equity trading research system: point-in-time data, honest ba
 6. **Point-in-time data.** Every stored fact has a `known_at` (UTC, tz-aware) timestamp. No look-ahead. Include delisted securities.
 7. **Every backtest run is logged** in the trial registry. Never touch the holdout without an explicit flag.
 8. **When unsure, stop and ask.** Write open questions in the PR or spec. Don't guess at requirements.
+9. **Claim before you build.** `uv run python scripts/team.py claim <Tn|issue#>` before any branch. GitHub holds the claim; STATUS.md is a snapshot. "Held by another team" means pick something else. One session per working directory (your own worktree or clone); `spike/` branches are exempt. Never `release --force` or `--owner-task` unless Jose says so. See [teams.md](docs/ways-of-working/teams.md).
 
 ## Commands
 ```bash
@@ -22,6 +23,8 @@ uv run ruff check . && uv run ruff format .  # lint + format
 uv run mypy                               # types (strict, src/)
 uv run pre-commit run --all-files         # all hooks
 uv add <pkg> / uv add --dev <pkg>         # deps (only if the plan lists them)
+uv run python scripts/team.py status      # who holds what, ready frontier
+uv run python scripts/team.py claim T5    # or an issue number; release to give back
 ```
 Run lint, format, mypy and pytest before every push.
 
@@ -41,6 +44,7 @@ Run lint, format, mypy and pytest before every push.
 | What to build / how | `docs/specs/`, `docs/plans/` |
 | Research and evidence grades | [docs/research/](docs/research/) |
 | Build agents and when to use them | [docs/ways-of-working/agents.md](docs/ways-of-working/agents.md) |
+| Working alongside other chat windows | [docs/ways-of-working/teams.md](docs/ways-of-working/teams.md) |
 | Doc types and templates | [docs/README.md](docs/README.md) |
 
 ## Before opening or readying a PR

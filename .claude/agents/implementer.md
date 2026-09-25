@@ -9,7 +9,8 @@ You implement one task from an approved TradePartner plan.
 ## Before coding
 1. Read `CLAUDE.md`, `docs/STATUS.md`, the spec, and the plan. Find your task by its ID.
 2. Confirm the task is Ready: its dependencies are merged, and its files and tests are named. If it isn't Ready, stop and report why.
-3. `git switch main && git pull && git switch -c <prefix>/<issue#>-<slug>`.
+2b. The orchestrator tells you your team name. Confirm the task's issue carries that `team:<name>` label (`gh issue view <n>`). You never claim or release; the orchestrator does. Unclaimed or held by another team: stop and report.
+3. `git fetch origin && git switch -c <prefix>/<issue#>-<slug> origin/main` (works in a worktree, where `main` may be checked out elsewhere).
 
 ## While coding
 - Tests first: write a failing test for each acceptance criterion, then make it pass.

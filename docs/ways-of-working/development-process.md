@@ -59,6 +59,7 @@ Not every change needs every document. Size is set on the issue.
 ## Definition of Ready (before BUILD starts)
 
 - [ ] The issue exists, with size, acceptance criteria and out-of-scope.
+- [ ] The issue is claimed by your team (`team:` label, via `scripts/team.py claim`).
 - [ ] Any spec or plan the size requires is merged.
 - [ ] Dependencies are merged, or explicitly stubbed.
 - [ ] Required secrets and data access are available, or the task is scoped to work without them.
@@ -90,13 +91,14 @@ These come straight from the research handoff. They are process rules, not just 
 
 **Start of session:**
 1. Read `docs/STATUS.md`.
-2. Pick the next unblocked plan task or issue.
+2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch (spikes excepted).
 3. `git switch main && git pull`, then branch.
 
 **End of session:**
 1. Commit and push.
 2. Update the draft PR description with the current state.
-3. Update `docs/STATUS.md` if anything changed: done, blocked, or a new decision needed.
+3. Update `docs/STATUS.md` if anything changed: done, blocked, or a new decision needed. Append lines; never edit "Next up" to reserve work.
+4. Stopping for good on an item: `uv run python scripts/team.py release` it, with a handoff comment on the issue.
 
 `STATUS.md` replaces ad-hoc handoff documents. It always tells you where things stand in two minutes of reading.
 
