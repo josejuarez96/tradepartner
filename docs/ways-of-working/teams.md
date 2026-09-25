@@ -22,16 +22,18 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 ## Set up a team (once per session)
 
-**In this repo, from a new Claude Code session (VS Code or terminal).** The session first takes a working directory nobody else uses, then registers:
+**From a new Claude Code session in this repo (VS Code or terminal), one command:**
 
 ```bash
-git worktree add --detach .claude/worktrees/<name> origin/main   # or Claude Code's EnterWorktree tool
-cd .claude/worktrees/<name>
-uv run python scripts/team.py register <name>      # writes .team here (gitignored), creates label team:<name>
+uv run python scripts/team.py start <name>
+cd <the path it prints>            # ~/Projects/tradepartner-teams/<name>, a worktree outside the repo
 ```
 
-The main checkout (`~/Projects/tradepartner`) is a working directory like any other; whichever session registered there owns it. A **separate clone** (`git clone … ~/Projects/tradepartner-<name>`, then `uv sync && uv run pre-commit install && register <name>`) works the same and is only needed for a second VS Code window.
+`start` fetches, creates the directory, writes `.team` there and creates the label. It refuses if the directory exists or if the name holds open issues (a live session is using it). The team name is typed **once**, in that command. The main checkout belongs to whichever team registered it (`atlas`), and `register` refuses to overwrite another team's `.team`.
 
+Team directories live **outside the repo** on purpose: a session that lists files in its own directory never sees another team's work. A **separate clone** (`git clone … ~/Projects/tradepartner-<name>`, then `uv sync && uv run pre-commit install && register <name>`) works the same and is only needed for a second VS Code window.
+
+- **Your directory is the only directory you touch.** Never `cd` into, read from, or run git in another team's directory or in the main checkout, not even "to check". Everything you need is in your worktree, on GitHub, or in `status`.
 - **One session per working directory, always.** Two sessions in one directory switch branches under each other. `.team` marks whose directory it is.
 - Names are short and lowercase (`atlas`, `team-b`). A session that is closed for good keeps its name; the next session may reuse it or pick a new one.
 - Implementer subagents get their own worktrees and are told the team name by the orchestrator; they verify the issue's `team:` label and never claim themselves.
@@ -106,7 +108,8 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 ## Never
 
 - Start from STATUS "Next up" without a claim.
-- Run two sessions in one working directory.
+- Run two sessions in one working directory, or register in a directory that already has a different `.team`.
+- Enter another team's directory or the main checkout for any reason.
 - Touch a branch, PR or issue that another team currently **holds** (a released or parked one is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
 - Merge. The owner merges, or explicitly tells one main session to (git-workflow rule 7).
