@@ -1,0 +1,1 @@
+- Phase 2 T13: `universe_as_of(conn, t, settings)` applies ADR 0006 rules 1–8 in order from rows known at T, reports each exclusion under its first failing rule with a reason, sums dual-class cap per company, adjusts shares only for splits with ex-date ≤ T, and records enabled rules and settings; truncation-invariant at every fixture `known_at` (#135)
