@@ -1,1 +1,1 @@
-- Phase 2 T8: `FilingSource` interface, fixture adapter, security master core (`build_master`, `securities_as_of`) (#77, PR #TBD)
+- Phase 2 T8: `FilingSource` interface, fixture adapter, security master core (`build_master`, `securities_as_of`) (#77, PR #85)
