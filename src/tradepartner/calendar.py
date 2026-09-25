@@ -15,10 +15,18 @@ The calendar's valid date range is pinned from config
 window (today - 20y .. today + 1y): an unpinned range rejects any date
 older than ~20 years and drifts with today's date, which is not
 reproducible.
+
+The range is read through `get_settings()`, which parses the environment and
+`.env` afresh on every call (~5 ms; deliberately uncached, see `config.py`).
+The session helpers run thousands of times per backtest, so the range is
+cached per **config state** instead (#154): a fingerprint of everything
+`Settings` reads for `calendar` (the `CALENDAR*` environment variables, and
+the `.env` file's path, mtime and size). Changing either re-reads the range.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime
 from functools import lru_cache
 
@@ -27,7 +35,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from exchange_calendars.errors import DateOutOfBounds, NotSessionError
 
-from tradepartner.config import get_settings
+from tradepartner.config import _default_env_file, get_settings
 
 _CALENDAR_NAME = "XNYS"
 
@@ -38,10 +46,33 @@ def _calendar(start: date, end: date) -> xcals.ExchangeCalendar:
     return xcals.get_calendar(_CALENDAR_NAME, start=pd.Timestamp(start), end=pd.Timestamp(end))
 
 
+def _config_fingerprint() -> tuple[object, ...]:
+    """What `Settings` reads for `calendar`, cheaply: the environment variables
+    that can set it (names are case-insensitive) and the `.env` file's state."""
+    env = tuple(sorted((k, v) for k, v in os.environ.items() if k.lower().startswith("calendar")))
+    path = _default_env_file()
+    try:
+        stat = path.stat()
+    except OSError:
+        return env, str(path), None
+    return env, str(path), stat.st_mtime_ns, stat.st_size
+
+
+@lru_cache(maxsize=8)
+def _calendar_bounds(fingerprint: tuple[object, ...]) -> tuple[date, date]:
+    """`(calendar.start, calendar.end)` for one config state (`fingerprint` is
+    the cache key only)."""
+    cfg = get_settings().calendar
+    return cfg.start, cfg.end
+
+
+def _bounds() -> tuple[date, date]:
+    return _calendar_bounds(_config_fingerprint())
+
+
 def _get_calendar() -> xcals.ExchangeCalendar:
     """The XNYS calendar, bounded by the current `calendar.start`/`.end` config."""
-    cfg = get_settings().calendar
-    return _calendar(cfg.start, cfg.end)
+    return _calendar(*_bounds())
 
 
 def _reject_datetime(day: date, *, func: str) -> None:
@@ -121,8 +152,7 @@ def all_sessions() -> tuple[date, ...]:
     """Every XNYS session in the configured `calendar.start`..`calendar.end`
     range, ascending. Cached per range; the same tuple object is returned
     while the range is unchanged."""
-    cfg = get_settings().calendar
-    return _all_sessions(cfg.start, cfg.end)
+    return _all_sessions(*_bounds())
 
 
 def last_session_of_month(year: int, month: int) -> date:

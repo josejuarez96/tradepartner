@@ -1,0 +1,1 @@
+- #154 Calendar helpers read `calendar.start`/`.end` once per config state (fingerprint of `CALENDAR*` env vars and the `.env` file's path, mtime and size) instead of rebuilding `Settings` per call; `is_session` ~14× faster; `get_settings()` stays uncached
