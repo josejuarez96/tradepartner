@@ -230,6 +230,67 @@ def synthetic() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 class TestSynthetic:
+    def test_filing_after_close_uses_new_york_date(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # 2019-03-06 01:30 UTC is 2019-03-05 20:30 in New York: filing session
+        # 03-05, so a window of 1 reaches back to 03-04 (UTC's 03-06 would not).
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NYSE", date(2019, 1, 2), _at(2018, 12, 3))
+        )
+        insert_row(
+            synthetic,
+            "delistings",
+            _delisting("S", "NYSE", datetime(2019, 3, 6, 1, 30, tzinfo=UTC)),
+        )
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NASDAQ", date(2019, 3, 4), _at(2019, 3, 6))
+        )
+        one = _settings(master={"transfer_window_sessions": 1})
+        assert (
+            _status(listing_ends_as_of(synthetic, LATE, one), "S", "NYSE")["status"]
+            == "transferred"
+        )
+
+    def test_weekend_filing_rolls_to_next_session(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Saturday 2019-03-09 filing: session Monday 03-11, window of 1 reaches
+        # 03-12 (Friday 03-08 as the filing session would stop at 03-11).
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NYSE", date(2019, 1, 2), _at(2018, 12, 3))
+        )
+        insert_row(synthetic, "delistings", _delisting("S", "NYSE", _at(2019, 3, 9, 15, 0)))
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NASDAQ", date(2019, 3, 12), _at(2019, 3, 12))
+        )
+        one = _settings(master={"transfer_window_sessions": 1})
+        assert (
+            _status(listing_ends_as_of(synthetic, LATE, one), "S", "NYSE")["status"]
+            == "transferred"
+        )
+
+    def test_new_listing_first_seen_after_window_is_delisted_then_relisted(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # The master's shape: valid_from is the session of the cover page that
+        # first shows the new exchange. Seen 3 weeks after the Form 25, it is
+        # outside the window: delisted, then a new listing (no transfer).
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NYSE", date(2019, 1, 2), _at(2018, 12, 3))
+        )
+        insert_row(synthetic, "delistings", _delisting("S", "NYSE", _at(2019, 3, 5)))
+        for day in (date(2019, 3, 14), date(2019, 3, 15), date(2019, 3, 26), date(2019, 3, 27)):
+            insert_row(synthetic, "prices_daily", _bar("S", day))
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NASDAQ", date(2019, 3, 26), _at(2019, 3, 26))
+        )
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        nyse = _status(df, "S", "NYSE")
+        assert nyse["status"] == "delisted"
+        assert nyse["end_session"] == date(2019, 3, 15)  # bars from the new listing excluded
+        assert _status(df, "S", "NASDAQ")["status"] == "listed"
+
     def test_relisting_outside_window_is_not_a_transfer(
         self, synthetic: duckdb.DuckDBPyConnection
     ) -> None:
@@ -324,6 +385,8 @@ class TestSynthetic:
 CIK_DUAL = "0000000007"
 CIK_SOLO = "0000000008"
 CIK_SNAP = "0000000009"
+CIK_WORD = "0000000010"  # cover page says "Common Shares"
+CIK_TWO = "0000000011"  # two common classes on one exchange
 
 
 def _sec(sid: str, cik: str) -> dict[str, Any]:
@@ -360,6 +423,18 @@ def _master() -> MasterBuild:
             "class_title": None,
             "provenance": "snapshot_static",
         },
+        {
+            **_listing(CIK_WORD, "WRD", "NYSE", date(2015, 1, 6), _at(2015, 1, 5)),
+            "class_title": "Common Shares, no par value",
+        },
+        {
+            **_listing(CIK_TWO, "TWA", "NYSE", date(2015, 1, 6), _at(2015, 1, 5)),
+            "class_title": "Class A Common Stock",
+        },
+        {
+            **_listing(f"{CIK_TWO}:b", "TWB", "NYSE", date(2015, 1, 6), _at(2015, 1, 5)),
+            "class_title": "Class B Common Stock",
+        },
     ]
     return MasterBuild(
         securities=(
@@ -367,6 +442,9 @@ def _master() -> MasterBuild:
             _sec(f"{CIK_DUAL}:6-preferred-stock", CIK_DUAL),
             _sec(CIK_SOLO, CIK_SOLO),
             _sec(CIK_SNAP, CIK_SNAP),
+            _sec(CIK_WORD, CIK_WORD),
+            _sec(CIK_TWO, CIK_TWO),
+            _sec(f"{CIK_TWO}:b", CIK_TWO),
         ),
         listings=tuple(listings),
         unmatched_snapshot=(),
@@ -432,6 +510,45 @@ class TestBuild:
     def test_unknown_cik_is_unmatched(self) -> None:
         filing = _filing("0000000099", "Common Stock", "NYSE", _at(2019, 3, 5))
         assert build_delistings([filing], _master(), ingested_at=INGESTED_AT).unmatched == (filing,)
+
+    def test_warrant_filing_never_ends_an_untitled_common_listing(self) -> None:
+        filing = _filing(CIK_SNAP, "Warrants to purchase Common Stock", "NYSE", _at(2018, 3, 5))
+        build = build_delistings([filing], _master(), ingested_at=INGESTED_AT)
+        assert build.delistings == ()
+        assert build.unmatched == (filing,)
+
+    def test_common_filing_finds_single_common_class_despite_wording(self) -> None:
+        build = build_delistings(
+            [_filing(CIK_WORD, "Common Stock", "NYSE", _at(2019, 3, 5))],
+            _master(),
+            ingested_at=INGESTED_AT,
+        )
+        assert [r["security_id"] for r in build.delistings] == [CIK_WORD]
+
+    def test_common_filing_with_two_common_classes_is_unmatched(self) -> None:
+        filing = _filing(CIK_TWO, "Common Stock", "NYSE", _at(2019, 3, 5))
+        assert build_delistings([filing], _master(), ingested_at=INGESTED_AT).unmatched == (filing,)
+
+    def test_resolution_through_later_listing_ends_nothing_before_it_is_known(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # The 2018 filing resolves through a listing known only in 2020: the
+        # row keeps its 2018 known_at and ends nothing until the listing is known.
+        master = _master()
+        filed = _at(2018, 3, 5)
+        build = build_delistings(
+            [_filing(CIK_SNAP, "Common Shares", "NYSE", filed)], master, ingested_at=INGESTED_AT
+        )
+        assert build.delistings[0]["known_at"] == filed
+        write_delistings(synthetic, build)
+        for row in master.listings:
+            insert_row(synthetic, "listings", row)
+        between = _at(2019, 6, 3)
+        assert delistings_as_of(synthetic, between)["security_id"].to_list() == [CIK_SNAP]
+        early = listing_ends_as_of(synthetic, between, _settings(), security_ids=[CIK_SNAP])
+        assert early.is_empty()
+        later = listing_ends_as_of(synthetic, LATE, _settings(), security_ids=[CIK_SNAP])
+        assert later["status"].to_list() == ["delisted"]
 
     def test_untitled_listing_of_single_class_issuer_matches(self) -> None:
         build = build_delistings(
@@ -520,6 +637,15 @@ class TestNoLookAhead:
         # Probes around every listing and delisting known_at, plus every
         # session close in the week or so around each filing (bars decide ends).
         probes = set(probe_timestamps(fixture_store, ("listings", "delistings")))
+        # Every bar known_at of a delisted name within 60 days of its filing.
+        bar_known_ats = fixture_store.execute(
+            """
+            SELECT DISTINCT p.known_at FROM prices_daily p JOIN delistings d USING (security_id)
+            WHERE p.session BETWEEN CAST(d.filed_at AS DATE) - 60 AND CAST(d.filed_at AS DATE) + 60
+            """
+        ).fetchall()
+        for (known_at,) in bar_known_ats:
+            probes.update({known_at - PROBE_EPSILON, known_at})
         for (filed,) in fixture_store.execute("SELECT filed_at FROM delistings").fetchall():
             day = filed.date()
             for offset in range(-8, 9):

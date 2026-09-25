@@ -13,11 +13,19 @@ days (Rule 12d2-2).
 **One class per filing.** A filing names a class, not a company, so it is
 resolved to the `security_id` of its CIK whose listing on the filing's
 exchange has the same title up to the first comma (master's
-`_norm_title`). A CIK with a single security whose listings on that
-exchange carry no title (snapshot rows) takes the filing too. Anything
-else, including a preferred title that matches no class, is returned in
-`unmatched`, never guessed: guessing would end the common listing on a
-preferred filing.
+`_norm_title`). Failing that, a filing whose title is plain common equity
+(master's `_is_common`, and no warrant, right, unit, preferred or
+depositary word) takes the one class on that exchange whose
+listings are all common-titled or untitled (snapshot rows), so "Common
+Stock" still finds a class whose cover page says "Common Shares". Anything
+else, including a warrant or preferred title that matches no class, or
+two common classes, is returned in `unmatched`, never guessed: guessing
+would end the common listing on a warrant or preferred filing.
+
+Resolution is a key mapping and may use master rows known after the
+filing (the master is built from full history). That never makes anything
+visible early: the row's `known_at` stays the acceptance, and at read time
+a filing ends only a listing already known at T.
 
 **Nothing derived is stored.** At T, from rows with `known_at <= T` only:
 
@@ -60,7 +68,7 @@ from tradepartner.store.asof import (
     listings_as_of,
 )
 from tradepartner.store.db import insert_row
-from tradepartner.store.master import MasterBuild, _norm_title
+from tradepartner.store.master import MasterBuild, _is_common, _norm_title
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 DELISTING_FORMS = frozenset({"25", "25-NSE"})
@@ -94,6 +102,16 @@ def _filing_session(filed_at: datetime) -> date:
     return day if is_session(day) else next_session(day)
 
 
+#: Words that make a title mentioning common stock something else
+#: ("Warrants to purchase Common Stock", "Units, each of one share ...").
+_NOT_COMMON_WORDS = ("warrant", "right", "unit", "preferred", "depositary", "note", "debenture")
+
+
+def _is_plain_common(title: str) -> bool:
+    norm = _norm_title(title)
+    return _is_common(title) and not any(word in norm for word in _NOT_COMMON_WORDS)
+
+
 def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
     """The `security_id` `filing` delists, or `None` if it is not certain."""
     candidates: set[str] = {
@@ -114,10 +132,17 @@ def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
     }
     if len(by_title) == 1:
         return by_title.pop()
-    untitled = on_exchange and all(row["class_title"] is None for row in on_exchange)
-    if not by_title and len(candidates) == 1 and untitled:
-        return next(iter(candidates))
-    return None
+    if by_title or not _is_plain_common(filing.class_title):
+        return None
+    titles: dict[str, list[str | None]] = defaultdict(list)
+    for row in on_exchange:
+        titles[row["security_id"]].append(row["class_title"])
+    common = {
+        security_id
+        for security_id, seen in titles.items()
+        if all(t is None or _is_plain_common(t) for t in seen)
+    }
+    return common.pop() if len(common) == 1 else None
 
 
 def build_delistings(
