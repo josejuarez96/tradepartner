@@ -1,6 +1,6 @@
 # Research Report: Alpaca missing-bar share and paper fills of pre-open market orders
 
-**Brief:** #106  ·  **Date:** 2026-09-25  ·  **Status:** INCOMPLETE (probes built, owner runs pending)  ·  **Agent/model:** team fearsill, claude-opus-5-5, owner-run probes
+**Brief:** #106  ·  **Date:** 2026-09-25  ·  **Status:** INCOMPLETE (Probe 2 historical run done; live case and Probe 3 pending)  ·  **Agent/model:** team fearsill, claude-opus-5-5, owner-run probes
 
 This is a probe report, not a literature search. It runs the two probes #86 left to the owner, per the protocols in [alpaca-open-and-depth](2026-09-25-alpaca-open-and-depth.md), "Owner probe protocols": Probe 2 (missing-bar share, feeds `ingest.max_missing_share`) and Probe 3 (pre-open paper fills, feeds `execution.fill_price` and the Phase 4 execution ADR). Probe 1 is #101.
 
@@ -26,7 +26,26 @@ Both scripts are on branch `spike/106-probes` (spike code, never merged), with o
 - **Sessions:** 5 normal sessions (no early close, no KO or AAPL earnings), 10 F and 10 W fills.
 
 ## Probe 2 results
-Pending owner run.
+Run 1 by team fearsill with the owner's keys and permission, 2026-09-25 08:06 UTC: `probe_missing_bars.py fetch` on `spike/106-probes`. It made 45 read-only calls with 0 errors, and the feed echo was `sip`. The run was re-graded offline at commit 1a7c749. The live case is pending: it runs after 17:00 ET today.
+
+- **Universe:** 8,814 active, tradable names on NYSE, Nasdaq and NYSE American as of today. By asset name, 7,304 are common-like. The rest are 438 warrants, 421 preferreds, 345 units, 176 notes and 130 rights.
+- **Window:** 2026-08-21 to 2026-09-18, 20 XNYS sessions.
+- **Finding 1: the source nearly always delivers a row.** A name with no trades on a session still gets a zero-volume placeholder bar (v=0, n=0), not a gap. The run held 12,398 such rows across 1,286 names; about three quarters were units, warrants and rights. Only 19 name-sessions had no row at all, all on three SPAC tickers (IPXGU 17, ATLQU 1, ATLQW 1).
+- **Finding 2: the protocol's IPO rule needed a fix.** The protocol treats a name as a probable IPO when its first bar comes after the window start. Taken as "first *traded* bar", that flagged 585 names, because any name that did not trade on 2026-08-21 counted. That also made the share climb through the window. The probe now takes a name as expected from its first row of any kind, which gives 75 probable IPOs.
+
+The rule is "missing if it has no bar", and there are three ways to read it:
+
+| Reading | Names in E (last session) | Median share | Max share (session) | Rule's candidate, provisional |
+|---|---|---|---|---|
+| A. No bar row (placeholders count as present) | 8,784 | 0.0001 | 0.0003 (2026-08-31) | 0.005 |
+| B. No traded bar (placeholders count as missing, #104's rule) | 8,784 | 0.0704 | 0.0796 (2026-09-11) | 0.160 → keep 0.05 |
+| C. As B, common-like names only | 7,282 | 0.0183 | 0.0222 (2026-09-09) | 0.045 |
+
+What this means for `ingest.max_missing_share` (the owner sets the value, after the live case):
+- **Reading A is the staleness signal.** It asks whether the source has delivered the session, which is the question spec rule 10 asks. The rule gives 0.005, a tenfold tightening. The live case decides whether that holds at ingest time, when the latest session may be less complete.
+- **Reading B cannot be the staleness test on this universe.** About 7% of listed names do not trade on a normal day, so 0.05 would flag every session as stale. #104's rule ("count placeholders as missing") is right for a delisting check, where a placeholder after the last session means the name is gone. It is wrong for the market-wide share.
+- **Reading C** mixes illiquidity with delivery. Eight common-like names had no trade in all 20 sessions (BIO.B, EFTY, HCHL, LAWR, MAGH, MAMK, PC, UCFI). That is a universe-filter question (T13's liquidity rule), not a staleness one.
+- **Recommendation for the owner, pending the live case:** measure staleness as reading A, rows absent from the listed set. Tighten to reading A's candidate if the live case confirms it. The spec wording "listed names are missing it" should say that a zero-volume row counts as present for staleness. That is a spec note for T16 and is not changed here.
 
 ## Probe 3 results
 Pending owner runs (5 sessions).
