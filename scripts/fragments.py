@@ -133,10 +133,14 @@ def _section_bounds(lines: Sequence[str], heading: str, level: str = "## ") -> t
 
 
 def _last_bullet_index(lines: Sequence[str], start: int, end: int) -> int:
-    """Index just after the last bullet in ``lines[start:end]`` (or ``start`` if none)."""
+    """Index just after the last bullet in ``lines[start:end]`` (or ``start`` if none).
+
+    An indented line directly under a bullet is its continuation and stays with it.
+    """
     last = start
     for i in range(start, end):
-        if BULLET_RE.match(lines[i]):
+        ln = lines[i]
+        if BULLET_RE.match(ln) or (last == i and ln[:1] in (" ", "\t") and ln.strip()):
             last = i + 1
     return last
 
@@ -228,10 +232,12 @@ def cmd_add(
 ) -> int:
     if not slug or not FRAGMENT_NAME_RE.match(f"{issue}-{slug}.md"):
         raise SystemExit("--slug must be lowercase letters, digits and dashes")
-    written: list[Path] = []
+    name = f"{issue}-{slug}.md"
+    plan: list[tuple[Path, str]] = []
     if status:
         body = "\n".join(_as_bullet(s) for s in status)
-        written.append(write_fragment(root, STATUS_DIR, issue, slug, body))
+        parse_status_fragment(STATUS_DIR / name, body)  # validate before writing anything
+        plan.append((STATUS_DIR, body))
     parts: list[str] = []
     for heading, items in (
         ("### Added", added),
@@ -243,17 +249,23 @@ def cmd_add(
             parts.append(heading)
             parts.extend(_as_bullet(s) for s in items)
     if parts:
-        written.append(write_fragment(root, CHANGELOG_DIR, issue, slug, "\n".join(parts)))
-    if not written:
+        body = "\n".join(parts)
+        parse_changelog_fragment(CHANGELOG_DIR / name, body)
+        plan.append((CHANGELOG_DIR, body))
+    if not plan:
         raise SystemExit("nothing to add: pass --status and/or --added/--changed/--fixed/--removed")
-    load_fragments(root)  # validate what we just wrote
-    for p in written:
-        print(f"wrote {p.relative_to(root)}")
+    for directory, _ in plan:
+        if (root / directory / name).exists():
+            raise FragmentError(f"{directory / name} exists; edit it instead of adding another")
+    for directory, body in plan:
+        print(f"wrote {write_fragment(root, directory, issue, slug, body).relative_to(root)}")
     return 0
 
 
 def _as_bullet(text: str) -> str:
     text = text.strip()
+    if not text or text == "-":
+        raise FragmentError("empty bullet")
     return text if text.startswith("- ") else f"- {text}"
 
 

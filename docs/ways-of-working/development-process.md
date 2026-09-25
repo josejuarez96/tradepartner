@@ -91,9 +91,9 @@ These come straight from the research handoff. They are process rules, not just 
 ## Session protocol (human or agent)
 
 **Start of session:**
-1. Read `docs/STATUS.md`.
+1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the Done entries not folded in yet.
 2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch (spikes excepted).
-3. `git switch main && git pull`, then branch.
+3. Branch from `origin/main` as the claim output prints (`git fetch origin && git switch -c <branch> origin/main`).
 
 **End of session:**
 1. Commit and push.

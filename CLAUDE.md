@@ -2,7 +2,7 @@
 
 Personal, local US-equity trading research system: point-in-time data, honest backtests, paper trading, then a small live account. Owner: Jose (solo). Agents build; the owner reviews and approves merges.
 
-**Start every session by reading [docs/STATUS.md](docs/STATUS.md)**, then run `uv run python scripts/team.py status`. STATUS tells you the phase; the board tells you who holds what and what is ready.
+**Start every session by reading [docs/STATUS.md](docs/STATUS.md)** and `uv run python scripts/fragments.py show` (Done entries not folded in yet), then run `uv run python scripts/team.py status`. STATUS tells you the phase; the board tells you who holds what and what is ready.
 
 ## Non-negotiables
 1. **Never commit to or push `main`.** Branch `<type>/<issue#>-<slug>` from the latest main and open a PR. Never force-push shared branches or use `--no-verify`. Merge a PR only when the owner explicitly tells you to merge that specific PR (squash, CI green); otherwise never merge. Subagents never merge. See [git-workflow.md](docs/ways-of-working/git-workflow.md).

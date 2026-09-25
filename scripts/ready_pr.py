@@ -8,16 +8,21 @@ Steps, in order (each one stops the run with a reason on failure):
 
 1. The PR's branch is checked out here and the working tree is clean.
 2. ``git fetch`` then ``git merge origin/main`` (a merge, not a rebase: no force-push, and
-   the squash merge flattens it anyway). A conflict is resolved automatically **only** when
-   every conflicted file is ``docs/STATUS.md`` or ``CHANGELOG.md`` and every conflict block
-   is two sets of list bullets (both sides only added lines). Both sides are kept, ``main``'s
-   first. Anything else aborts the merge and reports.
-3. Fragment check (``scripts/fragments.py check``), and the PR does not edit the shared
-   ``STATUS.md`` / ``CHANGELOG.md`` lists unless ``--allow-shared-files`` was given.
+   the squash merge flattens it anyway), with diff3 conflict markers. A conflict is resolved
+   automatically **only** when every conflicted file is ``docs/STATUS.md`` or
+   ``CHANGELOG.md`` and every conflict block is a pure insertion at one spot: the base
+   section is empty and both sides hold only list bullets. Both sides are kept, ``main``'s
+   first. Anything else (a line one side deleted or edited) aborts the merge and reports.
+3. Fragment check (``scripts/fragments.py check``); the branch's issue has a status fragment
+   (and a changelog fragment on ``feat/``/``fix/`` branches); and the PR adds no bullets to
+   the shared lists ("## Done" in ``STATUS.md``, "[Unreleased]" in ``CHANGELOG.md``) unless
+   it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
+   Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
 4. Local checks: ruff check, ruff format --check, mypy, pytest.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
-   ``safety-reviewer``) is mentioned in the PR body or a PR comment.
+   ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
+   the template's own wording): ``quant-auditor: PASS`` or ``PASS WITH FIXES``.
 6. Push, wait for CI on **that exact commit**, then ``gh pr ready``.
 
 Usage::
@@ -47,12 +52,22 @@ UNCHECKED_RE = re.compile(r"^\s*- \[ \] (.*)$", re.MULTILINE)
 CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)", re.IGNORECASE)
 BRANCH_ISSUE_RE = re.compile(r"^[a-z]+/(\d+)-")
 CONFLICT_RE = re.compile(
-    r"^<{7}[^\n]*\n(?P<ours>.*?)(?:^\|{7}[^\n]*\n.*?)?^={7}\n(?P<theirs>.*?)^>{7}[^\n]*\n",
+    r"^<{7}[^\n]*\n(?P<ours>.*?)(?:^\|{7}[^\n]*\n(?P<base>.*?))?^={7}\n(?P<theirs>.*?)^>{7}[^\n]*\n",
     re.MULTILINE | re.DOTALL,
 )
+VERDICT_RE = re.compile(
+    r"^\s*(?P<agent>quant-auditor|safety-reviewer):\s*(?P<verdict>pass(?: with fixes)?)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+STATUS_LIST = "## Done"
+CHANGELOG_LIST = "## [Unreleased]"
+FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 
-# Paths that require a specialist review before the PR is ready. Mirrors agents.md; the
-# names are the agents' file names under .claude/agents/.
+# Paths that require a specialist review before the PR is ready. The plan's per-task
+# "Review:" field (docs/plans/*.md) is the authority; these prefixes mirror it plus the
+# CLAUDE.md rule (data/backtests/signals -> quant-auditor; broker/orders/secrets/LLM inputs
+# -> safety-reviewer). Modules that do not exist yet are listed so the rule is right when
+# they appear. Widening a list needs no review; shrinking one is a safety-reviewer change.
 QUANT_AUDITOR = "quant-auditor"
 SAFETY_REVIEWER = "safety-reviewer"
 QUANT_PREFIXES = (
@@ -63,6 +78,8 @@ QUANT_PREFIXES = (
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
     "src/tradepartner/calendar.py",
+    "src/tradepartner/config.py",
+    "src/tradepartner/timeutil.py",
     "src/tradepartner/universe.py",
     "src/tradepartner/gap.py",
     "src/tradepartner/ingest.py",
@@ -70,6 +87,7 @@ QUANT_PREFIXES = (
     "src/tradepartner/health.py",
     "src/tradepartner/signals/",
     "src/tradepartner/backtest/",
+    "scripts/make_fixture_universe.py",
     "tests/lookahead/",
     "tests/fixtures/universe/",
 )
@@ -78,13 +96,23 @@ SAFETY_PREFIXES = (
     "src/tradepartner/adapters/fake_broker",
     "src/tradepartner/adapters/alpaca_raw",
     "src/tradepartner/adapters/edgar_raw",
+    "src/tradepartner/adapters/alpaca_prices",
+    "src/tradepartner/adapters/edgar.py",
     "src/tradepartner/cli_record.py",
     "src/tradepartner/cli.py",
     "src/tradepartner/config.py",
+    "src/tradepartner/ingest.py",
     "src/tradepartner/exec/",
     "src/tradepartner/risk/",
     "src/tradepartner/llm/",
+    "scripts/ready_pr.py",
+    "tests/fixtures/alpaca/",
+    "tests/fixtures/edgar/",
+    "docs/runbooks/",
     ".env.example",
+    ".claude/settings.json",
+    ".pre-commit-config.yaml",
+    "pyproject.toml",
 )
 LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "check", "."),
@@ -142,10 +170,13 @@ class Runner(Protocol):
 
 
 def resolve_append_conflicts(text: str) -> str | None:
-    """Resolve conflict blocks where both sides only added list bullets.
+    """Resolve diff3 conflict blocks that are pure insertions of list bullets.
 
+    A block qualifies only when its base section is present and empty (neither side deleted
+    or edited anything; both inserted at the same spot) and both sides hold only bullets.
     Returns the resolved text, ``main``'s lines (theirs) before the branch's (ours) in each
-    block, or ``None`` when any block holds something other than bullets or blank lines.
+    block, or ``None`` when any block fails the test. Markers without a base section (the
+    default conflict style) never qualify, since a deletion could hide in them.
     """
     if "<<<<<<<" not in text:
         return text
@@ -153,8 +184,12 @@ def resolve_append_conflicts(text: str) -> str | None:
 
     def _sub(m: re.Match[str]) -> str:
         nonlocal ok
+        base = m.group("base")
         ours = [ln for ln in m.group("ours").splitlines() if ln.strip()]
         theirs = [ln for ln in m.group("theirs").splitlines() if ln.strip()]
+        if base is None or base.strip():
+            ok = False
+            return m.group(0)
         if not all(BULLET_RE.match(ln) for ln in [*ours, *theirs]):
             ok = False
             return m.group(0)
@@ -192,10 +227,13 @@ def required_reviews(paths: Sequence[str]) -> set[str]:
     return out
 
 
-def missing_reviews(required: set[str], texts: Sequence[str]) -> list[str]:
-    """Required reviews not mentioned in any of ``texts`` (PR body and comments)."""
-    blob = "\n".join(texts).lower()
-    return sorted(r for r in required if r not in blob)
+def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
+    """Required reviews with no ``<agent>: PASS`` / ``PASS WITH FIXES`` line in a PR comment.
+
+    The PR body does not count: the template itself names both agents there.
+    """
+    passed = {m.group("agent").lower() for c in comments for m in VERDICT_RE.finditer(c)}
+    return sorted(r for r in required if r not in passed)
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
@@ -213,8 +251,41 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     return "failure"
 
 
-def shared_list_edits(diff_names: Sequence[str]) -> list[str]:
-    return [p for p in diff_names if p in SHARED_FILES]
+def list_bullets(text: str, heading: str) -> list[str]:
+    """Bullets under ``heading`` (a ``## `` section) up to the next ``## `` heading."""
+    out: list[str] = []
+    inside = False
+    for ln in text.splitlines():
+        if ln.startswith("## "):
+            inside = ln.strip() == heading
+            continue
+        if inside and BULLET_RE.match(ln):
+            out.append(ln.rstrip())
+    return out
+
+
+def added_list_bullets(main_text: str, branch_text: str, heading: str) -> list[str]:
+    """Bullets the branch adds under ``heading`` that ``main`` does not have."""
+    have = set(list_bullets(main_text, heading))
+    return [b for b in list_bullets(branch_text, heading) if b not in have]
+
+
+def is_fold(diff_names: Sequence[str], deleted: Sequence[str]) -> bool:
+    """A fold deletes fragment files while touching the shared files."""
+    return any(p.startswith(FRAGMENT_DIRS) for p in deleted) and any(
+        p in SHARED_FILES for p in diff_names
+    )
+
+
+def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
+    """Fragment files the branch's issue needs but the diff does not add."""
+    issue = issue_of_branch(branch)
+    if issue is None:
+        return []
+    need = [f"docs/status.d/{issue}-"]
+    if branch.startswith(("feat/", "fix/")):
+        need.append(f"changelog.d/{issue}-")
+    return [f"{p}<slug>.md" for p in need if not any(d.startswith(p) for d in diff_names)]
 
 
 # ── the flow ────────────────────────────────────────────────────────────────────
@@ -251,15 +322,37 @@ def ready(
     else:
         _merge_main(r, main_ref, say)
 
-    # 3. fragments and shared files
+    # 3. fragments and shared lists
     touched = r.git("diff", "--name-only", f"{main_ref}...HEAD").splitlines()
-    shared = shared_list_edits(touched)
-    if shared and not allow_shared_files:
-        raise ReadyError(
-            f"this PR edits {', '.join(shared)}. Record your entries as fragments instead: "
-            "`uv run python scripts/fragments.py add <issue> --slug <slug> --status ... "
-            "--added ...` (teams.md, Shared files). Process PRs may pass --allow-shared-files."
-        )
+    deleted = r.git("diff", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD").splitlines()
+    if not allow_shared_files:
+        added: list[str] = []
+        for path, heading in ((SHARED_FILES[0], STATUS_LIST), (SHARED_FILES[1], CHANGELOG_LIST)):
+            if path in touched:
+                main_text = (
+                    r.git("show", f"{main_ref}:{path}")
+                    if r.git_ok("cat-file", "-e", f"{main_ref}:{path}")
+                    else ""
+                )
+                added += [
+                    f"{path}: {b}" for b in added_list_bullets(main_text, r.read(path), heading)
+                ]
+        if added and not is_fold(touched, deleted):
+            raise ReadyError(
+                "this PR adds lines to the shared lists:\n  "
+                + "\n  ".join(added)
+                + "\nMove them into fragments (`uv run python scripts/fragments.py add <issue> "
+                "--slug <slug> --status ... --added ...`) and remove only those lines from the "
+                "shared files (teams.md, Shared files). A fold or a process PR may pass "
+                "--allow-shared-files."
+            )
+        missing_frag = missing_fragments(pr.branch, touched)
+        if missing_frag:
+            raise ReadyError(
+                "no fragment for this PR's issue: add "
+                + " and ".join(missing_frag)
+                + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
+            )
 
     # 4. local checks
     for cmd in LOCAL_CHECKS:
@@ -277,11 +370,11 @@ def ready(
     if issue is not None and issue not in closed_issues(pr.body):
         raise ReadyError(f"PR body must say `Closes #{issue}` (the branch's issue)")
     required = required_reviews(touched)
-    missing = missing_reviews(required, [pr.body, *pr.comments])
+    missing = missing_reviews(required, pr.comments)
     if missing:
         raise ReadyError(
-            "run these reviews and record the result in the PR body or a comment: "
-            + ", ".join(missing)
+            "run these reviews, address findings, then post a PR comment with a verdict line "
+            "`<agent>: PASS` or `<agent>: PASS WITH FIXES` for each: " + ", ".join(missing)
         )
     say(f"reviews required: {sorted(required) or 'none'}; all recorded")
 
@@ -309,7 +402,7 @@ def ready(
 
 def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
     say(f"merging {main_ref}")
-    if r.git_ok("merge", "--no-edit", main_ref):
+    if r.git_ok("-c", "merge.conflictStyle=diff3", "merge", "--no-edit", main_ref):
         return
     conflicted = r.git("diff", "--name-only", "--diff-filter=U").splitlines()
     others = [p for p in conflicted if p not in SHARED_FILES]
@@ -325,8 +418,8 @@ def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
         if resolved is None:
             r.git("merge", "--abort")
             raise ReadyError(
-                f"{path}: conflict is not two lists of added bullets; resolve by hand "
-                "(keep both sides), commit, and run again."
+                f"{path}: conflict is not a pure insertion of bullets on both sides (a line "
+                "was deleted or edited); resolve by hand, commit, and run again."
             )
         r.write(path, resolved)
         r.git("add", path)

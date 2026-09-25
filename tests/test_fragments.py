@@ -154,6 +154,25 @@ def test_add_check_show_and_fold_round_trip(
     assert (tmp_path / "docs" / "status.d" / "README.md").exists()
 
 
+def test_fold_keeps_a_wrapped_bullet_together() -> None:
+    text = "## Done\n- one\n  continued\n\n## Teams\n"
+    out = fragments.fold_status(text, [_frag("70-a.md", "- new\n")])
+    assert out == "## Done\n- one\n  continued\n- new\n\n## Teams\n"
+
+
+def test_add_validates_before_writing_anything(tmp_path: Path) -> None:
+    root = ["--root", str(tmp_path)]
+    with pytest.raises(SystemExit, match="empty"):
+        fragments.main([*root, "add", "70", "--slug", "a", "--status", "  ", "--added", "x"])
+    assert not (tmp_path / "docs" / "status.d").exists()
+    assert not (tmp_path / "changelog.d").exists()
+    (tmp_path / "changelog.d").mkdir()
+    (tmp_path / "changelog.d" / "70-a.md").write_text("### Added\n- there\n")
+    with pytest.raises(SystemExit, match="exists"):
+        fragments.main([*root, "add", "70", "--slug", "a", "--status", "s", "--added", "x"])
+    assert not (tmp_path / "docs" / "status.d").exists()  # status file was not written
+
+
 def test_check_fails_on_a_bad_fragment(tmp_path: Path) -> None:
     (tmp_path / "changelog.d").mkdir()
     (tmp_path / "changelog.d" / "70-x.md").write_text("no heading\n")

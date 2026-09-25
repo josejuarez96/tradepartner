@@ -69,7 +69,7 @@ issue → branch → draft PR → CI green → self-review → specialist review
 
 **No stacked PRs.** Don't open a PR whose base is another open PR's branch: when the base squash-merges, GitHub closes or breaks the stacked PR. Wait for the base to merge, then branch from `main`. (Phase 1 retro.)
 
-**CI must have run on the exact commit being merged.** "No checks reported" is not green; wait for the run (`gh pr checks <n> --watch`) after any rebase or force-push. (Phase 1 retro.)
+**CI must have run on the exact commit being merged.** "No checks reported" is not green; wait for the run (`gh pr checks <n> --watch`) after any merge of `main`, rebase or force-push; `ready_pr.py` does this wait for you. (Phase 1 retro.)
 
 ## Releases
 
