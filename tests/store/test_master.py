@@ -56,6 +56,7 @@ SWAP = "0000000010"  # two classes swap tickers between cover pages
 PREF = "0000000011"  # earliest cover page lists the preferred before the common
 MULTI = "0000000012"  # one class listed on two exchanges
 EARLY = "0000000013"  # snapshot fetched before a cover page that changes the ticker
+BANK = "0000000014"  # two depositary series with titles equal up to the comma
 EARLY_FETCH = datetime(2018, 6, 1, 14, 0, tzinfo=UTC)
 SPY_TRUST = "0000884394"
 ISHARES = "0001100663"
@@ -108,6 +109,7 @@ def _source() -> FixtureFilingSource:
             _filing(PREF, "Pref Corp", "10-K", _at(2018, 2, 2)),
             _filing(MULTI, "Multi Corp", "10-K", _at(2018, 2, 5)),
             _filing(EARLY, "Early Corp", "10-K", _at(2017, 3, 1)),
+            _filing(BANK, "Bank Corp", "10-K", _at(2018, 2, 6)),
         ],
         cover_pages=[
             _cover(TICK, _at(2019, 3, 1), ("Common Stock, par value $0.01", "TCKA", "NYSE")),
@@ -154,6 +156,20 @@ def _source() -> FixtureFilingSource:
                 ("Common Stock", "MLT", "NYSE"),
             ),
             _cover(EARLY, _at(2019, 3, 1), ("Common Stock", "ERLB", "NYSE")),
+            _cover(
+                BANK,
+                _at(2019, 2, 6),
+                ("Common Stock", "BK", "NYSE"),
+                ("Depositary Shares, each 1/1000th of a Series A Preferred", "BK-PA", "NYSE"),
+                ("Depositary Shares, each 1/1000th of a Series B Preferred", "BK-PB", "NYSE"),
+            ),
+            _cover(
+                BANK,
+                _at(2020, 2, 6),
+                ("Common Stock", "BK", "NYSE"),
+                ("Depositary Shares, each 1/1000th of a Series B Preferred", "BK-PB", "NYSE"),
+                ("Depositary Shares, each 1/1000th of a Series A Preferred", "BK-PA", "NYSE"),
+            ),
         ],
         snapshot=[
             _snap(ACME, "ACME CORP", "ACME", "NYSE"),
@@ -315,6 +331,15 @@ class TestDualClass:
         assert class_b != primary_security_id(SWAP)
         assert [r["ticker"] for r in _listings(store, class_b)] == ["ZB", "ZZ"]
 
+    def test_reordered_same_title_series_keep_their_ids(
+        self, store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Audit round 2: both series normalize to "depositary shares"; a
+        # reordered later cover page must not swap their security_ids.
+        rows = listings_as_of(store, INGESTED_AT).filter(pl.col("ticker").str.starts_with("BK-"))
+        by_id = rows.group_by("security_id").agg(pl.col("ticker").unique())
+        assert sorted(sorted(t) for t in by_id["ticker"].to_list()) == [["BK-PA"], ["BK-PB"]]
+
     def test_primary_is_the_common_class(self, store: duckdb.DuckDBPyConnection) -> None:
         # Auditor SHOULD FIX 3: the preferred is listed first on the page.
         (row,) = _listings(store, primary_security_id(PREF))
@@ -363,7 +388,9 @@ class TestStaticReliance:
     def test_ticker_changed_since_first_cover_is_not_guessed(self, built: MasterBuild) -> None:
         # TCKB is the current ticker, but the first cover page says TCKA, so
         # the pre-2019 ticker is unknown: reported, not written.
-        assert [e.ticker for e in built.unmatched_snapshot] == ["TCKB"]
+        # ERLB: a later fetch whose ticker differs from the static span the
+        # earliest fetch wrote (ERLA) is reported rather than dropped.
+        assert [e.ticker for e in built.unmatched_snapshot] == ["TCKB", "ERLB"]
         tick_static = [
             row
             for row in built.listings

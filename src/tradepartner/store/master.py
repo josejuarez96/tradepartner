@@ -113,7 +113,7 @@ class _Class:
     pairs: _Pairs = frozenset()  # (ticker, exchange) on the latest cover page showing it
     history: list[tuple[datetime, _Pairs]] = field(default_factory=list)
     first_listing: tuple[str, str, date, datetime] | None = None  # + the row's known_at
-    static_written: bool = False
+    static_ticker: str | None = None  # ticker of the static span, once written
 
     def pairs_at(self, t: datetime) -> _Pairs:
         """The pairs this class showed on the latest cover page known at `t`."""
@@ -293,8 +293,12 @@ class _Builder:
             if cls is None:
                 self.unmatched.append(entry)
                 continue
-            if self.static and cls.static_written:
-                continue  # the earliest fetch already covered the span before cover pages
+            if self.static and cls.static_ticker is not None:
+                # The earliest fetch already covered the span before cover
+                # pages; a later fetch showing another ticker is reported.
+                if entry.ticker != cls.static_ticker:
+                    self.unmatched.append(entry)
+                continue
             first_listing = cls.first_listing_at(t)
             if first_listing is None:
                 if self.static:
@@ -312,7 +316,8 @@ class _Builder:
     def _snapshot_listing(
         self, cls: _Class, entry: CompanySnapshotEntry, start: date, provenance: str
     ) -> None:
-        cls.static_written = cls.static_written or provenance == "snapshot_static"
+        if provenance == "snapshot_static" and cls.static_ticker is None:
+            cls.static_ticker = entry.ticker
         self.listing(
             cls.security_id,
             entry.ticker,
@@ -353,19 +358,27 @@ class _Builder:
 
 
 def _match(classes: list[_Class], item: CoverListing, claimed: dict[str, str]) -> _Class | None:
-    """The existing class `item` belongs to: the class already holding this
-    ticker and title on this page (a second exchange), else an unclaimed
-    class by title, else an unclaimed class by current ticker. Title comes
-    first so two classes swapping tickers keep their own `security_id`."""
+    """The existing class `item` belongs to, among classes not yet claimed on
+    this page: the class already holding this ticker and title on this page
+    (a second exchange); else one matching both title and current ticker;
+    else the only class with this title; else one with this current ticker.
+    Title before ticker keeps two classes that swap tickers apart; the
+    uniqueness rule keeps reordered same-titled series apart."""
     title = _norm_title(item.title)
     for cls in classes:
         if claimed.get(cls.security_id) == item.ticker and title in cls.titles:
             return cls
     free = [cls for cls in classes if cls.security_id not in claimed]
-    by_title = next((cls for cls in free if title in cls.titles), None)
-    return by_title or next(
-        (cls for cls in free if item.ticker in {ticker for ticker, _ in cls.pairs}), None
-    )
+    by_ticker = [c for c in free if item.ticker in {ticker for ticker, _ in c.pairs}]
+    exact = next((c for c in by_ticker if title in c.titles), None)
+    if exact is not None:
+        return exact
+    # A title shared by several classes (preferred series that differ only
+    # after the first comma) cannot decide on its own.
+    by_title = [c for c in classes if title in c.titles]
+    if len(by_title) == 1 and by_title[0] in free:
+        return by_title[0]
+    return by_ticker[0] if by_ticker else None
 
 
 def build_master(source: FilingSource, settings: Settings, *, ingested_at: datetime) -> MasterBuild:
