@@ -1,1 +1,0 @@
-- #73 agents.md: "Parallelism inside a team", what a window runs in parallel inside its claimed scope and what stays one-at-a-time (PR #74)

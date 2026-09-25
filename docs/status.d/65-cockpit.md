@@ -1,1 +1,0 @@
-- #65 Owner cockpit: `uv run python scripts/cockpit.py` (or `--loop N`) renders `data/cockpit/cockpit.html` showing teams, activity, tokens, claims, roadmap and plan by chain (PR #68)
