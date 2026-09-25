@@ -30,6 +30,34 @@ import streamlit as st
 from tradepartner.store import registry, schema
 
 _ALL: Final = "All hypotheses"
+_INSTANT: Final = pl.Datetime("us", "UTC")
+
+#: Explicit schemas: polars would infer each column's type from the first
+#: 100 rows, so a nullable text column (a message, a note) that is empty in
+#: the newest 100 rows would be typed null and reject an older value.
+_TRIALS_SCHEMA: Final[dict[str, pl.DataType]] = {
+    "trial": pl.Int64(),
+    "hypothesis": pl.Utf8(),
+    "kind": pl.Utf8(),
+    "status": pl.Utf8(),
+    "message": pl.Utf8(),
+    "window": pl.Utf8(),
+    "started_at": _INSTANT,
+    "finished_at": _INSTANT,
+    "synthetic": pl.Boolean(),
+    "holdout_repeat": pl.Boolean(),
+    "run_by": pl.Utf8(),
+    "note": pl.Utf8(),
+}
+_DECISIONS_SCHEMA: Final[dict[str, pl.DataType]] = {
+    "decision": pl.Int64(),
+    "made_at": _INSTANT,
+    "kind": pl.Utf8(),
+    "hypothesis": pl.Utf8(),
+    "trial": pl.Int64(),
+    "reason": pl.Utf8(),
+    "values": pl.Utf8(),
+}
 
 
 @dataclass(frozen=True)
@@ -106,7 +134,8 @@ def _trials_table(trials: tuple[registry.TrialSummary, ...]) -> pl.DataFrame:
                 "note": t.note,
             }
             for t in trials
-        ]
+        ],
+        schema=_TRIALS_SCHEMA,
     )
 
 
@@ -123,7 +152,8 @@ def _decisions_table(decisions: tuple[DecisionRow, ...]) -> pl.DataFrame:
                 "values": d.values_json,
             }
             for d in decisions
-        ]
+        ],
+        schema=_DECISIONS_SCHEMA,
     )
 
 

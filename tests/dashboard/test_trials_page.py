@@ -206,6 +206,51 @@ def test_status_counts(seeded_store: tuple[Path, Seeded]) -> None:
     assert counts == {"ok": 2, "failed": 1, "refused_gap": 1, "unfinished": 1}
 
 
+def _summary(trial_id: int, message: str | None, note: str | None) -> registry.TrialSummary:
+    return registry.TrialSummary(
+        trial_id=trial_id,
+        hypothesis_id=1,
+        slug="h1",
+        family="momentum",
+        kind="in_sample",
+        started_at=datetime(2020, 4, 1, tzinfo=UTC),
+        start_session=date(2020, 1, 31),
+        end_session=date(2020, 3, 31),
+        synthetic=False,
+        holdout_repeat=False,
+        run_by="owner",
+        note=note,
+        status="failed" if message else "ok",
+        message=message,
+        finished_at=None if message else datetime(2020, 4, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_tables_keep_a_late_message_after_100_empty_rows() -> None:
+    # polars infers types from the first 100 rows; an all-null message
+    # column there must not reject an older trial's message.
+    trials = (
+        *tuple(_summary(200 - i, None, None) for i in range(150)),
+        _summary(1, "provider raised", "rerun later"),
+    )
+    table = trials_page._trials_table(trials)
+    assert table["message"].to_list()[-1] == "provider raised"
+    assert table["note"].to_list()[-1] == "rerun later"
+    decisions = (
+        *tuple(
+            trials_page.DecisionRow(
+                200 - i, datetime(2020, 4, 1, tzinfo=UTC), "gap_signoff", None, None, "{}", "ok"
+            )
+            for i in range(150)
+        ),
+        trials_page.DecisionRow(
+            1, datetime(2020, 4, 1, tzinfo=UTC), "gap_override", "h1", 7, "{}", "late"
+        ),
+    )
+    table = trials_page._decisions_table(decisions)
+    assert (table["hypothesis"][-1], table["trial"][-1]) == ("h1", 7)
+
+
 # --- headless render ------------------------------------------------------------
 
 
