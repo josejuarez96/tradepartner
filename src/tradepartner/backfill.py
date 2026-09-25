@@ -231,7 +231,8 @@ def _price_chunk(
             raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {shown}")
         with_bars = {bar.security_id for bar in bars}
         missing = sorted(set(listed) - with_bars)
-        share, limit = len(missing) / len(listed), settings.ingest.max_missing_share
+        share = len(missing) / len(listed) if listed else 0.0
+        limit = settings.ingest.max_missing_share
         if share > limit:
             raise _Stale(
                 f"{len(missing)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
@@ -280,8 +281,9 @@ def _window_names(
     settings: Settings,
 ) -> tuple[list[str], list[str], str | None]:
     """From listings known at `t`: securities with a listing live at some
-    point in `window` (to fetch), the listed common and benchmark names live
-    through the whole window (the staleness denominator), and the reference
+    point in `window` (to fetch), the common and benchmark names listed
+    through the whole window, including any delisted only later (the
+    staleness denominator), and the reference
     symbol's `security_id`.
 
     A listing counts from its `valid_from`; a delisted or transferred one
@@ -313,9 +315,10 @@ def _window_names(
             continue
         ids.add(sid)
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= last))
+        through = live or (status == DELISTED and effective is not None and effective > last)
         counted = sid in benchmarks or kinds.get(sid) == "common"
-        if status == LISTED and row["valid_from"] <= first and counted:
-            listed.add(sid)
+        if through and row["valid_from"] <= first and counted:
+            listed.add(sid)  # today's status must not drop a name delisted later
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
     return sorted(ids), sorted(listed), reference

@@ -434,3 +434,20 @@ def test_a_month_with_too_many_names_missing_is_stale(settings: Settings) -> Non
     result = _backfill(settings, prices)
     assert result.runs[-1].status == STALE and ACME in result.runs[-1].message
     assert _read(settings, "SELECT max(session) FROM prices_daily") == [(date(2019, 4, 30),)]
+
+
+def test_a_name_delisted_after_the_month_still_counts_toward_its_staleness(
+    settings: Settings,
+) -> None:
+    # quant-auditor re-check on #171: ACME trades all of May and is delisted
+    # in June; a May that returns no ACME bars must be stale, not ok.
+    form_25 = DelistingFiling(
+        ACME, "25", "Common Stock", "NYSE", f"{ACME}-19-000025", _at(2019, 6, 10), date(2019, 6, 20)
+    )
+    prices = _History(gaps={(ACME, s) for s in _sessions(date(2019, 5, 1), date(2019, 5, 31))})
+    result = _backfill(settings, prices, filings=_filings(delistings=[form_25]))
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    assert ACME in result.runs[-1].message
