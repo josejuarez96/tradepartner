@@ -1,0 +1,1 @@
+- #198 CI runs on main are never cancelled: one concurrency group per main commit, cancel-in-progress only off main; PR branches still cancel superseded runs; `tests/test_ci_workflow.py` guards it
