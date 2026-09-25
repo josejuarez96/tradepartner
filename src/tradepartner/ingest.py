@@ -205,6 +205,7 @@ def _run_source(
     clock: Callable[[], datetime],
     cursor: str,
     dry_run: bool,
+    mode: str = MODE,
 ) -> SourceRun:
     run_id = uuid.uuid4().hex
 
@@ -218,7 +219,7 @@ def _run_source(
             if dry_run:
                 raise _DryRun(rows, message)
             run = outcome(OK, rows, message)
-            _write_run(conn, run_id, now, clock(), run)
+            _write_run(conn, run_id, now, clock(), run, mode)
         return run
     except _DryRun as dry:
         return outcome(OK, dry.rows, f"dry run: {dry}")
@@ -228,13 +229,26 @@ def _run_source(
         run = outcome(STALE, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts with a run row
         run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
-    if not dry_run:
-        try:
-            with open_for_write(settings) as conn:
-                init_schema(conn)
-                _write_run(conn, run_id, now, clock(), run)
-        except StoreLockedError as exc:
-            return outcome(run.status, 0, f"{run.message}; run row: {exc}")
+    return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
+
+
+def _record_only(
+    settings: Settings,
+    run_id: str,
+    now: datetime,
+    clock: Callable[[], datetime],
+    run: SourceRun,
+    mode: str,
+) -> SourceRun:
+    """Write only `run`'s `ingestion_runs` row, in a chunk of its own (a
+    stale or failed source); note in the message if the store is locked."""
+    try:
+        with open_for_write(settings) as conn:
+            init_schema(conn)
+            _write_run(conn, run_id, now, clock(), run, mode)
+    except StoreLockedError as exc:
+        message = _clean(f"{run.message}; run row: {exc}", settings)
+        return SourceRun(run.source, run.status, 0, run.chunk_cursor, message)
     return run
 
 
@@ -261,6 +275,7 @@ def _write_run(
     started_at: datetime,
     finished_at: datetime,
     run: SourceRun,
+    mode: str = MODE,
 ) -> None:
     insert_row(
         conn,
@@ -271,7 +286,7 @@ def _write_run(
             "finished_at": finished_at,
             "status": run.status,
             "source": run.source,
-            "mode": MODE,
+            "mode": mode,
             "rows_added": run.rows_added,
             "chunk_cursor": run.chunk_cursor,
             "message": run.message,
