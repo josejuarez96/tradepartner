@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -333,3 +334,34 @@ def test_env_file_change_to_the_range_takes_effect(
     assert tp_calendar.all_sessions()[-1] == date(2031, 12, 31)
     env_file.unlink()
     assert tp_calendar.all_sessions()[-1] > date(2031, 12, 31)
+
+
+def test_env_file_variable_reference_change_takes_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`.env` values expand `${VAR}` from the environment, so any variable counts."""
+    env_file = tmp_path / "calendar.env"
+    env_file.write_text("CALENDAR__END=${TP_TEST_END}\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env_file))
+    monkeypatch.setenv("TP_TEST_END", "2030-12-31")
+    assert tp_calendar.all_sessions()[-1] == date(2030, 12, 31)
+    monkeypatch.setenv("TP_TEST_END", "2031-12-31")
+    assert tp_calendar.all_sessions()[-1] == date(2031, 12, 31)
+
+
+def test_env_file_swapped_with_same_size_and_mtime_takes_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`cp -p` or a restore can keep size and mtime while changing the content."""
+    env_file = tmp_path / "calendar.env"
+    env_file.write_text("CALENDAR__END=2030-12-31\n")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(env_file))
+    assert tp_calendar.all_sessions()[-1] == date(2030, 12, 31)
+    before = env_file.stat()
+    replacement = tmp_path / "replacement.env"
+    replacement.write_text("CALENDAR__END=2032-12-31\n")
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    replacement.replace(env_file)
+    after = env_file.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert tp_calendar.all_sessions()[-1] == date(2032, 12, 31)

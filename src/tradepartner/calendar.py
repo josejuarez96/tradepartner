@@ -20,8 +20,10 @@ The range is read through `get_settings()`, which parses the environment and
 `.env` afresh on every call (~5 ms; deliberately uncached, see `config.py`).
 The session helpers run thousands of times per backtest, so the range is
 cached per **config state** instead (#154): a fingerprint of everything
-`Settings` reads for `calendar` (the `CALENDAR*` environment variables, and
-the `.env` file's path, mtime and size). Changing either re-reads the range.
+`Settings` can read for `calendar`, namely the whole environment (`.env` lines
+may expand `${VAR}` from it) and the `.env` file's path, inode, size, mtime and
+ctime (ctime cannot be reset by `utime`, and an atomic replace changes the
+inode). Changing any of them re-reads the range.
 """
 
 from __future__ import annotations
@@ -47,15 +49,15 @@ def _calendar(start: date, end: date) -> xcals.ExchangeCalendar:
 
 
 def _config_fingerprint() -> tuple[object, ...]:
-    """What `Settings` reads for `calendar`, cheaply: the environment variables
-    that can set it (names are case-insensitive) and the `.env` file's state."""
-    env = tuple(sorted((k, v) for k, v in os.environ.items() if k.lower().startswith("calendar")))
+    """What `Settings` can read for `calendar`, cheaply: the whole environment
+    and the `.env` file's state (a scan of `os.environ` and one `stat`)."""
+    env = frozenset(os.environ.items())
     path = _default_env_file()
     try:
         stat = path.stat()
     except OSError:
         return env, str(path), None
-    return env, str(path), stat.st_mtime_ns, stat.st_size
+    return env, str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
 @lru_cache(maxsize=8)
