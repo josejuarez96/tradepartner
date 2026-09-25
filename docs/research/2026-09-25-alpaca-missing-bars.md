@@ -1,6 +1,6 @@
 # Research Report: Alpaca missing-bar share on SIP daily bars
 
-**Brief:** #106  ·  **Date:** 2026-09-25  ·  **Status:** INCOMPLETE (history and next-day check done; the same-day live case is pending)  ·  **Agent/model:** teams fearsill and eclipse, claude-opus-5-5, owner-run probe (owner keys)
+**Brief:** #106  ·  **Date:** 2026-09-25  ·  **Status:** INCOMPLETE (history and next-day check done; the same-day live case is #183)  ·  **Agent/model:** teams fearsill and eclipse, claude-opus-5-5, owner-run probe (owner keys)
 
 This is a probe report, not a literature search. It runs Probe 2 of the protocols in [alpaca-open-and-depth](2026-09-25-alpaca-open-and-depth.md), "Owner probe protocols": the missing-bar share, which feeds `ingest.max_missing_share` (currently 0.05). Probe 1 is #101. Probe 3 (pre-open paper fills) was split to #182 and gets its own report.
 
@@ -20,7 +20,7 @@ The script is `scripts/probe_missing_bars.py` on branch `spike/106-probes` (comm
 **Runs**
 1. **History:** `fetch`, 2026-09-25 08:06 UTC, team fearsill with the owner's keys. 45 read-only calls, 0 errors, feed echo `sip`.
 2. **Next-day check:** `live`, 2026-09-25 19:47 UTC (15:47 ET), run by the owner. The run came before today's close, so the script read the last completed session, 2026-09-24, about 23 hours after its ingest time (close + `ingest.settle_delay_minutes`). The script printed a warning. It shows how complete a session looks a day later. It is **not** the same-day live case the protocol asks for. 45 calls, 0 errors.
-3. **Live case (pending):** `live` between 17:00 and 19:00 ET on a normal session, so the latest session is read about an hour after the close.
+3. **Live case (pending, #183):** `live` between 17:00 and 19:00 ET on a normal session, so the latest session is read about an hour after the close.
 
 ## Evidence
 
@@ -54,7 +54,7 @@ The candidates in the last column use the next-day check in place of the live sh
 - **Survivorship:** the universe is today's list, so names delisted inside the window are absent. That undercounts halts that ended in a delisting, as the protocol notes.
 
 ## Caveats & gaps
-- **Live case pending:** until it runs, the 0.010 candidate rests on historical and next-day data.
+- **Live case pending (#183):** until it runs, the 0.010 candidate rests on historical and next-day data.
 - **One window:** 20 sessions in late summer 2026. No early-close day, index rebalance or market-wide halt is in it.
 - **Re-run with real ingest:** the issue suggests measuring again once real ingest (T16 with the real EDGAR `FilingSource`) runs, with the store's own listed set instead of Alpaca's asset list.
 
