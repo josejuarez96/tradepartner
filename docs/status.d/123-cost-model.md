@@ -1,1 +1,0 @@
-- Phase 3 T33: cost model `backtest/costs.py` (`trade_cost`, `buy_notional_after_costs` keeping post-cost cash ≥ 0, `sensitivity_levels`), checked against a hand-computed three-trade fixture (#123, PR #124)

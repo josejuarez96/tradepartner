@@ -1,1 +1,0 @@
-- Phase 2 T11: EDGAR parsers (`adapters/edgar.py`) over T3's recordings: submissions and quarterly index with acceptance times (never from filing dates; unknown ones reported as unstamped), tickers snapshot, company facts, SGML header SIC (Eastern to UTC), cover-page classes and per-class shares via `edgartools`, Forms 25/25-NSE; exchanges normalized (#129, PR #131)
