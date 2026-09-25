@@ -443,6 +443,8 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
             cik, accession, root_document, settings=settings
         )
         fixture_name = _flatten_fixture_filename(root_document)
+        for stale in EDGAR_FIXTURES_DIR.glob(f"filing_{label}_*"):
+            stale.unlink()  # the document name changes per filing; keep exactly one per label
         _write_text_gz(
             EDGAR_FIXTURES_DIR / f"filing_{label}_{fixture_name}.gz",
             downloaded.read_text(encoding="utf-8", errors="replace"),
@@ -482,8 +484,6 @@ def main() -> int:
     EDGAR_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
 
     secrets = _configured_secrets(settings)
-    for stale in EDGAR_FIXTURES_DIR.glob("filing_*"):
-        stale.unlink()  # a re-run must not leave an older document beside the new one
     _record_edgar(settings, secrets)
     _record_alpaca(settings, secrets)
 

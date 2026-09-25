@@ -68,12 +68,16 @@ def _parsed_json_or_none(text: str) -> Any | None:
         return None
 
 
+GZIP_MAGIC = b"\x1f\x8b"
+
+
 def _fixture_text(path: Path) -> str:
-    """A fixture's text; `.gz` filing documents are decompressed first (T3)."""
-    if path.suffix == ".gz":
+    """A fixture's text; gzip files (by magic bytes, not suffix) are decompressed first."""
+    raw = path.read_bytes()
+    if raw[:2] == GZIP_MAGIC:
         with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
             return fh.read()
-    return path.read_text(encoding="utf-8", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
 
 
 def _assert_file_is_scrubbed(path: Path) -> None:
@@ -278,3 +282,12 @@ def test_key_management_personnel_compensation_does_not_trip_the_walk_test(
     fixture_file.write_text(json.dumps(payload), encoding="utf-8")
 
     _assert_file_is_scrubbed(fixture_file)  # raises AssertionError if it trips
+
+
+def test_walk_fails_on_a_key_hidden_inside_a_gzip_file_whatever_its_name(tmp_path: Path) -> None:
+    """A gzip file is decompressed before checking, even without a `.gz` suffix (T3)."""
+    hidden = tmp_path / "filing_x.htm"
+    with gzip.open(hidden, "wt", encoding="utf-8") as fh:
+        fh.write("<html>APCA-API-KEY-ID: PKABCDEFGHIJKLMNOPQRSTUV</html>")
+    with pytest.raises(AssertionError, match=r"Alpaca-style key prefix|header line"):
+        _assert_file_is_scrubbed(hidden)

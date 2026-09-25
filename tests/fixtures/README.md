@@ -41,7 +41,7 @@ config values they set, are in
   and the owner re-records.
 - `company_tickers.json` keeps the first 200 rows plus every row for a recorded CIK or
   symbol (`cli_record.trim_company_tickers`).
-- `filing_<label>_<document>.gz` is the whole primary document, gzip-compressed: the
+- `filing_<label>_<document>.gz` is the whole primary document, gzip-compressed (the filing-index excerpt stays plain `.txt`): the
   `dei:` cover tags are spread across the file, so it cannot be truncated. Read it with
   `gzip.open(path, "rt")`; `tests/test_fixture_scrub.py` decompresses before checking.
 
