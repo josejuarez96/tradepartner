@@ -140,3 +140,31 @@ def test_datetime_value_in_date_column_raises(
 
     (count,) = store_conn.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     assert count == 0
+
+
+def test_empty_not_null_varchar_cell_loads_as_empty_string_not_null(
+    tmp_path: Path, store_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """`facts.class_member` is `VARCHAR NOT NULL DEFAULT ''` (schema.py: `''`
+    is the sentinel for an undimensioned fact). DuckDB's `read_csv` treats a
+    quoted-empty cell as `NULL` by default, which would trip the `NOT NULL`
+    constraint even though the cell is present and explicitly empty — the
+    `force_not_null` fix (issue #28) must make it round-trip as `''`
+    instead."""
+    fixtures_dir = tmp_path / "universe"
+    fixtures_dir.mkdir()
+    csv_path = fixtures_dir / "facts.csv"
+    csv_path.write_text(
+        "security_id,fact_name,as_of_date,class_member,value,filing_accession,known_at,"
+        "ingested_at,source,provenance\n"
+        'S1,shares_outstanding,2020-01-02,"",1000000,,2020-01-02T21:00:00+00:00,'
+        "2020-01-02T21:00:00+00:00,test,filing\n"
+    )
+
+    load_universe_fixtures(store_conn, fixtures_dir)
+
+    class_member, is_null = store_conn.execute(
+        "SELECT class_member, class_member IS NULL FROM facts"
+    ).fetchone()  # type: ignore[misc]
+    assert class_member == ""
+    assert is_null is False
