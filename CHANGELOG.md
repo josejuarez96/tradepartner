@@ -12,6 +12,7 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Broker-level tests: an aware timestamp that overflows once converted to UTC raises `ValueError` naming the field from `Order`/`Fill`, and `FakeBroker.submit`/`simulate_fill` fail closed with no order, fill or position recorded (#57).
 - Research G8: survivorship-bias-free US daily price vendors for an individual (Norgate, Sharadar, CRSP, Tiingo, Massive, EODHD, Alpaca), with a cited comparison table and disconfirmation log (`docs/research/2026-09-25-price-vendors.md`) (#46).
 - Phase 2 T21a: Streamlit dashboard shell (`tradepartner.dashboard.app`): one short-lived read-only store connection per render handed to the selected page, "no store yet", "store busy" and "store unreadable" states, sidebar navigation with an empty data-health placeholder for T21 (#66).
+- Research G1 report: post-2010 long-only 12-1 momentum, net of costs, and post-publication weakening. Graded MIXED, with candidate Phase 3 magnitude, drawdown and cost inputs (#47).
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
