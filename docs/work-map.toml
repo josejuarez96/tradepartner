@@ -86,6 +86,18 @@ why = "Proves the guard rails bite before real data arrives."
 what = "Parsers that turn recorded EDGAR payloads into stored facts with provenance."
 why = "Real filings feed the security master and the universe rules."
 
+[task.T11b]
+what = "The real EDGAR filing source: the quarterly index of issuer filings, stamped with acceptance times, and the company snapshot."
+why = "Without it a real ingest has no filings; T11 only parsed recordings."
+
+[task.T11c]
+what = "Cover pages, per-class shares and SIC from the SEC Financial Statement and Notes data sets, with per-filing downloads only for the newest weeks."
+why = "Per-filing downloads for every issuer are hundreds of GB; the monthly data sets carry the same facts by accession (#174)."
+
+[task.T11d]
+what = "Form 25 delistings from EDGAR, the rule for a filing that fails the same way every night, and the owner's measured backfill cost."
+why = "One bad filing must not block the nightly ingest; the real backfill size decides how T19 runs it."
+
 [task.T12]
 what = "Parsers that turn recorded Alpaca payloads into stored bars and corporate actions."
 why = "Real prices for the backtest, stamped with when they became known."
