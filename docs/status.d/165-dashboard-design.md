@@ -1,1 +1,1 @@
-- #165 Dashboard design standard ([design/dashboard.md](design/dashboard.md)): one page skeleton, light and dark tokens, validated palette in fixed order, reserved status colours, page map per phase; roadmap UX line; applied from T21 and T44 (PR pending)
+- #165 Dashboard design standard ([design/dashboard.md](design/dashboard.md)): one page skeleton, light and dark tokens, validated palette in fixed order, reserved status colours, page map per phase; roadmap UX line; applied from T21 and T44 (PR #166)
