@@ -1,2 +1,0 @@
-### Added
-- Phase 3 T34: `tradepartner.backtest.signals.momentum_12_1` (month-end bars from the XNYS calendar, missing-bar names excluded and counted, only rows up to `t_session` read) and `tradepartner.backtest.portfolio` (`target_weights`: top `ceil(top_fraction × n)` names, equal weight summing to at most 1, ties by `security_id`; `drifted_weights` from dollar values; `trades_from` as target minus drifted) (#133).
