@@ -1,10 +1,10 @@
 # Teams: many chat windows, one plan
 
-**Status:** Accepted v1.0 (#36, 2026-09-25)
+**Status:** Accepted v1.0 (#36, PR #37, 2026-09-24)
 
 ## Why this exists
 
-On 2026-09-25 two orchestrator sessions each read "Next up" in `STATUS.md` and, within one minute of each other, opened issues and PRs for the same two plan tasks (T5: #22/#25, T20: #23/#24). Nothing in the ways of working said *claim before you build*, nothing gave a session an identity, and every PR edited the same three shared files. `STATUS.md` is a snapshot; it cannot arbitrate between concurrent readers.
+On 2026-09-24 two orchestrator sessions each read "Next up" in `STATUS.md` and, within one minute of each other, opened issues and PRs for the same two plan tasks (T5: #22/#25, T20: #23/#24). Nothing in the ways of working said *claim before you build*, nothing gave a session an identity, and every PR edited the same three shared files. `STATUS.md` is a snapshot; it cannot arbitrate between concurrent readers.
 
 This document adds the missing layer so that **any number of Claude Code windows** can build from one plan without stepping on each other. It changes nothing about branches, PRs, reviews or who merges: those rules stay in [git-workflow.md](git-workflow.md) and [development-process.md](development-process.md).
 
@@ -12,11 +12,11 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 | Term | Meaning |
 |---|---|
-| **Team** | One orchestrator chat window plus **one clone** of the repo. Registered once with `scripts/team.py register <name>`. |
+| **Team** | One orchestrator chat window plus **one clone** of the repo. Registered once with `scripts/team.py register <name>`. The owner is a team too, named `owner`. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
 | **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
-| **Ready frontier** | Unclaimed plan tasks whose dependencies are all ticked in the plan. |
+| **Ready frontier** | Unclaimed plan tasks whose dependencies are all ticked in the plan **as merged on `origin/main`**. The tool fetches and reads the plan from there, never from your working tree, so a checkbox ticked inside an unmerged PR does not open the next task. |
 | **Chain** | Consecutive dependent tasks that one team should keep (listed per plan). |
 | **Parked** | Label on a green PR whose team stopped. Re-claim its issue and continue the branch. |
 
@@ -30,7 +30,8 @@ uv run python scripts/team.py register <name>      # writes .team (gitignored), 
 ```
 
 - **One clone per team, always.** Two windows in one directory collide on `.claude/worktrees/` and on `.team`.
-- Names are short and lowercase (`atlas`, `team-b`). A window that is closed for good keeps its name; the next window may reuse it or pick a new one.
+- Names are short and lowercase (`atlas`, `team-b`). A window that is closed for good keeps its name; the next window may reuse it or pick a new one. `owner` is reserved for Jose's own clone.
+- Subagent worktrees under `.claude/worktrees/` inherit the clone's team: the tool finds `.team` through the worktree's common git dir.
 - Everything else (permissions, hooks, agents) comes with the clone from `.claude/settings.json` and `.pre-commit-config.yaml`.
 
 ## Session protocol (replaces the generic one for build sessions)
@@ -48,16 +49,18 @@ uv run python scripts/team.py register <name>      # writes .team (gitignored), 
 
 **End**
 1. Push; update the draft PR description with the current state.
-2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#>` and a handoff comment on the issue (done, remaining, gotchas). The PR gets the `parked` label if it is green.
+2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after a rebase), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas.
 
 ## The claim protocol, exactly
 
 1. **GitHub is the source of truth.** Issues, labels and comments decide; `STATUS.md` and the board are snapshots.
-2. **A plan task's claim lives on its canonical issue.** `claim T5` finds the lowest-numbered open issue labelled `task:T5`, or creates one from the plan line. If two teams create simultaneously, the higher number is closed as a duplicate by the tool: the tiebreak is deterministic and needs no conversation.
-3. **A claim is a comment, replayed in order.** The first unreleased `claim: team:<name>` holds the issue. GitHub orders comments, so there is no tie. The `team:<name>` label mirrors the holder for the board and CI.
-4. **Claims are per issue, not per team lifetime.** Release what you stop working on.
-5. **Dependencies must be merged.** `claim` refuses a task whose dependencies are unticked. `--allow-unready` exists for stubs that were agreed in writing on the issue (development-process, Definition of Ready).
-6. **Owner tasks** (marked `(owner)` in the plan) are never claimed by agents.
+2. **A plan task's claim lives on its canonical issue.** `claim T5` finds the lowest-numbered open issue labelled `task:T5`, or creates one from the plan line. If two teams create simultaneously, the higher number is closed as a duplicate by the tool: the tiebreak is deterministic and needs no conversation. An issue created by hand with a title like `T5: …` is normalised by `claim <number>`: the tool adds the task label and sends the claim to the canonical issue.
+3. **A claim is a comment, replayed in order.** The first unreleased comment whose **entire body** is `claim: team:<name>` holds the issue. GitHub orders comments, so there is no tie. Quoting the line inside a longer comment does nothing. The `team:<name>` label mirrors the holder for the board and CI; when they disagree, the comments win and `claim` repairs the label.
+4. **Claims are per issue, not per team lifetime.** Release what you stop working on. A released issue, with its branch and PR, passes to the next team that claims it.
+5. **Dependencies must be merged.** `claim` refuses a task whose dependencies are unticked on `origin/main`. `--allow-unready` exists for stubs that were agreed in writing on the issue (development-process, Definition of Ready).
+6. **Owner tasks** (marked `(owner)` in the plan) are claimed only by team `owner`. The owner's own PRs go through the same claim so the CI guard treats every PR alike.
+7. **A dead window keeps nothing.** If a window stopped without releasing, the owner runs `release <target> --force --reason "…"` from the `owner` clone. Nobody else may release another team's claim.
+8. **Spikes are exempt.** A `spike/` branch is never merged, so it needs no claim and the CI guard skips it.
 
 ## Picking work
 
@@ -74,30 +77,33 @@ Chains are a preference, not a lock. Every task is still claimed individually.
 Every PR touches `docs/STATUS.md`, `CHANGELOG.md` and one plan checkbox. To keep rebases trivial:
 
 - **Append one line** to STATUS "Done" and to CHANGELOG `[Unreleased]`. Tick only your checkbox. Do not reorder, rewrite or "tidy" neighbouring lines.
-- **Never edit STATUS "Next up" to reserve or advertise work.** The board replaces it. `doc-keeper` refreshes the STATUS snapshot after merges.
+- **STATUS's "Ready frontier snapshot" is written only by `doc-keeper`** (and by the PR that changes the process). It is a copy of `status` output, not a place to reserve or advertise work.
 - **Rebase on `main` right before marking ready**, and again after any merge that touched those files. Resolve append conflicts by keeping both lines.
 - **Code files: only those your plan task names.** If another team's open PR touches one of them, one of you waits; `status` shows open PRs per issue.
 
 ## CI guard
 
 The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull request. It fails when:
-- the issue behind the branch has no `team:` label (unclaimed work), or
-- the plan task behind the branch has more than one open PR (duplicate work; the lower issue number survives, close the other).
+- the branch has no issue number (`<prefix>/<issue#>-<slug>`), unless it is a `spike/` or `dependabot/` branch;
+- the issue has no claim comment, or its `team:` labels differ from the claim (exactly one label, equal to the holder);
+- the issue is titled as a plan task (`T5: …`) but lacks its `task:` label (run `claim <number>` to normalise it);
+- another open PR for the same plan task points at a **lower** issue number, or an **older** open PR points at the same issue. The lowest number always survives, so the surviving PR passes and only the duplicate goes red.
 
-Branches without an issue number (`spike/…`) are skipped with a warning.
+A label or comment change on an issue does not re-run a PR's checks. After claiming, push a commit or run `gh run rerun <run-id> --failed`. The job runs the PR's own copy of `scripts/team.py`; that is acceptable for a solo owner who reviews every diff.
 
 ## The owner's view
 
 - `uv run python scripts/team.py status` from any clone shows every team's claims.
 - **Merge order matters:** merging the head of a chain widens the frontier for everyone. Prefer merging chain heads first.
 - Labels of retired teams are harmless; delete them when convenient.
-- Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-25 (#34 → #31, #26 → #27).
+- Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
+- The owner's clone is team `owner`: it claims owner tasks (T3) and the owner's own docs PRs, and it is the only team that can `release --force`.
 
 ## Never
 
 - Start from STATUS "Next up" without a claim.
 - Share a clone between windows, or run two orchestrators in one directory.
-- Touch another team's branch or PR, or close its issue (the duplicate rule is the one exception, and the tool applies it).
+- Touch a branch, PR or issue that another team currently **holds** (a released or parked one is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
 - Merge. The owner merges, or explicitly tells one main session to (git-workflow rule 7).
 

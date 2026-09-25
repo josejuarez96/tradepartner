@@ -49,8 +49,8 @@ Dependent tasks one team should keep, in order. A chain is a preference, not a l
 
 | Chain | Tasks | Starts when |
 |---|---|---|
-| universe | T5 → T6 → T7 → T10 | now (T5 parked in PR #31, issue #22) |
-| broker | T20 | now (parked in PR #27, issue #23) |
+| universe | T5 → T6 → T7 → T10 | T4 merged (T10 also waits for T8b from the master chain) |
+| broker | T20 | T4 merged |
 | master | T8 → T8b → T9 | T6 merged |
 | parsers | T11, T12 (parallel) | T3 (owner) plus T9 for T11; T7 and T8b for T12 |
 | rules | T13 → T14, T15 | T9 and T10 merged |

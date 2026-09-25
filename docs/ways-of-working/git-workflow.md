@@ -78,7 +78,7 @@ issue → branch → draft PR → CI green → self-review → specialist review
 
 ## Parallel agents and teams
 
-- Each orchestrator chat window is a **team** with its **own clone**. Claims, the ready frontier, shared-file rules and the CI guard are in [teams.md](teams.md). No branch without `uv run python scripts/team.py claim`.
+- Each orchestrator chat window is a **team** with its **own clone**. Claims, the ready frontier, shared-file rules and the CI guard are in [teams.md](teams.md). No branch without `uv run python scripts/team.py claim` (`spike/` branches excepted; the owner claims as team `owner`).
 - Within a team, each subagent working in parallel gets its own **git worktree** and branch (`claude --worktree` or the worktree isolation option). Two agents never share a working directory.
 - Parallel agents must work on **non-overlapping files**. If two plan tasks touch the same module, run them one after the other.
 

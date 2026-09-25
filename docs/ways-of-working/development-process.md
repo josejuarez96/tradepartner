@@ -91,7 +91,7 @@ These come straight from the research handoff. They are process rules, not just 
 
 **Start of session:**
 1. Read `docs/STATUS.md`.
-2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch.
+2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch (spikes excepted).
 3. `git switch main && git pull`, then branch.
 
 **End of session:**
