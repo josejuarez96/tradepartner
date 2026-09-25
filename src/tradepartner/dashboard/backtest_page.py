@@ -413,9 +413,13 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     if not trials:
         st.info("No trials yet. Run `tradepartner backtest <hypothesis>` to record one.")
         return
-    labels = {_trial_label(t): t.trial_id for t in trials}
-    picked = st.selectbox("Trial", list(labels))
-    view = load_trial_view(conn, labels[picked] if picked else trials[0].trial_id)
+    # Options are ids under a fixed key, so a trial recorded or finished on the
+    # CLI while the page is open changes the labels but not the pick.
+    by_id = {t.trial_id: t for t in trials}
+    picked = st.selectbox(
+        "Trial", list(by_id), format_func=lambda i: _trial_label(by_id[i]), key="backtest_trial"
+    )
+    view = load_trial_view(conn, picked if picked is not None else trials[0].trial_id)
 
     _render_states(view)
     if view.trial.status == "ok":

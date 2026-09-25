@@ -237,8 +237,8 @@ def _text(at: AppTest) -> str:
 
 def _pick(at: AppTest, trial_id: int) -> AppTest:
     [picker] = at.selectbox
-    [label] = [o for o in picker.options if o.startswith(f"#{trial_id} ")]
-    picker.set_value(label).run()
+    assert any(o.startswith(f"#{trial_id} ") for o in picker.options)
+    picker.set_value(trial_id).run()
     return at
 
 
@@ -407,6 +407,23 @@ def test_render_holdout_repeat_red_flag_and_spends(
     assert "red flag" in text
     spends = next(df.value for df in at.dataframe if "holdout_reason" in df.value.columns)
     assert set(spends["trial_id"]) == {seeded.refused, seeded.holdout}
+
+
+def test_picked_trial_survives_a_new_trial(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, seeded_store: tuple[Path, Seeded]
+) -> None:
+    """A run recorded on the CLI while the page is open must not move the
+    picker to another trial (the option list and labels change)."""
+    store_path, seeded = seeded_store
+    at = _pick(_app(monkeypatch, store_path), seeded.unfinished)
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        h1 = registry.get_hypothesis(conn, "h1-momentum-12-1")
+        _ok_trial(conn, seed_settings, h1.hypothesis_id, 0.15, 0.03)
+    at.run()
+    assert not at.exception
+    assert at.selectbox[0].value == seeded.unfinished
+    assert f"Trial #{seeded.unfinished}:" in _text(at)
 
 
 def test_render_synthetic_trial_is_labelled(
