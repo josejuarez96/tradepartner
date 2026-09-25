@@ -269,6 +269,8 @@ def accessions_in_company_facts(payload: Any) -> set[str]:
     """Every `accn` referenced by any fact in a (trimmed) company-facts payload. Pure."""
     out: set[str] = set()
     facts = payload.get("facts", {}) if isinstance(payload, dict) else {}
+    if not isinstance(facts, dict):
+        return out
     for concepts in facts.values():
         if not isinstance(concepts, dict):
             continue
