@@ -401,7 +401,10 @@ def _source_counts(filings: FilingSource) -> str:
     The counts sit before the variable-length benchmarks list so
     `ingest.max_message_chars` never cuts them off. `filings` arrives
     wrapped in `_Recorded` (T17's fetch pass), so the counts are read from
-    the adapter underneath, never from the proxy (#194)."""
+    the adapter underneath, never from the proxy (#194). The adapter must
+    hold them as plain attributes set during the fetch pass, never as
+    properties that fetch: this read runs after the pass is frozen, inside
+    the write transaction."""
     while isinstance(filings, _Recorded):
         filings = filings._source
 
