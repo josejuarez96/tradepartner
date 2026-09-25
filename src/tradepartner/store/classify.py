@@ -39,7 +39,8 @@ known at one instant:
 Status forms decide domestic vs foreign: `10-K`, `10-KT`, `10-Q`, `S-1`
 are domestic; `20-F`, `40-F`, `F-1`, `6-K` foreign; the latest known wins,
 so a foreign issuer that starts filing 10-Ks becomes domestic then. An
-amendment (`/A`) counts as its base form. Funds and F-6 are sticky: once
+amendment (`/A`) counts as its base form. Filings accepted at one instant
+are ordered by accession. Funds and F-6 are sticky: once
 filed, they stay.
 
 **Timing.** The type is recomputed at the security's `known_at` and at
@@ -49,11 +50,20 @@ acceptance, a listing row's `known_at`); a row is written only when
 instant its classification first became knowable, never earlier than any
 evidence it used, and nothing is back-dated. Evidence accepted before the
 security's own `known_at` is applied at that `known_at`. `sic` is the
-latest header SIC known then (`None` before any header).
+latest header SIC known then (`None` before any header); a header without
+a SIC is skipped, so it never resets a SPAC.
 
 Commodity and grantor-trust ETFs that file 10-Ks under an ordinary SIC
 need price-source asset metadata (ADR 0006); `FilingSource` has none, so
-they classify by their title or fall to `common_default`.
+they classify by their title or fall to `common_default`. MLP "Common
+Units" titles are `unit` from their first cover page, while the same issuer
+is `common_default` before it. Both are open owner questions on PR #122.
+
+**Snapshot tickers and #35.** A class listed only by a `snapshot_static`
+row is `common_default` until that row's fetch, and only then can a suffix
+make it a warrant or unit. That is safe because #35 keeps the listing
+itself invisible before its `known_at`; any change letting such listings
+apply earlier must apply the suffix rows at the same time.
 """
 
 from __future__ import annotations
@@ -81,7 +91,7 @@ UNCLASSIFIABLE = "unclassifiable"
 SPAC_SIC = 6770
 FUND_FORMS = frozenset({"N-CSR", "N-CSRS", "N-PORT", "NPORT-P", "485BPOS", "N-2"})
 F6_FORMS = frozenset({"F-6", "F-6EF"})
-DOMESTIC_FORMS = frozenset({"10-K", "10-KT", "10-Q", "S-1"})
+DOMESTIC_FORMS = frozenset({"10-K", "10-KT", "10-K405", "10-KSB", "10-Q", "10-QSB", "S-1"})
 FOREIGN_FORMS = frozenset({"20-F", "40-F", "F-1", "6-K"})
 
 #: Title words, checked in order before the common-equity words.
@@ -122,7 +132,7 @@ class _Evidence:
     """Everything known about one CIK, as (instant, value) pairs."""
 
     forms: tuple[tuple[datetime, str], ...]
-    sics: tuple[tuple[datetime, int | None], ...]
+    sics: tuple[tuple[datetime, int], ...]
 
 
 def _base_form(form: str) -> str:
@@ -191,17 +201,18 @@ def _evidence(
     source: FilingSource, ciks: Iterable[str], settings: Settings
 ) -> dict[str, _Evidence]:
     wanted = set(ciks)
-    forms: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+    forms: dict[str, list[tuple[datetime, str, str]]] = defaultdict(list)
     for entry in source.filing_index():  # full history, as the master reads it
         if entry.cik in wanted:
-            forms[entry.cik].append((entry.accepted_at, _base_form(entry.form)))
+            forms[entry.cik].append((entry.accepted_at, entry.accession, _base_form(entry.form)))
     out: dict[str, _Evidence] = {}
     for cik in wanted:
         headers = source.filing_headers(cik, settings.master.issuer_forms)
-        sics = sorted(((h.accepted_at, h.accession), h.sic) for h in headers)
+        # A header without a SIC never erases a known one (a SPAC stays a SPAC).
+        sics = sorted((h.accepted_at, h.accession, h.sic) for h in headers if h.sic is not None)
         out[cik] = _Evidence(
-            forms=tuple(sorted(forms[cik])),
-            sics=tuple((stamp, sic) for (stamp, _), sic in sics),
+            forms=tuple((stamp, form) for stamp, _, form in sorted(forms[cik])),
+            sics=tuple((stamp, sic) for stamp, _, sic in sics),
         )
     return out
 

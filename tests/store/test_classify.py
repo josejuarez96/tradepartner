@@ -209,6 +209,35 @@ class TestRules:
             ("common", "title_common", _at(2022, 3, 1)),
         ]
 
+    def test_header_without_sic_keeps_the_spac(self) -> None:
+        source = FixtureFilingSource(
+            index=[_filing(SPAC, "S-1", _at(2020, 1, 6)), _filing(SPAC, "8-K", _at(2020, 6, 1))],
+            headers=[
+                _header(SPAC, "S-1", 6770, _at(2020, 1, 6)),
+                _header(SPAC, "8-K", None, _at(2020, 6, 1)),
+            ],
+            cover_pages=[_cover(SPAC, _at(2020, 3, 2), ("Class A Common Stock", "SPC", "NYSE"))],
+        )
+        latest = _latest(_build(source), primary_security_id(SPAC))
+        assert (latest["security_type"], latest["sic"]) == ("spac", 6770)
+
+    @pytest.mark.parametrize("form", ["10-KSB", "10-QSB", "10-K405"])
+    def test_older_domestic_forms(self, form: str) -> None:
+        source = FixtureFilingSource(
+            index=[_filing(BARE, "8-K", _at(2004, 1, 5)), _filing(BARE, form, _at(2004, 3, 1))]
+        )
+        assert _latest(_build(source), primary_security_id(BARE))["rule"] == "common_default"
+
+    def test_same_instant_status_forms_ordered_by_accession(self) -> None:
+        stamp = _at(2016, 4, 1)
+        source = FixtureFilingSource(
+            index=[
+                FilingIndexEntry(FOREIGN, "Co", "20-F", f"{FOREIGN}-000001", stamp),
+                FilingIndexEntry(FOREIGN, "Co", "10-K", f"{FOREIGN}-000002", stamp),
+            ]
+        )
+        assert _latest(_build(source), primary_security_id(FOREIGN))["rule"] == "common_default"
+
     @pytest.mark.parametrize("form", ["20-F", "40-F", "20-F/A"])
     def test_foreign_forms(self, form: str) -> None:
         # The 8-K creates the security (an amendment is not an issuer form).
