@@ -58,6 +58,12 @@ class DataProvider(Protocol):
         The marking frame (dividends included) and the signal frame are both this call."""
         ...
 
+    def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`prices_as_of(t, ids)`: unadjusted bars known at `t`, latest revision. Used only
+        for the raw fill price behind reported `shares` and the per-share commission
+        (req 2; costs are charged on shares actually traded), never for a ratio."""
+        ...
+
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         """`listing_ends_as_of(t)` for `ids`: each listing with `status` (listed,
         delisted, transferred) and `end_session`, derived from rows known at `t`."""

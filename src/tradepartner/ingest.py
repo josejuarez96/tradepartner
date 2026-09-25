@@ -6,7 +6,8 @@ minus `ingest.settle_delay_minutes` (`expected_session`). Sources run in
 order, `edgar` then `alpaca` (the price side fetches the names the master
 lists), and the run **halts** at the first source that is not `ok`.
 
-**One atomic chunk per source.** Each source's rows are written inside one
+**One atomic chunk per source.** EDGAR is fetched with no store connection
+open (a recording pass), then each source's rows are written inside one
 `store.db.open_for_write` transaction, which retries the lock for
 `store.lock_retry_seconds` and releases it when the chunk ends. A failure
 anywhere in the chunk rolls all of it back; an earlier source's committed
@@ -52,7 +53,9 @@ is fetching is stored, not refused as look-ahead.
 
 **Run messages** are stored with every configured secret value redacted,
 control characters replaced and the length capped at
-`ingest.max_message_chars`: an exception's text comes from a server.
+`ingest.max_message_chars`: an exception's text comes from a server. The
+EDGAR message carries the adapter's unstamped-filing, unstamped-fact and
+skipped-filer counts when the source exposes them (#172).
 """
 
 from __future__ import annotations
@@ -184,13 +187,20 @@ def ingest_session(
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
+    recorded = _Recorded(filings)
     work: dict[str, Callable[[duckdb.DuckDBPyConnection], tuple[int, str]]] = {
-        "edgar": lambda conn: _ingest_filings(conn, settings, filings, clock),
-        "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now),
+        "edgar": lambda conn: _ingest_filings(conn, settings, recorded, clock),
+        "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now, clock),
+    }
+    prepare: dict[str, Callable[[], object] | None] = {
+        "edgar": lambda: _prefetch(recorded, settings),
+        "alpaca": None,
     }
     runs: list[SourceRun] = []
     for name in SOURCES if source == "all" else (source,):
-        run = _run_source(name, work[name], settings, now, clock, cursor, dry_run)
+        run = _run_source(
+            name, work[name], settings, now, clock, cursor, dry_run, prepare=prepare[name]
+        )
         runs.append(run)
         if run.status != OK:
             break
@@ -205,20 +215,26 @@ def _run_source(
     clock: Callable[[], datetime],
     cursor: str,
     dry_run: bool,
+    mode: str = MODE,
+    prepare: Callable[[], object] | None = None,
 ) -> SourceRun:
+    """One chunk: `prepare` (fetching, no store connection open), then
+    `work` inside one write transaction with the run row."""
     run_id = uuid.uuid4().hex
 
     def outcome(status: str, rows: int, message: str) -> SourceRun:
         return SourceRun(name, status, rows, cursor, _clean(message, settings))
 
     try:
+        if prepare is not None:
+            prepare()
         with open_for_write(settings) as conn:
             init_schema(conn)
             rows, message = work(conn)
             if dry_run:
                 raise _DryRun(rows, message)
             run = outcome(OK, rows, message)
-            _write_run(conn, run_id, now, clock(), run)
+            _write_run(conn, run_id, now, clock(), run, mode)
         return run
     except _DryRun as dry:
         return outcome(OK, dry.rows, f"dry run: {dry}")
@@ -228,13 +244,26 @@ def _run_source(
         run = outcome(STALE, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts with a run row
         run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
-    if not dry_run:
-        try:
-            with open_for_write(settings) as conn:
-                init_schema(conn)
-                _write_run(conn, run_id, now, clock(), run)
-        except StoreLockedError as exc:
-            return outcome(run.status, 0, f"{run.message}; run row: {exc}")
+    return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
+
+
+def _record_only(
+    settings: Settings,
+    run_id: str,
+    now: datetime,
+    clock: Callable[[], datetime],
+    run: SourceRun,
+    mode: str,
+) -> SourceRun:
+    """Write only `run`'s `ingestion_runs` row, in a chunk of its own (a
+    stale or failed source); note in the message if the store is locked."""
+    try:
+        with open_for_write(settings) as conn:
+            init_schema(conn)
+            _write_run(conn, run_id, now, clock(), run, mode)
+    except StoreLockedError as exc:
+        message = _clean(f"{run.message}; run row: {exc}", settings)
+        return SourceRun(run.source, run.status, 0, run.chunk_cursor, message)
     return run
 
 
@@ -261,6 +290,7 @@ def _write_run(
     started_at: datetime,
     finished_at: datetime,
     run: SourceRun,
+    mode: str = MODE,
 ) -> None:
     insert_row(
         conn,
@@ -271,7 +301,7 @@ def _write_run(
             "finished_at": finished_at,
             "status": run.status,
             "source": run.source,
-            "mode": MODE,
+            "mode": mode,
             "rows_added": run.rows_added,
             "chunk_cursor": run.chunk_cursor,
             "message": run.message,
@@ -287,15 +317,20 @@ _FETCH_PASS = datetime(9000, 1, 1, tzinfo=UTC)
 
 
 class _Recorded(FilingSource):
-    """`source`, with each answer recorded so a second build reads the same."""
+    """`source`, with each answer recorded so a second build reads the same.
+    Once `frozen` (after the fetch pass), a question not already answered
+    raises instead of reaching the source, so no fetch runs under the lock."""
 
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._answers: dict[tuple[Any, ...], Any] = {}
+        self.frozen = False
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
         if key not in self._answers:
+            if self.frozen:
+                raise RuntimeError(f"filing source asked {key!r} after the fetch pass")
             self._answers[key] = getattr(self._source, method)(*args)
         return self._answers[key]
 
@@ -316,6 +351,13 @@ class _Recorded(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
+
+
+def _prefetch(recorded: _Recorded, settings: Settings) -> None:
+    """The fetch pass: every filing question, with no store connection open;
+    then `recorded` answers only from what it holds."""
+    _build_filings(recorded, settings, _FETCH_PASS)
+    recorded.frozen = True
 
 
 def _ingest_filings(
@@ -339,10 +381,39 @@ def _ingest_filings(
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
-        f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts; "
+        f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
+        f"{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _source_counts(filings: FilingSource) -> str:
+    """`"; unstamped: N filings, M facts; skipped filers: K"`, naming only the
+    attributes `filings` exposes, so rows the EDGAR adapter (T11b, T11c) left
+    out stay visible in the run row (#172). Duck-typed: each attribute is a
+    count or a collection; a fixture source has none and adds nothing.
+
+    Read once, after both builds, from the unwrapped source. The contract
+    this relies on: `unstamped_filings` and `skipped_filers` hold the result
+    of the run's one `filing_index` call, and `unstamped_facts` accumulates
+    over every `facts` call on the source instance, never reset per CIK.
+    The counts sit before the variable-length benchmarks list so
+    `ingest.max_message_chars` never cuts them off."""
+
+    def count(attribute: str) -> int | None:
+        value = getattr(filings, attribute, None)
+        return None if value is None else int(value if isinstance(value, int) else len(value))
+
+    unstamped = [
+        f"{n} {what}"
+        for what in ("filings", "facts")
+        if (n := count(f"unstamped_{what}")) is not None
+    ]
+    parts = [f"unstamped: {', '.join(unstamped)}"] if unstamped else []
+    if (skipped := count("skipped_filers")) is not None:
+        parts.append(f"skipped filers: {skipped}")
+    return "".join(f"; {part}" for part in parts)
 
 
 def _build_filings(
@@ -440,16 +511,24 @@ def fact_rows(
 
 
 def _ingest_prices(
-    conn: duckdb.DuckDBPyConnection, settings: Settings, prices: PriceSource, now: datetime
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    prices: PriceSource,
+    now: datetime,
+    clock: Callable[[], datetime],
 ) -> tuple[int, str]:
     session = expected_session(now, settings)
     symbol = settings.ingest.reference_symbol
-    fetch, listed, reference = _price_names(conn, now, session, settings)
+    # Read the store as of now, after the EDGAR chunk committed (its snapshot
+    # rows are stamped at their fetch time, which can be after the run began).
+    read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
+    fetch, listed, reference = _price_names(conn, read_at, session, settings)
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
     actions = prices.corporate_actions(ids, session.replace(day=1), session)
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
     have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
