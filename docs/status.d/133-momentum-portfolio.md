@@ -1,0 +1,1 @@
+- Phase 3 T34: 12-1 momentum signal (`backtest/signals.py`, excluded names counted, nothing after `t_session` read) and portfolio construction (`backtest/portfolio.py`: top fraction equal weight, ties by `security_id`, drifted weights, trades) (#133, PR #PR)
