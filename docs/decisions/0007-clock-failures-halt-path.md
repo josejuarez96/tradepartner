@@ -1,0 +1,40 @@
+# 0007. Clock failures take the halt path, never the rejection path
+
+**Status:** Accepted  ·  **Date:** 2026-09-25  ·  **Issue:** #64
+
+## Context
+
+`Broker.submit` ([adapters/broker.py](../../src/tradepartner/adapters/broker.py), T20) raises `ValueError` for two causes that mean opposite things:
+
+- a **bad request**: quantity, price, side, symbol or `client_order_id` fails validation in `OrderRequest`;
+- a **bad clock value**: the injected clock returns a naive `datetime`, or one that overflows once normalised to UTC. `FakeBroker.submit` passes that value to `Order(submitted_at=...)`, and `ensure_tz_aware_utc` ([timeutil.py](../../src/tradepartner/timeutil.py)) raises the same `ValueError`, naming the field (#43, tests in #57 / PR #63).
+
+Both raise the same type today because `ensure_tz_aware_utc` validates a value without knowing where it came from, and #43 deliberately gave callers one exception type for an invalid value. That is correct for a validator. It is not enough for the layer that will sit above the broker.
+
+[ADR 0003](0003-data-adapters-local-first.md) rule 7 puts every risk rule in a **risk-gated wrapper** around `Broker` (position limits, kill switch, idempotency), built in Phase 4 ([roadmap](../roadmap.md)). That wrapper has to decide, per exception, whether to **reject** one order and carry on with the rebalance, or **halt** the run. If it maps `ValueError` to "rejected", a broken clock is handled as a routine rejection, the rebalance continues, and every timestamp the run writes afterwards is wrong: `submitted_at` and `filled_at` on orders and fills, the `known_at` of anything journaled, the missed-rebalance detection of [ADR 0006](0006-universe-and-cadence.md), and the idempotency window a real adapter dedupes against. A wrong clock is a fault in the **system**, not in one order. Development-process rule 7 ("rules before money") says the kill switch and its triggers are written down before paper trading; this is one of those triggers, and it was raised by `safety-reviewer` on PR #54 ([#57](https://github.com/josejuarez96/tradepartner/issues/57) item 2, split into #64).
+
+This ADR decides what enters the halt path. What the halt path **does** (cancel open orders or leave them, alerting, how the owner resumes) belongs to the Phase 4 execution spec, and nothing here pre-empts it. No Phase 2 code changes.
+
+## Options considered
+
+1. **Keep one `ValueError`; the wrapper reads the message or field name to tell the causes apart.** Pro: no interface change. Con: string matching on an error message is exactly the kind of implicit contract that a later refactor breaks silently; a real broker adapter raises its own exception types anyway, so the wrapper would need a second mechanism for those.
+2. **(a) A distinct exception type for clock faults**, not a `ValueError` subclass, raised by the broker and mapped by the wrapper to the halt path. Pro: explicit, typed, testable; survives adapter swaps because the type lives in `adapters/broker.py`, which every adapter shares. Con: on its own it still lets a bad clock reach the broker, and it still needs a rule for exceptions nobody anticipated.
+3. **(b) Check clock health in the wrapper before `submit` is called**, so a bad clock never reaches the broker. Pro: catches the fault before the first order of a run. Con: a clock can go bad between the check and a `submit` (a run places many orders), and a real adapter may source timestamps from the broker, outside the pre-check's reach.
+4. **Both (a) and (b), under a fail-closed default: rejection is an allowlist, everything else halts.** Pro: the pre-check catches the common case before any order; the typed exception names the fault when it happens anyway; the allowlist means an exception nobody classified cannot fall into the rejection path by accident. Con: slightly more interface surface in `adapters/broker.py`; a run halts on faults that a more permissive design would skip past.
+
+## Decision
+
+We will take option 4.
+
+1. **Two paths, and the rejection path is an allowlist.** The Phase 4 wrapper treats an exception from `submit` as a per-order **rejection** (log it, continue the run) only if its type is on an explicit list of broker-raised, per-order outcomes: today `DuplicateClientOrderIdError` (resolved by reconciliation against the existing order, never by continuing blindly), and in Phase 4 whatever typed rejections the Alpaca adapter defines (not tradable, insufficient buying power, market closed). **Every other exception halts**, including `ValueError`, adapter transport errors, and anything not on the list. Fail closed is the default, not an opt-in.
+2. **Clock faults get their own type.** `adapters/broker.py` gains `ClockError`, which does **not** subclass `ValueError`. It is raised at the call site that knows a value came from a clock: `FakeBroker` (and any real adapter) wraps its clock call so that a naive or UTC-overflowing timestamp raises `ClockError` (chained from the `ValueError`) instead of letting `Order.__post_init__` raise a plain `ValueError`. `ensure_tz_aware_utc` is unchanged and keeps raising `ValueError`: it validates values, and #43's "one exception type for an invalid value" still holds for it. `ClockError` is the first member of a `SystemFaultError` family that the Phase 4 spec may extend (reconciliation mismatch, stale data), so every fault shares one halt mapping.
+3. **Clock health is checked before the first `submit` of a run.** The wrapper reads the clock it shares with the broker, passes it through `ensure_tz_aware_utc`, and raises `ClockError` before any order is placed if that fails. The Phase 4 spec may add plausibility bounds (for example: not earlier than the last committed ingestion run, not later than the next XNYS session), with thresholds in config per CLAUDE.md.
+4. **A `ValueError` from building an `OrderRequest` also halts.** The wrapper builds and validates every request of a run before it submits the first one; a request our own code cannot construct is a bug or a data fault, not a broker rejection. This is narrower than #64's framing of a bad request as a "normal rejection": that framing describes the broker's view, and the allowlist in point 1 is what keeps the two views from being confused.
+5. **Where it lands.** The Phase 4 plan lists, as one task: `ClockError` in `adapters/broker.py`, the clock wrap in `fake_broker.py`, and tests that (i) a clock returning a naive or overflowing value makes `submit` and `simulate_fill` raise `ClockError`, not `ValueError`, leaving no order behind and the `client_order_id` free (extending the #63 tests); (ii) the wrapper routes `ClockError` to the halt path; (iii) the wrapper routes an exception of an unknown type to the halt path. Until that task merges, `FakeBroker` keeps raising `ValueError` and nothing consumes it as a rejection, because no wrapper exists.
+
+## Consequences
+
+- Good: a broken clock cannot be mistaken for an order rejection; the classification is a type, not a string; an exception nobody thought of halts instead of slipping through; the same contract binds the fake broker and the real adapter, so the paper-to-live swap cannot lose it (ADR 0003 rule 7).
+- Bad / accepted risks: the wrapper halts on more conditions than a permissive design would, so some runs stop where a skip might have been fine; that is the intended trade at this scale (monthly rebalance, one owner, a logged missed rebalance is already an accepted event per ADR 0006). Adding a rejection type is a deliberate, reviewed edit to the allowlist, which is a `safety-reviewer` change.
+- Reversibility: cheap before Phase 4 (this is a contract with no implementation yet); moderate after, because the wrapper's tests encode it.
+- Revisit if: the Phase 4 spec chooses to source order timestamps from the broker rather than a local clock (the pre-check then covers less and the typed exception carries the load); paper trading shows halts from clock faults that were in fact benign; or a real adapter cannot distinguish a clock fault from a transport error.
