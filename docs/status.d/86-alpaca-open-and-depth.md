@@ -1,0 +1,1 @@
+- #86 Research: pre-open Alpaca fractional orders fill from Alpaca's inventory at the NBBO, never in the auction (Tier 1); whole-share auction participation not documented; paper has no auction. Owner probe protocols for corporate-actions depth, missing-bar share and a paper open probe; measurements moved to #101 (PR #100, [report](research/2026-09-25-alpaca-open-and-depth.md))
