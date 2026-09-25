@@ -1,0 +1,1 @@
+- #102 Plan amendment: T13 `universe_as_of` and T15 `survivorship_gap` take an optional `settings: Settings | None` (default: loaded config) for every `universe.*`, `master.*` and gap threshold, one override test each; unblocks Phase 3 T38 (PR #103)
