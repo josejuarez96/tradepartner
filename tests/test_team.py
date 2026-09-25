@@ -192,6 +192,52 @@ def test_load_tasks_reads_the_git_ref_not_the_working_tree(root: Path) -> None:
         team.load_tasks(root, "no-such-ref")
 
 
+# ── start and register ──────────────────────────────────────────────────────────
+
+
+def _init_repo(root: Path) -> None:
+    git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+    subprocess.run([*git, "add", "docs"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "plan"], check=True)
+
+
+def test_start_creates_a_worktree_outside_the_repo_and_registers_it(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_repo(root)
+    gh = FakeGitHub()
+    assert team.cmd_start(gh, root, "guilo", ref="HEAD") == 0
+    path = root.parent / f"{root.name}-teams" / "guilo"
+    assert path.is_dir() and not path.is_relative_to(root)
+    assert (path / team.TEAM_FILE).read_text().strip() == "guilo"
+    assert (path / "docs" / "plans" / "data-foundation.md").exists()
+    assert "team:guilo" in gh.labels
+    assert f"cd {path}" in capsys.readouterr().out
+    assert (root / team.TEAM_FILE).read_text().strip() == "atlas"  # main checkout untouched
+    with pytest.raises(SystemExit, match="already exists"):
+        team.cmd_start(gh, root, "guilo", ref="HEAD")
+
+
+def test_start_refuses_a_name_that_holds_open_issues(root: Path) -> None:
+    _init_repo(root)
+    gh = FakeGitHub()
+    gh.issues[30] = team.Issue(30, "chore", ("team:orion",))
+    with pytest.raises(SystemExit, match="holds open issues \\[30\\]"):
+        team.cmd_start(gh, root, "orion", ref="HEAD")
+    assert team.cmd_start(gh, root, "orion", ref="HEAD", reuse=True) == 0
+
+
+def test_register_never_overwrites_another_teams_directory(root: Path) -> None:
+    gh = FakeGitHub()
+    with pytest.raises(SystemExit, match="already belongs to team 'atlas'"):
+        team.cmd_register(gh, root, "orion")
+    assert (root / team.TEAM_FILE).read_text().strip() == "atlas"
+    assert team.cmd_register(gh, root, "atlas") == 0  # same name is fine
+    assert team.cmd_register(gh, root, "orion", force=True) == 0
+    assert (root / team.TEAM_FILE).read_text().strip() == "orion"
+
+
 # ── claim command ───────────────────────────────────────────────────────────────
 
 
