@@ -12,7 +12,7 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 | Term | Meaning |
 |---|---|
-| **Team** | One orchestrator chat window plus **one clone** of the repo. Registered once with `scripts/team.py register <name>`. The owner is a team too, named `owner`. |
+| **Team** | One orchestrator chat window plus **one clone** of the repo. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who merges. The window he types in is a team like any other. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
 | **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
@@ -30,7 +30,7 @@ uv run python scripts/team.py register <name>      # writes .team (gitignored), 
 ```
 
 - **One clone per team, always.** Two windows in one directory collide on `.claude/worktrees/` and on `.team`.
-- Names are short and lowercase (`atlas`, `team-b`). A window that is closed for good keeps its name; the next window may reuse it or pick a new one. `owner` is reserved for Jose's own clone.
+- Names are short and lowercase (`atlas`, `team-b`). A window that is closed for good keeps its name; the next window may reuse it or pick a new one.
 - Subagent worktrees under `.claude/worktrees/` inherit the clone's team: the tool finds `.team` through the worktree's common git dir.
 - Everything else (permissions, hooks, agents) comes with the clone from `.claude/settings.json` and `.pre-commit-config.yaml`.
 
@@ -58,8 +58,8 @@ uv run python scripts/team.py register <name>      # writes .team (gitignored), 
 3. **A claim is a comment, replayed in order.** The first unreleased comment whose **entire body** is `claim: team:<name>` holds the issue. GitHub orders comments, so there is no tie. Quoting the line inside a longer comment does nothing. The `team:<name>` label mirrors the holder for the board and CI; when they disagree, the comments win and `claim` repairs the label.
 4. **Claims are per issue, not per team lifetime.** Release what you stop working on. A released issue, with its branch and PR, passes to the next team that claims it.
 5. **Dependencies must be merged.** `claim` refuses a task whose dependencies are unticked on `origin/main`. `--allow-unready` exists for stubs that were agreed in writing on the issue (development-process, Definition of Ready).
-6. **Owner tasks** (marked `(owner)` in the plan) are claimed only by team `owner`. The owner's own PRs go through the same claim so the CI guard treats every PR alike.
-7. **A dead window keeps nothing.** If a window stopped without releasing, the owner runs `release <target> --force --reason "…"` from the `owner` clone. Nobody else may release another team's claim.
+6. **Owner tasks** (marked `(owner)` in the plan, such as T3) need Jose's keys. Only the window Jose is driving claims them, with `--owner-task`. Agents never pass that flag on their own.
+7. **A dead window keeps nothing.** If a window stopped without releasing, Jose runs `release <target> --force --reason "…"` from any clone. Agents never use `--force`; the tool cannot tell who is typing, so this is a rule, not a permission.
 8. **Spikes are exempt.** A `spike/` branch is never merged, so it needs no claim and the CI guard skips it.
 
 ## Picking work
@@ -97,7 +97,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - **Merge order matters:** merging the head of a chain widens the frontier for everyone. Prefer merging chain heads first.
 - Labels of retired teams are harmless; delete them when convenient.
 - Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
-- The owner's clone is team `owner`: it claims owner tasks (T3) and the owner's own docs PRs, and it is the only team that can `release --force`.
+- You are not a role in the tool. You merge, you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
 ## Never
 

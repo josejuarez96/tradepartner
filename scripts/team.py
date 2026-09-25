@@ -11,7 +11,7 @@ checkbox ticked inside an unmerged PR does not make the next task look ready.
 
 Usage (from a team's clone or one of its worktrees)::
 
-    uv run python scripts/team.py register <name>     # the owner registers as "owner"
+    uv run python scripts/team.py register <name>
     uv run python scripts/team.py whoami
     uv run python scripts/team.py status
     uv run python scripts/team.py claim T5             # plan task
@@ -37,7 +37,6 @@ TEAM_FILE = ".team"
 TEAM_ENV = "TRADEPARTNER_TEAM"
 PLAN_REF_ENV = "TRADEPARTNER_PLAN_REF"
 DEFAULT_PLAN_REF = "origin/main"
-OWNER_TEAM = "owner"
 TEAM_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
 TASK_ID_RE = re.compile(r"^T\d+[a-z]?$")
 TASK_REF_RE = re.compile(r"T\d+[a-z]?")
@@ -399,7 +398,7 @@ def plan_ref_from_env() -> str | None:
 
 def cmd_register(gh: GitHub, root: Path, name: str) -> int:
     if not TEAM_NAME_RE.match(name):
-        raise SystemExit("team name must match ^[a-z][a-z0-9-]{0,19}$ (e.g. atlas, team-b, owner)")
+        raise SystemExit("team name must match ^[a-z][a-z0-9-]{0,19}$ (e.g. atlas, team-b)")
     (root / TEAM_FILE).write_text(name + "\n")
     gh.ensure_label(f"{TEAM_LABEL_PREFIX}{name}", TEAM_LABEL_COLOR, f"Claimed by team {name}")
     print(
@@ -446,12 +445,15 @@ def _task_issue(gh: GitHub, task: Task, create: bool) -> Issue | None:
 
 
 def _check_task_claimable(
-    task: Task, tasks: Sequence[Task], team: str, allow_unready: bool
+    task: Task, tasks: Sequence[Task], allow_unready: bool, owner_task: bool
 ) -> None:
     if task.done:
         raise SystemExit(f"{task.id} is already ticked in {task.plan} on the merged plan")
-    if task.owner and team != OWNER_TEAM:
-        raise SystemExit(f"{task.id} is an owner task; only team '{OWNER_TEAM}' claims it")
+    if task.owner and not owner_task:
+        raise SystemExit(
+            f"{task.id} needs the owner's keys (.env). Claim it only from the window Jose is "
+            "driving, with --owner-task."
+        )
     if not is_ready(task, {t.id: t for t in tasks}) and not allow_unready:
         missing = [d for d in task.depends_on if not any(t.id == d and t.done for t in tasks)]
         raise SystemExit(
@@ -493,7 +495,13 @@ def _set_parked(gh: GitHub, issue_number: int, parked: bool) -> None:
 
 
 def cmd_claim(
-    gh: GitHub, root: Path, target: str, *, allow_unready: bool = False, ref: str | None = None
+    gh: GitHub,
+    root: Path,
+    target: str,
+    *,
+    allow_unready: bool = False,
+    owner_task: bool = False,
+    ref: str | None = None,
 ) -> int:
     team = require_team(root)
     tasks = load_tasks(root, ref)
@@ -518,7 +526,7 @@ def cmd_claim(
             task = _find_task(tasks, task_ids[0])
 
     if task is not None:
-        _check_task_claimable(task, tasks, team, allow_unready)
+        _check_task_claimable(task, tasks, allow_unready, owner_task)
         found = _task_issue(gh, task, create=True)
         assert found is not None
         _consolidate_duplicates(gh, task, found, team)
@@ -576,15 +584,18 @@ def cmd_release(
     if holder is None:
         raise SystemExit(f"#{issue.number} is not claimed")
     if holder != team:
-        if not (force and team == OWNER_TEAM):
+        if not force:
             raise SystemExit(
-                f"#{issue.number} is held by '{holder}', not by {team}; only the owner may --force"
+                f"#{issue.number} is held by '{holder}', not by {team}. Only Jose may "
+                "`release --force --reason` a dead window's claim; agents never do."
             )
         if not reason:
             raise SystemExit("--force needs --reason")
     gh.comment(issue.number, f"release: team:{holder}")
     if holder != team:
-        gh.comment(issue.number, f"Released by the owner from team '{holder}': {reason}")
+        gh.comment(
+            issue.number, f"Released by the owner (via team {team}) from '{holder}': {reason}"
+        )
     gh.remove_labels(issue.number, [f"{TEAM_LABEL_PREFIX}{holder}"])
     _set_parked(gh, issue.number, parked=park)
     print(f"released #{issue.number}; leave a handoff comment there (done, remaining, gotchas)")
@@ -737,10 +748,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("claim", help="claim a plan task (T5) or an issue (28)")
     p.add_argument("target")
     p.add_argument("--allow-unready", action="store_true", help="claim although deps are unmerged")
+    p.add_argument(
+        "--owner-task", action="store_true", help="task marked (owner): needs Jose's keys"
+    )
     p = sub.add_parser("release", help="give a claim back")
     p.add_argument("target")
     p.add_argument("--park", action="store_true", help="label this issue's open PRs `parked`")
-    p.add_argument("--force", action="store_true", help="owner only: release another team's claim")
+    p.add_argument("--force", action="store_true", help="Jose only: release a dead window's claim")
     p.add_argument("--reason", default="", help="required with --force")
     p = sub.add_parser("check-claims", help="CI guard for one PR")
     p.add_argument("--pr", type=int, required=True)
@@ -763,7 +777,14 @@ def main(argv: Sequence[str] | None = None, gh: GitHub | None = None) -> int:
         case "status":
             return cmd_status(gh, root, ref=ref)
         case "claim":
-            return cmd_claim(gh, root, args.target, allow_unready=args.allow_unready, ref=ref)
+            return cmd_claim(
+                gh,
+                root,
+                args.target,
+                allow_unready=args.allow_unready,
+                owner_task=args.owner_task,
+                ref=ref,
+            )
         case "release":
             return cmd_release(
                 gh, root, args.target, park=args.park, force=args.force, reason=args.reason, ref=ref

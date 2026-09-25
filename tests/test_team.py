@@ -212,18 +212,17 @@ def test_claim_refuses_unready_owner_and_done_tasks(root: Path) -> None:
     gh = FakeGitHub()
     with pytest.raises(SystemExit, match="not ready"):
         team.cmd_claim(gh, root, "T10")
-    with pytest.raises(SystemExit, match="owner task"):
+    with pytest.raises(SystemExit, match="owner's keys"):
         team.cmd_claim(gh, root, "T3")
     with pytest.raises(SystemExit, match="already ticked"):
         team.cmd_claim(gh, root, "T4")
     assert gh.issues == {}
 
 
-def test_owner_team_may_claim_owner_tasks(root: Path) -> None:
-    (root / team.TEAM_FILE).write_text("owner\n")
+def test_owner_task_needs_the_flag_but_any_team_may_claim_it(root: Path) -> None:
     gh = FakeGitHub()
-    assert team.cmd_claim(gh, root, "T3") == 0
-    assert "team:owner" in gh.list_issues("task:T3")[0].labels
+    assert team.cmd_claim(gh, root, "T3", owner_task=True) == 0
+    assert "team:atlas" in gh.list_issues("task:T3")[0].labels
 
 
 def test_claim_loses_to_existing_holder(root: Path) -> None:
@@ -307,15 +306,12 @@ def test_claim_existing_issue_by_number_and_release_with_park(root: Path) -> Non
     assert "parked" in gh.prs[0].labels
 
 
-def test_release_refuses_non_holder_unless_owner_forces_with_reason(root: Path) -> None:
+def test_release_refuses_non_holder_unless_forced_with_reason(root: Path) -> None:
     gh = FakeGitHub()
     gh.issues[28] = team.Issue(28, "bug", ("team:orion",))
     gh.comments[28] = ["claim: team:orion"]
     with pytest.raises(SystemExit, match="held by 'orion'"):
         team.cmd_release(gh, root, "28")
-    with pytest.raises(SystemExit, match="held by 'orion'"):
-        team.cmd_release(gh, root, "28", force=True, reason="window died")
-    (root / team.TEAM_FILE).write_text("owner\n")
     with pytest.raises(SystemExit, match="--reason"):
         team.cmd_release(gh, root, "28", force=True)
     assert team.cmd_release(gh, root, "28", force=True, reason="window died") == 0
