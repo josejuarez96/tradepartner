@@ -397,6 +397,7 @@ def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
         ["scripts/ready_pr.py"],
         ["pyproject.toml"],
         ["uv.lock"],
+        [".github/workflows/ci.yml"],
         ["docs/STATUS.md", "src/tradepartner/x.py"],
     ):
         assert ready_pr.tests_needed(code), code
@@ -452,3 +453,24 @@ def test_cli_tests_flags_are_exclusive() -> None:
     assert p.parse_args(["5", "--no-tests"]).tests is False
     with pytest.raises(SystemExit):
         p.parse_args(["5", "--tests", "--no-tests"])
+
+
+def test_cli_tests_needed_reads_paths_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CI pipes `git diff --name-only` in and gates its Tests step on the answer."""
+    import io
+
+    for stdin, answer in (
+        ("docs/plans/phase-2.md\nchangelog.d/78-x.md\n", "no"),
+        ("docs/STATUS.md\nsrc/tradepartner/x.py\n", "yes"),
+        ("", "no"),
+    ):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+        assert ready_pr.main(["--tests-needed"]) == 0
+        assert capsys.readouterr().out.strip() == answer, stdin
+
+
+def test_cli_needs_a_pr_unless_tests_needed() -> None:
+    with pytest.raises(SystemExit):
+        ready_pr.main([])
