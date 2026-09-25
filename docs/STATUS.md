@@ -13,7 +13,7 @@
 - Phase 2 T1: config, dependencies, calendar (PR #17)
 - Phase 2 T4: store schema, db layer, shared test loader (PR #20)
 - Phase 2 T2: raw-fetch clients (Alpaca, EDGAR) and fixture recorder, with secret/email/User-Agent scrub (PR #21)
-- Phase 2 T20: `Broker` interface and in-memory fake broker, no risk logic (PR TBD)
+- Phase 2 T20: `Broker` interface and in-memory fake broker, no risk logic (PR #26)
 
 ## In progress
 - **Owner task T3:** run `python -m tradepartner.cli_record` with Alpaca and EDGAR keys, record source facts
