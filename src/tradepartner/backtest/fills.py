@@ -82,7 +82,10 @@ def apply_trades(
     Drifted weights are value over equity (cash plus every position). A name leaving the
     targets is sold whole; a partial sell or a buy is the weight difference times equity.
     Sells first, then buys in `security_id` order, each buy capped by the cash left and
-    sized so notional plus cost fits in it. Names whose trade is exactly zero are not
+    sized so notional plus cost fits in it; when cash runs short (after a missed sell, or
+    costs), the names last in that order are the ones underfilled. A trim whose cost is at
+    least its notional is skipped (a name leaving the targets is still sold whole), and
+    cash is checked once all sells are done. Names whose trade is exactly zero are not
     orders. Raises `ValueError` for negative cash or positions, negative targets, or a
     traded name with a bar in the marking frame but none in `raw_frame`.
     """
@@ -126,13 +129,16 @@ def apply_trades(
             missing.append(sid)
             continue
         notional = min(-deltas[sid], held[sid])
-        cost = trade(sid, -notional, price)
+        cost = trade_cost(notional, notional / price[1], per_side_bps, commissions)
+        if sid in targets and cost >= notional:
+            continue  # a trim that costs at least what it raises is not an order
+        trades.append(Trade(sid, -notional, cost, price[0], price[1]))
         cash = cash + notional - cost
-        if cash < 0:
-            raise ValueError(f"selling {sid} costs more than the cash it raises")
         held[sid] -= notional
         if held[sid] == 0 or sid not in targets:
             del held[sid]
+    if cash < 0:
+        raise ValueError(f"the sells on {fill_session.isoformat()} cost more than they raise")
 
     for sid in [s for s in names if deltas[s] > 0]:
         price = price_of(sid)

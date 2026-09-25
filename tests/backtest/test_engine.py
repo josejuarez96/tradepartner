@@ -25,6 +25,7 @@ from tradepartner.store import registry
 SRC = Path(__file__).parents[2] / "src" / "tradepartner" / "backtest"
 
 T0, T1, T2, T3 = date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 28), date(2024, 4, 30)
+T4 = date(2024, 5, 31)
 F0, F1, F2 = fill_session(T0), fill_session(T1), fill_session(T2)
 HISTORY_START, HISTORY_END = date(2022, 12, 1), date(2024, 5, 31)
 SESSIONS = [s for s in all_sessions() if HISTORY_START <= s <= HISTORY_END]
@@ -189,7 +190,9 @@ class TestTargetsAndFills:
             (F0, "A")
         ].fill_price == pytest.approx(open_a)
 
-    def test_weights_report_shares_at_the_raw_fill_price(self) -> None:
+    @pytest.mark.parametrize("fill_price", ["close", "open"])
+    def test_weights_report_shares_at_the_raw_fill_price(self, fill_price: str) -> None:
+        """Shares are the dollar value at the fill over the raw fill price (req 2)."""
         raw = _price_rows().with_columns(pl.col("open") * 2, pl.col("close") * 2)
         provider = FakeProvider(
             prices=_price_rows(),
@@ -197,15 +200,15 @@ class TestTargetsAndFills:
             members={s: sorted(GROWTH) for s in rebalance_sessions(T0, HISTORY_END)},
             benchmarks={},
         )
-        result = _run(provider)[15.0]
+        result = _run(provider, _params(execution={"fill_price": fill_price}))[15.0]
         weight = {(w.fill_session, w.security_id): w for w in result.weights}[(F0, "A")]
-        position = result.position_values.filter(
+        bar = _price_rows().filter((pl.col("security_id") == "A") & (pl.col("session") == F0))
+        value_at_close = result.position_values.filter(
             (pl.col("security_id") == "A") & (pl.col("session") == F0)
         )["value"].item()
-        assert weight.fill_price is not None and weight.shares is not None
-        assert weight.shares == pytest.approx(position / weight.fill_price)
-        raw_close = raw.filter((pl.col("security_id") == "A") & (pl.col("session") == F0))
-        assert weight.fill_price == pytest.approx(raw_close["close"].item())
+        value_at_fill = value_at_close * bar[fill_price].item() / bar["close"].item()
+        assert weight.fill_price == pytest.approx(2 * bar[fill_price].item())
+        assert weight.shares == pytest.approx(value_at_fill / weight.fill_price)
 
     def test_missing_fills_for_a_buy_and_a_sell(self) -> None:
         # At F1 the plan buys C and sells B; neither has a bar that session.
@@ -310,13 +313,13 @@ class TestDividends:
 
     EX = date(2024, 2, 15)
 
-    def _provider(self, known: date) -> FakeProvider:
+    def _provider(self, known: date, ex: date, *, dropped: bool) -> FakeProvider:
         rows, adjusted = [], []
         for session in SESSIONS:
-            close = 99.0 if session >= self.EX else 100.0
+            close = 99.0 if session >= ex else 100.0
             at = session_close(session)
             rows.append(("A", session, close, close, at))
-            if session < self.EX:  # the restatement the dividend brings
+            if session < ex:  # the restatement the dividend brings
                 adjusted.append(("A", session, 99.0, 99.0, session_close(known)))
         schema = {
             "security_id": pl.Utf8,
@@ -330,14 +333,14 @@ class TestDividends:
         dividends = pl.DataFrame(
             {
                 "security_id": ["A"],
-                "ex_date": [self.EX],
+                "ex_date": [ex],
                 "ratio_or_amount": [1.0],
                 "known_at": [session_close(known)],
             },
             schema_overrides={"known_at": pl.Datetime("us", "UTC")},
         )
         members = {s: ["A"] for s in rebalance_sessions(T0, HISTORY_END)}
-        return FakeProvider(
+        provider = FakeProvider(
             prices=with_dividend,
             dividend_prices=with_dividend,
             raw=raw,
@@ -345,10 +348,16 @@ class TestDividends:
             benchmarks={},
             dividends=dividends,
         )
+        if dropped:
+            provider.dropped = dividends
+        return provider
 
-    def _result(self, known: date) -> BacktestResult:
+    def _result(
+        self, known: date, *, ex: date = EX, end: date = T3, dropped: bool = False
+    ) -> BacktestResult:
         params = _params(strategy={"top_fraction": 1.0}, costs={"per_side_bps": 0.0})
-        return _run(self._provider(known), params, levels=[0.0])[0.0]
+        provider = self._provider(known, ex, dropped=dropped)
+        return _run(provider, params, end=end, levels=[0.0])[0.0]
 
     def test_known_before_the_read_is_reinvested_in_that_step(self) -> None:
         result = self._result(known=date(2024, 2, 20))
@@ -356,19 +365,31 @@ class TestDividends:
         assert equity[T1] == pytest.approx(equity[F0])
         assert equity[date(2024, 2, 14)] == pytest.approx(equity[F0])
         assert [row.n_late_dividends for row in result.rebalances] == [0, 0, 0]
+        assert [row.n_dropped_dividends for row in result.rebalances] == [0, 0, 0]
 
     @pytest.mark.parametrize(
-        ("known", "row_session"), [(date(2024, 3, 5), T1), (date(2024, 4, 3), T2)]
+        ("known", "row_session"),
+        [(date(2024, 3, 5), T1), (date(2024, 4, 3), T2), (date(2024, 5, 3), T3)],
+        ids=["one-month", "two-months", "three-months"],
     )
     def test_known_after_the_read_is_lost_and_counted_late(
         self, known: date, row_session: date
     ) -> None:
-        result = self._result(known=known)
+        result = self._result(known=known, end=T4)
         equity = _equity(result)
         assert equity[T1] == pytest.approx(equity[F0] * 0.99)
-        assert equity[T3] == pytest.approx(equity[F0] * 0.99)
+        assert equity[T4] == pytest.approx(equity[F0] * 0.99)
         counts = {row.session: row.n_late_dividends for row in result.rebalances}
-        assert counts == {s: int(s == row_session) for s in (T0, T1, T2)}
+        assert counts == {s: int(s == row_session) for s in (T0, T1, T2, T3)}
+
+    def test_a_late_dividend_on_a_name_not_held_on_its_ex_date_is_not_counted(self) -> None:
+        # Ex 2024-01-22, before the first fill on F0: A was not held at the close before.
+        result = self._result(known=date(2024, 3, 5), ex=date(2024, 1, 22))
+        assert [row.n_late_dividends for row in result.rebalances] == [0, 0, 0]
+
+    def test_a_dropped_dividend_is_counted_in_the_month_of_its_ex_date(self) -> None:
+        result = self._result(known=date(2024, 2, 20), dropped=True)
+        assert [row.n_dropped_dividends for row in result.rebalances] == [1, 0, 0]
 
 
 class TestInvariance:
@@ -441,6 +462,40 @@ class TestApplyTrades:
         assert result.positions["B"] == 500.0  # unsold, last mark
         assert result.positions["C"] == pytest.approx(500.0)
         assert result.missing == ("B",)
+
+    def test_a_trim_smaller_than_its_cost_is_skipped_not_fatal(self) -> None:
+        """Cash near zero after a full rebalance and a $1 order fee: a $0.40 drift trim
+        would cost more than it raises, so it is not an order (quant-auditor, PR #159)."""
+        frame = self.FRAME.filter(pl.col("security_id") != "C")
+        result = apply_trades(
+            {"A": 5000.4, "B": 4999.6},
+            0.0,
+            {"A": 0.5, "B": 0.5},
+            frame,
+            frame,
+            F0,
+            fill_price="close",
+            per_side_bps=15.0,
+            commissions=Commissions(per_share=0.0, per_order=1.0),
+        )
+        assert result.positions == {"A": 5000.4, "B": 4999.6}
+        assert result.cash == 0.0
+        assert result.trades == ()
+
+    def test_an_exit_costing_more_than_it_raises_is_funded_by_other_sells(self) -> None:
+        result = apply_trades(
+            {"A": 0.5, "B": 1000.0},
+            0.0,
+            {"B": 0.5},
+            self.FRAME,
+            self.RAW,
+            F0,
+            fill_price="close",
+            per_side_bps=0.0,
+            commissions=Commissions(per_share=0.0, per_order=1.0),
+        )
+        assert "A" not in result.positions
+        assert result.cash >= 0.0
 
     def test_a_buy_is_sized_after_costs(self) -> None:
         result = apply_trades(

@@ -200,16 +200,12 @@ def _step(
     }
     book.values.append(values.select(list(_POSITION_SCHEMA)))
     fill_prices = {t.security_id: t.raw_fill_price for t in fill.trades}
-    after_fill = dict(
-        values.filter(pl.col("session") == plan.fill_session)
-        .select("security_id", "value")
-        .iter_rows()
-    )
     for sid, weight in sorted(plan.targets.items()):
         raw_price = fill_prices.get(sid)
         if raw_price is None and sid not in fill.missing:
             raw_price = _raw_price(raw, sid, plan.fill_session, fill_price)
-        shares = None if raw_price is None else after_fill.get(sid, 0.0) / raw_price
+        # Shares are the dollar value at the fill (not at the close) over the raw price.
+        shares = None if raw_price is None else fill.positions.get(sid, 0.0) / raw_price
         book.weights.append(WeightRow(plan.fill_session, sid, weight, raw_price, shares))
     book.rebalances.append(
         RebalanceRow(
