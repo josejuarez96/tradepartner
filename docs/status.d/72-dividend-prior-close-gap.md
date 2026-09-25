@@ -1,1 +1,0 @@
-- #72 Dividend prior-close fallback bounded by `adjust.max_prior_close_gap_sessions` (default 5 XNYS sessions); unapplied dividends reported by `dropped_dividends_as_of` (PR #79)
