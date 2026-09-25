@@ -20,8 +20,9 @@ Run this when the work on your claimed issue is complete and the draft PR descri
    `quant-auditor` for data, store, signals, backtests; `safety-reviewer` for broker, orders,
    secrets, config, LLM inputs. Address the findings, then post **a PR comment** whose first
    line is the verdict: `quant-auditor: PASS` or `quant-auditor: PASS WITH FIXES`, followed by
-   the findings and what you did. The command looks for that line in comments only; the PR
-   body does not count because the template already names both agents.
+   the findings and what you did. Only the **first line** of a comment counts, the latest
+   verdict per agent wins, and `FAIL` blocks. The PR body does not count because the template
+   already names both agents.
 3. Fill in the PR template. Tick every box, or replace an inapplicable one with `n/a` and why.
    The body must say `Closes #<issue>`.
 

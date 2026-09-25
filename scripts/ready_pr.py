@@ -56,9 +56,10 @@ CONFLICT_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 VERDICT_RE = re.compile(
-    r"^\s*(?P<agent>quant-auditor|safety-reviewer):\s*(?P<verdict>pass(?: with fixes)?)\b",
-    re.IGNORECASE | re.MULTILINE,
+    r"\A\s*(?P<agent>quant-auditor|safety-reviewer):\s*(?P<verdict>pass(?: with fixes)?|fail)\b",
+    re.IGNORECASE,
 )
+CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
 STATUS_LIST = "## Done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
@@ -106,6 +107,11 @@ SAFETY_PREFIXES = (
     "src/tradepartner/risk/",
     "src/tradepartner/llm/",
     "scripts/ready_pr.py",
+    "scripts/fragments.py",
+    "scripts/no_push_to_main.sh",
+    ".github/workflows/",
+    ".claude/agents/",
+    ".claude/skills/",
     "tests/fixtures/alpaca/",
     "tests/fixtures/edgar/",
     "docs/runbooks/",
@@ -228,12 +234,20 @@ def required_reviews(paths: Sequence[str]) -> set[str]:
 
 
 def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
-    """Required reviews with no ``<agent>: PASS`` / ``PASS WITH FIXES`` line in a PR comment.
+    """Required reviews whose latest verdict comment is not PASS / PASS WITH FIXES.
 
-    The PR body does not count: the template itself names both agents there.
+    A verdict is the **first line** of a PR comment, ``<agent>: PASS``, ``PASS WITH FIXES``
+    or ``FAIL``; comments are read in order and the latest verdict per agent wins. The PR
+    body does not count: the template itself names both agents there. In this solo repo
+    every comment comes from the owner's account, so this is a process gate, not an
+    authentication boundary.
     """
-    passed = {m.group("agent").lower() for c in comments for m in VERDICT_RE.finditer(c)}
-    return sorted(r for r in required if r not in passed)
+    latest: dict[str, str] = {}
+    for c in comments:
+        m = VERDICT_RE.match(c)
+        if m:
+            latest[m.group("agent").lower()] = m.group("verdict").lower()
+    return sorted(r for r in required if not latest.get(r, "").startswith("pass"))
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
@@ -310,6 +324,10 @@ def ready(
     branch = r.git("rev-parse", "--abbrev-ref", "HEAD")
     if branch != pr.branch:
         raise ReadyError(f"PR #{number} is on '{pr.branch}' but this checkout is on '{branch}'")
+    if pr.branch in {pr.base, "main", "HEAD"}:
+        raise ReadyError(
+            f"refusing to work on branch '{pr.branch}'; PRs come from feature branches"
+        )
     if r.git("status", "--porcelain"):
         raise ReadyError("working tree is not clean; commit or stash first")
     say(f"PR #{number}: branch {branch}, base {pr.base}")
@@ -414,7 +432,17 @@ def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
             "and run again."
         )
     for path in conflicted:
-        resolved = resolve_append_conflicts(r.read(path))
+        try:
+            text = r.read(path)
+        except FileNotFoundError:
+            text = ""
+        if "<<<<<<<" not in text:  # modify/delete or rename: nothing safe to do here
+            r.git("merge", "--abort")
+            raise ReadyError(
+                f"{path}: conflict without markers (deleted or renamed on one side); "
+                "resolve by hand, commit, and run again."
+            )
+        resolved = resolve_append_conflicts(text)
         if resolved is None:
             r.git("merge", "--abort")
             raise ReadyError(
@@ -445,6 +473,11 @@ def _wait_for_ci(
 # ── real runner ─────────────────────────────────────────────────────────────────
 
 
+def _redact(text: str) -> str:
+    """Strip any ``user:token@`` from URLs in tool output before it is shown."""
+    return CREDENTIAL_IN_URL_RE.sub("://***@", text.strip())
+
+
 class ShellRunner:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -458,7 +491,7 @@ class ShellRunner:
         try:
             return self._git(*args, check=True).stdout.strip()
         except subprocess.CalledProcessError as exc:
-            raise ReadyError(f"git {' '.join(args[:2])} failed: {exc.stderr.strip()}") from None
+            raise ReadyError(f"git {' '.join(args[:2])} failed: {_redact(exc.stderr)}") from None
 
     def git_ok(self, *args: str) -> bool:
         return self._git(*args, check=False).returncode == 0
@@ -480,7 +513,7 @@ class ShellRunner:
         except FileNotFoundError:
             raise ReadyError("gh CLI not found; install it and run `gh auth login`") from None
         except subprocess.CalledProcessError as exc:
-            raise ReadyError(f"gh {' '.join(args[:2])} failed: {exc.stderr.strip()}") from None
+            raise ReadyError(f"gh {' '.join(args[:2])} failed: {_redact(exc.stderr)}") from None
 
     def pr(self, number: int) -> Pr:
         raw = json.loads(

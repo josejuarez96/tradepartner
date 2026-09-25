@@ -100,7 +100,7 @@ def test_template_boxes_closes_and_branch_issue() -> None:
     assert ready_pr.issue_of_branch("spike/try-duckdb") is None
 
 
-def test_required_reviews_follow_paths_and_are_found_in_body_or_comments() -> None:
+def test_required_reviews_follow_paths_and_verdicts_come_from_comments_only() -> None:
     req = ready_pr.required_reviews(
         ["src/tradepartner/store/asof.py", "src/tradepartner/adapters/fake_broker.py", "docs/x.md"]
     )
@@ -113,6 +113,20 @@ def test_required_reviews_follow_paths_and_are_found_in_body_or_comments() -> No
         "safety-reviewer"
     ]
     assert ready_pr.missing_reviews(req, ["quant-auditor: pass", "safety-reviewer: PASS"]) == []
+    # first line only; latest verdict per agent wins; FAIL is recognised
+    assert ready_pr.missing_reviews({"quant-auditor"}, ["notes\nquant-auditor: PASS"]) == [
+        "quant-auditor"
+    ]
+    assert ready_pr.missing_reviews(
+        {"quant-auditor"}, ["quant-auditor: PASS", "quant-auditor: FAIL\nregression"]
+    ) == ["quant-auditor"]
+    assert (
+        ready_pr.missing_reviews(
+            {"quant-auditor"}, ["quant-auditor: FAIL", "quant-auditor: PASS WITH FIXES"]
+        )
+        == []
+    )
+    assert ready_pr.required_reviews([".github/workflows/ci.yml"]) == {"safety-reviewer"}
 
 
 def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> None:
@@ -257,9 +271,14 @@ def test_happy_path_pushes_waits_and_marks_ready() -> None:
     assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", "-q"]
 
 
-def test_wrong_branch_and_dirty_tree_stop_early() -> None:
+def test_wrong_branch_main_branch_and_dirty_tree_stop_early() -> None:
     with pytest.raises(ready_pr.ReadyError, match="checkout is on"):
         ready_pr.ready(FakeRunner(branch="main"), 69)
+    r = FakeRunner(branch="main")
+    r._pr = ready_pr.Pr(69, "main", "main", True, BODY_OK, ())
+    with pytest.raises(ready_pr.ReadyError, match="feature branches"):
+        ready_pr.ready(r, 69)
+    assert not [c for c in r.calls if c[0] == "git" and c[1] in ("push", "merge", "commit")]
     with pytest.raises(ready_pr.ReadyError, match="not clean"):
         ready_pr.ready(FakeRunner(dirty=True), 69)
 
@@ -298,6 +317,12 @@ def test_real_conflict_aborts_the_merge() -> None:
     with pytest.raises(ready_pr.ReadyError, match=r"conflicts in src/tradepartner/x\.py"):
         ready_pr.ready(r, 69)
     assert ("git", "merge", "--abort") in r.calls
+    # modify/delete: the file has no markers, so nothing is resolved or staged
+    r = FakeRunner(contains_main=False, merge_ok=False, conflicted={"CHANGELOG.md": "- ours\n"})
+    with pytest.raises(ready_pr.ReadyError, match="without markers"):
+        ready_pr.ready(r, 69)
+    assert ("git", "merge", "--abort") in r.calls
+    assert ("git", "add", "CHANGELOG.md") not in r.calls
 
 
 def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
@@ -346,6 +371,13 @@ def test_template_issue_and_reviews_are_enforced() -> None:
         ready_pr.ready(FakeRunner(comments=()), 69, dry_run=True)
     with pytest.raises(ready_pr.ReadyError, match="quant-auditor"):
         ready_pr.ready(FakeRunner(comments=("quant-auditor ran, looks fine",)), 69, dry_run=True)
+
+
+def test_redact_strips_credentials_from_urls() -> None:
+    assert ready_pr._redact("fatal: https://x:ghp_abc@github.com/a/b\n") == (
+        "fatal: https://***@github.com/a/b"
+    )
+    assert ready_pr._redact("plain error") == "plain error"
 
 
 def test_ci_failure_leaves_the_pr_a_draft() -> None:
