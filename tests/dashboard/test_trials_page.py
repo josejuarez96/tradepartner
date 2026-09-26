@@ -8,6 +8,7 @@ the page's only reader and needs no Streamlit.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -364,3 +365,17 @@ def test_render_registry_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert not at.exception
     assert "registry not initialised" in _text(at).lower()
     assert not at.dataframe
+
+
+def test_header_shows_as_of_and_last_updated(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    at = _app(monkeypatch, seeded_store[0])
+    assert not at.exception
+    text = _text(at)
+    assert "as of" in text and "last updated" in text
+
+
+def test_no_colour_literal_in_page_code() -> None:
+    source = Path(trials_page.__file__).read_text(encoding="utf-8")
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", source)

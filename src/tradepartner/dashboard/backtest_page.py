@@ -32,11 +32,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
+import altair as alt
 import duckdb
 import polars as pl
 import streamlit as st
 
+from tradepartner.backtest.engine import STRATEGY_SERIES
 from tradepartner.backtest.metrics import METRIC_KEYS, Basis, DeflatedSharpe, deflated_sharpe
+from tradepartner.dashboard import header, theme
 from tradepartner.store import registry, schema
 
 _BASES: Final[tuple[Basis, ...]] = ("raw", "excess_spy")
@@ -241,38 +244,46 @@ def _trial_label(t: registry.TrialSummary) -> str:
     )
 
 
-def _line_chart(rows: list[Row], y: str, title: str, *, log: bool = False, fmt: str = "") -> None:
-    y_axis: Row = {"field": y, "type": "quantitative", "title": title}
-    if log:
-        y_axis["scale"] = {"type": "log"}
-    if fmt:
-        y_axis["axis"] = {"format": fmt}
-    st.vega_lite_chart(
-        pl.DataFrame(rows),
-        {
-            "mark": {"type": "line"},
-            "encoding": {
-                "x": {"field": "session", "type": "temporal", "title": "session"},
-                "y": y_axis,
-                "color": {"field": "series", "type": "nominal"},
-            },
-        },
-        width="stretch",
+def _line_chart(
+    rows: list[Row], y: str, title: str, palette: theme.Palette, *, log: bool = False, fmt: str = ""
+) -> None:
+    """The examined strategy in the accent, benchmarks muted and dashed, one y-axis."""
+    if not rows:
+        st.caption("No rows to plot.")
+        return
+    names = sorted({str(r["series"]) for r in rows})
+    chart = (
+        alt.Chart(pl.DataFrame(rows).to_pandas())
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("session:T", title="session"),
+            y=alt.Y(
+                f"{y}:Q",
+                title=title,
+                scale=alt.Scale(type="log") if log else alt.Undefined,
+                axis=alt.Axis(format=fmt) if fmt else alt.Undefined,
+            ),
+            tooltip=[alt.Tooltip("session:T"), alt.Tooltip("series:N"), alt.Tooltip(f"{y}:Q")],
+            **theme.series_encodings(palette, names, STRATEGY_SERIES),
+        )
     )
+    st.altair_chart(theme.style(chart, palette), theme=None, width="stretch")
 
 
-def _bar_chart(rows: list[Row], y: str, title: str, fmt: str = "") -> None:
-    y_axis: Row = {"field": y, "type": "quantitative", "title": title}
-    if fmt:
-        y_axis["axis"] = {"format": fmt}
-    st.vega_lite_chart(
-        pl.DataFrame([{"session": r["session"], y: r[y]} for r in rows]),
-        {
-            "mark": {"type": "bar"},
-            "encoding": {"x": {"field": "session", "type": "temporal"}, "y": y_axis},
-        },
-        width="stretch",
+def _bar_chart(rows: list[Row], y: str, title: str, palette: theme.Palette, fmt: str = "") -> None:
+    if not rows:
+        st.caption("No rows to plot.")
+        return
+    chart = (
+        alt.Chart(pl.DataFrame([{"session": r["session"], y: r[y]} for r in rows]).to_pandas())
+        .mark_bar(**theme.bar_mark(palette))
+        .encode(
+            x=alt.X("session:T", title="session"),
+            y=alt.Y(f"{y}:Q", title=title, axis=alt.Axis(format=fmt) if fmt else alt.Undefined),
+            tooltip=[alt.Tooltip("session:T"), alt.Tooltip(f"{y}:Q")],
+        )
     )
+    st.altair_chart(theme.style(chart, palette), theme=None, width="stretch")
 
 
 def _metrics_table(view: TrialView) -> pl.DataFrame:
@@ -344,17 +355,18 @@ def _render_states(view: TrialView) -> None:
 
 
 def _render_results(view: TrialView) -> None:
+    palette = theme.palette()
     st.subheader("Equity")
     st.caption(f"Strategy, SPY and MTUM at {view.base_cost} bps per side, log axis.")
-    _line_chart(view.equity, "equity", "equity (log)", log=True)
+    _line_chart(view.equity, "equity", "equity (log)", palette, log=True)
 
     st.subheader("Drawdowns")
-    _line_chart(view.drawdowns, "drawdown", "drawdown", fmt="%")
+    _line_chart(view.drawdowns, "drawdown", "drawdown", palette, fmt="%")
 
     st.subheader("Turnover and costs")
     st.caption("Per rebalance at the base cost level.")
-    _bar_chart(view.rebalances, "turnover", "turnover (one-sided)", fmt="%")
-    _bar_chart(view.rebalances, "cost_paid", "cost paid ($)")
+    _bar_chart(view.rebalances, "turnover", "turnover (one-sided)", palette, fmt="%")
+    _bar_chart(view.rebalances, "cost_paid", "cost paid ($)", palette)
 
     st.subheader("Metrics per cost level")
     st.dataframe(_metrics_table(view), hide_index=True)
@@ -400,6 +412,7 @@ def _render_holdout_spends(view: TrialView) -> None:
 def render(conn: duckdb.DuckDBPyConnection) -> None:
     """Draw the backtest page from the shell's read-only connection."""
     st.header("Backtest")
+    header.render_freshness(header.store_freshness(conn, header.now()))
     try:
         schema.init_schema(conn)
     except schema.RegistryNotInitialised as exc:
