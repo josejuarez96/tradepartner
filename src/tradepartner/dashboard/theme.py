@@ -134,6 +134,36 @@ def threshold_mark(palette: Palette) -> dict[str, Any]:
     return {"color": palette.critical, "strokeDash": [4, 4], "strokeWidth": 2}
 
 
+def series_encodings(
+    palette: Palette, names: list[str], highlight: str, field: str = "series"
+) -> dict[str, Any]:
+    """Line-chart encodings for one examined series among comparisons: `highlight` in
+    the accent, solid; every other name (benchmarks) in secondary ink at the muted
+    opacity, dashed. Colour follows the name, never its rank; a legend is shown."""
+    others = sorted(n for n in names if n != highlight)
+    domain = [highlight, *others]
+    solid: list[int] = []
+    return {
+        "color": alt.Color(
+            f"{field}:N",
+            scale=alt.Scale(
+                domain=domain, range=[palette.accent, *[palette.text_secondary] * len(others)]
+            ),
+            legend=alt.Legend(title=None, orient="top"),
+        ),
+        "strokeDash": alt.StrokeDash(
+            f"{field}:N",
+            scale=alt.Scale(domain=domain, range=[solid, *[[4, 4]] * len(others)]),
+            legend=None,
+        ),
+        "opacity": alt.Opacity(
+            f"{field}:N",
+            scale=alt.Scale(domain=domain, range=[1, *[_MUTED_OPACITY] * len(others)]),
+            legend=None,
+        ),
+    }
+
+
 def style[Chart: (alt.Chart, alt.LayerChart)](chart: Chart, palette: Palette) -> Chart:
     """Apply the tokens to an Altair chart: recessive grid, secondary-ink axes, no frame."""
     styled: Chart = (

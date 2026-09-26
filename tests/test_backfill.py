@@ -306,6 +306,68 @@ def test_the_lock_is_free_while_a_month_is_fetched(settings: Settings) -> None:
     assert seen == [0]
 
 
+def _re_dated_across_months() -> list[CorporateAction]:
+    # One Alpaca id moved from May 20 to June 3: each month's window holds one revision.
+    return [
+        CorporateAction(
+            ACME,
+            ActionType.SPLIT,
+            ex,
+            2.0,
+            action_first_seen_known_at(ex),
+            "alpaca",
+            source_action_id="a1",
+        )
+        for ex in (date(2019, 5, 20), date(2019, 6, 3))
+    ]
+
+
+@dataclass
+class _Widened(_History):
+    """`_History` that runs `on_widened` (or raises) on a request spanning two months."""
+
+    on_widened: Callable[[], None] | None = None
+    fail_widened: bool = False
+
+    def corporate_actions(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[CorporateAction]:
+        if start.replace(day=1) != end.replace(day=1):
+            if self.fail_widened:
+                raise RuntimeError("actions endpoint down on the widened window")
+            if self.on_widened is not None:
+                self.on_widened()
+        return super().corporate_actions(security_ids, start, end)
+
+
+def test_a_re_dated_action_is_one_event_and_widened_outside_the_lock(
+    settings: Settings,
+) -> None:
+    seen: list[int] = []
+    prices = _Widened(
+        actions=_re_dated_across_months(),
+        on_widened=lambda: seen.append(_write_from_another_process(settings.store.path)),
+    )
+    assert _backfill(settings, prices, clock=_ticking(NOW, timedelta(seconds=1))).ok
+    assert seen == [0]  # the widened re-query ran with the write lock free
+    live = _read(
+        settings,
+        "SELECT ex_date, source_action_id FROM corporate_actions ORDER BY known_at DESC LIMIT 1",
+    )
+    assert live == [(date(2019, 6, 3), "a1")]
+    assert _read(settings, "SELECT count(*) FROM corporate_actions")[0][0] == 2
+
+
+def test_a_failed_widened_re_query_fails_only_its_month(settings: Settings) -> None:
+    prices = _Widened(actions=_re_dated_across_months(), fail_widened=True)
+    result = _backfill(settings, prices, clock=_ticking(NOW, timedelta(seconds=1)))
+    assert [run.status for run in result.runs if run.source == "alpaca"] == [OK, OK, FAILED]
+    assert _read(settings, "SELECT ex_date FROM corporate_actions") == [(date(2019, 5, 20),)]
+    assert _read(
+        settings, "SELECT count(*) FROM prices_daily WHERE session >= DATE '2019-06-01'"
+    ) == [(0,)]
+
+
 def test_a_locked_store_halts_the_chunk_with_status_locked(settings: Settings) -> None:
     _backfill(settings, _History(), source="edgar")
     code = textwrap.dedent(f"""

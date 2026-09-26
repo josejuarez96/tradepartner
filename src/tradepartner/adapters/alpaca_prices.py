@@ -328,7 +328,9 @@ class ActionsParse:
 def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> ActionsParse:
     """Splits and cash dividends from an `alpaca_raw.corporate_actions`
     payload, on the first-seen proxy, resolved on the last session before
-    each ex-date."""
+    each ex-date. Alpaca's stable `id` becomes `source_action_id`, so a
+    re-dated action is a revision of one event (#108, #181); a row without
+    one has none."""
     actions: list[CorporateAction] = []
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
@@ -365,6 +367,7 @@ def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> Act
                     ratio_or_amount=value,
                     known_at=action_first_seen_known_at(ex_date),
                     source=_ACTIONS_SOURCE,
+                    source_action_id=row.get("id"),
                 )
             )
     actions.sort(key=lambda a: (a.security_id, a.action_type.value, a.ex_date))
