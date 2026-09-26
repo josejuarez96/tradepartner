@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from streamlit.testing.v1 import AppTest
 
 from tradepartner.backtest.metrics import deflated_sharpe
 from tradepartner.config import Settings
-from tradepartner.dashboard import backtest_page
+from tradepartner.dashboard import backtest_page, theme
 from tradepartner.store import registry, schema
 from tradepartner.store.db import open_for_write
 
@@ -475,3 +476,33 @@ def test_render_registry_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert not at.exception
     assert "registry not initialised" in _text(at).lower()
     assert not at.selectbox
+
+
+def test_header_shows_as_of_and_last_updated(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    at = _app(monkeypatch, seeded_store[0])
+    assert not at.exception
+    text = _text(at)
+    assert "as of" in text and "last updated" in text
+
+
+def test_no_colour_literal_in_page_code() -> None:
+    source = Path(backtest_page.__file__).read_text(encoding="utf-8")
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", source)
+
+
+def test_equity_chart_accents_the_strategy_and_mutes_benchmarks(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, seeded = seeded_store
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    spec = json.loads(at.get("vega_lite_chart")[0].proto.spec)
+    palette = theme.PALETTES["light"]
+    color = spec["encoding"]["color"]["scale"]
+    assert color["domain"][0] == "strategy"
+    assert color["range"][0] == palette.accent
+    assert set(color["range"][1:]) == {palette.text_secondary}
+    dash = spec["encoding"]["strokeDash"]["scale"]["range"]
+    assert dash[0] == [] and all(d for d in dash[1:])
+    assert spec["config"]["axis"]["gridColor"] == palette.border
