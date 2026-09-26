@@ -19,6 +19,7 @@ and `parse_sgml_header` run for real rather than being stubbed.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
 import json
@@ -31,6 +32,7 @@ import pytest
 from edgar_transport import FIXTURES, EdgarRouter, edgar_settings
 from test_edgar_fsn import FSN_PAGE_URL, _fsn_zip_bytes, _fsn_zip_url, _num, _sub, _txt
 
+from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import (
     COVER_VERSION,
     HEADER_VERSION,
@@ -504,7 +506,11 @@ def test_a_per_document_header_cache_wins_over_fsn_until_a_version_bump(
     _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
 
     cache_path = (
-        Path(settings.edgar.cache_dir) / "header" / f"v{HEADER_VERSION}" / f"{APPLE_ACCESSION}.json"
+        Path(settings.edgar.cache_dir)
+        / "header"
+        / f"v{HEADER_VERSION}"
+        / f"{int(APPLE)}"
+        / f"{APPLE_ACCESSION}.json"
     )
     cache_path.parent.mkdir(parents=True)
     cache_path.write_text(
@@ -553,3 +559,80 @@ def test_alphabet_dual_class_cover_page_matches_fsn(tmp_path: Path) -> None:
     [page] = source.cover_pages(ALPHABET)
     assert page.accepted_at == ALPHABET_ACCEPTED
     assert {item.ticker for item in page.listings} == {"GOOGL", "GOOG"}
+
+
+# --- safety-reviewer fixes (#249) --------------------------------------------
+
+
+def test_a_combined_filing_gives_each_co_registrant_its_own_sic(tmp_path: Path) -> None:
+    """One accession filed by two CIKs (a parent and a subsidiary): each header
+    is parsed from that CIK's FILER block and cached per CIK, so neither CIK is
+    ever served the other's SIC."""
+    settings = _settings(tmp_path)
+    router = _router()
+    accession, other = "0000320193-26-000060", "0000999999"
+    router.add(_header_url(APPLE, accession), _synthetic_header(accession, form="8-K", sic=3571))
+    other_text = _synthetic_header(accession, form="8-K", sic=4911).replace(
+        "CENTRAL INDEX KEY:\t\t\t0000320193", f"CENTRAL INDEX KEY:\t\t\t{other}"
+    )
+    router.add(_header_url(other, accession), other_text)
+    source = _source(settings, router)
+    for cik in (APPLE, other):
+        _seed_stamps(source, cik, {accession: _record(accession, "8-K", INSIDE_LAG)})
+
+    [apple] = source.filing_headers(APPLE, ["8-K"])
+    [sub] = source.filing_headers(other, ["8-K"])
+    assert (apple.sic, sub.sic) == (3571, 4911)
+    before = len(router.urls)
+    assert [h.sic for h in source.filing_headers(APPLE, ["8-K"])] == [3571]  # cached, per CIK
+    assert router.urls[before:] == []
+
+
+def test_no_cached_fsn_period_in_range_fails_closed_with_no_request(tmp_path: Path) -> None:
+    """`edgar.fsn_first_year` past every listed period leaves no lag-window
+    start: fail closed, never treat all of history as the lag window (that
+    would request a header for every 8-K since 1993)."""
+    settings = edgar_settings(tmp_path, fsn_first_year=2030)
+    router = _router()
+    source = _source(settings, router)
+    old = "0000320193-20-000001"
+    _seed_stamps(source, APPLE, {old: _record(old, "8-K", BEFORE_LAG)})
+    with pytest.raises(RuntimeError, match="fsn_first_year"):
+        source.filing_headers(APPLE, ["8-K"])
+    with pytest.raises(RuntimeError, match="fsn_first_year"):
+        source.cover_pages(APPLE)
+    assert not [u for u in router.urls if "/Archives/" in u]
+
+
+def test_the_root_copy_is_fetched_never_an_xsl_rendering(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000070"
+    router.add(_download_url(APPLE, accession, "root.htm"), _COVER_DOCUMENT)
+    source = _source(settings, router)
+    _seed_stamps(
+        source,
+        APPLE,
+        {accession: _record(accession, "10-K", INSIDE_LAG, primary_document="xslFormX01/root.htm")},
+    )
+    [page] = source.cover_pages(APPLE)
+    assert page.accession == accession
+    assert _download_url(APPLE, accession, "root.htm") in router.urls
+    assert not [u for u in router.urls if "xsl" in u]
+
+
+@pytest.mark.parametrize(
+    "document", [_COVER_DOCUMENT, b"<html>not a cover page</html>"], ids=["parsed", "parse-error"]
+)
+def test_the_downloaded_document_is_deleted_after_parsing(tmp_path: Path, document: bytes) -> None:
+    """Deleted after a good parse and after a parse error alike."""
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000080"
+    router.add(_download_url(APPLE, accession, "del.htm"), document)
+    source = _source(settings, router)
+    record = _record(accession, "10-K", INSIDE_LAG, primary_document="del.htm")
+    _seed_stamps(source, APPLE, {accession: record})
+    with contextlib.suppress(ValueError):  # the parse-error case: still deleted
+        source.cover_pages(APPLE)
+    assert not edgar_raw.cached_filing_path(APPLE, accession, "del.htm", settings=settings).exists()

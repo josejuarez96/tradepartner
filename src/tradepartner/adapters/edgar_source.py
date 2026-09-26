@@ -60,6 +60,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import re
 import shutil
 import zipfile
 import zlib
@@ -671,16 +672,21 @@ class EdgarFilingSource(FilingSource):
 
     def _lag_window_start(self) -> datetime:
         """The first day (Eastern midnight, as UTC) of the newest cached FSN
-        period at or after `edgar.fsn_first_year`. With no cached period at
-        all (should not happen once `_ensure_fsn` has run), everything is
-        treated as inside the lag window rather than silently uncovered."""
+        period at or after `edgar.fsn_first_year`. With no such period
+        (e.g. `fsn_first_year` past the newest listed period) it raises
+        rather than treating all history as the lag window."""
         periods = [
             p
             for p in self._cached_fsn_periods()
             if edgar_raw.fsn_period_year(p) >= self._settings.edgar.fsn_first_year
         ]
         if not periods:
-            return datetime.min.replace(tzinfo=UTC)
+            # Fail closed: "everything is inside the lag window" would request
+            # a header for every 8-K and 10-Q since 1993 (#249 safety review).
+            raise RuntimeError(
+                "no cached FSN period at or after edgar.fsn_first_year="
+                f"{self._settings.edgar.fsn_first_year}; is it later than the newest period?"
+            )
         newest = max(periods, key=_fsn_period_sort_key)
         start = _fsn_period_start(newest)
         return datetime(start.year, start.month, start.day, tzinfo=_EASTERN).astimezone(UTC)
@@ -726,8 +732,10 @@ class EdgarFilingSource(FilingSource):
     def _fetch_cover_page(
         self, cik: str, accession: str, primary_document: str, accepted_at: datetime
     ) -> CoverPageParse:
+        # The root copy, never an `xsl.../` rendering of it (plan T11d).
+        root_document = re.sub(r"^xsl[^/]*/", "", primary_document)
         path = edgar_raw.download_filing_file(
-            cik, accession, primary_document, settings=self._settings, client=self._client
+            cik, accession, root_document, settings=self._settings, client=self._client
         )
         try:
             document = path.read_bytes()
@@ -738,6 +746,9 @@ class EdgarFilingSource(FilingSource):
         return parsed
 
     def _cover_cache_path(self, accession: str) -> Path:
+        # Shared across co-registrant CIKs on purpose: `parse_cover_page`
+        # does not depend on the CIK (unlike SGML headers, keyed per CIK).
+        edgar_raw.validate_accession(accession)
         return self._cache / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
 
     def _load_cover_cache(self, accession: str) -> _CachedCoverPage | None:
@@ -784,7 +795,7 @@ class EdgarFilingSource(FilingSource):
             base_form = record.form.removesuffix("/A")
             if base_form not in wanted:
                 continue
-            cached = self._load_header_cache(accession)
+            cached = self._load_header_cache(cik, accession)
             if cached is not None:
                 headers.append(
                     FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
@@ -818,7 +829,7 @@ class EdgarFilingSource(FilingSource):
     def _ranged_header(
         self, cik: str, accession: str, form: str, accepted_at: datetime
     ) -> FilingHeader:
-        cached = self._load_header_cache(accession)
+        cached = self._load_header_cache(cik, accession)
         if cached is None:
             text = edgar_raw.filing_sgml_header(
                 cik, accession, settings=self._settings, client=self._client
@@ -834,13 +845,20 @@ class EdgarFilingSource(FilingSource):
             sic = cached.sic
         return FilingHeader(cik, accession, form, sic, accepted_at)
 
-    def _header_cache_path(self, accession: str) -> Path:
-        return self._cache / "header" / f"v{HEADER_VERSION}" / f"{accession}.json"
+    def _header_cache_path(self, cik: str, accession: str) -> Path:
+        # Keyed per CIK: a combined filing's header gives each co-registrant
+        # its own FILER block's SIC (#249 safety review).
+        edgar_raw.validate_accession(accession)
+        return self._cache / "header" / f"v{HEADER_VERSION}" / f"{int(cik)}" / f"{accession}.json"
 
-    def _load_header_cache(self, accession: str) -> _CachedHeader | None:
+    def _load_header_cache(self, cik: str, accession: str) -> _CachedHeader | None:
         try:
-            data = json.loads(self._header_cache_path(accession).read_bytes())
-            if data.get("version") != HEADER_VERSION or data.get("accession") != accession:
+            data = json.loads(self._header_cache_path(cik, accession).read_bytes())
+            if (
+                data.get("version") != HEADER_VERSION
+                or data.get("accession") != accession
+                or data.get("cik") != cik
+            ):
                 return None
             return _CachedHeader(sic=data["sic"])
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -848,7 +866,9 @@ class EdgarFilingSource(FilingSource):
 
     def _save_header_cache(self, accession: str, cik: str, sic: int | None) -> None:
         data = {"version": HEADER_VERSION, "accession": accession, "cik": cik, "sic": sic}
-        edgar_raw.write_atomic(self._header_cache_path(accession), json.dumps(data).encode("utf-8"))
+        edgar_raw.write_atomic(
+            self._header_cache_path(cik, accession), json.dumps(data).encode("utf-8")
+        )
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         _t11f()
