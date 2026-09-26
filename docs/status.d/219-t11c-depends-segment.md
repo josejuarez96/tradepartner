@@ -1,0 +1,1 @@
+- #219 T11c and T11f escape clauses moved out of the Depends-on segment so `team.py` no longer reads a circular dependency; T11c is claimable
