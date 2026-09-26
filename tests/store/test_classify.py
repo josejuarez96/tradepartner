@@ -13,8 +13,9 @@ Scenarios use `FixtureFilingSource` with synthetic records, as in
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, date, datetime
+from typing import ClassVar
 
 import duckdb
 import pytest
@@ -220,6 +221,50 @@ class TestRules:
         )
         latest = _latest(_build(source), primary_security_id(SPAC))
         assert (latest["security_type"], latest["sic"]) == ("spac", 6770)
+
+    def test_the_call_site_reads_edgar_header_forms(self) -> None:
+        """T11d: `_evidence` asks for `settings.edgar.header_forms`, not
+        `settings.master.issuer_forms` (the pre-T11d call site)."""
+
+        class Capturing(FixtureFilingSource):
+            calls: ClassVar[list[tuple[str, tuple[str, ...]]]] = []
+
+            def filing_headers(self, cik: str, forms: Sequence[str]) -> list[FilingHeader]:
+                type(self).calls.append((cik, tuple(forms)))
+                return super().filing_headers(cik, forms)
+
+        source = Capturing(index=[_filing(PLAIN, "10-K", _at(2015, 3, 2))])
+        settings = _settings()
+        master = build_master(source, settings, ingested_at=INGESTED_AT)
+        build_classifications(source, master, settings, ingested_at=INGESTED_AT)
+        assert Capturing.calls
+        assert all(forms == tuple(settings.edgar.header_forms) for _, forms in Capturing.calls)
+        assert tuple(settings.edgar.header_forms) != tuple(settings.master.issuer_forms)
+
+    def test_an_override_of_edgar_header_forms_changes_which_headers_feed_sic(self) -> None:
+        """With `edgar.header_forms` limited to `10-K`, the SPAC's S-1 header
+        (SIC 6770, filed 2018-01-05) is never asked for, so rule 5 fires only
+        once the 10-K header arrives (2019-03-01), later than the default
+        `_source()` history (`test_sic_6770_is_spac_until_the_sic_changes`)."""
+        limited = _settings(edgar={"header_forms": ["10-K"]})
+        master = build_master(_source(), limited, ingested_at=INGESTED_AT)
+        built = build_classifications(_source(), master, limited, ingested_at=INGESTED_AT)
+        spac_rows = [r for r in _history(built, primary_security_id(SPAC)) if r[0] == "spac"]
+        assert spac_rows and spac_rows[0][2] == _at(2019, 3, 1)
+
+    def test_rule_5_fires_only_once_the_sic_is_known(self) -> None:
+        """Rule 5 (sic_6770) reads only header evidence known at or before T:
+        a header stamped after T never fires it early, and one stamped
+        before T does."""
+        source = FixtureFilingSource(
+            index=[_filing(SPAC, "S-1", _at(2020, 1, 6))],
+            headers=[_header(SPAC, "S-1", 6770, _at(2020, 1, 6))],
+        )
+        built = _build(source)
+        before = [r for r in _history(built, primary_security_id(SPAC)) if r[2] <= _at(2020, 1, 5)]
+        after = [r for r in _history(built, primary_security_id(SPAC)) if r[2] >= _at(2020, 1, 6)]
+        assert not any(r[0] == "spac" for r in before)
+        assert any(r[0] == "spac" for r in after)
 
     @pytest.mark.parametrize("form", ["10-KSB", "10-QSB", "10-K405"])
     def test_older_domestic_forms(self, form: str) -> None:
