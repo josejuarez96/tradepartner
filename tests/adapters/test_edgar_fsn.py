@@ -3,12 +3,11 @@ plan amendment #216).
 
 `parse_fsn` is exercised over synthetic rows built in this file (dual-class
 issuer, a `coreg` row, a filer-custom member, a non-`ClassOfStock` axis, a
-non-issuer CIK, and one accession whose rows do not parse) because
-`tests/fixtures/edgar/fsn/` has not been recorded yet: the owner records it
-with `python -m tradepartner.cli_record fsn`. The two tests keyed to real
-recorded periods (`2025_10`, `2026_02`) are skipped until then, so nothing
-here goes untested in the meantime -- the synthetic rows cover the same
-behaviour parse_fsn must have on the real files.
+non-issuer CIK, and one accession whose rows do not parse), and over the
+owner-recorded periods under `tests/fixtures/edgar/fsn/` (`2025_10` Apple,
+`2026_02` Alphabet; PR #232), which are compared with `parse_cover_page` on
+the same filings. The recorded tests are never skipped: missing fixtures
+must fail, not pass silently.
 
 `EdgarFilingSource._ensure_fsn` is tested against a synthetic FSN page and
 in-memory zips served by an `httpx.MockTransport`, reusing
@@ -21,11 +20,12 @@ way this suite already reaches into other adapter internals
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import zipfile
 from collections.abc import Mapping
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import httpx
@@ -276,15 +276,34 @@ class TestParseFsn:
         assert [r.accession for r in parsed.records] == [good]
         assert [f.accession for f in parsed.failures] == [bad]
 
-    def test_symbol_with_no_title_or_exchange_fails_that_accession_only(self) -> None:
-        good = "0000000005-25-000001"
-        bad = "0000000006-25-000001"
-        sub = [_sub(good, "5", "10-K"), _sub(bad, "6", "10-K")]
+    def test_symbol_with_no_title_or_exchange_is_skipped_and_counted(self) -> None:
+        """Owner decision 2026-09-26 (#224): the incomplete listing is dropped
+        and counted, and the filing keeps its SIC, shares and complete listings."""
+        accession = "0000000005-25-000001"
+        sub = [_sub(accession, "5", "10-K", sic="7372")]
+        num = [_num(accession, "EntityCommonStockSharesOutstanding", "100", "20250131")]
         txt = [
-            _txt(good, "Security12bTitle", "Common Stock"),
-            _txt(good, "TradingSymbol", "GOOD"),
-            _txt(good, "SecurityExchangeName", "Nasdaq Stock Market LLC"),
-            _txt(bad, "TradingSymbol", "BAD"),  # no title, no exchange
+            _txt(accession, "Security12bTitle", "Common Stock", dimh="0xa", dimn="1"),
+            _txt(accession, "TradingSymbol", "GOOD", dimh="0xa", dimn="1"),
+            _txt(accession, "SecurityExchangeName", "NASDAQ", dimh="0xa", dimn="1"),
+            _txt(accession, "TradingSymbol", "BAD", dimh="0xb", dimn="1"),  # no title/exchange
+        ]
+        dim = [_dim("0xa", "ClassOfStock=CommonClassA;"), _dim("0xb", "ClassOfStock=Units;")]
+        parsed = parse_fsn(sub, num, txt, dim)
+        [record] = parsed.records
+        assert parsed.failures == ()
+        assert [item.ticker for item in record.listings] == ["GOOD"]
+        assert (record.incomplete_listings, record.sic, len(record.shares)) == (1, 7372, 1)
+
+    def test_two_different_values_for_one_fact_fail_that_accession(self) -> None:
+        """Fail closed like `parse_cover_page`: never keep whichever came last."""
+        good, bad = "0000000008-25-000001", "0000000009-25-000001"
+        sub = [_sub(good, "8", "10-K"), _sub(bad, "9", "10-K")]
+        txt = [
+            _txt(good, "TradingSymbol", "SAME"),
+            _txt(good, "TradingSymbol", "SAME"),  # a repeat with the same value is fine
+            _txt(bad, "TradingSymbol", "ONE"),
+            _txt(bad, "TradingSymbol", "TWO"),
         ]
         parsed = parse_fsn(sub, [], txt, [])
         assert [r.accession for r in parsed.records] == [good]
@@ -334,19 +353,15 @@ def _cover_page_parse(name: str, accession: str) -> object:
 
 
 def _read_period_tsvs(period_dir: Path) -> tuple[list[dict[str, str]], ...]:
-    import csv
-
     def rows(name: str) -> list[dict[str, str]]:
-        with (period_dir / name).open(newline="", encoding="utf-8") as handle:
-            return [dict(row) for row in csv.DictReader(handle, delimiter="\t")]
+        # FSN members are unquoted TSV: split on tabs only, never csv quoting.
+        lines = (period_dir / name).read_text(encoding="utf-8").splitlines()
+        header = lines[0].split("\t")
+        return [dict(zip(header, line.split("\t"), strict=False)) for line in lines[1:]]
 
     return rows("sub.tsv"), rows("num.tsv"), rows("txt.tsv"), rows("dim.tsv")
 
 
-@pytest.mark.skipif(
-    not (FIXTURES / "2025_10" / "sub.tsv").exists(),
-    reason="owner records FSN fixtures: python -m tradepartner.cli_record fsn",
-)
 def test_plain_issuer_fsn_matches_cover_page_2025_10() -> None:
     accession = "0000320193-25-000079"
     sub, num, txt, dim = _read_period_tsvs(FIXTURES / "2025_10")
@@ -362,12 +377,13 @@ def test_plain_issuer_fsn_matches_cover_page_2025_10() -> None:
         f.class_member: f.value
         for f in cover.facts  # type: ignore[attr-defined]
     }
+    # FSN's ddate is the cover date rounded to month end, never the cover's own
+    # date (#224, quant-auditor): pinned so T11e cannot assume otherwise.
+    [cover_date] = {f.as_of_date for f in cover.facts}  # type: ignore[attr-defined]
+    assert {s.as_of_date for s in record.shares} == {date(2025, 10, 31)}
+    assert cover_date == date(2025, 10, 17) and cover_date != date(2025, 10, 31)
 
 
-@pytest.mark.skipif(
-    not (FIXTURES / "2026_02" / "sub.tsv").exists(),
-    reason="owner records FSN fixtures: python -m tradepartner.cli_record fsn",
-)
 def test_dual_class_fsn_matches_cover_page_2026_02() -> None:
     accession = "0001652044-26-000018"
     sub, num, txt, dim = _read_period_tsvs(FIXTURES / "2026_02")
@@ -383,6 +399,10 @@ def test_dual_class_fsn_matches_cover_page_2026_02() -> None:
         f.class_member: f.value
         for f in cover.facts  # type: ignore[attr-defined]
     }
+    # FSN's ddate is the cover date rounded to month end (see the 2025_10 test).
+    [cover_date] = {f.as_of_date for f in cover.facts}  # type: ignore[attr-defined]
+    assert {s.as_of_date for s in record.shares} == {date(2026, 1, 31)}
+    assert cover_date == date(2026, 1, 28) and cover_date != date(2026, 1, 31)
     # FSN drops the filing's non-breaking space (`Class&#160;A` arrives as
     # `ClassA`); parse_fsn restores it, so titles match the filing's and
     # ingest's class-letter rule still finds the class (#224, recorded 2026_02).
@@ -393,6 +413,36 @@ def test_dual_class_fsn_matches_cover_page_2026_02() -> None:
     [googl] = [item for item in record.listings if item.ticker == "GOOGL"]
     match = ingest._TITLE_CLASS.search(googl.title.lower())
     assert match is not None and match.group(1) == "a"
+
+
+def test_fsn_records_and_caches_carry_no_timestamp(tmp_path: Path) -> None:
+    """No look-ahead (plan T11c): Alphabet's recorded 0001652044-26-000018 has
+    FSN `accepted` 2026-02-04 21:56 (Eastern), `filed` 20260205 and `period`
+    20251231, while the submissions acceptance is 2026-02-05T02:56:03Z. None
+    of FSN's own dates may reach a record or the per-CIK cache: stamping is
+    T11d's, from the submissions acceptance, at read time."""
+    accession = "0001652044-26-000018"
+    sub, num, txt, dim = _read_period_tsvs(FIXTURES / "2026_02")
+    [sub_row] = [row for row in sub if row["adsh"] == accession]
+    assert (sub_row["accepted"], sub_row["filed"]) == ("2026-02-04 21:56:00.0", "20260205")
+
+    parsed = parse_fsn(sub, num, txt, dim)
+    [record] = [r for r in parsed.records if r.accession == accession]
+    for item in (record, *record.shares):
+        for field in dataclasses.fields(item):
+            assert not isinstance(getattr(item, field.name), datetime), field.name
+
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, "w") as archive:
+        for member in ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv"):
+            archive.write(FIXTURES / "2026_02" / member, member)
+    settings = _settings(tmp_path)
+    router = _router_with_fsn("2026_02", zips={"2026_02": zip_bytes.getvalue()})
+    _source_ready(settings, router)._ensure_fsn()
+    cache = Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}" / "0001652044.json"
+    text = cache.read_text()
+    for fsn_date in ("2026-02-04", "21:56", "20260205", "20251231", "2025-12-31"):
+        assert fsn_date not in text, fsn_date
 
 
 @pytest.mark.parametrize(
@@ -631,6 +681,28 @@ class TestEnsureFsn:
         source2 = _source_ready(settings, router)
         source2._ensure_fsn()
         assert (source2.fsn_reissue_undetected, source2.fsn_reissued) == (1, 0)
+
+    def test_manifest_failures_are_the_served_forms_only(self, tmp_path: Path) -> None:
+        """T11f's failure policy counts accessions this adapter serves: a failing
+        6-K (never cached) stays out of the manifest, a failing 10-K is in it."""
+        settings = _settings(tmp_path)
+        kept, unserved = "0000000021-15-000001", "0000000022-15-000001"
+        zip_bytes = _fsn_zip_bytes(
+            [_sub(kept, "21", "10-K"), _sub(unserved, "22", "6-K")],
+            [
+                _num(kept, "EntityCommonStockSharesOutstanding", "not-a-number", "20150131"),
+                _num(unserved, "EntityCommonStockSharesOutstanding", "bad", "20150131"),
+            ],
+            [],
+            [],
+        )
+        source = _source_ready(settings, _router_with_fsn("2015q1", zips={"2015q1": zip_bytes}))
+        source._ensure_fsn()
+        manifest_path = (
+            Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}" / "manifests" / "2015q1.json"
+        )
+        failed = json.loads(manifest_path.read_text())["accessions_failed"]
+        assert [(f["accession"], f["base_form"]) for f in failed] == [(kept, "10-K")]
 
     def test_an_unreadable_cik_cache_stops_extraction(self, tmp_path: Path) -> None:
         """A per-CIK cache that exists but does not load must not be silently

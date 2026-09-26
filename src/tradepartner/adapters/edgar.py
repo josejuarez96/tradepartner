@@ -603,7 +603,13 @@ _FSN_CLASS_AXIS = "ClassOfStock"
 
 @dataclass(frozen=True)
 class FsnShare:
-    """One `EntityCommonStockSharesOutstanding` fact from an FSN `num.tsv` row."""
+    """One `EntityCommonStockSharesOutstanding` fact from an FSN `num.tsv` row.
+
+    `as_of_date` is FSN's `ddate`, which FSN **rounds to the nearest month
+    end**: Alphabet's cover date 2026-01-28 arrives as 2026-01-31, Apple's
+    2025-10-17 as 2025-10-31 (recorded fixtures, #224). It is not the cover's
+    own date, it can fall after the filing's acceptance, and it is never a
+    `known_at`; T11e decides how FSN shares are dated and de-duplicated."""
 
     class_member: str
     value: float
@@ -620,6 +626,10 @@ class FsnFiling:
     sic: int | None
     listings: tuple[CoverListing, ...]
     shares: tuple[FsnShare, ...]
+    #: Listings with a trading symbol but no title or exchange, skipped
+    #: (owner decision 2026-09-26, #224): the filing's SIC, shares and complete
+    #: listings are kept rather than failing the whole accession.
+    incomplete_listings: int = 0
 
 
 @dataclass(frozen=True)
@@ -721,16 +731,21 @@ def _parse_one_fsn_filing(
         member = _fsn_class_member(row, dim_segments)
         if member is None:
             continue
-        groups.setdefault(member, {})[tag] = row.get("value") or ""
+        group, value = groups.setdefault(member, {}), row.get("value") or ""
+        if group.get(tag, value) != value:  # fail closed, as parse_cover_page does
+            raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
+        group[tag] = value
 
     listings: list[CoverListing] = []
+    incomplete = 0
     for group in groups.values():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
         if symbol is None:
             continue  # notes and other classes with no trading symbol
         if title is None or exchange is None:
-            raise ValueError(f"{accession}: symbol {symbol!r} lacks a title or exchange")
+            incomplete += 1  # skipped and counted, not a failure (owner, #224)
+            continue
         listings.append(
             CoverListing(restore_class_letter_space(title), symbol, normalize_exchange(exchange))
         )
@@ -744,7 +759,7 @@ def _parse_one_fsn_filing(
             continue
         shares.append(FsnShare(member, float(Decimal(row["value"])), _fsn_ddate(row["ddate"])))
 
-    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares))
+    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares), incomplete)
 
 
 def parse_fsn(

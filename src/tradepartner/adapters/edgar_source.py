@@ -172,6 +172,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_duplicates = 0
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
+        self.fsn_incomplete_listings = 0
         self._filing_index_ran = False
         self._fsn_ready = False
 
@@ -389,9 +390,7 @@ class EdgarFilingSource(FilingSource):
 
         Extracts every FSN period from `edgar.fsn_first_year` with no
         extraction cache yet, oldest first, keeping every accession whose
-        base form is in `edgar.cover_page_forms`. T11c note: the amendment's
-        full filter also names `edgar.header_forms`, a T11d config key that
-        does not exist yet; T11d widens this filter once it lands. The
+        base form is in `edgar.cover_page_forms` or `edgar.header_forms`. The
         issuer filter is never applied here, so a CIK that becomes an
         issuer later keeps its earlier rows.
 
@@ -421,6 +420,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_duplicates = 0
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
+        self.fsn_incomplete_listings = 0
 
         all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
         listed = set(all_periods)
@@ -521,6 +521,7 @@ class EdgarFilingSource(FilingSource):
             known_accessions.add(record.accession)
             if record.form.removesuffix("/A") in kept_forms:
                 per_cik_new.setdefault(record.cik, {})[record.accession] = record
+                self.fsn_incomplete_listings += record.incomplete_listings
         for cik, records in per_cik_new.items():
             existing = self._load_fsn_cache(cik, strict=True)
             existing.update(records)
@@ -540,6 +541,8 @@ class EdgarFilingSource(FilingSource):
                     "accepted": False,
                 }
                 for f in parsed.failures
+                # only forms this adapter serves count toward T11f's failure policy
+                if form_by_accession.get(f.accession, "").removesuffix("/A") in kept_forms
             ],
             "committed": False,
         }

@@ -444,6 +444,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_reissued", "FSN re-issued"),  # T11c: re-issued or rolled-up periods
         ("fsn_duplicates", "FSN duplicates"),
         ("fsn_reissue_undetected", "FSN re-issues unchecked"),
+        ("fsn_incomplete_listings", "FSN incomplete listings"),
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")
