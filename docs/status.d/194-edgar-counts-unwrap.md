@@ -1,1 +1,0 @@
-- #194 EDGAR run message reads the #172 unstamped and skipped-filer counts from the adapter under T17's `_Recorded` fetch-pass proxy; the two merges had never run together on main (every main CI run was cancelled by the next merge)
