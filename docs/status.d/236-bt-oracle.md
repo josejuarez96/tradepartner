@@ -1,0 +1,1 @@
+- Phase 3 T41: `bt` oracle on a temp-file fixture store under a synthetic `family=oracle` hypothesis; equity agrees at every session within 1e-9 (measured 8.5e-16) at zero costs and fractional shares, the delisted fixture name is sold at its last close in both engines, a one-session lag fails; `fill_price=open` not exercised, open question on the PR (PR #239)
