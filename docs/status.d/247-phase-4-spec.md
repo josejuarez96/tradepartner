@@ -1,0 +1,1 @@
+- #247 Phase 4 spec: `docs/specs/paper-trading.md` (risk-gated wrapper, Alpaca paper adapter, tracking run, journal chain, operations and override pages, alerts, wash-sale lot ledger, exit-criteria command; ten open questions for the owner)
