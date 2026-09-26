@@ -1,1 +1,0 @@
-- #199 `StoreProvider.raw_prices` (T38) implements the protocol method T37b added after T38 branched; `isinstance(StoreProvider, DataProvider)` holds again
