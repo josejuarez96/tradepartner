@@ -24,13 +24,13 @@ A personal, local system for researching, testing and paper-trading (then small-
 - Runs locally, for personal use only.
 - Paper trading first. Live capital is about $100 at most until the charter is amended. ⬜ Account type (taxable or retirement): decide before Phase 6.
 - ⬜ **Compliance:** employer personal-trading policy reviewed. Required before Phase 6; blocks nothing earlier.
-- **Budget:** data-vendor spend is deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md); interim ceiling for spend **by the running system** (data, APIs, LLM calls; development tooling excluded) is **$0/month** (free tiers only). The Phase 3 vendor ADR sets the ceiling for data, APIs and LLM spend from then on.
+- **Budget:** set by [ADR 0009](decisions/0009-price-vendor.md) at $0/month for data, APIs and LLM calls by the running system from Phase 3 until a later ADR changes it (data-vendor spend had been deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md)); interim ceiling for spend **by the running system** (data, APIs, LLM calls; development tooling excluded) is **$0/month** (free tiers only). The Phase 3 vendor ADR sets the ceiling for data, APIs and LLM spend from then on.
 - **Time:** no fixed weekly hours. Build and review hours are recorded in each phase retro, and the 6-month stop criterion above applies. The owner reviews and merges every PR (~≤400 lines each).
 
 ## Principles (from the research)
 1. Any edge comes from strategy, data or discipline. It does not come from using an LLM.
 2. Hypothesis before data. Count every trial. Keep a locked holdout.
 3. Code computes numbers. LLMs never place orders.
-4. Point-in-time data, including delisted names. *Amended 2026-09-26 by [ADR 0009](decisions/0009-price-vendor.md): for Phase 3, delisted names from 2016-01-04 as served by Alpaca SIP daily bars and stamped by Form 25 filings, verified on a sample, with the survivorship gap measured per rebalance and gated; a paid vendor enters only through a later ADR.*
+4. Point-in-time data, including delisted names. *Amended 2026-09-26 by [ADR 0009](decisions/0009-price-vendor.md): until a later ADR names a paid vendor, delisted names from 2016-01-04 as served by Alpaca SIP daily bars and stamped by Form 25 filings, observed on a sample of eight (2019 to 2023), with the survivorship gap measured per rebalance as a lower bound and gated on holdout runs.*
 5. Rules are set before money is at risk. Overrides are logged.
 6. Around 100 trades is mostly noise. Tune on process (calibration, costs, bugs), not on P&L.
