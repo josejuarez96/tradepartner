@@ -416,6 +416,14 @@ def download_filing_file(
 def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client | None) -> Path:
     """Stream `url` to `dest` behind the throttle and `User-Agent`, one retry
     on a rate-limit status as `_get` does, through a temp file and `os.replace`."""
+    return _stream_to_with_headers(url, dest, settings=settings, client=client)[0]
+
+
+def _stream_to_with_headers(
+    url: str, dest: Path, *, settings: Settings, client: httpx.Client | None
+) -> tuple[Path, httpx.Headers]:
+    """As `_stream_to`, but also returns the response headers (T11c: `Last-
+    Modified`, `ETag` and `Content-Length` go into the FSN period manifest)."""
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
         client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
@@ -429,6 +437,7 @@ def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client
                 time.sleep(_retry_backoff_seconds(response, settings))
                 continue
             response.raise_for_status()
+            response_headers = response.headers
             fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
             try:
                 with os.fdopen(fd, "wb") as file:
@@ -438,8 +447,111 @@ def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client
             except BaseException:
                 Path(tmp).unlink(missing_ok=True)
                 raise
-            return dest
+            return dest, response_headers
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+# --- SEC Financial Statement and Notes data sets (T11c) ---------------------
+
+_FSN_PAGE_URL = (
+    "https://www.sec.gov/data-research/sec-markets-data/financial-statement-notes-data-sets"
+)
+_FSN_ZIP_URL = (
+    "https://www.sec.gov/files/dera/data/financial-statement-notes-data-sets/{period}_notes.zip"
+)
+# The data-set page's href to one period's zip. Never a hardcoded
+# quarter-to-month boundary: SEC rolls months into quarters after the fact
+# (#174 F1, F10), so both `\d{4}q[1-4]` and `\d{4}_\d{2}` period spellings
+# are matched, and the caller (`fsn_periods`) sorts them, not this pattern.
+_FSN_PERIOD = r"\d{4}q[1-4]|\d{4}_(?:0[1-9]|1[0-2])"
+_FSN_PERIOD_RE = re.compile(_FSN_PERIOD)
+_FSN_PERIOD_PATTERN = re.compile(
+    rf"/files/dera/data/financial-statement-notes-data-sets/({_FSN_PERIOD})_notes\.zip"
+)
+
+
+def _validate_fsn_period(period: str) -> None:
+    """`period` must be `YYYYqN` or `YYYY_MM` before it reaches a URL or a
+    path under `edgar.cache_dir` (as `_validate_accession` guards accessions)."""
+    if not _FSN_PERIOD_RE.fullmatch(period):
+        raise InvalidFilingReferenceError(f"not an FSN period: {period!r}")
+
+
+def _fsn_period_sort_key(period: str) -> tuple[int, int, int]:
+    """`(year, month, rank)` for a period spelled `YYYYqN` or `YYYY_MM`, so
+    mixed quarterly/monthly periods sort oldest first and deterministically:
+    a quarter sorts at its first month, ahead of the months it later split
+    into (rank 0 before 1), never by the order the page happened to list."""
+    if "q" in period:
+        year, qtr = period.split("q")
+        return int(year), int(qtr) * 3 - 2, 0
+    year, month = period.split("_")
+    return int(year), int(month), 1
+
+
+def fsn_period_year(period: str) -> int:
+    """The calendar year of an FSN period spelled `YYYYqN` or `YYYY_MM`."""
+    return _fsn_period_sort_key(period)[0]
+
+
+def fsn_page_html(*, settings: Settings | None = None, client: httpx.Client | None = None) -> str:
+    """The raw FSN data-set page (the recorder writes this verbatim as
+    `tests/fixtures/edgar/fsn/page.html`; `fsn_periods` parses it)."""
+    settings = settings or get_settings()
+    return _get(_FSN_PAGE_URL, settings=settings, client=client).text
+
+
+def fsn_periods(
+    *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> list[str]:
+    """Every FSN period (`"2015q1"`, `"2026_02"`, ...) on the data-set page,
+    oldest first. Raises `ValueError` if the page names none."""
+    text = fsn_page_html(settings=settings, client=client)
+    periods = sorted(set(_FSN_PERIOD_PATTERN.findall(text)), key=_fsn_period_sort_key)
+    if not periods:
+        raise ValueError("fsn_periods: no FSN periods found on the data-set page")
+    return periods
+
+
+def fsn_zip(
+    period: str, *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> tuple[Path, httpx.Headers]:
+    """Stream one FSN period's zip into `edgar.cache_dir/fsn/`; returns its
+    path and response headers (`_stream_to_with_headers`). A 404 (an
+    unlisted or malformed period) propagates as `httpx.HTTPStatusError`."""
+    _validate_fsn_period(period)
+    settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "fsn" / f"{period}_notes.zip"
+    return _stream_to_with_headers(
+        _FSN_ZIP_URL.format(period=period), dest, settings=settings, client=client
+    )
+
+
+def fsn_validators(
+    period: str, *, settings: Settings | None = None, client: httpx.Client | None = None
+) -> httpx.Headers:
+    """A plain, unconditional `HEAD` of one FSN period's zip, behind the same
+    throttle, retry and `User-Agent` as every other request here; returns
+    the response headers (`Last-Modified`, `ETag`, `Content-Length`) so the
+    caller can compare them with the period's manifest."""
+    _validate_fsn_period(period)
+    settings = settings or get_settings()
+    url = _FSN_ZIP_URL.format(period=period)
+    headers = {"User-Agent": _user_agent(settings)}
+    http_client = (
+        client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
+    )
+    min_interval_seconds = 1.0 / settings.edgar.requests_per_second
+    timeout = settings.edgar.request_timeout_seconds
+
+    _LIMITER.wait(min_interval_seconds)
+    response = http_client.request("HEAD", url, headers=headers, timeout=timeout)
+    if response.status_code in _RETRY_STATUS_CODES:
+        time.sleep(_retry_backoff_seconds(response, settings))
+        _LIMITER.wait(min_interval_seconds)
+        response = http_client.request("HEAD", url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.headers
 
 
 def bulk_submissions(

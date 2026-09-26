@@ -157,6 +157,24 @@ class EdgarConfig(BaseModel):
     index_settle_days: int = Field(default=3, ge=0)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
     cover_page_forms: list[str] = Field(default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"])
+    # T11g (#216, #231): the oldest year of the SEC Financial Statement and Notes
+    # data sets to fetch. `2009` is FSN's own start; the default `2015` is
+    # one year before the 2016 price start, so the latest SIC before any
+    # T >= 2016 is already present.
+    fsn_first_year: int = Field(default=2015, ge=2009)
+    # T11d's keys, added in T11g so FSN extraction keeps these forms' SIC from
+    # the first run (no FSN_VERSION bump later). 8-K is included so a de-SPAC's
+    # new SIC arrives with its 8-K. `header_first_year` None means
+    # `fsn_first_year`, so an override of one follows the other.
+    header_forms: list[str] = Field(
+        default_factory=lambda: ["S-1", "F-1", "10-12B", "8-K", "10-K", "10-Q", "20-F", "40-F"]
+    )
+    header_first_year: int | None = Field(default=None, ge=1993)
+
+    @property
+    def header_start_year(self) -> int:
+        """`header_first_year`, or `fsn_first_year` when it is unset."""
+        return self.fsn_first_year if self.header_first_year is None else self.header_first_year
 
 
 class MasterConfig(BaseModel):

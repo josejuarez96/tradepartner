@@ -521,3 +521,113 @@ def test_a_bulk_download_failing_mid_stream_keeps_the_previous_zip(tmp_path: Pat
         )
     assert previous.read_bytes() == b"yesterday's zip"
     assert list(previous.parent.iterdir()) == [previous]
+
+
+# --- FSN data sets (T11c) -----------------------------------------------
+
+_FSN_PAGE_HTML = """
+<html><body>
+<a href="/files/dera/data/financial-statement-notes-data-sets/2015q1_notes.zip">2015q1</a>
+<a href="/files/dera/data/financial-statement-notes-data-sets/2026_02_notes.zip">2026_02</a>
+<a href="/files/dera/data/financial-statement-notes-data-sets/2025_10_notes.zip">2025_10</a>
+</body></html>
+"""
+
+
+def test_fsn_periods_oldest_first() -> None:
+    periods = edgar_raw.fsn_periods(
+        settings=_settings(),
+        client=_mock_client(lambda request: httpx.Response(200, content=_FSN_PAGE_HTML)),
+    )
+    assert periods == ["2015q1", "2025_10", "2026_02"]
+
+
+def test_fsn_periods_raises_when_page_has_no_matches() -> None:
+    with pytest.raises(ValueError, match="no FSN periods"):
+        edgar_raw.fsn_periods(
+            settings=_settings(),
+            client=_mock_client(lambda request: httpx.Response(200, content="<html></html>")),
+        )
+
+
+def test_fsn_zip_streams_into_the_fsn_cache_dir_and_returns_headers(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).endswith("2025_10_notes.zip")
+        assert request.headers["User-Agent"] == "TradePartner test-agent"
+        return httpx.Response(
+            200, content=b"PK fsn zip bytes", headers={"ETag": '"abc"', "Content-Length": "17"}
+        )
+
+    path, headers = edgar_raw.fsn_zip(
+        "2025_10", settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+    assert path == tmp_path / "fsn" / "2025_10_notes.zip"
+    assert path.read_bytes() == b"PK fsn zip bytes"
+    assert headers["ETag"] == '"abc"'
+
+
+def test_fsn_periods_break_ties_deterministically() -> None:
+    """During an SEC roll-up the page can list a quarter and its months
+    together: the quarter sorts at its first month, before its months, so
+    "first extracted" never depends on set order."""
+    page = "".join(
+        f'<a href="/files/dera/data/financial-statement-notes-data-sets/{p}_notes.zip">x</a>'
+        for p in ("2015_03", "2015_01", "2015q1", "2014q4", "2015_13", "2015_00")
+    )
+    periods = edgar_raw.fsn_periods(
+        settings=_settings(),
+        client=_mock_client(lambda request: httpx.Response(200, content=page)),
+    )
+    assert periods == ["2014q4", "2015q1", "2015_01", "2015_03"]  # months 00 and 13 are not periods
+
+
+@pytest.mark.parametrize("period", ["../../x", "2025_10/../../x", "2025-10", "2025_13", ""])
+def test_fsn_fetches_refuse_a_malformed_period(tmp_path: Path, period: str) -> None:
+    client = _mock_client(lambda request: pytest.fail("no request for a bad period"))
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.fsn_zip(period, settings=_settings(cache_dir=tmp_path), client=client)
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.fsn_validators(period, settings=_settings(), client=client)
+    assert not list(tmp_path.rglob("*"))
+
+
+def test_fsn_zip_404_propagates(tmp_path: Path) -> None:
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.fsn_zip(
+            "2099_01",
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(404)),
+        )
+
+
+def test_fsn_validators_sends_a_plain_head() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        assert request.headers["User-Agent"] == "TradePartner test-agent"
+        return httpx.Response(200, headers={"Last-Modified": "Wed, 01 Oct 2025 00:00:00 GMT"})
+
+    headers = edgar_raw.fsn_validators(
+        "2025_10", settings=_settings(), client=_mock_client(handler)
+    )
+    assert seen == ["HEAD"]
+    assert headers["Last-Modified"] == "Wed, 01 Oct 2025 00:00:00 GMT"
+
+
+def test_fsn_validators_retries_once_on_a_rate_limit_status() -> None:
+    served: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(1)
+        if len(served) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, headers={"ETag": '"x"'})
+
+    headers = edgar_raw.fsn_validators(
+        "2025_10",
+        settings=_settings(retry_backoff_seconds=0.001),
+        client=_mock_client(handler),
+    )
+    assert len(served) == 2
+    assert headers["ETag"] == '"x"'
