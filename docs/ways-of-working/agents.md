@@ -23,6 +23,7 @@ Six agents. That is deliberately few: each one owns a job the main session does 
 | `implementer` | Build | Executes **one** plan task on its own branch, tests first, and opens a draft PR. Doesn't expand scope | Code + tests | sonnet |
 | `quant-auditor` | Review | Audits diffs touching data, backtests or signals for look-ahead bias, survivorship, point-in-time violations, cost modeling and trial logging | No (read-only) | opus |
 | `safety-reviewer` | Review | Audits diffs touching the broker, orders, secrets, or LLM inputs/outputs: order isolation, idempotency, kill switch, prompt injection, key handling | No (read-only) | opus |
+| `backtest-runner` | Build / Review | Runs one registered hypothesis through the engine **only on a temp-file or fixture store** (`store_path` always set, synthetic trials, never the owner's registry) and reports the stored metrics, DSR, gap and per-rebalance counts. Never passes a holdout or override flag; never enters the main checkout | Only a scratch store | opus |
 | `doc-keeper` | Record | After a merge or at session end: updates `STATUS.md`, `CHANGELOG.md` and plan checkboxes, and flags drift between docs and code | Only `docs/`, `CHANGELOG.md` | haiku |
 
 **General code review** uses the built-in `/code-review` command. We don't need our own generic reviewer.
@@ -49,7 +50,7 @@ Any number of Claude Code chat windows may build in parallel; each one is a **te
 | Orchestrator window during Build and Review | **Opus 5.5** | Claims, delegation and review triage: capable, and cheaper than Fable |
 | Spec, plan and ADR drafting; phase retros; cross-team conflict resolution; changes to the ways-of-working docs | **Fable 5.1** | Errors here land in every later PR |
 | `implementer` | Sonnet (roster) | One scoped task with a plan line and tests |
-| `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer` | Opus (roster) | Judgment-heavy, read-only or doc-only |
+| `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer`, `backtest-runner` | Opus (roster) | Judgment-heavy, read-only or doc-only |
 | `doc-keeper` | Haiku (roster) | Mechanical |
 
 Start a window on Opus 5.5 by default. Escalate to Fable only for the second row, and say so in the PR description when you did.
@@ -99,5 +100,4 @@ The rules that address it:
 Create these when a phase needs them:
 
 - `data-validator` (Phase 2): checks a new data source for gaps, splits, delisting coverage, timezone handling and stale rows.
-- `backtest-runner` (Phase 3): runs a registered hypothesis against the backtester and appends to the trial registry. It never touches the holdout without an explicit flag.
 - `journal-analyst` (Phase 4+): produces the weekly calibration, cost and attribution report from the trade journal.
