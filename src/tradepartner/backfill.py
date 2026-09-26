@@ -37,10 +37,8 @@ backfill with a new, earlier `since`.
 
 from __future__ import annotations
 
-import time
 import uuid
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -64,6 +62,7 @@ from tradepartner.ingest import (
     _clean,
     _ingest_filings,
     _prefetch,
+    _read,
     _record_only,
     _Recorded,
     _replay_actions,
@@ -74,7 +73,7 @@ from tradepartner.ingest import (
     expected_session,
 )
 from tradepartner.store.classify import classifications_as_of
-from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
+from tradepartner.store.db import StoreLockedError, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.schema import init_schema
@@ -144,34 +143,6 @@ def backfill(
             if run.status != OK:
                 break
     return IngestResult(tuple(runs))
-
-
-@contextmanager
-def _read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
-    """A short-lived read-only connection, retrying a writer's lock for
-    `store.lock_retry_seconds` with `open_for_write`'s backoff (spec req 9),
-    then `StoreLockedError`."""
-    cfg = settings.store
-    deadline = time.monotonic() + cfg.lock_retry_seconds
-    delay = cfg.lock_retry_initial_delay_seconds
-    while True:
-        try:
-            reader = open_read_only(settings)
-            conn = reader.__enter__()
-        except StoreLockedError as exc:
-            if isinstance(exc.__cause__, duckdb.ConnectionException):
-                raise  # this process holds the file: waiting never helps
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise
-            time.sleep(min(delay, remaining))
-            delay = min(delay * 2, cfg.lock_retry_max_delay_seconds)
-            continue
-        try:
-            yield conn
-        finally:
-            reader.__exit__(None, None, None)
-        return
 
 
 def _cursor(since: date, through: date) -> str:
