@@ -95,7 +95,7 @@ what = "Fetch and parse the SEC Financial Statement and Notes data sets: cover p
 why = "Per-filing downloads for every issuer are hundreds of GB; the monthly data sets carry the same facts by accession (#174)."
 
 [task.T11d]
-what = "The adapter methods that serve cover pages and SIC headers from those caches, stamped at acceptance, with per-filing downloads only for the newest weeks."
+what = "The adapter methods that serve cover pages and SIC headers from those caches, stamped at acceptance, with per-filing downloads mainly for the newest weeks."
 why = "Turns the data sets into the point-in-time listings and SIC the security master and classification read."
 
 [task.T11e]
