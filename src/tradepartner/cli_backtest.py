@@ -211,14 +211,16 @@ def gap_signoff(
 ) -> None:
     """Record the owner's sign-off that a trial's survivorship gap is acceptable
     (ADR 0003 rule 8, ADR 0009): an `owner_decisions` row of kind `gap_signoff` with
-    the trial's gap values at this time. Only an `ok`, non-synthetic trial."""
+    the trial's gap values at this time. Only an `ok`, non-synthetic, `in_sample` trial:
+    the one `paper start` accepts (paper-trading spec req 14)."""
     settings = get_settings()
     try:
         with open_for_write(settings) as conn:
             schema.init_schema(conn)
             row = conn.execute(
                 "SELECT t.hypothesis_id, t.synthetic, r.status, r.gap_max_count_share, "
-                "r.gap_max_size_share FROM trials t LEFT JOIN trial_results r USING (trial_id) "
+                "r.gap_max_size_share, t.kind "
+                "FROM trials t LEFT JOIN trial_results r USING (trial_id) "
                 "WHERE t.trial_id = ?",
                 [trial],
             ).fetchone()
@@ -253,6 +255,8 @@ def _signoff_refusal(trial: int, row: tuple[Any, ...] | None) -> str | None:
         return f"trial {trial} is synthetic"
     if row[2] != "ok":
         return f"trial {trial} is {row[2] or 'unfinished'}, not ok"
+    if row[5] != "in_sample":
+        return f"trial {trial} is a {row[5]} trial; the Phase 4 gate reads in_sample only"
     return None
 
 

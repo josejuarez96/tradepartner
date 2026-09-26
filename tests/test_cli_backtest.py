@@ -281,3 +281,16 @@ def test_gap_signoff_refuses_a_trial_that_is_not_ok(store: Path) -> None:
     assert (refused.exit_code, missing.exit_code, blank.exit_code) == (2, 2, 2)
     assert "refused_holdout, not ok" in refused.stderr
     assert _rows(store, "SELECT COUNT(*) FROM owner_decisions") == [(0,)]
+
+
+@pytest.mark.usefixtures("registered")
+def test_gap_signoff_refuses_a_holdout_trial(store: Path) -> None:
+    assert invoke("backtest", SLUG, *HOLDOUT_WINDOW, *SPEND, *OVERRIDE).exit_code == 0
+    [(trial_id,)] = _rows(store, "SELECT trial_id FROM trials")
+
+    result = invoke("decision", "gap-signoff", "--trial", str(trial_id), "--reason", "x")
+
+    assert result.exit_code == 2
+    assert "holdout trial" in result.stderr
+    kinds = _rows(store, "SELECT kind FROM owner_decisions ORDER BY decision_id")
+    assert kinds == [("holdout_spend",), ("gap_override",)]
