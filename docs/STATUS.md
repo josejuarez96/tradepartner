@@ -101,7 +101,6 @@ Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/f
 - #231 T11g: FSN data-set fetch (`fsn_periods`, `fsn_zip`, `fsn_validators`), the `cli_record fsn` target and the FSN/header config keys, split from T11c
 - Phase 3 T41: `bt` oracle on a temp-file fixture store under a synthetic `family=oracle` hypothesis; equity agrees at every session within 1e-9 (measured 8.5e-16) at zero costs and fractional shares, the delisted fixture name is sold at its last close in both engines, a one-session lag fails; `fill_price=open` not exercised, open question on the PR (PR #239)
 - T29 (owner) ADR 0009 (Proposed): no paid price vendor for Phase 3; Alpaca SIP daily bars from 2016-01-04 plus EDGAR are the `PriceSource` for every registered hypothesis, budget USD 0, delisted coverage graded verified-on-sample, the survivorship gap measured per rebalance and gated, Phase 4 waits on the owner's gap sign-off in the registry, charter principle 4 amended, four re-open triggers with a vendor candidate order (#240)
-- #244 Doc-keeper fold of 2026-09-25/26: 46 STATUS and 45 CHANGELOG fragments folded, T29 ticked (ADR 0009), Teams, In progress, Ready frontier and Decisions refreshed
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
