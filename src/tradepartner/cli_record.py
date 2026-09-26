@@ -19,11 +19,14 @@ non-zero with a clear message when secrets are missing").
 from __future__ import annotations
 
 import base64
+import csv
 import gzip
+import io
 import json
 import re
 import sys
-from collections.abc import Iterable, Mapping
+import zipfile
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +39,8 @@ from tradepartner.config import Settings, get_settings
 FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 ALPACA_FIXTURES_DIR = FIXTURES_ROOT / "alpaca"
 EDGAR_FIXTURES_DIR = FIXTURES_ROOT / "edgar"
+#: T11c: the FSN data-set page and the two recorded periods' trimmed members.
+EDGAR_FSN_FIXTURES_DIR = EDGAR_FIXTURES_DIR / "fsn"
 
 SCRUBBED = "<scrubbed>"
 RECORDED_AT_FILE = FIXTURES_ROOT / "recorded_at.json"
@@ -515,6 +520,107 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
         )
 
 
+# --- FSN data sets (T11c: `python -m tradepartner.cli_record fsn`) ---------
+
+# The recorded periods (spec) and the one fixture accession to trim each
+# down to: Apple's plain-issuer 10-K in `2025_10`, Alphabet's dual-class 10-K
+# in `2026_02` (same accessions T3/T11's cover-page fixtures use).
+FSN_RECORD_PERIODS: dict[str, str] = {
+    "2025_10": "0000320193-25-000079",
+    "2026_02": "0001652044-26-000018",
+}
+# The four `dei` cover-page tags kept in the trimmed `num.tsv`/`txt.tsv`.
+FSN_RECORD_TAGS: tuple[str, ...] = (
+    "Security12bTitle",
+    "TradingSymbol",
+    "SecurityExchangeName",
+    "EntityCommonStockSharesOutstanding",
+)
+_FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
+
+
+def _read_fsn_tsv_rows(text: str) -> list[dict[str, str]]:
+    return [dict(row) for row in csv.DictReader(io.StringIO(text), delimiter="\t")]
+
+
+def _write_fsn_tsv_rows(rows: list[dict[str, str]], fieldnames: list[str]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
+def trim_fsn_member(
+    text: str, *, accessions: Iterable[str], tags: Iterable[str] | None = None
+) -> str:
+    """Keep only `sub`/`num`/`txt.tsv` rows whose `adsh` is in `accessions`,
+    further restricted to `tags` (`num.tsv`/`txt.tsv`'s `tag` column) when
+    given. Pure; an empty member (no rows at all) is returned unchanged."""
+    rows = _read_fsn_tsv_rows(text)
+    if not rows:
+        return text
+    fieldnames = list(rows[0].keys())
+    wanted = set(accessions)
+    kept = [row for row in rows if row.get("adsh") in wanted]
+    if tags is not None:
+        tag_set = set(tags)
+        kept = [row for row in kept if row.get("tag") in tag_set]
+    return _write_fsn_tsv_rows(kept, fieldnames)
+
+
+def trim_fsn_dim(text: str, *, dimhashes: Iterable[str]) -> str:
+    """Keep only `dim.tsv` rows whose `dimhash` is referenced by a kept
+    `num`/`txt.tsv` row. Pure."""
+    rows = _read_fsn_tsv_rows(text)
+    if not rows:
+        return text
+    fieldnames = list(rows[0].keys())
+    wanted = set(dimhashes)
+    kept = [row for row in rows if row.get("dimhash") in wanted]
+    return _write_fsn_tsv_rows(kept, fieldnames)
+
+
+def _record_fsn(settings: Settings, secrets: list[str]) -> None:
+    """`python -m tradepartner.cli_record fsn`: the data-set page plus the
+    two recorded periods, each trimmed to one fixture accession. Needs only
+    `SEC_EDGAR_USER_AGENT` (no Alpaca keys)."""
+    EDGAR_FSN_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+
+    page_html = edgar_raw.fsn_page_html(settings=settings)
+    _write_text(EDGAR_FSN_FIXTURES_DIR / "page.html", page_html, secrets=secrets)
+
+    for period, accession in FSN_RECORD_PERIODS.items():
+        zip_path, _headers = edgar_raw.fsn_zip(period, settings=settings)
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                names = {name.lower(): name for name in archive.namelist()}
+                raw = {
+                    member: archive.read(names[member]).decode("utf-8", errors="replace")
+                    for member in _FSN_MEMBERS
+                    if member in names
+                }
+        finally:
+            zip_path.unlink(missing_ok=True)
+
+        period_dir = EDGAR_FSN_FIXTURES_DIR / period
+        period_dir.mkdir(parents=True, exist_ok=True)
+        trimmed_sub = trim_fsn_member(raw["sub.tsv"], accessions=[accession])
+        trimmed_num = trim_fsn_member(raw["num.tsv"], accessions=[accession], tags=FSN_RECORD_TAGS)
+        trimmed_txt = trim_fsn_member(raw["txt.tsv"], accessions=[accession], tags=FSN_RECORD_TAGS)
+        dimhashes = {
+            row.get("dimh", "")
+            for row in (*_read_fsn_tsv_rows(trimmed_num), *_read_fsn_tsv_rows(trimmed_txt))
+            if row.get("dimh")
+        }
+        trimmed_dim = trim_fsn_dim(raw["dim.tsv"], dimhashes=dimhashes)
+
+        _write_text(period_dir / "sub.tsv", trimmed_sub, secrets=secrets)
+        _write_text(period_dir / "num.tsv", trimmed_num, secrets=secrets)
+        _write_text(period_dir / "txt.tsv", trimmed_txt, secrets=secrets)
+        _write_text(period_dir / "dim.tsv", trimmed_dim, secrets=secrets)
+
+
 def _record_alpaca(settings: Settings, secrets: list[str]) -> None:
     bars = alpaca_raw.daily_bars(ALPACA_SYMBOLS, ALPACA_START, ALPACA_END, settings=settings)
     _write_json(ALPACA_FIXTURES_DIR / "daily_bars.json", bars, secrets=secrets)
@@ -531,8 +637,30 @@ def _record_alpaca(settings: Settings, secrets: list[str]) -> None:
     _write_json(ALPACA_FIXTURES_DIR / "assets_snapshot.json", assets, secrets=secrets)
 
 
-def main() -> int:
+def main(argv: Sequence[str] = ()) -> int:
+    """`python -m tradepartner.cli_record [fsn]`. With no target, records
+    every fixture (Alpaca and EDGAR) as before. `fsn` (T11c) records only
+    the FSN data-set page and its two recorded periods, and needs only
+    `SEC_EDGAR_USER_AGENT` -- no Alpaca keys."""
+    target = argv[0] if argv else "all"
+    if target not in ("all", "fsn"):
+        # A typo must not fall through to the full recorder (Alpaca keys too).
+        print(f"cli_record: unknown target {target!r}; use 'fsn' or no target", file=sys.stderr)
+        return 2
     settings = get_settings()
+
+    if target == "fsn":
+        if _non_blank_secret(settings.sec_edgar_user_agent) is None:
+            print(
+                "cli_record: missing required secret(s): SEC_EDGAR_USER_AGENT. Set it in "
+                ".env (see .env.example) before running the recorder.",
+                file=sys.stderr,
+            )
+            return 1
+        _record_fsn(settings, _configured_secrets(settings))
+        print(f"cli_record: wrote FSN fixtures under {EDGAR_FSN_FIXTURES_DIR}")
+        return 0
+
     missing = _missing_secret_names(settings)
     if missing:
         print(
@@ -556,4 +684,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
