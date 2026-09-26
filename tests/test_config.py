@@ -90,9 +90,39 @@ def test_edgar_filing_source_defaults() -> None:
     assert s.edgar.cover_page_forms == ["10-K", "10-Q", "20-F", "40-F"]
 
 
+def test_edgar_fsn_first_year_default() -> None:
+    """T11c (#216): one year before the 2016 price start."""
+    assert _settings().edgar.fsn_first_year == 2015
+
+
+def test_edgar_header_forms_defaults() -> None:
+    """T11d's keys, added by T11c: registration forms, 8-K and the periodic
+    forms; `header_first_year` follows `fsn_first_year` unless set."""
+    s = _settings()
+    assert s.edgar.header_forms == ["S-1", "F-1", "10-12B", "8-K", "10-K", "10-Q", "20-F", "40-F"]
+    assert s.edgar.header_first_year is None
+    assert s.edgar.header_start_year == 2015  # follows fsn_first_year
+    s = Settings(_env_file=None, edgar={"fsn_first_year": 2019})
+    assert s.edgar.header_start_year == 2019
+    s = Settings(_env_file=None, edgar={"header_first_year": 2012})
+    assert s.edgar.header_first_year == 2012
+    assert s.edgar.header_start_year == 2012
+
+
+def test_edgar_fsn_first_year_override() -> None:
+    s = Settings(_env_file=None, edgar={"fsn_first_year": 2010})
+    assert s.edgar.fsn_first_year == 2010
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("index_first_year", 1992), ("index_settle_days", -1), ("bulk_stamp_threshold_ciks", 0)],
+    [
+        ("index_first_year", 1992),
+        ("index_settle_days", -1),
+        ("bulk_stamp_threshold_ciks", 0),
+        ("fsn_first_year", 2008),
+        ("header_first_year", 1992),
+    ],
 )
 def test_edgar_filing_source_keys_reject_nonsense(field: str, value: int) -> None:
     with pytest.raises(ValidationError):
