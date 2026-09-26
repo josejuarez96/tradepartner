@@ -281,6 +281,11 @@ what = "Clock failures halt the system instead of rejecting orders."
 why = "A broken clock must never look like a legitimate rejection."
 unblocks = ["phase:4"]
 
+[adr.0009]
+what = "No paid price vendor for Phase 3: Alpaca SIP bars from 2016 plus EDGAR, with the survivorship gap measured per rebalance and gated; budget re-opens on named triggers."
+why = "Delisted names were observed present on the free source and no vendor is verified; measuring the gap beats paying for a claim."
+unblocks = ["task:T45", "task:T45b"]
+
 [plan.data-foundation]
 what = "The Phase 2 build document: 25 tasks, one PR each, grouped in chains."
 why = "What the ready frontier is computed from."

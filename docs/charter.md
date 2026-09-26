@@ -31,6 +31,6 @@ A personal, local system for researching, testing and paper-trading (then small-
 1. Any edge comes from strategy, data or discipline. It does not come from using an LLM.
 2. Hypothesis before data. Count every trial. Keep a locked holdout.
 3. Code computes numbers. LLMs never place orders.
-4. Point-in-time data, including delisted names.
+4. Point-in-time data, including delisted names. *Amended 2026-09-26 by [ADR 0009](decisions/0009-price-vendor.md): for Phase 3, delisted names from 2016-01-04 as served by Alpaca SIP daily bars and stamped by Form 25 filings, verified on a sample, with the survivorship gap measured per rebalance and gated; a paid vendor enters only through a later ADR.*
 5. Rules are set before money is at risk. Overrides are logged.
 6. Around 100 trades is mostly noise. Tune on process (calibration, costs, bugs), not on P&L.
