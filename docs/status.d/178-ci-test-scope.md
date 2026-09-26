@@ -1,1 +1,0 @@
-- #178 CI skips pytest on PRs that touch no code, tests, scripts, deps or CI; slow-test measurement recorded on the issue (PR #179)
