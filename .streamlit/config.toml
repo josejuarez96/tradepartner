@@ -1,0 +1,36 @@
+# Dashboard theme (docs/design/dashboard.md). Mirrors src/tradepartner/dashboard/theme.py;
+# tests/dashboard/test_health_page.py keeps the two equal. Edit both together.
+
+[theme]
+font = "sans-serif"
+codeFont = "monospace"
+
+[theme.light]
+primaryColor = "#2a78d6"
+backgroundColor = "#f6f7f4"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1c2026"
+borderColor = "#d6dad3"
+baseRadius = "8px"
+chartCategoricalColors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+greenColor = "#2c7a4b"
+greenBackgroundColor = "#ddf0e3"
+orangeColor = "#b0741c"
+orangeBackgroundColor = "#f8ebd2"
+redColor = "#b23f36"
+redBackgroundColor = "#f7dedb"
+
+[theme.dark]
+primaryColor = "#3987e5"
+backgroundColor = "#12161a"
+secondaryBackgroundColor = "#1a2027"
+textColor = "#e7eaed"
+borderColor = "#303841"
+baseRadius = "8px"
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500"]
+greenColor = "#6cc08f"
+greenBackgroundColor = "#17301f"
+orangeColor = "#d9a650"
+orangeBackgroundColor = "#3a2e15"
+redColor = "#e07b73"
+redBackgroundColor = "#3b1f1d"
