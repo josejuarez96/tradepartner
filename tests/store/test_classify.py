@@ -257,14 +257,17 @@ class TestRules:
         a header stamped after T never fires it early, and one stamped
         before T does."""
         source = FixtureFilingSource(
-            index=[_filing(SPAC, "S-1", _at(2020, 1, 6))],
-            headers=[_header(SPAC, "S-1", 6770, _at(2020, 1, 6))],
+            # The security exists from 2019-03-01, so there is a "before" row
+            # to test; the only SIC evidence is the 8-K header of 2020-01-06.
+            index=[_filing(SPAC, "10-K", _at(2019, 3, 1)), _filing(SPAC, "8-K", _at(2020, 1, 6))],
+            headers=[_header(SPAC, "8-K", 6770, _at(2020, 1, 6))],
         )
-        built = _build(source)
-        before = [r for r in _history(built, primary_security_id(SPAC)) if r[2] <= _at(2020, 1, 5)]
-        after = [r for r in _history(built, primary_security_id(SPAC)) if r[2] >= _at(2020, 1, 6)]
+        history = _history(_build(source), primary_security_id(SPAC))
+        before = [r for r in history if r[2] < _at(2020, 1, 6)]
+        after = [r for r in history if r[2] >= _at(2020, 1, 6)]
+        assert before, history  # not vacuous: a row exists before the SIC is known
         assert not any(r[0] == "spac" for r in before)
-        assert any(r[0] == "spac" for r in after)
+        assert after and after[0][0] == "spac" and after[0][2] == _at(2020, 1, 6)
 
     @pytest.mark.parametrize("form", ["10-KSB", "10-QSB", "10-K405"])
     def test_older_domestic_forms(self, form: str) -> None:

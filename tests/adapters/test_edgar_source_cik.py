@@ -39,6 +39,7 @@ from tradepartner.adapters.edgar_source import (
     EdgarFilingSource,
     SubmissionRecord,
 )
+from tradepartner.adapters.filings import CoverPage, FilingHeader
 from tradepartner.config import Settings
 
 APPLE = "0000320193"
@@ -730,3 +731,54 @@ def test_a_cached_ranged_header_makes_no_second_request(tmp_path: Path) -> None:
     [second] = fresh.filing_headers(APPLE, ["8-K"])
     assert second == first
     assert not [u for u in router.urls[before:] if "/Archives/" in u]
+
+
+def test_cover_pages_and_headers_after_a_real_filing_index(tmp_path: Path) -> None:
+    """End to end (quant-auditor, #249): no hand-written stamps. The real
+    `filing_index()` scans synthetic index lines for the two recorded
+    accessions, stamps them from the recorded submissions, and `cover_pages`
+    and `filing_headers` serve FSN rows at exactly that stamp, never at FSN's
+    own dates. A second source on the same cache rebuilds the same records
+    without fetching submissions or FSN again."""
+    from edgar_transport import index_header, index_line
+
+    settings = edgar_settings(tmp_path, index_first_year=2025, fsn_first_year=2025)
+    router = _router()
+    lines = {
+        (2025, 4): index_line("10-K", "Apple Inc.", 320193, "2025-10-31", APPLE_ACCESSION),
+        (2026, 1): index_line("10-K", "Alphabet Inc.", 1652044, "2026-02-05", ALPHABET_ACCESSION),
+    }
+    for year, qtr in [(2025, 1), (2025, 2), (2025, 3), (2025, 4), (2026, 1), (2026, 2)]:
+        router.add_index(year, qtr, index_header() + lines.get((year, qtr), ""))
+    clock = datetime(2026, 4, 15, tzinfo=UTC)
+
+    def run() -> tuple[dict[str, datetime], list[CoverPage], list[CoverPage], list[FilingHeader]]:
+        source = EdgarFilingSource(settings, client=router.client(), clock=lambda: clock)
+        entries = {e.accession: e.accepted_at for e in source.filing_index()}
+        return (
+            entries,
+            source.cover_pages(APPLE),
+            source.cover_pages(ALPHABET),
+            source.filing_headers(APPLE, settings.edgar.header_forms),
+        )
+
+    entries, apple, alphabet, headers = run()
+    assert entries[APPLE_ACCESSION] == APPLE_ACCEPTED
+    assert entries[ALPHABET_ACCESSION] == ALPHABET_ACCEPTED
+    [apple_page] = [p for p in apple if p.accession == APPLE_ACCESSION]
+    [alphabet_page] = [p for p in alphabet if p.accession == ALPHABET_ACCESSION]
+    assert apple_page.accepted_at == APPLE_ACCEPTED and apple_page.accepted_at.tzinfo is UTC
+    # FSN has Alphabet accepted 2026-02-04 21:56 Eastern and filed 20260205;
+    # the served stamp is the submissions' 2026-02-05T02:56:03Z.
+    assert alphabet_page.accepted_at == ALPHABET_ACCEPTED
+    [apple_header] = [h for h in headers if h.accession == APPLE_ACCESSION]
+    assert (apple_header.sic, apple_header.accepted_at) == (3571, APPLE_ACCEPTED)
+
+    before = len(router.urls)
+    again = run()
+    assert again[1:] == (apple, alphabet, headers)
+    later = router.urls[before:]
+    assert not [u for u in later if "data.sec.gov/submissions" in u]
+    # FSN zip URLs appear once per cached period: the HEAD re-issue check,
+    # not a re-download (the router records URLs, not methods).
+    assert len([u for u in later if "_notes.zip" in u]) == 3
