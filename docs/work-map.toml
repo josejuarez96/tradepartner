@@ -293,3 +293,13 @@ why = "What the ready frontier is computed from."
 [spec.data-foundation]
 what = "What Phase 2 builds and how we know it is done."
 why = "The acceptance criteria every Phase 2 task answers to."
+
+[spec.paper-trading]
+what = "What Phase 4 builds and how we know it is done: the risk-gated broker wrapper, the Alpaca paper adapter, the scheduled tracking run, the journal, the operations and override pages, alerts and the wash-sale lot ledger."
+why = "The acceptance criteria every Phase 4 task answers to; six unattended paper rebalances under these rules are the MVP's finish line."
+unblocks = ["phase:4"]
+
+[issue.247]
+what = "Draft the Phase 4 spec so its tasks can be planned the day Phase 3 closes."
+why = "Phase 4 has no spec or plan; without one the wrapper, the run and the pages would be built from memory of the ADRs."
+unblocks = ["spec:paper-trading"]

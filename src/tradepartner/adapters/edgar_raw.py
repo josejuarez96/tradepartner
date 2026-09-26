@@ -203,6 +203,12 @@ def _padded_cik(cik: str) -> str:
     return cik.strip().zfill(10)
 
 
+def validate_accession(accession: str) -> None:
+    """Public form of `_validate_accession`, for callers that build cache
+    paths from an accession (T11d's cover and header caches)."""
+    _validate_accession(accession)
+
+
 def _validate_accession(accession: str) -> None:
     """`accession` must be a real EDGAR accession number, e.g. `0000320193-24-000123`.
 

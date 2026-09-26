@@ -1,4 +1,5 @@
-"""The EDGAR `FilingSource` (spec req 6, plan T11b; T11c adds the per-CIK methods).
+"""The EDGAR `FilingSource` (spec req 6, plan T11b; T11c adds FSN fetch and
+parse; T11d serves `cover_pages`/`filing_headers` from it).
 
 Every fetch goes through `edgar_raw` (throttle, retry, `User-Agent`) and
 every payload through the `edgar` parsers; this module decides what to
@@ -32,6 +33,26 @@ rebuilt about 03:00 ET, so after a bulk pass the CIKs still unstamped get
 the per-CIK fetch. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
 when its quarter had settled before the per-CIK fetch that lacked it.
+
+**Cover pages and headers (T11d).** `cover_pages` and `filing_headers` serve
+the FSN caches T11c built, each row re-stamped at read time from
+`_load_stamps(cik)`, never from FSN's own dates or a document's own
+`ACCEPTANCE-DATETIME`. What FSN does not (yet) hold is covered per
+document: a cover-page accession gets one iXBRL parse when it is inline
+XBRL, its base form is in `edgar.cover_page_forms` and it was accepted on
+or after the lag window's start (the first day of the newest cached FSN
+period); an older such accession absent from FSN is not fetched and is
+counted on `.fsn_missing`, unless its FSN extraction itself failed (that
+is T11f's `.failed_filings` to count). A header gets a ranged
+`filing_sgml_header` fetch when its accession is absent from FSN and
+either its base form is a registration form (`S-1`, `F-1`, `10-12B`)
+accepted on or after `edgar.header_start_year`, or it is accepted inside
+the lag window (periodic forms and 8-K); an FSN header with a blank SIC
+inside the lag window also gets one, so a de-SPAC's new SIC still
+arrives with its 8-K. Each per-document result is cached by accession,
+its stamp stripped, under its own version constant (`COVER_VERSION`,
+`HEADER_VERSION`): a cached entry always wins over FSN for its accession,
+until the version bumps or the cache is cleared.
 """
 
 from __future__ import annotations
@@ -39,6 +60,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import re
 import shutil
 import zipfile
 import zlib
@@ -54,13 +76,16 @@ import httpx
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import (
+    CoverPageParse,
     FsnFiling,
     FsnShare,
     UnstampedFiling,
     acceptance_times,
     parse_company_tickers,
+    parse_cover_page,
     parse_filing_index,
     parse_fsn,
+    parse_sgml_header,
 )
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -81,6 +106,17 @@ PARSER_VERSION = 1
 #: Separate from `PARSER_VERSION`, which stays the per-CIK stamps' key: a
 #: bump here re-downloads every period's zip (the PR states that cost).
 FSN_VERSION = 1
+#: Bumped when `parse_cover_page` changes and every per-document cover-page
+#: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
+#: or bumping this switches a per-document accession back to its FSN row.
+COVER_VERSION = 1
+#: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
+HEADER_VERSION = 1
+
+#: Registration forms (T11d): a ranged header is requested from
+#: `edgar.header_start_year`, unlike periodic forms and 8-K, which only get
+#: one inside the lag window.
+_REGISTRATION_FORMS = frozenset({"S-1", "F-1", "10-12B"})
 
 #: The four `dei` cover-page concepts FSN's `num.tsv`/`txt.tsv` are filtered
 #: to while streaming each zip member (module docstring "Caches").
@@ -173,8 +209,14 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
+        self.fsn_missing = 0
         self._filing_index_ran = False
         self._fsn_ready = False
+        self._fsn_failed_accessions: frozenset[str] = frozenset()
+        # Every accession FSN extracted, under whichever CIK it keys the filing
+        # to, and the in-range periods whose manifests load (the lag window).
+        self._fsn_extracted_accessions: frozenset[str] = frozenset()
+        self._fsn_loaded_periods: tuple[str, ...] = ()
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -421,6 +463,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
+        self.fsn_missing = 0
 
         all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
         listed = set(all_periods)
@@ -468,6 +511,21 @@ class EdgarFilingSource(FilingSource):
                 self.fsn_reissue_undetected += 1
             elif now != then:
                 self.fsn_reissued += 1  # re-issued: same period, new content
+
+        failed: set[str] = set()
+        extracted: set[str] = set()
+        loaded: list[str] = []
+        for period in self._cached_fsn_periods():
+            if edgar_raw.fsn_period_year(period) < self._settings.edgar.fsn_first_year:
+                continue
+            manifest = self._load_fsn_manifest(period)
+            if manifest is not None:
+                failed.update(f["accession"] for f in manifest.get("accessions_failed", []))
+                extracted.update(manifest.get("accessions_extracted", []))
+                loaded.append(period)
+        self._fsn_failed_accessions = frozenset(failed)
+        self._fsn_extracted_accessions = frozenset(extracted)
+        self._fsn_loaded_periods = tuple(loaded)
 
         self._fsn_ready = True
 
@@ -622,19 +680,216 @@ class EdgarFilingSource(FilingSource):
         except OSError:
             return []
 
-    # --- T11c ----------------------------------------------------------------
+    def _lag_window_start(self) -> datetime:
+        """The first day (Eastern midnight, as UTC) of the newest cached FSN
+        period at or after `edgar.fsn_first_year`. With no such period
+        (e.g. `fsn_first_year` past the newest listed period) it raises
+        rather than treating all history as the lag window."""
+        periods = self._fsn_loaded_periods  # in range, and the manifest loads
+        if not periods:
+            # Fail closed: "everything is inside the lag window" would request
+            # a header for every 8-K and 10-Q since 1993 (#249 safety review).
+            raise RuntimeError(
+                "no cached FSN period at or after edgar.fsn_first_year="
+                f"{self._settings.edgar.fsn_first_year}; is it later than the newest period?"
+            )
+        newest = max(periods, key=_fsn_period_sort_key)
+        start = _fsn_period_start(newest)
+        return datetime(start.year, start.month, start.day, tzinfo=_EASTERN).astimezone(UTC)
 
-    def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
-        _t11c()
-
-    def filing_headers(self, cik: str, forms: Sequence[str]) -> list[FilingHeader]:
-        _t11c()
+    # --- cover pages and headers from FSN (T11d) -----------------------------
 
     def cover_pages(self, cik: str) -> list[CoverPage]:
-        _t11c()
+        """FSN cover pages of `cik` (stamped at read time), plus a per-document
+        parse for lag-window accessions FSN does not (yet) hold. See the
+        module docstring's "Cover pages and headers" section."""
+        self._ensure_fsn()
+        stamps = self._load_stamps(cik)
+        fsn_cache = self._load_fsn_cache(cik)
+        cover_forms = set(self._settings.edgar.cover_page_forms)
+        lag_start = self._lag_window_start()
+
+        pages: list[CoverPage] = []
+        for accession, record in stamps.items():
+            if record.accepted_at is None:
+                continue  # unstampable: already reported on .unstamped_filings
+            if record.form.removesuffix("/A") not in cover_forms:
+                continue
+            cached = self._load_cover_cache(accession)
+            if cached is not None:
+                if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
+                    pages.append(CoverPage(cik, accession, record.accepted_at, cached.listings))
+                continue
+            fsn_filing = fsn_cache.get(accession)
+            if fsn_filing is not None:
+                pages.append(CoverPage(cik, accession, record.accepted_at, fsn_filing.listings))
+                continue
+            if accession in self._fsn_extracted_accessions:
+                continue  # FSN holds it under the filer's CIK: this CIK is a co-registrant
+            if not record.inline_xbrl:
+                continue
+            if record.accepted_at >= lag_start:
+                parsed = self._fetch_cover_page(
+                    cik, accession, record.primary_document, record.accepted_at
+                )
+                if parsed.cover.cik == cik:  # a combined filing names one entity
+                    pages.append(
+                        CoverPage(cik, accession, record.accepted_at, parsed.cover.listings)
+                    )
+            elif accession not in self._fsn_failed_accessions:
+                self.fsn_missing += 1
+        pages.sort(key=lambda p: (p.accepted_at, p.accession))
+        return pages
+
+    def _fetch_cover_page(
+        self, cik: str, accession: str, primary_document: str, accepted_at: datetime
+    ) -> CoverPageParse:
+        # The root copy, never an `xsl.../` rendering of it (plan T11d).
+        root_document = re.sub(r"^xsl[^/]*/", "", primary_document)
+        path = edgar_raw.download_filing_file(
+            cik, accession, root_document, settings=self._settings, client=self._client
+        )
+        try:
+            document = path.read_bytes()
+            parsed = parse_cover_page(document, accession=accession, accepted_at=accepted_at)
+        finally:
+            path.unlink(missing_ok=True)  # the document is deleted after parsing
+        self._save_cover_cache(accession, cik, parsed)
+        return parsed
+
+    def _cover_cache_path(self, accession: str) -> Path:
+        # One entry per accession: `parse_cover_page` does not depend on the
+        # CIK asking. The entry records the entity it names, and only that CIK
+        # is served its listings (co-registrants of a combined filing are not).
+        edgar_raw.validate_accession(accession)
+        return self._cache / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
+
+    def _load_cover_cache(self, accession: str) -> _CachedCoverPage | None:
+        try:
+            data = json.loads(self._cover_cache_path(accession).read_bytes())
+            if data.get("version") != COVER_VERSION or data.get("accession") != accession:
+                return None
+            return _CachedCoverPage(
+                entity_cik=str(data["entity_cik"]),
+                listings=tuple(CoverListing(*item) for item in data["listings"]),
+                facts=tuple(_fact_from_json(f) for f in data["facts"]),
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None  # absent, truncated or another version: fetch again
+
+    def _save_cover_cache(self, accession: str, cik: str, parsed: CoverPageParse) -> None:
+        data = {
+            "version": COVER_VERSION,
+            "accession": accession,
+            "cik": cik,
+            "entity_cik": parsed.cover.cik,
+            "listings": [
+                [item.title, item.ticker, item.exchange] for item in parsed.cover.listings
+            ],
+            "facts": [_fact_to_json(f) for f in parsed.facts],
+        }
+        edgar_raw.write_atomic(self._cover_cache_path(accession), json.dumps(data).encode("utf-8"))
+
+    def filing_headers(self, cik: str, forms: Sequence[str]) -> list[FilingHeader]:
+        """SIC headers of `cik`'s filings whose base form is in `forms`: from
+        FSN with no request, plus a ranged SGML header where the module
+        docstring's "Cover pages and headers" section says one is owed."""
+        self._ensure_fsn()
+        stamps = self._load_stamps(cik)
+        fsn_cache = self._load_fsn_cache(cik)
+        wanted = set(forms)
+        lag_start = self._lag_window_start()
+        header_start = datetime(
+            self._settings.edgar.header_start_year, 1, 1, tzinfo=_EASTERN
+        ).astimezone(UTC)
+
+        headers: list[FilingHeader] = []
+        for accession, record in stamps.items():
+            if record.accepted_at is None:
+                continue
+            base_form = record.form.removesuffix("/A")
+            if base_form not in wanted:
+                continue
+            cached = self._load_header_cache(cik, accession)
+            if cached is not None:
+                headers.append(
+                    FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
+                )
+                continue
+            fsn_filing = fsn_cache.get(accession)
+            if fsn_filing is not None and fsn_filing.sic is not None:
+                headers.append(
+                    FilingHeader(cik, accession, record.form, fsn_filing.sic, record.accepted_at)
+                )
+                continue
+            if fsn_filing is not None:
+                # a blank FSN SIC (#174: FSN's blanks are 8-Ks): a lag-window
+                # ranged header still brings a de-SPAC's new SIC.
+                if record.accepted_at >= lag_start:
+                    headers.append(
+                        self._ranged_header(cik, accession, record.form, record.accepted_at)
+                    )
+                continue
+            # absent from FSN entirely
+            if base_form in _REGISTRATION_FORMS:
+                if record.accepted_at >= header_start:
+                    headers.append(
+                        self._ranged_header(cik, accession, record.form, record.accepted_at)
+                    )
+            elif record.accepted_at >= lag_start:
+                headers.append(self._ranged_header(cik, accession, record.form, record.accepted_at))
+        headers.sort(key=lambda h: (h.accepted_at, h.accession))
+        return headers
+
+    def _ranged_header(
+        self, cik: str, accession: str, form: str, accepted_at: datetime
+    ) -> FilingHeader:
+        cached = self._load_header_cache(cik, accession)
+        if cached is None:
+            text = edgar_raw.filing_sgml_header(
+                cik, accession, settings=self._settings, client=self._client
+            )
+            parsed = parse_sgml_header(text, cik=cik)
+            if parsed.accession != accession:
+                raise ValueError(
+                    f"SGML header requested for {accession} names accession {parsed.accession!r}"
+                )
+            self._save_header_cache(accession, cik, parsed.sic)
+            sic = parsed.sic
+        else:
+            sic = cached.sic
+        return FilingHeader(cik, accession, form, sic, accepted_at)
+
+    def _header_cache_path(self, cik: str, accession: str) -> Path:
+        # Keyed per CIK: a combined filing's header gives each co-registrant
+        # its own FILER block's SIC (#249 safety review).
+        edgar_raw.validate_accession(accession)
+        return self._cache / "header" / f"v{HEADER_VERSION}" / f"{int(cik)}" / f"{accession}.json"
+
+    def _load_header_cache(self, cik: str, accession: str) -> _CachedHeader | None:
+        try:
+            data = json.loads(self._header_cache_path(cik, accession).read_bytes())
+            if (
+                data.get("version") != HEADER_VERSION
+                or data.get("accession") != accession
+                or data.get("cik") != cik
+            ):
+                return None
+            return _CachedHeader(sic=data["sic"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None  # absent, truncated or another version: fetch again
+
+    def _save_header_cache(self, accession: str, cik: str, sic: int | None) -> None:
+        data = {"version": HEADER_VERSION, "accession": accession, "cik": cik, "sic": sic}
+        edgar_raw.write_atomic(
+            self._header_cache_path(cik, accession), json.dumps(data).encode("utf-8")
+        )
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
-        _t11c()
+        _t11f()
+
+    def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+        _t11e()
 
 
 def _filed_by(row: UnstampedFiling) -> bool:
@@ -642,8 +897,74 @@ def _filed_by(row: UnstampedFiling) -> bool:
     return int(row.accession[:10]) == int(row.cik)
 
 
-def _t11c() -> NoReturn:
-    raise NotImplementedError("T11c")
+def _t11e() -> NoReturn:
+    raise NotImplementedError("T11e")
+
+
+def _t11f() -> NoReturn:
+    raise NotImplementedError("T11f")
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedFact:
+    """One cached cover-page share fact, unstamped (T11e re-stamps it, as
+    an FSN share is, never from this cache)."""
+
+    fact_name: str
+    as_of_date: date
+    class_member: str
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedCoverPage:
+    """A per-document cover-page parse cached under `COVER_VERSION`, its
+    stamp stripped (T11d re-stamps from `_load_stamps` at read time).
+    `entity_cik` is the CIK the cover page names."""
+
+    entity_cik: str
+    listings: tuple[CoverListing, ...]
+    facts: tuple[_CachedFact, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedHeader:
+    """A per-document SGML-header SIC cached under `HEADER_VERSION`. `sic`
+    itself may legitimately be `None`; the cache file's absence (not this
+    type) means "fetch it"."""
+
+    sic: int | None
+
+
+def _fact_to_json(fact: FactRecord) -> list[object]:
+    return [fact.fact_name, fact.as_of_date.isoformat(), fact.class_member, fact.value]
+
+
+def _fact_from_json(item: Sequence[object]) -> _CachedFact:
+    fact_name, as_of_date, class_member, value = item
+    return _CachedFact(
+        fact_name=str(fact_name),
+        as_of_date=date.fromisoformat(str(as_of_date)),
+        class_member=str(class_member),
+        value=float(value),  # type: ignore[arg-type]
+    )
+
+
+def _fsn_period_start(period: str) -> date:
+    """The first calendar day of an FSN period spelled `YYYYqN` or `YYYY_MM`
+    (a quarter's first month)."""
+    if "q" in period:
+        year, qtr = period.split("q")
+        return date(int(year), (int(qtr) - 1) * 3 + 1, 1)
+    year, month = period.split("_")
+    return date(int(year), int(month), 1)
+
+
+def _fsn_period_sort_key(period: str) -> tuple[int, int, int]:
+    """As `edgar_raw._fsn_period_sort_key`: a quarter ranks ahead of the
+    months it may later split into, at the same first month."""
+    start = _fsn_period_start(period)
+    return (start.year, start.month, 0 if "q" in period else 1)
 
 
 # --- FSN data sets: zip extraction and DuckDB reads (T11c) ------------------

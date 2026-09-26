@@ -462,18 +462,20 @@ def test_edgar_run_message_names_only_the_counts_the_source_exposes(settings: Se
 
 def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
     """T11c: FSN re-issues, duplicates and periods whose re-issue could not be
-    checked, before the benchmarks list so the length cap never cuts them."""
+    checked, before the benchmarks list so the length cap never cuts them.
+    T11d adds `.fsn_missing`: older cover-form accessions absent from FSN."""
 
     class Fsn(FixtureFilingSource):
         fsn_reissued = 2
         fsn_duplicates = 1
         fsn_reissue_undetected = 3
         fsn_incomplete_listings = 4
+        fsn_missing = 5
 
     message = _run(settings, filings=_filings(cls=Fsn), source="edgar").runs[0].message
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
-        "FSN incomplete listings: 4; missing"
+        "FSN incomplete listings: 4; FSN missing: 5; missing"
     )
     assert counts in message
 
