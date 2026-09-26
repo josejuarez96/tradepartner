@@ -511,6 +511,39 @@ def test_a_short_lived_reader_is_waited_for(settings: Settings) -> None:
         proc.wait(timeout=10)
 
 
+def _open_from_another_process(path: str, *, read_only: bool) -> int:
+    code = f"import duckdb; duckdb.connect(database={path!r}, read_only={read_only}).close()"
+    return subprocess.run([sys.executable, "-c", code], check=False).returncode
+
+
+@dataclass
+class _Slow(_Prices):
+    """`_Prices` that runs `during` while it fetches bars."""
+
+    during: Callable[[], None] | None = None
+
+    def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+        if self.during is not None:
+            self.during()
+        return super().bars(security_ids, start, end)
+
+
+def test_the_store_is_free_while_the_price_side_fetches(settings: Settings) -> None:
+    # #173: the daily Alpaca chunk reads its names on a short read and fetches
+    # with no connection open; only the write is a transaction.
+    _run(settings, source="edgar")
+    opened: list[int] = []
+
+    def others() -> None:
+        path = settings.store.path
+        opened.append(_open_from_another_process(path, read_only=True))
+        opened.append(_open_from_another_process(path, read_only=False))
+
+    result = _run(settings, _Slow(during=others), source="alpaca")
+    assert result.ok
+    assert opened == [0, 0]
+
+
 def test_a_writer_that_never_closes_fails_after_the_retry_window(settings: Settings) -> None:
     _run(settings)
     proc = _hold(settings.store.path, read_only=False, seconds=30)
