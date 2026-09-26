@@ -9,11 +9,13 @@
    `holdout.decide` with no gap series, then `registry.open_trial` with the kind,
    repeat mark and reasons that answer gives. The decision is pure and reads no
    market data, so it can precede the insert: the `trials` row is append-only,
-   so its kind must be known when it is written. A window or holdout refusal
-   has no kind and is opened as `in_sample`, so it never counts as a holdout
-   spend. A holdout run also appends a `holdout_spend` owner decision.
-2. **Refuse** `refused_window` and `refused_holdout` (and a gap override without
-   a reason) at once: `close_trial` in its own chunk, no `StoreProvider` built.
+   so its kind must be known when it is written. A refusal at this point
+   (`refused_window`, `refused_holdout`, or `refused_gap` for `--override-gap`
+   without a reason, before any gap read) is opened as `in_sample` with no
+   holdout reason, so it never counts as a holdout spend. A holdout run also
+   appends a `holdout_spend` owner decision.
+2. **Refuse** those at once: `close_trial` in its own chunk, no `StoreProvider`
+   built.
 3. **Gap gate** (holdout runs): `survivorship_gap` at the window's rebalance
    closes and nothing else, then `decide` again; `refused_gap` closes the trial,
    an override the gate needed appends a `gap_override` owner decision.
@@ -25,9 +27,17 @@
    since the open.
 
 Any exception after the open closes the trial `failed` with the exception's type
-and text, so every trial ends with a result row unless the process dies (then
-it lists as `unfinished`). An exception before the open (an unregistered slug,
-a synthetic trial on the real store) raises: there is no trial yet.
+and text as the message, and returns the formatted traceback in
+`RunOutcome.error` for the caller to print, so every trial ends with a result
+row unless the process dies (then it lists as `unfinished`). An exception before
+the open (an unregistered slug, a synthetic trial on the real store) raises:
+there is no trial yet.
+
+Only `write_results` compares the store's latest `ingested_at` with the value at
+the open. A `refused_gap`, and the gap values stored with a `gap_override`, are
+not compared: an ingest after the open can at worst leave a refusal that newer
+data would have passed (a refusal spends nothing) or override values read from
+the newer data, whose run then fails at the write. Conservative, not exact.
 
 DuckDB allows one connection mode per file per process, so no read-only
 connection is open while a write chunk runs: the provider releases its step
@@ -42,9 +52,12 @@ the real store whatever path reaches it.
 from __future__ import annotations
 
 import math
+import traceback
+from dataclasses import dataclass
 from datetime import date
 from functools import partial
 from pathlib import Path
+from typing import Literal, cast
 
 from tradepartner.backtest import engine
 from tradepartner.backtest.engine import BacktestResult
@@ -67,9 +80,23 @@ from tradepartner.store import registry, schema
 from tradepartner.store.db import open_for_write, open_read_only
 
 Results = dict[float, BacktestResult]
+Status = Literal["ok", "failed", "refused_window", "refused_holdout", "refused_gap"]
 
 #: The owner, unless a caller (`backtest-runner`, a test) names itself.
 DEFAULT_RUN_BY = "owner"
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    """One trial's outcome. `results` are the per-level results written with an
+    `ok` row, else None; `error` is the formatted traceback of the exception that
+    made the trial `failed` (None for a store change, which raises nothing), for
+    the caller to print. The one-line message is in `trial_results`."""
+
+    trial_id: int
+    status: Status
+    results: Results | None = None
+    error: str | None = None
 
 
 def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
@@ -89,9 +116,16 @@ def _window(frozen: Frozen, start: date | None, end: date | None) -> Window:
     )
 
 
-def _close(store: Settings, handle: registry.TrialHandle, status: str, message: str) -> None:
+def _close(
+    store: Settings,
+    handle: registry.TrialHandle,
+    status: Status,
+    message: str,
+    error: str | None = None,
+) -> RunOutcome:
     with open_for_write(store) as conn:
         registry.close_trial(conn, handle, status, message)
+    return RunOutcome(handle.trial_id, status, error=error)
 
 
 def _gap_values(decision: Decision, frozen: Frozen, series: dict[date, float]) -> dict[str, object]:
@@ -116,13 +150,13 @@ def run_hypothesis(
     reasons: Reasons | None = None,
     note: str | None = None,
     run_by: str = DEFAULT_RUN_BY,
-) -> tuple[int, Results | None]:
+) -> RunOutcome:
     """Run `slug`'s latest registration over `[start, end]` as one trial and return
-    `(trial_id, results)` (module docstring).
+    its `RunOutcome` (module docstring).
 
-    `start` and `end` default to the in-sample window's. `results` are the engine's
-    per-level results that were written with an `ok` row, or None when the trial
-    was refused or failed; its status and message are in `trial_results`. Raises
+    `start` and `end` default to the in-sample window's. The outcome carries the
+    recorded status, the results written with an `ok` row and, on `failed`, the
+    formatted traceback; the one-line message is in `trial_results`. Raises
     `registry.UnknownHypothesis` for an unregistered slug and
     `registry.RealStoreRefused` for `synthetic=True` on `settings.store.path`,
     both before any trial exists.
@@ -139,18 +173,19 @@ def run_hypothesis(
         spends = registry.family_holdout_spends(conn, hypothesis.family)
         decision = decide(window, frozen, flags, reasons, None, spends)
         sessions = gap_sessions(window)
-        holdout = decision.kind == "holdout"
+        refused = decision.outcome not in ("run", "needs_gap")
+        holdout = decision.kind == "holdout" and not refused
         handle = registry.open_trial(
             conn,
             hypothesis_id=hypothesis.hypothesis_id,
-            kind=decision.kind or "in_sample",
+            kind="holdout" if holdout else "in_sample",
             start_session=window.start,
             end_session=window.end,
             data_cutoff=read_time(sessions[-1]) if sessions else None,
             synthetic=synthetic,
             run_by=run_by,
-            holdout_repeat=decision.holdout_repeat,
-            holdout_reason=decision.holdout_reason,
+            holdout_repeat=holdout and decision.holdout_repeat,
+            holdout_reason=decision.holdout_reason if holdout else None,
             gap_override_reason=reasons.gap_reason if holdout and flags.override_gap else None,
             note=note,
             settings=live,
@@ -169,9 +204,8 @@ def run_hypothesis(
                 trial_id=handle.trial_id,
             )
 
-    if decision.outcome not in ("run", "needs_gap"):
-        _close(store, handle, decision.outcome, decision.message)
-        return handle.trial_id, None
+    if refused:
+        return _close(store, handle, cast(Status, decision.outcome), decision.message)
     try:
         with StoreProvider(partial(open_read_only, store), handle, params) as provider:
             if decision.outcome == "needs_gap":
@@ -182,8 +216,7 @@ def run_hypothesis(
                 provider.end_step()
                 decision = decide(window, frozen, flags, reasons, series, spends)
                 if decision.outcome != "run":
-                    _close(store, handle, decision.outcome, decision.message)
-                    return handle.trial_id, None
+                    return _close(store, handle, cast(Status, decision.outcome), decision.message)
                 if decision.gap_override_reason is not None:
                     with open_for_write(store) as conn:
                         registry.record_decision(
@@ -199,6 +232,8 @@ def run_hypothesis(
         with open_for_write(store) as conn:
             status = write_results(conn, handle, results, params)
     except Exception as exc:
-        _close(store, handle, "failed", f"{type(exc).__name__}: {exc}")
-        return handle.trial_id, None
-    return handle.trial_id, results if status == "ok" else None
+        error = "".join(traceback.format_exception(exc))
+        return _close(store, handle, "failed", f"{type(exc).__name__}: {exc}", error)
+    if status == "ok":
+        return RunOutcome(handle.trial_id, "ok", results)
+    return RunOutcome(handle.trial_id, "failed")

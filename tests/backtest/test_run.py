@@ -43,6 +43,8 @@ HOLDOUT_SESSIONS = (date(2019, 5, 31), date(2019, 6, 28), date(2019, 7, 31), dat
 LEVELS = {0.0, 15.0, 30.0, 60.0, 100.0}
 SPEND = Flags(spend_holdout=True)
 SPEND_REASON = Reasons(holdout_reason="owner spends the holdout")
+OVERRIDE = Flags(spend_holdout=True, override_gap=True)
+OVERRIDE_REASONS = Reasons(holdout_reason="spend", gap_reason="owner accepts the June gap")
 
 _METHODS = (
     "universe",
@@ -101,7 +103,14 @@ def store(fixture_store_path: Path) -> Path:
 
 
 class Calls(list[tuple[str, Any]]):
-    """`(method, t)` per provider call; `("__init__", None)` per construction."""
+    """`(method, t)` per provider call (`t` the read time, `late_dividends`' second
+    argument); `("__init__", None)` per construction. `inserted` is set once the
+    mid-run write has happened."""
+
+    inserted = False
+
+    def read_times(self) -> list[datetime]:
+        return [t for name, t in self if name != "__init__"]
 
 
 def _spy(
@@ -118,10 +127,11 @@ def _spy(
 
     def wrap(name: str) -> Any:
         def method(self: StoreProvider, *args: Any, **kwargs: Any) -> Any:
-            calls.append((name, args[0]))
+            calls.append((name, args[1] if name == "late_dividends" else args[0]))
             if name == fail:
                 raise RuntimeError("injected provider error")
-            if name == "adjusted_prices" and write_to is not None and len(calls) > 1:
+            if name == "adjusted_prices" and write_to is not None and not calls.inserted:
+                calls.inserted = True
                 _insert_mid_run(self, write_to)
             return getattr(StoreProvider, name)(self, *args, **kwargs)
 
@@ -133,14 +143,8 @@ def _spy(
     return calls
 
 
-_written: set[Path] = set()
-
-
 def _insert_mid_run(provider: StoreProvider, path: Path) -> None:
-    """Once per store: a new bar after the window, ingested now, between two reads."""
-    if path in _written:
-        return
-    _written.add(path)
+    """A new bar after the window, ingested now, between two reads."""
     provider.end_step()
     with open_for_write(_store(path)) as conn:
         insert_row(
@@ -201,23 +205,26 @@ def test_ok_run_returns_results_and_leaves_an_ok_row(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _spy(monkeypatch)
-    trial_id, results = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
 
+    assert (outcome.status, outcome.error) == ("ok", None)
+    results = outcome.results
     assert results is not None and set(results) == LEVELS
     assert max(row.n_targets for row in results[15.0].rebalances) >= 2
     conn = read()
-    trial = _row(conn, "trials", trial_id)
+    trial = _row(conn, "trials", outcome.trial_id)
     assert (trial["kind"], trial["synthetic"]) == ("in_sample", True)
     assert (trial["start_session"], trial["end_session"]) == (IN_SAMPLE_START, DEFAULT_END)
     assert trial["data_cutoff"] == read_time(DEFAULT_END)
-    assert _row(conn, "trial_results", trial_id)["status"] == "ok"
+    assert _row(conn, "trial_results", outcome.trial_id)["status"] == "ok"
     levels = conn.execute(
-        "SELECT DISTINCT cost_per_side_bps FROM trial_equity WHERE trial_id = ?", [trial_id]
+        "SELECT DISTINCT cost_per_side_bps FROM trial_equity WHERE trial_id = ?",
+        [outcome.trial_id],
     ).fetchall()
     assert {level for (level,) in levels} == LEVELS
     assert calls.count(("__init__", None)) == 1
-    # The engine read only at rebalance closes of the default window.
-    assert max(t for name, t in calls if name == "universe") <= read_time(DEFAULT_END)
+    # Every read is at or before the default window's last rebalance close.
+    assert calls.read_times() and max(calls.read_times()) <= read_time(DEFAULT_END)
 
 
 def test_frozen_params_used(store: Path, read: Read, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,9 +244,9 @@ def test_frozen_params_used(store: Path, read: Read, monkeypatch: pytest.MonkeyP
         return real_run(params, provider, start, end, *rest)
 
     monkeypatch.setattr(engine, "run", spy_run)
-    trial_id, results = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
 
-    assert results is not None
+    assert outcome.status == "ok" and outcome.results is not None
     [(params, start, end, levels)] = seen
     assert params.strategy.top_fraction == 0.5
     assert params.costs.per_side_bps == 15.0
@@ -247,17 +254,21 @@ def test_frozen_params_used(store: Path, read: Read, monkeypatch: pytest.MonkeyP
     assert params.gap.count_share_threshold == 0.05
     assert (start, end) == (IN_SAMPLE_START, DEFAULT_END)
     assert set(levels) == LEVELS
-    assert _row(read(), "trial_results", trial_id)["status"] == "ok"
+    assert _row(read(), "trial_results", outcome.trial_id)["status"] == "ok"
 
 
-def test_injected_provider_error_leaves_failed(
+def test_injected_provider_error_leaves_failed_and_returns_the_traceback(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _spy(monkeypatch, fail="universe")
-    trial_id, results = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
 
-    assert results is None
-    result = _row(read(), "trial_results", trial_id)
+    assert (outcome.status, outcome.results) == ("failed", None)
+    assert outcome.error is not None
+    assert outcome.error.startswith("Traceback (most recent call last):")
+    assert "in method" in outcome.error  # the spy's frame: the whole stack is kept
+    assert outcome.error.rstrip().endswith("RuntimeError: injected provider error")
+    result = _row(read(), "trial_results", outcome.trial_id)
     assert result["status"] == "failed"
     assert result["message"] == "RuntimeError: injected provider error"
 
@@ -266,11 +277,11 @@ def test_row_inserted_mid_run_leaves_failed(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _spy(monkeypatch, write_to=store)
-    trial_id, results = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
 
-    assert results is None
-    assert store in _written and ("adjusted_prices", read_time(DEFAULT_END)) in calls
-    result = _row(read(), "trial_results", trial_id)
+    assert (outcome.status, outcome.results, outcome.error) == ("failed", None, None)
+    assert calls.inserted and ("adjusted_prices", read_time(DEFAULT_END)) in calls
+    result = _row(read(), "trial_results", outcome.trial_id)
     assert (result["status"], result["message"]) == ("failed", registry.STORE_CHANGED_MESSAGE)
 
 
@@ -286,12 +297,13 @@ def test_refused_window_makes_no_provider_call(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, start: date, end: date
 ) -> None:
     calls = _spy(monkeypatch)
-    trial_id, results = run_hypothesis(SLUG, start, end, SPEND, store_path=store)
+    outcome = run_hypothesis(SLUG, start, end, SPEND, store_path=store)
 
-    assert results is None and calls == []
+    assert (outcome.status, outcome.results) == ("refused_window", None)
+    assert calls == []
     conn = read()
-    assert _row(conn, "trial_results", trial_id)["status"] == "refused_window"
-    trial = _row(conn, "trials", trial_id)
+    assert _row(conn, "trial_results", outcome.trial_id)["status"] == "refused_window"
+    trial = _row(conn, "trials", outcome.trial_id)
     assert (trial["start_session"], trial["end_session"]) == (start, end)
 
 
@@ -299,60 +311,126 @@ def test_refused_holdout_makes_no_provider_call(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _spy(monkeypatch)
-    trial_id, results = run_hypothesis(SLUG, *HOLDOUT_WINDOW, Flags(), store_path=store)
+    outcome = run_hypothesis(SLUG, *HOLDOUT_WINDOW, Flags(), store_path=store)
 
-    assert results is None and calls == []
+    assert (outcome.status, outcome.results) == ("refused_holdout", None)
+    assert calls == []
     conn = read()
-    assert _row(conn, "trial_results", trial_id)["status"] == "refused_holdout"
-    assert _row(conn, "trials", trial_id)["kind"] == "in_sample"
-    assert _decisions(conn, trial_id) == {}
+    assert _row(conn, "trial_results", outcome.trial_id)["status"] == "refused_holdout"
+    assert _row(conn, "trials", outcome.trial_id)["kind"] == "in_sample"
+    assert _decisions(conn, outcome.trial_id) == {}
 
 
 def test_refused_gap_after_gap_reads_only(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _spy(monkeypatch)
-    trial_id, results = run_hypothesis(
-        SLUG, *HOLDOUT_WINDOW, SPEND, reasons=SPEND_REASON, store_path=store
-    )
+    outcome = run_hypothesis(SLUG, *HOLDOUT_WINDOW, SPEND, reasons=SPEND_REASON, store_path=store)
 
-    assert results is None
+    assert (outcome.status, outcome.results) == ("refused_gap", None)
     assert calls == [
         ("__init__", None),
         *(("survivorship_gap", read_time(s)) for s in HOLDOUT_SESSIONS),
     ]
     conn = read()
-    result = _row(conn, "trial_results", trial_id)
+    result = _row(conn, "trial_results", outcome.trial_id)
     assert result["status"] == "refused_gap"
     assert "2019-06-28" in result["message"]
-    trial = _row(conn, "trials", trial_id)
+    trial = _row(conn, "trials", outcome.trial_id)
     assert (trial["kind"], trial["holdout_reason"]) == ("holdout", SPEND_REASON.holdout_reason)
     assert trial["gap_override_reason"] is None
-    decisions = _decisions(conn, trial_id)
+    decisions = _decisions(conn, outcome.trial_id)
     assert set(decisions) == {"holdout_spend"}
     assert decisions["holdout_spend"]["reason"] == SPEND_REASON.holdout_reason
+
+
+def test_override_without_a_gap_reason_spends_nothing(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    blank = Reasons(holdout_reason="spend", gap_reason="  ")
+    refused = run_hypothesis(
+        SLUG, *HOLDOUT_WINDOW, OVERRIDE, reasons=blank, synthetic=True, store_path=store
+    )
+
+    assert (refused.status, refused.results) == ("refused_gap", None)
+    assert calls == []
+    conn = read()
+    trial = _row(conn, "trials", refused.trial_id)
+    assert (trial["kind"], trial["holdout_reason"], trial["gap_override_reason"]) == (
+        "in_sample",
+        None,
+        None,
+    )
+    assert _decisions(conn, refused.trial_id) == {}
+    conn.close()
+
+    spend = run_hypothesis(
+        SLUG, *HOLDOUT_WINDOW, OVERRIDE, reasons=OVERRIDE_REASONS, synthetic=True, store_path=store
+    )
+    assert spend.status == "ok"
+    assert _row(read(), "trials", spend.trial_id)["holdout_repeat"] is False
 
 
 def test_gap_override_runs_and_records_the_owner_decision(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    reasons = Reasons(holdout_reason="spend", gap_reason="owner accepts the June gap")
-    flags = Flags(spend_holdout=True, override_gap=True)
-    trial_id, results = run_hypothesis(
-        SLUG, *HOLDOUT_WINDOW, flags, reasons=reasons, synthetic=True, store_path=store
+    outcome = run_hypothesis(
+        SLUG, *HOLDOUT_WINDOW, OVERRIDE, reasons=OVERRIDE_REASONS, synthetic=True, store_path=store
     )
 
-    assert results is not None
+    assert outcome.status == "ok" and outcome.results is not None
     conn = read()
-    assert _row(conn, "trial_results", trial_id)["status"] == "ok"
-    trial = _row(conn, "trials", trial_id)
-    assert (trial["kind"], trial["gap_override_reason"]) == ("holdout", reasons.gap_reason)
-    decisions = _decisions(conn, trial_id)
+    assert _row(conn, "trial_results", outcome.trial_id)["status"] == "ok"
+    trial = _row(conn, "trials", outcome.trial_id)
+    assert (trial["kind"], trial["gap_override_reason"]) == ("holdout", OVERRIDE_REASONS.gap_reason)
+    decisions = _decisions(conn, outcome.trial_id)
     assert set(decisions) == {"holdout_spend", "gap_override"}
     override = decisions["gap_override"]
-    assert override["reason"] == reasons.gap_reason
+    assert override["reason"] == OVERRIDE_REASONS.gap_reason
     assert override["values"]["count_share"]["2019-06-28"] == pytest.approx(1 / 13)
     assert override["values"]["threshold"] == 0.05
+
+
+def test_a_second_spend_by_the_same_hypothesis_needs_holdout_repeat(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = run_hypothesis(
+        SLUG, *HOLDOUT_WINDOW, OVERRIDE, reasons=OVERRIDE_REASONS, synthetic=True, store_path=store
+    )
+    assert first.status == "ok"
+
+    calls = _spy(monkeypatch)
+    second = run_hypothesis(
+        SLUG, *HOLDOUT_WINDOW, OVERRIDE, reasons=OVERRIDE_REASONS, synthetic=True, store_path=store
+    )
+    assert (second.status, second.results) == ("refused_holdout", None)
+    assert calls == []
+
+    repeat_flags = Flags(spend_holdout=True, override_gap=True, holdout_repeat=True)
+    third = run_hypothesis(
+        SLUG,
+        *HOLDOUT_WINDOW,
+        repeat_flags,
+        reasons=OVERRIDE_REASONS,
+        synthetic=True,
+        store_path=store,
+    )
+    assert third.status == "ok" and third.results is not None
+
+    conn = read()
+    marks = {
+        o.trial_id: (
+            _row(conn, "trials", o.trial_id)["kind"],
+            _row(conn, "trials", o.trial_id)["holdout_repeat"],
+        )
+        for o in (first, second, third)
+    }
+    assert marks == {
+        first.trial_id: ("holdout", False),
+        second.trial_id: ("in_sample", False),
+        third.trial_id: ("holdout", True),
+    }
 
 
 # --- synthetic --------------------------------------------------------------------------
@@ -374,8 +452,8 @@ def test_synthetic_accepted_on_a_temp_file(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, live: Path
 ) -> None:
     _spy(monkeypatch, fail="universe")
-    trial_id, _ = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
 
     assert not live.exists()
-    trial = _row(read(), "trials", trial_id)
+    trial = _row(read(), "trials", outcome.trial_id)
     assert trial["synthetic"] is True
