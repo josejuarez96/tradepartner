@@ -566,7 +566,7 @@ def _fetch_prices(
     fetch: set[str] = set()
     listed: set[str] = set()
     if Path(settings.store.path).exists():
-        with _read(settings) as conn:
+        with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
             # rows are stamped at their fetch time, which can be after the run began).
             read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
@@ -577,7 +577,7 @@ def _fetch_prices(
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
     action_window = (session.replace(day=1), session)
     actions = prices.corporate_actions(ids, *action_window)
-    with _read(settings) as conn:
+    with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
     actions, covered = _replay_actions(prices, actions, action_window, plan)
     ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
@@ -598,6 +598,20 @@ def _fetch_prices(
     return _PriceFetch(
         session, tuple(bars), tuple(actions), action_window, covered, ingested_at, message
     )
+
+
+@contextmanager
+def _price_read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """`_read` for the price side's fetch pass. It reads before any
+    `init_schema` (only a write migrates), so a store with no tables or an
+    older schema fails plainly: run `edgar` or `all` first."""
+    try:
+        with _read(settings) as conn:
+            yield conn
+    except (duckdb.CatalogException, duckdb.BinderException) as exc:
+        raise LookupError(
+            f"the store's schema is not ready for the price side; run edgar or all first: {exc}"
+        ) from exc
 
 
 def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tuple[int, str]:
