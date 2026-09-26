@@ -213,6 +213,10 @@ class EdgarFilingSource(FilingSource):
         self._filing_index_ran = False
         self._fsn_ready = False
         self._fsn_failed_accessions: frozenset[str] = frozenset()
+        # Every accession FSN extracted, under whichever CIK it keys the filing
+        # to, and the in-range periods whose manifests load (the lag window).
+        self._fsn_extracted_accessions: frozenset[str] = frozenset()
+        self._fsn_loaded_periods: tuple[str, ...] = ()
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -509,13 +513,19 @@ class EdgarFilingSource(FilingSource):
                 self.fsn_reissued += 1  # re-issued: same period, new content
 
         failed: set[str] = set()
+        extracted: set[str] = set()
+        loaded: list[str] = []
         for period in self._cached_fsn_periods():
             if edgar_raw.fsn_period_year(period) < self._settings.edgar.fsn_first_year:
                 continue
             manifest = self._load_fsn_manifest(period)
             if manifest is not None:
                 failed.update(f["accession"] for f in manifest.get("accessions_failed", []))
+                extracted.update(manifest.get("accessions_extracted", []))
+                loaded.append(period)
         self._fsn_failed_accessions = frozenset(failed)
+        self._fsn_extracted_accessions = frozenset(extracted)
+        self._fsn_loaded_periods = tuple(loaded)
 
         self._fsn_ready = True
 
@@ -675,11 +685,7 @@ class EdgarFilingSource(FilingSource):
         period at or after `edgar.fsn_first_year`. With no such period
         (e.g. `fsn_first_year` past the newest listed period) it raises
         rather than treating all history as the lag window."""
-        periods = [
-            p
-            for p in self._cached_fsn_periods()
-            if edgar_raw.fsn_period_year(p) >= self._settings.edgar.fsn_first_year
-        ]
+        periods = self._fsn_loaded_periods  # in range, and the manifest loads
         if not periods:
             # Fail closed: "everything is inside the lag window" would request
             # a header for every 8-K and 10-Q since 1993 (#249 safety review).
@@ -711,19 +717,25 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_cover_cache(accession)
             if cached is not None:
-                pages.append(CoverPage(cik, accession, record.accepted_at, cached.listings))
+                if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
+                    pages.append(CoverPage(cik, accession, record.accepted_at, cached.listings))
                 continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None:
                 pages.append(CoverPage(cik, accession, record.accepted_at, fsn_filing.listings))
                 continue
+            if accession in self._fsn_extracted_accessions:
+                continue  # FSN holds it under the filer's CIK: this CIK is a co-registrant
             if not record.inline_xbrl:
                 continue
             if record.accepted_at >= lag_start:
                 parsed = self._fetch_cover_page(
                     cik, accession, record.primary_document, record.accepted_at
                 )
-                pages.append(CoverPage(cik, accession, record.accepted_at, parsed.cover.listings))
+                if parsed.cover.cik == cik:  # a combined filing names one entity
+                    pages.append(
+                        CoverPage(cik, accession, record.accepted_at, parsed.cover.listings)
+                    )
             elif accession not in self._fsn_failed_accessions:
                 self.fsn_missing += 1
         pages.sort(key=lambda p: (p.accepted_at, p.accession))
@@ -746,8 +758,9 @@ class EdgarFilingSource(FilingSource):
         return parsed
 
     def _cover_cache_path(self, accession: str) -> Path:
-        # Shared across co-registrant CIKs on purpose: `parse_cover_page`
-        # does not depend on the CIK (unlike SGML headers, keyed per CIK).
+        # One entry per accession: `parse_cover_page` does not depend on the
+        # CIK asking. The entry records the entity it names, and only that CIK
+        # is served its listings (co-registrants of a combined filing are not).
         edgar_raw.validate_accession(accession)
         return self._cache / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
 
@@ -757,6 +770,7 @@ class EdgarFilingSource(FilingSource):
             if data.get("version") != COVER_VERSION or data.get("accession") != accession:
                 return None
             return _CachedCoverPage(
+                entity_cik=str(data["entity_cik"]),
                 listings=tuple(CoverListing(*item) for item in data["listings"]),
                 facts=tuple(_fact_from_json(f) for f in data["facts"]),
             )
@@ -768,6 +782,7 @@ class EdgarFilingSource(FilingSource):
             "version": COVER_VERSION,
             "accession": accession,
             "cik": cik,
+            "entity_cik": parsed.cover.cik,
             "listings": [
                 [item.title, item.ticker, item.exchange] for item in parsed.cover.listings
             ],
@@ -904,8 +919,10 @@ class _CachedFact:
 @dataclass(frozen=True, slots=True)
 class _CachedCoverPage:
     """A per-document cover-page parse cached under `COVER_VERSION`, its
-    stamp stripped (T11d re-stamps from `_load_stamps` at read time)."""
+    stamp stripped (T11d re-stamps from `_load_stamps` at read time).
+    `entity_cik` is the CIK the cover page names."""
 
+    entity_cik: str
     listings: tuple[CoverListing, ...]
     facts: tuple[_CachedFact, ...]
 

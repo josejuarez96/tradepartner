@@ -276,7 +276,10 @@ def test_an_fsn_failed_accession_inside_the_lag_window_is_fetched_not_counted(
         + "\n".join(f'<a href="{_fsn_zip_url(p)}">{p}</a>' for p in periods)
         + "</body></html>",
     )
-    router.add(_download_url("0000000099", failed_accession, "fail.htm"), _COVER_DOCUMENT)
+    # Apple's recorded cover, re-labelled as CIK 99's own (synthetic): the
+    # per-document page is served only to the entity it names.
+    document = _COVER_DOCUMENT.replace(b"0000320193", b"0000000099")
+    router.add(_download_url("0000000099", failed_accession, "fail.htm"), document)
     source = _source(settings, router)
     _seed_stamps(
         source,
@@ -342,6 +345,7 @@ def test_a_per_document_cover_cache_wins_over_fsn_until_a_version_bump(
         "version": COVER_VERSION,
         "accession": APPLE_ACCESSION,
         "cik": APPLE,
+        "entity_cik": APPLE,
         "listings": [["Stale Title", "STALE", "NYSE"]],
         "facts": [],
     }
@@ -636,3 +640,93 @@ def test_the_downloaded_document_is_deleted_after_parsing(tmp_path: Path, docume
     with contextlib.suppress(ValueError):  # the parse-error case: still deleted
         source.cover_pages(APPLE)
     assert not edgar_raw.cached_filing_path(APPLE, accession, "del.htm", settings=settings).exists()
+
+
+# --- quant-auditor fixes (#249) ----------------------------------------------
+
+OTHER = "0000999999"  # a co-registrant of Apple's filings, synthetic
+
+
+def test_a_co_registrant_gets_no_cover_page_from_an_fsn_filing_held_by_the_filer(
+    tmp_path: Path,
+) -> None:
+    """FSN keys a combined filing to its primary filer only. The co-registrant
+    must not be served the filer's listings, nor fetch, nor count it missing."""
+    settings = _settings(tmp_path)
+    router = _router()
+    source = _source(settings, router)
+    _seed_stamps(source, OTHER, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", BEFORE_LAG)})
+    before = len(router.urls)
+    assert source.cover_pages(OTHER) == []
+    assert source.fsn_missing == 0
+    assert not [u for u in router.urls[before:] if "/Archives/" in u]
+
+
+def test_a_per_document_cover_page_is_served_only_to_its_own_entity(tmp_path: Path) -> None:
+    """A lag-window combined filing parsed per document names its entity (the
+    Apple cover here); a co-registrant gets no listings and no second fetch."""
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000090"
+    router.add(_download_url(APPLE, accession, "joint.htm"), _COVER_DOCUMENT)
+    router.add(_download_url(OTHER, accession, "joint.htm"), _COVER_DOCUMENT)
+    source = _source(settings, router)
+    record = _record(accession, "10-K", INSIDE_LAG, primary_document="joint.htm")
+    _seed_stamps(source, OTHER, {accession: record})
+    _seed_stamps(source, APPLE, {accession: record})
+    assert source.cover_pages(OTHER) == []
+    [page] = source.cover_pages(APPLE)
+    assert page.accession == accession
+    fetches = [u for u in router.urls if u.endswith("/joint.htm")]
+    assert len(fetches) == 1  # the co-registrant's parse is cached with its entity
+    assert source.fsn_missing == 0
+
+
+@pytest.mark.parametrize(
+    ("accepted", "inside"),
+    [
+        (datetime(2026, 3, 1, 5, 30, tzinfo=UTC), True),  # 2026-03-01 00:30 EST
+        (datetime(2026, 3, 1, 4, 30, tzinfo=UTC), False),  # 2026-02-28 23:30 EST
+    ],
+    ids=["just-inside", "just-outside"],
+)
+def test_the_lag_window_starts_at_eastern_midnight_of_the_newest_period(
+    tmp_path: Path, accepted: datetime, inside: bool
+) -> None:
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000095"
+    router.add(_download_url(APPLE, accession, "edge.htm"), _COVER_DOCUMENT)
+    source = _source(settings, router)
+    record = _record(accession, "10-K", accepted, primary_document="edge.htm")
+    _seed_stamps(source, APPLE, {accession: record})
+    pages = source.cover_pages(APPLE)
+    assert (len(pages), source.fsn_missing) == ((1, 0) if inside else (0, 1))
+
+
+def test_an_unreadable_manifest_does_not_move_the_lag_window(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    router = _router()
+    source = _source(settings, router)
+    source._ensure_fsn()
+    manifests = Path(settings.edgar.cache_dir) / "fsn"
+    [manifest_dir] = list(manifests.glob("v*/manifests"))
+    (manifest_dir / "2026_09.json").write_text("{truncated")
+    fresh = _source(settings, router)
+    fresh._ensure_fsn()
+    assert fresh._lag_window_start() == datetime(2026, 3, 1, 5, 0, tzinfo=UTC)
+
+
+def test_a_cached_ranged_header_makes_no_second_request(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000096"
+    router.add(_header_url(APPLE, accession), _synthetic_header(accession, form="8-K"))
+    source = _source(settings, router)
+    _seed_stamps(source, APPLE, {accession: _record(accession, "8-K", INSIDE_LAG)})
+    [first] = source.filing_headers(APPLE, ["8-K"])
+    before = len(router.urls)
+    fresh = _source(settings, router)
+    [second] = fresh.filing_headers(APPLE, ["8-K"])
+    assert second == first
+    assert not [u for u in router.urls[before:] if "/Archives/" in u]
