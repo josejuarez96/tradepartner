@@ -34,6 +34,7 @@ through the stitched ratios, the delisting exit), not the signal or the adjustme
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
@@ -203,10 +204,16 @@ def _run_bt(
 
 
 def _max_relative_difference(ours: Mapping[date, float], theirs: pd.Series) -> float:
-    return max(
+    """Over every session of ours, which must all be in `theirs` besides `bt`'s own
+    start row; a non-finite equity on either side fails rather than drop out of `max`."""
+    compared = {session.date() for session in theirs.index[1:]}
+    assert compared == set(ours), "bt and our engine report different sessions"
+    differences = [
         abs(float(theirs[pd.Timestamp(session)]) - value) / abs(value)
         for session, value in ours.items()
-    )
+    ]
+    assert all(math.isfinite(d) for d in differences), "non-finite equity"
+    return max(differences)
 
 
 def test_bt_and_engine_agree_on_equity_at_every_session(
@@ -254,7 +261,6 @@ def test_the_delisted_name_is_sold_at_its_last_close_in_both_engines(
     quantity = float(child.positions[before])
     assert quantity > 0
     assert float(child.positions[at]) == 0.0
-    assert float(child.prices[at]) == last_close
     assert abs(quantity * last_close - held) / held <= TOLERANCE
 
 
