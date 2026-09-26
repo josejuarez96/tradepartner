@@ -6,8 +6,10 @@ minus `ingest.settle_delay_minutes` (`expected_session`). Sources run in
 order, `edgar` then `alpaca` (the price side fetches the names the master
 lists), and the run **halts** at the first source that is not `ok`.
 
-**One atomic chunk per source.** EDGAR is fetched with no store connection
-open (a recording pass), then each source's rows are written inside one
+**One atomic chunk per source.** Each source is fetched before its write
+transaction: EDGAR with no store connection open (a recording pass), the
+price side after reading its names and action replay plan on short
+read-only connections (#173). Then each source's rows are written inside one
 `store.db.open_for_write` transaction, which retries the lock for
 `store.lock_retry_seconds` and releases it when the chunk ends. A failure
 anywhere in the chunk rolls all of it back; an earlier source's committed
@@ -67,11 +69,14 @@ skipped-filer counts when the source exposes them (#172).
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -93,7 +98,13 @@ from tradepartner.store.classify import (
     build_classifications,
     classifications_as_of,
 )
-from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
+from tradepartner.store.db import (
+    StoreLockedError,
+    insert_row,
+    open_for_write,
+    open_read_only,
+    utc_now,
+)
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
@@ -198,11 +209,12 @@ def ingest_session(
     recorded = _Recorded(filings)
     work: dict[str, Callable[[duckdb.DuckDBPyConnection], tuple[int, str]]] = {
         "edgar": lambda conn: _ingest_filings(conn, settings, recorded, clock),
-        "alpaca": lambda conn: _ingest_prices(conn, settings, prices, now, clock),
+        "alpaca": lambda conn: _write_prices(conn, fetched["alpaca"]),
     }
+    fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
         "edgar": lambda: _prefetch(recorded, settings),
-        "alpaca": None,
+        "alpaca": lambda: fetched.update(alpaca=_fetch_prices(settings, prices, now, clock)),
     }
     runs: list[SourceRun] = []
     for name in SOURCES if source == "all" else (source,):
@@ -525,28 +537,50 @@ def fact_rows(
 # --- the price chunk --------------------------------------------------------
 
 
-def _ingest_prices(
-    conn: duckdb.DuckDBPyConnection,
+@dataclass(frozen=True)
+class _PriceFetch:
+    """The daily price chunk's fetch pass, ready to write."""
+
+    session: date
+    bars: tuple[Bar, ...]
+    actions: tuple[CorporateAction, ...]
+    action_window: tuple[date, date]
+    covered: tuple[date, date]
+    ingested_at: datetime
+    message: str
+
+
+def _fetch_prices(
     settings: Settings,
     prices: PriceSource,
     now: datetime,
     clock: Callable[[], datetime],
-) -> tuple[int, str]:
+) -> _PriceFetch:
+    """The price side's fetch pass (#173): names and the action replay plan
+    from short read-only connections, bars and actions fetched with no store
+    connection open, then the staleness checks. Raises `LookupError` with no
+    live reference listing and `_Stale` as in the module docstring."""
     session = expected_session(now, settings)
     symbol = settings.ingest.reference_symbol
-    # Read the store as of now, after the EDGAR chunk committed (its snapshot
-    # rows are stamped at their fetch time, which can be after the run began).
-    read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
-    fetch, listed, reference = _price_names(conn, read_at, session, settings)
+    reference: str | None = None
+    fetch: set[str] = set()
+    listed: set[str] = set()
+    if Path(settings.store.path).exists():
+        with _price_read(settings) as conn:
+            # Read the store as of now, after the EDGAR chunk committed (its snapshot
+            # rows are stamped at their fetch time, which can be after the run began).
+            read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
+            fetch, listed, reference = _price_names(conn, read_at, session, settings)
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
     action_window = (session.replace(day=1), session)
     actions = prices.corporate_actions(ids, *action_window)
-    plan = _replay_plan(conn, actions, action_window)
+    with _price_read(settings) as conn:
+        plan = _replay_plan(conn, actions, action_window)
     actions, covered = _replay_actions(prices, actions, action_window, plan)
-    now = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
+    ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
     have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
@@ -557,22 +591,73 @@ def _ingest_prices(
             f"{len(missing)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
             f"have no bar for {session}: {', '.join(missing[:10])}"
         )
-    window = [session, session]
-    added = _add_rows(
-        conn,
-        "prices_daily",
-        [_bar_row(bar, now) for bar in bars],
-        ingested_at=now,
-        current=True,
-        where="AND session BETWEEN ? AND ?",
-        params=window,
-    )
-    added += _add_actions(conn, actions, action_window, ingested_at=now, covered=covered)
     message = (
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
         f"{len(missing)} of {len(listed)} listed names missing"
     )
-    return added, message
+    return _PriceFetch(
+        session, tuple(bars), tuple(actions), action_window, covered, ingested_at, message
+    )
+
+
+@contextmanager
+def _price_read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """`_read` for the price side's fetch pass. It reads before any
+    `init_schema` (only a write migrates), so a store with no tables or an
+    older schema fails plainly: run `edgar` or `all` first."""
+    try:
+        with _read(settings) as conn:
+            yield conn
+    except (duckdb.CatalogException, duckdb.BinderException) as exc:
+        raise LookupError(
+            f"the store's schema is not ready for the price side; run edgar or all first: {exc}"
+        ) from exc
+
+
+def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tuple[int, str]:
+    """The price chunk's write: the fetched bars and actions, nothing fetched."""
+    at, session = fetched.ingested_at, fetched.session
+    added = _add_rows(
+        conn,
+        "prices_daily",
+        [_bar_row(bar, at) for bar in fetched.bars],
+        ingested_at=at,
+        current=True,
+        where="AND session BETWEEN ? AND ?",
+        params=[session, session],
+    )
+    added += _add_actions(
+        conn, fetched.actions, fetched.action_window, ingested_at=at, covered=fetched.covered
+    )
+    return added, fetched.message
+
+
+@contextmanager
+def _read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """A short-lived read-only connection, retrying a writer's lock for
+    `store.lock_retry_seconds` with `open_for_write`'s backoff (spec req 9),
+    then `StoreLockedError`."""
+    cfg = settings.store
+    deadline = time.monotonic() + cfg.lock_retry_seconds
+    delay = cfg.lock_retry_initial_delay_seconds
+    while True:
+        try:
+            reader = open_read_only(settings)
+            conn = reader.__enter__()
+        except StoreLockedError as exc:
+            if isinstance(exc.__cause__, duckdb.ConnectionException):
+                raise  # this process holds the file: waiting never helps
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, cfg.lock_retry_max_delay_seconds)
+            continue
+        try:
+            yield conn
+        finally:
+            reader.__exit__(None, None, None)
+        return
 
 
 def _price_names(

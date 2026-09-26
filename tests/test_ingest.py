@@ -52,6 +52,7 @@ from tradepartner.ingest import (
 )
 from tradepartner.store.asof import facts_as_of, live_actions_as_of, prices_as_of
 from tradepartner.store.classify import build_classifications
+from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import build_master
 from tradepartner.store.schema import init_schema
 
@@ -509,6 +510,92 @@ def test_a_short_lived_reader_is_waited_for(settings: Settings) -> None:
         assert _run(patient, now=NOW + timedelta(days=1)).ok
     finally:
         proc.wait(timeout=10)
+
+
+def _open_from_another_process(path: str, *, read_only: bool) -> int:
+    code = f"import duckdb; duckdb.connect(database={path!r}, read_only={read_only}).close()"
+    return subprocess.run([sys.executable, "-c", code], check=False).returncode
+
+
+@dataclass
+class _Slow(_Prices):
+    """`_Prices` that runs `during` while it fetches bars."""
+
+    during: Callable[[], None] | None = None
+
+    def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+        if self.during is not None:
+            self.during()
+        return super().bars(security_ids, start, end)
+
+
+def test_the_store_is_free_while_the_price_side_fetches(settings: Settings) -> None:
+    # #173: the daily Alpaca chunk reads its names on a short read and fetches
+    # with no connection open; only the write is a transaction.
+    _run(settings, source="edgar")
+    opened: list[int] = []
+
+    def others() -> None:
+        path = settings.store.path
+        opened.append(_open_from_another_process(path, read_only=True))
+        opened.append(_open_from_another_process(path, read_only=False))
+
+    result = _run(settings, _Slow(during=others), source="alpaca")
+    assert result.ok
+    assert opened == [0, 0]
+
+
+def test_a_writer_holding_the_store_during_the_name_read_is_locked(settings: Settings) -> None:
+    _run(settings, source="edgar")
+    proc = _hold(settings.store.path, read_only=False, seconds=30)
+    try:
+        result = _run(settings, source="alpaca")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    assert [(r.source, r.status) for r in result.runs] == [("alpaca", LOCKED)]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT count(*) FROM prices_daily").fetchone() == (0,)
+
+
+def test_a_newer_revision_written_during_the_fetch_fails_the_chunk(settings: Settings) -> None:
+    # Another writer commits a later revision of the reference bar while the
+    # price side fetches: the write would be back-dated behind it, so it fails.
+    _run(settings, source="edgar")
+    later = NOW + timedelta(hours=1)
+
+    def other_writer() -> None:
+        with open_for_write(settings) as conn:
+            insert_row(
+                conn,
+                "prices_daily",
+                {
+                    "security_id": SPY,
+                    "session": SESSION,
+                    "open": 99.0,
+                    "high": 99.0,
+                    "low": 99.0,
+                    "close": 99.0,
+                    "volume": 1,
+                    "known_at": later,
+                    "ingested_at": later,
+                    "source": "alpaca",
+                    "provenance": "bar",
+                },
+            )
+
+    result = _run(settings, _Slow(during=other_writer), source="alpaca")
+    assert [(r.source, r.status) for r in result.runs] == [("alpaca", FAILED)]
+    assert "back-dated" in result.runs[0].message
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT close FROM prices_daily").fetchall() == [(99.0,)]
+
+
+def test_a_store_without_a_schema_fails_the_price_side_plainly(settings: Settings) -> None:
+    duckdb.connect(settings.store.path).close()  # a file with no tables
+    result = _run(settings, source="alpaca")
+    assert [(r.source, r.status) for r in result.runs] == [("alpaca", FAILED)]
+    assert "schema is not ready" in result.runs[0].message
 
 
 def test_a_writer_that_never_closes_fails_after_the_retry_window(settings: Settings) -> None:
