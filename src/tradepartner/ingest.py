@@ -30,6 +30,12 @@ only if it changes what an as-of read returns:
   value now) follow `adapters.prices.revision_of`: first seen as stamped;
   unchanged is skipped; different is a new row at `known_at = ingested_at`,
   never back-dated, and an action keeps the stored `announced_at`.
+  Actions are matched on their identity (#108, #181, `_add_actions`): the
+  source's id when it gives one, so a re-dated action is a revision of one
+  event, found across ex-dates. An id-less re-date (one stored key of a
+  security and type gone from the window, one new key in it) and an id-less
+  key gaining an id are each written as a cancel of the old key plus the new
+  row, both at `ingested_at`. A key merely absent is never cancelled.
 - *Filed* rows (master, delistings, classifications, facts: `known_at` is a
   filing acceptance or fetch time) keep their `known_at` only when it is
   later than every stored row of their key and changes the view. Stored
@@ -121,8 +127,10 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "facts": (("security_id", "fact_name", "as_of_date", "class_member"), ("value",)),
     "prices_daily": (("security_id", "session"), ("open", "high", "low", "close", "volume")),
-    "corporate_actions": (("security_id", "action_type", "ex_date"), ("ratio_or_amount",)),
 }
+
+#: What makes an action row a new revision of its identity (`CorporateAction.same_values`).
+_ACTION_VALUES: tuple[str, ...] = ("action_type", "ex_date", "ratio_or_amount", "cancelled")
 
 
 @dataclass(frozen=True)
@@ -534,7 +542,10 @@ def _ingest_prices(
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
-    actions = prices.corporate_actions(ids, session.replace(day=1), session)
+    action_window = (session.replace(day=1), session)
+    actions = prices.corporate_actions(ids, *action_window)
+    plan = _replay_plan(conn, actions, action_window)
+    actions, covered = _replay_actions(prices, actions, action_window, plan)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
     have = {bar.security_id for bar in bars}
     if reference not in have:
@@ -556,15 +567,7 @@ def _ingest_prices(
         where="AND session BETWEEN ? AND ?",
         params=window,
     )
-    added += _add_rows(
-        conn,
-        "corporate_actions",
-        [_action_row(action, now) for action in actions],
-        ingested_at=now,
-        current=True,
-        where="AND ex_date BETWEEN ? AND ?",
-        params=[session.replace(day=1), session],
-    )
+    added += _add_actions(conn, actions, action_window, ingested_at=now, covered=covered)
     message = (
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
         f"{len(missing)} of {len(listed)} listed names missing"
@@ -633,11 +636,235 @@ def _action_row(action: CorporateAction, ingested_at: datetime) -> Row:
         "ex_date": action.ex_date,
         "ratio_or_amount": action.ratio_or_amount,
         "announced_at": action.announced_at,
+        "source_action_id": action.source_action_id or "",
+        "cancelled": action.cancelled,
         "known_at": action.known_at,
         "ingested_at": ingested_at,
         "source": action.source,
         "provenance": "action",
     }
+
+
+# --- corporate actions by identity (#108, #181) ------------------------------
+
+_Identity = tuple[Any, ...]
+
+
+def _identity(row: Mapping[str, Any]) -> _Identity:
+    """`CorporateAction.key` over a row: the source id when set ('' is none)."""
+    if row["source_action_id"]:
+        return (row["security_id"], "source_action_id", row["source_action_id"])
+    return (row["security_id"], row["action_type"], row["ex_date"])
+
+
+def _same_action(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    return all(a[c] == b[c] for c in _ACTION_VALUES)
+
+
+def _stored_actions(
+    conn: duckdb.DuckDBPyConnection, rows: Sequence[Row], window: tuple[date, date]
+) -> dict[_Identity, list[Row]]:
+    """Stored rows per identity, oldest first: those with an ex-date in
+    `window`, and every row of an incoming source id whatever its ex-date."""
+    ids = sorted({row["security_id"] for row in rows})
+    source_ids = sorted({row["source_action_id"] for row in rows if row["source_action_id"]})
+    cursor = conn.execute(
+        "SELECT * FROM corporate_actions WHERE list_contains(?, security_id) "
+        "AND (ex_date BETWEEN ? AND ? OR list_contains(?, source_action_id))",
+        [ids, *window, source_ids],
+    )
+    names = [d[0] for d in cursor.description]
+    history: dict[_Identity, list[Row]] = defaultdict(list)
+    for values in cursor.fetchall():
+        stored = dict(zip(names, values, strict=True))
+        history[_identity(stored)].append(stored)
+    for stored_rows in history.values():
+        stored_rows.sort(key=lambda r: r["known_at"])
+    return history
+
+
+def _cancel(latest: Row, ingested_at: datetime) -> Row:
+    if ingested_at <= latest["known_at"]:
+        raise ValueError(f"cancel at {ingested_at.isoformat()} would be back-dated")
+    return {**latest, "cancelled": True, "known_at": ingested_at, "ingested_at": ingested_at}
+
+
+def _outside(
+    history: Mapping[_Identity, list[Row]], rows: Sequence[Row], window: tuple[date, date]
+) -> list[date]:
+    """Stored ex-dates outside `window` of the source ids in `rows`."""
+    first, last = window
+    ids = {_identity(row) for row in rows if row["source_action_id"]}
+    return [
+        stored["ex_date"]
+        for identity in ids
+        for stored in history.get(identity, [])
+        if not first <= stored["ex_date"] <= last
+    ]
+
+
+_ReplayPlan = tuple[frozenset[_Identity], tuple[date, date]]
+
+
+def _replay_plan(
+    conn: duckdb.DuckDBPyConnection,
+    actions: Sequence[CorporateAction],
+    window: tuple[date, date],
+) -> _ReplayPlan | None:
+    """When a source id in `actions` (the source's answer for ex-dates in
+    `window`) has stored rows with an ex-date outside `window`: those ids
+    and the window widened to cover them; else `None`. Only reads `conn`.
+
+    A replaying source filters each revision on its own ex-date, so the
+    narrow answer could hold an older revision of a re-dated event and
+    revert it; `_replay_actions` asks again over the widened window.
+    """
+    rows = [_action_row(action, action.known_at) for action in actions]  # only ids are read
+    outside = _outside(_stored_actions(conn, rows, window), rows, window)
+    if not outside:
+        return None
+    first, last = window
+    ids = frozenset(_identity(row) for row in rows if row["source_action_id"])
+    return ids, (min(first, *outside), max(last, *outside))
+
+
+def _replay_actions(
+    prices: PriceSource,
+    actions: Sequence[CorporateAction],
+    window: tuple[date, date],
+    plan: _ReplayPlan | None,
+) -> tuple[list[CorporateAction], tuple[date, date]]:
+    """`actions` plus the source's answer for the plan's ids over its widened
+    window, and the window the list covers (`covered` for `_add_actions`).
+    Needs no store connection: backfill calls it with none open, so the
+    extra request never holds the store."""
+    if plan is None:
+        return list(actions), window
+    ids, wide = plan
+    again = prices.corporate_actions(sorted({identity[0] for identity in ids}), *wide)
+    extra = [a for a in again if a.key in ids]
+    return [*actions, *extra], wide
+
+
+def _add_actions(
+    conn: duckdb.DuckDBPyConnection,
+    actions: Sequence[CorporateAction],
+    window: tuple[date, date],
+    *,
+    ingested_at: datetime,
+    covered: tuple[date, date] | None = None,
+) -> int:
+    """Write `actions` (from `_replay_actions`, covering ex-dates in
+    `covered`, default `window`) by identity; return the rows added.
+
+    Per identity the source's latest record known by `ingested_at` is its
+    value now, under the revision rule of `_current` (a replayed revision
+    recorded later waits for a later run; a stored identity with no such
+    record is left as it is). If a source id has stored rows
+    with an ex-date outside `covered` (the store changed after the replay
+    was planned), nothing is written: `ValueError`, re-run. A cancel of an
+    identity never stored adds nothing.
+
+    Replacements are stamped at `ingested_at`, never at a first-seen proxy
+    (look-ahead). A first-seen id row whose `(security_id, action_type,
+    ex_date)` is a live stored id-less key cancels that key (once, however
+    many ids share it). When exactly one live id-less key of a security and
+    type in `window` is gone from the answer and exactly one new key of that
+    security and type appears (id-less, or an id that cancelled nothing),
+    the old key is cancelled: an id-less re-date, or an id-less key gaining
+    an id and a new ex-date. Any first-seen row of a security and type with
+    a cancel in this run is stamped at `ingested_at`, as the fixture
+    contract requires. A stored key that is only absent stays live: absence
+    is not a withdrawal. An id-less key re-dated out of `window` is not
+    seen, so both keys stay live; sources with ids (Alpaca) avoid that.
+    """
+    rows = [_action_row(action, ingested_at) for action in actions]
+    history = _stored_actions(conn, rows, window)
+    first, last = window
+    lo, hi = covered or window
+    stray = [ex for ex in _outside(history, rows, window) if not lo <= ex <= hi]
+    if stray:
+        raise ValueError(
+            f"stored revisions with ex-dates {sorted(set(stray))} fall outside the replayed "
+            f"window {lo}..{hi}; the store changed after the replay was planned, re-run"
+        )
+
+    records: dict[_Identity, list[Row]] = defaultdict(list)
+    for row in sorted(rows, key=lambda r: r["known_at"]):
+        records[_identity(row)].append(row)
+    incoming: dict[_Identity, Row] = {}
+    for identity, recs in records.items():
+        known = [r for r in recs if r["known_at"] <= ingested_at]
+        if known:
+            incoming[identity] = known[-1]
+        elif identity not in history:
+            incoming[identity] = recs[-1]  # first seen but not knowable yet: refused below
+
+    def live(identity: _Identity) -> Row | None:
+        past = history.get(identity)
+        return past[-1] if past and not past[-1]["cancelled"] else None
+
+    new_rows: list[Row] = []
+    cancelled: set[tuple[str, str]] = set()
+    retired: set[_Identity] = set()
+    first_seen: list[Row] = []
+    for identity, row in incoming.items():
+        past = history.get(identity)
+        if past:
+            revision = _current(row, past, ingested_at, _same_action)
+            new_rows += revision
+            if revision and row["cancelled"]:
+                cancelled.add((row["security_id"], row["action_type"]))
+                retired.add(identity)
+        elif not row["cancelled"]:
+            first_seen.append(row)
+
+    unpaired: list[Row] = []
+    for row in first_seen:
+        group = (row["security_id"], row["action_type"])
+        old = (*group, row["ex_date"])
+        if not row["source_action_id"]:
+            unpaired.append(row)
+        elif old in retired:  # its id-less key is already cancelled in this run
+            continue
+        elif (latest := live(old)) is not None and old not in incoming:
+            new_rows.append(_cancel(latest, ingested_at))  # an id-less key gaining an id
+            cancelled.add(group)
+            retired.add(old)
+        else:
+            unpaired.append(row)
+
+    gone: dict[tuple[str, str], list[Row]] = defaultdict(list)
+    for identity in history:
+        latest = live(identity)
+        if (
+            latest is not None
+            and not latest["source_action_id"]
+            and first <= latest["ex_date"] <= last
+            and identity not in incoming
+            and identity not in retired
+        ):
+            gone[(latest["security_id"], latest["action_type"])].append(latest)
+    appeared: dict[tuple[str, str], list[Row]] = defaultdict(list)
+    for row in unpaired:
+        appeared[(row["security_id"], row["action_type"])].append(row)
+    for group, old_rows in gone.items():
+        if len(old_rows) == 1 and len(appeared.get(group, [])) == 1:
+            new_rows.append(_cancel(old_rows[0], ingested_at))
+            cancelled.add(group)
+
+    for row in first_seen:
+        replaces = (row["security_id"], row["action_type"]) in cancelled
+        new_rows.append({**row, "known_at": ingested_at} if replaces else dict(row))
+
+    for new in new_rows:
+        if new["known_at"] > ingested_at:
+            raise ValueError(
+                f"corporate_actions {_identity(new)}: known_at {new['known_at'].isoformat()} "
+                f"is after ingested_at {ingested_at.isoformat()}; it is not knowable yet"
+            )
+        insert_row(conn, "corporate_actions", new)
+    return len(new_rows)
 
 
 # --- writing only what changes an as-of read --------------------------------

@@ -58,7 +58,7 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     SourceRun,
-    _action_row,
+    _add_actions,
     _add_rows,
     _bar_row,
     _clean,
@@ -66,6 +66,8 @@ from tradepartner.ingest import (
     _prefetch,
     _record_only,
     _Recorded,
+    _replay_actions,
+    _replay_plan,
     _run_source,
     _Stale,
     _write_run,
@@ -221,6 +223,10 @@ def _price_chunk(
             raise LookupError(f"reference symbol {symbol} has no listing in {first}..{last}")
         bars = [b for b in prices.bars(ids, first, last) if first <= b.session <= last]
         actions = prices.corporate_actions(ids, first, last)
+        with _read(settings) as conn:
+            plan = _replay_plan(conn, actions, window)
+        # A re-dated id's replay, fetched with no store connection open.
+        actions, covered = _replay_actions(prices, actions, window, plan)
         ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")
         have = {bar.session for bar in bars if bar.security_id == reference}
         days = (first + timedelta(days=n) for n in range((last - first).days + 1))
@@ -248,15 +254,7 @@ def _price_chunk(
                 where="AND session BETWEEN ? AND ?",
                 params=[first, last],
             )
-            added += _add_rows(
-                conn,
-                "corporate_actions",
-                [_action_row(action, ingested_at) for action in actions],
-                ingested_at=ingested_at,
-                current=True,
-                where="AND ex_date BETWEEN ? AND ?",
-                params=[first, last],
-            )
+            added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
             message = (
                 f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
                 f"{len(missing)} of {len(listed)} listed names without a bar"
