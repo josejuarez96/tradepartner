@@ -763,6 +763,12 @@ class EdgarFilingSource(FilingSource):
             base_form = record.form.removesuffix("/A")
             if base_form not in wanted:
                 continue
+            cached = self._load_header_cache(accession)
+            if cached is not None:
+                headers.append(
+                    FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
+                )
+                continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None and fsn_filing.sic is not None:
                 headers.append(
