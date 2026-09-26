@@ -32,7 +32,7 @@ Run by team bitfly on `2026_01_notes.zip` (43,055,315 bytes; members dated 2026-
 
 What P1 adds to the design:
 - **Class members are filer-custom.** Beyond `CommonClassA`, filers use extension members such as `ClassACommonStockParValue00001PerShareCustom`. The master matches classes by title and ticker (so listings are unaffected), but per-class shares need a member-to-class mapping by the listing triple of the same filing, not by member name.
-- **Titles are the filer's own text**, spaces preserved; odd spellings (Constellation's `ClassA Common Stock`) come from the filing, not from FSN.
+- **Titles are the filer's text, except that FSN drops non-breaking spaces** (*corrected 2026-09-26, #224*). Alphabet's 10-K tags `Class&#160;A Common Stock` and FSN has `ClassA Common Stock`, confirmed on the recorded `2026_02` fixture against the filing itself. Constellation's `ClassA` in this probe is the same effect, not the filer's spelling. T11c's `parse_fsn` restores the space between `Class` and a single class letter so ingest's class-letter match still works.
 - 32 % of 10-Qs carry no `TradingSymbol`: consistent with issuers that have no 12(b) listing (not checked one by one).
 - Not tested by P1: coverage before 2019 (cover tagging phase-in), and months before November 2020, which are quarterly files.
 

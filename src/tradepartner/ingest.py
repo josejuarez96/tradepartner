@@ -440,6 +440,13 @@ def _source_counts(filings: FilingSource) -> str:
     parts = [f"unstamped: {', '.join(unstamped)}"] if unstamped else []
     if (skipped := count("skipped_filers")) is not None:
         parts.append(f"skipped filers: {skipped}")
+    for attribute, label in (
+        ("fsn_reissued", "FSN re-issued"),  # T11c: re-issued or rolled-up periods
+        ("fsn_duplicates", "FSN duplicates"),
+        ("fsn_reissue_undetected", "FSN re-issues unchecked"),
+    ):
+        if (n := count(attribute)) is not None:
+            parts.append(f"{label}: {n}")
     return "".join(f"; {part}" for part in parts)
 
 

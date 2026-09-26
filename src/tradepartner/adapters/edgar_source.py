@@ -37,27 +37,34 @@ when its quarter had settled before the per-CIK fetch that lacked it.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
+import shutil
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 from zoneinfo import ZoneInfo
 
+import duckdb
 import httpx
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import (
+    FsnFiling,
+    FsnShare,
     UnstampedFiling,
     acceptance_times,
     parse_company_tickers,
     parse_filing_index,
+    parse_fsn,
 )
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
+    CoverListing,
     CoverPage,
     DelistingFiling,
     FactRecord,
@@ -70,6 +77,16 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Bumped when a parser change must re-stamp every cached accession.
 PARSER_VERSION = 1
+#: Bumped when a parser change must re-extract every cached FSN period.
+#: Separate from `PARSER_VERSION`, which stays the per-CIK stamps' key: a
+#: bump here re-downloads every period's zip (the PR states that cost).
+FSN_VERSION = 1
+
+#: The four `dei` cover-page concepts FSN's `num.tsv`/`txt.tsv` are filtered
+#: to while streaming each zip member (module docstring "Caches").
+_FSN_SHARES_TAG = "EntityCommonStockSharesOutstanding"
+_FSN_LISTING_TAGS = ("Security12bTitle", "TradingSymbol", "SecurityExchangeName")
+_FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
 
 _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
@@ -152,6 +169,11 @@ class EdgarFilingSource(FilingSource):
         self.requests = 0
         self.skipped_filers = 0
         self.unstamped_filings: list[UnstampedFiling] = []
+        self.fsn_duplicates = 0
+        self.fsn_reissued = 0
+        self.fsn_reissue_undetected = 0
+        self._filing_index_ran = False
+        self._fsn_ready = False
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -209,6 +231,7 @@ class EdgarFilingSource(FilingSource):
                     entries.append(FilingIndexEntry(cik, row.company_name, row.form, accession, at))
         entries.sort(key=lambda e: (e.accepted_at, e.accession, e.cik))
         self.unstamped_filings.sort(key=lambda r: (r.filed_on, r.accession, r.cik))
+        self._filing_index_ran = True
         return entries
 
     def _rows(
@@ -357,6 +380,204 @@ class EdgarFilingSource(FilingSource):
         entries = parse_company_tickers(payload, self._now())
         return sorted(entries, key=lambda e: (e.fetched_at, e.ticker, e.cik))
 
+    # --- FSN data sets (T11c) -------------------------------------------------
+
+    def _ensure_fsn(self) -> None:
+        """Runs once per instance, on the first `cover_pages`, `facts` or
+        `filing_headers` call (T11d/T11e wire those in); raises if
+        `filing_index` has not run yet.
+
+        Extracts every FSN period from `edgar.fsn_first_year` with no
+        extraction cache yet, oldest first, keeping every accession whose
+        base form is in `edgar.cover_page_forms`. T11c note: the amendment's
+        full filter also names `edgar.header_forms`, a T11d config key that
+        does not exist yet; T11d widens this filter once it lands. The
+        issuer filter is never applied here, so a CIK that becomes an
+        issuer later keeps its earlier rows.
+
+        Kept rows are regrouped into per-CIK cache files
+        (`edgar.cache_dir/fsn/v{FSN_VERSION}/{cik}.json`), like the stamps
+        cache. Each extracted period gets a manifest recording the zip's
+        content hash, its validators, the accessions extracted and the
+        accessions that failed extraction (error class, base form,
+        `accepted: False`), and `committed: False` until T11f's
+        `record_failures()` sets it. An accession seen in two periods keeps
+        the first extracted; the duplicate is counted on `.fsn_duplicates`.
+        A period is re-extracted only when `FSN_VERSION` changes.
+
+        For periods already extracted (a manifest exists) and still listed
+        on the data-set page, one `HEAD` compares their validators with the
+        manifest: a change is a re-issue, a cached period no longer listed
+        is a roll-up; both are counted on `.fsn_reissued` and never
+        re-extracted. A period with no usable validator (the `HEAD` fails, or
+        neither run has an `ETag` or `Last-Modified`) is counted on
+        `.fsn_reissue_undetected`, so the run message says its re-issues went
+        unchecked; it is never counted as a re-issue.
+        """
+        if self._fsn_ready:
+            return
+        if not self._filing_index_ran:
+            raise RuntimeError("_ensure_fsn: filing_index() must run first")
+        self.fsn_duplicates = 0
+        self.fsn_reissued = 0
+        self.fsn_reissue_undetected = 0
+
+        all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
+        listed = set(all_periods)
+        wanted = [
+            p
+            for p in all_periods
+            if edgar_raw.fsn_period_year(p) >= self._settings.edgar.fsn_first_year
+        ]
+
+        known_accessions: set[str] = set()
+        to_extract: list[str] = []
+        for period in wanted:
+            manifest = self._load_fsn_manifest(period)
+            if manifest is None:
+                to_extract.append(period)
+            else:
+                known_accessions.update(manifest["accessions_extracted"])
+
+        kept_forms = {*self._settings.edgar.cover_page_forms, *self._settings.edgar.header_forms}
+        for period in to_extract:
+            self._extract_fsn_period(period, kept_forms, known_accessions)
+
+        for period in self._cached_fsn_periods():
+            if edgar_raw.fsn_period_year(period) < self._settings.edgar.fsn_first_year:
+                continue
+            if period in to_extract:
+                continue
+            if period not in listed:
+                self.fsn_reissued += 1  # rolled up: cached but no longer listed
+                continue
+            manifest = self._load_fsn_manifest(period)
+            if manifest is None:
+                continue
+            try:
+                headers = edgar_raw.fsn_validators(
+                    period, settings=self._settings, client=self._client
+                )
+            except httpx.HTTPStatusError:
+                self.fsn_reissue_undetected += 1
+                continue
+            now, then = _fsn_validators_dict(headers), manifest.get("validators") or {}
+            if not _usable_validators(now) or not _usable_validators(then):
+                self.fsn_reissue_undetected += 1
+            elif now != then:
+                self.fsn_reissued += 1  # re-issued: same period, new content
+
+        self._fsn_ready = True
+
+    def _extract_fsn_period(
+        self, period: str, kept_forms: set[str], known_accessions: set[str]
+    ) -> None:
+        zip_path, headers = edgar_raw.fsn_zip(period, settings=self._settings, client=self._client)
+        with zip_path.open("rb") as zip_file:  # streamed: FSN zips reach hundreds of MB
+            content_hash = hashlib.file_digest(zip_file, "sha256").hexdigest()
+        extract_dir = self._cache / "fsn" / "_extract" / period
+        try:
+            members = _fsn_extract(zip_path, extract_dir)
+            sub_rows = _fsn_rows(members["sub.tsv"], ("adsh", "cik", "sic", "form"))
+            num_rows = _fsn_rows(
+                members["num.tsv"],
+                ("adsh", "tag", "ddate", "dimh", "dimn", "coreg", "value"),
+                where=f"tag = '{_FSN_SHARES_TAG}'",
+            )
+            listing_tags = ", ".join(f"'{tag}'" for tag in _FSN_LISTING_TAGS)
+            txt_rows = _fsn_rows(
+                members["txt.tsv"],
+                ("adsh", "tag", "dimh", "dimn", "coreg", "value"),
+                where=f"tag IN ({listing_tags})",
+            )
+            dim_rows = _fsn_rows(members["dim.tsv"], ("dimhash", "segments"))
+            parsed = parse_fsn(sub_rows, num_rows, txt_rows, dim_rows)
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            zip_path.unlink(missing_ok=True)  # the zip is deleted after extraction
+
+        form_by_accession = {str(row["adsh"]): str(row["form"]) for row in sub_rows}
+        per_cik_new: dict[str, dict[str, FsnFiling]] = {}
+        for record in parsed.records:
+            if record.accession in known_accessions:
+                self.fsn_duplicates += 1
+                continue
+            known_accessions.add(record.accession)
+            if record.form.removesuffix("/A") in kept_forms:
+                per_cik_new.setdefault(record.cik, {})[record.accession] = record
+        for cik, records in per_cik_new.items():
+            existing = self._load_fsn_cache(cik)
+            existing.update(records)
+            self._save_fsn_cache(cik, existing)
+
+        manifest = {
+            "version": FSN_VERSION,
+            "period": period,
+            "content_hash": content_hash,
+            "validators": _fsn_validators_dict(headers),
+            "accessions_extracted": sorted({r.accession for r in parsed.records}),
+            "accessions_failed": [
+                {
+                    "accession": f.accession,
+                    "error_class": f.error_class,
+                    "base_form": form_by_accession.get(f.accession, "").removesuffix("/A"),
+                    "accepted": False,
+                }
+                for f in parsed.failures
+            ],
+            "committed": False,
+        }
+        self._save_fsn_manifest(period, manifest)
+
+    def _fsn_root(self) -> Path:
+        return self._cache / "fsn" / f"v{FSN_VERSION}"
+
+    def _fsn_cache_path(self, cik: str) -> Path:
+        return self._fsn_root() / f"{cik}.json"
+
+    def _load_fsn_cache(self, cik: str) -> dict[str, FsnFiling]:
+        try:
+            data = json.loads(self._fsn_cache_path(cik).read_bytes())
+            if data.get("version") != FSN_VERSION or data.get("cik") != cik:
+                return {}
+            return {
+                accession: _fsn_filing_from_json(accession, cik, record)
+                for accession, record in data["records"].items()
+            }
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}  # absent, truncated or another layout: nothing cached yet
+
+    def _save_fsn_cache(self, cik: str, records: Mapping[str, FsnFiling]) -> None:
+        data = {
+            "version": FSN_VERSION,
+            "cik": cik,
+            "records": {accession: _fsn_filing_to_json(r) for accession, r in records.items()},
+        }
+        edgar_raw.write_atomic(self._fsn_cache_path(cik), json.dumps(data).encode("utf-8"))
+
+    def _fsn_manifest_path(self, period: str) -> Path:
+        return self._fsn_root() / "manifests" / f"{period}.json"
+
+    def _load_fsn_manifest(self, period: str) -> dict[str, Any] | None:
+        try:
+            data: dict[str, Any] = json.loads(self._fsn_manifest_path(period).read_bytes())
+            if data.get("version") != FSN_VERSION or data.get("period") != period:
+                return None
+            return data
+        except (OSError, ValueError, KeyError, TypeError):
+            return None  # absent, truncated or another layout: extract again
+
+    def _save_fsn_manifest(self, period: str, manifest: dict[str, Any]) -> None:
+        edgar_raw.write_atomic(
+            self._fsn_manifest_path(period), json.dumps(manifest).encode("utf-8")
+        )
+
+    def _cached_fsn_periods(self) -> list[str]:
+        try:
+            return [path.stem for path in (self._fsn_root() / "manifests").glob("*.json")]
+        except OSError:
+            return []
+
     # --- T11c ----------------------------------------------------------------
 
     def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
@@ -379,3 +600,87 @@ def _filed_by(row: UnstampedFiling) -> bool:
 
 def _t11c() -> NoReturn:
     raise NotImplementedError("T11c")
+
+
+# --- FSN data sets: zip extraction and DuckDB reads (T11c) ------------------
+
+
+def _fsn_extract(zip_path: Path, extract_dir: Path) -> dict[str, Path]:
+    """Extract `sub.tsv`, `num.tsv`, `txt.tsv` and `dim.tsv` from `zip_path`
+    into `extract_dir`; raises `ValueError` if the zip is missing one."""
+    with zipfile.ZipFile(zip_path) as archive:
+        names = {name.lower(): name for name in archive.namelist()}
+        paths: dict[str, Path] = {}
+        for member in _FSN_MEMBERS:
+            real_name = names.get(member)
+            if real_name is None:
+                raise ValueError(f"FSN zip {zip_path.name} is missing {member}")
+            paths[member] = Path(archive.extract(real_name, path=extract_dir))
+    return paths
+
+
+def _fsn_rows(
+    path: Path, columns: Sequence[str], *, where: str | None = None
+) -> list[dict[str, str]]:
+    """`columns` of `path` (a tab-separated FSN member) as plain string
+    dicts, via DuckDB `read_csv` with every column read as `varchar` (FSN's
+    own convention: numeric-looking columns like `cik` can have leading
+    zeros truncated otherwise) and no quoting (FSN's fields are never
+    quoted, and a bare `"` inside a `txt.tsv` value must not start one).
+    A zero-byte member (no header row at all -- a real FSN file never is
+    one, but a test fixture may be) has no columns to select and yields no
+    rows rather than a DuckDB binder error."""
+    if path.stat().st_size == 0:
+        return []
+    column_list = ", ".join(columns)
+    sql = (
+        f"SELECT {column_list} FROM read_csv(?, delim='\t', header=true, "
+        "all_varchar=true, quote='')"
+    )
+    if where:
+        sql += f" WHERE {where}"
+    connection = duckdb.connect()
+    try:
+        cursor = connection.execute(sql, [str(path)])
+        names = [description[0] for description in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def _fsn_validators_dict(headers: httpx.Headers) -> dict[str, str | None]:
+    """The subset of `headers` a period's manifest compares run to run."""
+    return {
+        "last_modified": headers.get("Last-Modified"),
+        "etag": headers.get("ETag"),
+        "content_length": headers.get("Content-Length"),
+    }
+
+
+def _usable_validators(validators: Mapping[str, str | None]) -> bool:
+    """An `ETag` or `Last-Modified`: `Content-Length` alone cannot tell a
+    re-issue of the same size from the original."""
+    return bool(validators.get("etag") or validators.get("last_modified"))
+
+
+def _fsn_filing_to_json(filing: FsnFiling) -> dict[str, Any]:
+    return {
+        "form": filing.form,
+        "sic": filing.sic,
+        "listings": [[item.title, item.ticker, item.exchange] for item in filing.listings],
+        "shares": [[s.class_member, s.value, s.as_of_date.isoformat()] for s in filing.shares],
+    }
+
+
+def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> FsnFiling:
+    return FsnFiling(
+        accession=accession,
+        cik=cik,
+        form=data["form"],
+        sic=data["sic"],
+        listings=tuple(CoverListing(*listing) for listing in data["listings"]),
+        shares=tuple(
+            FsnShare(member, value, date.fromisoformat(as_of))
+            for member, value, as_of in data["shares"]
+        ),
+    )
