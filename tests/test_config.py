@@ -101,8 +101,12 @@ def test_edgar_header_forms_defaults() -> None:
     s = _settings()
     assert s.edgar.header_forms == ["S-1", "F-1", "10-12B", "8-K", "10-K", "10-Q", "20-F", "40-F"]
     assert s.edgar.header_first_year is None
+    assert s.edgar.header_start_year == 2015  # follows fsn_first_year
+    s = Settings(_env_file=None, edgar={"fsn_first_year": 2019})
+    assert s.edgar.header_start_year == 2019
     s = Settings(_env_file=None, edgar={"header_first_year": 2012})
     assert s.edgar.header_first_year == 2012
+    assert s.edgar.header_start_year == 2012
 
 
 def test_edgar_fsn_first_year_override() -> None:

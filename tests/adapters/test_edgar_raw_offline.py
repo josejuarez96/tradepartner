@@ -566,11 +566,36 @@ def test_fsn_zip_streams_into_the_fsn_cache_dir_and_returns_headers(tmp_path: Pa
     assert headers["ETag"] == '"abc"'
 
 
-def test_fsn_zip_404_propagates() -> None:
+def test_fsn_periods_break_ties_deterministically() -> None:
+    """During an SEC roll-up the page can list a quarter and its months
+    together: the quarter sorts at its first month, before its months, so
+    "first extracted" never depends on set order."""
+    page = "".join(
+        f'<a href="/files/dera/data/financial-statement-notes-data-sets/{p}_notes.zip">x</a>'
+        for p in ("2015_03", "2015_01", "2015q1", "2014q4", "2015_13", "2015_00")
+    )
+    periods = edgar_raw.fsn_periods(
+        settings=_settings(),
+        client=_mock_client(lambda request: httpx.Response(200, content=page)),
+    )
+    assert periods == ["2014q4", "2015q1", "2015_01", "2015_03"]  # months 00 and 13 are not periods
+
+
+@pytest.mark.parametrize("period", ["../../x", "2025_10/../../x", "2025-10", "2025_13", ""])
+def test_fsn_fetches_refuse_a_malformed_period(tmp_path: Path, period: str) -> None:
+    client = _mock_client(lambda request: pytest.fail("no request for a bad period"))
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.fsn_zip(period, settings=_settings(cache_dir=tmp_path), client=client)
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.fsn_validators(period, settings=_settings(), client=client)
+    assert not list(tmp_path.rglob("*"))
+
+
+def test_fsn_zip_404_propagates(tmp_path: Path) -> None:
     with pytest.raises(httpx.HTTPStatusError):
         edgar_raw.fsn_zip(
             "2099_01",
-            settings=_settings(),
+            settings=_settings(cache_dir=tmp_path),
             client=_mock_client(lambda request: httpx.Response(404)),
         )
 

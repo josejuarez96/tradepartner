@@ -34,7 +34,10 @@ def _tsv(header: list[str], rows: list[list[str]]) -> str:
 
 def _synthetic_zip(accession: str, other: str) -> bytes:
     """One period: the fixture accession plus `other`, which trimming drops;
-    a kept tag, a dropped tag, a referenced and an unreferenced `dim` row."""
+    a kept tag, a dropped tag, a referenced and an unreferenced `dim` row.
+    `txt.tsv` has, just before the fixture's rows, a value FSN cut off at
+    2048 bytes that opens a `"` and never closes it, and the fixture's own
+    title contains quotes: FSN members are unquoted TSV."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("sub.tsv", _tsv(["adsh", "form"], [[accession, "10-K"], [other, "8-K"]]))
@@ -50,7 +53,17 @@ def _synthetic_zip(accession: str, other: str) -> bytes:
                 ],
             ),
         )
-        archive.writestr("txt.tsv", _tsv(facts, [[accession, "TradingSymbol", "0xbb", "AB"]]))
+        archive.writestr(
+            "txt.tsv",
+            _tsv(
+                facts,
+                [
+                    [other, "TextBlock", "0x00", '"truncated text with no closing quote'],
+                    [accession, "TradingSymbol", "0xbb", "AB"],
+                    [accession, "Security12bTitle", "0xbb", '"Common" Stock, Class B'],
+                ],
+            ),
+        )
         archive.writestr(
             "dim.tsv",
             _tsv(
@@ -68,7 +81,11 @@ def _synthetic_zip(accession: str, other: str) -> bytes:
 @pytest.fixture
 def recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Runs `main(["fsn"])` against the mock transport into `tmp_path`."""
-    settings = Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT)
+    settings = Settings(
+        _env_file=None,
+        sec_edgar_user_agent=USER_AGENT,
+        edgar={"cache_dir": str(tmp_path / "cache")},
+    )
     monkeypatch.setattr(cli_record, "get_settings", lambda: settings)
     monkeypatch.setattr(cli_record, "FIXTURES_ROOT", tmp_path)
     monkeypatch.setattr(cli_record, "EDGAR_FSN_FIXTURES_DIR", tmp_path / "fsn")
@@ -116,8 +133,36 @@ def test_each_period_is_trimmed_to_its_fixture_accession(recorded: Path) -> None
         assert "0xcc" not in member["dim.tsv"]
 
 
+def test_rows_are_kept_byte_for_byte_past_an_unclosed_quote(recorded: Path) -> None:
+    """An unquoted-TSV reader: the truncated `"` value before the fixture's
+    rows swallows nothing, and a title with quotes is not rewritten."""
+    for period, accession in cli_record.FSN_RECORD_PERIODS.items():
+        txt = (recorded / period / "txt.tsv").read_text()
+        assert f"{accession}\tTradingSymbol\t0xbb\tAB\n" in txt
+        assert f'{accession}\tSecurity12bTitle\t0xbb\t"Common" Stock, Class B\n' in txt
+        assert "truncated" not in txt
+
+
 def test_the_downloaded_zips_are_deleted(recorded: Path) -> None:
+    cache = recorded.parent / "cache"
+    assert cache.exists() and not list(cache.rglob("*.zip"))
     assert not list(recorded.rglob("*.zip"))
+
+
+def test_a_member_is_trimmed_from_a_stream_of_lines() -> None:
+    """The trim is pure over lines, so the recorder can stream a
+    multi-GB member without holding it."""
+    lines = iter(["adsh\ttag\tvalue\n", "B\tX\t1\n", "A\tX\t2\n", "A\tY\t3\n"])
+    kept = list(cli_record.trim_fsn_member(lines, accessions=["A"], tags=["X"]))
+    assert kept == ["adsh\ttag\tvalue\n", "A\tX\t2\n"]
+    assert list(cli_record.trim_fsn_member(iter([]), accessions=["A"])) == []
+
+
+def test_extra_arguments_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_record, "get_settings", lambda: pytest.fail("settings must not be read")
+    )
+    assert cli_record.main(["fsn", "extra"]) == 2
 
 
 def test_fsn_without_a_user_agent_fails_before_any_request(

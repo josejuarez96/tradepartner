@@ -463,20 +463,30 @@ _FSN_ZIP_URL = (
 # quarter-to-month boundary: SEC rolls months into quarters after the fact
 # (#174 F1, F10), so both `\d{4}q[1-4]` and `\d{4}_\d{2}` period spellings
 # are matched, and the caller (`fsn_periods`) sorts them, not this pattern.
+_FSN_PERIOD = r"\d{4}q[1-4]|\d{4}_(?:0[1-9]|1[0-2])"
+_FSN_PERIOD_RE = re.compile(_FSN_PERIOD)
 _FSN_PERIOD_PATTERN = re.compile(
-    r"/files/dera/data/financial-statement-notes-data-sets/(\d{4}q[1-4]|\d{4}_\d{2})_notes\.zip"
+    rf"/files/dera/data/financial-statement-notes-data-sets/({_FSN_PERIOD})_notes\.zip"
 )
 
 
-def _fsn_period_sort_key(period: str) -> tuple[int, int]:
-    """`(year, month)` for a period spelled `YYYYqN` or `YYYY_MM`, so mixed
-    quarterly/monthly periods still sort oldest first: a quarter sorts at
-    its last month, alongside the individual months it later split into."""
+def _validate_fsn_period(period: str) -> None:
+    """`period` must be `YYYYqN` or `YYYY_MM` before it reaches a URL or a
+    path under `edgar.cache_dir` (as `_validate_accession` guards accessions)."""
+    if not _FSN_PERIOD_RE.fullmatch(period):
+        raise InvalidFilingReferenceError(f"not an FSN period: {period!r}")
+
+
+def _fsn_period_sort_key(period: str) -> tuple[int, int, int]:
+    """`(year, month, rank)` for a period spelled `YYYYqN` or `YYYY_MM`, so
+    mixed quarterly/monthly periods sort oldest first and deterministically:
+    a quarter sorts at its first month, ahead of the months it later split
+    into (rank 0 before 1), never by the order the page happened to list."""
     if "q" in period:
         year, qtr = period.split("q")
-        return int(year), int(qtr) * 3
+        return int(year), int(qtr) * 3 - 2, 0
     year, month = period.split("_")
-    return int(year), int(month)
+    return int(year), int(month), 1
 
 
 def fsn_period_year(period: str) -> int:
@@ -509,6 +519,7 @@ def fsn_zip(
     """Stream one FSN period's zip into `edgar.cache_dir/fsn/`; returns its
     path and response headers (`_stream_to_with_headers`). A 404 (an
     unlisted or malformed period) propagates as `httpx.HTTPStatusError`."""
+    _validate_fsn_period(period)
     settings = settings or get_settings()
     dest = Path(settings.edgar.cache_dir) / "fsn" / f"{period}_notes.zip"
     return _stream_to_with_headers(
@@ -523,6 +534,7 @@ def fsn_validators(
     throttle, retry and `User-Agent` as every other request here; returns
     the response headers (`Last-Modified`, `ETag`, `Content-Length`) so the
     caller can compare them with the period's manifest."""
+    _validate_fsn_period(period)
     settings = settings or get_settings()
     url = _FSN_ZIP_URL.format(period=period)
     headers = {"User-Agent": _user_agent(settings)}

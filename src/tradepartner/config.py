@@ -171,6 +171,11 @@ class EdgarConfig(BaseModel):
     )
     header_first_year: int | None = Field(default=None, ge=1993)
 
+    @property
+    def header_start_year(self) -> int:
+        """`header_first_year`, or `fsn_first_year` when it is unset."""
+        return self.fsn_first_year if self.header_first_year is None else self.header_first_year
+
 
 class MasterConfig(BaseModel):
     """Security-master construction rules."""

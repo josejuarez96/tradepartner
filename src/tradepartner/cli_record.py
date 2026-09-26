@@ -19,14 +19,13 @@ non-zero with a clear message when secrets are missing").
 from __future__ import annotations
 
 import base64
-import csv
 import gzip
 import io
 import json
 import re
 import sys
 import zipfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -539,52 +538,64 @@ FSN_RECORD_TAGS: tuple[str, ...] = (
 _FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
 
 
-def _read_fsn_tsv_rows(text: str) -> list[dict[str, str]]:
-    return [dict(row) for row in csv.DictReader(io.StringIO(text), delimiter="\t")]
+def _column(header: str, name: str) -> int:
+    return header.rstrip("\r\n").split("\t").index(name)
 
 
-def _write_fsn_tsv_rows(rows: list[dict[str, str]], fieldnames: list[str]) -> str:
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-    return buffer.getvalue()
+def _field(line: str, index: int) -> str | None:
+    fields = line.rstrip("\r\n").split("\t")
+    return fields[index] if index < len(fields) else None
 
 
 def trim_fsn_member(
-    text: str, *, accessions: Iterable[str], tags: Iterable[str] | None = None
-) -> str:
-    """Keep only `sub`/`num`/`txt.tsv` rows whose `adsh` is in `accessions`,
-    further restricted to `tags` (`num.tsv`/`txt.tsv`'s `tag` column) when
-    given. Pure; an empty member (no rows at all) is returned unchanged."""
-    rows = _read_fsn_tsv_rows(text)
-    if not rows:
-        return text
-    fieldnames = list(rows[0].keys())
-    wanted = set(accessions)
-    kept = [row for row in rows if row.get("adsh") in wanted]
-    if tags is not None:
-        tag_set = set(tags)
-        kept = [row for row in kept if row.get("tag") in tag_set]
-    return _write_fsn_tsv_rows(kept, fieldnames)
+    lines: Iterable[str], *, accessions: Iterable[str], tags: Iterable[str] | None = None
+) -> Iterator[str]:
+    """The header and the `sub`/`num`/`txt.tsv` lines whose `adsh` is in
+    `accessions` (and whose `tag` is in `tags`, when given), each exactly as
+    read. Pure and streaming. FSN members are unquoted TSV, so a line is split
+    on tabs only: a value FSN cut off with an unclosed `"` swallows nothing,
+    and a quoted title is never rewritten."""
+    lines = iter(lines)
+    header = next(lines, None)
+    if header is None:
+        return
+    yield header
+    adsh = _column(header, "adsh")
+    tag = _column(header, "tag") if tags is not None else None
+    wanted, tag_set = set(accessions), set(tags or ())
+    for line in lines:
+        if _field(line, adsh) in wanted and (tag is None or _field(line, tag) in tag_set):
+            yield line
 
 
-def trim_fsn_dim(text: str, *, dimhashes: Iterable[str]) -> str:
-    """Keep only `dim.tsv` rows whose `dimhash` is referenced by a kept
-    `num`/`txt.tsv` row. Pure."""
-    rows = _read_fsn_tsv_rows(text)
-    if not rows:
-        return text
-    fieldnames = list(rows[0].keys())
-    wanted = set(dimhashes)
-    kept = [row for row in rows if row.get("dimhash") in wanted]
-    return _write_fsn_tsv_rows(kept, fieldnames)
+def trim_fsn_dim(lines: Iterable[str], *, dimhashes: Iterable[str]) -> Iterator[str]:
+    """The header and the `dim.tsv` lines whose `dimhash` a kept `num`/`txt`
+    line references, each exactly as read. Pure and streaming."""
+    lines = iter(lines)
+    header = next(lines, None)
+    if header is None:
+        return
+    yield header
+    column, wanted = _column(header, "dimhash"), set(dimhashes)
+    for line in lines:
+        if _field(line, column) in wanted:
+            yield line
+
+
+def _member_lines(archive: zipfile.ZipFile, member: str) -> Iterator[str]:
+    """`member`'s lines, streamed from the zip; `newline=""` keeps each line's
+    own ending, so a kept line is written back byte for byte."""
+    names = {name.lower(): name for name in archive.namelist()}
+    with archive.open(names[member]) as raw:
+        yield from io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="")
 
 
 def _record_fsn(settings: Settings, secrets: list[str]) -> None:
     """`python -m tradepartner.cli_record fsn`: the data-set page plus the
     two recorded periods, each trimmed to one fixture accession. Needs only
-    `SEC_EDGAR_USER_AGENT` (no Alpaca keys)."""
+    `SEC_EDGAR_USER_AGENT` (no Alpaca keys). Each member is streamed and
+    trimmed line by line, so memory stays small although an FSN member
+    decompresses to gigabytes."""
     EDGAR_FSN_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
 
     page_html = edgar_raw.fsn_page_html(settings=settings)
@@ -594,31 +605,35 @@ def _record_fsn(settings: Settings, secrets: list[str]) -> None:
         zip_path, _headers = edgar_raw.fsn_zip(period, settings=settings)
         try:
             with zipfile.ZipFile(zip_path) as archive:
-                names = {name.lower(): name for name in archive.namelist()}
-                raw = {
-                    member: archive.read(names[member]).decode("utf-8", errors="replace")
-                    for member in _FSN_MEMBERS
-                    if member in names
+                kept = {
+                    "sub.tsv": list(
+                        trim_fsn_member(_member_lines(archive, "sub.tsv"), accessions=[accession])
+                    )
                 }
+                for member in ("num.tsv", "txt.tsv"):
+                    kept[member] = list(
+                        trim_fsn_member(
+                            _member_lines(archive, member),
+                            accessions=[accession],
+                            tags=FSN_RECORD_TAGS,
+                        )
+                    )
+                dimhashes = {
+                    value
+                    for member in ("num.tsv", "txt.tsv")
+                    for line in kept[member][1:]
+                    if (value := _field(line, _column(kept[member][0], "dimh")))
+                }
+                kept["dim.tsv"] = list(
+                    trim_fsn_dim(_member_lines(archive, "dim.tsv"), dimhashes=dimhashes)
+                )
         finally:
             zip_path.unlink(missing_ok=True)
 
         period_dir = EDGAR_FSN_FIXTURES_DIR / period
         period_dir.mkdir(parents=True, exist_ok=True)
-        trimmed_sub = trim_fsn_member(raw["sub.tsv"], accessions=[accession])
-        trimmed_num = trim_fsn_member(raw["num.tsv"], accessions=[accession], tags=FSN_RECORD_TAGS)
-        trimmed_txt = trim_fsn_member(raw["txt.tsv"], accessions=[accession], tags=FSN_RECORD_TAGS)
-        dimhashes = {
-            row.get("dimh", "")
-            for row in (*_read_fsn_tsv_rows(trimmed_num), *_read_fsn_tsv_rows(trimmed_txt))
-            if row.get("dimh")
-        }
-        trimmed_dim = trim_fsn_dim(raw["dim.tsv"], dimhashes=dimhashes)
-
-        _write_text(period_dir / "sub.tsv", trimmed_sub, secrets=secrets)
-        _write_text(period_dir / "num.tsv", trimmed_num, secrets=secrets)
-        _write_text(period_dir / "txt.tsv", trimmed_txt, secrets=secrets)
-        _write_text(period_dir / "dim.tsv", trimmed_dim, secrets=secrets)
+        for member in _FSN_MEMBERS:
+            _write_text(period_dir / member, "".join(kept[member]), secrets=secrets)
 
 
 def _record_alpaca(settings: Settings, secrets: list[str]) -> None:
@@ -643,7 +658,7 @@ def main(argv: Sequence[str] = ()) -> int:
     the FSN data-set page and its two recorded periods, and needs only
     `SEC_EDGAR_USER_AGENT` -- no Alpaca keys."""
     target = argv[0] if argv else "all"
-    if target not in ("all", "fsn"):
+    if target not in ("all", "fsn") or len(argv) > 1:
         # A typo must not fall through to the full recorder (Alpaca keys too).
         print(f"cli_record: unknown target {target!r}; use 'fsn' or no target", file=sys.stderr)
         return 2
