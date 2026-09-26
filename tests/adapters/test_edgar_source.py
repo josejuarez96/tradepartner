@@ -339,18 +339,18 @@ def test_an_http_error_names_no_secret(settings: Settings) -> None:
 
 
 @pytest.mark.parametrize(
-    ("method", "args"),
+    ("method", "args", "task"),
     [
-        ("facts", (APPLE, ["EntityCommonStockSharesOutstanding"])),
-        ("filing_headers", (APPLE, ["10-K"])),
-        ("cover_pages", (APPLE,)),
-        ("delistings", ()),
+        ("facts", (APPLE, ["EntityCommonStockSharesOutstanding"]), "T11e"),
+        ("delistings", (), "T11f"),
     ],
 )
-def test_the_per_cik_methods_are_left_to_t11c(
-    settings: Settings, method: str, args: tuple[object, ...]
+def test_the_remaining_per_cik_methods_are_left_to_later_tasks(
+    settings: Settings, method: str, args: tuple[object, ...], task: str
 ) -> None:
-    with pytest.raises(NotImplementedError, match="T11c"):
+    """`cover_pages` and `filing_headers` are T11d's; `facts` (T11e) and
+    `delistings` (T11f) still raise, each naming its own task."""
+    with pytest.raises(NotImplementedError, match=task):
         getattr(_source(settings, _router()), method)(*args)
 
 

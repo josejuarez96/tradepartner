@@ -207,7 +207,7 @@ def _evidence(
             forms[entry.cik].append((entry.accepted_at, entry.accession, _base_form(entry.form)))
     out: dict[str, _Evidence] = {}
     for cik in wanted:
-        headers = source.filing_headers(cik, settings.master.issuer_forms)
+        headers = source.filing_headers(cik, settings.edgar.header_forms)
         # A header without a SIC never erases a known one (a SPAC stays a SPAC).
         sics = sorted((h.accepted_at, h.accession, h.sic) for h in headers if h.sic is not None)
         out[cik] = _Evidence(

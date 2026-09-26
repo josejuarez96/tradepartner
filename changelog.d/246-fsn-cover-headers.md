@@ -1,0 +1,2 @@
+### Added
+- Data: `EdgarFilingSource.cover_pages`/`filing_headers` serve FSN's per-CIK caches (T11c) stamped at read time, with per-document cover-page and ranged-SGML-header fallbacks (own `COVER_VERSION`/`HEADER_VERSION` caches, stamp stripped) for lag-window and registration-form accessions FSN does not hold; the EDGAR run message reports `.fsn_missing`; `store.classify`'s SIC evidence now reads `edgar.header_forms` instead of `master.issuer_forms` (#246).
