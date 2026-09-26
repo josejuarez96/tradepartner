@@ -309,6 +309,19 @@ class TestParseFsn:
         assert [r.accession for r in parsed.records] == [good]
         assert [f.accession for f in parsed.failures] == [bad]
 
+    def test_two_different_share_values_for_one_class_fail_that_accession(self) -> None:
+        good, bad = "0000000010-25-000001", "0000000011-25-000001"
+        sub = [_sub(good, "10", "10-K"), _sub(bad, "11", "10-K")]
+        num = [
+            _num(good, "EntityCommonStockSharesOutstanding", "5", "20250131"),
+            _num(good, "EntityCommonStockSharesOutstanding", "5", "20250131"),  # same value: fine
+            _num(bad, "EntityCommonStockSharesOutstanding", "5", "20250131"),
+            _num(bad, "EntityCommonStockSharesOutstanding", "6", "20250131"),
+        ]
+        parsed = parse_fsn(sub, num, [], [])
+        assert [(r.accession, len(r.shares)) for r in parsed.records] == [(good, 1)]
+        assert [f.accession for f in parsed.failures] == [bad]
+
     def test_title_with_no_symbol_is_not_a_listing(self) -> None:
         accession = "0000000007-25-000001"
         sub = [_sub(accession, "7", "10-K")]
@@ -703,6 +716,29 @@ class TestEnsureFsn:
         )
         failed = json.loads(manifest_path.read_text())["accessions_failed"]
         assert [(f["accession"], f["base_form"]) for f in failed] == [(kept, "10-K")]
+
+    def test_manifest_records_served_accessions_and_incomplete_listings(
+        self, tmp_path: Path
+    ) -> None:
+        """T11f's failure share needs served-form accessions as its denominator,
+        and the incomplete-listing count must outlive the run that extracted it."""
+        settings = _settings(tmp_path)
+        served, unserved = "0000000031-15-000001", "0000000032-15-000001"
+        zip_bytes = _fsn_zip_bytes(
+            [_sub(served, "31", "10-K"), _sub(unserved, "32", "6-K")],
+            [],
+            [_txt(served, "TradingSymbol", "NOEX"), _txt(unserved, "TradingSymbol", "X")],
+            [],
+        )
+        source = _source_ready(settings, _router_with_fsn("2015q1", zips={"2015q1": zip_bytes}))
+        source._ensure_fsn()
+        manifest_path = (
+            Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}" / "manifests" / "2015q1.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["accessions_served"] == [served]
+        assert manifest["incomplete_listings"] == 1  # the served 10-K only
+        assert source.fsn_incomplete_listings == 1
 
     def test_an_unreadable_cik_cache_stops_extraction(self, tmp_path: Path) -> None:
         """A per-CIK cache that exists but does not load must not be silently

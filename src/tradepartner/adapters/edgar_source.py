@@ -514,6 +514,8 @@ class EdgarFilingSource(FilingSource):
 
         form_by_accession = {str(row["adsh"]): str(row["form"]) for row in sub_rows}
         per_cik_new: dict[str, dict[str, FsnFiling]] = {}
+        served: list[str] = []
+        incomplete = 0
         for record in parsed.records:
             if record.accession in known_accessions:
                 self.fsn_duplicates += 1
@@ -521,7 +523,9 @@ class EdgarFilingSource(FilingSource):
             known_accessions.add(record.accession)
             if record.form.removesuffix("/A") in kept_forms:
                 per_cik_new.setdefault(record.cik, {})[record.accession] = record
-                self.fsn_incomplete_listings += record.incomplete_listings
+                served.append(record.accession)
+                incomplete += record.incomplete_listings
+        self.fsn_incomplete_listings += incomplete
         for cik, records in per_cik_new.items():
             existing = self._load_fsn_cache(cik, strict=True)
             existing.update(records)
@@ -533,6 +537,10 @@ class EdgarFilingSource(FilingSource):
             "content_hash": content_hash,
             "validators": _fsn_validators_dict(headers),
             "accessions_extracted": sorted({r.accession for r in parsed.records}),
+            # T11f: served-form accessions (the failure-share denominator with
+            # `accessions_failed`) and the period's skipped incomplete listings.
+            "accessions_served": sorted(served),
+            "incomplete_listings": incomplete,
             "accessions_failed": [
                 {
                     "accession": f.accession,

@@ -750,16 +750,19 @@ def _parse_one_fsn_filing(
             CoverListing(restore_class_letter_space(title), symbol, normalize_exchange(exchange))
         )
 
-    shares: list[FsnShare] = []
+    shares: dict[str, FsnShare] = {}
     for row in num_rows:
         if row.get("tag") != _SHARES_CONCEPT or _fsn_is_coreg(row):
             continue
         member = _fsn_class_member(row, dim_segments)
         if member is None:
             continue
-        shares.append(FsnShare(member, float(Decimal(row["value"])), _fsn_ddate(row["ddate"])))
+        share = FsnShare(member, float(Decimal(row["value"])), _fsn_ddate(row["ddate"]))
+        if shares.get(member, share) != share:  # fail closed, as for listing tags
+            raise ValueError(f"{accession}: two share values for {member or 'no class'}")
+        shares[member] = share
 
-    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares), incomplete)
+    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares.values()), incomplete)
 
 
 def parse_fsn(
