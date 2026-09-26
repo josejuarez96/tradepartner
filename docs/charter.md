@@ -24,7 +24,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 - Runs locally, for personal use only.
 - Paper trading first. Live capital is about $100 at most until the charter is amended. ⬜ Account type (taxable or retirement): decide before Phase 6.
 - ⬜ **Compliance:** employer personal-trading policy reviewed. Required before Phase 6; blocks nothing earlier.
-- **Budget:** set by [ADR 0009](decisions/0009-price-vendor.md) at $0/month for data, APIs and LLM calls by the running system from Phase 3 until a later ADR changes it (data-vendor spend had been deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md)); interim ceiling for spend **by the running system** (data, APIs, LLM calls; development tooling excluded) is **$0/month** (free tiers only). The Phase 3 vendor ADR sets the ceiling for data, APIs and LLM spend from then on.
+- **Budget:** set by [ADR 0009](decisions/0009-price-vendor.md) at $0/month for spend **by the running system** (data, APIs, LLM calls; development tooling excluded) from Phase 3 until a later ADR changes it (data-vendor spend had been deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md)).
 - **Time:** no fixed weekly hours. Build and review hours are recorded in each phase retro, and the 6-month stop criterion above applies. The owner reviews and merges every PR (~≤400 lines each).
 
 ## Principles (from the research)

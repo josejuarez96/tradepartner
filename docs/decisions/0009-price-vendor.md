@@ -42,7 +42,7 @@ We will run Phase 3 with **no paid price vendor**. The `PriceSource` for every r
 **Triggers that re-open the budget (any one):**
 - H1's in-sample run, or any later registered hypothesis, records a gap count share above `gap.count_share_threshold` at any month-end and the owner does not sign it off;
 - H1's in-sample run records any `truncated_tail` name the owner cannot explain as a data error in EDGAR;
-- the `truncated_history` side count at any in-sample rebalance exceeds `gap.count_share_threshold` of the listed set;
+- the `truncated_history` side count, excluding names whose first listing is less than `universe.min_history_months` before the rebalance (new listings fail rule 6 by construction), exceeds `gap.count_share_threshold` of the listed set at any in-sample rebalance;
 - a hypothesis the owner wants to register needs bars before 2016-01-04;
 - Alpaca withdraws SIP history from the free plan or changes its storage terms.
 
