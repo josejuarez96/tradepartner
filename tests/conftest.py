@@ -230,3 +230,21 @@ def fixture_store() -> Iterator[duckdb.DuckDBPyConnection]:
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def fixture_store_path(tmp_path: Path) -> Path:
+    """A temp-file store with the schema applied and the fixture universe
+    loaded, closed before it is returned, so a test can open its own write
+    and read-only connections to it (backtest plan T39b; shared by
+    `tests/backtest/` and `tests/oracle/`). The file is never
+    `settings.store.path`, so trials on it may be synthetic."""
+    path = tmp_path / "fixture_store.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
+    finally:
+        conn.close()
+    return path
