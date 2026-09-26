@@ -1,0 +1,1 @@
+- T39 run orchestration and refusals: `backtest.run.run_hypothesis` opens the trial, applies the window, holdout and gap decisions, runs the engine at every cost level over per-step read-only connections and writes results; failures, a mid-run store change and each refusal leave their result row (#221)
