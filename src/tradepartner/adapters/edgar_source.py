@@ -1,4 +1,5 @@
-"""The EDGAR `FilingSource` (spec req 6, plan T11b; T11c adds the per-CIK methods).
+"""The EDGAR `FilingSource` (spec req 6, plan T11b; T11c adds FSN fetch and
+parse; T11d serves `cover_pages`/`filing_headers` from it).
 
 Every fetch goes through `edgar_raw` (throttle, retry, `User-Agent`) and
 every payload through the `edgar` parsers; this module decides what to
@@ -32,6 +33,26 @@ rebuilt about 03:00 ET, so after a bulk pass the CIKs still unstamped get
 the per-CIK fetch. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
 when its quarter had settled before the per-CIK fetch that lacked it.
+
+**Cover pages and headers (T11d).** `cover_pages` and `filing_headers` serve
+the FSN caches T11c built, each row re-stamped at read time from
+`_load_stamps(cik)`, never from FSN's own dates or a document's own
+`ACCEPTANCE-DATETIME`. What FSN does not (yet) hold is covered per
+document: a cover-page accession gets one iXBRL parse when it is inline
+XBRL, its base form is in `edgar.cover_page_forms` and it was accepted on
+or after the lag window's start (the first day of the newest cached FSN
+period); an older such accession absent from FSN is not fetched and is
+counted on `.fsn_missing`, unless its FSN extraction itself failed (that
+is T11f's `.failed_filings` to count). A header gets a ranged
+`filing_sgml_header` fetch when its accession is absent from FSN and
+either its base form is a registration form (`S-1`, `F-1`, `10-12B`)
+accepted on or after `edgar.header_start_year`, or it is accepted inside
+the lag window (periodic forms and 8-K); an FSN header with a blank SIC
+inside the lag window also gets one, so a de-SPAC's new SIC still
+arrives with its 8-K. Each per-document result is cached by accession,
+its stamp stripped, under its own version constant (`COVER_VERSION`,
+`HEADER_VERSION`): a cached entry always wins over FSN for its accession,
+until the version bumps or the cache is cleared.
 """
 
 from __future__ import annotations
@@ -669,7 +690,7 @@ class EdgarFilingSource(FilingSource):
     def cover_pages(self, cik: str) -> list[CoverPage]:
         """FSN cover pages of `cik` (stamped at read time), plus a per-document
         parse for lag-window accessions FSN does not (yet) hold. See the
-        module docstring's T11d note."""
+        module docstring's "Cover pages and headers" section."""
         self._ensure_fsn()
         stamps = self._load_stamps(cik)
         fsn_cache = self._load_fsn_cache(cik)
@@ -746,7 +767,7 @@ class EdgarFilingSource(FilingSource):
     def filing_headers(self, cik: str, forms: Sequence[str]) -> list[FilingHeader]:
         """SIC headers of `cik`'s filings whose base form is in `forms`: from
         FSN with no request, plus a ranged SGML header where the module
-        docstring's T11d note says one is owed. See the module docstring."""
+        docstring's "Cover pages and headers" section says one is owed."""
         self._ensure_fsn()
         stamps = self._load_stamps(cik)
         fsn_cache = self._load_fsn_cache(cik)
