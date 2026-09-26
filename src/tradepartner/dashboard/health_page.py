@@ -46,12 +46,11 @@ import streamlit as st
 
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import Settings, get_settings
-from tradepartner.dashboard import theme
+from tradepartner.dashboard import header, theme
 from tradepartner.health import HealthReport, health_report
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
-from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 
 #: Sessions the window control starts with (a view default, not a threshold).
 DEFAULT_WINDOW_SESSIONS: Final = 60
@@ -137,15 +136,6 @@ def _series(
     return pl.DataFrame(out, schema=_SERIES_SCHEMA, orient="row")
 
 
-def _as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:
-    latest = [
-        conn.execute(f"SELECT max(known_at) FROM {table} WHERE known_at <= ?", [t]).fetchone()
-        for table in TABLE_PROVENANCE_VALUES
-    ]
-    known = [row[0] for row in latest if row is not None and row[0] is not None]
-    return max(known, default=None)
-
-
 def _stale_sessions(report: HealthReport) -> int | None:
     last_bar = report.coverage.last_bar
     if last_bar is None:
@@ -171,14 +161,10 @@ def load_health_view(
         ),
         window=window,
         threshold=settings.ingest.max_missing_share,
-        as_of=_as_of(conn, t),
+        as_of=header.store_freshness(conn, t).as_of,
         last_updated=max(finished, default=None),
         stale_sessions=_stale_sessions(report),
     )
-
-
-def _when(value: datetime | None) -> str:
-    return "never" if value is None else value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _default_window(session: date) -> tuple[date, date]:
@@ -188,7 +174,7 @@ def _default_window(session: date) -> tuple[date, date]:
 
 
 def _header(view: HealthView) -> None:
-    st.caption(f"as of {_when(view.as_of)} · last updated {_when(view.last_updated)}")
+    header.render_freshness(header.Freshness(view.as_of, view.last_updated))
     if view.stale_sessions is None:
         theme.status_badge("no bars yet", "warning")
     elif view.stale_sessions:
@@ -212,7 +198,7 @@ def _kpis(view: HealthView) -> None:
         help=f"{report.gaps.missing_sessions} missing sessions in total",
     )
     tiles[2].metric("Delisted names", report.delisted.count)
-    tiles[3].metric("Last update", _when(view.last_updated))
+    tiles[3].metric("Last update", header.when(view.last_updated))
 
 
 def _hero(view: HealthView, palette: theme.Palette) -> None:
@@ -286,7 +272,7 @@ def _sources_card(report: HealthReport) -> None:
         st.subheader("Sources")
         for ingest in report.ingests:
             st.markdown(
-                f"**{ingest.source}**: last ok {_when(ingest.last_ok_finished_at)}"
+                f"**{ingest.source}**: last ok {header.when(ingest.last_ok_finished_at)}"
                 f" (cursor {ingest.last_ok_cursor or '-'})"
             )
             if ingest.latest_status is None:

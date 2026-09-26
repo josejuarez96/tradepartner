@@ -27,6 +27,7 @@ import duckdb
 import polars as pl
 import streamlit as st
 
+from tradepartner.dashboard import header
 from tradepartner.store import registry, schema
 
 _ALL: Final = "All hypotheses"
@@ -160,6 +161,7 @@ def _decisions_table(decisions: tuple[DecisionRow, ...]) -> pl.DataFrame:
 def render(conn: duckdb.DuckDBPyConnection) -> None:
     """Draw the trial-registry view from the shell's read-only connection."""
     st.header("Trial registry")
+    header.render_freshness(header.store_freshness(conn, header.now()))
     try:
         schema.init_schema(conn)
     except schema.RegistryNotInitialised as exc:
