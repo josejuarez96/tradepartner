@@ -108,6 +108,15 @@ def _cik(value: object) -> str:
     return f"{int(str(value)):010d}"
 
 
+def normalize_class_member(raw: str) -> str:
+    """A class-axis dimension value with any `prefix:` and a trailing
+    `Member` dropped, so `us-gaap:CommonClassAMember` (cover-page iXBRL) and
+    `CommonClassA` (an FSN `dim.segments` member, whose namespace and
+    `Member` are already stripped) are one name. Pure; `""` stays `""`."""
+    value = raw.split(":", 1)[-1] if ":" in raw else raw
+    return value.removesuffix("Member")
+
+
 def _parse_utc(text: str) -> datetime:
     return ensure_tz_aware_utc(
         datetime.fromisoformat(text.replace("Z", "+00:00")), field_name="acceptanceDateTime"
@@ -521,7 +530,7 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
                     cik,
                     _SHARES_CONCEPT,
                     date.fromisoformat(context["instant"]),
-                    member,
+                    normalize_class_member(member),
                     float(Decimal(value)),
                     accession,
                     accepted_at,
@@ -576,3 +585,223 @@ def parse_delisting(
         accession=accession,
         accepted_at=accepted_at,
     )
+
+
+# --- SEC Financial Statement and Notes data sets (T11c) ---------------------
+#
+# `sub.tsv`, `num.tsv`, `txt.tsv` and `dim.tsv` of one FSN period zip, read
+# by the caller with DuckDB `read_csv(..., delim='\t', header=true,
+# all_varchar=true, quote='')` and passed here as row mappings already
+# filtered to the four `dei` cover-page tags. Records carry **no**
+# timestamp: `sub.accepted`, `filed` and `period` are never read (module
+# docstring "known_at"); T11d stamps these at read time from the
+# submissions acceptance cache.
+
+_FSN_LISTING_TAGS = frozenset({"Security12bTitle", "TradingSymbol", "SecurityExchangeName"})
+_FSN_CLASS_AXIS = "ClassOfStock"
+
+
+@dataclass(frozen=True)
+class FsnShare:
+    """One `EntityCommonStockSharesOutstanding` fact from an FSN `num.tsv` row.
+
+    `as_of_date` is FSN's `ddate`, which FSN **rounds to the nearest month
+    end**: Alphabet's cover date 2026-01-28 arrives as 2026-01-31, Apple's
+    2025-10-17 as 2025-10-31 (recorded fixtures, #224). It is not the cover's
+    own date, it can fall after the filing's acceptance, and it is never a
+    `known_at`; T11e decides how FSN shares are dated and de-duplicated."""
+
+    class_member: str
+    value: float
+    as_of_date: date
+
+
+@dataclass(frozen=True)
+class FsnFiling:
+    """One accession's cover facts and SIC from the FSN data sets, unstamped."""
+
+    accession: str
+    cik: str
+    form: str
+    sic: int | None
+    listings: tuple[CoverListing, ...]
+    shares: tuple[FsnShare, ...]
+    #: Listings with a trading symbol but no title or exchange, skipped
+    #: (owner decision 2026-09-26, #224): the filing's SIC, shares and complete
+    #: listings are kept rather than failing the whole accession.
+    incomplete_listings: int = 0
+
+
+@dataclass(frozen=True)
+class FsnFailure:
+    """An accession whose FSN rows did not parse.
+
+    `error_class` is the underlying exception's type name (`KeyError`,
+    `ValueError`, ...): `_fail_closed` chains the original exception as
+    `__cause__`, so a malformed-payload error (e.g. a missing column) keeps
+    its own class name rather than collapsing to `ValueError` (T11f's
+    per-`(error class, base form)` failure-policy grouping needs it)."""
+
+    accession: str
+    error: str
+    error_class: str
+
+
+@dataclass(frozen=True)
+class FsnParse:
+    records: tuple[FsnFiling, ...]
+    failures: tuple[FsnFailure, ...]
+
+
+_CLASS_LETTER_NO_SPACE = re.compile(r"\bClass([A-Z])\b")
+
+
+def restore_class_letter_space(title: str) -> str:
+    """`title` with the space put back between `Class` and a single class
+    letter. FSN drops the filing's non-breaking space, so Alphabet's
+    `Class&#160;A Common Stock` arrives as `ClassA Common Stock` (recorded
+    2026_02, #224), which ingest's class-letter rule would not match. Pure;
+    other lost NBSPs are left as FSN gives them."""
+    return _CLASS_LETTER_NO_SPACE.sub(r"Class \1", title)
+
+
+def _fsn_segments(raw: str) -> dict[str, str] | None:
+    """`dim.segments` (e.g. `"ClassOfStock=CommonClassA;"`) to `{axis:
+    member}`, or `None` if it names any axis other than `ClassOfStock`."""
+    pairs: dict[str, str] = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        axis, _, member = part.partition("=")
+        pairs[axis.strip()] = member.strip()
+    if set(pairs) - {_FSN_CLASS_AXIS}:
+        return None
+    return pairs
+
+
+def _fsn_ddate(value: str) -> date:
+    text = value.strip()
+    if len(text) != 8 or not text.isdigit():
+        raise ValueError(f"malformed ddate: {value!r}")
+    return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+
+
+def _fsn_is_coreg(row: Mapping[str, str]) -> bool:
+    return bool((row.get("coreg") or "").strip())
+
+
+def _fsn_class_member(row: Mapping[str, str], dim_segments: Mapping[str, str]) -> str | None:
+    """The row's class member: `""` when `dimn` is `0` (undimensioned), or
+    `None` when the row should be excluded (a non-`ClassOfStock` axis, or a
+    `dimh` with no matching `dim.tsv` row)."""
+    dimn = (row.get("dimn") or "0").strip()
+    if dimn in ("", "0"):
+        return ""
+    segments_raw = dim_segments.get((row.get("dimh") or "").strip())
+    if segments_raw is None:
+        return None
+    segments = _fsn_segments(segments_raw)
+    if segments is None:
+        return None
+    return normalize_class_member(segments.get(_FSN_CLASS_AXIS, ""))
+
+
+@_fail_closed
+def _parse_one_fsn_filing(
+    accession: str,
+    sub_row: Mapping[str, str],
+    num_rows: Sequence[Mapping[str, str]],
+    txt_rows: Sequence[Mapping[str, str]],
+    dim_segments: Mapping[str, str],
+) -> FsnFiling:
+    raw_cik = str(sub_row["cik"]).strip()
+    if not re.fullmatch(r"\d{1,10}", raw_cik):  # it names a cache file downstream
+        raise ValueError(f"{accession}: malformed CIK {raw_cik[:20]!r}")
+    cik = _cik(raw_cik)
+    form = str(sub_row["form"])
+    sic_raw = (sub_row.get("sic") or "").strip()
+    sic = int(sic_raw) if sic_raw else None
+
+    groups: dict[str, dict[str, str]] = {}
+    for row in txt_rows:
+        tag = row.get("tag")
+        if tag not in _FSN_LISTING_TAGS or _fsn_is_coreg(row):
+            continue
+        member = _fsn_class_member(row, dim_segments)
+        if member is None:
+            continue
+        group, value = groups.setdefault(member, {}), row.get("value") or ""
+        if group.get(tag, value) != value:  # fail closed, as parse_cover_page does
+            raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
+        group[tag] = value
+
+    listings: list[CoverListing] = []
+    incomplete = 0
+    for group in groups.values():
+        title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
+        exchange = group.get("SecurityExchangeName")
+        if symbol is None:
+            continue  # notes and other classes with no trading symbol
+        if title is None or exchange is None:
+            incomplete += 1  # skipped and counted, not a failure (owner, #224)
+            continue
+        listings.append(
+            CoverListing(restore_class_letter_space(title), symbol, normalize_exchange(exchange))
+        )
+
+    shares: dict[str, FsnShare] = {}
+    for row in num_rows:
+        if row.get("tag") != _SHARES_CONCEPT or _fsn_is_coreg(row):
+            continue
+        member = _fsn_class_member(row, dim_segments)
+        if member is None:
+            continue
+        share = FsnShare(member, float(Decimal(row["value"])), _fsn_ddate(row["ddate"]))
+        if shares.get(member, share) != share:  # fail closed, as for listing tags
+            raise ValueError(f"{accession}: two share values for {member or 'no class'}")
+        shares[member] = share
+
+    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares.values()), incomplete)
+
+
+def parse_fsn(
+    sub: Iterable[Mapping[str, str]],
+    num: Iterable[Mapping[str, str]],
+    txt: Iterable[Mapping[str, str]],
+    dim: Iterable[Mapping[str, str]],
+) -> FsnParse:
+    """One unstamped record per accession in `sub`, from one FSN period's
+    members. A `num`/`txt` row carrying a non-null `coreg`, or naming any
+    axis other than `ClassOfStock`, is excluded exactly as `parse_cover_page`
+    skips other axes. An accession whose rows do not parse yields one
+    failure; every other accession still parses (never raises for one bad
+    accession)."""
+    dim_segments = {str(row["dimhash"]): str(row["segments"]) for row in dim}
+    num_by_adsh: dict[str, list[Mapping[str, str]]] = {}
+    for row in num:
+        num_by_adsh.setdefault(str(row["adsh"]), []).append(row)
+    txt_by_adsh: dict[str, list[Mapping[str, str]]] = {}
+    for row in txt:
+        txt_by_adsh.setdefault(str(row["adsh"]), []).append(row)
+
+    records: list[FsnFiling] = []
+    failures: list[FsnFailure] = []
+    for sub_row in sub:
+        accession = str(sub_row["adsh"])
+        try:
+            records.append(
+                _parse_one_fsn_filing(
+                    accession,
+                    sub_row,
+                    num_by_adsh.get(accession, []),
+                    txt_by_adsh.get(accession, []),
+                    dim_segments,
+                )
+            )
+        except ValueError as error:
+            error_class = (
+                type(error.__cause__).__name__ if error.__cause__ else type(error).__name__
+            )
+            failures.append(FsnFailure(accession, str(error), error_class))
+    return FsnParse(tuple(records), tuple(failures))

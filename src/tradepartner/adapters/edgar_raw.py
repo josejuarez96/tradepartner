@@ -470,6 +470,11 @@ _FSN_PERIOD_PATTERN = re.compile(
 )
 
 
+def is_fsn_period(period: str) -> bool:
+    """Whether `period` is spelled `YYYYqN` or `YYYY_MM` (month 01 to 12)."""
+    return _FSN_PERIOD_RE.fullmatch(period) is not None
+
+
 def _validate_fsn_period(period: str) -> None:
     """`period` must be `YYYYqN` or `YYYY_MM` before it reaches a URL or a
     path under `edgar.cache_dir` (as `_validate_accession` guards accessions)."""

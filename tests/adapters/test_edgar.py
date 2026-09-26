@@ -19,6 +19,7 @@ import pytest
 
 from tradepartner.adapters.edgar import (
     acceptance_times,
+    normalize_class_member,
     normalize_exchange,
     parse_company_facts,
     parse_company_tickers,
@@ -279,6 +280,23 @@ class TestSgmlHeader:
             parse_sgml_header(text)
 
 
+class TestNormalizeClassMember:
+    def test_drops_prefix_and_trailing_member(self) -> None:
+        assert normalize_class_member("us-gaap:CommonClassAMember") == "CommonClassA"
+
+    def test_fsn_member_already_stripped_is_unchanged(self) -> None:
+        assert normalize_class_member("CommonClassA") == "CommonClassA"
+
+    def test_filer_custom_member(self) -> None:
+        assert (
+            normalize_class_member("goog:ClassACommonStockParValue00001PerShareCustomMember")
+            == "ClassACommonStockParValue00001PerShareCustom"
+        )
+
+    def test_empty_stays_empty(self) -> None:
+        assert normalize_class_member("") == ""
+
+
 class TestCoverPage:
     def test_dual_class_listings_and_shares(self, acceptance: dict[str, datetime]) -> None:
         accession = "0001652044-26-000018"
@@ -299,9 +317,9 @@ class TestCoverPage:
         assert cover.listings[0].title == "Class A Common Stock, $0.001 par value"
         shares = {f.class_member: f.value for f in parsed.facts}
         assert shares == {
-            "us-gaap:CommonClassAMember": 5_822_000_000,
-            "us-gaap:CommonClassBMember": 837_000_000,
-            "goog:CapitalClassCMember": 5_438_000_000,
+            "CommonClassA": 5_822_000_000,
+            "CommonClassB": 837_000_000,
+            "CapitalClassC": 5_438_000_000,
         }
         assert all(f.as_of_date == date(2026, 1, 28) for f in parsed.facts)
         assert all(f.accepted_at == accepted_at for f in parsed.facts)
