@@ -4,14 +4,16 @@ Every command is driven through `build_app(CliDeps(...))`, so settings, the
 clock, the EDGAR HTTP client, the price source and the dashboard launcher are
 injected: no test touches the network, the real store or `.env`.
 
-T11d/T11e/T11f are not merged when this spike was written: the EDGAR ingest
-test stubs `cover_pages`, `filing_headers`, `facts` and `delistings` on
-`EdgarFilingSource` and exercises the real `filing_index` and
-`companies_snapshot` over the recorded fixtures.
+T11e and T11f are not merged yet: the EDGAR ingest tests stub `facts` and
+`delistings` on `EdgarFilingSource` and run the real `filing_index`,
+`companies_snapshot` and T11d's `cover_pages` and `filing_headers` over the
+recorded fixtures.
 """
 
 from __future__ import annotations
 
+import io
+import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -95,28 +97,56 @@ def _output(result: Any) -> str:
 # --- ingest -------------------------------------------------------------------
 
 
+FSN_PAGE_URL = (
+    "https://www.sec.gov/data-research/sec-markets-data/financial-statement-notes-data-sets"
+)
+FSN_PERIODS = ("2025_10", "2026_02")  # recorded (#224): Apple, Alphabet
+
+
+def _fsn_zip_url(period: str) -> str:
+    return (
+        "https://www.sec.gov/files/dera/data/financial-statement-notes-data-sets/"
+        f"{period}_notes.zip"
+    )
+
+
+def _fsn_zip(period: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for member in ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv"):
+            archive.write(FIXTURES / "fsn" / period / member, member)
+    return buffer.getvalue()
+
+
 def _edgar_router() -> EdgarRouter:
     """Index quarters 2024 Q1 to 2026 Q3: the recorded 2024 Q1 index (Apple,
-    Alphabet and KLX rows only), header-only elsewhere."""
+    Alphabet and KLX rows only), header-only elsewhere; the two recorded FSN
+    periods for T11d's cover pages and headers."""
     router = EdgarRouter()
     for year in (2024, 2025, 2026):
         for qtr in range(1, 5):
             if (year, qtr) <= (2026, 3):
                 router.add_index(year, qtr, index_header())
     router.add_index(2024, 1, (FIXTURES / "filing_index_2024_qtr1.txt").read_text())
+    router.add(
+        FSN_PAGE_URL,
+        "".join(f'<a href="{_fsn_zip_url(p)}">{p}</a>' for p in FSN_PERIODS),
+    )
+    for period in FSN_PERIODS:
+        router.add(_fsn_zip_url(period), _fsn_zip(period))
     return router
 
 
 @pytest.fixture
 def stub_t11def(monkeypatch: pytest.MonkeyPatch) -> None:
-    """T11d/T11e/T11f placeholders answer empty until those tasks merge."""
-    for method in ("cover_pages", "filing_headers", "facts"):
-        monkeypatch.setattr(EdgarFilingSource, method, lambda self, *a, **k: [])
+    """T11e (`facts`) and T11f (`delistings`) placeholders answer empty until
+    those tasks merge; T11d's `cover_pages` and `filing_headers` run for real."""
+    monkeypatch.setattr(EdgarFilingSource, "facts", lambda self, cik, names: [])
     monkeypatch.setattr(EdgarFilingSource, "delistings", lambda self, since=None: [])
 
 
 def _edgar_cli_settings(tmp_path: Path, **overrides: Any) -> Settings:
-    base = edgar_settings(tmp_path / "cache")
+    base = edgar_settings(tmp_path / "cache", fsn_first_year=2025)
     return base.model_copy(
         update={
             "store": base.store.model_copy(
@@ -139,6 +169,7 @@ def test_ingest_edgar_builds_the_edgar_source_from_settings(
     assert result.exit_code == 0, _output(result)
     assert router.index_urls(), "the EDGAR index was never fetched"
     assert any("submissions/CIK0000320193" in url for url in router.urls)
+    assert FSN_PAGE_URL in router.urls  # T11d's cover pages and headers ran
     assert prices.calls == []
     with duckdb.connect(settings.store.path, read_only=True) as conn:
         rows = conn.execute("SELECT source, status FROM ingestion_runs").fetchall()
