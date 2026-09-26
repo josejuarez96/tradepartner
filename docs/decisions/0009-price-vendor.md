@@ -1,6 +1,6 @@
 # 0009. Price vendor: none for Phase 3; Alpaca SIP bars plus EDGAR, with the survivorship gap measured and gated
 
-**Status:** Proposed  ·  **Date:** 2026-09-26  ·  **Issue:** #240 (plan task T29)
+**Status:** Accepted 2026-09-26 (PR #241)  ·  **Date:** 2026-09-26  ·  **Issue:** #240 (plan task T29)
 
 ## Context
 

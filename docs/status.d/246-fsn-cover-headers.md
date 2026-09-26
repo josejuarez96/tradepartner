@@ -1,0 +1,1 @@
+- #246 T11d: `EdgarFilingSource.cover_pages`/`filing_headers` serve FSN's per-CIK caches, stamped at read time from the submissions acceptance, with per-document cover-page and ranged-header fallbacks for lag-window and registration-form accessions FSN does not hold; classification's SIC evidence now reads `edgar.header_forms`
