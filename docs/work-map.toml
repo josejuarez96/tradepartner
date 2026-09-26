@@ -91,14 +91,18 @@ what = "The real EDGAR filing source: the quarterly index of issuer filings, sta
 why = "Without it a real ingest has no filings; T11 only parsed recordings."
 
 [task.T11c]
-what = "Fetch and parse the SEC Financial Statement and Notes data sets: cover pages, per-class shares and SIC for every issuer filing since 2009, cached per CIK."
+what = "Fetch and parse the SEC Financial Statement and Notes data sets: cover pages, per-class shares and SIC for issuer filings since 2015, cached per CIK."
 why = "Per-filing downloads for every issuer are hundreds of GB; the monthly data sets carry the same facts by accession (#174)."
 
 [task.T11d]
-what = "The adapter methods that serve cover pages, shares and SIC from those caches, stamped at acceptance, with per-filing downloads only for the newest weeks."
-why = "Turns the data sets into the point-in-time facts the security master and classification read."
+what = "The adapter methods that serve cover pages and SIC headers from those caches, stamped at acceptance, with per-filing downloads only for the newest weeks."
+why = "Turns the data sets into the point-in-time listings and SIC the security master and classification read."
 
 [task.T11e]
+what = "The adapter method that serves shares outstanding: company facts plus per-class shares from the cover pages."
+why = "Dual-class share counts exist only on the cover page; the universe rules need them per class."
+
+[task.T11f]
 what = "Form 25 delistings from EDGAR, the rule for a filing that fails the same way every night, and the owner's measured backfill cost."
 why = "One bad filing must not block the nightly ingest; the real backfill size decides how T19 runs it."
 
