@@ -267,6 +267,15 @@ class TestParseFsn:
         assert failure.accession == bad
         assert isinstance(failure, FsnFailure)
 
+    @pytest.mark.parametrize("cik", ["1" * 400, "-5", "12a"])
+    def test_a_malformed_cik_fails_that_accession_only(self, cik: str) -> None:
+        """A CIK that is not 1 to 10 digits would make a bad cache file name;
+        it is one failure, not a run-wide error."""
+        good, bad = "0000000003-25-000001", "0000000004-25-000001"
+        parsed = parse_fsn([_sub(good, "3", "10-K"), _sub(bad, cik, "10-K")], [], [], [])
+        assert [r.accession for r in parsed.records] == [good]
+        assert [f.accession for f in parsed.failures] == [bad]
+
     def test_symbol_with_no_title_or_exchange_fails_that_accession_only(self) -> None:
         good = "0000000005-25-000001"
         bad = "0000000006-25-000001"
@@ -595,20 +604,24 @@ class TestEnsureFsn:
         [
             httpx.Response(404),
             httpx.Response(200, headers={"Content-Length": "10"}),
+            httpx.ConnectError("connection reset"),
         ],
-        ids=["head-fails", "no-etag-or-last-modified"],
+        ids=["head-fails", "no-etag-or-last-modified", "head-transport-error"],
     )
     def test_a_period_whose_reissue_cannot_be_checked_is_counted(
-        self, tmp_path: Path, head: httpx.Response
+        self, tmp_path: Path, head: httpx.Response | Exception
     ) -> None:
-        """No usable validator (a failed `HEAD`, or neither `ETag` nor
-        `Last-Modified`) is counted on `.fsn_reissue_undetected` so the run
-        message says re-issues went unchecked; it is never a re-issue."""
+        """No usable validator (a failed `HEAD` at the HTTP or network level,
+        or neither `ETag` nor `Last-Modified`) is counted on
+        `.fsn_reissue_undetected` so the run message says re-issues went
+        unchecked; it never aborts the run and is never a re-issue."""
         settings = _settings(tmp_path)
         zip_bytes = _one_period_zip("0000000011-15-000001", "11")
 
         def zip_route(request: httpx.Request) -> httpx.Response:
             if request.method == "HEAD":
+                if isinstance(head, Exception):
+                    raise head
                 return head
             return httpx.Response(200, content=zip_bytes, headers={"ETag": '"v1"'})
 
@@ -618,3 +631,32 @@ class TestEnsureFsn:
         source2 = _source_ready(settings, router)
         source2._ensure_fsn()
         assert (source2.fsn_reissue_undetected, source2.fsn_reissued) == (1, 0)
+
+    def test_an_unreadable_cik_cache_stops_extraction(self, tmp_path: Path) -> None:
+        """A per-CIK cache that exists but does not load must not be silently
+        replaced: its earlier periods have manifests and would never be
+        re-extracted, so that CIK's older records would be lost for good."""
+        settings = _settings(tmp_path)
+        root = Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}"
+        root.mkdir(parents=True)
+        (root / "0000000011.json").write_text("{truncated")
+        zips = {"2015q1": _one_period_zip("0000000011-15-000001", "11")}
+        source = _source_ready(settings, _router_with_fsn("2015q1", zips=zips))
+        with pytest.raises(ValueError, match=r"0000000011\.json"):
+            source._ensure_fsn()
+        assert (root / "0000000011.json").read_text() == "{truncated"
+
+    @pytest.mark.parametrize("stray", ["notes.json", "2015q1.json"])
+    def test_a_stray_or_foreign_manifest_is_ignored(self, tmp_path: Path, stray: str) -> None:
+        """A file in the manifests directory that is not a period's manifest
+        (a stray name, or valid JSON that is not an object) neither aborts
+        the run nor counts as extracted: the period is extracted again."""
+        settings = _settings(tmp_path)
+        manifests = Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / stray).write_text("[]")
+        zips = {"2015q1": _one_period_zip("0000000011-15-000001", "11")}
+        source = _source_ready(settings, _router_with_fsn("2015q1", zips=zips))
+        source._ensure_fsn()
+        manifest = json.loads((manifests / "2015q1.json").read_text())
+        assert manifest["accessions_extracted"] == ["0000000011-15-000001"]

@@ -458,7 +458,9 @@ class EdgarFilingSource(FilingSource):
                 headers = edgar_raw.fsn_validators(
                     period, settings=self._settings, client=self._client
                 )
-            except httpx.HTTPStatusError:
+            except (httpx.HTTPError, edgar_raw.RetryAfterTooLargeError):
+                # HTTP status or network failure: unchecked this run, never
+                # fatal. A missing User-Agent (EdgarCredentialsError) still raises.
                 self.fsn_reissue_undetected += 1
                 continue
             now, then = _fsn_validators_dict(headers), manifest.get("validators") or {}
@@ -490,7 +492,21 @@ class EdgarFilingSource(FilingSource):
                 ("adsh", "tag", "dimh", "dimn", "coreg", "value"),
                 where=f"tag IN ({listing_tags})",
             )
-            dim_rows = _fsn_rows(members["dim.tsv"], ("dimhash", "segments"))
+            # Only the dimensions a kept row uses: a quarterly dim.tsv is
+            # millions of rows, the largest part of peak memory otherwise.
+            dimhashes = sorted(
+                {str(row["dimh"]) for row in (*num_rows, *txt_rows) if row.get("dimh")}
+            )
+            dim_rows = (
+                _fsn_rows(
+                    members["dim.tsv"],
+                    ("dimhash", "segments"),
+                    where="list_contains(?, dimhash)",
+                    params=[dimhashes],
+                )
+                if dimhashes
+                else []
+            )
             parsed = parse_fsn(sub_rows, num_rows, txt_rows, dim_rows)
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
@@ -506,7 +522,7 @@ class EdgarFilingSource(FilingSource):
             if record.form.removesuffix("/A") in kept_forms:
                 per_cik_new.setdefault(record.cik, {})[record.accession] = record
         for cik, records in per_cik_new.items():
-            existing = self._load_fsn_cache(cik)
+            existing = self._load_fsn_cache(cik, strict=True)
             existing.update(records)
             self._save_fsn_cache(cik, existing)
 
@@ -535,17 +551,31 @@ class EdgarFilingSource(FilingSource):
     def _fsn_cache_path(self, cik: str) -> Path:
         return self._fsn_root() / f"{cik}.json"
 
-    def _load_fsn_cache(self, cik: str) -> dict[str, FsnFiling]:
+    def _load_fsn_cache(self, cik: str, *, strict: bool = False) -> dict[str, FsnFiling]:
+        """The CIK's cached FSN records; `{}` when there is no file. A file
+        that exists but does not load reads as `{}` too, unless `strict`: the
+        extraction path must not overwrite it, since its periods have
+        manifests and would never be extracted again."""
+        path = self._fsn_cache_path(cik)
+        if not path.exists():
+            return {}
         try:
-            data = json.loads(self._fsn_cache_path(cik).read_bytes())
+            data = json.loads(path.read_bytes())
+            if not isinstance(data, dict):
+                raise TypeError("not an object")
             if data.get("version") != FSN_VERSION or data.get("cik") != cik:
-                return {}
+                raise ValueError("another version or CIK")
             return {
                 accession: _fsn_filing_from_json(accession, cik, record)
                 for accession, record in data["records"].items()
             }
-        except (OSError, ValueError, KeyError, TypeError):
-            return {}  # absent, truncated or another layout: nothing cached yet
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            if strict:
+                raise ValueError(
+                    f"FSN cache {path} is unreadable ({type(exc).__name__}); delete it and "
+                    f"every manifest under {self._fsn_root() / 'manifests'} to re-extract"
+                ) from exc
+            return {}
 
     def _save_fsn_cache(self, cik: str, records: Mapping[str, FsnFiling]) -> None:
         data = {
@@ -560,11 +590,13 @@ class EdgarFilingSource(FilingSource):
 
     def _load_fsn_manifest(self, period: str) -> dict[str, Any] | None:
         try:
-            data: dict[str, Any] = json.loads(self._fsn_manifest_path(period).read_bytes())
+            data = json.loads(self._fsn_manifest_path(period).read_bytes())
+            if not isinstance(data, dict):
+                return None
             if data.get("version") != FSN_VERSION or data.get("period") != period:
                 return None
             return data
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return None  # absent, truncated or another layout: extract again
 
     def _save_fsn_manifest(self, period: str, manifest: dict[str, Any]) -> None:
@@ -574,7 +606,8 @@ class EdgarFilingSource(FilingSource):
 
     def _cached_fsn_periods(self) -> list[str]:
         try:
-            return [path.stem for path in (self._fsn_root() / "manifests").glob("*.json")]
+            stems = [path.stem for path in (self._fsn_root() / "manifests").glob("*.json")]
+            return [stem for stem in stems if edgar_raw.is_fsn_period(stem)]
         except OSError:
             return []
 
@@ -620,7 +653,11 @@ def _fsn_extract(zip_path: Path, extract_dir: Path) -> dict[str, Path]:
 
 
 def _fsn_rows(
-    path: Path, columns: Sequence[str], *, where: str | None = None
+    path: Path,
+    columns: Sequence[str],
+    *,
+    where: str | None = None,
+    params: Sequence[object] = (),
 ) -> list[dict[str, str]]:
     """`columns` of `path` (a tab-separated FSN member) as plain string
     dicts, via DuckDB `read_csv` with every column read as `varchar` (FSN's
@@ -641,7 +678,7 @@ def _fsn_rows(
         sql += f" WHERE {where}"
     connection = duckdb.connect()
     try:
-        cursor = connection.execute(sql, [str(path)])
+        cursor = connection.execute(sql, [str(path), *params])
         names = [description[0] for description in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
     finally:

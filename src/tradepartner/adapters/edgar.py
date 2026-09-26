@@ -705,7 +705,10 @@ def _parse_one_fsn_filing(
     txt_rows: Sequence[Mapping[str, str]],
     dim_segments: Mapping[str, str],
 ) -> FsnFiling:
-    cik = _cik(sub_row["cik"])
+    raw_cik = str(sub_row["cik"]).strip()
+    if not re.fullmatch(r"\d{1,10}", raw_cik):  # it names a cache file downstream
+        raise ValueError(f"{accession}: malformed CIK {raw_cik[:20]!r}")
+    cik = _cik(raw_cik)
     form = str(sub_row["form"])
     sic_raw = (sub_row.get("sic") or "").strip()
     sic = int(sic_raw) if sic_raw else None
