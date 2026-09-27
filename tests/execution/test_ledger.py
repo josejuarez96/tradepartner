@@ -6,6 +6,8 @@ literal check on `execution/ledger.py` is T50's (`tests/test_no_literals.py`).
 
 from __future__ import annotations
 
+import itertools
+import math
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -40,6 +42,8 @@ D7 = date(2026, 10, 7)
 D8 = date(2026, 10, 8)
 D9 = date(2026, 10, 9)
 A, B, C = "SEC_A", "SEC_B", "SEC_C"
+TOLERANCE = 1e-6  # stands in for the frozen risk.reconcile_quantity_tolerance
+_ADJUSTMENT_IDS = itertools.count(1)
 
 
 def _utc(day: date, hour: int, minute: int = 0) -> datetime:
@@ -101,10 +105,11 @@ def _adjustment(
     cash: float | None = None,
     known_at: datetime | None = None,
     window_id: int = WINDOW,
+    adjustment_id: int | None = None,
 ) -> AdjustmentRow:
     known = known_at or _utc(session, 21)
     return AdjustmentRow(
-        adjustment_id=1,
+        adjustment_id=adjustment_id or next(_ADJUSTMENT_IDS),
         window_id=window_id,
         run_id=RUN,
         session=session,
@@ -166,6 +171,7 @@ def _ledger(
     reconciliation: ReconciliationRow | None = None,
     starting_cash: float = 1000.0,
     through: date = D9,
+    window_id: int = WINDOW,
 ) -> Ledger:
     return from_journal(
         fills,
@@ -175,6 +181,8 @@ def _ledger(
         reconciliation,
         starting_cash,
         through,
+        window_id=window_id,
+        quantity_tolerance=TOLERANCE,
     )
 
 
@@ -427,7 +435,17 @@ def test_a_fill_disagreeing_with_its_order_is_refused() -> None:
 
 def test_through_must_be_a_date() -> None:
     with pytest.raises(ValueError, match="through"):
-        from_journal(FILLS, ORDERS, (), NO_ACTIONS, None, 1000.0, _utc(D9, 21))  # type: ignore[arg-type]
+        from_journal(
+            FILLS,
+            ORDERS,
+            (),
+            NO_ACTIONS,
+            None,
+            1000.0,
+            _utc(D9, 21),  # type: ignore[arg-type]
+            window_id=WINDOW,
+            quantity_tolerance=TOLERANCE,
+        )
 
 
 # A superseded fill is counted once, through the accessor.
@@ -527,3 +545,103 @@ def test_weights_refuse_non_positive_equity() -> None:
     ledger = _ledger([], [], starting_cash=0.0)
     with pytest.raises(ValueError, match="equity"):
         ledger.weights({})
+
+
+# Review fixes: window id, rows after `through`, dust, shorts, bad numbers, repeats.
+
+
+def test_a_reconciliation_of_another_window_is_refused_with_no_rows() -> None:
+    with pytest.raises(ValueError, match="window"):
+        _ledger([], [], reconciliation=_reconciliation(900.0, _utc(D5, 22), window_id=2))
+
+
+def test_every_row_must_be_of_the_named_window() -> None:
+    with pytest.raises(ValueError, match="window"):
+        _ledger(FILLS, ORDERS, window_id=2)
+
+
+def test_rows_dated_after_through_are_left_out() -> None:
+    buy_d9 = _order(A, "buy", D9, attempt=2)
+    fills = [*FILLS, _fill(buy_d9, 5, 40.0, fill_id=4)]
+    adjustments = (_adjustment("spinoff_receipt", D9, security_id=C, quantity=5.0, cash=3.0),)
+    ledger = _ledger(fills, [*ORDERS, buy_d9], adjustments=adjustments, through=D8)
+    # As on D8: the D9 fill and the D9 receipt are not in positions or cash.
+    assert ledger.positions == {A: 7.0, B: 4.0}
+    assert ledger.cash == pytest.approx(580.0)
+    # Stated for D9 they are.
+    later = _ledger(fills, [*ORDERS, buy_d9], adjustments=adjustments, through=D9)
+    assert later.positions == {A: 12.0, B: 4.0, C: 5.0}
+    assert later.cash == pytest.approx(580.0 - 200.0 + 3.0)
+
+
+def test_a_cash_base_after_through_is_refused() -> None:
+    with pytest.raises(ValueError, match="after"):
+        _ledger(FILLS, ORDERS, reconciliation=_reconciliation(600.0, _utc(D9, 13)), through=D8)
+
+
+def test_dust_within_the_tolerance_is_dropped() -> None:
+    sell = _order(A, "sell", D5)
+    fills = [
+        _fill(BUY_A, 0.1, 10.0, fill_id=1),
+        _fill(BUY_A, 0.2, 10.0, fill_id=2),
+        _fill(sell, 0.3, 10.0, fill_id=3),
+    ]
+    assert 0.1 + 0.2 - 0.3 != 0  # the float residue this case is about
+    ledger = _ledger(fills, [BUY_A, sell])
+    assert ledger.positions == {}
+    assert ledger.equity({}) == pytest.approx(1000.0)
+
+
+def test_a_negative_position_is_kept_but_refused_by_equity_and_weights() -> None:
+    sell = _order(A, "sell", D5)
+    fills = [_fill(BUY_A, 2, 50.0, fill_id=1), _fill(sell, 3, 50.0, fill_id=2)]
+    ledger = _ledger(fills, [BUY_A, sell])
+    assert ledger.positions == {A: -1.0}
+    assert ledger.short_names == (A,)
+    with pytest.raises(ValueError, match="negative"):
+        ledger.equity({A: 50.0})
+    with pytest.raises(ValueError, match="negative"):
+        ledger.weights({A: 50.0})
+
+
+@pytest.mark.parametrize("mark", [math.nan, math.inf, 0.0, -1.0])
+def test_a_bad_mark_is_refused(mark: float) -> None:
+    ledger = _ledger(FILLS, ORDERS)
+    with pytest.raises(ValueError, match="mark"):
+        ledger.equity({A: mark, B: 30.0})
+    with pytest.raises(ValueError, match="mark"):
+        ledger.weights({A: mark, B: 30.0})
+
+
+def test_non_finite_inputs_are_refused() -> None:
+    with pytest.raises(ValueError, match="starting_cash"):
+        _ledger([], [], starting_cash=math.nan)
+    with pytest.raises(ValueError, match="split ratio"):
+        _ledger(FILLS, ORDERS, actions=_splits((A, D8, math.nan)))
+    with pytest.raises(ValueError, match="broker_cash"):
+        _ledger(FILLS, ORDERS, reconciliation=_reconciliation(math.inf, _utc(D5, 22)))
+    with pytest.raises(ValueError, match="price"):
+        _ledger([_fill(BUY_A, 1, math.nan)], [BUY_A])
+    with pytest.raises(ValueError, match="quantity"):
+        _ledger(
+            [],
+            [],
+            adjustments=(_adjustment("carried_residue", D1, security_id=A, quantity=math.inf),),
+        )
+    with pytest.raises(ValueError, match="cash"):
+        _ledger([], [], adjustments=(_adjustment("dividend_cash", D1, cash=math.nan),))
+
+
+def test_a_repeated_fill_or_adjustment_is_refused() -> None:
+    with pytest.raises(ValueError, match="repeated"):
+        _ledger([*FILLS, FILLS[0]], ORDERS)
+    twice = _adjustment("dividend_cash", D1, cash=1.0)
+    with pytest.raises(ValueError, match="repeated"):
+        _ledger([], [], adjustments=(twice, twice))
+
+
+def test_a_negative_tolerance_is_refused() -> None:
+    with pytest.raises(ValueError, match="quantity_tolerance"):
+        from_journal(
+            [], [], (), NO_ACTIONS, None, 1.0, D9, window_id=WINDOW, quantity_tolerance=-1.0
+        )
