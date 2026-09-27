@@ -219,12 +219,30 @@ def test_broker_order_and_fill_ids_are_unique() -> None:
 
 
 def test_a_bad_price_fails_submit_before_anything_is_recorded() -> None:
-    broker = FakeBroker(clock=make_clock()[1], price_of=lambda symbol: float("nan"))
+    prices = {"AAPL": float("nan")}
+    broker = FakeBroker(clock=make_clock()[1], price_of=prices.__getitem__, cash=500.0)
     with pytest.raises(ValueError, match="price"):
         broker.submit(make_request())
     with pytest.raises(UnknownOrderError):
         broker.get_order("co-1")
     assert broker.fills() == [] and broker.positions() == {}
+    assert broker.account().cash == 500.0
+    prices["AAPL"] = 10.0
+    assert broker.submit(make_request(quantity=1)).broker_order_id == "fake-order-1"
+
+
+def test_account_refuses_a_bad_mark_price() -> None:
+    prices = {"AAPL": 10.0}
+    broker = FakeBroker(clock=make_clock()[1], price_of=prices.__getitem__)
+    broker.submit(make_request(quantity=1))
+    prices["AAPL"] = True  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="price"):
+        broker.account()
+
+
+def test_assets_values_must_be_assets() -> None:
+    with pytest.raises(TypeError, match="Asset"):
+        FakeBroker(clock=make_clock()[1], price_of=price_of, assets={"X": "not-an-asset"})  # type: ignore[dict-item]
 
 
 # --- get_order and open_orders ------------------------------------------------

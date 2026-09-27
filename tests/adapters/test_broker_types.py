@@ -181,6 +181,16 @@ def test_an_order_needs_exactly_one_of_notional_and_quantity(sizes: dict[str, An
         _order(**sizes)
 
 
+def test_nothing_filled_is_none_never_zero() -> None:
+    # An adapter maps a broker's filled_qty = 0 to None/None (Alpaca reports
+    # 0 on every unfilled order); zero is never a valid filled_quantity.
+    assert _order(filled_quantity=None, filled_avg_price=None).filled_quantity is None
+    with pytest.raises(ValueError, match="filled_quantity"):
+        _order(filled_quantity=0, filled_avg_price=None)
+    with pytest.raises(ValueError, match="filled_quantity"):
+        _order(filled_quantity=0, filled_avg_price=100.0)
+
+
 def test_filled_quantity_and_average_price_come_together() -> None:
     with pytest.raises(ValueError, match="filled_quantity and filled_avg_price"):
         _order(filled_quantity=1.0)

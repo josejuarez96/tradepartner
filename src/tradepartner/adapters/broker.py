@@ -73,7 +73,7 @@ def canonical_symbol(value: str) -> str:
     return value.upper()
 
 
-def _validate_positive_finite(value: float, *, field_name: str) -> float:
+def validate_positive_finite(value: float, *, field_name: str) -> float:
     """Raise `ValueError` unless `value` is a finite, positive, non-bool
     real number. `nan <= 0` and `inf <= 0` are both `False`, so a plain
     `value <= 0` check alone lets NaN/infinity through; `bool` is a
@@ -112,7 +112,7 @@ def _coerce_side(value: Side) -> Side:
 
 
 def _validate_optional_positive(value: float | None, *, field_name: str) -> float | None:
-    return None if value is None else _validate_positive_finite(value, field_name=field_name)
+    return None if value is None else validate_positive_finite(value, field_name=field_name)
 
 
 def _validate_finite(value: float, *, field_name: str) -> float:
@@ -233,7 +233,10 @@ class Order:
     and `get_order`. `broker_order_id`, `filled_quantity`,
     `filled_avg_price` and `filled_at` are `None` until the broker sets
     them; the two fill amounts come together, and a `FILLED` order carries
-    all three fill fields."""
+    all three fill fields. **Nothing filled is `None`, never zero:** an
+    adapter maps a broker's `filled_qty = 0` (Alpaca reports it on every
+    unfilled order) to `filled_quantity = filled_avg_price = None`, so
+    `filled_quantity`, when set, is always positive."""
 
     client_order_id: str
     symbol: str
@@ -312,9 +315,9 @@ class Fill:
         object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
         object.__setattr__(self, "side", _coerce_side(self.side))
         object.__setattr__(
-            self, "quantity", _validate_positive_finite(self.quantity, field_name="quantity")
+            self, "quantity", validate_positive_finite(self.quantity, field_name="quantity")
         )
-        object.__setattr__(self, "price", _validate_positive_finite(self.price, field_name="price"))
+        object.__setattr__(self, "price", validate_positive_finite(self.price, field_name="price"))
         object.__setattr__(
             self, "filled_at", ensure_tz_aware_utc(self.filled_at, field_name="filled_at")
         )

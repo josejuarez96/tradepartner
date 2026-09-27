@@ -71,6 +71,7 @@ from tradepartner.adapters.broker import (
     Side,
     UnknownOrderError,
     canonical_symbol,
+    validate_positive_finite,
 )
 from tradepartner.errors import ClockError
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -98,6 +99,9 @@ class FakeBroker(Broker):
         self._auto_fill = auto_fill
         self._cash = Decimal(repr(float(cash)))
         self._account_id = account_id
+        for asset in (assets or {}).values():
+            if not isinstance(asset, Asset):
+                raise TypeError(f"assets values must be Asset, got {type(asset).__name__}")
         self._assets = {canonical_symbol(s): a for s, a in (assets or {}).items()}
         self._orders: dict[str, Order] = {}
         self._fills: list[Fill] = []
@@ -225,7 +229,10 @@ class FakeBroker(Broker):
         as_of = self._now()
         marked = sum(
             (
-                net * Decimal(repr(float(self._price_of(symbol))))
+                net
+                * Decimal(
+                    repr(validate_positive_finite(self._price_of(symbol), field_name="price"))
+                )
                 for symbol, net in self._net_quantity.items()
                 if net != 0
             ),
