@@ -1,13 +1,22 @@
-"""`Broker` interface: the one seam order placement goes through (spec req 7
-"Broker interface"; Interfaces paragraph `Broker.submit/cancel/positions/fills`).
+"""`Broker` interface: the one seam order placement goes through (data spec
+req 7; completed for Phase 4 by paper-trading spec req 1, #33, plan T46b).
 
 This module defines the abstract interface and the small typed value
 objects it exchanges. It has no implementation: `adapters/fake_broker.py`
-(T20) is the only implementation in Phase 2, and it holds explicitly **no**
-risk logic — position limits, a kill switch and reconciliation are Phase 4
-(spec "Out of scope": "Risk-gated broker wrapper, Alpaca paper adapter,
-alerts (Phase 4)"; CLAUDE.md non-negotiable 5: "LLM output never reaches
-order placement without passing deterministic risk rules").
+and the Alpaca adapter (T48c) implement it, and neither holds risk logic:
+position limits, the kill switch and reconciliation live in the risk-gated
+wrapper (ADR 0003 rule 7; CLAUDE.md non-negotiable 5: "LLM output never
+reaches order placement without passing deterministic risk rules").
+
+**Orders.** An `OrderRequest` is a market DAY order sized by `notional` or
+`quantity`, exactly one; it carries no price. The broker's `Order` status
+is one of `OrderStatus` (`ACCEPTED`, `FILLED`, `EXPIRED`, `REJECTED`,
+`CANCELLED`); `TERMINAL_STATUSES` is every status but `ACCEPTED`. A partial
+fill is `ACCEPTED` with `filled_quantity` and `filled_avg_price` set. The
+journal-only state `pending` lives in `order_events.status`, never here.
+`cancel` is a request and returns `None`; its outcome is read back through
+`get_order`. The ABC exposes no clock (ADR 0007 point 5): the wrapper and
+the adapter are handed the same clock callable at composition time.
 
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
@@ -18,7 +27,7 @@ for that rule, so this module and `store.db` cannot drift out of sync on
 what counts as valid (issue #30).
 
 Every `symbol` field is canonicalized to upper-case ASCII at construction
-(`_canonical_symbol`), so netting and reconciliation compare one case
+(`canonical_symbol`), so netting and reconciliation compare one case
 form (issue #38). Any structure keyed by symbol (risk limits, a
 reconciler) must key on the same canonical form. Case only: separator
 variants such as `BRK.B` / `BRK-B` are not mapped here.
@@ -28,6 +37,7 @@ from __future__ import annotations
 
 import abc
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -49,7 +59,7 @@ def _validate_identifier(value: str, *, field_name: str) -> str:
     return value
 
 
-def _canonical_symbol(value: str) -> str:
+def canonical_symbol(value: str) -> str:
     """Validate `value` as an identifier and return its canonical form:
     ASCII, upper case (issue #38). Without this, `"aapl"` and `"AAPL"`
     net as two positions and would not match the broker's own records in
@@ -63,7 +73,7 @@ def _canonical_symbol(value: str) -> str:
     return value.upper()
 
 
-def _validate_positive_finite(value: float, *, field_name: str) -> float:
+def validate_positive_finite(value: float, *, field_name: str) -> float:
     """Raise `ValueError` unless `value` is a finite, positive, non-bool
     real number. `nan <= 0` and `inf <= 0` are both `False`, so a plain
     `value <= 0` check alone lets NaN/infinity through; `bool` is a
@@ -101,19 +111,54 @@ def _coerce_side(value: Side) -> Side:
         raise ValueError(f"side must be one of {allowed}, got {value!r}") from exc
 
 
-def _validate_order_fields(
-    *, client_order_id: str, symbol: str, side: Side, quantity: float, price: float
-) -> tuple[str, str, Side, float, float]:
-    """Shared validation for the fields common to `OrderRequest`, `Order`
-    and `Fill`, so the three value objects cannot drift out of sync on
-    what counts as a valid quantity/price/side/identifier.
-    """
-    client_order_id = _validate_identifier(client_order_id, field_name="client_order_id")
-    symbol = _canonical_symbol(symbol)
-    side = _coerce_side(side)
-    quantity = _validate_positive_finite(quantity, field_name="quantity")
-    price = _validate_positive_finite(price, field_name="price")
-    return client_order_id, symbol, side, quantity, price
+def _validate_optional_positive(value: float | None, *, field_name: str) -> float | None:
+    return None if value is None else validate_positive_finite(value, field_name=field_name)
+
+
+def _validate_finite(value: float, *, field_name: str) -> float:
+    """Raise `ValueError` unless `value` is a finite, non-bool real number
+    (any sign: account cash can be negative)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field_name} must be a real number, got {value!r}")
+    try:
+        is_finite = math.isfinite(value)
+    except OverflowError:
+        is_finite = False
+    if not is_finite:
+        raise ValueError(f"{field_name} must be a finite number, got {value!r}")
+    return float(value)
+
+
+def _validate_bool(value: bool, *, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a bool, got {value!r}")
+    return value
+
+
+def _validate_size(
+    notional: float | None, quantity: float | None
+) -> tuple[float | None, float | None]:
+    """Exactly one of `notional` and `quantity`, each positive and finite."""
+    if (notional is None) == (quantity is None):
+        raise ValueError(
+            f"exactly one of notional and quantity is required, got "
+            f"notional={notional!r}, quantity={quantity!r}"
+        )
+    return (
+        _validate_optional_positive(notional, field_name="notional"),
+        _validate_optional_positive(quantity, field_name="quantity"),
+    )
+
+
+def _coerce_status(value: OrderStatus) -> OrderStatus:
+    """`_coerce_side`'s rule for `OrderStatus`."""
+    if isinstance(value, OrderStatus):
+        return value
+    try:
+        return OrderStatus(value)
+    except ValueError as exc:
+        allowed = [member.value for member in OrderStatus]
+        raise ValueError(f"status must be one of {allowed}, got {value!r}") from exc
 
 
 class Side(StrEnum):
@@ -125,12 +170,20 @@ class Side(StrEnum):
 
 
 class OrderStatus(StrEnum):
-    """An order's lifecycle state. `FakeBroker` only ever produces these
-    three; there is no partial-fill state (see `fake_broker.py` docstring)."""
+    """The broker's view of an order (spec req 1). A partial fill is
+    `ACCEPTED` with `filled_quantity > 0`."""
 
-    OPEN = "open"
+    ACCEPTED = "accepted"
     FILLED = "filled"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
     CANCELLED = "cancelled"
+
+
+#: Every status an order never leaves.
+TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
+    {OrderStatus.FILLED, OrderStatus.EXPIRED, OrderStatus.REJECTED, OrderStatus.CANCELLED}
+)
 
 
 class DuplicateClientOrderIdError(Exception):
@@ -140,85 +193,110 @@ class DuplicateClientOrderIdError(Exception):
 
 
 class UnknownOrderError(Exception):
-    """Raised by `cancel` (or `FakeBroker.simulate_fill`) when no order
-    with the given `client_order_id` has ever been submitted."""
+    """Raised by `get_order` and `cancel` (and `FakeBroker.simulate_fill`)
+    when the broker has no order with the given `client_order_id`."""
 
 
 class OrderNotOpenError(Exception):
     """Raised by `cancel` (or `FakeBroker.simulate_fill`) when the order
-    exists but is already `FILLED` or `CANCELLED` — the caller is never
+    exists but is already in a terminal status; the caller is never
     silently ignored."""
 
 
 @dataclass(frozen=True)
 class OrderRequest:
-    """What a caller passes to `Broker.submit`.
-
-    `price` is the price this order fills at once it fills. Real brokers
-    would infer this from order type (market/limit); `FakeBroker` does no
-    market simulation (spec, Risks & domain checks: "Costs: none. Order
-    path: fake broker only"), so the caller supplies it directly (see
-    `fake_broker.py` docstring for the full fill-mechanism note).
-    """
+    """What a caller passes to `Broker.submit`: a market DAY order for
+    `notional` dollars or `quantity` shares, exactly one."""
 
     client_order_id: str
     symbol: str
     side: Side
-    quantity: float
-    price: float
+    notional: float | None = None
+    quantity: float | None = None
 
     def __post_init__(self) -> None:
-        client_order_id, symbol, side, quantity, price = _validate_order_fields(
-            client_order_id=self.client_order_id,
-            symbol=self.symbol,
-            side=self.side,
-            quantity=self.quantity,
-            price=self.price,
+        notional, quantity = _validate_size(self.notional, self.quantity)
+        object.__setattr__(
+            self,
+            "client_order_id",
+            _validate_identifier(self.client_order_id, field_name="client_order_id"),
         )
-        object.__setattr__(self, "client_order_id", client_order_id)
-        object.__setattr__(self, "symbol", symbol)
-        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
+        object.__setattr__(self, "side", _coerce_side(self.side))
+        object.__setattr__(self, "notional", notional)
         object.__setattr__(self, "quantity", quantity)
-        object.__setattr__(self, "price", price)
 
 
 @dataclass(frozen=True)
 class Order:
     """The broker's record of a submitted order, as returned by `submit`
-    and `cancel` and tracked internally between them."""
+    and `get_order`. `broker_order_id`, `filled_quantity`,
+    `filled_avg_price` and `filled_at` are `None` until the broker sets
+    them; the two fill amounts come together, and a `FILLED` order carries
+    all three fill fields. **Nothing filled is `None`, never zero:** an
+    adapter maps a broker's `filled_qty = 0` (Alpaca reports it on every
+    unfilled order) to `filled_quantity = filled_avg_price = None`, so
+    `filled_quantity`, when set, is always positive."""
 
     client_order_id: str
     symbol: str
     side: Side
-    quantity: float
-    price: float
+    notional: float | None
+    quantity: float | None
     status: OrderStatus
     submitted_at: datetime
+    broker_order_id: str | None = None
+    filled_quantity: float | None = None
+    filled_avg_price: float | None = None
+    filled_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        client_order_id, symbol, side, quantity, price = _validate_order_fields(
-            client_order_id=self.client_order_id,
-            symbol=self.symbol,
-            side=self.side,
-            quantity=self.quantity,
-            price=self.price,
+        notional, quantity = _validate_size(self.notional, self.quantity)
+        status = _coerce_status(self.status)
+        filled_quantity = _validate_optional_positive(
+            self.filled_quantity, field_name="filled_quantity"
         )
-        object.__setattr__(self, "client_order_id", client_order_id)
-        object.__setattr__(self, "symbol", symbol)
-        object.__setattr__(self, "side", side)
+        filled_avg_price = _validate_optional_positive(
+            self.filled_avg_price, field_name="filled_avg_price"
+        )
+        if (filled_quantity is None) != (filled_avg_price is None):
+            raise ValueError("filled_quantity and filled_avg_price are set together or not at all")
+        filled_at = (
+            None
+            if self.filled_at is None
+            else ensure_tz_aware_utc(self.filled_at, field_name="filled_at")
+        )
+        if status is OrderStatus.FILLED and (filled_quantity is None or filled_at is None):
+            raise ValueError("a FILLED order needs filled_quantity, filled_avg_price and filled_at")
+        broker_order_id = (
+            None
+            if self.broker_order_id is None
+            else _validate_identifier(self.broker_order_id, field_name="broker_order_id")
+        )
+        object.__setattr__(
+            self,
+            "client_order_id",
+            _validate_identifier(self.client_order_id, field_name="client_order_id"),
+        )
+        object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
+        object.__setattr__(self, "side", _coerce_side(self.side))
+        object.__setattr__(self, "notional", notional)
         object.__setattr__(self, "quantity", quantity)
-        object.__setattr__(self, "price", price)
+        object.__setattr__(self, "status", status)
         object.__setattr__(
             self,
             "submitted_at",
             ensure_tz_aware_utc(self.submitted_at, field_name="submitted_at"),
         )
+        object.__setattr__(self, "broker_order_id", broker_order_id)
+        object.__setattr__(self, "filled_quantity", filled_quantity)
+        object.__setattr__(self, "filled_avg_price", filled_avg_price)
+        object.__setattr__(self, "filled_at", filled_at)
 
 
 @dataclass(frozen=True)
 class Fill:
-    """One execution record. `FakeBroker` produces exactly one `Fill` per
-    filled order — no partial fills."""
+    """One execution record, identified by the broker's `broker_fill_id`."""
 
     client_order_id: str
     symbol: str
@@ -226,22 +304,27 @@ class Fill:
     quantity: float
     price: float
     filled_at: datetime
+    broker_fill_id: str
 
     def __post_init__(self) -> None:
-        client_order_id, symbol, side, quantity, price = _validate_order_fields(
-            client_order_id=self.client_order_id,
-            symbol=self.symbol,
-            side=self.side,
-            quantity=self.quantity,
-            price=self.price,
+        object.__setattr__(
+            self,
+            "client_order_id",
+            _validate_identifier(self.client_order_id, field_name="client_order_id"),
         )
-        object.__setattr__(self, "client_order_id", client_order_id)
-        object.__setattr__(self, "symbol", symbol)
-        object.__setattr__(self, "side", side)
-        object.__setattr__(self, "quantity", quantity)
-        object.__setattr__(self, "price", price)
+        object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
+        object.__setattr__(self, "side", _coerce_side(self.side))
+        object.__setattr__(
+            self, "quantity", validate_positive_finite(self.quantity, field_name="quantity")
+        )
+        object.__setattr__(self, "price", validate_positive_finite(self.price, field_name="price"))
         object.__setattr__(
             self, "filled_at", ensure_tz_aware_utc(self.filled_at, field_name="filled_at")
+        )
+        object.__setattr__(
+            self,
+            "broker_fill_id",
+            _validate_identifier(self.broker_fill_id, field_name="broker_fill_id"),
         )
 
 
@@ -260,16 +343,52 @@ class Position:
     quantity: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "symbol", _canonical_symbol(self.symbol))
+        object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
+
+
+@dataclass(frozen=True)
+class Account:
+    """The broker account at `as_of`: cash (may be negative), buying
+    power and equity, in dollars."""
+
+    account_id: str
+    cash: float
+    buying_power: float
+    equity: float
+    as_of: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "account_id", _validate_identifier(self.account_id, field_name="account_id")
+        )
+        for name in ("cash", "buying_power", "equity"):
+            object.__setattr__(self, name, _validate_finite(getattr(self, name), field_name=name))
+        object.__setattr__(self, "as_of", ensure_tz_aware_utc(self.as_of, field_name="as_of"))
+
+
+@dataclass(frozen=True)
+class Asset:
+    """What the broker says about one symbol. `cusip` is `None` when the
+    broker does not report one."""
+
+    tradable: bool
+    fractionable: bool
+    status: str
+    cusip: str | None
+
+    def __post_init__(self) -> None:
+        _validate_bool(self.tradable, field_name="tradable")
+        _validate_bool(self.fractionable, field_name="fractionable")
+        _validate_identifier(self.status, field_name="status")
+        if self.cusip is not None:
+            _validate_identifier(self.cusip, field_name="cusip")
 
 
 class Broker(abc.ABC):
-    """Abstract order-placement interface (spec "Interfaces":
-    `Broker.submit/cancel/positions/fills`).
+    """Abstract order-placement interface (paper-trading spec req 1).
 
     Instantiating this class directly raises `TypeError` (it declares
-    abstract methods); every concrete broker, including `FakeBroker`,
-    implements all four methods.
+    abstract methods). It has no clock member (ADR 0007 point 5).
     """
 
     @abc.abstractmethod
@@ -287,10 +406,25 @@ class Broker(abc.ABC):
         """
 
     @abc.abstractmethod
-    def cancel(self, client_order_id: str) -> Order:
-        """Cancel an open order. Raises `UnknownOrderError` if the id was
-        never submitted, or `OrderNotOpenError` if it is already `FILLED`
-        or `CANCELLED`."""
+    def cancel(self, client_order_id: str) -> None:
+        """Request cancellation of a non-terminal order; read the outcome
+        back through `get_order`. Raises `UnknownOrderError` if the broker
+        has no such order, or `OrderNotOpenError` if it is terminal."""
+
+    @abc.abstractmethod
+    def get_order(self, client_order_id: str) -> Order:
+        """The broker's current record of the order. Raises
+        `UnknownOrderError` when the broker has no such order (ADR 0007
+        point 3's fetch)."""
+
+    @abc.abstractmethod
+    def open_orders(self) -> list[Order]:
+        """Every order whose status is not in `TERMINAL_STATUSES`."""
+
+    @abc.abstractmethod
+    def fills(self, since: datetime | None = None) -> list[Fill]:
+        """Every fill with `filled_at >= since` (all when `None`), in fill
+        order."""
 
     @abc.abstractmethod
     def positions(self) -> dict[str, Position]:
@@ -298,5 +432,10 @@ class Broker(abc.ABC):
         net quantity is zero is absent from the result."""
 
     @abc.abstractmethod
-    def fills(self) -> list[Fill]:
-        """Every fill produced so far, in fill order."""
+    def account(self) -> Account:
+        """The account's cash, buying power and equity now."""
+
+    @abc.abstractmethod
+    def assets(self, symbols: Sequence[str]) -> dict[str, Asset]:
+        """The broker's `Asset` per requested symbol, keyed by canonical
+        symbol."""
