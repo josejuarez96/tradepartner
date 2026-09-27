@@ -18,6 +18,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from typing import Any
 
+import polars as pl
 import pytest
 
 from tradepartner.adapters.broker import Account, Asset
@@ -43,6 +44,27 @@ _S = date(2026, 10, 1)
 _PRICES = {"A": 10.0, "B": 20.0, "C": 50.0, "D": 100.0}
 _NO_COSTS = BuyCosts(per_side_bps=0.0, commissions=Commissions(per_share=0.0, per_order=0.0))
 _COSTS = BuyCosts(per_side_bps=15.0, commissions=Commissions(per_share=0.0, per_order=0.0))
+
+
+_NO_ACTIONS = pl.DataFrame(
+    schema={
+        "security_id": pl.Utf8,
+        "action_type": pl.Utf8,
+        "ex_date": pl.Date,
+        "ratio_or_amount": pl.Float64,
+    }
+)
+
+
+def _split(ex_date: date) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "security_id": ["A"],
+            "action_type": ["split"],
+            "ex_date": [ex_date],
+            "ratio_or_amount": [2.0],
+        }
+    )
 
 
 def _price_of(security_id: str) -> float:
@@ -198,7 +220,10 @@ def test_a_settings_override_changes_nothing(monkeypatch: pytest.MonkeyPatch) ->
     ledger = _ledger(A=10.0, B=0.5)
     orders = [*_passing_phase(), _order("B", "sell", 3, quantity=0.5)]
     assert isinstance(_check(orders, ledger=ledger), Skips)
-    assert _rules(_check(orders, ledger=ledger, quantity_decimals=0)) == {"sell_within_holding"}
+    assert _rules(_check(orders, ledger=ledger, quantity_decimals=0)) == {
+        "sell_within_holding",
+        "sell_sum_within_holding",
+    }
 
 
 # --- sells -----------------------------------------------------------------------------------
@@ -210,7 +235,7 @@ def test_a_sell_is_at_most_the_holding_rounded_down() -> None:
         _check([_order("A", "sell", quantity=1.23)], ledger=ledger, quantity_decimals=2), Skips
     )
     over = _check([_order("A", "sell", quantity=1.234)], ledger=ledger, quantity_decimals=2)
-    assert _rules(over) == {"sell_within_holding"}
+    assert _rules(over) == {"sell_within_holding", "sell_sum_within_holding"}
     assert isinstance(
         _check([_order("A", "sell", quantity=1.234)], ledger=ledger, quantity_decimals=3), Skips
     )
@@ -258,7 +283,7 @@ def test_open_sells_count_only_their_unfilled_part() -> None:
     fill = OrderedFill(
         fill=_fill("tp-A-1", 4.0), side="sell", security_id="A", symbol="A", run_id=1, window_id=1
     )
-    (open_sell,) = unfilled_sells([order], [accepted], [fill], _price_of)
+    (open_sell,) = unfilled_sells([order], [accepted], [fill], _price_of, _NO_ACTIONS, session=_S)
     assert open_sell == OpenSell("A", 2.0)
     # 8 + the 2 unfilled = 10 = the holding: passes; 8.5 + 2 does not
     assert isinstance(
@@ -268,7 +293,18 @@ def test_open_sells_count_only_their_unfilled_part() -> None:
     assert _rules(over) == {"sell_sum_within_holding"}
     # A terminal sell holds nothing back
     filled = replace(accepted, status="expired")
-    assert unfilled_sells([order], [accepted, filled], [fill], _price_of) == []
+    assert (
+        unfilled_sells([order], [accepted, filled], [fill], _price_of, _NO_ACTIONS, session=_S)
+        == []
+    )
+    # A 2:1 split between the order's session and S doubles the unfilled part:
+    # the holding is on S's basis, so counting 2 would let a batch oversell.
+    (split_sell,) = unfilled_sells([order], [accepted], [fill], _price_of, _split(_S), session=_S)
+    assert split_sell == OpenSell("A", 4.0)
+    before = unfilled_sells(
+        [order], [accepted], [fill], _price_of, _split(date(2026, 9, 30)), session=_S
+    )
+    assert before == [OpenSell("A", 2.0)]  # ex-date on the order's own session: already in
 
 
 def _fill(client_order_id: str, quantity: float) -> Any:
@@ -428,6 +464,8 @@ def test_a_whole_share_buy_that_does_not_fit_the_cash_left_is_deferred() -> None
     short = size_buys(buys, 200.0, _price_of, RiskConfig(), _NO_COSTS)
     assert [(s.decision_id, s.deferred) for s in short] == [(1, False), (2, True)]
     assert short[1].quantity is None and short[1].notional is None
+    # D, flooring to no share, is deferred before A is sized: A is rescaled alone
+    assert short[0].notional == pytest.approx(200.0)
 
 
 def test_a_scaled_attempt_below_the_minimum_is_deferred_and_the_rest_rescaled() -> None:
@@ -452,3 +490,95 @@ def test_sizing_refuses_bad_inputs() -> None:
             _NO_COSTS,
         )
     assert size_buys([], 10.0, _price_of, RiskConfig(), _NO_COSTS) == []
+
+
+def test_a_sized_batch_passes_the_cash_check_with_commissions() -> None:
+    """Sizing reserves each buy's per-order commission and the per-share one at
+    the lowest price, so its output never trips `buys_within_cash`."""
+    costs = BuyCosts(per_side_bps=15.0, commissions=Commissions(per_share=0.01, per_order=1.0))
+    buys = [
+        _buy(1, "A", 400.0),
+        _buy(2, "B", 300.0),
+        _buy(3, "C", 300.0),
+        _buy(4, "D", 250.0, whole_share=True),
+    ]
+    sizings = size_buys(buys, 1000.0, _price_of, RiskConfig(), costs)
+    assert not any(s.deferred for s in sizings)
+    by_id = {b.decision.decision_id: b for b in buys}
+    orders = [
+        _order(
+            s.security_id,
+            "buy",
+            s.decision_id,
+            notional=s.notional,
+            quantity=s.quantity,
+            whole_share=by_id[s.decision_id].by_whole_shares,
+            target_weight=0.01,
+        )
+        for s in sizings
+    ]
+    loose = RiskConfig(max_order_notional_fraction=1.0, max_gross_exposure=1.0)
+    ledger = Ledger(positions={}, cash=1000.0, through=_S)
+    result = _check(orders, loose, ledger=ledger, account=_account(1000.0), costs=costs)
+    assert isinstance(result, Skips), result
+    spent = 0.0
+    for order in orders:
+        buffered = order.price * (1 + RiskConfig().whole_share_price_buffer)
+        notional = (
+            buffered * order.quantity if order.whole_share and order.quantity else order.value()
+        )
+        spent += notional + trade_cost(notional, notional / order.price, 15.0, costs.commissions)
+    assert 900.0 < spent <= 1000.0
+    short = _check(orders, loose, ledger=ledger, account=_account(spent - 0.02), costs=costs)
+    assert _rules(short) == {"buys_within_cash"}
+
+
+def test_a_whole_share_buy_worth_less_than_the_minimum_is_deferred() -> None:
+    """One share at $0.50 is below a $1 minimum: deferred, not left for the
+    phase check to skip against the cap."""
+    prices = {**_PRICES, "E": 0.5}
+    buy = _buy(1, "A", 10.0)
+    small = _buy(2, "A", 0.6)  # one share of E at the buffered $0.51
+    cheap = replace(small, decision=replace(small.decision, security_id="E", whole_share=True))
+    sizings = size_buys([buy, cheap], 100.0, prices.__getitem__, RiskConfig(), _NO_COSTS)
+    assert [(s.decision_id, s.deferred) for s in sizings] == [(1, False), (2, True)]
+
+
+@pytest.mark.parametrize("weight", [math.nan, math.inf, -0.01])
+def test_a_non_finite_or_negative_target_weight_fails_closed(weight: float) -> None:
+    orders = [_order("C", "buy", 2, notional=50.0, target_weight=weight)]
+    assert _rules(_check(orders)) == {"max_position_weight"}
+
+
+def test_a_non_finite_price_for_a_name_not_held_fails_closed() -> None:
+    prices = {**_PRICES, "C": math.nan}
+    orders = [_order("C", "buy", 2, notional=50.0, target_weight=0.04)]
+    with pytest.raises(ValueError, match="price of C"):
+        _check(orders, price_of=prices.__getitem__)
+
+
+def test_a_buy_marked_as_an_exit_is_refused() -> None:
+    """Else a sub-minimum buy would pass as cap-exempt `dust`."""
+    for flags in ({"full_exit": True}, {"decision": "forced_exit"}):
+        with pytest.raises(ValueError, match="exit"):
+            _check([_order("C", "buy", 2, notional=0.5, target_weight=0.01, **flags)])
+
+
+def test_a_zero_size_order_is_skipped_even_with_no_minimum() -> None:
+    orders = [_order("A", "sell", 1, quantity=0.0)]
+    assert _skip_reasons(_check(orders, RiskConfig(min_order_notional=0.0))) == {
+        1: "skip_below_minimum"
+    }
+
+
+def test_a_delisted_name_the_broker_no_longer_lists_is_skipped_not_a_breach() -> None:
+    assets = {k: v for k, v in _ASSETS.items() if k != "A"}
+    orders = [_order("A", "sell", 7, quantity=1.0, listing_ended=True)]
+    assert _skip_reasons(_check(orders, assets=assets)) == {7: "skip_delisted"}
+
+
+def test_the_sell_sum_uses_the_holding_rounded_down() -> None:
+    ledger = _ledger(A=1.239)
+    orders = [_order("A", "sell", 1, quantity=0.62), _order("A", "sell", 2, quantity=0.615)]
+    result = _check(orders, ledger=ledger, quantity_decimals=2)
+    assert _rules(result) == {"sell_sum_within_holding"}  # 1.235 over 1.23, under 1.239

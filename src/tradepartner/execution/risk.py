@@ -12,7 +12,8 @@ explicitly. No numeric literal other than 0, 1, 2 and -1 appears here
 quantity), and returns either `Violations` (the batch halts before any submit)
 or `Skips` (the per-name skips and the orders left to submit). In order:
 
-1. **Phase-time skips**, per name, each with its journal reason:
+1. **Phase-time skips**, per name, each with its journal reason (a zero-size
+   order is always below the minimum):
    `skip_delisted` (the listing ended at close(S-1); a `forced_exit` is never
    skipped for it), `skip_untradable` (not `tradable`; `untradable` instead for
    a `forced_exit`, exempt from the cap like `dust`), `skip_below_one_share` (a
@@ -24,15 +25,17 @@ or `Skips` (the per-name skips and the orders left to submit). In order:
    kind `skip_cap` (the wrapper raises `SkipCapError`).
 3. **The batch limits** on the orders left, each a violation of kind
    `limit_breach` (`LimitBreachError`) naming its rule:
-   - `max_position_weight`: a buy's decision target weight (a buy without one
-     fails closed);
+   - `max_position_weight`: a buy's decision target weight (a buy without one,
+     or with a non-finite or negative one, fails closed);
    - `max_order_notional_fraction`: each order's notional against equity;
-   - `max_gross_exposure`: held value after the batch over equity;
+   - `max_gross_exposure`: held value after the batch over equity (a
+     non-finite price for any name fails closed);
    - `max_orders_per_run`: this phase's orders plus the run's earlier ones;
    - `sell_within_holding`: each sell at most the reconciled holding rounded
      down to `quantity_decimals` (no short, ever);
    - `sell_sum_within_holding`: a name's sells plus the unfilled quantity of its
-     non-terminal own sells from any session at most the holding;
+     non-terminal own sells from any session at most the holding, rounded down
+     as above;
    - `buys_within_cash`: the buys with their modelled cost, a whole-share buy
      at the reference price x (1 + `risk.whole_share_price_buffer`), within
      `account().cash` (never `buying_power`), checked here independently of the
@@ -49,9 +52,12 @@ notional sell is converted to shares at its order's reference price.
 spendable = `costs.buy_notional_after_costs(cash, ...)`; scale = min(1,
 spendable / the buys' remainders), so the cost reserve a first attempt's target
 already carries is not deducted twice; a notional buy whose scaled attempt falls
-below `risk.min_order_notional` is deferred and the others rescaled without it;
-whole-share buys come last, by floor at the buffered price, while that fits the
-cash left, else deferred.
+below `risk.min_order_notional`, or a whole-share buy that floors to no share
+(or to less than the minimum), is deferred and the others rescaled without it;
+each active buy's per-order commission is reserved before scaling; whole-share
+buys come last, by floor at the buffered price, while that fits the cash left,
+else deferred. Notionals are not rounded to cents here: the wrapper rounds them
+down (`round_down`), which only spends less.
 """
 
 from __future__ import annotations
@@ -60,13 +66,16 @@ import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import date
 from decimal import ROUND_DOWN, Decimal
+
+import polars as pl
 
 from tradepartner.adapters.broker import Account, Asset
 from tradepartner.backtest.costs import buy_notional_after_costs, trade_cost
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
-from tradepartner.execution.plan import BuyCosts, Remainder
+from tradepartner.execution.plan import BuyCosts, Remainder, _split_factor
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
     DecisionRow,
@@ -241,27 +250,36 @@ def unfilled_sells(
     order_events: Iterable[OrderEventRow],
     fills: Iterable[OrderedFill],
     price_of: PriceOf,
+    actions_as_of: pl.DataFrame,
+    *,
+    session: date,
 ) -> list[OpenSell]:
-    """The unfilled quantity of every non-terminal own sell in `orders`: its
-    submitted quantity (a notional at the reference price) minus its journaled
-    filled quantity, never below zero. An order with no event counts as open."""
+    """The unfilled part of every non-terminal own sell in `orders`, in shares
+    on session `session`'s basis, as `plan.remainder` measures it: a quantity
+    sell's submitted minus filled quantity, adjusted by the splits in
+    `actions_as_of` with ex-date in (the order's session, S]; a notional sell's
+    submitted notional minus its filled value, at the reference price. Never
+    below zero. An order with no event counts as open."""
     terminal = {e.client_order_id for e in order_events if e.status in TERMINAL_ORDER_STATUSES}
-    filled: dict[str, float] = defaultdict(float)
+    filled_quantity: dict[str, float] = defaultdict(float)
+    filled_value: dict[str, float] = defaultdict(float)
     for fill in fills:
-        filled[fill.fill.client_order_id] += fill.fill.quantity
+        row = fill.fill
+        filled_quantity[row.client_order_id] += row.quantity
+        filled_value[row.client_order_id] += row.quantity * row.price
     result = []
     for order in orders:
         if order.side != _SELL or order.client_order_id in terminal:
             continue
+        coid = order.client_order_id
         if order.quantity is not None:
-            submitted = order.quantity
+            factor = _split_factor(actions_as_of, order.security_id, order.session, session)
+            left = (order.quantity - filled_quantity[coid]) * factor
         elif order.notional is not None:
-            submitted = order.notional / _finite(
-                price_of(order.security_id), "price", positive=True
-            )
+            price = _finite(price_of(order.security_id), "price", positive=True)
+            left = (order.notional - filled_value[coid]) / price
         else:
-            raise ValueError(f"order {order.client_order_id!r} has neither quantity nor notional")
-        left = max(submitted - filled[order.client_order_id], 0.0)
+            raise ValueError(f"order {coid!r} has neither quantity nor notional")
         if left > 0:
             result.append(OpenSell(order.security_id, left))
     return result
@@ -271,13 +289,11 @@ def _skip_reason(
     order: PhaseOrder, asset: Asset, frozen: RiskConfig, whole_share: bool
 ) -> str | None:
     forced = order.decision == _FORCED_EXIT
-    if order.listing_ended and not forced:
-        return "skip_delisted"
     if not asset.tradable:
         return "untradable" if forced else "skip_untradable"
     if whole_share and order.quantity is not None and order.quantity < 1:
         return "dust" if order.full_exit else "skip_below_one_share"
-    if order.value() < frozen.min_order_notional:
+    if order.value() <= 0 or order.value() < frozen.min_order_notional:
         return "dust" if order.full_exit else "skip_below_minimum"
     return None
 
@@ -307,6 +323,8 @@ def check_phase(
             raise ValueError(f"order of decision {order.decision_id} needs exactly one size")
         _finite(order.price, f"price of {order.security_id}", positive=True)
         _finite(order.value(), f"size of decision {order.decision_id}")
+        if order.side == _BUY and (order.full_exit or order.decision == _FORCED_EXIT):
+            raise ValueError(f"buy of decision {order.decision_id} marked as an exit")
 
     violations: list[Violation] = []
 
@@ -316,6 +334,9 @@ def check_phase(
     skips: list[Skip] = []
     left: list[PhaseOrder] = []
     for order in orders:
+        if order.listing_ended and order.decision != _FORCED_EXIT:
+            skips.append(Skip(order.decision_id, order.security_id, "skip_delisted"))
+            continue
         asset = assets.get(order.security_id)
         if asset is None:
             breach("asset_missing", f"no asset read for {order.security_id}")
@@ -364,7 +385,12 @@ def check_phase(
             )
         if order.side == _BUY:
             weight = order.target_weight
-            if weight is None or weight > frozen.max_position_weight:
+            if (
+                weight is None
+                or not math.isfinite(weight)
+                or weight < 0
+                or weight > frozen.max_position_weight
+            ):
                 breach(
                     "max_position_weight",
                     f"{order.security_id} target weight {weight} over {frozen.max_position_weight}",
@@ -394,15 +420,21 @@ def check_phase(
         if sell.security_id in sold:
             sold[sell.security_id] += sell.unfilled_quantity
     for name, total in sold.items():
-        holding = ledger.positions.get(name, 0.0)
+        holding = round_down(max(ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
         if total > holding:
             breach(
                 "sell_sum_within_holding",
                 f"{name} sells and open sells of {total} over the holding {holding}",
             )
 
-    exposure = sum(max(q, 0.0) * price_of(name) for name, q in after.items()) / equity
-    if exposure > frozen.max_gross_exposure:
+    exposure = (
+        sum(
+            max(q, 0.0) * _finite(price_of(name), f"price of {name}", positive=True)
+            for name, q in after.items()
+        )
+        / equity
+    )
+    if not math.isfinite(exposure) or exposure > frozen.max_gross_exposure:
         breach(
             "max_gross_exposure",
             f"gross exposure after the batch {exposure:.4f} over {frozen.max_gross_exposure}",
@@ -437,22 +469,36 @@ def size_buys(
         b.decision.security_id: _finite(price_of(b.decision.security_id), "price", positive=True)
         for b in decisions
     }
-    # The lowest price buys the most shares, so a per-share commission is
-    # reserved for the worst case (Alpaca charges none).
-    spendable = buy_notional_after_costs(
-        cash, costs.per_side_bps, costs.commissions, price=min(prices.values())
-    )
+    buffer = 1 + frozen.whole_share_price_buffer
+
+    def whole_shares(buy: BuyToSize, scale: float) -> float:
+        buffered = prices[buy.decision.security_id] * buffer
+        return float(math.floor(buy.remainder.notional * scale / buffered))
+
+    def below_minimum(buy: BuyToSize, scale: float) -> bool:
+        if not buy.by_whole_shares:
+            attempt = buy.remainder.notional * scale
+            return attempt <= 0 or attempt < frozen.min_order_notional
+        quantity = whole_shares(buy, scale)
+        value = quantity * prices[buy.decision.security_id]
+        return quantity < 1 or value < frozen.min_order_notional
 
     active = [b for b in decisions if b.remainder.notional > 0]
     deferred: set[int] = {id(b) for b in decisions if b.remainder.notional <= 0}
     while True:
+        # Each buy pays its own per-order commission, and the lowest price buys
+        # the most shares (the worst case for a per-share one); Alpaca charges
+        # neither.
+        reserved = max(len(active) - 1, 0) * costs.commissions.per_order
+        spendable = buy_notional_after_costs(
+            max(cash - reserved, 0.0),
+            costs.per_side_bps,
+            costs.commissions,
+            price=min((prices[b.decision.security_id] for b in active), default=1.0),
+        )
         total = sum(b.remainder.notional for b in active)
         scale = min(1.0, spendable / total) if total > 0 else 0.0
-        low = [
-            b
-            for b in active
-            if not b.by_whole_shares and b.remainder.notional * scale < frozen.min_order_notional
-        ]
+        low = [b for b in active if below_minimum(b, scale)]
         if not low:
             break
         deferred.update(id(b) for b in low)
@@ -475,10 +521,8 @@ def size_buys(
     for buy in decisions:
         if not buy.by_whole_shares:
             continue
-        price = prices[buy.decision.security_id] * (1 + frozen.whole_share_price_buffer)
-        quantity = 0.0
-        if id(buy) not in deferred:
-            quantity = float(math.floor(buy.remainder.notional * scale / price))
+        price = prices[buy.decision.security_id] * buffer
+        quantity = 0.0 if id(buy) in deferred else whole_shares(buy, scale)
         cost = trade_cost(quantity * price, quantity, costs.per_side_bps, costs.commissions)
         if quantity >= 1 and quantity * price + cost <= cash_left:
             cash_left -= quantity * price + cost
