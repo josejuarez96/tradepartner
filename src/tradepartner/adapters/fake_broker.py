@@ -31,13 +31,20 @@ or after it with `after_record=True`), and `HoldCancel` (a `cancel` leaves
 the order `ACCEPTED`, Alpaca's `pending_cancel`, optionally after a partial
 fill, until `complete_cancel`). With no script the constructor's default
 applies (`auto_fill`). `apply(client_order_id, instruction)` does the same
-to an order already on the book. Partial fills accumulate: the order's
+to an order already on the book (scripting an id already on the book
+raises: use `apply`). Partial fills accumulate: the order's
 `filled_quantity` is their exact sum and `filled_avg_price` the
-quantity-weighted average; nothing checks a scripted amount against the
-ordered size. A script is consumed only when the `submit` it governs gets
-past the clock read and builds its order, so a `ClockError` or a bad price
-leaves it queued. Scripting calls are not `Broker` methods: they are not
-logged and read no clock unless they fill.
+quantity-weighted average; `filled_at` stays `None` until the order is
+`FILLED`, as on Alpaca. A partial fill that reaches a `quantity` order's
+size fills it and one beyond it raises; a `notional` order's partials are
+not checked against its size. A filled order cannot `Vanish` (a broker
+cannot forget an order it filled); an unfilled one that vanishes frees its
+id. A script is consumed only when the `submit` it governs gets past the
+clock read and builds its order, so a `ClockError` or a bad price leaves
+it queued; once a fault consumes an id's script, a retry of that id takes
+the next-submit queue's head, like any unscripted id. Scripting calls are
+not `Broker` methods: they are not logged and read no clock unless they
+fill.
 
 **Account.** `cash` starts at the constructor's value and moves by
 `quantity * price` per fill (a buy debits, a sell credits), exact in
@@ -80,6 +87,7 @@ the `Position` returned to callers.
 
 from __future__ import annotations
 
+import copy
 import math
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -261,6 +269,8 @@ class FakeBroker(Broker):
         entry = _Script(outcome=outcomes[0] if outcomes else None, hold=holds[0] if holds else None)
         if client_order_id is None:
             self._scripted_next.append(entry)
+        elif client_order_id in self._orders:
+            raise ValueError(f"{client_order_id!r} is on the book already: use apply")
         else:
             self._scripted_by_id[client_order_id] = entry
 
@@ -272,6 +282,8 @@ class FakeBroker(Broker):
             raise ValueError(f"not an instruction for an order on the book: {instruction!r}")
         order = self._require_order(client_order_id)
         if isinstance(instruction, Vanish):
+            if client_order_id in self._filled:
+                raise ValueError(f"{client_order_id!r} has fills: a broker cannot forget it")
             self._forget(client_order_id)
             return
         self._require_open(order, "change")
@@ -352,7 +364,7 @@ class FakeBroker(Broker):
             outcome = FillAt() if self._auto_fill else Accept()
         if isinstance(outcome, TransportFault) and not outcome.after_record:
             self._consume(cid, script)
-            raise outcome.error or FakeTransportError(f"transport error submitting {cid!r}")
+            raise _transport_error(outcome, f"transport error submitting {cid!r}")
 
         order = Order(
             client_order_id=cid,
@@ -385,7 +397,7 @@ class FakeBroker(Broker):
             order = fill[0]
             self._record_fill(*fill)
         if isinstance(outcome, TransportFault):
-            raise outcome.error or FakeTransportError(f"transport error after recording {cid!r}")
+            raise _transport_error(outcome, f"transport error after recording {cid!r}")
         return order
 
     def cancel(self, client_order_id: str) -> None:
@@ -536,12 +548,22 @@ class FakeBroker(Broker):
         )
         total_qty = done_qty + Decimal(repr(fill.quantity))
         total_notional = done_notional + Decimal(repr(fill.quantity)) * Decimal(repr(fill.price))
+        complete = isinstance(how, FillAt)
+        if isinstance(how, PartialFill) and order.quantity is not None:
+            ordered = Decimal(repr(order.quantity))
+            if total_qty > ordered:
+                raise ValueError(
+                    f"partial fill takes {order.client_order_id!r} to {total_qty}, "
+                    f"above its quantity {ordered}"
+                )
+            complete = total_qty == ordered
         filled = replace(
             order,
-            status=OrderStatus.FILLED if isinstance(how, FillAt) else order.status,
+            status=OrderStatus.FILLED if complete else order.status,
             filled_quantity=float(total_qty),
             filled_avg_price=fill.price if done_qty == 0 else float(total_notional / total_qty),
-            filled_at=filled_at,
+            # Alpaca sets `filled_at` only once the order is filled.
+            filled_at=filled_at if complete else order.filled_at,
         )
         return filled, fill
 
@@ -586,6 +608,12 @@ class FakeBroker(Broker):
             raise OrderNotOpenError(
                 f"order {order.client_order_id!r} is {order.status.value}, cannot {action}"
             )
+
+
+def _transport_error(fault: TransportFault, message: str) -> Exception:
+    """A fresh exception per raise, so one scripted fault object raised
+    twice never carries the first raise's traceback."""
+    return FakeTransportError(message) if fault.error is None else copy.copy(fault.error)
 
 
 def _signed(side: Side, amount: Decimal) -> Decimal:

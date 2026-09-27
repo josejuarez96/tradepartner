@@ -132,6 +132,7 @@ def test_partial_fill_is_accepted_with_fill_fields_and_stays_open() -> None:
 
     assert order.status is OrderStatus.ACCEPTED
     assert (order.filled_quantity, order.filled_avg_price) == (3.0, 99.0)
+    assert order.filled_at is None  # Alpaca sets it only once filled
     assert broker.open_orders() == [order]
     assert [(f.quantity, f.price) for f in broker.fills()] == [(3.0, 99.0)]
     assert broker.positions()["AAPL"].quantity == 3.0
@@ -199,6 +200,43 @@ def test_apply_vanish_forgets_an_order_already_on_the_book() -> None:
     assert broker.open_orders() == []
     with pytest.raises(UnknownOrderError):
         broker.get_order("a")
+    # Forgotten, so the id is free again.
+    assert broker.submit(buy("a")).status is OrderStatus.ACCEPTED
+
+
+def test_an_order_with_fills_cannot_vanish() -> None:
+    broker, _ = make_broker()
+    broker.script(PartialFill(quantity=1.0, avg_price=100.0))
+    broker.submit(buy("a"))
+
+    with pytest.raises(ValueError, match="has fills"):
+        broker.apply("a", Vanish())
+    assert broker.get_order("a").filled_quantity == 1.0
+
+
+def test_partials_reaching_the_quantity_fill_the_order_and_beyond_it_raise() -> None:
+    broker, clock = make_broker()
+    broker.script(PartialFill(quantity=6.0, avg_price=100.0))
+    broker.submit(buy("a", quantity=10.0))
+    broker.submit(buy("b", quantity=10.0))
+
+    with pytest.raises(ValueError, match="above its quantity"):
+        broker.apply("b", PartialFill(quantity=10.5, avg_price=100.0))
+    clock.now = T0 + timedelta(minutes=1)
+    broker.apply("a", PartialFill(quantity=4.0, avg_price=100.0))
+
+    order = broker.get_order("a")
+    assert (order.status, order.filled_quantity) == (OrderStatus.FILLED, 10.0)
+    assert order.filled_at == T0 + timedelta(minutes=1)
+    assert broker.get_order("b").filled_quantity is None
+
+
+def test_scripting_an_id_already_on_the_book_points_to_apply() -> None:
+    broker, _ = make_broker()
+    broker.submit(buy("a"))
+
+    with pytest.raises(ValueError, match="use apply"):
+        broker.script(Expire(), client_order_id="a")
 
 
 def test_transport_fault_before_the_book_records_leaves_nothing() -> None:
@@ -229,12 +267,17 @@ def test_transport_fault_after_the_book_records_keeps_the_order() -> None:
         broker.submit(buy("a"))
 
 
-def test_transport_fault_raises_the_scripted_error() -> None:
+def test_transport_fault_raises_the_scripted_error_afresh_each_time() -> None:
     broker, _ = make_broker()
-    broker.script(TransportFault(error=TimeoutError("read timed out")))
+    fault = TransportFault(error=TimeoutError("read timed out"))
+    broker.script(fault)
+    broker.script(fault)
 
-    with pytest.raises(TimeoutError, match="read timed out"):
+    with pytest.raises(TimeoutError, match="read timed out") as first:
         broker.submit(buy("a"))
+    with pytest.raises(TimeoutError) as second:
+        broker.submit(buy("a"))
+    assert first.value is not second.value
 
 
 def test_a_clock_fault_consumes_no_instruction() -> None:
@@ -310,7 +353,7 @@ def test_a_held_cancel_can_fill_before_completing() -> None:
 
     pending = broker.get_order("a")
     assert (pending.status, pending.filled_quantity) == (OrderStatus.ACCEPTED, 4.0)
-    assert pending.filled_at == T0 + timedelta(seconds=30)
+    assert pending.filled_at is None
     assert [(f.quantity, f.price) for f in broker.fills()] == [(4.0, 101.0)]
 
     broker.complete_cancel("a")
