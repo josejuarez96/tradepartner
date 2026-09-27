@@ -1,0 +1,1 @@
+- #258 Fact ingest now re-inserts an accession’s full current date/value set when it changes, so A→B→A serves A again without look-ahead

@@ -991,6 +991,110 @@ def test_a_late_filing_behind_a_stored_revision_is_one_row_at_ingested_at() -> N
     assert rows == [("A", T1), ("B", one), ("C", two)]
 
 
+def test_fact_redated_a_to_b_to_a_reinserts_latest_accession_revision() -> None:
+    """#258: a returned date must win without rewriting the old A row."""
+    conn = _store()
+    accession = f"{ACME}-18-000001"
+    base = {
+        "security_id": ACME,
+        "fact_name": "shares_outstanding",
+        "class_member": "",
+        "value": 5_000_000.0,
+        "filing_accession": accession,
+        "known_at": T1,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+    def ingest(as_of_date: date, at: datetime) -> int:
+        row = {**base, "as_of_date": as_of_date, "ingested_at": at}
+        return _add_rows(conn, "facts", [row], ingested_at=at, current=False)
+
+    a, b = date(2018, 12, 31), date(2018, 12, 15)
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+    assert ingest(a, first) == 1
+    assert ingest(b, second) == 1
+    assert ingest(a, third) == 1
+    assert ingest(a, third + timedelta(hours=1)) == 0
+
+    def dates(t: datetime) -> list[date]:
+        rows = facts_as_of(conn, t, [ACME])
+        return rows.filter(rows["filing_accession"] == accession)["as_of_date"].to_list()
+
+    assert dates(second - timedelta(microseconds=1)) == [a]
+    assert dates(third - timedelta(microseconds=1)) == [b]
+    assert dates(third) == [a]
+    stored = conn.execute(
+        "SELECT as_of_date, known_at FROM facts WHERE filing_accession = ? ORDER BY known_at",
+        [accession],
+    ).fetchall()
+    assert stored == [(a, T1), (b, second), (a, third)]
+
+
+def test_fact_redating_keeps_every_date_in_the_latest_accession_ingest() -> None:
+    """The latest ingest of a filing can contain two dates, then one, then two."""
+    conn = _store()
+    accession = f"{ACME}-18-000001"
+    a, b = date(2018, 12, 31), date(2018, 12, 15)
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+
+    def ingest(dates: tuple[date, ...], at: datetime) -> int:
+        rows = [
+            {
+                "security_id": ACME,
+                "fact_name": "shares_outstanding",
+                "as_of_date": d,
+                "class_member": "",
+                "value": 5_000_000.0,
+                "filing_accession": accession,
+                "known_at": T1,
+                "ingested_at": at,
+                "source": "edgar",
+                "provenance": "filing",
+            }
+            for d in dates
+        ]
+        return _add_rows(conn, "facts", rows, ingested_at=at, current=False)
+
+    assert ingest((a, b), first) == 2
+    assert ingest((b,), second) == 1
+    assert ingest((a, b), third) == 2
+    assert ingest((a, b), third + timedelta(hours=1)) == 0
+
+    def served(t: datetime) -> list[date]:
+        rows = facts_as_of(conn, t, [ACME])
+        return sorted(rows.filter(rows["filing_accession"] == accession)["as_of_date"].to_list())
+
+    assert served(second - timedelta(microseconds=1)) == [b, a]
+    assert served(third - timedelta(microseconds=1)) == [b]
+    assert served(third) == [b, a]
+
+
+def test_fact_redating_refuses_a_future_acceptance() -> None:
+    """Restamping a changed accession must not hide a future filing stamp."""
+    conn = _store()
+    base = {
+        "security_id": ACME,
+        "fact_name": "shares_outstanding",
+        "class_member": "",
+        "value": 5_000_000.0,
+        "filing_accession": f"{ACME}-18-000001",
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    first = {**base, "as_of_date": date(2018, 12, 31), "known_at": T1, "ingested_at": NOW}
+    assert _add_rows(conn, "facts", [first], ingested_at=NOW, current=False) == 1
+    future = {
+        **base,
+        "as_of_date": date(2018, 12, 15),
+        "known_at": NOW + timedelta(days=2),
+        "ingested_at": NOW + timedelta(days=1),
+    }
+    with pytest.raises(ValueError, match="not knowable yet"):
+        _add_rows(conn, "facts", [future], ingested_at=NOW + timedelta(days=1), current=False)
+    assert conn.execute("SELECT count(*) FROM facts").fetchone() == (1,)
+
+
 def test_fact_class_uses_the_classification_known_at_acceptance(settings: Settings) -> None:
     # A class classified common only after the fact was accepted cannot take it.
     source = _filings()

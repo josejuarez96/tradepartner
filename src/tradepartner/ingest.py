@@ -43,7 +43,11 @@ only if it changes what an as-of read returns:
   later than every stored row of their key and changes the view. Stored
   history is never rewritten: if the key's latest row still differs from
   the builder's latest (a restatement, a late filing, A -> B -> A), one row
-  with the builder's latest values is stamped at `ingested_at`.
+  with the builder's latest values is stamped at `ingested_at`. Facts with a
+  filing accession are compared as a whole date/value set per accession: if
+  that set changes, every current row is restamped at `ingested_at`, including
+  a date/value seen before. This lets A -> B -> A become visible again without
+  changing what an earlier as-of read saw.
 
 The price side fetches bars for the expected session and actions with
 `ex_date` from the first of its month to it, so revisions within the month
@@ -1039,10 +1043,67 @@ def _add_rows(
     for stored_rows in history.values():
         stored_rows.sort(key=lambda r: r["known_at"])
 
+    # A filing can move a fact from date A to B and later back to A. The facts
+    # reader selects the latest *ingest* of an accession, not the latest row of
+    # each date. Compare that whole accession's date/value set before the
+    # per-date writer runs; when it changes, reinsert its entire current set at
+    # this ingest time. Otherwise an old A row is skipped and B stays visible.
+    revised_facts: list[Row] = []
+    seen_filings: set[tuple[Any, ...]] = set()
+    if table == "facts":
+
+        def filing(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            return (
+                row["security_id"],
+                row["fact_name"],
+                row["class_member"],
+                row["filing_accession"],
+            )
+
+        past_by_filing: dict[tuple[Any, ...], list[Row]] = defaultdict(list)
+        for stored_rows in history.values():
+            for stored in stored_rows:
+                if stored["filing_accession"] is not None:
+                    past_by_filing[filing(stored)].append(stored)
+        built_by_filing: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+        for row in rows:
+            if row["filing_accession"] is not None:
+                built_by_filing[filing(row)].append(row)
+        for filing_key, built_rows in built_by_filing.items():
+            past = past_by_filing[filing_key]
+            if not past:
+                continue
+            seen_filings.add(filing_key)
+            for row in built_rows:
+                if row["known_at"] > ingested_at:
+                    raise ValueError(
+                        f"facts {filing_key}: known_at {row['known_at'].isoformat()} is after "
+                        f"ingested_at {ingested_at.isoformat()}; it is not knowable yet"
+                    )
+            latest_ingest = max(row["ingested_at"] for row in past)
+            latest = [row for row in past if row["ingested_at"] == latest_ingest]
+
+            def fact_values(rs: Sequence[Mapping[str, Any]]) -> set[tuple[date, Any]]:
+                return {(row["as_of_date"], row["value"]) for row in rs}
+
+            if fact_values(built_rows) == fact_values(latest):
+                continue
+            latest_known_at = max(row["known_at"] for row in past)
+            if ingested_at <= max(latest_known_at, latest_ingest):
+                raise ValueError(f"facts {filing_key}: revision would be back-dated")
+            revised_facts.extend(
+                {**row, "known_at": ingested_at, "ingested_at": ingested_at} for row in built_rows
+            )
+
     incoming: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
     for row in sorted(rows, key=lambda r: (key(r), r["known_at"])):
+        if table == "facts" and row["filing_accession"] is not None and filing(row) in seen_filings:
+            continue
         incoming[key(row)].append(row)
     added = 0
+    for new in revised_facts:
+        insert_row(conn, table, new)
+        added += 1
     for row_key, built in incoming.items():
         past = history[row_key]
         if current:  # the source's latest record per key is its value now
