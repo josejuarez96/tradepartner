@@ -1,0 +1,1 @@
+- Phase 4 T49b: `store/journal.py`, one frozen row type per journal table, one generic `append` (ids by the registry pattern, tz-aware `known_at <= ingested_at` refused otherwise), `fills_for` as the single reader of `fills` (superseded hidden, joined to orders, orphan fill raises), `all_fill_ids`, `JournalNotInitialised`; empty `execution` package init files (PR #286)
