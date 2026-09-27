@@ -999,3 +999,19 @@ def test_fact_class_uses_the_classification_known_at_acceptance(settings: Settin
     early = _fact(ACME, "", 1, f"{ACME}-18-000009", _at(2018, 3, 1) - timedelta(days=1))
     rows, unmatched = fact_rows([early], master, classes, ingested_at=NOW)
     assert rows == () and unmatched == (early,)
+
+
+def test_a_dry_run_whose_check_failures_raises_writes_no_run_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A dry run never writes a run row, failed or not (#275 safety review)."""
+
+    class Unhealthy(FixtureFilingSource):
+        def check_failures(self) -> None:
+            raise RuntimeError("too many failures")
+
+    _run(settings, source="edgar")  # a real run first, so the store exists
+    before = read("SELECT count(*) FROM ingestion_runs")
+    result = _run(settings, filings=_filings(cls=Unhealthy), source="edgar", dry_run=True)
+    assert result.runs[0].status == FAILED
+    assert read("SELECT count(*) FROM ingestion_runs") == before

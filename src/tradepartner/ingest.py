@@ -280,10 +280,11 @@ def _run_source(
         return outcome(LOCKED, 0, str(exc))
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
-        return _record_only(settings, run_id, now, clock, run, mode)
+        return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     except Exception as exc:  # any source or parse failure halts with a run row
         run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
-        return _record_only(settings, run_id, now, clock, run, mode)
+        # A dry run writes no run row, failed or not.
+        return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     if after_commit is not None:
         try:
             after_commit()

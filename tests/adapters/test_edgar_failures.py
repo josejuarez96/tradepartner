@@ -629,3 +629,71 @@ def test_ingest_session_halts_when_check_failures_raises(tmp_path: Path) -> None
         assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
         rows = conn.execute("SELECT status FROM ingestion_runs").fetchall()
         assert rows == [(FAILED,)]
+
+
+# --- safety-reviewer fixes (#275) --------------------------------------------
+
+
+@pytest.mark.parametrize("content", ["{truncated", "[]", '{"version": 1, "entries": []}'])
+def test_a_corrupt_failed_filings_file_fails_loudly_and_is_not_overwritten(
+    tmp_path: Path, content: str
+) -> None:
+    """The owner edits this file by hand: a typo must never silently lift every
+    quarantine and drop every `accepted` flag, nor be overwritten."""
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG)
+    path = Path(source._settings.edgar.cache_dir) / "failed_filings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    with pytest.raises(ValueError, match=r"failed_filings\.json"):
+        source.cover_pages(APPLE)
+    assert path.read_text() == content
+
+
+def test_another_failures_version_starts_fresh(tmp_path: Path) -> None:
+    """A valid file with another `version` is the documented way to retry
+    everything: it reads as empty, not as an error."""
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG)
+    path = Path(source._settings.edgar.cache_dir) / "failed_filings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": FAILURES_VERSION + 1, "entries": {}}))
+    assert source.cover_pages(APPLE) == []
+    assert source.failed_filings == 1
+
+
+def test_a_hand_edit_during_the_run_survives_record_failures(tmp_path: Path) -> None:
+    """`record_failures()` re-reads the file before writing, so an entry the
+    owner marks `accepted` (or deletes) while a run is in flight is kept."""
+    other = "0000320193-26-000200"
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG)
+    path = Path(source._settings.edgar.cache_dir) / "failed_filings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "error_class": "ValueError",
+        "base_form": "10-K",
+        "message_hash": "x",
+        "count": 2,
+        "last_counted_day": "2026-05-01",
+        "accepted": False,
+    }
+    path.write_text(json.dumps({"version": FAILURES_VERSION, "entries": {other: entry}}))
+    source.cover_pages(APPLE)  # loads the file, records this run's failure
+
+    # The owner accepts `other` by hand while the run is in flight.
+    path.write_text(
+        json.dumps({"version": FAILURES_VERSION, "entries": {other: {**entry, "accepted": True}}})
+    )
+    source.record_failures()
+    entries = json.loads(path.read_text())["entries"]
+    assert entries[other]["accepted"] is True
+    assert APPLE_ACCESSION in entries
+
+
+def test_an_unsafe_primary_document_propagates_never_a_quiet_skip(tmp_path: Path) -> None:
+    """The path-safety guard (`InvalidFilingReferenceError`) is not a filing
+    failure: a traversal attempt must fail the chunk, not be quarantined."""
+    from tradepartner.adapters.edgar_raw import InvalidFilingReferenceError
+
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG, filename="../escape.htm")
+    with pytest.raises(InvalidFilingReferenceError):
+        source.cover_pages(APPLE)
+    assert source.failed_filings == 0

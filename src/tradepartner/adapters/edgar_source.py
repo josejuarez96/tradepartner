@@ -98,6 +98,8 @@ cross-day pair rule only, never the per-document share.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import gzip
 import hashlib
 import itertools
@@ -1193,6 +1195,8 @@ class EdgarFilingSource(FilingSource):
                 raise
             self._record_failure(accession, type(error).__name__, base_form, str(error))
             return None
+        except edgar_raw.InvalidFilingReferenceError:
+            raise  # a tripped path-safety guard is not a filing failure (#275)
         except ValueError as error:
             self._record_failure(accession, type(error).__name__, base_form, str(error))
             return None
@@ -1227,14 +1231,28 @@ class EdgarFilingSource(FilingSource):
         return self._cache / "failed_filings.json"
 
     def _load_failed_filings(self) -> dict[str, dict[str, Any]]:
+        """The failure store. Absent, or another `FAILURES_VERSION` (the
+        documented way to retry everything): empty. Anything else that does
+        not load raises, naming the file: the owner edits it by hand, and a
+        typo must never silently lift every quarantine and `accepted` flag,
+        nor be overwritten by the next commit (#275)."""
+        path = self._failed_filings_path()
+        if not path.exists():
+            return {}
         try:
-            data = json.loads(self._failed_filings_path().read_bytes())
-            if not isinstance(data, dict) or data.get("version") != FAILURES_VERSION:
-                return {}
-            entries = data.get("entries")
-            return entries if isinstance(entries, dict) else {}
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            return {}  # absent, truncated or another version: start fresh
+            data = json.loads(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"{path} does not load ({type(exc).__name__}); fix it by hand"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} is not a JSON object; fix it by hand")
+        if data.get("version") != FAILURES_VERSION:
+            return {}
+        entries = data.get("entries")
+        if not isinstance(entries, dict) or not all(isinstance(v, dict) for v in entries.values()):
+            raise ValueError(f"{path} has malformed entries; fix it by hand")
+        return entries
 
     def _save_failed_filings(self, entries: Mapping[str, dict[str, Any]]) -> None:
         data = {"version": FAILURES_VERSION, "entries": dict(entries)}
@@ -1254,7 +1272,37 @@ class EdgarFilingSource(FilingSource):
         preserved across an advance.
         """
         today = self._now().astimezone(_EASTERN).date().isoformat()
-        store = dict(self._failure_store())
+        with self._failed_filings_lock():
+            # Re-read under the lock, never the copy loaded at the fetch pass:
+            # an owner's hand edit (or another writer) since then is kept (#275).
+            store = dict(self._load_failed_filings())
+            self._merge_pending_failures(store, today)
+            self._save_failed_filings(store)
+        self._failed_filings_cache = store
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is not None and not manifest.get("committed", False):
+                manifest["committed"] = True
+                self._save_fsn_manifest(period, manifest)
+        # The run is recorded: its in-memory failures and attempts end with it.
+        self._pending_failures.clear()
+        self._collision_failures.clear()
+        self._per_document_attempted.clear()
+
+    @contextlib.contextmanager
+    def _failed_filings_lock(self) -> Iterator[None]:
+        """An advisory lock around `failed_filings.json`'s read-merge-write."""
+        lock_path = self._failed_filings_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def _merge_pending_failures(self, store: dict[str, dict[str, Any]], today: str) -> None:
+        """This run's failures into `store`, by the counted-day rule."""
         for accession, (error_class, base_form, message) in self._pending_failures.items():
             message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
             entry = store.get(accession)
@@ -1273,17 +1321,6 @@ class EdgarFilingSource(FilingSource):
                 "last_counted_day": today,
                 "accepted": bool(entry.get("accepted", False)) if entry is not None else False,
             }
-        self._save_failed_filings(store)
-        self._failed_filings_cache = store
-        for period in self._cached_fsn_periods():
-            manifest = self._load_fsn_manifest(period)
-            if manifest is not None and not manifest.get("committed", False):
-                manifest["committed"] = True
-                self._save_fsn_manifest(period, manifest)
-        # The run is recorded: its in-memory failures and attempts end with it.
-        self._pending_failures.clear()
-        self._collision_failures.clear()
-        self._per_document_attempted.clear()
 
     def check_failures(self) -> None:
         """Called by `_prefetch` after the fetch pass, before the lock.
