@@ -645,3 +645,32 @@ def test_a_negative_tolerance_is_refused() -> None:
         from_journal(
             [], [], (), NO_ACTIONS, None, 1.0, D9, window_id=WINDOW, quantity_tolerance=-1.0
         )
+
+
+@pytest.mark.parametrize(
+    ("quantity", "price"), [(0.0, 50.0), (-1.0, 50.0), (1.0, 0.0), (1.0, -5.0)]
+)
+def test_a_fill_breaking_the_fills_checks_is_refused(quantity: float, price: float) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        _ledger([_fill(BUY_A, quantity, price)], [BUY_A])
+
+
+def test_an_implied_residual_price_needs_only_to_be_finite() -> None:
+    feed = _fill(BUY_A, 9, 50.0, fill_id=1)
+    residual = FillRow(
+        fill_id=2,
+        client_order_id=BUY_A.client_order_id,
+        filled_at=feed.fill.filled_at,
+        quantity=1.0,
+        price=0.0,
+        price_implied=True,
+        broker_fill_id=f"synthetic:{BUY_A.client_order_id}",
+        source="broker_status",
+        known_at=feed.fill.known_at,
+        ingested_at=feed.fill.ingested_at,
+    )
+    implied = OrderedFill(residual, "buy", A, "A", RUN, WINDOW)
+    ledger = _ledger([feed, implied], [BUY_A])
+    # 9 + 1 shares; cash moves only by the feed fill's 450.
+    assert ledger.positions == {A: 10.0}
+    assert ledger.cash == pytest.approx(550.0)

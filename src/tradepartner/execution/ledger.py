@@ -160,8 +160,13 @@ def _check_fill(fill: OrderedFill, orders: Mapping[str, OrderRow], seen: set[int
         )
     if fill.side not in (_BUY, _SELL):
         raise ValueError(f"fill {row.fill_id} has side {fill.side!r}")
-    _finite(row.quantity, f"fill {row.fill_id} quantity")
-    _finite(row.price, f"fill {row.fill_id} price")
+    if _finite(row.quantity, f"fill {row.fill_id} quantity") <= 0:
+        raise ValueError(f"fill {row.fill_id} quantity is {row.quantity}, must be positive")
+    # Mirrors the `fills` CHECKs: a `broker_feed` price is positive; an implied
+    # (`broker_status`) residual price is whatever makes the order's total match
+    # the broker's average price, so it is only required to be finite.
+    if _finite(row.price, f"fill {row.fill_id} price") <= 0 and not row.price_implied:
+        raise ValueError(f"fill {row.fill_id} price is {row.price}, must be positive")
 
 
 def _check_adjustment(row: AdjustmentRow, seen: set[int]) -> None:
