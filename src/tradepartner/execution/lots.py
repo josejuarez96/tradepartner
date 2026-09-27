@@ -25,7 +25,9 @@ journal. Nothing here reads a clock or the store.
   local trade date is at most `WASH_SALE_WINDOW_DAYS` from its own, before or
   after (R1), in acquisition order (R11). A replacement share absorbs at most
   one loss (R13), and shares closed by the same sale are never its own
-  replacement. Each disposal is scanned on its own, so a loss and a gain closed
+  replacement. Taken literally (an owner question on #308), the unsold rest
+of a lot, or another fill of the same order, bought inside the window does
+count as a replacement. Each disposal is scanned on its own, so a loss and a gain closed
   the same day are flagged and reported apart, never netted (R14); a December
   sale is matched to a January purchase like any other (R15). Each match is a
   `WashSaleFlag` with the replacement lot, the matched quantity and the
@@ -150,7 +152,14 @@ def rebuild(
 ) -> tuple[list[Lot], list[Disposal], list[WashSaleFlag]]:
     """Lots, FIFO disposals and wash-sale flags from `fills_for`'s live fills
     (module docstring). `orders` must hold every fill's order; `assets` maps a
-    broker symbol to its `Asset` for the CUSIP."""
+    broker symbol to its `Asset` for the CUSIP.
+
+    A loss's flags depend on acquisitions after it, as the rule requires, so a
+    caller reporting the ledger as of an instant t must pass only fills with
+    `known_at <= t`; `fills_for` does not filter by `known_at`. Raises
+    `LotLedgerError` on a sale beyond the holding, which a split, a spin-off
+    receipt or a stock merger (none of them a fill) produces: a writer must
+    catch it and alert rather than fail its run."""
     lot_list: list[Lot] = []
     disposals: list[Disposal] = []
     same_sale: dict[int, dict[int, Decimal]] = {}  # disposal id -> lot id -> quantity sold

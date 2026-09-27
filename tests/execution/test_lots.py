@@ -258,6 +258,45 @@ def test_shares_sold_in_the_same_sale_are_not_their_own_replacement() -> None:
     assert flags == []
 
 
+def test_literal_rule_the_unsold_rest_of_a_partly_sold_lot_is_matched() -> None:
+    """Pinned while the owner decides (#308): the statute's literal reading
+    counts the 6 unsold shares of the same purchase as replacements."""
+    book = Book()
+    book.trade("buy", 10, 100.0, date(2025, 3, 1))
+    book.trade("sell", 4, 90.0, date(2025, 3, 20))
+
+    [lot], _, [flag] = book.run()
+
+    assert (flag.replacement_lot_id, flag.matched_quantity) == (lot.lot_id, 4.0)
+
+
+def test_literal_rule_another_fill_of_the_same_order_is_matched() -> None:
+    """Pinned while the owner decides (#308): a buy filled in two parts is two
+    lots, and a loss on the first part is matched to the second."""
+    book = Book()
+    order = _order("buy1", "buy")
+    book.orders.append(order)
+    day = date(2025, 3, 3)
+    book.fills += [_fill(order, 5, 100.0, _at(day, 14)), _fill(order, 5, 100.0, _at(day, 15))]
+    book.trade("sell", 5, 90.0, date(2025, 3, 20))
+
+    found_lots, _, [flag] = book.run()
+
+    assert (flag.replacement_lot_id, flag.matched_quantity) == (found_lots[1].lot_id, 5.0)
+
+
+def test_the_window_counts_new_york_dates_not_utc_dates() -> None:
+    sale_day = date(2025, 3, 3)  # the loss sale at 20:00 UTC, 15:00 in New York
+    inside = sale_day + timedelta(days=WASH_SALE_WINDOW_DAYS + 1)  # 02:00 UTC: 30 local days
+    outside = sale_day + timedelta(days=WASH_SALE_WINDOW_DAYS + 2)  # 02:00 UTC: 31 local days
+    for buy_day, matched in ((inside, True), (outside, False)):
+        book = Book()
+        book.trade("buy", 10, 100.0, date(2025, 1, 2))
+        book.trade("sell", 10, 90.0, sale_day)
+        book.trade("buy", 10, 90.0, buy_day, hour_utc=2)
+        assert bool(book.run()[2]) is matched, buy_day
+
+
 def test_a_gain_disposal_flags_nothing() -> None:
     book = Book()
     book.trade("buy", 10, 100.0, date(2025, 1, 2))
