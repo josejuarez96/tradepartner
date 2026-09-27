@@ -279,6 +279,7 @@ def _row(table: str, **values: object) -> dict[str, object]:
             "filled_at": _NOW,
             "quantity": 1.5,
             "price": 10.0,
+            "price_implied": False,
             "broker_fill_id": "bf-1",
             "source": "broker_feed",
         },
@@ -290,6 +291,29 @@ def _row(table: str, **values: object) -> dict[str, object]:
             "reason": "owner excludes this name for a reason",
         },
         "paper_window_stops": {"window_id": 1, "at": _NOW, "state": "requested"},
+        "paper_runs": {
+            "run_id": 1,
+            "window_id": 1,
+            "session": _NOW.date(),
+            "kind": "mark",
+            "started_at": _NOW,
+            "invoked_by": "scheduler",
+            "code_version": "abc",
+        },
+        "positions_daily": {
+            "run_id": 1,
+            "session": _NOW.date(),
+            "security_id": "SEC_A",
+            "quantity": 2.0,
+            "cash": 100.0,
+        },
+        "alerts": {
+            "alert_id": 1,
+            "session": _NOW.date(),
+            "kind": "no_window",
+            "message": "m",
+            "at": _NOW,
+        },
     }
     return {**base[table], "known_at": _NOW, "ingested_at": _NOW, **values}
 
@@ -303,6 +327,18 @@ def _insert(conn: duckdb.DuckDBPyConnection, table: str, row: dict[str, object])
 def test_known_at_after_ingested_at_is_refused(journal: duckdb.DuckDBPyConnection) -> None:
     with pytest.raises(duckdb.ConstraintException):
         _insert(journal, "fills", _row("fills", known_at=_NOW + timedelta(seconds=1)))
+
+
+@pytest.mark.parametrize("table", sorted(_EXPECTED_JOURNAL_TABLES))
+def test_every_journal_table_checks_known_at_not_after_ingested_at(
+    journal: duckdb.DuckDBPyConnection, table: str
+) -> None:
+    checks = journal.execute(
+        "SELECT constraint_text FROM duckdb_constraints() "
+        "WHERE table_name = ? AND constraint_type = 'CHECK'",
+        [table],
+    ).fetchall()
+    assert ("CHECK((known_at <= ingested_at))",) in checks
 
 
 def test_known_at_is_required(journal: duckdb.DuckDBPyConnection) -> None:
@@ -323,25 +359,69 @@ def test_broker_fill_id_is_unique_and_superseded_by_nullable(
         _insert(journal, "fills", _row("fills", fill_id=3))  # bf-1 again
 
 
-def test_price_implied_defaults_false_and_only_broker_feed_needs_a_positive_price(
+def test_an_implied_fill_is_exactly_a_broker_status_row_at_any_price(
     journal: duckdb.DuckDBPyConnection,
 ) -> None:
-    _insert(journal, "fills", _row("fills"))
     implied = _row(
         "fills",
         fill_id=2,
-        broker_fill_id="status-1",
+        broker_fill_id="synthetic:tp-20261001-SEC_A-buy-1",
         source="broker_status",
         price=-0.5,
         price_implied=True,
     )
     _insert(journal, "fills", implied)
-    assert journal.execute("SELECT price_implied FROM fills ORDER BY fill_id").fetchall() == [
-        (False,),
-        (True,),
-    ]
+    for bad in (
+        _row("fills", fill_id=3, broker_fill_id="bf-3", price=0.0),  # feed price must be > 0
+        _row("fills", fill_id=4, broker_fill_id="bf-4", price_implied=True),
+        {**implied, "fill_id": 5, "broker_fill_id": "synthetic:x", "price_implied": False},
+        _row("fills", fill_id=6, broker_fill_id="bf-6", quantity=0.0),
+    ):
+        with pytest.raises(duckdb.ConstraintException):
+            _insert(journal, "fills", bad)
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [
+        ("fills", "price_implied"),
+        ("decisions", "whole_share"),
+        ("paper_run_results", "clock_fault"),
+    ],
+)
+def test_decided_flags_have_no_default(
+    journal: duckdb.DuckDBPyConnection, table: str, column: str
+) -> None:
+    """A writer must state these; a silent FALSE would mislead the lot ledger, the
+    remainder rule and the halt record."""
+    [(default, nullable)] = journal.execute(
+        "SELECT column_default, is_nullable FROM information_schema.columns "
+        "WHERE table_name = ? AND column_name = ?",
+        [table, column],
+    ).fetchall()
+    assert (default, nullable) == (None, "NO")
+
+
+def test_a_non_session_run_has_neither_session_nor_kind(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(journal, "paper_runs", _row("paper_runs", session=None, kind=None))
+    for run_id, values in ((2, {"session": None}), (3, {"kind": None})):
+        with pytest.raises(duckdb.ConstraintException):
+            _insert(journal, "paper_runs", _row("paper_runs", run_id=run_id, **values))
+
+
+def test_a_flat_session_is_marked_by_a_cash_only_row(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(journal, "positions_daily", _row("positions_daily", security_id=None, quantity=0.0))
     with pytest.raises(duckdb.ConstraintException):
-        _insert(journal, "fills", _row("fills", fill_id=3, broker_fill_id="bf-3", price=0.0))
+        _insert(journal, "positions_daily", _row("positions_daily", security_id=None))
+
+
+def test_an_alert_always_has_its_dedupe_session(journal: duckdb.DuckDBPyConnection) -> None:
+    with pytest.raises(duckdb.ConstraintException):
+        _insert(journal, "alerts", _row("alerts", session=None))
 
 
 @pytest.mark.parametrize("reason", ["", "   "])
@@ -404,6 +484,7 @@ def test_insert_row_writes_a_column_named_at(journal: duckdb.DuckDBPyConnection)
         "alerts",
         {
             "alert_id": 1,
+            "session": _NOW.date(),
             "kind": "locked",
             "message": "m",
             "at": _NOW,

@@ -595,7 +595,8 @@ SIDES: tuple[str, ...] = ("buy", "sell")
 
 #: Every journal column the spec enumerates as a closed set, with its allowed
 #: values; the DDL turns each into a `CHECK`. Columns in `NULLABLE_JOURNAL_ENUMS`
-#: may also be NULL (the spec lists `null` among their values).
+#: may also be NULL: the spec lists `null` among their values, or the row can
+#: lack the thing (a skip decision has no side, a non-session run no kind).
 JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ("paper_window_stops", "state"): ("requested", "closed", "abandoned"),
     ("paper_runs", "kind"): ("rebalance", "catch_up", "mark", "stop"),
@@ -674,9 +675,9 @@ NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
     {
         ("rebalance_events", "reason"),
         ("decisions", "side"),
+        ("paper_runs", "kind"),
         ("decision_events", "reason"),
         ("adjustments", "origin"),
-        ("kill_switch", "source"),
     }
 )
 
@@ -721,20 +722,23 @@ CREATE TABLE IF NOT EXISTS paper_window_stops (
 )
 """
 
-# code_dirty is NULL outside a git checkout, as `trials.code_dirty`.
+# code_dirty is NULL outside a git checkout, as `trials.code_dirty`. On a
+# non-session day the run has no S and no kind (it exits with a `no_session`
+# result), so session and kind are NULL together.
 _CREATE_PAPER_RUNS = f"""
 CREATE TABLE IF NOT EXISTS paper_runs (
     run_id BIGINT NOT NULL PRIMARY KEY,
     window_id BIGINT NOT NULL,
-    session DATE NOT NULL,
-    kind VARCHAR NOT NULL,
+    session DATE,
+    kind VARCHAR,
     started_at TIMESTAMPTZ NOT NULL,
     invoked_by VARCHAR NOT NULL,
     code_version VARCHAR NOT NULL,
     code_dirty BOOLEAN,
     {_JOURNAL_TIMESTAMPS},
     {_check("paper_runs", "kind")},
-    {_check("paper_runs", "invoked_by")}
+    {_check("paper_runs", "invoked_by")},
+    CHECK ((session IS NULL) = (kind IS NULL))
 )
 """
 
@@ -747,7 +751,7 @@ CREATE TABLE IF NOT EXISTS paper_run_results (
     status VARCHAR NOT NULL,
     fault_type VARCHAR,
     message VARCHAR,
-    clock_fault BOOLEAN NOT NULL DEFAULT FALSE,
+    clock_fault BOOLEAN NOT NULL,
     {_JOURNAL_TIMESTAMPS},
     {_check("paper_run_results", "status")}
 )
@@ -806,7 +810,8 @@ CREATE TABLE IF NOT EXISTS signals (
 """
 
 # rebalance_session is NULL for a decision outside a rebalance (a forced
-# exit). `reason` is an open set in the spec ("…"), so it has no CHECK.
+# exit); side is NULL on a decision that trades nothing (a skip, dust).
+# `reason` is an open set in the spec ("…"), so it has no CHECK.
 # whole_share is the fractionable flag at decision time, read from this row
 # and never from the live asset.
 _CREATE_DECISIONS = f"""
@@ -821,7 +826,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     planned_notional DOUBLE,
     planned_quantity DOUBLE,
     target_notional DOUBLE,
-    whole_share BOOLEAN NOT NULL DEFAULT FALSE,
+    whole_share BOOLEAN NOT NULL,
     decision VARCHAR NOT NULL,
     reason VARCHAR,
     override_id BIGINT,
@@ -834,7 +839,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 _CREATE_DECISION_EVENTS = f"""
 CREATE TABLE IF NOT EXISTS decision_events (
     decision_id BIGINT NOT NULL,
-    run_id BIGINT,
+    run_id BIGINT NOT NULL,
     status VARCHAR NOT NULL,
     reason VARCHAR,
     unfunded_notional DOUBLE,
@@ -882,9 +887,11 @@ CREATE TABLE IF NOT EXISTS order_events (
 )
 """
 
-# quantity is unsigned (side comes from the order). A `broker_status` row
-# (an implied residual) may carry any price as computed, flagged
-# price_implied; only `broker_feed` rows must have a positive price. A
+# quantity is unsigned (side comes from the order). A `broker_status` row is
+# the implied residual that completes an order (`broker_fill_id =
+# synthetic:<client_order_id>`): its price is stored as computed and flagged
+# price_implied, which is exactly `source = 'broker_status'`; only
+# `broker_feed` rows must have a positive price. A
 # later real fill supersedes it through superseded_by; every reader goes
 # through `store.journal`'s accessor, which hides superseded rows.
 _CREATE_FILLS = f"""
@@ -894,13 +901,14 @@ CREATE TABLE IF NOT EXISTS fills (
     filled_at TIMESTAMPTZ NOT NULL,
     quantity DOUBLE NOT NULL,
     price DOUBLE NOT NULL,
-    price_implied BOOLEAN NOT NULL DEFAULT FALSE,
+    price_implied BOOLEAN NOT NULL,
     broker_fill_id VARCHAR NOT NULL UNIQUE,
     source VARCHAR NOT NULL,
     superseded_by BIGINT,
     {_JOURNAL_TIMESTAMPS},
     {_check("fills", "source")},
-    CHECK (quantity >= 0),
+    CHECK (quantity > 0),
+    CHECK (price_implied = (source = 'broker_status')),
     CHECK (source <> 'broker_feed' OR price > 0)
 )
 """
@@ -940,17 +948,21 @@ CREATE TABLE IF NOT EXISTS outcomes (
 )
 """
 
+# A session with no position (cash only, as at close(T_0) or after a full
+# exit) is one row with security_id NULL and quantity 0, so its equity (cash)
+# is still marked.
 _CREATE_POSITIONS_DAILY = f"""
 CREATE TABLE IF NOT EXISTS positions_daily (
     run_id BIGINT NOT NULL,
     session DATE NOT NULL,
-    security_id VARCHAR NOT NULL,
+    security_id VARCHAR,
     quantity DOUBLE NOT NULL,
     mark_price DOUBLE,
     value DOUBLE,
     cash DOUBLE,
     tradable BOOLEAN,
-    {_JOURNAL_TIMESTAMPS}
+    {_JOURNAL_TIMESTAMPS},
+    CHECK (security_id IS NOT NULL OR quantity = 0)
 )
 """
 
@@ -992,7 +1004,7 @@ CREATE TABLE IF NOT EXISTS kill_switch (
     window_id BIGINT NOT NULL,
     "at" TIMESTAMPTZ NOT NULL,
     state VARCHAR NOT NULL,
-    source VARCHAR,
+    source VARCHAR NOT NULL,
     fault_type VARCHAR,
     reason VARCHAR,
     run_id BIGINT,
@@ -1024,11 +1036,13 @@ CREATE TABLE IF NOT EXISTS overrides (
 """
 
 # run_id is NULL for an alert raised outside a run (`locked`, `no_window`).
+# session is the run's S, or the calendar session containing `at` (the next
+# one on a non-session day): always set, since alerts dedupe on it.
 _CREATE_ALERTS = f"""
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id BIGINT NOT NULL PRIMARY KEY,
     run_id BIGINT,
-    session DATE,
+    session DATE NOT NULL,
     kind VARCHAR NOT NULL,
     message VARCHAR NOT NULL,
     "at" TIMESTAMPTZ NOT NULL,
