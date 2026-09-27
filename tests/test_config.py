@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tradepartner.config import Settings
+from tradepartner.config import FROZEN_PAPER_KEYS, PaperConfig, Settings
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +28,13 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "UNIVERSE__EXCLUDE_SIC_RANGES",
         "HOLDOUT__START",
         "HOLDOUT__END",
+        "ALPACA__PAPER",
+        "ALPACA_PAPER_API_KEY",
+        "ALPACA_PAPER_API_SECRET",
+        "ALERT_SMTP_HOST",
+        "ALERT_SMTP_USER",
+        "ALERT_SMTP_PASSWORD",
+        "ALERT_EMAIL_TO",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -478,3 +485,274 @@ def test_misspelt_phase3_env_var_fails_loudly_naming_the_key(
     monkeypatch.setenv("COSTS__PER_SIDE_BP", "0")
     with pytest.raises(ValidationError, match="per_side_bp"):
         Settings(_env_file=None)
+
+
+# --- Phase 4 keys (docs/specs/paper-trading.md "Config keys", ADR 0010 point 1, T47) ---
+
+
+def test_alpaca_paper_guarded_default_true() -> None:
+    """`alpaca.paper` is guarded: Phase 6 changes it by ADR, never by config."""
+    assert _settings().alpaca.paper is True
+
+
+def test_alpaca_paper_rejects_false_in_code() -> None:
+    with pytest.raises(ValidationError, match="guarded setting"):
+        Settings(_env_file=None, alpaca={"paper": False})
+
+
+def test_alpaca_paper_rejects_false_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALPACA__PAPER", "false")
+    with pytest.raises(ValidationError, match="guarded setting"):
+        Settings(_env_file=None)
+
+
+def test_alpaca_paper_cannot_be_assigned_after_construction() -> None:
+    """The guard runs at construction, so the section is frozen: no later assignment can
+    point the order path at the live endpoint (safety-reviewer on T47)."""
+    s = _settings()
+    with pytest.raises(ValidationError):
+        s.alpaca.paper = False  # type: ignore[misc]
+    assert s.alpaca.paper is True
+
+
+def test_alpaca_rejects_unknown_keys() -> None:
+    """A misspelt broker fact must fail loudly, not leave the real one unset."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca={"quantity_decimal": 4})
+
+
+def test_alpaca_trading_defaults() -> None:
+    a = _settings().alpaca
+    assert a.trading_requests_per_minute == pytest.approx(150.0)
+    assert a.trading_request_timeout_seconds == pytest.approx(30.0)
+    assert a.trading_max_retries == 3
+    # Broker facts the recording task (T48b) sets; no default, so the adapter
+    # refuses to construct until they are known.
+    assert a.quantity_decimals is None
+    assert a.client_order_id_max_length is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"trading_requests_per_minute": 0},
+        {"trading_request_timeout_seconds": 0},
+        {"trading_max_retries": -1},
+        {"quantity_decimals": -1},
+        {"client_order_id_max_length": 0},
+        {"trading_request_timeout_seconds": float("inf")},
+        {"trading_requests_per_minute": float("inf")},
+    ],
+)
+def test_alpaca_trading_keys_reject_nonsense(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca=override)
+
+
+def test_risk_defaults_match_adr_0010() -> None:
+    r = _settings().risk
+    assert r.max_position_weight == pytest.approx(0.05)
+    assert r.max_order_notional_fraction == pytest.approx(0.05)
+    assert r.max_gross_exposure == pytest.approx(1.0)
+    assert r.max_orders_per_run == 250
+    assert r.max_skips_per_run == 10
+    assert r.max_rejections_per_run == 5
+    assert r.max_drawdown == pytest.approx(0.30)
+    assert r.min_order_notional == pytest.approx(1.0)
+    assert r.whole_share_price_buffer == pytest.approx(0.02)
+    assert r.max_unspent_cash_fraction == pytest.approx(0.05)
+    assert r.max_fill_lag_sessions == 1
+    assert r.clock_max_sessions_late == 1
+    assert r.max_broker_clock_skew_seconds == pytest.approx(60.0)
+    assert r.reconcile_quantity_tolerance == pytest.approx(1e-6)
+    assert r.reconcile_cash_tolerance == pytest.approx(0.01)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_position_weight",
+        "max_order_notional_fraction",
+        "max_gross_exposure",
+        "max_drawdown",
+        "whole_share_price_buffer",
+        "max_unspent_cash_fraction",
+    ],
+)
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
+def test_risk_fractions_outside_unit_interval_rejected(field: str, value: float) -> None:
+    """Every `risk.*` fraction is a share in [0, 1]; above 1 would be leverage."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={field: value})
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_risk_max_fill_lag_sessions_at_least_one(value: int) -> None:
+    """Validated >= 1 (spec): the bound is measured in whole sessions past the anchor."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"max_fill_lag_sessions": value})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"max_orders_per_run": 0},
+        {"max_skips_per_run": -1},
+        {"max_rejections_per_run": -1},
+        {"clock_max_sessions_late": -1},
+        {"min_order_notional": -1.0},
+        {"max_broker_clock_skew_seconds": -1.0},
+        {"reconcile_quantity_tolerance": -1e-6},
+        {"reconcile_cash_tolerance": float("inf")},
+        {"max_position_weigth": 0.05},
+    ],
+)
+def test_risk_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> None:
+    """The section is frozen into the window by name (req 14): a typo must fail, never
+    fall back to a default."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk=override)
+
+
+def test_paper_defaults() -> None:
+    p = _settings().paper
+    assert p.min_rebalances == 6
+    assert p.tracking_k == pytest.approx(2.0)
+    assert p.tracking_rule == "raw"  # T70 sets `residual` after Probe 3 (#247 Q4)
+    assert p.max_catch_up_sessions == 5
+    assert p.submit_window_before_open_minutes == 90
+    assert p.submit_window_after_open_minutes == 30
+    assert p.sell_wait_seconds == pytest.approx(900.0)
+    assert p.poll_interval_seconds == pytest.approx(15.0)
+    assert p.accept_wait_seconds == pytest.approx(30.0)
+    assert p.fill_read_overlap_seconds == pytest.approx(60.0)
+    assert p.order_id_prefix == "tp"
+    assert p.live_capital_reference == pytest.approx(100.0)
+    assert p.min_override_reason_chars == 20
+
+
+def test_paper_tracking_rule_residual_accepted_and_others_rejected() -> None:
+    assert Settings(_env_file=None, paper={"tracking_rule": "residual"}).paper.tracking_rule == (
+        "residual"
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"tracking_rule": "net"})
+
+
+def test_paper_poll_interval_never_above_accept_wait() -> None:
+    """Spec req 3(f): `Settings` rejects a poll interval above the accept wait."""
+    with pytest.raises(ValidationError, match="poll_interval_seconds"):
+        Settings(_env_file=None, paper={"poll_interval_seconds": 31.0, "accept_wait_seconds": 30.0})
+    equal = {"poll_interval_seconds": 30.0, "accept_wait_seconds": 30.0}
+    assert Settings(_env_file=None, paper=equal).paper.poll_interval_seconds == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"min_rebalances": 0},
+        {"tracking_k": -1.0},
+        {"max_catch_up_sessions": -1},
+        {"submit_window_before_open_minutes": -1},
+        {"submit_window_after_open_minutes": -1},
+        {"sell_wait_seconds": -1.0},
+        {"poll_interval_seconds": 0.0},
+        {"accept_wait_seconds": 0.0},
+        {"fill_read_overlap_seconds": -1.0},
+        {"order_id_prefix": ""},
+        {"order_id_prefix": "t p"},
+        {"live_capital_reference": 0.0},
+        {"min_override_reason_chars": 0},
+        {"tracking_k": float("nan")},
+        {"min_rebalance": 6},
+    ],
+)
+def test_paper_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper=override)
+
+
+def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
+    assert FROZEN_PAPER_KEYS == (
+        "tracking_k",
+        "min_rebalances",
+        "tracking_rule",
+        "max_catch_up_sessions",
+        "min_override_reason_chars",
+    )
+    assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
+
+
+def test_alerts_channels_default_store_and_macos() -> None:
+    """#247 Q2: `[store, macos]`; `email` only when the owner sets the `ALERT_*` variables."""
+    assert _settings().alerts.channels == ["store", "macos"]
+    with_email = ["store", "macos", "email"]
+    assert Settings(_env_file=None, alerts={"channels": with_email}).alerts.channels == with_email
+
+
+@pytest.mark.parametrize(
+    "channels",
+    [["macos"], [], ["store", "store"], ["store", "push"]],
+)
+def test_alerts_channels_require_store_once_and_known_names(channels: list[str]) -> None:
+    """`store` is always a channel (spec req 11); a paid push service needs a budget change."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alerts={"channels": channels})
+
+
+def test_paper_and_alert_secrets_default_to_none() -> None:
+    s = _settings()
+    assert s.alpaca_paper_api_key is None
+    assert s.alpaca_paper_api_secret is None
+    assert s.alert_smtp_host is None
+    assert s.alert_smtp_user is None
+    assert s.alert_smtp_password is None
+    assert s.alert_email_to is None
+
+
+def test_paper_and_alert_secrets_absent_from_repr_and_str(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "pk-paper-abc123")
+    monkeypatch.setenv("ALPACA_PAPER_API_SECRET", "ps-paper-secret456")
+    monkeypatch.setenv("ALERT_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("ALERT_SMTP_USER", "alerts-user")
+    monkeypatch.setenv("ALERT_SMTP_PASSWORD", "smtp-pass-789")
+    monkeypatch.setenv("ALERT_EMAIL_TO", "jose@example.com")
+    s = _settings()
+    assert s.alpaca_paper_api_key is not None
+    assert s.alpaca_paper_api_key.get_secret_value() == "pk-paper-abc123"
+    assert s.alert_smtp_host == "smtp.example.com"
+    for blob in (repr(s), str(s)):
+        for secret in ("pk-paper-abc123", "ps-paper-secret456", "alerts-user", "smtp-pass-789"):
+            assert secret not in blob
+        assert "jose@example.com" not in blob
+
+
+def test_paper_keys_are_separate_from_data_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live-capable data key never reaches the order path: the paper keys are their
+    own variables and do not fall back to `ALPACA_API_KEY`/`ALPACA_API_SECRET`."""
+    monkeypatch.setenv("ALPACA_API_KEY", "sk-live-abc123")
+    monkeypatch.setenv("ALPACA_API_SECRET", "sk-live-secret456")
+    s = _settings()
+    assert s.alpaca_paper_api_key is None
+    assert s.alpaca_paper_api_secret is None
+
+
+def test_env_example_lists_phase_4_variables_but_never_alpaca_paper() -> None:
+    """`alpaca.paper` is never listed as overridable (spec, Config keys); the paper keys,
+    the invoker marker and the four `ALERT_*` variables are."""
+    text = Path(__file__).resolve().parents[1] / ".env.example"
+    upper = text.read_text(encoding="utf-8").upper()
+    assert "ALPACA__PAPER" not in upper
+    assert "ALPACA_PAPER=" not in upper
+    for name in (
+        "ALPACA_PAPER_API_KEY",
+        "ALPACA_PAPER_API_SECRET",
+        "TRADEPARTNER_INVOKED_BY",
+        "ALERT_SMTP_HOST",
+        "ALERT_SMTP_USER",
+        "ALERT_SMTP_PASSWORD",
+        "ALERT_EMAIL_TO",
+    ):
+        assert name in upper
