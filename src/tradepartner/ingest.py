@@ -216,10 +216,25 @@ def ingest_session(
         "edgar": lambda: _prefetch(recorded, settings),
         "alpaca": lambda: fetched.update(alpaca=_fetch_prices(settings, prices, now, clock)),
     }
+    # T11h: `record_failures` (the failure policy's after-commit hook), edgar
+    # only, read from the adapter under `_Recorded` -- a fixture source and
+    # the alpaca chunk never have one.
+    after_commit: dict[str, Callable[[], None] | None] = {
+        "edgar": getattr(_unwrap(filings), "record_failures", None),
+        "alpaca": None,
+    }
     runs: list[SourceRun] = []
     for name in SOURCES if source == "all" else (source,):
         run = _run_source(
-            name, work[name], settings, now, clock, cursor, dry_run, prepare=prepare[name]
+            name,
+            work[name],
+            settings,
+            now,
+            clock,
+            cursor,
+            dry_run,
+            prepare=prepare[name],
+            after_commit=after_commit[name],
         )
         runs.append(run)
         if run.status != OK:
@@ -237,9 +252,13 @@ def _run_source(
     dry_run: bool,
     mode: str = MODE,
     prepare: Callable[[], object] | None = None,
+    after_commit: Callable[[], None] | None = None,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
-    `work` inside one write transaction with the run row."""
+    `work` inside one write transaction with the run row, then -- only for a
+    committed `ok`, non-dry run -- `after_commit` (T11h's `record_failures`),
+    called outside the write transaction; an exception from it is appended
+    to the returned message only, the committed run row never rewritten."""
     run_id = uuid.uuid4().hex
 
     def outcome(status: str, rows: int, message: str) -> SourceRun:
@@ -255,16 +274,24 @@ def _run_source(
                 raise _DryRun(rows, message)
             run = outcome(OK, rows, message)
             _write_run(conn, run_id, now, clock(), run, mode)
-        return run
     except _DryRun as dry:
         return outcome(OK, dry.rows, f"dry run: {dry}")
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
+        return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     except Exception as exc:  # any source or parse failure halts with a run row
         run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
-    return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
+        # A dry run writes no run row, failed or not.
+        return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
+    if after_commit is not None:
+        try:
+            after_commit()
+        except Exception as exc:  # never rewrites the already-committed run row
+            message = _clean(f"{run.message}; after_commit: {type(exc).__name__}: {exc}", settings)
+            run = SourceRun(run.source, run.status, run.rows_added, run.chunk_cursor, message)
+    return run
 
 
 def _record_only(
@@ -373,10 +400,22 @@ class _Recorded(FilingSource):
         return list(self._ask("delistings", since))
 
 
+def _unwrap(filings: FilingSource) -> FilingSource:
+    """The adapter under any number of `_Recorded` wrappers (T17's fetch
+    pass, T11h's `after_commit`/`check_failures` reads)."""
+    while isinstance(filings, _Recorded):
+        filings = filings._source
+    return filings
+
+
 def _prefetch(recorded: _Recorded, settings: Settings) -> None:
     """The fetch pass: every filing question, with no store connection open;
-    then `recorded` answers only from what it holds."""
+    then `check_failures()` (T11h), if the source under `recorded` has one,
+    before the lock; then `recorded` answers only from what it holds."""
     _build_filings(recorded, settings, _FETCH_PASS)
+    check_failures = getattr(_unwrap(recorded), "check_failures", None)
+    if check_failures is not None:
+        check_failures()
     recorded.frozen = True
 
 
@@ -425,8 +464,7 @@ def _source_counts(filings: FilingSource) -> str:
     hold them as plain attributes set during the fetch pass, never as
     properties that fetch: this read runs after the pass is frozen, inside
     the write transaction."""
-    while isinstance(filings, _Recorded):
-        filings = filings._source
+    filings = _unwrap(filings)
 
     def count(attribute: str) -> int | None:
         value = getattr(filings, attribute, None)
@@ -448,6 +486,9 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
         ("unstamped_delistings", "unstamped delistings"),  # T11f
+        ("failed_filings", "failed filings"),  # T11h: the failure policy
+        ("quarantined", "quarantined"),
+        ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")
