@@ -598,3 +598,32 @@ def test_target_refuses_a_decision_that_is_not_a_planned_buy() -> None:
     buy = _decision(side="buy", planned_notional=100.0, decision_id=10)
     with pytest.raises(ValueError, match="planned_buys"):
         target_notional(buy, 100.0, [], [], price_of, COSTS)
+
+
+def test_a_new_skip_kind_is_closed_by_its_prefix() -> None:
+    state = _state(_decision(side=None, decision="skip_something_new"))
+    assert (state.state, state.reason) == (State.CLOSED, "skip_something_new")
+
+
+def test_only_the_plans_own_sells_fund_the_target() -> None:
+    buy = _decision(side="buy", planned_notional=1000.0, decision_id=10)
+    sells = [
+        _decision(planned_notional=400.0, decision_id=20),
+        # An exclude_name override sells too.
+        _decision(planned_notional=100.0, decision="override", decision_id=21),
+        # A skip or dust row carrying a side is not a sell the plan made.
+        _decision(planned_notional=300.0, decision="skip_below_minimum", decision_id=22),
+        _decision(planned_quantity=2, decision="dust", decision_id=23),
+    ]
+    spendable = buy_notional_after_costs(500.0, 15.0, COSTS.commissions, price=PRICE)
+    got = target_notional(buy, 0.0, sells, [buy], price_of, COSTS)
+    assert got == pytest.approx(1000.0 * spendable / 1000.0)
+
+
+def test_a_plan_sell_or_buy_with_no_amount_is_refused() -> None:
+    buy = _decision(side="buy", planned_notional=100.0, decision_id=10)
+    with pytest.raises(ValueError, match="planned sell"):
+        target_notional(buy, 100.0, [_decision(decision_id=20)], [buy], price_of, COSTS)
+    blank = _decision(side="buy", decision_id=11)
+    with pytest.raises(ValueError, match="planned_notional"):
+        target_notional(buy, 100.0, [], [buy, blank], price_of, COSTS)

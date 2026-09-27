@@ -17,7 +17,7 @@ ex-date is after the date the quantity was stated for and on or before S.
 
 How decisions are read (T53 writes them this way):
 
-- `skip_*` and `dust` decisions are closed with that reason; an `override`
+- every `skip_*` kind and `dust` are closed with that reason; an `override`
   decision with no side is a `keep_name` and closed; an `override` with a side
   (`exclude_name`) trades like any other decision.
 - A sell with `planned_quantity` is a quantity sell, one with
@@ -62,16 +62,11 @@ _FORCED_EXIT = "forced_exit"
 _KEEP_NAME = "keep_name"
 _WRITTEN_OFF = "written_off"
 _CLOSING_EVENTS = frozenset({"skipped", _WRITTEN_OFF})
-_CLOSED_KINDS = frozenset(
-    {
-        "skip_below_minimum",
-        "skip_untradable",
-        "skip_below_one_share",
-        "skip_delisted",
-        "skip_zero",
-        "dust",
-    }
-)
+_SKIP_PREFIX = "skip_"
+_DUST = "dust"
+_TRADE = "trade"
+#: Decision kinds whose sells are the plan's own (their proceeds fund the buys).
+_PLAN_TRADE_KINDS = frozenset({_TRADE, _OVERRIDE})
 _HALT = "halt"
 _HALT_CANCEL_STATUSES = frozenset({"cancel_requested", "cancel_failed"})
 _NOT_RECEIVED = "not_received"
@@ -246,10 +241,11 @@ def target_notional(
     """A buy's target, fixed at plan time: `planned_notional` x min(1, spendable
     / the planned buys' notional sum). Spendable is
     `costs.buy_notional_after_costs` on `cash_before` plus the proceeds of every
-    sell the plan made at the reference price (a planned notional, or a planned
-    quantity x price). A `forced_exit` sell is not the plan's, so its proceeds
-    stay out: they are cash until the next rebalance. `planned_buys` is the
-    rebalance's buy decisions, `decision` among them.
+    sell the plan made (`trade` or `override` sells) at the reference price (a
+    planned notional, or a planned quantity x price). A `forced_exit` sell is
+    not the plan's, so its proceeds stay out: they are cash until the next
+    rebalance. A plan sell or a buy with no planned amount raises `ValueError`.
+    `planned_buys` is the rebalance's buy decisions, `decision` among them.
     """
     if decision.side != _BUY or decision.planned_notional is None:
         raise ValueError(f"decision {decision.decision_id} is not a buy with a planned notional")
@@ -258,12 +254,17 @@ def target_notional(
         raise ValueError(f"decision {decision_id} is not among planned_buys")
     proceeds = 0.0
     for sell in planned_sells:
-        if sell.decision == _FORCED_EXIT or sell.side != _SELL:
-            continue
+        if sell.decision not in _PLAN_TRADE_KINDS or sell.side != _SELL:
+            continue  # a forced exit, a skip or dust is not a sell the plan made
         if sell.planned_notional is not None:
             proceeds += sell.planned_notional
         elif sell.planned_quantity is not None:
             proceeds += sell.planned_quantity * _price(price_of, sell.security_id)
+        else:
+            raise ValueError(f"planned sell {sell.decision_id} has no planned quantity or notional")
+    missing = [b.decision_id for b in planned_buys if b.planned_notional is None]
+    if missing:
+        raise ValueError(f"planned buys {missing} have no planned_notional")
     total = sum(b.planned_notional or 0.0 for b in planned_buys)
     if not total > 0:
         raise ValueError("planned_buys have no positive planned notional")
@@ -315,7 +316,7 @@ def decision_state(
     """
     _check_session(session)
     decision_id = _decision_id(decision)
-    if decision.decision in _CLOSED_KINDS:
+    if decision.decision.startswith(_SKIP_PREFIX) or decision.decision == _DUST:
         return DecisionState(State.CLOSED, decision.decision)
     if decision.decision == _OVERRIDE and decision.side is None:
         return DecisionState(State.CLOSED, _KEEP_NAME)
