@@ -53,3 +53,22 @@ def test_smtp_login_forms_are_configured_and_scrubbed() -> None:
     scrubbed, _ = cli_record.scrub_text(transcript, secrets=secrets)
     for form in (plain, login_user, login_password):
         assert form not in scrubbed
+
+
+def test_a_failed_flatten_prints_a_scrubbed_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = _paper_settings()
+    assert settings.alpaca_paper_api_key is not None
+    key = settings.alpaca_paper_api_key.get_secret_value()
+
+    def leaky(*_args: object, **_kwargs: object) -> list[object]:
+        raise cli_record.PaperRecordingError(f"flatten refused, broker echoed {key}")
+
+    monkeypatch.setattr(cli_record, "_paper_flatten", leaky)
+    client = _ScriptedPaperClient()
+    with pytest.raises(cli_record.PaperRecordingError):
+        cli_record._paper_finish(_raw_on(client), settings, iter(["x"]), {})
+    err = capsys.readouterr().err
+    assert "NOT FLAT?" in err and "broker echoed" in err
+    assert key not in err

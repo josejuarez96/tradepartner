@@ -1025,8 +1025,8 @@ def _secret_fields() -> list[str]:
 
     return sorted(
         name
-        for name, field in Settings.model_fields.items()
-        if "SecretStr" in str(field.annotation) or field.annotation is SecretStr
+        for name, info in Settings.model_fields.items()
+        if "SecretStr" in str(info.annotation) or info.annotation is SecretStr
     )
 
 
@@ -1052,3 +1052,46 @@ def test_every_secret_field_is_redacted_from_run_messages() -> None:
     for value in values.values():
         assert value not in cleaned
     assert cleaned.count("[redacted]") == len(values)
+
+
+def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
+    """`ingest._secret_values` finds secrets among `Settings`' own fields by type;
+    a secret nested in a sub-model, a container or `SecretBytes` would be missed,
+    so this pins that none exists (#334 review)."""
+    import typing
+
+    from pydantic import BaseModel, SecretBytes, SecretStr
+
+    def mentions_secret(annotation: object) -> bool:
+        if annotation in (SecretStr, SecretBytes):
+            return True
+        return any(mentions_secret(arg) for arg in typing.get_args(annotation))
+
+    def models_in(annotation: object) -> list[type[BaseModel]]:
+        found = []
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            found.append(annotation)
+        for arg in typing.get_args(annotation):
+            found += models_in(arg)
+        return found
+
+    offenders = []
+    for name, info in Settings.model_fields.items():
+        args = typing.get_args(info.annotation)
+        plain = info.annotation is SecretStr or (
+            SecretStr in args and all(a in (SecretStr, type(None)) for a in args)
+        )
+        if mentions_secret(info.annotation) and not plain:
+            offenders.append(name)
+        seen: set[type[BaseModel]] = set()
+        stack = models_in(info.annotation)
+        while stack:
+            model = stack.pop()
+            if model in seen:
+                continue
+            seen.add(model)
+            for sub_name, sub in model.model_fields.items():
+                if mentions_secret(sub.annotation):
+                    offenders.append(f"{name}.{sub_name}")
+                stack += models_in(sub.annotation)
+    assert offenders == []

@@ -251,7 +251,10 @@ def _smtp_login_forms(settings: Settings) -> list[str]:
     `AUTH PLAIN` carries base64("\\0user\\0password"), and `AUTH LOGIN` sends
     base64(user) and base64(password) on their own. A raw-value scrub would
     miss them in a transcript or an exception, so they are scrubbed too. The
-    alert delivery path must never enable `smtplib` debug output regardless."""
+    alert delivery path must never enable `smtplib` debug output regardless, and
+    must pass `smtplib.login` the same raw (unstripped) values these forms are
+    built from. CRAM-MD5 (tried first when a server offers it) sends
+    base64("user hmac"), which exposes the user name only and is not covered."""
     user = _non_blank_secret(settings.alert_smtp_user)
     password = _non_blank_secret(settings.alert_smtp_password)
     forms = [base64.b64encode(v.encode()).decode() for v in (user, password) if v]
@@ -787,7 +790,8 @@ def _paper_finish(
         out["positions_after"] = raw.list_positions()
         out["open_orders_after"] = raw.list_open_orders()
     except (AlpacaTradingError, PaperRecordingError) as error:
-        print(f"cli_record: NOT FLAT? flattening failed ({error}); check it", file=sys.stderr)
+        message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
+        print(f"cli_record: NOT FLAT? flattening failed ({message}); check it", file=sys.stderr)
         raise
     residue = [str(p.get("symbol")) for p in out["positions_after"]] + [
         str(o.get("client_order_id")) for o in out["open_orders_after"]
