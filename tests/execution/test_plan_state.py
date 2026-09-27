@@ -757,3 +757,10 @@ def test_an_earlier_order_still_in_flight_keeps_the_decision_in_flight() -> None
     second = _order(d, S2, notional=300.0)
     events = [_event(first, "accepted"), _event(second, "expired")]
     assert _state(d, [first, second], events).state == State.IN_FLIGHT
+
+
+def test_the_target_refuses_a_negative_cost_rate() -> None:
+    buy = _decision(side="buy", planned_notional=100.0, decision_id=10)
+    bad = BuyCosts(per_side_bps=-20_000.0, commissions=COSTS.commissions)
+    with pytest.raises(ValueError, match="per_side_bps"):
+        target_notional(buy, 100.0, [], [buy], price_of, bad)

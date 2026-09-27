@@ -295,6 +295,9 @@ def target_notional(
     not the plan's, so its proceeds stay out: they are cash until the next
     rebalance. A plan sell or a buy with no planned amount raises `ValueError`.
     `planned_buys` is the rebalance's buy decisions, `decision` among them.
+    Its `price_of` is the plan's own: the close at close(T_i), with no later
+    split applied, since planned quantities are stated for T_i (not the run
+    session's price the other functions take).
     """
     if decision.side != _BUY or decision.planned_notional is None:
         raise ValueError(f"decision {decision.decision_id} is not a buy with a planned notional")
@@ -317,6 +320,7 @@ def target_notional(
     if decision_id not in ids[len(planned_sells) :]:
         raise ValueError(f"decision {decision_id} is not among planned_buys")
     _finite(cash_before, "cash_before", non_negative=True)
+    _finite(costs.per_side_bps, "costs.per_side_bps", non_negative=True)
     proceeds = 0.0
     for sell in planned_sells:
         if sell.decision not in _PLAN_TRADE_KINDS or sell.side != _SELL:
@@ -344,7 +348,7 @@ def target_notional(
         costs.commissions,
         price=_price(price_of, decision.security_id),
     )
-    _finite(spendable, "spendable")
+    _finite(spendable, "spendable", non_negative=True)
     return decision.planned_notional * min(1.0, spendable / total)
 
 
