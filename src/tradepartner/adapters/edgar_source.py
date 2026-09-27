@@ -80,11 +80,13 @@ import re
 import shutil
 import zipfile
 import zlib
+from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -132,6 +134,10 @@ COVER_VERSION = 1
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: Bumped to retry every accession in `failed_filings.json` (T11h): deleting
+#: an entry by hand un-quarantines one accession; bumping this un-quarantines
+#: every one and resets every count.
+FAILURES_VERSION = 1
 
 #: Registration forms (T11d): a ranged header is requested from
 #: `edgar.header_start_year`, unlike periodic forms and 8-K, which only get
@@ -150,6 +156,13 @@ _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
 _EXCHANGE_FORMS = frozenset({"25-NSE", "25-NSE/A"})
 
 Quarter = tuple[int, int]
+
+_T = TypeVar("_T")
+
+
+class FilingFailuresError(RuntimeError):
+    """Raised by `check_failures()` (T11h) when the failure policy's
+    thresholds are crossed; the chunk fails with no row written."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +257,25 @@ class EdgarFilingSource(FilingSource):
         # False once the per-CIK API was chosen, None until decided.
         self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
         self._facts_memo: dict[tuple[str, str], _FactsCache] = {}
+        # T11h: the failure policy.
+        self.failed_filings = 0
+        self.quarantined = 0
+        self.facts_missing = 0
+        # accession -> (error_class, base_form, message), skipped this run,
+        # never yet written to failed_filings.json (that is `record_failures`'s
+        # job, after an `ok` commit).
+        self._pending_failures: dict[str, tuple[str, str, str]] = {}
+        # Pending failures recorded from a fact collision (facts(): withholds
+        # one key, not a fetch): counted toward `_check_cross_day_pairs` only,
+        # never `_check_per_document_group`'s numerator.
+        self._collision_failures: set[str] = set()
+        # Per-document accessions actually fetched this run (cache hits and
+        # quarantined accessions excluded): `check_failures`'s denominator.
+        self._per_document_attempted: set[str] = set()
+        self._failed_filings_cache: dict[str, dict[str, Any]] | None = None
+        # FSN accessions newly recorded as failed by this run's own
+        # `_extract_fsn_period` calls, folded into `.failed_filings`.
+        self._fsn_extraction_failures_this_run = 0
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -491,6 +523,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
         self.fsn_missing = 0
+        self._fsn_extraction_failures_this_run = 0
 
         all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
         listed = set(all_periods)
@@ -616,6 +649,17 @@ class EdgarFilingSource(FilingSource):
             existing.update(records)
             self._save_fsn_cache(cik, existing)
 
+        accessions_failed = [
+            {
+                "accession": f.accession,
+                "error_class": f.error_class,
+                "base_form": form_by_accession.get(f.accession, "").removesuffix("/A"),
+                "accepted": False,
+            }
+            for f in parsed.failures
+            # only forms this adapter serves count toward T11h's failure policy
+            if form_by_accession.get(f.accession, "").removesuffix("/A") in kept_forms
+        ]
         manifest = {
             "version": FSN_VERSION,
             "period": period,
@@ -626,20 +670,15 @@ class EdgarFilingSource(FilingSource):
             # `accessions_failed`) and the period's skipped incomplete listings.
             "accessions_served": sorted(served),
             "incomplete_listings": incomplete,
-            "accessions_failed": [
-                {
-                    "accession": f.accession,
-                    "error_class": f.error_class,
-                    "base_form": form_by_accession.get(f.accession, "").removesuffix("/A"),
-                    "accepted": False,
-                }
-                for f in parsed.failures
-                # only forms this adapter serves count toward T11f's failure policy
-                if form_by_accession.get(f.accession, "").removesuffix("/A") in kept_forms
-            ],
+            "accessions_failed": accessions_failed,
             "committed": False,
         }
         self._save_fsn_manifest(period, manifest)
+        # T11h: an FSN accession whose rows failed extraction counts on
+        # `.failed_filings`, never quarantined, retried only when FSN_VERSION
+        # changes (the zip is gone).
+        self._fsn_extraction_failures_this_run += len(accessions_failed)
+        self._update_failed_filings_count()
 
     def _fsn_root(self) -> Path:
         return self._cache / "fsn" / f"v{FSN_VERSION}"
@@ -746,7 +785,10 @@ class EdgarFilingSource(FilingSource):
         when present (a co-registrant's copy of another entity's page is
         skipped), else its FSN row, else a lag-window per-document parse; an
         older accession absent from FSN is counted on `.fsn_missing` once,
-        by `cover_pages` (`count_missing=False` for `facts`)."""
+        by `cover_pages` (`count_missing=False` for `facts`). This method
+        runs for both `cover_pages` and `facts` (T11h): an accession already
+        failed earlier this run is not fetched twice, and quarantine is
+        counted only once, on the `cover_pages` pass."""
         self._ensure_fsn()
         fsn_cache = self._load_fsn_cache(cik)
         cover_forms = set(self._settings.edgar.cover_page_forms)
@@ -770,10 +812,22 @@ class EdgarFilingSource(FilingSource):
             if not record.inline_xbrl:
                 continue
             if record.accepted_at >= lag_start:
-                parsed = self._fetch_cover_page(
-                    cik, accession, record.primary_document, record.accepted_at
+                if accession in self._pending_failures:
+                    continue  # failed earlier this run (cover_pages, then facts): never twice
+                if self._is_quarantined(accession):
+                    if count_missing:  # count once per run, on the cover_pages pass
+                        self.quarantined += 1
+                    continue
+                base_form = record.form.removesuffix("/A")
+                fetch: Callable[[], CoverPageParse] = partial(
+                    self._fetch_cover_page,
+                    cik,
+                    accession,
+                    record.primary_document,
+                    record.accepted_at,
                 )
-                if parsed.cover.cik == cik:  # a combined filing names one entity
+                parsed = self._guarded(accession, base_form, fetch)
+                if parsed is not None and parsed.cover.cik == cik:  # a combined filing names one
                     yield record, _CachedCoverPage(cik, parsed.cover.listings, _strip(parsed.facts))
             elif count_missing and accession not in self._fsn_failed_accessions:
                 self.fsn_missing += 1
@@ -863,20 +917,40 @@ class EdgarFilingSource(FilingSource):
                 # a blank FSN SIC (#174: FSN's blanks are 8-Ks): a lag-window
                 # ranged header still brings a de-SPAC's new SIC.
                 if record.accepted_at >= lag_start:
-                    headers.append(
-                        self._ranged_header(cik, accession, record.form, record.accepted_at)
+                    header = self._maybe_ranged_header(
+                        cik, accession, record.form, base_form, record.accepted_at
                     )
+                    if header is not None:
+                        headers.append(header)
                 continue
             # absent from FSN entirely
             if base_form in _REGISTRATION_FORMS:
                 if record.accepted_at >= header_start:
-                    headers.append(
-                        self._ranged_header(cik, accession, record.form, record.accepted_at)
+                    header = self._maybe_ranged_header(
+                        cik, accession, record.form, base_form, record.accepted_at
                     )
+                    if header is not None:
+                        headers.append(header)
             elif record.accepted_at >= lag_start:
-                headers.append(self._ranged_header(cik, accession, record.form, record.accepted_at))
+                header = self._maybe_ranged_header(
+                    cik, accession, record.form, base_form, record.accepted_at
+                )
+                if header is not None:
+                    headers.append(header)
         headers.sort(key=lambda h: (h.accepted_at, h.accession))
         return headers
+
+    def _maybe_ranged_header(
+        self, cik: str, accession: str, form: str, base_form: str, accepted_at: datetime
+    ) -> FilingHeader | None:
+        """`_ranged_header`, gated by the quarantine check and wrapped in
+        `_guarded` (T11h): a mismatched accession, or a 404/410, is skipped."""
+        if self._is_quarantined(accession):
+            self.quarantined += 1
+            return None
+        return self._guarded(
+            accession, base_form, lambda: self._ranged_header(cik, accession, form, accepted_at)
+        )
 
     def _ranged_header(
         self, cik: str, accession: str, form: str, accepted_at: datetime
@@ -930,8 +1004,7 @@ class EdgarFilingSource(FilingSource):
         `primaryDocument` is not an `.xml` file is not downloaded: counted
         on `.pre_xml_delistings` (`parse_delisting` reads XML only, and the
         index runs from 1993, long before EDGAR's XML forms). A cached
-        parse makes no request. Errors propagate (T11c/T11d/T11e's own
-        behaviour today; T11h wraps them)."""
+        parse, or a quarantined accession (T11h), makes no request."""
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
         self.pre_xml_delistings = 0
@@ -996,10 +1069,20 @@ class EdgarFilingSource(FilingSource):
             if not record.primary_document.lower().endswith(".xml"):
                 self.pre_xml_delistings += 1
                 continue
-            parsed = self._fetch_delisting(
-                cik, accession, record.form, record.primary_document, accepted_at
+            if self._is_quarantined(accession):
+                self.quarantined += 1
+                continue
+            delisting_fetch: Callable[[], DelistingFiling] = partial(
+                self._fetch_delisting,
+                cik,
+                accession,
+                record.form,
+                record.primary_document,
+                accepted_at,
             )
-            results.append(parsed)
+            parsed = self._guarded(accession, record.form.removesuffix("/A"), delisting_fetch)
+            if parsed is not None:
+                results.append(parsed)
         if since is not None:
             results = [d for d in results if d.accepted_at >= since]
         results.sort(key=lambda d: (d.accepted_at, d.accession))
@@ -1055,6 +1138,208 @@ class EdgarFilingSource(FilingSource):
         edgar_raw.write_atomic(
             self._delisting_cache_path(accession), json.dumps(data).encode("utf-8")
         )
+
+    # --- failure policy (T11h) -----------------------------------------------
+
+    def _is_quarantined(self, accession: str) -> bool:
+        """Whether `accession` failed identically on `edgar.max_filing_failures`
+        consecutive counted days: no further request until its
+        `failed_filings.json` entry is deleted by hand or `FAILURES_VERSION`
+        changes. `accepted` does not lift a quarantine (plan T11h: "accepted
+        per-document entries stay quarantined"), only `check_failures`'s
+        thresholds."""
+        entry = self._failure_store().get(accession)
+        return entry is not None and entry["count"] >= self._settings.edgar.max_filing_failures
+
+    def _guarded(self, accession: str, base_form: str, fn: Callable[[], _T]) -> _T | None:
+        """Run one per-document fetch/parse, skipping (never raising) the
+        four failure kinds plan T11h names: a `ValueError` from a parser (a
+        malformed document, a forged fact collision, or `_ranged_header`'s
+        own accession-mismatch check), or a 404/410 for the document or
+        header itself. Any other `httpx.HTTPStatusError` (a 500, say) still
+        propagates and fails the chunk. Records `accession` as attempted
+        this run either way (`check_failures`'s per-document denominator)."""
+        self._per_document_attempted.add(accession)
+        try:
+            return fn()
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code not in (404, 410):
+                raise
+            self._record_failure(accession, type(error).__name__, base_form, str(error))
+            return None
+        except ValueError as error:
+            self._record_failure(accession, type(error).__name__, base_form, str(error))
+            return None
+
+    def _record_failure(
+        self,
+        accession: str,
+        error_class: str,
+        base_form: str,
+        message: str,
+        *,
+        collision: bool = False,
+    ) -> None:
+        """Record one skipped failure for `record_failures()` to write later.
+        `collision=True` (a `facts()` key withheld, not a fetch skipped) is
+        excluded from `_check_per_document_group`'s numerator (plan T11h:
+        "counts toward the (error class, base form) rule only")."""
+        self._pending_failures[accession] = (error_class, base_form, message)
+        if collision:
+            self._collision_failures.add(accession)
+        self._update_failed_filings_count()
+
+    def _update_failed_filings_count(self) -> None:
+        self.failed_filings = len(self._pending_failures) + self._fsn_extraction_failures_this_run
+
+    def _failure_store(self) -> dict[str, dict[str, Any]]:
+        if self._failed_filings_cache is None:
+            self._failed_filings_cache = self._load_failed_filings()
+        return self._failed_filings_cache
+
+    def _failed_filings_path(self) -> Path:
+        return self._cache / "failed_filings.json"
+
+    def _load_failed_filings(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self._failed_filings_path().read_bytes())
+            if not isinstance(data, dict) or data.get("version") != FAILURES_VERSION:
+                return {}
+            entries = data.get("entries")
+            return entries if isinstance(entries, dict) else {}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return {}  # absent, truncated or another version: start fresh
+
+    def _save_failed_filings(self, entries: Mapping[str, dict[str, Any]]) -> None:
+        data = {"version": FAILURES_VERSION, "entries": dict(entries)}
+        edgar_raw.write_atomic(self._failed_filings_path(), json.dumps(data).encode("utf-8"))
+
+    def record_failures(self) -> None:
+        """The `after_commit` hook (T11h): advances `failed_filings.json`'s
+        consecutive-counted-day counts for this run's per-document failures
+        (`_pending_failures`), and marks every still-uncommitted FSN
+        manifest `committed: true`.
+
+        Counts advance at most once per Eastern calendar day, the day read
+        from the clock now (commit time). A second writer the same day is
+        idempotent: an entry already advanced today is left alone. A
+        different error message (or class) than the stored entry resets the
+        count to 1 instead of incrementing it; `accepted` (set by hand) is
+        preserved across an advance.
+        """
+        today = self._now().astimezone(_EASTERN).date().isoformat()
+        store = dict(self._failure_store())
+        for accession, (error_class, base_form, message) in self._pending_failures.items():
+            message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            entry = store.get(accession)
+            if entry is not None and entry.get("last_counted_day") == today:
+                continue  # already advanced today
+            same = (
+                entry is not None
+                and entry.get("error_class") == error_class
+                and entry.get("message_hash") == message_hash
+            )
+            store[accession] = {
+                "error_class": error_class,
+                "base_form": base_form,
+                "message_hash": message_hash,
+                "count": (entry["count"] + 1) if same and entry is not None else 1,
+                "last_counted_day": today,
+                "accepted": bool(entry.get("accepted", False)) if entry is not None else False,
+            }
+        self._save_failed_filings(store)
+        self._failed_filings_cache = store
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is not None and not manifest.get("committed", False):
+                manifest["committed"] = True
+                self._save_fsn_manifest(period, manifest)
+        # The run is recorded: its in-memory failures and attempts end with it.
+        self._pending_failures.clear()
+        self._collision_failures.clear()
+        self._per_document_attempted.clear()
+
+    def check_failures(self) -> None:
+        """Called by `_prefetch` after the fetch pass, before the lock.
+        Raises `FilingFailuresError` (the chunk fails, nothing written) when
+        any of plan T11h's three rules fires; see the module docstring."""
+        reasons: list[str] = []
+        self._check_fsn_group(reasons)
+        self._check_per_document_group(reasons)
+        self._check_cross_day_pairs(reasons)
+        if reasons:
+            raise FilingFailuresError("; ".join(reasons))
+
+    def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
+        min_n = self._settings.edgar.min_failed_filings
+        max_share = self._settings.edgar.max_failed_filing_share
+        if failures >= min_n and denominator > 0 and failures / denominator > max_share:
+            share = failures / denominator
+            return (
+                f"{label}: {failures} failures of {denominator} attempted "
+                f"({share:.1%}, over {max_share:.1%})"
+            )
+        return None
+
+    def _check_fsn_group(self, reasons: list[str]) -> None:
+        """FSN's denominator is every served-form accession (`accessions_served`
+        plus `accessions_failed`) of every period whose manifest is still
+        uncommitted, not only those extracted this run."""
+        failures = denominator = 0
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is None or manifest.get("committed", False):
+                continue
+            served = manifest.get("accessions_served", [])
+            failed = manifest.get("accessions_failed", [])
+            denominator += len(served) + len(failed)
+            failures += sum(1 for f in failed if not f.get("accepted", False))
+        reason = self._threshold_reason("FSN extraction", failures, denominator)
+        if reason:
+            reasons.append(reason)
+
+    def _check_per_document_group(self, reasons: list[str]) -> None:
+        """Per-document's denominator is the accessions attempted this run
+        (cache hits and quarantined accessions excluded); a `facts()`
+        collision counts toward `_check_cross_day_pairs` only, never here."""
+        store = self._failure_store()
+        failures = sum(
+            1
+            for accession in self._pending_failures
+            if accession not in self._collision_failures
+            and not store.get(accession, {}).get("accepted", False)
+        )
+        denominator = len(self._per_document_attempted)
+        reason = self._threshold_reason("per-document", failures, denominator)
+        if reason:
+            reasons.append(reason)
+
+    def _check_cross_day_pairs(self, reasons: list[str]) -> None:
+        """One (error class, base form) pair with at least
+        `edgar.min_failed_filings` distinct accessions, `accepted: true`
+        entries excluded, across `failed_filings.json`, this run's not-yet-
+        recorded failures and every FSN manifest's `accessions_failed`."""
+        pairs: dict[tuple[str, str], set[str]] = defaultdict(set)
+        store = self._failure_store()
+        for accession, entry in store.items():
+            if not entry.get("accepted", False):
+                pairs[(entry["error_class"], entry["base_form"])].add(accession)
+        for accession, (error_class, base_form, _message) in self._pending_failures.items():
+            if not store.get(accession, {}).get("accepted", False):
+                pairs[(error_class, base_form)].add(accession)
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is None:
+                continue
+            for failure in manifest.get("accessions_failed", []):
+                if not failure.get("accepted", False):
+                    pairs[(failure["error_class"], failure["base_form"])].add(failure["accession"])
+        min_n = self._settings.edgar.min_failed_filings
+        for (error_class, base_form), accessions in pairs.items():
+            if len(accessions) >= min_n:
+                reasons.append(
+                    f"{error_class}/{base_form}: {len(accessions)} accessions across days"
+                )
 
     # --- facts (T11e) ---------------------------------------------------------
 

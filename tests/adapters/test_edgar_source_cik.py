@@ -470,15 +470,19 @@ def test_an_sgml_header_is_served_at_the_submissions_acceptance(tmp_path: Path) 
     assert header.accepted_at == forged_stamp
 
 
-def test_a_header_naming_another_accession_raises(tmp_path: Path) -> None:
+def test_a_header_naming_another_accession_skips_and_records(tmp_path: Path) -> None:
+    """T11h: `_ranged_header`'s own accession-mismatch `ValueError` is one of
+    the failure policy's skipped-not-raised kinds, recorded on
+    `.failed_filings`, the run left `ok`."""
     settings = _settings(tmp_path)
     router = _router()
     accession = "0000320193-26-000080"
     router.add(_header_url(APPLE, accession), _synthetic_header("0000320193-26-999999"))
     source = _source(settings, router)
     _seed_stamps(source, APPLE, {accession: _record(accession, "10-K", INSIDE_LAG)})
-    with pytest.raises(ValueError, match="names accession"):
-        source.filing_headers(APPLE, ["10-K"])
+    headers = source.filing_headers(APPLE, ["10-K"])
+    assert accession not in {h.accession for h in headers}
+    assert source.failed_filings == 1
 
 
 def test_an_http_error_on_a_ranged_header_propagates(tmp_path: Path) -> None:
@@ -928,7 +932,9 @@ def test_an_http_error_on_a_delisting_document_propagates(tmp_path: Path) -> Non
         source.delistings()
 
 
-def test_a_delisting_parse_error_propagates(tmp_path: Path) -> None:
+def test_a_delisting_parse_error_skips_and_records(tmp_path: Path) -> None:
+    """T11h: a `parse_delisting` `ValueError` skips that accession, records
+    it and leaves the run `ok`, instead of raising."""
     accession = "0005555557-26-000001"
     line = index_line("25", "Bad Corp 2", 5555557, "2026-09-01", accession)
     router = _delisting_router(line)
@@ -939,8 +945,9 @@ def test_a_delisting_parse_error_propagates(tmp_path: Path) -> None:
     )
     router.add(_download_url("0005555557", accession, "primary_doc.xml"), b"<not-a-delisting/>")
     source = _delisting_source(router, tmp_path)
-    with pytest.raises(ValueError, match="has no"):
-        source.delistings()
+    results = source.delistings()
+    assert accession not in {d.accession for d in results}
+    assert source.failed_filings == 1
 
 
 @pytest.mark.parametrize(
