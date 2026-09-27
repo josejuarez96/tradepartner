@@ -50,9 +50,10 @@ name's latest decision is a `window_stop` forced exit whose latest event is
 name's latest decision is a `window_stop`, `delisted` or `untargeted_receipt`
 forced exit whose latest event is `skipped` with reason `untradable`, while the
 latest flag is false); their sum capped at the holding. "Latest" is by
-`known_at`, the id breaking a tie; the latest flag is the name's latest row by
-session then `known_at` that carries one (a row with no flag is not a flag, and
-no flag at all is not false). The caller passes one window's rows.
+`known_at` (a decision's id, then input order, breaking a tie); the latest flag
+is the name's latest row by session then `known_at` that carries one (a row
+with no flag is not a flag, and no flag at all is not false). Rows are placed
+in the window through the window's runs, and rows dated after S are cut.
 
 **Rebalance state** (`rebalance_state`) is derived: a journaled `executed` or
 `missed` event of the window's runs is the state; otherwise the rebalance is
@@ -68,7 +69,7 @@ included: that fails safe, since an in-flight decision is never re-ordered.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -118,6 +119,8 @@ _UNTRADABLE = "untradable"
 _WINDOW_STOP = "window_stop"
 #: Forced-exit reasons whose `untradable` skip leaves an untradable residue.
 _UNTRADABLE_EXIT_REASONS = frozenset({_WINDOW_STOP, "delisted", "untargeted_receipt"})
+#: A carried residue's origin (spec req 14: `paper start` copies it from the stop row).
+_RESIDUE_ORIGINS = frozenset({_DUST, _UNTRADABLE})
 
 
 class RebalanceState(StrEnum):
@@ -479,7 +482,29 @@ def decision_state(
 # --- residues and rebalance state (T52b) -------------------------------------------
 
 
-def _latest_flag(security_id: str, positions_daily: Iterable[PositionDailyRow]) -> bool | None:
+def _latest[R](rows: Sequence[R], key: Callable[[R], tuple[object, ...]]) -> R:
+    """The latest of `rows` by `key`; on a tie, the one later in the input."""
+    return max(enumerate(rows), key=lambda p: (*key(p[1]), p[0]))[1]
+
+
+def _run_windows(runs: Iterable[PaperRunRow]) -> dict[int, int]:
+    windows: dict[int, int] = {}
+    for run in runs:
+        if run.run_id is None:
+            raise ValueError("a paper run has no run_id")
+        windows[run.run_id] = run.window_id
+    return windows
+
+
+def _in_window(run_id: int | None, runs: Mapping[int, int], window_id: int, what: str) -> bool:
+    """Whether a row of run `run_id` belongs to the window; a run not among
+    `runs` at all raises, since its row cannot be placed."""
+    if run_id is None or run_id not in runs:
+        raise ValueError(f"{what} names run {run_id}, which is not among the runs given")
+    return runs[run_id] == window_id
+
+
+def _latest_flag(security_id: str, positions_daily: Sequence[PositionDailyRow]) -> bool | None:
     """The name's latest `tradable` flag: its latest row carrying one."""
     flagged = [
         row
@@ -488,24 +513,24 @@ def _latest_flag(security_id: str, positions_daily: Iterable[PositionDailyRow]) 
     ]
     if not flagged:
         return None
-    return max(flagged, key=lambda row: (row.session, row.known_at)).tradable
+    return _latest(flagged, lambda row: (row.session, row.known_at)).tradable
 
 
-def _latest_decision(security_id: str, decisions: Iterable[DecisionRow]) -> DecisionRow | None:
+def _latest_decision(security_id: str, decisions: Sequence[DecisionRow]) -> DecisionRow | None:
     mine = [d for d in decisions if d.security_id == security_id]
     if not mine:
         return None
-    return max(mine, key=lambda d: (d.known_at, _decision_id(d)))
+    return _latest(mine, lambda d: (d.known_at, _decision_id(d)))
 
 
 def _latest_event(
-    decision: DecisionRow, decision_events: Iterable[DecisionEventRow]
+    decision: DecisionRow, decision_events: Sequence[DecisionEventRow]
 ) -> DecisionEventRow | None:
     decision_id = _decision_id(decision)
     mine = [e for e in decision_events if e.decision_id == decision_id]
     if not mine:
         return None
-    return max(enumerate(mine), key=lambda p: (p[1].known_at, p[0]))[1]
+    return _latest(mine, lambda e: (e.known_at,))
 
 
 def _carried(
@@ -515,17 +540,17 @@ def _carried(
     session: date,
     flag_false: bool,
 ) -> float:
-    """The window's carried residue of the name, split-adjusted through `session`;
-    an `origin = untradable` row counts only while the latest flag is false."""
-    rows = [
-        row
-        for row in adjustments
-        if row.kind == _CARRIED_RESIDUE and row.security_id == security_id
-    ]
-    if len({row.window_id for row in rows}) > 1:
-        raise ValueError(f"carried residues of {security_id} come from more than one window")
+    """The carried residue of the name, split-adjusted through `session`; an
+    `origin = untradable` row counts only while the latest flag is false."""
     total = 0.0
-    for row in rows:
+    for row in adjustments:
+        if row.kind != _CARRIED_RESIDUE or row.security_id != security_id:
+            continue
+        if row.origin not in _RESIDUE_ORIGINS:
+            raise ValueError(
+                f"carried residue {row.adjustment_id} has origin {row.origin!r}, "
+                f"not one of {sorted(_RESIDUE_ORIGINS)}"
+            )
         if row.quantity is None:
             raise ValueError(f"carried residue {row.adjustment_id} has no quantity")
         quantity = _finite(
@@ -545,22 +570,52 @@ def residue(
     positions_daily: Sequence[PositionDailyRow],
     ledger: Ledger,
     actions_as_of: pl.DataFrame,
+    *,
+    window_id: int,
+    runs: Sequence[PaperRunRow],
 ) -> float:
     """The name's residue quantity on the ledger's session (module docstring;
     spec req 14): carried + dust + untradable, capped at the holding.
 
-    All rows are one window's; `ledger.through` is S, the session the holding
-    and the split-adjusted carried quantity are stated for, and `actions_as_of`
-    the actions read at close(S-1). A name not held has no residue.
+    `ledger.through` is S, the session the holding and the split-adjusted
+    carried quantity are stated for; `actions_as_of` is read at close(S-1).
+    Rows are placed in the window `window_id` through `runs` (`run_id` ->
+    `paper_runs.window_id`) and an adjustment's own `window_id`: rows of another
+    window are ignored, a row of a run not among `runs` raises. Adjustments and
+    marks dated after S are left out, as the ledger leaves them out. `decisions`
+    and `decision_events` are those known to the run on S, the run's own
+    included (its `untradable` exit counts at once). A name not held has no
+    residue; a negative holding raises (the system is long-only).
     """
     _check_session(ledger.through)
+    through = ledger.through
+    windows = _run_windows(runs)
     held = _finite(ledger.positions.get(security_id, 0.0), f"holding of {security_id}")
-    if held <= 0:
+    if held < 0:
+        raise ValueError(f"holding of {security_id} is {held}: the ledger is short")
+    carried_rows = [
+        row for row in adjustments if row.window_id == window_id and row.session <= through
+    ]
+    decisions = [
+        d
+        for d in decisions
+        if _in_window(d.run_id, windows, window_id, f"decision {d.decision_id}")
+    ]
+    decision_events = [
+        e
+        for e in decision_events
+        if _in_window(e.run_id, windows, window_id, f"event of decision {e.decision_id}")
+    ]
+    marks = [
+        m
+        for m in positions_daily
+        if _in_window(m.run_id, windows, window_id, f"mark of {m.security_id} on {m.session}")
+        and m.session <= through
+    ]
+    if held == 0:
         return 0.0
-    flag_false = _latest_flag(security_id, positions_daily) is False
-    carried = min(
-        _carried(security_id, adjustments, actions_as_of, ledger.through, flag_false), held
-    )
+    flag_false = _latest_flag(security_id, marks) is False
+    carried = min(_carried(security_id, carried_rows, actions_as_of, through, flag_false), held)
     dust = untradable = 0.0
     latest = _latest_decision(security_id, decisions)
     if latest is not None and latest.decision == _FORCED_EXIT:
@@ -589,14 +644,21 @@ def rebalance_state(
     """The state of rebalance T_i = `rebalance_session` of the open `window` on
     session S = `session` (module docstring; spec Definitions > Rebalance state).
 
-    `runs` ties events and decisions to the window (`run_id` ->
-    `paper_runs.window_id`); rows of other windows or rebalances are ignored.
-    `decision_states` pairs each decision with its `decision_state`. Raises
-    `ValueError` for a T_i before the window's `first_rebalance_session`, one
-    whose fill session is after S (not due yet), a date that is not a rebalance
-    session, and a rebalance journaled both `executed` and `missed`.
+    `runs` places events and decisions in the window (`run_id` ->
+    `paper_runs.window_id`): rows of another window or rebalance are ignored,
+    and a row of a run not among `runs` raises, so an incomplete run list can
+    never hide a `missed` event or an open decision. `decision_states` pairs
+    each decision with its `decision_state`. A rebalance with no decision stays
+    `pending` (and lapses to `missed` on schedule): an unplanned rebalance is
+    never `executed`. Raises `ValueError` for a T_i before the window's
+    `first_rebalance_session`, one whose fill session is after S (not due yet), a
+    date that is not a rebalance session, a rebalance journaled both `executed`
+    and `missed`, and a decision of the window with no rebalance session that is
+    not a forced exit.
     """
     _check_session(session)
+    if window.window_id is None:
+        raise ValueError("the window has no window_id")
     if rebalance_session < window.first_rebalance_session:
         raise ValueError(
             f"rebalance {rebalance_session} is before the window's first rebalance "
@@ -604,23 +666,28 @@ def rebalance_state(
         )
     if fill_session(rebalance_session) > session:
         raise ValueError(f"rebalance {rebalance_session} is not due on {session}")
-    run_ids = {run.run_id for run in runs if run.window_id == window.window_id}
+    windows = _run_windows(runs)
     statuses = {
         event.status
         for event in rebalance_events
-        if event.rebalance_session == rebalance_session and event.run_id in run_ids
+        if _in_window(event.run_id, windows, window.window_id, f"rebalance event {event}")
+        and event.rebalance_session == rebalance_session
     }
     if len(statuses) > 1:
         raise ValueError(f"rebalance {rebalance_session} is journaled both {sorted(statuses)}")
     if statuses:
         return RebalanceState(statuses.pop())
-    mine = [
-        state
-        for decision, state in decision_states
-        if decision.rebalance_session == rebalance_session
-        and decision.decision != _FORCED_EXIT
-        and decision.run_id in run_ids
-    ]
+    mine: list[DecisionState] = []
+    for decision, state in decision_states:
+        what = f"decision {decision.decision_id}"
+        if not _in_window(decision.run_id, windows, window.window_id, what):
+            continue
+        if decision.decision == _FORCED_EXIT:
+            continue
+        if decision.rebalance_session is None:
+            raise ValueError(f"{what} is not a forced exit and has no rebalance session")
+        if decision.rebalance_session == rebalance_session:
+            mine.append(state)
     if mine and all(state.state in (State.CLOSED, State.SETTLED) for state in mine):
         return RebalanceState.EXECUTED
     return RebalanceState.PENDING

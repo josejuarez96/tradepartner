@@ -70,6 +70,24 @@ def _split(security_id: str, ex_date: date, ratio: float) -> pl.DataFrame:
     )
 
 
+def _paper_run(run_id: int, day: date, *, window_id: int = WINDOW) -> PaperRunRow:
+    return PaperRunRow(
+        run_id=run_id,
+        window_id=window_id,
+        session=day,
+        kind="rebalance",
+        started_at=_utc(day, 13),
+        invoked_by="scheduler",
+        code_version="abc",
+        known_at=_utc(day, 13),
+        ingested_at=_utc(day, 13),
+    )
+
+
+#: Run 1 is this window's; run 50 is the previous window's.
+RESIDUE_RUNS = (_paper_run(1, date(2026, 11, 2)), _paper_run(50, START, window_id=WINDOW - 1))
+
+
 def _ledger(**positions: float) -> Ledger:
     return Ledger(positions=positions, cash=1000.0, through=S)
 
@@ -98,10 +116,11 @@ def _decision(
     security_id: str = A,
     rebalance_session: date | None = None,
     side: str | None = "sell",
+    run_id: int = 1,
 ) -> DecisionRow:
     return DecisionRow(
         decision_id=next(_IDS),
-        run_id=1,
+        run_id=run_id,
         rebalance_session=rebalance_session,
         security_id=security_id,
         side=side,
@@ -121,7 +140,7 @@ def _skipped(decision: DecisionRow, reason: str, day: date | None = None) -> Dec
     at = _utc(day, 14) if day is not None else decision.known_at + timedelta(minutes=5)
     return DecisionEventRow(
         decision_id=decision.decision_id,
-        run_id=1,
+        run_id=decision.run_id,
         status="skipped",
         reason=reason,
         known_at=at,
@@ -129,9 +148,11 @@ def _skipped(decision: DecisionRow, reason: str, day: date | None = None) -> Dec
     )
 
 
-def _mark(day: date, tradable: bool | None, *, security_id: str = A) -> PositionDailyRow:
+def _mark(
+    day: date, tradable: bool | None, *, security_id: str = A, run_id: int = 1
+) -> PositionDailyRow:
     return PositionDailyRow(
-        run_id=1,
+        run_id=run_id,
         session=day,
         security_id=security_id,
         quantity=10.0,
@@ -150,6 +171,7 @@ def _residue(
     ledger: Ledger | None = None,
     actions: pl.DataFrame | None = None,
     security_id: str = A,
+    runs: Sequence[PaperRunRow] = RESIDUE_RUNS,
 ) -> float:
     return residue(
         security_id,
@@ -159,6 +181,8 @@ def _residue(
         marks,
         ledger if ledger is not None else _ledger(**{A: 10.0}),
         actions if actions is not None else _no_actions(),
+        window_id=WINDOW,
+        runs=runs,
     )
 
 
@@ -320,8 +344,9 @@ def test_rows_of_other_names_and_kinds_are_ignored() -> None:
     )
 
 
-def test_a_negative_holding_has_no_residue() -> None:
-    assert _residue(adjustments=[_carried(0.4)], ledger=_ledger(**{A: -1.0})) == 0.0
+def test_a_negative_holding_raises() -> None:
+    with pytest.raises(ValueError, match="short"):
+        _residue(adjustments=[_carried(0.4)], ledger=_ledger(**{A: -1.0}))
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -0.5])
@@ -330,9 +355,48 @@ def test_a_bad_carried_quantity_raises(bad: float) -> None:
         _residue(adjustments=[_carried(bad)])
 
 
-def test_carried_rows_of_two_windows_raise() -> None:
-    with pytest.raises(ValueError, match="window"):
-        _residue(adjustments=[_carried(0.2), _carried(0.2, window_id=WINDOW + 1)])
+def test_rows_of_another_window_are_ignored() -> None:
+    """A carried row of another window, and the previous window's `window_stop`
+    exit skipped as dust, are not this window's residue."""
+    assert _residue(adjustments=[_carried(0.2, window_id=WINDOW + 1)]) == 0.0
+    old_exit = _decision(date(2026, 9, 29), run_id=50)
+    assert _residue(decisions=[old_exit], events=[_skipped(old_exit, "dust")]) == 0.0
+    old_flag = _mark(date(2026, 9, 29), False, run_id=50)
+    assert _residue(adjustments=[_carried(3.0, origin="untradable")], marks=[old_flag]) == 0.0
+
+
+@pytest.mark.parametrize("what", ["decision", "event", "mark"])
+def test_a_row_of_an_unknown_run_raises(what: str) -> None:
+    exit_ = _decision(date(2026, 11, 19))
+    stray = _decision(date(2026, 11, 19), run_id=77)
+    rows: dict[str, object] = {
+        "decision": {"decisions": [stray]},
+        "event": {
+            "decisions": [exit_],
+            "events": [DecisionEventRow(**{**_skipped(exit_, "dust").__dict__, "run_id": 77})],
+        },
+        "mark": {"marks": [_mark(S, False, run_id=77)]},
+    }
+    with pytest.raises(ValueError, match="run 77"):
+        _residue(**rows[what])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("origin", [None, "carried", ""])
+def test_a_carried_row_without_a_residue_origin_raises(origin: str | None) -> None:
+    with pytest.raises(ValueError, match="origin"):
+        _residue(adjustments=[_carried(0.4, origin=origin)])
+
+
+def test_rows_dated_after_the_session_change_nothing() -> None:
+    """No look-ahead: a mark or a carried row dated after S (a later run's rows
+    in the journal) leaves the residue on S unchanged."""
+    carried = _carried(3.0, origin="untradable")
+    base = [_mark(date(2026, 11, 19), False)]
+    later_mark = _mark(S + timedelta(days=3), True)
+    assert _residue(adjustments=[carried], marks=base) == pytest.approx(3.0)
+    assert _residue(adjustments=[carried], marks=[*base, later_mark]) == pytest.approx(3.0)
+    later_carried = AdjustmentRow(**{**_carried(2.0).__dict__, "session": S + timedelta(days=3)})
+    assert _residue(adjustments=[later_carried]) == 0.0
 
 
 def test_the_same_inputs_give_the_same_quantity() -> None:
@@ -372,18 +436,7 @@ def _window(first: date = T_OCT) -> PaperWindowRow:
     )
 
 
-def _run(run_id: int, day: date, *, window_id: int = WINDOW) -> PaperRunRow:
-    return PaperRunRow(
-        run_id=run_id,
-        window_id=window_id,
-        session=day,
-        kind="rebalance",
-        started_at=_utc(day, 13),
-        invoked_by="scheduler",
-        code_version="abc",
-        known_at=_utc(day, 13),
-        ingested_at=_utc(day, 13),
-    )
+_run = _paper_run
 
 
 RUNS = (_run(1, date(2026, 11, 2)), _run(2, date(2026, 11, 3)))
@@ -451,8 +504,12 @@ def test_decisions_of_another_rebalance_or_window_are_ignored() -> None:
     other_month = _state_of(State.OPEN, rebalance_session=T_NOV)
     assert _rebalance([_state_of(State.SETTLED), other_month]) is RebalanceState.EXECUTED
     stray_row, stray = _state_of(State.OPEN)
-    foreign = DecisionRow(**{**stray_row.__dict__, "run_id": 99})
-    assert _rebalance([_state_of(State.SETTLED), (foreign, stray)]) is RebalanceState.EXECUTED
+    foreign = DecisionRow(**{**stray_row.__dict__, "run_id": 9})
+    runs = (*RUNS, _run(9, date(2026, 11, 2), window_id=WINDOW - 1))
+    assert (
+        _rebalance([_state_of(State.SETTLED), (foreign, stray)], runs=runs)
+        is RebalanceState.EXECUTED
+    )
 
 
 def test_a_journaled_event_is_the_state() -> None:
@@ -469,6 +526,21 @@ def test_events_of_another_window_or_rebalance_are_ignored() -> None:
     runs = (*RUNS, foreign_run)
     assert _rebalance([], [_event("missed", run_id=9)], runs=runs) is RebalanceState.PENDING
     assert _rebalance([], [_event("missed", t=T_NOV)], runs=runs) is RebalanceState.PENDING
+
+
+def test_a_row_of_a_run_not_given_raises() -> None:
+    """An incomplete run list can never hide a `missed` event or an open decision."""
+    with pytest.raises(ValueError, match="run 77"):
+        _rebalance([], [_event("missed", run_id=77, reason="skip_cap")])
+    stray_row, stray = _state_of(State.OPEN)
+    foreign = DecisionRow(**{**stray_row.__dict__, "run_id": 77})
+    with pytest.raises(ValueError, match="run 77"):
+        _rebalance([_state_of(State.SETTLED), (foreign, stray)])
+
+
+def test_a_plan_decision_without_a_rebalance_session_raises() -> None:
+    with pytest.raises(ValueError, match="no rebalance session"):
+        _rebalance([_state_of(State.SETTLED), _state_of(State.OPEN, rebalance_session=None)])
 
 
 def test_conflicting_events_raise() -> None:
