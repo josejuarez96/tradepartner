@@ -230,7 +230,10 @@ def _configured_secrets(settings: Settings) -> list[str]:
     credential pair, in case a payload ever carries an `Authorization:
     Basic ...` value built from them (T2 review round 2, safety-reviewer
     MUST FIX) -- on top of the `Authorization`-header-name scrub in
-    `scrub_json`, which catches it regardless of content.
+    `scrub_json`, which catches it regardless of content. The Phase 4 alert
+    secrets (`ALERT_SMTP_USER`, `ALERT_SMTP_PASSWORD`, `ALERT_EMAIL_TO`) are
+    included (#320): an SMTP password is neither email- nor key-shaped, so no
+    pattern would catch it.
     """
     api_key = _non_blank_secret(settings.alpaca_api_key)
     api_secret = _non_blank_secret(settings.alpaca_api_secret)
@@ -238,7 +241,15 @@ def _configured_secrets(settings: Settings) -> list[str]:
     paper_key = _non_blank_secret(settings.alpaca_paper_api_key)
     paper_secret = _non_blank_secret(settings.alpaca_paper_api_secret)
 
-    values = [v for v in (api_key, api_secret, user_agent, paper_key, paper_secret) if v]
+    alert_values = (
+        _non_blank_secret(settings.alert_smtp_user),
+        _non_blank_secret(settings.alert_smtp_password),
+        _non_blank_secret(settings.alert_email_to),
+    )
+
+    values = [
+        v for v in (api_key, api_secret, user_agent, paper_key, paper_secret, *alert_values) if v
+    ]
     for key, secret in ((api_key, api_secret), (paper_key, paper_secret)):
         if key is not None and secret is not None:
             values.append(base64.b64encode(f"{key}:{secret}".encode()).decode())

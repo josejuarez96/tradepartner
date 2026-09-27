@@ -703,6 +703,14 @@ def test_alerts_channels_default_store_and_macos() -> None:
     assert Settings(_env_file=None, alerts={"channels": with_email}).alerts.channels == with_email
 
 
+def test_alerts_delivery_timeout_defaults_to_ten_seconds_and_must_be_positive() -> None:
+    """T57: bounds one `osascript` call or SMTP socket operation; the spec names no value."""
+    assert _settings().alerts.delivery_timeout_seconds == 10.0
+    for bad in (0, -1.0):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, alerts={"delivery_timeout_seconds": bad})
+
+
 @pytest.mark.parametrize(
     "channels",
     [["macos"], [], ["store", "store"], ["store", "push"]],

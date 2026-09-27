@@ -429,3 +429,49 @@ def test_paper_script_reports_not_flat_when_a_flattening_sell_is_refused(
     )
     assert f"NOT FLAT: {NON_FRACTIONABLE}" in capsys.readouterr().err
     assert not paper_dir.exists()
+
+
+# --- #320: the Phase 4 alert secrets are scrubbed too ------------------------
+
+_ALERT_SECRETS = {
+    "alert_smtp_user": "relay-login-gamma",
+    "alert_smtp_password": "correct horse battery staple 99",
+    "alert_email_to": "owner.alerts@example.org",
+}
+
+
+@pytest.mark.parametrize("field", sorted(_ALERT_SECRETS))
+def test_alert_secrets_are_configured_and_scrubbed(field: str) -> None:
+    from tradepartner import cli
+
+    value = _ALERT_SECRETS[field]
+    settings = Settings(_env_file=None, **{field: value})
+    assert value in cli_record._configured_secrets(settings)
+
+    message = f"sent alert via {value} ok"
+    try:
+        raise RuntimeError(f"SMTP login failed for {value!r}: 535 rejected")
+    except RuntimeError as exc:
+        exception_text = f"{type(exc).__name__}: {exc}"
+    for text in (message, exception_text):
+        scrubbed, count = cli_record.scrub_text(
+            text, secrets=cli_record._configured_secrets(settings)
+        )
+        assert value not in scrubbed
+        assert count >= 1
+        assert value not in cli._scrubbed(text, settings)
+
+
+def test_blank_alert_secrets_are_not_configured() -> None:
+    settings = Settings(
+        _env_file=None,
+        alert_smtp_user="  ",
+        alert_smtp_password="",
+        alert_email_to=None,
+        alpaca_api_key=None,
+        alpaca_api_secret=None,
+        alpaca_paper_api_key=None,
+        alpaca_paper_api_secret=None,
+        sec_edgar_user_agent=None,
+    )
+    assert cli_record._configured_secrets(settings) == []
