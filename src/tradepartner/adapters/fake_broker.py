@@ -433,7 +433,7 @@ class FakeBroker(Broker):
         return self._fill(order, FillAt(), filled_at)
 
     def fills(self, since: datetime | None = None) -> list[Fill]:
-        self._log("fills", since)
+        self._log(self.fills.__name__, since)
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
         visible = [
