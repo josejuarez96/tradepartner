@@ -1639,3 +1639,48 @@ def test_a_pre_xml_form_25_under_two_ciks_is_counted_once(tmp_path: Path) -> Non
     source = _delisting_source(router, tmp_path)
     source.delistings()
     assert source.pre_xml_delistings == 1
+
+
+def _bulk_zip(*ciks: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        for cik in ciks:
+            bulk.writestr(f"CIK{cik}.json", json.dumps(_apple_entries()))
+    return buffer.getvalue()
+
+
+def _bulk_source(tmp_path: Path, zip_bytes: bytes) -> tuple[EdgarFilingSource, EdgarRouter]:
+    settings = _settings(tmp_path, bulk_stamp_threshold_ciks=1)
+    router = _facts_router(**{APPLE: 404})
+    router.add(BULK_FACTS_URL, zip_bytes)
+    source = _source(settings, router)
+    _seed_apple(source)
+    _seed_stamps(
+        source,
+        ALPHABET,
+        {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
+    )
+    return source, router
+
+
+def test_a_cik_absent_from_the_bulk_zip_and_404_counts_missing(tmp_path: Path) -> None:
+    """Plan T11h: a CIK absent from `companyfacts.zip` (then 404 from the API)
+    is counted on `.facts_missing`, not a filing failure."""
+    source, _router = _bulk_source(tmp_path, _bulk_zip(ALPHABET))
+    _shares(source, APPLE)
+    assert (source.facts_missing, source.failed_filings) == (1, 0)
+
+
+def test_a_bulk_payload_is_kept_when_the_api_404s(tmp_path: Path) -> None:
+    """The zip holds the CIK but trails its latest filing and the API 404s:
+    the zip's facts are served, not replaced by an empty cached result, and
+    the result is not cached as complete, so the next run asks again."""
+    source, router = _bulk_source(tmp_path, _bulk_zip(APPLE))
+    first = _shares(source, APPLE)
+    assert source.facts_missing == 0
+    assert any(f.accession == APPLE_ACCESSION for f in first)
+    api = COMPANY_FACTS_URL.format(cik=APPLE)
+    before = router.urls.count(api)
+    fresh = _source(source._settings, router)
+    _shares(fresh, APPLE)
+    assert router.urls.count(api) == before + 1  # not cached as complete

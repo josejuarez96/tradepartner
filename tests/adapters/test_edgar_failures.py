@@ -697,3 +697,77 @@ def test_an_unsafe_primary_document_propagates_never_a_quiet_skip(tmp_path: Path
     with pytest.raises(InvalidFilingReferenceError):
         source.cover_pages(APPLE)
     assert source.failed_filings == 0
+
+
+# --- quant-auditor fixes (#275) ----------------------------------------------
+
+
+def _write_store(source: EdgarFilingSource, entries: dict[str, dict[str, object]]) -> Path:
+    path = Path(source._settings.edgar.cache_dir) / "failed_filings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": FAILURES_VERSION, "entries": entries}))
+    source._failed_filings_cache = None
+    return path
+
+
+def _entry(count: int, *, kind: str = "fetch", accepted: bool = False) -> dict[str, object]:
+    return {
+        "error_class": "ValueError",
+        "base_form": "10-K",
+        "message_hash": "h1",
+        "count": count,
+        "last_counted_day": "2026-05-01",
+        "accepted": accepted,
+        "kind": kind,
+    }
+
+
+def test_a_collision_never_quarantines_its_accession(tmp_path: Path) -> None:
+    """Collisions are re-detected from cached data every run; they count toward
+    the (error class, base form) rule only, never toward quarantine, so a
+    parser fix and version bump can still re-parse the accession."""
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG)
+    _write_store(source, {"A": _entry(9, kind="collision"), "B": _entry(9)})
+    assert not source._is_quarantined("A")
+    assert source._is_quarantined("B")
+
+
+def test_a_recorded_collision_is_stored_as_a_collision(tmp_path: Path) -> None:
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG)
+    source._record_failure(APPLE_ACCESSION, "ValueError", "10-K", "collides", collision=True)
+    source.record_failures()
+    path = Path(source._settings.edgar.cache_dir) / "failed_filings.json"
+    assert json.loads(path.read_text())["entries"][APPLE_ACCESSION]["kind"] == "collision"
+
+
+def test_a_changed_error_clears_accepted(tmp_path: Path) -> None:
+    """`accepted` was given for one error; a different one must be reviewed
+    again, never hidden behind the old acceptance."""
+    source, _router = _garbage_source(tmp_path, lambda: INSIDE_LAG)
+    path = _write_store(source, {APPLE_ACCESSION: _entry(2, accepted=True)})
+    source._record_failure(APPLE_ACCESSION, "ValueError", "10-K", "a different message")
+    source.record_failures()
+    entry = json.loads(path.read_text())["entries"][APPLE_ACCESSION]
+    assert (entry["accepted"], entry["count"]) == (False, 1)
+
+
+def test_an_accession_that_now_succeeds_is_pruned(tmp_path: Path) -> None:
+    """After a parser fix, a formerly failing accession that parses this run
+    leaves the store, so stale entries stop failing every nightly chunk."""
+    from test_edgar_source_cik import _COVER_DOCUMENT
+
+    settings = _settings(tmp_path)
+    router = _router()
+    router.add(
+        "https://www.sec.gov/Archives/edgar/data/320193/000032019326000100/fixed.htm",
+        _COVER_DOCUMENT,
+    )
+    source = EdgarFilingSource(settings, client=router.client(), clock=lambda: INSIDE_LAG)
+    source._filing_index_ran = True
+    record = _record(APPLE_ACCESSION, "10-K", INSIDE_LAG, primary_document="fixed.htm")
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: record})
+    path = _write_store(source, {APPLE_ACCESSION: _entry(2), "OTHER": _entry(2)})
+    assert [p.accession for p in source.cover_pages(APPLE)] == [APPLE_ACCESSION]
+    source.record_failures()
+    entries = json.loads(path.read_text())["entries"]
+    assert APPLE_ACCESSION not in entries and "OTHER" in entries

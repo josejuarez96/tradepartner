@@ -297,6 +297,9 @@ class EdgarFilingSource(FilingSource):
         # one key, not a fetch): counted toward `_check_cross_day_pairs` only,
         # never `_check_per_document_group`'s numerator.
         self._collision_failures: set[str] = set()
+        # Accessions whose guarded fetch succeeded this run: their stale
+        # failed_filings.json entries are pruned by `record_failures()`.
+        self._succeeded_this_run: set[str] = set()
         # Per-document accessions actually fetched this run (cache hits and
         # quarantined accessions excluded): `check_failures`'s denominator.
         self._per_document_attempted: set[str] = set()
@@ -1177,7 +1180,9 @@ class EdgarFilingSource(FilingSource):
         per-document entries stay quarantined"), only `check_failures`'s
         thresholds."""
         entry = self._failure_store().get(accession)
-        return entry is not None and entry["count"] >= self._settings.edgar.max_filing_failures
+        if entry is None or entry.get("kind") == "collision":
+            return False  # a collision counts toward the pair rule only, never quarantine
+        return bool(entry["count"] >= self._settings.edgar.max_filing_failures)
 
     def _guarded(self, accession: str, base_form: str, fn: Callable[[], _T]) -> _T | None:
         """Run one per-document fetch/parse, skipping (never raising) the
@@ -1189,7 +1194,7 @@ class EdgarFilingSource(FilingSource):
         this run either way (`check_failures`'s per-document denominator)."""
         self._per_document_attempted.add(accession)
         try:
-            return fn()
+            result = fn()
         except httpx.HTTPStatusError as error:
             if error.response.status_code not in (404, 410):
                 raise
@@ -1200,6 +1205,8 @@ class EdgarFilingSource(FilingSource):
         except ValueError as error:
             self._record_failure(accession, type(error).__name__, base_form, str(error))
             return None
+        self._succeeded_this_run.add(accession)
+        return result
 
     def _record_failure(
         self,
@@ -1276,6 +1283,8 @@ class EdgarFilingSource(FilingSource):
             # Re-read under the lock, never the copy loaded at the fetch pass:
             # an owner's hand edit (or another writer) since then is kept (#275).
             store = dict(self._load_failed_filings())
+            for accession in self._succeeded_this_run - self._pending_failures.keys():
+                store.pop(accession, None)  # it parses now: the old failure is resolved
             self._merge_pending_failures(store, today)
             self._save_failed_filings(store)
         self._failed_filings_cache = store
@@ -1288,6 +1297,7 @@ class EdgarFilingSource(FilingSource):
         self._pending_failures.clear()
         self._collision_failures.clear()
         self._per_document_attempted.clear()
+        self._succeeded_this_run.clear()
 
     @contextlib.contextmanager
     def _failed_filings_lock(self) -> Iterator[None]:
@@ -1319,7 +1329,9 @@ class EdgarFilingSource(FilingSource):
                 "message_hash": message_hash,
                 "count": (entry["count"] + 1) if same and entry is not None else 1,
                 "last_counted_day": today,
-                "accepted": bool(entry.get("accepted", False)) if entry is not None else False,
+                # `accepted` was given for one error: a different one is reviewed again.
+                "accepted": bool(entry.get("accepted", False)) if same and entry else False,
+                "kind": "collision" if accession in self._collision_failures else "fetch",
             }
 
     def check_failures(self) -> None:
@@ -1592,16 +1604,21 @@ class EdgarFilingSource(FilingSource):
                     self._facts_bulk = (path, frozenset(bulk.namelist()))
             else:
                 self._facts_bulk = False
+        bulk_payload: Any | None = None
         if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
             with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
-                payload = json.loads(bulk.read(f"CIK{cik}.json"))
-            if _holds_accession(payload, cik, latest):
-                return payload, True
+                bulk_payload = json.loads(bulk.read(f"CIK{cik}.json"))
+            if _holds_accession(bulk_payload, cik, latest):
+                return bulk_payload, True
         try:
             payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
         except httpx.HTTPStatusError as error:
             if error.response.status_code != 404:
                 raise
+            if bulk_payload is not None:
+                # The zip has this CIK's facts, only trailing `latest`: serve
+                # them, marked incomplete so the next run asks again (#275).
+                return bulk_payload, False
             self.facts_missing += 1
             return None, True  # no XBRL facts at all: an empty result is cached
         return payload, _holds_accession(payload, cik, latest)
