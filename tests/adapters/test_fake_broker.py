@@ -1,29 +1,36 @@
-"""Tests for the `Broker` interface and `FakeBroker` (T20).
+"""Tests for `FakeBroker` and the broker value objects' validation (T20,
+moved to the Phase 4 types in T46b).
 
 Covers: abstractness, idempotent `submit` on a repeated `client_order_id`
-(including against an open or cancelled original), `cancel`/`simulate_fill`
-transitions and their error cases, fill/positions accounting (fill order,
-not submission order; exact netting; short positions), state isolation
-from returned collections, input validation (quantity, price, side,
-symbol, tz-aware timestamps normalized to UTC), symbol case
-canonicalization so `aapl` and `AAPL` net as one position (issue #38), and, at the broker level,
-an aware timestamp that overflows once converted to UTC (issue #43)
-raising `ValueError` (not `OverflowError`) from `Order`/`Fill`
-construction, and a bad clock (naive, overflowing, not a `datetime`, or
-raising) making `FakeBroker.submit`/`simulate_fill` raise `ClockError`
-with no state changed (ADR 0007 point 4, T46).
+(including against an accepted or cancelled original), `cancel` (a request
+returning `None`, its outcome read back through `get_order`),
+`simulate_fill` transitions and their error cases, the injected price
+function, `get_order`, `open_orders`, `fills(since)` inclusive at equal
+timestamps, `account` and `assets` shapes, fill/positions accounting (fill
+order, not submission order; exact netting; short positions), state
+isolation from returned collections, input validation (quantity, price,
+side, symbol, tz-aware timestamps normalized to UTC), symbol case
+canonicalization so `aapl` and `AAPL` net as one position (issue #38), an
+aware timestamp that overflows once converted to UTC (issue #43) raising
+`ValueError` (not `OverflowError`) from `Order`/`Fill` construction, and a
+bad clock (naive, overflowing, not a `datetime`, or raising) making
+`submit`/`simulate_fill`/`account` raise `ClockError` with no state changed
+(ADR 0007 point 4, T46).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from tradepartner.adapters.broker import (
+    TERMINAL_STATUSES,
+    Account,
+    Asset,
     Broker,
     DuplicateClientOrderIdError,
     Fill,
@@ -39,6 +46,11 @@ from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.errors import ClockError, SystemFaultError
 
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
+PRICES = {"AAPL": 100.0, "MSFT": 200.0, "BRK.B": 400.0}
+
+
+def price_of(symbol: str) -> float:
+    return PRICES[symbol]
 
 
 def make_clock(start: datetime = T0) -> tuple[list[datetime], Callable[[], datetime]]:
@@ -54,9 +66,9 @@ def make_clock(start: datetime = T0) -> tuple[list[datetime], Callable[[], datet
     return ticks, clock
 
 
-def make_broker(*, auto_fill: bool = True) -> tuple[FakeBroker, list[datetime]]:
+def make_broker(*, auto_fill: bool = True, **kwargs: Any) -> tuple[FakeBroker, list[datetime]]:
     ticks, clock = make_clock()
-    return FakeBroker(clock=clock, auto_fill=auto_fill), ticks
+    return FakeBroker(clock=clock, price_of=price_of, auto_fill=auto_fill, **kwargs), ticks
 
 
 def make_request(
@@ -64,16 +76,43 @@ def make_request(
     client_order_id: str = "co-1",
     symbol: str = "AAPL",
     side: Side = Side.BUY,
-    quantity: float = 10,
-    price: float = 100.0,
+    quantity: float | None = 10,
+    notional: float | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         client_order_id=client_order_id,
         symbol=symbol,
         side=side,
-        quantity=quantity,
-        price=price,
+        notional=notional,
+        quantity=None if notional is not None else quantity,
     )
+
+
+def make_order(**overrides: Any) -> Order:
+    values: dict[str, Any] = {
+        "client_order_id": "co-1",
+        "symbol": "AAPL",
+        "side": Side.BUY,
+        "quantity": 1,
+        "status": OrderStatus.ACCEPTED,
+        "submitted_at": T0,
+    }
+    values.update(overrides)
+    return Order(**values)
+
+
+def make_fill(**overrides: Any) -> Fill:
+    values: dict[str, Any] = {
+        "client_order_id": "co-1",
+        "symbol": "AAPL",
+        "side": Side.BUY,
+        "quantity": 1,
+        "price": 1.0,
+        "filled_at": T0,
+        "broker_fill_id": "f-1",
+    }
+    values.update(overrides)
+    return Fill(**values)
 
 
 # --- Abstractness -----------------------------------------------------
@@ -85,10 +124,15 @@ def test_broker_is_abstract() -> None:
 
 
 def test_fake_broker_implements_every_method() -> None:
-    broker = FakeBroker(clock=lambda: T0)
+    broker, _ = make_broker()
     assert isinstance(broker, Broker)
-    for name in ("submit", "cancel", "positions", "fills"):
+    for name in Broker.__abstractmethods__:
         assert callable(getattr(broker, name))
+
+
+def test_fake_broker_exposes_its_clock_for_the_identity_test() -> None:
+    _, clock = make_clock()
+    assert FakeBroker(clock=clock, price_of=price_of).clock is clock
 
 
 # --- Idempotency --------------------------------------------------------
@@ -96,25 +140,25 @@ def test_fake_broker_implements_every_method() -> None:
 
 def test_duplicate_client_order_id_is_rejected_and_original_unchanged() -> None:
     broker, _ = make_broker()
-    original = broker.submit(make_request(quantity=10, price=100.0))
+    original = broker.submit(make_request(quantity=10))
 
     with pytest.raises(DuplicateClientOrderIdError):
-        broker.submit(make_request(quantity=999, price=1.0))
+        broker.submit(make_request(quantity=999))
 
     fills = broker.fills()
     assert len(fills) == 1
     assert fills[0].quantity == 10
     assert fills[0].price == 100.0
+    assert broker.get_order("co-1") == original
     assert original.quantity == 10
-    assert original.price == 100.0
 
 
-def test_duplicate_client_order_id_against_open_original_leaves_positions_unchanged() -> None:
+def test_duplicate_client_order_id_against_accepted_original_leaves_positions_unchanged() -> None:
     broker, _ = make_broker(auto_fill=False)
-    broker.submit(make_request(client_order_id="co-1", quantity=10, price=100.0))
+    broker.submit(make_request(client_order_id="co-1", quantity=10))
 
     with pytest.raises(DuplicateClientOrderIdError):
-        broker.submit(make_request(client_order_id="co-1", quantity=999, price=1.0))
+        broker.submit(make_request(client_order_id="co-1", quantity=999))
 
     assert broker.positions() == {}
     broker.simulate_fill("co-1")
@@ -123,14 +167,98 @@ def test_duplicate_client_order_id_against_open_original_leaves_positions_unchan
 
 def test_duplicate_client_order_id_against_cancelled_original_leaves_positions_unchanged() -> None:
     broker, _ = make_broker(auto_fill=False)
-    broker.submit(make_request(client_order_id="co-1", quantity=10, price=100.0))
+    broker.submit(make_request(client_order_id="co-1", quantity=10))
     broker.cancel("co-1")
 
     with pytest.raises(DuplicateClientOrderIdError):
-        broker.submit(make_request(client_order_id="co-1", quantity=999, price=1.0))
+        broker.submit(make_request(client_order_id="co-1", quantity=999))
 
     assert broker.positions() == {}
     assert broker.fills() == []
+
+
+# --- submit -----------------------------------------------------------------
+
+
+def test_submit_without_auto_fill_returns_an_accepted_order_with_a_broker_id() -> None:
+    broker, ticks = make_broker(auto_fill=False)
+    order = broker.submit(make_request(quantity=10))
+    assert order.status is OrderStatus.ACCEPTED
+    assert order.submitted_at == ticks[0]
+    assert order.broker_order_id
+    assert (order.filled_quantity, order.filled_avg_price, order.filled_at) == (None, None, None)
+
+
+def test_auto_fill_fills_at_the_injected_price() -> None:
+    broker, ticks = make_broker()
+    order = broker.submit(make_request(symbol="MSFT", quantity=3))
+    assert order.status is OrderStatus.FILLED
+    assert (order.filled_quantity, order.filled_avg_price, order.filled_at) == (
+        3.0,
+        200.0,
+        ticks[0],
+    )
+    [fill] = broker.fills()
+    assert (fill.price, fill.quantity, fill.filled_at) == (200.0, 3.0, ticks[0])
+
+
+def test_a_notional_order_fills_notional_over_price_shares() -> None:
+    broker, _ = make_broker()
+    order = broker.submit(make_request(symbol="AAPL", notional=250.0))
+    assert (order.notional, order.quantity) == (250.0, None)
+    assert order.filled_quantity == 2.5
+    assert broker.positions()["AAPL"].quantity == 2.5
+
+
+def test_broker_order_and_fill_ids_are_unique() -> None:
+    broker, _ = make_broker()
+    orders = [broker.submit(make_request(client_order_id=f"co-{n}")) for n in range(3)]
+    assert len({o.broker_order_id for o in orders}) == 3
+    assert len({f.broker_fill_id for f in broker.fills()}) == 3
+
+
+def test_a_bad_price_fails_submit_before_anything_is_recorded() -> None:
+    broker = FakeBroker(clock=make_clock()[1], price_of=lambda symbol: float("nan"))
+    with pytest.raises(ValueError, match="price"):
+        broker.submit(make_request())
+    with pytest.raises(UnknownOrderError):
+        broker.get_order("co-1")
+    assert broker.fills() == [] and broker.positions() == {}
+
+
+# --- get_order and open_orders ------------------------------------------------
+
+
+def test_get_order_of_an_unknown_id_raises() -> None:
+    broker, _ = make_broker()
+    with pytest.raises(UnknownOrderError):
+        broker.get_order("does-not-exist")
+
+
+def test_get_order_reads_the_current_state() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    submitted = broker.submit(make_request())
+    assert broker.get_order("co-1") == submitted
+    filled = broker.simulate_fill("co-1")
+    assert broker.get_order("co-1") == filled
+
+
+def test_open_orders_lists_every_non_terminal_order_in_submission_order() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    for n in range(4):
+        broker.submit(make_request(client_order_id=f"co-{n}"))
+    broker.simulate_fill("co-1")
+    broker.cancel("co-2")
+    open_ids = [o.client_order_id for o in broker.open_orders()]
+    assert open_ids == ["co-0", "co-3"]
+    assert all(o.status not in TERMINAL_STATUSES for o in broker.open_orders())
+
+
+def test_mutating_returned_open_orders_does_not_affect_broker_state() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    broker.submit(make_request())
+    broker.open_orders().clear()
+    assert len(broker.open_orders()) == 1
 
 
 # --- Cancel ---------------------------------------------------------------
@@ -157,11 +285,14 @@ def test_cancel_already_cancelled_raises() -> None:
         broker.cancel("co-1")
 
 
-def test_cancel_open_order_transitions_and_never_fills() -> None:
+def test_cancel_returns_none_and_the_outcome_is_read_back_through_get_order() -> None:
     broker, _ = make_broker(auto_fill=False)
-    broker.submit(make_request())
-    cancelled = broker.cancel("co-1")
+    submitted = broker.submit(make_request())
+    result = broker.cancel("co-1")  # type: ignore[func-returns-value]
+    assert result is None
+    cancelled = broker.get_order("co-1")
     assert cancelled.status is OrderStatus.CANCELLED
+    assert cancelled.broker_order_id == submitted.broker_order_id
     assert broker.fills() == []
     with pytest.raises(OrderNotOpenError):
         broker.simulate_fill("co-1")
@@ -171,16 +302,25 @@ def test_cancel_open_order_transitions_and_never_fills() -> None:
 # --- simulate_fill --------------------------------------------------------
 
 
-def test_simulate_fill_on_open_order_with_auto_fill_disabled() -> None:
+def test_simulate_fill_on_accepted_order_with_auto_fill_disabled() -> None:
     broker, ticks = make_broker(auto_fill=False)
-    broker.submit(make_request(quantity=10, price=100.0))
+    broker.submit(make_request(quantity=10))
     filled = broker.simulate_fill("co-1")
 
     assert filled.status is OrderStatus.FILLED
+    assert filled.filled_at == ticks[-1]
     fills = broker.fills()
     assert len(fills) == 1
     assert fills[0].client_order_id == "co-1"
     assert fills[0].filled_at == ticks[-1]
+
+
+def test_simulate_fill_uses_the_price_at_fill_time() -> None:
+    prices = {"AAPL": 100.0}
+    broker = FakeBroker(clock=make_clock()[1], price_of=prices.__getitem__, auto_fill=False)
+    broker.submit(make_request())
+    prices["AAPL"] = 105.0
+    assert broker.simulate_fill("co-1").filled_avg_price == 105.0
 
 
 def test_simulate_fill_after_cancel_raises() -> None:
@@ -202,7 +342,7 @@ def test_simulate_fill_unknown_id_raises() -> None:
 
 def test_filled_order_produces_exactly_one_fill_with_expected_fields() -> None:
     broker, ticks = make_broker()
-    broker.submit(make_request(client_order_id="co-1", quantity=10, price=100.0))
+    broker.submit(make_request(client_order_id="co-1", quantity=10))
 
     fills = broker.fills()
     assert len(fills) == 1
@@ -212,13 +352,14 @@ def test_filled_order_produces_exactly_one_fill_with_expected_fields() -> None:
     assert fill.price == 100.0
     assert fill.filled_at == ticks[0]
     assert fill.filled_at.tzinfo is not None
+    assert fill.broker_fill_id
 
 
 def test_fills_returned_in_fill_order() -> None:
     broker, _ = make_broker()
-    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", price=100.0))
-    broker.submit(make_request(client_order_id="co-2", symbol="MSFT", price=200.0))
-    broker.submit(make_request(client_order_id="co-3", symbol="AAPL", price=101.0))
+    broker.submit(make_request(client_order_id="co-1", symbol="AAPL"))
+    broker.submit(make_request(client_order_id="co-2", symbol="MSFT"))
+    broker.submit(make_request(client_order_id="co-3", symbol="AAPL"))
 
     ids = [fill.client_order_id for fill in broker.fills()]
     assert ids == ["co-1", "co-2", "co-3"]
@@ -226,14 +367,37 @@ def test_fills_returned_in_fill_order() -> None:
 
 def test_fills_returned_in_fill_order_not_submission_order() -> None:
     broker, _ = make_broker(auto_fill=False)
-    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", price=100.0))
-    broker.submit(make_request(client_order_id="co-2", symbol="MSFT", price=200.0))
+    broker.submit(make_request(client_order_id="co-1", symbol="AAPL"))
+    broker.submit(make_request(client_order_id="co-2", symbol="MSFT"))
 
     broker.simulate_fill("co-2")
     broker.simulate_fill("co-1")
 
     ids = [fill.client_order_id for fill in broker.fills()]
     assert ids == ["co-2", "co-1"]
+
+
+def test_fills_since_is_inclusive_at_equal_timestamps() -> None:
+    broker, ticks = make_broker()
+    for n in range(3):
+        broker.submit(make_request(client_order_id=f"co-{n}"))
+    assert [f.client_order_id for f in broker.fills(since=ticks[1])] == ["co-1", "co-2"]
+    assert [f.client_order_id for f in broker.fills(since=ticks[2])] == ["co-2"]
+    assert broker.fills(since=ticks[2] + timedelta(microseconds=1)) == []
+    assert len(broker.fills(since=None)) == 3
+
+
+def test_fills_since_compares_instants_across_time_zones() -> None:
+    broker, ticks = make_broker()
+    broker.submit(make_request())
+    eastern = ticks[0].astimezone(ZoneInfo("America/New_York"))
+    assert len(broker.fills(since=eastern)) == 1
+
+
+def test_fills_since_must_be_tz_aware() -> None:
+    broker, _ = make_broker()
+    with pytest.raises(ValueError, match="since"):
+        broker.fills(since=datetime(2026, 1, 5))  # noqa: DTZ001
 
 
 def test_positions_aggregate_net_quantity_buy_and_sell() -> None:
@@ -281,6 +445,65 @@ def test_positions_sign_is_correct_for_each_side() -> None:
     assert broker.positions()["AAPL"].quantity == 2
 
 
+# --- account and assets ------------------------------------------------------------
+
+
+def test_account_shape_and_cash_follows_fills() -> None:
+    broker, ticks = make_broker(cash=10_000.0, account_id="paper-1")
+    before = broker.account()
+    assert isinstance(before, Account)
+    assert (before.account_id, before.cash, before.buying_power, before.equity) == (
+        "paper-1",
+        10_000.0,
+        10_000.0,
+        10_000.0,
+    )
+    assert before.as_of == ticks[-1]
+
+    broker.submit(make_request(symbol="AAPL", quantity=10))  # 1,000 at 100
+    broker.submit(make_request(client_order_id="co-2", symbol="MSFT", side=Side.SELL, quantity=1))
+    after = broker.account()
+    assert after.cash == 10_000.0 - 1_000.0 + 200.0
+    assert after.buying_power == after.cash
+    # Equity marks positions at the injected price: 10 AAPL at 100, -1 MSFT at 200.
+    assert after.equity == after.cash + 1_000.0 - 200.0
+
+
+def test_account_cash_is_exact_in_cents() -> None:
+    broker = FakeBroker(
+        clock=make_clock()[1], price_of=lambda symbol: 0.1, cash=0.3, auto_fill=True
+    )
+    broker.submit(make_request(quantity=1))
+    broker.submit(make_request(client_order_id="co-2", quantity=2))
+    assert broker.account().cash == 0.0
+
+
+def test_account_reads_the_clock_through_the_wrap() -> None:
+    broker = FakeBroker(clock=lambda: datetime(2026, 1, 5), price_of=price_of)  # noqa: DTZ001
+    with pytest.raises(ClockError):
+        broker.account()
+
+
+def test_assets_default_to_tradable_fractionable_active() -> None:
+    broker, _ = make_broker()
+    assets = broker.assets(["aapl", "MSFT"])
+    assert set(assets) == {"AAPL", "MSFT"}
+    assert assets["AAPL"] == Asset(tradable=True, fractionable=True, status="active", cusip=None)
+
+
+def test_assets_serve_the_configured_flags() -> None:
+    halted = Asset(tradable=False, fractionable=False, status="inactive", cusip="000000000")
+    broker, _ = make_broker(assets={"brk.b": halted})
+    assets = broker.assets(["BRK.B", "AAPL"])
+    assert assets["BRK.B"] == halted
+    assert assets["AAPL"].tradable is True
+
+
+def test_assets_of_no_symbols_is_empty() -> None:
+    broker, _ = make_broker()
+    assert broker.assets([]) == {}
+
+
 # --- State isolation from returned collections -----------------------------
 
 
@@ -316,15 +539,9 @@ def test_quantity_must_be_positive_finite_on_order_request(bad_quantity: float) 
         make_request(quantity=bad_quantity)
 
 
-@pytest.mark.parametrize("bad_price", [0, -1.0, float("nan"), float("inf"), float("-inf")])
-def test_price_must_be_positive_finite_on_order_request(bad_price: float) -> None:
-    with pytest.raises(ValueError, match="price"):
-        make_request(price=bad_price)
-
-
 def test_quantity_rejects_bool() -> None:
     with pytest.raises(ValueError, match="quantity"):
-        make_request(quantity=True)  # type: ignore[arg-type]
+        make_request(quantity=True)
 
 
 def test_quantity_huge_int_raises_value_error_not_overflow_error() -> None:
@@ -338,55 +555,19 @@ def test_quantity_huge_int_raises_value_error_not_overflow_error() -> None:
 @pytest.mark.parametrize("bad_quantity", [0, -5, float("nan"), float("inf")])
 def test_quantity_must_be_positive_finite_on_fill(bad_quantity: float) -> None:
     with pytest.raises(ValueError, match="quantity"):
-        Fill(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=bad_quantity,
-            price=1.0,
-            filled_at=T0,
-        )
+        make_fill(quantity=bad_quantity)
 
 
 @pytest.mark.parametrize("bad_price", [0, -1.0, float("nan"), float("inf")])
 def test_price_must_be_positive_finite_on_fill(bad_price: float) -> None:
     with pytest.raises(ValueError, match="price"):
-        Fill(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=1,
-            price=bad_price,
-            filled_at=T0,
-        )
+        make_fill(price=bad_price)
 
 
 @pytest.mark.parametrize("bad_quantity", [0, -5, float("nan"), float("inf")])
 def test_quantity_must_be_positive_finite_on_order(bad_quantity: float) -> None:
     with pytest.raises(ValueError, match="quantity"):
-        Order(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=bad_quantity,
-            price=1.0,
-            status=OrderStatus.OPEN,
-            submitted_at=T0,
-        )
-
-
-@pytest.mark.parametrize("bad_price", [0, -1.0, float("nan"), float("inf")])
-def test_price_must_be_positive_finite_on_order(bad_price: float) -> None:
-    with pytest.raises(ValueError, match="price"):
-        Order(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=1,
-            price=bad_price,
-            status=OrderStatus.OPEN,
-            submitted_at=T0,
-        )
+        make_order(quantity=bad_quantity)
 
 
 # --- Validation: identifiers and side --------------------------------------
@@ -409,20 +590,8 @@ def test_symbol_must_not_have_surrounding_whitespace() -> None:
 def test_symbol_is_canonicalized_to_upper_case_on_every_value_object(raw: str) -> None:
     assert make_request(symbol=raw).symbol == "AAPL"
     assert Position(symbol=raw, quantity=1).symbol == "AAPL"
-    order = Order(
-        client_order_id="co-1",
-        symbol=raw,
-        side=Side.BUY,
-        quantity=1,
-        price=1.0,
-        status=OrderStatus.OPEN,
-        submitted_at=T0,
-    )
-    assert order.symbol == "AAPL"
-    fill = Fill(
-        client_order_id="co-1", symbol=raw, side=Side.BUY, quantity=1, price=1.0, filled_at=T0
-    )
-    assert fill.symbol == "AAPL"
+    assert make_order(symbol=raw).symbol == "AAPL"
+    assert make_fill(symbol=raw).symbol == "AAPL"
 
 
 def test_symbols_differing_only_in_case_net_into_one_position() -> None:
@@ -476,7 +645,6 @@ def test_side_string_is_coerced_and_nets_correctly() -> None:
         symbol="AAPL",
         side="buy",  # type: ignore[arg-type]
         quantity=10,
-        price=100.0,
     )
     assert request.side is Side.BUY
 
@@ -491,7 +659,6 @@ def test_invalid_side_string_is_rejected() -> None:
             symbol="AAPL",
             side="hold",  # type: ignore[arg-type]
             quantity=10,
-            price=100.0,
         )
 
 
@@ -500,14 +667,7 @@ def test_invalid_side_string_is_rejected() -> None:
 
 def test_naive_datetime_raises_on_fill() -> None:
     with pytest.raises(ValueError, match="tz-aware"):
-        Fill(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=1,
-            price=1.0,
-            filled_at=datetime(2026, 1, 5, 15, 0),  # naive  # noqa: DTZ001
-        )
+        make_fill(filled_at=datetime(2026, 1, 5, 15, 0))  # naive  # noqa: DTZ001
 
 
 # An aware datetime whose UTC-converted value overflows `datetime`'s
@@ -522,29 +682,14 @@ _OVERFLOWING_DATETIMES = [
 @pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
 def test_utc_overflow_raises_value_error_on_order(overflowing: datetime) -> None:
     with pytest.raises(ValueError, match=r"submitted_at=.*out of the range") as excinfo:
-        Order(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=1,
-            price=1.0,
-            status=OrderStatus.OPEN,
-            submitted_at=overflowing,
-        )
+        make_order(submitted_at=overflowing)
     assert isinstance(excinfo.value.__cause__, OverflowError)
 
 
 @pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
 def test_utc_overflow_raises_value_error_on_fill(overflowing: datetime) -> None:
     with pytest.raises(ValueError, match=r"filled_at=.*out of the range") as excinfo:
-        Fill(
-            client_order_id="co-1",
-            symbol="AAPL",
-            side=Side.BUY,
-            quantity=1,
-            price=1.0,
-            filled_at=overflowing,
-        )
+        make_fill(filled_at=overflowing)
     assert isinstance(excinfo.value.__cause__, OverflowError)
 
 
@@ -553,7 +698,7 @@ def test_utc_overflow_raises_value_error_on_fill(overflowing: datetime) -> None:
 # Every clock reading is validated where it is read; any failure of the call
 # or the validation is a `ClockError` (a `SystemFaultError`, never a
 # `ValueError`), raised before any `Order` or `Fill` is built and before any
-# state changes. These replace #63's clock tests, which expected `ValueError`.
+# state changes.
 
 
 def _raising_clock() -> datetime:
@@ -602,15 +747,18 @@ class _SwitchableClock:
         return self.bad  # type: ignore[return-value]
 
 
-@pytest.mark.parametrize(
+_BAD_CLOCK_PARAMS = pytest.mark.parametrize(
     ("bad", "cause"), [(b, c) for _, b, c in _BAD_CLOCKS], ids=[i for i, _, _ in _BAD_CLOCKS]
 )
+
+
+@_BAD_CLOCK_PARAMS
 def test_a_bad_clock_makes_submit_raise_clock_error_and_records_nothing(
     bad: object, cause: type[BaseException]
 ) -> None:
     clock = _SwitchableClock(bad)
     clock.good = False
-    broker = FakeBroker(clock=clock)
+    broker = FakeBroker(clock=clock, price_of=price_of)
 
     with pytest.raises(ClockError) as caught:
         broker.submit(make_request())
@@ -618,9 +766,12 @@ def test_a_bad_clock_makes_submit_raise_clock_error_and_records_nothing(
     assert isinstance(caught.value, SystemFaultError)
     assert isinstance(caught.value.__cause__, cause)
 
-    # No order recorded: unknown to cancel, no fill, no position.
+    # No order recorded: unknown to get_order and cancel, no fill, no position.
+    with pytest.raises(UnknownOrderError):
+        broker.get_order("co-1")
     with pytest.raises(UnknownOrderError):
         broker.cancel("co-1")
+    assert broker.open_orders() == []
     assert broker.fills() == []
     assert broker.positions() == {}
 
@@ -631,39 +782,37 @@ def test_a_bad_clock_makes_submit_raise_clock_error_and_records_nothing(
     assert order.status is OrderStatus.FILLED
 
 
-@pytest.mark.parametrize(
-    ("bad", "cause"), [(b, c) for _, b, c in _BAD_CLOCKS], ids=[i for i, _, _ in _BAD_CLOCKS]
-)
+@_BAD_CLOCK_PARAMS
 def test_a_bad_clock_makes_submit_raise_clock_error_without_auto_fill(
     bad: object, cause: type[BaseException]
 ) -> None:
     clock = _SwitchableClock(bad)
     clock.good = False
-    broker = FakeBroker(clock=clock, auto_fill=False)
+    broker = FakeBroker(clock=clock, price_of=price_of, auto_fill=False)
     with pytest.raises(ClockError) as caught:
         broker.submit(make_request())
     assert isinstance(caught.value.__cause__, cause)
     with pytest.raises(UnknownOrderError):
-        broker.cancel("co-1")
+        broker.get_order("co-1")
+    assert broker.open_orders() == []
     assert broker.fills() == []
     assert broker.positions() == {}
     clock.good = True
-    assert broker.submit(make_request()).status is OrderStatus.OPEN
+    assert broker.submit(make_request()).status is OrderStatus.ACCEPTED
 
 
-@pytest.mark.parametrize(
-    ("bad", "cause"), [(b, c) for _, b, c in _BAD_CLOCKS], ids=[i for i, _, _ in _BAD_CLOCKS]
-)
+@_BAD_CLOCK_PARAMS
 def test_a_bad_clock_makes_simulate_fill_raise_clock_error_and_changes_nothing(
     bad: object, cause: type[BaseException]
 ) -> None:
     clock = _SwitchableClock(bad)
-    broker = FakeBroker(clock=clock, auto_fill=False)
+    broker = FakeBroker(clock=clock, price_of=price_of, auto_fill=False)
     held = broker.submit(make_request(client_order_id="held", symbol="MSFT"))
-    held = broker.simulate_fill(held.client_order_id)  # a position exists before the fault
+    broker.simulate_fill(held.client_order_id)  # a position exists before the fault
     order = broker.submit(make_request())
-    assert order.status is OrderStatus.OPEN
+    assert order.status is OrderStatus.ACCEPTED
     fills_before, positions_before = broker.fills(), broker.positions()
+    cash_before = broker.account().cash
 
     clock.good = False
     with pytest.raises(ClockError) as caught:
@@ -671,13 +820,21 @@ def test_a_bad_clock_makes_simulate_fill_raise_clock_error_and_changes_nothing(
     assert not isinstance(caught.value, ValueError)
     assert isinstance(caught.value.__cause__, cause)
 
-    # No fill recorded, positions unchanged, and the order still OPEN and
-    # otherwise unchanged: it fills normally once the clock is good.
+    # No fill recorded, positions and cash unchanged, and the order still
+    # ACCEPTED and otherwise unchanged: it fills normally once the clock is good.
+    assert broker.get_order(order.client_order_id) == order
+    assert broker.open_orders() == [order]
     assert broker.fills() == fills_before
     assert broker.positions() == positions_before
     clock.good = True
+    assert broker.account().cash == cash_before
     filled = broker.simulate_fill(order.client_order_id)
-    assert filled == replace(order, status=OrderStatus.FILLED)
+    assert filled.status is OrderStatus.FILLED
+    assert (filled.client_order_id, filled.broker_order_id, filled.submitted_at) == (
+        order.client_order_id,
+        order.broker_order_id,
+        order.submitted_at,
+    )
     assert len(broker.fills()) == len(fills_before) + 1
 
 
@@ -685,7 +842,7 @@ def test_a_clock_error_names_the_clock_and_only_the_cause_type() -> None:
     def leaky() -> datetime:
         raise RuntimeError("GET https://broker.example/clock?key=do-not-print")
 
-    broker = FakeBroker(clock=leaky)
+    broker = FakeBroker(clock=leaky, price_of=price_of)
     with pytest.raises(ClockError, match=r"^clock failed: RuntimeError$") as caught:
         broker.submit(make_request())
     assert "do-not-print" not in str(caught.value)
@@ -698,19 +855,19 @@ def test_a_base_exception_from_the_clock_is_not_turned_into_a_clock_error() -> N
     def interrupted() -> datetime:
         raise KeyboardInterrupt
 
-    broker = FakeBroker(clock=interrupted)
+    broker = FakeBroker(clock=interrupted, price_of=price_of)
     with pytest.raises(KeyboardInterrupt):
         broker.submit(make_request())
 
 
 def test_the_clock_is_read_once_per_submit_and_once_per_simulate_fill() -> None:
     clock = _SwitchableClock(None)
-    broker = FakeBroker(clock=clock, auto_fill=False)
+    broker = FakeBroker(clock=clock, price_of=price_of, auto_fill=False)
     order = broker.submit(make_request())
     assert clock.calls == 1
     broker.simulate_fill(order.client_order_id)
     assert clock.calls == 2
-    auto = FakeBroker(clock=clock)
+    auto = FakeBroker(clock=clock, price_of=price_of)
     auto.submit(make_request())
     assert clock.calls == 3
 
@@ -721,7 +878,7 @@ def test_non_utc_clock_is_normalized_to_utc() -> None:
     def clock() -> datetime:
         return eastern
 
-    broker = FakeBroker(clock=clock)
+    broker = FakeBroker(clock=clock, price_of=price_of)
     order = broker.submit(make_request())
 
     assert order.submitted_at == T0
