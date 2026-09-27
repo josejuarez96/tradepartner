@@ -310,12 +310,12 @@ why = "The acceptance criteria every Phase 4 task answers to; six unattended pap
 unblocks = ["phase:4"]
 
 [spec.strategy-lab]
-what = "What the strategy lab builds and how we know it is done: sweeps registered from one file as grids of variants, cadence as a frozen hypothesis parameter, a shadow-paper replay harness, and the storage and compute rules for thousands of trials."
+what = "What the strategy lab builds and how we know it is done: sweeps registered from one file as grids of variants, cadence as a frozen hypothesis parameter, and the storage and compute rules for thousands of trials (the shadow-paper replay is deferred to a follow-up spec)."
 why = "Lets the owner develop strategies in volume while H1's paper run proceeds without loosening the registry's guarantees: locked holdout, one owner spend per hypothesis, every run a trial, deflated Sharpe over the family."
 unblocks = ["phase:3"]
 
 [issue.281]
-what = "Draft the strategy-lab spec (sweeps, cadence, replay, compute) as a spec only, no plan and no code."
+what = "Draft the strategy-lab spec (sweeps, cadence, compute; the replay deferred) as a spec only, no plan and no code."
 why = "Volume without a spec would be untracked tuning; the spec fixes the guardrails before any sweep runs."
 unblocks = ["spec:strategy-lab"]
 
