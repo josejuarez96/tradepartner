@@ -65,8 +65,13 @@ class JournalRow(Protocol):
 
     TABLE: ClassVar[str]
     ID_COLUMN: ClassVar[str | None]
-    known_at: datetime
-    ingested_at: datetime
+
+    # Read-only members, so a frozen row type satisfies the protocol.
+    @property
+    def known_at(self) -> datetime: ...
+
+    @property
+    def ingested_at(self) -> datetime: ...
 
 
 @dataclass(frozen=True, kw_only=True)
