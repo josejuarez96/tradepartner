@@ -347,9 +347,23 @@ def facts_as_of(
     """`facts` rows known by `t`: one per `(security_id, fact_name,
     as_of_date, class_member)`, the latest revision as of `t` (spec
     acceptance: "Restated shares fact: `facts_as_of(T)` returns the earlier
-    value between the two `known_at`, the later after")."""
+    value between the two `known_at`, the later after").
+
+    Then one per `(security_id, fact_name, class_member, filing_accession)`
+    among rows that carry an accession, the latest-**ingested** one (plan
+    T11e): the EDGAR adapter re-dates a filing's shares when company facts
+    arrive after the FSN month end or when the accession switches source,
+    and the store keeps both dates as rows; only the newest ingest's date
+    is the filing's. Rows with no accession are untouched.
+    """
     t = _validate_t(t)
-    return _latest_as_of(conn, "facts", _FACT_KEY, t, security_ids)
+    frame = _latest_as_of(conn, "facts", _FACT_KEY, t, security_ids)
+    accession = pl.col("filing_accession")
+    keyed = frame.filter(accession.is_not_null()).sort("ingested_at", descending=True)
+    keyed = keyed.unique(
+        subset=["security_id", "fact_name", "class_member", "filing_accession"], keep="first"
+    )
+    return pl.concat([frame.filter(accession.is_null()), keyed]).sort(list(_FACT_KEY))
 
 
 def listings_as_of(

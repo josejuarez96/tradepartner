@@ -338,20 +338,11 @@ def test_an_http_error_names_no_secret(settings: Settings) -> None:
     assert USER_AGENT not in str(raised.value) and "test@example.com" not in repr(raised.value)
 
 
-@pytest.mark.parametrize(
-    ("method", "args", "task"),
-    [
-        ("facts", (APPLE, ["EntityCommonStockSharesOutstanding"]), "T11e"),
-        ("delistings", (), "T11f"),
-    ],
-)
-def test_the_remaining_per_cik_methods_are_left_to_later_tasks(
-    settings: Settings, method: str, args: tuple[object, ...], task: str
-) -> None:
-    """`cover_pages` and `filing_headers` are T11d's; `facts` (T11e) and
-    `delistings` (T11f) still raise, each naming its own task."""
-    with pytest.raises(NotImplementedError, match=task):
-        getattr(_source(settings, _router()), method)(*args)
+def test_delistings_are_left_to_t11f(settings: Settings) -> None:
+    """`cover_pages` and `filing_headers` are T11d's, `facts` T11e's;
+    `delistings` (T11f) still raises, naming its task."""
+    with pytest.raises(NotImplementedError, match="T11f"):
+        _source(settings, _router()).delistings()
 
 
 def test_entries_are_filing_index_entries(settings: Settings) -> None:

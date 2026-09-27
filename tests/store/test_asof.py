@@ -810,6 +810,63 @@ class TestFactsAsOf:
         )
         assert later["value"] == pytest.approx(1_050_000)
 
+    def test_one_accession_and_class_resolves_to_its_latest_ingested_row(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """T11e reader rule: a fact re-dated for the same `(security, fact name,
+        class, filing accession)` (FSN's month end first, the company-facts
+        date on a later run) is served once, under the latest-ingested date;
+        rows with no accession are untouched."""
+        known_at = datetime(2021, 1, 20, 21, 0, tzinfo=UTC)
+        base = {
+            "security_id": "SEC_FACTS_RESTATED",
+            "fact_name": "shares_outstanding",
+            "class_member": "",
+            "known_at": known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        }
+        insert_row(
+            fixture_store,
+            "facts",
+            {
+                **base,
+                "as_of_date": date(2021, 1, 31),
+                "value": 500.0,
+                "filing_accession": "0000000001-21-000001",
+                "ingested_at": datetime(2021, 2, 1, tzinfo=UTC),
+            },
+        )
+        insert_row(
+            fixture_store,
+            "facts",
+            {
+                **base,
+                "as_of_date": date(2021, 1, 15),
+                "value": 500.0,
+                "filing_accession": "0000000001-21-000001",
+                "ingested_at": datetime(2021, 3, 1, tzinfo=UTC),
+            },
+        )
+        insert_row(
+            fixture_store,
+            "facts",
+            {
+                **base,
+                "as_of_date": date(2021, 1, 10),
+                "value": 400.0,
+                "filing_accession": None,
+                "ingested_at": datetime(2021, 2, 1, tzinfo=UTC),
+            },
+        )
+        rows = facts_as_of(
+            fixture_store, datetime(2021, 6, 1, tzinfo=UTC), security_ids=["SEC_FACTS_RESTATED"]
+        )
+        by_accession = rows.filter(pl.col("filing_accession") == "0000000001-21-000001")
+        assert by_accession.height == 1
+        assert by_accession.row(0, named=True)["as_of_date"] == date(2021, 1, 15)
+        assert _one(rows, as_of_date=date(2021, 1, 10))["value"] == pytest.approx(400.0)
+
     def test_before_any_known_at_returns_nothing(
         self, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:
