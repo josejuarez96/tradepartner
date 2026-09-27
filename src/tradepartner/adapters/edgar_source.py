@@ -1360,8 +1360,11 @@ class EdgarFilingSource(FilingSource):
         **De-duplication across sources** on (accession, fact name, class
         member): a per-document parse wins over company facts, which win over
         FSN; every source's records keep their own `as_of_date` keys within
-        the winner; the same key with different values in two sources raises
-        `ValueError` (the chunk fails until T11f's policy) and serves neither.
+        the winner; the same key with different values in two sources is a
+        collision (T11h): only that (accession, fact name, class member) key
+        is withheld, recorded under the accession's base form, and it counts
+        toward `check_failures`'s cross-day (error class, base form) rule
+        only; the accession's other facts are still served.
         """
         _validate_cik(cik)
         self._ensure_fsn()
@@ -1402,21 +1405,33 @@ class EdgarFilingSource(FilingSource):
         out: list[FactRecord] = []
         for (accession, fact_name, member), sources in by_key.items():
             label = f"{accession}: {fact_name} {member or 'undimensioned'}"
-            dated: dict[str, dict[date, float]] = {}
-            for source, facts in sources.items():
-                for fact in facts:
-                    held = dated.setdefault(source, {}).setdefault(fact.as_of_date, fact.value)
-                    if held != fact.value:  # one source, one date, two values
-                        raise ValueError(f"{label} has two {source} values on {fact.as_of_date}")
-            for a, b in itertools.combinations(sorted(dated), 2):
-                common = dated[a].keys() & dated[b].keys()
-                if common:  # comparable dates must agree, value for value
-                    clash = [d for d in common if dated[a][d] != dated[b][d]]
-                    if clash:
-                        days = ", ".join(d.isoformat() for d in sorted(clash))
-                        raise ValueError(f"{label} differs between {a} and {b} on {days}")
-                elif set(dated[a].values()).isdisjoint(dated[b].values()):
-                    raise ValueError(f"{label} differs between {a} and {b}: no value in common")
+            base_form = stamps[accession].form.removesuffix("/A")
+            try:
+                dated: dict[str, dict[date, float]] = {}
+                for source, facts in sources.items():
+                    for fact in facts:
+                        held = dated.setdefault(source, {}).setdefault(fact.as_of_date, fact.value)
+                        if held != fact.value:  # one source, one date, two values
+                            raise ValueError(
+                                f"{label} has two {source} values on {fact.as_of_date}"
+                            )
+                for a, b in itertools.combinations(sorted(dated), 2):
+                    common = dated[a].keys() & dated[b].keys()
+                    if common:  # comparable dates must agree, value for value
+                        clash = [d for d in common if dated[a][d] != dated[b][d]]
+                        if clash:
+                            days = ", ".join(d.isoformat() for d in sorted(clash))
+                            raise ValueError(f"{label} differs between {a} and {b} on {days}")
+                    elif set(dated[a].values()).isdisjoint(dated[b].values()):
+                        raise ValueError(f"{label} differs between {a} and {b}: no value in common")
+            except ValueError as error:
+                # T11h: a collision withholds only this key, never the whole
+                # accession; recorded under its base form for the cross-day
+                # rule only, never `_check_per_document_group`'s numerator.
+                self._record_failure(
+                    accession, type(error).__name__, base_form, str(error), collision=True
+                )
+                continue
             winner = next(s for s in ("document", "company", "fsn") if s in sources)
             accepted_at = stamps[accession].accepted_at
             if accepted_at is None:  # every source above is stamped; a bug otherwise
@@ -1458,10 +1473,14 @@ class EdgarFilingSource(FilingSource):
         cached = self._facts_memo.get((cik, key)) or _load_facts_cache(path, cik, key)
         if cached is None:
             payload, complete = self._company_facts_payload(cik, latest)
-            cached = [
-                (f.fact_name, f.accession, f.as_of_date, f.value)
-                for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
-            ]
+            cached = (
+                []
+                if payload is None  # T11h/T11e: no XBRL facts at all; not a filing failure
+                else [
+                    (f.fact_name, f.accession, f.as_of_date, f.value)
+                    for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
+                ]
+            )
             self._facts_memo[cik, key] = cached  # one fetch per CIK per run, cached or not
             if complete:  # else the payload trails the latest filing: fetch again next run
                 rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
@@ -1483,14 +1502,16 @@ class EdgarFilingSource(FilingSource):
             out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
-    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any, bool]:
+    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool]:
         """The raw company-facts payload and whether it already holds
         `latest` (the filing the cache is keyed by): from one
         `companyfacts.zip` when more than `edgar.bulk_stamp_threshold_ciks`
         stamped CIKs need a fetch (the stamping rule), else the per-CIK API;
         a CIK the zip lacks, or whose zip payload trails `latest` (the zip is
         rebuilt nightly), falls back to the API. A payload for another CIK
-        raises."""
+        raises. A 404 from the per-CIK API (T11h, T11e's leftover: many
+        issuers have no XBRL facts at all) is **not** a filing failure: the
+        payload is `None`, complete `True` (an empty result is cached)."""
         if self._facts_bulk is None:
             stale = 0
             for stamps_path in self._stamps_path("0").parent.glob("*.json"):
@@ -1513,7 +1534,13 @@ class EdgarFilingSource(FilingSource):
                 payload = json.loads(bulk.read(f"CIK{cik}.json"))
             if _holds_accession(payload, cik, latest):
                 return payload, True
-        payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
+        try:
+            payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != 404:
+                raise
+            self.facts_missing += 1
+            return None, True  # no XBRL facts at all: an empty result is cached
         return payload, _holds_accession(payload, cik, latest)
 
 
