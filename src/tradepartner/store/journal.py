@@ -717,3 +717,354 @@ def all_fill_ids(conn: duckdb.DuckDBPyConnection) -> frozenset[str]:
     insert-or-ignore check, so a fill is never journaled twice."""
     require_journal(conn)
     return frozenset(row[0] for row in conn.execute("SELECT broker_fill_id FROM fills").fetchall())
+
+
+# --- Readers (plan T49c) -------------------------------------------------------------
+#
+# Reads only. Every reader calls `require_journal` first, so a version-4 store
+# raises `JournalNotInitialised`. A row tied to a window through a column
+# (`window_id`) or through its run (`run_id -> paper_runs.window_id`, or an order's
+# run for `order_events` and `outcomes`) is read per window; later tasks never add a
+# reader here, they query in their own module. Rows come back in `known_at` order,
+# ties broken by `ingested_at` and then insertion order (DuckDB's `rowid`), or in id
+# order for a table with its own id; "latest" always means latest by that order,
+# never by a broker instant.
+
+#: `order_events` statuses that end an order. Terminal is absorbing: an order with
+#: any of these rows is terminal whatever rows follow it in `known_at` order.
+TERMINAL_ORDER_STATUSES: tuple[str, ...] = ("filled", "expired", "rejected", "cancelled")
+#: Statuses that show the broker has the order; an order with none is `pending`
+#: (spec req 4, "Unknown state"), whatever `cancel_*` rows follow.
+ACKNOWLEDGED_ORDER_STATUSES: tuple[str, ...] = ("accepted", "replay", *TERMINAL_ORDER_STATUSES)
+#: `paper_window_stops` states that close a window (`requested` leaves it open).
+CLOSING_STOP_STATES: tuple[str, ...] = ("closed", "abandoned")
+
+_ORDER = "t.known_at, t.ingested_at, t.rowid"
+_RUN_IN_WINDOW = "t.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)"
+_ORDER_IN_WINDOW = (
+    "(? IS NULL OR t.client_order_id IN (SELECT o.client_order_id FROM orders o "
+    "JOIN paper_runs r ON r.run_id = o.run_id WHERE r.window_id = ?))"
+)
+
+
+@dataclass(frozen=True)
+class RunWithResult:
+    """A `paper_runs` row and its `paper_run_results` row, None while unfinished."""
+
+    run: PaperRunRow
+    result: PaperRunResultRow | None
+
+
+@dataclass(frozen=True)
+class DecisionWithEvents:
+    """A decision and its `decision_events` rows in `known_at` order."""
+
+    decision: DecisionRow
+    events: tuple[DecisionEventRow, ...]
+
+
+@dataclass(frozen=True)
+class OverrideWithConsumption:
+    """An override and what consumed it: the decisions citing it (`exclude_name`,
+    `keep_name`) or the `kill_switch` rows citing it (`engage_kill_switch`)."""
+
+    override: OverrideRow
+    decision_ids: tuple[int, ...]
+    kill_switch_event_ids: tuple[int, ...]
+
+    @property
+    def consumed(self) -> bool:
+        """True once a decision or a `kill_switch` row cites the override."""
+        return bool(self.decision_ids or self.kill_switch_event_ids)
+
+
+def _select[R](
+    conn: duckdb.DuckDBPyConnection,
+    row_type: type[R],
+    where: str = "TRUE",
+    params: Iterable[Any] = (),
+    order: str = _ORDER,
+) -> list[R]:
+    """Rows of `row_type`'s table (aliased `t`) matching `where`, as row objects."""
+    require_journal(conn)
+    names = [f.name for f in fields(row_type)]  # type: ignore[arg-type]
+    columns = ", ".join(f't."{name}"' for name in names)
+    table = row_type.TABLE  # type: ignore[attr-defined]
+    rows = conn.execute(
+        f"SELECT {columns} FROM {table} t WHERE {where} ORDER BY {order}", list(params)
+    ).fetchall()
+    return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
+
+
+def _open_windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
+    return _select(
+        conn,
+        PaperWindowRow,
+        "t.window_id NOT IN (SELECT window_id FROM paper_window_stops "
+        "WHERE list_contains(?, state))",
+        [list(CLOSING_STOP_STATES)],
+        order="t.window_id",
+    )
+
+
+def open_window(conn: duckdb.DuckDBPyConnection) -> PaperWindowRow | None:
+    """The open window (no `closed` or `abandoned` stop row), or None. Fails closed
+    with `JournalIntegrityError` when more than one window is open."""
+    windows = _open_windows(conn)
+    if len(windows) > 1:
+        ids = ", ".join(str(w.window_id) for w in windows)
+        raise JournalIntegrityError(f"more than one open paper window: {ids}")
+    return windows[0] if windows else None
+
+
+def latest_window(conn: duckdb.DuckDBPyConnection) -> PaperWindowRow | None:
+    """The window with the highest id, open or closed (what `paper check` and
+    `paper report` target), or None before the first `paper start`."""
+    windows = _select(conn, PaperWindowRow, order="t.window_id DESC")
+    return windows[0] if windows else None
+
+
+def window_stops_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperWindowStopRow]:
+    """The window's `paper_window_stops` rows."""
+    return _select(conn, PaperWindowStopRow, "t.window_id = ?", [window_id])
+
+
+def runs_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[RunWithResult]:
+    """The window's runs in `run_id` order, each with its result (None while
+    unfinished)."""
+    runs = _select(conn, PaperRunRow, "t.window_id = ?", [window_id], order="t.run_id")
+    results = {
+        r.run_id: r
+        for r in _select(
+            conn,
+            PaperRunResultRow,
+            "t.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)",
+            [window_id],
+        )
+    }
+    return [RunWithResult(run, results.get(run.run_id)) for run in runs]  # type: ignore[arg-type]
+
+
+def orders_for(conn: duckdb.DuckDBPyConnection, *, window_id: int | None) -> list[OrderRow]:
+    """The window's orders (through their run), or every order when `window_id` is
+    None (the collectors read own orders account-wide)."""
+    return _select(conn, OrderRow, _ORDER_IN_WINDOW, [window_id, window_id])
+
+
+def order_events_for(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None
+) -> list[OrderEventRow]:
+    """Every `order_events` row of the window's orders (or of every order)."""
+    return _select(conn, OrderEventRow, _ORDER_IN_WINDOW, [window_id, window_id])
+
+
+def latest_order_events(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None
+) -> dict[str, OrderEventRow]:
+    """Each order's latest event by `known_at` (not insertion order, not the
+    broker's `event_at`), keyed by `client_order_id`; an order with no event is
+    absent."""
+    return {e.client_order_id: e for e in order_events_for(conn, window_id=window_id)}
+
+
+def _orders_where(
+    conn: duckdb.DuckDBPyConnection, window_id: int | None, statuses: tuple[str, ...]
+) -> list[OrderRow]:
+    return _select(
+        conn,
+        OrderRow,
+        f"{_ORDER_IN_WINDOW} AND t.client_order_id NOT IN (SELECT client_order_id "
+        "FROM order_events WHERE list_contains(?, status))",
+        [window_id, window_id, list(statuses)],
+    )
+
+
+def non_terminal_orders(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None
+) -> list[OrderRow]:
+    """Orders with no terminal event (`pending` ones included), for the window or,
+    with None, account-wide."""
+    return _orders_where(conn, window_id, TERMINAL_ORDER_STATUSES)
+
+
+def pending_orders(conn: duckdb.DuckDBPyConnection, *, window_id: int | None) -> list[OrderRow]:
+    """Orders with no broker-acknowledged event (`accepted`, `replay` or terminal),
+    whatever `cancel_*` rows follow: settled only by `paper resume`."""
+    return _orders_where(conn, window_id, ACKNOWLEDGED_ORDER_STATUSES)
+
+
+def orders_on_session(
+    conn: duckdb.DuckDBPyConnection, session: date, security_id: str, side: str
+) -> list[OrderRow]:
+    """Every order on `session` for (`security_id`, `side`), across decisions and
+    windows: the attempt count behind `client_order_id`. Not filtered by window,
+    because ids are unique store-wide and a window filter could re-issue one."""
+    return _select(
+        conn,
+        OrderRow,
+        "t.session = ? AND t.security_id = ? AND t.side = ?",
+        [session, security_id, side],
+    )
+
+
+def decisions_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, rebalance_session: date | None = None
+) -> list[DecisionWithEvents]:
+    """The window's decisions in `decision_id` order, each with its events; only
+    one rebalance's when `rebalance_session` is given (forced exits, which have
+    none, are then left out)."""
+    where = _RUN_IN_WINDOW
+    params: list[Any] = [window_id]
+    if rebalance_session is not None:
+        where += " AND t.rebalance_session = ?"
+        params.append(rebalance_session)
+    decisions = _select(conn, DecisionRow, where, params, order="t.decision_id")
+    events: dict[int, list[DecisionEventRow]] = {}
+    for event in _select(
+        conn,
+        DecisionEventRow,
+        f"t.decision_id IN (SELECT decision_id FROM decisions t WHERE {_RUN_IN_WINDOW})",
+        [window_id],
+    ):
+        events.setdefault(event.decision_id, []).append(event)
+    return [
+        DecisionWithEvents(d, tuple(events.get(d.decision_id, ())))  # type: ignore[arg-type]
+        for d in decisions
+    ]
+
+
+def fill_cursors(conn: duckdb.DuckDBPyConnection) -> list[FillCursorRow]:
+    """Every `fill_cursors` row (account-wide: collectors read `fills(since)` for
+    the whole account)."""
+    return _select(conn, FillCursorRow)
+
+
+def latest_collected_through(conn: duckdb.DuckDBPyConnection) -> datetime | None:
+    """The latest `collected_through` across every `fill_cursors` row, or None."""
+    through = [c.collected_through for c in fill_cursors(conn)]
+    return max(through) if through else None
+
+
+def kill_switch_events_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[KillSwitchRow]:
+    """The window's `kill_switch` rows; the derived state reads the last one."""
+    return _select(conn, KillSwitchRow, "t.window_id = ?", [window_id])
+
+
+def positions_daily_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, after: date | None = None
+) -> list[PositionDailyRow]:
+    """The window's marks (through their run) in session order, only those after
+    `after` when given."""
+    return _select(
+        conn,
+        PositionDailyRow,
+        f"{_RUN_IN_WINDOW} AND (? IS NULL OR t.session > ?)",
+        [window_id, after, after],
+        order=f"t.session, {_ORDER}",
+    )
+
+
+def last_marked_session(conn: duckdb.DuckDBPyConnection, window_id: int) -> date | None:
+    """The latest session the window has a mark for, or None: the mark step
+    writes every session after it through S-1."""
+    marks = positions_daily_for(conn, window_id)
+    return marks[-1].session if marks else None
+
+
+def adjustments_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, through_session: date | None = None
+) -> list[AdjustmentRow]:
+    """The window's `adjustments` rows, only those on or before `through_session`
+    when given."""
+    return _select(
+        conn,
+        AdjustmentRow,
+        "t.window_id = ? AND (? IS NULL OR t.session <= ?)",
+        [window_id, through_session, through_session],
+    )
+
+
+def reconciliations_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[ReconciliationRow]:
+    """The window's `reconciliations` rows."""
+    return _select(conn, ReconciliationRow, "t.window_id = ?", [window_id])
+
+
+def last_ok_reconciliation(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> ReconciliationRow | None:
+    """The window's latest `ok` reconciliation (the ledger's cash base), or None."""
+    rows = _select(conn, ReconciliationRow, "t.window_id = ? AND t.status = 'ok'", [window_id])
+    return rows[-1] if rows else None
+
+
+def rebalance_events_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> list[RebalanceEventRow]:
+    """The window's `rebalance_events` rows (through their run)."""
+    return _select(conn, RebalanceEventRow, _RUN_IN_WINDOW, [window_id])
+
+
+def plans_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperPlanRow]:
+    """The window's `paper_plans` rows (through their run)."""
+    return _select(conn, PaperPlanRow, _RUN_IN_WINDOW, [window_id])
+
+
+def signals_for(conn: duckdb.DuckDBPyConnection, run_id: int) -> list[SignalRow]:
+    """One planning run's `signals` rows."""
+    return _select(conn, SignalRow, "t.run_id = ?", [run_id])
+
+
+def overrides_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[OverrideWithConsumption]:
+    """The window's overrides in `override_id` order, each with the decisions and
+    `kill_switch` rows citing it (consumption is visible only through those)."""
+    overrides = _select(conn, OverrideRow, "t.window_id = ?", [window_id], order="t.override_id")
+    cited = "t.override_id IN (SELECT override_id FROM overrides WHERE window_id = ?)"
+    decisions: dict[int, list[int]] = {}
+    for d in _select(conn, DecisionRow, cited, [window_id], order="t.decision_id"):
+        decisions.setdefault(d.override_id, []).append(d.decision_id)  # type: ignore[arg-type]
+    engaged: dict[int, list[int]] = {}
+    for k in _select(conn, KillSwitchRow, cited, [window_id], order="t.event_id"):
+        engaged.setdefault(k.override_id, []).append(k.event_id)  # type: ignore[arg-type]
+    return [
+        OverrideWithConsumption(
+            o,
+            tuple(decisions.get(o.override_id, ())),  # type: ignore[arg-type]
+            tuple(engaged.get(o.override_id, ())),  # type: ignore[arg-type]
+        )
+        for o in overrides
+    ]
+
+
+def unconsumed_kill_switch_overrides(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> list[OverrideRow]:
+    """The window's `engage_kill_switch` overrides no `kill_switch` row cites yet:
+    they count as engaged until a run or phase boundary appends that row."""
+    return [
+        o.override
+        for o in overrides_for(conn, window_id)
+        if o.override.kind == "engage_kill_switch" and not o.kill_switch_event_ids
+    ]
+
+
+def paper_reports_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperReportRow]:
+    """The window's `paper_reports` rows."""
+    return _select(conn, PaperReportRow, "t.window_id = ?", [window_id])
+
+
+def resume_invocations(conn: duckdb.DuckDBPyConnection) -> list[ResumeInvocationRow]:
+    """Every `resume_invocations` row in `resume_id` order (the table has no
+    window; its outcome is the `kill_switch` row carrying the `resume_id`)."""
+    return _select(conn, ResumeInvocationRow, order="t.resume_id")
+
+
+def alerts_for(conn: duckdb.DuckDBPyConnection, *, kind: str, session: date) -> list[AlertRow]:
+    """The alerts under one dedupe key (`kind`, `alerts.session`)."""
+    return _select(
+        conn, AlertRow, "t.kind = ? AND t.session = ?", [kind, session], order="t.alert_id"
+    )
+
+
+def outcomes_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[OutcomeRow]:
+    """The window's `outcomes` rows (through their order's run)."""
+    return _select(conn, OutcomeRow, _ORDER_IN_WINDOW, [window_id, window_id])
