@@ -1,0 +1,1 @@
+- #306 Event-data spec: `docs/specs/event-data.md` (timestamped collectors for EDGAR 8-K and Form 4, the Federal Register and optional news metadata in a separate events file; an event-study engine registered and counted in the trial registry at store schema version 6; two clocks, fan-out, date-clustered errors; collectors first, engine after T45b; two open questions)
