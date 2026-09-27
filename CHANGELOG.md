@@ -72,6 +72,21 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Data: `edgar_raw.fsn_periods`, `fsn_zip` and `fsn_validators` for the SEC Financial Statement and Notes data sets; `python -m tradepartner.cli_record fsn`; config `edgar.fsn_first_year`, `edgar.header_forms`, `edgar.header_first_year` (#231).
 - T41 `bt` oracle test (`tests/oracle/test_bt_oracle.py`): our engine and `bt` agree on equity within 1e-9 on the fixture universe, delisted-name exit asserted in both (#236)
 - ADR 0009 (Proposed), price vendor: none for Phase 3, Alpaca SIP bars plus EDGAR with the survivorship gap gated; charter principle 4 amended; work-map entry (T29, #240).
+- Data: `edgar.parse_fsn`, `normalize_class_member`, `restore_class_letter_space` and `EdgarFilingSource._ensure_fsn` (per-CIK FSN caches with per-period manifests); the EDGAR run message reports FSN re-issues, duplicates and unchecked re-issues (#224).
+- Data: `EdgarFilingSource.cover_pages`/`filing_headers` serve FSN's per-CIK caches (T11c) stamped at read time, with per-document cover-page and ranged-SGML-header fallbacks (own `COVER_VERSION`/`HEADER_VERSION` caches, stamp stripped) for lag-window and registration-form accessions FSN does not hold; the EDGAR run message reports `.fsn_missing`; `store.classify`'s SIC evidence now reads `edgar.header_forms` instead of `master.issuer_forms` (#246).
+- Docs: Phase 4 paper-trading spec with requirements and testable acceptance criteria for the risk-gated broker wrapper, the daily tracking run, the journal, the pages, alerts and the lot ledger (#247)
+- Data: `EdgarFilingSource.facts` (T11e): company facts plus per-class cover shares from FSN and lag-window documents, stamped at read time, dated per the owner's 2026-09-26 rule and de-duplicated across sources; `facts_as_of` serves the latest-ingested row per (security, fact name, class, filing accession) (#252)
+- ADR 0010 (Proposed), Phase 4 risk rules: limits by `risk.*` key, per-phase pre-submit checks, journal-derived order ids (#254).
+- Docs: Phase 4 plan `docs/plans/paper-trading.md` (50 tasks, chains, verification, rollback) and its work-map entries (#255)
+- Data: `EdgarFilingSource.delistings(since)` (Forms 25 and 25-NSE over full history, root XML document, stamped at read time); pre-XML Form 25s are counted in the EDGAR run message (#261).
+- `tradepartner.errors`: the shared fault types (`SystemFaultError` and subclasses, `StaleDataError`); `FakeBroker` raises `ClockError` instead of `ValueError` on a bad clock (ADR 0007 Task A, #264).
+- Paper-trading journal tables at store schema version 5 (`schema.JOURNAL_TABLE_NAMES`, `JOURNAL_ENUMS`) and the `version_4_store` test helper (#265)
+- Config: Phase 4 sections `risk.*` (ADR 0010 point 1), `paper.*` and `alerts.*`, the guarded `alpaca.paper`, the trading client keys, the two broker facts left unset for the recording task, and the `ALPACA_PAPER_API_*`/`ALERT_*` variables (T47, #267)
+- Docs: ADR 0011 decides the dashboard technology for Phase 4 and after: Streamlit under the design standard, no separate API, React behind an API rejected with revisit conditions; the design standard's open decision now points at it (#268)
+- Docs: Phase 4 plan rows T66, T69 and T69b carry ADR 0011's amendments (submit-before-render, localhost refusal, `page_data` bound); no dependency changed (#273)
+- Docs: strategy-lab spec with testable acceptance criteria for sweeps, cadence as a hypothesis parameter, vintage and resumption, and registry growth, the shadow-paper replay deferred to a follow-up spec, plus the exact Phase 3 spec, ADR 0006 (as a superseding ADR), charter, paper-spec and roadmap sentences it amends (#281)
+- Broker: `AlpacaTradingRaw` paper trading raw client and the `cli_record paper` recording target; the fixture scrub covers paper keys and account ids (#282)
+- Journal writer and fills accessor (`store.journal`: row types, `append`, `fills_for`, `all_fill_ids`, `JournalNotInitialised`) (#285)
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -99,6 +114,9 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Dashboard: `backtest_page` charts use `theme.series_encodings`, `theme.bar_mark` and `theme.style`; both Phase 3 pages show the freshness header from the new `tradepartner.dashboard.header` (`store_freshness`, `Freshness`, `when`, `render_freshness`) (#185).
 - Phase 3 spec req 13 and plan: plan-read timing check added as task T40b; T45 depends on it (#201).
 - Plan: T11c, T11d, T11e, T11f replace the single T11c (FSN data sets for cover facts and SIC; `edgar.fsn_first_year`, `edgar.header_forms`, `edgar.header_first_year`, `edgar.max_filing_failures`, `edgar.min_failed_filings`, `edgar.max_failed_filing_share`); T19 depends on T11f; spec security-master table amended; work-map words for T11b to T11f (#216).
+- Broker interface completed for Phase 4 (spec req 1, #33): `OPEN` is renamed `ACCEPTED`, requests carry `notional` or `quantity` and no price, `cancel` returns `None`, and `get_order`, `open_orders`, `fills(since)`, `account` and `assets` are new; `FakeBroker` takes a `price_of` function (#277).
+- Docs: STATUS and CHANGELOG fold of the 2026-09-26/27 fragments, plan ticks and board refresh (#293)
+- Docs: Phase 4 plan T68 checkbox ticked, merged as #269 (#276)
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
