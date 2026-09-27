@@ -193,8 +193,8 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
     caller's `row` Mapping itself is never mutated; a new list of values is
     built for the bind.
 
-    `table` is always a name from `tradepartner.store.schema.TABLE_NAMES`
-    supplied by our own code, never external input.
+    `table` and the column names are always schema names supplied by our
+    own code (fact, registry or journal tables), never external input.
     """
     column_types = _column_types(conn, table)
     bound_values: list[Any] = []
@@ -217,7 +217,8 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
                 f"got {type(value).__name__}: {value!r}"
             )
         bound_values.append(value)
-    columns = ", ".join(row.keys())
+    # Quoted: the journal names a column `at`, a DuckDB keyword (Phase 4 T49).
+    columns = ", ".join(f'"{name}"' for name in row)
     placeholders = ", ".join("?" for _ in row)
     conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", bound_values)
 

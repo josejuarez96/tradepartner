@@ -25,7 +25,7 @@ by column type, before any row reaches these tables.
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
 EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
 If a store records a version this code has no path from (anything other
-than 2, 3 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+than 2, 3, 4 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
 `SchemaVersionError` rather than silently operating against a shape it
 does not know about.
 
@@ -58,7 +58,19 @@ registry; #83 took version 2 first, so the registry is version 3):
   failed migration leaves the store as it was. A read-only connection
   never migrates: a version-3 store raises `SchemaVersionError` naming the
   fix (open it for writing once).
-- **A later fact-table DDL change goes to version 5**, with its own
+- **Version 5** (Phase 4 T49): adds the paper-trading journal tables
+  (`JOURNAL_TABLE_NAMES`). The migration from version 2, 3 or 4 is
+  additive for the journal: it creates the journal tables and appends a
+  version-5 row (after the version-3 and version-4 steps when those are
+  due); no fact or registry table changes. **Any** write connection
+  migrates, `ingest` included, so the owner's store reaches version 5 on
+  the first nightly run after this version is pulled: the owner copies the
+  store file before that pull (the Phase 4 runbook repeats this). A
+  read-only connection never migrates, and it accepts a version-4 store as
+  a pre-journal version, so fact and registry reads keep working there; a
+  journal read on such a store is `store.journal`'s
+  `JournalNotInitialised`, raised when the tables are absent.
+- **A later fact-table DDL change goes to version 6**, with its own
   migration and a note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -71,6 +83,22 @@ only); the only schema-level backstops are the primary keys (one
 columns (`trials.kind`, `trial_results.status`, `owner_decisions.kind`).
 No foreign keys are declared, as for the fact tables; ids are assigned by
 `store.registry`, not by a sequence.
+
+Journal tables (Phase 4 spec "Data / interfaces" > Tables) are not fact
+tables either: they carry `known_at` (the shared clock's reading when the
+system learned or decided the fact; a broker timestamp is never a
+`known_at`) and `ingested_at`, both NOT NULL with `known_at <=
+ingested_at`, but no `source` or `provenance`, and they stay out of
+`TABLE_NAMES`. Append-only by contract (`store.journal` exposes inserts and
+reads only), so no column is filled in later. Schema-level backstops: a
+primary key on each table's own id, `fills.broker_fill_id` UNIQUE, a
+`CHECK` on every column the spec enumerates as a closed set (an open set,
+written with "…" in the spec, gets none), `overrides.reason` non-blank
+after trimming, and a positive `price` on `broker_feed` fills. A column is
+NOT NULL only where the spec's rules say it always has a value; anything
+conditional (a reason, a fault type, a broker id, a JSON detail) is
+nullable. No foreign keys, as for the other tables; ids come from
+`store.journal`.
 
 Design decisions (not pinned by the spec text, recorded here because
 they shape this DDL):
@@ -128,7 +156,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 }
 
 #: The schema version `init_schema` records on a fresh store and migrates
-#: a version-2 or version-3 store to. Bump and add a migration note (not
+#: a version-2, 3 or 4 store to. Bump and add a migration note (not
 #: silent DDL edits) if the shape of a table changes after data has been
 #: loaded.
 #:
@@ -148,7 +176,11 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #:   `known_at`. Migration from version 2 or 3: the table is rebuilt in one
 #:   transaction with every existing row kept and given `source_action_id =
 #:   ''`, `cancelled = FALSE`, which is exactly its identity before (#108).
-CURRENT_SCHEMA_VERSION = 4
+#: - 5 (Phase 4 T49): the paper-trading journal tables
+#:   (`JOURNAL_TABLE_NAMES`). Additive migration from version 2, 3 or 4: the
+#:   journal tables are created and a version-5 row appended; no fact or
+#:   registry table changes (module docstring, "Schema versions").
+CURRENT_SCHEMA_VERSION = 5
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -156,6 +188,10 @@ _PRE_REGISTRY_VERSION = 2
 #: The last version without action identity (#108): the registry, and
 #: `corporate_actions` still keyed by `(security_id, action_type, ex_date)`.
 _PRE_ACTION_IDENTITY_VERSION = 3
+
+#: The last version without the journal (#108's action identity and the
+#: registry): read-only connections still serve fact and registry reads.
+_PRE_JOURNAL_VERSION = 4
 
 
 class SchemaVersionError(RuntimeError):
@@ -545,6 +581,596 @@ _REGISTRY_TABLE_DDL: tuple[str, ...] = (
 )
 
 
+# Paper-trading journal (schema version 5; Phase 4 spec "Data / interfaces"
+# > Tables and module docstring). Every JSON payload is VARCHAR, as in the
+# registry. Money and quantities are DOUBLE (fractional shares).
+_JOURNAL_TIMESTAMPS = """
+    known_at TIMESTAMPTZ NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL,
+    CHECK (known_at <= ingested_at)
+"""
+
+
+SIDES: tuple[str, ...] = ("buy", "sell")
+
+#: Every journal column the spec enumerates as a closed set, with its allowed
+#: values; the DDL turns each into a `CHECK`. Columns in `NULLABLE_JOURNAL_ENUMS`
+#: may also be NULL: the spec lists `null` among their values, or the row can
+#: lack the thing (a skip decision has no side, a non-session run no kind).
+JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("paper_window_stops", "state"): ("requested", "closed", "abandoned"),
+    ("paper_runs", "kind"): ("rebalance", "catch_up", "mark", "stop"),
+    ("paper_runs", "invoked_by"): ("scheduler", "tty"),
+    ("paper_run_results", "status"): (
+        "ok",
+        "halted",
+        "stale",
+        "skipped_kill_switch",
+        "crashed",
+        "failed",
+        "no_session",
+    ),
+    ("rebalance_events", "status"): ("executed", "missed"),
+    ("rebalance_events", "reason"): (
+        "catch_up_lapsed",
+        "kill_switch",
+        "limit_breach",
+        "skip_cap",
+        "window_stop",
+    ),
+    ("signals", "reason"): ("selected", "below_cut", "excluded_no_history"),
+    ("decisions", "side"): SIDES,
+    ("decisions", "decision"): (
+        "trade",
+        "skip_below_minimum",
+        "skip_untradable",
+        "skip_below_one_share",
+        "skip_delisted",
+        "skip_zero",
+        "dust",
+        "override",
+        "forced_exit",
+    ),
+    ("decision_events", "status"): ("skipped", "written_off"),
+    ("decision_events", "reason"): (
+        "skip_below_one_share",
+        "skip_untradable",
+        "skip_below_minimum",
+        "skip_delisted",
+        "dust",
+        "untradable",
+        "unfunded",
+    ),
+    ("orders", "phase"): ("sell", "buy", "exit"),
+    ("orders", "side"): SIDES,
+    ("order_events", "status"): (
+        "pending",
+        "accepted",
+        "replay",
+        "cancel_requested",
+        "cancel_noop",
+        "cancel_failed",
+        "filled",
+        "expired",
+        "rejected",
+        "cancelled",
+    ),
+    ("fills", "source"): ("broker_feed", "broker_status"),
+    ("fill_cursors", "writer_kind"): ("run", "resume"),
+    ("outcomes", "kind"): ("position_return", "realised_pnl", "not_executed"),
+    ("adjustments", "kind"): (
+        "corporate_action_cash",
+        "dividend_cash",
+        "spinoff_receipt",
+        "carried_residue",
+    ),
+    ("adjustments", "origin"): ("dust", "untradable"),
+    ("reconciliations", "status"): ("ok", "mismatch", "pending_unresolved", "fills_lagging"),
+    ("kill_switch", "state"): ("engaged", "released"),
+    ("kill_switch", "source"): ("owner", "fault", "drawdown"),
+    ("overrides", "kind"): ("exclude_name", "keep_name", "engage_kill_switch"),
+}
+
+NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("rebalance_events", "reason"),
+        ("decisions", "side"),
+        ("paper_runs", "kind"),
+        ("decision_events", "reason"),
+        ("adjustments", "origin"),
+    }
+)
+
+
+def _check(table: str, column: str) -> str:
+    """The `CHECK` restricting `table.column` to its `JOURNAL_ENUMS` values (and
+    NULL when it is in `NULLABLE_JOURNAL_ENUMS`)."""
+    allowed = ", ".join(f"'{value}'" for value in JOURNAL_ENUMS[table, column])
+    check = f"{column} IN ({allowed})"
+    if (table, column) in NULLABLE_JOURNAL_ENUMS:
+        return f"CHECK ({column} IS NULL OR {check})"
+    return f"CHECK ({check})"
+
+
+_CREATE_PAPER_WINDOWS = f"""
+CREATE TABLE IF NOT EXISTS paper_windows (
+    window_id BIGINT NOT NULL PRIMARY KEY,
+    hypothesis_id BIGINT NOT NULL,
+    first_rebalance_session DATE NOT NULL,
+    account_id VARCHAR NOT NULL,
+    starting_cash DOUBLE NOT NULL,
+    starting_equity DOUBLE NOT NULL,
+    code_version VARCHAR NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    frozen_json VARCHAR NOT NULL,
+    frozen_sha256 VARCHAR NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+# `abandoned` from the start (#247 Q13; T64b amends the spec to match).
+_CREATE_PAPER_WINDOW_STOPS = f"""
+CREATE TABLE IF NOT EXISTS paper_window_stops (
+    window_id BIGINT NOT NULL,
+    "at" TIMESTAMPTZ NOT NULL,
+    state VARCHAR NOT NULL,
+    reason VARCHAR,
+    reconciliation_id BIGINT,
+    residues_json VARCHAR,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("paper_window_stops", "state")}
+)
+"""
+
+# code_dirty is NULL outside a git checkout, as `trials.code_dirty`. On a
+# non-session day the run has no S and no kind (it exits with a `no_session`
+# result), so session and kind are NULL together.
+_CREATE_PAPER_RUNS = f"""
+CREATE TABLE IF NOT EXISTS paper_runs (
+    run_id BIGINT NOT NULL PRIMARY KEY,
+    window_id BIGINT NOT NULL,
+    session DATE,
+    kind VARCHAR,
+    started_at TIMESTAMPTZ NOT NULL,
+    invoked_by VARCHAR NOT NULL,
+    code_version VARCHAR NOT NULL,
+    code_dirty BOOLEAN,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("paper_runs", "kind")},
+    {_check("paper_runs", "invoked_by")},
+    CHECK ((session IS NULL) = (kind IS NULL))
+)
+"""
+
+# One result per run: a run's outcome is this row, never an update; a run
+# without one is `unfinished`.
+_CREATE_PAPER_RUN_RESULTS = f"""
+CREATE TABLE IF NOT EXISTS paper_run_results (
+    run_id BIGINT NOT NULL PRIMARY KEY,
+    finished_at TIMESTAMPTZ NOT NULL,
+    status VARCHAR NOT NULL,
+    fault_type VARCHAR,
+    message VARCHAR,
+    clock_fault BOOLEAN NOT NULL,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("paper_run_results", "status")}
+)
+"""
+
+# One plan per planning run (a catch-up re-uses the decisions, never re-plans).
+# store_max_ingested_at is NULL on a store with no fact rows, as in `trials`.
+_CREATE_PAPER_PLANS = f"""
+CREATE TABLE IF NOT EXISTS paper_plans (
+    run_id BIGINT NOT NULL PRIMARY KEY,
+    plan_trial_id BIGINT NOT NULL,
+    rebalance_session DATE NOT NULL,
+    store_max_ingested_at TIMESTAMPTZ,
+    n_universe INTEGER NOT NULL,
+    n_targets INTEGER NOT NULL,
+    n_orders_below_min_at_live_capital INTEGER NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+# `pending` is derived (F_i <= S and no row), never stored.
+_CREATE_REBALANCE_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS rebalance_events (
+    rebalance_session DATE NOT NULL,
+    run_id BIGINT NOT NULL,
+    status VARCHAR NOT NULL,
+    reason VARCHAR,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("rebalance_events", "status")},
+    {_check("rebalance_events", "reason")}
+)
+"""
+
+_CREATE_PAPER_REPORTS = f"""
+CREATE TABLE IF NOT EXISTS paper_reports (
+    window_id BIGINT NOT NULL,
+    trial_id BIGINT NOT NULL,
+    through_session DATE NOT NULL,
+    run_at TIMESTAMPTZ NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+# score and rank are NULL for a name excluded for lack of history.
+_CREATE_SIGNALS = f"""
+CREATE TABLE IF NOT EXISTS signals (
+    run_id BIGINT NOT NULL,
+    rebalance_session DATE NOT NULL,
+    security_id VARCHAR NOT NULL,
+    score DOUBLE,
+    rank INTEGER,
+    reason VARCHAR NOT NULL,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("signals", "reason")}
+)
+"""
+
+# rebalance_session is NULL for a decision outside a rebalance (a forced
+# exit); side is NULL on a decision that trades nothing (a skip, dust).
+# `reason` is an open set in the spec ("…"), so it has no CHECK.
+# whole_share is the fractionable flag at decision time, read from this row
+# and never from the live asset.
+_CREATE_DECISIONS = f"""
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id BIGINT NOT NULL PRIMARY KEY,
+    run_id BIGINT NOT NULL,
+    rebalance_session DATE,
+    security_id VARCHAR NOT NULL,
+    target_weight DOUBLE,
+    drifted_weight DOUBLE,
+    side VARCHAR,
+    planned_notional DOUBLE,
+    planned_quantity DOUBLE,
+    target_notional DOUBLE,
+    whole_share BOOLEAN NOT NULL,
+    decision VARCHAR NOT NULL,
+    reason VARCHAR,
+    override_id BIGINT,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("decisions", "side")},
+    {_check("decisions", "decision")}
+)
+"""
+
+_CREATE_DECISION_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS decision_events (
+    decision_id BIGINT NOT NULL,
+    run_id BIGINT NOT NULL,
+    status VARCHAR NOT NULL,
+    reason VARCHAR,
+    unfunded_notional DOUBLE,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("decision_events", "status")},
+    {_check("decision_events", "reason")}
+)
+"""
+
+# An order is sized by notional or by quantity, so each may be NULL.
+_CREATE_ORDERS = f"""
+CREATE TABLE IF NOT EXISTS orders (
+    client_order_id VARCHAR NOT NULL PRIMARY KEY,
+    decision_id BIGINT NOT NULL,
+    run_id BIGINT NOT NULL,
+    session DATE NOT NULL,
+    attempt INTEGER NOT NULL,
+    phase VARCHAR NOT NULL,
+    security_id VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL,
+    side VARCHAR NOT NULL,
+    notional DOUBLE,
+    quantity DOUBLE,
+    sells_in_flight_at_submit BOOLEAN NOT NULL,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("orders", "phase")},
+    {_check("orders", "side")}
+)
+"""
+
+# event_at is the broker's instant (NULL before the broker has one, e.g. a
+# `pending` row written before submit); `reason` is an open set.
+_CREATE_ORDER_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS order_events (
+    client_order_id VARCHAR NOT NULL,
+    event_at TIMESTAMPTZ,
+    status VARCHAR NOT NULL,
+    reason VARCHAR,
+    broker_order_id VARCHAR,
+    filled_quantity DOUBLE,
+    filled_avg_price DOUBLE,
+    raw_json VARCHAR,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("order_events", "status")}
+)
+"""
+
+# quantity is unsigned (side comes from the order). A `broker_status` row is
+# the implied residual that completes an order (`broker_fill_id =
+# synthetic:<client_order_id>`): its price is stored as computed and flagged
+# price_implied, which is exactly `source = 'broker_status'`; only
+# `broker_feed` rows must have a positive price. A
+# later real fill supersedes it through superseded_by; every reader goes
+# through `store.journal`'s accessor, which hides superseded rows.
+_CREATE_FILLS = f"""
+CREATE TABLE IF NOT EXISTS fills (
+    fill_id BIGINT NOT NULL PRIMARY KEY,
+    client_order_id VARCHAR NOT NULL,
+    filled_at TIMESTAMPTZ NOT NULL,
+    quantity DOUBLE NOT NULL,
+    price DOUBLE NOT NULL,
+    price_implied BOOLEAN NOT NULL,
+    broker_fill_id VARCHAR NOT NULL UNIQUE,
+    source VARCHAR NOT NULL,
+    superseded_by BIGINT,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("fills", "source")},
+    CHECK (quantity > 0),
+    CHECK (price_implied = (source = 'broker_status')),
+    CHECK (source <> 'broker_feed' OR price > 0)
+)
+"""
+
+_CREATE_FILL_CURSORS = f"""
+CREATE TABLE IF NOT EXISTS fill_cursors (
+    writer_kind VARCHAR NOT NULL,
+    writer_id BIGINT NOT NULL,
+    collected_through TIMESTAMPTZ NOT NULL,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("fill_cursors", "writer_kind")}
+)
+"""
+
+# Written first; the outcome is the `kill_switch` `released` row carrying
+# this resume_id, or its absence.
+_CREATE_RESUME_INVOCATIONS = f"""
+CREATE TABLE IF NOT EXISTS resume_invocations (
+    resume_id BIGINT NOT NULL PRIMARY KEY,
+    "at" TIMESTAMPTZ NOT NULL,
+    reason VARCHAR NOT NULL,
+    accept_broker_fills BOOLEAN NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+_CREATE_OUTCOMES = f"""
+CREATE TABLE IF NOT EXISTS outcomes (
+    client_order_id VARCHAR NOT NULL,
+    through_session DATE NOT NULL,
+    kind VARCHAR NOT NULL,
+    value DOUBLE,
+    contribution DOUBLE,
+    mark_price DOUBLE,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("outcomes", "kind")}
+)
+"""
+
+# A session with no position (cash only, as at close(T_0) or after a full
+# exit) is one row with security_id NULL and quantity 0, so its equity (cash)
+# is still marked.
+_CREATE_POSITIONS_DAILY = f"""
+CREATE TABLE IF NOT EXISTS positions_daily (
+    run_id BIGINT NOT NULL,
+    session DATE NOT NULL,
+    security_id VARCHAR,
+    quantity DOUBLE NOT NULL,
+    mark_price DOUBLE,
+    value DOUBLE,
+    cash DOUBLE,
+    tradable BOOLEAN,
+    {_JOURNAL_TIMESTAMPS},
+    CHECK (security_id IS NOT NULL OR quantity = 0)
+)
+"""
+
+_CREATE_ADJUSTMENTS = f"""
+CREATE TABLE IF NOT EXISTS adjustments (
+    adjustment_id BIGINT NOT NULL PRIMARY KEY,
+    window_id BIGINT NOT NULL,
+    run_id BIGINT,
+    session DATE NOT NULL,
+    kind VARCHAR NOT NULL,
+    origin VARCHAR,
+    security_id VARCHAR,
+    quantity DOUBLE,
+    cash DOUBLE,
+    explanation_json VARCHAR,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("adjustments", "kind")},
+    {_check("adjustments", "origin")}
+)
+"""
+
+_CREATE_RECONCILIATIONS = f"""
+CREATE TABLE IF NOT EXISTS reconciliations (
+    reconciliation_id BIGINT NOT NULL PRIMARY KEY,
+    window_id BIGINT NOT NULL,
+    run_id BIGINT,
+    "at" TIMESTAMPTZ NOT NULL,
+    status VARCHAR NOT NULL,
+    broker_cash DOUBLE,
+    mismatches_json VARCHAR,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("reconciliations", "status")}
+)
+"""
+
+_CREATE_KILL_SWITCH = f"""
+CREATE TABLE IF NOT EXISTS kill_switch (
+    event_id BIGINT NOT NULL PRIMARY KEY,
+    window_id BIGINT NOT NULL,
+    "at" TIMESTAMPTZ NOT NULL,
+    state VARCHAR NOT NULL,
+    source VARCHAR NOT NULL,
+    fault_type VARCHAR,
+    reason VARCHAR,
+    run_id BIGINT,
+    override_id BIGINT,
+    resume_id BIGINT,
+    reconciliation_id BIGINT,
+    peak_equity DOUBLE,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("kill_switch", "state")},
+    {_check("kill_switch", "source")}
+)
+"""
+
+# The frozen `paper.min_override_reason_chars` is checked by the writer; the
+# schema refuses a blank reason whatever the config says.
+_CREATE_OVERRIDES = f"""
+CREATE TABLE IF NOT EXISTS overrides (
+    override_id BIGINT NOT NULL PRIMARY KEY,
+    window_id BIGINT NOT NULL,
+    made_at TIMESTAMPTZ NOT NULL,
+    rebalance_session DATE,
+    security_id VARCHAR,
+    kind VARCHAR NOT NULL,
+    reason VARCHAR NOT NULL,
+    {_JOURNAL_TIMESTAMPS},
+    {_check("overrides", "kind")},
+    CHECK (length(trim(reason)) >= 1)
+)
+"""
+
+# run_id is NULL for an alert raised outside a run (`locked`, `no_window`).
+# session is the run's S, or the calendar session containing `at` (the next
+# one on a non-session day): always set, since alerts dedupe on it.
+_CREATE_ALERTS = f"""
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id BIGINT NOT NULL PRIMARY KEY,
+    run_id BIGINT,
+    session DATE NOT NULL,
+    kind VARCHAR NOT NULL,
+    message VARCHAR NOT NULL,
+    "at" TIMESTAMPTZ NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+_CREATE_ALERT_DELIVERIES = f"""
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    alert_id BIGINT NOT NULL,
+    channel VARCHAR NOT NULL,
+    "at" TIMESTAMPTZ NOT NULL,
+    ok BOOLEAN NOT NULL,
+    error VARCHAR,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+# cusip is NULL when the broker's asset has none; fill_id is NULL for a lot
+# merged from an order's fills at its average price (a `price_implied` fill).
+_CREATE_LOTS = f"""
+CREATE TABLE IF NOT EXISTS lots (
+    lot_id BIGINT NOT NULL PRIMARY KEY,
+    account_id VARCHAR NOT NULL,
+    account_type VARCHAR NOT NULL,
+    account_owner VARCHAR NOT NULL,
+    security_id VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL,
+    cusip VARCHAR,
+    trade_at TIMESTAMPTZ NOT NULL,
+    trade_date_local DATE NOT NULL,
+    quantity DOUBLE NOT NULL,
+    cost_basis DOUBLE NOT NULL,
+    fill_id BIGINT,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+_CREATE_DISPOSALS = f"""
+CREATE TABLE IF NOT EXISTS disposals (
+    disposal_id BIGINT NOT NULL PRIMARY KEY,
+    lot_id BIGINT NOT NULL,
+    account_id VARCHAR NOT NULL,
+    trade_at TIMESTAMPTZ NOT NULL,
+    trade_date_local DATE NOT NULL,
+    quantity DOUBLE NOT NULL,
+    proceeds DOUBLE NOT NULL,
+    realised_pnl DOUBLE NOT NULL,
+    tax_year INTEGER NOT NULL,
+    fill_id BIGINT,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+_CREATE_WASH_SALE_FLAGS = f"""
+CREATE TABLE IF NOT EXISTS wash_sale_flags (
+    flag_id BIGINT NOT NULL PRIMARY KEY,
+    disposal_id BIGINT NOT NULL,
+    replacement_lot_id BIGINT NOT NULL,
+    matched_quantity DOUBLE NOT NULL,
+    disallowed_amount DOUBLE NOT NULL,
+    scanned_at TIMESTAMPTZ NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+#: The paper-trading journal tables added at schema version 5, disjoint
+#: from `TABLE_NAMES` and `REGISTRY_TABLE_NAMES`, so the look-ahead harness
+#: never sees them.
+JOURNAL_TABLE_NAMES: tuple[str, ...] = (
+    "paper_windows",
+    "paper_window_stops",
+    "paper_runs",
+    "paper_run_results",
+    "paper_plans",
+    "rebalance_events",
+    "paper_reports",
+    "signals",
+    "decisions",
+    "decision_events",
+    "orders",
+    "order_events",
+    "fills",
+    "fill_cursors",
+    "resume_invocations",
+    "outcomes",
+    "positions_daily",
+    "adjustments",
+    "reconciliations",
+    "kill_switch",
+    "overrides",
+    "alerts",
+    "alert_deliveries",
+    "lots",
+    "disposals",
+    "wash_sale_flags",
+)
+
+_JOURNAL_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_PAPER_WINDOWS,
+    _CREATE_PAPER_WINDOW_STOPS,
+    _CREATE_PAPER_RUNS,
+    _CREATE_PAPER_RUN_RESULTS,
+    _CREATE_PAPER_PLANS,
+    _CREATE_REBALANCE_EVENTS,
+    _CREATE_PAPER_REPORTS,
+    _CREATE_SIGNALS,
+    _CREATE_DECISIONS,
+    _CREATE_DECISION_EVENTS,
+    _CREATE_ORDERS,
+    _CREATE_ORDER_EVENTS,
+    _CREATE_FILLS,
+    _CREATE_FILL_CURSORS,
+    _CREATE_RESUME_INVOCATIONS,
+    _CREATE_OUTCOMES,
+    _CREATE_POSITIONS_DAILY,
+    _CREATE_ADJUSTMENTS,
+    _CREATE_RECONCILIATIONS,
+    _CREATE_KILL_SWITCH,
+    _CREATE_OVERRIDES,
+    _CREATE_ALERTS,
+    _CREATE_ALERT_DELIVERIES,
+    _CREATE_LOTS,
+    _CREATE_DISPOSALS,
+    _CREATE_WASH_SALE_FLAGS,
+)
+
+
 def _is_read_only(conn: duckdb.DuckDBPyConnection) -> bool:
     """Whether `conn`'s current database is attached read-only."""
     result = conn.execute(
@@ -570,8 +1196,8 @@ def _max_version(conn: duckdb.DuckDBPyConnection) -> int | None:
 def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
     """The read-only path of `init_schema`: no DDL, only a version check."""
     max_version = _max_version(conn)
-    if max_version == CURRENT_SCHEMA_VERSION:
-        return
+    if max_version in (_PRE_JOURNAL_VERSION, CURRENT_SCHEMA_VERSION):
+        return  # a version-4 store serves fact and registry reads; no journal
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
         raise SchemaVersionError(
             f"store has schema version {max_version}, this code expects "
@@ -660,7 +1286,7 @@ def _migrate_action_identity(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 or version-3 store to version 4.
+    version-2, version-3 or version-4 store to version 5.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -672,15 +1298,18 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; a version-3 store gets `corporate_actions`
-    rebuilt with the version-4 columns (every row kept) and an appended
-    version-4 row; a version-2 store gets that plus the registry tables and
-    a version-3 row. Nothing else changes (module docstring, "Schema
-    versions").
+    `CURRENT_SCHEMA_VERSION`; a version-4 store gets the journal tables and
+    an appended version-5 row; a version-3 store gets that plus
+    `corporate_actions` rebuilt with the version-4 columns (every row kept)
+    and a version-4 row; a version-2 store gets all of that plus the
+    registry tables and a version-3 row. Nothing else changes (module
+    docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-4 store passes, a
-    version-2 or uninitialised store raises `RegistryNotInitialised`, and a
-    version-3 store raises `SchemaVersionError`.
+    On a read-only connection no DDL runs: a version-5 store passes, and so
+    does a version-4 store (fact and registry reads work; the journal
+    tables are absent, which `store.journal` reports); a version-2 or
+    uninitialised store raises `RegistryNotInitialised`, and a version-3
+    store raises `SchemaVersionError`.
 
     Raises `SchemaVersionError` if the store records any other version:
     this module has no migration from it, so operating on a store shaped
@@ -692,15 +1321,16 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         forget_column_types(conn)
         return
     max_version = _max_version(conn)
-    migratable = (_PRE_REGISTRY_VERSION, _PRE_ACTION_IDENTITY_VERSION)
+    pre_identity = (_PRE_REGISTRY_VERSION, _PRE_ACTION_IDENTITY_VERSION)
+    migratable = (*pre_identity, _PRE_JOURNAL_VERSION)
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
             f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
         )
     with _atomic(conn):
-        if max_version in migratable:
+        if max_version in pre_identity:
             _migrate_action_identity(conn)
-        for ddl in _TABLE_DDL + _REGISTRY_TABLE_DDL:
+        for ddl in _TABLE_DDL + _REGISTRY_TABLE_DDL + _JOURNAL_TABLE_DDL:
             conn.execute(ddl)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
