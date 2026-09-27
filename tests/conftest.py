@@ -248,3 +248,27 @@ def fixture_store_path(tmp_path: Path) -> Path:
     finally:
         conn.close()
     return path
+
+
+def version_4_store(path: Path) -> Path:
+    """Write a store file at `path` shaped as `init_schema` left it at schema
+    version 4 (fact and registry tables, no journal; Phase 4 plan T49) with
+    the fixture universe loaded and one `schema_version` row, and return
+    `path`. Built from the current fact and registry DDL, which version 5 left
+    unchanged (pinned by hash in `tests/store/test_journal_schema.py`), and
+    never through `init_schema`, which would migrate it. For journal code
+    that must refuse, and fact or registry reads that must still work, on a
+    store no write has touched since T49."""
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        for ddl in schema._TABLE_DDL + schema._REGISTRY_TABLE_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (4, TIMESTAMPTZ "
+            "'2026-09-26 12:00:00+00')"
+        )
+        load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
+    finally:
+        conn.close()
+    return path

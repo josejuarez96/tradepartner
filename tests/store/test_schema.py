@@ -808,8 +808,9 @@ def test_corporate_actions_carry_source_action_id_and_cancelled(
     ).fetchall() == [("", False)]
 
 
-def test_schema_version_is_bumped_for_action_identity() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 4
+def test_schema_version_is_bumped_past_action_identity() -> None:
+    """#108 took version 4; the Phase 4 journal (T49) is version 5."""
+    assert schema.CURRENT_SCHEMA_VERSION == 5
 
 
 def test_two_source_ids_may_share_an_ex_date_and_known_at(
