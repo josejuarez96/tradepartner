@@ -1,0 +1,1 @@
+- #273 Phase 4 plan rows T66, T69 and T69b amended per ADR 0011: the override submit before the shell's read-only render, the localhost and telemetry refusal with `.streamlit/config.toml`, and the `page_data` row bound (`dashboard.page_row_limit`) with a timing check
