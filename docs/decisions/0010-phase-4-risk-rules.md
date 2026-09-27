@@ -1,0 +1,61 @@
+# 0010. Phase 4 risk rules: the limits, when they are checked, and how an order id is derived
+
+**Status:** Accepted (by merging PR #256; owner decision on #247 question 12, 2026-09-26 ET)  ·  **Date:** 2026-09-26  ·  **Issue:** #254  ·  **Amends:** ADR 0007 point 6
+
+## Context
+
+ADR 0005 names "Risk rules (Phase 4 ADR)" as the record of what stands between a signal and an order, and the development process requires an ADR for any change to a risk rule. ADR 0007 decided that rejection is an allowlist and everything else halts (point 1), that a duplicate client order id is an idempotent replay whose derivation "the Phase 4 spec owns" (point 3), that the clock is checked before any order (point 5), and that the wrapper "builds and validates every request of a run before it submits the first one" (point 6). The Phase 4 spec ([paper-trading.md](../specs/paper-trading.md), reqs 3 to 5, merged as #248) defines the wrapper in enough detail that three things need a decision record rather than a spec sentence: which limits are the risk rules and their defaults, when the checks run in a two-phase run, and what the id derivation is. The spec itself says its per-phase validation deviates from ADR 0007 point 6 and that the deviation is recorded here. The owner chose option (a) of the spec's question 12 on #247 (2026-09-26 ET): a short ADR, with ADR 0009 accepted first (#251).
+
+Two facts shape the rules. Paper executes each rebalance in two phases on one session: sells before the open, then buys sized from the cash the sells actually raised, never from buying power. And an order attempt is journaled before it is submitted, so the journal, not the broker, is the source of truth for what was tried.
+
+## Options considered
+
+1. **Record the rules and defaults here, checks before each phase's first submit, id derived from the journal with an attempt number** (this ADR). Pro: one place names every limit, its key and its default; the per-phase check matches how buys are sized; the id is a pure function of the journal, so a crash cannot produce two live orders for one decision. Con: a rule change needs a new ADR, which is the point.
+2. **Let the spec be the record.** Pro: no extra document. Con: the spec is a Draft that Phase 6 will amend; a risk rule inside a 190-line requirement is easy to change without noticing, and ADR 0005 and the process both ask for an ADR.
+3. **Validate once per run, before the sells, as ADR 0007 point 6 words it.** Pro: simpler. Con: buy requests do not exist until the sells have filled, so a once-per-run validation would either check unsized requests or skip them.
+4. **ADR 0007's own example id, rebalance session plus symbol plus side, with no attempt number.** Pro: shorter. Con: a re-attempt after an expiry or a partial fill would reuse a terminal order's id and be adopted as a replay of the wrong order.
+
+## Decision
+
+We will record the Phase 4 risk rules here. Every limit is a named key under `risk.*` in config, the whole section frozen into the paper window at `paper start` and read from the window afterwards (spec req 14), except `alpaca.quantity_decimals`, which the recording task sets and the adapter reads at run time, and the rejection allowlist, which stays a frozen code constant per ADR 0007 point 1. No other risk limit is a literal in code.
+
+**1. The limits and their defaults.**
+
+| Rule | Key | Default | On breach |
+|---|---|---|---|
+| per-name target weight | `risk.max_position_weight` | 0.05 | batch halts, `LimitBreachError` (every "batch halts" row below raises it) |
+| per-order notional as a fraction of equity | `risk.max_order_notional_fraction` | 0.05 | batch halts |
+| gross exposure after the batch (no leverage, the charter's rule) | `risk.max_gross_exposure` | 1.0 | batch halts |
+| every sell quantity ≤ the reconciled holding, rounded down to `alpaca.quantity_decimals` (long-only, no shorts, ever) | none, structural | n/a | batch halts |
+| buys sized after the modelled cost (`costs.*`) within `account().cash`, never `buying_power` | none, structural | n/a | batch halts |
+| order count per run | `risk.max_orders_per_run` | 250 | batch halts |
+| skips other than `dust` and `untradable` per run | `risk.max_skips_per_run` | 10 | `SkipCapError`, rebalance `missed` (`skip_cap`) |
+| asynchronous rejections per submitting run, or every order rejected | `risk.max_rejections_per_run` | 5 | `RejectionCapError` |
+| drawdown of ledger equity at the mark step below the window's peak by more than this fraction (strict; peak initially `paper_windows.starting_equity`, reset at each release to the last-mark ledger equity; fires once per crossing) | `risk.max_drawdown` | 0.30 | kill switch engaged (source `drawdown`) and alert, for an owner review released with a reason; not an exit rule |
+| minimum order notional | `risk.min_order_notional` | 1.0 (Alpaca's fractional minimum per H1's note, unverified until the recording task) | skip `skip_below_minimum` when the target is below it; a scaled attempt below it while the remainder is above is deferred, not skipped and not counted toward the cap; a full exit below it is `dust`, cap-exempt |
+| whole-share buy checked against cash at close(S−1) plus this fraction | `risk.whole_share_price_buffer` | 0.02 | skip or defer |
+| cash left after execution above this share of equity | `risk.max_unspent_cash_fraction` | 0.05 | alert only |
+| a fill still lagging at a `paper run` collection at or after this many sessions (≥ 1) past the first reconciliation that listed it | `risk.max_fill_lag_sessions` | 1 | `ReconciliationError` (a `mismatch` row if the switch is already engaged; `paper resume` refuses) |
+| clock reading later than close(S) by more than this many sessions | `risk.clock_max_sessions_late` | 1 | `ClockError` |
+| broker timestamp later than the clock reading by more than this | `risk.max_broker_clock_skew_seconds` | 60 | `ClockError` |
+| reconciliation quantity and cash tolerances | `risk.reconcile_quantity_tolerance`, `risk.reconcile_cash_tolerance` | 1e-6, 0.01 | `ReconciliationError` outside them |
+
+`risk.max_rejections_per_run` replaces ADR 0007's proposed `exec.max_rejections_per_run`; rejections count against the submitting run. Per-name conditions skip the name with a journaled reason instead of halting: not tradable (`skip_untradable`), a whole-share quantity that rounds to zero (`skip_below_one_share`), a notional below the minimum, a listing that ended (`skip_delisted`, handled by forced exits). A `LimitBreachError` or `SkipCapError` in a batch that contains a rebalance's decisions marks that rebalance `missed` (`limit_breach` or `skip_cap`); a forced-exits-only batch that halts leaves the pending rebalance pending. Values that the recording task sets before the first `paper start` (`risk.min_order_notional`, the two reconciliation tolerances, per spec questions 5 and 14) are confirmed by the recording PR, which appends a dated "Amendment" section to this ADR (ADR 0004 precedent) and updates the spec and config; after the first `paper start`, any change to a default is a new ADR.
+
+**2. When the checks run: before each phase's first submit, for every wrapper batch (rebalance, catch-up, forced-exits-only and `stop`).** This amends ADR 0007 point 6: requests are built and validated before each phase's first submit, not before the run's, because buys are sized from cash the sells raised and cannot be built earlier. ADR 0007 point 5 is kept as written and repeated before the buys phase. Before each phase, in this order, the wrapper: reads the derived kill-switch state and any unconsumed `engage_kill_switch` override and, if engaged, submits nothing more and ends the run `skipped_kill_switch`; runs the clock pre-check (well-formed; not earlier than the last `ok` ingestion run's finish; not later than close(S) plus `risk.clock_max_sessions_late` sessions; wrapper and adapter hold one clock object; every later reading monotonic, or `ClockError`); builds and validates every request of the phase (a `ValueError` halts, ADR 0007 point 6 as amended); checks the phase's batch against the limits above; writes the phase's `orders` rows with their `pending` events and commits. Only then does it submit. After each submit, an order that is not `ACCEPTED` or terminal within `paper.accept_wait_seconds` halts with `AcknowledgementTimeoutError`.
+
+**3. The client order id is a pure function of the journal.** Every attempt's id is `f"{paper.order_id_prefix}-{S:%Y%m%d}-{security_id}-{side}-{attempt}"`, where S is the run's session and `attempt` is 1 plus the count of `orders` rows already journaled on S for that (security, side) across every decision, counting rows written earlier in the same batch in write order. A test pins the derivation and its length against the broker's recorded limit. Consequences the spec relies on: two decisions on one name can never share an id; an attempt is journaled before it is submitted and a journaled attempt is never re-submitted, so a crash cannot produce two live orders for one decision; and a `DuplicateClientOrderIdError` can only mean the journal and the broker disagree, which is why ADR 0007 point 3 treats an identical duplicate as a replay and a differing one as a halt. Every later attempt for a decision is sized for the previous attempt's remainder.
+
+**4. Halts, the allowlist and the kill switch**, as merged in spec reqs 4 and 5 (#248), restated so a later ADR knows what it supersedes:
+- The rejection allowlist per `Broker` method is a frozen code constant pinned by a test: `submit` empty; `cancel` `{OrderNotOpenError}` (journaled `cancel_noop`); every other method empty. Every other exception halts, `SystemFaultError` first. Changing the allowlist is a safety-reviewed change (ADR 0007).
+- A halt, in order: appends the `kill_switch` `engaged` row, retrying the store lock per `store.lock_retry_seconds`, and if the write still fails delivers a `kill_switch_write_failed` alert through every non-store channel and exits non-zero; journals the fault; best-effort cancels this run's acknowledged non-terminal orders, journaling `cancel_requested` before every call and its outcome after, and leaves `pending` orders (no broker-acknowledged event) to `paper resume`; writes the alert and the run's `halted` row; re-raises. `StaleDataError` halts the run without engaging the switch, because the next ingest cures it.
+- The kill-switch state is derived: engaged when the latest row is `engaged`, or when any earlier run ended `halted`, `crashed`, `failed` or without a result row and no `released` row follows it. It is released only by the owner with `paper resume --reason`; nothing bypasses it.
+
+**5. Changing a rule.** A new limit, a changed default after the first `paper start`, a change to the check order, to the allowlist or to the id derivation is a new ADR that supersedes the affected point here; the spec and the frozen window then follow it. The Phase 6 live ADR is expected to supersede points 1 and 4 for live money and must say what it keeps.
+
+## Consequences
+
+- Good: every rule that can stop an order has a name, a key, a default and a place; the per-phase check matches how money actually moves; the id rule makes crash recovery a journal read rather than a guess; ADR 0007's point 6 is amended in the open rather than quietly contradicted.
+- Bad / accepted risks: a limit breach in the buys phase leaves the sells executed and their proceeds in cash until the next rebalance, by design, and the whole rebalance is marked missed; the defaults are the spec's reasoning for H1 at paper scale, not measurements, and `risk.min_order_notional` rests on an unverified note until the recording task confirms Alpaca's minimum.
+- Reversibility: a default is cheap to change in code but costs a window: spec req 14 makes any risk-rule change mid-window a `paper stop`, an ADR and a new window, which liquidates the book and restarts the six-rebalance evidence clock. The check order and the id derivation change only between windows, because replay and the journal's decision-state logic depend on both.
+- Revisit if: the recording task's precision, id-length or minimum-notional answers differ from the assumptions; Probe 3 (#182) changes the two-phase timing; the Phase 6 live ADR is written.

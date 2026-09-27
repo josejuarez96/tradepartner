@@ -338,13 +338,6 @@ def test_an_http_error_names_no_secret(settings: Settings) -> None:
     assert USER_AGENT not in str(raised.value) and "test@example.com" not in repr(raised.value)
 
 
-def test_facts_is_left_to_a_later_task(settings: Settings) -> None:
-    """`cover_pages` and `filing_headers` are T11d's; `delistings` is T11f's
-    (below); `facts` still raises, naming its own task."""
-    with pytest.raises(NotImplementedError, match="T11e"):
-        _source(settings, _router()).facts(APPLE, ["EntityCommonStockSharesOutstanding"])
-
-
 def test_entries_are_filing_index_entries(settings: Settings) -> None:
     entries = _source(settings, _router()).filing_index()
     assert all(isinstance(e, FilingIndexEntry) for e in entries)
