@@ -29,8 +29,10 @@ from pathlib import Path
 
 import httpx
 import pytest
-from edgar_transport import FIXTURES, EdgarRouter, edgar_settings
+from edgar_transport import FIXTURES, EdgarRouter, edgar_settings, index_header, index_line
 from test_edgar_fsn import FSN_PAGE_URL, _fsn_zip_bytes, _fsn_zip_url, _num, _sub, _txt
+from test_edgar_source import EXCHANGE_LINE, KLX, KLX_25NSE, KLX_LINE, MISSING_LINE, SUBMISSIONS_URL
+from test_edgar_source import _payload as _index_payload
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import (
@@ -784,3 +786,97 @@ def test_cover_pages_and_headers_after_a_real_filing_index(tmp_path: Path) -> No
     # FSN zip URLs appear once per cached period: the HEAD re-issue check,
     # not a re-download (the router records URLs, not methods).
     assert len([u for u in later if "_notes.zip" in u]) == 3
+
+
+# --- delistings (T11f) -------------------------------------------------------
+#
+# `delistings()` scans the quarterly index for real, unlike `cover_pages`/
+# `filing_headers` above, which shortcut `filing_index()` with `_seed_stamps`.
+# Every quarter but 2026 Q3 (which carries the recorded KLX 25-NSE synthetic
+# index line, borrowed from `test_edgar_source.py`) is header-only: unlike
+# that module's own `_router`, this one never serves the *real* 2024 Q1
+# index, which carries many real Form 25/25-NSE rows for CIKs this test's
+# router has no submissions fixture for.
+
+_DELISTING_CLOCK = datetime(2026, 9, 25, tzinfo=UTC)
+_DELISTING_DOCUMENT = gzip.decompress(
+    (FIXTURES / "filing_delisted_25nse_primary_doc.xml.gz").read_bytes()
+)
+_KLX_PRIMARY_DOCUMENT = "xslF25X02/primary_doc.xml"
+
+
+def _delisting_router(*extra_lines: str) -> EdgarRouter:
+    router = EdgarRouter()
+    quarters = [(y, q) for y in range(2024, 2027) for q in range(1, 5) if (y, q) <= (2026, 3)]
+    for year, qtr in quarters:
+        router.add_index(year, qtr, index_header())
+    router.add_index(
+        2026, 3, index_header() + "".join((KLX_LINE, EXCHANGE_LINE, MISSING_LINE, *extra_lines))
+    )
+    return router
+
+
+def _delisting_source(router: EdgarRouter, tmp_path: Path) -> EdgarFilingSource:
+    settings = edgar_settings(tmp_path)
+    return EdgarFilingSource(settings, client=router.client(), clock=lambda: _DELISTING_CLOCK)
+
+
+def _add_klx_document(router: EdgarRouter) -> None:
+    router.add(_download_url(KLX, KLX_25NSE, _KLX_PRIMARY_DOCUMENT), _DELISTING_DOCUMENT)
+
+
+def test_the_recorded_klx_25nse_yields_its_class_title_and_exchange(tmp_path: Path) -> None:
+    router = _delisting_router()
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    [delisting] = source.delistings()
+    assert delisting.cik == KLX
+    assert delisting.accession == KLX_25NSE
+    assert delisting.form == "25-NSE"
+    assert delisting.class_title == "rights"
+    assert delisting.exchange == "NASDAQ"
+
+
+def test_delistings_since_filters_on_accepted_at(tmp_path: Path) -> None:
+    router = _delisting_router()
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    before = datetime(2026, 9, 24, tzinfo=UTC)
+    after = datetime(2026, 9, 25, tzinfo=UTC)
+    assert [d.accession for d in source.delistings(since=before)] == [KLX_25NSE]
+    assert source.delistings(since=after) == []
+
+
+def test_a_cached_delisting_makes_no_request(tmp_path: Path) -> None:
+    router = _delisting_router()
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    [first] = source.delistings()
+    document_url = _download_url(KLX, KLX_25NSE, _KLX_PRIMARY_DOCUMENT)
+    assert len([u for u in router.urls if u == document_url]) == 1
+
+    before = len(router.urls)
+    [again] = source.delistings()
+    assert again == first
+    assert router.urls[before:] == []
+
+
+def test_a_pre_xml_form_25_is_not_downloaded_and_is_counted(tmp_path: Path) -> None:
+    """`_payload`'s recorded documents are all `doc.htm`: not XML, so
+    `parse_delisting` (XML only) is never even called for it."""
+    form_25 = "0005555555-26-000001"
+    line = index_line("25", "Old Corp", 5555555, "2026-09-01", form_25)
+    router = _delisting_router(line)
+    router.add(
+        f"{SUBMISSIONS_URL}CIK0005555555.json",
+        _index_payload(5555555, (form_25, "25", "2026-09-01T20:00:00")),
+    )
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    results = source.delistings()
+    assert form_25 not in {d.accession for d in results}
+    assert KLX_25NSE in {d.accession for d in results}
+    assert source.pre_xml_delistings == 1
+    # submissions are fetched (to know the primary document is `doc.htm`),
+    # but no `Archives/edgar/data/...` document request for it
+    assert not any("Archives/edgar/data/5555555" in u for u in router.urls)
