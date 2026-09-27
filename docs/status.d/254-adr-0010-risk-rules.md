@@ -1,0 +1,1 @@
+- #254 ADR 0010 (Proposed): Phase 4 risk rules recorded, the named `risk.*` limits that halt or skip, checks before each phase's first submit (per-phase reading of ADR 0007 point 5), the client order id as a pure function of the journal (ADR 0007 point 3), the halt sequence; a plan prerequisite of the wrapper task

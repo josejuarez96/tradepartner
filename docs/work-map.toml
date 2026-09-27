@@ -286,6 +286,11 @@ what = "No paid price vendor for Phase 3: Alpaca SIP bars from 2016 plus EDGAR, 
 why = "Delisted names were observed present on the free source and no vendor is verified; measuring the gap beats paying for a claim."
 unblocks = ["task:T45", "task:T45b"]
 
+[adr.0010]
+what = "Phase 4 risk rules: the named limits that halt or skip an order, checks run before each phase's first submit, and the order id derived from the journal."
+why = "ADR 0005 asked for a risk-rules ADR; the two-phase run and crash recovery both depend on where the checks sit and how ids are made."
+unblocks = ["phase:4"]
+
 [plan.data-foundation]
 what = "The Phase 2 build document: 25 tasks, one PR each, grouped in chains."
 why = "What the ready frontier is computed from."
