@@ -177,6 +177,34 @@ def test_edgar_is_one_full_history_chunk(settings: Settings) -> None:
     assert _read(settings, "SELECT count(*) FROM securities WHERE known_at < '2019-04-10'")[0][0]
 
 
+def test_backfills_edgar_chunk_calls_record_failures_after_a_committed_ok(
+    settings: Settings,
+) -> None:
+    """T11f: `backfill`'s edgar chunk passes `after_commit` exactly as
+    `ingest_session` does (both read from `tests.test_ingest`'s
+    `_RecordFailures`, imported here so the wiring is exercised, not
+    re-implemented)."""
+    from test_ingest import _RecordFailures
+
+    calls: list[str] = []
+    filings = _filings(cls=lambda **kw: _RecordFailures(calls, **kw))
+    result = _backfill(settings, _History(), filings=filings, source="edgar")
+    assert result.runs[0].status == OK
+    assert calls == ["called"]
+
+
+def test_backfills_check_failures_raising_fails_the_edgar_chunk(settings: Settings) -> None:
+    from tradepartner.adapters.fixture_filings import FixtureFilingSource
+
+    class Unhealthy(FixtureFilingSource):
+        def check_failures(self) -> None:
+            raise RuntimeError("too many failures")
+
+    result = _backfill(settings, _History(), filings=_filings(cls=Unhealthy), source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "too many failures" in result.runs[0].message
+
+
 def test_actions_are_fetched_per_month_window(settings: Settings) -> None:
     ex = date(2019, 5, 15)
     div = CorporateAction(
