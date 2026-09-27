@@ -287,7 +287,7 @@ why = "Delisted names were observed present on the free source and no vendor is 
 unblocks = ["task:T45", "task:T45b"]
 
 [adr.0010]
-what = "Phase 4 risk rules: the named limits that halt or skip an order, checks run before each phase's first submit, and the order id derived from the journal."
+what = "Phase 4 risk rules: the named limits and defaults that halt or skip an order, checks run before each phase's first submit (amends ADR 0007 point 6), and the order id derived from the journal."
 why = "ADR 0005 asked for a risk-rules ADR; the two-phase run and crash recovery both depend on where the checks sit and how ids are made."
 unblocks = ["phase:4"]
 
