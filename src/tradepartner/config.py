@@ -12,10 +12,15 @@ standards).
 than the charter default, including an environment override, so it cannot
 be silently loosened; changing it is a charter amendment, not a config edit.
 
-Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`) are
-`SecretStr` so their values never appear in `repr()`/`str()` of `Settings`,
-including `SEC_EDGAR_USER_AGENT`, which by SEC convention embeds a personal
-contact email.
+Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
+Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` and the `ALERT_SMTP_*`
+credentials) are `SecretStr` so their values never appear in `repr()`/`str()`
+of `Settings`, including `SEC_EDGAR_USER_AGENT` and `ALERT_EMAIL_TO`, which
+embed a personal contact email.
+
+`alpaca.paper` is guarded the same way as `universe.exclude_sic_ranges`: the
+order path reaches the paper endpoint only (Phase 4 spec req 2), and Phase 6
+changes it by ADR, never by an environment variable.
 
 The `.env` file is anchored to the project root
 (`Path(__file__).resolve().parents[2] / ".env"`), not the process's current
@@ -214,6 +219,27 @@ class AlpacaConfig(BaseModel):
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
+    # --- Phase 4 trading keys (docs/specs/paper-trading.md req 2, T47) ---
+    # Guarded: the trading client is constructed with `paper=True` on every path
+    # and a `false` here is refused, even from the environment (validator below).
+    paper: bool = True
+    # The EDGAR client pattern: pace, timeout and retries from config. The pace sits
+    # under Alpaca's documented limit, which the recording task (T48b) confirms.
+    trading_requests_per_minute: float = Field(default=150.0, gt=0)
+    trading_request_timeout_seconds: float = Field(default=30.0, gt=0)
+    trading_max_retries: int = Field(default=3, ge=0)
+    # Broker facts with no default, set by the recording task (T48b): the accepted
+    # fractional quantity precision and the `client_order_id` length limit. The
+    # adapter (T48c) refuses to construct while either is `None`.
+    quantity_decimals: int | None = Field(default=None, ge=0)
+    client_order_id_max_length: int | None = Field(default=None, gt=0)
+
+    @field_validator("paper")
+    @classmethod
+    def _guard_paper(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("guarded setting; change only by ADR (Phase 6 live trading)")
+        return value
 
 
 class ExecutionConfig(BaseModel):
@@ -408,6 +434,113 @@ class MetricsConfig(BaseModel):
     red_flag_excess_cagr_pp: float = Field(default=3.0, ge=0)
 
 
+# --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
+
+# The five `paper.*` keys req 14 freezes into the window at `paper start`, beside the
+# whole `risk.*` section; every other `paper.*` key is read at run time.
+FROZEN_PAPER_KEYS: tuple[str, ...] = (
+    "tracking_k",
+    "min_rebalances",
+    "tracking_rule",
+    "max_catch_up_sessions",
+    "min_override_reason_chars",
+)
+
+AlertChannel = Literal["store", "macos", "email"]
+_DEFAULT_ALERT_CHANNELS: tuple[AlertChannel, ...] = ("store", "macos")
+
+
+class RiskConfig(BaseModel):
+    """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
+    whole section frozen into the paper window at `paper start` and read from the
+    window afterwards (spec req 14), never from live `Settings`.
+
+    Unknown keys are refused (a typo must fail, since the section is frozen by name) and
+    non-finite floats too. Every fraction is a share in [0, 1]: above 1 would be leverage
+    (`max_gross_exposure`, the charter's rule) or a meaningless threshold.
+    `max_fill_lag_sessions` is at least 1 (spec req 8). Defaults are the spec's
+    reasoning for H1 at paper scale, not measurements; `min_order_notional` and the two
+    reconciliation tolerances are confirmed by the recording task (T48b), and after the
+    first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    max_position_weight: float = Field(default=0.05, ge=0, le=1)
+    max_order_notional_fraction: float = Field(default=0.05, ge=0, le=1)
+    max_gross_exposure: float = Field(default=1.0, ge=0, le=1)
+    max_orders_per_run: int = Field(default=250, gt=0)
+    max_skips_per_run: int = Field(default=10, ge=0)
+    max_rejections_per_run: int = Field(default=5, ge=0)
+    max_drawdown: float = Field(default=0.30, ge=0, le=1)
+    min_order_notional: float = Field(default=1.0, ge=0)
+    whole_share_price_buffer: float = Field(default=0.02, ge=0, le=1)
+    max_unspent_cash_fraction: float = Field(default=0.05, ge=0, le=1)
+    max_fill_lag_sessions: int = Field(default=1, ge=1)
+    clock_max_sessions_late: int = Field(default=1, ge=0)
+    max_broker_clock_skew_seconds: float = Field(default=60.0, ge=0)
+    reconcile_quantity_tolerance: float = Field(default=1e-6, ge=0)
+    reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
+
+
+class PaperConfig(BaseModel):
+    """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
+
+    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys. The six
+    timing keys (`submit_window_*`, `sell_wait_seconds`, `poll_interval_seconds`,
+    `accept_wait_seconds`, `fill_read_overlap_seconds`) are the spec's placeholders until
+    Probe 3 (#182) sets them (T70), which also switches `tracking_rule` to `residual`
+    (#247 Q4). `poll_interval_seconds` never exceeds `accept_wait_seconds` (req 3(f)), or
+    the acknowledgement poll could never run before its own deadline. `order_id_prefix`
+    is one token with no whitespace, since it heads every `client_order_id`.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    min_rebalances: int = Field(default=6, gt=0)
+    tracking_k: float = Field(default=2.0, ge=0)
+    tracking_rule: Literal["raw", "residual"] = "raw"
+    max_catch_up_sessions: int = Field(default=5, ge=0)
+    submit_window_before_open_minutes: int = Field(default=90, ge=0)
+    submit_window_after_open_minutes: int = Field(default=30, ge=0)
+    sell_wait_seconds: float = Field(default=900.0, ge=0)
+    poll_interval_seconds: float = Field(default=15.0, gt=0)
+    accept_wait_seconds: float = Field(default=30.0, gt=0)
+    fill_read_overlap_seconds: float = Field(default=60.0, ge=0)
+    order_id_prefix: str = Field(default="tp", min_length=1, pattern=r"^\S+$")
+    live_capital_reference: float = Field(default=100.0, gt=0)
+    min_override_reason_chars: int = Field(default=20, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_poll_within_accept_wait(self) -> PaperConfig:
+        if self.poll_interval_seconds > self.accept_wait_seconds:
+            raise ValueError(
+                f"poll_interval_seconds ({self.poll_interval_seconds}) must not exceed "
+                f"accept_wait_seconds ({self.accept_wait_seconds})"
+            )
+        return self
+
+
+class AlertsConfig(BaseModel):
+    """Alert delivery channels (spec req 11; #247 Q2). `store` is always a channel, so
+    the `alerts` table stays the source of truth; `email` works only when the four
+    `ALERT_*` variables are set (`Settings.alert_*`). No channel repeats.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    channels: list[AlertChannel] = Field(default_factory=lambda: list(_DEFAULT_ALERT_CHANNELS))
+
+    @field_validator("channels")
+    @classmethod
+    def _validate_channels(cls, value: list[AlertChannel]) -> list[AlertChannel]:
+        if "store" not in value:
+            raise ValueError("alerts.channels must include 'store' (the source of truth)")
+        if len(set(value)) != len(value):
+            raise ValueError(f"alerts.channels must not repeat, got {value}")
+        return value
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -434,10 +567,24 @@ class Settings(BaseSettings):
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    paper: PaperConfig = Field(default_factory=PaperConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
     sec_edgar_user_agent: SecretStr | None = Field(default=None)
+    # Phase 4 (spec req 2): the paper trading keys are their own variables and never
+    # fall back to the data keys, so a live-capable key is never in the order path.
+    alpaca_paper_api_key: SecretStr | None = Field(default=None)
+    alpaca_paper_api_secret: SecretStr | None = Field(default=None)
+    # Phase 4 (spec req 11): the optional `email` alert channel. Top-level like the other
+    # env-named secrets, because the nested delimiter is `__` and the spec names these
+    # variables `ALERT_SMTP_HOST` etc.
+    alert_smtp_host: str | None = Field(default=None)
+    alert_smtp_user: SecretStr | None = Field(default=None)
+    alert_smtp_password: SecretStr | None = Field(default=None)
+    alert_email_to: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so
