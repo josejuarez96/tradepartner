@@ -34,6 +34,7 @@ from tradepartner.store.journal import (
     OrderRow,
     PaperRunRow,
     PaperWindowRow,
+    RebalanceEventRow,
     ReconciliationRow,
     append,
     decisions_for,
@@ -950,3 +951,249 @@ def test_a_resume_never_writes_a_write_off(
     assert collected.written_off == ()
     with open_read_only(journal_settings) as conn:
         assert all(not d.events for d in decisions_for(conn, open_window.window_id))  # type: ignore[arg-type]
+
+
+# --- review fixes: clock, duplicates, excess, rejections after a resume -------
+
+
+def test_a_naive_clock_is_a_clock_error_with_nothing_written(
+    journal_settings: Settings, open_window: PaperWindowRow, scripted_fake: FakeBroker
+) -> None:
+    naive = datetime(2026, 10, 1, 14, 0)  # noqa: DTZ001 - the fault under test
+    with pytest.raises(ClockError):
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [],
+            lambda: naive,
+            "run",
+            1,
+            FROZEN,
+            journal_settings,
+        )
+    assert _cursors(journal_settings) == []
+
+
+def test_a_raising_clock_is_a_clock_error(
+    journal_settings: Settings, open_window: PaperWindowRow, scripted_fake: FakeBroker
+) -> None:
+    def broken() -> datetime:
+        raise OSError("ntp")
+
+    with pytest.raises(ClockError):
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [],
+            broken,
+            "run",
+            1,
+            FROZEN,
+            journal_settings,
+        )
+    assert _cursors(journal_settings) == []
+
+
+def test_a_clock_that_goes_back_before_the_write_is_a_clock_error(
+    journal_settings: Settings, open_window: PaperWindowRow, scripted_fake: FakeBroker
+) -> None:
+    readings = iter(
+        [datetime(2026, 10, 1, 14, 5, tzinfo=UTC), datetime(2026, 10, 1, 14, 0, tzinfo=UTC)]
+    )
+    with pytest.raises(ClockError, match="went back"):
+        collect(
+            scripted_fake,
+            lambda: open_for_write(journal_settings),
+            [],
+            lambda: next(readings),
+            "run",
+            1,
+            FROZEN,
+            journal_settings,
+        )
+    assert _cursors(journal_settings) == []
+
+
+def test_an_order_passed_twice_is_refused(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    with pytest.raises(ValueError, match="more than once"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [order, order], writer_id=run_id)
+
+
+def test_journaled_fills_above_the_brokers_quantity_keep_the_order_in_flight(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    at = fixed_clock()
+    _append(
+        journal_settings,
+        FillRow(
+            client_order_id="tp-a",
+            filled_at=at,
+            quantity=5.0,
+            price=50.0,
+            price_implied=False,
+            broker_fill_id="reissued-1",
+            source="broker_feed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    scripted_fake.apply("tp-a", Expire())  # the broker says nothing filled
+    (reading,) = _collect(
+        journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id
+    ).readings
+    assert reading.excess and not reading.lagging and not reading.terminal_written
+    assert _statuses(journal_settings, "tp-a") == ["pending", "accepted"]
+
+
+def test_rejections_a_resume_journaled_are_judged_by_the_next_run(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    submitting, orders = _rejecting_run(
+        journal_settings, open_window, scripted_fake, fixed_clock, rejected=2
+    )
+    fixed_clock.advance(minutes=5)
+    first = _collect(
+        journal_settings, scripted_fake, fixed_clock, orders, writer_kind="resume", writer_id=1
+    )
+    assert [b.run_id for b in first.rejections] == [submitting]
+    fixed_clock.advance(hours=18)
+    next_run = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=submitting + 1)
+    assert [b.run_id for b in next_run.rejections] == [submitting]
+    fixed_clock.advance(hours=24)
+    later_run = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=submitting + 2)
+    assert later_run.rejections == ()
+
+
+# --- review fixes: the write-off back-fill judges pending rebalances only ----
+
+
+def _raising_price(_security_id: str) -> float:
+    raise KeyError("no close at S-1 for a delisted name")
+
+
+def test_a_settled_rebalance_is_never_rejudged_for_write_offs(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    old = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-old", notional=1000.0)
+    scripted_fake.apply("tp-old", Expire())
+    _collect(journal_settings, scripted_fake, fixed_clock, [old], writer_id=run_id)
+    at = fixed_clock()
+    _append(
+        journal_settings,
+        RebalanceEventRow(
+            rebalance_session=date(2026, 9, 30),
+            run_id=run_id,
+            status="executed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    fixed_clock.advance(days=30)
+    later = _run(journal_settings, open_window, fixed_clock())
+    context = WriteOffContext(
+        window_id=open_window.window_id,  # type: ignore[arg-type]
+        actions_as_of=NO_ACTIONS,
+        price_of=_raising_price,
+        session=date(2026, 10, 30),
+    )
+    collected = _collect(
+        journal_settings, scripted_fake, fixed_clock, [], writer_id=later, write_offs=context
+    )
+    assert collected.written_off == ()
+
+
+def test_a_write_off_pricing_failure_never_loses_the_collection(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", notional=1000.0)
+    scripted_fake.apply("tp-a", PartialFill(12.0, 50.0))
+    scripted_fake.apply("tp-a", Expire())
+    fixed_clock.advance(minutes=1)
+    context = WriteOffContext(
+        window_id=open_window.window_id,  # type: ignore[arg-type]
+        actions_as_of=NO_ACTIONS,
+        price_of=_raising_price,
+        session=THU,
+    )
+    with pytest.raises(KeyError):
+        _collect(
+            journal_settings,
+            scripted_fake,
+            fixed_clock,
+            [order],
+            writer_id=run_id,
+            write_offs=context,
+        )
+    assert [f.fill.broker_fill_id for f in _fills(journal_settings)] == ["fake-fill-1"]
+    assert _statuses(journal_settings, "tp-a")[-1] == "expired"
+    assert len(_cursors(journal_settings)) == 1
+
+
+# --- review fixes: the lag bound fails closed on a format drift ----------------
+
+
+def _raw_reconciliation(mismatches: object, status: str = "fills_lagging") -> ReconciliationRow:
+    return ReconciliationRow(
+        reconciliation_id=1,
+        window_id=1,
+        at=_at(THU),
+        status=status,
+        mismatches_json=json.dumps(mismatches),
+        known_at=_at(THU),
+        ingested_at=_at(THU),
+    )
+
+
+@pytest.mark.parametrize(
+    "mismatches",
+    [
+        {"lagging": [{"client_order_id": "tp-a"}]},
+        {"lagging": "tp-a"},
+        {"fills_lagging": ["tp-a"]},
+        {"lagging": []},
+    ],
+)
+def test_a_lagging_list_it_cannot_trust_fails_closed(mismatches: object) -> None:
+    with pytest.raises(ValueError, match="mismatches_json"):
+        lag_verdict(_plain_order("tp-a", 1), [_raw_reconciliation(mismatches)], FRI, FROZEN)
+
+
+def test_an_ok_row_with_no_lagging_key_lists_nothing() -> None:
+    row = _raw_reconciliation({"mismatches": []}, status="ok")
+    assert not lag_verdict(_plain_order("tp-a", 1), [row], FRI, FROZEN).breached
+
+
+def test_the_lag_bound_refuses_a_day_that_is_not_a_session() -> None:
+    with pytest.raises(ValueError, match="not a trading session"):
+        lag_verdict(_plain_order("tp-a", 1), [], date(2026, 10, 3), FROZEN)
+
+
+def test_the_anchor_day_is_the_new_york_date() -> None:
+    # 01:00 UTC Friday is 21:00 ET Thursday: Friday is one session past.
+    order = _plain_order("tp-a", 1)
+    rows = [_reconciliation(datetime(2026, 10, 2, 1, 0, tzinfo=UTC), ["tp-a"], 1)]
+    verdict = lag_verdict(order, rows, FRI, FROZEN)
+    assert (verdict.sessions_past, verdict.breached) == (1, True)
