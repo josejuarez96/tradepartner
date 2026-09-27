@@ -1032,7 +1032,7 @@ def test_fact_redated_a_to_b_to_a_reinserts_latest_accession_revision() -> None:
 
 
 def test_fact_redating_keeps_every_date_in_the_latest_accession_ingest() -> None:
-    """The latest ingest of a filing can contain two dates, then one, then two."""
+    """A complete source snapshot can remove a date, then restore it later."""
     conn = _store()
     accession = f"{ACME}-18-000001"
     a, b = date(2018, 12, 31), date(2018, 12, 15)
@@ -1066,6 +1066,7 @@ def test_fact_redating_keeps_every_date_in_the_latest_accession_ingest() -> None
         return sorted(rows.filter(rows["filing_accession"] == accession)["as_of_date"].to_list())
 
     assert served(second - timedelta(microseconds=1)) == [b, a]
+    # The one-date source correction hides A only from the second ingest onward.
     assert served(third - timedelta(microseconds=1)) == [b]
     assert served(third) == [b, a]
 

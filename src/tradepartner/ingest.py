@@ -1022,7 +1022,12 @@ def _add_rows(
     params: Sequence[Any] = (),
 ) -> int:
     """Insert each row of `rows` that changes an as-of read (module
-    docstring); return how many were inserted."""
+    docstring); return how many were inserted.
+
+    For an existing fact accession, `rows` is its complete current date/value
+    set. A date absent from that set is a source correction and disappears from
+    later as-of reads. Callers must not pass a partial accession snapshot.
+    """
     key_cols, value_cols = _TABLES[table]
 
     def key(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -1048,6 +1053,8 @@ def _add_rows(
     # each date. Compare that whole accession's date/value set before the
     # per-date writer runs; when it changes, reinsert its entire current set at
     # this ingest time. Otherwise an old A row is skipped and B stays visible.
+    # The incoming set is authoritative: a removed date must stay absent, even
+    # though its old row remains available to earlier as-of reads.
     revised_facts: list[Row] = []
     seen_filings: set[tuple[Any, ...]] = set()
     if table == "facts":
@@ -1075,6 +1082,7 @@ def _add_rows(
                 continue
             seen_filings.add(filing_key)
             for row in built_rows:
+                # Keep the caller's acceptance-time guard before restamping.
                 if row["known_at"] > ingested_at:
                     raise ValueError(
                         f"facts {filing_key}: known_at {row['known_at'].isoformat()} is after "
