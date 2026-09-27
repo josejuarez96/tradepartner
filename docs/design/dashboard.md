@@ -84,6 +84,6 @@ Interaction defaults: every chart with a plot has a hover layer; hit targets are
 
 Chat assistants, "AI insight" cards, upgrade or promotional banners, user avatars and notifications (single owner, local), live-streaming widgets, and any widget that writes to the store other than the override form. If a mock shows it and this list names it, it is out.
 
-## Open decision, deferred
+## Open decision, closed
 
-Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, is decided by an ADR at the start of Phase 4, when the operations page (the densest one) is specified. Until then this standard is implemented on Streamlit. A React choice would amend the roadmap's "no separate API" rule and must say why the duplicated logic is worth it.
+Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, was the one decision this standard left open for the start of Phase 4. [ADR 0011](../decisions/0011-dashboard-technology.md) (#268, owner decision on #247 question 1, 2026-09-27) decides it: **Streamlit under this standard, no separate API**. Pages stay pure functions of a read-only connection, the operations page draws `execution.ops.page_data`, the override form is the only write and calls the store's own writer, and the roadmap's "no separate API, no duplicated logic" rule stands. A React front end is the rejected option, with the conditions for revisiting it, in the ADR.

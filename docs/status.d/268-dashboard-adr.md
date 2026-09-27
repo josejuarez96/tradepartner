@@ -1,0 +1,1 @@
+- #268 T68: ADR 0011, dashboard technology: Streamlit under the design standard, no separate API, the override form the only write through the store's writer; the design standard's open decision closed
