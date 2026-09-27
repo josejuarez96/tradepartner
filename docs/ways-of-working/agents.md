@@ -23,7 +23,7 @@ Seven agents. That is deliberately few: each one owns a job the main session doe
 | `implementer` | Build | Executes **one** plan task on its own branch, tests first, and opens a draft PR. Doesn't expand scope | Code + tests | sonnet |
 | `quant-auditor` | Review | Audits diffs touching data, backtests or signals for look-ahead bias, survivorship, point-in-time violations, cost modeling and trial logging | No (read-only) | opus |
 | `safety-reviewer` | Review | Audits diffs touching the broker, orders, secrets, or LLM inputs/outputs: order isolation, idempotency, kill switch, prompt injection, key handling | No (read-only) | opus |
-| `backtest-runner` | Build / Review | Runs **one** registered hypothesis on a temp-file copy of the fixture store (`store_path` always set, so its trials are synthetic and never reach the owner's registry) and reports metrics, gap and refusals. Never passes a holdout or override flag, never enters the main checkout | Only its temp store | sonnet |
+| `backtest-runner` | Build / Review | Runs **one** hypothesis file on a temp-file copy of the fixture store it builds itself (`store_path` always set, so its trials are synthetic and never reach the owner's registry), inside the fixture's 2018-2020 window, and reports metrics, gap and refusals. Never passes a holdout or override flag, never enters the main checkout. Its scripts run through `uv run python`, which must stay off the allow list | Only its scratchpad | sonnet |
 | `doc-keeper` | Record | After a merge or at session end: updates `STATUS.md`, `CHANGELOG.md` and plan checkboxes, and flags drift between docs and code | Only `docs/`, `CHANGELOG.md` | haiku |
 
 **General code review** uses the built-in `/code-review` command. We don't need our own generic reviewer.
