@@ -14,7 +14,7 @@ This doc covers build agents only. Whether TradePartner has an LLM layer at all 
 
 ## Roster
 
-Six agents. That is deliberately few: each one owns a job the main session does badly or inconsistently. Add an agent only after doing the same job by hand about three times and seeing it go wrong.
+Seven agents. That is deliberately few: each one owns a job the main session does badly or inconsistently. Add an agent only after doing the same job by hand about three times and seeing it go wrong.
 
 | Agent | Stage | Job | Writes? | Model |
 |---|---|---|---|---|
@@ -23,6 +23,7 @@ Six agents. That is deliberately few: each one owns a job the main session does 
 | `implementer` | Build | Executes **one** plan task on its own branch, tests first, and opens a draft PR. Doesn't expand scope | Code + tests | sonnet |
 | `quant-auditor` | Review | Audits diffs touching data, backtests or signals for look-ahead bias, survivorship, point-in-time violations, cost modeling and trial logging | No (read-only) | opus |
 | `safety-reviewer` | Review | Audits diffs touching the broker, orders, secrets, or LLM inputs/outputs: order isolation, idempotency, kill switch, prompt injection, key handling | No (read-only) | opus |
+| `backtest-runner` | Build / Review | Runs **one** hypothesis file on a temp-file copy of the fixture store it builds itself (`store_path` always set, so its trials are synthetic and never reach the owner's registry), inside the fixture's 2018-2020 window, and reports metrics, gap and refusals. Never passes a holdout or override flag, never enters the main checkout. Its scripts run through `uv run python`, which must stay off the allow list | Only its scratchpad | sonnet |
 | `doc-keeper` | Record | After a merge or at session end: updates `STATUS.md`, `CHANGELOG.md` and plan checkboxes, and flags drift between docs and code | Only `docs/`, `CHANGELOG.md` | haiku |
 
 **General code review** uses the built-in `/code-review` command. We don't need our own generic reviewer.
@@ -48,7 +49,7 @@ Any number of Claude Code chat windows may build in parallel; each one is a **te
 |---|---|---|
 | Orchestrator window during Build and Review | **Opus 5.5** | Claims, delegation and review triage: capable, and cheaper than Fable |
 | Spec, plan and ADR drafting; phase retros; cross-team conflict resolution; changes to the ways-of-working docs | **Fable 5.1** | Errors here land in every later PR |
-| `implementer` | Sonnet (roster) | One scoped task with a plan line and tests |
+| `implementer`, `backtest-runner` | Sonnet (roster) | One scoped task with a plan line and tests; one scripted fixture run |
 | `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer` | Opus (roster) | Judgment-heavy, read-only or doc-only |
 | `doc-keeper` | Haiku (roster) | Mechanical |
 
@@ -99,5 +100,4 @@ The rules that address it:
 Create these when a phase needs them:
 
 - `data-validator` (Phase 2): checks a new data source for gaps, splits, delisting coverage, timezone handling and stale rows.
-- `backtest-runner` (Phase 3): runs a registered hypothesis against the backtester and appends to the trial registry. It never touches the holdout without an explicit flag.
 - `journal-analyst` (Phase 4+): produces the weekly calibration, cost and attribution report from the trade journal.
