@@ -1,4 +1,5 @@
-"""The `tradepartner` command (Phase 2 plan T19; spec reqs 9, 11, 12 and "CLI").
+"""The `tradepartner` command (Phase 2 plan T19; spec reqs 9, 11, 12 and "CLI";
+Phase 3 plan T42, backtest spec reqs 10-12 and 16).
 
 - `tradepartner ingest [--source alpaca|edgar|all] [--backfill --since DATE]
   [--dry-run]` runs `ingest.ingest_session`, or `backfill.backfill` with
@@ -18,6 +19,30 @@
   `OUT_DIR/<table>.parquet` through a read-only connection, and refuses to
   overwrite a file already there.
 
+Phase 3 (T42):
+
+- `tradepartner backtest <hypothesis> [--start] [--end] [--spend-holdout
+  --holdout-reason] [--holdout-repeat] [--override-gap --gap-reason] [--note]`
+  runs `backtest.run.run_hypothesis` on `settings.store.path`: there is no
+  `--synthetic` flag and no store-path option. It prints the trial id and
+  status, the base-cost metrics table, the strategy per cost level, the gap
+  maxima, the DSR and the flags, and exits 0 for `ok`, 1 for `failed` and 2 for
+  any refusal. `--spend-holdout` without a non-blank `--holdout-reason`, a reason
+  without its flag, or a bad date is refused before any trial is opened; an
+  unregistered slug likewise. `--override-gap` without `--gap-reason` is left to
+  the run, which records it as `refused_gap`.
+- `tradepartner hypothesis register <file>` registers the file and prints the
+  full frozen set and its hash (spec req 10).
+- `tradepartner trials [--hypothesis] [--include-synthetic]` lists trials newest
+  first, `unfinished`, failed and refused ones with their message; synthetic
+  trials only when asked for.
+- `tradepartner decision gap-signoff --trial <id> --reason` appends a
+  `gap_signoff` owner decision for an `ok` trial, with its gap maxima and the
+  frozen threshold (spec req 12, ADR 0003 rule 8).
+
+Text that can carry an exception's words (run messages and tracebacks) is
+passed through the `cli_record` fixture scrub before it is printed.
+
 **Exit codes.** 0 success; 1 a source not `ok`, a failed health check, or no
 store; 2 a usage or configuration error found before any work: inconsistent
 flags, or a secret the chosen sources need is missing. The missing secret is
@@ -34,6 +59,7 @@ over the real ones.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -51,11 +77,17 @@ from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, ListingResolv
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.backfill import backfill
+from tradepartner.backtest.holdout import GAP_THRESHOLD_KEY, Flags, Reasons
+from tradepartner.backtest.hypothesis import HypothesisFileError, register
+from tradepartner.backtest.metrics import METRIC_KEYS
+from tradepartner.backtest.run import RunOutcome, run_hypothesis
+from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
+from tradepartner.store import registry, schema
 from tradepartner.store.asof import listings_as_of
-from tradepartner.store.db import StoreLockedError, open_read_only, utc_now
+from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -236,6 +268,116 @@ def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
     return tables
 
 
+# --- Phase 3: backtest, hypothesis register, trials, decision (plan T42) ------------
+
+#: `backtest`'s exit code per trial status (spec req 16): 0 ok, 1 failed, 2 refused.
+STATUS_EXIT: dict[str, int] = {
+    "ok": 0,
+    "failed": 1,
+    "refused_window": USAGE_ERROR,
+    "refused_holdout": USAGE_ERROR,
+    "refused_gap": USAGE_ERROR,
+}
+_REGISTERED_BY = "owner"
+_SERIES_ORDER = ("strategy", "SPY", "MTUM")
+#: The metrics shown per cost level, strategy series only.
+_LEVEL_METRICS = ("cagr", "sharpe_annual", "excess_cagr_spy", "max_drawdown", "cost_drag")
+
+
+def _scrubbed(text: str, settings: Settings) -> str:
+    """`text` with every configured secret, email and key-shaped token replaced,
+    by the `cli_record` fixture scrub, for text that can carry an exception's words."""
+    return scrub_text(text, secrets=_configured_secrets(settings))[0]
+
+
+def _fmt(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _bps(level: float) -> str:
+    return f"{level:g} bps"
+
+
+def _parse_day(flag: str, value: str | None) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
+
+
+def _blank_text(value: str | None) -> bool:
+    return value is None or not value.strip()
+
+
+def _row(conn: duckdb.DuckDBPyConnection, table: str, trial_id: int) -> dict[str, Any] | None:
+    cursor = conn.execute(f"SELECT * FROM {table} WHERE trial_id = ?", [trial_id])
+    names = [d[0] for d in cursor.description]
+    row = cursor.fetchone()
+    return None if row is None else dict(zip(names, row, strict=True))
+
+
+def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings: Settings) -> None:
+    """The trial id and status, its message, and for `ok` the metrics table, the
+    per-level table, the gap maxima and the flags (spec req 16)."""
+    trial = _row(conn, "trials", outcome.trial_id) or {}
+    result = _row(conn, "trial_results", outcome.trial_id) or {}
+    typer.echo(f"trial {outcome.trial_id}: {outcome.status}")
+    if result.get("message"):
+        typer.echo(f"  {_scrubbed(str(result['message']), settings)}")
+    typer.echo(
+        f"  kind {trial.get('kind')}, window {trial.get('start_session')} to "
+        f"{trial.get('end_session')}"
+    )
+    if outcome.status != "ok":
+        return
+    hypothesis = registry.get_hypothesis_by_id(conn, int(trial["hypothesis_id"]))
+    base = float(hypothesis.params[registry.BASE_COST_KEY])
+    rows = conn.execute(
+        "SELECT series, cost_per_side_bps, metric, value FROM trial_metrics WHERE trial_id = ?",
+        [outcome.trial_id],
+    ).fetchall()
+    values = {(s, float(level), m): v for s, level, m, v in rows}
+    metrics = [m for m in METRIC_KEYS if any(k[2] == m for k in values)]
+    width = max(len(m) for m in metrics) if metrics else 6
+    typer.echo(f"metrics at the base cost, {_bps(base)} per side:")
+    typer.echo(f"  {'metric':<{width}}  " + "  ".join(f"{s:>10}" for s in _SERIES_ORDER))
+    for metric in metrics:
+        cells = "  ".join(f"{_fmt(values.get((s, base, metric))):>10}" for s in _SERIES_ORDER)
+        typer.echo(f"  {metric:<{width}}  {cells}")
+    levels = sorted({k[1] for k in values})
+    typer.echo("strategy per cost level:")
+    typer.echo(f"  {'level':<8}  " + "  ".join(f"{m:>15}" for m in _LEVEL_METRICS))
+    for level in levels:
+        cells = "  ".join(f"{_fmt(values.get(('strategy', level, m))):>15}" for m in _LEVEL_METRICS)
+        typer.echo(f"  {_bps(level):<8}  {cells}")
+    typer.echo(
+        f"gap max: count share {_fmt(result.get('gap_max_count_share'))}, "
+        f"size share {_fmt(result.get('gap_max_size_share'))}"
+    )
+    typer.echo(
+        f"dsr {_fmt(result.get('dsr'))}, dsr excess SPY {_fmt(result.get('dsr_excess'))} "
+        f"(basis {result.get('dsr_basis')}, n trials {result.get('n_trials')})"
+    )
+    typer.echo(
+        f"flags: red flag {_fmt(result.get('red_flag'))}, synthetic "
+        f"{_fmt(trial.get('synthetic'))}, holdout repeat {_fmt(trial.get('holdout_repeat'))}"
+    )
+    for label, key in (
+        ("holdout reason", "holdout_reason"),
+        ("gap override", "gap_override_reason"),
+    ):
+        if trial.get(key):
+            typer.echo(f"{label}: {trial[key]}")
+
+
 def make_app(
     *,
     settings: Callable[[], Settings] = get_settings,
@@ -355,6 +497,156 @@ def make_app(
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         typer.echo(f"exported {len(tables)} tables to {out_dir}")
+
+    @app.command()
+    def backtest(
+        hypothesis: Annotated[str, typer.Argument(help="the registered hypothesis slug")],
+        start: Annotated[str | None, typer.Option(help="first session, YYYY-MM-DD")] = None,
+        end: Annotated[str | None, typer.Option(help="last session, YYYY-MM-DD")] = None,
+        spend_holdout: Annotated[
+            bool, typer.Option(help="run a window touching the holdout (needs a reason)")
+        ] = False,
+        holdout_reason: Annotated[str | None, typer.Option(help="why the holdout is spent")] = None,
+        holdout_repeat: Annotated[
+            bool, typer.Option(help="spend this hypothesis's holdout again")
+        ] = False,
+        override_gap: Annotated[
+            bool, typer.Option(help="run past the survivorship-gap gate (needs a reason)")
+        ] = False,
+        gap_reason: Annotated[str | None, typer.Option(help="why the gap is accepted")] = None,
+        note: Annotated[str | None, typer.Option(help="a note stored with the trial")] = None,
+    ) -> None:
+        """Run a registered hypothesis as one trial on the store."""
+        first, last = _parse_day("--start", start), _parse_day("--end", end)
+        if spend_holdout and _blank_text(holdout_reason):
+            raise _fail("--spend-holdout needs --holdout-reason", USAGE_ERROR)
+        if holdout_reason is not None and not spend_holdout:
+            raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
+        if gap_reason is not None and not override_gap:
+            raise _fail("--gap-reason goes with --override-gap", USAGE_ERROR)
+        s = settings()
+        try:
+            outcome = run_hypothesis(
+                hypothesis,
+                first,
+                last,
+                Flags(
+                    spend_holdout=spend_holdout,
+                    holdout_repeat=holdout_repeat,
+                    override_gap=override_gap,
+                ),
+                reasons=Reasons(holdout_reason=holdout_reason, gap_reason=gap_reason),
+                note=note,
+            )
+        except (registry.UnknownHypothesis, HypothesisFileError) as exc:
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        with open_read_only(s) as conn:
+            _print_trial(conn, outcome, s)
+        if outcome.error:
+            typer.echo(_scrubbed(outcome.error, s), err=True)
+        raise typer.Exit(STATUS_EXIT[outcome.status])
+
+    hypothesis_app = typer.Typer(no_args_is_help=True, help="Pre-register hypotheses.")
+    app.add_typer(hypothesis_app, name="hypothesis")
+
+    @hypothesis_app.command("register")
+    def hypothesis_register(
+        file: Annotated[Path, typer.Argument(help="the hypothesis file (docs/hypotheses/*.md)")],
+    ) -> None:
+        """Register a hypothesis file and print its frozen parameters and their hash."""
+        s = settings()
+        if not file.is_file():
+            raise _fail(f"no hypothesis file at {file}", USAGE_ERROR)
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                record = register(conn, file, registered_by=_REGISTERED_BY, settings=s)
+        except (HypothesisFileError, registry.RegistryError) as exc:
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        typer.echo(
+            f"hypothesis {record.hypothesis_id}: {record.slug} ({record.family}), "
+            f"in-sample from {record.in_sample_start}, holdout {record.holdout_start} "
+            f"to {record.holdout_end}"
+        )
+        typer.echo(f"frozen parameters sha256 {record.params_sha256}:")
+        for key in sorted(record.params):
+            typer.echo(f"  {key} = {json.dumps(record.params[key], default=str)}")
+
+    @app.command()
+    def trials(
+        hypothesis: Annotated[str | None, typer.Option(help="only this slug")] = None,
+        include_synthetic: Annotated[bool, typer.Option(help="list synthetic trials too")] = False,
+    ) -> None:
+        """List trials newest first, with failed, refused and unfinished ones."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                listed = registry.list_trials(conn, hypothesis, include_synthetic)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (duckdb.CatalogException, duckdb.BinderException):
+            raise _fail("registry not initialised: register a hypothesis first", 1) from None
+        typer.echo("id  hypothesis  kind  window  status  flags  message")
+        for t in listed:
+            flags = [
+                name
+                for name, on in (("synthetic", t.synthetic), ("repeat", t.holdout_repeat))
+                if on
+            ]
+            message = _scrubbed(t.message, s).strip() if t.message else ""
+            typer.echo(
+                f"{t.trial_id}  {t.slug}  {t.kind}  {t.start_session}..{t.end_session}  "
+                f"{t.status}  {','.join(flags) or '-'}  {message}"
+            )
+
+    decision_app = typer.Typer(no_args_is_help=True, help="Record an owner decision.")
+    app.add_typer(decision_app, name="decision")
+
+    @decision_app.command("gap-signoff")
+    def gap_signoff(
+        trial: Annotated[int, typer.Option(help="the ok trial whose gap is signed off")],
+        reason: Annotated[str, typer.Option(help="why the recorded gap is accepted")],
+    ) -> None:
+        """Sign off a trial's recorded survivorship gap (ADR 0003 rule 8)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                trial_row = _row(conn, "trials", trial)
+                result = _row(conn, "trial_results", trial)
+                if trial_row is None:
+                    raise _fail(f"trial {trial} does not exist", USAGE_ERROR)
+                if result is None or result["status"] != "ok":
+                    status = "unfinished" if result is None else result["status"]
+                    raise _fail(f"trial {trial} is {status}; only an ok trial", USAGE_ERROR)
+                record = registry.get_hypothesis_by_id(conn, int(trial_row["hypothesis_id"]))
+                decision_id = registry.record_decision(
+                    conn,
+                    kind="gap_signoff",
+                    reason=reason,
+                    values={
+                        "gap_max_count_share": result["gap_max_count_share"],
+                        "gap_max_size_share": result["gap_max_size_share"],
+                        "count_share_threshold": record.params.get(GAP_THRESHOLD_KEY),
+                        "start_session": str(trial_row["start_session"]),
+                        "end_session": str(trial_row["end_session"]),
+                    },
+                    hypothesis_id=record.hypothesis_id,
+                    trial_id=trial,
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        typer.echo(f"decision {decision_id}: gap_signoff for trial {trial} ({record.slug})")
 
     return app
 
