@@ -36,9 +36,10 @@ Column `at` is a DuckDB keyword: SQL naming it must quote it (`"at"`);
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
 from datetime import date, datetime
+from types import MappingProxyType
 from typing import Any, ClassVar, Protocol
 
 import duckdb
@@ -547,37 +548,39 @@ class WashSaleFlagRow:
 
 
 #: Every row type, by table, in `JOURNAL_TABLE_NAMES` order.
-ROW_TYPES: dict[str, type[Any]] = {
-    row_type.TABLE: row_type
-    for row_type in (
-        PaperWindowRow,
-        PaperWindowStopRow,
-        PaperRunRow,
-        PaperRunResultRow,
-        PaperPlanRow,
-        RebalanceEventRow,
-        PaperReportRow,
-        SignalRow,
-        DecisionRow,
-        DecisionEventRow,
-        OrderRow,
-        OrderEventRow,
-        FillRow,
-        FillCursorRow,
-        ResumeInvocationRow,
-        OutcomeRow,
-        PositionDailyRow,
-        AdjustmentRow,
-        ReconciliationRow,
-        KillSwitchRow,
-        OverrideRow,
-        AlertRow,
-        AlertDeliveryRow,
-        LotRow,
-        DisposalRow,
-        WashSaleFlagRow,
-    )
-}
+ROW_TYPES: Mapping[str, type[Any]] = MappingProxyType(
+    {
+        row_type.TABLE: row_type
+        for row_type in (
+            PaperWindowRow,
+            PaperWindowStopRow,
+            PaperRunRow,
+            PaperRunResultRow,
+            PaperPlanRow,
+            RebalanceEventRow,
+            PaperReportRow,
+            SignalRow,
+            DecisionRow,
+            DecisionEventRow,
+            OrderRow,
+            OrderEventRow,
+            FillRow,
+            FillCursorRow,
+            ResumeInvocationRow,
+            OutcomeRow,
+            PositionDailyRow,
+            AdjustmentRow,
+            ReconciliationRow,
+            KillSwitchRow,
+            OverrideRow,
+            AlertRow,
+            AlertDeliveryRow,
+            LotRow,
+            DisposalRow,
+            WashSaleFlagRow,
+        )
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -620,21 +623,22 @@ def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
     the caller's transaction."""
     if type(row) not in ROW_TYPES.values():
         raise TypeError(f"not a journal row type: {type(row).__name__}")
-    known_at = ensure_tz_aware(row.known_at, field=f"{row.TABLE}.known_at")
-    ingested_at = ensure_tz_aware(row.ingested_at, field=f"{row.TABLE}.ingested_at")
+    table, id_column = type(row).TABLE, type(row).ID_COLUMN
+    known_at = ensure_tz_aware(row.known_at, field=f"{table}.known_at")
+    ingested_at = ensure_tz_aware(row.ingested_at, field=f"{table}.ingested_at")
     if known_at > ingested_at:
         raise ValueError(
-            f"{row.TABLE}: known_at {known_at.isoformat()} is after ingested_at "
+            f"{table}: known_at {known_at.isoformat()} is after ingested_at "
             f"{ingested_at.isoformat()}"
         )
     require_journal(conn)
     values = {f.name: getattr(row, f.name) for f in fields(row)}  # type: ignore[arg-type]
     row_id = None
-    if row.ID_COLUMN is not None:
-        row_id = values[row.ID_COLUMN]
+    if id_column is not None:
+        row_id = values[id_column]
         if row_id is None:
-            row_id = values[row.ID_COLUMN] = _next_id(conn, row.TABLE, row.ID_COLUMN)
-    insert_row(conn, row.TABLE, values)
+            row_id = values[id_column] = _next_id(conn, table, id_column)
+    insert_row(conn, table, values)
     return row_id
 
 
@@ -650,16 +654,37 @@ def fills_for(
     """Every live fill (superseded rows hidden), oldest `fill_id` first, each with
     its order's side and security; optionally only a window's (through the order's
     run) or only some orders'. The only reader of `fills`: every consumer (ledger,
-    lots, outcomes, reports, pages) goes through it."""
+    lots, outcomes, reports, pages) goes through it.
+
+    Fails closed: raises `JournalIntegrityError` when any superseded row points at
+    something other than a live `broker_status` fill of its own order (so no fill is
+    hidden by a bad pointer), and when a live fill in scope has no `orders` row or
+    its order no `paper_runs` row (a fill whose window cannot be told is never
+    filtered out of a window's ledger)."""
     require_journal(conn)
+    if isinstance(client_order_ids, str):
+        raise TypeError("client_order_ids must be a collection of ids, not one string")
     ids = None if client_order_ids is None else sorted(set(client_order_ids))
+    bad = conn.execute(
+        "SELECT f.fill_id, f.superseded_by FROM fills f "
+        "LEFT JOIN fills s ON s.fill_id = f.superseded_by "
+        "WHERE f.superseded_by IS NOT NULL AND (s.fill_id IS NULL "
+        "OR s.source <> 'broker_status' OR s.client_order_id <> f.client_order_id "
+        "OR s.superseded_by IS NOT NULL) ORDER BY f.fill_id"
+    ).fetchall()
+    if bad:
+        pairs = ", ".join(f"{fill} -> {target}" for fill, target in bad)
+        raise JournalIntegrityError(
+            f"fills superseded by something other than a live broker_status fill of "
+            f"their own order: {pairs}"
+        )
     selected = ", ".join(f"f.{name}" for name in _FILL_COLUMNS)
     rows = conn.execute(
-        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.window_id "
+        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id "
         "FROM fills f LEFT JOIN orders o USING (client_order_id) "
         "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE f.superseded_by IS NULL "
-        "AND (? IS NULL OR r.window_id = ?) "
+        "AND (? IS NULL OR r.run_id IS NULL OR r.window_id = ?) "
         "AND (? IS NULL OR list_contains(?, f.client_order_id)) "
         "ORDER BY f.fill_id",
         [window_id, window_id, ids, ids],
@@ -668,11 +693,12 @@ def fills_for(
     result: list[OrderedFill] = []
     for row in rows:
         fill = FillRow(**dict(zip(_FILL_COLUMNS, row[:width], strict=True)))
-        side, security_id, symbol, run_id, _ = row[width:]
-        if side is None:
+        side, security_id, symbol, run_id, known_run = row[width:]
+        if side is None or known_run is None:
+            missing = "orders row" if side is None else f"paper_runs row for run {run_id}"
             raise JournalIntegrityError(
-                f"fill {fill.fill_id} ({fill.broker_fill_id}) has no orders row "
-                f"for {fill.client_order_id!r}"
+                f"fill {fill.fill_id} ({fill.broker_fill_id}) of "
+                f"{fill.client_order_id!r} has no {missing}"
             )
         result.append(OrderedFill(fill, side, security_id, symbol, run_id))
     return result

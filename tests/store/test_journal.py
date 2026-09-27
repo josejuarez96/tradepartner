@@ -78,7 +78,25 @@ def _sample(row_type: type[Any], **values: Any) -> Any:
 
 
 def test_the_module_never_updates_or_deletes() -> None:
-    assert re.search(r"\b(UPDATE|DELETE)\b", MODULE.read_text()) is None
+    """No SQL string in the module updates, deletes or replaces a row (docstrings,
+    which say it never does, are prose and skipped)."""
+    tree = ast.parse(MODULE.read_text())
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+    }
+    sql = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+    pattern = re.compile(r"\b(UPDATE|DELETE|REPLACE|TRUNCATE|DROP)\b|ON\s+CONFLICT", re.I)
+    assert [text for text in sql if pattern.search(text)] == []
 
 
 def test_fills_is_selected_only_inside_the_accessor_and_all_fill_ids() -> None:
@@ -275,10 +293,59 @@ def test_the_accessor_joins_side_and_security_and_filters(
     assert fills_for(seeded, client_order_ids=[]) == []
 
 
-def test_a_live_fill_without_its_order_raises(seeded: duckdb.DuckDBPyConnection) -> None:
+@pytest.mark.parametrize("window_id", [None, 1])
+def test_a_live_fill_without_its_order_raises(
+    seeded: duckdb.DuckDBPyConnection, window_id: int | None
+) -> None:
     _fill(seeded, "nobody", "bf-orphan")
-    with pytest.raises(JournalIntegrityError, match="nobody"):
+    with pytest.raises(JournalIntegrityError, match=r"nobody.*orders row"):
+        fills_for(seeded, window_id=window_id)
+
+
+@pytest.mark.parametrize("window_id", [None, 1])
+def test_a_fill_whose_order_has_no_run_raises(
+    seeded: duckdb.DuckDBPyConnection, window_id: int | None
+) -> None:
+    _order(seeded, "lost", run_id=99, side="buy")
+    _fill(seeded, "lost", "bf-lost")
+    with pytest.raises(JournalIntegrityError, match="paper_runs row for run 99"):
+        fills_for(seeded, window_id=window_id)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["dangling", "feed-target", "other-order", "chained", "self"],
+)
+def test_a_bad_superseded_pointer_raises(seeded: duckdb.DuckDBPyConnection, shape: str) -> None:
+    synthetic = _fill(seeded, "a", "synthetic:a", source="broker_status", price_implied=True)
+    feed = _fill(seeded, "a", "bf-a")
+    other = _fill(seeded, "b", "synthetic:b", source="broker_status", price_implied=True)
+    target = {
+        "dangling": 999,
+        "feed-target": feed,
+        "other-order": other,
+        "chained": _fill(seeded, "a", "bf-a-2", superseded_by=synthetic),
+        "self": None,
+    }[shape]
+    if shape == "self":
+        target = 10
+        _fill(seeded, "a", "bf-self", fill_id=10, superseded_by=10)
+    else:
+        _fill(seeded, "a", f"bf-{shape}", superseded_by=target)
+    if shape == "chained":  # a pointer at a row that is itself superseded
+        _fill(seeded, "a", "bf-a-3", superseded_by=target)
+    with pytest.raises(JournalIntegrityError, match=f"-> {target}"):
         fills_for(seeded)
+
+
+def test_one_string_is_not_a_list_of_order_ids(seeded: duckdb.DuckDBPyConnection) -> None:
+    with pytest.raises(TypeError):
+        fills_for(seeded, client_order_ids="abc")
+
+
+def test_row_types_cannot_be_changed_by_callers() -> None:
+    with pytest.raises(TypeError):
+        ROW_TYPES["fills"] = DecisionRow  # type: ignore[index]
 
 
 # --- version-4 store ----------------------------------------------------------------------
