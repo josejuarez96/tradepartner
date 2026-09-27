@@ -53,12 +53,28 @@ arrives with its 8-K. Each per-document result is cached by accession,
 its stamp stripped, under its own version constant (`COVER_VERSION`,
 `HEADER_VERSION`): a cached entry always wins over FSN for its accession,
 until the version bumps or the cache is cleared.
+
+**Facts (T11e).** `facts` joins two sources, both stamped at read time from
+`_load_stamps(cik)`: company facts (`companyfacts.zip` above the stamping
+threshold, the per-CIK API below it; parsed facts cached per CIK under
+`PARSER_VERSION` and the CIK's latest stamped cover-form accession, so a
+10-K/A invalidates and an 8-K does not) and the per-class shares of the
+CIK's cover pages, walked with exactly `cover_pages`'s precedence. An FSN
+share is dated by the company-facts `end` of its accession when there is
+one, else `min(ddate, acceptance date in New York)`, because FSN's `ddate`
+is a rounded month end (owner decision 2026-09-26, #242); a per-document
+record keeps its cover date. Records are de-duplicated across sources on
+(accession, fact name, class member), the winner keeping its own dates; two
+sources agreeing on no value raise `ValueError` until T11f's policy. The
+store's `facts_as_of` serves one row per (security, fact name, class,
+accession), the latest ingested, so a re-dated share never appears twice.
 """
 
 from __future__ import annotations
 
 import gzip
 import hashlib
+import itertools
 import json
 import re
 import shutil
@@ -81,6 +97,7 @@ from tradepartner.adapters.edgar import (
     FsnShare,
     UnstampedFiling,
     acceptance_times,
+    parse_company_facts,
     parse_company_tickers,
     parse_cover_page,
     parse_filing_index,
@@ -217,6 +234,10 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
+        # T11e: the `companyfacts.zip` path and member names once downloaded,
+        # False once the per-CIK API was chosen, None until decided.
+        self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
+        self._facts_memo: dict[tuple[str, str], _FactsCache] = {}
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -703,13 +724,27 @@ class EdgarFilingSource(FilingSource):
         """FSN cover pages of `cik` (stamped at read time), plus a per-document
         parse for lag-window accessions FSN does not (yet) hold. See the
         module docstring's "Cover pages and headers" section."""
+        pages = [
+            CoverPage(cik, record.accession, record.accepted_at, payload.listings)
+            for record, payload in self._cover_sources(cik, self._load_stamps(cik))
+            if record.accepted_at is not None
+        ]
+        pages.sort(key=lambda p: (p.accepted_at, p.accession))
+        return pages
+
+    def _cover_sources(
+        self, cik: str, stamps: Mapping[str, SubmissionRecord], *, count_missing: bool = True
+    ) -> Iterator[tuple[SubmissionRecord, _CachedCoverPage | FsnFiling]]:
+        """The one precedence walk behind `cover_pages` and `facts`: for each
+        stamped cover-form accession of `cik`, its per-document cache entry
+        when present (a co-registrant's copy of another entity's page is
+        skipped), else its FSN row, else a lag-window per-document parse; an
+        older accession absent from FSN is counted on `.fsn_missing` once,
+        by `cover_pages` (`count_missing=False` for `facts`)."""
         self._ensure_fsn()
-        stamps = self._load_stamps(cik)
         fsn_cache = self._load_fsn_cache(cik)
         cover_forms = set(self._settings.edgar.cover_page_forms)
         lag_start = self._lag_window_start()
-
-        pages: list[CoverPage] = []
         for accession, record in stamps.items():
             if record.accepted_at is None:
                 continue  # unstampable: already reported on .unstamped_filings
@@ -718,11 +753,11 @@ class EdgarFilingSource(FilingSource):
             cached = self._load_cover_cache(accession)
             if cached is not None:
                 if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
-                    pages.append(CoverPage(cik, accession, record.accepted_at, cached.listings))
+                    yield record, cached
                 continue
             fsn_filing = fsn_cache.get(accession)
             if fsn_filing is not None:
-                pages.append(CoverPage(cik, accession, record.accepted_at, fsn_filing.listings))
+                yield record, fsn_filing
                 continue
             if accession in self._fsn_extracted_accessions:
                 continue  # FSN holds it under the filer's CIK: this CIK is a co-registrant
@@ -733,13 +768,9 @@ class EdgarFilingSource(FilingSource):
                     cik, accession, record.primary_document, record.accepted_at
                 )
                 if parsed.cover.cik == cik:  # a combined filing names one entity
-                    pages.append(
-                        CoverPage(cik, accession, record.accepted_at, parsed.cover.listings)
-                    )
-            elif accession not in self._fsn_failed_accessions:
+                    yield record, _CachedCoverPage(cik, parsed.cover.listings, _strip(parsed.facts))
+            elif count_missing and accession not in self._fsn_failed_accessions:
                 self.fsn_missing += 1
-        pages.sort(key=lambda p: (p.accepted_at, p.accession))
-        return pages
 
     def _fetch_cover_page(
         self, cik: str, accession: str, primary_document: str, accepted_at: datetime
@@ -888,8 +919,208 @@ class EdgarFilingSource(FilingSource):
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         _t11f()
 
+    # --- facts (T11e) ---------------------------------------------------------
+
     def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
-        _t11e()
+        """Facts named in `names` for `cik`: company facts (undimensioned, from
+        `companyfacts.zip` or the per-CIK API, cached by `_facts_cache_key`)
+        plus the per-class shares of the CIK's cover pages (FSN rows and
+        lag-window per-document parses, the `_cover_sources` walk), every
+        record stamped at read time from `_load_stamps(cik)`.
+
+        **Dating** (owner decision 2026-09-26, #242), per accession: a
+        per-document record keeps its cover date; an FSN share takes the
+        company-facts `end` of the same accession and fact name when there is
+        one (a cover has one date context), else
+        `min(ddate, accepted_at in New York)`, so a date never falls after
+        the fact became known (FSN's `ddate` is a rounded month end).
+
+        **De-duplication across sources** on (accession, fact name, class
+        member): a per-document parse wins over company facts, which win over
+        FSN; every source's records keep their own `as_of_date` keys within
+        the winner; the same key with different values in two sources raises
+        `ValueError` (the chunk fails until T11f's policy) and serves neither.
+        """
+        _validate_cik(cik)
+        self._ensure_fsn()
+        wanted = set(names)
+        stamps = self._load_stamps(cik)
+        company = self._company_facts(cik, stamps, wanted)  # accession -> unstamped facts
+        by_key: dict[tuple[str, str, str], dict[str, list[_CachedFact]]] = {}
+
+        def put(accession: str, source: str, fact: _CachedFact) -> None:
+            key = (accession, fact.fact_name, fact.class_member)
+            by_key.setdefault(key, {}).setdefault(source, []).append(fact)
+
+        for accession, facts in company.items():
+            for fact in facts:
+                put(accession, "company", fact)
+        for record, payload in self._cover_sources(cik, stamps, count_missing=False):
+            if isinstance(payload, _CachedCoverPage):
+                for fact in payload.facts:
+                    if fact.fact_name in wanted:
+                        put(record.accession, "document", fact)
+                continue
+            if _FSN_SHARES_TAG not in wanted or record.accepted_at is None:
+                continue
+            ends = {
+                f.as_of_date
+                for f in company.get(record.accession, ())
+                if f.fact_name == _FSN_SHARES_TAG
+            }
+            eastern = record.accepted_at.astimezone(_EASTERN).date()
+            for share in payload.shares:
+                as_of = max(ends) if ends else min(share.as_of_date, eastern)
+                put(
+                    record.accession,
+                    "fsn",
+                    _CachedFact(_FSN_SHARES_TAG, as_of, share.class_member, share.value),
+                )
+
+        out: list[FactRecord] = []
+        for (accession, fact_name, member), sources in by_key.items():
+            label = f"{accession}: {fact_name} {member or 'undimensioned'}"
+            dated: dict[str, dict[date, float]] = {}
+            for source, facts in sources.items():
+                for fact in facts:
+                    held = dated.setdefault(source, {}).setdefault(fact.as_of_date, fact.value)
+                    if held != fact.value:  # one source, one date, two values
+                        raise ValueError(f"{label} has two {source} values on {fact.as_of_date}")
+            for a, b in itertools.combinations(sorted(dated), 2):
+                common = dated[a].keys() & dated[b].keys()
+                if common:  # comparable dates must agree, value for value
+                    clash = [d for d in common if dated[a][d] != dated[b][d]]
+                    if clash:
+                        days = ", ".join(d.isoformat() for d in sorted(clash))
+                        raise ValueError(f"{label} differs between {a} and {b} on {days}")
+                elif set(dated[a].values()).isdisjoint(dated[b].values()):
+                    raise ValueError(f"{label} differs between {a} and {b}: no value in common")
+            winner = next(s for s in ("document", "company", "fsn") if s in sources)
+            accepted_at = stamps[accession].accepted_at
+            if accepted_at is None:  # every source above is stamped; a bug otherwise
+                raise RuntimeError(f"{label} reached the output without a stamp")
+            for as_of, value in dated[winner].items():
+                out.append(FactRecord(cik, fact_name, as_of, member, value, accession, accepted_at))
+        out.sort(
+            key=lambda f: (f.accepted_at, f.accession, f.fact_name, f.class_member, f.as_of_date)
+        )
+        return out
+
+    def _facts_cache_key(
+        self, stamps: Mapping[str, SubmissionRecord], cover_forms: set[str]
+    ) -> str | None:
+        """The CIK's latest stamped accession whose base form is a cover form:
+        company facts are re-fetched only when it changes (a new 10-K/A
+        invalidates the cache; an 8-K does not)."""
+        latest = [
+            r
+            for r in stamps.values()
+            if r.accepted_at is not None and r.form.removesuffix("/A") in cover_forms
+        ]
+        if not latest:
+            return None
+        return max(latest, key=lambda r: (r.accepted_at, r.accession)).accession
+
+    def _company_facts(
+        self, cik: str, stamps: Mapping[str, SubmissionRecord], wanted: set[str]
+    ) -> dict[str, list[_CachedFact]]:
+        """`cik`'s company facts named in `wanted`, per accession, stamped
+        only when the accession has a stamp (an unstamped one is absent, then
+        present once its stamp arrives). Cached under `PARSER_VERSION` by
+        `_facts_cache_key`; a CIK with no cover-form accession makes no request."""
+        latest = self._facts_cache_key(stamps, set(self._settings.edgar.cover_page_forms))
+        if latest is None:
+            return {}
+        key = _facts_key(latest, wanted)
+        path = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{cik}.json"
+        cached = self._facts_memo.get((cik, key)) or _load_facts_cache(path, cik, key)
+        if cached is None:
+            payload, complete = self._company_facts_payload(cik, latest)
+            cached = [
+                (f.fact_name, f.accession, f.as_of_date, f.value)
+                for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
+            ]
+            self._facts_memo[cik, key] = cached  # one fetch per CIK per run, cached or not
+            if complete:  # else the payload trails the latest filing: fetch again next run
+                rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
+                data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
+                edgar_raw.write_atomic(path, json.dumps(data).encode("utf-8"))
+        fsn_cache = self._load_fsn_cache(cik)
+        out: dict[str, list[_CachedFact]] = {}
+        for name, accession, as_of, value in cached:
+            record = stamps.get(accession)
+            if record is None or record.accepted_at is None or name not in wanted:
+                continue
+            if accession in self._fsn_extracted_accessions and accession not in fsn_cache:
+                continue  # FSN holds it under another CIK: a co-registrant's combined filing
+            cover = self._load_cover_cache(accession)
+            if cover is not None and cover.entity_cik != cik:
+                continue  # the per-document parse names another entity
+            eastern = record.accepted_at.astimezone(_EASTERN).date()
+            capped = min(as_of, eastern)  # an XBRL date typo never dates a fact after its stamp
+            out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
+        return out
+
+    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any, bool]:
+        """The raw company-facts payload and whether it already holds
+        `latest` (the filing the cache is keyed by): from one
+        `companyfacts.zip` when more than `edgar.bulk_stamp_threshold_ciks`
+        stamped CIKs need a fetch (the stamping rule), else the per-CIK API;
+        a CIK the zip lacks, or whose zip payload trails `latest` (the zip is
+        rebuilt nightly), falls back to the API. A payload for another CIK
+        raises."""
+        if self._facts_bulk is None:
+            stale = 0
+            for stamps_path in self._stamps_path("0").parent.glob("*.json"):
+                other = stamps_path.stem
+                if not _CIK_PATTERN.fullmatch(other):
+                    continue  # not a stamps file
+                cover_forms = set(self._settings.edgar.cover_page_forms)
+                other_latest = self._facts_cache_key(self._load_stamps(other), cover_forms)
+                cache = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{other}.json"
+                if other_latest is not None and _cached_latest(cache, other) != other_latest:
+                    stale += 1
+            if stale > self._settings.edgar.bulk_stamp_threshold_ciks:
+                path = edgar_raw.bulk_company_facts(settings=self._settings, client=self._client)
+                with zipfile.ZipFile(path) as bulk:
+                    self._facts_bulk = (path, frozenset(bulk.namelist()))
+            else:
+                self._facts_bulk = False
+        if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
+            with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
+                payload = json.loads(bulk.read(f"CIK{cik}.json"))
+            if _holds_accession(payload, cik, latest):
+                return payload, True
+        payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
+        return payload, _holds_accession(payload, cik, latest)
+
+
+def _holds_accession(payload: Any, cik: str, accession: str) -> bool:
+    """Whether the company-facts `payload` (checked to be `cik`'s) carries any
+    entry, of any concept, for `accession`."""
+    if str(payload["cik"]).zfill(10) != cik:
+        raise ValueError(f"company facts for CIK {payload['cik']!r} served for {cik}")
+    return any(
+        entry["accn"] == accession
+        for concepts in payload["facts"].values()
+        for concept in concepts.values()
+        for entries in concept["units"].values()
+        for entry in entries
+    )
+
+
+def _facts_key(latest: str, wanted: set[str]) -> str:
+    """The facts cache key: the latest cover-form accession and the names
+    asked for, so a new filing or a new name re-fetches."""
+    return f"{latest}|{','.join(sorted(wanted))}"
+
+
+_CIK_PATTERN = re.compile(r"\d{10}")
+
+
+def _validate_cik(cik: str) -> None:
+    if not isinstance(cik, str) or not _CIK_PATTERN.fullmatch(cik):
+        raise ValueError(f"cik must be a 10-digit zero-padded string, got {cik!r}")
 
 
 def _filed_by(row: UnstampedFiling) -> bool:
@@ -897,8 +1128,48 @@ def _filed_by(row: UnstampedFiling) -> bool:
     return int(row.accession[:10]) == int(row.cik)
 
 
-def _t11e() -> NoReturn:
-    raise NotImplementedError("T11e")
+class _EveryAccession(dict[str, datetime]):
+    """An `acceptance` mapping that stamps every company-facts entry with a
+    placeholder, so `parse_company_facts` yields every entry for caching;
+    the real stamp is applied at read time from `_load_stamps`."""
+
+    _PLACEHOLDER = datetime(2000, 1, 1, tzinfo=UTC)
+
+    def get(self, key: str, default: datetime | None = None) -> datetime:  # type: ignore[override]
+        return self._PLACEHOLDER
+
+
+_FactsCache = list[tuple[str, str, date, float]]
+
+
+def _cached_latest(path: Path, cik: str) -> str | None:
+    """The latest cover-form accession a facts cache file was keyed by, or
+    None when there is no usable cache (the bulk decision's staleness probe,
+    which cannot know the names a later `facts` call will ask for)."""
+    try:
+        data = json.loads(path.read_bytes())
+        if data["version"] != PARSER_VERSION or data["cik"] != cik:
+            return None
+        return str(data["key"]).split("|", 1)[0]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _load_facts_cache(path: Path, cik: str, key: str) -> _FactsCache | None:
+    try:
+        data = json.loads(path.read_bytes())
+        if data["version"] != PARSER_VERSION or data["cik"] != cik or data["key"] != key:
+            return None
+        return [
+            (str(name), str(accession), date.fromisoformat(str(as_of)), float(value))
+            for name, accession, as_of, value in data["facts"]
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None  # absent, truncated, another version or a new latest accession
+
+
+def _strip(facts: Sequence[FactRecord]) -> tuple[_CachedFact, ...]:
+    return tuple(_fact_from_json(_fact_to_json(f)) for f in facts)
 
 
 def _t11f() -> NoReturn:

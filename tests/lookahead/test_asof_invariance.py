@@ -396,3 +396,78 @@ def test_harness_catches_a_function_that_ignores_known_at(
     full = _leaky_prices_as_of(fixture_store, t)
     result = _leaky_prices_as_of(truncated.at(t), t)
     assert not full.equals(result), "a function that ignores known_at should fail this check"
+
+
+def _fact_row(
+    conn: duckdb.DuckDBPyConnection,
+    as_of: date,
+    value: float,
+    accession: str,
+    *,
+    known_at: datetime,
+    ingested_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "facts",
+        {
+            "security_id": "SEC_REDATED",
+            "fact_name": "shares_outstanding",
+            "class_member": "",
+            "as_of_date": as_of,
+            "value": value,
+            "filing_accession": accession,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_re_dated_accession_rows_invariant_under_truncation() -> None:
+    """T11e (quant-auditor, #253): the fixture store has no filing re-dated
+    by a later ingest, so `facts_as_of`'s accession rule (latest ingest per
+    accession, applied on rows known by `t`) is exercised here on a synthetic
+    store: a stale FSN month-end row and, in a later ingest, the same
+    accession under the company-facts date, beside another filing's row on
+    the stale date. The harness cuts by `known_at`; the rule must give the
+    same answer on the cut store at every probe, including probes between
+    the two rows' `known_at` values and between the two ingests."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    try:
+        a2_known = datetime(2025, 11, 5, 21, tzinfo=UTC)
+        a1_known = datetime(2025, 11, 20, 21, tzinfo=UTC)
+        _fact_row(conn, date(2025, 10, 31), 200.0, "A2", known_at=a2_known, ingested_at=a2_known)
+        _fact_row(conn, date(2025, 10, 31), 100.0, "A1", known_at=a1_known, ingested_at=a1_known)
+        _fact_row(
+            conn,
+            date(2025, 10, 17),
+            100.0,
+            "A1",
+            known_at=a1_known,
+            ingested_at=datetime(2026, 1, 10, 12, tzinfo=UTC),
+        )
+        truncated_store = TruncatedStore(conn)
+        try:
+            probes = [*probe_timestamps(conn), datetime(2026, 3, 1, tzinfo=UTC)]
+            seen = set()
+            for t in probes:
+                full = facts_as_of(conn, t)
+                assert full.equals(facts_as_of(truncated_store.at(t), t)), f"disagreed at T={t!r}"
+                seen.add(
+                    tuple(sorted(zip(full["filing_accession"], full["as_of_date"], strict=True)))
+                )
+            # Before A1 is known: A2 alone. After: A1 under its latest-ingested
+            # date beside A2's 10-31 row, never A1's stale 10-31 row.
+            assert seen == {
+                (),
+                (("A2", date(2025, 10, 31)),),
+                (("A1", date(2025, 10, 17)), ("A2", date(2025, 10, 31))),
+            }
+        finally:
+            truncated_store.close()
+    finally:
+        conn.close()

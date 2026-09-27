@@ -347,9 +347,46 @@ def facts_as_of(
     """`facts` rows known by `t`: one per `(security_id, fact_name,
     as_of_date, class_member)`, the latest revision as of `t` (spec
     acceptance: "Restated shares fact: `facts_as_of(T)` returns the earlier
-    value between the two `known_at`, the later after")."""
+    value between the two `known_at`, the later after").
+
+    **Accession rule first** (plan T11e): among the rows known by `t` that
+    carry a `filing_accession`, only those from the latest ingest of their
+    `(security_id, fact_name, class_member, filing_accession)` count, every
+    row of that ingest (a filing may legitimately carry two dates); the
+    EDGAR adapter re-dates a filing's shares when company facts arrive after
+    the FSN month end or when the accession switches source, the store keeps
+    both dates as rows, and only the newest ingest's dates are the filing's.
+    Rows with no accession are untouched. The per-date collapse runs on what
+    is left, so a stale re-dated row can never shadow another filing's row
+    on the same date.
+    """
     t = _validate_t(t)
-    return _latest_as_of(conn, "facts", _FACT_KEY, t, security_ids)
+    params: list[Any] = [t]
+    security_filter = _security_filter(security_ids, params)
+    partition = ", ".join(_FACT_KEY)
+    sql = f"""
+        WITH known AS (
+            SELECT *, MAX(ingested_at) OVER (
+                PARTITION BY security_id, fact_name, class_member, filing_accession
+            ) AS _latest_ingest
+            FROM facts
+            WHERE known_at <= ?
+            {security_filter}
+        ),
+        current AS (
+            SELECT * EXCLUDE (_latest_ingest) FROM known
+            WHERE filing_accession IS NULL OR ingested_at = _latest_ingest
+        )
+        SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY {partition} ORDER BY known_at DESC
+            ) AS _rn
+            FROM current
+        )
+        WHERE _rn = 1
+        ORDER BY {partition}
+    """
+    return conn.execute(sql, params).pl()
 
 
 def listings_as_of(
