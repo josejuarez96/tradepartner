@@ -291,6 +291,11 @@ what = "Phase 4 risk rules: the named limits and defaults that halt or skip an o
 why = "ADR 0005 asked for a risk-rules ADR; the two-phase run and crash recovery both depend on where the checks sit and how ids are made."
 unblocks = ["phase:4"]
 
+[adr.0011]
+what = "Streamlit under the design standard for every dashboard page, no separate API; the override form is the only write and calls the store's own writer; React behind an API is the rejected option with its revisit conditions."
+why = "Closes the design standard's one open decision so the operations page (T69) can be built; keeps one code path for the override write."
+unblocks = ["task:T69"]
+
 [plan.data-foundation]
 what = "The Phase 2 build document: 25 tasks, one PR each, grouped in chains."
 why = "What the ready frontier is computed from."
