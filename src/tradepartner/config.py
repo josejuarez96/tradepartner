@@ -170,6 +170,18 @@ class EdgarConfig(BaseModel):
         default_factory=lambda: ["S-1", "F-1", "10-12B", "8-K", "10-K", "10-Q", "20-F", "40-F"]
     )
     header_first_year: int | None = Field(default=None, ge=1993)
+    # T11f: the failure policy (a filing that fails the same way on every
+    # run). An accession failing identically this many consecutive counted
+    # (Eastern) days is quarantined: no further request until its entry is
+    # deleted or FAILURES_VERSION changes.
+    max_filing_failures: int = Field(default=3, gt=0)
+    # `check_failures()`'s per-group and cross-day thresholds: a group's (or
+    # one error-class/base-form pair's) failures must clear both the count
+    # floor and the share ceiling to fail the chunk, so neither a handful of
+    # failures in a huge FSN period nor a tiny share of a huge run alone
+    # trips it.
+    min_failed_filings: int = Field(default=5, gt=0)
+    max_failed_filing_share: float = Field(default=0.01, gt=0, le=1)
 
     @property
     def header_start_year(self) -> int:
