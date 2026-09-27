@@ -114,6 +114,15 @@ def test_edgar_fsn_first_year_override() -> None:
     assert s.edgar.fsn_first_year == 2010
 
 
+def test_edgar_failure_policy_defaults() -> None:
+    """T11h's keys: quarantine after 3 consecutive counted days, and
+    `check_failures()`'s count floor and share ceiling."""
+    s = Settings(_env_file=None)
+    assert s.edgar.max_filing_failures == 3
+    assert s.edgar.min_failed_filings == 5
+    assert s.edgar.max_failed_filing_share == pytest.approx(0.01)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -122,9 +131,13 @@ def test_edgar_fsn_first_year_override() -> None:
         ("bulk_stamp_threshold_ciks", 0),
         ("fsn_first_year", 2008),
         ("header_first_year", 1992),
+        ("max_filing_failures", 0),
+        ("min_failed_filings", 0),
+        ("max_failed_filing_share", 0),
+        ("max_failed_filing_share", 1.5),
     ],
 )
-def test_edgar_filing_source_keys_reject_nonsense(field: str, value: int) -> None:
+def test_edgar_filing_source_keys_reject_nonsense(field: str, value: float) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, edgar={field: value})
 
