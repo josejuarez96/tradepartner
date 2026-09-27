@@ -3,8 +3,11 @@
 
 The journal tables (`schema.JOURNAL_TABLE_NAMES`, schema version 5) are append-only:
 this module inserts and reads, and never updates or deletes, as `store.registry`
-does for the registry. A later fact (a fill superseded by a real one, an order's
-next state) is a new row, never an edit.
+does for the registry. A later fact is a new row, never an edit: an order's next
+state is an `order_events` row, and a real fill arriving after the synthetic
+`broker_status` residual that completed its order is journaled with `superseded_by`
+= the synthetic's `fill_id` and hidden (spec req 8; only the new row can carry the
+pointer).
 
 - **Row types**: one frozen dataclass per journal table, named after it, whose
   fields are the table's columns in order (a test holds them to the schema). A
@@ -592,6 +595,7 @@ class OrderedFill:
     security_id: str
     symbol: str
     run_id: int
+    window_id: int
 
 
 def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
@@ -651,10 +655,13 @@ def fills_for(
     window_id: int | None = None,
     client_order_ids: Iterable[str] | None = None,
 ) -> list[OrderedFill]:
-    """Every live fill (superseded rows hidden), oldest `fill_id` first, each with
+    """Every live fill (superseded rows hidden), in `fill_id` order, each with
     its order's side and security; optionally only a window's (through the order's
     run) or only some orders'. The only reader of `fills`: every consumer (ledger,
-    lots, outcomes, reports, pages) goes through it.
+    lots, outcomes, reports, pages) goes through it. `fill_id` order is collection
+    order, not trade order (a lagging fill collected later has a higher id and an
+    earlier `filled_at`): anything order-sensitive, such as FIFO lots, sorts by
+    `(filled.filled_at, fill_id)` itself.
 
     Fails closed: raises `JournalIntegrityError` when any superseded row points at
     something other than a live `broker_status` fill of its own order (so no fill is
@@ -680,7 +687,8 @@ def fills_for(
         )
     selected = ", ".join(f"f.{name}" for name in _FILL_COLUMNS)
     rows = conn.execute(
-        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id "
+        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id, "
+        "r.window_id "
         "FROM fills f LEFT JOIN orders o USING (client_order_id) "
         "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE f.superseded_by IS NULL "
@@ -693,14 +701,14 @@ def fills_for(
     result: list[OrderedFill] = []
     for row in rows:
         fill = FillRow(**dict(zip(_FILL_COLUMNS, row[:width], strict=True)))
-        side, security_id, symbol, run_id, known_run = row[width:]
+        side, security_id, symbol, run_id, known_run, fill_window = row[width:]
         if side is None or known_run is None:
             missing = "orders row" if side is None else f"paper_runs row for run {run_id}"
             raise JournalIntegrityError(
                 f"fill {fill.fill_id} ({fill.broker_fill_id}) of "
                 f"{fill.client_order_id!r} has no {missing}"
             )
-        result.append(OrderedFill(fill, side, security_id, symbol, run_id))
+        result.append(OrderedFill(fill, side, security_id, symbol, run_id, fill_window))
     return result
 
 

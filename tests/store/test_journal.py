@@ -43,6 +43,15 @@ _NOW = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
 _SESSION = date(2026, 10, 1)
 #: Nullable columns a valid sample row still needs (a position row names its security).
 _SAMPLE_EXTRAS: dict[str, dict[str, Any]] = {"positions_daily": {"security_id": "SEC_A"}}
+_PYTHON_TYPES = {
+    "BIGINT": "int",
+    "INTEGER": "int",
+    "DOUBLE": "float",
+    "VARCHAR": "str",
+    "BOOLEAN": "bool",
+    "DATE": "date",
+    "TIMESTAMP WITH TIME ZONE": "datetime",
+}
 _TYPES = {"int": 1, "float": 1.0, "str": "x", "bool": False, "date": _SESSION, "datetime": _NOW}
 
 
@@ -95,7 +104,7 @@ def test_the_module_never_updates_or_deletes() -> None:
         and isinstance(node.value, str)
         and id(node) not in docstrings
     ]
-    pattern = re.compile(r"\b(UPDATE|DELETE|REPLACE|TRUNCATE|DROP)\b|ON\s+CONFLICT", re.I)
+    pattern = re.compile(r"\b(UPDATE|DELETE|REPLACE|TRUNCATE|DROP|ALTER)\b|ON\s+CONFLICT", re.I)
     assert [text for text in sql if pattern.search(text)] == []
 
 
@@ -126,7 +135,9 @@ def test_fills_is_selected_only_inside_the_accessor_and_all_fill_ids() -> None:
 
 def test_known_at_is_never_assigned_from_a_broker_field() -> None:
     """No `known_at=<...filled_at|event_at|at>` or `known_at = ...` from a broker
-    instant anywhere in the module."""
+    instant anywhere in the module. This module builds no rows, so the check guards
+    against a future change here; the real guard is in the collectors (T58), which
+    stamp `known_at` from the clock."""
     tree = ast.parse(MODULE.read_text())
     broker = {"filled_at", "event_at", "at", "finished_at"}
     for node in ast.walk(tree):
@@ -162,9 +173,16 @@ def test_row_type_fields_are_the_table_columns(conn: duckdb.DuckDBPyConnection, 
     ).fetchall()
     row_type = ROW_TYPES[table]
     assert [f.name for f in fields(row_type)] == [name for name, _ in columns]
+    types = dict(
+        conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?",
+            [table],
+        ).fetchall()
+    )
     for f, (name, nullable) in zip(fields(row_type), columns, strict=True):
         optional = f.default is None
         assert optional == (nullable == "YES" or name == row_type.ID_COLUMN), name
+        assert _field_type(row_type, name) == _PYTHON_TYPES[types[name]], name
     assert table == row_type.TABLE
 
 
@@ -279,10 +297,12 @@ def test_the_accessor_joins_side_and_security_and_filters(
     for coid in ("a", "b", "c"):
         _fill(seeded, coid, f"bf-{coid}")
     every = fills_for(seeded)
-    assert [(f.fill.client_order_id, f.side, f.security_id, f.symbol) for f in every] == [
-        ("a", "buy", "SEC_a", "A"),
-        ("b", "sell", "SEC_b", "B"),
-        ("c", "buy", "SEC_c", "C"),
+    assert [
+        (f.fill.client_order_id, f.side, f.security_id, f.symbol, f.window_id) for f in every
+    ] == [
+        ("a", "buy", "SEC_a", "A", 1),
+        ("b", "sell", "SEC_b", "B", 1),
+        ("c", "buy", "SEC_c", "C", 2),
     ]
     assert [f.fill.client_order_id for f in fills_for(seeded, window_id=1)] == ["a", "b"]
     assert [f.fill.client_order_id for f in fills_for(seeded, window_id=2)] == ["c"]
