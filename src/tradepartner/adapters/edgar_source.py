@@ -1,5 +1,6 @@
 """The EDGAR `FilingSource` (spec req 6, plan T11b; T11c adds FSN fetch and
-parse; T11d serves `cover_pages`/`filing_headers` from it).
+parse; T11d serves `cover_pages`/`filing_headers` from it; T11e adds
+`facts`; T11f adds `delistings`; T11h adds the failure policy).
 
 Every fetch goes through `edgar_raw` (throttle, retry, `User-Agent`) and
 every payload through the `edgar` parsers; this module decides what to
@@ -43,7 +44,7 @@ XBRL, its base form is in `edgar.cover_page_forms` and it was accepted on
 or after the lag window's start (the first day of the newest cached FSN
 period); an older such accession absent from FSN is not fetched and is
 counted on `.fsn_missing`, unless its FSN extraction itself failed (that
-is T11f's `.failed_filings` to count). A header gets a ranged
+is T11h's `.failed_filings` to count). A header gets a ranged
 `filing_sgml_header` fetch when its accession is absent from FSN and
 either its base form is a registration form (`S-1`, `F-1`, `10-12B`)
 accepted on or after `edgar.header_start_year`, or it is accepted inside
@@ -65,9 +66,34 @@ one, else `min(ddate, acceptance date in New York)`, because FSN's `ddate`
 is a rounded month end (owner decision 2026-09-26, #242); a per-document
 record keeps its cover date. Records are de-duplicated across sources on
 (accession, fact name, class member), the winner keeping its own dates; two
-sources agreeing on no value raise `ValueError` until T11f's policy. The
+sources disagreeing on a value is a collision (T11h's policy, below). The
 store's `facts_as_of` serves one row per (security, fact name, class,
 accession), the latest ingested, so a re-dated share never appears twice.
+A company-facts 404, or a CIK the bulk zip has no file for, is not a filing
+failure (many issuers have no XBRL facts): counted on `.facts_missing`, its
+empty result cached the same way as a real payload.
+
+**Failure policy (T11h, owner decision (2)).** A per-document fetch/parse
+that raises `ValueError` (a malformed document, a fact collision) or meets a
+404/410 for the document or header itself is skipped, not raised: `_guarded`
+records it in `failed_filings.json` (keyed by `FAILURES_VERSION`) with a
+count of consecutive Eastern days it has failed identically, advanced only
+by `record_failures()` (the `after_commit` hook `ingest.py`/`backfill.py`
+call after a committed `ok`, non-dry-run EDGAR chunk). An accession failing
+identically `edgar.max_filing_failures` days running is quarantined: no
+further request until its entry is deleted or `FAILURES_VERSION` changes.
+An FSN accession whose rows failed extraction is recorded in its period's
+manifest instead, counted on `.failed_filings`, never quarantined, and
+retried only when `FSN_VERSION` changes. `check_failures()` (called by
+`ingest.py`'s `_prefetch`, before the lock) raises `FilingFailuresError`
+when an uncommitted FSN period's failure share, or the run's per-document
+failure share, clears both `edgar.min_failed_filings` and
+`edgar.max_failed_filing_share`, or when one (error class, base form) pair
+has at least `edgar.min_failed_filings` distinct non-`accepted` accessions
+across `failed_filings.json` and every FSN manifest together. A fact
+collision withholds only the collided (accession, fact name, class member)
+key, recorded under the accession's base form, counting toward the
+cross-day pair rule only, never the per-document share.
 """
 
 from __future__ import annotations
