@@ -308,3 +308,213 @@ unblocks = ["phase:4"]
 what = "Draft the Phase 4 spec so its tasks can be planned the day Phase 3 closes."
 why = "Phase 4 has no spec or plan; without one the wrapper, the run and the pages would be built from memory of the ADRs."
 unblocks = ["spec:paper-trading"]
+
+[plan.paper-trading]
+what = "The Phase 4 build document: 50 tasks, one PR each, from broker types to the phase-close evidence, grouped in chains."
+why = "What the ready frontier is computed from once Phase 3 closes; six unattended paper rebalances under these tasks are the MVP's finish line."
+unblocks = ["phase:4"]
+
+[issue.255]
+what = "Draft the Phase 4 plan from the merged paper-trading spec: tasks, files, tests, dependencies, chains, owner gates."
+why = "Phase 4 cannot be claimed, built or measured until the spec is broken into tasks the board can hand out."
+unblocks = ["plan:paper-trading"]
+
+[task.T46]
+what = "ADR 0007's Task A: the typed system-fault errors and the clock wrap in the fake broker."
+why = "A broken clock must raise its own error before any order or fill exists; every later task imports these types."
+
+[task.T46b]
+what = "The broker types Phase 4 needs: account, assets, open orders, order lookup, fills with ids, one status set."
+why = "Risk checks and crash recovery cannot work without account and open-order queries (#33)."
+
+[task.T46c]
+what = "A scriptable fake broker: told per order to accept, fill, part-fill, expire, reject, vanish or hold a cancel."
+why = "The wrapper's tests need every broker outcome on demand, with no network."
+
+[task.T47]
+what = "The Phase 4 config keys: risk limits, paper timings, alert channels, the guarded paper-only switch and the paper keys."
+why = "Every threshold lives in config; the paper flag can never be turned off by an environment variable."
+
+[task.T48]
+what = "A thin client for Alpaca's paper trading API and a recorder that saves scrubbed responses as fixtures."
+why = "Tests replay recordings; only the owner ever runs the recorder against the paper account."
+
+[task.T48b]
+what = "The owner records paper responses with paper keys and writes down what Alpaca paper actually does: precision, id limits, cash timing, corporate actions."
+why = "The adapter and the sizing rules depend on facts only a real account can answer."
+
+[task.T48c]
+what = "The Alpaca paper broker adapter, paper endpoint only, with one status table and no risk logic, and the production-only broker factory."
+why = "The real broker behind the wrapper; Phase 6 swaps its endpoint, not its rules."
+
+[task.T49]
+what = "The journal tables in the store, append-only, at schema version 5."
+why = "Every signal, decision, order, fill and outcome is a stored fact with a known_at from here on."
+
+[task.T49b]
+what = "The journal's row types and writers, and the single accessor every reader of fills goes through."
+why = "Inserts only, like the trial registry; one accessor so a superseded fill is never counted twice."
+
+[task.T49c]
+what = "The journal's readers, per window and per run."
+why = "Every derived state (switch, decisions, rebalances) is a query over these rows."
+
+[task.T50]
+what = "The deterministic client order id and the tests that fence the order path."
+why = "Only the wrapper may submit or cancel; an id derived from the journal makes a crash unable to double an order."
+
+[task.T51]
+what = "The ledger: positions and cash rebuilt from journaled fills and adjustments, split-adjusted as of a time."
+why = "The journal is the truth about what we hold; the broker is what we reconcile it against."
+
+[task.T52]
+what = "Pure functions for what a decision still needs (open, in flight, settled, closed), how much remains, and a buy's target."
+why = "Re-runs and catch-ups trade only remainders; the rules must be one function of the journal, not run-time state."
+
+[task.T52b]
+what = "The residue a name carries (dust, untradable, carried) and the derived state of a rebalance (pending, executed, missed)."
+why = "A window must be able to close around residues, and a rebalance nobody ran must still lapse on schedule."
+
+[task.T53]
+what = "The backtest engine's plan function made public, tracking-trial windows, and the step that turns a plan into journaled decisions."
+why = "Paper plans with the same code the backtest ran, so paper and backtest can be compared honestly."
+
+[task.T54]
+what = "The risk checks on each batch of orders and the rule that sizes buys from the cash the sells raised."
+why = "Position, order and exposure limits, no shorts and no borrowing, all from the window's frozen values."
+
+[task.T55]
+what = "Reconciliation: compare the ledger with the broker's positions, orders and cash, explaining only what known facts explain."
+why = "Any drift the journal cannot explain halts the system rather than being papered over."
+
+[task.T56]
+what = "The wash-sale lot ledger: lots, FIFO disposals and wash-sale flags per the IRS rules from G7."
+why = "Phase 6 needs it before its first taxable trade; paper fills are the only real stream to test it on."
+
+[task.T57]
+what = "Alerts stored first, then delivered to macOS notifications and optional email, with every attempt recorded."
+why = "The system runs unattended; a failure nobody hears about is the worst failure."
+
+[task.T58]
+what = "Collecting order outcomes and fills from the broker without counting a fill twice, closing an order before its fills arrive, or letting a fill lag forever."
+why = "A lagging fill feed must never engage the kill switch by mistake, and never leave a position out of the ledger."
+
+[task.T59]
+what = "The kill switch, derived from journal rows and engaged by faults, drawdown or the owner, plus the one run lock every command shares."
+why = "A lost write or a crash must leave the switch engaged, never open; two runs must never overlap."
+
+[task.T60]
+what = "The wrapper's core: the clock pre-check, the rejection allowlist, the halt path in order, and duplicate-id replay."
+why = "ADR 0007 made into code: anything unclassified halts, and a halt writes the switch row before anything else."
+
+[task.T60b]
+what = "The machinery every wrapper phase shares: switch re-read, validation, limits, skips, journaled orders before submit, acknowledgement polling."
+why = "A batch that breaks a limit submits nothing, and every order is on record before the broker sees it."
+
+[task.T60c]
+what = "The wrapper's sells phase: exits and trims sized from the reconciled holding, submitted before the open."
+why = "Sells fund buys and can never exceed what is held."
+
+[task.T60d]
+what = "The wrapper's buys phase: sized from cash after the sells, deferred when the cash is not there."
+why = "Nothing is ever borrowed."
+
+[task.T60e]
+what = "Re-attempts for remainders only, and write-offs when a rebalance's last phase leaves a buy unfunded."
+why = "No buy is ever placed twice, and a halted attempt is never mistaken for a funding shortfall."
+
+[task.T61]
+what = "Reconciliation with the store's explanations: splits, delistings, spin-offs and dividends known at the previous close."
+why = "One shared check for the run, resume, stop and the reconcile command."
+
+[task.T61b]
+what = "The owner's resume: settle pending orders, reconcile, release the switch, all with a reason."
+why = "After a crash or a halt nothing trades until a human has reasoned and the books agree."
+
+[task.T62]
+what = "Outcomes per order (return, realised P&L or the cost of a miss) and the lot-ledger rows, written when due."
+why = "The journal chain ends in an outcome; Phase 4's exit check counts every chain."
+
+[task.T63]
+what = "The daily tracking run's core: lock, staleness, collection, reconciliation, result row, halts through the wrapper."
+why = "Runs every session unattended; most days it only collects and reconciles."
+
+[task.T63b]
+what = "The run's marks, drawdown check, lapse rules and due outcomes."
+why = "Every month-end gets a mark even after a missed run, and a rebalance nobody traded lapses on schedule."
+
+[task.T63c]
+what = "The run's plan step: plan under a trial at the month-end close and journal the decisions."
+why = "The plan is the engine's own function, so paper equals the backtest by construction."
+
+[task.T63d]
+what = "The run's trade step: the submit window, the hand-off to the wrapper, and same-session collection."
+why = "Orders go only inside the window the owner set, and a rebalance is executed only when every decision is done."
+
+[task.T63e]
+what = "Forced exits for delisted names and spin-off receipts, the only intra-month trades allowed."
+why = "A name that vanished from the exchange is sold at its last venue, never held in limbo."
+
+[task.T63f]
+what = "The stop runs that flatten the account through the wrapper when a window closes, leaving only residues."
+why = "The only legal way to a flat account; the owner never trades by hand."
+
+[task.T63g]
+what = "The no-look-ahead suite for the tracking run: cutting the store, journal included, at the previous close changes nothing."
+why = "The same guard rail the backtest has, applied to the paper path."
+
+[task.T63h]
+what = "End-to-end tests for a crash, the resume and the next run, the fill-lag bound, the journal chain, and every alert kind."
+why = "The recovery path is where money is lost; it is tested as a whole, not only in pieces."
+
+[task.T64]
+what = "Starting a paper window: behind the gap sign-off gate, on a flat account, with the limits frozen into the window."
+why = "Rules are frozen before the first order and cannot move while results accumulate."
+
+[task.T64b]
+what = "Stopping a window when flat apart from residues, abandoning one that cannot close, the owner's kill, and the one override writer."
+why = "Every way out of a window is journaled with a reason; the page and the CLI share one write."
+
+[task.T65]
+what = "The paper-versus-backtest comparison per month under the rule frozen at start, with the dividend and fill-timing terms printed beside the raw number."
+why = "ADR 0005's first exit check, decomposed so a known execution gap is not mistaken for a bug."
+
+[task.T65b]
+what = "The target comparison (override, late data or bug) and the report command that opens the tracking trial."
+why = "A plan that drifts from the engine is caught by name, and a late bar is not blamed on the code."
+
+[task.T66]
+what = "The exit-criteria command and the pure data behind the operations page."
+why = "Phase 4 ends when a command says so, with each check naming its query."
+
+[task.T67]
+what = "The tradepartner paper commands: start, stop, run, reconcile, kill, resume, report, check, status, abandon, override."
+why = "What the scheduler and the owner call; no flag can reach a live endpoint or bypass a limit."
+
+[task.T68]
+what = "The decision record on dashboard technology: Streamlit with the design standard, the override form as the only write."
+why = "The design standard deferred this to Phase 4; the page task needs it settled."
+
+[task.T69]
+what = "The operations page: positions, orders, today's ranking with reasons, fills, the chain per order, alerts, kill-switch state."
+why = "Phase 4's exit requires the owner to see the system's state, not trust it."
+
+[task.T69b]
+what = "The override screen: the dashboard's one write, a reasoned exclude, keep or kill-switch row."
+why = "Every human override is logged with a reason and passes the same risk rules."
+
+[task.T70]
+what = "The amendment to ADRs 0005 and 0006 recording the residual tracking rule, and the timing keys set from Probe 3."
+why = "The comparison rule and the submit timings are fixed from evidence before the first paper order."
+
+[task.T70b]
+what = "The runbook for scheduling the paper run before the open and for what to do on each alert."
+why = "The owner must know how to respond when the unattended system stops."
+
+[task.T71]
+what = "The owner starts the paper window on the real store after the gap sign-off and installs the scheduler."
+why = "The first unattended paper run; only the owner holds the keys and the store."
+
+[task.T71b]
+what = "The phase close: the exit-criteria command exits 0 on the real store after six unattended rebalances."
+why = "The MVP's finish line."

@@ -1,0 +1,1 @@
+- #255 Phase 4 plan: `docs/plans/paper-trading.md`, 50 tasks T46 to T71b in 19 chains (ADR 0007 Task A first, the wrapper in five tasks, the tracking run in six plus two test suites, window, report, check, CLI, two pages, two docs tasks, two owner tasks), owner gates on the task lines, work-map entries per task
