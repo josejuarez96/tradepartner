@@ -54,8 +54,24 @@ def next_attempt(orders_on_session: Iterable[OrderRow], security_id: str, side: 
     session, across every decision and phase, with the rows written earlier
     in the same batch appended in write order. Only the rows given are read;
     rows for another security or side are not counted.
+
+    The rows are checked against themselves, because a wrongly scoped read
+    would re-issue an id: they must all be on one session, and the matching
+    rows' `attempt` values must be exactly 1, 2, ... n in write order. A gap,
+    a duplicate or a stray session raises `ValueError`.
     """
     _check_side(side)
-    return 1 + sum(
-        1 for row in orders_on_session if row.security_id == security_id and row.side == side
-    )
+    sessions: set[date] = set()
+    attempts: list[int] = []
+    for row in orders_on_session:
+        sessions.add(row.session)
+        if row.security_id == security_id and row.side == side:
+            attempts.append(row.attempt)
+    if len(sessions) > 1:
+        raise ValueError(f"orders_on_session spans sessions {sorted(sessions)}")
+    expected = list(range(1, len(attempts) + 1))
+    if attempts != expected:
+        raise ValueError(
+            f"journaled attempts for ({security_id}, {side}) are {attempts}, expected {expected}"
+        )
+    return len(attempts) + 1

@@ -149,6 +149,31 @@ def test_attempt_reads_only_the_rows_it_is_given() -> None:
     assert next_attempt([], "0000320193", "buy") == 1
 
 
+def test_attempt_refuses_rows_from_two_sessions() -> None:
+    rows = [
+        _row("0000320193", "buy"),
+        _row("0000789019", "buy", session=date(2026, 9, 30)),
+    ]
+    with pytest.raises(ValueError, match="spans sessions"):
+        next_attempt(rows, "0000320193", "buy")
+
+
+@pytest.mark.parametrize(
+    "attempts",
+    [[2], [1, 3], [1, 1], [2, 1]],
+    ids=["missing-first", "gap", "duplicate", "out-of-write-order"],
+)
+def test_attempt_refuses_a_broken_attempt_sequence(attempts: list[int]) -> None:
+    rows = [_row("0000320193", "buy", attempt=a) for a in attempts]
+    with pytest.raises(ValueError, match="journaled attempts"):
+        next_attempt(rows, "0000320193", "buy")
+
+
+def test_other_names_do_not_enter_the_sequence_check() -> None:
+    rows = [_row("0000789019", "buy", attempt=5), _row("0000320193", "sell", attempt=3)]
+    assert next_attempt(rows, "0000320193", "buy") == 1
+
+
 def test_attempt_refuses_an_unknown_side() -> None:
     with pytest.raises(ValueError):
         next_attempt([], "0000320193", "short")
@@ -164,7 +189,10 @@ def test_id_fits_the_brokers_recorded_length() -> None:
     limit = settings.alpaca.client_order_id_max_length
     if limit is None:
         pytest.skip("alpaca.client_order_id_max_length is unset until T48b records it")
-    attempt = settings.risk.max_orders_per_run
+    # Attempts per (security, side) add up across the runs of one session, so
+    # no config key bounds them; five digits is headroom, not a limit. T48b
+    # also confirms the broker accepts the `:` in a secondary class's id.
+    attempt = 99_999
     for security_id in (
         _longest_fixture_security_id(),
         "0001652044:class-c-capital-stock",
