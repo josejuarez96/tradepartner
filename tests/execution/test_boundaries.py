@@ -2,20 +2,30 @@
 
 Static checks over `src/tradepartner/`, tests excepted:
 
-1. No module outside `execution/` imports `AlpacaBroker` or `FakeBroker`
-   (or the `adapters.alpaca_broker` module), so `cli.py` can only get a
-   broker from `execution.brokers.build_broker` (ADR 0003 rule 7).
-2. No `.submit(` or `.cancel(` call outside `execution/wrapper.py`, so the
-   risk-gated wrapper is the only caller that can place or cancel an order.
-3. `adapters.alpaca_trading_raw` is imported only by `adapters/alpaca_broker.py`
-   and `cli_record.py` (the owner-run paper recorder, T48).
+1. No module outside `execution/` imports, reads as an attribute or names in
+   a string `AlpacaBroker` or `FakeBroker`, or imports the
+   `adapters.alpaca_broker` or `adapters.fake_broker` module, so `cli.py` can
+   only get a broker from `execution.brokers.build_broker` (ADR 0003 rule 7).
+2. No `.submit` or `.cancel` attribute, called or passed on as a bound method,
+   and no `getattr`/`methodcaller` with those names, outside
+   `execution/wrapper.py`, so the risk-gated wrapper is the only code that can
+   place or cancel an order. An unrelated `executor.submit` is refused too, by
+   intent.
+3. `adapters.alpaca_trading_raw` and `AlpacaTradingRaw` are imported or read
+   only by `adapters/alpaca_broker.py` and `cli_record.py` (the owner-run paper
+   recorder, T48), re-exports and attribute chains included.
 4. No module other than `store/journal.py` and `store/schema.py` names the
-   `fills` table in SQL (`FROM`, `JOIN` or `INTO` followed by the name, or
-   the name as a whole string literal), so every reader goes through
-   `store.journal.fills_for`. Docstrings, identifiers and module names such
-   as a `Broker.fills` method do not count.
-5. Nothing under `backtest/` imports `store.journal` or names a journal table
-   in SQL by the same rule, so the backtest never reads paper results.
+   `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`, in
+   a comma-separated `FROM` list, optionally schema-qualified and quoted), as
+   a whole string literal, or through `FillRow.TABLE`, so every reader goes
+   through `store.journal.fills_for`. Docstrings, identifiers and module names
+   such as a `Broker.fills` method do not count.
+5. Nothing under `backtest/` imports `store.journal` or `execution`, reads
+   `JOURNAL_TABLE_NAMES`, or names a journal table in SQL by the same rule,
+   so the backtest never reads paper results.
+
+A non-literal `import_module`/`__import__` fails checks 1 and 3, since no
+static check can follow it.
 
 `wrapper.py` does not exist yet; the checks pass on the current tree and bind
 the tasks that add it.
@@ -36,6 +46,7 @@ SRC = Path(__file__).resolve().parents[2] / "src"
 
 BROKER_CLASSES = frozenset({"AlpacaBroker", "FakeBroker"})
 ALPACA_BROKER_MODULE = "tradepartner.adapters.alpaca_broker"
+BROKER_MODULES = (ALPACA_BROKER_MODULE, "tradepartner.adapters.fake_broker")
 TRADING_RAW_MODULE = "tradepartner.adapters.alpaca_trading_raw"
 ORDER_CALLS = frozenset({"submit", "cancel"})
 WRAPPER = "tradepartner.execution.wrapper"
@@ -156,7 +167,8 @@ def broker_class_imports(module: Module) -> list[str]:
     found = sorted(
         name
         for name in imported_names(module)
-        if name.rpartition(".")[2] in BROKER_CLASSES or _names_module(name, ALPACA_BROKER_MODULE)
+        if name.rpartition(".")[2] in BROKER_CLASSES
+        or any(_names_module(name, target) for target in BROKER_MODULES)
     )
     found += sorted(
         f"attribute {chain}"
@@ -336,6 +348,8 @@ def test_boundary_holds_on_the_tree(check: str) -> None:
         ("importlib.import_module('tradepartner.adapters.alpaca_broker')", "t.x", False, True),
         ("import tradepartner.adapters.broker", "tradepartner.cli", False, False),
         ("broker_type = getattr(module, 'FakeBroker')", "tradepartner.cli", False, True),
+        ("from tradepartner.adapters.fake_broker import *\nb = FakeBroker()", "t.cli", False, True),
+        ("importlib.import_module('tradepartner.adapters.fake_broker')", "t.cli", False, True),
         ("mod = importlib.import_module(name)", "tradepartner.cli", False, True),
         ("mod = __import__(f'tradepartner.adapters.{n}')", "tradepartner.cli", False, True),
     ],
