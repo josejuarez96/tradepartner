@@ -1,0 +1,1 @@
+- #296 Boundary test fences the alpaca-py trading SDK to the adapters: `alpaca.trading.client` only in `alpaca_raw`/`alpaca_trading_raw`, `alpaca.trading.requests` only in `alpaca_trading_raw`/`cli_record`, `.submit_order`/`.cancel_order*` only there and in `alpaca_broker` (`tests/execution/test_sdk_boundary.py`)
