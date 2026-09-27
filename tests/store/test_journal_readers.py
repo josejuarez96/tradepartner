@@ -25,6 +25,7 @@ from tradepartner.store.journal import (
     DecisionEventRow,
     DecisionRow,
     FillCursorRow,
+    FillRow,
     JournalIntegrityError,
     JournalNotInitialised,
     KillSwitchRow,
@@ -457,11 +458,28 @@ def test_pending_and_non_terminal_orders(conn: duckdb.DuckDBPyConnection) -> Non
     _event(conn, "expired_then_noop", "accepted", 0)
     _event(conn, "expired_then_noop", "cancel_noop", 9)
     _event(conn, "expired_then_noop", "expired", 3)
+    # A fill collected before any acknowledging event (a submit that timed out
+    # after the broker took the order) acknowledges it: not pending, still open.
+    _order(conn, run_id, decision_id, "pending_with_fill")
+    _event(conn, "pending_with_fill", "pending", 0)
+    append(
+        conn,
+        FillRow(
+            client_order_id="pending_with_fill",
+            filled_at=_at(1),
+            quantity=0.5,
+            price=10.0,
+            price_implied=False,
+            broker_fill_id="bf-1",
+            source="broker_feed",
+            **_stamp(2),
+        ),
+    )
 
     pending = {o.client_order_id for o in journal.pending_orders(conn, window_id=window_id)}
     open_ = {o.client_order_id for o in journal.non_terminal_orders(conn, window_id=window_id)}
     assert pending == {"none", "pending", "pending_cancel"}
-    assert open_ == {"none", "pending", "pending_cancel", "accepted", "replay"}
+    assert open_ == {"none", "pending", "pending_cancel", "accepted", "replay", "pending_with_fill"}
     assert pending == {o.client_order_id for o in journal.pending_orders(conn, window_id=None)}
 
 
@@ -662,6 +680,19 @@ def test_overrides_with_their_consumption(conn: duckdb.DuckDBPyConnection) -> No
             **_stamp(1),
         ),
     )
+    # A `released` row citing an override consumes nothing (req 5: only an
+    # `engaged` row citing it does).
+    append(
+        conn,
+        KillSwitchRow(
+            window_id=window_id,
+            at=_at(2),
+            state="released",
+            source="owner",
+            override_id=pending_kill,
+            **_stamp(2),
+        ),
+    )
     found = {o.override.override_id: o for o in journal.overrides_for(conn, window_id)}
     assert found[excluded].decision_ids == (decision_id,) and found[excluded].consumed
     assert not found[unused].consumed
@@ -694,3 +725,65 @@ def test_reports_resumes_alerts_and_outcomes(conn: duckdb.DuckDBPyConnection) ->
     assert [
         (a.kind, a.session) for a in journal.alerts_for(conn, kind="no_window", session=_NEXT)
     ] == [("no_window", _NEXT)]
+
+
+def test_the_private_select_refuses_fills(conn: duckdb.DuckDBPyConnection) -> None:
+    """`fills` is read only through `fills_for`, which hides superseded rows."""
+    with pytest.raises(TypeError, match="fills_for"):
+        journal._select(conn, FillRow)
+
+
+def test_status_constants_are_schema_values() -> None:
+    order_statuses = set(schema.JOURNAL_ENUMS["order_events", "status"])
+    assert set(journal.TERMINAL_ORDER_STATUSES) <= order_statuses
+    assert set(journal.ACKNOWLEDGED_ORDER_STATUSES) <= order_statuses
+    assert set(journal.CLOSING_STOP_STATES) <= set(
+        schema.JOURNAL_ENUMS["paper_window_stops", "state"]
+    )
+
+
+def test_order_readers_fail_closed_on_an_order_with_no_run(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    window_id = _window(conn)
+    _order(conn, 99, 1, "orphan")
+    for read in (
+        journal.orders_for,
+        journal.order_events_for,
+        journal.non_terminal_orders,
+        journal.pending_orders,
+    ):
+        with pytest.raises(JournalIntegrityError, match="orphan"):
+            read(conn, window_id=window_id)
+
+
+def test_an_override_is_consumed_only_by_what_its_kind_consumes(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A decision citing an `engage_kill_switch` override, or another window's
+    `engaged` row citing it, does not consume it."""
+    window_id = _window(conn)
+    run_id = _run(conn, window_id)
+    kill = append(
+        conn,
+        OverrideRow(
+            window_id=window_id, made_at=_at(0), kind="engage_kill_switch", reason="r", **_stamp()
+        ),
+    )
+    _decision(conn, run_id, override_id=kill)
+    append(
+        conn,
+        KillSwitchRow(
+            window_id=window_id + 1,
+            at=_at(1),
+            state="engaged",
+            source="owner",
+            override_id=kill,
+            **_stamp(1),
+        ),
+    )
+    (found,) = journal.overrides_for(conn, window_id)
+    assert not found.consumed
+    assert [o.override_id for o in journal.unconsumed_kill_switch_overrides(conn, window_id)] == [
+        kill
+    ]

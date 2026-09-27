@@ -728,13 +728,15 @@ def all_fill_ids(conn: duckdb.DuckDBPyConnection) -> frozenset[str]:
 # reader here, they query in their own module. Rows come back in `known_at` order,
 # ties broken by `ingested_at` and then insertion order (DuckDB's `rowid`), or in id
 # order for a table with its own id; "latest" always means latest by that order,
-# never by a broker instant.
+# never by a broker instant. No reader applies a `known_at` cutoff: a caller that
+# needs state as of an instant (the ledger at close(S-1), say) filters itself.
 
 #: `order_events` statuses that end an order. Terminal is absorbing: an order with
 #: any of these rows is terminal whatever rows follow it in `known_at` order.
 TERMINAL_ORDER_STATUSES: tuple[str, ...] = ("filled", "expired", "rejected", "cancelled")
-#: Statuses that show the broker has the order; an order with none is `pending`
-#: (spec req 4, "Unknown state"), whatever `cancel_*` rows follow.
+#: Statuses that show the broker has the order; an order with none of them and no
+#: journaled fill is `pending` (spec req 4, "Unknown state"), whatever `cancel_*`
+#: rows follow.
 ACKNOWLEDGED_ORDER_STATUSES: tuple[str, ...] = ("accepted", "replay", *TERMINAL_ORDER_STATUSES)
 #: `paper_window_stops` states that close a window (`requested` leaves it open).
 CLOSING_STOP_STATES: tuple[str, ...] = ("closed", "abandoned")
@@ -766,7 +768,7 @@ class DecisionWithEvents:
 @dataclass(frozen=True)
 class OverrideWithConsumption:
     """An override and what consumed it: the decisions citing it (`exclude_name`,
-    `keep_name`) or the `kill_switch` rows citing it (`engage_kill_switch`)."""
+    `keep_name`) or the `engaged` `kill_switch` rows citing it (`engage_kill_switch`)."""
 
     override: OverrideRow
     decision_ids: tuple[int, ...]
@@ -774,8 +776,11 @@ class OverrideWithConsumption:
 
     @property
     def consumed(self) -> bool:
-        """True once a decision or a `kill_switch` row cites the override."""
-        return bool(self.decision_ids or self.kill_switch_event_ids)
+        """True once what its kind consumes cites it: an `engaged` `kill_switch` row
+        for `engage_kill_switch`, a decision for the name kinds."""
+        if self.override.kind == "engage_kill_switch":
+            return bool(self.kill_switch_event_ids)
+        return bool(self.decision_ids)
 
 
 def _select[R](
@@ -785,7 +790,10 @@ def _select[R](
     params: Iterable[Any] = (),
     order: str = _ORDER,
 ) -> list[R]:
-    """Rows of `row_type`'s table (aliased `t`) matching `where`, as row objects."""
+    """Rows of `row_type`'s table (aliased `t`) matching `where`, as row objects.
+    Never `fills`: that table is read only through `fills_for`."""
+    if row_type is FillRow:
+        raise TypeError("fills is read only through fills_for")
     require_journal(conn)
     names = [f.name for f in fields(row_type)]  # type: ignore[arg-type]
     columns = ", ".join(f't."{name}"' for name in names)
@@ -845,9 +853,25 @@ def runs_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[RunWithRes
     return [RunWithResult(run, results.get(run.run_id)) for run in runs]  # type: ignore[arg-type]
 
 
+def _require_orders_have_runs(conn: duckdb.DuckDBPyConnection) -> None:
+    """Fail closed, as `fills_for` does: an order whose run has no `paper_runs` row
+    would drop out of every per-window order read (and so out of the halt path's
+    and reconciliation's view) instead of being seen."""
+    require_journal(conn)
+    orphans = conn.execute(
+        "SELECT o.client_order_id FROM orders o LEFT JOIN paper_runs r "
+        "ON r.run_id = o.run_id WHERE r.run_id IS NULL ORDER BY o.client_order_id"
+    ).fetchall()
+    if orphans:
+        ids = ", ".join(repr(row[0]) for row in orphans)
+        raise JournalIntegrityError(f"orders with no paper_runs row: {ids}")
+
+
 def orders_for(conn: duckdb.DuckDBPyConnection, *, window_id: int | None) -> list[OrderRow]:
     """The window's orders (through their run), or every order when `window_id` is
-    None (the collectors read own orders account-wide)."""
+    None (the collectors read own orders account-wide). Raises
+    `JournalIntegrityError` when any order has no run (every order reader does)."""
+    _require_orders_have_runs(conn)
     return _select(conn, OrderRow, _ORDER_IN_WINDOW, [window_id, window_id])
 
 
@@ -855,6 +879,7 @@ def order_events_for(
     conn: duckdb.DuckDBPyConnection, *, window_id: int | None
 ) -> list[OrderEventRow]:
     """Every `order_events` row of the window's orders (or of every order)."""
+    _require_orders_have_runs(conn)
     return _select(conn, OrderEventRow, _ORDER_IN_WINDOW, [window_id, window_id])
 
 
@@ -863,13 +888,16 @@ def latest_order_events(
 ) -> dict[str, OrderEventRow]:
     """Each order's latest event by `known_at` (not insertion order, not the
     broker's `event_at`), keyed by `client_order_id`; an order with no event is
-    absent."""
+    absent. Not an order's state: a `cancel_noop` journaled after `expired` is the
+    latest row of a terminal order. State comes from `non_terminal_orders` and
+    `pending_orders`."""
     return {e.client_order_id: e for e in order_events_for(conn, window_id=window_id)}
 
 
 def _orders_where(
     conn: duckdb.DuckDBPyConnection, window_id: int | None, statuses: tuple[str, ...]
 ) -> list[OrderRow]:
+    _require_orders_have_runs(conn)
     return _select(
         conn,
         OrderRow,
@@ -888,9 +916,17 @@ def non_terminal_orders(
 
 
 def pending_orders(conn: duckdb.DuckDBPyConnection, *, window_id: int | None) -> list[OrderRow]:
-    """Orders with no broker-acknowledged event (`accepted`, `replay` or terminal),
-    whatever `cancel_*` rows follow: settled only by `paper resume`."""
-    return _orders_where(conn, window_id, ACKNOWLEDGED_ORDER_STATUSES)
+    """Orders with no broker-acknowledged event (`accepted`, `replay` or terminal)
+    and no journaled fill (read through `fills_for`), whatever `cancel_*` rows
+    follow: settled only by `paper resume`."""
+    candidates = _orders_where(conn, window_id, ACKNOWLEDGED_ORDER_STATUSES)
+    if not candidates:
+        return []
+    filled = {
+        f.fill.client_order_id
+        for f in fills_for(conn, client_order_ids=[o.client_order_id for o in candidates])
+    }
+    return [o for o in candidates if o.client_order_id not in filled]
 
 
 def orders_on_session(
@@ -946,7 +982,10 @@ def latest_collected_through(conn: duckdb.DuckDBPyConnection) -> datetime | None
 
 
 def kill_switch_events_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[KillSwitchRow]:
-    """The window's `kill_switch` rows; the derived state reads the last one."""
+    """The window's `kill_switch` rows in `known_at` order (then insertion order).
+    Rows written on the halt path after a `ClockError` carry `utc_now()` stamps,
+    so the caller deriving the state must not trust `known_at` order alone there
+    (`event_id` is write order)."""
     return _select(conn, KillSwitchRow, "t.window_id = ?", [window_id])
 
 
@@ -1016,14 +1055,16 @@ def signals_for(conn: duckdb.DuckDBPyConnection, run_id: int) -> list[SignalRow]
 
 def overrides_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[OverrideWithConsumption]:
     """The window's overrides in `override_id` order, each with the decisions and
-    `kill_switch` rows citing it (consumption is visible only through those)."""
+    `engaged` `kill_switch` rows citing it (consumption is visible only through
+    those; a `released` row citing it consumes nothing)."""
     overrides = _select(conn, OverrideRow, "t.window_id = ?", [window_id], order="t.override_id")
     cited = "t.override_id IN (SELECT override_id FROM overrides WHERE window_id = ?)"
     decisions: dict[int, list[int]] = {}
     for d in _select(conn, DecisionRow, cited, [window_id], order="t.decision_id"):
         decisions.setdefault(d.override_id, []).append(d.decision_id)  # type: ignore[arg-type]
     engaged: dict[int, list[int]] = {}
-    for k in _select(conn, KillSwitchRow, cited, [window_id], order="t.event_id"):
+    engaged_rows = f"{cited} AND t.state = 'engaged' AND t.window_id = ?"
+    for k in _select(conn, KillSwitchRow, engaged_rows, [window_id, window_id], order="t.event_id"):
         engaged.setdefault(k.override_id, []).append(k.event_id)  # type: ignore[arg-type]
     return [
         OverrideWithConsumption(
