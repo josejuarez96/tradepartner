@@ -545,11 +545,14 @@ class AlertsConfig(BaseModel):
     """Alert delivery channels (spec req 11; #247 Q2). `store` is always a channel, so
     the `alerts` table stays the source of truth; `email` works only when the four
     `ALERT_*` variables are set (`Settings.alert_*`). No channel repeats.
+    `delivery_timeout_seconds` bounds one `osascript` call, and each SMTP socket
+    operation, so a stuck channel cannot hold a run (the spec names no value; T57).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     channels: list[AlertChannel] = Field(default_factory=lambda: list(_DEFAULT_ALERT_CHANNELS))
+    delivery_timeout_seconds: float = Field(default=10.0, gt=0)
 
     @field_validator("channels")
     @classmethod
