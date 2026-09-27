@@ -217,7 +217,8 @@ def insert_row(conn: duckdb.DuckDBPyConnection, table: str, row: Mapping[str, An
                 f"got {type(value).__name__}: {value!r}"
             )
         bound_values.append(value)
-    columns = ", ".join(row.keys())
+    # Quoted: the journal names a column `at`, a DuckDB keyword (Phase 4 T49).
+    columns = ", ".join(f'"{name}"' for name in row)
     placeholders = ", ".join("?" for _ in row)
     conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", bound_values)
 

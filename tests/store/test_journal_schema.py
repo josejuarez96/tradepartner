@@ -27,6 +27,7 @@ from conftest import version_4_store
 
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
+from tradepartner.store.db import insert_row
 
 _EXPECTED_JOURNAL_TABLES = {
     "paper_windows",
@@ -393,3 +394,21 @@ def test_journal_session_columns_are_dates(journal: duckdb.DuckDBPyConnection) -
     ).fetchall()
     assert rows
     assert {data_type for _, _, data_type in rows} == {"DATE"}
+
+
+def test_insert_row_writes_a_column_named_at(journal: duckdb.DuckDBPyConnection) -> None:
+    """`at` is a DuckDB keyword; `store.db.insert_row`, which T49b's writer uses,
+    quotes column names so the spec's column name works as it is."""
+    insert_row(
+        journal,
+        "alerts",
+        {
+            "alert_id": 1,
+            "kind": "locked",
+            "message": "m",
+            "at": _NOW,
+            "known_at": _NOW,
+            "ingested_at": _NOW,
+        },
+    )
+    assert journal.execute('SELECT "at" FROM alerts').fetchall() == [(_NOW,)]
