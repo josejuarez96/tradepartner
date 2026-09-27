@@ -310,7 +310,7 @@ why = "Phase 4 has no spec or plan; without one the wrapper, the run and the pag
 unblocks = ["spec:paper-trading"]
 
 [plan.paper-trading]
-what = "The Phase 4 build document: 38 tasks, one PR each, from broker types to the phase-close evidence, grouped in chains."
+what = "The Phase 4 build document: 49 tasks, one PR each, from broker types to the phase-close evidence, grouped in chains."
 why = "What the ready frontier is computed from once Phase 3 closes; six unattended paper rebalances under these tasks are the MVP's finish line."
 unblocks = ["phase:4"]
 
@@ -320,10 +320,14 @@ why = "Phase 4 cannot be claimed, built or measured until the spec is broken int
 unblocks = ["plan:paper-trading"]
 
 [task.T46]
-what = "The broker types Phase 4 needs (account, assets, open orders, order lookup, fills with ids, one status set) and ADR 0007's typed clock fault."
-why = "Every later task imports these; a broken clock must raise its own error before any order or fill exists."
+what = "ADR 0007's Task A: the typed system-fault errors and the clock wrap in the fake broker."
+why = "A broken clock must raise its own error before any order or fill exists; every later task imports these types."
 
 [task.T46b]
+what = "The broker types Phase 4 needs: account, assets, open orders, order lookup, fills with ids, one status set."
+why = "Risk checks and crash recovery cannot work without account and open-order queries (#33)."
+
+[task.T46c]
 what = "A scriptable fake broker: told per order to accept, fill, part-fill, expire, reject, vanish or hold a cancel."
 why = "The wrapper's tests need every broker outcome on demand, with no network."
 
@@ -340,7 +344,7 @@ what = "The owner records paper responses with paper keys and writes down what A
 why = "The adapter and the sizing rules depend on facts only a real account can answer."
 
 [task.T48c]
-what = "The Alpaca paper broker adapter, paper endpoint only, with one status table and no risk logic."
+what = "The Alpaca paper broker adapter, paper endpoint only, with one status table and no risk logic, and the production-only broker factory."
 why = "The real broker behind the wrapper; Phase 6 swaps its endpoint, not its rules."
 
 [task.T49]
@@ -348,11 +352,15 @@ what = "The journal tables in the store, append-only, at schema version 5."
 why = "Every signal, decision, order, fill and outcome is a stored fact with a known_at from here on."
 
 [task.T49b]
-what = "The journal's writers and readers, and the single accessor every reader of fills goes through."
+what = "The journal's row types and writers, and the single accessor every reader of fills goes through."
 why = "Inserts only, like the trial registry; one accessor so a superseded fill is never counted twice."
 
+[task.T49c]
+what = "The journal's readers, per window and per run."
+why = "Every derived state (switch, decisions, rebalances) is a query over these rows."
+
 [task.T50]
-what = "The execution package, the deterministic client order id, and the tests that fence the order path."
+what = "The deterministic client order id and the tests that fence the order path."
 why = "Only the wrapper may submit or cancel; an id derived from the journal makes a crash unable to double an order."
 
 [task.T51]
@@ -360,8 +368,12 @@ what = "The ledger: positions and cash rebuilt from journaled fills and adjustme
 why = "The journal is the truth about what we hold; the broker is what we reconcile it against."
 
 [task.T52]
-what = "Pure functions for what a decision still needs (open, in flight, settled, closed), how much remains, and what residue a name carries."
+what = "Pure functions for what a decision still needs (open, in flight, settled, closed), how much remains, and a buy's target."
 why = "Re-runs and catch-ups trade only remainders; the rules must be one function of the journal, not run-time state."
+
+[task.T52b]
+what = "The residue a name carries (dust, untradable, carried) and the derived state of a rebalance (pending, executed, missed)."
+why = "A window must be able to close around residues, and a rebalance nobody ran must still lapse on schedule."
 
 [task.T53]
 what = "The backtest engine's plan function made public, tracking-trial windows, and the step that turns a plan into journaled decisions."
@@ -384,27 +396,39 @@ what = "Alerts stored first, then delivered to macOS notifications and optional 
 why = "The system runs unattended; a failure nobody hears about is the worst failure."
 
 [task.T58]
-what = "Collecting order outcomes and fills from the broker without ever counting a fill twice or closing an order before its fills arrive."
-why = "A lagging fill feed must never engage the kill switch or leave a position out of the ledger."
+what = "Collecting order outcomes and fills from the broker without counting a fill twice, closing an order before its fills arrive, or letting a fill lag forever."
+why = "A lagging fill feed must never engage the kill switch by mistake, and never leave a position out of the ledger."
 
 [task.T59]
-what = "The kill switch: a state derived from journal rows, engaged by faults, drawdown or the owner, released only by a reasoned resume."
-why = "A lost write or a crash must leave the switch engaged, never open."
+what = "The kill switch, derived from journal rows and engaged by faults, drawdown or the owner, plus the one run lock every command shares."
+why = "A lost write or a crash must leave the switch engaged, never open; two runs must never overlap."
 
 [task.T60]
 what = "The wrapper's core: the clock pre-check, the rejection allowlist, the halt path in order, and duplicate-id replay."
 why = "ADR 0007 made into code: anything unclassified halts, and a halt writes the switch row before anything else."
 
 [task.T60b]
-what = "The wrapper's sells phase and the machinery every phase shares: limits, skips, journaled orders before submit, acknowledgement polling."
-why = "Sells fund buys; a batch that breaks a limit submits nothing."
+what = "The machinery every wrapper phase shares: switch re-read, validation, limits, skips, journaled orders before submit, acknowledgement polling."
+why = "A batch that breaks a limit submits nothing, and every order is on record before the broker sees it."
 
 [task.T60c]
-what = "The wrapper's buys phase: sized from cash after the sells, deferred or written off when the cash is not there, re-attempted for remainders only."
-why = "Nothing is ever borrowed and no buy is ever placed twice."
+what = "The wrapper's sells phase: exits and trims sized from the reconciled holding, submitted before the open."
+why = "Sells fund buys and can never exceed what is held."
+
+[task.T60d]
+what = "The wrapper's buys phase: sized from cash after the sells, deferred when the cash is not there."
+why = "Nothing is ever borrowed."
+
+[task.T60e]
+what = "Re-attempts for remainders only, and write-offs when a rebalance's last phase leaves a buy unfunded."
+why = "No buy is ever placed twice, and a halted attempt is never mistaken for a funding shortfall."
 
 [task.T61]
-what = "Reconciliation with the store's explanations, and the owner's resume: settle pending orders, reconcile, release the switch."
+what = "Reconciliation with the store's explanations: splits, delistings, spin-offs and dividends known at the previous close."
+why = "One shared check for the run, resume, stop and the reconcile command."
+
+[task.T61b]
+what = "The owner's resume: settle pending orders, reconcile, release the switch, all with a reason."
 why = "After a crash or a halt nothing trades until a human has reasoned and the books agree."
 
 [task.T62]
@@ -412,35 +436,55 @@ what = "Outcomes per order (return, realised P&L or the cost of a miss) and the 
 why = "The journal chain ends in an outcome; Phase 4's exit check counts every chain."
 
 [task.T63]
-what = "The daily tracking run's core: lock, staleness, collection, reconciliation, marks, drawdown, result row."
-why = "Runs every session unattended; most days it only collects, reconciles and marks."
+what = "The daily tracking run's core: lock, staleness, collection, reconciliation, result row, halts through the wrapper."
+why = "Runs every session unattended; most days it only collects and reconciles."
 
 [task.T63b]
-what = "The tracking run's rebalance step: plan under a trial at the month-end close, journal decisions, trade inside the submit window."
-why = "The plan is the engine's own function, so paper equals the backtest by construction."
+what = "The run's marks, drawdown check, lapse rules and due outcomes."
+why = "Every month-end gets a mark even after a missed run, and a rebalance nobody traded lapses on schedule."
 
 [task.T63c]
+what = "The run's plan step: plan under a trial at the month-end close and journal the decisions."
+why = "The plan is the engine's own function, so paper equals the backtest by construction."
+
+[task.T63d]
+what = "The run's trade step: the submit window, the hand-off to the wrapper, and same-session collection."
+why = "Orders go only inside the window the owner set, and a rebalance is executed only when every decision is done."
+
+[task.T63e]
 what = "Forced exits for delisted names and spin-off receipts, and the stop runs that flatten the account when a window closes."
 why = "The only intra-month trades allowed, and the only legal way to a flat account."
 
-[task.T63d]
+[task.T63f]
 what = "The no-look-ahead suite for the tracking run: cutting the store, journal included, at the previous close changes nothing."
 why = "The same guard rail the backtest has, applied to the paper path."
 
+[task.T63g]
+what = "End-to-end tests for a crash, the resume and the next run, the fill-lag bound, and every alert kind."
+why = "The recovery path is where money is lost; it is tested as a whole, not only in pieces."
+
 [task.T64]
-what = "The paper window: start behind the gap sign-off gate with frozen limits, stop when flat apart from residues, abandon as a last resort."
+what = "Starting a paper window: behind the gap sign-off gate, on a flat account, with the limits frozen into the window."
 why = "Rules are frozen before the first order and cannot move while results accumulate."
 
+[task.T64b]
+what = "Stopping a window when flat apart from residues, abandoning one that cannot close, the owner's kill, and the one override writer."
+why = "Every way out of a window is journaled with a reason; the page and the CLI share one write."
+
 [task.T65]
-what = "The paper-versus-backtest comparison under the rule frozen at start, with the dividend and fill-timing terms printed beside the raw number."
+what = "The paper-versus-backtest comparison per month under the rule frozen at start, with the dividend and fill-timing terms printed beside the raw number."
 why = "ADR 0005's first exit check, decomposed so a known execution gap is not mistaken for a bug."
+
+[task.T65b]
+what = "The target comparison (override, late data or bug) and the report command that opens the tracking trial."
+why = "A plan that drifts from the engine is caught by name, and a late bar is not blamed on the code."
 
 [task.T66]
 what = "The exit-criteria command and the pure data behind the operations page."
 why = "Phase 4 ends when a command says so, with each check naming its query."
 
 [task.T67]
-what = "The tradepartner paper commands: start, stop, run, reconcile, kill, resume, report, check, status, abandon."
+what = "The tradepartner paper commands: start, stop, run, reconcile, kill, resume, report, check, status, abandon, override."
 why = "What the scheduler and the owner call; no flag can reach a live endpoint or bypass a limit."
 
 [task.T68]
