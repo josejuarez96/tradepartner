@@ -788,6 +788,34 @@ class TestDividendPriorCloseStaleness:
             dropped_dividends_as_of(synthetic_store, date(2021, 3, 1))  # type: ignore[arg-type]
 
 
+def _fact(
+    conn: duckdb.DuckDBPyConnection,
+    as_of: date,
+    value: float,
+    accession: str | None,
+    ingested_at: datetime,
+    *,
+    known_at: datetime = datetime(2021, 1, 20, 21, 0, tzinfo=UTC),
+) -> None:
+    """One `shares_outstanding` fact row for SEC_FACTS_RESTATED (T11e reader tests)."""
+    insert_row(
+        conn,
+        "facts",
+        {
+            "security_id": "SEC_FACTS_RESTATED",
+            "fact_name": "shares_outstanding",
+            "class_member": "",
+            "as_of_date": as_of,
+            "value": value,
+            "filing_accession": accession,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
 class TestFactsAsOf:
     def test_restated_shares_fact_returns_earlier_then_later_value(
         self, fixture_store: duckdb.DuckDBPyConnection
@@ -866,6 +894,70 @@ class TestFactsAsOf:
         assert by_accession.height == 1
         assert by_accession.row(0, named=True)["as_of_date"] == date(2021, 1, 15)
         assert _one(rows, as_of_date=date(2021, 1, 10))["value"] == pytest.approx(400.0)
+
+    def test_two_dates_of_one_accession_from_one_ingest_are_both_served(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A filing may carry two dates (same-source records keep their own
+        keys): both rows of the latest ingest are served, never one picked
+        arbitrarily."""
+        ingested = datetime(2021, 2, 1, tzinfo=UTC)
+        for as_of, value in ((date(2021, 1, 31), 500.0), (date(2021, 1, 15), 510.0)):
+            _fact(fixture_store, as_of, value, "0000000001-21-000002", ingested)
+        rows = facts_as_of(
+            fixture_store, datetime(2021, 6, 1, tzinfo=UTC), security_ids=["SEC_FACTS_RESTATED"]
+        )
+        both = rows.filter(pl.col("filing_accession") == "0000000001-21-000002")
+        assert sorted(both["as_of_date"].to_list()) == [date(2021, 1, 15), date(2021, 1, 31)]
+
+    def test_a_stale_re_dated_row_never_shadows_another_filings_row(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """A2's genuine 10-31 row (known 11-05) and A1's stale FSN row on the
+        same date (known 11-20, later re-dated to 10-17): after the re-date,
+        A1 serves 10-17 and A2's 10-31 row is still served, because the
+        accession rule runs before the per-date collapse."""
+        _fact(
+            fixture_store,
+            date(2025, 10, 31),
+            200.0,
+            "0000000002-25-000001",
+            datetime(2025, 11, 5, tzinfo=UTC),
+            known_at=datetime(2025, 11, 5, tzinfo=UTC),
+        )
+        a1_known = datetime(2025, 11, 20, tzinfo=UTC)
+        _fact(
+            fixture_store,
+            date(2025, 10, 31),
+            100.0,
+            "0000000001-25-000001",
+            a1_known,
+            known_at=a1_known,
+        )
+        _fact(
+            fixture_store,
+            date(2025, 10, 17),
+            100.0,
+            "0000000001-25-000001",
+            datetime(2026, 1, 10, tzinfo=UTC),
+            known_at=a1_known,
+        )
+        early = facts_as_of(
+            fixture_store, datetime(2025, 11, 10, tzinfo=UTC), security_ids=["SEC_FACTS_RESTATED"]
+        )
+        assert _one(early, as_of_date=date(2025, 10, 31))["value"] == pytest.approx(200.0)
+        late = facts_as_of(
+            fixture_store, datetime(2026, 3, 1, tzinfo=UTC), security_ids=["SEC_FACTS_RESTATED"]
+        )
+        served = {
+            (r["as_of_date"], r["filing_accession"]): r["value"]
+            for r in late.iter_rows(named=True)
+            if r["as_of_date"] >= date(2025, 10, 1)
+        }
+        assert served == {
+            (date(2025, 10, 31), "0000000002-25-000001"): 200.0,
+            (date(2025, 10, 17), "0000000001-25-000001"): 100.0,
+        }
 
     def test_before_any_known_at_returns_nothing(
         self, fixture_store: duckdb.DuckDBPyConnection

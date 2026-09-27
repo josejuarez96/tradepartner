@@ -1039,7 +1039,9 @@ def _facts_cache_key(settings: Settings, cik: str) -> str | None:
     path = Path(settings.edgar.cache_dir) / "facts" / f"v{PARSER_VERSION}" / f"{cik}.json"
     data = json.loads(path.read_text())
     assert data["version"] == PARSER_VERSION and data["cik"] == cik
-    return str(data["key"]) if data["key"] is not None else None
+    accession, names = str(data["key"]).split("|", 1)
+    assert names == SHARES
+    return accession
 
 
 def test_company_facts_are_cached_by_the_latest_cover_form_accession(tmp_path: Path) -> None:
@@ -1057,10 +1059,17 @@ def test_company_facts_are_cached_by_the_latest_cover_form_accession(tmp_path: P
     _seed_apple(source, _record(eight_k, "8-K", INSIDE_LAG, inline_xbrl=False))
     _shares(source, APPLE)
     assert router.urls.count(url) == 1 and _facts_cache_key(settings, APPLE) == APPLE_ACCESSION
-    amendment = "0000320193-26-000701"
-    _seed_apple(source, _record(amendment, "10-K/A", INSIDE_LAG, inline_xbrl=False))
+    # A newer cover-form filing the payload already holds: re-fetched and re-keyed.
+    ten_q = _record(APPLE_10Q, "10-Q", APPLE_10Q_ACCEPTED, inline_xbrl=False)
+    _seed_apple(source, ten_q)
     _shares(source, APPLE)
-    assert router.urls.count(url) == 2 and _facts_cache_key(settings, APPLE) == amendment
+    assert router.urls.count(url) == 2 and _facts_cache_key(settings, APPLE) == APPLE_10Q
+    # A 10-K/A the payload does not hold yet: re-fetched, served, but the cache
+    # keeps the last complete key so the next run fetches again.
+    amendment = "0000320193-26-000701"
+    _seed_apple(source, ten_q, _record(amendment, "10-K/A", INSIDE_LAG, inline_xbrl=False))
+    _shares(source, APPLE)
+    assert router.urls.count(url) == 3 and _facts_cache_key(settings, APPLE) == APPLE_10Q
 
 
 def test_the_bulk_company_facts_path_caches_by_the_same_key(tmp_path: Path) -> None:
@@ -1134,3 +1143,135 @@ def test_facts_after_a_real_filing_index(tmp_path: Path) -> None:
     assert run() == (apple, alphabet)
     later = router.urls[before:]
     assert not [u for u in later if "companyfacts" in u or "data.sec.gov/submissions" in u]
+
+
+# --- facts: reviewer fixes (#253) ---------------------------------------------
+
+
+def test_a_co_registrant_gets_no_company_facts_from_the_filers_accession(tmp_path: Path) -> None:
+    """Apple's company facts (synthetic) carry Alphabet's combined-filing
+    accession, stamped under Apple too: FSN holds it under Alphabet, so Apple
+    is never served the filer's share count (bitfly's handoff on #252)."""
+    payload = _apple_entries(
+        _entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000),
+        _entry(ALPHABET_ACCESSION, "2026-01-28", 12_097_000_000),
+    )
+    source = _source(_settings(tmp_path), _facts_router(**{APPLE: payload}))
+    _seed_apple(source, _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED))
+    assert {f.accession for f in _shares(source, APPLE)} == {APPLE_ACCESSION}
+
+
+def test_a_payload_trailing_the_latest_filing_is_not_cached(tmp_path: Path) -> None:
+    """The cache key is the latest stamped cover-form accession; a payload
+    that does not hold it yet (the API trails acceptance) is served but not
+    cached, so the next run re-fetches and re-dates with no new accession."""
+    settings = _settings(tmp_path)
+    router = _facts_router(**{APPLE: _apple_entries()})
+    source = _source(settings, router)
+    _seed_apple(source)
+    [first] = _shares(source, APPLE)
+    assert first.as_of_date == date(2025, 10, 31)
+    cache = Path(settings.edgar.cache_dir) / "facts" / f"v{PARSER_VERSION}" / f"{APPLE}.json"
+    assert not cache.exists()
+
+    source2 = _source(settings, _facts_router())
+    _seed_apple(source2)
+    [second] = _shares(source2, APPLE)
+    assert second.as_of_date == date(2025, 10, 17) and cache.exists()
+
+
+def test_the_bulk_payload_trailing_the_latest_filing_falls_back_to_the_api(
+    tmp_path: Path,
+) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:  # rebuilt nightly: lacks today's filing
+        bulk.writestr(f"CIK{APPLE}.json", json.dumps(_apple_entries()))
+    settings = _settings(tmp_path, bulk_stamp_threshold_ciks=1)
+    router = _facts_router()
+    router.add(BULK_FACTS_URL, buffer.getvalue())
+    source = _source(settings, router)
+    _seed_apple(source)
+    _seed_stamps(
+        source,
+        ALPHABET,
+        {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
+    )
+    [record] = _shares(source, APPLE)
+    assert record.as_of_date == date(2025, 10, 17)
+    assert router.urls.count(BULK_FACTS_URL) == 1
+    assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == 1
+
+
+def test_a_lag_window_cover_date_wins_over_a_differing_company_facts_end(tmp_path: Path) -> None:
+    accession = "0000320193-26-000050"
+    payload = _apple_entries(_entry(accession, "2025-12-31", 14_776_353_000))
+    router = _facts_router(**{APPLE: payload})
+    router.add(_download_url(APPLE, accession, "lagwin.htm"), _COVER_DOCUMENT)
+    source = _source(_settings(tmp_path), router)
+    _seed_apple(source, _record(accession, "10-K", INSIDE_LAG, primary_document="lagwin.htm"))
+    records = [f for f in _shares(source, APPLE) if f.accession == accession]
+    assert [(f.as_of_date, f.value) for f in records] == [(date(2025, 10, 17), 14_776_353_000.0)]
+
+
+def test_a_same_date_disagreement_raises_even_when_another_value_matches(tmp_path: Path) -> None:
+    """Company facts {V1 on D1, V9 on D2} against FSN's V1 dated D2 (the FSN
+    share takes the latest company-facts end): the values on D2 differ, so
+    an overlapping value elsewhere does not excuse the clash."""
+    payload = _apple_entries(
+        _entry(APPLE_ACCESSION, "2025-09-27", 14_776_353_000),
+        _entry(APPLE_ACCESSION, "2025-10-17", 99),
+    )
+    source = _source(_settings(tmp_path), _facts_router(**{APPLE: payload}))
+    _seed_apple(source)
+    with pytest.raises(ValueError, match="2025-10-17"):
+        _shares(source, APPLE)
+
+
+def test_a_company_facts_end_after_acceptance_is_capped(tmp_path: Path) -> None:
+    payload = _apple_entries(_entry(APPLE_ACCESSION, "2035-10-17", 14_776_353_000))
+    source = _source(_settings(tmp_path), _facts_router(**{APPLE: payload}))
+    _seed_apple(source)
+    assert {f.as_of_date for f in _shares(source, APPLE)} == {date(2025, 10, 31)}
+
+
+def test_a_new_name_re_fetches_company_facts(tmp_path: Path) -> None:
+    router = _facts_router()
+    source = _source(_settings(tmp_path), router)
+    _seed_apple(source)
+    _shares(source, APPLE)
+    url = COMPANY_FACTS_URL.format(cik=APPLE)
+    assert router.urls.count(url) == 1
+    floats = source.facts(APPLE, [SHARES, "EntityPublicFloat"])
+    assert router.urls.count(url) == 2
+    assert {f.fact_name for f in floats if f.accession == APPLE_ACCESSION} == {
+        SHARES,
+        "EntityPublicFloat",
+    }
+
+
+def test_a_malformed_cik_is_refused_before_any_io(tmp_path: Path) -> None:
+    router = _facts_router()
+    source = _source(_settings(tmp_path), router)
+    with pytest.raises(ValueError, match="10-digit"):
+        source.facts("320193", [SHARES])
+    with pytest.raises(ValueError, match="10-digit"):
+        source.facts("../0000320193", [SHARES])
+    assert router.urls == []
+
+
+def test_a_bulk_payload_for_another_cik_raises(tmp_path: Path) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        bulk.write(FIXTURES / "company_facts_dual_class.json", f"CIK{APPLE}.json")
+    settings = _settings(tmp_path, bulk_stamp_threshold_ciks=1)
+    router = _facts_router()
+    router.add(BULK_FACTS_URL, buffer.getvalue())
+    source = _source(settings, router)
+    _seed_apple(source)
+    _seed_stamps(
+        source,
+        ALPHABET,
+        {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
+    )
+    with pytest.raises(ValueError, match="served for"):
+        _shares(source, APPLE)

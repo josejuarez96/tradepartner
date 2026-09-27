@@ -234,8 +234,10 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
-        # T11e: `companyfacts.zip` path once downloaded, False once per-CIK was chosen.
-        self._facts_bulk: Path | bool | None = None
+        # T11e: the `companyfacts.zip` path and member names once downloaded,
+        # False once the per-CIK API was chosen, None until decided.
+        self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
+        self._facts_memo: dict[tuple[str, str], _FactsCache] = {}
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -939,6 +941,8 @@ class EdgarFilingSource(FilingSource):
         the winner; the same key with different values in two sources raises
         `ValueError` (the chunk fails until T11f's policy) and serves neither.
         """
+        _validate_cik(cik)
+        self._ensure_fsn()
         wanted = set(names)
         stamps = self._load_stamps(cik)
         company = self._company_facts(cik, stamps, wanted)  # accession -> unstamped facts
@@ -966,31 +970,37 @@ class EdgarFilingSource(FilingSource):
             }
             eastern = record.accepted_at.astimezone(_EASTERN).date()
             for share in payload.shares:
-                dated = max(ends) if ends else min(share.as_of_date, eastern)
+                as_of = max(ends) if ends else min(share.as_of_date, eastern)
                 put(
                     record.accession,
                     "fsn",
-                    _CachedFact(_FSN_SHARES_TAG, dated, share.class_member, share.value),
+                    _CachedFact(_FSN_SHARES_TAG, as_of, share.class_member, share.value),
                 )
 
         out: list[FactRecord] = []
         for (accession, fact_name, member), sources in by_key.items():
-            values = {source: {f.value for f in facts} for source, facts in sources.items()}
-            for a, b in itertools.combinations(sorted(values), 2):
-                if values[a].isdisjoint(values[b]):  # the sources agree on no value
-                    raise ValueError(
-                        f"{accession}: {fact_name} {member or 'undimensioned'} differs between "
-                        f"{a} {sorted(values[a])} and {b} {sorted(values[b])}"
-                    )
+            label = f"{accession}: {fact_name} {member or 'undimensioned'}"
+            dated: dict[str, dict[date, float]] = {}
+            for source, facts in sources.items():
+                for fact in facts:
+                    held = dated.setdefault(source, {}).setdefault(fact.as_of_date, fact.value)
+                    if held != fact.value:  # one source, one date, two values
+                        raise ValueError(f"{label} has two {source} values on {fact.as_of_date}")
+            for a, b in itertools.combinations(sorted(dated), 2):
+                common = dated[a].keys() & dated[b].keys()
+                if common:  # comparable dates must agree, value for value
+                    clash = [d for d in common if dated[a][d] != dated[b][d]]
+                    if clash:
+                        days = ", ".join(d.isoformat() for d in sorted(clash))
+                        raise ValueError(f"{label} differs between {a} and {b} on {days}")
+                elif set(dated[a].values()).isdisjoint(dated[b].values()):
+                    raise ValueError(f"{label} differs between {a} and {b}: no value in common")
             winner = next(s for s in ("document", "company", "fsn") if s in sources)
             accepted_at = stamps[accession].accepted_at
-            assert accepted_at is not None  # every source above is stamped
-            for fact in {f.as_of_date: f for f in sources[winner]}.values():
-                out.append(
-                    FactRecord(
-                        cik, fact_name, fact.as_of_date, member, fact.value, accession, accepted_at
-                    )
-                )
+            if accepted_at is None:  # every source above is stamped; a bug otherwise
+                raise RuntimeError(f"{label} reached the output without a stamp")
+            for as_of, value in dated[winner].items():
+                out.append(FactRecord(cik, fact_name, as_of, member, value, accession, accepted_at))
         out.sort(
             key=lambda f: (f.accepted_at, f.accession, f.fact_name, f.class_member, f.as_of_date)
         )
@@ -1018,52 +1028,99 @@ class EdgarFilingSource(FilingSource):
         only when the accession has a stamp (an unstamped one is absent, then
         present once its stamp arrives). Cached under `PARSER_VERSION` by
         `_facts_cache_key`; a CIK with no cover-form accession makes no request."""
-        key = self._facts_cache_key(stamps, set(self._settings.edgar.cover_page_forms))
-        if key is None:
+        latest = self._facts_cache_key(stamps, set(self._settings.edgar.cover_page_forms))
+        if latest is None:
             return {}
+        key = _facts_key(latest, wanted)
         path = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{cik}.json"
-        cached = _load_facts_cache(path, cik, key)
+        cached = self._facts_memo.get((cik, key)) or _load_facts_cache(path, cik, key)
         if cached is None:
-            payload = self._company_facts_payload(cik)
+            payload, complete = self._company_facts_payload(cik, latest)
             cached = [
                 (f.fact_name, f.accession, f.as_of_date, f.value)
                 for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
             ]
-            data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": cached}
-            edgar_raw.write_atomic(path, json.dumps(data, default=str).encode("utf-8"))
+            self._facts_memo[cik, key] = cached  # one fetch per CIK per run, cached or not
+            if complete:  # else the payload trails the latest filing: fetch again next run
+                rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
+                data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
+                edgar_raw.write_atomic(path, json.dumps(data).encode("utf-8"))
+        fsn_cache = self._load_fsn_cache(cik)
         out: dict[str, list[_CachedFact]] = {}
         for name, accession, as_of, value in cached:
             record = stamps.get(accession)
             if record is None or record.accepted_at is None or name not in wanted:
                 continue
-            out.setdefault(accession, []).append(_CachedFact(name, as_of, "", value))
+            if accession in self._fsn_extracted_accessions and accession not in fsn_cache:
+                continue  # FSN holds it under another CIK: a co-registrant's combined filing
+            cover = self._load_cover_cache(accession)
+            if cover is not None and cover.entity_cik != cik:
+                continue  # the per-document parse names another entity
+            eastern = record.accepted_at.astimezone(_EASTERN).date()
+            capped = min(as_of, eastern)  # an XBRL date typo never dates a fact after its stamp
+            out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
-    def _company_facts_payload(self, cik: str) -> Any:
-        """The raw company-facts payload: from one `companyfacts.zip` when
-        more than `edgar.bulk_stamp_threshold_ciks` stamped CIKs need a
-        fetch (the stamping rule), else the per-CIK API; a CIK absent from
-        the zip falls back to the API."""
+    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any, bool]:
+        """The raw company-facts payload and whether it already holds
+        `latest` (the filing the cache is keyed by): from one
+        `companyfacts.zip` when more than `edgar.bulk_stamp_threshold_ciks`
+        stamped CIKs need a fetch (the stamping rule), else the per-CIK API;
+        a CIK the zip lacks, or whose zip payload trails `latest` (the zip is
+        rebuilt nightly), falls back to the API. A payload for another CIK
+        raises."""
         if self._facts_bulk is None:
             stale = 0
             for stamps_path in self._stamps_path("0").parent.glob("*.json"):
                 other = stamps_path.stem
-                key = self._facts_cache_key(
-                    self._load_stamps(other), set(self._settings.edgar.cover_page_forms)
-                )
+                if not _CIK_PATTERN.fullmatch(other):
+                    continue  # not a stamps file
+                cover_forms = set(self._settings.edgar.cover_page_forms)
+                other_latest = self._facts_cache_key(self._load_stamps(other), cover_forms)
                 cache = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{other}.json"
-                if key is not None and _load_facts_cache(cache, other, key) is None:
+                if other_latest is not None and _cached_latest(cache, other) != other_latest:
                     stale += 1
-            self._facts_bulk = (
-                edgar_raw.bulk_company_facts(settings=self._settings, client=self._client)
-                if stale > self._settings.edgar.bulk_stamp_threshold_ciks
-                else False
-            )
-        if isinstance(self._facts_bulk, Path):
-            with zipfile.ZipFile(self._facts_bulk) as bulk:
-                if f"CIK{cik}.json" in bulk.namelist():
-                    return json.loads(bulk.read(f"CIK{cik}.json"))
-        return edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
+            if stale > self._settings.edgar.bulk_stamp_threshold_ciks:
+                path = edgar_raw.bulk_company_facts(settings=self._settings, client=self._client)
+                with zipfile.ZipFile(path) as bulk:
+                    self._facts_bulk = (path, frozenset(bulk.namelist()))
+            else:
+                self._facts_bulk = False
+        if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
+            with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
+                payload = json.loads(bulk.read(f"CIK{cik}.json"))
+            if _holds_accession(payload, cik, latest):
+                return payload, True
+        payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
+        return payload, _holds_accession(payload, cik, latest)
+
+
+def _holds_accession(payload: Any, cik: str, accession: str) -> bool:
+    """Whether the company-facts `payload` (checked to be `cik`'s) carries any
+    entry, of any concept, for `accession`."""
+    if str(payload["cik"]).zfill(10) != cik:
+        raise ValueError(f"company facts for CIK {payload['cik']!r} served for {cik}")
+    return any(
+        entry["accn"] == accession
+        for concepts in payload["facts"].values()
+        for concept in concepts.values()
+        for entries in concept["units"].values()
+        for entry in entries
+    )
+
+
+def _facts_key(latest: str, wanted: set[str]) -> str:
+    """The facts cache key: the latest cover-form accession and the names
+    asked for, so a new filing or a new name re-fetches."""
+    return f"{latest}|{','.join(sorted(wanted))}"
+
+
+_CIK_PATTERN = re.compile(r"\d{10}")
+
+
+def _validate_cik(cik: str) -> None:
+    if not isinstance(cik, str) or not _CIK_PATTERN.fullmatch(cik):
+        raise ValueError(f"cik must be a 10-digit zero-padded string, got {cik!r}")
 
 
 def _filed_by(row: UnstampedFiling) -> bool:
@@ -1083,6 +1140,19 @@ class _EveryAccession(dict[str, datetime]):
 
 
 _FactsCache = list[tuple[str, str, date, float]]
+
+
+def _cached_latest(path: Path, cik: str) -> str | None:
+    """The latest cover-form accession a facts cache file was keyed by, or
+    None when there is no usable cache (the bulk decision's staleness probe,
+    which cannot know the names a later `facts` call will ask for)."""
+    try:
+        data = json.loads(path.read_bytes())
+        if data["version"] != PARSER_VERSION or data["cik"] != cik:
+            return None
+        return str(data["key"]).split("|", 1)[0]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def _load_facts_cache(path: Path, cik: str, key: str) -> _FactsCache | None:
