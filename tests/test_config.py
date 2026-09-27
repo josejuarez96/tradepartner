@@ -506,6 +506,21 @@ def test_alpaca_paper_rejects_false_from_environment(monkeypatch: pytest.MonkeyP
         Settings(_env_file=None)
 
 
+def test_alpaca_paper_cannot_be_assigned_after_construction() -> None:
+    """The guard runs at construction, so the section is frozen: no later assignment can
+    point the order path at the live endpoint (safety-reviewer on T47)."""
+    s = _settings()
+    with pytest.raises(ValidationError):
+        s.alpaca.paper = False  # type: ignore[misc]
+    assert s.alpaca.paper is True
+
+
+def test_alpaca_rejects_unknown_keys() -> None:
+    """A misspelt broker fact must fail loudly, not leave the real one unset."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca={"quantity_decimal": 4})
+
+
 def test_alpaca_trading_defaults() -> None:
     a = _settings().alpaca
     assert a.trading_requests_per_minute == pytest.approx(150.0)

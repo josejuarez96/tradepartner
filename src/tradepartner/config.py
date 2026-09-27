@@ -215,7 +215,15 @@ class AlpacaConfig(BaseModel):
     `process_date`, which can trail the ex-date by weeks (a GE dividend: ex 2020-12-18,
     processed 2021-01-25; #101 probe 1). `AlpacaPriceSource` asks for actions processed up
     to this many calendar days after the end of an ex-date window, then filters on ex-date.
+
+    Frozen and closed (T47, safety-reviewer): the `paper` guard below runs at
+    construction, so an attribute assignment after the fact must be impossible too, and a
+    misspelt broker fact (`quantity_decimals`) must fail rather than stay unset silently.
+    `model_copy(update=...)` and `model_construct` still bypass any pydantic validator, so
+    the trading client (T48) passes the literal `paper=True` and never forwards this field.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
