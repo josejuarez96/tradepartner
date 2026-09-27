@@ -348,6 +348,14 @@ def test_health_with_no_store_exits_non_zero(tmp_path: Path) -> None:
     assert not Path(settings.store.path).exists()
 
 
+def test_health_on_a_store_with_no_schema_exits_non_zero(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    duckdb.connect(settings.store.path).close()
+    result = _invoke(settings, ["health"])
+    assert result.exit_code == 1
+    assert "no usable schema" in result.output
+
+
 def test_health_on_a_locked_store_reports_busy(tmp_path: Path, fixture_store_path: Path) -> None:
     settings = _settings(tmp_path, store=fixture_store_path)
     with open_for_write(settings):
@@ -426,6 +434,22 @@ def test_export_refuses_to_overwrite(tmp_path: Path, fixture_store_path: Path) -
     result = _invoke(settings, ["export", str(out)])
     assert result.exit_code == 1
     assert (out / "listings.parquet").read_text() == "keep me"
+
+
+def test_export_refuses_a_dangling_symlink_and_a_file_as_the_directory(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    out = tmp_path / "export"
+    out.mkdir()
+    (out / "listings.parquet").symlink_to(tmp_path / "elsewhere.parquet")
+    assert _invoke(settings, ["export", str(out)]).exit_code == 1
+    assert not (tmp_path / "elsewhere.parquet").exists()
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")
+    result = _invoke(settings, ["export", str(a_file)])
+    assert result.exit_code == 1
+    assert "not a directory" in result.output
 
 
 def test_export_with_no_store_exits_non_zero(tmp_path: Path) -> None:

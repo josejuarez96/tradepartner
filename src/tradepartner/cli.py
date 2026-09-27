@@ -53,7 +53,7 @@ from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.backfill import backfill
 from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
-from tradepartner.ingest import SOURCES, IngestResult, ingest_session
+from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import StoreLockedError, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -103,7 +103,7 @@ class StorePriceSource(PriceSource):
     def _source(self) -> AlpacaPriceSource:
         if self._inner is None:
             at = ensure_tz_aware_utc(self._clock(), field_name="clock()")
-            with open_read_only(self._settings) as conn:
+            with _read(self._settings) as conn:  # waits out a writer like ingest's reads
                 listings = listings_as_of(conn, at)
             self._inner = AlpacaPriceSource(
                 ListingResolver(listings.iter_rows(named=True)),
@@ -222,14 +222,17 @@ def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
             "WHERE table_schema = 'main' AND table_type = 'BASE TABLE' ORDER BY table_name"
         ).fetchall()
     ]
+    if out_dir.exists() and not out_dir.is_dir():
+        raise _fail(f"{out_dir} exists and is not a directory", 1)
     targets = {table: out_dir / f"{table}.parquet" for table in tables}
-    clash = sorted(str(path) for path in targets.values() if path.exists())
+    clash = sorted(str(p) for p in targets.values() if p.exists() or p.is_symlink())
     if clash:
         raise _fail(f"refusing to overwrite: {', '.join(clash)}", 1)
     out_dir.mkdir(parents=True, exist_ok=True)
     for table, path in targets.items():
+        name = table.replace('"', '""')
         literal = str(path).replace("'", "''")
-        conn.execute(f"COPY (SELECT * FROM \"{table}\") TO '{literal}' (FORMAT parquet)")
+        conn.execute(f"COPY (SELECT * FROM \"{name}\") TO '{literal}' (FORMAT parquet)")
     return tables
 
 
@@ -257,7 +260,9 @@ def make_app(
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
-            raise _fail(f"--source must be all, {' or '.join(SOURCES)}; got {source!r}", 2)
+            raise _fail(
+                f"--source must be all, {' or '.join(SOURCES)}; got {source!r}", USAGE_ERROR
+            )
         if backfill_ != (since is not None):
             raise _fail("--backfill and --since go together", USAGE_ERROR)
         if backfill_ and dry_run:
@@ -305,6 +310,10 @@ def make_app(
                 report = health_report(conn, t, s)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except (duckdb.CatalogException, duckdb.BinderException) as exc:
+            raise _fail(
+                f"the store has no usable schema; run `tradepartner ingest`: {exc}", 1
+            ) from None
         _print_report(report)
         if (count := _quarantined(report)) > 0:
             typer.echo(
