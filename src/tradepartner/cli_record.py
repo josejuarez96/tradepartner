@@ -27,17 +27,17 @@ import re
 import sys
 import zipfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, OrderRequest
 from pydantic import SecretStr
 
+from tradepartner import calendar
 from tradepartner.adapters import alpaca_raw, alpaca_trading_raw, edgar_raw
-from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingRaw
+from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError, AlpacaTradingRaw
 from tradepartner.config import Settings, get_settings
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
@@ -678,6 +678,9 @@ PAPER_SYMBOL = "KO"
 PAPER_BUY_NOTIONAL = 5.0  # dollars, above Alpaca's $1 fractional minimum
 PAPER_FRACTIONAL_QTY = 0.5
 PAPER_RESTING_LIMIT_FRACTION = 0.9  # a buy limit this far under the fill price rests
+# The script starts only inside regular hours with at least this long before the close,
+# so no market DAY order (the flattening sells included) queues overnight.
+PAPER_MIN_MINUTES_BEFORE_CLOSE = 30
 _PAPER_TERMINAL = frozenset({"filled", "canceled", "expired", "rejected"})
 _PAPER_RESTING = frozenset({"new", "accepted"})
 
@@ -714,8 +717,8 @@ def _paper_submit(
     """`{"submit": response, "polls": [...]}`, or `{"error": ...}` when refused."""
     try:
         submitted = raw.submit_order(request)
-    except APIError as error:
-        return {"error": {"status_code": error.status_code, "body": str(error)}}
+    except AlpacaTradingError as error:
+        return {"error": {"status_code": error.status_code, "body": error.body}}
     cid = str(request.client_order_id)
     return {"submit": submitted, "polls": _paper_await(raw, cid, settings, until)}
 
@@ -743,7 +746,8 @@ def _held_quantity(positions: list[Any], symbol: str) -> float:
 
 
 def _paper_flatten(raw: AlpacaTradingRaw, settings: Settings, ids: Iterator[str]) -> list[Any]:
-    """Cancel every open order, then sell every position whole."""
+    """Cancel every open order, then sell every position whole. A refused sell is
+    kept as its step; the flatness check after it reports what is left."""
     steps: list[Any] = []
     for order in raw.list_open_orders():
         raw.cancel_order(str(order["id"]))
@@ -758,14 +762,48 @@ def _paper_flatten(raw: AlpacaTradingRaw, settings: Settings, ids: Iterator[str]
     return steps
 
 
+def _paper_finish(
+    raw: AlpacaTradingRaw, settings: Settings, ids: Iterator[str], out: dict[str, Any]
+) -> list[str]:
+    """Flatten, then re-read positions and open orders into `out`; return what is
+    left (symbols and order ids), printing a NOT FLAT line when anything is."""
+    try:
+        out["flatten"] = _paper_flatten(raw, settings, ids)
+        out["positions_after"] = raw.list_positions()
+        out["open_orders_after"] = raw.list_open_orders()
+    except (AlpacaTradingError, PaperRecordingError) as error:
+        print(f"cli_record: NOT FLAT? flattening failed ({error}); check it", file=sys.stderr)
+        raise
+    residue = [str(p.get("symbol")) for p in out["positions_after"]] + [
+        str(o.get("client_order_id")) for o in out["open_orders_after"]
+    ]
+    if residue:
+        print(f"cli_record: NOT FLAT: {', '.join(residue)}; check it", file=sys.stderr)
+    return residue
+
+
+def _require_regular_hours(now: datetime) -> None:
+    """Refuse outside regular hours or within `PAPER_MIN_MINUTES_BEFORE_CLOSE` of the
+    close (XNYS calendar; during regular hours the UTC date is the session date)."""
+    day = now.date()
+    if not calendar.is_session(day):
+        raise PaperRecordingError(f"{day} is not a trading session")
+    latest = calendar.session_close(day) - timedelta(minutes=PAPER_MIN_MINUTES_BEFORE_CLOSE)
+    if not calendar.session_open(day) <= now <= latest:
+        raise PaperRecordingError(
+            f"run between the open and {PAPER_MIN_MINUTES_BEFORE_CLOSE} minutes before the close"
+        )
+
+
 def _record_paper(
-    raw: AlpacaTradingRaw, settings: Settings, non_fractionable: str
+    raw: AlpacaTradingRaw, settings: Settings, non_fractionable: str, now: datetime
 ) -> dict[str, Any]:
     """Run the fixed paper script; return `{fixture name: raw response}`. Refuses,
     before any order, a non-flat account or a symbol pair that is not (tradable and
     fractionable, tradable and not fractionable). Always tries to end flat, and raises
     if it did not."""
-    started = datetime.now(UTC)
+    started = now
+    _require_regular_hours(now)
     out: dict[str, Any] = {"account_before": raw.get_account()}
     if raw.list_positions() or raw.list_open_orders():
         raise PaperRecordingError("the paper account holds positions or open orders; flatten it")
@@ -794,7 +832,10 @@ def _record_paper(
         out["sell_above_held"] = _paper_submit(
             raw, _market(PAPER_SYMBOL, sell, next(ids), qty=above), settings
         )
-        price = float(out["buy_whole"]["polls"][-1]["filled_avg_price"])
+        whole = out["buy_whole"].get("polls", [{}])[-1]
+        if whole.get("status") != "filled":
+            raise PaperRecordingError(f"the whole-share buy ended {whole.get('status')!r}")
+        price = float(whole["filled_avg_price"])
         resting_id = next(ids)
         resting = LimitOrderRequest(
             symbol=PAPER_SYMBOL,
@@ -817,22 +858,22 @@ def _record_paper(
             raw, _market(non_fractionable, sell, next(ids), qty=PAPER_FRACTIONAL_QTY), settings
         )
     finally:
-        out["flatten"] = _paper_flatten(raw, settings, ids)
-    out["positions_after"] = raw.list_positions()
-    out["open_orders_after"] = raw.list_open_orders()
+        residue = _paper_finish(raw, settings, ids, out)
+    if residue:
+        raise PaperRecordingError("the paper account is not flat after the script")
     out["account_after"] = raw.get_account()
     out["fill_activities"] = raw.list_fill_activities(started)
-    if out["positions_after"] or out["open_orders_after"]:
-        raise PaperRecordingError("the paper account is not flat after the script; check it")
     return out
 
 
-def _run_paper(raw: AlpacaTradingRaw, settings: Settings, non_fractionable: str) -> int:
+def _run_paper(
+    raw: AlpacaTradingRaw, settings: Settings, non_fractionable: str, now: datetime | None = None
+) -> int:
     """Record, then scrub (keys, emails, the account's own ids) and write every
     response under `ALPACA_PAPER_FIXTURES_DIR`, merging `recorded_at.json`."""
     try:
-        recordings = _record_paper(raw, settings, non_fractionable)
-    except PaperRecordingError as error:
+        recordings = _record_paper(raw, settings, non_fractionable, now or datetime.now(UTC))
+    except (PaperRecordingError, AlpacaTradingError) as error:
         print(f"cli_record: {error}", file=sys.stderr)
         return 1
     account = recordings["account_before"]

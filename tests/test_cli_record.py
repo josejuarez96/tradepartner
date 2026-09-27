@@ -10,6 +10,7 @@ message.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -209,6 +210,7 @@ PAPER_SECRET = "paperSecretFake1234567890abcdefghij"  # gitleaks:allow
 ACCOUNT_ID = "0b6f3c1e-1111-4222-8333-944455556666"
 ACCOUNT_NUMBER = "PA3FAKE12345"
 NON_FRACTIONABLE = "NFX"
+IN_HOURS = datetime(2026, 9, 28, 15, 0, tzinfo=UTC)  # a Monday session, 11:00 New York
 
 
 def _paper_settings(**overrides: str | None) -> Settings:
@@ -349,7 +351,9 @@ def test_paper_script_ends_flat_and_writes_scrubbed_recordings(
     (tmp_path / "recorded_at.json").write_text('{"alpaca/daily_bars.json": "2026-09-25"}')
     client = _ScriptedPaperClient()
 
-    assert cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE) == 0
+    assert (
+        cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE, IN_HOURS) == 0
+    )
 
     assert client.positions == {} and client.get_orders() == []
     written = {path.stem: path.read_text() for path in paper_dir.glob("*.json")}
@@ -372,7 +376,9 @@ def test_paper_script_refuses_a_non_flat_account_before_any_order(
     paper_dir = _redirect_fixtures(tmp_path, monkeypatch)
     client = _ScriptedPaperClient(positions={"KO": 2.0})
 
-    assert cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE) == 1
+    assert (
+        cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE, IN_HOURS) == 1
+    )
     assert client.submitted == [] and not paper_dir.exists()
 
 
@@ -382,5 +388,44 @@ def test_paper_script_refuses_a_fractionable_symbol_as_non_fractionable(
     _redirect_fixtures(tmp_path, monkeypatch)
     client = _ScriptedPaperClient()
 
-    assert cli_record._run_paper(_raw_on(client), _paper_settings(), "SPY") == 1
+    assert cli_record._run_paper(_raw_on(client), _paper_settings(), "SPY", IN_HOURS) == 1
     assert client.submitted == []
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 9, 28, 12, 0, tzinfo=UTC),  # before the open
+        datetime(2026, 9, 28, 19, 45, tzinfo=UTC),  # 15 minutes before the close
+        datetime(2026, 9, 27, 15, 0, tzinfo=UTC),  # a Sunday
+    ],
+)
+def test_paper_script_refuses_outside_regular_hours(
+    now: datetime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _redirect_fixtures(tmp_path, monkeypatch)
+    client = _ScriptedPaperClient()
+
+    assert cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE, now) == 1
+    assert client.submitted == []
+
+
+def test_paper_script_reports_not_flat_when_a_flattening_sell_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paper_dir = _redirect_fixtures(tmp_path, monkeypatch)
+    client = _ScriptedPaperClient()
+    submit = client.submit_order
+
+    def refuse_non_fractionable_sells(order_data: Any) -> Any:
+        if order_data.symbol == NON_FRACTIONABLE and order_data.side.value == "sell":
+            raise client._refuse(403, "fractional orders not supported")
+        return submit(order_data)
+
+    client.submit_order = refuse_non_fractionable_sells  # type: ignore[method-assign]
+
+    assert (
+        cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE, IN_HOURS) == 1
+    )
+    assert f"NOT FLAT: {NON_FRACTIONABLE}" in capsys.readouterr().err
+    assert not paper_dir.exists()

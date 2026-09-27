@@ -10,14 +10,17 @@ Paper only, on every path (spec req 2): the `TradingClient` is built with the li
 `model_construct` bypass that field's guard; construction also refuses to start when
 `settings.alpaca.paper is not True`. Credentials come from `ALPACA_PAPER_API_KEY` /
 `ALPACA_PAPER_API_SECRET` only, never the data keys, so a live-capable key is never in
-the order path. No exception raised here carries a secret.
+the order path. A failed request is re-raised as `AlpacaTradingError`, holding only
+the status code and response body, raised outside the SDK's exception so no
+`__context__` keeps its request (whose headers carry the keys).
 
 The EDGAR client pattern: requests are paced at `alpaca.trading_requests_per_minute`,
 time out after `alpaca.trading_request_timeout_seconds`, and a timeout (or a 429/504,
 the SDK's own retry codes, whose internal retry is switched off) is retried
-`alpaca.trading_max_retries` times, then raised. A retried submit is safe because the
-broker refuses a second order with the same `client_order_id`, so `submit_order`
-requires one.
+`alpaca.trading_max_retries` times, then raised. `submit_order` requires a
+`client_order_id`, so the broker refuses a second order with it; when a retry of a
+submit is refused with 422, the first attempt landed, and the order is read back by
+that id and returned instead of the refusal.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 import requests
+from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus
@@ -44,6 +48,7 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 OPEN_ORDERS_LIMIT = 500
 ACTIVITIES_PAGE_SIZE = 100
 _RETRY_STATUS_CODES = frozenset({429, 504})
+_DUPLICATE_STATUS_CODE = 422
 
 
 class AlpacaPaperCredentialsError(RuntimeError):
@@ -52,6 +57,18 @@ class AlpacaPaperCredentialsError(RuntimeError):
 
 class AlpacaPaperGuardError(RuntimeError):
     """`settings.alpaca.paper` is not `True` (the guard was bypassed)."""
+
+
+class AlpacaTradingError(RuntimeError):
+    """A failed trading request: `status_code` (None for a transport failure), the
+    response `body`, and whether an earlier attempt of the same call had failed
+    retryably (`retried`). Holds no request, so no header and no key."""
+
+    def __init__(self, status_code: int | None, body: str, *, retried: bool) -> None:
+        super().__init__(f"alpaca trading request failed ({status_code}): {body}")
+        self.status_code = status_code
+        self.body = body
+        self.retried = retried
 
 
 class PacingClock(Protocol):
@@ -147,6 +164,13 @@ def _retryable(error: BaseException) -> bool:
     return isinstance(error, APIError) and error.status_code in _RETRY_STATUS_CODES
 
 
+def _describe(error: APIError | requests.RequestException) -> tuple[int | None, str]:
+    """`(status_code, body)` of a failed request, never its request or headers."""
+    if isinstance(error, APIError):
+        return error.status_code, str(error)
+    return None, type(error).__name__
+
+
 class AlpacaTradingRaw:
     """Paced, retried raw calls to the Alpaca **paper** trading API."""
 
@@ -167,6 +191,8 @@ class AlpacaTradingRaw:
             )
         key, secret = _paper_credentials(settings)
         alpaca = settings.alpaca
+        if isinstance(client, TradingClient) and client._base_url != BaseURL.TRADING_PAPER:
+            raise AlpacaPaperGuardError("the injected TradingClient is not on the paper URL")
         self._client: TradingClientLike = (
             client
             if client is not None
@@ -187,20 +213,32 @@ class AlpacaTradingRaw:
             self._last = self.clock.monotonic()
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
+        retried = False
         for attempt in range(self._max_retries + 1):
             self._pace()
             try:
                 return fn(*args)
-            except (requests.Timeout, APIError) as error:
-                if not _retryable(error) or attempt == self._max_retries:
-                    raise
+            except (requests.RequestException, APIError) as error:
+                status_code, body = _describe(error)
+                again = _retryable(error) and attempt < self._max_retries
+            # Raised here, outside the `except`, so the SDK exception is not kept as
+            # `__context__`.
+            if not again:
+                raise AlpacaTradingError(status_code, body, retried=retried)
+            retried = True
         raise AssertionError("unreachable")  # pragma: no cover
 
     def submit_order(self, request: OrderRequest) -> Any:
-        """`POST /v2/orders`; `request` must carry a `client_order_id`."""
+        """`POST /v2/orders`; `request` must carry a `client_order_id`. A 422 on a
+        retry means the first attempt landed: the order is read back and returned."""
         if not request.client_order_id:
             raise ValueError("submit_order needs a client_order_id (retries rely on it)")
-        return self._call(self._client.submit_order, request)
+        try:
+            return self._call(self._client.submit_order, request)
+        except AlpacaTradingError as error:
+            if not (error.retried and error.status_code == _DUPLICATE_STATUS_CODE):
+                raise
+        return self.get_order_by_client_id(request.client_order_id)
 
     def cancel_order(self, broker_order_id: str) -> None:
         """`DELETE /v2/orders/{id}`: a request; read the outcome back by id."""
@@ -240,6 +278,8 @@ class AlpacaTradingRaw:
             activities.extend(page)
             if len(page) < ACTIVITIES_PAGE_SIZE:
                 return activities
+            if params.get("page_token") == page[-1]["id"]:
+                raise RuntimeError("fill activities paging did not advance")
             params["page_token"] = page[-1]["id"]
 
     def get_assets(self, symbols: Sequence[str]) -> list[Any]:

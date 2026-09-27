@@ -9,15 +9,18 @@ from __future__ import annotations
 import ast
 import inspect
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import requests
+from alpaca.common.exceptions import APIError
 
 from tradepartner.adapters import alpaca_trading_raw as raw_mod
 from tradepartner.adapters.alpaca_trading_raw import (
     AlpacaPaperCredentialsError,
     AlpacaPaperGuardError,
+    AlpacaTradingError,
     AlpacaTradingRaw,
 )
 from tradepartner.config import Settings
@@ -214,9 +217,29 @@ def test_a_timeout_is_retried_max_retries_times_then_raised() -> None:
     client = FakeClient(fail_with=[requests.Timeout("slow")] * 10)
     raw = AlpacaTradingRaw(_settings(trading_max_retries=2), client=client, clock=clock)
 
-    with pytest.raises(requests.Timeout):
+    with pytest.raises(AlpacaTradingError) as err:
         raw.get_account()
     assert len(client.calls) == 3
+    assert err.value.status_code is None and err.value.retried
+    # No SDK exception (whose request headers carry the keys) kept on the error.
+    assert err.value.__context__ is None and err.value.__cause__ is None
+    assert PAPER_KEY not in repr(vars(err.value)) and PAPER_KEY not in str(err.value)
+
+
+def _api_error(status: int) -> APIError:
+    http_error = SimpleNamespace(response=SimpleNamespace(status_code=status))
+    return APIError('{"code": 1, "message": "refused"}', http_error)
+
+
+def test_a_429_is_retried_and_a_403_is_not() -> None:
+    client = FakeClient(fail_with=[_api_error(429)])
+    assert _raw(client=client).get_account() == {"cash": "100"}
+
+    client = FakeClient(fail_with=[_api_error(403)])
+    with pytest.raises(AlpacaTradingError) as err:
+        _raw(client=client).get_account()
+    assert err.value.status_code == 403 and not err.value.retried
+    assert len(client.calls) == 1
 
 
 def test_a_timeout_then_success_returns_the_payload() -> None:
@@ -251,6 +274,42 @@ def test_submit_requires_a_client_order_id() -> None:
 
     request.client_order_id = "rec-1"
     assert raw.submit_order(request) == {"id": "o1", "status": "accepted"}
+
+
+def _request() -> Any:
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
+
+    return MarketOrderRequest(
+        symbol="KO",
+        notional=5,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        client_order_id="rec-1",
+    )
+
+
+def test_a_submit_refused_as_duplicate_on_retry_returns_the_landed_order() -> None:
+    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _api_error(422)])
+    assert _raw(client=client).submit_order(_request()) == {"client_order_id": "rec-1"}
+    assert [name for name, _ in client.calls] == [
+        "submit_order",
+        "submit_order",
+        "get_order_by_client_id",
+    ]
+
+
+def test_a_duplicate_on_the_first_submit_attempt_is_raised() -> None:
+    client = FakeClient(fail_with=[_api_error(422)])
+    with pytest.raises(AlpacaTradingError) as err:
+        _raw(client=client).submit_order(_request())
+    assert err.value.status_code == 422 and len(client.calls) == 1
+
+
+def test_an_injected_trading_client_on_the_live_url_is_refused() -> None:
+    live = raw_mod.TradingClient(api_key=PAPER_KEY, secret_key=PAPER_SECRET, paper=False)
+    with pytest.raises(AlpacaPaperGuardError):
+        AlpacaTradingRaw(_settings(), client=live, clock=FakeClock())
 
 
 def test_thin_calls_reach_the_client() -> None:
@@ -296,6 +355,14 @@ def test_fill_activities_page_through_after_a_utc_instant() -> None:
     assert path1 == "/account/activities/FILL"
     assert params1["after"] == "2026-09-28T13:30:00+00:00" and params1["direction"] == "asc"
     assert "page_token" not in params1 and params2["page_token"] == f"a{size - 1}"
+
+
+def test_fill_activities_raise_when_paging_does_not_advance() -> None:
+    client = FakeClient()
+    page = [{"id": f"a{i}"} for i in range(raw_mod.ACTIVITIES_PAGE_SIZE)]
+    client.pages = [page, page, page]
+    with pytest.raises(RuntimeError, match="did not advance"):
+        _raw(client=client).list_fill_activities(datetime(2026, 9, 28, tzinfo=UTC))
 
 
 def test_fill_activities_refuse_a_naive_instant() -> None:

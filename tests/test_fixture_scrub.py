@@ -116,7 +116,7 @@ def _assert_file_is_scrubbed(path: Path) -> None:
         # here, where the pattern cannot collide with EDGAR's upper-case words.
         assert not PAPER_ACCOUNT_NUMBER_PATTERN.search(text), f"paper account number in {path}"
         for value in _iter_account_ids(parsed):
-            assert value == SCRUBBED, f"unscrubbed account id in {path}: {value!r}"
+            assert value in (SCRUBBED, None), f"unscrubbed account id in {path}: {value!r}"
     if parsed is not None:
         # JSON-string-value-only: scanning raw serialized text for a
         # "key-shaped" token risks both false positives (e.g. a camelCase
