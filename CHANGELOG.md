@@ -115,7 +115,6 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Phase 3 spec req 13 and plan: plan-read timing check added as task T40b; T45 depends on it (#201).
 - Plan: T11c, T11d, T11e, T11f replace the single T11c (FSN data sets for cover facts and SIC; `edgar.fsn_first_year`, `edgar.header_forms`, `edgar.header_first_year`, `edgar.max_filing_failures`, `edgar.min_failed_filings`, `edgar.max_failed_filing_share`); T19 depends on T11f; spec security-master table amended; work-map words for T11b to T11f (#216).
 - Broker interface completed for Phase 4 (spec req 1, #33): `OPEN` is renamed `ACCEPTED`, requests carry `notional` or `quantity` and no price, `cancel` returns `None`, and `get_order`, `open_orders`, `fills(since)`, `account` and `assets` are new; `FakeBroker` takes a `price_of` function (#277).
-- Docs: STATUS and CHANGELOG fold of the 2026-09-26/27 fragments, plan ticks and board refresh (#293)
 - Docs: Phase 4 plan T68 checkbox ticked, merged as #269 (#276)
 
 ### Fixed
