@@ -142,6 +142,37 @@ Live trading, a live endpoint, live keys and live sizing (Phase 6; `alpaca.paper
 **Config keys** (defaults; source). The whole `risk.*` section and the five `paper.*` keys req 14 names are frozen into the window at `paper start`; the other `paper.*`, `alpaca.*` and `alerts.*` keys are read at run time:
 `alpaca.paper=true` (**guarded**; Phase 6 changes it by ADR); `alpaca.trading_requests_per_minute=150`, `alpaca.trading_request_timeout_seconds=30.0`, `alpaca.trading_max_retries=3` (the EDGAR client pattern; the pace sits under Alpaca's documented limit, which the recording task confirms); `alpaca.quantity_decimals` (set by the recording task, no default: the adapter refuses to construct until it is set); `risk.max_position_weight=0.05` (five times H1's ~1% equal weight; catches a sizing bug, never binds on a correct plan); `risk.max_order_notional_fraction=0.05` (same reasoning); `risk.max_gross_exposure=1.0` (charter: no leverage); `risk.max_orders_per_run=250` (about 100 in and 100 out at H1's decile, with room); `risk.max_rejections_per_run=5` and `risk.max_skips_per_run=10` (ADR 0007's proposed `exec.max_rejections_per_run`, renamed into `risk.*` so the frozen `execution.*` section is never confused with live keys); `risk.max_drawdown=0.30` (open question 3; frozen at start); `risk.min_order_notional=1.0` (Alpaca's fractional minimum per H1's Q1 note; the recording task confirms it); `risk.whole_share_price_buffer=0.02` (a whole-share buy is priced at close(S−1) plus this fraction when checked against cash, so an overnight gap cannot overspend); `risk.max_unspent_cash_fraction=0.05` (cash left at `executed` above this share of equity is alerted: the book is under-invested for a reason worth a look); `risk.max_fill_lag_sessions=1` (validated ≥ 1; a fill the feed has not delivered by the next session's collection is a fault, not a lag); `risk.clock_max_sessions_late=1` (ADR 0007 point 5's proposed upper bound); `risk.max_broker_clock_skew_seconds=60`; `risk.reconcile_quantity_tolerance=1e-6`, `risk.reconcile_cash_tolerance=0.01` (open question 5; frozen at start); `paper.min_rebalances=6`, `paper.tracking_k=2` (ADR 0005; frozen at start); `paper.tracking_rule=raw` (open question 4; frozen at start); `paper.max_catch_up_sessions=5` (open question 6; frozen at start); `paper.submit_window_before_open_minutes=90`, `paper.submit_window_after_open_minutes=30`, `paper.sell_wait_seconds=900`, `paper.poll_interval_seconds=15`, `paper.accept_wait_seconds=30` (validated: the poll interval never exceeds the accept wait), `paper.fill_read_overlap_seconds=60` (open question 14; Probe 3 informs them); `paper.order_id_prefix=tp`; `paper.live_capital_reference=100.0` (charter's live amount); `paper.min_override_reason_chars=20` (frozen at start); `alerts.channels=[store, macos]` (open question 2). `WASH_SALE_WINDOW_DAYS = 30` is a derived constant (IRC §1091) defined in `execution/lots.py`, not a key; the no-literal AST check exempts that one assignment by name. Frozen hypothesis keys reused unchanged: `execution.fill_price`, `costs.*`, `strategy.*`, `universe.*`, `gap.*`. `alpaca.paper` is never listed as overridable in `.env.example`.
 
+
+### T70 amendment draft — 2026-09-27
+
+The owner selected `paper.tracking_rule = residual` in [#247 Q4/Q14](https://github.com/josejuarez96/tradepartner/issues/247#issuecomment-5851267262).
+The proposed [ADR 0005](../decisions/0005-objective-benchmark-stop-criteria.md)
+and [ADR 0006](../decisions/0006-universe-and-cadence.md) amendments record the
+rule: raw is always printed beside residual; missed and override months are
+excluded from the maximum and listed; paper executes in two phases at the NBBO
+after the open while H1's backtest keeps its frozen close. The window freezes
+the comparison rule, not the six runtime timing keys below.
+
+**Pending evidence, not final values.** [Probe 3 (#182)](https://github.com/josejuarez96/tradepartner/issues/182)
+has no report as of this draft. These are the existing Q14 placeholders, not
+measurements or newly chosen defaults:
+
+| Runtime key | Existing placeholder | Final value / measured rationale |
+|---|---:|---|
+| `paper.submit_window_before_open_minutes` | 90 | Pending #182 |
+| `paper.submit_window_after_open_minutes` | 30 | Pending #182 |
+| `paper.sell_wait_seconds` | 900 | Pending #182 |
+| `paper.poll_interval_seconds` | 15 | Pending #182 |
+| `paper.accept_wait_seconds` | 30 | Pending #182 |
+| `paper.fill_read_overlap_seconds` | 60 | Pending #182 |
+
+Before T70 is complete, cite the report and justify each final value from its
+evidence (including any placeholder retained), update `PaperConfig` and
+`tests/test_config.py` together, set the default tracking rule to `residual`,
+and reconcile the Config keys list above with those values. The poll interval
+must remain at most the accept wait. The implementation still defaults to `raw`
+while this amendment is pending; T70 remains unticked and must merge before T71.
+
 **Env vars**: `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET` (new; the data keys stay `ALPACA_API_KEY`/`ALPACA_API_SECRET`), `TRADEPARTNER_INVOKED_BY` (set to `scheduler` by the plist), `ALERT_SMTP_HOST`, `ALERT_SMTP_USER`, `ALERT_SMTP_PASSWORD`, `ALERT_EMAIL_TO` (optional). **CLI**: `paper start|stop|run|reconcile|kill|resume|report|check|status` (req 16).
 
 ## Risks & domain checks
