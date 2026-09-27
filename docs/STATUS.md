@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-26 · **Phase:** 2, Data foundation (24/31) and 3, Backtest (21/24) in parallel · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
+**Updated:** 2026-09-27 · **Phase:** 2, Data foundation (28/32) and 3, Backtest (21/24), with 4, Paper trading (7/50) in build · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Done
 Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/fragments.py show` (#70).
@@ -101,28 +101,54 @@ Plus the entries in `docs/status.d/` not folded in yet: `uv run python scripts/f
 - #231 T11g: FSN data-set fetch (`fsn_periods`, `fsn_zip`, `fsn_validators`), the `cli_record fsn` target and the FSN/header config keys, split from T11c
 - Phase 3 T41: `bt` oracle on a temp-file fixture store under a synthetic `family=oracle` hypothesis; equity agrees at every session within 1e-9 (measured 8.5e-16) at zero costs and fractional shares, the delisted fixture name is sold at its last close in both engines, a one-session lag fails; `fill_price=open` not exercised, open question on the PR (PR #239)
 - T29 (owner) ADR 0009 (Proposed): no paid price vendor for Phase 3; Alpaca SIP daily bars from 2016-01-04 plus EDGAR are the `PriceSource` for every registered hypothesis, budget USD 0, delisted coverage graded verified-on-sample, the survivorship gap measured per rebalance and gated, Phase 4 waits on the owner's gap sign-off in the registry, charter principle 4 amended, four re-open triggers with a vendor candidate order (#240)
+- #224 T11c: `parse_fsn` and `_ensure_fsn` turn the FSN data sets into unstamped per-CIK caches of cover listings, per-class shares and SIC
+- #244 Doc-keeper fold of 2026-09-25/26: 46 STATUS and 45 CHANGELOG fragments folded, T29 ticked (ADR 0009), Teams, In progress, Ready frontier and Decisions refreshed
+- #246 T11d: `EdgarFilingSource.cover_pages`/`filing_headers` serve FSN's per-CIK caches, stamped at read time from the submissions acceptance, with per-document cover-page and ranged-header fallbacks for lag-window and registration-form accessions FSN does not hold; classification's SIC evidence now reads `edgar.header_forms`
+- #247 Phase 4 spec: `docs/specs/paper-trading.md` (risk-gated wrapper, Alpaca paper adapter, tracking run, journal chain, operations and override pages, alerts, wash-sale lot ledger, exit-criteria command; fourteen open questions for the owner)
+- #250 Owner accepted ADR 0009 (price vendor: none for Phase 3) by merging #241; status line updated
+- #252 T11e: `EdgarFilingSource.facts` serves company facts (bulk or per-CIK, cached by the latest cover-form accession) and per-class cover shares (FSN and lag-window documents) stamped from the submissions, dated by the company-facts `end` or the capped FSN month end, de-duplicated across sources; `facts_as_of` resolves one row per accession and class to its latest-ingested date
+- #254 ADR 0010 (Proposed): Phase 4 risk rules recorded, the named `risk.*` limits that halt or skip, checks before each phase's first submit (per-phase reading of ADR 0007 point 5), the client order id as a pure function of the journal (ADR 0007 point 3), the halt sequence; a plan prerequisite of the wrapper task
+- #255 Phase 4 plan: `docs/plans/paper-trading.md`, 50 tasks T46 to T71b in 19 chains (ADR 0007 Task A first, the wrapper in five tasks, the tracking run in six plus two test suites, window, report, check, CLI, two pages, two docs tasks, two owner tasks), owner gates on the task lines, work-map entries per task
+- #259 T11e ticked in the Phase 2 plan after #253; T11f opens
+- #261 T11f: `EdgarFilingSource.delistings(since)` from Form 25 documents, pre-XML Form 25s counted; the failure policy split to T11h
+- Phase 4 T46: `tradepartner/errors.py` (`SystemFaultError` with `ClockError`, `ReconciliationError`, `RejectionCapError`, `SkipCapError`, `KillSwitchEngagedError`, `LimitBreachError`, `AcknowledgementTimeoutError`; `StaleDataError` beside them; none a `ValueError`); `FakeBroker` wraps every clock read per ADR 0007 point 4, so a naive, overflowing, non-`datetime` or raising clock makes `submit`/`simulate_fill` raise `ClockError` with no state changed (#264)
+- Phase 4 T49: paper-trading journal at schema version 5, 26 append-only tables (`JOURNAL_TABLE_NAMES`) with `known_at`/`ingested_at` NOT NULL, a CHECK on every closed enumeration, additive migration from 2, 3 or 4; read-only connections accept a version-4 store; `insert_row` quotes column names (the journal's `at`); copy the owner store before pulling, since any write migrates it (PR #272)
+- Phase 4 T47: config and env (`RiskConfig` with ADR 0010's keys, `PaperConfig` with `FROZEN_PAPER_KEYS`, `AlertsConfig.channels`, guarded `alpaca.paper`, the trading pace/timeout/retry keys, `quantity_decimals` and `client_order_id_max_length` unset until T48b, separate paper keys and `ALERT_*` secrets as `SecretStr`; `.env.example` updated, the stale `ALPACA_PAPER` line removed) (#267)
+- #268 T68: ADR 0011, dashboard technology: Streamlit under the design standard, no separate API, the override form the only write through the store's writer outside the read-only render, Streamlit bound to localhost; the design standard's open decision closed
+- #273 Phase 4 plan rows T66, T69 and T69b amended per ADR 0011: the override submit before the shell's read-only render, the localhost and telemetry refusal with `.streamlit/config.toml`, and the `page_data` row bound (`dashboard.page_row_limit`) with a timing check
+- #276 T68 ticked in the Phase 4 plan (ADR 0011 merged as #269 without its tick)
+- Phase 4 T46b: broker types per spec req 1 (#33): `OrderStatus` exactly `{ACCEPTED, FILLED, EXPIRED, REJECTED, CANCELLED}` with `TERMINAL_STATUSES`, a market DAY `OrderRequest` by `notional` or `quantity` with no price, `Order` fill fields, `Fill.broker_fill_id`, `Account`, `Asset`, `cancel -> None`, abstract `get_order`/`open_orders`/`fills(since)`/`account`/`assets`, no clock on the ABC; `FakeBroker` implements them over its book with an injected `price_of` and a public `clock` (#277)
+- #281 Strategy-lab spec: `docs/specs/strategy-lab.md` (sweeps as grids of registered variants, one read set per read group, fingerprints registered once across sweeps and families, pre-declared selection with argmax-only promotion at the family's SR* high-water mark, capped per sweep and per family, family rules fixed at first registration with a pinned `FAMILY_PARENTS` lineage, no holdout spend after the lab without a promotion, `schedule.rebalance_cadence` and `schedule.signal_anchor` as frozen keys behind a pinned defaults table so H1 is never re-registered, metrics annualised from the schedule and DSR with V in annual units, per-cutoff vintage with resumable sweeps, quiet intervals, detail levels and size guards; the shadow-paper replay deferred to a follow-up spec with the paper rules it would relax listed; amendments to the Phase 3 spec, a superseding ADR for cadence, the charter line, the paper spec gate and the roadmap listed for the owner; twelve open questions; six spec-critic passes recorded on PR #284)
+- Phase 4 T48: `adapters/alpaca_trading_raw.py` (`AlpacaTradingRaw`: `TradingClient` built with the literal `paper=True` from the paper keys only, refusing to start when `alpaca.paper` is not true, paced, timed out and retried from `alpaca.trading_*`, raw JSON calls) and `cli_record paper SYMBOL`, the owner-run paper script (flat account required, ends flat, responses scrubbed of keys, emails and account ids into `tests/fixtures/alpaca/paper/`) (#282)
+- Phase 4 T49b: `store/journal.py`, one frozen row type per journal table, one generic `append` (ids by the registry pattern, tz-aware `known_at <= ingested_at` refused otherwise), `fills_for` as the single reader of `fills` (superseded hidden, joined to orders, orphan fill raises), `all_fill_ids`, `JournalNotInitialised`; empty `execution` package init files (PR #286)
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
-Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-26 17:48 UTC: active claims are `atlas` (#244, this fold), `bitfly` (T11c, #224, PR #242 draft), `eclipse` (#182, owner-run, waits for Monday). Windows for blanc, declactic, entrophy, kimmia and minnow closed on 2026-09-26; otegra and placid are new and idle; the owner pruned the emory, klous, ubiquity and xerex directories.
+Live board: `uv run python scripts/team.py status`. Snapshot 2026-09-27: `atlas` #293 (this fold), `chawal` #263 T11h (took over bitfly's parked draft PR #275, checks green), `cupertiene` #288 T49c (PR #291 draft), `dante` #287 T46c (PR #292 draft), `eonic` #289 T50 (PR #290 draft), `meridian` #294 T70, `eclipse` #182 (owner-run Probe 3, waits for Monday).
+Retired 2026-09-27: otegra (T46b, #280), placid (T49b, #286), bitfly (T11h handed to chawal); their directories wait for the owner's `team.py prune`.
 
 ## In progress
-- **Phase 2 critical path:** T11c (bitfly, PR #242) → T11d → T11e → T11f → T19 → T22 (its #173 dependency merged, PR #227) → T23.
-- **Phase 3 critical path:** T42 needs T19; T45 needs T42 (T29 done, ADR 0009); T45b (owner) needs T45.
-- **Owner cleanup (agents are blocked from this):** retired team directories: only `diomedes` remains, kept for inspection, with uncommitted changes; the three research branches still checked out in closed worktrees; two entries under `.claude/worktrees/`.
+- **Phase 2 critical path:** T11h (chawal, PR #275) → T19 → T22 → T23.
+- **Phase 3 critical path:** T42 needs T19; T45 needs T42; T45b (owner) needs T45.
+- **Phase 4:** T46c (PR #292), T49c (PR #291), T50 (PR #290), T70 (meridian, after Probe 3); T48b (owner) gates T48c, T60d, T67, T70b and T71.
+- **Owner cleanup (agents are blocked from this):** prune the retired team directories; `diomedes` kept for inspection, with uncommitted changes; the closed research worktrees and two entries under `.claude/worktrees/`.
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
-Copied from `team.py status` on 2026-09-26 17:48 UTC, as if the T29 tick had merged. Claim through the tool, never from this list.
-1. ready plan tasks: none unclaimed apart from owner items
-2. unclaimed issues: #183 (owner-run Probe 2 same-day live case, Monday 17:00 to 19:00 ET), #33 (Phase 4 idea, leave it)
+Copied from `team.py status` on 2026-09-27. Claim through the tool, never from this list.
+1. ready plan tasks: T48b (owner: `python -m tradepartner.cli_record paper <SYMBOL>` on a flat paper account in market hours, a non-fractionable symbol)
+2. unclaimed issues: #258 (A→B→A facts, unsized), #183 (owner-run Probe 2 same-day live case), #33 (broker account query; delivered in substance by T46b/#280, closable)
 3. parked PRs: none
 
 ## Blocked
-- none. The two owner-run probes (#182, #183) wait for a session day.
+- Every other plan task waits on its dependencies (board: T19, T22, T23, T42, T45, T45b, T48c, T51 to T67, T69, T69b, T70b, T71, T71b).
+- T70 waits on Probe 3 (#182) results; T48c and its dependents wait on the owner's T48b recording.
 
 ## Decisions needed from owner
-- Rebalance cadence: the owner wants to test weekly rebalancing later. Proposed 2026-09-25: amend the Phase 3 spec so the rebalance schedule is a hypothesis parameter (month-end or week-end sessions; metrics annualised from the schedule). Not yet decided.
-- Sign-off on H1's recorded survivorship gap (`gap_signoff` owner decision in the registry) is required before Phase 4, per ADR 0009 and ADR 0003 rule 8.
-- #182 and #183 owner-run probes, Monday to Friday 2026-09-28 to 2026-10-02.
+- #281 strategy-lab questions 2, 8 and 11 (ordering against T45b, dropping the shadow-paper replay, family lineage); then Fable drafts the Phase 3 spec sentence amendments and a superseding cadence ADR 0012 as separate PRs.
+- A session day for owner-run probes #182 (Probe 3, Mon to Fri 2026-09-28 to 10-02, submit 09:00 to 09:15 ET, collect after 09:46) and #183.
+- T48b paper recording run (owner keys, market hours, flat account).
+- Close #33 (delivered by T46b, #280).
+- Prune the retired team directories (otegra, placid, bitfly).
+- Sign-off on H1's recorded survivorship gap (`gap_signoff` in the registry) before Phase 4 paper start, per ADR 0009 and ADR 0003 rule 8.
 - GitHub Pro decision for the server-side main ruleset still open.
 - Before Phase 6 only: account type, employer compliance check
