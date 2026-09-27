@@ -6,7 +6,9 @@ fails, then delivers to each channel in `alerts.channels`, journaling one
 `alert_deliveries` row per attempt. A channel failure never raises: it is a
 failed delivery row, and the caller's status is whatever it was. The emitter
 writes the alert before its exception propagates; the row runs in the caller's
-transaction (`store.journal.append`), so the caller commits it.
+transaction (`store.journal.append`), so the caller commits it, and must do so
+before re-raising: channels are called before that commit, so a rollback would
+leave a delivered alert with no row (and no dedupe record).
 
 Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
 
@@ -27,25 +29,35 @@ table), `macos` (an `osascript` notification), `email` (SMTP to `ALERT_EMAIL_TO`
 from the `ALERT_SMTP_*` settings, over STARTTLS; skipped, as a failed row saying
 so, unless all four are set). `ALERT_SMTP_HOST` may carry a port
 (`smtp.example.com:587`), which `smtplib` parses. No secret value is ever logged
-or journaled: every delivery error has the configured secrets masked.
+or journaled (see "Secrets" below).
 
-The clock stamps `at`, `known_at` and `ingested_at`. If it raises or returns a
-naive value, the stamp falls back to `store.db.utc_now()`, as the halt path's
-rows do after a `ClockError` (spec Definitions): the alert for a clock fault
-must still be written.
+The clock stamps `at`, `known_at` and `ingested_at` (converted to UTC). On the
+halt path after a `ClockError` the caller passes `clock_fault=True`: the clock
+is never read and every row is stamped with `store.db.utc_now()` (spec
+Definitions). If the clock raises or returns a naive value anyway, the stamp
+falls back the same way: the alert for a clock fault must still be written.
+
+Secrets: every `SecretStr` value in `Settings` (the Alpaca keys and the
+`ALERT_*` values) is masked in the alert message before it is journaled or sent,
+and in every delivery error, whatever its case or repr escaping, since an
+emitter may pass an exception's text. SMTP uses STARTTLS with a verifying
+context (certificate and hostname) before any credential is sent.
 """
 
 from __future__ import annotations
 
+import re
 import smtplib
+import ssl
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from email.message import EmailMessage
 from typing import Any
 
 import duckdb
+from pydantic import SecretStr
 
 from tradepartner.config import Settings
 from tradepartner.store import journal
@@ -121,14 +133,24 @@ class Alerter:
     def __repr__(self) -> str:
         return f"Alerter(channels={self._channels!r})"
 
-    def write(self, kind: str, run_id: int | None, session: date, message: str) -> int:
+    def write(
+        self,
+        kind: str,
+        run_id: int | None,
+        session: date,
+        message: str,
+        *,
+        clock_fault: bool = False,
+    ) -> int:
         """Append the alert (unless its dedupe key already has one) and deliver it;
         return its `alert_id`, the existing one for a duplicate, which is not
         delivered again. Raises `ValueError` for an unknown kind, a
         `kill_switch_write_failed` (use `deliver_without_store`), a run-scoped kind
         without a run or a session-scoped kind with one; store errors propagate
         (the caller then falls back to `deliver_without_store`). Never raises for
-        a delivery failure."""
+        a delivery failure. `clock_fault=True` (the halt path after a
+        `ClockError`) stamps every row with `store.db.utc_now()` and never reads
+        the clock, which may be returning implausible but well-formed values."""
         _check_kind(kind)
         if kind in NON_STORE_KINDS:
             raise ValueError(f"{kind} never touches the store: use deliver_without_store")
@@ -136,10 +158,11 @@ class Alerter:
             raise ValueError(f"{kind} has no run; got run {run_id}")
         if kind not in SESSION_SCOPED_KINDS and run_id is None:
             raise ValueError(f"{kind} is run-scoped and needs a run id")
+        message = self._scrub(message)
         existing = self._existing(kind, run_id, session)
         if existing is not None:
             return existing
-        now = self._now()
+        now = self._now(clock_fault)
         alert_id = journal.append(
             self._conn,
             AlertRow(
@@ -158,7 +181,7 @@ class Alerter:
                 outcome = Delivery("store", True)
             else:
                 outcome = self._deliver(channel, kind, message)
-            stamp = self._now()
+            stamp = self._now(clock_fault)
             journal.append(
                 self._conn,
                 AlertDeliveryRow(
@@ -180,6 +203,7 @@ class Alerter:
         _check_kind(kind)
         if kind not in NON_STORE_KINDS:
             raise ValueError(f"only {NON_STORE_KINDS} bypass the store; got {kind}")
+        message = self._scrub(message)
         return [self._deliver(c, kind, message) for c in self._channels if c != "store"]
 
     # --- internals ---------------------------------------------------------------------
@@ -194,14 +218,16 @@ class Alerter:
         ).fetchone()
         return None if row is None or row[0] is None else int(row[0])
 
-    def _now(self) -> datetime:
+    def _now(self, clock_fault: bool) -> datetime:
+        if clock_fault:
+            return utc_now()
         try:
             now = self._clock()
+            if not isinstance(now, datetime) or now.utcoffset() is None:
+                return utc_now()
+            return now.astimezone(UTC)
         except Exception:
             return utc_now()
-        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-            return utc_now()
-        return now
 
     def _deliver(self, channel: str, kind: str, message: str) -> Delivery:
         try:
@@ -244,18 +270,23 @@ class Alerter:
         email["To"] = s.alert_email_to.get_secret_value()
         email.set_content(message)
         with self._smtp(s.alert_smtp_host, timeout=DELIVERY_TIMEOUT_SECONDS) as client:
-            client.starttls()
+            client.starttls(context=ssl.create_default_context())
             client.login(user, s.alert_smtp_password.get_secret_value())
             client.send_message(email)
 
     def _secrets(self) -> Sequence[str]:
-        s = self._settings
-        values = (s.alert_smtp_user, s.alert_smtp_password, s.alert_email_to)
-        return [v.get_secret_value() for v in values if v is not None and v.get_secret_value()]
+        values = (getattr(self._settings, name) for name in type(self._settings).model_fields)
+        return [
+            v.get_secret_value()
+            for v in values
+            if isinstance(v, SecretStr) and v.get_secret_value()
+        ]
 
     def _scrub(self, text: str) -> str:
-        for secret in sorted(self._secrets(), key=len, reverse=True):
-            text = text.replace(secret, _MASK)
+        """`text` with every secret masked, in any case and in its repr-escaped form."""
+        forms = {form for secret in self._secrets() for form in (secret, repr(secret)[1:-1])}
+        for form in sorted(forms, key=len, reverse=True):
+            text = re.sub(re.escape(form), _MASK, text, flags=re.IGNORECASE)
         return text
 
 

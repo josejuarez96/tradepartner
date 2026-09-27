@@ -10,9 +10,10 @@ the spec's list is accepted and any other refused.
 from __future__ import annotations
 
 import re
+import ssl
 import subprocess
 from collections.abc import Iterator, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any, ClassVar
 
@@ -105,10 +106,13 @@ class FakeSMTP:
     def __exit__(self, *exc: object) -> None:
         return None
 
-    def starttls(self) -> None:
+    def starttls(self, *, context: ssl.SSLContext | None = None) -> None:
+        assert context is not None, "STARTTLS must use a verifying context"
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
         self.tls = True
 
     def login(self, user: str, password: str) -> None:
+        assert self.tls, "credentials must never be sent before STARTTLS"
         if FakeSMTP.fail_login_with is not None:
             raise FakeSMTP.fail_login_with
         self.logins.append((user, password))
@@ -326,3 +330,109 @@ def test_the_module_has_no_secret_logging() -> None:
     for line in text.splitlines():
         if "get_secret_value" in line:
             assert not re.search(r"\b(logging|logger|log\.|print)\b|\blog\(", line)
+
+
+# --- stamps --------------------------------------------------------------------------------
+
+
+def _stamps(conn: duckdb.DuckDBPyConnection) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    alert_rows = conn.execute('SELECT "at", known_at, ingested_at FROM alerts').fetchall()
+    delivery_rows = conn.execute(
+        'SELECT "at", known_at, ingested_at FROM alert_deliveries'
+    ).fetchall()
+    return alert_rows, delivery_rows
+
+
+def test_rows_are_stamped_with_the_clock_reading_in_utc(conn: duckdb.DuckDBPyConnection) -> None:
+    eastern = timezone(timedelta(hours=-4))
+    alerter = Alerter(
+        _settings(["store", "macos"]),
+        conn,
+        lambda: _NOW.astimezone(eastern),
+        runner=FakeRunner(),
+        smtp=FakeSMTP,
+    )
+    alerter.write("halted", 7, _SESSION, "m")
+    alert_rows, delivery_rows = _stamps(conn)
+    assert alert_rows == [(_NOW, _NOW, _NOW)]
+    assert delivery_rows == [(_NOW, _NOW, _NOW)] * 2
+
+
+def test_a_clock_fault_never_reads_the_clock(conn: duckdb.DuckDBPyConnection) -> None:
+    """After a `ClockError` the clock may return well-formed nonsense (a year
+    ahead, say): with `clock_fault=True` it is never called and every stamp is
+    `utc_now()`."""
+    calls: list[datetime] = []
+    ahead = _NOW + timedelta(days=365)
+
+    def implausible() -> datetime:
+        calls.append(ahead)
+        return ahead
+
+    alerter = Alerter(
+        _settings(["store", "macos"]), conn, implausible, runner=FakeRunner(), smtp=FakeSMTP
+    )
+    before = datetime.now(UTC)
+    alerter.write("halted", 7, _SESSION, "m", clock_fault=True)
+    after = datetime.now(UTC)
+    assert calls == []
+    alert_rows, delivery_rows = _stamps(conn)
+    for row in alert_rows + delivery_rows:
+        assert all(before <= stamp <= after for stamp in row)
+
+
+@pytest.mark.parametrize("reading", ["raises", "naive"])
+def test_a_broken_clock_falls_back_to_utc_now(
+    conn: duckdb.DuckDBPyConnection, reading: str
+) -> None:
+    def clock() -> datetime:
+        if reading == "raises":
+            raise OSError("clock gone")
+        return datetime(2026, 10, 1, 21, 0)  # noqa: DTZ001 (a naive reading on purpose)
+
+    before = datetime.now(UTC)
+    Alerter(_settings(), conn, clock, runner=FakeRunner(), smtp=FakeSMTP).write(
+        "halted", 7, _SESSION, "m"
+    )
+    ((at, known_at, ingested_at),), _ = _stamps(conn)
+    assert at.tzinfo is not None and before <= at == known_at == ingested_at <= datetime.now(UTC)
+
+
+# --- secrets in messages ---------------------------------------------------------------------
+
+
+def test_secrets_are_masked_in_the_message_before_it_is_stored_or_sent(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """An emitter may pass an exception's text; a key in it never reaches the
+    store, the notification or the email."""
+    runner = FakeRunner()
+    alerter = _alerter(
+        conn,
+        _settings(["store", "macos", "email"], alpaca_paper_api_key="PKFAKEKEY123", **_SECRETS),
+        runner=runner,
+    )
+    alerter.write("run_failed", 7, _SESSION, "401 for key pkfakekey123 and HUNTER2-VERY-SECRET")
+    ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
+    ((_, _, script),) = runner.calls
+    (smtp,) = FakeSMTP.instances
+    for text in (message, script, smtp.sent[0].get_content()):
+        assert "pkfakekey123" not in text.lower() and "hunter2" not in text.lower()
+        assert "401 for key ***" in text
+    outcomes = alerter.deliver_without_store("kill_switch_write_failed", "key PKFAKEKEY123")
+    assert all(o.ok for o in outcomes)
+    assert "PKFAKEKEY123" not in runner.calls[-1][2]
+
+
+def test_a_secret_is_masked_in_errors_in_any_case_or_repr_form(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    secrets = {**_SECRETS, "alert_smtp_password": "pa'ss\\word"}
+    FakeSMTP.fail_login_with = RuntimeError(
+        f"refused {secrets['alert_email_to'].upper()} {secrets['alert_smtp_password']!r}"
+    )
+    alerter = _alerter(conn, _settings(["store", "email"], **secrets))
+    alerter.write("drawdown", 7, _SESSION, "m")
+    ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
+    assert not ok and error is not None and "refused" in error
+    assert "OWNER-INBOX" not in error and "word" not in error
