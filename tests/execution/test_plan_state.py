@@ -7,6 +7,7 @@ Hand-computed cases, one per state and remainder kind. The literal check on
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 
@@ -627,3 +628,132 @@ def test_a_plan_sell_or_buy_with_no_amount_is_refused() -> None:
     blank = _decision(side="buy", decision_id=11)
     with pytest.raises(ValueError, match="planned_notional"):
         target_notional(buy, 100.0, [], [buy, blank], price_of, COSTS)
+
+
+# Review fixes (#329): clamps, finiteness, rebalance scope, integrity, precedence.
+
+
+def _implied(order: OrderRow, quantity: float, price: float) -> OrderedFill:
+    real = _fill(order, quantity, 1.0)
+    row = FillRow(
+        fill_id=real.fill.fill_id,
+        client_order_id=order.client_order_id,
+        filled_at=real.fill.filled_at,
+        quantity=quantity,
+        price=price,
+        price_implied=True,
+        broker_fill_id=f"synthetic:{order.client_order_id}",
+        source="broker_status",
+        known_at=real.fill.known_at,
+        ingested_at=real.fill.ingested_at,
+    )
+    return OrderedFill(row, order.side, order.security_id, order.symbol, order.run_id, 1)
+
+
+def test_a_negative_implied_price_never_lifts_a_remainder_above_the_plan() -> None:
+    buy = _decision(side="buy", planned_notional=1000.0, target=1000.0)
+    o = _order(buy, S1, notional=1000.0, sells_in_flight=True)
+    r = _remainder(buy, [o], [_implied(o, 10, -50.0)])
+    assert r.notional == 1000.0
+    sell = _decision(planned_notional=500.0, decision_id=2)
+    o2 = _order(sell, S1, attempt=2, notional=500.0)
+    assert _remainder(sell, [o2], [_implied(o2, 2, -10.0)]).notional == 500.0
+
+
+def test_an_overfilled_order_leaves_a_zero_remainder() -> None:
+    d = _decision(planned_quantity=10)
+    o = _order(d, S1, quantity=10)
+    assert _remainder(d, [o], [_fill(o, 12, 50.0)]).quantity == 0.0
+
+
+def test_a_fully_filled_decision_settles_even_with_a_zero_minimum() -> None:
+    d = _decision(planned_quantity=10)
+    o = _order(d, S1, quantity=10)
+    state = _state(
+        d,
+        [o],
+        [_event(o, "filled")],
+        [_fill(o, 10, 50.0)],
+        frozen=RiskConfig(min_order_notional=0.0),
+    )
+    assert state.state == State.SETTLED
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "nan-fill-price",
+        "inf-fill-quantity",
+        "nan-planned",
+        "inf-target",
+        "negative-planned",
+        "inf-price",
+    ],
+)
+def test_non_finite_or_negative_amounts_are_refused(case: str) -> None:
+    buy = _decision(side="buy", planned_notional=100.0, target=100.0)
+    o = _order(buy, S1, notional=100.0, sells_in_flight=True)
+    with pytest.raises(ValueError):
+        if case == "nan-fill-price":
+            _state(buy, [o], [_event(o, "filled")], [_fill(o, 1, math.nan)])
+        elif case == "inf-fill-quantity":
+            _state(buy, [o], [_event(o, "filled")], [_fill(o, math.inf, 50.0)])
+        elif case == "nan-planned":
+            _state(_decision(planned_notional=math.nan))
+        elif case == "inf-target":
+            _state(_decision(side="buy", planned_notional=1.0, target=math.inf))
+        elif case == "negative-planned":
+            _state(_decision(planned_quantity=-5))
+        else:
+            remainder(buy, [], [], [], NO_ACTIONS, lambda _s: math.inf, session=S2)
+
+
+@pytest.mark.parametrize("ratio", [0.0, -2.0, math.nan])
+def test_a_bad_split_ratio_is_refused(ratio: float) -> None:
+    with pytest.raises(ValueError, match="split"):
+        _remainder(_decision(planned_quantity=10), [], [], actions=_splits((A, S1, ratio)))
+
+
+def test_an_order_disagreeing_with_its_decision_is_refused() -> None:
+    sell = _decision(planned_quantity=10)
+    wrong = _order(_decision(side="buy", planned_notional=1.0, target=1.0), S1, notional=1.0)
+    with pytest.raises(ValueError, match="disagrees"):
+        _remainder(sell, [wrong], [])
+
+
+def test_the_target_refuses_rows_of_another_rebalance_or_repeats() -> None:
+    buy = _decision(side="buy", planned_notional=1000.0, decision_id=10)
+    old_sell = _decision(planned_notional=900.0, rebalance_session=date(2026, 9, 1), decision_id=20)
+    with pytest.raises(ValueError, match="rebalance"):
+        target_notional(buy, 0.0, [old_sell], [buy], price_of, COSTS)
+    sell = _decision(planned_notional=900.0, decision_id=20)
+    with pytest.raises(ValueError, match="repeated"):
+        target_notional(buy, 0.0, [sell, sell], [buy], price_of, COSTS)
+    with pytest.raises(ValueError, match="not a buy"):
+        target_notional(buy, 0.0, [], [buy, sell], price_of, COSTS)
+
+
+def test_the_target_refuses_non_finite_cash() -> None:
+    buy = _decision(side="buy", planned_notional=1000.0, decision_id=10)
+    with pytest.raises(ValueError, match="cash_before"):
+        target_notional(buy, math.nan, [], [buy], price_of, COSTS)
+
+
+def test_a_closing_event_takes_precedence_over_an_order_in_flight() -> None:
+    d = _decision(side="buy", planned_notional=100.0, target=100.0)
+    o = _order(d, S1, notional=100.0)
+    state = _state(
+        d,
+        [o],
+        [_event(o, "accepted")],
+        decision_events=[_decision_event(d, "skipped", "untradable")],
+    )
+    assert state.state == State.CLOSED
+
+
+def test_an_earlier_order_still_in_flight_keeps_the_decision_in_flight() -> None:
+    d = _decision(side="buy", planned_notional=500.0, target=500.0)
+    first = _order(d, S1, notional=500.0)
+    second = _order(d, S2, notional=300.0)
+    events = [_event(first, "accepted"), _event(second, "expired")]
+    assert _state(d, [first, second], events).state == State.IN_FLIGHT

@@ -27,6 +27,18 @@ How decisions are read (T53 writes them this way):
   `rebalance_session`, or, for a forced exit (no rebalance session), for the
   New York date of its `known_at`.
 
+`price_of(security_id)` is the reference price on the same split basis as the
+quantities: the close read at close(S-1), divided by the splits with ex-date
+after that close's session and on or before S (so on an ex-date the price is
+in post-split shares). The spec does not say this; T53 and T54 build
+`price_of` and follow it.
+
+Every amount read is checked finite, and amounts that cannot be negative are
+checked too; a remainder is clamped to [0, the amount it is measured against]
+(a buy's target, the latest order's quantity or notional), so no fill price,
+implied or not, can make it larger than the plan. Rows of one decision whose
+side or security disagree with it raise `ValueError`.
+
 An order is terminal when **any** of its events is terminal (a `cancel_noop`
 may follow `expired`), and in flight otherwise, an order with no event at all
 included: that fails safe, since an in-flight decision is never re-ordered.
@@ -34,6 +46,7 @@ included: that fails safe, since an in-flight decision is never re-ordered.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -124,10 +137,32 @@ def _decision_id(decision: DecisionRow) -> int:
     return decision.decision_id
 
 
+def _finite(value: float, what: str, *, non_negative: bool = False) -> float:
+    if not math.isfinite(value):
+        raise ValueError(f"{what} is {value}, not a finite number")
+    if non_negative and value < 0:
+        raise ValueError(f"{what} is {value}, must not be negative")
+    return value
+
+
+def _clamp(value: float, upper: float) -> float:
+    return min(max(value, 0.0), upper)
+
+
 def _orders_of(decision: DecisionRow, orders: Iterable[OrderRow]) -> list[OrderRow]:
-    """The decision's orders, oldest attempt first."""
+    """The decision's orders, oldest attempt first; one whose side or security
+    disagrees with the decision raises."""
     decision_id = _decision_id(decision)
     mine = [o for o in orders if o.decision_id == decision_id]
+    for order in mine:
+        if (order.side, order.security_id) != (decision.side, decision.security_id):
+            raise ValueError(
+                f"order {order.client_order_id!r} ({order.side} {order.security_id}) disagrees "
+                f"with decision {decision_id} ({decision.side} {decision.security_id})"
+            )
+        for amount, name in ((order.quantity, "quantity"), (order.notional, "notional")):
+            if amount is not None:
+                _finite(amount, f"order {order.client_order_id!r} {name}", non_negative=True)
     return sorted(mine, key=lambda o: (o.session, o.attempt))
 
 
@@ -135,9 +170,13 @@ def _filled(order: OrderRow, fills: Iterable[OrderedFill]) -> tuple[float, float
     """Filled shares and filled value of one order."""
     quantity = value = 0.0
     for fill in fills:
-        if fill.fill.client_order_id == order.client_order_id:
-            quantity += fill.fill.quantity
-            value += fill.fill.quantity * fill.fill.price
+        row = fill.fill
+        if row.client_order_id != order.client_order_id:
+            continue
+        if (fill.side, fill.security_id) != (order.side, order.security_id):
+            raise ValueError(f"fill {row.fill_id} disagrees with order {order.client_order_id!r}")
+        quantity += _finite(row.quantity, f"fill {row.fill_id} quantity", non_negative=True)
+        value += row.quantity * _finite(row.price, f"fill {row.fill_id} price")
     return quantity, value
 
 
@@ -152,7 +191,10 @@ def _split_factor(
             and row["action_type"] == _SPLIT
             and stated_on < row["ex_date"] <= session
         ):
-            factor *= float(row["ratio_or_amount"])
+            ratio = _finite(float(row["ratio_or_amount"]), f"split ratio of {security_id}")
+            if ratio <= 0:
+                raise ValueError(f"split of {security_id} has ratio {ratio}")
+            factor *= ratio
     return factor
 
 
@@ -164,7 +206,7 @@ def _stated_on(decision: DecisionRow) -> date:
 
 def _price(price_of: PriceOf, security_id: str) -> float:
     price = price_of(security_id)
-    if not price > 0:
+    if not (math.isfinite(price) and price > 0):
         raise ValueError(f"reference price of {security_id} is {price}, must be positive")
     return price
 
@@ -204,8 +246,11 @@ def remainder(
     if decision.side == _BUY:
         if decision.target_notional is None:
             raise ValueError(f"buy decision {decision.decision_id} has no target_notional")
+        target = _finite(
+            decision.target_notional, f"decision {decision.decision_id} target", non_negative=True
+        )
         spent = sum(_filled(order, fills)[1] for order in mine)
-        notional = decision.target_notional - spent
+        notional = _clamp(target - spent, target)
         return Remainder(quantity=notional / price, notional=notional)
     if decision.side != _SELL:
         raise ValueError(f"decision {decision.decision_id} has side {decision.side!r}")
@@ -214,18 +259,22 @@ def remainder(
         filled_quantity, filled_value = _filled(latest, fills)
         if latest.quantity is not None:
             factor = _split_factor(actions_as_of, decision.security_id, latest.session, session)
-            quantity = (latest.quantity - filled_quantity) * factor
+            quantity = _clamp(
+                (latest.quantity - filled_quantity) * factor, latest.quantity * factor
+            )
             return Remainder(quantity=quantity, notional=quantity * price)
         if latest.notional is None:
             raise ValueError(f"order {latest.client_order_id!r} has neither quantity nor notional")
-        notional = latest.notional - filled_value
+        notional = _clamp(latest.notional - filled_value, latest.notional)
         return Remainder(quantity=notional / price, notional=notional)
+    what = f"decision {decision.decision_id}"
     if decision.planned_quantity is not None:
+        planned = _finite(decision.planned_quantity, f"{what} quantity", non_negative=True)
         factor = _split_factor(actions_as_of, decision.security_id, _stated_on(decision), session)
-        quantity = decision.planned_quantity * factor
+        quantity = planned * factor
         return Remainder(quantity=quantity, notional=quantity * price)
     if decision.planned_notional is not None:
-        notional = decision.planned_notional
+        notional = _finite(decision.planned_notional, f"{what} notional", non_negative=True)
         return Remainder(quantity=notional / price, notional=notional)
     raise ValueError(f"sell decision {decision.decision_id} has no planned quantity or notional")
 
@@ -250,22 +299,43 @@ def target_notional(
     if decision.side != _BUY or decision.planned_notional is None:
         raise ValueError(f"decision {decision.decision_id} is not a buy with a planned notional")
     decision_id = _decision_id(decision)
-    if decision_id not in {b.decision_id for b in planned_buys}:
+    rebalance = decision.rebalance_session
+    if rebalance is None:
+        raise ValueError(f"buy decision {decision_id} has no rebalance session")
+    ids = [row.decision_id for row in (*planned_sells, *planned_buys)]
+    if None in ids or len(set(ids)) != len(ids):
+        raise ValueError("planned_sells and planned_buys hold a missing or repeated decision_id")
+    for row in (*planned_sells, *planned_buys):
+        if (row.rebalance_session, row.run_id) != (rebalance, decision.run_id) and (
+            row.decision != _FORCED_EXIT
+        ):
+            raise ValueError(
+                f"decision {row.decision_id} is not of rebalance {rebalance} run {decision.run_id}"
+            )
+    if any(b.side != _BUY for b in planned_buys):
+        raise ValueError("planned_buys holds a decision that is not a buy")
+    if decision_id not in ids[len(planned_sells) :]:
         raise ValueError(f"decision {decision_id} is not among planned_buys")
+    _finite(cash_before, "cash_before", non_negative=True)
     proceeds = 0.0
     for sell in planned_sells:
         if sell.decision not in _PLAN_TRADE_KINDS or sell.side != _SELL:
             continue  # a forced exit, a skip or dust is not a sell the plan made
+        what = f"planned sell {sell.decision_id}"
         if sell.planned_notional is not None:
-            proceeds += sell.planned_notional
+            proceeds += _finite(sell.planned_notional, what, non_negative=True)
         elif sell.planned_quantity is not None:
-            proceeds += sell.planned_quantity * _price(price_of, sell.security_id)
+            quantity = _finite(sell.planned_quantity, what, non_negative=True)
+            proceeds += quantity * _price(price_of, sell.security_id)
         else:
-            raise ValueError(f"planned sell {sell.decision_id} has no planned quantity or notional")
+            raise ValueError(f"{what} has no planned quantity or notional")
     missing = [b.decision_id for b in planned_buys if b.planned_notional is None]
     if missing:
         raise ValueError(f"planned buys {missing} have no planned_notional")
-    total = sum(b.planned_notional or 0.0 for b in planned_buys)
+    total = sum(
+        _finite(b.planned_notional or 0.0, f"planned buy {b.decision_id}", non_negative=True)
+        for b in planned_buys
+    )
     if not total > 0:
         raise ValueError("planned_buys have no positive planned notional")
     spendable = buy_notional_after_costs(
@@ -274,6 +344,7 @@ def target_notional(
         costs.commissions,
         price=_price(price_of, decision.security_id),
     )
+    _finite(spendable, "spendable")
     return decision.planned_notional * min(1.0, spendable / total)
 
 
@@ -346,7 +417,7 @@ def decision_state(
         if decision.whole_share
         else frozen.min_order_notional
     )
-    if left.notional < minimum:
+    if left.quantity <= 0 or left.notional < minimum:
         return DecisionState(State.SETTLED, remainder=left)
 
     latest = mine[-1]
