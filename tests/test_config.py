@@ -540,6 +540,8 @@ def test_alpaca_trading_defaults() -> None:
         {"trading_max_retries": -1},
         {"quantity_decimals": -1},
         {"client_order_id_max_length": 0},
+        {"trading_request_timeout_seconds": float("inf")},
+        {"trading_requests_per_minute": float("inf")},
     ],
 )
 def test_alpaca_trading_keys_reject_nonsense(override: dict[str, object]) -> None:

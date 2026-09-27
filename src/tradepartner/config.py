@@ -223,7 +223,7 @@ class AlpacaConfig(BaseModel):
     the trading client (T48) passes the literal `paper=True` and never forwards this field.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
