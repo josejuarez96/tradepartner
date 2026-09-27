@@ -1543,3 +1543,22 @@ def test_an_unstamped_delisting_is_counted_not_lost(tmp_path: Path) -> None:
     source = _delisting_source(router, tmp_path)
     assert accession not in {d.accession for d in source.delistings()}
     assert source.unstamped_delistings == 1
+
+
+def test_a_pre_xml_form_25_under_two_ciks_is_counted_once(tmp_path: Path) -> None:
+    """`.pre_xml_delistings` counts accessions, not (CIK, accession) pairs."""
+    form_25 = "0005555570-26-000001"
+    lines = (
+        index_line("25", "Old Co", 5555570, "2026-09-01", form_25),
+        index_line("25", "Old Co Parent", 5555571, "2026-09-01", form_25),
+    )
+    router = _delisting_router(*lines)
+    _add_klx_document(router)
+    for cik in (5555570, 5555571):
+        router.add(
+            f"{SUBMISSIONS_URL}CIK{cik:010d}.json",
+            _index_payload(cik, (form_25, "25", "2026-09-01T20:00:00")),  # doc.htm: pre-XML
+        )
+    source = _delisting_source(router, tmp_path)
+    source.delistings()
+    assert source.pre_xml_delistings == 1

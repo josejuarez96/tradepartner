@@ -973,8 +973,9 @@ class EdgarFilingSource(FilingSource):
                 if r is not None and r.accepted_at is not None
             ]
             if not stamped:
-                # Counted here: an exchange-only 25-NSE is a row `filing_index`
-                # never keeps, so its `.unstamped_filings` would not show it.
+                # Every unstamped delisting accession, so an exchange-only 25-NSE
+                # (a row `filing_index` never keeps) is visible too. It overlaps
+                # `.unstamped_filings` for subject-company rows: never add the two.
                 self.unstamped_delistings += 1
                 continue
             cik, record, accepted_at = stamped[0]
