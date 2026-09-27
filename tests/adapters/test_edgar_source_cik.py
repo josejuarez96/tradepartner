@@ -466,15 +466,17 @@ def test_an_sgml_header_is_served_at_the_submissions_acceptance(tmp_path: Path) 
     assert header.accepted_at == forged_stamp
 
 
-def test_a_header_naming_another_accession_raises(tmp_path: Path) -> None:
+def test_a_header_naming_another_accession_is_skipped_not_raised(tmp_path: Path) -> None:
+    """T11f's failure policy: this used to raise (T11d); it is now one of
+    the four failure kinds the policy skips, never raises."""
     settings = _settings(tmp_path)
     router = _router()
     accession = "0000320193-26-000080"
     router.add(_header_url(APPLE, accession), _synthetic_header("0000320193-26-999999"))
     source = _source(settings, router)
     _seed_stamps(source, APPLE, {accession: _record(accession, "10-K", INSIDE_LAG)})
-    with pytest.raises(ValueError, match="names accession"):
-        source.filing_headers(APPLE, ["10-K"])
+    assert source.filing_headers(APPLE, ["10-K"]) == []
+    assert source.failed_filings == 1
 
 
 def test_an_http_error_on_a_ranged_header_propagates(tmp_path: Path) -> None:

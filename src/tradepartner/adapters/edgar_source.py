@@ -64,11 +64,13 @@ import re
 import shutil
 import zipfile
 import zlib
+from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeVar
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -83,6 +85,7 @@ from tradepartner.adapters.edgar import (
     acceptance_times,
     parse_company_tickers,
     parse_cover_page,
+    parse_delisting,
     parse_filing_index,
     parse_fsn,
     parse_sgml_header,
@@ -112,6 +115,14 @@ FSN_VERSION = 1
 COVER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
+#: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
+DELISTING_VERSION = 1
+#: Bumped to retry every accession in `failed_filings.json` (T11f): deleting
+#: an entry by hand un-quarantines one accession; bumping this un-quarantines
+#: every one and resets every count.
+FAILURES_VERSION = 1
+
+_T = TypeVar("_T")
 
 #: Registration forms (T11d): a ranged header is requested from
 #: `edgar.header_start_year`, unlike periodic forms and 8-K, which only get
@@ -130,6 +141,11 @@ _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
 _EXCHANGE_FORMS = frozenset({"25-NSE", "25-NSE/A"})
 
 Quarter = tuple[int, int]
+
+
+class FilingFailuresError(RuntimeError):
+    """Raised by `check_failures()` (T11f) when the failure policy's
+    thresholds are crossed; the chunk fails with no row written."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +233,18 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
+        # T11f: the failure policy.
+        self.pre_xml_delistings = 0
+        self.failed_filings = 0
+        self.quarantined = 0
+        # accession -> (error_class, base_form, message), skipped this run,
+        # never yet written to failed_filings.json (that is `record_failures`'s
+        # job, after an `ok` commit).
+        self._pending_failures: dict[str, tuple[str, str, str]] = {}
+        # Per-document accessions actually fetched this run (cache hits and
+        # quarantined accessions excluded): `check_failures`'s denominator.
+        self._per_document_attempted: set[str] = set()
+        self._failed_filings_cache: dict[str, dict[str, Any]] | None = None
 
     def _count(self, request: httpx.Request) -> None:
         self.requests += 1
@@ -729,10 +757,19 @@ class EdgarFilingSource(FilingSource):
             if not record.inline_xbrl:
                 continue
             if record.accepted_at >= lag_start:
-                parsed = self._fetch_cover_page(
-                    cik, accession, record.primary_document, record.accepted_at
+                if self._is_quarantined(accession):
+                    self.quarantined += 1
+                    continue
+                base_form = record.form.removesuffix("/A")
+                fetch: Callable[[], CoverPageParse] = partial(
+                    self._fetch_cover_page,
+                    cik,
+                    accession,
+                    record.primary_document,
+                    record.accepted_at,
                 )
-                if parsed.cover.cik == cik:  # a combined filing names one entity
+                parsed = self._guarded(accession, base_form, fetch)
+                if parsed is not None and parsed.cover.cik == cik:  # a combined filing names one
                     pages.append(
                         CoverPage(cik, accession, record.accepted_at, parsed.cover.listings)
                     )
@@ -790,6 +827,187 @@ class EdgarFilingSource(FilingSource):
         }
         edgar_raw.write_atomic(self._cover_cache_path(accession), json.dumps(data).encode("utf-8"))
 
+    # --- failure policy (T11f) -------------------------------------------------
+
+    def _is_quarantined(self, accession: str) -> bool:
+        """Whether `accession` failed identically on `edgar.max_filing_failures`
+        consecutive counted days: no further request until its
+        `failed_filings.json` entry is deleted by hand or `FAILURES_VERSION`
+        changes. `accepted` does not lift a quarantine (plan T11f: "accepted
+        per-document entries stay quarantined"), only `check_failures`'s
+        thresholds."""
+        entry = self._failure_store().get(accession)
+        return entry is not None and entry["count"] >= self._settings.edgar.max_filing_failures
+
+    def _guarded(self, accession: str, base_form: str, fn: Callable[[], _T]) -> _T | None:
+        """Run one per-document fetch/parse, skipping (never raising) the
+        four failure kinds plan T11f names: a `ValueError` from a parser (a
+        malformed document, a forged fact collision, or `_ranged_header`'s
+        own accession-mismatch check), or a 404/410 for the document or
+        header itself. Any other `httpx.HTTPStatusError` (a 500, say) still
+        propagates and fails the chunk. Records `accession` as attempted
+        this run either way (`check_failures`'s per-document denominator)."""
+        self._per_document_attempted.add(accession)
+        try:
+            return fn()
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code not in (404, 410):
+                raise
+            self._record_failure(accession, type(error).__name__, base_form, str(error))
+            return None
+        except ValueError as error:
+            self._record_failure(accession, type(error).__name__, base_form, str(error))
+            return None
+
+    def _record_failure(
+        self, accession: str, error_class: str, base_form: str, message: str
+    ) -> None:
+        self._pending_failures[accession] = (error_class, base_form, message)
+        self.failed_filings = len(self._pending_failures)
+
+    def _failure_store(self) -> dict[str, dict[str, Any]]:
+        if self._failed_filings_cache is None:
+            self._failed_filings_cache = self._load_failed_filings()
+        return self._failed_filings_cache
+
+    def _failed_filings_path(self) -> Path:
+        return self._cache / "failed_filings.json"
+
+    def _load_failed_filings(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self._failed_filings_path().read_bytes())
+            if not isinstance(data, dict) or data.get("version") != FAILURES_VERSION:
+                return {}
+            entries = data.get("entries")
+            return entries if isinstance(entries, dict) else {}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return {}  # absent, truncated or another version: start fresh
+
+    def _save_failed_filings(self, entries: Mapping[str, dict[str, Any]]) -> None:
+        data = {"version": FAILURES_VERSION, "entries": dict(entries)}
+        edgar_raw.write_atomic(self._failed_filings_path(), json.dumps(data).encode("utf-8"))
+
+    def record_failures(self) -> None:
+        """The `after_commit` hook (T11f): advances `failed_filings.json`'s
+        consecutive-counted-day counts for this run's per-document failures
+        (`_pending_failures`), and marks every still-uncommitted FSN
+        manifest `committed: true`.
+
+        Counts advance at most once per Eastern calendar day, the day read
+        from the clock now (commit time). A second writer the same day is
+        idempotent: an entry already advanced today is left alone. A
+        different error message (or class) than the stored entry resets the
+        count to 1 instead of incrementing it; `accepted` (set by hand) is
+        preserved across an advance.
+        """
+        today = self._now().astimezone(_EASTERN).date().isoformat()
+        store = dict(self._failure_store())
+        for accession, (error_class, base_form, message) in self._pending_failures.items():
+            message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            entry = store.get(accession)
+            if entry is not None and entry.get("last_counted_day") == today:
+                continue  # already advanced today
+            same = (
+                entry is not None
+                and entry.get("error_class") == error_class
+                and entry.get("message_hash") == message_hash
+            )
+            store[accession] = {
+                "error_class": error_class,
+                "base_form": base_form,
+                "message_hash": message_hash,
+                "count": (entry["count"] + 1) if same and entry is not None else 1,
+                "last_counted_day": today,
+                "accepted": bool(entry.get("accepted", False)) if entry is not None else False,
+            }
+        self._save_failed_filings(store)
+        self._failed_filings_cache = store
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is not None and not manifest.get("committed", False):
+                manifest["committed"] = True
+                self._save_fsn_manifest(period, manifest)
+
+    def check_failures(self) -> None:
+        """Called by `_prefetch` after the fetch pass, before the lock.
+        Raises `FilingFailuresError` (the chunk fails, nothing written) when
+        any of plan T11f's three rules fires; see the module docstring."""
+        reasons: list[str] = []
+        self._check_fsn_group(reasons)
+        self._check_per_document_group(reasons)
+        self._check_cross_day_pairs(reasons)
+        if reasons:
+            raise FilingFailuresError("; ".join(reasons))
+
+    def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
+        min_n = self._settings.edgar.min_failed_filings
+        max_share = self._settings.edgar.max_failed_filing_share
+        if failures >= min_n and denominator > 0 and failures / denominator > max_share:
+            share = failures / denominator
+            return (
+                f"{label}: {failures} failures of {denominator} attempted "
+                f"({share:.1%}, over {max_share:.1%})"
+            )
+        return None
+
+    def _check_fsn_group(self, reasons: list[str]) -> None:
+        """FSN's denominator is every served-form accession (`accessions_served`
+        plus `accessions_failed`) of every period whose manifest is still
+        uncommitted, not only those extracted this run."""
+        failures = denominator = 0
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is None or manifest.get("committed", False):
+                continue
+            served = manifest.get("accessions_served", [])
+            failed = manifest.get("accessions_failed", [])
+            denominator += len(served) + len(failed)
+            failures += sum(1 for f in failed if not f.get("accepted", False))
+        reason = self._threshold_reason("FSN extraction", failures, denominator)
+        if reason:
+            reasons.append(reason)
+
+    def _check_per_document_group(self, reasons: list[str]) -> None:
+        """Per-document's denominator is the accessions attempted this run
+        (cache hits and quarantined accessions excluded)."""
+        store = self._failure_store()
+        failures = sum(
+            1
+            for accession in self._pending_failures
+            if not store.get(accession, {}).get("accepted", False)
+        )
+        denominator = len(self._per_document_attempted)
+        reason = self._threshold_reason("per-document", failures, denominator)
+        if reason:
+            reasons.append(reason)
+
+    def _check_cross_day_pairs(self, reasons: list[str]) -> None:
+        """One (error class, base form) pair with at least
+        `edgar.min_failed_filings` distinct accessions, `accepted: true`
+        entries excluded, across `failed_filings.json`, this run's not-yet-
+        recorded failures and every FSN manifest's `accessions_failed`."""
+        pairs: dict[tuple[str, str], set[str]] = defaultdict(set)
+        store = self._failure_store()
+        for accession, entry in store.items():
+            if not entry.get("accepted", False):
+                pairs[(entry["error_class"], entry["base_form"])].add(accession)
+        for accession, (error_class, base_form, _message) in self._pending_failures.items():
+            if not store.get(accession, {}).get("accepted", False):
+                pairs[(error_class, base_form)].add(accession)
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is None:
+                continue
+            for failure in manifest.get("accessions_failed", []):
+                if not failure.get("accepted", False):
+                    pairs[(failure["error_class"], failure["base_form"])].add(failure["accession"])
+        min_n = self._settings.edgar.min_failed_filings
+        for (error_class, base_form), accessions in pairs.items():
+            if len(accessions) >= min_n:
+                reasons.append(
+                    f"{error_class}/{base_form}: {len(accessions)} accessions across days"
+                )
+
     def filing_headers(self, cik: str, forms: Sequence[str]) -> list[FilingHeader]:
         """SIC headers of `cik`'s filings whose base form is in `forms`: from
         FSN with no request, plus a ranged SGML header where the module
@@ -826,20 +1044,40 @@ class EdgarFilingSource(FilingSource):
                 # a blank FSN SIC (#174: FSN's blanks are 8-Ks): a lag-window
                 # ranged header still brings a de-SPAC's new SIC.
                 if record.accepted_at >= lag_start:
-                    headers.append(
-                        self._ranged_header(cik, accession, record.form, record.accepted_at)
+                    header = self._maybe_ranged_header(
+                        cik, accession, record.form, base_form, record.accepted_at
                     )
+                    if header is not None:
+                        headers.append(header)
                 continue
             # absent from FSN entirely
             if base_form in _REGISTRATION_FORMS:
                 if record.accepted_at >= header_start:
-                    headers.append(
-                        self._ranged_header(cik, accession, record.form, record.accepted_at)
+                    header = self._maybe_ranged_header(
+                        cik, accession, record.form, base_form, record.accepted_at
                     )
+                    if header is not None:
+                        headers.append(header)
             elif record.accepted_at >= lag_start:
-                headers.append(self._ranged_header(cik, accession, record.form, record.accepted_at))
+                header = self._maybe_ranged_header(
+                    cik, accession, record.form, base_form, record.accepted_at
+                )
+                if header is not None:
+                    headers.append(header)
         headers.sort(key=lambda h: (h.accepted_at, h.accession))
         return headers
+
+    def _maybe_ranged_header(
+        self, cik: str, accession: str, form: str, base_form: str, accepted_at: datetime
+    ) -> FilingHeader | None:
+        """`_ranged_header`, gated by the quarantine check and wrapped in
+        `_guarded` (T11f): a mismatched accession, or a 404/410, is skipped."""
+        if self._is_quarantined(accession):
+            self.quarantined += 1
+            return None
+        return self._guarded(
+            accession, base_form, lambda: self._ranged_header(cik, accession, form, accepted_at)
+        )
 
     def _ranged_header(
         self, cik: str, accession: str, form: str, accepted_at: datetime
@@ -886,7 +1124,130 @@ class EdgarFilingSource(FilingSource):
         )
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
-        _t11f()
+        """Every Form 25, 25/A, 25-NSE and 25-NSE/A over full history
+        (`since` filters the result, never the scan), de-duplicated by
+        accession as `filing_index` de-duplicates its own rows (the
+        exchange's own copy of a 25-NSE dropped). A 25 or 25-NSE whose
+        `primaryDocument` is not an `.xml` file is not downloaded: counted
+        on `.pre_xml_delistings`, never a filing failure (`parse_delisting`
+        reads XML only, and the index runs from 1993, long before EDGAR's
+        XML forms). A cached parse makes no request; a quarantined
+        accession makes none either (T11f failure policy)."""
+        if since is not None:
+            since = ensure_tz_aware_utc(since, field_name="since")
+        self.pre_xml_delistings = 0
+        start = (self._settings.edgar.index_first_year, 1)
+        last = quarter_of(self._now())
+        quarters = [(y, q) for y in range(start[0], last[0] + 1) for q in range(1, 5)]
+        quarters = [q for q in quarters if start <= q <= last]
+
+        delisting_ciks: dict[str, set[str]] = {}
+        for _, row in self._rows(quarters, last):
+            if row.form in _DELISTING_FORMS:
+                delisting_ciks.setdefault(row.accession, set()).add(row.cik)
+
+        kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
+        for quarter, row in self._rows(quarters, last):
+            if row.form not in _DELISTING_FORMS:
+                continue
+            if (
+                row.form in _EXCHANGE_FORMS
+                and _filed_by(row)
+                and len(delisting_ciks[row.accession]) > 1
+            ):
+                continue  # the exchange's copy of a 25-NSE; the subject company keeps it
+            kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
+
+        stamps = self._stamp(kept)
+        results: list[DelistingFiling] = []
+        for cik, rows in kept.items():
+            for accession, (_row, _quarter) in rows.items():
+                record = stamps[cik].get(accession)
+                if record is None or record.accepted_at is None:
+                    continue  # unstamped: filing_index()'s .unstamped_filings already has it
+                if self._is_quarantined(accession):
+                    self.quarantined += 1
+                    continue
+                cached = self._load_delisting_cache(accession)
+                if cached is not None:
+                    results.append(
+                        DelistingFiling(
+                            cik=cached.cik,
+                            form=cached.form,
+                            class_title=cached.class_title,
+                            exchange=cached.exchange,
+                            accession=accession,
+                            accepted_at=record.accepted_at,
+                            effective_on=cached.effective_on,
+                        )
+                    )
+                    continue
+                if not record.primary_document.lower().endswith(".xml"):
+                    self.pre_xml_delistings += 1
+                    continue
+                delisting_fetch: Callable[[], DelistingFiling] = partial(
+                    self._fetch_delisting,
+                    cik,
+                    accession,
+                    record.form,
+                    record.primary_document,
+                    record.accepted_at,
+                )
+                parsed = self._guarded(accession, record.form.removesuffix("/A"), delisting_fetch)
+                if parsed is not None:
+                    results.append(parsed)
+        if since is not None:
+            results = [d for d in results if d.accepted_at >= since]
+        results.sort(key=lambda d: (d.accepted_at, d.accession))
+        return results
+
+    def _fetch_delisting(
+        self, cik: str, accession: str, form: str, primary_document: str, accepted_at: datetime
+    ) -> DelistingFiling:
+        path = edgar_raw.download_filing_file(
+            cik, accession, primary_document, settings=self._settings, client=self._client
+        )
+        try:
+            text = path.read_text()
+            parsed = parse_delisting(text, form=form, accession=accession, accepted_at=accepted_at)
+        finally:
+            path.unlink(missing_ok=True)  # the document is deleted after parsing
+        self._save_delisting_cache(accession, parsed)
+        return parsed
+
+    def _delisting_cache_path(self, accession: str) -> Path:
+        edgar_raw.validate_accession(accession)
+        return self._cache / "delisting" / f"v{DELISTING_VERSION}" / f"{accession}.json"
+
+    def _load_delisting_cache(self, accession: str) -> _CachedDelisting | None:
+        try:
+            data = json.loads(self._delisting_cache_path(accession).read_bytes())
+            if data.get("version") != DELISTING_VERSION or data.get("accession") != accession:
+                return None
+            effective = data.get("effective_on")
+            return _CachedDelisting(
+                cik=str(data["cik"]),
+                form=str(data["form"]),
+                class_title=str(data["class_title"]),
+                exchange=str(data["exchange"]),
+                effective_on=date.fromisoformat(effective) if effective else None,
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None  # absent, truncated or another version: fetch again
+
+    def _save_delisting_cache(self, accession: str, parsed: DelistingFiling) -> None:
+        data = {
+            "version": DELISTING_VERSION,
+            "accession": accession,
+            "cik": parsed.cik,
+            "form": parsed.form,
+            "class_title": parsed.class_title,
+            "exchange": parsed.exchange,
+            "effective_on": parsed.effective_on.isoformat() if parsed.effective_on else None,
+        }
+        edgar_raw.write_atomic(
+            self._delisting_cache_path(accession), json.dumps(data).encode("utf-8")
+        )
 
     def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
         _t11e()
@@ -899,10 +1260,6 @@ def _filed_by(row: UnstampedFiling) -> bool:
 
 def _t11e() -> NoReturn:
     raise NotImplementedError("T11e")
-
-
-def _t11f() -> NoReturn:
-    raise NotImplementedError("T11f")
 
 
 @dataclass(frozen=True, slots=True)
@@ -934,6 +1291,19 @@ class _CachedHeader:
     type) means "fetch it"."""
 
     sic: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedDelisting:
+    """A per-document `parse_delisting` result cached under
+    `DELISTING_VERSION`, its stamp stripped (re-applied from `_stamp` at
+    read time, as cover pages and headers are)."""
+
+    cik: str
+    form: str
+    class_title: str
+    exchange: str
+    effective_on: date | None
 
 
 def _fact_to_json(fact: FactRecord) -> list[object]:
