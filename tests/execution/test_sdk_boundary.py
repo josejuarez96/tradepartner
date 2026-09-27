@@ -1,29 +1,41 @@
 """The alpaca-py trading SDK stays inside the adapters (#296).
 
-Static checks over `src/tradepartner/`, tests excepted, so no module can reach
-the broker through the SDK and around both the raw client's `paper=True`
-guard and the risk-gated wrapper:
+Static checks over `src/tradepartner/`, tests excepted. They fence the known
+SDK entry points and order-changing calls, which would otherwise get around
+the risk-gated wrapper (and, for a client built elsewhere, the raw client's
+`paper=True` guard). A name-based check cannot see computed names such as
+`getattr(c, "submit_" + "order")`; review still has to.
 
-1. `alpaca.trading.client` (and `TradingClient`, however reached) is imported
+1. `alpaca.trading.client` (and `TradingClient`, however reached) and the
+   adapters' client factories `_trading_client`/`_build_client` are imported
    or read only by `adapters/alpaca_raw.py` (the data adapter, assets only)
    and `adapters/alpaca_trading_raw.py`.
 2. `alpaca.trading.requests` (and any `...Request` class re-exported from
    `alpaca.trading`) is imported only by `adapters/alpaca_trading_raw.py` and
-   `cli_record.py` (the owner-run paper recorder, T48).
-3. A `.submit_order` or `.cancel_order*` attribute, called or passed on as a
+   `cli_record.py` (the owner-run paper recorder, T48). Read-only request
+   types count too, by intent: widening the list is a reviewed change.
+3. An order-changing SDK method (`submit_order`, `cancel_order*`,
+   `replace_order*`, `close_position`, `close_all_positions`,
+   `exercise_options_position`) as an attribute, called or passed on as a
    bound method, or named through `getattr`/`methodcaller`, appears only in
    `adapters/alpaca_trading_raw.py`, `adapters/alpaca_broker.py` and
    `cli_record.py`.
+4. The same three modules alone name the REST order or position paths
+   (`/orders`, `/positions`, `/v2/orders`, `/v2/positions`) in a string, so
+   the SDK's generic `.post`/`.delete` or a direct HTTP call cannot place or
+   close an order elsewhere. Docstrings do not count.
 
 `from alpaca.trading import *` fails checks 1 and 2, and a non-literal
 `import_module`/`__import__` fails both too, since no static check can follow
 it. `adapters/alpaca_broker.py` does not exist yet (T48c); the checks pass on
-the current tree and bind the task that adds it.
+the current tree and bind the task that adds it. `scripts/` is not scanned:
+no script touches the trading SDK, and scripts never place orders.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +51,15 @@ CLIENT_IMPORTERS = frozenset(
 )
 REQUESTS_IMPORTERS = frozenset(
     {"tradepartner.adapters.alpaca_trading_raw", "tradepartner.cli_record"}
+)
+CLIENT_FACTORIES = frozenset({"_trading_client", "_build_client"})
+ORDER_METHOD_PREFIXES = (
+    "submit_order",
+    "cancel_order",
+    "replace_order",
+    "close_position",
+    "close_all_positions",
+    "exercise_options_position",
 )
 ORDER_METHOD_USERS = frozenset(
     {
@@ -122,11 +143,30 @@ def _attribute_chains(module: Module) -> set[str]:
     return {_chain(node) for node in ast.walk(module.tree) if isinstance(node, ast.Attribute)}
 
 
+def _docstring_nodes(tree: ast.Module) -> set[int]:
+    ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                ids.add(id(body[0].value))
+    return ids
+
+
 def _strings(module: Module) -> set[str]:
+    """Every string constant, f-string parts included, docstrings excluded."""
+    docstrings = _docstring_nodes(module.tree)
     return {
         node.value
         for node in ast.walk(module.tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
     }
 
 
@@ -145,28 +185,47 @@ def _under(name: str, target: str) -> bool:
     return name == target or name.startswith(target + ".")
 
 
-def _is_trading_chain(chain: str, submodule: str) -> bool:
-    """`alpaca.trading.<submodule>` or `trading.<submodule>` inside a chain."""
+def _trading_aliases(module: Module) -> set[str]:
+    """Local names bound to the `alpaca.trading` package itself:
+    `import alpaca.trading as at` and `from alpaca import trading [as t]`."""
+    aliases = set()
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Import):
+            aliases.update(a.asname for a in node.names if a.name == SDK_TRADING and a.asname)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "alpaca":
+            aliases.update(a.asname or a.name for a in node.names if a.name == "trading")
+    return aliases
+
+
+def _below_trading(chain: str, aliases: set[str]) -> list[str] | None:
+    """What an attribute chain reads below `alpaca.trading`, or None when its
+    root is not the package (`self.trading.client` is someone else's)."""
     parts = chain.split(".")
-    return any(parts[i : i + 2] == ["trading", submodule] for i in range(len(parts) - 1))
+    if parts[:2] == ["alpaca", "trading"]:
+        return parts[2:]
+    if parts[0] in aliases:
+        return parts[1:]
+    return None
 
 
 def client_imports(module: Module) -> list[str]:
-    """Imports, attribute reads or name strings of the SDK trading client."""
+    """Imports, attribute reads or name strings of the SDK trading client or
+    of the adapters' factories that build one."""
+    client_names = CLIENT_FACTORIES | {"TradingClient"}
+    aliases = _trading_aliases(module)
     found = sorted(
         n
         for n in imported_names(module)
-        if _under(n, SDK_CLIENT)
-        or n.rpartition(".")[2] == "TradingClient"
-        or n == f"{SDK_TRADING}.*"
+        if _under(n, SDK_CLIENT) or n.rpartition(".")[2] in client_names or n == f"{SDK_TRADING}.*"
     )
     found += sorted(
         f"attribute {chain}"
         for chain in _attribute_chains(module)
-        if "TradingClient" in chain.split(".") or _is_trading_chain(chain, "client")
+        if client_names & set(chain.split("."))
+        or (_below_trading(chain, aliases) or [""])[0] == "client"
     )
     found += sorted(
-        f"string {s!r}" for s in _strings(module) if s == "TradingClient" or _under(s, SDK_CLIENT)
+        f"string {s!r}" for s in _strings(module) if s in client_names or _under(s, SDK_CLIENT)
     )
     return found + non_literal_dynamic_imports(module)
 
@@ -180,20 +239,22 @@ def requests_imports(module: Module) -> list[str]:
         or n == f"{SDK_TRADING}.*"
         or (n.rpartition(".")[0] == SDK_TRADING and n.endswith("Request"))
     )
+    aliases = _trading_aliases(module)
+    below = ((chain, _below_trading(chain, aliases)) for chain in _attribute_chains(module))
     found += sorted(
         f"attribute {chain}"
-        for chain in _attribute_chains(module)
-        if _is_trading_chain(chain, "requests")
+        for chain, rest in below
+        if rest and (rest[0] == "requests" or rest[0].endswith("Request"))
     )
     return found + non_literal_dynamic_imports(module)
 
 
 def _is_order_method(name: object) -> bool:
-    return isinstance(name, str) and (name == "submit_order" or name.startswith("cancel_order"))
+    return isinstance(name, str) and name.startswith(ORDER_METHOD_PREFIXES)
 
 
 def order_method_uses(module: Module) -> list[str]:
-    """Any `.submit_order`/`.cancel_order*` attribute, called or passed on as
+    """Any order-changing SDK method as an attribute, called or passed on as
     a bound method, plus `getattr(x, "submit_order")` and
     `methodcaller("submit_order")`, by line. A `def submit_order` is not an
     attribute and does not count."""
@@ -209,6 +270,14 @@ def order_method_uses(module: Module) -> list[str]:
     return found
 
 
+_ORDER_PATH = re.compile(r"(?:^|/v2)/(?:orders|positions)(?:[/?:]|$)")
+
+
+def order_path_strings(module: Module) -> list[str]:
+    """String literals naming a REST order or position path, docstrings excluded."""
+    return sorted(f"string {s!r}" for s in _strings(module) if _ORDER_PATH.search(s))
+
+
 def _offenders(check: str) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for module in MODULES:
@@ -218,6 +287,8 @@ def _offenders(check: str) -> dict[str, list[str]]:
             found = requests_imports(module)
         elif check == "order_method" and module.name not in ORDER_METHOD_USERS:
             found = order_method_uses(module)
+        elif check == "order_path" and module.name not in ORDER_METHOD_USERS:
+            found = order_path_strings(module)
         else:
             continue
         if found:
@@ -234,7 +305,7 @@ def test_the_scan_sees_the_sdk_importers() -> None:
     assert order_method_uses(by_name["tradepartner.cli_record"])
 
 
-@pytest.mark.parametrize("check", ("client", "requests", "order_method"))
+@pytest.mark.parametrize("check", ("client", "requests", "order_method", "order_path"))
 def test_sdk_boundary_holds_on_the_tree(check: str) -> None:
     assert _offenders(check) == {}
 
@@ -255,6 +326,11 @@ def test_sdk_boundary_holds_on_the_tree(check: str) -> None:
         ("importlib.import_module('alpaca.trading.client')", True),
         ("client_type = getattr(module, 'TradingClient')", True),
         ("mod = importlib.import_module(name)", True),
+        ("from tradepartner.adapters.alpaca_raw import _trading_client", True),
+        ("from tradepartner.adapters import alpaca_raw\nc = alpaca_raw._trading_client(s)", True),
+        ("from tradepartner.adapters.alpaca_trading_raw import _build_client", True),
+        ("import alpaca.trading as at\nc = at.client.TradingClient", True),
+        ("self.trading.client = make()", False),
         ("from alpaca.trading.enums import OrderSide", False),
         ("from alpaca.data.historical.stock import StockHistoricalDataClient", False),
         ("from tradepartner.adapters.broker import Broker", False),
@@ -274,6 +350,10 @@ def test_client_checker(source: str, expected: bool) -> None:
         ("from alpaca.trading import *", True),
         ("import alpaca\nr = alpaca.trading.requests.MarketOrderRequest()", True),
         ("__import__('alpaca.trading.requests')", True),
+        ("import alpaca.trading as at\nr = at.MarketOrderRequest()", True),
+        ("import alpaca.trading as at\nr = at.requests.MarketOrderRequest()", True),
+        ("from alpaca.trading import GetAssetsRequest", True),
+        ("settings.trading.requests_per_minute", False),
         ("from alpaca.trading.enums import TimeInForce", False),
         ("from alpaca.data.requests import StockBarsRequest", False),
         ("import requests\nrequests.get(url)", False),
@@ -295,6 +375,11 @@ def test_requests_checker(source: str, expected: bool) -> None:
         ("getattr(client, 'submit_order')(request)", True),
         ("getattr(client, 'cancel_orders')()", True),
         ("operator.methodcaller('submit_order', request)(client)", True),
+        ("client.replace_order_by_id(order_id, patch)", True),
+        ("client.close_position('AAPL')", True),
+        ("client.close_all_positions(cancel_orders=True)", True),
+        ("client.exercise_options_position(symbol)", True),
+        ("getattr(client, 'close_all_positions')()", True),
         ("def submit_order(self, request): ...", False),
         ("broker.submit(request)", False),
         ("client.get_orders(filter)", False),
@@ -303,3 +388,21 @@ def test_requests_checker(source: str, expected: bool) -> None:
 )
 def test_order_method_checker(source: str, expected: bool) -> None:
     assert bool(order_method_uses(Module.parse(source, "tradepartner.x"))) is expected
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('raw._client.post("/orders", data)', True),
+        ('client.delete("/positions")', True),
+        ('client.delete(f"/orders/{order_id}")', True),
+        ('httpx.post("https://paper-api.alpaca.markets/v2/orders", json=body)', True),
+        ('client.get("/v2/positions/AAPL")', True),
+        ('client.get("/account/activities/FILL")', False),
+        ('"""Reads `GET /v2/orders` back by id."""', False),
+        ('label = "orders per day"', False),
+        ('conn.execute("SELECT * FROM positions_daily")', False),
+    ],
+)
+def test_order_path_checker(source: str, expected: bool) -> None:
+    assert bool(order_path_strings(Module.parse(source, "tradepartner.x"))) is expected
