@@ -375,7 +375,7 @@ def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings:
         ("gap override", "gap_override_reason"),
     ):
         if trial.get(key):
-            typer.echo(f"{label}: {trial[key]}")
+            typer.echo(f"{label}: {_scrubbed(str(trial[key]), settings)}")
 
 
 def make_app(
@@ -525,6 +525,11 @@ def make_app(
         if gap_reason is not None and not override_gap:
             raise _fail("--gap-reason goes with --override-gap", USAGE_ERROR)
         s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        if s.store.path != get_settings().store.path:
+            # run_hypothesis loads its own settings; the result is read back through `s`.
+            raise _fail("backtest runs only on the loaded settings' store", USAGE_ERROR)
         try:
             outcome = run_hypothesis(
                 hypothesis,
@@ -538,10 +543,14 @@ def make_app(
                 reasons=Reasons(holdout_reason=holdout_reason, gap_reason=gap_reason),
                 note=note,
             )
-        except (registry.UnknownHypothesis, HypothesisFileError) as exc:
-            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except (registry.RegistryError, ValueError) as exc:
+            # Raised before a trial is opened (unknown slug, stored parameters that
+            # fail their hash, a frozen window that cannot be resolved): a refusal.
+            raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), USAGE_ERROR) from None
+        except Exception as exc:
+            raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), 1) from None
         with open_read_only(s) as conn:
             _print_trial(conn, outcome, s)
         if outcome.error:
@@ -587,11 +596,14 @@ def make_app(
             raise missing
         try:
             with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
                 listed = registry.list_trials(conn, hypothesis, include_synthetic)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
-        except (duckdb.CatalogException, duckdb.BinderException):
+        except schema.RegistryNotInitialised:
             raise _fail("registry not initialised: register a hypothesis first", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
         typer.echo("id  hypothesis  kind  window  status  flags  message")
         for t in listed:
             flags = [
@@ -637,7 +649,7 @@ def make_app(
                     values={
                         "gap_max_count_share": result["gap_max_count_share"],
                         "gap_max_size_share": result["gap_max_size_share"],
-                        "count_share_threshold": record.params.get(GAP_THRESHOLD_KEY),
+                        "count_share_threshold": record.params[GAP_THRESHOLD_KEY],
                         "start_session": str(trial_row["start_session"]),
                         "end_session": str(trial_row["end_session"]),
                     },

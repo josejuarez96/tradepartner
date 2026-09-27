@@ -203,6 +203,16 @@ def test_ok_run_exits_zero_and_prints_trial_metrics_gap_and_flags(
     _assert_scrubbed(out)
 
 
+def test_the_metrics_table_uses_the_frozen_base_cost(
+    registered: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COSTS__PER_SIDE_BPS", "99")
+    out = _cli("backtest", SLUG)
+    assert out.exit_code == 0, out.output
+    assert "metrics at the base cost, 15 bps per side" in out.stdout
+    assert "99 bps" not in out.stdout
+
+
 def test_failed_run_exits_one_with_the_trial_id_and_the_error(
     registered: Path, read: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -215,6 +225,49 @@ def test_failed_run_exits_one_with_the_trial_id_and_the_error(
     assert _status(read, _trial_id(out)) == "failed"
     assert "RuntimeError" in out.output
     _assert_scrubbed(out)
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (ValueError(f"in_sample_start after the holdout, {USER_AGENT}"), 2),
+        (registry.RegistryError(f"bad registration {ALPACA_KEY}"), 2),
+        (OSError(f"disk trouble {ALPACA_SECRET}"), 1),
+    ],
+)
+def test_errors_before_a_trial_exit_cleanly_and_scrubbed(
+    registered: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, code: int
+) -> None:
+    def raises(*_: object, **__: object) -> None:
+        raise error
+
+    monkeypatch.setattr(cli, "run_hypothesis", raises)
+    out = _cli("backtest", SLUG)
+    assert out.exit_code == code, out.output
+    assert type(error).__name__ in out.output
+    assert "Traceback" not in out.output
+    _assert_scrubbed(out)
+
+
+def test_backtest_with_no_store_exits_one_and_creates_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("STORE__PATH", str(tmp_path / "absent.duckdb"))
+    out = _cli("backtest", SLUG)
+    assert out.exit_code == 1
+    assert not (tmp_path / "absent.duckdb").exists()
+
+
+def test_backtest_refuses_an_injected_settings_store_other_than_the_loaded_one(
+    registered: Path, tmp_path: Path, live: Path
+) -> None:
+    elsewhere = Settings(_env_file=None, store={"path": str(tmp_path / "elsewhere.duckdb")})
+    duckdb.connect(elsewhere.store.path).close()
+    app = cli.make_app(settings=lambda: elsewhere)
+    out = CliRunner().invoke(app, ["backtest", SLUG])
+    assert out.exit_code == 2
+    assert "loaded settings' store" in out.output
+    assert get_settings().store.path == str(live)
 
 
 def test_refused_window_exits_two(registered: Path, read: Any) -> None:
@@ -388,9 +441,10 @@ def test_trials_with_no_store_exits_one(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 
 def test_gap_signoff_appends_an_owner_decision_with_the_gap_values(
-    registered: Path, read: Any
+    registered: Path, read: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     trial_id = _trial_id(_cli("backtest", SLUG))
+    monkeypatch.setenv("GAP__COUNT_SHARE_THRESHOLD", "0.5")  # live value: must not be used
     out = _cli("decision", "gap-signoff", "--trial", str(trial_id), "--reason", "gap accepted")
     assert out.exit_code == 0, out.output
     rows = (
@@ -407,7 +461,17 @@ def test_gap_signoff_appends_an_owner_decision_with_the_gap_values(
     assert (kind, reason) == ("gap_signoff", "gap accepted")
     assert hypothesis_id == registry.get_hypothesis(read(), SLUG).hypothesis_id
     values = json.loads(values_json)
-    assert {"gap_max_count_share", "gap_max_size_share", "count_share_threshold"} <= set(values)
+    stored = (
+        read()
+        .execute(
+            "SELECT gap_max_count_share, gap_max_size_share FROM trial_results WHERE trial_id = ?",
+            [trial_id],
+        )
+        .fetchone()
+    )
+    assert stored is not None and stored[0] is not None
+    assert (values["gap_max_count_share"], values["gap_max_size_share"]) == stored
+    assert values["count_share_threshold"] == 0.05  # the frozen value, not the live 0.5
     _assert_scrubbed(out)
 
 
@@ -423,15 +487,33 @@ def test_a_second_signoff_appends_another_row(registered: Path, read: Any) -> No
 
 
 @pytest.mark.parametrize(
-    ("trial", "reason"), [("999", "why"), (None, "   "), (None, None), ("refused", "why")]
+    ("trial", "reason"),
+    [
+        ("999", "why"),
+        (None, "   "),
+        (None, None),
+        ("refused", "why"),
+        ("failed", "why"),
+        ("unfinished", "why"),
+    ],
 )
 def test_gap_signoff_refusals_exit_two_and_write_nothing(
-    registered: Path, read: Any, trial: str | None, reason: str | None
+    registered: Path,
+    read: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    trial: str | None,
+    reason: str | None,
 ) -> None:
     if trial is None:
         trial = str(_trial_id(_cli("backtest", SLUG)))
     elif trial == "refused":
         trial = str(_trial_id(_cli("backtest", SLUG, *HOLDOUT_WINDOW)))
+    elif trial == "failed":
+        with monkeypatch.context() as patch:
+            patch.setattr(engine, "run", _boom)
+            trial = str(_trial_id(_cli("backtest", SLUG)))
+    elif trial == "unfinished":
+        trial = str(_unfinished_trial())
     args = ["decision", "gap-signoff", "--trial", trial]
     if reason is not None:
         args += ["--reason", reason]
@@ -441,3 +523,23 @@ def test_gap_signoff_refusals_exit_two_and_write_nothing(
         read().execute("SELECT count(*) FROM owner_decisions WHERE kind = 'gap_signoff'").fetchone()
     )
     assert count == (0,)
+
+
+def _boom(*_: object, **__: object) -> None:
+    raise RuntimeError("engine exploded")
+
+
+def _unfinished_trial() -> int:
+    """A trial whose process died: a `trials` row and no result row."""
+    with open_for_write(get_settings()) as conn:
+        record = registry.get_hypothesis(conn, SLUG)
+        return registry.open_trial(
+            conn,
+            hypothesis_id=record.hypothesis_id,
+            kind="in_sample",
+            start_session=date(2018, 1, 31),
+            end_session=date(2019, 5, 31),
+            data_cutoff=None,
+            synthetic=False,
+            run_by="test",
+        ).trial_id
