@@ -63,8 +63,12 @@ def conn() -> Iterator[duckdb.DuckDBPyConnection]:
         c.close()
 
 
+_TIMEOUT = 7.5
+
+
 def _settings(channels: Sequence[str] = ("store",), **secrets: str) -> Settings:
-    return Settings(_env_file=None, alerts={"channels": list(channels)}, **secrets)  # type: ignore[call-arg]
+    alerts_config = {"channels": list(channels), "delivery_timeout_seconds": _TIMEOUT}
+    return Settings(_env_file=None, alerts=alerts_config, **secrets)  # type: ignore[call-arg]
 
 
 class FakeRunner:
@@ -83,7 +87,7 @@ class FakeRunner:
             self.alerts_seen.append(count)
         if self.fail:
             raise subprocess.CalledProcessError(1, args, stderr=b"osascript: boom")
-        assert kwargs.get("check") is True and kwargs.get("timeout")
+        assert kwargs.get("check") is True and kwargs.get("timeout") == _TIMEOUT
         return subprocess.CompletedProcess(args, 0)
 
 
@@ -251,7 +255,7 @@ def test_email_is_sent_over_starttls_to_the_configured_address(
     alerter = _alerter(conn, _settings(["store", "email"], **_SECRETS))
     alert_id = alerter.write("drawdown", 7, _SESSION, "equity below the peak")
     (smtp,) = FakeSMTP.instances
-    assert smtp.host == "smtp.example.test:587" and smtp.tls
+    assert smtp.host == "smtp.example.test:587" and smtp.tls and smtp.timeout == _TIMEOUT
     assert smtp.logins == [("owner-login@example.test", "hunter2-very-secret")]
     (message,) = smtp.sent
     assert message["To"] == "owner-inbox@example.test"

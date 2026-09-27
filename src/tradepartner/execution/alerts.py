@@ -26,7 +26,8 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
 
 Channels: `store` (always; its delivery row records that the alert is in the
 table), `macos` (an `osascript` notification), `email` (SMTP to `ALERT_EMAIL_TO`
-from the `ALERT_SMTP_*` settings, over STARTTLS; skipped, as a failed row saying
+from the `ALERT_SMTP_*` settings, over STARTTLS; each attempt bounded by
+`alerts.delivery_timeout_seconds`; skipped, as a failed row saying
 so, unless all four are set). `ALERT_SMTP_HOST` may carry a port
 (`smtp.example.com:587`), which `smtplib` parses. No secret value is ever logged
 or journaled (see "Secrets" below).
@@ -93,10 +94,6 @@ ALERT_KINDS: tuple[str, ...] = (
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")
 #: Kinds that never touch the store.
 NON_STORE_KINDS: tuple[str, ...] = ("kill_switch_write_failed",)
-
-#: Upper bound on one `osascript` or SMTP attempt, so a stuck channel cannot hold
-#: the run. Not a trading limit; T47 left no config key for it (an open question on issue #310).
-DELIVERY_TIMEOUT_SECONDS = 30.0
 
 _MASK = "***"
 
@@ -252,7 +249,7 @@ class Alerter:
             ["osascript", "-e", script],
             check=True,
             capture_output=True,
-            timeout=DELIVERY_TIMEOUT_SECONDS,
+            timeout=self._settings.alerts.delivery_timeout_seconds,
         )
 
     def _email_configured(self) -> bool:
@@ -269,7 +266,9 @@ class Alerter:
         email["From"] = user
         email["To"] = s.alert_email_to.get_secret_value()
         email.set_content(message)
-        with self._smtp(s.alert_smtp_host, timeout=DELIVERY_TIMEOUT_SECONDS) as client:
+        with self._smtp(
+            s.alert_smtp_host, timeout=self._settings.alerts.delivery_timeout_seconds
+        ) as client:
             client.starttls(context=ssl.create_default_context())
             client.login(user, s.alert_smtp_password.get_secret_value())
             client.send_message(email)
