@@ -480,6 +480,16 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
     assert counts in message
 
 
+def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settings) -> None:
+    """T11f: a Form 25/25-NSE skipped pre-fetch (not XML)."""
+
+    class Delistings(FixtureFilingSource):
+        pre_xml_delistings = 7
+
+    message = _run(settings, filings=_filings(cls=Delistings), source="edgar").runs[0].message
+    assert "; pre-XML delistings: 7; missing" in message
+
+
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:
     message = _run(settings, source="edgar").runs[0].message
     assert "unstamped" not in message and "skipped" not in message

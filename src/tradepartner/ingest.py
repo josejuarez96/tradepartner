@@ -446,6 +446,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_reissue_undetected", "FSN re-issues unchecked"),
         ("fsn_incomplete_listings", "FSN incomplete listings"),
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
+        ("pre_xml_delistings", "pre-XML delistings"),  # T11f
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")
