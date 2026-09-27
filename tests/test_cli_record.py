@@ -470,6 +470,8 @@ def test_blank_alert_secrets_are_not_configured() -> None:
         alert_email_to=None,
         alpaca_api_key=None,
         alpaca_api_secret=None,
+        alpaca_paper_api_key=None,
+        alpaca_paper_api_secret=None,
         sec_edgar_user_agent=None,
     )
     assert cli_record._configured_secrets(settings) == []
