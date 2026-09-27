@@ -25,9 +25,14 @@ quantity at its original `request.price` — there is no partial fill.
 **Clock.** All timestamps come from an injectable `clock: Callable[[],
 datetime]` supplied at construction, never from `datetime.now()` called
 internally, so tests are deterministic (CLAUDE.md: "Datetimes are always
-timezone-aware UTC"). A clock that returns a naive `datetime` causes the
-same `ValueError` as any other naive timestamp, raised when the value is
-used to construct an `Order`/`Fill`.
+timezone-aware UTC"). Every clock call is wrapped (ADR 0007 point 4): the
+reading goes straight through `ensure_tz_aware_utc(..., field_name="clock")`,
+and any exception from the call or the validation (the clock raising, a
+non-`datetime`, a naive value, a UTC overflow) becomes `ClockError` chained
+from the original, before any `Order` or `Fill` is built and before any state
+changes. A `BaseException` such as `KeyboardInterrupt` propagates untouched.
+`ClockError` is a `SystemFaultError`, never a `ValueError`, so the Phase 4
+wrapper cannot mistake a broken clock for a rejected order.
 
 **Position netting.** Net quantity per symbol is accumulated internally as
 `decimal.Decimal` (via `Decimal(repr(fill.quantity))`) rather than `float`,
@@ -56,6 +61,8 @@ from tradepartner.adapters.broker import (
     Side,
     UnknownOrderError,
 )
+from tradepartner.errors import ClockError
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 
 class FakeBroker(Broker):
@@ -82,7 +89,7 @@ class FakeBroker(Broker):
                 f"client_order_id already submitted: {request.client_order_id!r}"
             )
 
-        submitted_at = self._clock()
+        submitted_at = self._now()
         order = Order(
             client_order_id=request.client_order_id,
             symbol=request.symbol,
@@ -116,7 +123,14 @@ class FakeBroker(Broker):
         of the `Broker` interface — a `FakeBroker`-specific escape hatch
         for tests that submit with `auto_fill=False` (see module
         docstring)."""
-        return self._simulate_fill(client_order_id=client_order_id, filled_at=self._clock())
+        return self._simulate_fill(client_order_id=client_order_id, filled_at=self._now())
+
+    def _now(self) -> datetime:
+        """One clock reading, tz-aware UTC, or `ClockError` (module docstring)."""
+        try:
+            return ensure_tz_aware_utc(self._clock(), field_name="clock")
+        except Exception as exc:
+            raise ClockError(f"clock failed: {type(exc).__name__}: {exc}") from exc
 
     def _simulate_fill(self, *, client_order_id: str, filled_at: datetime) -> Order:
         order = self._require_order(client_order_id)
