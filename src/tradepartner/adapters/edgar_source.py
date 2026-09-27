@@ -84,7 +84,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -100,6 +100,7 @@ from tradepartner.adapters.edgar import (
     parse_company_facts,
     parse_company_tickers,
     parse_cover_page,
+    parse_delisting,
     parse_filing_index,
     parse_fsn,
     parse_sgml_header,
@@ -129,6 +130,8 @@ FSN_VERSION = 1
 COVER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
+#: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
+DELISTING_VERSION = 1
 
 #: Registration forms (T11d): a ranged header is requested from
 #: `edgar.header_start_year`, unlike periodic forms and 8-K, which only get
@@ -234,6 +237,9 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
+        # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
+        self.pre_xml_delistings = 0
+        self.unstamped_delistings = 0
         # T11e: the `companyfacts.zip` path and member names once downloaded,
         # False once the per-CIK API was chosen, None until decided.
         self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
@@ -917,7 +923,138 @@ class EdgarFilingSource(FilingSource):
         )
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
-        _t11f()
+        """Every Form 25, 25/A, 25-NSE and 25-NSE/A over full history
+        (`since` filters the result, never the scan), de-duplicated by
+        accession as `filing_index` de-duplicates its own rows (the
+        exchange's own copy of a 25-NSE dropped). A 25 or 25-NSE whose
+        `primaryDocument` is not an `.xml` file is not downloaded: counted
+        on `.pre_xml_delistings` (`parse_delisting` reads XML only, and the
+        index runs from 1993, long before EDGAR's XML forms). A cached
+        parse makes no request. Errors propagate (T11c/T11d/T11e's own
+        behaviour today; T11h wraps them)."""
+        if since is not None:
+            since = ensure_tz_aware_utc(since, field_name="since")
+        self.pre_xml_delistings = 0
+        self.unstamped_delistings = 0
+        start = (self._settings.edgar.index_first_year, 1)
+        last = quarter_of(self._now())
+        quarters = [(y, q) for y in range(start[0], last[0] + 1) for q in range(1, 5)]
+        quarters = [q for q in quarters if start <= q <= last]
+
+        delisting_ciks: dict[str, set[str]] = {}
+        for _, row in self._rows(quarters, last):
+            if row.form in _DELISTING_FORMS:
+                delisting_ciks.setdefault(row.accession, set()).add(row.cik)
+
+        kept: dict[str, dict[str, tuple[UnstampedFiling, Quarter]]] = {}
+        for quarter, row in self._rows(quarters, last):
+            if row.form not in _DELISTING_FORMS:
+                continue
+            if (
+                row.form in _EXCHANGE_FORMS
+                and _filed_by(row)
+                and len(delisting_ciks[row.accession]) > 1
+            ):
+                continue  # the exchange's copy of a 25-NSE; the subject company keeps it
+            kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
+
+        stamps = self._stamp(kept)
+        # One result per accession (plan T11f): a Form 25 kept under several
+        # CIKs is served once, from the first CIK (index order) that stamps it.
+        candidates: dict[str, list[tuple[str, SubmissionRecord | None]]] = {}
+        for cik, rows in kept.items():
+            for accession in rows:
+                candidates.setdefault(accession, []).append((cik, stamps[cik].get(accession)))
+        results: list[DelistingFiling] = []
+        for accession, options in candidates.items():
+            stamped = [
+                (c, r, r.accepted_at)
+                for c, r in options
+                if r is not None and r.accepted_at is not None
+            ]
+            if not stamped:
+                # Every unstamped delisting accession, so an exchange-only 25-NSE
+                # (a row `filing_index` never keeps) is visible too. It overlaps
+                # `.unstamped_filings` for subject-company rows: never add the two.
+                self.unstamped_delistings += 1
+                continue
+            cik, record, accepted_at = stamped[0]
+            cached = self._load_delisting_cache(accession)
+            if cached is not None:
+                results.append(
+                    DelistingFiling(
+                        cik=cached.cik,
+                        form=cached.form,
+                        class_title=cached.class_title,
+                        exchange=cached.exchange,
+                        accession=accession,
+                        accepted_at=accepted_at,
+                        effective_on=cached.effective_on,
+                    )
+                )
+                continue
+            if not record.primary_document.lower().endswith(".xml"):
+                self.pre_xml_delistings += 1
+                continue
+            parsed = self._fetch_delisting(
+                cik, accession, record.form, record.primary_document, accepted_at
+            )
+            results.append(parsed)
+        if since is not None:
+            results = [d for d in results if d.accepted_at >= since]
+        results.sort(key=lambda d: (d.accepted_at, d.accession))
+        return results
+
+    def _fetch_delisting(
+        self, cik: str, accession: str, form: str, primary_document: str, accepted_at: datetime
+    ) -> DelistingFiling:
+        # The root copy, never an `xsl.../` rendering of it (as `_fetch_cover_page`, T11d).
+        root_document = re.sub(r"^xsl[^/]*/", "", primary_document)
+        path = edgar_raw.download_filing_file(
+            cik, accession, root_document, settings=self._settings, client=self._client
+        )
+        try:
+            text = path.read_text(encoding="utf-8")
+            parsed = parse_delisting(text, form=form, accession=accession, accepted_at=accepted_at)
+        finally:
+            path.unlink(missing_ok=True)  # the document is deleted after parsing
+        self._save_delisting_cache(accession, parsed)
+        return parsed
+
+    def _delisting_cache_path(self, accession: str) -> Path:
+        edgar_raw.validate_accession(accession)
+        return self._cache / "delisting" / f"v{DELISTING_VERSION}" / f"{accession}.json"
+
+    def _load_delisting_cache(self, accession: str) -> _CachedDelisting | None:
+        path = self._delisting_cache_path(accession)  # validates first, outside the try
+        try:
+            data = json.loads(path.read_bytes())
+            if data.get("version") != DELISTING_VERSION or data.get("accession") != accession:
+                return None
+            effective = data.get("effective_on")
+            return _CachedDelisting(
+                cik=str(data["cik"]),
+                form=str(data["form"]),
+                class_title=str(data["class_title"]),
+                exchange=str(data["exchange"]),
+                effective_on=date.fromisoformat(effective) if effective else None,
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None  # absent, truncated or another version: fetch again
+
+    def _save_delisting_cache(self, accession: str, parsed: DelistingFiling) -> None:
+        data = {
+            "version": DELISTING_VERSION,
+            "accession": accession,
+            "cik": parsed.cik,
+            "form": parsed.form,
+            "class_title": parsed.class_title,
+            "exchange": parsed.exchange,
+            "effective_on": parsed.effective_on.isoformat() if parsed.effective_on else None,
+        }
+        edgar_raw.write_atomic(
+            self._delisting_cache_path(accession), json.dumps(data).encode("utf-8")
+        )
 
     # --- facts (T11e) ---------------------------------------------------------
 
@@ -1172,10 +1309,6 @@ def _strip(facts: Sequence[FactRecord]) -> tuple[_CachedFact, ...]:
     return tuple(_fact_from_json(_fact_to_json(f)) for f in facts)
 
 
-def _t11f() -> NoReturn:
-    raise NotImplementedError("T11f")
-
-
 @dataclass(frozen=True, slots=True)
 class _CachedFact:
     """One cached cover-page share fact, unstamped (T11e re-stamps it, as
@@ -1205,6 +1338,19 @@ class _CachedHeader:
     type) means "fetch it"."""
 
     sic: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedDelisting:
+    """A per-document `parse_delisting` result cached under
+    `DELISTING_VERSION`, its stamp stripped (re-applied from `_stamp` at
+    read time, as cover pages and headers are)."""
+
+    cik: str
+    form: str
+    class_title: str
+    exchange: str
+    effective_on: date | None
 
 
 def _fact_to_json(fact: FactRecord) -> list[object]:

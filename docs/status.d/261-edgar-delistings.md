@@ -1,0 +1,1 @@
+- #261 T11f: `EdgarFilingSource.delistings(since)` from Form 25 documents, pre-XML Form 25s counted; the failure policy split to T11h
