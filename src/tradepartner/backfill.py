@@ -69,6 +69,7 @@ from tradepartner.ingest import (
     _replay_plan,
     _run_source,
     _Stale,
+    _unwrap,
     _write_run,
     expected_session,
 )
@@ -125,6 +126,7 @@ def backfill(
             dry_run=False,
             mode=BACKFILL,
             prepare=lambda: _prefetch(recorded, settings),
+            after_commit=getattr(_unwrap(filings), "record_failures", None),
         )
         runs.append(run)
         if run.status != OK:
