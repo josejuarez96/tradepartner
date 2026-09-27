@@ -236,11 +236,11 @@ class AlpacaConfig(BaseModel):
     trading_requests_per_minute: float = Field(default=150.0, gt=0)
     trading_request_timeout_seconds: float = Field(default=30.0, gt=0)
     trading_max_retries: int = Field(default=3, ge=0)
-    # Broker facts with no default, set by the recording task (T48b): the accepted
-    # fractional quantity precision and the `client_order_id` length limit. The
-    # adapter (T48c) refuses to construct while either is `None`.
-    quantity_decimals: int | None = Field(default=None, ge=0)
-    client_order_id_max_length: int | None = Field(default=None, gt=0)
+    # Alpaca's Trading API docs allow 9 fractional decimal places and at most
+    # 128 characters in a client order id (T48b); paper recordings confirm the
+    # account behavior separately.
+    quantity_decimals: int | None = Field(default=9, ge=0)
+    client_order_id_max_length: int | None = Field(default=128, gt=0)
 
     @field_validator("paper")
     @classmethod

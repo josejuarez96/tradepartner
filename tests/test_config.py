@@ -526,10 +526,9 @@ def test_alpaca_trading_defaults() -> None:
     assert a.trading_requests_per_minute == pytest.approx(150.0)
     assert a.trading_request_timeout_seconds == pytest.approx(30.0)
     assert a.trading_max_retries == 3
-    # Broker facts the recording task (T48b) sets; no default, so the adapter
-    # refuses to construct until they are known.
-    assert a.quantity_decimals is None
-    assert a.client_order_id_max_length is None
+    # Alpaca's documented fractional precision and client-order-id limit (T48b).
+    assert a.quantity_decimals == 9
+    assert a.client_order_id_max_length == 128
 
 
 @pytest.mark.parametrize(
