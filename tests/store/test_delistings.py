@@ -596,6 +596,44 @@ class TestBuild:
         )
         assert build.delistings[0]["effective_on"] == date(2019, 3, 20)
 
+    @pytest.mark.parametrize("form", ["25/A", "25-NSE/A"])
+    def test_amendments_are_delisting_forms(self, form: str) -> None:
+        """EDGAR's full history has amended Form 25s (owner decision
+        2026-09-26, #262): the builder accepts them instead of failing the
+        whole EDGAR chunk on the first one."""
+        build = build_delistings(
+            [_filing(CIK_SOLO, "Common Stock", "NASDAQ", _at(2019, 3, 5), form=form)],
+            _master(),
+            ingested_at=INGESTED_AT,
+        )
+        assert [r["security_id"] for r in build.delistings] == [CIK_SOLO]
+
+    def test_an_amendment_never_moves_the_listing_end_later_or_earlier(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The earliest filing ends the listing: a 25/A filed after its
+        original changes nothing."""
+        master = _master()
+        original = _filing(CIK_SOLO, "Common Stock", "NASDAQ", _at(2019, 3, 5))
+        amended = DelistingFiling(
+            cik=CIK_SOLO,
+            form="25/A",
+            class_title="Common Stock",
+            exchange="NASDAQ",
+            accession=f"{CIK_SOLO}-amended",
+            accepted_at=_at(2019, 4, 1),
+            effective_on=None,
+        )
+        for row in master.listings:
+            insert_row(synthetic, "listings", row)
+        alone = build_delistings([original], master, ingested_at=INGESTED_AT)
+        write_delistings(synthetic, alone)
+        before = listing_ends_as_of(synthetic, LATE, _settings(), security_ids=[CIK_SOLO])
+        # A later run ingests the amendment on its own.
+        write_delistings(synthetic, build_delistings([amended], master, ingested_at=INGESTED_AT))
+        after = listing_ends_as_of(synthetic, LATE, _settings(), security_ids=[CIK_SOLO])
+        assert after.to_dicts() == before.to_dicts()
+
     def test_other_forms_rejected(self) -> None:
         with pytest.raises(ValueError, match="10-K"):
             build_delistings(

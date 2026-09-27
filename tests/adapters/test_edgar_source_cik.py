@@ -1478,3 +1478,68 @@ def test_a_bulk_payload_for_another_cik_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="served for"):
         _shares(source, APPLE)
+
+
+# --- review fixes (#262) -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["{truncated", '{"version": 999}', '{"version": 1, "accession": "0000000000-00-000000"}'],
+    ids=["truncated", "other-version", "other-accession"],
+)
+def test_an_unreadable_delisting_cache_entry_is_fetched_again(tmp_path: Path, stored: str) -> None:
+    """A corrupt or foreign cache entry reads as absent, never fails the
+    chunk: the document is fetched again and parsed correctly."""
+    router = _delisting_router()
+    _add_klx_document(router)
+    source = _delisting_source(router, tmp_path)
+    [expected] = source.delistings()
+    cache_path = (
+        Path(source._settings.edgar.cache_dir)
+        / "delisting"
+        / f"v{DELISTING_VERSION}"
+        / f"{KLX_25NSE}.json"
+    )
+    cache_path.write_text(stored)
+    fresh = _delisting_source(router, tmp_path)
+    before = len(router.urls)
+    [again] = fresh.delistings()
+    assert again == expected
+    document_url = _download_url(KLX, KLX_25NSE, _KLX_ROOT_DOCUMENT)
+    assert router.urls[before:].count(document_url) == 1
+
+
+def test_a_form_25_listed_under_two_ciks_is_returned_once(tmp_path: Path) -> None:
+    """De-duplicated by accession (plan T11f): a delisting kept under a
+    co-registrant CIK as well as the subject company yields one record, so
+    the delistings builder never writes the same row twice."""
+    co_registrant = 5555599
+    line = index_line("25-NSE", "KLX Subsidiary LLC", co_registrant, "2026-09-24", KLX_25NSE)
+    router = _delisting_router(line)
+    _add_klx_document(router)
+    router.add(
+        f"{SUBMISSIONS_URL}CIK{co_registrant:010d}.json",
+        _xml_payload(co_registrant, KLX_25NSE, "2026-09-24T14:08:40", form="25-NSE"),
+    )
+    source = _delisting_source(router, tmp_path)
+    results = source.delistings()
+    assert [d.accession for d in results].count(KLX_25NSE) == 1
+
+
+def test_an_unstamped_delisting_is_counted_not_lost(tmp_path: Path) -> None:
+    """A 25-NSE indexed only under the exchange's CIK (a row `filing_index`
+    never keeps, so its `.unstamped_filings` never sees it) that the
+    submissions do not list is excluded and counted on
+    `.unstamped_delistings`, never silently dropped."""
+    exchange, accession = 1354457, "0001354457-26-000950"
+    line = index_line("25-NSE", "Nasdaq Stock Market LLC", exchange, "2026-09-10", accession)
+    router = _delisting_router(line)
+    _add_klx_document(router)
+    router.add(
+        f"{SUBMISSIONS_URL}CIK{exchange:010d}.json",
+        _xml_payload(exchange, "0001354457-26-000001", "2026-01-05T15:00:00", form="25-NSE"),
+    )
+    source = _delisting_source(router, tmp_path)
+    assert accession not in {d.accession for d in source.delistings()}
+    assert source.unstamped_delistings == 1

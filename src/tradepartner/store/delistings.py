@@ -71,7 +71,10 @@ from tradepartner.store.db import insert_row
 from tradepartner.store.master import MasterBuild, _is_common, _norm_title
 from tradepartner.timeutil import ensure_tz_aware_utc
 
-DELISTING_FORMS = frozenset({"25", "25-NSE"})
+# Amendments too (owner decision 2026-09-26, #262): EDGAR's history has them,
+# and `derive_listing_ends`' earliest-filing rule means an amendment never
+# moves a listing's end, while a 25/A whose original is missing still ends it.
+DELISTING_FORMS = frozenset({"25", "25-NSE", "25/A", "25-NSE/A"})
 
 #: Days from filing to effect when the filing states none (Rule 12d2-2).
 _DEFAULT_EFFECTIVE_DAYS = 10

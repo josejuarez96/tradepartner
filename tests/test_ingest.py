@@ -485,9 +485,10 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
 
     class Delistings(FixtureFilingSource):
         pre_xml_delistings = 7
+        unstamped_delistings = 2
 
     message = _run(settings, filings=_filings(cls=Delistings), source="edgar").runs[0].message
-    assert "; pre-XML delistings: 7; missing" in message
+    assert "; pre-XML delistings: 7; unstamped delistings: 2; missing" in message
 
 
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:

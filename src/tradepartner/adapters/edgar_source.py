@@ -239,6 +239,7 @@ class EdgarFilingSource(FilingSource):
         self._fsn_loaded_periods: tuple[str, ...] = ()
         # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
         self.pre_xml_delistings = 0
+        self.unstamped_delistings = 0
         # T11e: the `companyfacts.zip` path and member names once downloaded,
         # False once the per-CIK API was chosen, None until decided.
         self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
@@ -934,6 +935,7 @@ class EdgarFilingSource(FilingSource):
         if since is not None:
             since = ensure_tz_aware_utc(since, field_name="since")
         self.pre_xml_delistings = 0
+        self.unstamped_delistings = 0
         start = (self._settings.edgar.index_first_year, 1)
         last = quarter_of(self._now())
         quarters = [(y, q) for y in range(start[0], last[0] + 1) for q in range(1, 5)]
@@ -957,33 +959,46 @@ class EdgarFilingSource(FilingSource):
             kept.setdefault(row.cik, {}).setdefault(row.accession, (row, quarter))
 
         stamps = self._stamp(kept)
-        results: list[DelistingFiling] = []
+        # One result per accession (plan T11f): a Form 25 kept under several
+        # CIKs is served once, from the first CIK (index order) that stamps it.
+        candidates: dict[str, list[tuple[str, SubmissionRecord | None]]] = {}
         for cik, rows in kept.items():
-            for accession, (_row, _quarter) in rows.items():
-                record = stamps[cik].get(accession)
-                if record is None or record.accepted_at is None:
-                    continue  # unstamped: filing_index()'s .unstamped_filings already has it
-                cached = self._load_delisting_cache(accession)
-                if cached is not None:
-                    results.append(
-                        DelistingFiling(
-                            cik=cached.cik,
-                            form=cached.form,
-                            class_title=cached.class_title,
-                            exchange=cached.exchange,
-                            accession=accession,
-                            accepted_at=record.accepted_at,
-                            effective_on=cached.effective_on,
-                        )
+            for accession in rows:
+                candidates.setdefault(accession, []).append((cik, stamps[cik].get(accession)))
+        results: list[DelistingFiling] = []
+        for accession, options in candidates.items():
+            stamped = [
+                (c, r, r.accepted_at)
+                for c, r in options
+                if r is not None and r.accepted_at is not None
+            ]
+            if not stamped:
+                # Counted here: an exchange-only 25-NSE is a row `filing_index`
+                # never keeps, so its `.unstamped_filings` would not show it.
+                self.unstamped_delistings += 1
+                continue
+            cik, record, accepted_at = stamped[0]
+            cached = self._load_delisting_cache(accession)
+            if cached is not None:
+                results.append(
+                    DelistingFiling(
+                        cik=cached.cik,
+                        form=cached.form,
+                        class_title=cached.class_title,
+                        exchange=cached.exchange,
+                        accession=accession,
+                        accepted_at=accepted_at,
+                        effective_on=cached.effective_on,
                     )
-                    continue
-                if not record.primary_document.lower().endswith(".xml"):
-                    self.pre_xml_delistings += 1
-                    continue
-                parsed = self._fetch_delisting(
-                    cik, accession, record.form, record.primary_document, record.accepted_at
                 )
-                results.append(parsed)
+                continue
+            if not record.primary_document.lower().endswith(".xml"):
+                self.pre_xml_delistings += 1
+                continue
+            parsed = self._fetch_delisting(
+                cik, accession, record.form, record.primary_document, accepted_at
+            )
+            results.append(parsed)
         if since is not None:
             results = [d for d in results if d.accepted_at >= since]
         results.sort(key=lambda d: (d.accepted_at, d.accession))
@@ -998,7 +1013,7 @@ class EdgarFilingSource(FilingSource):
             cik, accession, root_document, settings=self._settings, client=self._client
         )
         try:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             parsed = parse_delisting(text, form=form, accession=accession, accepted_at=accepted_at)
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing
@@ -1010,8 +1025,9 @@ class EdgarFilingSource(FilingSource):
         return self._cache / "delisting" / f"v{DELISTING_VERSION}" / f"{accession}.json"
 
     def _load_delisting_cache(self, accession: str) -> _CachedDelisting | None:
+        path = self._delisting_cache_path(accession)  # validates first, outside the try
         try:
-            data = json.loads(self._delisting_cache_path(accession).read_bytes())
+            data = json.loads(path.read_bytes())
             if data.get("version") != DELISTING_VERSION or data.get("accession") != accession:
                 return None
             effective = data.get("effective_on")
