@@ -9,12 +9,15 @@ symbol, tz-aware timestamps normalized to UTC), symbol case
 canonicalization so `aapl` and `AAPL` net as one position (issue #38), and, at the broker level,
 an aware timestamp that overflows once converted to UTC (issue #43)
 raising `ValueError` (not `OverflowError`) from `Order`/`Fill`
-construction and from `FakeBroker.submit`/`simulate_fill`.
+construction, and a bad clock (naive, overflowing, not a `datetime`, or
+raising) making `FakeBroker.submit`/`simulate_fill` raise `ClockError`
+with no state changed (ADR 0007 point 4, T46).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -33,6 +36,7 @@ from tradepartner.adapters.broker import (
     UnknownOrderError,
 )
 from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.errors import ClockError, SystemFaultError
 
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 
@@ -506,57 +510,6 @@ def test_naive_datetime_raises_on_fill() -> None:
         )
 
 
-def test_naive_clock_raises_on_submit() -> None:
-    # A closure driven by a mutable mode holder, so the same broker instance
-    # can be switched from a naive clock to a good (tz-aware) one between
-    # calls — `make_clock` always advances from a fixed tz-aware start and
-    # can't be flipped to naive, so it doesn't fit here.
-    mode = ["naive"]
-
-    def clock() -> datetime:
-        return datetime(2026, 1, 5, 15, 0) if mode[0] == "naive" else T0  # noqa: DTZ001
-
-    broker = FakeBroker(clock=clock)
-    with pytest.raises(ValueError, match="tz-aware"):
-        broker.submit(make_request())
-
-    # Switch to a good clock: resubmitting the same client_order_id then
-    # succeeds, because the earlier failed submit never recorded a partial
-    # order (it raised while constructing the `Order`, before `self._orders`
-    # was touched).
-    mode[0] = "good"
-    order = broker.submit(make_request())
-    assert order.client_order_id == "co-1"
-    assert order.status is OrderStatus.FILLED
-
-
-def test_naive_clock_raises_on_simulate_fill_path() -> None:
-    # First call (submit) returns a tz-aware datetime so the order is
-    # recorded as OPEN; the second call (simulate_fill) returns a naive one,
-    # so the failure is actually exercised inside `simulate_fill` rather
-    # than inside `submit`.
-    mode = ["good"]
-
-    def clock() -> datetime:
-        return T0 if mode[0] == "good" else datetime(2026, 1, 5, 15, 0, 1)  # noqa: DTZ001
-
-    broker = FakeBroker(clock=clock, auto_fill=False)
-    order = broker.submit(make_request())
-    assert order.status is OrderStatus.OPEN
-
-    mode[0] = "bad"
-    with pytest.raises(ValueError, match="tz-aware"):
-        broker.simulate_fill(order.client_order_id)
-
-    # The naive `filled_at` makes `Fill` construction raise before any
-    # fill/position state is recorded and before the order's status changes
-    # — it is still OPEN, so a following `cancel` succeeds.
-    cancelled = broker.cancel(order.client_order_id)
-    assert cancelled.status is OrderStatus.CANCELLED
-    assert broker.fills() == []
-    assert broker.positions() == {}
-
-
 # An aware datetime whose UTC-converted value overflows `datetime`'s
 # representable range (issue #43): near `datetime.min` with a positive
 # offset, and near `datetime.max` with a negative offset.
@@ -595,56 +548,171 @@ def test_utc_overflow_raises_value_error_on_fill(overflowing: datetime) -> None:
     assert isinstance(excinfo.value.__cause__, OverflowError)
 
 
-@pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
-def test_utc_overflow_clock_raises_on_submit_and_leaves_id_free(overflowing: datetime) -> None:
-    # Mirrors test_naive_clock_raises_on_submit, but with a clock value
-    # that is tz-aware and still overflows once converted to UTC.
-    mode = ["overflowing"]
+# --- Clock faults (ADR 0007 point 4, plan T46) ---------------------------------
+#
+# Every clock reading is validated where it is read; any failure of the call
+# or the validation is a `ClockError` (a `SystemFaultError`, never a
+# `ValueError`), raised before any `Order` or `Fill` is built and before any
+# state changes. These replace #63's clock tests, which expected `ValueError`.
 
-    def clock() -> datetime:
-        return overflowing if mode[0] == "overflowing" else T0
 
+def _raising_clock() -> datetime:
+    raise RuntimeError("clock source unavailable")
+
+
+class _DatetimeLookalike:
+    """Not a `datetime`, but has every attribute `ensure_tz_aware_utc` reads."""
+
+    tzinfo = UTC
+
+    def utcoffset(self) -> timedelta:
+        return timedelta(0)
+
+    def astimezone(self, tz: object) -> _DatetimeLookalike:
+        return self
+
+
+#: (id, a bad clock reading or a callable that raises, the original error type)
+_BAD_CLOCKS: list[tuple[str, object, type[BaseException]]] = [
+    ("naive", datetime(2026, 1, 5, 15, 0), ValueError),  # noqa: DTZ001
+    ("overflow-min", _OVERFLOWING_DATETIMES[0], ValueError),
+    ("overflow-max", _OVERFLOWING_DATETIMES[1], ValueError),
+    ("not-a-datetime-str", "2026-01-05T15:00:00+00:00", TypeError),
+    ("not-a-datetime-none", None, TypeError),
+    ("not-a-datetime-lookalike", _DatetimeLookalike(), TypeError),
+    ("raises", _raising_clock, RuntimeError),
+]
+
+
+class _SwitchableClock:
+    """Returns `T0` (advancing a second per call) while `good`, else the bad
+    reading, or calls the bad callable."""
+
+    def __init__(self, bad: object) -> None:
+        self.bad = bad
+        self.good = True
+        self.calls = 0
+
+    def __call__(self) -> datetime:
+        self.calls += 1
+        if self.good:
+            return T0 + timedelta(seconds=self.calls)
+        if callable(self.bad):
+            return self.bad()  # type: ignore[no-any-return]
+        return self.bad  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    ("bad", "cause"), [(b, c) for _, b, c in _BAD_CLOCKS], ids=[i for i, _, _ in _BAD_CLOCKS]
+)
+def test_a_bad_clock_makes_submit_raise_clock_error_and_records_nothing(
+    bad: object, cause: type[BaseException]
+) -> None:
+    clock = _SwitchableClock(bad)
+    clock.good = False
     broker = FakeBroker(clock=clock)
-    with pytest.raises(ValueError, match=r"submitted_at=.*out of the range"):
-        broker.submit(make_request())
 
+    with pytest.raises(ClockError) as caught:
+        broker.submit(make_request())
+    assert not isinstance(caught.value, ValueError)
+    assert isinstance(caught.value, SystemFaultError)
+    assert isinstance(caught.value.__cause__, cause)
+
+    # No order recorded: unknown to cancel, no fill, no position.
+    with pytest.raises(UnknownOrderError):
+        broker.cancel("co-1")
     assert broker.fills() == []
     assert broker.positions() == {}
 
-    # The earlier failed submit never recorded a partial order (it raised
-    # while constructing the `Order`, before `self._orders` was touched),
-    # so the same client_order_id can be resubmitted once the clock is good.
-    mode[0] = "good"
+    # The client_order_id is reusable once the clock is good.
+    clock.good = True
     order = broker.submit(make_request())
     assert order.client_order_id == "co-1"
     assert order.status is OrderStatus.FILLED
 
 
-@pytest.mark.parametrize("overflowing", _OVERFLOWING_DATETIMES)
-def test_utc_overflow_clock_raises_on_simulate_fill_path(overflowing: datetime) -> None:
-    # Mirrors test_naive_clock_raises_on_simulate_fill_path: the submit
-    # clock tick is good so the order is recorded as OPEN, and the
-    # simulate_fill tick overflows.
-    mode = ["good"]
-
-    def clock() -> datetime:
-        return T0 if mode[0] == "good" else overflowing
-
+@pytest.mark.parametrize(
+    ("bad", "cause"), [(b, c) for _, b, c in _BAD_CLOCKS], ids=[i for i, _, _ in _BAD_CLOCKS]
+)
+def test_a_bad_clock_makes_submit_raise_clock_error_without_auto_fill(
+    bad: object, cause: type[BaseException]
+) -> None:
+    clock = _SwitchableClock(bad)
+    clock.good = False
     broker = FakeBroker(clock=clock, auto_fill=False)
-    order = broker.submit(make_request())
-    assert order.status is OrderStatus.OPEN
-
-    mode[0] = "overflowing"
-    with pytest.raises(ValueError, match=r"filled_at=.*out of the range"):
-        broker.simulate_fill(order.client_order_id)
-
-    # The overflowing `filled_at` makes `Fill` construction raise before
-    # any fill/position state is recorded and before the order's status
-    # changes -- it is still OPEN, so a following `cancel` succeeds.
-    cancelled = broker.cancel(order.client_order_id)
-    assert cancelled.status is OrderStatus.CANCELLED
+    with pytest.raises(ClockError) as caught:
+        broker.submit(make_request())
+    assert isinstance(caught.value.__cause__, cause)
+    with pytest.raises(UnknownOrderError):
+        broker.cancel("co-1")
     assert broker.fills() == []
     assert broker.positions() == {}
+    clock.good = True
+    assert broker.submit(make_request()).status is OrderStatus.OPEN
+
+
+@pytest.mark.parametrize(
+    ("bad", "cause"), [(b, c) for _, b, c in _BAD_CLOCKS], ids=[i for i, _, _ in _BAD_CLOCKS]
+)
+def test_a_bad_clock_makes_simulate_fill_raise_clock_error_and_changes_nothing(
+    bad: object, cause: type[BaseException]
+) -> None:
+    clock = _SwitchableClock(bad)
+    broker = FakeBroker(clock=clock, auto_fill=False)
+    held = broker.submit(make_request(client_order_id="held", symbol="MSFT"))
+    held = broker.simulate_fill(held.client_order_id)  # a position exists before the fault
+    order = broker.submit(make_request())
+    assert order.status is OrderStatus.OPEN
+    fills_before, positions_before = broker.fills(), broker.positions()
+
+    clock.good = False
+    with pytest.raises(ClockError) as caught:
+        broker.simulate_fill(order.client_order_id)
+    assert not isinstance(caught.value, ValueError)
+    assert isinstance(caught.value.__cause__, cause)
+
+    # No fill recorded, positions unchanged, and the order still OPEN and
+    # otherwise unchanged: it fills normally once the clock is good.
+    assert broker.fills() == fills_before
+    assert broker.positions() == positions_before
+    clock.good = True
+    filled = broker.simulate_fill(order.client_order_id)
+    assert filled == replace(order, status=OrderStatus.FILLED)
+    assert len(broker.fills()) == len(fills_before) + 1
+
+
+def test_a_clock_error_names_the_clock_and_only_the_cause_type() -> None:
+    def leaky() -> datetime:
+        raise RuntimeError("GET https://broker.example/clock?key=do-not-print")
+
+    broker = FakeBroker(clock=leaky)
+    with pytest.raises(ClockError, match=r"^clock failed: RuntimeError$") as caught:
+        broker.submit(make_request())
+    assert "do-not-print" not in str(caught.value)
+    assert "do-not-print" in str(caught.value.__cause__)  # the chain keeps the detail
+
+
+def test_a_base_exception_from_the_clock_is_not_turned_into_a_clock_error() -> None:
+    # ADR 0007 point 1: `BaseException` (KeyboardInterrupt, SystemExit)
+    # propagates untouched and is never classified.
+    def interrupted() -> datetime:
+        raise KeyboardInterrupt
+
+    broker = FakeBroker(clock=interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        broker.submit(make_request())
+
+
+def test_the_clock_is_read_once_per_submit_and_once_per_simulate_fill() -> None:
+    clock = _SwitchableClock(None)
+    broker = FakeBroker(clock=clock, auto_fill=False)
+    order = broker.submit(make_request())
+    assert clock.calls == 1
+    broker.simulate_fill(order.client_order_id)
+    assert clock.calls == 2
+    auto = FakeBroker(clock=clock)
+    auto.submit(make_request())
+    assert clock.calls == 3
 
 
 def test_non_utc_clock_is_normalized_to_utc() -> None:
