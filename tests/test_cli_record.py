@@ -9,11 +9,16 @@ message.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from alpaca.common.exceptions import APIError
 
 from tradepartner import cli_record
+from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingRaw
 from tradepartner.config import Settings
 
 
@@ -195,3 +200,187 @@ def test_recorded_at_notes_utc_time_per_fixture(
     cli_record._write_json(target, {"k": "v"}, secrets=[])
     assert list(cli_record._recorded_at) == ["alpaca/x.json"]
     assert cli_record._recorded_at["alpaca/x.json"].endswith("+00:00")
+
+
+# --- the `paper` target (T48) -------------------------------------------------
+
+PAPER_KEY = "PKPAPERFAKE1234567890"  # gitleaks:allow
+PAPER_SECRET = "paperSecretFake1234567890abcdefghij"  # gitleaks:allow
+ACCOUNT_ID = "0b6f3c1e-1111-4222-8333-944455556666"
+ACCOUNT_NUMBER = "PA3FAKE12345"
+NON_FRACTIONABLE = "NFX"
+
+
+def _paper_settings(**overrides: str | None) -> Settings:
+    values: dict[str, str | None] = {
+        "alpaca_paper_api_key": PAPER_KEY,
+        "alpaca_paper_api_secret": PAPER_SECRET,
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def _redirect_fixtures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(cli_record, "FIXTURES_ROOT", tmp_path)
+    monkeypatch.setattr(cli_record, "ALPACA_PAPER_FIXTURES_DIR", tmp_path / "alpaca" / "paper")
+    monkeypatch.setattr(cli_record, "RECORDED_AT_FILE", tmp_path / "recorded_at.json")
+    monkeypatch.setattr(cli_record, "_recorded_at", {})
+    return tmp_path / "alpaca" / "paper"
+
+
+@pytest.mark.parametrize("missing", ["alpaca_paper_api_key", "alpaca_paper_api_secret"])
+def test_paper_target_refused_without_paper_keys_writing_nothing(
+    missing: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paper_dir = _redirect_fixtures(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli_record, "get_settings", lambda: _paper_settings(**{missing: None}))
+
+    assert cli_record.main(["paper", NON_FRACTIONABLE]) == 1
+
+    err = capsys.readouterr().err
+    assert missing.upper() in err
+    assert PAPER_KEY not in err and PAPER_SECRET not in err
+    assert not paper_dir.exists() and list(tmp_path.iterdir()) == []
+
+
+def test_paper_target_refused_when_the_paper_guard_was_bypassed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _redirect_fixtures(tmp_path, monkeypatch)
+    settings = _paper_settings()
+    bypassed = settings.model_copy(
+        update={"alpaca": settings.alpaca.model_copy(update={"paper": False})}
+    )
+    monkeypatch.setattr(cli_record, "get_settings", lambda: bypassed)
+
+    assert cli_record.main(["paper", NON_FRACTIONABLE]) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("argv", [["papr"], ["paper"], ["paper", "A", "B"], ["fsn", "x"]])
+def test_unknown_target_or_bad_paper_arguments_exit_2(argv: list[str]) -> None:
+    assert cli_record.main(argv) == 2
+
+
+class _ScriptedPaperClient:
+    """A paper account in memory: market orders fill at once at 10, limit orders
+    rest, a sell above the held quantity or a reused `client_order_id` is refused."""
+
+    def __init__(self, positions: dict[str, float] | None = None) -> None:
+        self.positions = dict(positions or {})
+        self.orders: dict[str, dict[str, Any]] = {}
+        self.submitted: list[str] = []
+
+    @staticmethod
+    def _refuse(status: int, message: str) -> APIError:
+        http_error = SimpleNamespace(response=SimpleNamespace(status_code=status))
+        return APIError(json.dumps({"code": status, "message": message}), http_error)
+
+    def submit_order(self, order_data: Any) -> Any:
+        cid, symbol = order_data.client_order_id, order_data.symbol
+        self.submitted.append(cid)
+        if cid in self.orders:
+            raise self._refuse(422, "client_order_id must be unique")
+        qty = order_data.qty if order_data.qty is not None else order_data.notional / 10
+        if order_data.side.value == "sell" and qty > self.positions.get(symbol, 0) + 1e-9:
+            raise self._refuse(403, "insufficient qty available for order")
+        order = {"id": f"id-{cid}", "client_order_id": cid, "symbol": symbol, "status": "new"}
+        if order_data.type.value == "market":
+            sign = 1 if order_data.side.value == "buy" else -1
+            self.positions[symbol] = self.positions.get(symbol, 0) + sign * qty
+            if abs(self.positions[symbol]) < 1e-9:
+                del self.positions[symbol]
+            order.update(status="filled", filled_qty=str(qty), filled_avg_price="10")
+        self.orders[cid] = order
+        return dict(order)
+
+    def cancel_order_by_id(self, order_id: str) -> None:
+        for order in self.orders.values():
+            if order["id"] == order_id and order["status"] == "new":
+                order["status"] = "canceled"
+
+    def get_order_by_client_id(self, client_id: str) -> Any:
+        return dict(self.orders[client_id])
+
+    def get_orders(self, filter: Any = None) -> Any:
+        return [dict(o) for o in self.orders.values() if o["status"] == "new"]
+
+    def get_all_positions(self) -> Any:
+        return [
+            {"symbol": s, "qty": str(q), "account_id": ACCOUNT_ID}
+            for s, q in self.positions.items()
+        ]
+
+    def get_account(self) -> Any:
+        return {"id": ACCOUNT_ID, "account_number": ACCOUNT_NUMBER, "cash": "100000"}
+
+    def get_asset(self, symbol_or_asset_id: str) -> Any:
+        fractionable = symbol_or_asset_id != NON_FRACTIONABLE
+        return {"symbol": symbol_or_asset_id, "tradable": True, "fractionable": fractionable}
+
+    def get(self, path: str, data: Any = None) -> Any:
+        return [{"id": "act-1", "activity_type": "FILL", "note": f"acct {ACCOUNT_ID}"}]
+
+
+class _FakeClock:
+    """Advances only when slept on, so pacing and polling cost no real time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _raw_on(client: _ScriptedPaperClient) -> AlpacaTradingRaw:
+    return AlpacaTradingRaw(_paper_settings(), client=client, clock=_FakeClock())
+
+
+def test_paper_script_ends_flat_and_writes_scrubbed_recordings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper_dir = _redirect_fixtures(tmp_path, monkeypatch)
+    (tmp_path / "recorded_at.json").write_text('{"alpaca/daily_bars.json": "2026-09-25"}')
+    client = _ScriptedPaperClient()
+
+    assert cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE) == 0
+
+    assert client.positions == {} and client.get_orders() == []
+    written = {path.stem: path.read_text() for path in paper_dir.glob("*.json")}
+    assert {"buy_fractional", "sell_above_held", "duplicate_client_order_id", "flatten"} <= set(
+        written
+    )
+    assert json.loads(written["sell_above_held"])["error"]["status_code"] == 403
+    assert json.loads(written["duplicate_client_order_id"])["error"]["status_code"] == 422
+    assert json.loads(written["resting_cancelled"])[-1]["status"] == "canceled"
+    for text in written.values():
+        for secret in (ACCOUNT_ID, ACCOUNT_NUMBER, PAPER_KEY, PAPER_SECRET):
+            assert secret not in text
+    recorded_at = json.loads((tmp_path / "recorded_at.json").read_text())
+    assert "alpaca/daily_bars.json" in recorded_at and "alpaca/paper/flatten.json" in recorded_at
+
+
+def test_paper_script_refuses_a_non_flat_account_before_any_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper_dir = _redirect_fixtures(tmp_path, monkeypatch)
+    client = _ScriptedPaperClient(positions={"KO": 2.0})
+
+    assert cli_record._run_paper(_raw_on(client), _paper_settings(), NON_FRACTIONABLE) == 1
+    assert client.submitted == [] and not paper_dir.exists()
+
+
+def test_paper_script_refuses_a_fractionable_symbol_as_non_fractionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _redirect_fixtures(tmp_path, monkeypatch)
+    client = _ScriptedPaperClient()
+
+    assert cli_record._run_paper(_raw_on(client), _paper_settings(), "SPY") == 1
+    assert client.submitted == []

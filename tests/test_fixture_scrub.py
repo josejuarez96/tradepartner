@@ -20,6 +20,7 @@ Two layers:
 
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 from pathlib import Path
@@ -27,16 +28,19 @@ from typing import Any
 
 import pytest
 
+from tradepartner import cli_record
 from tradepartner.cli_record import (
     ALPACA_KEY_PREFIX_PATTERN,
     EMAIL_PATTERN,
     KEY_SHAPED_PATTERN,
+    PAPER_ACCOUNT_NUMBER_PATTERN,
     SCRUBBED,
     SENSITIVE_HEADER_LINE_PATTERN,
     USER_AGENT_HEADER_PATTERN,
     scrub_json,
     scrub_text,
 )
+from tradepartner.config import Settings
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -59,6 +63,20 @@ def _iter_json_strings(value: Any) -> list[str]:
     elif isinstance(value, str):
         strings.append(value)
     return strings
+
+
+def _iter_account_ids(value: Any) -> list[Any]:
+    """Every value under an `account_number`/`account_id` key, at any depth."""
+    found: list[Any] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in ("account_number", "account_id"):
+                found.append(v)
+            found.extend(_iter_account_ids(v))
+    elif isinstance(value, list):
+        for v in value:
+            found.extend(_iter_account_ids(v))
+    return found
 
 
 def _parsed_json_or_none(text: str) -> Any | None:
@@ -93,6 +111,12 @@ def _assert_file_is_scrubbed(path: Path) -> None:
     )
 
     parsed = _parsed_json_or_none(text)
+    if path.parent.name == "paper" and path.parent.parent.name == "alpaca":
+        # T48: paper recordings carry the account's number and ids; checked only
+        # here, where the pattern cannot collide with EDGAR's upper-case words.
+        assert not PAPER_ACCOUNT_NUMBER_PATTERN.search(text), f"paper account number in {path}"
+        for value in _iter_account_ids(parsed):
+            assert value == SCRUBBED, f"unscrubbed account id in {path}: {value!r}"
     if parsed is not None:
         # JSON-string-value-only: scanning raw serialized text for a
         # "key-shaped" token risks both false positives (e.g. a camelCase
@@ -291,3 +315,50 @@ def test_walk_fails_on_a_key_hidden_inside_a_gzip_file_whatever_its_name(tmp_pat
         fh.write("<html>APCA-API-KEY-ID: PKABCDEFGHIJKLMNOPQRSTUV</html>")
     with pytest.raises(AssertionError, match=r"Alpaca-style key prefix|header line"):
         _assert_file_is_scrubbed(hidden)
+
+
+# --- paper trading recordings (T48) -----------------------------------------
+
+PAPER_KEY = "PKPAPERFAKE1234567890"  # gitleaks:allow
+PAPER_SECRET = "paperSecretFake1234567890abcdefghij"  # gitleaks:allow
+
+
+def test_scrub_json_removes_paper_keys_and_account_ids() -> None:
+    settings = Settings(
+        _env_file=None, alpaca_paper_api_key=PAPER_KEY, alpaca_paper_api_secret=PAPER_SECRET
+    )
+    secrets = cli_record._configured_secrets(settings)
+    basic = base64.b64encode(f"{PAPER_KEY}:{PAPER_SECRET}".encode()).decode()
+    assert {PAPER_KEY, PAPER_SECRET, basic} <= set(secrets)
+    payload = {
+        "id": "acct-0b6f3c1e",
+        "account_number": "PA3FAKE12345",
+        "cash": "100000",
+        "positions": [{"symbol": "KO", "account_id": "acct-0b6f3c1e"}],
+        "echo": f"headers {PAPER_KEY} {PAPER_SECRET}",
+    }
+
+    scrubbed, _ = scrub_json(payload, secrets=[*secrets, "acct-0b6f3c1e"])
+
+    assert scrubbed["id"] == SCRUBBED and scrubbed["account_number"] == SCRUBBED
+    assert scrubbed["positions"][0] == {"symbol": "KO", "account_id": SCRUBBED}
+    assert scrubbed["cash"] == "100000"
+    assert PAPER_KEY not in json.dumps(scrubbed) and PAPER_SECRET not in json.dumps(scrubbed)
+
+
+def test_walk_fails_on_a_paper_account_number_left_in_a_paper_recording(tmp_path: Path) -> None:
+    paper = tmp_path / "alpaca" / "paper"
+    paper.mkdir(parents=True)
+    leaked = paper / "account_before.json"
+    leaked.write_text(json.dumps({"note": "account PA3FAKE12345"}), encoding="utf-8")
+    with pytest.raises(AssertionError, match="paper account number"):
+        _assert_file_is_scrubbed(leaked)
+
+    leaked.write_text(json.dumps([{"account_id": "abc"}]), encoding="utf-8")
+    with pytest.raises(AssertionError, match="unscrubbed account id"):
+        _assert_file_is_scrubbed(leaked)
+
+
+def test_paper_account_number_pattern_ignores_upper_case_words() -> None:
+    assert not PAPER_ACCOUNT_NUMBER_PATTERN.search("PARTNERSHIP PARTICIPATIONS")
+    assert PAPER_ACCOUNT_NUMBER_PATTERN.search("PA3FAKE12345")

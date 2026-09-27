@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import gzip
 import io
+import itertools
 import json
 import re
 import sys
@@ -30,13 +31,19 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, OrderRequest
 from pydantic import SecretStr
 
-from tradepartner.adapters import alpaca_raw, edgar_raw
+from tradepartner.adapters import alpaca_raw, alpaca_trading_raw, edgar_raw
+from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingRaw
 from tradepartner.config import Settings, get_settings
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 ALPACA_FIXTURES_DIR = FIXTURES_ROOT / "alpaca"
+#: T48: paper trading responses, recorded by the owner with paper keys (T48b).
+ALPACA_PAPER_FIXTURES_DIR = ALPACA_FIXTURES_DIR / "paper"
 EDGAR_FIXTURES_DIR = FIXTURES_ROOT / "edgar"
 #: T11c: the FSN data-set page and the two recorded periods' trimmed members.
 EDGAR_FSN_FIXTURES_DIR = EDGAR_FIXTURES_DIR / "fsn"
@@ -78,6 +85,13 @@ USER_AGENT_HEADER_PATTERN = re.compile(r'(?i)"user-agent"\s*:\s*"(?!<scrubbed>)[
 SENSITIVE_HEADER_LINE_PATTERN = re.compile(
     r"(?im)^\s*(?:user-agent|authorization|apca-api-(?:key-id|secret-key))\s*[:=].*"
 )
+
+# A paper account number ("PA" then letters and digits, at least one digit, so an
+# upper-case word such as "PARTNERSHIP" never matches). Checked only over the paper
+# recordings by the walk test; the recorder scrubs account ids by field name and by
+# the recorded account's own values (T48).
+PAPER_ACCOUNT_NUMBER_PATTERN = re.compile(r"\bPA(?=[A-Z0-9]*\d)[A-Z0-9]{8,}\b")
+_ACCOUNT_ID_KEYS = frozenset({"account_number", "account_id"})
 
 # Field names whose *entire* value is inherently secret, regardless of its
 # shape -- unlike the content patterns above, which scrub only the matched
@@ -162,7 +176,7 @@ def _scrub_json_value(
             count += n
         return result_list, count
     if isinstance(value, str):
-        if key is not None and key.strip().lower() in _SENSITIVE_HEADER_KEYS:
+        if key is not None and key.strip().lower() in _SENSITIVE_HEADER_KEYS | _ACCOUNT_ID_KEYS:
             return _scrub_whole_if_changed(value)
         if (
             key is not None
@@ -221,11 +235,13 @@ def _configured_secrets(settings: Settings) -> list[str]:
     api_key = _non_blank_secret(settings.alpaca_api_key)
     api_secret = _non_blank_secret(settings.alpaca_api_secret)
     user_agent = _non_blank_secret(settings.sec_edgar_user_agent)
+    paper_key = _non_blank_secret(settings.alpaca_paper_api_key)
+    paper_secret = _non_blank_secret(settings.alpaca_paper_api_secret)
 
-    values = [v for v in (api_key, api_secret, user_agent) if v is not None]
-    if api_key is not None and api_secret is not None:
-        basic = base64.b64encode(f"{api_key}:{api_secret}".encode()).decode()
-        values.append(basic)
+    values = [v for v in (api_key, api_secret, user_agent, paper_key, paper_secret) if v]
+    for key, secret in ((api_key, api_secret), (paper_key, paper_secret)):
+        if key is not None and secret is not None:
+            values.append(base64.b64encode(f"{key}:{secret}".encode()).decode())
     return values
 
 
@@ -652,17 +668,217 @@ def _record_alpaca(settings: Settings, secrets: list[str]) -> None:
     _write_json(ALPACA_FIXTURES_DIR / "assets_snapshot.json", assets, secrets=secrets)
 
 
+# --- paper trading responses (T48: `python -m tradepartner.cli_record paper SYMBOL`) ---
+
+# The one order path outside the risk-gated wrapper (T50 fences its import): tiny
+# market orders on one liquid, fractionable name, plus one whole share of a
+# non-fractionable name the owner names on the command line. Run by the owner only
+# (T48b), during regular hours, on a flat paper account; the script ends flat.
+PAPER_SYMBOL = "KO"
+PAPER_BUY_NOTIONAL = 5.0  # dollars, above Alpaca's $1 fractional minimum
+PAPER_FRACTIONAL_QTY = 0.5
+PAPER_RESTING_LIMIT_FRACTION = 0.9  # a buy limit this far under the fill price rests
+_PAPER_TERMINAL = frozenset({"filled", "canceled", "expired", "rejected"})
+_PAPER_RESTING = frozenset({"new", "accepted"})
+
+
+class PaperRecordingError(RuntimeError):
+    """The paper script refused to start, or could not finish flat."""
+
+
+def _paper_await(
+    raw: AlpacaTradingRaw, client_order_id: str, settings: Settings, until: frozenset[str]
+) -> list[Any]:
+    """Poll `get_order_by_client_id` every `paper.poll_interval_seconds` until the
+    status is in `until`; every change of status is kept. Gives up after
+    `paper.sell_wait_seconds`."""
+    deadline = raw.clock.monotonic() + settings.paper.sell_wait_seconds
+    seen: list[Any] = []
+    while True:
+        order = raw.get_order_by_client_id(client_order_id)
+        if not seen or order.get("status") != seen[-1].get("status"):
+            seen.append(order)
+        if order.get("status") in until:
+            return seen
+        if raw.clock.monotonic() >= deadline:
+            raise PaperRecordingError(f"order {client_order_id} still {order.get('status')!r}")
+        raw.clock.sleep(settings.paper.poll_interval_seconds)
+
+
+def _paper_submit(
+    raw: AlpacaTradingRaw,
+    request: OrderRequest,
+    settings: Settings,
+    until: frozenset[str] = _PAPER_TERMINAL,
+) -> dict[str, Any]:
+    """`{"submit": response, "polls": [...]}`, or `{"error": ...}` when refused."""
+    try:
+        submitted = raw.submit_order(request)
+    except APIError as error:
+        return {"error": {"status_code": error.status_code, "body": str(error)}}
+    cid = str(request.client_order_id)
+    return {"submit": submitted, "polls": _paper_await(raw, cid, settings, until)}
+
+
+def _market(
+    symbol: str,
+    side: OrderSide,
+    cid: str,
+    *,
+    qty: float | None = None,
+    notional: float | None = None,
+) -> MarketOrderRequest:
+    return MarketOrderRequest(
+        symbol=symbol,
+        side=side,
+        time_in_force=TimeInForce.DAY,
+        client_order_id=cid,
+        qty=qty,
+        notional=notional,
+    )
+
+
+def _held_quantity(positions: list[Any], symbol: str) -> float:
+    return sum(float(p["qty"]) for p in positions if p.get("symbol") == symbol)
+
+
+def _paper_flatten(raw: AlpacaTradingRaw, settings: Settings, ids: Iterator[str]) -> list[Any]:
+    """Cancel every open order, then sell every position whole."""
+    steps: list[Any] = []
+    for order in raw.list_open_orders():
+        raw.cancel_order(str(order["id"]))
+        cid = str(order["client_order_id"])
+        steps.append({"cancel": cid, "polls": _paper_await(raw, cid, settings, _PAPER_TERMINAL)})
+    for position in raw.list_positions():
+        qty = float(position["qty"])
+        if qty <= 0:
+            raise PaperRecordingError(f"position {position.get('symbol')} is not long: {qty}")
+        request = _market(str(position["symbol"]), OrderSide.SELL, next(ids), qty=qty)
+        steps.append(_paper_submit(raw, request, settings))
+    return steps
+
+
+def _record_paper(
+    raw: AlpacaTradingRaw, settings: Settings, non_fractionable: str
+) -> dict[str, Any]:
+    """Run the fixed paper script; return `{fixture name: raw response}`. Refuses,
+    before any order, a non-flat account or a symbol pair that is not (tradable and
+    fractionable, tradable and not fractionable). Always tries to end flat, and raises
+    if it did not."""
+    started = datetime.now(UTC)
+    out: dict[str, Any] = {"account_before": raw.get_account()}
+    if raw.list_positions() or raw.list_open_orders():
+        raise PaperRecordingError("the paper account holds positions or open orders; flatten it")
+    out["assets"] = raw.get_assets([PAPER_SYMBOL, non_fractionable])
+    liquid, other = out["assets"]
+    if not (liquid.get("tradable") and liquid.get("fractionable")):
+        raise PaperRecordingError(f"{PAPER_SYMBOL} is not tradable and fractionable")
+    if not other.get("tradable") or other.get("fractionable"):
+        raise PaperRecordingError(f"{non_fractionable} must be tradable and not fractionable")
+
+    ids = (f"rec{started:%Y%m%d%H%M%S}-{n}" for n in itertools.count(1))
+    first = next(ids)
+    buy, sell = OrderSide.BUY, OrderSide.SELL
+    try:
+        out["buy_fractional"] = _paper_submit(
+            raw, _market(PAPER_SYMBOL, buy, first, notional=PAPER_BUY_NOTIONAL), settings
+        )
+        out["buy_whole"] = _paper_submit(
+            raw, _market(PAPER_SYMBOL, buy, next(ids), qty=1), settings
+        )
+        out["sell_fractional"] = _paper_submit(
+            raw, _market(PAPER_SYMBOL, sell, next(ids), qty=PAPER_FRACTIONAL_QTY), settings
+        )
+        out["positions_held"] = raw.list_positions()
+        above = round(_held_quantity(out["positions_held"], PAPER_SYMBOL) + PAPER_FRACTIONAL_QTY, 9)
+        out["sell_above_held"] = _paper_submit(
+            raw, _market(PAPER_SYMBOL, sell, next(ids), qty=above), settings
+        )
+        price = float(out["buy_whole"]["polls"][-1]["filled_avg_price"])
+        resting_id = next(ids)
+        resting = LimitOrderRequest(
+            symbol=PAPER_SYMBOL,
+            side=buy,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=resting_id,
+            qty=1,
+            limit_price=round(price * PAPER_RESTING_LIMIT_FRACTION, 2),
+        )
+        out["resting"] = _paper_submit(raw, resting, settings, _PAPER_RESTING | _PAPER_TERMINAL)
+        raw.cancel_order(str(out["resting"]["submit"]["id"]))
+        out["resting_cancelled"] = _paper_await(raw, resting_id, settings, _PAPER_TERMINAL)
+        out["duplicate_client_order_id"] = _paper_submit(
+            raw, _market(PAPER_SYMBOL, buy, first, notional=PAPER_BUY_NOTIONAL), settings
+        )
+        out["non_fractionable_buy"] = _paper_submit(
+            raw, _market(non_fractionable, buy, next(ids), qty=1), settings
+        )
+        out["non_fractionable_sell_fractional"] = _paper_submit(
+            raw, _market(non_fractionable, sell, next(ids), qty=PAPER_FRACTIONAL_QTY), settings
+        )
+    finally:
+        out["flatten"] = _paper_flatten(raw, settings, ids)
+    out["positions_after"] = raw.list_positions()
+    out["open_orders_after"] = raw.list_open_orders()
+    out["account_after"] = raw.get_account()
+    out["fill_activities"] = raw.list_fill_activities(started)
+    if out["positions_after"] or out["open_orders_after"]:
+        raise PaperRecordingError("the paper account is not flat after the script; check it")
+    return out
+
+
+def _run_paper(raw: AlpacaTradingRaw, settings: Settings, non_fractionable: str) -> int:
+    """Record, then scrub (keys, emails, the account's own ids) and write every
+    response under `ALPACA_PAPER_FIXTURES_DIR`, merging `recorded_at.json`."""
+    try:
+        recordings = _record_paper(raw, settings, non_fractionable)
+    except PaperRecordingError as error:
+        print(f"cli_record: {error}", file=sys.stderr)
+        return 1
+    account = recordings["account_before"]
+    secrets = _configured_secrets(settings) + [
+        str(account[k]) for k in ("id", "account_number") if account.get(k)
+    ]
+    ALPACA_PAPER_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    for name, payload in recordings.items():
+        _write_json(ALPACA_PAPER_FIXTURES_DIR / f"{name}.json", payload, secrets=secrets)
+    previous = json.loads(RECORDED_AT_FILE.read_text()) if RECORDED_AT_FILE.exists() else {}
+    RECORDED_AT_FILE.write_text(
+        json.dumps({**previous, **_recorded_at}, indent=2, sort_keys=True) + "\n"
+    )
+    print(f"cli_record: wrote paper fixtures under {ALPACA_PAPER_FIXTURES_DIR}")
+    return 0
+
+
 def main(argv: Sequence[str] = ()) -> int:
-    """`python -m tradepartner.cli_record [fsn]`. With no target, records
-    every fixture (Alpaca and EDGAR) as before. `fsn` (T11c) records only
+    """`python -m tradepartner.cli_record [fsn | paper SYMBOL]`. With no target,
+    records every fixture (Alpaca and EDGAR) as before. `fsn` (T11c) records only
     the FSN data-set page and its two recorded periods, and needs only
-    `SEC_EDGAR_USER_AGENT` -- no Alpaca keys."""
+    `SEC_EDGAR_USER_AGENT`. `paper SYMBOL` (T48) places the paper script's orders
+    and needs only the paper keys; `SYMBOL` is a tradable, non-fractionable name."""
     target = argv[0] if argv else "all"
-    if target not in ("all", "fsn") or len(argv) > 1:
+    if target == "paper" and len(argv) != 2:
+        print("cli_record: usage: paper NON_FRACTIONABLE_SYMBOL", file=sys.stderr)
+        return 2
+    if target not in ("all", "fsn", "paper") or (target != "paper" and len(argv) > 1):
         # A typo must not fall through to the full recorder (Alpaca keys too).
-        print(f"cli_record: unknown target {target!r}; use 'fsn' or no target", file=sys.stderr)
+        print(
+            f"cli_record: unknown target {target!r}; use 'fsn', 'paper SYMBOL' or no target",
+            file=sys.stderr,
+        )
         return 2
     settings = get_settings()
+
+    if target == "paper":
+        try:
+            raw = AlpacaTradingRaw(settings)
+        except (
+            alpaca_trading_raw.AlpacaPaperCredentialsError,
+            alpaca_trading_raw.AlpacaPaperGuardError,
+        ) as error:
+            print(f"cli_record: {error}", file=sys.stderr)
+            return 1
+        return _run_paper(raw, settings, argv[1].upper())
 
     if target == "fsn":
         if _non_blank_secret(settings.sec_edgar_user_agent) is None:
