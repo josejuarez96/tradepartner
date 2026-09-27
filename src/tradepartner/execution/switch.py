@@ -3,9 +3,13 @@
 
 **Derived, never stored.** `derive` is pure over one window's rows: the
 switch is engaged when the window's latest `kill_switch` row is `engaged`, or
-when any run of the window other than the reading one ended `halted`, `crashed`
-or `failed`, or has no result row, and no `released` row came after that run's
-`started_at`. So a lost write or a crash cannot leave the switch open. Rows and
+when any run of the window other than the reading one has no result row, or
+ended `halted`, `crashed` or `failed` with no `released` row after both its
+`started_at` and its `finished_at`. So a lost write or a crash cannot leave the
+switch open. A run with no result row is never cleared by a release, whatever
+the timestamps say: `paper resume` closes it as `crashed` before it releases,
+and a release stamped by a clock that runs ahead of the crashed run's must not
+clear a crash it never saw. Rows and
 runs of another window are ignored: a closed window's faulted run never engages
 the next one. "Latest" is write order (`event_id`), not `known_at`, because a
 row written on the halt path after a `ClockError` carries a real-time stamp
@@ -16,13 +20,22 @@ A reader that does not hold the run lock (`execution.lock`) passes
 `lock_free=is_held(...) is False`. While the lock is held, the window's latest
 unfinished run is the one in progress: the state reports `run_in_progress`
 for it instead of engaging. An older unfinished run still engages, because
-only one process can hold the lock. A run that holds the lock itself passes
-`lock_free=True` and its own `run_id` as `reading_run`.
+only one process can hold the lock. A process that holds the lock itself
+(`paper run`, `resume`, `reconcile`, `stop`, `abandon`) passes `lock_free=True`
+and never asks `is_held`, which reports its own lock as held and would hide a
+real crash; a run also passes its own `run_id` as `reading_run`.
+
+An `engage_kill_switch` override that no `engaged` row cites yet does not
+engage the derived state: it takes effect when the next run or phase boundary
+calls `engage_from_overrides`, which writes that row (spec req 5).
 
 **Writers.** Each opens its own write chunk (`store.db.open_for_write`, which
 retries the store lock for `store.lock_retry_seconds`) and stamps `at`,
 `known_at` and `ingested_at` from one reading of the caller's clock. After a
-`ClockError` the halt path passes `store.db.utc_now`.
+`ClockError` the halt path passes `store.db.utc_now`. The clock is read outside
+the write: an exception it raises propagates rather than becoming a
+`WriteFailed`. A caller must close its own connections to the store before
+calling a writer; an open one in the same process makes the write fail at once.
 
 - `engage` appends one `engaged` row. It returns `WriteFailed` when the store
   cannot be written, rather than raising, so the halt path can deliver
@@ -34,9 +47,14 @@ retries the store lock for `store.lock_retry_seconds`) and stamps `at`,
   override engages exactly once, and a later release does not re-arm it.
 - `release` appends the `released` row that ends an engagement. It carries
   the `resume_id`, the reconciliation that passed and the equity the drawdown
-  peak resets to. It refuses a reconciliation that is not `ok` or not this
-  window's, and a `resume_id` with no `resume_invocations` row. Only `paper
-  resume` calls it (T60e), after its own checks.
+  peak resets to. It is the only gate in code before a `released` row, so it
+  checks, in one transaction, that: the window is open; the reconciliation is
+  this window's latest and `ok`, and not older than the resume; the resume is
+  the latest `resume_invocations` row and no `released` row cites it yet; no
+  run of the window is unfinished; the switch is engaged (a release with
+  nothing engaged would only reset the drawdown peak); and the peak is a
+  positive finite number. Only `paper resume` calls it (T60e), after its own
+  checks.
 
 **Drawdown** (ADR 0010 point 1): at the mark step, ledger equity below the
 window's peak by more than the frozen `risk.max_drawdown`, strictly, engages
@@ -44,7 +62,9 @@ the switch with source `drawdown`. The peak is `paper_windows.starting_equity`,
 reset at each release to the `peak_equity` on the release row; it is not a
 running maximum. The trigger fires once per crossing. It is disarmed from its
 own `engaged` row until the next release, so a mark that stays below the line
-while the switch is engaged adds no second row.
+while the switch is engaged adds no second row. A non-finite equity or peak, or
+a peak that is not positive, raises `ValueError` rather than reading as "no
+drawdown", so the caller's halt path engages the switch instead.
 """
 
 from __future__ import annotations
@@ -65,8 +85,11 @@ from tradepartner.store.journal import (
     PaperRunRow,
     PaperWindowRow,
     append,
+    kill_switch_events_for,
+    open_window,
     reconciliations_for,
     resume_invocations,
+    runs_for,
     unconsumed_kill_switch_overrides,
 )
 
@@ -134,13 +157,11 @@ def derive(
             continue
         result = finished.get(run_id)
         if result is None:
-            fault = "unfinished"
-        elif result.status in FAULTED_RUN_STATUSES:
-            fault = result.status
-        else:
-            continue
-        if not any(at > run.started_at for at in releases):
-            causes.append(f"run {run_id} {fault}")
+            causes.append(f"run {run_id} unfinished")
+        elif result.status in FAULTED_RUN_STATUSES and not any(
+            at > run.started_at and at > result.finished_at for at in releases
+        ):
+            causes.append(f"run {run_id} {result.status}")
 
     return SwitchState(
         engaged=bool(causes), run_in_progress=in_progress is not None, causes=tuple(causes)
@@ -248,16 +269,17 @@ def release(
     peak_equity: float,
 ) -> int:
     """Append the `released` row (source `owner`) and return its `event_id`.
-    Raises `ValueError`, writing nothing, unless `reconciliation_id` is an `ok`
-    reconciliation of this window and `resume_id` a journaled resume. Store
-    errors propagate: the owner's `paper resume` reports them."""
+    Raises `ValueError`, writing nothing, when any check in the module docstring
+    fails. Store errors propagate: the owner's `paper resume` reports them."""
+    if not (math.isfinite(peak_equity) and peak_equity > 0):
+        raise ValueError(f"peak_equity must be positive and finite, got {peak_equity!r}")
     with open_for_write(settings) as conn:
+        window = open_window(conn)
+        if window is None or window.window_id != window_id:
+            raise ValueError(f"window {window_id} is not the open window")
+        reconciliations = reconciliations_for(conn, window_id)
         reconciliation = next(
-            (
-                r
-                for r in reconciliations_for(conn, window_id)
-                if r.reconciliation_id == reconciliation_id
-            ),
+            (r for r in reconciliations if r.reconciliation_id == reconciliation_id),
             None,
         )
         if reconciliation is None:
@@ -266,8 +288,38 @@ def release(
             raise ValueError(
                 f"reconciliation {reconciliation_id} is {reconciliation.status!r}, not ok"
             )
-        if all(r.resume_id != resume_id for r in resume_invocations(conn)):
+        latest = max(r.reconciliation_id or 0 for r in reconciliations)
+        if reconciliation_id != latest:
+            raise ValueError(
+                f"reconciliation {reconciliation_id} is not the window's latest ({latest})"
+            )
+        resumes = resume_invocations(conn)
+        resume = next((r for r in resumes if r.resume_id == resume_id), None)
+        if resume is None:
             raise ValueError(f"no resume_invocations row {resume_id}")
+        if resume_id != max(r.resume_id or 0 for r in resumes):
+            raise ValueError(f"resume {resume_id} is not the latest resume")
+        rows = kill_switch_events_for(conn, window_id)
+        if any(r.state == RELEASED and r.resume_id == resume_id for r in rows):
+            raise ValueError(f"resume {resume_id} has already released the switch")
+        if reconciliation.at < resume.at:
+            raise ValueError(f"reconciliation {reconciliation_id} is older than resume {resume_id}")
+        runs = runs_for(conn, window_id)
+        unfinished = [str(r.run.run_id) for r in runs if r.result is None]
+        if unfinished:
+            raise ValueError(
+                f"run(s) {', '.join(unfinished)} unfinished: close them as crashed first"
+            )
+        state = derive(
+            window,
+            rows,
+            [r.run for r in runs],
+            [r.result for r in runs if r.result is not None],
+            reading_run=None,
+            lock_free=True,
+        )
+        if not state.engaged:
+            raise ValueError(f"the kill switch of window {window_id} is not engaged")
         now = clock()
         return _append(
             conn,
@@ -287,15 +339,17 @@ def release(
 
 def drawdown_peak(window: PaperWindowRow, kill_switch_rows: Sequence[KillSwitchRow]) -> float:
     """The drawdown peak: the `peak_equity` of the window's last `released` row,
-    else its `starting_equity`."""
+    else its `starting_equity`. Raises `ValueError` when that value is missing,
+    not finite or not positive, rather than fall back to another peak."""
     releases = [
         r
         for r in sorted(kill_switch_rows, key=_event_order)
         if r.window_id == window.window_id and r.state == RELEASED
     ]
-    if releases and releases[-1].peak_equity is not None:
-        return releases[-1].peak_equity
-    return window.starting_equity
+    peak = releases[-1].peak_equity if releases else window.starting_equity
+    if peak is None or not (math.isfinite(peak) and peak > 0):
+        raise ValueError(f"window {window.window_id} has no usable drawdown peak: {peak!r}")
+    return peak
 
 
 def drawdown_armed(window_id: int, kill_switch_rows: Sequence[KillSwitchRow]) -> bool:
@@ -318,6 +372,9 @@ def drawdown_check(equity: float, peak: float, max_drawdown: float, *, armed: bo
     the peak), strictly. A drop equal to the threshold up to float rounding
     (`math.isclose`'s default relative tolerance) is at the threshold, so an
     equity of exactly `peak * (1 - max_drawdown)` never fires however it was
-    computed."""
+    computed. Raises `ValueError` for a non-finite `equity` or `peak`, or a peak
+    that is not positive."""
+    if not (math.isfinite(equity) and math.isfinite(peak) and peak > 0):
+        raise ValueError(f"drawdown needs finite equity and a positive peak: {equity!r}, {peak!r}")
     drop, threshold = peak - equity, peak * max_drawdown
     return armed and drop > threshold and not math.isclose(drop, threshold)

@@ -20,6 +20,10 @@ than "engaged" for an unfinished run while the lock is held
 as if a run held it; the caller of `run_lock` treats that like any other
 `locked` exit.
 
+The store and its lock file live on a local disk (the owner's Mac). On a
+network filesystem `flock` may be emulated per process and would not refuse a
+second holder in the same process.
+
 This is a separate lock from DuckDB's own file lock on the store, which is held
 only per write chunk (`store.db.open_for_write`) and released between chunks.
 """
@@ -80,7 +84,8 @@ def run_lock(settings: Settings) -> Iterator[None]:
 
 def is_held(settings: Settings) -> bool:
     """True while some process holds the run lock. Never creates the lock file:
-    before the first run there is no file and nothing holds it."""
+    before the first run there is no file and nothing holds it. A process that
+    holds the lock gets True here for its own lock; it must not ask."""
     path = lock_path(settings)
     try:
         fd = os.open(path, os.O_RDONLY)

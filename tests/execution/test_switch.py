@@ -35,10 +35,12 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     ReconciliationRow,
     ResumeInvocationRow,
     append,
     kill_switch_events_for,
+    runs_for,
 )
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -181,6 +183,24 @@ def test_a_release_before_the_faulted_run_started_does_not_clear_it() -> None:
     assert state.causes == ("run 1 crashed",)
 
 
+def test_a_release_never_clears_an_unfinished_run() -> None:
+    # The release's clock may run ahead of the crashed run's: a release stamped
+    # after its `started_at` still did not see it (resume closes it first).
+    runs = [_run(1, 0), _run(2, 60)]
+    rows = [_row(1, "engaged", 3), _row(2, "released", 120)]
+    state = derive(_window(), rows, runs, [_result(1, "ok", 5)], reading_run=None, lock_free=True)
+    assert state.engaged
+    assert state.causes == ("run 2 unfinished",)
+
+
+def test_a_release_before_the_faulted_run_finished_does_not_clear_it() -> None:
+    runs = [_run(1, 0), _run(2, 60)]
+    rows = [_row(1, "engaged", 3), _row(2, "released", 10)]
+    results = [_result(1, "halted", 20)]
+    state = derive(_window(), rows, runs, results, reading_run=2, lock_free=True)
+    assert state.causes == ("run 1 halted",)
+
+
 def test_a_held_lock_shows_the_latest_unfinished_run_as_in_progress() -> None:
     runs = [_run(1, 0), _run(2, 60)]
     state = derive(_window(), [], runs, [_result(1, "ok", 5)], reading_run=None, lock_free=False)
@@ -247,6 +267,29 @@ def test_drawdown_at_exactly_the_threshold_does_not_fire(peak: float, max_drawdo
     for equity in (peak - peak * max_drawdown, peak * (1 - max_drawdown)):
         assert not drawdown_check(equity, peak, max_drawdown, armed=True)
     assert drawdown_check(peak * (1 - max_drawdown) - 0.01, peak, max_drawdown, armed=True)
+
+
+@pytest.mark.parametrize(
+    ("equity", "peak"),
+    [
+        (float("nan"), 1000.0),
+        (float("-inf"), 1000.0),
+        (0.0, float("nan")),
+        (0.0, float("inf")),
+        (0.0, 0.0),
+        (-5.0, -10.0),
+    ],
+)
+def test_drawdown_refuses_a_value_it_cannot_judge(equity: float, peak: float) -> None:
+    with pytest.raises(ValueError, match="drawdown"):
+        drawdown_check(equity, peak, 0.30, armed=True)
+
+
+@pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), 0.0, -1.0])
+def test_the_peak_refuses_an_unusable_release_value(bad: float | None) -> None:
+    rows = [_row(1, "engaged", 5), _row(2, "released", 9, peak_equity=bad)]
+    with pytest.raises(ValueError, match="peak"):
+        drawdown_peak(_window(), rows)
 
 
 def test_a_disarmed_drawdown_never_fires() -> None:
@@ -456,21 +499,40 @@ def test_engage_from_overrides_returns_a_write_failure_when_locked(locked_store:
 
 
 def _resume_and_reconciliation(
-    settings: Settings, status: str, window_id: int = _WINDOW
+    settings: Settings,
+    status: str,
+    window_id: int = _WINDOW,
+    *,
+    resume_at: int = 60,
+    reconciled_at: int = 61,
 ) -> tuple[int, int]:
+    return _resume(settings, resume_at), _reconciliation(settings, status, window_id, reconciled_at)
+
+
+def _resume(settings: Settings, minutes: int = 60) -> int:
     with open_for_write(settings) as conn:
         resume_id = append(
             conn,
             ResumeInvocationRow(
-                at=_at(60), reason="checked", accept_broker_fills=False, **_stamp(60)
+                at=_at(minutes), reason="checked", accept_broker_fills=False, **_stamp(minutes)
             ),
         )
+    assert resume_id is not None
+    return resume_id
+
+
+def _reconciliation(
+    settings: Settings, status: str = "ok", window_id: int = _WINDOW, minutes: int = 61
+) -> int:
+    with open_for_write(settings) as conn:
         reconciliation_id = append(
             conn,
-            ReconciliationRow(window_id=window_id, at=_at(61), status=status, **_stamp(61)),
+            ReconciliationRow(
+                window_id=window_id, at=_at(minutes), status=status, **_stamp(minutes)
+            ),
         )
-    assert resume_id is not None and reconciliation_id is not None
-    return resume_id, reconciliation_id
+    assert reconciliation_id is not None
+    return reconciliation_id
 
 
 def test_release_appends_the_released_row_with_the_peak(store: Settings) -> None:
@@ -537,3 +599,114 @@ def test_the_module_never_updates_or_deletes() -> None:
     text = inspect.getsource(switch).upper()
     assert "UPDATE " not in text
     assert "DELETE " not in text
+
+
+def _release(
+    settings: Settings, resume_id: int, reconciliation_id: int, peak: float = 900.0
+) -> int:
+    return release(
+        settings,
+        _Clock(),
+        window_id=_WINDOW,
+        resume_id=resume_id,
+        reconciliation_id=reconciliation_id,
+        peak_equity=peak,
+    )
+
+
+def _engaged(settings: Settings) -> None:
+    assert isinstance(
+        engage(settings, _Clock(), window_id=_WINDOW, source="owner", reason="paper kill"), int
+    )
+
+
+@pytest.mark.parametrize("peak", [float("nan"), float("inf"), 0.0, -100.0])
+def test_release_refuses_an_unusable_peak(store: Settings, peak: float) -> None:
+    _engaged(store)
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ValueError, match="peak_equity"):
+        _release(store, resume_id, reconciliation_id, peak)
+    assert [r.state for r in _rows(store)] == ["engaged"]
+
+
+def test_release_refuses_an_older_ok_reconciliation(store: Settings) -> None:
+    _engaged(store)
+    resume_id, old_ok = _resume_and_reconciliation(store, "ok")
+    _reconciliation(store, "mismatch", minutes=62)
+    with pytest.raises(ValueError, match="latest"):
+        _release(store, resume_id, old_ok)
+    assert [r.state for r in _rows(store)] == ["engaged"]
+
+
+def test_release_refuses_an_older_resume(store: Settings) -> None:
+    _engaged(store)
+    old_resume = _resume(store, 60)
+    _resume(store, 61)
+    reconciliation_id = _reconciliation(store, minutes=62)
+    with pytest.raises(ValueError, match="latest resume"):
+        _release(store, old_resume, reconciliation_id)
+
+
+def test_release_refuses_a_resume_that_already_released(store: Settings) -> None:
+    _engaged(store)
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    _release(store, resume_id, reconciliation_id)
+    _engaged(store)
+    again = _reconciliation(store, minutes=70)
+    with pytest.raises(ValueError, match="already released"):
+        _release(store, resume_id, again)
+
+
+def test_release_refuses_a_reconciliation_older_than_the_resume(store: Settings) -> None:
+    _engaged(store)
+    resume_id, reconciliation_id = _resume_and_reconciliation(
+        store, "ok", resume_at=60, reconciled_at=59
+    )
+    with pytest.raises(ValueError, match="older than resume"):
+        _release(store, resume_id, reconciliation_id)
+
+
+def test_release_refuses_when_nothing_is_engaged(store: Settings) -> None:
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ValueError, match="not engaged"):
+        _release(store, resume_id, reconciliation_id)
+    assert _rows(store) == []
+
+
+def test_release_refuses_while_a_run_is_unfinished(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        append(conn, _run(5, 10))
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ValueError, match=r"run\(s\) 5 unfinished"):
+        _release(store, resume_id, reconciliation_id)
+    assert _rows(store) == []
+
+
+def test_release_clears_a_crash_the_resume_closed(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        append(conn, _run(5, 10))
+        append(conn, _result(5, "crashed", 59))
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    _release(store, resume_id, reconciliation_id)
+    with open_read_only(store) as conn:
+        runs = runs_for(conn, _WINDOW)
+    state = derive(
+        _window(),
+        _rows(store),
+        [r.run for r in runs],
+        [r.result for r in runs if r.result is not None],
+        reading_run=None,
+        lock_free=True,
+    )
+    assert not state.engaged
+
+
+def test_release_refuses_a_window_that_is_not_open(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        append(
+            conn,
+            PaperWindowStopRow(window_id=_WINDOW, at=_at(80), state="closed", **_stamp(80)),
+        )
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ValueError, match="not the open window"):
+        _release(store, resume_id, reconciliation_id)
