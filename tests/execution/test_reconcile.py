@@ -216,7 +216,9 @@ def test_a_journal_open_order_the_broker_holds_open_matches() -> None:
         1_000.0,
         open_orders=[reading],
         journal_open=[
-            JournalOpenOrder(row, pending=False, journaled_quantity=0.0, reading=reading)
+            JournalOpenOrder(
+                row, pending=False, journaled_quantity=0.0, journaled_notional=0.0, reading=reading
+            )
         ],
     )
     assert result.status == "ok"
@@ -230,7 +232,9 @@ def test_a_journal_open_order_the_broker_calls_open_but_does_not_list_is_a_misma
         _positions(AAA=1.0),
         1_000.0,
         journal_open=[
-            JournalOpenOrder(row, pending=False, journaled_quantity=0.0, reading=reading)
+            JournalOpenOrder(
+                row, pending=False, journaled_quantity=0.0, journaled_notional=0.0, reading=reading
+            )
         ],
     )
     assert _kinds(result) == ["missing_open_order"]
@@ -242,7 +246,11 @@ def test_an_acknowledged_open_order_without_a_reading_is_a_mismatch() -> None:
         _ledger(SEC_A=1.0),
         _positions(AAA=1.0),
         1_000.0,
-        journal_open=[JournalOpenOrder(row, pending=False, journaled_quantity=0.0, reading=None)],
+        journal_open=[
+            JournalOpenOrder(
+                row, pending=False, journaled_quantity=0.0, journaled_notional=0.0, reading=None
+            )
+        ],
     )
     assert _kinds(result) == ["missing_open_order"]
 
@@ -255,7 +263,13 @@ def test_a_journal_open_order_the_broker_finished_with_every_fill_collected_is_o
         _positions(AAA=3.0),
         800.0,
         journal_open=[
-            JournalOpenOrder(row, pending=False, journaled_quantity=2.0, reading=reading)
+            JournalOpenOrder(
+                row,
+                pending=False,
+                journaled_quantity=2.0,
+                journaled_notional=200.0,
+                reading=reading,
+            )
         ],
     )
     assert result.status == "ok"
@@ -378,13 +392,13 @@ def test_two_ended_listings_share_the_cash_by_reference_value() -> None:
     result = _run(
         _ledger(1_000.0, SEC_A=1.0, SEC_B=2.0),  # reference values 100 and 100
         {},
-        1_300.0,
+        1_150.0,
         explanations=_explanations(ended=frozenset({"SEC_A", "SEC_B"})),
     )
     assert result.status == "ok"
     assert sorted((a.security_id, a.cash) for a in result.adjustments) == [
-        ("SEC_A", pytest.approx(150.0)),
-        ("SEC_B", pytest.approx(150.0)),
+        ("SEC_A", pytest.approx(75.0)),
+        ("SEC_B", pytest.approx(75.0)),
     ]
 
 
@@ -404,7 +418,7 @@ def test_a_spin_off_child_explains_a_new_position() -> None:
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0, KID=2.5),
         1_000.0,
-        explanations=_explanations(spinoffs={"SEC_KID": "SEC_A"}),
+        explanations=_explanations(spinoffs={"SEC_KID": ("SEC_A", 0.25)}),
     )
 
     assert result.status == "ok"
@@ -422,7 +436,7 @@ def test_a_spin_off_child_of_a_name_not_held_is_a_mismatch() -> None:
         _ledger(1_000.0, SEC_B=1.0),
         _positions(BBB=1.0, KID=2.5),
         1_000.0,
-        explanations=_explanations(spinoffs={"SEC_KID": "SEC_A"}),
+        explanations=_explanations(spinoffs={"SEC_KID": ("SEC_A", 0.25)}),
     )
     assert _kinds(result) == ["broker_only_position"]
 
@@ -432,7 +446,7 @@ def test_a_credited_dividend_explains_the_cash() -> None:
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
         1_004.5,
-        explanations=_explanations(dividends={"SEC_A": 0.45}),
+        explanations=_explanations(dividends={"SEC_A": 4.5}),
     )
 
     assert result.status == "ok"
@@ -450,7 +464,7 @@ def test_a_dividend_not_credited_is_not_journaled() -> None:
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
         1_000.0,
-        explanations=_explanations(dividends={"SEC_A": 0.45}),
+        explanations=_explanations(dividends={"SEC_A": 4.5}),
     )
     assert result.status == "ok"
     assert result.adjustments == ()
@@ -461,7 +475,7 @@ def test_a_cash_difference_other_than_the_dividend_is_a_mismatch() -> None:
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0),
         1_006.0,
-        explanations=_explanations(dividends={"SEC_A": 0.45}),
+        explanations=_explanations(dividends={"SEC_A": 4.5}),
     )
     assert _kinds(result) == ["cash"]
     assert result.adjustments == ()
@@ -476,6 +490,7 @@ def _lagging_buy(filled: float, journaled: float, avg: float = 100.0) -> Journal
         row,
         pending=False,
         journaled_quantity=journaled,
+        journaled_notional=journaled * avg,
         reading=_reading(row, OrderStatus.FILLED, filled=filled, avg=avg),
     )
 
@@ -537,6 +552,7 @@ def _pending(coid: str, security_id: str, side: str, **size: float) -> JournalOp
         _order_row(coid, security_id, side, **size),
         pending=True,
         journaled_quantity=0.0,
+        journaled_notional=0.0,
         reading=None,
     )
 
@@ -620,4 +636,231 @@ def test_the_mismatches_json_is_stable() -> None:
         "lagging",
         "pending",
         "explained",
+        "allowed",
     }
+
+
+# --- review fixes: bounds, deferral, validation ---------------------------------
+
+
+def test_ended_listing_proceeds_above_the_reference_value_cap_are_a_mismatch() -> None:
+    """4 SEC_B at a 50 reference with the 2% buffer caps the proceeds at 204."""
+    inside = _run(
+        _ledger(1_000.0, SEC_B=4.0),
+        {},
+        1_204.0,
+        explanations=_explanations(ended=frozenset({"SEC_B"})),
+    )
+    assert inside.status == "ok"
+    beyond = _run(
+        _ledger(1_000.0, SEC_B=4.0),
+        {},
+        1_205.0,
+        explanations=_explanations(ended=frozenset({"SEC_B"})),
+    )
+    assert _kinds(beyond) == ["cash"]
+    assert beyond.adjustments == ()
+
+
+def test_an_ended_listing_during_a_lag_is_deferred_not_journaled() -> None:
+    """Ended SEC_B paying 190 and a lagging SEC_A buy of 300: the cash is -110.
+    Journaling proceeds now would book 0 and halt later, so nothing is proposed."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=12.0, SEC_B=4.0),
+        _positions(AAA=15.0),
+        890.0,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(ended=frozenset({"SEC_B"})),
+    )
+    assert result.status == "fills_lagging"
+    assert result.adjustments == ()
+    assert result.explained == ()
+    reasons = {a.reason for a in result.allowed}
+    assert "deferred ended listing" in reasons
+
+
+def test_an_ended_listing_while_an_order_is_pending_is_deferred() -> None:
+    pending = _pending("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", notional=200.0)
+    result = _run(
+        _ledger(1_000.0, SEC_B=4.0),
+        {},
+        1_190.0,
+        journal_open=[pending],
+        explanations=_explanations(ended=frozenset({"SEC_B"})),
+    )
+    assert result.status == "pending_unresolved"
+    assert result.adjustments == ()
+
+
+def test_a_spin_off_during_a_lag_is_deferred() -> None:
+    result = _run(
+        _ledger(700.0, SEC_A=12.0),
+        _positions(AAA=15.0, KID=3.0),
+        400.0,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(spinoffs={"SEC_KID": ("SEC_A", 0.25)}),
+    )
+    assert result.status == "fills_lagging"
+    assert result.adjustments == ()
+    assert [a.reason for a in result.allowed if a.security_id == "SEC_KID"] == [
+        "deferred spin-off receipt"
+    ]
+
+
+def test_a_spin_off_must_match_its_ratio() -> None:
+    """10 parent shares at 0.25 is 2.5 children: 3 is too many, 1.4 too few
+    even for cash in lieu of a fraction."""
+    for received in (3.0, 1.4):
+        result = _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0, KID=received),
+            1_000.0,
+            explanations=_explanations(spinoffs={"SEC_KID": ("SEC_A", 0.25)}),
+        )
+        assert _kinds(result) == ["broker_only_position"], received
+    in_lieu = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0, KID=2.0),
+        1_001.0,
+        explanations=_explanations(spinoffs={"SEC_KID": ("SEC_A", 0.25)}),
+    )
+    assert _kinds(in_lieu) == ["cash"]  # the cash in lieu is not explained here
+    assert in_lieu.explained[0].quantity == 2.0
+
+
+def test_the_lag_cash_allowance_is_the_unjournaled_notional() -> None:
+    """50 journaled at 100, then 50 more at 102: the reading averages 101 on
+    100, so 5,100 of cash is still unjournaled, not 50 x 101 = 5,050."""
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", quantity=100.0)
+    item = JournalOpenOrder(
+        row,
+        pending=False,
+        journaled_quantity=50.0,
+        journaled_notional=5_000.0,
+        reading=_reading(row, OrderStatus.FILLED, filled=100.0, avg=101.0),
+    )
+    result = _run(
+        _ledger(10_000.0, SEC_A=50.0), _positions(AAA=100.0), 4_900.0, journal_open=[item]
+    )
+    assert result.status == "fills_lagging"
+
+
+def test_a_lagging_sell_allows_more_cash_and_fewer_shares() -> None:
+    row = _order_row("tp-20261007-SEC_A-sell-1", "SEC_A", "sell", quantity=5.0)
+    item = JournalOpenOrder(
+        row,
+        pending=False,
+        journaled_quantity=2.0,
+        journaled_notional=200.0,
+        reading=_reading(row, OrderStatus.FILLED, filled=5.0, avg=100.0),
+    )
+    ok = _run(_ledger(1_000.0, SEC_A=8.0), _positions(AAA=5.0), 1_300.0, journal_open=[item])
+    assert ok.status == "fills_lagging"
+    wrong_way = _run(_ledger(1_000.0, SEC_A=8.0), _positions(AAA=11.0), 700.0, journal_open=[item])
+    assert sorted(_kinds(wrong_way)) == ["cash", "quantity"]
+
+
+@pytest.mark.parametrize(
+    ("filled", "avg"),
+    [(5.0, None), (5.0, 0.0), (5.0, float("inf")), (float("inf"), 100.0), (50.0, 100.0)],
+)
+def test_a_reading_that_cannot_bound_the_lag_is_a_mismatch(
+    filled: float, avg: float | None
+) -> None:
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", quantity=5.0)
+    reading = Order.__new__(Order)  # bypass validation to model a bad adapter reading
+    object.__setattr__(
+        reading,
+        "__dict__",
+        {
+            **vars(_reading(row, OrderStatus.ACCEPTED)),
+            "filled_quantity": filled,
+            "filled_avg_price": avg,
+        },
+    )
+    item = JournalOpenOrder(
+        row, pending=False, journaled_quantity=2.0, journaled_notional=200.0, reading=reading
+    )
+    result = _run(
+        _ledger(1_000.0, SEC_A=2.0),
+        _positions(AAA=2.0),
+        1_000.0,
+        open_orders=[reading],
+        journal_open=[item],
+    )
+    assert "bad_reading" in _kinds(result)
+
+
+def test_pending_allowances_are_one_way_and_listed() -> None:
+    pending = _pending("tp-20261007-SEC_B-buy-1", "SEC_B", "buy", notional=200.0)
+    wrong_way = _run(
+        _ledger(1_000.0, SEC_B=4.0), _positions(BBB=1.0), 1_150.0, journal_open=[pending]
+    )
+    assert sorted(_kinds(wrong_way)) == ["cash", "quantity"]
+    too_many = _run(_ledger(1_000.0), _positions(BBB=4.2), 800.0, journal_open=[pending])
+    assert _kinds(too_many) == ["broker_only_position"]  # 200 / 50 x 1.02 = 4.08
+    inside = _run(_ledger(1_000.0), _positions(BBB=3.9), 805.0, journal_open=[pending])
+    listed = json.loads(inside.mismatches_json)["allowed"]
+    assert {entry["reason"] for entry in listed} == {
+        "cash within the open allowances",
+        "quantity within the open allowances",
+    }
+
+
+def test_adjustments_are_proposed_only_on_an_ok_result() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_004.5,
+        explanations=_explanations(dividends={"SEC_A": 4.5}),
+        account_id="other",
+    )
+    assert result.status == "mismatch"
+    assert result.adjustments == ()
+    assert [a.kind for a in result.explained] == ["dividend_cash"]
+
+
+def test_an_own_open_order_for_another_symbol_differs_from_its_row() -> None:
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", notional=100.0)
+    swapped = _reading(
+        _order_row(row.client_order_id, "SEC_B", "buy", notional=100.0), OrderStatus.ACCEPTED
+    )
+    result = _run(
+        _ledger(SEC_A=1.0),
+        _positions(AAA=1.0),
+        1_000.0,
+        open_orders=[swapped],
+        journal_open=[
+            JournalOpenOrder(
+                row,
+                pending=False,
+                journaled_quantity=0.0,
+                journaled_notional=0.0,
+                reading=_reading(row, OrderStatus.ACCEPTED),
+            )
+        ],
+    )
+    assert _kinds(result) == ["open_order_differs"]
+
+
+def test_inputs_that_cannot_be_compared_raise() -> None:
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", notional=100.0)
+    item = JournalOpenOrder(
+        row,
+        pending=False,
+        journaled_quantity=0.0,
+        journaled_notional=0.0,
+        reading=_reading(row, OrderStatus.ACCEPTED),
+    )
+    with pytest.raises(ValueError, match="twice"):
+        _run(_ledger(), {}, 1_000.0, open_orders=[item.reading], journal_open=[item, item])  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="finite"):
+        _run(_ledger(float("nan")), {}, 1_000.0)
+    with pytest.raises(ValueError, match="finite"):
+        _run(_ledger(), {}, float("inf"))
+    with pytest.raises(ValueError, match="reference price"):
+        _run(_ledger(), {}, 1_000.0, explanations=_explanations(reference_prices={"SEC_A": 0.0}))
+    with pytest.raises(ValueError, match="maps from"):
+        _run(
+            _ledger(), {}, 1_000.0, explanations=_explanations(symbols={"SEC_A": "X", "SEC_B": "X"})
+        )
