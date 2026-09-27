@@ -310,7 +310,7 @@ why = "Phase 4 has no spec or plan; without one the wrapper, the run and the pag
 unblocks = ["spec:paper-trading"]
 
 [plan.paper-trading]
-what = "The Phase 4 build document: 49 tasks, one PR each, from broker types to the phase-close evidence, grouped in chains."
+what = "The Phase 4 build document: 50 tasks, one PR each, from broker types to the phase-close evidence, grouped in chains."
 why = "What the ready frontier is computed from once Phase 3 closes; six unattended paper rebalances under these tasks are the MVP's finish line."
 unblocks = ["phase:4"]
 
@@ -452,15 +452,19 @@ what = "The run's trade step: the submit window, the hand-off to the wrapper, an
 why = "Orders go only inside the window the owner set, and a rebalance is executed only when every decision is done."
 
 [task.T63e]
-what = "Forced exits for delisted names and spin-off receipts, and the stop runs that flatten the account when a window closes."
-why = "The only intra-month trades allowed, and the only legal way to a flat account."
+what = "Forced exits for delisted names and spin-off receipts, the only intra-month trades allowed."
+why = "A name that vanished from the exchange is sold at its last venue, never held in limbo."
 
 [task.T63f]
+what = "The stop runs that flatten the account through the wrapper when a window closes, leaving only residues."
+why = "The only legal way to a flat account; the owner never trades by hand."
+
+[task.T63g]
 what = "The no-look-ahead suite for the tracking run: cutting the store, journal included, at the previous close changes nothing."
 why = "The same guard rail the backtest has, applied to the paper path."
 
-[task.T63g]
-what = "End-to-end tests for a crash, the resume and the next run, the fill-lag bound, and every alert kind."
+[task.T63h]
+what = "End-to-end tests for a crash, the resume and the next run, the fill-lag bound, the journal chain, and every alert kind."
 why = "The recovery path is where money is lost; it is tested as a whole, not only in pieces."
 
 [task.T64]
