@@ -1,6 +1,6 @@
 # Dashboard design standard
 
-**Status:** Accepted v1.0 (#165, 2026-09-25) · **Applies to:** every dashboard page from T21 (data health) and T44 (trial registry) onward; T43's backtest page, merged before this standard, is retrofitted by T44 · **Owner:** Jose
+**Status:** Accepted v1.1 (#165, 2026-09-25; open decision closed by [ADR 0011](../decisions/0011-dashboard-technology.md), #268, 2026-09-26) · **Applies to:** every dashboard page from T21 (data health) and T44 (trial registry) onward; T43's backtest page, merged before this standard, is retrofitted by T44 · **Owner:** Jose
 
 ## Why this exists
 
@@ -78,12 +78,13 @@ Interaction defaults: every chart with a plot has a hover layer; hit targets are
 - One CSS block injected once in `app.py` styles cards (`div[data-testid="stVerticalBlockBorderWrapper"]`), metric tiles (`div[data-testid="stMetric"]`) and tables; pages never inject their own CSS.
 - Charts are Plotly with a shared template from `theme.py`; a page never sets a colour literally. Categorical slot order is the template's `colorway`.
 - `st.set_page_config(layout="wide")` stays; the grid is `st.columns` with the ratios above.
-- Every page is a pure function of a read-only connection and a date range (T21a), so it renders headless in tests; the tests assert the header shows "as of" and "last updated" and that no colour literal appears in page code.
+- Every page is a pure function of a read-only connection and a date range (T21a), so it renders headless in tests; the tests assert the header shows "as of" and "last updated" and that no colour literal appears in page code. The one exception is the override page's **submit** (ADR 0011, 2026-09-26): the form still renders read-only, but the shell runs its submit through the store's own writer before it opens the read-only connection, since a write cannot open in-process while a read connection is held.
+- `.streamlit/config.toml` binds Streamlit's server to localhost and turns usage telemetry off (ADR 0011); a test pins both.
 
 ## What stays out
 
 Chat assistants, "AI insight" cards, upgrade or promotional banners, user avatars and notifications (single owner, local), live-streaming widgets, and any widget that writes to the store other than the override form. If a mock shows it and this list names it, it is out.
 
-## Open decision, closed
+## Open decision, closed (formerly "Open decision, deferred")
 
-Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, was the one decision this standard left open for the start of Phase 4. [ADR 0011](../decisions/0011-dashboard-technology.md) (#268, owner decision on #247 question 1, 2026-09-27) decides it: **Streamlit under this standard, no separate API**. Pages stay pure functions of a read-only connection, the operations page draws `execution.ops.page_data`, the override form is the only write and calls the store's own writer, and the roadmap's "no separate API, no duplicated logic" rule stands. A React front end is the rejected option, with the conditions for revisiting it, in the ADR.
+Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, was the one decision this standard left open for the start of Phase 4. [ADR 0011](../decisions/0011-dashboard-technology.md) (#268, owner decision on #247 question 1, 2026-09-26 ET) decides it: **Streamlit under this standard, no separate API, Streamlit's own server bound to localhost**. Pages render as pure functions of a read-only connection, the operations page draws `execution.ops.page_data`, the override form is the only write and its submit calls the store's own writer outside the shell's read-only connection, and the roadmap's "no separate API, no duplicated logic" rule stands. A React front end is the rejected option, with the conditions for revisiting it, in the ADR.
