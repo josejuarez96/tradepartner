@@ -93,6 +93,7 @@ def make_order(**overrides: Any) -> Order:
         "client_order_id": "co-1",
         "symbol": "AAPL",
         "side": Side.BUY,
+        "notional": None,
         "quantity": 1,
         "status": OrderStatus.ACCEPTED,
         "submitted_at": T0,
