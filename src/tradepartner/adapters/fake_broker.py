@@ -128,9 +128,16 @@ class FakeBroker(Broker):
     def _now(self) -> datetime:
         """One clock reading, tz-aware UTC, or `ClockError` (module docstring)."""
         try:
-            return ensure_tz_aware_utc(self._clock(), field_name="clock")
+            reading = self._clock()
+            if not isinstance(reading, datetime):
+                # `ensure_tz_aware_utc` duck-types; an object with `tzinfo`,
+                # `utcoffset` and `astimezone` would pass it.
+                raise TypeError(f"clock returned {type(reading).__name__}, not datetime")
+            return ensure_tz_aware_utc(reading, field_name="clock")
         except Exception as exc:
-            raise ClockError(f"clock failed: {type(exc).__name__}: {exc}") from exc
+            # The type only: the chained cause keeps the detail, and a
+            # broker-sourced clock's message could carry request details.
+            raise ClockError(f"clock failed: {type(exc).__name__}") from exc
 
     def _simulate_fill(self, *, client_order_id: str, filled_at: datetime) -> Order:
         order = self._require_order(client_order_id)

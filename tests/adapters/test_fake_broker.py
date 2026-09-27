@@ -560,13 +560,26 @@ def _raising_clock() -> datetime:
     raise RuntimeError("clock source unavailable")
 
 
+class _DatetimeLookalike:
+    """Not a `datetime`, but has every attribute `ensure_tz_aware_utc` reads."""
+
+    tzinfo = UTC
+
+    def utcoffset(self) -> timedelta:
+        return timedelta(0)
+
+    def astimezone(self, tz: object) -> _DatetimeLookalike:
+        return self
+
+
 #: (id, a bad clock reading or a callable that raises, the original error type)
 _BAD_CLOCKS: list[tuple[str, object, type[BaseException]]] = [
     ("naive", datetime(2026, 1, 5, 15, 0), ValueError),  # noqa: DTZ001
     ("overflow-min", _OVERFLOWING_DATETIMES[0], ValueError),
     ("overflow-max", _OVERFLOWING_DATETIMES[1], ValueError),
-    ("not-a-datetime-str", "2026-01-05T15:00:00+00:00", AttributeError),
-    ("not-a-datetime-none", None, AttributeError),
+    ("not-a-datetime-str", "2026-01-05T15:00:00+00:00", TypeError),
+    ("not-a-datetime-none", None, TypeError),
+    ("not-a-datetime-lookalike", _DatetimeLookalike(), TypeError),
     ("raises", _raising_clock, RuntimeError),
 ]
 
@@ -627,10 +640,15 @@ def test_a_bad_clock_makes_submit_raise_clock_error_without_auto_fill(
     clock = _SwitchableClock(bad)
     clock.good = False
     broker = FakeBroker(clock=clock, auto_fill=False)
-    with pytest.raises(ClockError):
+    with pytest.raises(ClockError) as caught:
         broker.submit(make_request())
+    assert isinstance(caught.value.__cause__, cause)
     with pytest.raises(UnknownOrderError):
         broker.cancel("co-1")
+    assert broker.fills() == []
+    assert broker.positions() == {}
+    clock.good = True
+    assert broker.submit(make_request()).status is OrderStatus.OPEN
 
 
 @pytest.mark.parametrize(
@@ -663,10 +681,15 @@ def test_a_bad_clock_makes_simulate_fill_raise_clock_error_and_changes_nothing(
     assert len(broker.fills()) == len(fills_before) + 1
 
 
-def test_a_clock_error_names_the_clock() -> None:
-    broker = FakeBroker(clock=lambda: datetime(2026, 1, 5, 15, 0))  # noqa: DTZ001
-    with pytest.raises(ClockError, match="clock"):
+def test_a_clock_error_names_the_clock_and_only_the_cause_type() -> None:
+    def leaky() -> datetime:
+        raise RuntimeError("GET https://broker.example/clock?key=do-not-print")
+
+    broker = FakeBroker(clock=leaky)
+    with pytest.raises(ClockError, match=r"^clock failed: RuntimeError$") as caught:
         broker.submit(make_request())
+    assert "do-not-print" not in str(caught.value)
+    assert "do-not-print" in str(caught.value.__cause__)  # the chain keeps the detail
 
 
 def test_a_base_exception_from_the_clock_is_not_turned_into_a_clock_error() -> None:
