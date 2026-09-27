@@ -491,6 +491,89 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
     assert "; pre-XML delistings: 7; unstamped delistings: 2; missing" in message
 
 
+def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
+    """T11h: failed filings, quarantined accessions and facts missing."""
+
+    class Failing(FixtureFilingSource):
+        failed_filings = 2
+        quarantined = 1
+        facts_missing = 4
+
+    message = _run(settings, filings=_filings(cls=Failing), source="edgar").runs[0].message
+    counts = "; failed filings: 2; quarantined: 1; facts missing: 4; missing"
+    assert counts in message
+
+
+class _RecordFailures(FixtureFilingSource):
+    """Records every `record_failures()` call on a list shared with the test."""
+
+    def __init__(self, calls: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._calls = calls
+
+    def record_failures(self) -> None:
+        self._calls.append("called")
+
+
+def test_after_commit_is_called_only_after_a_committed_ok_edgar_chunk(
+    settings: Settings,
+) -> None:
+    calls: list[str] = []
+    filings = _filings(cls=lambda **kw: _RecordFailures(calls, **kw))
+    result = _run(settings, filings=filings, source="all")
+    assert result.ok
+    assert calls == ["called"]  # once for edgar; alpaca has no `record_failures`
+
+
+def test_after_commit_is_not_called_for_a_dry_run(settings: Settings) -> None:
+    calls: list[str] = []
+    filings = _filings(cls=lambda **kw: _RecordFailures(calls, **kw))
+    result = _run(settings, filings=filings, source="edgar", dry_run=True)
+    assert result.runs[0].status == OK
+    assert calls == []
+
+
+def test_after_commit_is_not_called_for_a_failed_chunk(settings: Settings) -> None:
+    calls: list[str] = []
+
+    class Broken(_RecordFailures):
+        def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+            raise RuntimeError("companyfacts 503")
+
+    filings = _filings(cls=lambda **kw: Broken(calls, **kw))
+    result = _run(settings, filings=filings, source="edgar")
+    assert result.runs[0].status == FAILED
+    assert calls == []
+
+
+def test_after_commit_exception_leaves_status_ok_and_the_committed_row_untouched(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    class Boom(FixtureFilingSource):
+        def record_failures(self) -> None:
+            raise RuntimeError("disk full")
+
+    result = _run(settings, filings=_filings(cls=Boom), source="edgar")
+    run = result.runs[0]
+    assert run.status == OK
+    assert "after_commit: RuntimeError: disk full" in run.message
+    stored_message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "after_commit" not in stored_message  # the committed row was never rewritten
+
+
+def test_check_failures_raising_fails_the_chunk_with_one_failed_run_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    class Unhealthy(FixtureFilingSource):
+        def check_failures(self) -> None:
+            raise RuntimeError("too many failures")
+
+    result = _run(settings, filings=_filings(cls=Unhealthy), source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "too many failures" in result.runs[0].message
+    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:
     message = _run(settings, source="edgar").runs[0].message
     assert "unstamped" not in message and "skipped" not in message
