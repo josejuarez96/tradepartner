@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+from pydantic import SecretStr
 
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -317,17 +318,26 @@ def _record_only(
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
+def _secret_values(settings: Settings) -> list[str]:
+    """The value of every `SecretStr` field on `settings`, found by type, so a
+    secret added to `Settings` later is redacted without editing this list
+    (#334). Blank values are left out; longest first, so a secret that
+    contains another is redacted whole."""
+    values = []
+    for name in type(settings).model_fields:
+        secret = getattr(settings, name)
+        if isinstance(secret, SecretStr):
+            value = secret.get_secret_value().strip()
+            if value:
+                values.append(value)
+    return sorted(set(values), key=len, reverse=True)
+
+
 def _clean(message: str, settings: Settings) -> str:
-    """`message` with configured secrets redacted, control characters
+    """`message` with every configured secret redacted, control characters
     replaced by a space, and cut to `ingest.max_message_chars`."""
-    for secret in (
-        settings.alpaca_api_key,
-        settings.alpaca_api_secret,
-        settings.sec_edgar_user_agent,
-    ):
-        value = secret.get_secret_value().strip() if secret is not None else ""
-        if value:
-            message = message.replace(value, "[redacted]")
+    for value in _secret_values(settings):
+        message = message.replace(value, "[redacted]")
     return _CONTROL.sub(" ", message)[: settings.ingest.max_message_chars]
 
 

@@ -242,7 +242,22 @@ def _configured_secrets(settings: Settings) -> list[str]:
     for key, secret in ((api_key, api_secret), (paper_key, paper_secret)):
         if key is not None and secret is not None:
             values.append(base64.b64encode(f"{key}:{secret}".encode()).decode())
+    values.extend(_smtp_login_forms(settings))
     return values
+
+
+def _smtp_login_forms(settings: Settings) -> list[str]:
+    """The base64 forms SMTP AUTH sends for the alert credentials (#334):
+    `AUTH PLAIN` carries base64("\\0user\\0password"), and `AUTH LOGIN` sends
+    base64(user) and base64(password) on their own. A raw-value scrub would
+    miss them in a transcript or an exception, so they are scrubbed too. The
+    alert delivery path must never enable `smtplib` debug output regardless."""
+    user = _non_blank_secret(settings.alert_smtp_user)
+    password = _non_blank_secret(settings.alert_smtp_password)
+    forms = [base64.b64encode(v.encode()).decode() for v in (user, password) if v]
+    if user is not None and password is not None:
+        forms.append(base64.b64encode(f"\0{user}\0{password}".encode()).decode())
+    return forms
 
 
 def _missing_secret_names(settings: Settings) -> list[str]:
@@ -874,7 +889,9 @@ def _run_paper(
     try:
         recordings = _record_paper(raw, settings, non_fractionable, now or datetime.now(UTC))
     except (PaperRecordingError, AlpacaTradingError) as error:
-        print(f"cli_record: {error}", file=sys.stderr)
+        # An adapter error can echo a response body; scrub it like a fixture (#334).
+        message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
+        print(f"cli_record: {message}", file=sys.stderr)
         return 1
     account = recordings["account_before"]
     secrets = _configured_secrets(settings) + [

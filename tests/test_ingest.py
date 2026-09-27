@@ -1015,3 +1015,40 @@ def test_a_dry_run_whose_check_failures_raises_writes_no_run_row(
     result = _run(settings, filings=_filings(cls=Unhealthy), source="edgar", dry_run=True)
     assert result.runs[0].status == FAILED
     assert read("SELECT count(*) FROM ingestion_runs") == before
+
+
+# --- #334: every SecretStr field is redacted from run messages ---------------
+
+
+def _secret_fields() -> list[str]:
+    from pydantic import SecretStr
+
+    return sorted(
+        name
+        for name, field in Settings.model_fields.items()
+        if "SecretStr" in str(field.annotation) or field.annotation is SecretStr
+    )
+
+
+def test_every_secret_field_is_redacted_from_run_messages() -> None:
+    from tradepartner.ingest import _clean
+
+    fields = _secret_fields()
+    # The eight known today; a new SecretStr field joins this loop by itself.
+    assert {
+        "alpaca_api_key",
+        "alpaca_api_secret",
+        "alpaca_paper_api_key",
+        "alpaca_paper_api_secret",
+        "sec_edgar_user_agent",
+        "alert_smtp_user",
+        "alert_smtp_password",
+        "alert_email_to",
+    } <= set(fields)
+    values = {name: f"value-of-{name}-7c1" for name in fields}
+    settings = Settings(_env_file=None, **values)
+    message = "; ".join(f"{name} leaked {value}" for name, value in values.items())
+    cleaned = _clean(message, settings)
+    for value in values.values():
+        assert value not in cleaned
+    assert cleaned.count("[redacted]") == len(values)
