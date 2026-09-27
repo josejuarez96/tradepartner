@@ -1054,10 +1054,11 @@ def test_every_secret_field_is_redacted_from_run_messages() -> None:
     assert cleaned.count("[redacted]") == len(values)
 
 
-def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
-    """`ingest._secret_values` finds secrets among `Settings`' own fields by type;
-    a secret nested in a sub-model, a container or `SecretBytes` would be missed,
-    so this pins that none exists (#334 review)."""
+def _secret_offenders(model: type[Any]) -> list[str]:
+    """Fields of `model` holding a secret that `ingest._secret_values` would
+    miss: anything but a bare or Optional `SecretStr` at the top level, and any
+    `SecretStr`/`SecretBytes` inside a nested model or container."""
+    import types
     import typing
 
     from pydantic import BaseModel, SecretBytes, SecretStr
@@ -1076,22 +1077,54 @@ def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
         return found
 
     offenders = []
-    for name, info in Settings.model_fields.items():
-        args = typing.get_args(info.annotation)
-        plain = info.annotation is SecretStr or (
-            SecretStr in args and all(a in (SecretStr, type(None)) for a in args)
+    for name, info in model.model_fields.items():
+        annotation = info.annotation
+        plain = annotation is SecretStr or (
+            typing.get_origin(annotation) in (typing.Union, types.UnionType)
+            and set(typing.get_args(annotation)) == {SecretStr, type(None)}
         )
-        if mentions_secret(info.annotation) and not plain:
+        if mentions_secret(annotation) and not plain:
             offenders.append(name)
         seen: set[type[BaseModel]] = set()
-        stack = models_in(info.annotation)
+        stack = models_in(annotation)
         while stack:
-            model = stack.pop()
-            if model in seen:
+            sub_model = stack.pop()
+            if sub_model in seen:
                 continue
-            seen.add(model)
-            for sub_name, sub in model.model_fields.items():
+            seen.add(sub_model)
+            for sub_name, sub in sub_model.model_fields.items():
                 if mentions_secret(sub.annotation):
                     offenders.append(f"{name}.{sub_name}")
                 stack += models_in(sub.annotation)
-    assert offenders == []
+    return offenders
+
+
+def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
+    """`ingest._secret_values` finds secrets among `Settings`' own fields by type;
+    a secret nested in a sub-model, a container or `SecretBytes` would be missed,
+    so this pins that none exists (#334 review)."""
+    assert _secret_offenders(Settings) == []
+
+
+def test_the_secret_guard_flags_what_the_scrub_would_miss() -> None:
+    from pydantic import BaseModel, SecretBytes, SecretStr
+
+    class _Sub(BaseModel):
+        token: SecretStr | None = None
+
+    class _Probe(BaseModel):
+        fine: SecretStr | None = None
+        also_fine: SecretStr = SecretStr("x")
+        listed: list[SecretStr] | None = None
+        tupled: tuple[SecretStr, ...] = ()
+        mapped: dict[str, SecretStr] = {}
+        raw: SecretBytes | None = None
+        nested: _Sub | None = None
+
+    assert sorted(_secret_offenders(_Probe)) == [
+        "listed",
+        "mapped",
+        "nested.token",
+        "raw",
+        "tupled",
+    ]
