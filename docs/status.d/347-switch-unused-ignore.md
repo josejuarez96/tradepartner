@@ -1,0 +1,1 @@
+- #347 main green again: removed the unused `type: ignore` (and its stale comment) in `execution/switch.py`, left after #315 made `JournalRow`'s timestamps read-only
