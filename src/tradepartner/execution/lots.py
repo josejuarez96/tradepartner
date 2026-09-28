@@ -92,6 +92,7 @@ class Lot:
     quantity: float
     cost_basis: float
     fill_id: int | None
+    client_order_id: str  # the acquiring order (not a `lots` column; T62 attributes by it)
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class Disposal:
     realised_pnl: float
     tax_year: int
     fill_id: int | None
+    client_order_id: str  # the selling order (not a `disposals` column; T62 attributes by it)
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,7 @@ class _Trade:
     value: Decimal  # quantity x price
     fill_id: int | None
     order_key: int  # the lowest fill_id, for a stable order within an instant
+    client_order_id: str
 
 
 @dataclass
@@ -181,6 +184,7 @@ def rebuild(
                 quantity=float(trade.quantity),
                 cost_basis=float(trade.value),
                 fill_id=trade.fill_id,
+                client_order_id=trade.client_order_id,
             )
             lot_list.append(lot)
             open_lots.setdefault(trade.security_id, []).append(
@@ -202,6 +206,7 @@ def rebuild(
                 realised_pnl=float(proceeds - basis),
                 tax_year=local.year,
                 fill_id=trade.fill_id,
+                client_order_id=trade.client_order_id,
             )
             disposals.append(disposal)
             same_sale[disposal.disposal_id] = this_sale
@@ -239,6 +244,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                     value=sum((q * p for _, q, p in parts), _ZERO),
                     fill_id=None,
                     order_key=min(_fill_key(item) for item in group),
+                    client_order_id=first.fill.client_order_id,
                 )
             )
             continue
@@ -252,6 +258,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                 value=quantity * price,
                 fill_id=item.fill.fill_id,
                 order_key=_fill_key(item),
+                client_order_id=item.fill.client_order_id,
             )
             for item, quantity, price in parts
         )
