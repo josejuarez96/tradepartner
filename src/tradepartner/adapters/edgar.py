@@ -255,23 +255,31 @@ _INDEX_ROW = re.compile(
     r"^(?P<form>\S(?:.*?\S)?)\s{2,}(?P<name>\S.*?)\s+(?P<cik>\d+)\s+"
     r"(?P<filed>\d{4}-\d{2}-\d{2})\s+edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
 )
+# A row whose company-name column is blank (EDGAR has such rows, e.g. a 1997 SC 13D). Tried
+# only when `_INDEX_ROW` fails, so a one-character form can never absorb the name (#358).
+_INDEX_ROW_BLANK_NAME = re.compile(
+    r"^(?P<form>\S(?:.*?\S)?)\s{2,}(?P<cik>\d+)\s+"
+    r"(?P<filed>\d{4}-\d{2}-\d{2})\s+edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
+)
 
 
 @_fail_closed
 def parse_filing_index(text: str, acceptance: Mapping[str, datetime]) -> FilingIndexParse:
     """Rows of a quarterly `form.idx`, stamped from `acceptance`
     (`acceptance_times`); rows with no acceptance time go to `unstamped`.
-    A data row (one naming `edgar/data/`) that does not parse raises."""
+    A data row (one naming `edgar/data/`) that does not parse raises. A row whose
+    company-name column is blank (EDGAR has such rows, e.g. a 1997 SC 13D) parses with
+    an empty name (#358)."""
     entries: list[FilingIndexEntry] = []
     unstamped: list[UnstampedFiling] = []
     for line in text.splitlines():
-        match = _INDEX_ROW.match(line)
+        match = _INDEX_ROW.match(line) or _INDEX_ROW_BLANK_NAME.match(line)
         if match is None:
             if "edgar/data/" in line:
                 raise ValueError(f"form.idx row does not parse: {line.strip()!r}")
             continue
         cik, accession = _cik(match["cik"]), match["accession"]
-        form, name = match["form"], match["name"]
+        form, name = match["form"], match.groupdict().get("name") or ""
         accepted_at = acceptance.get(accession)
         if accepted_at is None:
             filed_on = date.fromisoformat(match["filed"])

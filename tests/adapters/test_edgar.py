@@ -156,6 +156,27 @@ class TestFilingIndex:
         row = next(r for r in parsed.unstamped if r.accession == "0001683168-24-000531")
         assert (row.cik, row.form, row.filed_on) == ("0001133116", "1-A", date(2024, 1, 30))
 
+    def test_blank_company_name_row_parses_with_an_empty_name(self) -> None:
+        # The owner's first real backfill hit this 1997 row in a quarterly index (#358).
+        blank = (
+            "SC 13D" + " " * 75 + "1036125     1997-03-24  "
+            "edgar/data/1036125/0000950134-97-002093.txt\n"
+        )
+        parsed = parse_filing_index(_text("filing_index_2024_qtr1.txt") + blank, {})
+        row = next(r for r in parsed.unstamped if r.accession == "0000950134-97-002093")
+        assert (row.cik, row.company_name, row.form, row.filed_on) == (
+            "0001036125",
+            "",
+            "SC 13D",
+            date(1997, 3, 24),
+        )
+        # a normal row still keeps its name whole
+        named = next(r for r in parsed.unstamped if r.accession != "0000950134-97-002093")
+        assert named.company_name and not named.company_name[0].isspace()
+        # a one-character form followed by a name never loses a CIK digit to the name
+        four = next(r for r in parsed.unstamped if r.form == "4")
+        assert four.cik == "0001652044" and four.company_name == "Alphabet Inc."
+
     def test_malformed_data_row_raises(self) -> None:
         text = _text("filing_index_2024_qtr1.txt") + "10-K garbled edgar/data/1/x.txt\n"
         with pytest.raises(ValueError, match="does not parse"):
