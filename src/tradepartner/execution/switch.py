@@ -169,9 +169,7 @@ def derive(
 
 
 def _append(conn: duckdb.DuckDBPyConnection, row: KillSwitchRow) -> int:
-    # `journal.JournalRow` declares `known_at`/`ingested_at` as settable members,
-    # which no frozen row type satisfies under mypy; `append` itself only reads them.
-    event_id = append(conn, row)  # type: ignore[arg-type]
+    event_id = append(conn, row)
     assert event_id is not None
     return event_id
 
