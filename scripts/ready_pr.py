@@ -316,6 +316,22 @@ def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
     return [f"changelog.d/{issue}-<slug>.md"]
 
 
+def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
+    """On a ``feat/`` or ``fix/`` branch, whether none of the issue's added
+    ``changelog.d`` fragments holds a CHANGELOG heading with a bullet (a STATUS-only
+    fragment, or only an old ``docs/status.d`` one, does not record the change)."""
+    if not branch.startswith(("feat/", "fix/")):
+        return False
+    for text in fragment_texts:
+        heading = False
+        for line in text.splitlines():
+            if line.startswith("### "):
+                heading = True
+            elif heading and BULLET_RE.match(line):
+                return False
+    return True
+
+
 def tests_needed(paths: Sequence[str]) -> bool:
     """Whether the diff can make pytest fail: it touches code, tests, scripts or deps."""
     return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
@@ -393,6 +409,17 @@ def ready(
                 "no fragment for this PR's issue: add "
                 + " and ".join(missing_frag)
                 + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
+            )
+        issue = issue_of_branch(pr.branch)
+        own = [
+            p
+            for p in touched
+            if issue is not None and p.startswith(f"changelog.d/{issue}-") and p not in deleted
+        ]
+        if lacks_changelog_bullets(pr.branch, [r.read(p) for p in own]):
+            raise ReadyError(
+                "a feat/fix PR records its change in CHANGELOG: add a bullet to "
+                f"changelog.d/{issue}-<slug>.md (`fragments.py add ... --added/--fixed ...`)"
             )
 
     # 4. local checks; pytest only when the diff can fail it (None = decide from the paths)
