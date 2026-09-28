@@ -230,7 +230,7 @@ def collect(
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
-    `connect` opens a write chunk (`lambda: store.db.open_for_write(settings)`),
+    `connect` opens a write chunk (`lambda: store.db.open_forappend(settings)`),
     `frozen` is the window's frozen `risk.*` section, and `settings` gives the
     run-time `paper.fill_read_overlap_seconds`. `writer_kind` is `run` or
     `resume` and `writer_id` its run or resume id. Raises `ValueError` for a
@@ -284,7 +284,7 @@ def collect(
         through = max(
             (t for t in (latest_seen, cursor) if t is not None), default=open_since or stamp
         )
-        _write(
+        append(
             conn,
             FillCursorRow(
                 writer_kind=writer_kind,
@@ -345,12 +345,6 @@ def _runs_to_judge(
     return sorted(runs)
 
 
-def _write(conn: duckdb.DuckDBPyConnection, row: object) -> int | None:
-    # `journal.JournalRow` declares `known_at`/`ingested_at` as settable members,
-    # which no frozen row type satisfies under mypy; `append` only reads them.
-    return append(conn, row)  # type: ignore[arg-type]
-
-
 def _earliest_open_pending(conn: duckdb.DuckDBPyConnection) -> datetime | None:
     """The earliest `known_at` of the `pending` event of any non-terminal order."""
     open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=None)}
@@ -395,7 +389,7 @@ def _journal_fills(
             for f in fills_for(conn, client_order_ids=[fill.client_order_id])
             if f.fill.source == _BROKER_STATUS
         ]
-        _write(
+        append(
             conn,
             FillRow(
                 client_order_id=fill.client_order_id,
@@ -439,7 +433,7 @@ def _journal_terminals(
         lagging, excess = gap > tolerance, -gap > tolerance
         terminal = reading.status in TERMINAL_STATUSES and not (lagging or excess)
         if terminal:
-            _write(
+            append(
                 conn,
                 OrderEventRow(
                     client_order_id=order.client_order_id,
@@ -493,7 +487,7 @@ def _back_fill_write_offs(
         if not state.written_off:
             continue
         assert decision.decision_id is not None and state.remainder is not None
-        _write(
+        append(
             conn,
             DecisionEventRow(
                 decision_id=decision.decision_id,
