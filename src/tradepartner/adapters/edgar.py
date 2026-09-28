@@ -256,11 +256,12 @@ _INDEX_ROW = re.compile(
     r"(?P<filed>\d{4}-\d{2}-\d{2})\s+edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
 )
 # A row whose company-name column is blank (EDGAR has such rows, e.g. a 1997 SC 13D). Tried
-# only when `_INDEX_ROW` fails, so a one-character form can never absorb the name. The gap
-# must be at least 40 spaces: the form column is 12 wide and the name column 62, so a blank
-# name leaves 50 or more, while a form and a name separated by one space never do (#358).
+# only when `_INDEX_ROW` fails, so a one-character form can never absorb the name. The form
+# is capped at 16 characters (the form column is 17 wide, the name column 62) and the gap
+# must be at least 40 spaces, so a form and a name separated by one space, whatever the form
+# length, never pass as a long form with a blank name (#358).
 _INDEX_ROW_BLANK_NAME = re.compile(
-    r"^(?P<form>\S(?:.*?\S)?)\s{40,}(?P<cik>\d+)\s+"
+    r"^(?P<form>\S(?:.{0,14}\S)?)\s{40,}(?P<cik>\d+)\s+"
     r"(?P<filed>\d{4}-\d{2}-\d{2})\s+edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
 )
 

@@ -190,6 +190,13 @@ class TestFilingIndex:
         )
         with pytest.raises(ValueError, match="does not parse"):
             parse_filing_index(_text("filing_index_2024_qtr1.txt") + row, {})
+        # a 16-character form, one space and a short name padded to its column (safety-reviewer)
+        wide = (
+            "SEC STAFF ACTION Acme Corp" + " " * 53 + "1652044     2024-01-31  "
+            "edgar/data/1652044/0001652044-24-000098.txt\n"
+        )
+        with pytest.raises(ValueError, match="does not parse"):
+            parse_filing_index(_text("filing_index_2024_qtr1.txt") + wide, {})
 
     def test_every_row_is_parsed(self) -> None:
         parsed = parse_filing_index(_text("filing_index_2024_qtr1.txt"), {})
