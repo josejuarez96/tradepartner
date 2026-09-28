@@ -118,7 +118,9 @@ they shape this DDL):
   "name: companies snapshot, snapshot_static" note, which still applies
   to other uses of a snapshot company name (e.g. a `listings`-level
   display name). `name` stays `NOT NULL`: every `securities` row is
-  created *from* a filing, so a name is always available at insert time.
+  created *from* a filing, so a name is always available at insert time,
+  although it may be the empty string for an index row whose name column
+  is blank (#358).
 """
 
 from __future__ import annotations
