@@ -134,6 +134,39 @@ def test_parse_plan_reads_ids_titles_deps_owner_and_phase() -> None:
     assert tasks["T5"].phase == 2
 
 
+def test_task_brief_prints_the_task_line_and_its_dependencies_with_locations() -> None:
+    tasks = team.parse_plan(PLAN, "docs/plans/data-foundation.md")
+    by_id = {t.id: t for t in tasks}
+    lines = team.task_brief(by_id["T10"], tasks).splitlines()
+    assert lines[0] == "docs/plans/data-foundation.md:9"
+    assert lines[1] == by_id["T10"].line
+    assert lines[1].startswith("- [ ] **T10: Suite.**")
+    assert "depends on:" in lines
+    assert "  docs/plans/data-foundation.md:7" in lines
+    assert "  " + by_id["T5"].line in lines
+    assert "  docs/plans/data-foundation.md:8" in lines
+    assert "  " + by_id["T8b"].line in lines
+    # one level only: T4 (T5's dependency) is not printed
+    assert not any("**T4:" in line for line in lines)
+    # no dependencies (``n/a``): the task line alone, no "depends on:" section
+    t1 = team.task_brief(by_id["T1"], tasks).splitlines()
+    assert t1 == ["docs/plans/data-foundation.md:4", by_id["T1"].line]
+    # a dependency id that is in no plan is named, not skipped
+    orphan = team.Task("T9", "x", False, False, ("T99",), "p", 2, "- [ ] **T9: x.**", 1)
+    assert "  T99: not a plan task" in team.task_brief(orphan, tasks).splitlines()
+
+
+def test_show_prints_the_brief_without_touching_github(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert team.cmd_show(root, "T10", ref=None) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("docs/plans/data-foundation.md:9\n- [ ] **T10: Suite.**")
+    assert "**T8b: Delistings.**" in out
+    with pytest.raises(SystemExit, match="not a plan task id"):
+        team.cmd_show(root, "28", ref=None)
+
+
 def test_ready_frontier_requires_every_dependency_ticked() -> None:
     tasks = team.parse_plan(PLAN, "p")
     assert [t.id for t in team.ready_tasks(tasks)] == ["T3", "T5", "T20"]
@@ -252,7 +285,12 @@ def test_claim_creates_issue_comments_and_labels(
     assert {"task:T5", "type:feat", "phase:2", "team:atlas"} <= set(issue.labels)
     assert {"task:T5", "type:feat", "phase:2", "team:atlas"} <= gh.labels
     assert gh.comments[issue.number] == ["claim: team:atlas"]
-    assert "git switch -c feat/100-fixture-universe-csv-and origin/main" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "git switch -c feat/100-fixture-universe-csv-and origin/main" in out
+    # the claim prints the task's own line and its dependency lines (#352)
+    assert "your task, from the merged plan" in out
+    assert "- [ ] **T5: Fixture universe (CSV) and generator.**" in out
+    assert "- [x] **T4: Store schema.**" in out
 
 
 def test_claim_refuses_unready_owner_and_done_tasks(root: Path) -> None:

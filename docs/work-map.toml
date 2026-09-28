@@ -533,3 +533,8 @@ why = "The first unattended paper run; only the owner holds the keys and the sto
 [task.T71b]
 what = "The phase close: the exit-criteria command exits 0 on the real store after six unattended rebalances."
 why = "The MVP's finish line."
+
+[issue.352]
+what = "team.py claim and show print a task's plan line and its dependencies' lines; implementers read those, not the plan; reviewers post the full report on the PR and return ten lines."
+why = "Implementers started at ~65k tokens of docs and orchestrators carried every reviewer report; the always-loaded context is the main usage cost (brief of 2026-09-28)."
+unblocks = ["issue:351", "issue:353"]
