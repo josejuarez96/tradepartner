@@ -13,8 +13,10 @@ from datetime import UTC, date, datetime
 from itertools import count
 
 import duckdb
+import polars as pl
 import pytest
 
+from tradepartner.calendar import previous_session
 from tradepartner.execution.lots import LedgerAccount, rebuild
 from tradepartner.execution.outcomes import (
     Outcome,
@@ -24,6 +26,7 @@ from tradepartner.execution.outcomes import (
 )
 from tradepartner.store import schema
 from tradepartner.store.journal import (
+    DecisionRow,
     FillRow,
     OrderedFill,
     OrderEventRow,
@@ -142,7 +145,14 @@ class Book:
     def price_of(self, security_id: str, session: date) -> float | None:
         return self.closes.get((security_id, session))
 
-    def due(self, session: date, window: OutcomeWindow | None = None) -> list[Outcome]:
+    def due(
+        self,
+        session: date,
+        window: OutcomeWindow | None = None,
+        *,
+        decisions: Sequence[DecisionRow] = (),
+        actions: pl.DataFrame | None = None,
+    ) -> list[Outcome]:
         ledger = rebuild(self.fills, self.orders, {}, ACCOUNT)
         return due_outcomes(
             window or OutcomeWindow(window_id=1),
@@ -153,6 +163,8 @@ class Book:
             ledger,
             self.price_of,
             session,
+            decisions=decisions,
+            actions=actions,
         )
 
 
@@ -300,20 +312,32 @@ def test_realised_pnl_waits_when_the_lot_ledger_is_unavailable() -> None:
 # --- the first stop run's mark
 
 
-def test_stopped_window_horizon_is_the_first_stop_runs_mark() -> None:
+def test_stopped_window_horizon_is_close_s_minus_1_of_the_first_flat_stop_run() -> None:
+    """A buy on a name never held, expired: the first `stop` run on S finds it
+    flat and writes the row from close(S-1); close(S) is never read."""
     stop_run = date(2026, 10, 21)
     book = Book()
     coid = book.order("SEC_C", "buy", "expired")
     book.closes[("SEC_C", T_I)] = 20.0
-    book.closes[("SEC_C", stop_run)] = 21.0
+    book.closes[("SEC_C", previous_session(stop_run))] = 21.0
+    book.closes[("SEC_C", stop_run)] = 99.0  # not known before the open on S
     window = OutcomeWindow(
-        window_id=1, stop_requested=date(2026, 10, 20), stop_run_sessions=(stop_run,)
+        window_id=1, stop_requested=date(2026, 10, 20), stop_flat={"SEC_C": stop_run}
     )
 
-    assert book.due(date(2026, 10, 20), window) == []
+    assert book.due(previous_session(stop_run), window) == []
     [outcome] = book.due(stop_run, window)  # written by the stop run itself
-    assert (outcome.client_order_id, outcome.through_session) == (coid, stop_run)
+    assert (outcome.client_order_id, outcome.through_session) == (coid, previous_session(stop_run))
     assert outcome.value == pytest.approx(0.05)
+    assert outcome.mark_price == 21.0
+
+
+def test_a_name_still_held_at_the_first_stop_run_is_not_due_then() -> None:
+    stop_run = date(2026, 10, 21)
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    window = OutcomeWindow(window_id=1, stop_requested=date(2026, 10, 20), stop_flat={})
+    assert book.due(stop_run, window) == []
 
 
 def test_stopped_window_horizon_is_the_flattening_fill_when_earlier() -> None:
@@ -321,16 +345,16 @@ def test_stopped_window_horizon_is_the_flattening_fill_when_earlier() -> None:
     book = Book()
     coid = book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
     book.order("SEC_A", "sell", "filled", [(10.0, 105.0)], session=flatten, phase="exit")
-    book.closes[("SEC_A", flatten)] = 106.0
+    book.closes[("SEC_A", flatten)] = 106.0  # the close after the exit is not the mark
     window = OutcomeWindow(
-        window_id=1, stop_requested=date(2026, 10, 19), stop_run_sessions=(date(2026, 10, 22),)
+        window_id=1, stop_requested=date(2026, 10, 19), stop_flat={"SEC_A": date(2026, 10, 22)}
     )
 
     outcomes = _by_kind(book.due(date(2026, 10, 21), window))
 
     buy = outcomes[(coid, "position_return")]
     assert buy.through_session == flatten
-    assert buy.value == pytest.approx(0.06)
+    assert (buy.value, buy.mark_price) == (pytest.approx(0.05), 105.0)
 
 
 def test_stopped_window_horizon_is_close_of_the_next_rebalance_when_earlier() -> None:
@@ -338,10 +362,96 @@ def test_stopped_window_horizon_is_close_of_the_next_rebalance_when_earlier() ->
     coid = book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
     book.mark("SEC_A", T_NEXT, 110.0, 10.0)
     window = OutcomeWindow(
-        window_id=1, stop_requested=date(2026, 11, 3), stop_run_sessions=(date(2026, 11, 4),)
+        window_id=1, stop_requested=date(2026, 11, 3), stop_flat={"SEC_A": date(2026, 11, 4)}
     )
     [outcome] = book.due(DUE, window)
     assert (outcome.client_order_id, outcome.through_session) == (coid, T_NEXT)
+
+
+# --- splits, calendar, look-ahead, equity ------------------------------------------
+
+
+def _split(security_id: str, ex_date: date, ratio: float) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "security_id": [security_id],
+            "action_type": ["split"],
+            "ex_date": [ex_date],
+            "ratio_or_amount": [ratio],
+        }
+    )
+
+
+def test_a_split_inside_the_horizon_adjusts_the_start_not_the_return() -> None:
+    """10 bought at 100, a 2:1 split on 2026-10-15, marked at 55: +10%, and a
+    1,100 - 1,000 = 100 dollar gain."""
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 55.0, 20.0)
+    [outcome] = book.due(DUE, actions=_split("SEC_A", date(2026, 10, 15), 2.0))
+    assert outcome.value == pytest.approx(0.10)
+    assert outcome.contribution == pytest.approx(0.01)
+
+
+def test_a_split_adjusts_the_not_executed_start_price() -> None:
+    book = Book()
+    book.order("SEC_C", "buy", "expired")
+    book.closes[("SEC_C", T_I)] = 20.0
+    book.closes[("SEC_C", T_NEXT)] = 11.0
+    [outcome] = book.due(DUE, actions=_split("SEC_C", date(2026, 10, 15), 2.0))
+    assert outcome.value == pytest.approx(0.10)
+
+
+def test_the_decisions_rebalance_session_sets_the_horizon() -> None:
+    """A re-attempt on 2026-11-02 for rebalance 2026-09-30 still ends at
+    close(2026-10-30), which the order's session alone would put at 2026-11-30."""
+    late = date(2026, 11, 2)
+    book = Book()
+    coid = book.order("SEC_C", "buy", "expired", session=late)
+    decision = DecisionRow(
+        decision_id=1,
+        run_id=1,
+        rebalance_session=T_I,
+        security_id="SEC_C",
+        whole_share=False,
+        decision="trade",
+        known_at=STAMP,
+        ingested_at=STAMP,
+    )
+    [outcome] = book.due(date(2026, 11, 3), decisions=[decision])
+    assert (outcome.client_order_id, outcome.through_session) == (coid, T_NEXT)
+    assert book.due(date(2026, 11, 3)) == []  # without it: due after 2026-11-30
+
+
+def test_a_january_order_rolls_the_year() -> None:
+    book = Book()
+    coid = book.order("SEC_C", "buy", "expired", session=date(2027, 1, 4))
+    [outcome] = book.due(date(2027, 2, 1))
+    assert (outcome.client_order_id, outcome.through_session) == (coid, date(2027, 1, 29))
+    assert book.due(date(2027, 1, 29)) == []
+
+
+def test_prices_after_the_horizon_change_nothing() -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.order("SEC_C", "sell", "expired")
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    book.closes.update({("SEC_C", T_I): 20.0, ("SEC_C", T_NEXT): 21.0})
+    before = book.due(DUE)
+    book.mark("SEC_A", DUE, 500.0, 10.0)
+    book.closes.update({("SEC_C", DUE): 500.0, ("SEC_A", DUE): 500.0})
+    assert book.due(DUE) == before
+
+
+def test_equity_without_a_cash_row_leaves_the_contribution_empty() -> None:
+    book = Book()
+    book.marks = []
+    book.mark("SEC_Z", T_I, 10.0)
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    [outcome] = book.due(DUE)
+    assert outcome.value == pytest.approx(0.10)
+    assert outcome.contribution is None
 
 
 # --- the writer ------------------------------------------------------------------
@@ -443,30 +553,57 @@ def test_the_writer_appends_outcomes_and_lots_once(conn: duckdb.DuckDBPyConnecti
     assert lot == (pytest.approx(10.0), pytest.approx(940.0), None)
 
 
-def test_a_changed_ledger_is_appended_as_a_new_set(conn: duckdb.DuckDBPyConnection) -> None:
+def _changed_ledger(conn: duckdb.DuckDBPyConnection) -> Book:
     book = Book()
     book.order("SEC_B", "buy", "filled", [(10.0, 50.0)], session=date(2026, 9, 1))
     book.order("SEC_B", "sell", "filled", [(10.0, 40.0)])
     _journal(conn, book)
     write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print)
     assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
-
     later = Book()
-    rebuy = later.order("SEC_B", "buy", "filled", [(5.0, 41.0)], session=date(2026, 10, 5))
-    append(conn, later.orders[0])
-    for event in later.events:
-        append(conn, event)
-    append(conn, later.fills[0].fill)
+    later.order("SEC_B", "buy", "filled", [(5.0, 41.0)], session=date(2026, 10, 5))
+    for row in (*later.orders, *later.events, later.fills[0].fill):
+        append(conn, row)
+    return book
+
+
+def test_a_changed_ledger_is_appended_as_a_new_set(conn: duckdb.DuckDBPyConnection) -> None:
+    book = _changed_ledger(conn)
+
     result = write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, book.price_of, date(2026, 10, 6), _clock, on_lot_error=print
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        date(2026, 10, 6),
+        lambda: _utc(DUE, 15),
+        on_lot_error=print,
     )
 
     assert result.lot_rows == 2 + 1 + 1  # two lots, one disposal, one wash-sale flag
+    latest = "(SELECT max(known_at) FROM lots)"
+    assert _count(conn, f"lots WHERE known_at = {latest}") == 2
+    assert _count(conn, f"disposals WHERE known_at = {latest}") == 1
     flag = conn.execute(
         "SELECT matched_quantity, disallowed_amount FROM wash_sale_flags"
     ).fetchone()
     assert flag == (pytest.approx(5.0), pytest.approx(50.0))
-    assert rebuy
+
+
+def test_a_changed_ledger_with_the_same_stamp_is_not_merged(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    book = _changed_ledger(conn)
+    errors: list[str] = []
+
+    result = write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, book.price_of, date(2026, 10, 6), _clock, on_lot_error=errors.append
+    )
+
+    assert result.lot_rows == 0
+    assert len(errors) == 1 and "did not advance" in errors[0]
+    assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
 
 
 def test_a_lot_ledger_error_alerts_and_the_outcomes_still_run(
