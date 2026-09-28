@@ -533,3 +533,7 @@ why = "The first unattended paper run; only the owner holds the keys and the sto
 [task.T71b]
 what = "The phase close: the exit-criteria command exits 0 on the real store after six unattended rebalances."
 why = "The MVP's finish line."
+
+[issue.351]
+what = "Slims the always-loaded STATUS to a board with the last 10 done lines, one bookkeeping fragment per PR, and a CI budget on STATUS and CLAUDE.md."
+why = "Every session re-read a 10k-token STATUS on every turn; a smaller, bounded board keeps each session's context for the work itself."

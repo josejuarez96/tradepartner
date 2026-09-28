@@ -70,7 +70,7 @@ Not every change needs every document. Size is set on the issue.
 - [ ] There are tests for new behavior. A bug fix starts with a failing test.
 - [ ] CI is green: lint, format, types, tests, hygiene.
 - [ ] There are no TODOs without a linked issue.
-- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, one STATUS "Done" line and one CHANGELOG bullet as **fragments** (`uv run python scripts/fragments.py add <issue> ...`, never an edit to `STATUS.md` or `CHANGELOG.md` themselves; #70), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
+- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, one STATUS "Recently done" line (at most 240 characters) and the CHANGELOG bullets in **one fragment file** (`uv run python scripts/fragments.py add <issue> --slug <slug> --status "..." --added "..."`, never an edit to `STATUS.md` or `CHANGELOG.md` themselves; #70, #351), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
 - [ ] The PR was marked ready by `/ready-pr` (`scripts/ready_pr.py`), which ran the checks, verified the template and the specialist reviews, and waited for CI on the merged commit.
 - [ ] Data code: every stored fact has `known_at`, and `quant-auditor` has passed.
 - [ ] Execution, LLM or secrets code: `safety-reviewer` has passed.
@@ -91,14 +91,14 @@ These come straight from the research handoff. They are process rules, not just 
 ## Session protocol (human or agent)
 
 **Start of session:**
-1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the Done entries not folded in yet.
+1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the recently done entries not folded in yet.
 2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch (spikes excepted).
 3. Branch from `origin/main` as the claim output prints (`git fetch origin && git switch -c <branch> origin/main`).
 
 **End of session:**
 1. Commit and push.
 2. Update the draft PR description with the current state.
-3. Record what changed: your Done line and CHANGELOG bullet as fragments (`scripts/fragments.py add`); a new blocker or decision needed as a line under STATUS "Blocked" or "Decisions needed" (those short lists rarely collide). Never edit "Next up" or the frontier snapshot to reserve work.
+3. Record what changed: your STATUS line and CHANGELOG bullets in one fragment (`scripts/fragments.py add`, one call per PR); a new blocker or decision needed as a line under STATUS "Blocked" or "Decisions needed" (those short lists rarely collide). Never edit "Next up" or the frontier snapshot to reserve work.
 4. Stopping for good on an item: `uv run python scripts/team.py release` it, with a handoff comment on the issue.
 
 `STATUS.md` replaces ad-hoc handoff documents. It always tells you where things stand in two minutes of reading.

@@ -1,1 +1,0 @@
-- Phase 2 T22 (#312): scheduling runbook `docs/runbooks/scheduling.md`, with the `com.tradepartner.ingest` launchd plist, PATH for `uv`, working dir and `.env`, sleep vs power-off with a `pmset` wake, logs, TCC, the evidence query, and a `collect` placeholder; the five scheduled `ok` runs are the owner's evidence, in T23

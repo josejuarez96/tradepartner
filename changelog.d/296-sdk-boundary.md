@@ -1,2 +1,0 @@
-### Added
-- Static boundary test `tests/execution/test_sdk_boundary.py` fences the known alpaca-py trading SDK entry points: the trading client and the adapters' client factories, the order request types, the order-changing SDK methods (`submit_order`, `cancel_order*`, `replace_order*`, `close_*position*`, `exercise_options_position`) and the REST order and position paths stay in the adapters and the paper recorder, so the risk-gated wrapper cannot be bypassed through them (#296)

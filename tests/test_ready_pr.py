@@ -142,12 +142,15 @@ def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> N
     assert not ready_pr.is_fold(["docs/STATUS.md"], [])
 
 
-def test_missing_fragments_by_branch_type() -> None:
-    assert ready_pr.missing_fragments("feat/69-x", ["src/a.py"]) == [
-        "docs/status.d/69-<slug>.md",
-        "changelog.d/69-<slug>.md",
-    ]
+def test_missing_fragments_needs_one_file_for_the_issue() -> None:
+    assert ready_pr.missing_fragments("feat/69-x", ["src/a.py"]) == ["changelog.d/69-<slug>.md"]
+    assert ready_pr.missing_fragments("feat/69-x", ["changelog.d/69-x.md"]) == []
+    assert ready_pr.missing_fragments("docs/55-x", ["changelog.d/55-x.md"]) == []
+    # The pre-#351 layout still counts during the transition.
     assert ready_pr.missing_fragments("docs/55-x", ["docs/status.d/55-x.md"]) == []
+    assert ready_pr.missing_fragments("feat/69-x", ["changelog.d/70-x.md"]) == [
+        "changelog.d/69-<slug>.md"
+    ]
     assert ready_pr.missing_fragments("spike/x", []) == []
 
 
@@ -326,12 +329,12 @@ def test_real_conflict_aborts_the_merge() -> None:
 
 
 def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
-    main = "## Done\n- a\n\n## Blocked\n- none\n"
-    frags = ["docs/status.d/69-x.md", "changelog.d/69-x.md"]
+    main = "## Recently done\n- a\n\n## Blocked\n- none\n"
+    frags = ["changelog.d/69-x.md"]
     added = FakeRunner(
         touched=["docs/STATUS.md", *frags],
         main_files={"docs/STATUS.md": main},
-        conflicted={"docs/STATUS.md": "## Done\n- a\n- mine\n\n## Blocked\n- none\n"},
+        conflicted={"docs/STATUS.md": "## Recently done\n- a\n- mine\n\n## Blocked\n- none\n"},
     )
     with pytest.raises(ready_pr.ReadyError, match="adds lines to the shared lists"):
         ready_pr.ready(added, 69, dry_run=True)
@@ -340,15 +343,15 @@ def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
     blocked_only = FakeRunner(
         touched=["docs/STATUS.md", *frags],
         main_files={"docs/STATUS.md": main},
-        conflicted={"docs/STATUS.md": "## Done\n- a\n\n## Blocked\n- waiting on T3\n"},
+        conflicted={"docs/STATUS.md": "## Recently done\n- a\n\n## Blocked\n- waiting on T3\n"},
     )
     assert ready_pr.ready(blocked_only, 69, dry_run=True) == 0
 
     fold = FakeRunner(
-        touched=["docs/STATUS.md", "docs/status.d/1-a.md", *frags],
-        deleted=["docs/status.d/1-a.md"],
+        touched=["docs/STATUS.md", "changelog.d/1-a.md", *frags],
+        deleted=["changelog.d/1-a.md"],
         main_files={"docs/STATUS.md": main},
-        conflicted={"docs/STATUS.md": "## Done\n- a\n- folded\n\n## Blocked\n- none\n"},
+        conflicted={"docs/STATUS.md": "## Recently done\n- a\n- folded\n\n## Blocked\n- none\n"},
     )
     assert ready_pr.ready(fold, 69, dry_run=True) == 0
 
@@ -358,7 +361,7 @@ def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
 
 def test_missing_fragment_stops_the_run() -> None:
     r = FakeRunner(touched=["src/tradepartner/store/asof.py"])
-    with pytest.raises(ready_pr.ReadyError, match=r"docs/status\.d/69-<slug>\.md"):
+    with pytest.raises(ready_pr.ReadyError, match=r"changelog\.d/69-<slug>\.md"):
         ready_pr.ready(r, 69, dry_run=True)
 
 

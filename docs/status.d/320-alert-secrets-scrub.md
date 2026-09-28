@@ -1,1 +1,0 @@
-- #320 `cli_record._configured_secrets` includes the Phase 4 alert secrets (`ALERT_SMTP_USER`, `ALERT_SMTP_PASSWORD`, `ALERT_EMAIL_TO`), so the fixture recorder and the CLI error scrub replace them; blank values stay out
