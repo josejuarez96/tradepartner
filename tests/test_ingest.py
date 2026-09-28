@@ -1015,3 +1015,116 @@ def test_a_dry_run_whose_check_failures_raises_writes_no_run_row(
     result = _run(settings, filings=_filings(cls=Unhealthy), source="edgar", dry_run=True)
     assert result.runs[0].status == FAILED
     assert read("SELECT count(*) FROM ingestion_runs") == before
+
+
+# --- #334: every SecretStr field is redacted from run messages ---------------
+
+
+def _secret_fields() -> list[str]:
+    from pydantic import SecretStr
+
+    return sorted(
+        name
+        for name, info in Settings.model_fields.items()
+        if "SecretStr" in str(info.annotation) or info.annotation is SecretStr
+    )
+
+
+def test_every_secret_field_is_redacted_from_run_messages() -> None:
+    from tradepartner.ingest import _clean
+
+    fields = _secret_fields()
+    # The eight known today; a new SecretStr field joins this loop by itself.
+    assert {
+        "alpaca_api_key",
+        "alpaca_api_secret",
+        "alpaca_paper_api_key",
+        "alpaca_paper_api_secret",
+        "sec_edgar_user_agent",
+        "alert_smtp_user",
+        "alert_smtp_password",
+        "alert_email_to",
+    } <= set(fields)
+    values = {name: f"value-of-{name}-7c1" for name in fields}
+    settings = Settings(_env_file=None, **values)
+    message = "; ".join(f"{name} leaked {value}" for name, value in values.items())
+    cleaned = _clean(message, settings)
+    for value in values.values():
+        assert value not in cleaned
+    assert cleaned.count("[redacted]") == len(values)
+
+
+def _secret_offenders(model: type[Any]) -> list[str]:
+    """Fields of `model` holding a secret that `ingest._secret_values` would
+    miss: anything but a bare or Optional `SecretStr` at the top level, and any
+    `SecretStr`/`SecretBytes` inside a nested model or container."""
+    import types
+    import typing
+
+    from pydantic import BaseModel, SecretBytes, SecretStr
+
+    def mentions_secret(annotation: object) -> bool:
+        if annotation in (SecretStr, SecretBytes):
+            return True
+        return any(mentions_secret(arg) for arg in typing.get_args(annotation))
+
+    def models_in(annotation: object) -> list[type[BaseModel]]:
+        found = []
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            found.append(annotation)
+        for arg in typing.get_args(annotation):
+            found += models_in(arg)
+        return found
+
+    offenders = []
+    for name, info in model.model_fields.items():
+        annotation = info.annotation
+        plain = annotation is SecretStr or (
+            typing.get_origin(annotation) in (typing.Union, types.UnionType)
+            and set(typing.get_args(annotation)) == {SecretStr, type(None)}
+        )
+        if mentions_secret(annotation) and not plain:
+            offenders.append(name)
+        seen: set[type[BaseModel]] = set()
+        stack = models_in(annotation)
+        while stack:
+            sub_model = stack.pop()
+            if sub_model in seen:
+                continue
+            seen.add(sub_model)
+            for sub_name, sub in sub_model.model_fields.items():
+                if mentions_secret(sub.annotation):
+                    offenders.append(f"{name}.{sub_name}")
+                stack += models_in(sub.annotation)
+    return offenders
+
+
+def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
+    """`ingest._secret_values` finds secrets among `Settings`' own fields by type;
+    a secret nested in a sub-model, a container or `SecretBytes` would be missed,
+    so this pins that none exists (#334 review)."""
+    assert _secret_offenders(Settings) == []
+
+
+def test_the_secret_guard_flags_what_the_scrub_would_miss() -> None:
+    from pydantic import BaseModel, SecretBytes, SecretStr
+
+    class _Sub(BaseModel):
+        token: SecretStr | None = None
+
+    class _Probe(BaseModel):
+        fine: SecretStr | None = None
+        also_fine: SecretStr = SecretStr("x")
+        listed: list[SecretStr] | None = None
+        tupled: tuple[SecretStr, ...] = ()
+        mapped: dict[str, SecretStr] = {}
+        raw: SecretBytes | None = None
+        nested: _Sub | None = None
+
+    assert sorted(_secret_offenders(_Probe)) == [
+        "listed",
+        "mapped",
+        "nested.token",
+        "raw",
+        "tupled",
+    ]
