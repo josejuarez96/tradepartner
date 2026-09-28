@@ -565,7 +565,7 @@ class TestPublicPlan:
 
         monkeypatch.setattr(engine, "_plan", recording)
         _run(_provider(), end=T4)
-        monkeypatch.setattr(engine, "_plan", original)
+        monkeypatch.setattr(engine, "_plan", original)  # the check below calls the real one
         # Every rebalance but the last is planned, in order, once.
         assert [p.session for p in recorded] == [T0, T1, T2, T3]
         for loop_plan in recorded:

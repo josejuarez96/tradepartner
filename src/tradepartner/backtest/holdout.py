@@ -190,7 +190,7 @@ def _tracking(window: Window, frozen: Frozen) -> Decision:
             f"tracking window start {window.start} is before {first}, the first rebalance "
             f"session after holdout.end {frozen.holdout_end}",
         )
-    return Decision("run", "tracking", "tracking run")
+    return Decision("run", "tracking", "tracking run; holdout and gap flags are not read")
 
 
 def default_in_sample_window(frozen: Frozen) -> Window:
