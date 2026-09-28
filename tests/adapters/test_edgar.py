@@ -182,6 +182,15 @@ class TestFilingIndex:
         with pytest.raises(ValueError, match="does not parse"):
             parse_filing_index(text, {})
 
+    def test_form_and_name_separated_by_one_space_still_raises(self) -> None:
+        # the blank-name pattern must not swallow a mis-columned row as a long form (#358)
+        row = (
+            "10-K Acme Corp      1652044     2024-01-31  "
+            "edgar/data/1652044/0001652044-24-000099.txt\n"
+        )
+        with pytest.raises(ValueError, match="does not parse"):
+            parse_filing_index(_text("filing_index_2024_qtr1.txt") + row, {})
+
     def test_every_row_is_parsed(self) -> None:
         parsed = parse_filing_index(_text("filing_index_2024_qtr1.txt"), {})
         assert not parsed.entries
