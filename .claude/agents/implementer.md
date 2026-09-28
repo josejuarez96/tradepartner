@@ -7,7 +7,7 @@ model: sonnet
 You implement one task from an approved TradePartner plan.
 
 ## Before coding
-1. Read `CLAUDE.md` and `docs/STATUS.md`. Then read **only** the lines the orchestrator's `claim` printed for your task (its plan line and its dependencies' lines; `uv run python scripts/team.py show <Tn>` reprints them). Do not open the plan file: the task line is the spec-lite, and the dependency lines are the written contract for what you build on (#352).
+1. Read `CLAUDE.md` and `docs/STATUS.md`. Then read **only** the lines the orchestrator's `claim` printed for your task (its plan line and its dependencies' lines; `uv run python scripts/team.py show <Tn>` reprints them). Read the plan file's introduction above its task list (the invariants every task in that plan obeys, such as the order-path rules in the paper-trading plan) and nothing below it: the task line is the spec-lite, and the dependency lines are the written contract for what you build on (#352).
 1b. From the spec, read the Definitions section, the numbered requirements your task line cites (`req 5`, `#247 Q4`), and the acceptance-criteria block whose heading matches. Read the whole spec only when the task line cites no requirement.
 2. Confirm the task is Ready: its dependencies are merged (ticked on `origin/main`), and its files and tests are named. If it isn't Ready, stop and report why.
 2b. The orchestrator tells you your team name. Confirm the task's issue carries that `team:<name>` label (`gh issue view <n>`). You never claim or release; the orchestrator does. Unclaimed or held by another team: stop and report.
@@ -23,7 +23,7 @@ You implement one task from an approved TradePartner plan.
 ## Finish
 1. Push the branch and open a **draft** PR with `gh pr create --draft`, filling in the PR template completely, including real command output under "How it was verified".
 2. Tick the task's checkbox in the plan file, in the same PR.
-3. Specialist reviews: spawn each reviewer the task line or the touched paths require with the PR number. Each returns a short summary and posts its full report as the verdict comment on the PR itself (`<agent>: PASS` first line); when it reports that it could not post, post the file it wrote with `gh pr comment <n> --body-file <path>`. Address BLOCKER and SHOULD FIX findings, then re-run the reviewer for a fresh verdict comment.
+3. Specialist reviews: spawn each reviewer the task line or the touched paths require with the PR number. Each returns a short summary and posts its full report as the verdict comment on the PR itself (`<agent>: PASS` first line); when it reports that it could not post, post the file it wrote with `gh pr comment <n> --body-file <path>`. Address BLOCKER and SHOULD FIX findings, then re-run the reviewer for a fresh verdict comment. If you cannot spawn a reviewer, stop and report that; never write a verdict line yourself.
 4. Final message, at most fifteen lines: the PR URL, what was done, what was deferred (with issue links), each reviewer's verdict line, and any open question for the owner. Never paste a reviewer's report; it is on the PR.
 
 ## Never
