@@ -46,10 +46,11 @@ Team directories live **outside the repo** on purpose: a session that lists file
 1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the recently done entries not folded in yet.
 2. `uv run python scripts/team.py status`: who holds what, the ready frontier, loose issues, parked PRs.
 3. `uv run python scripts/team.py claim <Tn | issue#>`. If it says the item is held by another team, pick the next one. **Never** start anyway.
-4. Branch as the claim output suggests (`<prefix>/<issue#>-<slug>` from `origin/main`), then work as usual: `implementer` subagents in their own worktrees, tests first, draft PR early.
+4. Branch as the claim output suggests (`<prefix>/<issue#>-<slug>` from `origin/main`), then work as usual: `implementer` subagents in their own worktrees, tests first, draft PR early. Hand the implementer the lines `claim` printed (the task's plan line and its dependencies' lines; `team.py show <Tn>` reprints them), not the plan file (#352).
 
 **During**
 - One `implementer` per claimed task, one writer per branch. Run several in parallel only on tasks with disjoint files. Read-only helpers and the reviewers may run alongside; the table in [agents.md](agents.md#parallelism-inside-a-team) says what goes in parallel and what does not.
+- Reviewers (`spec-critic`, `quant-auditor`, `safety-reviewer`) post their full report as the PR's verdict comment and return a ten-line summary; a window never pastes a report into its own context or its messages (#352).
 - An implementer never claims or releases; it checks that its issue carries the team label and stops if not.
 - Anything you notice outside your task becomes an issue (`gh issue create`), unclaimed, for any team to pick up.
 

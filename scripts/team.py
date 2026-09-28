@@ -17,7 +17,8 @@ directory it prints (a git worktree outside the repo, so other teams' files stay
     uv run python scripts/team.py register <name>     # only for a clone you set up by hand
     uv run python scripts/team.py whoami
     uv run python scripts/team.py status
-    uv run python scripts/team.py claim T5             # plan task
+    uv run python scripts/team.py claim T5             # plan task; prints its plan line and deps
+    uv run python scripts/team.py show T5              # the same lines, without claiming
     uv run python scripts/team.py claim 28             # existing issue
     uv run python scripts/team.py release T5 --park    # hand a green PR to the next team
     uv run python scripts/team.py check-claims --pr 31
@@ -83,6 +84,8 @@ class Task:
     depends_on: tuple[str, ...]
     plan: str
     phase: int | None
+    line: str = ""
+    lineno: int = 0
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,7 @@ def parse_plan(text: str, plan: str) -> list[Task]:
     phase_match = PHASE_RE.search(text.splitlines()[0] if text else "")
     phase = int(phase_match.group(1)) if phase_match else None
     tasks: list[Task] = []
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), start=1):
         m = TASK_LINE_RE.match(line)
         if not m:
             continue
@@ -125,9 +128,33 @@ def parse_plan(text: str, plan: str) -> list[Task]:
                 depends_on=deps,
                 plan=plan,
                 phase=phase,
+                line=line,
+                lineno=lineno,
             )
         )
     return tasks
+
+
+def task_brief(task: Task, tasks: Sequence[Task]) -> str:
+    """The lines an implementer needs instead of the whole plan (#352).
+
+    The task's own plan line, then the full line of each direct dependency (the written
+    contract for what the task builds on), each with its plan path and line number. A
+    dependency that is not in any plan (``n/a``, an issue number) is listed as unknown.
+    """
+    by_id = {t.id: t for t in tasks}
+    out = [f"{task.plan}:{task.lineno}", task.line]
+    if task.depends_on:
+        out.append("")
+        out.append("depends on:")
+        for dep in task.depends_on:
+            d = by_id.get(dep)
+            if d is None:
+                out.append(f"  {dep}: not a plan task")
+                continue
+            out.append(f"  {d.plan}:{d.lineno}")
+            out.append(f"  {d.line}")
+    return "\n".join(out)
 
 
 def is_ready(task: Task, by_id: dict[str, Task]) -> bool:
@@ -631,6 +658,19 @@ def cmd_claim(
     _set_parked(gh, issue.number, parked=False)
     print(f"claimed #{issue.number} '{issue.title}' for team {team}")
     print(f"branch: git fetch origin && git switch -c {suggest_branch(issue)} origin/main")
+    if task is not None:
+        print()
+        print("your task, from the merged plan (read this, not the plan file):")
+        print(task_brief(task, tasks))
+    return 0
+
+
+def cmd_show(root: Path, target: str, *, ref: str | None = None) -> int:
+    """Print a plan task's line and its dependencies' lines, without claiming."""
+    if not TASK_ID_RE.match(target):
+        raise SystemExit(f"{target} is not a plan task id (T5, T8b)")
+    tasks = load_tasks(root, ref)
+    print(task_brief(_find_task(tasks, target), tasks))
     return 0
 
 
@@ -922,6 +962,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("whoami", help="print this clone's team")
     sub.add_parser("status", help="lanes board: claims, ready frontier, loose issues, parked PRs")
+    p = sub.add_parser("show", help="print a plan task's line and its dependencies' lines")
+    p.add_argument("target")
     p = sub.add_parser("claim", help="claim a plan task (T5) or an issue (28)")
     p.add_argument("target")
     p.add_argument("--allow-unready", action="store_true", help="claim although deps are unmerged")
@@ -960,6 +1002,8 @@ def main(argv: Sequence[str] | None = None, gh: GitHub | None = None) -> int:
             return 0
         case "status":
             return cmd_status(gh, root, ref=ref)
+        case "show":
+            return cmd_show(root, args.target, ref=ref)
         case "claim":
             return cmd_claim(
                 gh,
