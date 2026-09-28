@@ -630,3 +630,22 @@ def test_a_lot_ledger_error_alerts_and_the_outcomes_still_run(
         (buy, "position_return")
     }
     assert sell
+
+
+def test_a_bad_split_ratio_raises() -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 55.0, 20.0)
+    with pytest.raises(ValueError, match="ratio"):
+        book.due(DUE, actions=_split("SEC_A", date(2026, 10, 15), 0.0))
+
+
+def test_a_stop_horizon_never_ends_before_the_orders_session() -> None:
+    late = date(2026, 10, 22)
+    book = Book()
+    coid = book.order("SEC_C", "buy", "expired", session=late)
+    window = OutcomeWindow(
+        window_id=1, stop_requested=date(2026, 10, 20), stop_flat={"SEC_C": date(2026, 10, 21)}
+    )
+    [outcome] = book.due(date(2026, 10, 23), window)
+    assert (outcome.client_order_id, outcome.through_session) == (coid, late)

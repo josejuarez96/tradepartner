@@ -52,6 +52,7 @@ do not take yet) never fails the run: the writer passes its message to
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -167,7 +168,10 @@ def _split_factor(
             and row["action_type"] == _SPLIT
             and after < row["ex_date"] <= through
         ):
-            factor *= float(row["ratio_or_amount"])
+            ratio = float(row["ratio_or_amount"])
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise ValueError(f"split of {security_id} has ratio {ratio}")
+            factor *= ratio
     return factor
 
 
@@ -226,7 +230,9 @@ def _horizon(
     stop_run = window.stop_flat.get(order.security_id)
     if stop_run is not None and stop_run >= window.stop_requested:
         candidates.append((previous_session(stop_run), None))
-    return min(candidates, key=lambda c: c[0])
+    end = min(candidates, key=lambda c: c[0])
+    # Never before the order's own session, whatever the caller's map says.
+    return end if end[0] >= order.session else (order.session, None)
 
 
 def _equity_before(marks: Sequence[PositionDailyRow], session: date) -> float | None:
