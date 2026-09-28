@@ -19,6 +19,13 @@ calendar. The run orchestration (T39) opens the trial handle first, then asks
    `--override-gap` comes with a non-blank reason. A NaN share counts as a
    breach: it cannot show the gap is below the threshold.
 
+**Tracking windows** (Phase 4 spec req 10; plan T53). `decide(..., tracking=True)`
+replaces rules 1 to 3 for a `kind=tracking` trial (a plan trial or `paper report`'s
+tracking trial): the window must start at or after the first rebalance session
+**after** the frozen `holdout.end` (`first_tracking_session`) and end no earlier than
+it starts, else `refused_window`; it is never a holdout spend or repeat and has no gap
+gate, and the holdout and gap flags are ignored.
+
 Rules 1 and 2 need no provider read. When they pass for a holdout window and
 no gap series is given yet, the outcome is `needs_gap`: the caller reads
 `survivorship_gap` at `Decision.gap_sessions` only, then calls `decide` again
@@ -40,7 +47,7 @@ from tradepartner.calendar import last_session_of_month
 from tradepartner.store.registry import HoldoutSpend, HypothesisRecord
 
 Outcome = Literal["run", "needs_gap", "refused_window", "refused_holdout", "refused_gap"]
-RunKind = Literal["in_sample", "holdout"]
+RunKind = Literal["in_sample", "holdout", "tracking"]
 
 GAP_THRESHOLD_KEY = "gap.count_share_threshold"
 
@@ -160,6 +167,32 @@ def window_touches_holdout(window: Window, frozen: Frozen) -> bool:
     return window.start <= frozen.holdout_end and window.end >= frozen.holdout_start
 
 
+def first_tracking_session(frozen: Frozen) -> date:
+    """The first rebalance session strictly after the frozen `holdout.end`: where a
+    `kind=tracking` window may start (Phase 4 spec req 10)."""
+    end = frozen.holdout_end
+    first = last_session_of_month(end.year, end.month)
+    if first <= end:
+        first = last_session_of_month(*_next_month(end))
+    return first
+
+
+def _tracking(window: Window, frozen: Frozen) -> Decision:
+    first = first_tracking_session(frozen)
+    if window.end < window.start:
+        return Decision(
+            "refused_window", None, f"window end {window.end} is before its start {window.start}"
+        )
+    if window.start < first:
+        return Decision(
+            "refused_window",
+            None,
+            f"tracking window start {window.start} is before {first}, the first rebalance "
+            f"session after holdout.end {frozen.holdout_end}",
+        )
+    return Decision("run", "tracking", "tracking run")
+
+
 def default_in_sample_window(frozen: Frozen) -> Window:
     """`[in_sample_start, last rebalance session strictly before holdout.start]`,
     so an ordinary run cannot drift into the holdout."""
@@ -194,6 +227,8 @@ def decide(
     reasons: Reasons,
     gap_series: Mapping[date, float] | None,
     prior_spends: Sequence[HoldoutSpend],
+    *,
+    tracking: bool = False,
 ) -> Decision:
     """Apply the window, holdout and gap rules (module docstring) to one run.
 
@@ -203,7 +238,12 @@ def decide(
     trial as `holdout` before reading `family_holdout_spends` drops its own id,
     or every first spend reads as a repeat. Raises `ValueError` when a
     series is given but misses a rebalance session of the window.
+
+    With `tracking=True` only the tracking-window rule applies (module
+    docstring): `flags`, `reasons`, `gap_series` and `prior_spends` are not read.
     """
+    if tracking:
+        return _tracking(window, frozen)
     refusal = _window_refusal(window, frozen)
     if refusal is not None:
         return Decision("refused_window", None, refusal)
