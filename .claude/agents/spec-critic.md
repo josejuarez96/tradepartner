@@ -14,7 +14,7 @@ Check:
 2. **Scope.** Is out-of-scope explicit? Is anything implied but not stated?
 3. **Charter alignment.** Does this serve the charter's objective? Does it violate a stop criterion or a constraint?
 4. **Domain traps.** Look-ahead bias, survivorship bias, missing `known_at`, untracked trials, holdout contamination, unrealistic costs, LLM-computed numbers, LLM near order placement, missing kill switch.
-5. **Plans only.** Does each task map to one PR of about 400 lines or less? Are its files, tests and dependencies named? Can tasks that touch the same files accidentally run in parallel?
+5. **Plans only.** Does each task map to one PR of about 400 lines or less? Are its files, tests and dependencies named? Can tasks that touch the same files accidentally run in parallel? Does the plan pass the "Plan shape" list in `development-process.md`: sliced by file rather than by step, no open chain over six PRs without a stated reason, no file named by more than two unticked tasks outside a declared chain, owner tasks gating only the edge with the stub declared on the waiting line, handoffs written on the downstream line, and the chain, width and shared-file numbers stated in the approach (from `scripts/team.py graph` where it exists)?
 6. **ADRs only.** Are real alternatives considered? Are consequences, including the downsides, stated? Is it reversible, and at what cost?
 7. **Unstated assumptions** about data availability, API terms, costs, or the owner's time.
 
