@@ -518,6 +518,11 @@ why = "The design standard deferred this to Phase 4; the page task needs it sett
 what = "The operations page: positions, orders, today's ranking with reasons, fills, the chain per order, alerts, kill-switch state."
 why = "Phase 4's exit requires the owner to see the system's state, not trust it."
 
+[task.T54d]
+what = "A pure function that adds up the unfilled notional of our own buys still open at the broker, so the buys phase sizes from cash minus that reserve."
+why = "Broker cash does not hold back our own open buys; without the reserve two runs' buys could both fill and borrow, which the charter forbids (ADR 0010 amendment 2026-10-01)."
+unblocks = ["task:T60b", "task:T71"]
+
 [task.T69b]
 what = "The override screen: the dashboard's one write, a reasoned exclude, keep or kill-switch row."
 why = "Every human override is logged with a reason and passes the same risk rules."
@@ -537,6 +542,15 @@ why = "The first unattended paper run; only the owner holds the keys and the sto
 [task.T71b]
 what = "The phase close: the exit-criteria command exits 0 on the real store after six unattended rebalances."
 why = "The MVP's finish line."
+
+[issue.469]
+what = "Writes the owner's #366 batch 2 answers into the documents: the ADR 0010 amendment and T54d for the open-buy cash reserve, the spin-off rules in the spec, and the decisions_from confirmations."
+why = "Answers left only in an issue comment are invisible to the next implementer; the plan line and the spec are what a task reads."
+unblocks = ["task:T54d", "task:T60b", "task:T64b"]
+
+[issue.473]
+what = "Stores spin-off actions (child, parent, ratio) so reconciliation can explain a spin-off instead of halting for a manual fix."
+why = "Until then a spin-off the broker books halts the paper window; it needs T48b's recording of how Alpaca paper books one."
 
 [issue.352]
 what = "team.py claim and show print a task's plan line and its dependencies' lines; implementers read those, not the plan; reviewers post the full report on the PR and return ten lines."
