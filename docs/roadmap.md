@@ -22,6 +22,15 @@ The MVP is a plain quant system: **long-only, monthly-rebalanced 12-1 momentum**
 - News-text signals. Backtestable in principle, but they fight the speed problem. Revisit after the MVP runs.
 - The LLM analyst layer (Phase 5). No evidence yet that it adds predictive value. Its first job, if any, is process discipline (e.g. a pre-mortem on owner overrides), not prediction.
 
+## Calendar-bound phases and what fills them
+
+Added 2026-09-30 (#388). Phase 4 exits after at least six monthly rebalances of unattended paper runs, so once `paper start` runs, about six calendar months pass that no build throughput can shorten; Phase 6's pre-set stop criteria work the same way. Windows that would otherwise idle take the items below, in this order, each through its own spec, plan or ADR PR under the plan-shape rules in [development-process.md](ways-of-working/development-process.md), and none touching Phase 4 code:
+
+1. **The Phase 5 spec and plan** under [ADR 0008](decisions/0008-llm-role.md) (an advisory memo at most, never a number and never an order): the fixed input packet, the post-cutoff-only evaluation plan and the calibration record. Drafting can start once the Phase 4 journal schema is final, since the packet reads the journal.
+2. **Phase 6 preparation** as docs tasks the owner completes: the written stop criteria, the account-type decision and the employer compliance check.
+3. **The `data-validator` and `journal-analyst` agents** ([agents.md](ways-of-working/agents.md) candidates): the first is Phase 2's T23, whose agent half does not need the owner's scheduling evidence and can be split from it by a Phase 2 plan amendment; the second needs a real journal.
+4. **The strategy-lab and event-data engines** once the owner answers #281 and #307, and the timestamped social collector side job, which needs its own ADR before it enters scope.
+
 ## User experience
 
 The owner is the only user, and the system runs locally. The interface is a **cross-cutting slice of every phase**, not a phase of its own: each phase exits with its page in place (the **UX** items above).
