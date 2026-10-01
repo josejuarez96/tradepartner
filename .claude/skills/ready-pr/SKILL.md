@@ -23,7 +23,8 @@ Run this when the work on your claimed issue is complete and the draft PR descri
    WITH FIXES`) and returns a ten-line summary; if it says it could not post, post the file it
    wrote with `gh pr comment <n> --body-file <path>`. Address the findings and re-run it for a
    fresh verdict. Only the **first line** of a comment counts, the latest verdict per agent
-   wins, and `FAIL` blocks. The PR body does not count because the template already names
+   wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` both block until a re-review
+   after the fixes posts `PASS` (#356). The PR body does not count because the template already names
    both agents. (#352)
 3. Fill in the PR template. Tick every box, or replace an inapplicable one with `n/a` and why.
    The body must say `Closes #<issue>`.
