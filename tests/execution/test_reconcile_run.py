@@ -972,24 +972,101 @@ def test_the_post_trade_read_sees_the_runs_own_rows(
     assert set(found.reference_prices) == {SPY, MTUM}
 
 
+def _collected_late(
+    settings: Settings,
+    run_id: int,
+    security_id: str,
+    symbol: str,
+    quantity: float,
+    collected: datetime,
+) -> None:
+    """An order known before close(S-1), filled at 15:59 ET on S-1, and collected (fill
+    and terminal event journaled) at `collected` by S's step 3."""
+    placed = CUT - timedelta(hours=1)
+    filled = CUT - timedelta(minutes=1)
+    order = _order(
+        settings,
+        run_id,
+        f"tp-late-{symbol}",
+        security_id,
+        symbol,
+        quantity,
+        events=("pending", "accepted"),
+        fill=False,
+        at=placed,
+    )
+    _append(
+        settings,
+        FillRow(
+            client_order_id=order.client_order_id,
+            filled_at=filled,
+            quantity=quantity,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id=f"fill-{order.client_order_id}",
+            source="broker_feed",
+            known_at=collected,
+            ingested_at=collected,
+        ),
+        OrderEventRow(
+            client_order_id=order.client_order_id,
+            status="filled",
+            known_at=collected,
+            ingested_at=collected,
+        ),
+    )
+
+
+def test_a_late_collected_fill_and_a_later_adjustment_change_no_explanation(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """The fills and adjustments cuts: a fill filled on S-1 but collected on S, and a
+    `dividend_cash` row journaled on S, are not read at `as_of` = close(S-1). Read at
+    the run's clock, the fill becomes MTUM's dividend base and the row settles SPY's."""
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 1.5, CUT - timedelta(hours=2))
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(hours=2))
+    collected = datetime(2026, 10, 1, 13, 0, tzinfo=UTC)  # S's step 3, before the open
+    _collected_late(journal_settings, run_id, MTUM, "MTUM", 4.0, collected)
+    before = _explain(journal_settings, open_window, CUT)
+    assert before.dividends == pytest.approx({SPY: 15.0})  # MTUM not yet held at CUT
+
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            run_id=run_id,
+            session=S,
+            kind="dividend_cash",
+            security_id=SPY,
+            cash=15.0,
+            known_at=collected + timedelta(hours=8),
+            ingested_at=collected + timedelta(hours=8),
+        ),
+    )
+
+    assert _explain(journal_settings, open_window, CUT) == before
+    later = _explain(journal_settings, open_window, collected + timedelta(hours=9))
+    assert later.dividends == pytest.approx({MTUM: 2.0})
+
+
 def test_reconcile_now_states_the_ledger_from_rows_known_at_as_of(
     journal_settings: Settings,
     fake: BookedFake,
     open_window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
-    """`reconcile_now` passes its `as_of` to every journal read: a fill known after it
-    is not in the ledger, so the broker's position in that name is unexplained."""
+    """`reconcile_now` passes its `as_of` to the ledger's journal read: a fill collected
+    after it is not in the ledger, so the broker's position in that name is unexplained
+    (why a run's pre-trade reconciliation cannot cut at close(S-1), #488)."""
     run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
-    fill_at = fixed_clock() - timedelta(minutes=10)
-    _order(journal_settings, run_id, "tp-late", MTUM, "MTUM", 4.0, at=fill_at)
-    fake.submit(OrderRequest("tp-late", "MTUM", Side.BUY, quantity=4.0))
-    fake.simulate_fill("tp-late")
+    collected = fixed_clock() - timedelta(minutes=10)
+    _collected_late(journal_settings, run_id, MTUM, "MTUM", 4.0, collected)
+    fake.submit(OrderRequest("tp-late-MTUM", "MTUM", Side.BUY, quantity=4.0))
+    fake.simulate_fill("tp-late-MTUM")
 
-    with pytest.raises(ReconciliationError):
-        _reconcile(
-            journal_settings, fake, open_window, fixed_clock, as_of=fill_at - timedelta(minutes=1)
-        )
+    with pytest.raises(ReconciliationError, match=r"broker_only_position"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=CUT)
     fixed_clock.advance(minutes=5)
     assert (
         _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=fixed_clock()).status
@@ -1004,6 +1081,6 @@ def test_an_as_of_after_the_clock_reading_is_refused_before_any_broker_call(
     fixed_clock: FixedClock,
 ) -> None:
     later = fixed_clock() + timedelta(seconds=1)
-    with pytest.raises(ValueError, match="after the clock reading"):
+    with pytest.raises(ClockError, match="after the clock reading"):
         _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=later)
     assert _rows(journal_settings, open_window) == []

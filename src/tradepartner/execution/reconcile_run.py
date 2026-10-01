@@ -456,16 +456,18 @@ def reconcile_now(
     the explanations read at (module docstring), never after the clock reading.
 
     Raises `ReconciliationError` on a mismatch (the row is written first),
-    `ClockError` for a bad clock reading, `ValueError` for a non-session
-    `session`, a window without an id, or a naive `as_of` or one after the clock
-    reading, and whatever the broker raises (every
-    allowlist this reaches is empty, req 4)."""
+    `ClockError` for a bad clock reading or an `as_of` after it, `ValueError`
+    for a non-session `session`, a window without an id, or a naive `as_of`,
+    and whatever the broker raises (every allowlist this reaches is empty,
+    req 4)."""
     window_id = _window_id(window)
     cut = _cut(session)
     now = _read_clock(clock)
     as_of = ensure_tz_aware_utc(as_of, field_name="as_of")
     if as_of > now:
-        raise ValueError(f"as_of {as_of.isoformat()} is after the clock reading {now.isoformat()}")
+        # A clock that went back between the caller's reading and this one (or a
+        # caller cutting in the future): the same fault as a stamp going back.
+        raise ClockError(f"as_of {as_of.isoformat()} is after the clock reading {now.isoformat()}")
     through = _stated_through(session, now)
     tolerance = frozen.reconcile_quantity_tolerance
 
