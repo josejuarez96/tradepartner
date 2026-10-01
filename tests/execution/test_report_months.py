@@ -270,9 +270,15 @@ def test_modelled_cost_uses_trial_equity_not_paper_equity() -> None:
 def test_action_identity_matches_store_asof_source_action_id() -> None:
     # A re-dated dividend under one `source_action_id`: the store's own
     # identity (`security_id`, `source_action_id`) must collapse both
-    # revisions to the latest ex-date, never keep both alive at once
-    # (`store.asof._ACTION_IDENTITY_PARTITION`).
-    ex_date = date(2026, 10, 15)
+    # revisions to the latest-known one, never keep both alive at once
+    # (`store.asof._ACTION_IDENTITY_PARTITION`). The original revision is
+    # dated INSIDE this month; the later, latest-known revision moves it
+    # OUTSIDE this month (a correction): a wrong identity that groups by
+    # `(security_id, action_type, ex_date)` instead of `source_action_id`
+    # would treat these as two distinct actions and keep the original's
+    # in-month dividend alive, double-reporting the term as nonzero instead
+    # of the correct zero.
+    ex_date = date(2026, 10, 15)  # inside this month (T0, T1]
     record_date = previous_session(ex_date)
     equity = {T0: 100_000.0, T1: 101_000.0}
     trial = _trial(equity, {T0: 0.0})
@@ -281,7 +287,7 @@ def test_action_identity_matches_store_asof_source_action_id() -> None:
         {
             "security_id": [A],
             "action_type": ["dividend"],
-            "ex_date": [date(2026, 9, 1)],  # originally dated outside this month
+            "ex_date": [ex_date],  # originally dated inside this month
             "ratio_or_amount": [0.5],
             "known_at": [_utc(T0)],
             "cancelled": [False],
@@ -292,9 +298,9 @@ def test_action_identity_matches_store_asof_source_action_id() -> None:
         {
             "security_id": [A],
             "action_type": ["dividend"],
-            "ex_date": [ex_date],  # re-dated into this month, same source id
+            "ex_date": [date(2026, 9, 1)],  # corrected to a date outside this month
             "ratio_or_amount": [0.5],
-            "known_at": [_utc(T1)],
+            "known_at": [_utc(T1)],  # the latest-known revision of the same source id
             "cancelled": [False],
             "source_action_id": ["div-1"],
         }
@@ -304,10 +310,11 @@ def test_action_identity_matches_store_asof_source_action_id() -> None:
     result = compare_months(
         _window(tracking_rule="residual"), trial, journal, actions, _no_price, None
     )
-    # One dividend of 0.5/share x 100 shares, not two: a wrong identity that
-    # kept the original revision alive too would double this.
-    expected = (0.5 * 100.0) / 100_000.0
-    assert result.months[0].dividend_term == pytest.approx(expected)
+    # The correction moved the dividend out of this month entirely: the
+    # correct identity (by source_action_id) leaves nothing to count here.
+    # A wrong identity (keeping the original's in-month row alive too) would
+    # report 0.5*100/100_000 = 0.0005 instead.
+    assert result.months[0].dividend_term == pytest.approx(0.0)
 
 
 def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None:
