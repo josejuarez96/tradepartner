@@ -123,12 +123,8 @@ def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason
 # --- version 6 and the migration from version 5 ---------------------------------------
 
 
-def test_current_schema_version_is_6() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 6
-
-
-def test_fresh_init_records_version_6(journal: duckdb.DuckDBPyConnection) -> None:
-    assert _versions(journal) == [6]
+def test_fresh_init_records_the_current_version(journal: duckdb.DuckDBPyConnection) -> None:
+    assert _versions(journal) == [schema.CURRENT_SCHEMA_VERSION]
 
 
 def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
@@ -151,7 +147,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
             _event(conn, "halted")
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == [5, 6]
+    assert versions == [5, 6, 7]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t != "order_events"} == others_before
 
@@ -184,7 +180,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [5, 6]
+        assert _versions(conn) == [5, 6, 7]
 
 
 def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothing(
