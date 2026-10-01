@@ -463,6 +463,16 @@ def build_graph(
     }
 
 
+def critical_path_ids(tasks: Iterable[Any]) -> list[str]:
+    """Graph node ids of the longest chain of open plan tasks, first to last (#438).
+
+    The chain is ``team.critical_path`` (#389): open tasks only, ties broken by task id.
+    The page draws it heavier than the other arrows so the owner can see what the finish
+    line waits on.
+    """
+    return [f"task:{t.id}" for t in team.critical_path(list(tasks))]
+
+
 def phase_progress(
     roadmap: list[dict[str, Any]],
     current_phase: int | None,
@@ -893,6 +903,7 @@ def collect(
         work_map=work_map,
         repo_url=repo_url,
     )
+    graph["critical_path"] = critical_path_ids(tasks)
     progress = phase_progress(roadmap, header["phase"], mvp, graph["nodes"], issues, adrs)
     return {
         "generated_at": now.isoformat(),
