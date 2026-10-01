@@ -864,3 +864,179 @@ def test_inputs_that_cannot_be_compared_raise() -> None:
         _run(
             _ledger(), {}, 1_000.0, explanations=_explanations(symbols={"SEC_A": "X", "SEC_B": "X"})
         )
+
+
+# --- #398, #399, #400: the notional lag bound and dividends beside other allowances
+
+
+def test_an_oversized_reading_on_a_notional_order_is_a_bad_reading() -> None:
+    """#398: a $500 notional buy read as 1000 shares at $100 cannot bound the lag."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=1_010.0),
+        -99_000.0,
+        journal_open=[_lagging_buy(1_000.0, 0.0)],
+    )
+
+    assert result.status == "mismatch"
+    assert "bad_reading" in _kinds(result)
+    assert result.lagging_ids == ()
+
+
+def test_a_notional_reading_within_its_buffered_notional_still_lags() -> None:
+    """#398: 5.1 shares at $100 on a $500 order is at 500 x (1 + buffer)."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=15.1),
+        490.0,
+        journal_open=[_lagging_buy(5.1, 0.0)],
+    )
+
+    assert result.status == "fills_lagging"
+
+
+def test_a_notional_reading_past_its_buffered_notional_is_a_bad_reading() -> None:
+    """#398: 5.11 shares at $100 is $511, past 500 x 1.02 + the cash tolerance."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=15.11),
+        489.0,
+        journal_open=[_lagging_buy(5.11, 0.0)],
+    )
+
+    assert "bad_reading" in _kinds(result)
+
+
+def test_a_credited_dividend_while_a_buy_lags_is_allowed_and_deferred() -> None:
+    """#399: the broker filled 5 (journal 2) and credited $4.50 on SEC_B."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=12.0, SEC_B=4.0),
+        _positions(AAA=15.0, BBB=4.0),
+        704.5,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(dividends={"SEC_B": 4.5}),
+    )
+
+    assert result.status == "fills_lagging"
+    assert result.adjustments == () and result.explained == ()
+    assert ("deferred dividend", 4.5, "SEC_B") in [
+        (a.reason, a.difference, a.security_id) for a in result.allowed
+    ]
+
+
+def test_a_credited_dividend_while_an_order_is_pending_is_allowed() -> None:
+    """#399: a pending $500 buy the broker never filled, plus a $4.50 credit."""
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", notional=500.0)
+    pending = JournalOpenOrder(
+        row, pending=True, journaled_quantity=0.0, journaled_notional=0.0, reading=None
+    )
+    result = _run(
+        _ledger(1_000.0, SEC_B=4.0),
+        _positions(BBB=4.0),
+        1_004.5,
+        journal_open=[pending],
+        explanations=_explanations(dividends={"SEC_B": 4.5}),
+    )
+
+    assert result.status == "pending_unresolved"
+    assert result.adjustments == ()
+
+
+def test_cash_within_the_proceeds_cap_is_all_proceeds_beside_a_dividend() -> None:
+    """#400: SEC_C ended (cap 5 x 20 x 1.02 = 102) and SEC_A has $4.50 due. Paper
+    is not expected to pay dividends, so $102 that the proceeds alone can
+    hold is all proceeds."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=5.0),
+        _positions(AAA=10.0),
+        1_102.0,
+        explanations=_explanations(ended=frozenset({"SEC_C"}), dividends={"SEC_A": 4.5}),
+    )
+
+    assert result.status == "ok"
+    found = {(a.kind, a.security_id): a.cash for a in result.adjustments}
+    assert found == {("corporate_action_cash", "SEC_C"): pytest.approx(102.0)}
+
+
+def test_cash_beyond_the_proceeds_cap_is_read_as_the_dividend_beside_them() -> None:
+    """#400: $104.50 is more than the $102 cap: $100 of proceeds and the $4.50
+    dividend, not a cash mismatch."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=5.0),
+        _positions(AAA=10.0),
+        1_104.5,
+        explanations=_explanations(ended=frozenset({"SEC_C"}), dividends={"SEC_A": 4.5}),
+    )
+
+    assert result.status == "ok"
+    found = {(a.kind, a.security_id): a.cash for a in result.adjustments}
+    assert found == {
+        ("corporate_action_cash", "SEC_C"): pytest.approx(100.0),
+        ("dividend_cash", "SEC_A"): pytest.approx(4.5),
+    }
+    [removal] = [a for a in result.adjustments if a.kind == "corporate_action_cash"]
+    assert removal.quantity == -5.0
+
+
+def test_cash_beyond_the_cap_and_the_dividend_is_still_a_mismatch() -> None:
+    """#400: $107.50 is more than the $102 cap plus the $4.50 dividend."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=5.0),
+        _positions(AAA=10.0),
+        1_107.5,
+        explanations=_explanations(ended=frozenset({"SEC_C"}), dividends={"SEC_A": 4.5}),
+    )
+
+    assert _kinds(result) == ["cash"]
+    assert result.adjustments == ()
+
+
+def test_an_ended_listing_whose_cash_excludes_the_dividend_keeps_all_proceeds() -> None:
+    """#400: when the dividend does not fit the cash, the proceeds take it all."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0, SEC_C=5.0),
+        _positions(AAA=10.0),
+        1_002.0,
+        explanations=_explanations(ended=frozenset({"SEC_C"}), dividends={"SEC_A": 4.5}),
+    )
+
+    assert result.status == "ok"
+    found = {(a.kind, a.security_id): a.cash for a in result.adjustments}
+    assert found == {("corporate_action_cash", "SEC_C"): pytest.approx(2.0)}
+
+
+def test_cash_beyond_the_lag_and_the_dividend_is_still_a_mismatch() -> None:
+    """#399: the band runs from the lag's -$300 to the dividend's +$4.50; a
+    dollar above that is a mismatch."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=12.0, SEC_B=4.0),
+        _positions(AAA=15.0, BBB=4.0),
+        1_005.5,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(dividends={"SEC_B": 4.5}),
+    )
+
+    assert _kinds(result) == ["cash"]
+
+
+def test_a_deferred_dividend_widens_the_cash_band_only_upward() -> None:
+    """#399: $4.50 less cash than the lag explains is not absorbed by a dividend."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=12.0, SEC_B=4.0),
+        _positions(AAA=15.0, BBB=4.0),
+        695.5,
+        journal_open=[_lagging_buy(5.0, 2.0)],
+        explanations=_explanations(dividends={"SEC_B": 4.5}),
+    )
+
+    assert _kinds(result) == ["cash"]
+
+
+def test_a_negative_dividend_due_is_refused() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0),
+            1_000.0,
+            explanations=_explanations(dividends={"SEC_A": -1.0}),
+        )
