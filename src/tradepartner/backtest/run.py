@@ -75,6 +75,7 @@ from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.results import write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry, schema
 from tradepartner.store.db import open_for_write, open_read_only
@@ -123,6 +124,11 @@ def _close(
     message: str,
     error: str | None = None,
 ) -> RunOutcome:
+    """Close the trial with `message`, scrubbed of every configured secret at
+    write time (an exception's words can carry one; #342), as `ingest._clean`
+    does for run rows. `error`, the traceback, is returned, not stored; the CLI
+    scrubs it when it prints it."""
+    message = scrub_text(message, secrets=_configured_secrets(store))[0]
     with open_for_write(store) as conn:
         registry.close_trial(conn, handle, status, message)
     return RunOutcome(handle.trial_id, status, error=error)

@@ -38,7 +38,7 @@ from pydantic import SecretStr
 from tradepartner import calendar
 from tradepartner.adapters import alpaca_raw, alpaca_trading_raw, edgar_raw
 from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError, AlpacaTradingRaw
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, secret_values
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 ALPACA_FIXTURES_DIR = FIXTURES_ROOT / "alpaca"
@@ -226,31 +226,26 @@ def _non_blank_secret(secret: SecretStr | None) -> str | None:
 def _configured_secrets(settings: Settings) -> list[str]:
     """Every real secret value to scrub as a substring, plus derived forms.
 
-    Includes the HTTP Basic `base64("key:secret")` form of the Alpaca
-    credential pair, in case a payload ever carries an `Authorization:
-    Basic ...` value built from them (T2 review round 2, safety-reviewer
-    MUST FIX) -- on top of the `Authorization`-header-name scrub in
-    `scrub_json`, which catches it regardless of content. The Phase 4 alert
-    secrets (`ALERT_SMTP_USER`, `ALERT_SMTP_PASSWORD`, `ALERT_EMAIL_TO`) are
-    included (#320): an SMTP password is neither email- nor key-shaped, so no
-    pattern would catch it.
+    Starts from `config.secret_values`, every `SecretStr` field found by type,
+    so a secret added to `Settings` later is scrubbed from CLI output and
+    fixtures without editing this function (#342), as `ingest._clean` does
+    for run rows (#334). An SMTP password is neither email- nor key-shaped,
+    so no pattern would catch it otherwise (#320).
+
+    On top: the HTTP Basic `base64("key:secret")` form of each Alpaca
+    credential pair, in case a payload ever carries an `Authorization: Basic
+    ...` value built from them (T2 review round 2, safety-reviewer MUST FIX),
+    on top of the `Authorization`-header-name scrub in `scrub_json`, which
+    catches it regardless of content; and the SMTP AUTH forms.
     """
-    api_key = _non_blank_secret(settings.alpaca_api_key)
-    api_secret = _non_blank_secret(settings.alpaca_api_secret)
-    user_agent = _non_blank_secret(settings.sec_edgar_user_agent)
-    paper_key = _non_blank_secret(settings.alpaca_paper_api_key)
-    paper_secret = _non_blank_secret(settings.alpaca_paper_api_secret)
-
-    alert_values = (
-        _non_blank_secret(settings.alert_smtp_user),
-        _non_blank_secret(settings.alert_smtp_password),
-        _non_blank_secret(settings.alert_email_to),
+    values = secret_values(settings)
+    pairs = (
+        (settings.alpaca_api_key, settings.alpaca_api_secret),
+        (settings.alpaca_paper_api_key, settings.alpaca_paper_api_secret),
     )
-
-    values = [
-        v for v in (api_key, api_secret, user_agent, paper_key, paper_secret, *alert_values) if v
-    ]
-    for key, secret in ((api_key, api_secret), (paper_key, paper_secret)):
+    for key_field, secret_field in pairs:
+        key = _non_blank_secret(key_field)
+        secret = _non_blank_secret(secret_field)
         if key is not None and secret is not None:
             values.append(base64.b64encode(f"{key}:{secret}".encode()).decode())
     values.extend(_smtp_login_forms(settings))
@@ -949,7 +944,9 @@ def main(argv: Sequence[str] = ()) -> int:
             alpaca_trading_raw.AlpacaPaperCredentialsError,
             alpaca_trading_raw.AlpacaPaperGuardError,
         ) as error:
-            print(f"cli_record: {error}", file=sys.stderr)
+            # Fixed text today; scrubbed anyway so every recorder error has one rule (#342).
+            message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
+            print(f"cli_record: {message}", file=sys.stderr)
             return 1
         return _run_paper(raw, settings, argv[1].upper())
 

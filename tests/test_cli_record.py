@@ -96,6 +96,44 @@ def test_configured_secrets_excludes_blank_values() -> None:
     assert secrets == ["TradePartner test@example.com"]
 
 
+def test_configured_secrets_finds_a_new_secret_field_by_type() -> None:
+    """A `SecretStr` field added to `Settings` later is scrubbed from CLI output
+    and fixtures without editing a list, as `ingest._clean` already does (#342)."""
+    from pydantic import SecretStr
+
+    class _MoreSettings(Settings):
+        future_token: SecretStr | None = None
+
+    settings = _MoreSettings(_env_file=None, future_token="fake-future-token-342")
+    assert "fake-future-token-342" in cli_record._configured_secrets(settings)
+
+
+@pytest.mark.parametrize("error_name", ["AlpacaPaperCredentialsError", "AlpacaPaperGuardError"])
+def test_paper_construction_errors_are_scrubbed(
+    error_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`main paper` prints the adapter's construction errors through `scrub_text`,
+    the same rule as every other recorder error (#342)."""
+    from tradepartner.adapters import alpaca_trading_raw
+
+    paper_key = "PKFAKEPAPER342ABCDEFG"  # gitleaks:allow
+    settings = _settings(alpaca_paper_api_key=paper_key)
+    monkeypatch.setattr(cli_record, "get_settings", lambda: settings)
+    error = getattr(alpaca_trading_raw, error_name)
+
+    def refuse(_settings: Settings) -> AlpacaTradingRaw:
+        raise error(f"refused for {paper_key}")
+
+    monkeypatch.setattr(cli_record, "AlpacaTradingRaw", refuse)
+
+    assert cli_record.main(["paper", "XYZ"]) == 1
+    captured = capsys.readouterr()
+    assert paper_key not in captured.err
+    assert "cli_record: refused for" in captured.err
+
+
 # --- filing-document helpers (MUST FIX #2) ----------------------------------
 
 
