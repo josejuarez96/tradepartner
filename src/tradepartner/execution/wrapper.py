@@ -106,9 +106,10 @@ residues, the decision states and the reference prices share one frame (#518).
    `ValueError` halts the phase before any request reaches the broker;
 6. `risk.check_phase` against that same cash: a violation raises
    `LimitBreachError` (any `limit_breach`) or `SkipCapError` with zero submits,
-   after a `missed` `rebalance_events` row with that reason when the batch
-   held the rebalance's decisions (a forced-exits-only batch leaves it
-   pending); a skip-cap halt writes no `decision_events` row;
+   after a `missed` `rebalance_events` row with that reason when the **batch**
+   held the rebalance's decisions, whichever phase breached (a
+   forced-exits-only batch leaves it pending); a skip-cap halt writes no
+   `decision_events` row;
 7. one write chunk: the phase-time `skipped` rows, then the `orders` rows
    (`sells_in_flight_at_submit` true on a sell, `not last` on a buy) and their
    `pending` events, committed before the first submit;
@@ -537,9 +538,9 @@ class RiskGatedBroker:
         if run.run_id is None or run.session is None:
             raise ValueError("execute needs a journaled run with its session")
         rows = [*decisions, *forced_exits]
-        rebalance = {
-            d.decision_id: d.rebalance_session for d in decisions if d.decision_id is not None
-        }
+        # The batch holds these rebalances: a halt in either phase marks them
+        # `missed` (ADR 0010 point 2), whichever decisions that phase held.
+        rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
         sold = phases.PhaseOrders((), ())
         submitted: list[str] = []
@@ -588,7 +589,7 @@ class RiskGatedBroker:
         self,
         run: PaperRunRow,
         rows: Sequence[DecisionRow],
-        rebalance: Mapping[int, date | None],
+        rebalance: Sequence[date],
         sold: phases.PhaseOrders,
         prior_orders: int,
         prior_skips: int,
@@ -660,7 +661,7 @@ class RiskGatedBroker:
         built: phases.PhaseOrders,
         assets: Mapping[str, Asset],
         account: Account,
-        rebalance: Mapping[int, date | None],
+        rebalance: Sequence[date],
         phase: str,
         prior_orders: int,
         prior_skips: int,
@@ -694,9 +695,7 @@ class RiskGatedBroker:
             prior_skips=counted,
         )
         if isinstance(verdict, Violations):
-            touched = {o.decision_id for o in built.orders} | {s.decision_id for s in built.skips}
-            held = {rebalance[i] for i in touched if i in rebalance}
-            self._refuse(run, verdict, sorted(t for t in held if t is not None))
+            self._refuse(run, verdict, rebalance)
         left_ids = {o.decision_id for o in verdict.orders}
         final = phases.PhaseOrders(tuple(o for o in built.orders if o.decision_id in left_ids), ())
         requests = self._requests(final, book, session)
@@ -750,7 +749,8 @@ class RiskGatedBroker:
     def _refuse(self, run: PaperRunRow, verdict: Violations, missed: Sequence[date]) -> NoReturn:
         """Raise the batch's violation: `LimitBreachError` when any rule is a
         `limit_breach`, else `SkipCapError`, after a `missed` row for each
-        rebalance in `missed` (those whose decisions the batch held)."""
+        rebalance in `missed` (those whose decisions the batch held, in either
+        phase; a forced-exits-only batch holds none)."""
         breaches = [v for v in verdict.violations if v.kind == _LIMIT_BREACH]
         reason = _LIMIT_BREACH if breaches else _SKIP_CAP
         message = "; ".join(f"{v.rule}: {v.detail}" for v in verdict.violations)

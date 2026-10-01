@@ -332,13 +332,15 @@ def _execute(
 # --- the reference price ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("known_by_cut", "quantity"), [(True, 10.0), (False, 5.0)])
+@pytest.mark.parametrize(("known_by_cut", "quantity"), [(True, 15.0), (False, 7.5)])
 def test_a_split_on_s_known_at_close_s_minus_1_halves_the_reference_price(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, known_by_cut: bool, quantity: float
 ) -> None:
     """A 2:1 split with ex_date = S known at close(S-1) halves the reference price
-    and doubles the holding, from one frame (#518 items 5, 6): a $500 trim sells
-    10 post-split shares. Known only after close(S-1), it changes nothing: 5."""
+    and doubles the holding, from one frame (#518 items 5, 6): a $750 trim sells
+    15 post-split shares, more than the 10 an unsplit ledger would hold (so it
+    would breach `sell_within_holding`). Known only after close(S-1), it changes
+    nothing: 7.5."""
     _hold(env, A, 10.0)
     _split(
         env.settings,
@@ -346,7 +348,7 @@ def test_a_split_on_s_known_at_close_s_minus_1_halves_the_reference_price(
         2.0,
         CUT - timedelta(minutes=1) if known_by_cut else CUT + timedelta(minutes=1),
     )
-    trim = _decision(env, A, "sell", notional=500.0)
+    trim = _decision(env, A, "sell", notional=750.0)
 
     outcome = _execute(_gate(env, alerter_conn), env, [trim])
 
@@ -498,6 +500,22 @@ def test_a_forced_exits_only_batch_that_halts_leaves_the_rebalance_pending(
     with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
         _execute(_gate(env, alerter_conn), env, [], [forced])
     assert _missed(env.settings) == []
+
+
+def test_a_sells_phase_breach_marks_a_held_buys_only_rebalance_missed(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The batch holds the rebalance (buys only) and a forced exit: the sells
+    phase holds only the exit, and its breach still marks the rebalance
+    `missed` (ADR 0010 point 2: per batch, not per phase)."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 8.0)
+    buy = _decision(env, B, "buy", notional=3000.0)
+    forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
+    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
+        _execute(_gate(env, alerter_conn), env, [buy], (forced,))
+    assert _missed(env.settings) == [("missed", "limit_breach")]
+    assert _submits(env.fake) == []
 
 
 # --- the journal before the broker ---------------------------------------------------------
