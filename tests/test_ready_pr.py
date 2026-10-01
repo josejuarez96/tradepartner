@@ -109,9 +109,7 @@ def test_required_reviews_follow_paths_and_verdicts_come_from_comments_only() ->
     assert ready_pr.required_reviews(["src/tradepartner/adapters/edgar.py"]) == req
     # the template names both agents, so the body never satisfies a review
     assert ready_pr.missing_reviews(req, [TEMPLATE, "ran quant-auditor, fine"]) == sorted(req)
-    assert ready_pr.missing_reviews(req, ["Quant-Auditor: PASS WITH FIXES\ndetails"]) == [
-        "safety-reviewer"
-    ]
+    assert ready_pr.missing_reviews(req, ["Quant-Auditor: PASS\ndetails"]) == ["safety-reviewer"]
     assert ready_pr.missing_reviews(req, ["quant-auditor: pass", "safety-reviewer: PASS"]) == []
     # first line only; latest verdict per agent wins; FAIL is recognised
     assert ready_pr.missing_reviews({"quant-auditor"}, ["notes\nquant-auditor: PASS"]) == [
@@ -120,13 +118,27 @@ def test_required_reviews_follow_paths_and_verdicts_come_from_comments_only() ->
     assert ready_pr.missing_reviews(
         {"quant-auditor"}, ["quant-auditor: PASS", "quant-auditor: FAIL\nregression"]
     ) == ["quant-auditor"]
+    assert ready_pr.required_reviews([".github/workflows/ci.yml"]) == {"safety-reviewer"}
+
+
+def test_pass_with_fixes_counts_only_once_a_later_pass_follows() -> None:
+    # #356: PASS WITH FIXES means SHOULD FIX findings are open until the re-review says PASS
+    qa = {"quant-auditor"}
+    assert ready_pr.missing_reviews(qa, ["quant-auditor: PASS WITH FIXES\nfix x"]) == [
+        "quant-auditor"
+    ]
+    assert ready_pr.missing_reviews(
+        qa, ["quant-auditor: FAIL", "quant-auditor: PASS WITH FIXES"]
+    ) == ["quant-auditor"]
+    assert ready_pr.missing_reviews(
+        qa, ["quant-auditor: PASS", "quant-auditor: PASS WITH FIXES"]
+    ) == ["quant-auditor"]
     assert (
         ready_pr.missing_reviews(
-            {"quant-auditor"}, ["quant-auditor: FAIL", "quant-auditor: PASS WITH FIXES"]
+            qa, ["quant-auditor: PASS WITH FIXES", "fixed in abc", "quant-auditor: PASS"]
         )
         == []
     )
-    assert ready_pr.required_reviews([".github/workflows/ci.yml"]) == {"safety-reviewer"}
 
 
 def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> None:

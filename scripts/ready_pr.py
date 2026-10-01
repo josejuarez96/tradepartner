@@ -28,7 +28,8 @@ Steps, in order (each one stops the run with a reason on failure):
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
-   the template's own wording): ``quant-auditor: PASS`` or ``PASS WITH FIXES``.
+   the template's own wording), and the latest one is ``quant-auditor: PASS``. A
+   ``PASS WITH FIXES`` needs a re-review after the fixes that posts ``PASS``.
 6. Push, wait for CI on **that exact commit**, then ``gh pr ready``.
 
 Usage::
@@ -247,10 +248,12 @@ def required_reviews(paths: Sequence[str]) -> set[str]:
 
 
 def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
-    """Required reviews whose latest verdict comment is not PASS / PASS WITH FIXES.
+    """Required reviews whose latest verdict comment is not PASS.
 
     A verdict is the **first line** of a PR comment, ``<agent>: PASS``, ``PASS WITH FIXES``
-    or ``FAIL``; comments are read in order and the latest verdict per agent wins. The PR
+    or ``FAIL``; comments are read in order and the latest verdict per agent wins. Only
+    ``PASS`` passes: ``PASS WITH FIXES`` leaves SHOULD FIX findings open, so it counts once
+    the re-review after the fixes posts a later ``PASS`` (#356). The PR
     body does not count: the template itself names both agents there. In this solo repo
     every comment comes from the owner's account, so this is a process gate, not an
     authentication boundary.
@@ -260,7 +263,7 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
         m = VERDICT_RE.match(c)
         if m:
             latest[m.group("agent").lower()] = m.group("verdict").lower()
-    return sorted(r for r in required if not latest.get(r, "").startswith("pass"))
+    return sorted(r for r in required if latest.get(r) != "pass")
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
@@ -450,8 +453,9 @@ def ready(
     missing = missing_reviews(required, pr.comments)
     if missing:
         raise ReadyError(
-            "run these reviews, address findings, then post a PR comment with a verdict line "
-            "`<agent>: PASS` or `<agent>: PASS WITH FIXES` for each: " + ", ".join(missing)
+            "run these reviews, address findings and re-run them until the latest PR comment "
+            "verdict line is `<agent>: PASS` (PASS WITH FIXES needs a re-review) for each: "
+            + ", ".join(missing)
         )
     say(f"reviews required: {sorted(required) or 'none'}; all recorded")
 
