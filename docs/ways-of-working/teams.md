@@ -2,13 +2,32 @@
 
 **Status:** Accepted v1.0 (#36, PR #37, 2026-09-24)
 
-## Why this exists
+## Command card
+
+Everything a build window types, in order of use. The rules behind each line follow under [Rules and history](#rules-and-history).
+
+| Command | When |
+|---|---|
+| `uv run python scripts/team.py start <name>` | Once per new session, from the main checkout; then `cd` into the directory it prints and work only there. |
+| `uv run python scripts/team.py whoami` | To check which team this directory belongs to. |
+| `uv run python scripts/team.py status` | At session start and before picking work: claims, ready frontier, loose issues, parked PRs. |
+| `uv run python scripts/team.py claim <Tn\|issue#>` | Before any branch. It prints the branch command, the task's plan line and its dependencies' lines. |
+| `uv run python scripts/team.py show <Tn>` | To reprint a task's plan line and dependency lines without claiming. |
+| `uv run python scripts/team.py release <Tn\|issue#> [--park]` | When you stop for good on an item: `--park` for a green PR, plain for a red or empty one. Write a handoff comment. |
+| `uv run python scripts/fragments.py add <issue> --slug <slug> --status "…" --added "…"` | Once per PR, before ready: the STATUS line and CHANGELOG bullets as one new file. |
+| `uv run python scripts/ready_pr.py <pr>` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
+
+Owner only: `release --force`, `claim --owner-task`, `prune --yes`.
+
+## Rules and history
+
+### Why this exists
 
 On 2026-09-24 two orchestrator sessions each read "Next up" in `STATUS.md` and, within one minute of each other, opened issues and PRs for the same two plan tasks (T5: #22/#25, T20: #23/#24). Nothing in the ways of working said *claim before you build*, nothing gave a session an identity, and every PR edited the same three shared files. `STATUS.md` is a snapshot; it cannot arbitrate between concurrent readers.
 
 This document adds the missing layer so that **any number of Claude Code windows** can build from one plan without stepping on each other. It changes nothing about branches, PRs, reviews or who merges: those rules stay in [git-workflow.md](git-workflow.md) and [development-process.md](development-process.md).
 
-## Vocabulary
+### Vocabulary
 
 | Term | Meaning |
 |---|---|
@@ -20,7 +39,7 @@ This document adds the missing layer so that **any number of Claude Code windows
 | **Chain** | Consecutive dependent tasks that one team should keep (listed per plan). |
 | **Parked** | Label on a green PR whose team stopped. Re-claim its issue and continue the branch. |
 
-## Set up a team (once per session)
+### Set up a team (once per session)
 
 **From a new Claude Code session in this repo (VS Code or terminal), one command:**
 
@@ -40,7 +59,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 - Branch from `origin/main`, not a local `main`: `git fetch origin && git switch -c <branch> origin/main` (the claim output prints this). A worktree cannot check out `main` while the main checkout has it.
 - Hooks and permissions are shared through the repo (`.pre-commit-config.yaml`, `.claude/settings.json`).
 
-## Session protocol (replaces the generic one for build sessions)
+### Session protocol (replaces the generic one for build sessions)
 
 **Start**
 1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the recently done entries not folded in yet.
@@ -59,7 +78,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 1. Done with the task: `/ready-pr` (runs `uv run python scripts/ready_pr.py <pr>`): merges `main` in, runs the checks, verifies the template and the specialist reviews, waits for CI on that commit and marks the PR ready. It never merges. Do not mark a PR ready by hand.
 2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after bringing `main` in with `/ready-pr`), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas. If the window is done for good, say so there; the owner prunes its directory when convenient.
 
-## The claim protocol, exactly
+### The claim protocol, exactly
 
 1. **GitHub is the source of truth.** Issues, labels and comments decide; `STATUS.md` and the board are snapshots.
 2. **A plan task's claim lives on its canonical issue.** `claim T5` finds the lowest-numbered open issue labelled `task:T5`, or creates one from the plan line. If two teams create simultaneously, the higher number is closed as a duplicate by the tool: the tiebreak is deterministic and needs no conversation. An issue created by hand with a title like `T5: …` is normalised by `claim <number>`: the tool adds the task label and sends the claim to the canonical issue.
@@ -70,7 +89,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 7. **A dead window keeps nothing.** If a window stopped without releasing, Jose runs `release <target> --force --reason "…"` from any clone. Agents never use `--force`; the tool cannot tell who is typing, so this is a rule, not a permission.
 8. **Spikes are exempt.** A `spike/` branch is never merged, so it needs no claim and the CI guard skips it.
 
-## Picking work
+### Picking work
 
 In this order:
 1. The next task in the chain you are already on. Context carries over and the files are yours already.
@@ -84,18 +103,18 @@ In this order:
 
 Chains are a preference, not a lock. Every task is still claimed individually.
 
-## Shared files: how N PRs avoid conflicts
+### Shared files: how N PRs avoid conflicts
 
 Until 2026-09-25 every PR appended one line to `docs/STATUS.md` ("Done") and one to `CHANGELOG.md` (`[Unreleased]`) at the same anchor. Git cannot merge two insertions at one spot, so every merge to `main` conflicted every other open PR, and each team looped: merge main, resolve, push, wait for CI, main moves, repeat (#70). The fix is that a PR **adds files, never lines**:
 
 - **Bookkeeping is one fragment per PR.** `uv run python scripts/fragments.py add <issue> --slug <slug> --status "<Recently done line>" --added "<CHANGELOG bullet>"` writes `changelog.d/<issue>-<slug>.md`: the STATUS line (at most 240 characters, linked to the PR or issue) first, then the CHANGELOG headings and bullets (#351). New files never conflict. PRs opened before #351 may still carry the old pair (`docs/status.d/` plus `changelog.d/`); both are still read and folded. Do not edit `STATUS.md`'s "Recently done" list or `CHANGELOG.md`'s `[Unreleased]` directly; `ready_pr.py` refuses a PR that does (`--allow-shared-files` is for process PRs only). Reading STATUS: `uv run python scripts/fragments.py show` prints the pending entries.
 - **Folding.** `uv run python scripts/fragments.py fold` moves every fragment into the two files in issue order and deletes it; STATUS keeps only the last 10 "Recently done" lines, because CHANGELOG and git history keep the rest (#351). `doc-keeper` runs it on the branch it is invoked on: a PR that edits those files for another reason (a plan amendment, a retro, the phase-close PR), or a fold PR **the owner asks for** when STATUS has gone stale, roughly every ten merges. Agents never open a fold PR on their own: a per-merge bookkeeping PR is what the Phase 1 retro banned. `ready_pr.py` recognises a fold (it deletes fragment files) and lets it through; doc-keeper's snapshot refresh in the same PR passes with `--allow-shared-files`.
-- **Plan checkboxes.** Tick only your checkbox. Different lines merge cleanly, and the CI `claims` job already stops two PRs from building one task.
+- **Plan checkboxes.** Tick only your checkbox, and collapse that line to `- [x] **Tn: Title** (#issue, PR #n) · Files: <paths> · Depends on: <unchanged>` (#353; `tests/test_docs_budget.py` caps a finished line at 400 characters). Different lines merge cleanly, and the CI `claims` job already stops two PRs from building one task.
 - **STATUS's "Ready frontier snapshot" and "Teams" are written only by `doc-keeper`** (and by the PR that changes the process). They are copies of `status` output, not a place to reserve or advertise work.
 - **Bring `main` in with a merge, not a rebase**, right before marking ready: `ready_pr.py` does it. A merge needs no force-push, so a branch two teams have pushed stays safe, and the squash merge flattens it anyway. The only conflict it resolves on its own is two lists of added bullets in the shared files (both sides kept); anything else stops and tells you.
 - **Code files: only those your plan task names.** If another team's open PR touches one of them, one of you waits; `status` shows open PRs per issue.
 
-## CI guard
+### CI guard
 
 The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull request. It fails when:
 - the branch has no issue number (`<prefix>/<issue#>-<slug>`), unless it is a `spike/` or `dependabot/` branch;
@@ -105,7 +124,7 @@ The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull requ
 
 A label or comment change on an issue does not re-run a PR's checks. After claiming, push a commit or run `gh run rerun <run-id> --failed`. The job runs the PR's own copy of `scripts/team.py`; that is acceptable for a solo owner who reviews every diff.
 
-## The owner's view
+### The owner's view
 
 - `uv run python scripts/team.py status` from any clone shows every team's claims.
 - **Merge order matters:** merging the head of a chain widens the frontier for everyone. Prefer merging chain heads first.
@@ -114,7 +133,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
 - You are not a role in the tool. You merge, you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
-## Never
+### Never
 
 - Start from STATUS "Next up" without a claim.
 - Run two sessions in one working directory, or register in a directory that already has a different `.team`.
@@ -123,6 +142,6 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
 - Merge. The owner merges, or explicitly tells one main session to (git-workflow rule 7).
 
-## Model tiers
+### Model tiers
 
 Which model a window or agent runs on is set in [agents.md](agents.md#orchestrator-windows-and-model-tiers): Opus 5.5 for orchestrator windows, Fable only where a wrong judgment propagates (specs, plans, ADRs, retros, conflict resolution, these docs), roster models unchanged.

@@ -92,7 +92,7 @@ These come straight from the research handoff. They are process rules, not just 
 
 **Start of session:**
 1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the recently done entries not folded in yet.
-2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch (spikes excepted).
+2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md); every command on its [command card](teams.md#command-card)). No claim, no branch (spikes excepted).
 3. Branch from `origin/main` as the claim output prints (`git fetch origin && git switch -c <branch> origin/main`). The claim also prints the task's plan line and its dependencies' lines: that is what the implementer reads, plus the spec sections the line cites, never the whole plan or spec (`team.py show <Tn>` reprints it; #352).
 
 **End of session:**
