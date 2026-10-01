@@ -252,31 +252,6 @@ def test_cmd_graph_prints_the_sections_and_respects_max_depth(
     assert team.cmd_graph(graph_root, ref=None, max_depth=3) == 1
 
 
-def test_cmd_graph_plan_filter_limits_to_one_plan_file(
-    root: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # Task ids are unique project-wide in real plans (PLAN only goes up to T20), so this
-    # second plan uses T91-T97 rather than reusing GRAPH_PLAN's T1-T7 verbatim, which would
-    # collide with PLAN's own T1, T3, T4, T5 and T20 once both plans load into one `tasks`.
-    other_plan = """# Plan: Graph fixture 2 (Phase 9)
-
-## Tasks
-- [x] **T91: Config.** Files: `src/a.py` · Depends on: n/a · Review: qa.
-- [ ] **T92 (owner): Secrets setup.** Files: `src/b.py` · Depends on: T91 · Review: safety-reviewer.
-- [ ] **T93: Branch A.** Files: `src/b.py`, `tests/test_b.py` · Depends on: T92 · Review: qa.
-- [ ] **T94: Branch B.** Files: `src/b.py` · Depends on: T92 · Review: qa.
-- [ ] **T97: Diamond join.** Files: `src/d.py` · Depends on: T93, T94 · Review: qa.
-- [ ] **T95: Chain tail.** Files: `src/c.py` · Depends on: T97 · Review: qa.
-- [x] **T96: Done task sharing file.** Files: `src/b.py` · Depends on: T91 · Review: qa.
-"""
-    (root / "docs" / "plans" / "graph-fixture.md").write_text(other_plan)
-    assert team.cmd_graph(root, ref=None, plan="graph-fixture") == 0
-    out = capsys.readouterr().out
-    assert "T92 -> T93 -> T97 -> T95" in out
-    # The data-foundation plan's tasks (T10, T8b, ...) are excluded by the filter.
-    assert "T10" not in out
-
-
 # ── graph: code-review follow-ups (#389) ────────────────────────────────────────
 
 
@@ -291,6 +266,49 @@ def test_critical_path_and_depth_levels_raise_systemexit_on_a_dependency_cycle()
         team.critical_path(tasks)
     with pytest.raises(SystemExit, match="cycle"):
         team.depth_levels(tasks)
+
+
+def test_cycle_error_excludes_tasks_that_merely_lead_into_the_cycle() -> None:
+    # T1 leads into the T2 <-> T3 cycle but is not part of it; the error should name
+    # only T2 and T3 (second code review on #389).
+    plan = """# Plan: Lead-in cycle fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Leads into a cycle.** Files: `src/a.py` · Depends on: T2 · Review: qa.
+- [ ] **T2: Cycle member.** Files: `src/b.py` · Depends on: T3 · Review: qa.
+- [ ] **T3: Cycle member.** Files: `src/c.py` · Depends on: T2 · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/lead-in-cycle-fixture.md")
+    with pytest.raises(SystemExit) as exc_info:
+        team.critical_path(tasks)
+    message = str(exc_info.value)
+    assert "T1" not in message
+    assert "T2" in message
+    assert "T3" in message
+
+
+def test_downstream_of_seeds_visited_with_the_start_task() -> None:
+    # T1 (open, owner) depends on T2 (done); T2 depends back on T1. Without seeding
+    # ``visited`` with the start task, this cycle through a done task made T1 its own
+    # dependant (second code review on #389).
+    plan = """# Plan: Self-cycle-through-done fixture (Phase 9)
+
+## Tasks
+- [ ] **T1 (owner): Root.** Files: `src/a.py` · Depends on: T2 · Review: qa.
+- [x] **T2: Done, cycles back to T1.** Files: `src/b.py` · Depends on: T1 · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/self-cycle-through-done-fixture.md")
+    assert team.downstream_of(tasks, "T1") == []
+
+
+def test_task_files_counts_known_extensionless_root_files() -> None:
+    plan = """# Plan: Dotfiles fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Dotfiles.** Files: `.python-version`, `.unstamped_filings` · Depends on: n/a · r: qa
+"""
+    tasks = team.parse_plan(plan, "docs/plans/root-dotfiles-fixture.md")
+    assert team.task_files(tasks[0]) == [".python-version"]
 
 
 def test_file_contention_dedupes_a_file_named_twice_by_one_task() -> None:
