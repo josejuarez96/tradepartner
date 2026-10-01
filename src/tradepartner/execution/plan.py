@@ -94,6 +94,7 @@ from tradepartner.store.journal import (
     PositionDailyRow,
     RebalanceEventRow,
 )
+from tradepartner.store.schema import HALT_REASON, NOT_RECEIVED_REASON
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SPLIT = "split"
@@ -109,9 +110,9 @@ _DUST = "dust"
 _TRADE = "trade"
 #: Decision kinds whose sells are the plan's own (their proceeds fund the buys).
 _PLAN_TRADE_KINDS = frozenset({_TRADE, _OVERRIDE})
-_HALT = "halt"
+_HALT = HALT_REASON
 _HALT_CANCEL_STATUSES = frozenset({"cancel_requested", "cancel_failed"})
-_NOT_RECEIVED = "not_received"
+_NOT_RECEIVED = NOT_RECEIVED_REASON
 _CANCELLED = "cancelled"
 _SKIPPED = "skipped"
 _CARRIED_RESIDUE = "carried_residue"

@@ -25,7 +25,7 @@ by column type, before any row reaches these tables.
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
 EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
 If a store records a version this code has no path from (anything other
-than 2, 3, 4 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+than 2, 3, 4, 5 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
 `SchemaVersionError` rather than silently operating against a shape it
 does not know about.
 
@@ -70,8 +70,18 @@ registry; #83 took version 2 first, so the registry is version 3):
   a pre-journal version, so fact and registry reads keep working there; a
   journal read on such a store is `store.journal`'s
   `JournalNotInitialised`, raised when the tables are absent.
-- **A later fact-table DDL change goes to version 6**, with its own
-  migration and a note here, never a silent edit of the DDL below.
+- **Version 6** (#332): `order_events.reason` becomes a nullable closed set
+  (`ORDER_EVENT_REASONS`), so a misspelt `halt` or `not_received` can no
+  longer turn off `plan.decision_state`'s protection of a halted or
+  never-received buy. DuckDB cannot add a `CHECK` in place, so the
+  migration from version 5 rebuilds `order_events` with the version-6 DDL,
+  every row kept; it first refuses with `SchemaVersionError`, changing
+  nothing, if a stored reason is outside the set. A store at version 4 or
+  earlier gets the version-6 journal directly and both version rows. A
+  read-only connection accepts a version-5 store (reads do not depend on
+  the `CHECK`).
+- **A later DDL change goes to version 7**, with its own migration and a
+  note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
 `known_at`/`ingested_at`/`source`/`provenance` columns, and they are kept
@@ -158,7 +168,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 }
 
 #: The schema version `init_schema` records on a fresh store and migrates
-#: a version-2, 3 or 4 store to. Bump and add a migration note (not
+#: a version-2, 3, 4 or 5 store to. Bump and add a migration note (not
 #: silent DDL edits) if the shape of a table changes after data has been
 #: loaded.
 #:
@@ -182,7 +192,11 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #:   (`JOURNAL_TABLE_NAMES`). Additive migration from version 2, 3 or 4: the
 #:   journal tables are created and a version-5 row appended; no fact or
 #:   registry table changes (module docstring, "Schema versions").
-CURRENT_SCHEMA_VERSION = 5
+#: - 6 (#332): `order_events.reason` gets a nullable closed `CHECK`
+#:   (`ORDER_EVENT_REASONS`). Migration from version 5: `order_events` is
+#:   rebuilt in one transaction with every row kept, refused first if a stored
+#:   reason is outside the set (module docstring, "Schema versions").
+CURRENT_SCHEMA_VERSION = 6
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -194,6 +208,10 @@ _PRE_ACTION_IDENTITY_VERSION = 3
 #: The last version without the journal (#108's action identity and the
 #: registry): read-only connections still serve fact and registry reads.
 _PRE_JOURNAL_VERSION = 4
+
+#: The last version without the `order_events.reason` `CHECK` (#332):
+#: read-only connections serve every read.
+_PRE_ORDER_EVENT_REASON_VERSION = 5
 
 
 class SchemaVersionError(RuntimeError):
@@ -595,6 +613,16 @@ _JOURNAL_TIMESTAMPS = """
 
 SIDES: tuple[str, ...] = ("buy", "sell")
 
+#: `order_events.reason` of the `cancel_requested` (and `cancel_failed`) event the
+#: halt path journals before each cancel call.
+HALT_REASON = "halt"
+#: `order_events.reason` of the terminal `cancelled` event `paper resume` journals
+#: for a `pending` order the broker never received.
+NOT_RECEIVED_REASON = "not_received"
+#: Every `order_events.reason` the spec names (#332). `plan.decision_state` keeps a
+#: buy open on these exact spellings, so the column is a closed set.
+ORDER_EVENT_REASONS: tuple[str, ...] = (HALT_REASON, NOT_RECEIVED_REASON)
+
 #: Every journal column the spec enumerates as a closed set, with its allowed
 #: values; the DDL turns each into a `CHECK`. Columns in `NULLABLE_JOURNAL_ENUMS`
 #: may also be NULL: the spec lists `null` among their values, or the row can
@@ -657,6 +685,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "rejected",
         "cancelled",
     ),
+    ("order_events", "reason"): ORDER_EVENT_REASONS,
     ("fills", "source"): ("broker_feed", "broker_status"),
     ("fill_cursors", "writer_kind"): ("run", "resume"),
     ("outcomes", "kind"): ("position_return", "realised_pnl", "not_executed"),
@@ -680,6 +709,7 @@ NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
         ("paper_runs", "kind"),
         ("decision_events", "reason"),
         ("adjustments", "origin"),
+        ("order_events", "reason"),
     }
 )
 
@@ -873,7 +903,7 @@ CREATE TABLE IF NOT EXISTS orders (
 """
 
 # event_at is the broker's instant (NULL before the broker has one, e.g. a
-# `pending` row written before submit); `reason` is an open set.
+# `pending` row written before submit); `reason` is a closed set since version 6.
 _CREATE_ORDER_EVENTS = f"""
 CREATE TABLE IF NOT EXISTS order_events (
     client_order_id VARCHAR NOT NULL,
@@ -885,7 +915,8 @@ CREATE TABLE IF NOT EXISTS order_events (
     filled_avg_price DOUBLE,
     raw_json VARCHAR,
     {_JOURNAL_TIMESTAMPS},
-    {_check("order_events", "status")}
+    {_check("order_events", "status")},
+    {_check("order_events", "reason")}
 )
 """
 
@@ -1198,8 +1229,12 @@ def _max_version(conn: duckdb.DuckDBPyConnection) -> int | None:
 def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
     """The read-only path of `init_schema`: no DDL, only a version check."""
     max_version = _max_version(conn)
-    if max_version in (_PRE_JOURNAL_VERSION, CURRENT_SCHEMA_VERSION):
-        return  # a version-4 store serves fact and registry reads; no journal
+    if max_version in (
+        _PRE_JOURNAL_VERSION,
+        _PRE_ORDER_EVENT_REASON_VERSION,
+        CURRENT_SCHEMA_VERSION,
+    ):
+        return  # version 4 serves fact and registry reads; version 5 every read
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
         raise SchemaVersionError(
             f"store has schema version {max_version}, this code expects "
@@ -1286,9 +1321,44 @@ def _migrate_action_identity(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(f"ALTER TABLE {_ACTIONS_STAGING_TABLE} RENAME TO corporate_actions")
 
 
+#: Where `_migrate_order_event_reasons` builds the version-6 table before it
+#: takes the name `order_events`.
+_ORDER_EVENTS_STAGING_TABLE = "order_events_v6"
+
+
+def _migrate_order_event_reasons(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild a version-5 `order_events` with the version-6 DDL (module
+    docstring, "Schema versions"), every row kept. Raises `SchemaVersionError`
+    before any change if a stored reason is outside `ORDER_EVENT_REASONS`: that
+    row needs the owner's look, not a silent rewrite. Runs inside
+    `init_schema`'s transaction."""
+    allowed = ", ".join("?" for _ in ORDER_EVENT_REASONS)
+    stray = conn.execute(
+        "SELECT DISTINCT reason FROM order_events "
+        f"WHERE reason IS NOT NULL AND reason NOT IN ({allowed}) ORDER BY reason",
+        list(ORDER_EVENT_REASONS),
+    ).fetchall()
+    if stray:
+        found = ", ".join(repr(reason) for (reason,) in stray)
+        raise SchemaVersionError(
+            f"order_events holds reasons outside {ORDER_EVENT_REASONS}: {found}; "
+            f"the store stays at version {_PRE_ORDER_EVENT_REASON_VERSION} until "
+            "they are resolved"
+        )
+    staging_ddl = _CREATE_ORDER_EVENTS.replace(
+        "CREATE TABLE IF NOT EXISTS order_events (",
+        f"CREATE TABLE {_ORDER_EVENTS_STAGING_TABLE} (",
+        1,
+    )
+    conn.execute(staging_ddl)
+    conn.execute(f"INSERT INTO {_ORDER_EVENTS_STAGING_TABLE} BY NAME SELECT * FROM order_events")
+    conn.execute("DROP TABLE order_events")
+    conn.execute(f"ALTER TABLE {_ORDER_EVENTS_STAGING_TABLE} RENAME TO order_events")
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2, version-3 or version-4 store to version 5.
+    version-2, 3, 4 or 5 store to version 6.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -1300,15 +1370,16 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; a version-4 store gets the journal tables and
-    an appended version-5 row; a version-3 store gets that plus
+    `CURRENT_SCHEMA_VERSION`; a version-5 store gets `order_events` rebuilt
+    with the reason `CHECK` (every row kept) and a version-6 row; a version-4
+    store gets the journal tables and version-5 and version-6 rows; a version-3 store gets that plus
     `corporate_actions` rebuilt with the version-4 columns (every row kept)
     and a version-4 row; a version-2 store gets all of that plus the
     registry tables and a version-3 row. Nothing else changes (module
     docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-5 store passes, and so
-    does a version-4 store (fact and registry reads work; the journal
+    On a read-only connection no DDL runs: a version-6 or version-5 store
+    passes, and so does a version-4 store (fact and registry reads work; the journal
     tables are absent, which `store.journal` reports); a version-2 or
     uninitialised store raises `RegistryNotInitialised`, and a version-3
     store raises `SchemaVersionError`.
@@ -1324,7 +1395,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         return
     max_version = _max_version(conn)
     pre_identity = (_PRE_REGISTRY_VERSION, _PRE_ACTION_IDENTITY_VERSION)
-    migratable = (*pre_identity, _PRE_JOURNAL_VERSION)
+    migratable = (*pre_identity, _PRE_JOURNAL_VERSION, _PRE_ORDER_EVENT_REASON_VERSION)
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
             f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
@@ -1332,6 +1403,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     with _atomic(conn):
         if max_version in pre_identity:
             _migrate_action_identity(conn)
+        if max_version == _PRE_ORDER_EVENT_REASON_VERSION:
+            _migrate_order_event_reasons(conn)
         for ddl in _TABLE_DDL + _REGISTRY_TABLE_DDL + _JOURNAL_TABLE_DDL:
             conn.execute(ddl)
         forget_column_types(conn)
