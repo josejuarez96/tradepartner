@@ -22,7 +22,19 @@ This module is deliberately split into two layers:
   connection to the page so a page never has to open its own.
 
 Navigation maps each entry to a page's `render(conn)`: "Data health"
-(`health_page`, T21), "Backtest" (T43) and "Trial registry" (T44).
+(`health_page`, T21), "Backtest" (T43), "Trial registry" (T44) and
+"Operations" (`ops_page`, T69).
+
+**Server options (ADR 0011, 2026-09-26, #273).** Streamlit is itself an HTTP
+and websocket server, bound to every interface unless told otherwise, and
+`.streamlit/config.toml` is only a default: `STREAMLIT_SERVER_ADDRESS` or a
+`--server.address` flag would override it. So `render_app` refuses to render
+anything else unless the *running* `server.address` is `localhost` or
+`127.0.0.1` and `browser.gatherUsageStats` is false, and says what to fix
+rather than silently opening a network boundary the owner never chose.
+`_server_options_ok` is the pure check (`Settings` never enters it: these are
+Streamlit's own options, read through `st.get_option`), so the refusal is
+unit-testable without a page render.
 """
 
 from __future__ import annotations
@@ -38,8 +50,11 @@ import duckdb
 import streamlit as st
 
 from tradepartner.config import Settings, get_settings
-from tradepartner.dashboard import backtest_page, health_page, trials_page
+from tradepartner.dashboard import backtest_page, health_page, ops_page, trials_page
 from tradepartner.store.db import StoreLockedError, open_read_only
+
+#: ADR 0011 point 3: the only addresses `render_app` accepts for `server.address`.
+_ALLOWED_SERVER_ADDRESSES = frozenset({"localhost", "127.0.0.1"})
 
 
 class StoreState(StrEnum):
@@ -141,7 +156,25 @@ _PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "Data health": health_page.render,
     "Backtest": backtest_page.render,
     "Trial registry": trials_page.render,
+    "Operations": ops_page.render,
 }
+
+
+def _server_options_ok(address: str | None, gather_usage_stats: bool | None) -> tuple[bool, str]:
+    """Whether the *running* Streamlit options satisfy ADR 0011 point 3, and if
+    not, a message naming what to fix. Pure, so the refusal is testable without
+    a Streamlit script run (module docstring)."""
+    if address in _ALLOWED_SERVER_ADDRESSES and gather_usage_stats is False:
+        return True, ""
+    return False, (
+        f"Refusing to render: server.address is {address!r} and "
+        f"browser.gatherUsageStats is {gather_usage_stats!r}. ADR 0011 requires "
+        f"server.address to be one of {sorted(_ALLOWED_SERVER_ADDRESSES)} and "
+        "browser.gatherUsageStats to be false, so the dashboard's one write "
+        "(the override form) is never reachable from another machine. Fix "
+        "`.streamlit/config.toml` (or an overriding STREAMLIT_SERVER_ADDRESS / "
+        "--server.address) and reload."
+    )
 
 
 def render_app(settings: Settings | None = None) -> None:
@@ -162,6 +195,13 @@ def render_app(settings: Settings | None = None) -> None:
 
     st.set_page_config(page_title="TradePartner", layout="wide")
     st.title("TradePartner")
+
+    ok, message = _server_options_ok(
+        st.get_option("server.address"), st.get_option("browser.gatherUsageStats")
+    )
+    if not ok:
+        st.error(message)
+        return
 
     page_name = st.sidebar.radio("Navigate", list(_PAGES))
 
