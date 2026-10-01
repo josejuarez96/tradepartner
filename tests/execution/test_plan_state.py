@@ -70,6 +70,7 @@ def _decision(
     security_id: str = A,
     rebalance_session: date | None = T0,
     decision_id: int = 1,
+    reason: str | None = None,
 ) -> DecisionRow:
     stamp = _utc(T0, 21)
     return DecisionRow(
@@ -83,6 +84,7 @@ def _decision(
         target_notional=target,
         whole_share=whole_share,
         decision=decision,
+        reason=reason,
         known_at=stamp,
         ingested_at=stamp,
     )
@@ -319,10 +321,13 @@ def test_skip_and_dust_decisions_are_closed(kind: str) -> None:
     assert (state.state, state.reason) == (State.CLOSED, kind)
 
 
-def test_a_keep_name_override_is_closed() -> None:
-    # `keep_name` is an `override` decision with nothing to trade (no side).
-    state = _state(_decision(side=None, decision="override"))
-    assert (state.state, state.reason) == (State.CLOSED, "keep_name")
+@pytest.mark.parametrize("kind", ["keep_name", "exclude_name"])
+def test_a_sideless_override_is_closed_with_its_own_kind(kind: str) -> None:
+    # An `override` decision with nothing to trade (no side): every `keep_name`, and
+    # an `exclude_name` of a name not held (#450). The state names the override's
+    # kind, never `keep_name` for an `exclude_name`.
+    state = _state(_decision(side=None, decision="override", reason=kind))
+    assert (state.state, state.reason) == (State.CLOSED, kind)
 
 
 @pytest.mark.parametrize(
