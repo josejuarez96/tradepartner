@@ -1,6 +1,7 @@
 """Decision state, remainders and buy targets (Phase 4 spec, Definitions >
 Decision; plan T52), residues and rebalance state (spec req 14 and
-Definitions > Rebalance state; plan T52b).
+Definitions > Rebalance state; plan T52b), and the decisions a plan makes
+(`decisions_from`, spec reqs 3, 7 step 6 and 9; plan T53b).
 
 Every decision is in exactly one state, derived from the journal and never
 stored: **closed** (nothing more is ordered for it in this rebalance),
@@ -69,17 +70,20 @@ included: that fails safe, since an in-flight decision is never re-ordered.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
+from tradepartner.backtest.engine import Plan
 from tradepartner.backtest.schedule import fill_session
-from tradepartner.config import RiskConfig
+from tradepartner.calendar import previous_session, session_close
+from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution.ledger import Ledger
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
@@ -89,10 +93,12 @@ from tradepartner.store.journal import (
     OrderedFill,
     OrderEventRow,
     OrderRow,
+    OverrideRow,
     PaperRunRow,
     PaperWindowRow,
     PositionDailyRow,
     RebalanceEventRow,
+    SignalRow,
 )
 from tradepartner.store.schema import HALT_REASON, NOT_RECEIVED_REASON
 
@@ -122,6 +128,18 @@ _WINDOW_STOP = "window_stop"
 _UNTRADABLE_EXIT_REASONS = frozenset({_WINDOW_STOP, "delisted", "untargeted_receipt"})
 #: A carried residue's origin (spec req 14: `paper start` copies it from the stop row).
 _RESIDUE_ORIGINS = frozenset({_DUST, _UNTRADABLE})
+#: Full-exit reasons `decisions_from` writes (spec req 3; Definitions > Full exit).
+_LEFT_TARGETS = "left_targets"
+_LEFT_UNIVERSE = "left_universe"
+_EXCLUDE_NAME = "exclude_name"
+_NAME_OVERRIDES = frozenset({_EXCLUDE_NAME, _KEEP_NAME})
+_SKIP_DELISTED = "skip_delisted"
+_SKIP_BELOW_MINIMUM = "skip_below_minimum"
+_SKIP_ZERO = "skip_zero"
+#: `signals.reason` values.
+_SELECTED = "selected"
+_BELOW_CUT = "below_cut"
+_EXCLUDED_NO_HISTORY = "excluded_no_history"
 
 
 class RebalanceState(StrEnum):
@@ -692,3 +710,377 @@ def rebalance_state(
     if mine and all(state.state in (State.CLOSED, State.SETTLED) for state in mine):
         return RebalanceState.EXECUTED
     return RebalanceState.PENDING
+
+
+# --- decisions from a plan (T53b) --------------------------------------------------
+
+
+class AssetFlags(Protocol):
+    """What `decisions_from` reads from the broker's `assets` answer for a name
+    (`adapters.broker.Asset` fits; this module imports no adapter)."""
+
+    @property
+    def fractionable(self) -> bool:
+        """Whether the broker trades the name in fractional shares."""
+        ...
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One planned `decisions` row before the run journals it (`row`)."""
+
+    security_id: str
+    rebalance_session: date
+    decision: str
+    whole_share: bool
+    target_weight: float
+    drifted_weight: float
+    side: str | None = None
+    planned_notional: float | None = None
+    planned_quantity: float | None = None
+    target_notional: float | None = None
+    reason: str | None = None
+    override_id: int | None = None
+
+    def row(self, *, run_id: int, known_at: datetime, ingested_at: datetime) -> DecisionRow:
+        """The `decisions` row for run `run_id`; its id is assigned on insert."""
+        return DecisionRow(
+            run_id=run_id,
+            rebalance_session=self.rebalance_session,
+            security_id=self.security_id,
+            target_weight=self.target_weight,
+            drifted_weight=self.drifted_weight,
+            side=self.side,
+            planned_notional=self.planned_notional,
+            planned_quantity=self.planned_quantity,
+            target_notional=self.target_notional,
+            whole_share=self.whole_share,
+            decision=self.decision,
+            reason=self.reason,
+            override_id=self.override_id,
+            known_at=known_at,
+            ingested_at=ingested_at,
+        )
+
+
+@dataclass(frozen=True)
+class Signal:
+    """One planned `signals` row: a universe member's score, rank and reason."""
+
+    security_id: str
+    rebalance_session: date
+    reason: str
+    score: float | None = None
+    rank: int | None = None
+
+    def row(self, *, run_id: int, known_at: datetime, ingested_at: datetime) -> SignalRow:
+        """The `signals` row for run `run_id`."""
+        return SignalRow(
+            run_id=run_id,
+            rebalance_session=self.rebalance_session,
+            security_id=self.security_id,
+            score=self.score,
+            rank=self.rank,
+            reason=self.reason,
+            known_at=known_at,
+            ingested_at=ingested_at,
+        )
+
+
+@dataclass(frozen=True)
+class Decisions:
+    """`decisions_from`'s answer: the decisions (by `security_id`), the signals
+    (by rank, the excluded last) and the `paper_plans` live-capital count."""
+
+    decisions: tuple[Decision, ...]
+    signals: tuple[Signal, ...]
+    n_orders_below_min_at_live_capital: int
+
+
+@dataclass(frozen=True)
+class _Intent:
+    """A name's trade before the minimum: side, notional, and for a full exit its
+    shares at S."""
+
+    side: str
+    notional: float
+    full_exit_reason: str | None = None
+    held: float = 0.0
+
+
+def _visible_splits(actions_as_of: pl.DataFrame, cutoff: datetime) -> pl.DataFrame:
+    """The frame's splits, refusing any row known after `cutoff` (close(S-1))."""
+    if "known_at" not in actions_as_of.columns:
+        raise ValueError("actions_as_of has no known_at column to check against close(S-1)")
+    splits = actions_as_of.filter(pl.col("action_type") == _SPLIT)
+    late = splits.filter(pl.col("known_at") > cutoff)
+    if late.height:
+        names = sorted(set(late["security_id"].to_list()))
+        raise ValueError(f"actions_as_of holds splits of {names} known after close(S-1) ({cutoff})")
+    return splits
+
+
+def _plan_overrides(overrides: Iterable[OverrideRow], rebalance: date) -> dict[str, OverrideRow]:
+    """The `exclude_name` and `keep_name` overrides naming `rebalance`, by name."""
+    mine: dict[str, OverrideRow] = {}
+    for row in overrides:
+        if row.kind not in _NAME_OVERRIDES or row.rebalance_session != rebalance:
+            continue
+        if row.security_id is None:
+            raise ValueError(f"override {row.override_id} ({row.kind}) names no security")
+        if row.override_id is None:
+            raise ValueError(f"override of {row.security_id} has no override_id")
+        if row.security_id in mine:
+            raise ValueError(
+                f"overrides {mine[row.security_id].override_id} and {row.override_id} both "
+                f"name {row.security_id} for rebalance {rebalance}"
+            )
+        mine[row.security_id] = row
+    return mine
+
+
+def _ranked(scores: Mapping[str, float]) -> dict[str, int]:
+    """Rank 1 for the highest score; equal scores by `security_id`."""
+    order = sorted(scores, key=lambda sid: (-scores[sid], sid))
+    return {sid: rank for rank, sid in enumerate(order, start=1)}
+
+
+def _signals(plan: Plan) -> tuple[Signal, ...]:
+    for sid, score in plan.scores.items():
+        _finite(score, f"score of {sid}")
+    ranks = _ranked(plan.scores)
+    members = set(plan.members)
+    excluded = set(plan.excluded_no_history)
+    if set(plan.scores) | excluded != members or set(plan.scores) & excluded:
+        raise ValueError("the plan's scores and exclusions do not partition its members")
+    if not set(plan.targets) <= set(plan.scores):
+        raise ValueError("the plan has targets that are not scored members")
+    scored = [
+        Signal(
+            security_id=sid,
+            rebalance_session=plan.session,
+            reason=_SELECTED if sid in plan.targets else _BELOW_CUT,
+            score=plan.scores[sid],
+            rank=ranks[sid],
+        )
+        for sid in sorted(ranks, key=ranks.__getitem__)
+    ]
+    unscored = [
+        Signal(security_id=sid, rebalance_session=plan.session, reason=_EXCLUDED_NO_HISTORY)
+        for sid in sorted(excluded)
+    ]
+    return (*scored, *unscored)
+
+
+def _buy_targets(
+    intents: Mapping[str, _Intent],
+    cash_before: float,
+    price_of: PriceOf,
+    costs: BuyCosts,
+) -> dict[str, float]:
+    """Each buy's target (`target_notional`'s formula, spec Definitions): its
+    notional x min(1, spendable / the buys' sum), spendable after costs on cash
+    plus every plan sell's value at the reference price."""
+    proceeds = sum(i.notional for i in intents.values() if i.side == _SELL)
+    buys = {sid: i.notional for sid, i in intents.items() if i.side == _BUY}
+    total = sum(buys.values())
+    _finite(costs.per_side_bps, "costs.per_side_bps", non_negative=True)
+    targets: dict[str, float] = {}
+    for sid, notional in buys.items():
+        spendable = buy_notional_after_costs(
+            cash_before + proceeds,
+            costs.per_side_bps,
+            costs.commissions,
+            price=_price(price_of, sid),
+        )
+        targets[sid] = notional * min(1.0, _finite(spendable, "spendable") / total)
+    return targets
+
+
+def decisions_from(
+    plan: Plan,
+    ledger: Ledger,
+    overrides: Sequence[OverrideRow],
+    assets: Mapping[str, AssetFlags],
+    listings_at: Mapping[str, date | None],
+    open_forced_exits: Collection[str],
+    frozen: RiskConfig,
+    settings: Settings,
+    *,
+    price_of: PriceOf,
+    actions_as_of: pl.DataFrame,
+    costs: BuyCosts,
+) -> Decisions:
+    """The decisions of rebalance T_i = `plan.session` on the run's session
+    S = `ledger.through` (spec Definitions > Decision, reqs 7 step 6 and 9).
+
+    One decision per held-or-target name, by `security_id`:
+
+    - no decision for a name in `open_forced_exits` (its open or in-flight
+      `forced_exit` decision handles it, req 3);
+    - `skip_delisted` for a name in `listings_at` whose listing ended at
+      close(S-1) (its end session on or before S-1, or unknown);
+    - an `exclude_name` override (`overrides` naming T_i) sells a held name
+      whole (`override`, side `sell`, reason `exclude_name`) and buys nothing
+      for an unheld target (`override`, no side), its weight left in cash; a
+      `keep_name` override trades nothing (`override`, no side, reason
+      `keep_name`); either carries its `override_id`;
+    - a held name outside the universe is sold whole by quantity (`trade`,
+      reason `left_universe`), a held member outside the targets likewise
+      (`left_targets`);
+    - any other name trades notional: target weight minus drifted ledger weight,
+      times equity (a buy, or a trim sold by notional);
+    - a full exit worth less than `risk.min_order_notional`, or a whole-share one
+      below one share, is plan-time `dust` (never by the buffered-share minimum,
+      ADR 0010 amendment 2026-09-30); a trade below the minimum is
+      `skip_below_minimum`, and exactly zero `skip_zero`.
+
+    Weights and notionals are at S: the ledger's quantities and `price_of`, the
+    reference price on S (the close(S-1) close in post-split shares, as
+    `decision_state` reads it). A planned quantity is stated in T_i's units, as
+    `remainder` reads it: the shares at S divided by the splits with ex-date in
+    (T_i, S]. `actions_as_of` is read at close(S-1); a split row known after it
+    raises, as the run cannot have read it. A buy's `target_notional` is the
+    Definitions formula (`target_notional`): its planned notional x min(1,
+    spendable / the planned buys' sum), spendable from
+    `costs.buy_notional_after_costs` on `ledger.cash` plus every sell the plan
+    made at the reference price (a forced exit's proceeds stay out).
+
+    `whole_share` is the name's `fractionable` flag negated, from `assets`
+    (keyed by `security_id`; the caller maps symbols); a name that would trade
+    and is missing from it raises. The plan side (targets, signals) reads only
+    `plan`, the engine's read at close(T_i). `n_orders_below_min_at_live_capital`
+    counts every name with an order to place (a trade, an `exclude_name` sell,
+    and the `skip_below_minimum` and `dust` ones) whose notional scaled to
+    `paper.live_capital_reference` / equity is below `risk.min_order_notional`.
+    """
+    session = ledger.through
+    _check_session(session)
+    if session <= plan.session:
+        raise ValueError(
+            f"the ledger is stated for {session}, which is not after the rebalance {plan.session}"
+        )
+    if ledger.short_names:
+        raise ValueError(f"the ledger is short {list(ledger.short_names)}")
+    previous = previous_session(session)
+    splits = _visible_splits(actions_as_of, session_close(previous))
+    marks = {sid: _price(price_of, sid) for sid in ledger.positions}
+    equity = ledger.equity(marks)
+    if not (math.isfinite(equity) and equity > 0):
+        raise ValueError(f"equity is {equity}, the plan needs a positive equity")
+    drifted = ledger.weights(marks)
+    for sid, weight in plan.targets.items():
+        _finite(weight, f"target weight of {sid}", non_negative=True)
+    signals = _signals(plan)
+    named = _plan_overrides(overrides, plan.session)
+    universe = set(plan.members)
+    held = {sid for sid, quantity in ledger.positions.items() if quantity > 0}
+    targets = {sid for sid, weight in plan.targets.items() if weight > 0}
+
+    def ended(sid: str) -> bool:
+        if sid not in listings_at:
+            return False
+        end = listings_at[sid]
+        return end is None or end <= previous
+
+    def whole_share(sid: str, *, required: bool) -> bool:
+        if sid not in assets:
+            if required:
+                raise ValueError(f"{sid} is missing from the assets read")
+            return False
+        return not assets[sid].fractionable
+
+    def base(sid: str) -> dict[str, Any]:
+        return {
+            "security_id": sid,
+            "rebalance_session": plan.session,
+            "target_weight": plan.targets.get(sid, 0.0),
+            "drifted_weight": drifted.get(sid, 0.0),
+        }
+
+    decided: dict[str, Decision] = {}
+    intents: dict[str, _Intent] = {}  # names with an order to place, before the minimum
+    for sid in sorted(held | targets):
+        if sid in open_forced_exits:
+            continue
+        if ended(sid):
+            decided[sid] = Decision(
+                **base(sid), decision=_SKIP_DELISTED, whole_share=whole_share(sid, required=False)
+            )
+            continue
+        override = named.get(sid)
+        if override is not None and (override.kind == _KEEP_NAME or sid not in held):
+            decided[sid] = Decision(
+                **base(sid),
+                decision=_OVERRIDE,
+                whole_share=whole_share(sid, required=False),
+                reason=override.kind,
+                override_id=override.override_id,
+            )
+            continue
+        value = ledger.positions.get(sid, 0.0) * marks.get(sid, 0.0)
+        if override is not None:
+            intent = _Intent(_SELL, value, _EXCLUDE_NAME, ledger.positions[sid])
+        elif sid in held and sid not in universe:
+            intent = _Intent(_SELL, value, _LEFT_UNIVERSE, ledger.positions[sid])
+        elif sid in held and sid not in targets:
+            intent = _Intent(_SELL, value, _LEFT_TARGETS, ledger.positions[sid])
+        else:
+            delta = (plan.targets.get(sid, 0.0) - drifted.get(sid, 0.0)) * equity
+            intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta))
+        intents[sid] = intent
+
+    minimum = frozen.min_order_notional
+    for sid, intent in list(intents.items()):
+        whole = whole_share(sid, required=True)
+        kind = _OVERRIDE if intent.full_exit_reason == _EXCLUDE_NAME else _TRADE
+        override_id = named[sid].override_id if sid in named else None
+        if intent.full_exit_reason is not None:
+            if intent.notional < minimum or (whole and intent.held < 1):
+                decided[sid] = Decision(
+                    **base(sid),
+                    decision=_DUST,
+                    whole_share=whole,
+                    reason=intent.full_exit_reason,
+                    override_id=override_id,
+                )
+                continue
+            factor = _split_factor(splits, sid, plan.session, session)
+            decided[sid] = Decision(
+                **base(sid),
+                decision=kind,
+                whole_share=whole,
+                side=_SELL,
+                planned_quantity=intent.held / factor,
+                reason=intent.full_exit_reason,
+                override_id=override_id,
+            )
+            continue
+        if intent.notional == 0 or intent.notional < minimum:
+            decided[sid] = Decision(
+                **base(sid),
+                decision=_SKIP_ZERO if intent.notional == 0 else _SKIP_BELOW_MINIMUM,
+                whole_share=whole,
+            )
+            if intent.notional == 0:
+                del intents[sid]
+            continue
+        decided[sid] = Decision(
+            **base(sid),
+            decision=_TRADE,
+            whole_share=whole,
+            side=intent.side,
+            planned_notional=intent.notional,
+        )
+
+    placed = {sid: i for sid, i in intents.items() if decided[sid].side is not None}
+    for sid, target in _buy_targets(placed, ledger.cash, price_of, costs).items():
+        decided[sid] = replace(decided[sid], target_notional=target)
+
+    live_scale = settings.paper.live_capital_reference / equity
+    below = sum(1 for i in intents.values() if i.notional * live_scale < minimum)
+    return Decisions(
+        decisions=tuple(decided[sid] for sid in sorted(decided)),
+        signals=signals,
+        n_orders_below_min_at_live_capital=below,
+    )
