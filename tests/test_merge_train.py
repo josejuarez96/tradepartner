@@ -427,3 +427,11 @@ def test_a_skipped_claims_run_is_not_green() -> None:
 def test_bisect_bounds_outside_the_batch_are_refused(green: int, red: int) -> None:
     with pytest.raises(ValueError):
         mt.bisect_result(green, red, [1, 2, 3, 4])
+
+
+def test_a_green_prefix_outside_the_accepted_list_is_refused() -> None:
+    record = _record([3], n=2)
+    with pytest.raises(ValueError, match="outside"):
+        mt.mergeable_prefix(record, [True, True])
+    with pytest.raises(ValueError, match="head SHA"):
+        mt.comment("CULPRIT", "b", prefix=2)

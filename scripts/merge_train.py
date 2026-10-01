@@ -294,6 +294,8 @@ def mergeable_prefix(record: Record, still_valid: Sequence[bool]) -> int:
     refused, so a PR nobody checked can never count as verified."""
     if len(still_valid) != len(record.accepted()):
         raise ValueError(f"{len(still_valid)} verdicts for {len(record.accepted())} accepted PRs")
+    if any(not 1 <= k <= len(still_valid) for k in record.green_prefixes):
+        raise ValueError(f"green prefixes {record.green_prefixes} outside 1..{len(still_valid)}")
     return max((k for k in record.green_prefixes if all(still_valid[:k])), default=0)
 
 
@@ -355,6 +357,8 @@ def comment(outcome: str, batch: str, **detail: Any) -> str:
         lines += [f"prefix {k} {prefixes[k]}" for k in sorted(prefixes)]
         return "\n".join(lines)
     if outcome == "CULPRIT":
+        if not detail.get("head"):
+            raise ValueError("a CULPRIT comment needs the PR's head SHA")
         lines.append(f"head {detail.pop('head')}")  # read back exactly by check (d)
     if outcome == "INCONCLUSIVE":
         reason = str(detail.pop("reason"))
