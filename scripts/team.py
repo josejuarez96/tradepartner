@@ -23,6 +23,7 @@ directory it prints (a git worktree outside the repo, so other teams' files stay
     uv run python scripts/team.py release T5 --park    # hand a green PR to the next team
     uv run python scripts/team.py check-claims --pr 31
     uv run python scripts/team.py prune [--hours 6] [--yes]   # owner: drop idle retired team dirs
+    uv run python scripts/team.py graph [--ref origin/main] [--plan <name>] [--max-depth N]
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ TASK_LINE_RE = re.compile(
 )
 TITLE_TASK_RE = re.compile(r"^(T\d+[a-z]?)\s*[:(]")
 DEPENDS_RE = re.compile(r"Depends on:\s*([^·]+)")
+FILES_SEGMENT_RE = re.compile(r"Files:\s*(?P<seg>[^·]*)")
+FILE_PATH_RE = re.compile(r"`((?:src|tests|docs|scripts)/[^`]+|\.[^`]+)`")
 PHASE_RE = re.compile(r"\(Phase (\d+)\)")
 BRANCH_ISSUE_RE = re.compile(r"^[a-z]+/(\d+)-")
 EXEMPT_BRANCH_PREFIXES = ("spike/", "dependabot/")
@@ -167,6 +170,115 @@ def is_ready(task: Task, by_id: dict[str, Task]) -> bool:
 def ready_tasks(tasks: Sequence[Task]) -> list[Task]:
     by_id = {t.id: t for t in tasks}
     return [t for t in tasks if is_ready(t, by_id)]
+
+
+def task_files(task: Task) -> list[str]:
+    """Backticked file paths named in a task line's ``Files:`` segment (#389).
+
+    The segment runs from ``Files:`` to the next `` · ``. A path counts only when it
+    starts with ``src/``, ``tests/``, ``docs/``, ``scripts/`` or a dot (e.g. ``.streamlit/``).
+    """
+    m = FILES_SEGMENT_RE.search(task.line)
+    if not m:
+        return []
+    return FILE_PATH_RE.findall(m.group("seg"))
+
+
+def _open_chain_tiebreak(chain: Sequence[str]) -> tuple[int, Sequence[str]]:
+    """Sort key: longer chains first, ties broken lexicographically by task id (#389)."""
+    return (-len(chain), chain)
+
+
+def critical_path(tasks: Sequence[Task]) -> list[Task]:
+    """The longest chain of open tasks, counting only open tasks; ties break by task id.
+
+    A dependency that is done (or unknown) does not extend the chain; it is treated as
+    already clear, same as ``is_ready``.
+    """
+    by_id = {t.id: t for t in tasks}
+    open_tasks = [t for t in tasks if not t.done]
+    cache: dict[str, list[str]] = {}
+
+    def chain(task_id: str) -> list[str]:
+        if task_id in cache:
+            return cache[task_id]
+        task = by_id[task_id]
+        open_deps = sorted(d for d in task.depends_on if d in by_id and not by_id[d].done)
+        candidates = [chain(d) for d in open_deps]
+        longest = min(candidates, key=_open_chain_tiebreak, default=[])
+        result = [*longest, task_id]
+        cache[task_id] = result
+        return result
+
+    chains = [chain(t.id) for t in open_tasks]
+    if not chains:
+        return []
+    winner = min(chains, key=_open_chain_tiebreak)
+    return [by_id[i] for i in winner]
+
+
+def depth_levels(tasks: Sequence[Task]) -> dict[int, list[str]]:
+    """Open tasks by depth; depth 1 = every dependency ticked or absent from the plan.
+
+    Done tasks never appear (they are not claimable work); the depth of an open task is
+    one more than the deepest of its still-open dependencies.
+    """
+    by_id = {t.id: t for t in tasks}
+    cache: dict[str, int] = {}
+
+    def depth(task_id: str) -> int:
+        if task_id in cache:
+            return cache[task_id]
+        task = by_id[task_id]
+        open_deps = [d for d in task.depends_on if d in by_id and not by_id[d].done]
+        d = 1 + max((depth(dep) for dep in open_deps), default=0)
+        cache[task_id] = d
+        return d
+
+    levels: dict[int, list[str]] = {}
+    for t in tasks:
+        if t.done:
+            continue
+        levels.setdefault(depth(t.id), []).append(t.id)
+    for ids in levels.values():
+        ids.sort()
+    return levels
+
+
+def file_contention(tasks: Sequence[Task]) -> dict[str, list[str]]:
+    """Files named in an open task's ``Files:`` segment by two or more open tasks.
+
+    A done task never contributes, even if it shares the path with open tasks.
+    """
+    by_file: dict[str, list[str]] = {}
+    for t in tasks:
+        if t.done:
+            continue
+        for f in task_files(t):
+            by_file.setdefault(f, []).append(t.id)
+    return {f: ids for f, ids in by_file.items() if len(ids) >= 2}
+
+
+def downstream_of(tasks: Sequence[Task], task_id: str) -> list[str]:
+    """Transitive open dependants of ``task_id``, sorted by task id."""
+    by_id = {t.id: t for t in tasks}
+    dependants: dict[str, list[str]] = {}
+    for t in tasks:
+        for dep in t.depends_on:
+            dependants.setdefault(dep, []).append(t.id)
+
+    seen: set[str] = set()
+
+    def visit(tid: str) -> None:
+        for child in dependants.get(tid, []):
+            task = by_id.get(child)
+            if task is None or task.done or child in seen:
+                continue
+            seen.add(child)
+            visit(child)
+
+    visit(task_id)
+    return sorted(seen)
 
 
 def resolve_holder(comment_bodies: Iterable[str]) -> str | None:
@@ -782,6 +894,54 @@ def cmd_status(gh: GitHub, root: Path, *, ref: str | None = None) -> int:
     return 0
 
 
+def cmd_graph(
+    root: Path, *, ref: str | None, plan: str | None = None, max_depth: int | None = None
+) -> int:
+    """Read-only shape of the open plan tasks: critical path, depth, file contention,
+    owner gates (#389). Computed from ``load_tasks``, the same plan source as ``status``;
+    no GitHub call, nothing written.
+    """
+    tasks = load_tasks(root, ref)
+    if plan is not None:
+        tasks = [t for t in tasks if Path(t.plan).stem == plan]
+
+    path = critical_path(tasks)
+    print("CRITICAL PATH (longest chain of open tasks)")
+    print(f"  {' -> '.join(t.id for t in path)}" if path else "  none")
+
+    print("\nDEPTH LEVELS (open tasks; depth 1 = every dependency ticked or absent)")
+    levels = depth_levels(tasks)
+    if levels:
+        for d in sorted(levels):
+            print(f"  {d}: {', '.join(levels[d])}")
+    else:
+        print("  none")
+
+    print("\nFILE CONTENTION (files named by two or more open tasks)")
+    contention = file_contention(tasks)
+    if contention:
+        for f in sorted(contention):
+            print(f"  {f}: {', '.join(contention[f])}")
+    else:
+        print("  none")
+
+    print("\nOWNER GATES (owner tasks on the critical path, with open tasks downstream)")
+    owners_on_path = [t for t in path if t.owner]
+    if owners_on_path:
+        for t in owners_on_path:
+            downstream = downstream_of(tasks, t.id)
+            print(f"  {t.id}: {', '.join(downstream) or 'none'}")
+    else:
+        print("  none")
+
+    longest = len(path)
+    print(f"\nLONGEST CHAIN: {longest} open task(s)")
+    if max_depth is not None and longest > max_depth:
+        print(f"exceeds --max-depth {max_depth}")
+        return 1
+    return 0
+
+
 # ── prune (owner-run, ad hoc) ───────────────────────────────────────────────────
 
 PRUNE_DEFAULT_HOURS = 6
@@ -980,6 +1140,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("prune", help="owner, ad hoc: remove idle team dirs with no open claim")
     p.add_argument("--hours", type=float, default=PRUNE_DEFAULT_HOURS, help="idle threshold")
     p.add_argument("--yes", action="store_true", help="remove; without it, print the plan")
+    p = sub.add_parser(
+        "graph",
+        help="read-only: critical path, depth levels, file contention, owner gates",
+    )
+    p.add_argument("--ref", default=None, help="plan ref to read (default origin/main)")
+    p.add_argument("--plan", default=None, help="limit to one plan file, by its stem")
+    p.add_argument(
+        "--max-depth", type=int, default=None, help="exit 1 when the longest chain exceeds N"
+    )
     return parser
 
 
@@ -1016,6 +1185,13 @@ def main(argv: Sequence[str] | None = None, gh: GitHub | None = None) -> int:
         case "release":
             return cmd_release(
                 gh, root, args.target, park=args.park, force=args.force, reason=args.reason, ref=ref
+            )
+        case "graph":
+            return cmd_graph(
+                root,
+                ref=args.ref if args.ref is not None else ref,
+                plan=args.plan,
+                max_depth=args.max_depth,
             )
     return 2
 

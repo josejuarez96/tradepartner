@@ -35,6 +35,21 @@ PLAN = """# Plan: Data foundation (Phase 2)
 - [ ] **T20: `Broker` interface and fake broker.** Files: `b.py` · Depends on: T4 · Review: sr.
 """
 
+# A second, small plan for the graph tests (#389): a diamond (T3/T4 both gate T7), a file
+# (`src/b.py`) named by three open tasks and one done task, and an owner task (T2) with open
+# tasks downstream of it.
+GRAPH_PLAN = """# Plan: Graph fixture (Phase 9)
+
+## Tasks
+- [x] **T1: Config.** Files: `src/a.py` · Depends on: n/a · Review: qa.
+- [ ] **T2 (owner): Secrets setup.** Files: `src/b.py` · Depends on: T1 · Review: safety-reviewer.
+- [ ] **T3: Branch A.** Files: `src/b.py`, `tests/test_b.py` · Depends on: T2 · Review: qa.
+- [ ] **T4: Branch B.** Files: `src/b.py` · Depends on: T2 · Review: qa.
+- [ ] **T7: Diamond join.** Files: `src/d.py` · Depends on: T3, T4 · Review: qa.
+- [ ] **T5: Chain tail.** Files: `src/c.py` · Depends on: T7 · Review: qa.
+- [x] **T6: Done task sharing file.** Files: `src/b.py` · Depends on: T1 · Review: qa.
+"""
+
 
 class FakeGitHub:
     """In-memory GitHub that records the calls the commands make."""
@@ -115,6 +130,14 @@ def root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def graph_root(tmp_path: Path) -> Path:
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    (tmp_path / "docs" / "plans" / "graph-fixture.md").write_text(GRAPH_PLAN)
+    (tmp_path / team.TEAM_FILE).write_text("atlas\n")
+    return tmp_path
+
+
 def _pr(n: int, branch: str, labels: tuple[str, ...] = ()) -> team.PullRequest:
     return team.PullRequest(n, branch, True, labels, f"pr {n}")
 
@@ -170,6 +193,74 @@ def test_show_prints_the_brief_without_touching_github(
 def test_ready_frontier_requires_every_dependency_ticked() -> None:
     tasks = team.parse_plan(PLAN, "p")
     assert [t.id for t in team.ready_tasks(tasks)] == ["T3", "T5", "T20"]
+
+
+# ── graph: critical path, depth, file contention, owner gates (#389) ───────────────
+
+
+def test_critical_path_picks_the_longest_open_chain_through_the_diamond() -> None:
+    tasks = team.parse_plan(GRAPH_PLAN, "docs/plans/graph-fixture.md")
+    # T2 -> T3 -> T7 -> T5 and T2 -> T4 -> T7 -> T5 tie at length 4; T3 < T4 wins the tie.
+    assert [t.id for t in team.critical_path(tasks)] == ["T2", "T3", "T7", "T5"]
+    # Done tasks never extend or appear in the chain.
+    assert all(not t.done for t in team.critical_path(tasks))
+
+
+def test_depth_levels_group_open_tasks_and_exclude_done_tasks() -> None:
+    tasks = team.parse_plan(GRAPH_PLAN, "docs/plans/graph-fixture.md")
+    levels = team.depth_levels(tasks)
+    assert levels == {1: ["T2"], 2: ["T3", "T4"], 3: ["T7"], 4: ["T5"]}
+    assert "T1" not in [i for ids in levels.values() for i in ids]
+    assert "T6" not in [i for ids in levels.values() for i in ids]
+
+
+def test_file_contention_lists_files_named_by_two_or_more_open_tasks() -> None:
+    tasks = team.parse_plan(GRAPH_PLAN, "docs/plans/graph-fixture.md")
+    contention = team.file_contention(tasks)
+    # src/b.py is named by three open tasks (T2, T3, T4); the done T6 sharing it doesn't count.
+    assert contention == {"src/b.py": ["T2", "T3", "T4"]}
+    # tests/test_b.py and src/d.py are each named by only one open task: no contention.
+    assert "tests/test_b.py" not in contention
+    assert "src/d.py" not in contention
+
+
+def test_downstream_of_returns_transitive_open_dependants_of_an_owner_task() -> None:
+    tasks = team.parse_plan(GRAPH_PLAN, "docs/plans/graph-fixture.md")
+    owner_task = next(t for t in tasks if t.id == "T2")
+    assert owner_task.owner is True
+    assert team.downstream_of(tasks, "T2") == ["T3", "T4", "T5", "T7"]
+    # A task with no dependants has an empty downstream list.
+    assert team.downstream_of(tasks, "T5") == []
+
+
+def test_cmd_graph_prints_the_sections_and_respects_max_depth(
+    graph_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert team.cmd_graph(graph_root, ref=None) == 0
+    out = capsys.readouterr().out
+    assert "CRITICAL PATH" in out
+    assert "T2 -> T3 -> T7 -> T5" in out
+    assert "DEPTH LEVELS" in out
+    assert "3: T7" in out
+    assert "FILE CONTENTION" in out
+    assert "src/b.py: T2, T3, T4" in out
+    assert "OWNER GATES" in out
+    assert "T2: T3, T4, T5, T7" in out
+    assert "LONGEST CHAIN: 4" in out
+
+    assert team.cmd_graph(graph_root, ref=None, max_depth=4) == 0
+    assert team.cmd_graph(graph_root, ref=None, max_depth=3) == 1
+
+
+def test_cmd_graph_plan_filter_limits_to_one_plan_file(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (root / "docs" / "plans" / "graph-fixture.md").write_text(GRAPH_PLAN)
+    assert team.cmd_graph(root, ref=None, plan="graph-fixture") == 0
+    out = capsys.readouterr().out
+    assert "T2 -> T3 -> T7 -> T5" in out
+    # The data-foundation plan's tasks (T10, T8b, ...) are excluded by the filter.
+    assert "T10" not in out
 
 
 def test_resolve_holder_whole_body_claims_in_order_with_release() -> None:
