@@ -154,6 +154,51 @@ def test_pass_with_fixes_counts_only_once_a_later_pass_follows() -> None:
         assert ready_pr.missing_reviews(qa, [ok]) == [], ok
 
 
+REPO = Path(__file__).resolve().parents[1]
+# Listed on purpose before the module exists; drop an entry once its module lands.
+PLANNED_PREFIXES = {
+    "src/tradepartner/adapters/alpaca_broker",  # T48c
+    "src/tradepartner/llm/",  # Phase 5, ADR 0008
+    "src/tradepartner/signals/",  # no plan names it; signals live in backtest/signals.py
+    "src/tradepartner/risk/",  # no plan names it; the checks live in execution/risk.py
+}
+
+
+def _on_tree(prefix: str) -> bool:
+    target = REPO / prefix
+    if prefix.endswith("/"):
+        return target.is_dir()
+    return any(target.parent.glob(target.name + "*"))
+
+
+def test_every_order_path_module_requires_the_safety_review() -> None:
+    src = REPO / "src" / "tradepartner"
+    modules = [
+        *(src / "execution").glob("*.py"),
+        *(src / "adapters").glob("*broker*.py"),
+        src / "adapters" / "alpaca_trading_raw.py",
+        src / "cli_record.py",
+        src / "errors.py",  # the kill-switch and halt-path error types
+        REPO / "tests" / "test_ready_pr.py",  # its PLANNED_PREFIXES could hide a rename
+    ]
+    assert len(modules) > 10
+    for m in modules:
+        path = m.relative_to(REPO).as_posix()
+        assert "safety-reviewer" in ready_pr.required_reviews([path]), path
+    assert "safety-reviewer" in ready_pr.required_reviews(
+        ["src/tradepartner/adapters/alpaca_broker.py", "src/tradepartner/execution/brokers.py"]
+    )
+
+
+def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
+    # a rename must not silently disable the gate (#357: exec/ vs execution/)
+    for prefix in (*ready_pr.QUANT_PREFIXES, *ready_pr.SAFETY_PREFIXES):
+        if prefix not in PLANNED_PREFIXES:
+            assert _on_tree(prefix), prefix
+    for prefix in PLANNED_PREFIXES:
+        assert not _on_tree(prefix), f"{prefix} exists now; drop it from PLANNED_PREFIXES"
+
+
 def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> None:
     main = "## Done\n- a\n\n## Blocked\n- none\n"
     assert ready_pr.added_list_bullets(main, "## Done\n- a\n- b\n\n## Blocked\n", "## Done") == [
