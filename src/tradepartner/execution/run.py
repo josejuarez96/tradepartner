@@ -45,10 +45,12 @@ engaged the row is the report and the run goes on (spec req 8). Then the
 decisions are all closed or settled (`plan.rebalance_state`) gets its
 `executed` row, before the lapse rule.
 
-**Step 4.** `reconcile_now` (T61). Then one `assets` read for every name the
-ledger holds at S, kept for the marks, the lot ledger, the exits and the
-planning step; the planning step's `assets_read` answers from it and reads the
-broker through the same path for any symbol it lacks.
+**Step 4.** `reconcile_now` (T61), its journal cut (`as_of`, #488) a clock
+reading taken just before the call, so step 3's collected rows are in it.
+Then one `assets` read for every name the ledger holds at S, kept for the
+marks, the lot ledger, the exits and the planning step; the planning step's
+`assets_read` answers from it and reads the broker through the same path for
+any symbol it lacks.
 
 **Step 5.** `marks.marks_for` rows for every session after the window's last
 mark (or from the window's start date) through S-1; the drawdown check (T59)
@@ -64,7 +66,7 @@ due plans through `planning.plan_rebalance` (with this run's `assets` read and
 the `fills_lagging` state: any order lagging at step 3 or at step 4) and goes
 to `trade_step`; any other run goes to `exits_step`.
 
-**Steps 8 and 9.** `reconcile_now` again, then the `ok` result row.
+**Steps 8 and 9.** `reconcile_now` again, cut the same way, then the `ok` result row.
 
 **Exits.** Every broker read the run makes itself, the collection, both
 reconciliations and the planning step's `assets` reads go through one path: an
@@ -867,6 +869,12 @@ class _Run:
                     )
 
     def _reconcile(self) -> Reconciliation:
+        """Steps 4 and 8. The journal cut (`as_of`, #488) is a clock reading
+        taken just before the call: step 3 has already journaled this run's
+        collected fills and terminal events, stamped after close(S-1), and a
+        ledger cut at close(S-1) would drop them while the broker holds them
+        (#488's corrected guidance). Store facts stay cut at close(S-1)."""
+        as_of = self.gate.read_clock()
         return self._halting(
             lambda: reconcile_now(
                 self.settings,
@@ -878,6 +886,7 @@ class _Run:
                 self.connect,
                 self.run_id,
                 frozen=self.frozen,
+                as_of=as_of,
             )
         )
 

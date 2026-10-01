@@ -772,3 +772,23 @@ def test_a_secret_in_a_failure_is_masked_in_the_result_row_and_the_alert(
         assert "***" in text
         for form in (secret, secret.upper(), escaped, escaped.upper()):
             assert form not in text
+
+
+def test_a_late_fill_collected_at_step_3_does_not_halt_step_4(
+    env: Env, exits_done: list[object]
+) -> None:
+    """Step 4 reads the journal as of a clock reading taken just before it, so a
+    fill of an earlier run's order that step 3 collects today (known after
+    close(S-1)) is in the ledger it reconciles (#488's corrected guidance)."""
+    window = _marked(env)
+    earlier = env.past_run(window, _at(MON))
+    env.order(earlier, "tp-late", _at(MON))
+    env.fake.simulate_fill("tp-late")  # filled Monday; nothing collected it yet
+    outcome = env.run(_at(TUE))
+    assert outcome.status == "ok"
+    known = env.query("SELECT known_at FROM fills WHERE client_order_id = 'tp-late'")
+    assert [k[0] > _at(MON, 20) for k in known] == [True]  # collected after close(S-1)
+    assert env.query("SELECT status FROM reconciliations WHERE run_id = ?", [outcome.run_id]) == [
+        ("ok",),
+        ("ok",),
+    ]
