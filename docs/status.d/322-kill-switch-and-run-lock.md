@@ -1,1 +1,0 @@
-- Phase 4 T59 (#322): `execution/lock.py` (the exclusive `flock` run lock on `<store.path>.paper.lock`, `LockHeld` at once, `is_held`) and `execution/switch.py` (the derived kill-switch state per window, `engage` with a `WriteFailed` return, `engage_from_overrides` exactly once, `release` gated on an `ok` reconciliation, the drawdown trigger)

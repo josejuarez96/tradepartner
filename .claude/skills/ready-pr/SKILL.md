@@ -9,20 +9,22 @@ Run this when the work on your claimed issue is complete and the draft PR descri
 
 ## Before you run it
 
-1. Bookkeeping goes in **fragments, not the shared files**. If you have not done so:
+1. Bookkeeping goes in **one fragment file, not the shared files**. If you have not done so:
    ```bash
    uv run python scripts/fragments.py add <issue> --slug <short-slug> \
-     --status "<one Done line, with the PR number>" \
+     --status "<one Recently done line, at most 240 characters, with the PR number>" \
      --added "<one CHANGELOG bullet>"      # or --changed / --fixed
    ```
    Do not edit `docs/STATUS.md` or `CHANGELOG.md` yourself. Tick only your plan checkbox.
 2. Run the specialist reviews the touched paths require (the plan task's `Review:` field):
    `quant-auditor` for data, store, signals, backtests; `safety-reviewer` for broker, orders,
-   secrets, config, LLM inputs. Address the findings, then post **a PR comment** whose first
-   line is the verdict: `quant-auditor: PASS` or `quant-auditor: PASS WITH FIXES`, followed by
-   the findings and what you did. Only the **first line** of a comment counts, the latest
-   verdict per agent wins, and `FAIL` blocks. The PR body does not count because the template
-   already names both agents.
+   secrets, config, LLM inputs. Give the agent the PR number: it posts its full report as **a
+   PR comment** whose first line is the verdict (`quant-auditor: PASS` or `quant-auditor: PASS
+   WITH FIXES`) and returns a ten-line summary; if it says it could not post, post the file it
+   wrote with `gh pr comment <n> --body-file <path>`. Address the findings and re-run it for a
+   fresh verdict. Only the **first line** of a comment counts, the latest verdict per agent
+   wins, and `FAIL` blocks. The PR body does not count because the template already names
+   both agents. (#352)
 3. Fill in the PR template. Tick every box, or replace an inapplicable one with `n/a` and why.
    The body must say `Closes #<issue>`.
 

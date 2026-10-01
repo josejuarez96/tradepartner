@@ -13,9 +13,10 @@ Steps, in order (each one stops the run with a reason on failure):
    ``CHANGELOG.md`` and every conflict block is a pure insertion at one spot: the base
    section is empty and both sides hold only list bullets. Both sides are kept, ``main``'s
    first. Anything else (a line one side deleted or edited) aborts the merge and reports.
-3. Fragment check (``scripts/fragments.py check``); the branch's issue has a status fragment
-   (and a changelog fragment on ``feat/``/``fix/`` branches); and the PR adds no bullets to
-   the shared lists ("## Done" in ``STATUS.md``, "[Unreleased]" in ``CHANGELOG.md``) unless
+3. Fragment check (``scripts/fragments.py check``); the branch's issue has its fragment
+   (``changelog.d/<issue>-<slug>.md``, or the pre-#351 ``docs/status.d/`` one); and the PR
+   adds no bullets to the shared lists ("## Recently done" in ``STATUS.md``,
+   "[Unreleased]" in ``CHANGELOG.md``) unless
    it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
 4. Local checks: ruff check, ruff format --check, mypy and the fragment check always;
@@ -68,7 +69,7 @@ VERDICT_RE = re.compile(
     re.IGNORECASE,
 )
 CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
-STATUS_LIST = "## Done"
+STATUS_LIST = "## Recently done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 
@@ -304,14 +305,31 @@ def is_fold(diff_names: Sequence[str], deleted: Sequence[str]) -> bool:
 
 
 def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
-    """Fragment files the branch's issue needs but the diff does not add."""
+    """The fragment file the branch's issue needs but the diff does not add: one
+    ``changelog.d/<issue>-<slug>.md`` (#351), or the pre-#351 ``docs/status.d/`` one."""
     issue = issue_of_branch(branch)
     if issue is None:
         return []
-    need = [f"docs/status.d/{issue}-"]
-    if branch.startswith(("feat/", "fix/")):
-        need.append(f"changelog.d/{issue}-")
-    return [f"{p}<slug>.md" for p in need if not any(d.startswith(p) for d in diff_names)]
+    have = tuple(f"{d}{issue}-" for d in FRAGMENT_DIRS)
+    if any(d.startswith(have) for d in diff_names):
+        return []
+    return [f"changelog.d/{issue}-<slug>.md"]
+
+
+def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
+    """On a ``feat/`` or ``fix/`` branch, whether none of the issue's added
+    ``changelog.d`` fragments holds a CHANGELOG heading with a bullet (a STATUS-only
+    fragment, or only an old ``docs/status.d`` one, does not record the change)."""
+    if not branch.startswith(("feat/", "fix/")):
+        return False
+    for text in fragment_texts:
+        heading = False
+        for line in text.splitlines():
+            if line.startswith("### "):
+                heading = True
+            elif heading and BULLET_RE.match(line):
+                return False
+    return True
 
 
 def tests_needed(paths: Sequence[str]) -> bool:
@@ -391,6 +409,17 @@ def ready(
                 "no fragment for this PR's issue: add "
                 + " and ".join(missing_frag)
                 + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
+            )
+        issue = issue_of_branch(pr.branch)
+        own = [
+            p
+            for p in touched
+            if issue is not None and p.startswith(f"changelog.d/{issue}-") and p not in deleted
+        ]
+        if lacks_changelog_bullets(pr.branch, [r.read(p) for p in own]):
+            raise ReadyError(
+                "a feat/fix PR records its change in CHANGELOG: add a bullet to "
+                f"changelog.d/{issue}-<slug>.md (`fragments.py add ... --added/--fixed ...`)"
             )
 
     # 4. local checks; pytest only when the diff can fail it (None = decide from the paths)
