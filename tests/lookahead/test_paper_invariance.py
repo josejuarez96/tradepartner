@@ -12,8 +12,8 @@ then injects on top every kind of row known after close(S-1):
   S, and the S+1 run (unfinished) with its `positions_daily` mark;
 - a late bar revision of a held name's S-1 bar, and of an anchor bar the plan at T_i
   reads;
-- late corporate actions: a split of a held name with ex-date S-1 and a dividend with
-  ex-date S, both known only after close(S-1).
+- late corporate actions: a split of one held name with ex-date S-1 and a dividend of
+  the other with ex-date S, both known only after close(S-1).
 
 Each piece is computed on that full store and on `TruncatedStore` cut at close(S-1),
 the harness extended to cut `JOURNAL_TABLE_NAMES` too (`tables=CUT_TABLES`), and the
@@ -33,7 +33,9 @@ two must be equal:
   input is cut at `as_of` (`known_at <= as_of`) where it is loaded. No run loader
   exists yet (T63), so `_derived` loads through `store.journal`'s readers and applies
   that cut itself; on the cut store it applies none, so the check is that the `as_of`
-  rule and the harness's truncation give the same state.
+  rule and the harness's truncation give the same state. Until #507 routes it through
+  T63's loaders, that equality holds by construction; its liveness half is the
+  evidence that the loaders must cut.
 
 Every equality has a liveness half, so an equal result is the pieces ignoring the late
 rows, not the rows missing: `test_every_injected_fact_is_live` sees each injected row
@@ -383,6 +385,8 @@ class Fixture:
     #: held[0]'s S-1 close as first known, and as revised after the cut.
     original_close: float
     revised_close: float
+    #: The scored member whose anchor bar (T_{i-1}) is revised after the cut.
+    anchored: str
 
     @property
     def window_id(self) -> int:
@@ -472,8 +476,8 @@ def fixture() -> Iterator[Fixture]:
             ingested_at=finished,
         ),
     )
-    for sid in held:  # a dividend with ex-date S, known before the cut
-        _action(conn, sid, "dividend", S, DIVIDEND, CUT - LATE)
+    # A dividend of held[1] with ex-date S, known before the cut (held[0]'s comes late).
+    _action(conn, held[1], "dividend", S, DIVIDEND, CUT - LATE)
 
     # Everything known after close(S-1): the run on S ...
     run_s = _run(conn, window_id, S, "rebalance")
@@ -552,12 +556,10 @@ def fixture() -> Iterator[Fixture]:
     conn.execute(  # held[0] does not trade on S (a halted session)
         "DELETE FROM prices_daily WHERE security_id = ? AND session = ?", [held[0], S]
     )
-    for sid in later.members:
-        if sid in later.scores:
-            _revise(conn, sid, ANCHOR, 1.5)
-            break
+    anchored = next(sid for sid in later.members if sid in later.scores)
+    _revise(conn, anchored, ANCHOR, 1.5)
     _action(conn, held[1], "split", S_PREV, 2.0, CUT + LATE)
-    _action(conn, new, "dividend", S, DIVIDEND, CUT + LATE)
+    _action(conn, held[0], "dividend", S, DIVIDEND, CUT + LATE)
     try:
         yield Fixture(
             full=conn,
@@ -570,6 +572,7 @@ def fixture() -> Iterator[Fixture]:
             run_s=run_s,
             original_close=original,
             revised_close=_bar(conn, held[0], S_PREV, LATER)["close"],
+            anchored=anchored,
         )
     finally:
         conn.close()
@@ -647,7 +650,8 @@ class Derived:
 def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime | None) -> Derived:
     """Every derived state of the window on S from `conn`'s journal, cut at `as_of`
     where loaded (None: no cut, every row `conn` holds). Store facts are read at
-    close(S-1) either way."""
+    close(S-1) either way. #507: once T63's loaders exist, call them here with
+    `as_of` in place of `_known`, so the check tests production."""
     window_id = fixture.window_id
     with_events = journal.decisions_for(conn, window_id)
     decisions = _known([d.decision for d in with_events], as_of)
@@ -739,7 +743,10 @@ def test_every_injected_fact_is_live(fixture: Fixture, cut: duckdb.DuckDBPyConne
     assert fixture.revised_close != fixture.original_close
     assert _bar(fixture.full, fixture.held[0], S_PREV, CUT)["close"] == fixture.original_close
     actions = live_actions_as_of(fixture.full, LATER)
-    for sid, kind in ((fixture.held[1], "split"), (fixture.new, "dividend")):
+    anchor_cut = _bar(fixture.full, fixture.anchored, ANCHOR, CUT)["close"]
+    assert _bar(fixture.full, fixture.anchored, ANCHOR, LATER)["close"] != anchor_cut
+    assert _bar(cut, fixture.anchored, ANCHOR, CUT)["close"] == anchor_cut
+    for sid, kind in ((fixture.held[1], "split"), (fixture.held[0], "dividend")):
         assert not actions.filter(
             (pl.col("security_id") == sid) & (pl.col("action_type") == kind)
         ).is_empty()
@@ -788,7 +795,8 @@ def test_the_explanations_are_unchanged_on_the_cut(
     assert full == _explain(fixture, cut, LATER)
     # The late dividend, the late split and S's own rows explain nothing ...
     assert set(full.symbols) == set(fixture.held)
-    assert full.dividends == pytest.approx({sid: QUANTITY * DIVIDEND for sid in fixture.held})
+    # (held[0]'s dividend is known only after the cut; held[1]'s holding is pre-split)
+    assert full.dividends == pytest.approx({fixture.held[1]: QUANTITY * DIVIDEND})
     assert full.reference_prices[fixture.held[0]] == fixture.original_close
     # ... and read past the cut, S's rows do: a new name, S's reconciliation as the base.
     after = _explain(fixture, fixture.full, LATER)
@@ -834,7 +842,7 @@ def test_a_late_corporate_action_is_used_by_no_explanation_and_no_remainder(
     with actions at close(S) instead, the trim's remainder doubles."""
     full = _derived(fixture, fixture.full, CUT)
     assert full.remainder == _derived(fixture, cut, None).remainder
-    assert fixture.new not in _explain(fixture, fixture.full, CUT).dividends
+    assert fixture.held[0] not in _explain(fixture, fixture.full, CUT).dividends
     with_events = journal.decisions_for(fixture.full, fixture.window_id)
     [trim] = [d.decision for d in with_events if d.decision.decision_id == fixture.in_flight]
     orders = _known(journal.orders_for(fixture.full, window_id=fixture.window_id), CUT)
