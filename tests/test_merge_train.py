@@ -97,7 +97,7 @@ def test_a_ready_pr_is_eligible_even_when_behind_main() -> None:
             None,
             None,
             PATHS,
-            (f"merge-train: CULPRIT batch 20261001-120000-abcdef1\nhead {HEAD}",),
+            (mt.comment("CULPRIT", "20261001-120000-abcdef1", head=HEAD),),
             "(d)",
         ),
         (None, _checks("FAILURE"), PATHS, (), "(e)"),
@@ -129,7 +129,7 @@ def test_the_first_failing_check_in_req_1_order_is_the_reason() -> None:
 def test_a_culprit_is_eligible_again_once_its_head_changes_and_ineligible_does_not_hide_it() -> (
     None
 ):
-    culprit = _c(f"merge-train: CULPRIT batch 20261001-120000-abcdef1\nhead {HEAD}")
+    culprit = _c(mt.comment("CULPRIT", "20261001-120000-abcdef1", head=HEAD))
     ineligible = _c("merge-train: INELIGIBLE batch 20261002-120000-abcdef1\n(d) culprit")
     assert _eligible(comments=(culprit, ineligible)).startswith("(d)")
     assert _eligible(_pr(head="c" * 40), _checks(sha="c" * 40), comments=(culprit,)) is None
@@ -361,11 +361,11 @@ def test_the_record_must_match_the_tested_comments() -> None:
     "outcome", ["TESTED", "MERGED", "DROPPED", "CULPRIT", "HELD", "INCONCLUSIVE", "INELIGIBLE"]
 )
 def test_every_comment_starts_with_the_train_line(outcome: str) -> None:
-    detail: dict[str, object] = (
-        {"position": 1, "head": HEAD, "prefixes": {1: "u"}}
-        if outcome == "TESTED"
-        else {"reason": "r"}
-    )
+    detail: dict[str, object] = {"reason": "r"}
+    if outcome == "TESTED":
+        detail = {"position": 1, "head": HEAD, "prefixes": {1: "u"}}
+    elif outcome == "CULPRIT":
+        detail = {"head": HEAD, "prefix": 2, "probe": "u"}
     text = mt.comment(outcome, "20261001-090507-0123456", **detail)
     assert text.splitlines()[0] == f"merge-train: {outcome} batch 20261001-090507-0123456"
 
@@ -378,3 +378,52 @@ def test_the_inconclusive_comment_names_the_uv_lock_prs() -> None:
     )
     with pytest.raises(ValueError):
         mt.comment("APPROVED", "b")
+
+
+# --- safety review on #479 -------------------------------------------------------------
+
+
+def test_the_record_check_refuses_a_pr_deleted_from_or_duplicated_in_the_prefix() -> None:
+    """A prefix longer than the accepted list, or a PR listed twice, never matches."""
+    full = _record([4])
+    comments = _tested(full)
+    deleted = _record([4])
+    del deleted.prs[3]
+    assert not mt.record_matches_comments(deleted, comments)
+    duplicated = _record([4])
+    duplicated.prs[3] = duplicated.prs[0]
+    assert not mt.record_matches_comments(duplicated, comments)
+    with pytest.raises(ValueError, match="verdicts"):
+        mt.mergeable_prefix(deleted, [True] * 4)
+
+
+def test_the_mergeable_prefix_needs_one_verdict_per_accepted_pr() -> None:
+    with pytest.raises(ValueError, match="1 verdicts for 4"):
+        mt.mergeable_prefix(_record([4]), [True])
+
+
+def test_the_culprit_rule_reads_an_exact_head_line() -> None:
+    """Check (d) compares the CULPRIT comment's own `head` line, emitted by `comment`,
+    for equality: a short SHA or the head quoted elsewhere does not count."""
+    batch = "20261001-120000-abcdef1"
+    text = mt.comment("CULPRIT", batch, head=HEAD, prefix=2)
+    assert f"\nhead {HEAD}\n" in f"{text}\n"
+    assert _eligible(comments=(_c(text),)).startswith("(d)")
+    short = mt.comment("CULPRIT", batch, head=HEAD[:7])
+    assert _eligible(comments=(_c(short),)) is None
+    quoted = _c(f"merge-train: CULPRIT batch {batch}\nhead {'b' * 40}\nnot {HEAD}")
+    assert _eligible(comments=(quoted,)) is None
+
+
+def test_a_skipped_claims_run_is_not_green() -> None:
+    runs = (
+        ready_pr.CheckRun("checks", "COMPLETED", "SUCCESS"),
+        ready_pr.CheckRun("claims", "COMPLETED", "SKIPPED"),
+    )
+    assert _eligible(checks=ready_pr.HeadChecks(HEAD, runs)).startswith("(e)")
+
+
+@pytest.mark.parametrize(("green", "red"), [(-1, 0), (4, 5), (2, 2), (3, 2)])
+def test_bisect_bounds_outside_the_batch_are_refused(green: int, red: int) -> None:
+    with pytest.raises(ValueError):
+        mt.bisect_result(green, red, [1, 2, 3, 4])

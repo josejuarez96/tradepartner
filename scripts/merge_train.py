@@ -162,6 +162,12 @@ def _train_line(body: str) -> tuple[str, str] | None:
     return (match["outcome"], match["batch"]) if match else None
 
 
+def _head_line(body: str) -> str | None:
+    """The SHA on a comment's exact `head <sha>` line, if it has one."""
+    match = re.search(r"^head (\S+)$", body, re.MULTILINE)
+    return match[1] if match else None
+
+
 def eligibility(
     pr: PullRequest,
     head_checks: ready_pr.HeadChecks,
@@ -179,18 +185,20 @@ def eligibility(
         return "(c) parked"
     bodies = owner_bodies(comments, pr.owner)
     train = [(line, b) for b in bodies if (line := _train_line(b)) and line[0] != "INELIGIBLE"]
-    if train and train[-1][0][0] == "CULPRIT" and pr.head in train[-1][1]:
+    if train and train[-1][0][0] == "CULPRIT" and _head_line(train[-1][1]) == pr.head:
         return "(d) culprit at its current head"
-    runs = {r.name for r in head_checks.runs}
+    green = {r.name for r in head_checks.runs if r.conclusion.upper() == "SUCCESS"}
     if (
-        not set(_REQUIRED_CHECKS) <= runs
+        not set(_REQUIRED_CHECKS) <= green
         or ready_pr.checks_state(head_checks, pr.head) != "success"
     ):
-        return "(e) checks and claims not both green on the head"
+        return "(e) checks and claims did not both conclude success on the head"
     if unchecked := ready_pr.unchecked_boxes(pr.body):
         return f"(f) unticked box: {unchecked[0]}"
     issue = ready_pr.issue_of_branch(pr.branch)
-    if issue is None or issue not in ready_pr.closed_issues(pr.body):
+    if issue is None:
+        return f"(g) branch {pr.branch} names no issue"
+    if issue not in ready_pr.closed_issues(pr.body):
         return f"(g) body does not say Closes #{issue}"
     missing = ready_pr.missing_fragments(pr.branch, diff_paths)
     if missing or ready_pr.lacks_changelog_bullets(pr.branch, pr.fragment_texts):
@@ -272,8 +280,8 @@ def next_probe(green_k: int, red_k: int) -> int | None:
 
 def bisect_result(green_k: int, red_k: int, accepted: Sequence[int]) -> tuple[int, list[int]]:
     """(culprit, held): the PR at position `red_k` and every PR after it."""
-    if red_k - green_k != 1:
-        raise ValueError(f"bounds {green_k}, {red_k} are not adjacent: no culprit yet")
+    if not 0 <= green_k < red_k <= len(accepted) or red_k - green_k != 1:
+        raise ValueError(f"bounds {green_k}, {red_k} not adjacent within 0..{len(accepted)}")
     return accepted[red_k - 1], list(accepted[red_k:])
 
 
@@ -281,7 +289,11 @@ def bisect_result(green_k: int, red_k: int, accepted: Sequence[int]) -> tuple[in
 
 
 def mergeable_prefix(record: Record, still_valid: Sequence[bool]) -> int:
-    """The longest green prefix whose PRs all still verify (0: merge nothing)."""
+    """The longest green prefix whose PRs all still verify (0: merge nothing).
+    `still_valid` holds one verdict per accepted PR, in order; any other length is
+    refused, so a PR nobody checked can never count as verified."""
+    if len(still_valid) != len(record.accepted()):
+        raise ValueError(f"{len(still_valid)} verdicts for {len(record.accepted())} accepted PRs")
     return max((k for k in record.green_prefixes if all(still_valid[:k])), default=0)
 
 
@@ -302,8 +314,14 @@ def _parse_tested(body: str) -> tuple[str, int, str, frozenset[int]] | None:
 def record_matches_comments(record: Record, owner_comments: Mapping[int, Sequence[str]]) -> bool:
     """Whether the frozen record is the one `build` reported (req 7). `owner_comments`
     maps each PR number to the bodies its owner-authored comments carry."""
-    longest = max(record.green_prefixes, default=0)
     accepted = record.accepted()
+    numbers = [pr.number for pr in record.prs]
+    if len(set(numbers)) != len(numbers):
+        return False  # a PR listed twice
+    if any(not 1 <= g <= len(accepted) for g in record.green_prefixes):
+        return False  # a prefix longer than the accepted list: a PR was removed
+    longest = max(record.green_prefixes, default=0)
+    position = {pr.number: k for k, pr in enumerate(accepted, start=1)}
     listed: set[int] = set()
     for pr in record.prs:
         tested = [
@@ -311,7 +329,7 @@ def record_matches_comments(record: Record, owner_comments: Mapping[int, Sequenc
             for body in owner_comments.get(pr.number, ())
             if (t := _parse_tested(body)) and t[0] == record.batch_id
         ]
-        k = accepted.index(pr) + 1 if pr in accepted else None
+        k = position.get(pr.number)
         if k is None or k > longest:
             if tested:
                 return False
@@ -336,6 +354,8 @@ def comment(outcome: str, batch: str, **detail: Any) -> str:
         prefixes: Mapping[int, str] = detail["prefixes"]
         lines += [f"prefix {k} {prefixes[k]}" for k in sorted(prefixes)]
         return "\n".join(lines)
+    if outcome == "CULPRIT":
+        lines.append(f"head {detail.pop('head')}")  # read back exactly by check (d)
     if outcome == "INCONCLUSIVE":
         reason = str(detail.pop("reason"))
         uv_lock = [int(n) for n in detail.pop("uv_lock_prs", ())]
