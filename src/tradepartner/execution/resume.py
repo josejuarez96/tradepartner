@@ -29,7 +29,8 @@ The only way the kill switch is released. In the req 5 order:
      With it, each such order `get_order` reports finished gets a synthetic
      residual fill and its terminal event; one the broker still holds open
      refuses, since it may yet fill.
-6. `reconcile_now` (T61) for the clock's session. A mismatch refuses (the
+6. `reconcile_now` (T61) for the clock's session, its journal cut (`as_of`)
+   a clock reading taken after every row steps 1 to 5 wrote. A mismatch refuses (the
    mismatch row is written, the switch stays engaged, and is engaged with
    source `fault` if nothing had engaged it). Any other status but
    `ok` refuses too: `switch.release` takes only an `ok` reconciliation, so
@@ -441,9 +442,20 @@ def resume(
             synthetic = synthetic_fills
 
         session = command_session(now)
+        # The journal cut (#488): a reading after the settlement, the collection
+        # and the synthetic fills, so the ledger sees every row this resume wrote.
+        as_of = _read_clock(clock)
         try:
             result = reconcile_now(
-                settings, connect, broker, window, session, clock, connect, frozen=frozen
+                settings,
+                connect,
+                broker,
+                window,
+                session,
+                clock,
+                connect,
+                frozen=frozen,
+                as_of=as_of,
             )
         except ReconciliationError as exc:
             # A fault found here engages the switch when nothing has (a resume

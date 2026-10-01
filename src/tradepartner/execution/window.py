@@ -936,7 +936,15 @@ def stop(
         session = command_session(now)
         try:
             result = reconcile_now(
-                settings, connect, broker, window, session, clock, connect, frozen=frozen
+                settings,
+                connect,
+                broker,
+                window,
+                session,
+                clock,
+                connect,
+                frozen=frozen,
+                as_of=_command_clock(clock),  # every row journaled so far (#488)
             )
         except ReconciliationError as exc:
             message = f"reconciliation failed: {exc}"
@@ -1019,6 +1027,7 @@ def abandon(
                 clock,
                 connect,
                 frozen=frozen,
+                as_of=_command_clock(clock),  # every row journaled so far (#488)
             )
         except ReconciliationError as exc:
             mismatch = exc  # its row is written before the error: abandon lists it
