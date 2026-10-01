@@ -692,8 +692,10 @@ def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
     journal no write has migrated has no window either), or a
     `multiple_open_windows` refusal (spec req 14: only one window may ever be
     open) when the journal has more than one open window. Every command that
-    calls this (`stop`, `abandon`, `kill`, `override`) refuses the same way;
-    none of them has written anything by this point."""
+    calls this (`stop`, `abandon`, `kill`, `override`) refuses the same way.
+    `stop`, `kill` and `override` call it before writing anything; `abandon`'s
+    re-check (after its reconciliation row) still refuses the same way, but
+    by then the reconciliation row is already written."""
     try:
         window = open_window(conn)
     except JournalNotInitialised:
