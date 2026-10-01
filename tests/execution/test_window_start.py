@@ -739,3 +739,150 @@ def test_refuses_a_spinoff_whose_ex_date_is_not_yet_effective(
     with pytest.raises(window.StartRefusedError) as exc:
         window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
     assert exc.value.reason == "not_flat"
+
+
+def test_refuses_a_spinoff_not_yet_known(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """No-look-ahead on `known_at`, not just `ex_date`: a spin-off this
+    process could not yet have read explains nothing, even with a past
+    ex-date (a fixture could otherwise smuggle look-ahead past the ex-date
+    bound alone)."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (10.0, None)},
+    )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=(stop_at + timedelta(days=2)).date(),
+        ratio_or_amount=0.2,
+        known_at=fixed_clock() + timedelta(days=1),  # known only after "now"
+        source_action_id=SPY,
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 2.0
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"
+
+
+def test_refuses_a_spinoff_ex_dated_on_the_stop_session(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """The bound is `stated_on < ex_date`, strict: a spin-off ex-dated on the
+    stop session itself (already reflected in the residue quantity the stop
+    row listed) does not explain a position a second time."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (10.0, None)},
+    )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=stop_at.date(),  # on the stop session, not after it
+        ratio_or_amount=0.2,
+        known_at=stop_at - timedelta(days=1),
+        source_action_id=SPY,
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 2.0
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"
+
+
+def test_accepts_spinoff_with_a_parent_split_before_and_a_child_split_after(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """Exercises both split-adjustment legs so the fix cannot regress to the
+    unadjusted math: a 2-for-1 parent split between the stop session and the
+    spin-off's ex-date, then a 3-for-1 child split between the ex-date and
+    now. The stored adjustment keeps the ex-date's own basis (5.0 = 10.0
+    post-parent-split shares x 0.5 ratio), letting the ledger apply the
+    child's own 3-for-1 split itself; the live broker position the quantity
+    both splits would actually produce (15.0) is what `start` must accept."""
+    stop_at = fixed_clock() - timedelta(days=20)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (5.0, None)},
+    )
+    ex_date = (stop_at + timedelta(days=5)).date()
+    _insert_action(
+        journal_settings,
+        security_id=SPY,
+        action_type="split",
+        ex_date=(stop_at + timedelta(days=2)).date(),  # between the stop session and the ex-date
+        ratio_or_amount=2.0,
+        known_at=stop_at + timedelta(days=1),
+    )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=ex_date,
+        ratio_or_amount=0.5,
+        known_at=stop_at + timedelta(days=6),
+        source_action_id=SPY,
+    )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="split",
+        ex_date=(fixed_clock() - timedelta(days=1)).date(),  # between the ex-date and now
+        ratio_or_amount=3.0,
+        known_at=fixed_clock() - timedelta(days=2),
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0  # 5 pre-split shares, doubled
+    fake.extra_quantity["SPLT"] = 15.0  # (10 * 0.5) post-parent-split child shares, tripled
+
+    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    window_id = result.window.window_id
+    assert window_id is not None
+
+    with open_read_only(journal_settings) as conn:
+        fills = fills_for(conn, window_id=window_id)
+        orders = orders_for(conn, window_id=window_id)
+        adjustments = adjustments_for(conn, window_id=window_id)
+        actions = live_actions_as_of(conn, fixed_clock())
+    receipts = [a for a in adjustments if a.kind == "spinoff_receipt"]
+    assert len(receipts) == 1
+    assert receipts[0].security_id == CHILD
+    assert receipts[0].session == ex_date
+    assert receipts[0].quantity == pytest.approx(5.0)  # the ex-date's own basis, unadjusted
+
+    ledger = from_journal(
+        fills,
+        orders,
+        adjustments,
+        actions,
+        None,
+        result.window.starting_cash,
+        result.window.first_rebalance_session,
+        window_id=window_id,
+        quantity_tolerance=journal_settings.risk.reconcile_quantity_tolerance,
+    )
+    # The ledger applies the child's own split itself (its documented
+    # convention): 5.0 stored x 3.0 (the child's split since the ex-date) =
+    # 15.0, matching what the live broker actually holds.
+    assert ledger.positions[CHILD] == pytest.approx(15.0)
+    assert fake.positions()["SPLT"].quantity == pytest.approx(ledger.positions[CHILD])
