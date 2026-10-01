@@ -17,31 +17,29 @@ The last 10, newest last; older ones are in [CHANGELOG.md](../CHANGELOG.md) and 
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
-Live board: `uv run python scripts/team.py status` (2026-10-01). Active teams: atlas (main), bramble (#498), finch T60d, heron T63c, lantern #405, marigold #447, plover T65, sparrow T69, tern T64b, wren T63e. Dead claims pending `release --force`: `meridian` #258, `eclipse` #182. Retired directories wait for `team.py prune --yes`.
+Live board: `uv run python scripts/team.py status`. Snapshot 2026-10-01: orchestrator **tradepartner-e3** (atlas, main checkout, where the owner runs the backfill; no git ops there meanwhile). The owner retired the day's windows; e3 runs background teams in retired directories: plover T65, finch T60d, wren T63e, tern T64b, sparrow T69, heron (#431 refresh), marigold (#466 refresh), osprey (#488 then T63g). bramble holds #498. Dead claims for the owner's `release --force`: `meridian` #258, `eclipse` #182. Retired directories wait for `team.py prune --yes`.
 
 ## In progress
-- Draft PRs in flight (team.py status): T60d #494 (finch, re-attempt scope), T63c #431 ready (heron, planning), T69 #496 (sparrow, operations), T64b #495 (tern, window stop), T63e #493 (wren, exits). Ready PRs parked on owner merge: #480 (T60 fix), #479 T72 (#475), #478 T73 (#476), #445 (prefixes), #419 (alerts), #305, #299, #297.
-- Ingest issues: #498 (bramble, FSN tabs). Tests: #448 ready (lantern, #405), #406-boundary-fences draft (#406-#407-#418).
+- **Phase 4 PRs:** #434 T65, #494 T60d, #493 T63e, #495 T64b, #496 T69; #431 T63c and #466 (#447) being brought up to date with main; #488 (journal reads cut at `as_of`, owner chose option 1; the decision is the plan), then T63g (#486) stacked on it.
+- **Ready, owner's merge:** #478 T73, #479 T72 (merge train), #419 (#394; spec adds optional `ALERT_EMAIL_FROM`), #480 (#395; spec), #501 (this fold). #445 (#381) merges last, after the order-path PRs.
 - **Phase 2:** T22's tick waits on the owner's ingest runs (runbook merged, #316), then T23.
-- **Phase 3:** T45b owner, backfill rerun pending, then health check, hypothesis register, backtest h1-momentum-12-1.
-- **Phase 4:** frontier open: T60c, T63g pure suites; T60 fix #480 parked ready for merge; T53b waits on #350.
-- **Process:** #489 process improvements merged; fold PR #499 in progress.
+- **Phase 3:** T45b (owner): the backfill rerun (`ingest --backfill --since 2016-01-01`) after #461, then `health --check`, `hypothesis register`, `backtest h1-momentum-12-1`. #498 (embedded tabs in an FSN value) may fail EDGAR again.
+- **Process:** #490 merged (report-only messages, Sonnet windows for simple work, two review passes); merge-train T72/T73 ready, T72b onward follow.
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
 Copied from `team.py status` on 2026-10-01. Claim through the tool, never from this list.
-1. plan tasks ready: T22 (agent, runbook merged), T45b/T48b (owner-gated), T60c/T63g (agent pure suite), T70/T72/T73 (parked ready PRs: #297, #479, #478).
-2. parked ready PRs: #480 (T60 fix), #479 (T72), #478 (T73), #445 (prefixes), #419 (alerts SMTP), #305 (ingest), #299 (T48b), #297 (T70).
-3. unclaimed issues by priority: #488 M (reconcile explanations), #497/#491/#471 S (reattempts, processes, fences), then #470/#473/#472/#435 (feature/data/test issues), then size-S fixes (#416, #412, #411, #410, #409, #407, #406, #404, #403, #395, #394, #382, #381, #376, #258, #183, #182, #33, #366).
+1. ready plan tasks: T60c once T60d, T63e and #431 merge (shared files); T63 once #431 merges; T70 (#297 parked, gated on Probe 3); T22, T45b, T48b (owner).
+2. parked PRs: #467 (#406/#407/#418 fences, safety PASS, ready_pr not run), #305 (#258), #299 (T48b), #297 (T70).
+3. unclaimed issues: #497, #491, #471, #470, #472, #473, #435, #416, #410, #409, #404, #403, #382, #376, #183, #33.
 
 ## Blocked
-- Plan tasks blocked on dependencies (team.py status): T23, T48c, T60b, T60d, T60e, T63, T63d, T63f, T63h, T63i, T65b, T66, T67, T69b, T71, T71b, T72b, T72c, T74, T75, T75b.
-- T60d/T65/T69 in flight; T48c/T60b/T60e/T63/T67/T71 wait on T48b (owner recording); T23 waits on T22 (owner evidence); T63i/T66 blocked on open dependencies.
+- Every other plan task waits on its dependencies (board: T23, T48c, T60b, T60e, T63d to T63i, T65b, T66, T67, T69b, T71, T71b, T72b to T75b).
+- T48c, T60e, T67 and T71 wait on the owner's T48b recording; T70 on Probe 3; T23 on T22's evidence.
 
 ## Decisions needed from owner
-- Rerun backfill (#45b), then `health --check`, hypothesis register, backtest h1, then T22 plist install (evidence).
-- T48b recorder and Probe 3 (#182): market hours, submit 09:00–09:15 ET, collect after 09:46; `cli_record paper <SYMBOL>` flat account.
-- #488 open size question: is the reconcile_run explanations task (plan line or new task?). Judgment calls in #493 (T63e), #495 (T64b) PR bodies.
-- Merged PR answers: #339 T54 ADR 0010 (per-order exit limit, spin-off rules in #473 spec change), #349 T62 (alert kind), #331 T59 (release).
-- #281 strategy-lab qs 2, 8, 11; Phase 3 spec amendments; cadence ADR 0012; event-data spec (#307); event-study engine after T45b.
-- `release --force` for dead claims (#258, #182); `team.py prune --yes`; close #33; gap_signoff before Phase 4 paper start.
+- Merges above; the judgment calls listed in the PR bodies of #493 (T63e: spin-off receipt spent, whole-share dust loop) and #495 (T64b: abandoned `residues_json` shape, override field refusal, mismatch at the closing stop engages the switch).
+- After the backfill: `health --check`, T45b, then the ingest plist (runbook) for T22's evidence.
+- A market-hours session for Probe 3 (#182, submit 09:00 to 09:15 ET, collect after 09:46) and the T48b recorder (`cli_record paper <SYMBOL>`, flat paper account).
+- Open questions: #416, #470 (a), #411/#412, #366 Q19 to Q24, #473; #281 strategy-lab questions 2, 8 and 11; event-data spec (#307).
+- `release --force` for #258 and #182; `team.py prune --yes`; close #33; `gap_signoff` on H1 before Phase 4 paper start.
 - GitHub Pro server-side ruleset decision; account type and compliance check (Phase 6).
