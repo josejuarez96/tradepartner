@@ -118,8 +118,6 @@ _CLOSING_EVENTS = frozenset({"skipped", _WRITTEN_OFF})
 _SKIP_PREFIX = "skip_"
 _DUST = "dust"
 _TRADE = "trade"
-#: `trade` sell reasons that sell the whole holding (spec Definitions > Full exit).
-_FULL_EXIT_TRADE_REASONS = frozenset({"left_targets", "left_universe"})
 #: Decision kinds whose sells are the plan's own (their proceeds fund the buys).
 _PLAN_TRADE_KINDS = frozenset({_TRADE, _OVERRIDE})
 _HALT = "halt"
@@ -138,6 +136,8 @@ _RESIDUE_ORIGINS = frozenset({_DUST, _UNTRADABLE})
 _LEFT_TARGETS = "left_targets"
 _LEFT_UNIVERSE = "left_universe"
 _EXCLUDE_NAME = "exclude_name"
+#: `trade` sell reasons that sell the whole holding (spec Definitions > Full exit).
+_FULL_EXIT_TRADE_REASONS = frozenset({_LEFT_TARGETS, _LEFT_UNIVERSE})
 _NAME_OVERRIDES = frozenset({_EXCLUDE_NAME, _KEEP_NAME})
 _SKIP_DELISTED = "skip_delisted"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
