@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import duckdb
+import polars as pl
 import pytest
 
 from tradepartner.adapters.broker import Asset
@@ -43,8 +44,12 @@ from tradepartner.store import journal, registry
 from tradepartner.store.db import configure_connection
 from tradepartner.store.journal import (
     AdjustmentRow,
+    DecisionEventRow,
     DecisionRow,
     JournalRow,
+    OrderEventRow,
+    OrderRow,
+    OverrideRow,
     PaperPlanRow,
     PaperRunRow,
     PaperWindowRow,
@@ -450,11 +455,11 @@ def _replan(env: Env) -> planning.PlanOutcome:
 def test_the_ledger_and_prices_read_nothing_known_after_close_s_minus_1(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A held name's S-1 bar revised (close x 10) after close(S-1) changes no
-    decision. Teeth: with the cut moved past the revision, equity moves and so
+    """A held name's S-1 bar revised (close x 10) one minute after close(S-1)
+    changes no decision. Teeth: with the cut moved past the revision, equity moves and so
     do the buys' notionals."""
     base = _view(env.plan())
-    late = session_close(F_I) + timedelta(minutes=5)
+    late = session_close(T_I) + timedelta(minutes=1)  # just after close(S-1)
     env.conn.execute(
         "INSERT INTO prices_daily SELECT * REPLACE (close * 10 AS close, ? AS known_at, "
         "? AS ingested_at) FROM prices_daily WHERE security_id = 'SEC_SPY' AND session = ?",
@@ -664,8 +669,8 @@ def test_an_executed_or_missed_rebalance_is_not_caught_up(env: Env, status: str)
     events = [_event(env, status)]
     catch_up = _sessions_after(F_I, 1)
     assert rebalance_kind(env.window, runs, events, catch_up, MAX_CATCH_UP) is None
-    # The fill session itself is still a rebalance session by date.
-    assert rebalance_kind(env.window, runs, events, F_I, MAX_CATCH_UP) == "rebalance"
+    # Not on its own fill session either: a same-session re-run trades nothing.
+    assert rebalance_kind(env.window, runs, events, F_I, MAX_CATCH_UP) is None
 
 
 def test_an_event_of_another_window_does_not_count(env: Env) -> None:
@@ -703,3 +708,225 @@ def test_the_plan_path_imports_no_adapter() -> None:
     assert not [m for m in imported if m.startswith("tradepartner.adapters")], imported
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     assert not names & {"AlpacaBroker", "FakeBroker", "utc_now", "now_utc"}
+
+
+# --- the reference price ---------------------------------------------------------------------
+
+
+def _splits(*rows: tuple[str, date, float]) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {"security_id": s, "action_type": "split", "ex_date": d, "ratio_or_amount": r}
+            for s, d, r in rows
+        ],
+        schema={
+            "security_id": pl.Utf8,
+            "action_type": pl.Utf8,
+            "ex_date": pl.Date,
+            "ratio_or_amount": pl.Float64,
+        },
+    )
+
+
+def _copy_bar(env: Env, new_id: str, session: date) -> float:
+    env.conn.execute(
+        "INSERT INTO prices_daily SELECT * REPLACE (? AS security_id) FROM prices_daily "
+        "WHERE security_id = 'SEC_SPY' AND session = ?",
+        [new_id, session],
+    )
+    row = env.conn.execute(
+        "SELECT close FROM prices_daily WHERE security_id = ? AND session = ?", [new_id, session]
+    ).fetchone()
+    assert row is not None
+    return float(row[0])
+
+
+def test_the_reference_price_divides_by_the_splits_in_s_minus_1_to_s(env: Env) -> None:
+    close = _copy_bar(env, "SEC_X", T_I)
+    splits = _splits(("SEC_X", T_I, 5.0), ("SEC_X", F_I, 2.0), ("SEC_X", T_NEXT, 7.0))
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_X"}, splits)
+    assert prices["SEC_X"] == pytest.approx(close / 2.0)
+
+
+def test_an_older_bar_is_divided_by_every_split_after_its_own_session(env: Env) -> None:
+    """The latest bar is 2019-04-26: a split ex 2019-04-29 (inside the gap before
+    S-1) and one ex S both apply; one ex on the bar's own session does not."""
+    bar = date(2019, 4, 26)
+    close = _copy_bar(env, "SEC_X", bar)
+    splits = _splits(("SEC_X", bar, 5.0), ("SEC_X", date(2019, 4, 29), 2.0), ("SEC_X", F_I, 3.0))
+    prices = planning.reference_prices(env.conn, F_I, {"SEC_X"}, splits)
+    assert prices["SEC_X"] == pytest.approx(close / 6.0)
+
+
+def test_a_name_with_no_bar_by_s_minus_1_raises(env: Env) -> None:
+    with pytest.raises(ValueError, match="SEC_NONE"):
+        planning.reference_prices(env.conn, F_I, {"SEC_NONE"}, _splits())
+
+
+# --- review fixes (safety-reviewer and quant-auditor on #431) ---------------------------
+
+
+def test_a_fault_after_the_transaction_ended_still_propagates_unchanged(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing rollback (here the transaction is already gone) never replaces
+    the exception that caused it: a `StaleDataError` still takes its own path."""
+
+    def ends_then_raises(*_args: Any, **_kwargs: Any) -> Any:
+        env.conn.rollback()
+        raise StaleDataError("injected")
+
+    counts = env.counts()
+    monkeypatch.setattr(planning.engine, "plan", ends_then_raises)
+    with pytest.raises(StaleDataError):
+        env.plan()
+    assert env.counts() == counts
+
+
+def _forced_exit(env: Env, sid: str) -> DecisionRow:
+    stamp = _utc(F_I, 11)
+    row = DecisionRow(
+        run_id=env.run.run_id,  # type: ignore[arg-type]
+        security_id=sid,
+        side="sell",
+        planned_quantity=HELD[sid],
+        whole_share=False,
+        decision="forced_exit",
+        reason="delisted",
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+    return replace(row, decision_id=journal.append(env.conn, row))
+
+
+@pytest.mark.parametrize("state", ["open", "in_flight", "closed"])
+def test_a_name_with_an_open_or_in_flight_forced_exit_gets_no_decision(
+    env: Env, state: str
+) -> None:
+    exit_ = _forced_exit(env, "SEC_DUAL_A")
+    stamp = _utc(F_I, 11)
+    if state == "in_flight":
+        order = OrderRow(
+            client_order_id="tp-20190501-SEC_DUAL_A-sell-1",
+            decision_id=exit_.decision_id,  # type: ignore[arg-type]
+            run_id=env.run.run_id,  # type: ignore[arg-type]
+            session=F_I,
+            attempt=1,
+            phase="exit",
+            security_id="SEC_DUAL_A",
+            symbol="DUALA",
+            side="sell",
+            quantity=HELD["SEC_DUAL_A"],
+            sells_in_flight_at_submit=False,
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+        journal.append(env.conn, order)
+        journal.append(
+            env.conn,
+            OrderEventRow(
+                client_order_id=order.client_order_id,
+                status="accepted",
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+    if state == "closed":
+        journal.append(
+            env.conn,
+            DecisionEventRow(
+                decision_id=exit_.decision_id,  # type: ignore[arg-type]
+                run_id=env.run.run_id,  # type: ignore[arg-type]
+                status="skipped",
+                reason="untradable",
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+    decided = _decisions(env.plan())
+    if state == "closed":
+        assert decided["SEC_DUAL_A"].reason == "left_targets"
+    else:
+        assert "SEC_DUAL_A" not in decided
+    assert decided["SEC_SPY"].reason == "left_universe"
+
+
+def test_frozen_risk_must_be_the_windows(env: Env) -> None:
+    with pytest.raises(ValueError, match="frozen risk"):
+        plan_rebalance(
+            env.conn,
+            journal,
+            env.window,
+            env.run,
+            F_I,
+            env.settings,
+            RiskConfig(),
+            AssetsRead(),
+            False,
+            now=_utc(F_I, 12),
+        )
+
+
+def test_a_naive_now_is_refused(env: Env) -> None:
+    with pytest.raises(ValueError, match="tz-aware"):
+        plan_rebalance(
+            env.conn,
+            journal,
+            env.window,
+            env.run,
+            F_I,
+            env.settings,
+            FROZEN,
+            AssetsRead(),
+            False,
+            now=datetime(2019, 5, 1, 12),  # noqa: DTZ001 - naive on purpose
+        )
+
+
+def test_a_plan_row_with_no_decision_is_reused_too(env: Env) -> None:
+    stamp = _utc(F_I, 12)
+    journal.append(
+        env.conn,
+        PaperPlanRow(
+            run_id=env.run.run_id,  # type: ignore[arg-type]
+            plan_trial_id=0,
+            rebalance_session=T_I,
+            n_universe=0,
+            n_targets=0,
+            n_orders_below_min_at_live_capital=0,
+            known_at=stamp,
+            ingested_at=stamp,
+        ),
+    )
+    counts = env.counts()
+    outcome = env.plan(assets_read=_raising(RuntimeError))
+    assert (outcome.status, outcome.decisions) == ("reused", ())
+    assert env.counts() == counts
+
+
+def test_only_the_windows_overrides_naming_t_i_apply(env: Env) -> None:
+    stamp = _utc(F_I, 9)
+
+    def override(rebalance: date, window_id: int) -> None:
+        journal.append(
+            env.conn,
+            OverrideRow(
+                window_id=window_id,
+                made_at=stamp,
+                rebalance_session=rebalance,
+                security_id="SEC_DUAL_B",
+                kind="exclude_name",
+                reason="the owner's reason, long enough",
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+
+    override(T_NEXT, env.window.window_id)  # type: ignore[arg-type]
+    override(T_I, 999)
+    assert _decisions(env.plan())["SEC_DUAL_B"].decision == "trade"
+    for table in ("paper_plans", "decisions", "signals"):
+        env.conn.execute(f"DELETE FROM {table}")
+    override(T_I, env.window.window_id)  # type: ignore[arg-type]
+    dual_b = _decisions(env.plan(run=env.run_on(F_I)))["SEC_DUAL_B"]
+    assert (dual_b.decision, dual_b.side, dual_b.reason) == ("override", None, "exclude_name")

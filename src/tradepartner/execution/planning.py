@@ -46,7 +46,10 @@ no trial, `signals`, `decisions` or `paper_plans` row.
 
 This module imports no adapter (the `assets` reads go through `assets_read`),
 calls no broker and reads no clock: rows are stamped with `now`, the run's
-clock reading, which the caller takes. `conn` is a write connection with no
+clock reading, which the caller takes (the registry still stamps its own
+`started_at` and `finished_at` on the trial). `frozen` must equal the window's
+frozen `risk.*` section (`reconcile_run.frozen_risk`), and a plan is re-used
+when T_i has journaled decisions or a `paper_plans` row. `conn` is a write connection with no
 transaction open.
 """
 
@@ -56,7 +59,7 @@ import bisect
 import json
 import math
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import partial
@@ -84,6 +87,7 @@ from tradepartner.execution.plan import (
     decision_state,
     decisions_from,
 )
+from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
@@ -200,7 +204,9 @@ def due_rebalance(
     session: date,
     max_catch_up_sessions: int,
 ) -> tuple[RebalanceKind, date] | None:
-    """The run's planning kind on S with its T_i, or None (module docstring).
+    """The run's planning kind on S with its T_i, or None (module docstring). A
+    T_i with an `executed` or `missed` event has no kind, on its F_i too, so a
+    same-session re-run after a halt that wrote `missed` trades nothing.
 
     Only the latest rebalance due by S can be planned: an earlier one has a
     later rebalance's fill session between it and S, by which time it lapsed.
@@ -213,14 +219,14 @@ def due_rebalance(
     if t_i is None:
         return None
     f_i = fill_session(t_i)
-    if session == f_i:
-        return _REBALANCE, t_i
     windows = {run.run_id: run.window_id for run in runs}
     for event in rebalance_events:
         if event.run_id not in windows:
             raise ValueError(f"rebalance event of run {event.run_id}, which is not among the runs")
         if windows[event.run_id] == window.window_id and event.rebalance_session == t_i:
-            return None  # executed or missed
+            return None  # executed or missed, even on its own F_i: never traded again
+    if session == f_i:
+        return _REBALANCE, t_i
     if _sessions_after(f_i, session) <= max_catch_up_sessions:
         return _CATCH_UP, t_i
     return None
@@ -254,28 +260,30 @@ def reference_prices(
 ) -> dict[str, float]:
     """The reference price on S per name (spec Definitions > Reference price):
     the close of its latest bar on or before S-1 known at close(S-1), divided
-    by the split ratios with ex-date in (S-1, S] in `actions_as_of` (read at
-    close(S-1)). A name with no such bar raises `ValueError`."""
+    by the split ratios with ex-date in (that bar's session, S] in
+    `actions_as_of` (read at close(S-1)): (S-1, S] when the S-1 bar exists, and
+    every later split too when the latest bar is older. A name with no such bar
+    raises `ValueError`."""
     _check_session(session)
     if not names:
         return {}
     previous = previous_session(session)
     bars = prices_as_of(conn, _cut(session), sorted(names)).filter(pl.col("session") <= previous)
     latest = {
-        row["security_id"]: float(row["close"])
+        row["security_id"]: (row["session"], float(row["close"]))
         for row in bars.sort("session").group_by("security_id").last().iter_rows(named=True)
     }
     missing = sorted(set(names) - set(latest))
     if missing:
         raise ValueError(f"no bar on or before {previous} known at close(S-1) for {missing}")
     prices: dict[str, float] = {}
-    for sid, close in latest.items():
+    for sid, (bar_session, close) in latest.items():
         factor = 1.0
         for row in actions_as_of.iter_rows(named=True):
             if (
                 row["security_id"] == sid
                 and row["action_type"] == _SPLIT
-                and previous < row["ex_date"] <= session
+                and bar_session < row["ex_date"] <= session
             ):
                 factor *= float(row["ratio_or_amount"])
         price = close / factor
@@ -407,6 +415,14 @@ def _open_forced_exits(
     return frozenset(live)
 
 
+def _rollback(conn: duckdb.DuckDBPyConnection) -> None:
+    """Roll the step's transaction back. A rollback that fails (the transaction
+    already ended) is ignored, so the exception that caused it always
+    propagates, unchanged, to its own path."""
+    with suppress(duckdb.Error):
+        conn.rollback()
+
+
 @contextmanager
 def _lend(conn: duckdb.DuckDBPyConnection) -> Iterator[duckdb.DuckDBPyConnection]:
     """`conn` as a `StoreProvider` connection factory: lent, never closed."""
@@ -470,13 +486,16 @@ def _read(
     actions = live_actions_as_of(conn, _cut(session))
     ledger = _ledger(conn, window, window_id, session, actions, frozen)
     held = sorted(sid for sid, quantity in ledger.positions.items() if quantity > 0)
-    exits = sorted(
-        d.decision.security_id
-        for d in store_journal.decisions_for(conn, window_id)
-        if d.decision.decision == _FORCED_EXIT
-    )
-    prices = reference_prices(conn, session, {*held, *exits}, actions)
-    forced = _open_forced_exits(conn, window_id, session, actions, frozen, prices.__getitem__)
+    prices = reference_prices(conn, session, held, actions)
+
+    def exit_price(sid: str) -> float:
+        # Lazy: only a forced exit whose state needs a remainder is priced, so an
+        # old terminal exit of a name with no recent bar cannot block the plan.
+        if sid not in prices:
+            prices.update(reference_prices(conn, session, {sid}, actions))
+        return prices[sid]
+
+    forced = _open_forced_exits(conn, window_id, session, actions, frozen, exit_price)
     overrides = tuple(o.override for o in store_journal.overrides_for(conn, window_id))
     held_assets = _assets(assets_read, _symbols(conn, session, held))
     return _Reads(
@@ -599,11 +618,20 @@ def plan_rebalance(
         raise ValueError("the window and the run must be rows read from the store")
     if run.window_id != window.window_id:
         raise ValueError(f"run {run.run_id} is not of window {window.window_id}")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError(f"now must be tz-aware, got {now!r}")
+    if frozen != frozen_risk(window):
+        raise ValueError(f"frozen is not window {window.window_id}'s frozen risk section")
     t_i = _latest_due(window, session)
     if t_i is None:
         raise ValueError(f"no rebalance of window {window.window_id} is due on {session}")
     journaled = store_journal.decisions_for(conn, window.window_id, rebalance_session=t_i)
-    if journaled:
+    planned = [
+        p for p in store_journal.plans_for(conn, window.window_id) if p.rebalance_session == t_i
+    ]
+    if journaled or planned:
+        # Keyed on the plan row too, so a committed plan with no decision is
+        # never planned again.
         return PlanOutcome(t_i, "reused", tuple(d.decision for d in journaled))
     if lagging:
         return PlanOutcome(t_i, "lagging")
@@ -634,7 +662,7 @@ def plan_rebalance(
         rows = _write(conn, journal, run.run_id, t_i, plan, decided, handle, now)
         _trial(lambda: _close_ok(conn, handle), "its result")
     except BaseException:
-        conn.rollback()
+        _rollback(conn)
         raise
     conn.commit()
     return PlanOutcome(t_i, "planned", rows, handle.trial_id)
