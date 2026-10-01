@@ -32,6 +32,18 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
    ```
 5. **Find `uv`'s absolute path:** `command -v uv`. On Apple silicon with Homebrew it is `/opt/homebrew/bin/uv`; the standalone installer puts it at `~/.local/bin/uv`.
 
+## Before pulling a schema migration
+
+**Any write connection migrates the store** (T49's docstring) — not just a `tradepartner migrate` you'd notice running. The very first scheduled `ingest` or `paper run` after a `git pull` that bumps `CURRENT_SCHEMA_VERSION` migrates the store to the new version as a side effect of its normal write, with no separate step and no prompt. Two migrations are coming: [#365](https://github.com/josejuarez96/tradepartner/issues/365) (schema v6) and [#377](https://github.com/josejuarez96/tradepartner/issues/377) (a `CHECK` enum change, also a migration). Before `git pull`-ing a change that bumps the version, **copy the store file first**, so a migration you need to back out of still has a pre-migration copy to restore from:
+
+```bash
+cd ~/Projects/tradepartner
+STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().store.path)")
+cp "$STORE_PATH" "$STORE_PATH.bak-$(date +%Y%m%d)"
+```
+
+This reads the path the running settings actually use (respecting `STORE__PATH` in `.env` if you've set it, per "PATH, working directory and `.env`" below) rather than assuming the default `data/tradepartner.duckdb`, and copies no secret — only the store file itself. Keep the dated copy until you've confirmed the next scheduled `ingest` and `paper run` both completed `ok` on the new version; a copy from before a bad migration is the only way back without redoing a backfill.
+
 ## PATH, working directory and `.env`
 
 launchd starts jobs with a minimal environment: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, the working directory `/`, and none of your shell profile. Three things follow:
