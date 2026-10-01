@@ -247,6 +247,102 @@ def test_equal_returns_both_rules_pass() -> None:
         assert result.months[0].raw == pytest.approx(0.0)
 
 
+def test_modelled_cost_uses_trial_equity_not_paper_equity() -> None:
+    # Paper's account is 10x smaller than the trial it is tracked against.
+    # Spec req 10: "the trial's base-level cost_paid at T_i over its equity
+    # at close(T_i)" -- "its" is the trial's, so the threshold must not
+    # scale with paper's account size.
+    paper_equity = {T0: 10_000.0, T1: 10_100.0}  # paper return = 0.01
+    trial_equity = {T0: 100_000.0, T1: 101_000.0}  # trial return = 0.01
+    trial = _trial(trial_equity, {T0: 1_000.0})  # modelled cost = 1_000/100_000 = 0.01
+    journal = _journal(positions_daily=_flat_marks(paper_equity))
+    result = compare_months(
+        _window(tracking_rule="raw", tracking_k=1.0), trial, journal, _no_actions(), _no_price, None
+    )
+    assert result.months[0].modelled_cost == pytest.approx(0.01)
+    assert result.months[0].raw == pytest.approx(0.0)  # both returns are 0.01
+    assert result.passed
+    # Had the cost instead divided by paper's equity (10_000), the modelled
+    # cost would be 0.1, ten times too loose: the check would still pass
+    # here, but the printed modelled_cost value pins the right number.
+
+
+def test_action_identity_matches_store_asof_source_action_id() -> None:
+    # A re-dated dividend under one `source_action_id`: the store's own
+    # identity (`security_id`, `source_action_id`) must collapse both
+    # revisions to the latest ex-date, never keep both alive at once
+    # (`store.asof._ACTION_IDENTITY_PARTITION`).
+    ex_date = date(2026, 10, 15)
+    record_date = previous_session(ex_date)
+    equity = {T0: 100_000.0, T1: 101_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    marks = [*_flat_marks(equity), _position_mark(record_date, A, 100.0, 50.0)]
+    original = pl.DataFrame(
+        {
+            "security_id": [A],
+            "action_type": ["dividend"],
+            "ex_date": [date(2026, 9, 1)],  # originally dated outside this month
+            "ratio_or_amount": [0.5],
+            "known_at": [_utc(T0)],
+            "cancelled": [False],
+            "source_action_id": ["div-1"],
+        }
+    )
+    revised = pl.DataFrame(
+        {
+            "security_id": [A],
+            "action_type": ["dividend"],
+            "ex_date": [ex_date],  # re-dated into this month, same source id
+            "ratio_or_amount": [0.5],
+            "known_at": [_utc(T1)],
+            "cancelled": [False],
+            "source_action_id": ["div-1"],
+        }
+    )
+    actions = pl.concat([original, revised])
+    journal = _journal(positions_daily=marks)
+    result = compare_months(
+        _window(tracking_rule="residual"), trial, journal, actions, _no_price, None
+    )
+    # One dividend of 0.5/share x 100 shares, not two: a wrong identity that
+    # kept the original revision alive too would double this.
+    expected = (0.5 * 100.0) / 100_000.0
+    assert result.months[0].dividend_term == pytest.approx(expected)
+
+
+def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None:
+    # A `dividend_cash` credit journaled (known) only after close(T_{i+1})
+    # was not knowable when month i was reported and must not retroactively
+    # zero its dividend term.
+    ex_date = date(2026, 10, 15)
+    record_date = previous_session(ex_date)
+    equity = {T0: 100_000.0, T1: 101_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    marks = [*_flat_marks(equity), _position_mark(record_date, A, 100.0, 50.0)]
+    dividends = _action(A, "dividend", ex_date, 0.5, _utc(T1))
+    late_credit = _journal(
+        positions_daily=marks,
+        adjustments=[
+            AdjustmentRow(
+                adjustment_id=next(_IDS),
+                window_id=WINDOW_ID,
+                run_id=1,
+                session=ex_date,
+                kind="dividend_cash",
+                security_id=A,
+                cash=50.0,
+                known_at=session_close(T1) + timedelta(seconds=1),
+                ingested_at=session_close(T1) + timedelta(seconds=1),
+            )
+        ],
+    )
+    result = compare_months(
+        _window(tracking_rule="residual"), trial, late_credit, dividends, _no_price, None
+    )
+    expected = (0.5 * 100.0) / 100_000.0
+    assert result.months[0].dividend_term == pytest.approx(expected)
+
+
 def test_raw_boundary_exact_passes_one_above_fails() -> None:
     # Every number below is a dyadic fraction (an exact power-of-two divisor)
     # so the arithmetic `compare_months` does is bit-exact, and the "exactly
