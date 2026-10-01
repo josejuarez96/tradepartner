@@ -33,8 +33,10 @@ quantity tolerance. Its symbol may then differ, in the order's direction, by up
 to the unjournaled quantity, and cash, in the order's direction, by up to the
 unjournaled notional (`filled_quantity` x `filled_avg_price` less the journaled
 notional, the spec's synthetic-fill residual). A reading that cannot bound this
-(a non-finite or oversized `filled_quantity`, a missing or non-positive
-`filled_avg_price`) is `bad_reading`. While any order is `pending`, the status
+(a non-finite `filled_quantity`, one above a quantity order's size, a filled
+value above a notional order's notional x (1 + `risk.whole_share_price_buffer`),
+a missing or non-positive `filled_avg_price`) is `bad_reading`. While any
+order is `pending`, the status
 is `pending_unresolved` whatever the differences; a pending order allows its
 symbol to differ in its direction by up to its quantity (a notional order's at
 the buffered reference price) and cash by up to its notional (a quantity
@@ -60,12 +62,16 @@ difference an allowance absorbs is listed under `allowed`.
   adjustment adds it.
 - A credited dividend (`explanations.dividends`: cash due per name) explains a
   cash difference equal to the total due: one `dividend_cash` adjustment per
-  name. It is not journaled when the cash does not show it.
+  name. It is not journaled when the cash does not show it. Beside an ended
+  listing, the dividends come out of the cash before the proceeds are
+  attributed, and the proceeds take it all only when the cash cannot hold
+  both (#400).
 
 The caller passes only spin-offs and dividends not yet journaled (ex or pay date
 after the window's last `ok` reconciliation). While any order is lagging or
 pending, no explanation is journaled: an ended or spun-off name is allowed and
-listed under `deferred`, its cash allowed up to the same bound, and the next
+listed under `deferred`, its cash allowed up to the same bound, a dividend's
+credit allowed up to the amount due (#399), and the next
 reconciliation without an open allowance journals it once, so a wrong
 adjustment never enters the append-only journal.
 
@@ -266,7 +272,7 @@ def compare(
             bands[order.security_id].widen(sign * shares)
             cash_band.widen(-sign * spend)
             continue
-        lag = _lag(item, q_tol)
+        lag = _lag(item, q_tol, buffer)
         if isinstance(lag, Mismatch):
             mismatches.append(lag)
         elif lag is not None:
@@ -316,34 +322,44 @@ def compare(
             )
 
     difference = account.cash - ledger.cash
-    cash_ok = cash_band.allows(difference, cash_tol)
-    if removed:
-        value = [expected[name] * explanations.reference_prices.get(name, 0.0) for name in removed]
-        cap = math.fsum(value) * (1 + buffer)
-        proceeds = difference
-        if deferring:
-            cash_band.widen(cap)
-            cash_ok = cash_band.allows(difference, cash_tol)
-        elif -cash_tol <= proceeds <= cap + cash_tol:
-            cash_ok = True
-            proceeds = min(max(proceeds, 0.0), cap)
-            explained += _ended_adjustments(removed, expected, value, proceeds)
-        else:
-            cash_ok = False
-        for name in removed:
-            expected.pop(name)
     dividends = {
         name: _finite(amount, f"dividend due on {name}")
         for name, amount in sorted(explanations.dividends.items())
     }
-    if not removed and not cash_ok and dividends and not deferring:
-        credited = math.fsum(dividends.values())
+    credited = math.fsum(dividends.values())
+    if deferring and dividends:
+        # A credit while an allowance is open is allowed, never journaled (#399).
+        cash_band.widen(credited)
+        allowed += [
+            Allowed("deferred dividend", amount, name) for name, amount in dividends.items()
+        ]
+    cash_ok = cash_band.allows(difference, cash_tol)
+    if removed:
+        value = [expected[name] * explanations.reference_prices.get(name, 0.0) for name in removed]
+        cap = math.fsum(value) * (1 + buffer)
+        if deferring:
+            cash_band.widen(cap)
+            cash_ok = cash_band.allows(difference, cash_tol)
+        else:
+            # The dividends are taken out of the cash first, so a final dividend
+            # is never booked as merger proceeds; if the cash cannot hold both,
+            # the proceeds take it all (#400).
+            cash_ok = False
+            for with_dividends in (True, False) if dividends else (False,):
+                proceeds = difference - (credited if with_dividends else 0.0)
+                if -cash_tol <= proceeds <= cap + cash_tol:
+                    cash_ok = True
+                    proceeds = min(max(proceeds, 0.0), cap)
+                    explained += _ended_adjustments(removed, expected, value, proceeds)
+                    if with_dividends:
+                        explained += _dividend_adjustments(dividends)
+                    break
+        for name in removed:
+            expected.pop(name)
+    elif not cash_ok and dividends and not deferring:
         if abs(difference - credited) <= cash_tol:
             cash_ok = True
-            explained += [
-                ProposedAdjustment("dividend_cash", name, None, amount, "credited dividend")
-                for name, amount in dividends.items()
-            ]
+            explained += _dividend_adjustments(dividends)
     if not cash_ok:
         mismatches.append(Mismatch("cash", f"broker {account.cash}, ledger {ledger.cash}"))
     elif abs(difference) > cash_tol and deferring:
@@ -440,10 +456,13 @@ def _pending_bounds(
     return quantity, quantity * price * (1 + buffer)
 
 
-def _lag(item: JournalOpenOrder, tolerance: float) -> tuple[float, float] | Mismatch | None:
+def _lag(
+    item: JournalOpenOrder, tolerance: float, buffer: float
+) -> tuple[float, float] | Mismatch | None:
     """(unjournaled shares, unjournaled notional) of a lagging order, None when
     it is not lagging, or a `bad_reading` mismatch when the reading cannot
-    bound the lag."""
+    bound the lag: more shares than a quantity order asked for, or more
+    filled value than a notional order's notional x (1 + `buffer`) (#398)."""
     reading, order = item.reading, item.order
     if reading is None or reading.filled_quantity is None:
         return None
@@ -459,6 +478,7 @@ def _lag(item: JournalOpenOrder, tolerance: float) -> tuple[float, float] | Mism
         or price is None
         or not math.isfinite(price)
         or price <= 0
+        or (order.notional is not None and filled * price > abs(order.notional) * (1 + buffer))
     ):
         return Mismatch(
             "bad_reading",
@@ -503,6 +523,14 @@ def _order_mismatches(
                 )
             )
     return found
+
+
+def _dividend_adjustments(dividends: Mapping[str, float]) -> list[ProposedAdjustment]:
+    """One `dividend_cash` row per name with the dividend credited."""
+    return [
+        ProposedAdjustment("dividend_cash", name, None, amount, "credited dividend")
+        for name, amount in dividends.items()
+    ]
 
 
 def _ended_adjustments(
