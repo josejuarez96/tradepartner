@@ -285,7 +285,6 @@ def test_secrets_absent_from_repr_and_str(monkeypatch: pytest.MonkeyPatch) -> No
         assert "sk-live-abc123" not in blob
         assert "sk-live-secret456" not in blob
         assert "jose@example.com" not in blob
-        assert "alerts-sender@example.com" not in blob
 
 
 # --- .env resolution: anchored to the project root, not the CWD -----------
@@ -752,6 +751,7 @@ def test_paper_and_alert_secrets_absent_from_repr_and_str(
         for secret in ("pk-paper-abc123", "ps-paper-secret456", "alerts-user", "smtp-pass-789"):
             assert secret not in blob
         assert "jose@example.com" not in blob
+        assert "alerts-sender@example.com" not in blob
 
 
 def test_paper_keys_are_separate_from_data_keys(monkeypatch: pytest.MonkeyPatch) -> None:
