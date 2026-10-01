@@ -83,6 +83,20 @@ def _run(run_id: int, session: date, *, window_id: int = WINDOW) -> PaperRunRow:
     )
 
 
+def _null_session_run(run_id: int, started_at: datetime, *, window_id: int = WINDOW) -> PaperRunRow:
+    """A run invoked on a non-session day: `session` and `kind` are both
+    `NULL` in the schema."""
+    return PaperRunRow(
+        run_id=run_id,
+        window_id=window_id,
+        session=None,
+        started_at=started_at,
+        invoked_by="tty",
+        code_version="x",
+        **_stamp(started_at),
+    )
+
+
 def _result(run_id: int, at: datetime, status: str) -> PaperRunResultRow:
     return PaperRunResultRow(
         run_id=run_id,
@@ -647,6 +661,53 @@ def test_lapses_reason_is_kill_switch_when_engaged_before_f0_and_never_released(
     rows = [_kill_switch_row(1, session_close(before_f0), "engaged")]
 
     assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+
+def test_lapses_does_not_raise_on_a_null_session_run_before_the_period() -> None:
+    """quant-auditor finding on #532 at 8da3e8d: `paper_runs.session` is
+    nullable (a run invoked on a non-session day ends `no_session` with no
+    `session` or `kind`). A routine weekend/holiday invocation before the
+    catch-up period must not raise and must not engage it -- its result is
+    `no_session`, never in `FAULTED_RUN_STATUSES`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    weekend_run = _null_session_run(1, session_close(before_f0) - timedelta(hours=1))
+    weekend_result = _result(1, session_close(before_f0) - timedelta(hours=1), "no_session")
+
+    assert lapses(window, [weekend_run], [], [], [weekend_result], past, frozen) == [
+        Missed(rebalance_session=t0, reason="catch_up_lapsed")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_for_a_null_session_unfinished_run() -> None:
+    """quant-auditor finding on #532 at 8da3e8d: a null-session run that
+    crashed (no result row at all) and was never released still engages
+    the switch by `execution.switch.derive`'s own rule, whatever its
+    `session`; placed by `started_at` against the period boundaries, it
+    must carry forward into the period the same way a dated run does."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    crashed = _null_session_run(1, session_close(before_f0) - timedelta(hours=1))
+
+    assert lapses(window, [crashed], [], [], [], past, frozen) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 

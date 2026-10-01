@@ -320,17 +320,21 @@ def _faulted_run_in_period(
     period, whatever became of it after); a run from before the period
     counts only while `_uncleared_by` says it still carried forward into the
     period's start, mirroring `derive`'s own rule rather than resetting at
-    each session like a per-close snapshot would."""
+    each session like a per-close snapshot would. `session` is nullable
+    (`paper_runs`: a run invoked on a non-session day ends `no_session` with
+    no `session` or `kind`), so such a run is placed by `started_at` against
+    the same period boundaries instead of raising; its result is routinely
+    `no_session`, never in `FAULTED_RUN_STATUSES`, so it drops out at the
+    fault check like any other unfaulted run, and only a genuinely faulted
+    or unfinished null-session row (`derive` counts those too, whatever
+    their session) reaches the `started_at` placement."""
     finished = {r.run_id: r for r in results}
     period = frozenset(sessions)
     period_start = session_close(previous_session(sessions[0]))
+    period_end = session_close(sessions[-1])
     releases = [r.at for r in kill_switch_rows if r.window_id == window_id and r.state == RELEASED]
     for run in runs:
         if run.window_id != window_id:
-            continue
-        if run.session is None:
-            raise ValueError("a paper run has no session")
-        if run.session > sessions[-1]:
             continue
         if run.run_id is None:
             raise ValueError("a paper run has no run_id")
@@ -338,8 +342,16 @@ def _faulted_run_in_period(
         faulted = result is None or result.status in FAULTED_RUN_STATUSES
         if not faulted:
             continue
-        if run.session in period:
-            return True
+        if run.session is not None:
+            if run.session > sessions[-1]:
+                continue
+            if run.session in period:
+                return True
+        else:
+            if run.started_at > period_end:
+                continue
+            if run.started_at > period_start:
+                return True
         if _uncleared_by(run, result, releases, period_start):
             return True
     return False
