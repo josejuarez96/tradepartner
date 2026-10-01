@@ -85,7 +85,8 @@ class TruncatedStore:
     `tables` (default: every fact table) selects which tables get a
     `main.<table>` view; the rest are simply absent from `main`, so an
     as-of function that queries one of them fails loudly rather than
-    silently seeing untruncated data.
+    silently seeing untruncated data. A table in `tables` that is not a fact
+    table (a journal table, say) is copied and cut by its `known_at` too.
     """
 
     def __init__(
@@ -95,7 +96,10 @@ class TruncatedStore:
         self._conn = duckdb.connect(":memory:")
         configure_connection(self._conn)
         self._conn.execute(f"CREATE SCHEMA {_SOURCE_SCHEMA}")
-        for table in _FACT_TABLES:
+        # Every fact table, plus any other table `tables` names (the journal, for
+        # T63g): a subclass that leaves a fact table out of `tables` still builds
+        # its own view over `truncation_source.<table>`.
+        for table in dict.fromkeys((*_FACT_TABLES, *self.tables)):
             # A vectorized Arrow hand-off (rather than `fetchall` +
             # `executemany` row by row): this happens once per
             # `TruncatedStore`, not once per probe.
@@ -111,9 +115,12 @@ class TruncatedStore:
         self._conn.execute("CREATE TABLE probe_t (t TIMESTAMPTZ)")
         self._conn.execute("INSERT INTO probe_t VALUES (NULL)")
         for table in self.tables:
+            # A journal reader breaks `known_at` ties by insertion order (`t.rowid`),
+            # which a view does not have: a non-fact view carries its source row's.
+            rowid = "" if table in _FACT_TABLES else ", rowid AS rowid"
             self._conn.execute(
                 f"CREATE VIEW main.{table} AS "
-                f"SELECT * FROM {_SOURCE_SCHEMA}.{table} "
+                f"SELECT *{rowid} FROM {_SOURCE_SCHEMA}.{table} "
                 "WHERE known_at <= (SELECT t FROM probe_t)"
             )
 

@@ -156,17 +156,30 @@ def run_hypothesis(
     reasons: Reasons | None = None,
     note: str | None = None,
     run_by: str = DEFAULT_RUN_BY,
+    kind: Literal["tracking"] | None = None,
 ) -> RunOutcome:
     """Run `slug`'s latest registration over `[start, end]` as one trial and return
     its `RunOutcome` (module docstring).
 
-    `start` and `end` default to the in-sample window's. The outcome carries the
-    recorded status, the results written with an `ok` row and, on `failed`, the
-    formatted traceback; the one-line message is in `trial_results`. Raises
-    `registry.UnknownHypothesis` for an unregistered slug and
-    `registry.RealStoreRefused` for `synthetic=True` on `settings.store.path`,
-    both before any trial exists.
+    `start` and `end` default to the in-sample window's, unless `kind="tracking"`
+    (Phase 4 spec req 10; plan T65b), in which case both are required (there is no
+    default tracking window: `paper report` names `[T_0, last completed T]` itself)
+    and `holdout.decide`'s tracking rule (T53) replaces the window, holdout and gap
+    rules; `flags` and `reasons` are not read, and the trial is opened `kind=tracking`,
+    so it is never counted in a family's `N`, `V` or holdout spends
+    (`registry.family_sharpes` and `family_holdout_spends` both filter on `trials.kind`).
+    The outcome carries the recorded status, the results written with an `ok` row
+    and, on `failed`, the formatted traceback; the one-line message is in
+    `trial_results`. Raises `registry.UnknownHypothesis` for an unregistered slug,
+    `registry.RealStoreRefused` for `synthetic=True` on `settings.store.path`, and
+    `ValueError` for `kind="tracking"` with a missing `start` or `end`, all before
+    any trial exists.
     """
+    tracking = kind == "tracking"
+    if tracking:
+        if start is None or end is None:
+            raise ValueError("a tracking run needs an explicit start and end")
+        tracking_window = Window(start, end)
     reasons = reasons if reasons is not None else Reasons()
     live = get_settings()
     store = _on_store(live, store_path)
@@ -175,16 +188,21 @@ def run_hypothesis(
         hypothesis = registry.get_hypothesis(conn, slug)
         params = load_frozen(conn, slug, settings=live)
         frozen = Frozen.from_hypothesis(hypothesis)
-        window = _window(frozen, start, end)
+        window = tracking_window if tracking else _window(frozen, start, end)
         spends = registry.family_holdout_spends(conn, hypothesis.family)
-        decision = decide(window, frozen, flags, reasons, None, spends)
+        decision = decide(window, frozen, flags, reasons, None, spends, tracking=tracking)
         sessions = gap_sessions(window)
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
+        # A refusal is always recorded `in_sample` (it spent nothing), whatever
+        # `decision.kind` says: `refused_gap` keeps the holdout `Decision` its gate
+        # started from (`holdout.decide`'s `replace(spend, outcome="refused_gap", ...)`),
+        # so `decision.kind == "holdout"` there even though the run never happened.
+        trial_kind = decision.kind if not refused and decision.kind is not None else "in_sample"
         handle = registry.open_trial(
             conn,
             hypothesis_id=hypothesis.hypothesis_id,
-            kind="holdout" if holdout else "in_sample",
+            kind=trial_kind,
             start_session=window.start,
             end_session=window.end,
             data_cutoff=read_time(sessions[-1]) if sessions else None,

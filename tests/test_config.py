@@ -15,7 +15,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tradepartner.config import FROZEN_PAPER_KEYS, PaperConfig, Settings, _default_env_file
+from tradepartner.config import (
+    FROZEN_EXECUTION_KEYS,
+    FROZEN_PAPER_KEYS,
+    ExecutionConfig,
+    PaperConfig,
+    Settings,
+    _default_env_file,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -694,6 +701,13 @@ def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
         "min_override_reason_chars",
     )
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
+
+
+def test_frozen_execution_keys_cover_fill_price() -> None:
+    """#366 Q20 (owner): `execution.fill_price` freezes into the paper window
+    beside the `paper.*` keys, read from `frozen_json`, never live `Settings`."""
+    assert FROZEN_EXECUTION_KEYS == ("fill_price",)
+    assert set(FROZEN_EXECUTION_KEYS) <= set(ExecutionConfig.model_fields)
 
 
 def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None:
