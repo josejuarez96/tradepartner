@@ -42,12 +42,13 @@ window's live fills, appends the due outcomes, and appends the rebuilt
 clock reading, only when the set differs from the latest one journaled (so a
 rebuild that changes nothing appends nothing, and the current ledger is the
 set with the latest `known_at`). A changed set whose clock reading does not
-advance past the latest set's is not appended (it would merge with it) and is
-reported like an error. A `LotLedgerError` (a sale beyond the fill-built
-holding: a split, spin-off receipt, stock merger or carried residue, which lots
-do not take yet) never fails the run: the writer passes its message to
-`on_lot_error` (the caller alerts and dedupes), writes no lot rows and holds
-`realised_pnl` back until the ledger rebuilds.
+advance past the latest set's is not appended (it would merge with it), is
+reported like an error, and holds `realised_pnl` back like one. A
+`LotLedgerError` (a sale beyond the fill-built holding: a split, spin-off
+receipt, stock merger or carried residue, which lots do not take yet) never
+fails the run: the writer passes its message to `on_lot_error` (the caller
+alerts and dedupes), writes no lot rows and holds `realised_pnl` back until
+the ledger rebuilds.
 """
 
 from __future__ import annotations
@@ -83,6 +84,7 @@ from tradepartner.store.journal import (
     PositionDailyRow,
     WashSaleFlagRow,
 )
+from tradepartner.store.schema import atomic
 
 PriceOf = Callable[[str, date], float | None]
 LotLedger = tuple[Sequence[Lot], Sequence[Disposal], Sequence[WashSaleFlag]]
@@ -385,58 +387,66 @@ def write_outcomes_and_lots(
     docstring). `on_lot_error` receives a `LotLedgerError`'s message; the caller
     alerts. `actions` is the `live_actions_as_of(close(S-1))` frame and
     `stop_flat` the per-name first flat `stop` run session (`OutcomeWindow`).
-    Every row is stamped with one reading of `clock`."""
+    Every row is stamped with one reading of `clock`. The reads and every
+    append run in one transaction (the caller's when one is open, which it
+    then commits or rolls back), so a failure part-way leaves the previous
+    lot set current and no outcome of this call; `on_lot_error` is called
+    once the block has finished."""
     now = clock()
-    fills = journal.fills_for(conn, window_id=window_id)
-    orders = journal.orders_for(conn, window_id=window_id)
-    events = journal.order_events_for(conn, window_id=window_id)
-    marks = journal.positions_daily_for(conn, window_id)
-    written = frozenset((o.client_order_id, o.kind) for o in journal.outcomes_for(conn, window_id))
-    decisions = [d.decision for d in journal.decisions_for(conn, window_id)]
-
-    ledger: LotLedger | None
-    lot_error: str | None = None
-    try:
-        ledger = rebuild(fills, orders, assets, account)
-    except LotLedgerError as exc:
-        ledger, lot_error = None, str(exc)
-        on_lot_error(lot_error)
-    lot_rows = 0
-    if ledger is not None:
-        appended = _append_ledger(conn, ledger, now)
-        if appended is None:
-            lot_error = f"lot ledger changed but the clock ({now.isoformat()}) did not advance"
-            on_lot_error(lot_error)
-        else:
-            lot_rows = appended
-
-    window = OutcomeWindow(window_id, stop_requested, dict(stop_flat or {}), written)
-    outcomes = due_outcomes(
-        window,
-        orders,
-        events,
-        fills,
-        marks,
-        ledger,
-        prices,
-        session,
-        decisions=decisions,
-        actions=actions,
-    )
-    for outcome in outcomes:
-        journal.append(
-            conn,
-            OutcomeRow(
-                client_order_id=outcome.client_order_id,
-                through_session=outcome.through_session,
-                kind=outcome.kind,
-                value=outcome.value,
-                contribution=outcome.contribution,
-                mark_price=outcome.mark_price,
-                known_at=now,
-                ingested_at=now,
-            ),
+    with atomic(conn):
+        fills = journal.fills_for(conn, window_id=window_id)
+        orders = journal.orders_for(conn, window_id=window_id)
+        events = journal.order_events_for(conn, window_id=window_id)
+        marks = journal.positions_daily_for(conn, window_id)
+        written = frozenset(
+            (o.client_order_id, o.kind) for o in journal.outcomes_for(conn, window_id)
         )
+        decisions = [d.decision for d in journal.decisions_for(conn, window_id)]
+
+        ledger: LotLedger | None
+        lot_error: str | None = None
+        try:
+            ledger = rebuild(fills, orders, assets, account)
+        except LotLedgerError as exc:
+            ledger, lot_error = None, str(exc)
+        lot_rows = 0
+        if ledger is not None:
+            appended = _append_ledger(conn, ledger, now)
+            if appended is None:
+                lot_error = f"lot ledger changed but the clock ({now.isoformat()}) did not advance"
+                ledger = None  # unsaved: realised P&L waits for a run that saves it
+            else:
+                lot_rows = appended
+
+        window = OutcomeWindow(window_id, stop_requested, dict(stop_flat or {}), written)
+        outcomes = due_outcomes(
+            window,
+            orders,
+            events,
+            fills,
+            marks,
+            ledger,
+            prices,
+            session,
+            decisions=decisions,
+            actions=actions,
+        )
+        for outcome in outcomes:
+            journal.append(
+                conn,
+                OutcomeRow(
+                    client_order_id=outcome.client_order_id,
+                    through_session=outcome.through_session,
+                    kind=outcome.kind,
+                    value=outcome.value,
+                    contribution=outcome.contribution,
+                    mark_price=outcome.mark_price,
+                    known_at=now,
+                    ingested_at=now,
+                ),
+            )
+    if lot_error is not None:
+        on_lot_error(lot_error)
     return WriteResult(outcomes=len(outcomes), lot_rows=lot_rows, lot_error=lot_error)
 
 

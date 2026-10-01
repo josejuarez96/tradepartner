@@ -24,10 +24,11 @@ from tradepartner.execution.outcomes import (
     due_outcomes,
     write_outcomes_and_lots,
 )
-from tradepartner.store import schema
+from tradepartner.store import journal, schema
 from tradepartner.store.journal import (
     DecisionRow,
     FillRow,
+    JournalRow,
     OrderedFill,
     OrderEventRow,
     OrderRow,
@@ -37,6 +38,7 @@ from tradepartner.store.journal import (
     append,
     outcomes_for,
 )
+from tradepartner.store.schema import in_transaction
 
 T_I = date(2026, 9, 30)
 F_I = date(2026, 10, 1)
@@ -649,3 +651,90 @@ def test_a_stop_horizon_never_ends_before_the_orders_session() -> None:
     )
     [outcome] = book.due(date(2026, 10, 23), window)
     assert (outcome.client_order_id, outcome.through_session) == (coid, late)
+
+
+def _latest_lots(conn: duckdb.DuckDBPyConnection) -> list[tuple[object, ...]]:
+    return conn.execute(
+        "SELECT security_id, quantity, cost_basis FROM lots "
+        "WHERE known_at = (SELECT max(known_at) FROM lots) ORDER BY lot_id"
+    ).fetchall()
+
+
+def test_a_crash_mid_write_leaves_the_previous_ledger_current(
+    conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The changed set is two lots, a disposal and a flag: a failure after
+    the first new lot rolls the whole write back, so the latest set is still
+    the previous one and no outcome is left behind (#370)."""
+    book = _changed_ledger(conn)
+    before = _latest_lots(conn)
+    counts = {t: _count(conn, t) for t in ("lots", "disposals", "wash_sale_flags", "outcomes")}
+    real_append = journal.append
+    calls = count(1)
+
+    def failing_append(c: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
+        if next(calls) == 2:
+            raise RuntimeError("crash mid-write")
+        return real_append(c, row)
+
+    monkeypatch.setattr(journal, "append", failing_append)
+    with pytest.raises(RuntimeError, match="crash mid-write"):
+        write_outcomes_and_lots(
+            conn, 1, ACCOUNT, {}, book.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
+        )
+    monkeypatch.undo()
+
+    assert _latest_lots(conn) == before
+    assert {t: _count(conn, t) for t in counts} == counts
+    assert not in_transaction(conn)
+
+
+def test_the_writer_joins_the_callers_transaction(conn: duckdb.DuckDBPyConnection) -> None:
+    """Inside a transaction the caller opened, the writer neither commits nor
+    rolls back: the caller's rollback removes its rows."""
+    book = _changed_ledger(conn)
+    before = _latest_lots(conn)
+
+    conn.execute("BEGIN TRANSACTION")
+    result = write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, book.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
+    )
+    assert result.lot_rows == 4 and in_transaction(conn)
+    conn.execute("ROLLBACK")
+
+    assert _latest_lots(conn) == before
+
+
+def test_realised_pnl_waits_when_the_changed_ledger_is_not_saved(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A changed ledger whose clock did not advance is not appended, so no
+    realised P&L is written from it; the next run with a later clock writes
+    the set and the P&L together (#371)."""
+    book = Book()
+    book.order("SEC_B", "buy", "filled", [(10.0, 50.0)], session=date(2026, 9, 1))
+    _journal(conn, book)
+    write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print)
+    later = Book()
+    sell = later.order("SEC_B", "sell", "filled", [(10.0, 40.0)])
+    for row in (*later.orders, *later.events, later.fills[0].fill):
+        append(conn, row)
+    errors: list[str] = []
+
+    write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, later.price_of, DUE, _clock, on_lot_error=errors.append
+    )
+
+    assert len(errors) == 1 and "did not advance" in errors[0]
+    assert (sell, "realised_pnl") not in {
+        (r.client_order_id, r.kind) for r in outcomes_for(conn, 1)
+    }
+    assert _count(conn, "disposals") == 0
+
+    write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, later.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
+    )
+
+    [pnl] = [r for r in outcomes_for(conn, 1) if r.kind == "realised_pnl"]
+    assert (pnl.client_order_id, pnl.value) == (sell, pytest.approx(-100.0))
+    assert _count(conn, "disposals") == 1
