@@ -309,6 +309,20 @@ class TestParseFsn:
         assert [r.accession for r in parsed.records] == [good]
         assert [f.accession for f in parsed.failures] == [bad]
 
+    @pytest.mark.parametrize("tag", ["TradingSymbol", "Security12bTitle", "SecurityExchangeName"])
+    def test_a_replaced_byte_in_a_listing_value_fails_that_accession(self, tag: str) -> None:
+        """#455: `_fsn_rows` turns an invalid byte into U+FFFD; a listing
+        built from it would be a phantom ticker, so the accession fails."""
+        good, bad = "0000000012-25-000001", "0000000013-25-000001"
+        sub = [_sub(good, "12", "10-K"), _sub(bad, "13", "10-K")]
+        values = {"Security12bTitle": "Common Stock", "TradingSymbol": "ABC"}
+        values["SecurityExchangeName"] = "NYSE"
+        txt = [_txt(good, t, v) for t, v in values.items()]
+        txt += [_txt(bad, t, v + "�" if t == tag else v) for t, v in values.items()]
+        parsed = parse_fsn(sub, [], txt, [])
+        assert [r.accession for r in parsed.records] == [good]
+        assert [f.accession for f in parsed.failures] == [bad]
+
     def test_two_different_share_values_for_one_class_fail_that_accession(self) -> None:
         good, bad = "0000000010-25-000001", "0000000011-25-000001"
         sub = [_sub(good, "10", "10-K"), _sub(bad, "11", "10-K")]
