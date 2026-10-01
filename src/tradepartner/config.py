@@ -564,6 +564,22 @@ class AlertsConfig(BaseModel):
         return value
 
 
+class DashboardConfig(BaseModel):
+    """Dashboard page settings (ADR 0011, #273; plan T66b).
+
+    `page_row_limit` bounds every per-row read a page makes over the journal
+    (the alerts list, the chain view, the fills table): a page's read
+    connection is held for as long as its read takes, and that connection
+    blocks the run's write connections (`store.db.open_for_write` retries for
+    `store.lock_retry_seconds` and then fails), so the read must be bounded
+    structurally rather than by how large the journal has grown.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    page_row_limit: int = Field(default=500, gt=0)
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -593,6 +609,7 @@ class Settings(BaseSettings):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     paper: PaperConfig = Field(default_factory=PaperConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)

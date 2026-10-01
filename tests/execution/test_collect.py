@@ -15,7 +15,7 @@ import pytest
 from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, PartialFill, Reject
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.errors import ClockError
+from tradepartner.errors import ClockError, RejectionCapError
 from tradepartner.execution.collect import (
     Collected,
     RejectionBreach,
@@ -1150,6 +1150,48 @@ def test_a_write_off_pricing_failure_never_loses_the_collection(
     assert [f.fill.broker_fill_id for f in _fills(journal_settings)] == ["fake-fill-1"]
     assert _statuses(journal_settings, "tp-a")[-1] == "expired"
     assert len(_cursors(journal_settings)) == 1
+
+
+def test_a_write_off_failure_after_a_rejection_verdict_still_carries_the_verdict(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    # #396: the cursor commits before the back-fill, so a later collection never
+    # judges these rejections again; a back-fill failure must not drop the verdict.
+    submitting, orders = _rejecting_run(
+        journal_settings, open_window, scripted_fake, fixed_clock, rejected=2
+    )
+    partial = _order(
+        journal_settings, scripted_fake, fixed_clock, submitting, "tp-a", notional=1000.0
+    )
+    scripted_fake.apply("tp-a", PartialFill(12.0, 50.0))
+    scripted_fake.apply("tp-a", Expire())
+    fixed_clock.advance(minutes=1)
+    context = WriteOffContext(
+        window_id=open_window.window_id,  # type: ignore[arg-type]
+        actions_as_of=NO_ACTIONS,
+        price_of=_raising_price,
+        session=THU,
+    )
+    frozen = RiskConfig(max_rejections_per_run=1)
+    with pytest.raises(RejectionCapError, match=f"run {submitting} had 2 of 3") as raised:
+        _collect(
+            journal_settings,
+            scripted_fake,
+            fixed_clock,
+            [*orders, partial],
+            writer_id=submitting,
+            frozen=frozen,
+            write_offs=context,
+        )
+    assert isinstance(raised.value.__cause__, KeyError)
+    assert len(_cursors(journal_settings)) == 1
+    fixed_clock.advance(hours=20)
+    assert (
+        _collect(journal_settings, scripted_fake, fixed_clock, [], frozen=frozen).rejections == ()
+    )
 
 
 # --- review fixes: the lag bound fails closed on a format drift ----------------

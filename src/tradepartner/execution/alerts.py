@@ -43,9 +43,11 @@ Definitions). If the clock raises or returns a naive value anyway, the stamp
 falls back the same way: the alert for a clock fault must still be written.
 
 Secrets: every `SecretStr` value in `Settings` (the Alpaca keys and the
-`ALERT_*` values) is masked in the alert message before it is journaled or sent,
+`ALERT_*` values, as `config.secret_values` lists them: stripped, blanks left
+out, #417) is masked in the alert message before it is journaled or sent,
 and in every delivery error, whatever its case or repr escaping, since an
-emitter may pass an exception's text. SMTP uses STARTTLS with a verifying
+emitter may pass an exception's text. A failed `osascript` records its stderr,
+which carries the cause, masked the same way (#402). SMTP uses STARTTLS with a verifying
 context (certificate and hostname) before any credential is sent.
 """
 
@@ -55,16 +57,15 @@ import re
 import smtplib
 import ssl
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from email.message import EmailMessage
 from typing import Any
 
 import duckdb
-from pydantic import SecretStr
 
-from tradepartner.config import Settings
+from tradepartner.config import Settings, secret_values
 from tradepartner.store import journal
 from tradepartner.store.db import utc_now
 from tradepartner.store.journal import AlertDeliveryRow, AlertRow
@@ -133,6 +134,12 @@ class Alerter:
         self._clock = clock
         self._runner = runner
         self._smtp = smtp
+        # Settings are fixed for the Alerter's life, so the masked forms are too.
+        self._secret_forms = sorted(
+            {form for secret in secret_values(settings) for form in (secret, repr(secret)[1:-1])},
+            key=len,
+            reverse=True,
+        )
 
     def __repr__(self) -> str:
         return f"Alerter(channels={self._channels!r})"
@@ -244,7 +251,7 @@ class Alerter:
             else:
                 return Delivery(channel, False, f"unknown channel {channel!r}")
         except Exception as exc:
-            return Delivery(channel, False, self._scrub(f"{type(exc).__name__}: {exc}"))
+            return Delivery(channel, False, self._scrub(_describe(exc)))
         return Delivery(channel, True)
 
     def _macos(self, kind: str, message: str) -> None:
@@ -288,18 +295,9 @@ class Alerter:
             except Exception:
                 client.close()
 
-    def _secrets(self) -> Sequence[str]:
-        values = (getattr(self._settings, name) for name in type(self._settings).model_fields)
-        return [
-            v.get_secret_value()
-            for v in values
-            if isinstance(v, SecretStr) and v.get_secret_value()
-        ]
-
     def _scrub(self, text: str) -> str:
         """`text` with every secret masked, in any case and in its repr-escaped form."""
-        forms = {form for secret in self._secrets() for form in (secret, repr(secret)[1:-1])}
-        for form in sorted(forms, key=len, reverse=True):
+        for form in self._secret_forms:
             text = re.sub(re.escape(form), _MASK, text, flags=re.IGNORECASE)
         return text
 
@@ -319,6 +317,19 @@ def _smtp_address(setting: str) -> tuple[str, int]:
     if not host or not port_text.isdigit() or not 0 < int(port_text) <= _MAX_PORT:
         raise ValueError("ALERT_SMTP_HOST must be host or host:port with a port in 1..65535")
     return host, int(port_text)
+
+
+def _describe(exc: Exception) -> str:
+    """An exception as a delivery error: its type and text, plus a failed
+    subprocess's stderr, which `CalledProcessError`'s text leaves out (#402).
+    The caller scrubs it."""
+    text = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+        stderr = exc.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        text = f"{text} stderr: {str(stderr).strip()}"
+    return text
 
 
 def _applescript(text: str) -> str:

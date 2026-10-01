@@ -247,6 +247,24 @@ def test_a_raising_channel_leaves_a_failed_row_and_never_raises(
     assert store_row == (alert_id, "store", True, None)
 
 
+def test_a_failed_osascript_records_its_stderr_scrubbed(conn: duckdb.DuckDBPyConnection) -> None:
+    """`CalledProcessError`'s text omits stderr, which carries the cause (#402);
+    a secret in it is still masked."""
+
+    class Refusing(FakeRunner):
+        def __call__(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+            raise subprocess.CalledProcessError(
+                1, args, stderr=b"Not authorized to send Apple events to hunter2-very-secret\n"
+            )
+
+    alerter = _alerter(conn, _settings(["store", "macos"], **_SECRETS), runner=Refusing())
+    alerter.write("halted", 7, _SESSION, "m")
+    ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "macos"]
+    assert not ok and error is not None
+    assert "CalledProcessError" in error and "Not authorized to send Apple events to ***" in error
+    assert "hunter2" not in error
+
+
 def test_osascript_receives_the_message_escaped(conn: duckdb.DuckDBPyConnection) -> None:
     runner = FakeRunner()
     alerter = _alerter(conn, _settings(["store", "macos"]), runner=runner)
@@ -533,3 +551,25 @@ def test_a_secret_is_masked_in_errors_in_any_case_or_repr_form(
     ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
     assert not ok and error is not None and "refused" in error
     assert "OWNER-INBOX" not in error and "word" not in error
+
+
+@pytest.mark.parametrize("blank", [" ", "  \t", "\n"])
+def test_a_blank_secret_masks_nothing(conn: duckdb.DuckDBPyConnection, blank: str) -> None:
+    """A whitespace-only secret (an `.env` line like `ALERT_SMTP_USER=' '`) must not
+    turn every space of the message into the mask (#417); `config.secret_values`
+    drops it, as the other scrubbers do."""
+    alerter = _alerter(
+        conn, _settings(alert_smtp_user=blank, alert_email_to="owner-inbox@example.test")
+    )
+    alerter.write(
+        "halted", 7, _SESSION, "kill switch write failed at run 7 for owner-inbox@example.test"
+    )
+    ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
+    assert message == "kill switch write failed at run 7 for ***"
+
+
+def test_a_padded_secret_is_masked_by_its_stripped_value(conn: duckdb.DuckDBPyConnection) -> None:
+    alerter = _alerter(conn, _settings(alert_smtp_password="  hunter2-very-secret  "))
+    alerter.write("halted", 7, _SESSION, "auth hunter2-very-secret refused")
+    ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
+    assert message == "auth *** refused"
