@@ -16,6 +16,9 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
   `rejection_cap`, `skip_cap`, `missed_run`, `missed_rebalance`, `drawdown`,
   `unspent_cash`: the tracking run and the risk-gated wrapper (T60 to T63f).
   Run-scoped: one alert per (kind, run), `alerts.session` = the run's S.
+- `lot_ledger`: the tracking run (T63), when the lot ledger cannot be rebuilt
+  (`execution.outcomes`); added 2026-10-01 by the owner's answer to #366 Q5.
+  Run-scoped.
 - `locked`, `no_window`: the run's entry (T63), before any run row exists.
   No run id; one alert per (kind, session), `session` being the calendar session
   containing the instant, or the next one on a non-session day (the caller's).
@@ -94,6 +97,7 @@ ALERT_KINDS: tuple[str, ...] = (
     "unspent_cash",
     "locked",
     "no_window",
+    "lot_ledger",
 )
 #: Kinds with no run, deduped on (kind, session).
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")
