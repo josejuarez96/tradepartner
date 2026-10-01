@@ -1011,11 +1011,19 @@ class _Run:
     def _lapses(self) -> None:
         """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert."""
         with open_read_only(self.settings) as conn:
-            run_rows = [r.run for r in runs_for(conn, self.window_id)]
+            runs = runs_for(conn, self.window_id)
             events = rebalance_events_for(conn, self.window_id)
+            rows = kill_switch_events_for(conn, self.window_id)
         frozen_values: dict[str, Any] = json.loads(self.window.frozen_json)
-        state = replace(self.state, engaged=self.engaged)
-        missed = marks.lapses(self.window, run_rows, events, state, self.session, frozen_values)
+        missed = marks.lapses(
+            self.window,
+            [r.run for r in runs],
+            events,
+            rows,
+            [r.result for r in runs if r.result is not None],
+            self.session,
+            frozen_values,
+        )
         if not missed:
             return
         stamp = self.gate.read_clock()
