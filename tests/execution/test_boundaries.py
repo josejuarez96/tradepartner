@@ -18,8 +18,9 @@ Static checks over `src/tradepartner/`, tests excepted:
    recorder, T48), re-exports and attribute chains included.
 4. No module other than `store/journal.py` and `store/schema.py` names the
    `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`,
-   parenthesised or not, in the comma-separated `FROM` list of a `SELECT`,
-   optionally schema-qualified and quoted), as
+   parenthesised or not, or in a comma-separated `FROM` list after `SELECT`,
+   `UPDATE` or `DELETE` or after an upper-case `FROM`, optionally
+   schema-qualified and quoted), as
    a whole string literal, or through `FillRow.TABLE`, so every reader goes
    through `store.journal.fills_for`. Docstrings, identifiers and module names
    such as a `Broker.fills` method do not count.
@@ -220,6 +221,13 @@ def broker_class_imports(module: Module) -> list[str]:
 def _name_args(node: ast.Call) -> list[ast.expr]:
     """The arguments that name an attribute in a by-name lookup call."""
     called = _called_name(node)
+    if any(isinstance(a, ast.Starred) for a in node.args) and called in (
+        "getattr",
+        "methodcaller",
+        "attrgetter",
+        "__getattribute__",
+    ):
+        return list(node.args)  # the name may be inside the star: never a literal
     if called == "getattr":
         return node.args[1:2]
     if called == "methodcaller":
@@ -309,8 +317,9 @@ _QUALIFIER = r"(?:[\"'`]?\w+[\"'`]?\.)?[\"'`]?"
 
 def sql_table_references(module: Module, tables: tuple[str, ...]) -> list[str]:
     """Tables among `tables` that `module` names in SQL (after `FROM`, `JOIN`,
-    `INTO`, `UPDATE` or `TABLE`, parenthesised or not, or in the comma-separated
-    `FROM` list of a `SELECT`) or as a whole string literal."""
+    `INTO`, `UPDATE` or `TABLE`, parenthesised or not, or in a comma-separated
+    `FROM` list after `SELECT`, `UPDATE`, `DELETE` or an upper-case `FROM`) or as
+    a whole string literal."""
     found = []
     strings = _strings(module.tree)
     for table in tables:
@@ -320,10 +329,12 @@ def sql_table_references(module: Module, tables: tuple[str, ...]) -> list[str]:
             rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)(?=[\s(])[\s(]*{_QUALIFIER}{name}\b",
             re.IGNORECASE,
         )
-        # a comma list only after SELECT ... FROM, so prose such as "from orders, fills
-        # and adjustments" does not count (#407)
+        # a comma-separated FROM list: any case after SELECT, UPDATE or DELETE, and an
+        # upper-case FROM anywhere (a query fragment), so lower-case prose such as "from
+        # orders, fills and adjustments" does not count (#407)
+        listed = rf"\bFROM\b[^;]*?,[\s(]*{_QUALIFIER}{name}\b"
         from_list = re.compile(
-            rf"\bSELECT\b[^;]*?\bFROM\b[^;]*?,[\s(]*{_QUALIFIER}{name}\b", re.IGNORECASE
+            rf"\b(?:SELECT|UPDATE|DELETE)\b[^;]*?{listed}|(?-i:{listed})", re.IGNORECASE
         )
         quoted = {table, f'"{table}"', f"'{table}'", f"`{table}`"}
         if any(s.strip() in quoted or keyword.search(s) or from_list.search(s) for s in strings):
@@ -452,6 +463,7 @@ def test_broker_class_checker(source: str, name: str, is_package: bool, expected
         ("broker.__getattribute__(name)(request)", True),
         ("getattr(func, 'id', None)", False),
         ("value = getattr(record, field_name)", False),
+        ("getattr(*target)(request)", True),
         ("operator.attrgetter('price')(row)", False),
         ("row.__getattribute__('price')", False),
     ],
@@ -509,6 +521,9 @@ def test_trading_raw_checker(source: str, name: str, expected: bool) -> None:
         ('conn.execute("SELECT * FROM(fills)")', True),
         ('conn.execute("SELECT * FROM orders o, (fills) f")', True),
         ('reason = "positions from orders, fills and adjustments"', False),
+        ('conn.execute("UPDATE orders o SET x = 1 FROM orders p, fills f WHERE 1")', True),
+        ('where = "FROM orders, fills"', True),
+        ('conn.execute("delete from orders using x from y, fills")', True),
     ],
 )
 def test_fills_sql_checker(source: str, expected: bool) -> None:
