@@ -24,6 +24,7 @@ from tradepartner.execution.plan import (
     Remainder,
     State,
     decision_state,
+    is_full_exit,
     remainder,
     target_notional,
 )
@@ -254,13 +255,18 @@ def test_quantity_sell_remainder_reads_only_the_latest_order() -> None:
     assert _remainder(d, [second, first], fills).quantity == 3.0
 
 
-def test_notional_sell_remainder_is_submitted_notional_minus_filled_value() -> None:
+def test_a_trim_remainder_is_planned_notional_minus_filled_value_over_every_order() -> None:
+    """A trim is notional and its orders are quantity sells (ADR 0010
+    amendment 2026-09-30): what is left is measured against the plan, not
+    against the latest order's quantity."""
     d = _decision(planned_notional=500.0)
-    o = _order(d, S1, notional=500.0)
-    r = _remainder(d, [o], [_fill(o, 3, 100.0), _fill(o, 1, 90.0)])
-    # 500 - (300 + 90) = 110 notional; 110 / 50 = 2.2 shares at the reference price.
-    assert r.notional == pytest.approx(110.0)
-    assert r.quantity == pytest.approx(2.2)
+    first = _order(d, S1, quantity=6.0)
+    second = _order(d, S2, attempt=2, quantity=4.0)
+    fills = [_fill(first, 3, 100.0), _fill(first, 1, 90.0), _fill(second, 1, 60.0)]
+    r = _remainder(d, [first, second], fills)
+    # 500 - (300 + 90 + 60) = 50 notional; 50 / 50 = 1 share at the reference price.
+    assert r.notional == pytest.approx(50.0)
+    assert r.quantity == pytest.approx(1.0)
 
 
 def test_buy_remainder_is_target_minus_filled_value_over_every_order() -> None:
@@ -394,6 +400,56 @@ def test_a_whole_share_residue_of_one_share_or_more_stays_open() -> None:
     state = _state(d, [o], [_event(o, "expired")], [_fill(o, 8, 50.0)])
     # 2 x 50 = 100, above 51.
     assert state.state == State.OPEN
+
+
+@pytest.mark.parametrize("kind", ["trade", "forced_exit", "override"])
+def test_a_whole_share_full_exit_with_one_share_left_stays_open(kind: str) -> None:
+    """#366 Q3: the buffered-share minimum is for trims; a full exit sells its
+    last share and settles only below one share or below the minimum."""
+    reason = {"trade": "left_targets", "forced_exit": "window_stop", "override": None}[kind]
+    d = _decision(planned_quantity=10, whole_share=True, decision=kind, reason=reason)
+    o = _order(d, S1, quantity=10)
+    one_left = _state(d, [o], [_event(o, "expired")], [_fill(o, 9, 50.0)])
+    assert one_left.state == State.OPEN  # 1 x 50 = 50, below one buffered share (51)
+    sub_share = _state(d, [o], [_event(o, "expired")], [_fill(o, 9.5, 50.0)])
+    assert sub_share.state == State.SETTLED
+    cheap = _state(
+        d,
+        [o],
+        [_event(o, "expired")],
+        [_fill(o, 9, 50.0)],
+        frozen=RiskConfig(min_order_notional=60.0),
+    )
+    assert cheap.state == State.SETTLED  # one share worth 50, below a $60 minimum
+
+
+@pytest.mark.parametrize(
+    ("side", "kind", "reason", "expected"),
+    [
+        ("sell", "forced_exit", "delisted", True),
+        ("sell", "forced_exit", "untargeted_receipt", True),
+        ("sell", "forced_exit", "window_stop", True),
+        ("sell", "trade", "left_targets", True),
+        ("sell", "trade", "left_universe", True),
+        ("sell", "override", "exclude_name", True),
+        ("sell", "trade", None, False),
+        ("buy", "trade", None, False),
+        (None, "override", "keep_name", False),
+        (None, "override", "exclude_name", False),  # an unheld exclude_name (#450)
+    ],
+)
+def test_is_full_exit_follows_the_spec_table(
+    side: str | None, kind: str, reason: str | None, expected: bool
+) -> None:
+    assert is_full_exit(_decision(side=side, decision=kind, reason=reason)) is expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason"), [("trade", "drifted"), ("skip_below_minimum", None), ("dust", None)]
+)
+def test_is_full_exit_refuses_a_sell_outside_the_table(kind: str, reason: str | None) -> None:
+    with pytest.raises(ValueError, match="full exit"):
+        is_full_exit(_decision(decision=kind, reason=reason))
 
 
 def test_a_fractionable_remainder_below_the_minimum_settles() -> None:
