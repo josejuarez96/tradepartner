@@ -1,0 +1,141 @@
+# Spec: Merge train (batch ready PRs, one combined CI run, bisect on red)
+
+**Status:** Draft  ·  **Issue:** #460  ·  **Related:** [git-workflow.md](../ways-of-working/git-workflow.md) (rules 6 and 7, "How the rules are enforced"), [teams.md](../ways-of-working/teams.md) (claims, fragments, the CI guard), [development-process.md](../ways-of-working/development-process.md) (Build → Merge gate), `scripts/ready_pr.py`, `.github/workflows/ci.yml`, `.github/rulesets/protect-main.json`, [ADR 0002](../decisions/0002-git-workflow.md)
+
+## Problem & why now
+
+Every PR's CI tests the PR against the `main` of its own run, and `ready_pr.py` marks it ready on that run. Nothing tests the PRs **together** before they land, so a queue of individually green PRs can break `main`. It did twice on 2026-10-01:
+
+- **#430 after #387.** #387 (collapse finished plan lines; CI caps a finished line at 400 characters) merged at 03:39:33Z and #430 (the T70b runbook, ticking a 978-character line) at 03:39:42Z, nine seconds apart. Both were green against the `main` they were tested on. `main` went red on `test_finished_plan_lines_are_collapsed`; #443 fixed it.
+- **#444 × #429.** #444 made `switch.release` raise when the new row would not clear the switch; #429 (T61b resume) had a test expecting a REFUSED outcome from the same path. Eleven PRs merged between 12:49Z and 12:52Z, each green on its own run; the `main` runs for #429, #432, #436 and #433 all failed on #429's test; #454 fixed it.
+
+The alternative, bringing `main` into each PR and waiting for a fresh run before every merge, costs one CI run (about 28 to 32 minutes for the `checks` job on 2026-10-01) per PR and serialises the owner: merge one, refresh the next, wait, merge. With ten ready PRs that is five hours of wall clock for the merges alone. The owner has decided (#460) to build a small, deterministic merge train rather than wait for GitHub's native merge queue, which GitHub's 2023-07-12 availability note limits to "all public repos owned by organizations" and Enterprise Cloud; this repository is owned by a personal account.
+
+## Users & usage
+
+- **The owner** (Jose) decides which batch merges. He runs, or tells one orchestrator window to run, `uv run python scripts/merge_train.py build`, reads the batch report, and says "merge train `<batch id>`"; only then does `merge_train.py merge <batch id>` run, by him or by that window. Expected cadence: whenever two or more PRs are ready, typically a few times a day while several windows build.
+- **Build windows** (any team) see the outcome on their PRs as a comment whose first line is `merge-train: <OUTCOME> …`, exactly as review verdicts work today. A dropped or culprit PR goes back to its team; nothing else changes for them. A PR that is behind `main` does not need `ready_pr.py` run again just because `main` moved: the train tests it against the current `main` as part of the batch.
+- **An orchestrator window** may run `build` on the owner's request. `build` only pushes `train/*` branches, triggers CI and posts comments; it merges nothing.
+
+## Definitions
+
+| Term | Meaning |
+|---|---|
+| **Eligible PR** | An open, non-draft PR against `main` that `ready_pr.py` marked ready and that still passes the train's checks at build time (req 1). |
+| **Batch** | An ordered list of eligible PRs chosen for one train run, identified by a **batch id** `YYYYMMDD-HHMM-<base7>` (UTC build time, first seven characters of the base SHA). |
+| **Base** | The SHA of `origin/main` the batch was built on. |
+| **Train branch** | `train/<batch id>`: `base` with each accepted PR's head merged in order (`git merge --no-ff`, one merge commit per PR). |
+| **Prefix k** | The first k PRs of the batch's accepted list; its **tree** is the tree of the train branch after the k-th merge (`tree_k`; `tree_0` is `base`'s tree). |
+| **Probe** | A CI run on `train/<batch id>/p<k>`, a branch at the train branch's commit after the k-th merge, used by the bisect. |
+| **Green tree** | A tree that a CI run on exactly that tree concluded `success`: the full batch tree, or a probe's tree. Only green trees ever land. |
+| **Outcome** | One of `green`, `red`, `inconclusive` for a CI run, per req 4. |
+| **Record** | `data/merge_train/<batch id>.json`, everything `build` learned and `merge` needs (Data / interfaces). |
+
+## Requirements
+
+1. **Eligibility is deterministic and re-derived from GitHub at build time**, never from a cached board. A PR is eligible when all of: it is open and not a draft; its base is `main`; it carries no `parked` label; the `checks` and `claims` check runs on its **head SHA** both concluded `success` (a head with no completed run is not green, git-workflow "CI must have run on the exact commit"); its body has no unticked template box and says `Closes #<issue>` for its branch's issue; its fragment is present in its diff against `base`; and every specialist review that its diff against `base` requires has a latest first-line verdict `<agent>: PASS` in a PR comment. The last four reuse `ready_pr.py`'s pure functions (`unchecked_boxes`, `closed_issues`, `missing_fragments`, `required_reviews`, `missing_reviews`) by import, so the train and `ready_pr.py` cannot disagree. A PR that is **behind `main`** is eligible: testing it against the current `main` is the train's job. An ineligible PR is listed in the report with the failed check; it is never silently skipped.
+2. **The batch and its order are fixed before anything runs.** `build` takes explicit PR numbers, or, with none, every eligible PR. The default order is ascending PR number; `--order` may name the PRs explicitly. The order is written in the record and in the report, and `merge` never reorders.
+3. **The train branch is built by textual merges, in order, and a conflict drops only that PR.** From a fresh worktree at `base`: for each PR, `git merge --no-ff --no-edit <head SHA>`; on conflict, `git merge --abort`, record the PR as `dropped` with the conflicted paths and the earlier batch PRs whose diffs touch those paths, and continue with the next PR on the train as it stands. A PR whose head is already an ancestor of `base` is recorded `already merged` and skipped. The train resolves no conflict itself, not even the STATUS/CHANGELOG bullet case `ready_pr.py` handles: the dropped PR's team brings `main` in with `ready_pr.py` after the train and the next train takes it. The tree after each merge is recorded (`tree_k`).
+4. **One full CI run on the train branch, classified three ways.** The branch is pushed and the existing workflow runs on the `push` event (CI amendment: `push.branches` gains `train/**`; the `Test scope` step already answers `yes` for a non-PR event, so the **full suite** runs, whatever the batch touched; the `claims` job stays PR-only). The train waits up to `--timeout-min` (default 60; `ready_pr.py`'s 25 is shorter than the `checks` job takes) for the run on the pushed SHA. Outcome:
+   - `green`: the `checks` job concluded `success`.
+   - `red`: the `checks` job concluded `failure` **and** at least one of the steps `Hygiene`, `Fragments`, `Lint`, `Format`, `Types`, `Tests` ran to a conclusion. Only a red run says something about the code.
+   - `inconclusive`: anything else: no run appeared, the run was cancelled, timed out, or failed before those steps (a job that fails at `Set up job` or `Install`, or in under 60 seconds with no step logs, is the GitHub Actions billing or infrastructure case). An inconclusive run **never** starts a bisect and never marks a PR a culprit; the report says to check Actions and to rerun `build --resume <batch id>`, which re-attaches to the same branch and run (or the run's rerun) instead of rebuilding.
+5. **Red bisects over prefixes, and only green trees are ever merged.** Precondition: `base` itself is green (the latest `main` run on `base` concluded `success`). If `main` is red or has no finished run at `base`, a red batch is reported `inconclusive: main is red at base` and nothing is bisected or blamed; the owner lands the fix for `main` first. Otherwise, with n accepted PRs, prefix 0 green and prefix n red, the train binary-searches the prefix length: test the midpoint prefix as a probe, move the green bound up or the red bound down, stop when they are adjacent; at most ⌈log₂ n⌉ probes, each a full run. The result names the **culprit**: the PR at the first red prefix's end, with the green prefix it was added to and the probe run's URL. The PRs after the culprit are `held` (untested beyond the culprit) and go to the next train unchanged. An inconclusive probe stops the bisect with the bounds found so far; the longest green prefix found stays mergeable.
+6. **Merge lands the longest green prefix, and only when the tested tree is what lands.** `merge <batch id>` re-verifies, at run time: `origin/main` equals `base`; every PR of the prefix is still open, still eligible under req 1, and its head still equals the recorded SHA. If a PR at position i fails this, the mergeable prefix shrinks to the longest **green** prefix shorter than i (a probe's tree) or to nothing; a prefix that never ran green is never merged on the assumption that it would pass. Then, PR by PR in order: predict the squash tree locally (`git merge --squash <head>` onto the current `main` tip in the worktree) and require it to equal `tree_k`; `gh pr merge <n> --squash --match-head-commit <head SHA>`; fetch; require the new `origin/main` to be a child of the previous tip and its tree to equal `tree_k`. Any mismatch stops the train before the next merge, with the report naming the SHA that landed and that its tree was not the tested one (the push to `main` runs CI on it, so the next step is to read that run). The commit message is GitHub's squash default for this repo (the PR title, as today); the train passes no subject or body.
+7. **Owner authority.** Nothing merges without the owner's "merge" for that batch id. `merge` takes a batch id and nothing else: no PR list, no order, no flag that widens the batch. The record is frozen at the end of `build` (the ordered list, head SHAs, trees, outcomes); `merge` refuses a record whose PR list or heads differ from the `merge-train: TESTED` comments `build` posted on the PRs. The script contains no LLM call and makes no judgment call: every decision in it is a rule in this spec. The window that runs `merge` is bound by CLAUDE.md rule 1 and git-workflow rule 7 as amended by this spec's plan: "merge train `<batch id>`" from the owner is the explicit instruction for exactly the PRs the record names, and a subagent never runs `merge`. `.claude/settings.json` lists `merge_train.py merge` under `ask`, beside `gh pr merge`.
+8. **Reporting is on the PR, machine-readable, and local.** `build` and `merge` each post one comment per affected PR whose first line is `merge-train: <OUTCOME> batch <batch id>` with OUTCOME in `TESTED` (green, with the run URL), `MERGED` (with the `main` SHA), `DROPPED` (conflict: paths and the PRs), `CULPRIT` (the green prefix and the probe URL), `HELD` (after the culprit, or head changed, or not re-verified), `INCONCLUSIVE` (what to check), `INELIGIBLE` (the failed check). The same text is printed and written to the record. A PR's latest `merge-train:` comment is its current train state.
+9. **Failure modes are handled by rule, not by hand.** CI timeout and billing/infra failures: req 4. A PR updated mid-train: `--match-head-commit` makes GitHub refuse the merge, and req 6 shrinks the prefix before it is tried. `main` moving mid-train: req 6 merges nothing and the owner reruns `build`; a PR the owner merged by hand meanwhile is `already merged` in the next build. The train's own merge of PR k failing (GitHub refuses, network): the train stops at k−1 with the prefix merged so far, all of it tested as part of a green tree only if the stop happened after a full green prefix landed; the report states which commits landed and that `main`'s head tree differs from a tested tree if it does. Branch cleanup (`git push origin --delete train/<batch id>…`) runs at the end of `merge` and in `prune`; a branch left behind is harmless, and the deletion may need the owner's confirmation under the agent permission rules.
+10. **`main` protection matches the train.** The repository is public since 2026-10-01 (`gh repo view` reports `PUBLIC`), where GitHub offers repository rulesets without a paid plan, so the "inactive until GitHub Pro" ruleset in `.github/rulesets/protect-main.json` can be activated. The train needs one change in it: `strict_required_status_checks_policy` must be `false`, because strict means "the branch must be up to date with `main` before merging", which is exactly what the train does not require. The spec proposes two variants for the owner to pick (Open question 1): (a) the current rules with that flag flipped: PR required, squash only, `checks` required on the head, linear history, no force-push, no deletion; (b) the same plus a required status context `merge-train` that only the train sets, on each head SHA it is about to merge (`POST /repos/{owner}/{repo}/statuses/{sha}`, state `success`, description `batch <batch id>`, the run URL as target): with it, a hand merge in the GitHub UI is refused unless the owner is a bypass actor. Either way, this is a guard against habit, not an authentication boundary: every token in this repo is the owner's, as `ready_pr.py`'s review gate already says of itself.
+
+## Acceptance criteria (testable)
+
+Unit tests run against a fake runner (the `Runner` protocol pattern of `scripts/ready_pr.py`), so no test needs the network. Criteria 13 and 14 are the owner's one real run.
+
+- [ ] **AC1 (req 1).** Given a PR that is a draft, or has the `parked` label, or whose head's `checks` or `claims` run did not conclude `success`, or whose body has an unticked box, or whose diff against `base` requires `safety-reviewer` and whose latest `safety-reviewer:` comment is `PASS WITH FIXES`, when `build` runs, then the PR is listed `INELIGIBLE` with that one reason and is not merged into the train branch.
+- [ ] **AC2 (req 1).** Given a ready PR whose branch is 20 commits behind `main`, when `build` runs, then it is eligible and merged into the train branch.
+- [ ] **AC3 (req 2).** Given eligible PRs #12, #7 and #9 and no `--order`, when `build` runs, then the record's order is 7, 9, 12; given `--order 12 7 9`, then 12, 7, 9; and `merge` never changes it.
+- [ ] **AC4 (req 3).** Given PR B conflicts textually with PR A earlier in the batch, when `build` runs, then the train branch holds A and every later non-conflicting PR, B is `DROPPED` with the conflicted paths and `#A` named, and the worktree has no merge in progress afterwards.
+- [ ] **AC5 (req 3).** Given a PR whose head is an ancestor of `base`, when `build` runs, then it is recorded `already merged`, gets no comment, and the batch continues.
+- [ ] **AC6 (req 4).** Given the train run concludes `success`, then the record's batch outcome is `green`, the batch tree is a green tree, and each accepted PR gets a `merge-train: TESTED batch <id>` comment with the run URL.
+- [ ] **AC7 (req 4).** Given the `checks` job fails at `Install` (or in under 60 seconds with no later step), or the run is cancelled, or no run appears within `--timeout-min`, then the outcome is `inconclusive`, no probe branch is pushed, no PR is named a culprit, and `build --resume <id>` picks the same branch and run up again.
+- [ ] **AC8 (req 5).** Given a batch of five with `main` green at `base` and a fake CI that fails every prefix containing PR 4, when `build` runs, then the probes tested are prefixes 2 and 4 (then 3), PR 4 is `CULPRIT` with green prefix [1, 2, 3], PR 5 is `HELD`, and no more than ⌈log₂ 5⌉ = 3 probes ran.
+- [ ] **AC9 (req 5).** Given `main`'s latest run at `base` is `failure` or unfinished and the batch is red, then no probe runs and the report says `inconclusive: main is red at base`.
+- [ ] **AC10 (req 6).** Given a green batch, when `merge <id>` runs, then the PRs merge in order with `--squash --match-head-commit <recorded head>`, after each merge `origin/main` is a child of the previous tip with tree `tree_k`, and each PR gets `merge-train: MERGED batch <id>` with the `main` SHA.
+- [ ] **AC11 (req 6).** Given PR 3 of a green batch of four was pushed after `build` (head changed), when `merge` runs, then nothing merges unless prefix 2's tree ran green as a probe, in which case PRs 1 and 2 merge and PRs 3 and 4 are `HELD`; given `origin/main` no longer equals `base`, then nothing merges and the report says to rerun `build`.
+- [ ] **AC12 (req 6).** Given the predicted squash tree of PR 2 differs from `tree_2`, or the tree that landed differs from `tree_2`, then the train stops before any further merge and the report names the landed SHA as untested.
+- [ ] **AC13 (req 7).** Given a record whose PR list was edited after `build` (it no longer matches the `TESTED` comments), when `merge` runs, then it refuses before any merge; and `merge` accepts no PR numbers or order flags (`argparse` rejects them).
+- [ ] **AC14 (req 4, owner).** Given the CI amendment merged, when the owner pushes a branch `train/smoke`, then one workflow run starts on it with the `Tests` step run (not skipped), and no `claims` job.
+- [ ] **AC15 (reqs 3 to 8, owner).** The owner runs `build` on a batch of at least three real ready PRs and `merge` on the result; the PR comments, the record and `gh run list` agree, and the next `main` run on the head commit is green.
+- [ ] **AC16 (req 10, owner).** With the ruleset active, `git push origin HEAD:main` from any clone is refused by the server, and a hand merge of a PR whose `checks` run is red is refused; under variant (b), a hand merge of a green PR without the `merge-train` status is refused too.
+
+## Out of scope
+
+- GitHub's native merge queue (unavailable to a user-owned repository, see Problem) and `merge_group` workflow triggers.
+- Resolving any conflict inside the train, including the STATUS/CHANGELOG bullet case and adjacent plan-line ticks (Open question 4).
+- Testing every prefix so that each intermediate `main` commit is individually green. After a batch of n, `main` gets n squash commits; only the last has a tree that ran as a whole. Intermediate commits are prefixes that may not have run (and in the #444 × #429 shape, where a later PR in the batch is the fix, an intermediate `main` run can be red while the batch head is green). The invariant this spec guarantees is: **`main`'s head after a train is a green tree.** Readers of the `main` CI history look at the head's run.
+- Reducing the per-merge `main` runs (#198 keeps one completed run per `main` commit); Actions minutes are free on a public repository.
+- A cockpit panel for the train (Open question 6); the `merge-train:` comments are on the PRs the cockpit already lists.
+- Changing how a PR becomes ready. `ready_pr.py` is unchanged except for its safety-review prefixes (plan T74).
+- Auto-running trains on a schedule or when N PRs are ready (Open question 5).
+
+## Data / interfaces
+
+**Commands** (`scripts/merge_train.py`, run from any team directory; it works in its own temporary worktree under the scratchpad or `data/merge_train/worktree`, never in the caller's checkout):
+
+```
+uv run python scripts/merge_train.py build [PR ...] [--order N N ...] [--timeout-min 60] [--poll-s 30]
+uv run python scripts/merge_train.py build --resume <batch id>        # re-attach to the branch and run
+uv run python scripts/merge_train.py merge <batch id>                 # owner's word required
+uv run python scripts/merge_train.py status [<batch id>]              # print a record, or list records
+uv run python scripts/merge_train.py prune                            # delete train/* branches of finished batches
+```
+
+Exit codes: 0 when the command finished its rule (a green build, a complete merge, a listed status); 1 when it stopped early with a reason (ineligible everything, inconclusive, red with a culprit, a refused or stopped merge). The reason is the last line of output, prefixed `STOPPED:`.
+
+**Record** `data/merge_train/<batch id>.json` (`data/` is gitignored; one file per batch, written atomically, never edited by hand):
+
+| Field | Content |
+|---|---|
+| `batch_id`, `built_at` | id and UTC build time |
+| `base` | `origin/main` SHA at build |
+| `main_green_at_base` | `true`/`false`/`null` (no finished run) |
+| `requested` | PR numbers as given, or `all` |
+| `prs` | ordered list of `{number, head, branch, issue, state}` with state in `accepted`, `dropped`, `already_merged`, `ineligible`; `reason` for the last three (`dropped` carries `paths` and `conflicts_with`) |
+| `trees` | `tree_0 … tree_n` |
+| `train_branch`, `train_sha`, `run_id`, `run_url`, `outcome` | the full run; outcome `green`/`red`/`inconclusive` with `detail` |
+| `probes` | list of `{k, branch, sha, run_id, run_url, outcome}` |
+| `green_prefixes` | the k values whose trees ran green |
+| `culprit`, `held` | PR numbers |
+| `merge` | `{started_at, merged: [{number, main_sha, tree}], stopped_at_position, reason}` |
+
+**CI amendment** (`.github/workflows/ci.yml`): `on.push.branches: [main, 'train/**']`; the concurrency group for a `train/**` ref is per SHA, like `main`'s, so a probe pushed while the batch run is still going cancels nothing. The `claims` job keeps `if: github.event_name == 'pull_request'`.
+
+**Ruleset** (`.github/rulesets/protect-main.json`): `strict_required_status_checks_policy: false`; variant (b) adds `{ "context": "merge-train" }` to `required_status_checks`. Applied by the owner with the `gh api -X POST … /rulesets --input` line git-workflow.md already prints.
+
+**Permissions** (`.claude/settings.json`): `Bash(uv run python scripts/merge_train.py merge:*)` under `ask`.
+
+**Review prefixes** (`scripts/ready_pr.py`): `scripts/merge_train.py` and `tests/test_merge_train.py` join `SAFETY_PREFIXES`; shrinking that list is already a safety-reviewer change.
+
+**Constants with flags, as in `ready_pr.py`:** timeout (60 min), poll interval (30 s), the inconclusive threshold (60 s), the step names that make a failure `red`. No config key: the train is a process script, not part of `tradepartner`'s `Settings`.
+
+## Risks & domain checks
+
+- **Order path, secrets, LLM inputs:** none. The train never runs `tradepartner`; it runs `git` and `gh`. No secret is read; `gh` output is passed through the same `://user:token@` redaction `ready_pr.py` uses before anything is printed or posted.
+- **The merge path is deterministic.** Every branch in the script is a rule above; the only human input is the owner's batch id. An orchestrator window that runs `merge` on the owner's word adds no judgment of its own (req 7). This is the process analogue of domain rule 5: nothing with discretion sits between the test and the merge.
+- **Same account, same token.** Comments, statuses and merges all come from the owner's account, so the train's checks are process gates, exactly as `ready_pr.py`'s review gate says of itself. The ruleset (req 10) is the only server-side rule, and the owner can bypass or edit it.
+- **A false culprit.** Bisection assumes that a red prefix stays red when extended. Where it does not hold (a later PR fixes an earlier one's break), the culprit named is still the PR whose addition turned a green prefix red, which is true as stated; the fix PR is `HELD` and lands in the next train after the culprit's team has looked. No PR is ever merged on an inferred result (req 5).
+- **CI minutes.** One full run per batch plus ⌈log₂ n⌉ on red, plus the n `main` runs after the merges. Free on a public repository; the time cost is the ~30 minutes per run, in wall clock, which the batch amortises.
+- **A train branch pushed by an agent is not `main`.** `no_push_to_main.sh` and the `deny` rules stay as they are; `train/**` is an ordinary branch. The branches are deleted after `merge` or by `prune`; the owner may have to confirm the deletion.
+- **GitHub's squash versus git's merge.** The predicted-tree check and the landed-tree check (req 6) bracket GitHub's merge implementation; a rename-heavy PR where the two disagree stops the train rather than landing something untested.
+
+## Open questions
+
+Marked for Jose; the plan does not guess at them.
+
+1. **Ruleset variant and bypass.** Activate the ruleset now that the repo is public? Variant (a) (PR + green `checks` on the head, non-strict, squash only, linear, no force-push or deletion) or (b) (plus the `merge-train` required status, so only the train merges)? With the owner as a bypass actor (he can still merge by hand in a pinch) or with no bypass (even he goes through the train, or edits the ruleset first)? Variant (b) also means a `main`-red hotfix goes through a one-PR train, which is about 30 minutes slower than a hand merge.
+2. **Who may run `build`, and what counts as "merge".** Proposal: any orchestrator window may run `build` when the owner asks; `merge` runs only in the window the owner addresses, after "merge train `<batch id>`" naming the id. Is the id in the owner's message required, or does "merge the train" after a single report suffice?
+3. **Default order.** Ascending PR number (oldest first) is proposed. Alternatives: ready time, or chain heads first (teams.md "merge chain heads first" matters less when the batch lands within minutes).
+4. **Conflicts inside the train.** Dropping on any conflict is proposed. Should the train apply `ready_pr.py`'s bullet-append resolution for STATUS/CHANGELOG, and should adjacent plan-line ticks (two tasks on consecutive lines of one plan both ticking in one batch, which git reports as a conflict) be resolved by a rule, or stay a drop?
+5. **Cadence.** On request only (proposed), or may an idle window run `build` whenever two or more PRs are ready and report?
+6. **Where the batch log lives.** PR comments plus the local record (proposed), or also one pinned "merge train log" issue with a comment per batch, which the cockpit could read?
+7. **Intermediate `main` commits.** Accept that only the batch head is a tested tree (Out of scope), or require every prefix to run green (n runs per batch, which removes most of the saving)?
