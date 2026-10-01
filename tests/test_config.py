@@ -696,6 +696,14 @@ def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
 
 
+def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None:
+    """ADR 0011, #273: bounds every per-row read a page makes over the journal."""
+    assert _settings().dashboard.page_row_limit == 500
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, dashboard={"page_row_limit": bad})
+
+
 def test_alerts_channels_default_store_and_macos() -> None:
     """#247 Q2: `[store, macos]`; `email` only when the owner sets the `ALERT_*` variables."""
     assert _settings().alerts.channels == ["store", "macos"]
