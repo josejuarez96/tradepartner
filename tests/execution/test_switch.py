@@ -26,6 +26,7 @@ from tradepartner.execution.switch import (
     drawdown_peak,
     engage,
     engage_from_overrides,
+    faulted_runs,
     release,
 )
 from tradepartner.store import schema
@@ -182,6 +183,22 @@ def test_a_release_before_the_faulted_run_started_does_not_clear_it() -> None:
     )
     assert state.engaged
     assert state.causes == ("run 1 crashed",)
+
+
+def test_faulted_runs_are_the_runs_a_release_would_clear() -> None:
+    # #397: resume judges these runs' rejections; the rule is `derive`'s.
+    runs = [_run(1, 0), _run(2, 40), _run(3, 60), _run(4, 70), _run(5, 0, window_id=_WINDOW + 1)]
+    rows = [_row(1, "engaged", 3), _row(2, "released", 30), _row(3, "engaged", 61)]
+    results = [
+        _result(1, "halted", 5),  # cleared by the release at 30
+        _result(2, "ok", 45),
+        _result(3, "failed", 65),
+        _result(4, "crashed", 75),
+        _result(5, "halted", 5),  # another window's
+    ]
+    assert faulted_runs(_window(), rows, runs, results) == (3, 4)
+    state = derive(_window(), rows, runs, results, reading_run=None, lock_free=True)
+    assert state.causes[1:] == ("run 3 failed", "run 4 crashed")
 
 
 def test_a_release_never_clears_an_unfinished_run() -> None:
