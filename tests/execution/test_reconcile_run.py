@@ -17,7 +17,13 @@ from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import reconcile_run, switch
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, OK, PENDING_UNRESOLVED
+from tradepartner.execution.reconcile import (
+    FILLS_LAGGING,
+    MISMATCH,
+    OK,
+    PENDING_UNRESOLVED,
+    Explanations,
+)
 from tradepartner.execution.reconcile_run import (
     NoWindowError,
     command_session,
@@ -266,6 +272,7 @@ def _reconcile(
     clock: FixedClock,
     *,
     run_id: int | None = None,
+    as_of: datetime | None = None,
 ) -> Any:
     return reconcile_now(
         settings,
@@ -277,6 +284,7 @@ def _reconcile(
         lambda: open_for_write(settings),
         run_id,
         frozen=FROZEN,
+        as_of=clock() if as_of is None else as_of,
     )
 
 
@@ -868,3 +876,118 @@ def test_the_row_and_its_adjustments_commit_together(
     with pytest.raises(RuntimeError, match="disk full"):
         _reconcile(journal_settings, fake, open_window, fixed_clock)
     assert _rows(journal_settings, open_window) == []
+
+
+# --- the journal cut (#488) ---------------------------------------------------------
+
+
+def _later_run(settings: Settings, window: PaperWindowRow) -> None:
+    """What the run on S journals after close(S-1): a MTUM buy filled at 15:00Z and an
+    `ok` reconciliation at 21:00Z, both on S."""
+    at = datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
+    (run_id,) = _append(
+        settings,
+        PaperRunRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=S,
+            kind="rebalance",
+            started_at=at,
+            invoked_by="scheduler",
+            code_version="test",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert run_id is not None
+    _order(settings, run_id, "tp-on-s", MTUM, "MTUM", 5.0, at=at)
+    reconciled = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
+    _append(
+        settings,
+        ReconciliationRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            run_id=run_id,
+            at=reconciled,
+            status=OK,
+            broker_cash=98_500.0,
+            known_at=reconciled,
+            ingested_at=reconciled,
+        ),
+    )
+
+
+def _explain(settings: Settings, window: PaperWindowRow, as_of: datetime) -> Explanations:
+    with open_read_only(settings) as conn:
+        return explanations_as_of(
+            conn,
+            window,
+            S,
+            as_of=as_of,
+            settings=settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+
+def test_journal_rows_known_after_as_of_change_no_explanation(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """#488's failing case: the run on S's own rows, known after close(S-1), neither add
+    a name nor become the dividend base of the pre-trade read (`as_of` = close(S-1))."""
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    reconciled = BOUGHT_AT + timedelta(hours=6)
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            run_id=run_id,
+            at=reconciled,
+            status=OK,
+            broker_cash=99_000.0,
+            known_at=reconciled,
+            ingested_at=reconciled,
+        ),
+    )
+    _dividend(journal_settings, SPY, 1.5, CUT - timedelta(hours=2))
+    before = _explain(journal_settings, open_window, CUT)
+
+    _later_run(journal_settings, open_window)
+
+    assert _explain(journal_settings, open_window, CUT) == before
+    assert before.symbols == {SPY: "SPY"}
+    assert before.dividends == pytest.approx({SPY: 15.0})
+
+
+def test_the_post_trade_read_sees_the_runs_own_rows(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    """Step 8 reads at the run's clock, so the run's own S fills are explained."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _later_run(journal_settings, open_window)
+    step_8 = datetime(2026, 10, 1, 20, 30, tzinfo=UTC)  # after the fill, before the 21:00Z row
+    found = _explain(journal_settings, open_window, step_8)
+    assert found.symbols == {SPY: "SPY", MTUM: "MTUM"}
+    assert set(found.reference_prices) == {SPY, MTUM}
+
+
+def test_reconcile_now_states_the_ledger_from_rows_known_at_as_of(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """`reconcile_now` passes its `as_of` to every journal read: a fill known after it
+    is not in the ledger, so the broker's position in that name is unexplained."""
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fill_at = fixed_clock() - timedelta(minutes=10)
+    _order(journal_settings, run_id, "tp-late", MTUM, "MTUM", 4.0, at=fill_at)
+    fake.submit(OrderRequest("tp-late", "MTUM", Side.BUY, quantity=4.0))
+    fake.simulate_fill("tp-late")
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(
+            journal_settings, fake, open_window, fixed_clock, as_of=fill_at - timedelta(minutes=1)
+        )
+    fixed_clock.advance(minutes=5)
+    assert (
+        _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=fixed_clock()).status
+        == OK
+    )
