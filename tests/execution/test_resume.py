@@ -290,6 +290,7 @@ def _lagging_third_fill(
         clock,
         lambda: open_for_write(settings),
         frozen=FROZEN,
+        as_of=clock(),
     )
     assert first.lagging_ids == (coid,)
     clock.now = DAY2
@@ -676,6 +677,7 @@ def test_with_the_flag_an_order_the_broker_still_holds_open_is_refused(
         fixed_clock,
         lambda: open_for_write(journal_settings),
         frozen=FROZEN,
+        as_of=fixed_clock(),
     )
     fixed_clock.now = DAY2
     _engage(journal_settings, window, fixed_clock)
@@ -817,6 +819,7 @@ def test_a_synthetic_fill_without_the_brokers_time_takes_the_orders_session_clos
         fixed_clock,
         lambda: open_for_write(journal_settings),
         frozen=FROZEN,
+        as_of=fixed_clock(),
     )
     fixed_clock.now = DAY2
     _engage(journal_settings, window, fixed_clock)

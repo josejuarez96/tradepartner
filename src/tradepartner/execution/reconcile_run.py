@@ -13,9 +13,10 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
    `pending` order is never read: only `paper resume` settles it (req 4).
 3. Build the ledger stated through S, or through the clock's New York date
    while no session has opened since S (a weekend `paper reconcile`, so its
-   own earlier `ok` row stays the cash base), with splits from
+   own earlier `ok` row stays the cash base), from the journal rows known at
+   the caller's `as_of` (below) with splits from
    `live_actions_as_of(close(S-1))`, and the explanations
-   (`explanations_as_of`), then call `compare`.
+   (`explanations_as_of`, at the same `as_of`), then call `compare`.
 4. In one write chunk, append the `reconciliations` row and the `adjustments`
    rows an `ok` result's explanations imply. Each row is stamped with the
    same clock reading, so every adjustment is inside the reconciliation that
@@ -25,9 +26,24 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
    Engaging the switch and alerting belong to the caller: the run's halt
    path (T60) for steps 4 and 8, `reconcile_command` for `paper reconcile`.
 
+**The journal cut (#488).** Every fill, order, adjustment and `ok`
+reconciliation the ledger and the explanations read is cut at one explicit
+`as_of` instant: a row counts only when its `known_at <= as_of`. Store facts
+(listings, delistings, actions, bars) are always cut at close(S-1), whatever
+`as_of` is. So the result depends on (S, `as_of`) and on nothing journaled
+after `as_of`, whenever it is called. The caller chooses `as_of` and always
+passes it: `paper reconcile` and `paper resume` pass a clock reading taken
+just before the call (every row they and earlier runs journaled), and a
+run's post-trade read (step 8) passes its own clock reading, so its own
+fills on S are explained. `as_of` may not be later than `reconcile_now`'s
+clock reading. The open-orders and `lagging` inputs (step 1) are the
+journal's current state, which the broker's current open orders are compared
+with.
+
 **`explanations_as_of`** is the read-only half (T63g's no-look-ahead suite
-calls it on a truncated store). Every fact it reads is from rows with
-`known_at <= close(S-1)`:
+calls it on a truncated store). Every store fact it reads is from rows with
+`known_at <= close(S-1)`, and every journal row from rows with `known_at <=
+as_of`:
 
 - `symbols`: each name the window's journal holds (fills, orders,
   adjustments) maps to the ticker of its current listing at S, meaning the
@@ -204,12 +220,20 @@ def _stated_through(session: date, now: datetime) -> date:
     return day if day > session and command_session(now) == session else session
 
 
-def _journal_state(conn: duckdb.DuckDBPyConnection, window_id: int) -> _JournalState:
+def _journal_state(
+    conn: duckdb.DuckDBPyConnection, window_id: int, as_of: datetime
+) -> _JournalState:
+    """The window's journal rows known at `as_of` (`known_at <= as_of`): the one
+    place the ledger's and the explanations' journal input is cut (#488)."""
     return _JournalState(
-        fills=fills_for(conn, window_id=window_id),
-        orders=orders_for(conn, window_id=window_id),
-        adjustments=adjustments_for(conn, window_id),
-        ok_rows=[r for r in reconciliations_for(conn, window_id) if r.status == OK],
+        fills=[f for f in fills_for(conn, window_id=window_id) if f.fill.known_at <= as_of],
+        orders=[o for o in orders_for(conn, window_id=window_id) if o.known_at <= as_of],
+        adjustments=[a for a in adjustments_for(conn, window_id) if a.known_at <= as_of],
+        ok_rows=[
+            r
+            for r in reconciliations_for(conn, window_id)
+            if r.status == OK and r.known_at <= as_of
+        ],
     )
 
 
@@ -359,18 +383,21 @@ def explanations_as_of(
     window: PaperWindowRow,
     session: date,
     *,
+    as_of: datetime,
     settings: Settings,
     broker_symbols: Collection[str] = (),
     quantity_tolerance: float,
 ) -> Explanations:
-    """What the store knew at close(S-1) to explain the broker on S (module
-    docstring). Read-only. `broker_symbols` are `positions()`' keys, so a symbol
+    """What the store knew at close(S-1), and the journal at `as_of`, to explain
+    the broker on S (module docstring). Read-only. `as_of` is the journal cut
+    (tz-aware). `broker_symbols` are `positions()`' keys, so a symbol
     the journal never held can still be matched. `settings` gives
     `master.transfer_window_sessions` for the listing ends, and
     `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`.
-    Raises `ValueError` for a non-session `session`."""
+    Raises `ValueError` for a non-session `session` or a naive `as_of`."""
     cut = _cut(session)
-    state = _journal_state(conn, _window_id(window))
+    as_of = ensure_tz_aware_utc(as_of, field_name="as_of")
+    state = _journal_state(conn, _window_id(window), as_of)
     actions = live_actions_as_of(conn, cut)
     return _explanations(
         conn, state, actions, window, session, settings, broker_symbols, quantity_tolerance, session
@@ -415,6 +442,7 @@ def reconcile_now(
     run_id: int | None = None,
     *,
     frozen: RiskConfig,
+    as_of: datetime,
 ) -> Reconciliation:
     """Reconcile window `window` on session `session` (module docstring) and
     return the compare result once its rows are committed.
@@ -424,15 +452,20 @@ def reconcile_now(
     store.db.open_for_write(settings)` in a run). `frozen` is the window's
     frozen `risk` section and `settings` gives the run-time
     `paper.order_id_prefix` and `master.transfer_window_sessions`. `run_id`
-    names the run, None outside one.
+    names the run, None outside one. `as_of` is the journal cut the ledger and
+    the explanations read at (module docstring), never after the clock reading.
 
     Raises `ReconciliationError` on a mismatch (the row is written first),
     `ClockError` for a bad clock reading, `ValueError` for a non-session
-    `session` or a window without an id, and whatever the broker raises (every
+    `session`, a window without an id, or a naive `as_of` or one after the clock
+    reading, and whatever the broker raises (every
     allowlist this reaches is empty, req 4)."""
     window_id = _window_id(window)
     cut = _cut(session)
     now = _read_clock(clock)
+    as_of = ensure_tz_aware_utc(as_of, field_name="as_of")
+    if as_of > now:
+        raise ValueError(f"as_of {as_of.isoformat()} is after the clock reading {now.isoformat()}")
     through = _stated_through(session, now)
     tolerance = frozen.reconcile_quantity_tolerance
 
@@ -458,7 +491,7 @@ def reconcile_now(
     ]
 
     with connect() as conn:
-        state = _journal_state(conn, window_id)
+        state = _journal_state(conn, window_id, as_of)
         actions = live_actions_as_of(conn, cut)
         explanations = _explanations(
             conn, state, actions, window, session, settings, positions.keys(), tolerance, through
@@ -544,10 +577,11 @@ def reconcile_command(
         if window is None:
             raise NoWindowError("no_window: no paper window is open")
         frozen = frozen_risk(window)
-        session = command_session(_read_clock(clock))
+        now = _read_clock(clock)
+        session = command_session(now)
         try:
             return reconcile_now(
-                settings, connect, broker, window, session, clock, connect, frozen=frozen
+                settings, connect, broker, window, session, clock, connect, frozen=frozen, as_of=now
             )
         except ReconciliationError as exc:
             try:

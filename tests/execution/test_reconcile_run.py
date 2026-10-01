@@ -323,6 +323,7 @@ def test_explanations_read_only_rows_known_at_close_of_the_previous_session(
             conn,
             open_window,
             S,
+            as_of=CUT,
             settings=journal_settings,
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
@@ -346,6 +347,7 @@ def test_a_broker_symbol_the_journal_never_held_maps_through_its_listing(
             conn,
             open_window,
             S,
+            as_of=CUT,
             settings=journal_settings,
             broker_symbols=["SPY", "MTUM", "NOPE"],
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
@@ -784,6 +786,7 @@ def test_reference_prices_are_bars_known_at_close_of_the_previous_session(
             conn,
             open_window,
             S,
+            as_of=CUT,
             settings=journal_settings,
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
@@ -804,6 +807,7 @@ def test_a_dividend_is_owed_on_the_holding_before_its_ex_date(
             conn,
             open_window,
             S,
+            as_of=on_ex_date,  # a post-trade read on S: the orders journaled then count
             settings=journal_settings,
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
@@ -852,7 +856,7 @@ def test_a_clock_going_back_is_a_clock_error_and_writes_nothing(
         [datetime(2026, 10, 1, 14, 0, tzinfo=UTC), datetime(2026, 10, 1, 13, 59, tzinfo=UTC)]
     )
     with pytest.raises(ClockError, match="went back"):
-        _reconcile(journal_settings, fake, open_window, lambda: next(readings))  # type: ignore[arg-type]
+        _reconcile(journal_settings, fake, open_window, lambda: next(readings), as_of=CUT)  # type: ignore[arg-type]
     assert _rows(journal_settings, open_window) == []
 
 
@@ -991,3 +995,15 @@ def test_reconcile_now_states_the_ledger_from_rows_known_at_as_of(
         _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=fixed_clock()).status
         == OK
     )
+
+
+def test_an_as_of_after_the_clock_reading_is_refused_before_any_broker_call(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    later = fixed_clock() + timedelta(seconds=1)
+    with pytest.raises(ValueError, match="after the clock reading"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=later)
+    assert _rows(journal_settings, open_window) == []
