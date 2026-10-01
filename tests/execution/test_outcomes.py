@@ -285,6 +285,58 @@ def test_a_bad_equity_is_refused(bad: float) -> None:
         book.due(DUE)
 
 
+def _due_without_lots(book: Book, window: OutcomeWindow | None = None) -> list[Outcome]:
+    return due_outcomes(
+        window or OutcomeWindow(window_id=1),
+        book.orders,
+        book.events,
+        book.fills,
+        book.marks,
+        None,
+        book.price_of,
+        DUE,
+    )
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_buy_fill_price_is_refused(bad: float) -> None:
+    """A NaN or infinite fill price, or an average that is not positive, never
+    becomes a position return or a contribution."""
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, bad)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    with pytest.raises(ValueError, match="price"):
+        _due_without_lots(book)
+
+
+def test_an_implied_residual_below_zero_with_a_positive_average_passes() -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(6.0, 100.0), (4.0, -1.0)], implied_last=True)
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    [outcome] = _due_without_lots(book)
+    assert outcome.value == pytest.approx(110.0 / 59.6 - 1)
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_flattening_fill_price_is_refused(bad: float) -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.order("SEC_A", "sell", "filled", [(10.0, bad)], session=date(2026, 10, 20), phase="exit")
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    window = OutcomeWindow(window_id=1, stop_requested=date(2026, 10, 19))
+    with pytest.raises(ValueError, match="flattening"):
+        _due_without_lots(book, window)
+
+
+def test_an_order_with_nothing_left_to_write_reads_no_price() -> None:
+    """A bad mark stops only the outcomes still to be written."""
+    book = Book()
+    coid = book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, float("nan"), 10.0)
+    window = OutcomeWindow(window_id=1, written=frozenset({(coid, "position_return")}))
+    assert _due_without_lots(book, window) == []
+
+
 def test_a_mark_row_without_a_price_still_falls_back_to_the_close() -> None:
     book = Book()
     book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])

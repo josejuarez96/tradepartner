@@ -31,8 +31,10 @@ run on a session after its horizon's last session:
 - **Prices.** The horizon's mark is the flattening fill's price, else the
   `positions_daily` mark of the name on that session, else `prices(security_id,
   session)` (the raw close). A missing price leaves the value and mark None; a
-  NaN, infinite, zero or negative one (mark, close or start) raises
-  `ValueError` before anything is appended. Equity is the `positions_daily`
+  NaN, infinite, zero or negative one (mark, close, start or an order's
+  average fill price; a fill price must be finite) raises `ValueError` before
+  any outcome is appended. An order with no outcome left to write reads no
+  price, so a bad row stops only the outcomes that need it. Equity is the `positions_daily`
   rows of one session: the cash of its row without a `security_id` plus every
   name's value; a missing cash row or value leaves the contribution None, and a
   non-finite or non-positive total raises `ValueError`.
@@ -324,25 +326,42 @@ def due_outcomes(
         through, fill_mark = _horizon(order, window, flattening, rebalance_of)
         if not session > through:
             continue
-        security = order.security_id
-        equity = _equity_before(marks, order.session)
         own = by_order.get(order.client_order_id, [])
         quantity = sum(item.fill.quantity for item in own)
+        earned = []
+        if quantity > 0 and order.side == _BUY:
+            earned.append(POSITION_RETURN)
+        if quantity > 0 and order.side == _SELL and lots is not None:
+            earned.append(REALISED_PNL)
+        if status != _FILLED:
+            earned.append(NOT_EXECUTED)
+        pending = {k for k in earned if (order.client_order_id, k) not in window.written}
+        if not pending:
+            continue  # nothing to write: its prices are never read
+        security = order.security_id
+        equity = _equity_before(marks, order.session) if pending - {NOT_EXECUTED} else None
         mark = (
             _price(fill_mark, f"mark (flattening fill) of {security}")
             if fill_mark is not None
             else _mark(marks, prices, security, through)
         )
         candidates: list[Outcome] = []
-        if quantity > 0 and order.side == _BUY:
+        if POSITION_RETURN in pending:
+            for item in own:
+                if not math.isfinite(item.fill.price):
+                    raise ValueError(
+                        f"fill {item.fill.fill_id} of {order.client_order_id} has price "
+                        f"{item.fill.price!r}"
+                    )
             cost = sum(i.fill.quantity * i.fill.price for i in own)
             shares = sum(
                 i.fill.quantity
                 * _split_factor(actions, security, _local(i.fill.filled_at), through)
                 for i in own
             )
-            average = cost / shares
-            value = None if mark is None or average <= 0 else mark / average - 1
+            average = _price(cost / shares, f"average fill price of {order.client_order_id}")
+            assert average is not None
+            value = None if mark is None else mark / average - 1
             gain = None if mark is None else mark * shares - cost
             candidates.append(
                 Outcome(
@@ -354,14 +373,16 @@ def due_outcomes(
                     mark,
                 )
             )
-        if quantity > 0 and order.side == _SELL and lots is not None:
+        if REALISED_PNL in pending:
             pnl = realised.get(order.client_order_id)
+            if pnl is not None and not math.isfinite(pnl):
+                raise ValueError(f"realised P&L of {order.client_order_id} is {pnl!r}")
             candidates.append(
                 Outcome(
                     order.client_order_id, through, REALISED_PNL, pnl, _share(pnl, equity), mark
                 )
             )
-        if status != _FILLED:
+        if NOT_EXECUTED in pending:
             before = previous_session(order.session)
             start = _price(prices(security, before), f"start price of {security} on {before}")
             if start is not None:
@@ -370,7 +391,7 @@ def due_outcomes(
             candidates.append(
                 Outcome(order.client_order_id, through, NOT_EXECUTED, value, None, mark)
             )
-        due += [o for o in candidates if (o.client_order_id, o.kind) not in window.written]
+        due += candidates
     return due
 
 
