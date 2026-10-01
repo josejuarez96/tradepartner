@@ -391,7 +391,8 @@ def write_outcomes_and_lots(
     append run in one transaction (the caller's when one is open, which it
     then commits or rolls back), so a failure part-way leaves the previous
     lot set current and no outcome of this call; `on_lot_error` is called
-    once the block has finished."""
+    once the block has finished, so a lot error found before such a failure
+    is not reported by this call (the next run finds it again)."""
     now = clock()
     with atomic(conn):
         fills = journal.fills_for(conn, window_id=window_id)

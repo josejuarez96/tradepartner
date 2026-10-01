@@ -660,8 +660,9 @@ def _latest_lots(conn: duckdb.DuckDBPyConnection) -> list[tuple[object, ...]]:
     ).fetchall()
 
 
+@pytest.mark.parametrize("crash", [RuntimeError, KeyboardInterrupt])
 def test_a_crash_mid_write_leaves_the_previous_ledger_current(
-    conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+    conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch, crash: type[BaseException]
 ) -> None:
     """The changed set is two lots, a disposal and a flag: a failure after
     the first new lot rolls the whole write back, so the latest set is still
@@ -674,11 +675,11 @@ def test_a_crash_mid_write_leaves_the_previous_ledger_current(
 
     def failing_append(c: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
         if next(calls) == 2:
-            raise RuntimeError("crash mid-write")
+            raise crash("crash mid-write")
         return real_append(c, row)
 
     monkeypatch.setattr(journal, "append", failing_append)
-    with pytest.raises(RuntimeError, match="crash mid-write"):
+    with pytest.raises(crash, match="crash mid-write"):
         write_outcomes_and_lots(
             conn, 1, ACCOUNT, {}, book.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
         )
@@ -686,6 +687,27 @@ def test_a_crash_mid_write_leaves_the_previous_ledger_current(
 
     assert _latest_lots(conn) == before
     assert {t: _count(conn, t) for t in counts} == counts
+    assert not in_transaction(conn)
+
+
+def test_a_raising_lot_error_callback_leaves_the_write_committed(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """`on_lot_error` runs after the block: its exception propagates, the
+    rows stay committed and no transaction is left open."""
+    book = Book()
+    book.order("SEC_KID", "sell", "filled", [(2.0, 5.0)])
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    _journal(conn, book)
+
+    def boom(message: str) -> None:
+        raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match="more than the ledger holds"):
+        write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=boom)
+
+    assert _count(conn, "outcomes") == 1
     assert not in_transaction(conn)
 
 
