@@ -552,7 +552,10 @@ class PaperConfig(BaseModel):
 class AlertsConfig(BaseModel):
     """Alert delivery channels (spec req 11; #247 Q2). `store` is always a channel, so
     the `alerts` table stays the source of truth; `email` works only when the four
-    `ALERT_*` variables are set (`Settings.alert_*`). No channel repeats.
+    `ALERT_*` variables are set (`Settings.alert_*`). No channel repeats, and at
+    least one non-store channel (`macos` or `email`) must be present (#366 Q22
+    (iii), #416): `kill_switch_write_failed` is delivered by `deliver_without_store`,
+    which never uses `store`, so a store-only config would reach no channel at all.
     `delivery_timeout_seconds` bounds one `osascript` call, and each SMTP socket
     operation, so a stuck channel cannot hold a run (the spec names no value; T57).
     """
@@ -569,6 +572,13 @@ class AlertsConfig(BaseModel):
             raise ValueError("alerts.channels must include 'store' (the source of truth)")
         if len(set(value)) != len(value):
             raise ValueError(f"alerts.channels must not repeat, got {value}")
+        if not any(c != "store" for c in value):
+            raise ValueError(
+                "alerts.channels must include at least one non-store channel "
+                "('macos' or 'email'): 'kill_switch_write_failed' is delivered by "
+                "deliver_without_store, which never uses 'store', so a store-only "
+                "config would reach no channel (#366 Q22 (iii), #416)"
+            )
         return value
 
 

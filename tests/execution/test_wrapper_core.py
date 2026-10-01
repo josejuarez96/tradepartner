@@ -47,6 +47,7 @@ from tradepartner.execution.plan import State, decision_state
 from tradepartner.execution.wrapper import (
     ALLOWLISTS,
     CANCEL_ALLOWLIST,
+    CRASH_EXIT_CODE,
     SUBMIT_ALLOWLIST,
     WRITE_FAILED_EXIT_CODE,
     RiskGatedBroker,
@@ -820,6 +821,7 @@ def test_the_write_failure_path_alerts_outside_the_store_and_exits_non_zero(
         _halt(gate, ValueError("boom"), run)
 
     assert exited.value.code == WRITE_FAILED_EXIT_CODE != 0
+    assert WRITE_FAILED_EXIT_CODE != CRASH_EXIT_CODE  # #515 (ii): launchd/runbook tell them apart
     assert isinstance(exited.value.__cause__, ValueError)
     [(kind, message)] = spy.sent
     assert kind == "kill_switch_write_failed"

@@ -743,6 +743,14 @@ def test_alerts_channels_require_store_once_and_known_names(channels: list[str])
         Settings(_env_file=None, alerts={"channels": channels})
 
 
+def test_alerts_channels_require_a_non_store_channel() -> None:
+    """#366 Q22 (iii), #515/#416: `store`-only would make `deliver_without_store`
+    (the halt path's `kill_switch_write_failed` alert, which never touches the
+    store) deliver through nothing at all."""
+    with pytest.raises(ValidationError, match="non-store"):
+        Settings(_env_file=None, alerts={"channels": ["store"]})
+
+
 def test_paper_and_alert_secrets_default_to_none() -> None:
     s = _settings()
     assert s.alpaca_paper_api_key is None

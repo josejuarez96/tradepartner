@@ -28,8 +28,9 @@ order:
 1. the `kill_switch` `engaged` row (source `fault`, the fault's type, the
    message as its reason) through T59's `switch.engage`, which retries the
    lock; when the write still fails, the `kill_switch_write_failed` alert goes
-   through every non-store channel and the process exits non-zero
-   (`SystemExit(WRITE_FAILED_EXIT_CODE)`) with nothing else done. The
+   through every non-store channel and the process exits non-zero with a code
+   distinct from a crash's (`SystemExit(WRITE_FAILED_EXIT_CODE)`, `!=
+   CRASH_EXIT_CODE`, #515) with nothing else done. The
    `engaged` row is where the fault is journaled with its type; the result row
    (step 5) repeats the type with the full message. `StaleDataError` writes no
    `engaged` row: it is a data fault the next ingest cures;
@@ -217,6 +218,7 @@ __all__ = [
     "ALLOWLISTS",
     "ASSETS_ALLOWLIST",
     "CANCEL_ALLOWLIST",
+    "CRASH_EXIT_CODE",
     "FILLS_ALLOWLIST",
     "GET_ORDER_ALLOWLIST",
     "OPEN_ORDERS_ALLOWLIST",
@@ -256,8 +258,14 @@ ALLOWLISTS: Mapping[str, tuple[type[Exception], ...]] = MappingProxyType(
     }
 )
 
-#: The exit status when the `engaged` row cannot be written (spec req 4).
-WRITE_FAILED_EXIT_CODE = 1
+#: An uncaught exception's exit status (Python/typer's default). Named here so the
+#: two codes are defined side by side and nothing hardcodes `1` to mean "crashed".
+CRASH_EXIT_CODE = 1
+
+#: The exit status when the `engaged` row itself cannot be written (spec req 4):
+#: distinct from `CRASH_EXIT_CODE` so the launchd plist and the runbook can tell a
+#: failed halt write apart from an ordinary crash (#366 Q22 (ii), #515).
+WRITE_FAILED_EXIT_CODE = 2
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _MASK = "***"
