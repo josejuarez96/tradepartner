@@ -562,7 +562,7 @@ why = "Lets many windows' PRs land together in one tested tree instead of one re
 unblocks = ["plan:merge-train"]
 
 [plan.merge-train]
-what = "Six tasks: the script's pure core and its runner, the CI trigger for train branches, the review-prefix and ask-rule wiring, the ways-of-working update with the ruleset file, and the owner's activation and first real run."
+what = "Seven tasks: the script's pure core, its runner with build, its merge command, the CI trigger for train branches, the review-prefix and ask-rule wiring, the ways-of-working update with the ruleset file, and the owner's activation and first real run."
 why = "The build document for the train; the owner's ruleset activation is the edge and gates nothing."
 
 [task.T72]
@@ -570,8 +570,12 @@ what = "The merge train's pure half: records, eligibility reusing ready_pr's che
 why = "Every rule of the spec is a pure function tested without the network, so the merge path has no judgment call in it."
 
 [task.T72b]
-what = "The merge train's runner and commands: build, merge, status and prune over git and gh in a temporary worktree."
-why = "The one command that merges, bound to a frozen batch id and the owner's word."
+what = "The merge train's runner and the build command: the squash-built train branch, one full run, the confirming rerun, the bisect, the comments and the record, over git and gh in the train's own worktree."
+why = "Everything that tests a batch, and nothing that lands one."
+
+[task.T72c]
+what = "The merge train's merge command (re-verify, head re-read, squash merge with --match-head-commit, retries, tree check, resume), plus status and prune."
+why = "The one command that merges, bound to a frozen batch id and the owner's word; reviewed on its own."
 
 [task.T73]
 what = "CI runs the full suite on train/** branches, one run per SHA."
