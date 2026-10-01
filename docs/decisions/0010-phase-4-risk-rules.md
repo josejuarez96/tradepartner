@@ -23,11 +23,12 @@ We will record the Phase 4 risk rules here. Every limit is a named key under `ri
 
 | Rule | Key | Default | On breach |
 |---|---|---|---|
-| per-name target weight | `risk.max_position_weight` | 0.05 | batch halts, `LimitBreachError` (every "batch halts" row below raises it) |
-| per-order notional as a fraction of equity | `risk.max_order_notional_fraction` | 0.05 | batch halts |
+| per-name target weight; and, for every name the phase buys, its held value after the phase over equity *(amended 2026-09-30)* | `risk.max_position_weight` | 0.05 | batch halts, `LimitBreachError` (every "batch halts" row below raises it) |
+| at most one order per (name, side) in a phase *(amended 2026-09-30)* | none, structural | n/a | batch halts |
+| per-order notional as a fraction of equity, for buys and trims; full exits and forced exits (`stop` liquidations included) are exempt *(amended 2026-09-30)* | `risk.max_order_notional_fraction` | 0.05 | batch halts |
 | gross exposure after the batch (no leverage, the charter's rule) | `risk.max_gross_exposure` | 1.0 | batch halts |
 | every sell quantity ≤ the reconciled holding, rounded down to `alpaca.quantity_decimals` (long-only, no shorts, ever) | none, structural | n/a | batch halts |
-| buys sized after the modelled cost (`costs.*`) within `account().cash`, never `buying_power` | none, structural | n/a | batch halts |
+| buys sized after the modelled cost (`costs.*`) within `account().cash`, never `buying_power`, compared strictly with no tolerance *(amended 2026-09-30)* | none, structural | n/a | batch halts |
 | order count per run | `risk.max_orders_per_run` | 250 | batch halts |
 | skips other than `dust` and `untradable` per run | `risk.max_skips_per_run` | 10 | `SkipCapError`, rebalance `missed` (`skip_cap`) |
 | asynchronous rejections per submitting run, or every order rejected | `risk.max_rejections_per_run` | 5 | `RejectionCapError` |
@@ -59,3 +60,12 @@ We will record the Phase 4 risk rules here. Every limit is a named key under `ri
 - Bad / accepted risks: a limit breach in the buys phase leaves the sells executed and their proceeds in cash until the next rebalance, by design, and the whole rebalance is marked missed; the defaults are the spec's reasoning for H1 at paper scale, not measurements, and `risk.min_order_notional` rests on an unverified note until the recording task confirms Alpaca's minimum.
 - Reversibility: a default is cheap to change in code but costs a window: spec req 14 makes any risk-rule change mid-window a `paper stop`, an ADR and a new window, which liquidates the book and restarts the six-rebalance evidence clock. The check order and the id derivation change only between windows, because replay and the journal's decision-state logic depend on both.
 - Revisit if: the recording task's precision, id-length or minimum-notional answers differ from the assumptions; Probe 3 (#182) changes the two-phase timing; the Phase 6 live ADR is written.
+
+## Amendment 2026-09-30
+
+The owner answered [#366](https://github.com/josejuarez96/tradepartner/issues/366) questions 1 and 2 ([comment](https://github.com/josejuarez96/tradepartner/issues/366#issuecomment-5922811240)). Each answer had been raised as an owner question by `safety-reviewer` on T54 ([#339](https://github.com/josejuarez96/tradepartner/pull/339), items A to D). No window has started, so under point 5 these are amendments to point 1, not a new ADR. The spec's req 3 (c) and its acceptance list follow ([#367](https://github.com/josejuarez96/tradepartner/issues/367)).
+
+1. **Exits are exempt from the per-order limit** (#366 Q1, option b). `risk.max_order_notional_fraction` bounds buys and trims only. It does not bound a full exit (a plan `trade` decision that sells the whole holding) or a `forced_exit` of any reason, including `window_stop` liquidations. Before this, a name that drifted above the limit (for example, one that doubled) could not be exited at all: every attempt halted the batch, and `paper stop` could never flatten the account. An exit cannot add risk. The sell-sum rule (every sell ≤ the reconciled holding) still bounds every exit.
+2. **The weight is also checked after the phase, and one order per (name, side)** (#366 Q2 A, option a). Before, only the decision's *target* weight was checked. Now the check also covers every name the phase buys: its held value after the phase, at the reference prices, over the same equity, must be ≤ `risk.max_position_weight`. A phase with two orders on one (name, side) halts the batch. This closes the cases where two buys of one name, or a buy on top of a drifted holding, ended above the limit. Names the phase does not buy are not checked, so drift alone never halts a batch.
+3. **Buys within cash is strict** (#366 Q2 C, option a). The buys phase passes only when Σ buy notional plus its modelled cost ≤ `account().cash`, with no tolerance. `risk.reconcile_cash_tolerance` is a reconciliation key only and is not read by the cash rule. Sizing already stays under cash, so a strict comparison refuses only a sizing bug.
+4. **The notional-sell gap-down exposure is accepted** (#366 Q2 D, option a). A notional trim is converted to a quantity at the reference price (close(S−1)) for the sell-sum rule, as the spec's req 3 says. An open below that price sells more shares than the estimate. This is accepted, not buffered. Full exits are by quantity, so only trims are exposed, and the next collection and reconciliation see the shares actually sold.
