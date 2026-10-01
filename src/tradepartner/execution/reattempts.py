@@ -55,7 +55,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
-from tradepartner.execution.plan import DecisionState, Remainder, State
+from tradepartner.execution.plan import FORCED_EXIT, DecisionState, Remainder, State
 from tradepartner.store.journal import DecisionRow
 
 __all__ = ["PHASES", "Attempt", "AttemptScope", "WrittenOff", "attempt_scope", "write_offs"]
@@ -63,7 +63,6 @@ __all__ = ["PHASES", "Attempt", "AttemptScope", "WrittenOff", "attempt_scope", "
 PHASES = ("sell", "buy")
 _SELL, _BUY = PHASES
 _IN_PLAY = frozenset({State.OPEN, State.IN_FLIGHT})
-_FORCED_EXIT = "forced_exit"
 
 
 @dataclass(frozen=True)
@@ -120,7 +119,7 @@ def _check_decisions(decisions: Sequence[DecisionRow]) -> None:
         if decision_id in seen:
             raise ValueError(f"decision {decision_id} is passed twice")
         seen.add(decision_id)
-    planned = [d for d in decisions if d.decision != _FORCED_EXIT]
+    planned = [d for d in decisions if d.decision != FORCED_EXIT]
     if any(d.rebalance_session is None for d in planned):
         raise ValueError("a decision that is not a forced exit has no rebalance session")
     rebalances = sorted({str(d.rebalance_session) for d in planned})
@@ -131,7 +130,7 @@ def _check_decisions(decisions: Sequence[DecisionRow]) -> None:
 def _last(decisions: Sequence[DecisionRow], states: Mapping[int, DecisionState]) -> bool:
     """True when no sell of the rebalance is open or in flight."""
     return not any(
-        d.side == _SELL and d.decision != _FORCED_EXIT and _state(d, states).state in _IN_PLAY
+        d.side == _SELL and d.decision != FORCED_EXIT and _state(d, states).state in _IN_PLAY
         for d in decisions
     )
 

@@ -16,8 +16,9 @@ import polars as pl
 import pytest
 
 from tradepartner.config import RiskConfig
+from tradepartner.execution import reattempts
 from tradepartner.execution.ids import client_order_id
-from tradepartner.execution.plan import DecisionState, Remainder, State, decision_state
+from tradepartner.execution.plan import FORCED_EXIT, DecisionState, Remainder, State, decision_state
 from tradepartner.execution.reattempts import (
     Attempt,
     WrittenOff,
@@ -483,3 +484,10 @@ def test_a_deferred_id_that_is_not_an_open_buy_of_the_phase_raises() -> None:
     for deferred in ([1], [9]):
         with pytest.raises(ValueError, match="is not an open buy of the phase"):
             write_offs([buy], states, phase="buy", **done, deferred=deferred)
+
+
+def test_reattempts_shares_plans_forced_exit_constant() -> None:
+    """#497: reattempts.py imports `plan.FORCED_EXIT` rather than defining
+    its own literal, so the two modules can never drift apart."""
+    assert reattempts.FORCED_EXIT is FORCED_EXIT
+    assert FORCED_EXIT == "forced_exit"
