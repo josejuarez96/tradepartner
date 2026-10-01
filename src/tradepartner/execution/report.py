@@ -32,9 +32,11 @@ rebalance month i (consecutive sessions `trial.sessions[i]` = T_i and
   close(T_i) (`execution.plan.residue`, evaluated on rows known at close(T_i))
   of the residue quantity x (close(T_{i+1}) split-adjusted back to T_i's
   basis, minus close(T_i));
-- the **modelled cost**: the trial's base-level `cost_paid` at T_i over
-  paper's own equity at close(T_i) (the same denominator every other term
-  uses, so the check compares like with like).
+- the **modelled cost**: the trial's base-level `cost_paid` at T_i over the
+  trial's own equity at close(T_i) (spec req 10: "the trial's base-level
+  `cost_paid` at T_i over its equity at close(T_i)" - "its" is the trial's,
+  not paper's, so the threshold tracks the trial's own scale and is unaffected
+  by paper's account size relative to the trial's).
 
 The check applies `window`'s frozen `paper.tracking_k` to that month's
 modelled cost, against the series the frozen `paper.tracking_rule` names
@@ -59,7 +61,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-from tradepartner.calendar import session_close
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.store.journal import (
@@ -217,18 +219,41 @@ def _quantity_at(marks: Sequence[PositionDailyRow], security_id: str, session: d
 def _actions_as_of(actions: pl.DataFrame, t: datetime) -> pl.DataFrame:
     """The latest revision of each `corporate_actions` identity with
     `known_at <= t`, dropped if cancelled: a simplified in-memory mirror of
-    `store.asof.live_actions_as_of` for a frame the caller already holds
-    (identity = `security_id`, `action_type`, `ex_date`, and `source_action_id`
-    when the frame carries one)."""
+    `store.asof.live_actions_as_of`'s `_ACTION_IDENTITY_PARTITION` (#108): the
+    identity is `(security_id, source_action_id)` when the frame carries a
+    non-empty `source_action_id`, else `(security_id, action_type, ex_date)`,
+    so a re-dated event (a changed `ex_date` on the same `source_action_id`)
+    stays one row at its latest ex-date, never two."""
     if actions.is_empty():
         return actions
     frame = actions.filter(pl.col("known_at") <= t)
     if frame.is_empty():
         return frame
-    identity = ["security_id", "action_type", "ex_date"]
     if "source_action_id" in frame.columns:
-        identity.append("source_action_id")
-    frame = frame.sort("known_at").group_by(identity, maintain_order=True).last()
+        has_source = pl.col("source_action_id").fill_null("") != ""
+        identity_expr = (
+            pl.when(has_source)
+            .then(pl.format("src:{}:{}", "security_id", "source_action_id"))
+            .otherwise(
+                pl.format(
+                    "typ:{}:{}:{}", "security_id", "action_type", pl.col("ex_date").cast(pl.Utf8)
+                )
+            )
+            .alias("_identity")
+        )
+        frame = (
+            frame.with_columns(identity_expr)
+            .sort("known_at")
+            .group_by("_identity", maintain_order=True)
+            .last()
+            .drop("_identity")
+        )
+    else:
+        frame = (
+            frame.sort("known_at")
+            .group_by(["security_id", "action_type", "ex_date"], maintain_order=True)
+            .last()
+        )
     if "cancelled" in frame.columns:
         frame = frame.filter(~pl.col("cancelled").fill_null(False))
     return frame
@@ -259,21 +284,29 @@ def _dividend_term(
 ) -> float:
     if actions_as_of_next.is_empty():
         return 0.0
-    credited = {
-        (row.security_id, row.session)
-        for row in adjustments
-        if row.kind == _DIVIDEND_CASH and row.security_id is not None
-    }
+    #: Sessions a `dividend_cash` adjustment was journaled for each name:
+    #: reconcile stamps it at the reconciliation session, on or after the
+    #: ex-date (`execution.reconcile_run._dividends`), never on the ex-date
+    #: itself, so the match is "on or after", not "equal to".
+    credited: dict[str, list[date]] = {}
+    for adjustment in adjustments:
+        if adjustment.kind == _DIVIDEND_CASH and adjustment.security_id is not None:
+            credited.setdefault(adjustment.security_id, []).append(adjustment.session)
     total = 0.0
-    for row in actions_as_of_next.filter(pl.col("action_type") == _DIVIDEND).iter_rows(named=True):
-        ex_date = row["ex_date"]
+    for action_row in actions_as_of_next.filter(pl.col("action_type") == _DIVIDEND).iter_rows(
+        named=True
+    ):
+        ex_date = action_row["ex_date"]
         if not (t_i < ex_date <= t_next):
             continue
-        security_id = row["security_id"]
-        if (security_id, ex_date) in credited:
+        security_id = action_row["security_id"]
+        if any(session >= ex_date for session in credited.get(security_id, ())):
             continue
-        quantity = _quantity_at(marks, security_id, ex_date)
-        total += float(row["ratio_or_amount"]) * quantity
+        #: Entitlement is held as of the session before the ex-date (the
+        #: record date; `execution.reconcile_run._dividends` uses the same
+        #: `previous_session(ex_date)` holding), never the ex-date's own close.
+        quantity = _quantity_at(marks, security_id, previous_session(ex_date))
+        total += float(action_row["ratio_or_amount"]) * quantity
     return total
 
 
@@ -311,19 +344,32 @@ def _residue_term(
         for row in journal.positions_daily
         if row.session == t_i and row.security_id is not None and row.quantity != 0
     }
+    if not held:
+        return 0.0
+    #: `execution.plan.residue` requires its `decisions`, `decision_events`
+    #: and `positions_daily` rows to be those known to the run on the ledger's
+    #: session (its own docstring), and raises on a row whose run is not among
+    #: `runs`: restrict all four to runs at or before T_i so a later month's
+    #: decision (e.g. a later `dust` or `untradable` close) can never reach
+    #: back into this month's residue (no look-ahead).
+    known_runs = tuple(r for r in journal.runs if r.session is not None and r.session <= t_i)
+    known_run_ids = {r.run_id for r in known_runs}
+    known_decisions = [d for d in journal.decisions if d.run_id in known_run_ids]
+    known_decision_events = [e for e in journal.decision_events if e.run_id in known_run_ids]
+    known_marks = [m for m in journal.positions_daily if m.run_id in known_run_ids]
     total = 0.0
     for security_id, quantity in held.items():
         ledger = Ledger(positions={security_id: quantity}, cash=0.0, through=t_i)
         quantity_at_risk = residue_of(
             security_id,
             journal.adjustments,
-            journal.decisions,
-            journal.decision_events,
-            journal.positions_daily,
+            known_decisions,
+            known_decision_events,
+            known_marks,
             ledger,
             actions_as_of_i,
             window_id=window_id,
-            runs=journal.runs,
+            runs=known_runs,
         )
         if quantity_at_risk == 0.0:
             continue
@@ -332,7 +378,7 @@ def _residue_term(
         if close_i is None or close_next is None:
             raise ValueError(f"no close for {security_id} on {t_i} or {t_next}")
         factor = _split_factor(actions_as_of_next, security_id, t_i, t_next)
-        adjusted_next = close_next / factor
+        adjusted_next = close_next * factor
         total += quantity_at_risk * (adjusted_next - close_i)
     return total
 
@@ -389,7 +435,7 @@ def compare_months(
             )
             / paper_equity_i
         )
-        modelled_cost = trial.cost_paid[t_i] / paper_equity_i
+        modelled_cost = trial.cost_paid[t_i] / trial.equity[t_i]
 
         missed = any(
             event.rebalance_session == t_i and event.status == _MISSED

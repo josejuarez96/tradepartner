@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 import polars as pl
 import pytest
 
-from tradepartner.calendar import session_close
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.execution.report import (
     Journal,
@@ -289,11 +289,14 @@ def test_raw_boundary_exact_passes_one_above_fails() -> None:
 
 def test_dividend_term_and_dividend_cash_zero() -> None:
     ex_date = date(2026, 10, 15)
+    record_date = previous_session(ex_date)
     equity = {T0: 100_000.0, T1: 101_000.0}
     trial = _trial(equity, {T0: 0.0})
+    # Entitlement is held as of the session before the ex-date (the record
+    # date), not the ex-date's own close (`_dividends` in reconcile_run.py).
     marks = [
         *_flat_marks(equity),
-        _position_mark(ex_date, A, 100.0, 50.0),
+        _position_mark(record_date, A, 100.0, 50.0),
     ]
     dividends = _action(A, "dividend", ex_date, 0.5, _utc(T1))  # amount 0.5/share
 
@@ -309,7 +312,10 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
     raw_fail_equity = {T0: 100_000.0, T1: 100_000.0}  # paper flat, trial up 1%: raw = -0.01
     raw_fail_trial = _trial({T0: 100_000.0, T1: 101_000.0}, {T0: 1.0})
     raw_fail_journal = _journal(
-        positions_daily=[*_flat_marks(raw_fail_equity), _position_mark(ex_date, A, 100.0, 50.0)]
+        positions_daily=[
+            *_flat_marks(raw_fail_equity),
+            _position_mark(record_date, A, 100.0, 50.0),
+        ]
     )
     raw_result = compare_months(
         _window(tracking_rule="raw"),
@@ -343,7 +349,8 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
     assert rescued.passed
     assert not residual_result.passed  # sanity: the small dividend does not rescue it
 
-    # The same dividend, but the broker already credited it: contributes zero.
+    # The same dividend, but the broker already credited it: contributes zero,
+    # whether journaled on the ex-date itself...
     credited = _journal(
         positions_daily=marks,
         adjustments=[
@@ -364,6 +371,31 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
         _window(tracking_rule="residual"), trial, credited, dividends, _no_price, None
     )
     assert credited_result.months[0].dividend_term == pytest.approx(0.0)
+
+    # ...or, as `reconcile_run._dividends` actually stamps it, several
+    # sessions later at the pay date: a session-equality match would miss
+    # this and double-count the dividend (the bug this case pins).
+    pay_date = ex_date + timedelta(days=5)
+    credited_lagged = _journal(
+        positions_daily=marks,
+        adjustments=[
+            AdjustmentRow(
+                adjustment_id=next(_IDS),
+                window_id=WINDOW_ID,
+                run_id=1,
+                session=pay_date,
+                kind="dividend_cash",
+                security_id=A,
+                cash=50.0,
+                known_at=_utc(pay_date),
+                ingested_at=_utc(pay_date),
+            )
+        ],
+    )
+    credited_lagged_result = compare_months(
+        _window(tracking_rule="residual"), trial, credited_lagged, dividends, _no_price, None
+    )
+    assert credited_lagged_result.months[0].dividend_term == pytest.approx(0.0)
 
 
 def test_fill_timing_term_positive_for_costly_buy_and_sell() -> None:
@@ -436,14 +468,75 @@ def test_residue_term_hand_computed_and_split_adjusted() -> None:
     assert result.months[0].residue_term == pytest.approx(expected)
     assert result.months[0].residual == pytest.approx(0.0)  # never folded into the residual
 
-    # A 2:1 split inside the month: the term is unchanged (split-adjusted close).
-    split_close_next = close_next * 2.0  # post-split price for the same pre-split value
+    # A realistic forward 2:1 split inside the month: the observed market
+    # close roughly HALVES (one pre-split share becomes two post-split
+    # shares at about half the price), so bringing it back to T0's basis
+    # MULTIPLIES by the split ratio, never divides (`execution.ledger`'s own
+    # `_split_factor` convention: a holding's *quantity* is multiplied
+    # forward by the ratio, so a *price* read on the post-split side must be
+    # multiplied, not divided, to land back on the pre-split basis). A test
+    # that instead doubled the post-split close would pass under either sign
+    # convention and hide the bug; this one fails under a wrong `/ factor`.
+    split_close_next = close_next / 2.0  # the actual post-split observed close
     split_closes = _prices({(A, T0): close_i, (A, T1): split_close_next})
     split_actions = _action(A, "split", date(2026, 10, 15), 2.0, _utc(T1))
     split_result = compare_months(
         _window(tracking_rule="raw"), trial, journal, split_actions, split_closes, None
     )
     assert split_result.months[0].residue_term == pytest.approx(expected)
+
+
+def test_residue_term_no_look_ahead_on_later_decision() -> None:
+    # A name held at T0 with no decision yet; a *later* run (T1) writes a
+    # `window_stop` forced exit closed `dust`, which would make the whole
+    # holding a residue -- but only from T1 on. The residue term at month 0
+    # (evaluated on rows known at close(T0)) must not see that future row.
+    equity = {T0: 100_000.0, T1: 100_000.0}
+    trial = _trial(equity, {T0: 0.0})
+    close_i, close_next = 50.0, 55.0
+    closes = _prices({(A, T0): close_i, (A, T1): close_next})
+    marks = [
+        _cash_mark(T0, 100_000.0 - 10.0 * close_i),
+        _cash_mark(T1, 100_000.0 - 10.0 * close_i),
+        _position_mark(T0, A, 10.0, close_i, run_id=1),
+        _position_mark(T1, A, 10.0, close_next, run_id=2, tradable=False),
+    ]
+    future_decision_id = next(_IDS)
+    decisions = [
+        DecisionRow(
+            decision_id=future_decision_id,
+            run_id=2,  # the T1 run, after month 0's T_i = T0
+            rebalance_session=None,
+            security_id=A,
+            whole_share=False,
+            decision="forced_exit",
+            reason="window_stop",
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        )
+    ]
+    decision_events = [
+        DecisionEventRow(
+            decision_id=future_decision_id,
+            run_id=2,
+            status="skipped",
+            reason="dust",
+            known_at=_utc(T1),
+            ingested_at=_utc(T1),
+        )
+    ]
+    journal = _journal(
+        positions_daily=marks,
+        decisions=decisions,
+        decision_events=decision_events,
+        runs=(_run(1, T0), _run(2, T1)),
+    )
+    result = compare_months(
+        _window(tracking_rule="raw"), trial, journal, _no_actions(), closes, None
+    )
+    # Month 0 (T0 -> T1): the dust decision is dated at T1, not known at
+    # close(T0), so it must not make T0's residue term nonzero.
+    assert result.months[0].residue_term == pytest.approx(0.0)
 
 
 def test_raw_rule_excludes_missed_lists_override() -> None:
@@ -579,9 +672,10 @@ def test_superseded_fill_counted_once() -> None:
 
 def test_no_look_ahead_late_dividend_not_counted() -> None:
     ex_date = date(2026, 10, 15)
+    record_date = previous_session(ex_date)
     equity = {T0: 100_000.0, T1: 101_000.0}
     trial = _trial(equity, {T0: 0.0})
-    marks = [*_flat_marks(equity), _position_mark(ex_date, A, 100.0, 50.0)]
+    marks = [*_flat_marks(equity), _position_mark(record_date, A, 100.0, 50.0)]
     # Known only AFTER close(T1): must not affect month 0's dividend term.
     late = _action(A, "dividend", ex_date, 5.0, session_close(T1) + timedelta(seconds=1))
     journal = _journal(positions_daily=marks)
