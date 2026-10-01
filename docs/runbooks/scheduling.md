@@ -52,6 +52,7 @@ launchctl print gui/$(id -u)/com.tradepartner.paper | grep state    # once insta
 STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().store.path)")
 cp "$STORE_PATH" "$STORE_PATH.bak-$(date +%Y%m%d)"
 [ -f "$STORE_PATH.wal" ] && cp "$STORE_PATH.wal" "$STORE_PATH.wal.bak-$(date +%Y%m%d)"
+git rev-parse HEAD > "$STORE_PATH.bak-$(date +%Y%m%d).commit"   # the pre-migration commit, for a restore
 
 git pull
 launchctl enable gui/$(id -u)/com.tradepartner.ingest
@@ -60,7 +61,7 @@ launchctl enable gui/$(id -u)/com.tradepartner.paper   # once installed
 
 `disable`/`enable` persist the on/off state across reboots and are reversed in the same call shape used in "Install, test, remove" and "To pause the job" below; re-enabling immediately after the pull is what lets the next scheduled run actually happen and migrate the store — disabled jobs never run, so there is nothing to wait on before re-enabling. This reads the store path the running settings actually use (respecting `STORE__PATH` in `.env` if you've set it, per "PATH, working directory and `.env`" below) rather than assuming the default `data/tradepartner.duckdb`, and copies no secret — only the store file and its write-ahead log, if DuckDB has left one. Keep the dated copies until you've confirmed the next scheduled `ingest` and `paper run` both completed `ok` on the new version, then delete them.
 
-**To restore from a copy:** disable both jobs and confirm neither is mid-run (as above), `git checkout` the commit the copy predates (code past the bump expects the new, migrated schema, so restoring the file alone is not enough), delete any live `<path>.wal` so DuckDB doesn't replay it onto the restored file, then copy the dated backup (and its `.wal.bak-DATE` counterpart, if one exists) back over the live path. Re-enable the jobs only once you've decided which code they should run next. If any window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap — the run halts and the switch engages rather than silently losing track of an order.
+**To restore from a copy:** disable both jobs and confirm neither is mid-run (as above), `git checkout` the commit recorded in the matching `.commit` file (the code you were on when you took that copy — code past the migration expects the new schema, so restoring the file alone is not enough), delete any live `<path>.wal` so DuckDB doesn't replay it onto the restored file, then copy the dated backup (and its `.wal.bak-DATE` counterpart, if one exists) back over the live path. Re-enable the jobs only once you've decided which code they should run next. If any window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap — the run halts and the switch engages rather than silently losing track of an order.
 
 ## PATH, working directory and `.env`
 
