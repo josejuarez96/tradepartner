@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from tradepartner.execution.plan import (
     Decisions,
     Signal,
     decisions_from,
+    remainder,
 )
 from tradepartner.store.journal import DecisionRow, OverrideRow, SignalRow
 
@@ -470,6 +472,35 @@ def test_planned_quantities_are_stated_for_t_i_units() -> None:
     c = _by_name(result)["C"]
     assert c.planned_quantity == pytest.approx(5.0)
     assert c.drifted_weight == pytest.approx(500 / EQUITY)
+
+
+def test_a_catch_up_split_inside_t_i_to_s_minus_1_round_trips_through_remainder() -> None:
+    """Catch-up on S = 2026-10-05 (S-1 = 2026-10-02): a 3-for-1 split of C ex
+    2026-10-02, strictly inside (T_i, S-1], known at close(2026-10-01). The 15
+    shares held at S are 5 in T_i units, and `remainder` on S, reading the same
+    frame, restates them to the 15 the ledger holds."""
+    catch_up, ex_date = date(2026, 10, 5), date(2026, 10, 2)
+    prices = dict(PRICES, C=100.0 / 3)
+    actions = _actions(("C", ex_date, 3.0, session_close(S)))
+    result = decisions_from(
+        _plan(),
+        Ledger(positions={"A": 10.0, "C": 15.0, "X": 1.0}, cash=1000.0, through=catch_up),
+        (),
+        _assets(),
+        {},
+        frozenset(),
+        FROZEN,
+        SETTINGS,
+        price_of=prices.__getitem__,
+        actions_as_of=actions,
+        costs=COSTS,
+    )
+    c = _by_name(result)["C"]
+    assert c.planned_quantity == pytest.approx(5.0)
+    row = replace(c.row(run_id=1, known_at=STAMP, ingested_at=STAMP), decision_id=1)
+    left = remainder(row, [], [], [], actions, prices.__getitem__, session=catch_up)
+    assert left.quantity == pytest.approx(15.0)
+    assert left.notional == pytest.approx(500.0)
 
 
 def test_a_split_known_after_close_s_minus_1_is_refused() -> None:
