@@ -715,7 +715,10 @@ def _fsn_class_member(row: Mapping[str, str], dim_segments: Mapping[str, str]) -
     segments = _fsn_segments(segments_raw)
     if segments is None:
         return None
-    return normalize_class_member(segments.get(_FSN_CLASS_AXIS, ""))
+    member = segments.get(_FSN_CLASS_AXIS, "")
+    if "\ufffd" in member:  # an invalid byte or a tab `_fsn_rows` replaced (#498)
+        raise ValueError(f"undecodable byte or embedded tab in class member {member[:60]!r}")
+    return normalize_class_member(member)
 
 
 @_fail_closed
@@ -743,8 +746,10 @@ def _parse_one_fsn_filing(
         if member is None:
             continue
         group, value = groups.setdefault(member, {}), row.get("value") or ""
-        if "\ufffd" in value:  # an invalid byte `_fsn_rows` replaced (#455)
-            raise ValueError(f"{accession}: undecodable byte in {tag} ({member or 'no class'})")
+        if "\ufffd" in value:  # an invalid byte or a tab `_fsn_rows` replaced (#455, #498)
+            raise ValueError(
+                f"{accession}: undecodable byte or embedded tab in {tag} ({member or 'no class'})"
+            )
         if group.get(tag, value) != value:  # fail closed, as parse_cover_page does
             raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
         group[tag] = value

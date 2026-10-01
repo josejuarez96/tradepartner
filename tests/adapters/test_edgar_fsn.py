@@ -28,6 +28,7 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
 
+import duckdb
 import httpx
 import pytest
 from edgar_transport import EdgarRouter, edgar_settings
@@ -40,7 +41,12 @@ from tradepartner.adapters.edgar import (
     parse_fsn,
     restore_class_letter_space,
 )
-from tradepartner.adapters.edgar_source import FSN_VERSION, EdgarFilingSource, _fsn_rows
+from tradepartner.adapters.edgar_source import (
+    FSN_VERSION,
+    EdgarFilingSource,
+    _fsn_normalize_member,
+    _fsn_rows,
+)
 from tradepartner.adapters.filings import CoverListing
 from tradepartner.config import Settings
 
@@ -318,7 +324,7 @@ class TestParseFsn:
         values = {"Security12bTitle": "Common Stock", "TradingSymbol": "ABC"}
         values["SecurityExchangeName"] = "NYSE"
         txt = [_txt(good, t, v) for t, v in values.items()]
-        txt += [_txt(bad, t, v + "�" if t == tag else v) for t, v in values.items()]
+        txt += [_txt(bad, t, v + "\ufffd" if t == tag else v) for t, v in values.items()]
         parsed = parse_fsn(sub, [], txt, [])
         assert [r.accession for r in parsed.records] == [good]
         assert [f.accession for f in parsed.failures] == [bad]
@@ -836,9 +842,10 @@ def test_fsn_rows_folds_a_values_embedded_tabs_into_the_last_column(tmp_path: Pa
         path,
         ("adsh", "tag", "value"),
         where="tag IN ('AmendmentDescription', 'TradingSymbol')",
+        free_text="value",
     )
     assert [row["value"] for row in rows] == [
-        "NOTE���SandRidge�Inc.",
+        "NOTE\ufffd\ufffd\ufffdSandRidge\ufffdInc.",
         "SD",
     ]
 
@@ -861,8 +868,124 @@ def test_a_listing_value_with_an_embedded_tab_fails_that_accession(tmp_path: Pat
         path,
         ("adsh", "tag", "dimh", "dimn", "coreg", "value"),
         where="tag IN ('Security12bTitle', 'TradingSymbol', 'SecurityExchangeName')",
+        free_text="value",
     )
     sub = [_sub(good, "14", "10-K"), _sub(bad, "15", "10-K")]
     parsed = parse_fsn(sub, [], txt, [])
+    assert [r.accession for r in parsed.records] == [good]
+    assert [f.accession for f in parsed.failures] == [bad]
+    [record] = parsed.records
+    assert [listing.ticker for listing in record.listings] == ["ABC"]
+
+
+def test_fsn_rows_leaves_well_formed_lines_byte_for_byte(tmp_path: Path) -> None:
+    """The fold is a no-op without surplus fields: CRLF and LF endings, an
+    empty last field and a bare quote all survive the rewrite unchanged."""
+    body = (
+        _TXT_HEADER
+        + b"0000000016-15-000001\tTradingSymbol\t0x00\t0\t\tABC\r\n"
+        + b"0000000016-15-000001\tSecurity12bTitle\t0x00\t0\t\t\n"
+        + b'0000000016-15-000001\tOther\t0x00\t0\t\tsays "hi\n'
+    )
+    path = tmp_path / "txt.tsv"
+    path.write_bytes(body)
+    _fsn_normalize_member(path, free_text="value")  # DuckDB cannot sniff mixed endings
+    assert path.read_bytes() == body
+
+
+def test_fsn_rows_still_fails_a_line_with_too_few_fields(tmp_path: Path) -> None:
+    path = _write_txt_tsv(tmp_path / "txt.tsv", b"0000000017-15-000001\tTradingSymbol\tABC\n")
+    with pytest.raises(duckdb.Error):
+        _fsn_rows(path, ("adsh", "value"), free_text="value")
+
+
+def test_fsn_rows_does_not_fold_a_member_whose_last_column_is_not_free_text(
+    tmp_path: Path,
+) -> None:
+    """Surplus fields in `sub`/`num`/`dim` would shift into a column that is
+    not free text, so they still fail the read loudly."""
+    path = _write_txt_tsv(
+        tmp_path / "num.tsv", b"0000000018-15-000001\tShares\t0x00\t0\t\t100\t5\n"
+    )
+    with pytest.raises(duckdb.Error):
+        _fsn_rows(path, ("adsh", "value"))
+
+
+def test_fsn_rows_refuses_to_fold_into_a_column_the_header_lacks(tmp_path: Path) -> None:
+    path = tmp_path / "txt.tsv"
+    path.write_bytes(b"adsh\ttext\tfootnote\n0000000019-15-000001\tABC\t\n")
+    with pytest.raises(ValueError, match="no 'value' column to fold tabs into"):
+        _fsn_rows(path, ("adsh", "text"), free_text="value")
+
+
+def test_ensure_fsn_extracts_a_period_whose_txt_note_carries_tabs(tmp_path: Path) -> None:
+    """End to end, as the 2015q1 backfill: a SandRidge-like note with literal
+    tabs no longer fails the period, and a listing value with one fails only
+    its own accession (counted in the manifest, never cached)."""
+    good, noted, bad = "0000000041-15-000001", "0001349436-15-000028", "0000000043-15-000001"
+    txt = [
+        _txt(noted, "AmendmentDescription", "EXPLANATORY NOTE\t\t\tSandRidge\tEnergy"),
+        *(
+            _txt(adsh, tag, value)
+            for adsh, symbol in ((good, "TCK"), (noted, "SD"), (bad, "AB\tC"))
+            for tag, value in (
+                ("Security12bTitle", "Common Stock"),
+                ("TradingSymbol", symbol),
+                ("SecurityExchangeName", "New York Stock Exchange"),
+            )
+        ),
+    ]
+    zip_bytes = _fsn_zip_bytes(
+        [_sub(good, "41", "10-K"), _sub(noted, "1349436", "10-K/A"), _sub(bad, "43", "10-K")],
+        [_num(good, "EntityCommonStockSharesOutstanding", "100", "20141231")],
+        txt,
+        [],
+    )
+    settings = _settings(tmp_path)
+    source = _source_ready(settings, _router_with_fsn("2015q1", zips={"2015q1": zip_bytes}))
+    source._ensure_fsn()
+    root = Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}"
+    manifest = json.loads((root / "manifests" / "2015q1.json").read_text())
+    assert manifest["accessions_extracted"] == [good, noted]
+    assert [f["accession"] for f in manifest["accessions_failed"]] == [bad]
+    cached = json.loads((root / "0001349436.json").read_text())
+    assert cached["records"][noted]["listings"] == [["Common Stock", "SD", "NYSE"]]
+    assert not (root / "0000000043.json").exists()
+
+
+def test_fsn_rows_folds_dim_tabs_into_segments_not_the_last_column(tmp_path: Path) -> None:
+    # As 2025_07 dim.tsv: an InvestmentIdentifier segment carries a tab and
+    # `segt`, the last column, is a flag.
+    path = tmp_path / "dim.tsv"
+    filler = b"".join(b"0x%032x\tClassOfStock=Common;\t0\n" % i for i in range(5000))
+    path.write_bytes(
+        b"dimhash\tsegments\tsegt\n"
+        + filler
+        + b'0xc61f\t"InvestmentIdentifier=Debt, Inc.,\tSenior Secured;"\t0\n'
+    )
+    rows = _fsn_rows(
+        path, ("dimhash", "segments", "segt"), where="dimhash = '0xc61f'", free_text="segments"
+    )
+    assert rows == [
+        {
+            "dimhash": "0xc61f",
+            "segments": '"InvestmentIdentifier=Debt, Inc.,\ufffdSenior Secured;"',
+            "segt": "0",
+        }
+    ]
+
+
+def test_a_class_member_with_a_folded_tab_fails_that_accession() -> None:
+    good, bad = "0000000016-15-000001", "0000000017-15-000001"
+    sub = [_sub(good, "16", "10-K"), _sub(bad, "17", "10-K")]
+    num = [
+        _num(good, "EntityCommonStockSharesOutstanding", "5", "20150131", dimh="0xaa", dimn="1"),
+        _num(bad, "EntityCommonStockSharesOutstanding", "5", "20150131", dimh="0xbb", dimn="1"),
+    ]
+    dim = [
+        _dim("0xaa", "ClassOfStock=CommonClassA;"),
+        _dim("0xbb", "ClassOfStock=Common\ufffdClassA;"),
+    ]
+    parsed = parse_fsn(sub, num, [], dim)
     assert [r.accession for r in parsed.records] == [good]
     assert [f.accession for f in parsed.failures] == [bad]
