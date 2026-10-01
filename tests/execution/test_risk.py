@@ -835,3 +835,13 @@ def test_a_whole_share_decisions_full_exit_still_goes_by_whole_shares() -> None:
     assert isinstance(_check([floor], _LOOSE, ledger=ledger, assets=assets), Skips)
     fractional = replace(floor, quantity=2.4)
     assert _rules(_check([fractional], _LOOSE, ledger=ledger, assets=assets)) == {"whole_shares"}
+
+
+def test_a_buy_of_a_name_that_lost_fractionable_flooring_to_zero_is_deferred() -> None:
+    """#395: journaled `whole_share = false`, sized by whole shares since the
+    name lost `fractionable`: $50 of D at the buffered $102 floors to no
+    share, so it is deferred (no order, no skip), not skipped."""
+    lost = replace(_buy(1, "D", 50.0), whole_share=True)
+    assert lost.decision.whole_share is False and lost.by_whole_shares
+    (sizing,) = size_buys([lost], 1000.0, _price_of, RiskConfig(), _NO_COSTS)
+    assert sizing.deferred
