@@ -95,7 +95,12 @@ class BacktestResult:
 @dataclass(frozen=True)
 class Plan:
     """What the read at close(T_i) decides, identical for every cost level (public for
-    Phase 4's tracking runs, which plan with the engine's own function, plan T53)."""
+    Phase 4's tracking runs, which plan with the engine's own function, plan T53).
+
+    `members` (the universe, sorted), `scores` (the momentum signal) and
+    `excluded_no_history` (members without both anchor bars) are the reads behind the
+    targets, kept for Phase 4's `decisions_from` (plan T53b); the loop does not read
+    them."""
 
     session: date
     fill_session: date
@@ -104,6 +109,9 @@ class Plan:
     n_static_listings: int
     n_excluded_no_history: int
     gap: GapReading
+    members: tuple[str, ...]
+    scores: dict[str, float]
+    excluded_no_history: tuple[str, ...]
 
 
 @dataclass
@@ -179,6 +187,9 @@ def _plan(provider: DataProvider, params: Settings, session: date) -> Plan:
         n_static_listings=provider.static_listing_count(t, members),
         n_excluded_no_history=signal.n_excluded,
         gap=provider.survivorship_gap(t),
+        members=tuple(members),
+        scores=signal.scores,
+        excluded_no_history=signal.excluded,
     )
 
 

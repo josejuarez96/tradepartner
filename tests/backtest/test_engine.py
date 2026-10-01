@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import itertools
 import math
 from collections.abc import Iterable, Sequence
@@ -577,3 +578,43 @@ class TestPublicPlan:
         assert (public.session, public.fill_session) == (T0, F0)
         assert set(public.targets) == {"A", "B"}
         assert public.n_universe == 4
+
+    def test_the_plan_carries_the_loops_universe_scores_and_exclusions(self) -> None:
+        """T53b: the universe members, the signal scores and the names excluded for no
+        history are exactly what the plan read at close(T0) (the momentum signal over
+        the members' frame), and agree with the counts the rebalance row records."""
+        provider = _provider(skip=[("D", date(2023, 12, 29))])  # D's skip-month anchor
+        params = _params()
+        public = engine.plan(provider, params, T0)
+        t = read_time(T0)
+        members = sorted(provider.universe(t).members["security_id"].to_list())
+        strategy = params.strategy
+        frame = provider.adjusted_prices(t, members, strategy.signal_total_return)
+        signal = engine.momentum_12_1(
+            frame, T0, strategy.formation_months, strategy.skip_months, security_ids=members
+        )
+        assert public.members == tuple(members) == ("A", "B", "C", "D")
+        assert public.scores == signal.scores
+        assert set(public.scores) == {"A", "B", "C"}
+        assert public.excluded_no_history == signal.excluded == ("D",)
+        assert public.n_universe == len(public.members)
+        assert public.n_excluded_no_history == len(public.excluded_no_history)
+        assert set(public.targets) <= set(public.scores)
+
+    def test_the_new_fields_leave_the_run_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No behaviour change: a run whose plans drop the new fields' contents gives
+        the same result (the loop reads only the fields it read before T53b)."""
+        provider_skip = [("D", date(2023, 12, 29))]
+        want = _run(_provider(provider_skip), end=T4)
+        original = engine._plan
+
+        def emptied(provider: Any, params: Settings, session: date) -> engine.Plan:
+            plan = original(provider, params, session)
+            return dataclasses.replace(plan, members=(), scores={}, excluded_no_history=())
+
+        monkeypatch.setattr(engine, "_plan", emptied)
+        got = _run(_provider(provider_skip), end=T4)
+        for level, result in want.items():
+            assert got[level].equity == result.equity
+            assert got[level].rebalances == result.rebalances
+            assert got[level].targets == result.targets
