@@ -1055,7 +1055,7 @@ def test_every_secret_field_is_redacted_from_run_messages() -> None:
 
 
 def _secret_offenders(model: type[Any]) -> list[str]:
-    """Fields of `model` holding a secret that `ingest._secret_values` would
+    """Fields of `model` holding a secret that `config.secret_values` would
     miss: anything but a bare or Optional `SecretStr` at the top level, and any
     `SecretStr`/`SecretBytes` inside a nested model or container."""
     import types
@@ -1100,7 +1100,7 @@ def _secret_offenders(model: type[Any]) -> list[str]:
 
 
 def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
-    """`ingest._secret_values` finds secrets among `Settings`' own fields by type;
+    """`config.secret_values` finds secrets among `Settings`' own fields by type;
     a secret nested in a sub-model, a container or `SecretBytes` would be missed,
     so this pins that none exists (#334 review)."""
     assert _secret_offenders(Settings) == []

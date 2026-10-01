@@ -80,7 +80,6 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-from pydantic import SecretStr
 
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -93,7 +92,7 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session
-from tradepartner.config import Settings
+from tradepartner.config import Settings, secret_values
 from tradepartner.store.classify import (
     ClassificationBuild,
     build_classifications,
@@ -318,25 +317,10 @@ def _record_only(
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
-def _secret_values(settings: Settings) -> list[str]:
-    """The value of every `SecretStr` field on `settings`, found by type, so a
-    secret added to `Settings` later is redacted without editing this list
-    (#334). Blank values are left out; longest first, so a secret that
-    contains another is redacted whole."""
-    values = []
-    for name in type(settings).model_fields:
-        secret = getattr(settings, name)
-        if isinstance(secret, SecretStr):
-            value = secret.get_secret_value().strip()
-            if value:
-                values.append(value)
-    return sorted(set(values), key=len, reverse=True)
-
-
 def _clean(message: str, settings: Settings) -> str:
     """`message` with every configured secret redacted, control characters
     replaced by a space, and cut to `ingest.max_message_chars`."""
-    for value in _secret_values(settings):
+    for value in secret_values(settings):
         message = message.replace(value, "[redacted]")
     return _CONTROL.sub(" ", message)[: settings.ingest.max_message_chars]
 

@@ -77,7 +77,9 @@ FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 # "Review:" field (docs/plans/*.md) is the authority; these prefixes mirror it plus the
 # CLAUDE.md rule (data/backtests/signals -> quant-auditor; broker/orders/secrets/LLM inputs
 # -> safety-reviewer). Modules that do not exist yet are listed so the rule is right when
-# they appear. Widening a list needs no review; shrinking one is a safety-reviewer change.
+# they appear; tests/test_ready_pr.py names them in PLANNED_PREFIXES and fails on any other
+# prefix missing from the tree, so a rename cannot silently disable the gate.
+# Widening a list needs no review; shrinking one is a safety-reviewer change.
 QUANT_AUDITOR = "quant-auditor"
 SAFETY_REVIEWER = "safety-reviewer"
 QUANT_PREFIXES = (
@@ -105,6 +107,8 @@ SAFETY_PREFIXES = (
     "src/tradepartner/adapters/broker",
     "src/tradepartner/adapters/fake_broker",
     "src/tradepartner/adapters/alpaca_raw",
+    "src/tradepartner/adapters/alpaca_trading_raw",
+    "src/tradepartner/adapters/alpaca_broker",
     "src/tradepartner/adapters/edgar_raw",
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
@@ -112,10 +116,12 @@ SAFETY_PREFIXES = (
     "src/tradepartner/cli.py",
     "src/tradepartner/config.py",
     "src/tradepartner/ingest.py",
-    "src/tradepartner/exec/",
+    "src/tradepartner/execution/",
+    "src/tradepartner/errors.py",
     "src/tradepartner/risk/",
     "src/tradepartner/llm/",
     "scripts/ready_pr.py",
+    "tests/test_ready_pr.py",
     "scripts/fragments.py",
     "scripts/no_push_to_main.sh",
     ".github/workflows/",
