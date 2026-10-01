@@ -40,7 +40,7 @@ Shape (development-process.md, "Plan shape"): slice by file, not by step; no ope
 ## Verification
 
 1. Any checkout: `uv run pytest tests/test_merge_train.py tests/test_ready_pr.py tests/test_docs_budget.py` green with no network (the fake runner covers AC1 to AC13 and AC17, `merge --resume` included).
-2. Owner (T75b): AC14, the `train/smoke` run; AC15, a real batch of three or more PRs built and merged with the PR set, heads, run id, outcome and `main` SHAs matching across the PR comments, `~/.tradepartner/merge_train/<id>.json` and `gh run list --branch train/<id>`, and `main`'s run on the head commit green; AC16, the server refusing a direct push and a hand merge of a red PR.
+2. Owner (T75b): AC14, the `train/smoke` run; AC15, a real batch of three or more PRs built and merged with the PR set, heads, run id, outcome and `main` SHAs matching across the PR comments, `~/.tradepartner/merge_train/<id>.json` and `gh run list --branch train/<id>`, and `main`'s run on the head commit green; AC16, every check listed on T75b.
 3. Over the following week: no `main`-red incident of the #430 or #444 × #429 shape, and `gh run list --branch main` showing the per-merge runs as before.
 
 ## Rollback
