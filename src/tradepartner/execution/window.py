@@ -1,5 +1,6 @@
-"""Window start (Phase 4 spec req 14 "Entry gate, start and stop"; ADR 0009
-point 3; plan T64).
+"""Window start, stop, abandon, kill and the override writer (Phase 4 spec
+req 14 "Entry gate, start and stop", req 5, req 9 and open question 13; ADR
+0009 point 3; plans T64 and T64b).
 
 `start(settings, connect, broker, clock, slug)` is `paper start --hypothesis
 <slug>`. In order it refuses, before any write:
@@ -77,6 +78,70 @@ position is accepted and journaled `spinoff_receipt` at the ex-date's own
 share basis (the ledger split-adjusts it forward like any other
 adjustment); the owner should confirm this convention (or replace it with
 a schema change) before it is relied on for a real spin-off.
+
+**The other commands (T64b).** Each raises `WindowCommandRefused(reason,
+message)` for a refusal, whose `reason` is one of the codes below and whose
+message names everything that is missing. A blank `--reason` is refused
+(`reason`) before the lock, the clock or the broker is touched; every stored
+reason is the trimmed text.
+
+- **`stop(settings, connect, broker, clock, reason)`** is `paper stop`. It
+  takes the run lock (`LockHeld` at once while a run holds it) and refuses
+  `no_window`. It refuses `kill_switch` while the window's derived switch is
+  engaged (`switch.derive` as a lock holder) or an `engage_kill_switch`
+  override of the window is unconsumed (`derive` alone ignores those). With
+  no `requested` row it appends `state = requested` and stops there. A later
+  call refuses, in this order and writing nothing for the first two:
+  `kill_switch` as above; `not_ready`, naming every order of the window that
+  is not terminal and every terminal one without an outcome row of each kind
+  it earns (`execution.outcomes`: a buy with fills owes `position_return`, a
+  sell with fills `realised_pnl`, and a terminal status other than `filled`
+  also `not_executed`); `reconciliation`, when its own `reconcile_now` for
+  the clock's session (`reconcile_run.command_session`) with the frozen risk
+  section raises a mismatch (the row is written and the switch engaged with
+  source `fault`, as `paper reconcile` does) or ends in any status but `ok`;
+  `not_flat`, naming each short holding (the system is long-only) and each
+  name the ledger holds above its residue
+  (`plan.residue`) by more than the frozen
+  `risk.reconcile_quantity_tolerance`. Otherwise it appends `state = closed`
+  with that reconciliation's id and `residues_json` in the shape above, each
+  name's quantity being the ledger's holding. Its origin is `untradable` when
+  any counted part is untradable (an untradable skip, or a carried row of
+  that origin), else `dust`, as spec req 14 has it ("untradable wins when
+  parts mix"). The parts are told apart by calling `plan.residue` on subsets
+  of its own inputs, so the residue rule lives in one function. The switch is
+  checked again inside the chunk that appends either row, so a `paper kill`
+  or an override written meanwhile is never missed.
+- **`abandon(settings, connect, broker, clock, reason)`** is the owner-only
+  `paper abandon` (#247 Q13). It takes the run lock, refuses `no_window`,
+  and does not look at the switch (a window that cannot be released can only
+  end this way). It runs a final `reconcile_now`, keeping its row whatever
+  its status (a mismatch is the expected case and engages nothing: the
+  window ends here; but when anything after a mismatch fails, so the window
+  stays open, it engages the switch with source `fault` before re-raising),
+  then appends `state = abandoned` with the owner's note
+  as `reason` (#247 Q13's "ADR-style note", also written on #247 or its
+  successor), that reconciliation's id and `residues_json` = `{"positions":
+  {symbol: quantity per broker.positions()}, "mismatches": [...], "lagging":
+  [...], "pending": [...]}` from that reconciliation's `mismatches_json`.
+  `start` never parses it (after an abandoned window the account must be
+  strictly flat). It releases nothing.
+- **`kill(settings, connect, clock, reason)`** is `paper kill`. It takes no
+  run lock, so the owner can engage while a run holds it, refuses
+  `no_window` writing nothing, and appends an `engaged` row with source
+  `owner` (`switch.engage`), returning its `event_id`. A row that cannot be
+  written, for any reason (the store, or the clock it is stamped with),
+  raises `KillWriteFailed`.
+- **`override(settings, clock, kind, rebalance_session, security_id,
+  reason)`** is the one writer the override page (T69b) and the CLI (T67)
+  share. It reads the clock, then opens one short-lived `open_for_write`
+  (`StoreLockedError` propagates: "store busy"), refuses `no_window`, refuses
+  `override` for a kind outside the schema's set or fields the kind does not
+  take (`engage_kill_switch` takes neither a session nor a name;
+  `exclude_name` and `keep_name` take both, the session a rebalance session
+  no earlier than the window's T_0), refuses `reason` when the trimmed reason
+  is shorter than the window's frozen `paper.min_override_reason_chars`, and
+  returns the new `override_id`.
 """
 
 from __future__ import annotations
@@ -95,24 +160,46 @@ import polars as pl
 from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.broker import Broker
-from tradepartner.calendar import last_session_of_month, session_close
-from tradepartner.config import FROZEN_PAPER_KEYS, Settings
+from tradepartner.calendar import last_session_of_month, previous_session, session_close
+from tradepartner.config import FROZEN_PAPER_KEYS, RiskConfig, Settings
+from tradepartner.errors import ClockError, ReconciliationError
+from tradepartner.execution import plan as plan_rules
+from tradepartner.execution import switch
+from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import run_lock
+from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
+from tradepartner.execution.reconcile import OK
+from tradepartner.execution.reconcile_run import command_session, frozen_risk, reconcile_now
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
+    TERMINAL_ORDER_STATUSES,
     AdjustmentRow,
     JournalNotInitialised,
+    OverrideRow,
     PaperWindowRow,
+    PaperWindowStopRow,
+    adjustments_for,
     append,
+    decisions_for,
+    fills_for,
+    kill_switch_events_for,
     latest_window,
+    non_terminal_orders,
     open_window,
+    order_events_for,
+    orders_for,
+    outcomes_for,
+    positions_daily_for,
+    reconciliations_for,
+    runs_for,
+    unconsumed_kill_switch_overrides,
     window_stops_for,
 )
-from tradepartner.store.schema import init_schema
+from tradepartner.store.schema import JOURNAL_ENUMS, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -516,3 +603,587 @@ def start(
             else None
         )
         return StartResult(window=result_window, abandoned_note=abandoned_note)
+
+
+# --- stop, abandon, kill and the override writer (T64b) -------------------------
+
+#: `WindowCommandRefused.reason` codes (module docstring).
+NO_WINDOW = "no_window"
+REASON = "reason"
+KILL_SWITCH = "kill_switch"
+NOT_READY = "not_ready"
+RECONCILIATION = "reconciliation"
+NOT_FLAT = "not_flat"
+OVERRIDE = "override"
+
+REQUESTED = "requested"
+CLOSED = "closed"
+ABANDONED = _ABANDONED
+_ENGAGE_KILL_SWITCH = "engage_kill_switch"
+_OWNER = "owner"
+_FAULT = "fault"
+_FILLED = "filled"
+_BUY = "buy"
+_SELL = "sell"
+_MIN_OVERRIDE_REASON_KEY = f"{_PAPER_PREFIX}min_override_reason_chars"
+
+
+class WindowCommandRefused(RuntimeError):
+    """`paper stop`, `abandon`, `kill` or an override refused. `reason` is a
+    short machine-readable code (module docstring; the CLI, T67, and the page,
+    T69b, map it to their own message and exit code); `message` (this
+    exception's `str()`) names what is missing, for a human."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class KillWriteFailed(RuntimeError):
+    """`paper kill` could not write its `engaged` row, so the switch is NOT
+    engaged by it."""
+
+
+@dataclass(frozen=True)
+class StopResult:
+    """What `stop` appended: `requested`, or `closed` with the reconciliation
+    that passed and the `residues_json` it listed."""
+
+    state: str
+    reconciliation_id: int | None
+    residues_json: str | None
+
+
+@dataclass(frozen=True)
+class AbandonResult:
+    """What `abandon` appended: the final reconciliation's id and status, and
+    the `residues_json` it listed."""
+
+    reconciliation_id: int
+    reconciliation_status: str
+    residues_json: str
+
+
+def _command_clock(clock: Callable[[], datetime]) -> datetime:
+    """One clock reading, tz-aware UTC, or `ClockError` (ADR 0007 point 4)."""
+    try:
+        return _read_clock(clock)
+    except Exception as exc:
+        raise ClockError(f"clock failed: {type(exc).__name__}") from exc
+
+
+def _note(reason: str, command: str) -> str:
+    """The trimmed reason, refused when blank."""
+    note = reason.strip()
+    if not note:
+        raise WindowCommandRefused(REASON, f"{command} needs a non-blank --reason")
+    return note
+
+
+def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
+    """The open window and its id, or a `no_window` refusal (a store whose
+    journal no write has migrated has no window either)."""
+    try:
+        window = open_window(conn)
+    except JournalNotInitialised:
+        window = None
+    if window is None or window.window_id is None:
+        raise WindowCommandRefused(NO_WINDOW, "no_window: no paper window is open")
+    return window, window.window_id
+
+
+def _engaged_causes(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> list[str]:
+    """Why the window's switch counts as engaged for a lock holder: the derived
+    state's causes, then each unconsumed `engage_kill_switch` override."""
+    window_id = window.window_id
+    assert window_id is not None
+    runs = runs_for(conn, window_id)
+    state = switch.derive(
+        window,
+        kill_switch_events_for(conn, window_id),
+        [r.run for r in runs],
+        [r.result for r in runs if r.result is not None],
+        reading_run=None,
+        lock_free=True,
+    )
+    causes = list(state.causes)
+    causes += [
+        f"override {o.override_id} engage_kill_switch is not yet consumed"
+        for o in unconsumed_kill_switch_overrides(conn, window_id)
+    ]
+    return causes
+
+
+def _refuse_if_engaged(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> None:
+    causes = _engaged_causes(conn, window)
+    if causes:
+        raise WindowCommandRefused(KILL_SWITCH, "the kill switch is engaged: " + "; ".join(causes))
+
+
+def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
+    """Every order of the window that is not terminal, and every outcome kind a
+    terminal one earns (`execution.outcomes`) with no row yet."""
+    orders = orders_for(conn, window_id=window_id)
+    open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=window_id)}
+    terminal: dict[str, str] = {}
+    for event in sorted(
+        order_events_for(conn, window_id=window_id), key=lambda e: (e.known_at, e.ingested_at)
+    ):
+        if event.status in TERMINAL_ORDER_STATUSES:
+            terminal.setdefault(event.client_order_id, event.status)
+    filled: dict[str, float] = {}
+    for item in fills_for(conn, window_id=window_id):
+        coid = item.fill.client_order_id
+        filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
+    written = {(o.client_order_id, o.kind) for o in outcomes_for(conn, window_id)}
+
+    missing: list[str] = []
+    for order in sorted(orders, key=lambda o: o.client_order_id):
+        coid = order.client_order_id
+        if coid in open_ids or coid not in terminal:
+            missing.append(f"order {coid} ({order.symbol}) is not terminal")
+            continue
+        earned: list[str] = []
+        if filled.get(coid, 0.0) > 0 and order.side == _BUY:
+            earned.append(POSITION_RETURN)
+        if filled.get(coid, 0.0) > 0 and order.side == _SELL:
+            earned.append(REALISED_PNL)
+        if terminal[coid] != _FILLED:
+            earned.append(NOT_EXECUTED)
+        missing += [
+            f"order {coid} ({order.symbol}) has no {kind} outcome"
+            for kind in earned
+            if (coid, kind) not in written
+        ]
+    return missing
+
+
+def _origin(parts: dict[str, float], security_id: str) -> str:
+    """`untradable` when any counted part is untradable, else `dust` (spec req
+    14). Raises `ValueError` when no part is counted at all."""
+    if parts["untradable"] > 0 or parts["carried_untradable"] > 0:
+        return _UNTRADABLE
+    if parts["dust"] > 0 or parts["carried_dust"] > 0:
+        return _DUST
+    raise ValueError(f"the residue of {security_id} has no part with an origin")
+
+
+def _residues(
+    connect: Connect, window: PaperWindowRow, session: date, frozen: RiskConfig
+) -> dict[str, dict[str, Any]]:
+    """The `closed` row's residues, keyed by `security_id`, or a `not_flat`
+    refusal naming each name held above its residue (module docstring)."""
+    window_id = window.window_id
+    assert window_id is not None
+    tolerance = frozen.reconcile_quantity_tolerance
+    with connect() as conn:
+        fills = fills_for(conn, window_id=window_id)
+        orders = orders_for(conn, window_id=window_id)
+        adjustments = adjustments_for(conn, window_id)
+        ok_rows = [r for r in reconciliations_for(conn, window_id) if r.status == OK]
+        decided = decisions_for(conn, window_id)
+        marks = positions_daily_for(conn, window_id)
+        runs = [r.run for r in runs_for(conn, window_id)]
+        actions = live_actions_as_of(conn, session_close(previous_session(session)))
+    stated = [r for r in ok_rows if _ny_date(r.at) <= session]
+    ledger = from_journal(
+        fills,
+        orders,
+        adjustments,
+        actions,
+        stated[-1] if stated else None,
+        window.starting_cash,
+        session,
+        window_id=window_id,
+        quantity_tolerance=tolerance,
+    )
+    decisions = [d.decision for d in decided]
+    events = [e for d in decided for e in d.events]
+    carried = [a for a in adjustments if a.kind == _CARRIED_RESIDUE]
+
+    def part(
+        security_id: str,
+        rows: list[AdjustmentRow],
+        *,
+        with_decisions: bool = True,
+        with_marks: bool = True,
+    ) -> float:
+        return plan_rules.residue(
+            security_id,
+            rows,
+            decisions if with_decisions else [],
+            events if with_decisions else [],
+            marks if with_marks else [],
+            ledger,
+            actions,
+            window_id=window_id,
+            runs=runs,
+        )
+
+    listed: dict[str, dict[str, Any]] = {}
+    offenders: list[str] = []
+    for security_id, held in sorted(ledger.positions.items()):
+        if held < -tolerance:
+            # Long-only: a short the broker agrees with is never "flat".
+            offenders.append(f"{security_id} holds {held:g}, a short position")
+            continue
+        if held <= tolerance:
+            continue
+        quantity = part(security_id, adjustments)
+        if held > quantity + tolerance:
+            offenders.append(f"{security_id} holds {held:g} against a residue of {quantity:g}")
+            continue
+        # The parts, each through `plan.residue` itself: without the carried
+        # rows (dust + untradable), without the marks too (dust alone: an
+        # untradable part needs a `tradable = false` mark), and the carried
+        # rows of each origin alone.
+        uncarried = part(security_id, [])
+        dust = part(security_id, [], with_marks=False)
+        parts = {
+            "untradable": uncarried - dust,
+            "dust": dust,
+            "carried_untradable": part(
+                security_id,
+                [a for a in carried if a.origin == _UNTRADABLE],
+                with_decisions=False,
+            ),
+            "carried_dust": part(
+                security_id, [a for a in carried if a.origin == _DUST], with_decisions=False
+            ),
+        }
+        listed[security_id] = {
+            "quantity": held,
+            "origin": _origin(parts, security_id),
+        }
+    if offenders:
+        raise WindowCommandRefused(
+            NOT_FLAT,
+            "the account is not flat apart from residues: " + "; ".join(offenders),
+        )
+    return listed
+
+
+def _engage_fault(
+    settings: Settings, clock: Callable[[], datetime], window_id: int, exc: Exception
+) -> str | None:
+    """Engage the switch for a reconciliation fault, as `paper reconcile` does;
+    the error text when the row could not be written."""
+    try:
+        engaged = switch.engage(
+            settings,
+            clock,
+            window_id=window_id,
+            source=_FAULT,
+            fault_type=ReconciliationError.__name__,
+            reason=str(exc),
+        )
+    except Exception as engage_error:  # a bad clock reading, say
+        engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
+    return engaged.error if isinstance(engaged, switch.WriteFailed) else None
+
+
+def _latest_reconciliation(conn: duckdb.DuckDBPyConnection, window_id: int) -> Any:
+    rows = reconciliations_for(conn, window_id)
+    if not rows:
+        raise RuntimeError(f"window {window_id} has no reconciliation row")
+    return max(rows, key=lambda r: r.reconciliation_id or 0)
+
+
+def stop(
+    settings: Settings,
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    reason: str,
+) -> StopResult:
+    """`paper stop --reason` (module docstring). `connect` opens a write chunk
+    (`lambda: store.db.open_for_write(settings)`). Raises `WindowCommandRefused`
+    for every refusal, `LockHeld` while another process holds the run lock,
+    `ClockError` for a bad clock reading, and whatever the broker or the store
+    raises."""
+    note = _note(reason, "paper stop")
+    with run_lock(settings):
+        with connect() as conn:
+            window, window_id = _window_of(conn)
+            _refuse_if_engaged(conn, window)
+            requested = any(s.state == REQUESTED for s in window_stops_for(conn, window_id))
+        now = _command_clock(clock)
+
+        if not requested:
+            with connect() as conn:
+                _refuse_if_engaged(conn, window)
+                append(
+                    conn,
+                    PaperWindowStopRow(
+                        window_id=window_id,
+                        at=now,
+                        state=REQUESTED,
+                        reason=note,
+                        known_at=now,
+                        ingested_at=now,
+                    ),
+                )
+            return StopResult(REQUESTED, None, None)
+
+        with connect() as conn:
+            missing = _not_ready(conn, window_id)
+        if missing:
+            raise WindowCommandRefused(
+                NOT_READY, "the window cannot close yet: " + "; ".join(missing)
+            )
+
+        frozen = frozen_risk(window)
+        session = command_session(now)
+        try:
+            result = reconcile_now(
+                settings, connect, broker, window, session, clock, connect, frozen=frozen
+            )
+        except ReconciliationError as exc:
+            message = f"reconciliation failed: {exc}"
+            error = _engage_fault(settings, clock, window_id, exc)
+            if error is not None:
+                message += (
+                    f"; the kill switch row could not be written, so it is NOT engaged: {error}"
+                )
+            raise WindowCommandRefused(RECONCILIATION, message) from exc
+        with connect() as conn:
+            reconciliation = _latest_reconciliation(conn, window_id)
+        if result.status != OK:
+            waiting = ", ".join((*result.lagging_ids, *result.pending_ids)) or "none listed"
+            raise WindowCommandRefused(
+                RECONCILIATION,
+                f"reconciliation {reconciliation.reconciliation_id} is {result.status}, "
+                f"not ok (orders: {waiting})",
+            )
+
+        residues = _residues(connect, window, session, frozen)
+        residues_json = json.dumps(residues, sort_keys=True, allow_nan=False)
+        stamp = _command_clock(clock)
+        if stamp < reconciliation.at:
+            raise ClockError(
+                f"clock went back from {reconciliation.at.isoformat()} to {stamp.isoformat()}"
+            )
+        with connect() as conn:
+            _refuse_if_engaged(conn, window)
+            latest = _latest_reconciliation(conn, window_id)
+            if latest.reconciliation_id != reconciliation.reconciliation_id:
+                raise WindowCommandRefused(
+                    RECONCILIATION,
+                    f"reconciliation {latest.reconciliation_id} was written after "
+                    f"{reconciliation.reconciliation_id}: run paper stop again",
+                )
+            append(
+                conn,
+                PaperWindowStopRow(
+                    window_id=window_id,
+                    at=stamp,
+                    state=CLOSED,
+                    reason=note,
+                    reconciliation_id=reconciliation.reconciliation_id,
+                    residues_json=residues_json,
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+        return StopResult(CLOSED, reconciliation.reconciliation_id, residues_json)
+
+
+def abandon(
+    settings: Settings,
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    reason: str,
+) -> AbandonResult:
+    """`paper abandon --reason`, owner-only (module docstring; #247 Q13).
+    Raises `WindowCommandRefused` for a blank reason or no open window,
+    `LockHeld` while another process holds the run lock, `ClockError` for a
+    bad clock reading, and whatever the broker or the store raises (nothing
+    but the reconciliation row is then written)."""
+    note = _note(reason, "paper abandon")
+    with run_lock(settings):
+        with connect() as conn:
+            window, window_id = _window_of(conn)
+        frozen = frozen_risk(window)
+        now = _command_clock(clock)
+        mismatch: ReconciliationError | None = None
+        try:
+            reconcile_now(
+                settings,
+                connect,
+                broker,
+                window,
+                command_session(now),
+                clock,
+                connect,
+                frozen=frozen,
+            )
+        except ReconciliationError as exc:
+            mismatch = exc  # its row is written before the error: abandon lists it
+        try:
+            return _abandon_row(connect, broker, clock, window_id, note)
+        except Exception:
+            # The window stays open over a mismatch row: engage, as `stop` does,
+            # so it is never left unwatched.
+            if mismatch is not None:
+                _engage_fault(settings, clock, window_id, mismatch)
+            raise
+
+
+def _abandon_row(
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    window_id: int,
+    note: str,
+) -> AbandonResult:
+    """`abandon`'s positions read and its `abandoned` row, after the final
+    reconciliation."""
+    positions = broker.positions()
+    with connect() as conn:
+        reconciliation = _latest_reconciliation(conn, window_id)
+    recorded = json.loads(reconciliation.mismatches_json or "{}")
+    residues_json = json.dumps(
+        {
+            "positions": {
+                symbol: position.quantity
+                for symbol, position in sorted(positions.items())
+                if position.quantity != 0
+            },
+            "mismatches": recorded.get("mismatches", []),
+            "lagging": recorded.get("lagging", []),
+            "pending": recorded.get("pending", []),
+        },
+        sort_keys=True,
+        allow_nan=False,
+    )
+    stamp = _command_clock(clock)
+    if stamp < reconciliation.at:
+        raise ClockError(
+            f"clock went back from {reconciliation.at.isoformat()} to {stamp.isoformat()}"
+        )
+    with connect() as conn:
+        _window_of(conn)
+        append(
+            conn,
+            PaperWindowStopRow(
+                window_id=window_id,
+                at=stamp,
+                state=ABANDONED,
+                reason=note,
+                reconciliation_id=reconciliation.reconciliation_id,
+                residues_json=residues_json,
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+    return AbandonResult(reconciliation.reconciliation_id, reconciliation.status, residues_json)
+
+
+def kill(
+    settings: Settings,
+    connect: Connect,
+    clock: Callable[[], datetime],
+    reason: str,
+) -> int:
+    """`paper kill --reason` (module docstring): the `engaged` row's
+    `event_id`. Takes no run lock. Raises `WindowCommandRefused` for a blank
+    reason or no open window (nothing written) and `KillWriteFailed` when the
+    row cannot be written."""
+    note = _note(reason, "paper kill")
+    with connect() as conn:
+        _, window_id = _window_of(conn)
+    try:
+        engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
+    except Exception as exc:  # a bad clock reading, say: still not engaged
+        engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
+    if isinstance(engaged, switch.WriteFailed):
+        raise KillWriteFailed(
+            f"the kill switch row could not be written, so it is NOT engaged: {engaged.error}"
+        )
+    return engaged
+
+
+def _min_override_reason_chars(window: PaperWindowRow) -> int:
+    """The window's frozen `paper.min_override_reason_chars`; `ValueError`
+    when `frozen_json` lacks it or it is not a positive integer."""
+    try:
+        frozen = json.loads(window.frozen_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"window {window.window_id} frozen_json is not JSON") from exc
+    value = frozen.get(_MIN_OVERRIDE_REASON_KEY) if isinstance(frozen, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"window {window.window_id} frozen_json has no usable "
+            f"{_MIN_OVERRIDE_REASON_KEY}: {value!r}"
+        )
+    return value
+
+
+def _override_fields(
+    window: PaperWindowRow, kind: str, rebalance_session: date | None, security_id: str | None
+) -> None:
+    """Refuse `override` for a kind outside the schema's set or fields it does
+    not take (module docstring)."""
+    kinds = JOURNAL_ENUMS[("overrides", "kind")]
+    if kind not in kinds:
+        raise WindowCommandRefused(OVERRIDE, f"override kind {kind!r} is not one of {kinds}")
+    if kind == _ENGAGE_KILL_SWITCH:
+        if rebalance_session is not None or security_id is not None:
+            raise WindowCommandRefused(OVERRIDE, f"{kind} takes no rebalance session and no name")
+        return
+    if rebalance_session is None or not security_id:
+        raise WindowCommandRefused(OVERRIDE, f"{kind} needs a rebalance session and a name")
+    if isinstance(rebalance_session, datetime) or rebalance_session != last_session_of_month(
+        rebalance_session.year, rebalance_session.month
+    ):
+        raise WindowCommandRefused(
+            OVERRIDE, f"{rebalance_session} is not a rebalance session (a month's last session)"
+        )
+    if rebalance_session < window.first_rebalance_session:
+        raise WindowCommandRefused(
+            OVERRIDE,
+            f"{rebalance_session} is before the window's first rebalance "
+            f"{window.first_rebalance_session}",
+        )
+
+
+def override(
+    settings: Settings,
+    clock: Callable[[], datetime],
+    kind: str,
+    rebalance_session: date | None,
+    security_id: str | None,
+    reason: str,
+) -> int:
+    """Append one `overrides` row to the open window and return its
+    `override_id` (module docstring; spec req 9). Raises
+    `WindowCommandRefused` for every refusal, nothing written, and
+    `StoreLockedError` when the store stays locked ("store busy")."""
+    now = _command_clock(clock)
+    note = reason.strip()
+    with open_for_write(settings) as conn:
+        window, window_id = _window_of(conn)
+        _override_fields(window, kind, rebalance_session, security_id)
+        minimum = _min_override_reason_chars(window)
+        if len(note) < minimum:
+            raise WindowCommandRefused(
+                REASON,
+                f"the override reason is {len(note)} characters once trimmed; "
+                f"the window's frozen minimum is {minimum}",
+            )
+        override_id = append(
+            conn,
+            OverrideRow(
+                window_id=window_id,
+                made_at=now,
+                rebalance_session=rebalance_session,
+                security_id=security_id,
+                kind=kind,
+                reason=note,
+                known_at=now,
+                ingested_at=now,
+            ),
+        )
+    assert override_id is not None
+    return override_id
