@@ -712,13 +712,18 @@ def _fsn_class_member(row: Mapping[str, str], dim_segments: Mapping[str, str]) -
     segments_raw = dim_segments.get((row.get("dimh") or "").strip())
     if segments_raw is None:
         return None
+    # An invalid byte or a tab `_fsn_rows` replaced (#498), anywhere in a
+    # ClassOfStock segment: beside the axis key it would read as another
+    # axis and drop the class silently, so the accession fails instead.
+    if "\ufffd" in segments_raw and _FSN_CLASS_AXIS in segments_raw:
+        raise ValueError(
+            f"{row.get('adsh', '')}: undecodable byte or embedded tab in "
+            f"segments {segments_raw[:60]!r}"
+        )
     segments = _fsn_segments(segments_raw)
     if segments is None:
         return None
-    member = segments.get(_FSN_CLASS_AXIS, "")
-    if "\ufffd" in member:  # an invalid byte or a tab `_fsn_rows` replaced (#498)
-        raise ValueError(f"undecodable byte or embedded tab in class member {member[:60]!r}")
-    return normalize_class_member(member)
+    return normalize_class_member(segments.get(_FSN_CLASS_AXIS, ""))
 
 
 @_fail_closed

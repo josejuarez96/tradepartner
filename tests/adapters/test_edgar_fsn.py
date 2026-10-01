@@ -975,7 +975,17 @@ def test_fsn_rows_folds_dim_tabs_into_segments_not_the_last_column(tmp_path: Pat
     ]
 
 
-def test_a_class_member_with_a_folded_tab_fails_that_accession() -> None:
+@pytest.mark.parametrize(
+    "segments",
+    [
+        "ClassOfStock=Common\ufffdClassA;",
+        # quant-auditor on #504: a tab beside the axis key would otherwise
+        # read as another axis and drop the class's shares silently.
+        "ClassOfStock=CommonClassA;\ufffd",
+        "\ufffdClassOfStock=CommonClassA;",
+    ],
+)
+def test_a_class_member_with_a_folded_tab_fails_that_accession(segments: str) -> None:
     good, bad = "0000000016-15-000001", "0000000017-15-000001"
     sub = [_sub(good, "16", "10-K"), _sub(bad, "17", "10-K")]
     num = [
@@ -984,7 +994,7 @@ def test_a_class_member_with_a_folded_tab_fails_that_accession() -> None:
     ]
     dim = [
         _dim("0xaa", "ClassOfStock=CommonClassA;"),
-        _dim("0xbb", "ClassOfStock=Common\ufffdClassA;"),
+        _dim("0xbb", segments),
     ]
     parsed = parse_fsn(sub, num, [], dim)
     assert [r.accession for r in parsed.records] == [good]
