@@ -32,7 +32,16 @@ from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store.journal import AlertRow, ReconciliationRow
 
-_OK = "ok"
+#: Severity per `execution.reconcile` status (module docstring there, "Status"):
+#: `mismatch` is the only real error (the caller raises `ReconciliationError` on
+#: it); `pending_unresolved` and `fills_lagging` are expected, allowance-governed
+#: transient states, not errors, so they read as a warning, never critical.
+_RECONCILIATION_STATUS: dict[str, theme.Status] = {
+    "ok": "good",
+    "pending_unresolved": "warning",
+    "fills_lagging": "warning",
+    "mismatch": "critical",
+}
 
 _RANKING_SCHEMA: dict[str, pl.DataType] = {
     "security_id": pl.Utf8(),
@@ -226,7 +235,7 @@ def _reconciliation_card(reconciliation: ReconciliationRow | None) -> None:
         if reconciliation is None:
             theme.status_badge("no reconciliation yet", "warning")
             return
-        status: theme.Status = "good" if reconciliation.status == _OK else "critical"
+        status = _RECONCILIATION_STATUS.get(reconciliation.status, "critical")
         theme.status_badge(f"{reconciliation.status} ({header.when(reconciliation.at)})", status)
         if reconciliation.broker_cash is not None:
             st.caption(f"broker cash: {reconciliation.broker_cash:,.2f}")

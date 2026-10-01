@@ -25,7 +25,7 @@ from streamlit.testing.v1 import AppTest
 
 from tradepartner.calendar import next_session
 from tradepartner.config import Settings
-from tradepartner.dashboard import ops_page
+from tradepartner.dashboard import ops_page, theme
 from tradepartner.execution import ops
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write, utc_now
@@ -354,6 +354,23 @@ def test_render_reconciliation_status(monkeypatch: pytest.MonkeyPatch, seeded_st
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
     assert "ok" in _text(at).lower()
+
+
+@pytest.mark.parametrize(
+    ("status", "colour"),
+    [
+        ("ok", "green"),
+        ("pending_unresolved", "orange"),
+        ("fills_lagging", "orange"),
+        ("mismatch", "red"),
+    ],
+)
+def test_reconciliation_status_severity(status: str, colour: str) -> None:
+    """A transient, allowance-governed status (`pending_unresolved`,
+    `fills_lagging`) reads as a warning, never the same critical red as a real
+    `mismatch` (code review on PR #496: both painted the same badge before this
+    mapping existed)."""
+    assert theme.STATUS_COLOR[ops_page._RECONCILIATION_STATUS.get(status, "critical")] == colour
 
 
 def test_render_reads_only_through_the_shells_connection(
