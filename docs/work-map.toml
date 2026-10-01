@@ -543,6 +543,10 @@ what = "team.py claim and show print a task's plan line and its dependencies' li
 why = "Implementers started at ~65k tokens of docs and orchestrators carried every reviewer report; the always-loaded context is the main usage cost (brief of 2026-09-28)."
 unblocks = ["issue:351", "issue:353"]
 
+[issue.353]
+what = "Collapses every finished plan task to one line (title, issue, PR, Files paths, Depends on), caps finished lines at 400 characters in CI, and puts a one-screen command card at the top of teams.md."
+why = "The three plans were about 50k tokens, mostly finished tasks; an implementer's brief reads dependency lines, so shorter finished lines keep each session's context for the work itself."
+
 [issue.351]
 what = "Slims the always-loaded STATUS to a board with the last 10 done lines, one bookkeeping fragment per PR, and a CI budget on STATUS and CLAUDE.md."
 why = "Every session re-read a 10k-token STATUS on every turn; a smaller, bounded board keeps each session's context for the work itself."
