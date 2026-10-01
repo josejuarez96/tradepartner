@@ -22,9 +22,9 @@ Each task = one branch = one PR (~≤400 lines; generated fixture CSVs excluded)
 
 - [x] **T1: Config, dependencies, calendar.** (#13, PR #17) · Files: `src/tradepartner/{config,calendar}.py`, `pyproject.toml`, `uv.lock`, `.env.example`, `docs/decisions/0004-tooling-adopt-avoid.md` · Depends on: n/a
 - [x] **T2: Raw-fetch clients and the recorder.** (#18, PR #21) · Files: `src/tradepartner/adapters/{alpaca_raw,edgar_raw}.py`, `src/tradepartner/cli_record.py`, `tests/test_fixture_scrub.py` · Depends on: T1
-- [x] **T3 (owner): Record fixtures and resolve source facts.** (#84, PR #87) · Files: `docs/research/2026-09-25-free-data-terms.md`, `src/tradepartner/config.py`, `tests/test_config.py` · Depends on: T2
+- [x] **T3 (owner): Record fixtures and resolve source facts.** (#84, PR #87) · Files: `tests/fixtures/{alpaca,edgar}/*`, `docs/research/2026-09-25-free-data-terms.md`, `src/tradepartner/config.py`, `tests/test_config.py` · Depends on: T2
 - [x] **T4: Store schema, db layer, shared test loader.** (#19, PR #20) · Files: `src/tradepartner/store/{__init__,schema,db}.py`, `src/tradepartner/adapters/__init__.py`, `tests/conftest.py` · Depends on: T1
-- [x] **T5: Fixture universe (CSV) and generator.** (#22, PR #31) · Files: `scripts/make_fixture_universe.py`, `tests/fixtures/universe/README.md` · Depends on: T4
+- [x] **T5: Fixture universe (CSV) and generator.** (#22, PR #31) · Files: `scripts/make_fixture_universe.py`, `tests/fixtures/universe/*.csv`, `tests/fixtures/universe/README.md` · Depends on: T4
 - [x] **T6: As-of primitives and truncation-invariance harness.** (#39, PR #69) · Files: `src/tradepartner/store/asof.py`, `tests/lookahead/{__init__,harness}.py` · Depends on: T5
 - [x] **T7: `PriceSource` interface and fixture adapter.** (#75, PR #81) · Files: `src/tradepartner/adapters/{prices,fixture_prices}.py` · Depends on: T6
 - [x] **T8: `FilingSource` interface, fixture adapter, security master core.** (#77, PR #85) · Files: `src/tradepartner/adapters/{filings,fixture_filings}.py`, `src/tradepartner/store/master.py` · Depends on: T6
@@ -37,7 +37,7 @@ Each task = one branch = one PR (~≤400 lines; generated fixture CSVs excluded)
 - [x] **T11c: EDGAR FSN data sets, fetch, parse and record.** (#224, PR #242) · Files: `src/tradepartner/adapters/edgar_raw.py`, `src/tradepartner/adapters/edgar.py`, `src/tradepartner/adapters/edgar_source.py`, `src/tradepartner/ingest.py`, `tests/test_ingest.py`, `src/tradepartner/cli_record.py`, `src/tradepartner/config.py`, `tests/test_config.py` · Depends on: T11b, T11g
 - [x] **T11d: EDGAR `FilingSource` adapter, cover pages and headers from FSN.** (#246, PR #249) · Files: `src/tradepartner/adapters/edgar_source.py`, `src/tradepartner/ingest.py`, `tests/test_ingest.py`, `src/tradepartner/config.py`, `tests/test_config.py`, `src/tradepartner/store/classify.py` · Depends on: T11c
 - [x] **T11e: EDGAR `FilingSource` adapter, facts.** (#252, PR #253) · Files: `src/tradepartner/adapters/edgar_source.py` · Depends on: T11d
-- [x] **T11f: EDGAR `FilingSource` adapter, delistings.** (#261, PR #262) · Files: `src/tradepartner/adapters/edgar_source.py`, `src/tradepartner/ingest.py`, `tests/test_ingest.py` · Depends on: T11e
+- [x] **T11f: EDGAR `FilingSource` adapter, delistings.** (#261, PR #262) · Files: `src/tradepartner/adapters/edgar_source.py`, `src/tradepartner/ingest.py`, `tests/test_ingest.py`, `src/tradepartner/store/delistings.py` · Depends on: T11e
 - [x] **T11h: EDGAR failure policy and backfill measurement.** (#263, PR #275) · Files: `src/tradepartner/adapters/edgar_source.py`, `src/tradepartner/ingest.py`, `src/tradepartner/backfill.py`, `src/tradepartner/config.py`, `tests/test_config.py` · Depends on: T11f
 - [x] **T12: Alpaca parsers.** (#137, PR #139) · Files: `src/tradepartner/adapters/alpaca_prices.py` · Depends on: T3, T7, T8b
 - [x] **T13: Universe rules.** (#135, PR #136) · Files: `src/tradepartner/universe.py`, `tests/lookahead/test_universe_invariance.py` · Depends on: T9, T10

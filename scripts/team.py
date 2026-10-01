@@ -140,7 +140,9 @@ def task_brief(task: Task, tasks: Sequence[Task]) -> str:
 
     The task's own plan line, then the full line of each direct dependency (the written
     contract for what the task builds on), each with its plan path and line number. A
-    dependency that is not in any plan (``n/a``, an issue number) is listed as unknown.
+    finished dependency's line is collapsed to its Files paths (#353), so its contract is
+    the code there. A dependency that is not in any plan (``n/a``, an issue number) is
+    listed as unknown.
     """
     by_id = {t.id: t for t in tasks}
     out = [f"{task.plan}:{task.lineno}", task.line]

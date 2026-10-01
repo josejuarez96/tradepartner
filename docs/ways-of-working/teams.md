@@ -8,14 +8,14 @@ Everything a build window types, in order of use. The rules behind each line fol
 
 | Command | When |
 |---|---|
-| `uv run python scripts/team.py start <name>` | Once per new session, from the main checkout; then `cd` into the directory it prints and work only there. |
+| `uv run python scripts/team.py start <name>` | Once per new session, where the session opened; then `cd` into the directory it prints and work only there. |
 | `uv run python scripts/team.py whoami` | To check which team this directory belongs to. |
 | `uv run python scripts/team.py status` | At session start and before picking work: claims, ready frontier, loose issues, parked PRs. |
 | `uv run python scripts/team.py claim <Tn\|issue#>` | Before any branch. It prints the branch command, the task's plan line and its dependencies' lines. |
 | `uv run python scripts/team.py show <Tn>` | To reprint a task's plan line and dependency lines without claiming. |
 | `uv run python scripts/team.py release <Tn\|issue#> [--park]` | When you stop for good on an item: `--park` for a green PR, plain for a red or empty one. Write a handoff comment. |
 | `uv run python scripts/fragments.py add <issue> --slug <slug> --status "…" --added "…"` | Once per PR, before ready: the STATUS line and CHANGELOG bullets as one new file. |
-| `uv run python scripts/ready_pr.py <pr>` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
+| `uv run python scripts/ready_pr.py <pr> --timeout-min 45` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
 
 Owner only: `release --force`, `claim --owner-task`, `prune --yes`.
 
