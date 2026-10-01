@@ -1,8 +1,10 @@
-# Runbook: scheduling the daily ingest
+# Runbook: scheduling the daily ingest and paper run
 
-Owner-run. This page installs `tradepartner ingest` as a launchd job on the Mac that holds the real store. It also shows how to collect the evidence that closes Phase 2 plan T22: five consecutive scheduled `ok` runs ([data-foundation spec](../specs/data-foundation.md), exit criteria). Agents never run any of this. The store, `.env` and the job all live in the main checkout, which agents do not enter ([teams.md](../ways-of-working/teams.md)).
+Owner-run. This page installs `tradepartner ingest` and `tradepartner paper run` as launchd jobs on the Mac that holds the real store, and covers the owner's operating procedure for a scheduled `paper run`: what each alert means, the kill/resume procedure, and when `abandon` is the right call. Agents never run any of this. The store, `.env` and the jobs all live in the main checkout, which agents do not enter ([teams.md](../ways-of-working/teams.md)). It also shows how to collect the evidence that closes Phase 2 plan T22: five consecutive scheduled `ok` ingest runs ([data-foundation spec](../specs/data-foundation.md), exit criteria).
 
-Later sections are added by later tasks. The `paper run` plist comes from T70b ([paper-trading plan](../plans/paper-trading.md)). The `collect` plist is a placeholder until the event collectors merge (last section).
+The `collect` plist is a placeholder until the event collectors merge (last section).
+
+**Status of the `paper run` section below (2026-09-30).** The CLI commands it names (`paper start|stop|run|reconcile|kill|resume|report|check|status`) are fixed by [plan task T67](../plans/paper-trading.md)'s line but not yet built (`src/tradepartner/cli.py` has no `paper` subcommand yet); each is marked **(built by T67)**. `paper abandon` and `paper override`, the `abandoned` window state and the strictly-flat rule are scheduled as a dated spec amendment by [T64b](../plans/paper-trading.md), not yet written into [the spec](../specs/paper-trading.md) or built; marked **(built by T64b/T67)**. The six `paper.*` timing keys used in the sample plist below (`submit_window_before_open_minutes` and friends) are still the spec's placeholder defaults in `config.py`, not Probe 3 measurements; [T70](../plans/paper-trading.md) sets their final values once Probe 3 (#182, owner-run the week of 2026-09-28) reports, and this section's schedule must be recomputed then. Nothing below instructs bypassing a risk check, releasing the kill switch without a reconciliation, or putting a secret on a command line; where that is tempting there is no flag for it, by design (spec req 16).
 
 ## What the job does
 
@@ -194,6 +196,165 @@ The evidence is **five consecutive scheduled runs in which both `edgar` and `alp
 - **Consecutive:** no scheduled run between them failed. A failed run can show a row that is not `ok`, only an `edgar` row (the run stopped before `alpaca`), or no row at all (locked), so also check `ingest.log` for every evening in the stretch.
 
 Five runs over five distinct trading sessions (`chunk_cursor`) is the stronger reading, and the one to aim for. Paste the query output and the matching `ingest.log` lines into the T23 close-out PR, which carries the T22 evidence; T22 is ticked when that evidence is in.
+
+## Scheduling `paper run`
+
+Install this only after [T71](../plans/paper-trading.md) (the owner's `paper start` on the real store) has happened. Until then, run `paper run` by hand if you need to, and never schedule it.
+
+### What the job does
+
+Once per XNYS session, `tradepartner paper run` **(built by T67)** does one of two things, depending on whether S (the session the run targets) is a fill session:
+- **Every session:** collects order outcomes since the last run, reconciles the ledger against the broker, and marks the account (drawdown check). While the kill switch is engaged it still does this much, read-only against the broker, but submits nothing.
+- **On a fill session, if the run starts inside the submit window:** also plans, submits sells, waits for them to finish, then submits buys sized from the cash the sells raised. A fill-session run that starts outside the window leaves the rebalance `pending` for a later in-window run; it submits nothing, forced exits included.
+
+**The submit window** is `[open(S) − paper.submit_window_before_open_minutes, open(S) + paper.submit_window_after_open_minutes]`. With the current config defaults (`submit_window_before_open_minutes=90`, `submit_window_after_open_minutes=30`, `sell_wait_seconds=900`, `poll_interval_seconds=15`, `accept_wait_seconds=30`) the window opens 90 minutes before the open and closes 30 minutes after it — **pending T70 / Probe 3**: these are the spec's placeholders, not measured values, and the window's edges will move once T70 sets the six timing keys from Probe 3's report. Recompute the schedule below against whatever `paper.submit_window_before_open_minutes` is on main at the time you install the job (`uv run python -c "from tradepartner.config import get_settings; print(get_settings().paper)"`).
+
+The job must start **after the previous session's `ingest` has completed** (the scheduler assumption in the spec's "Users & usage") and **inside the submit window**, so schedule it comfortably after both edges: a few minutes after the window opens gives margin for `uv sync` and the clock pre-check, and still leaves the full window for sells-then-buys. With today's placeholder defaults (open at 9:30 ET, window opens at 8:00 ET) that means roughly **08:05 ET**; the 18:30 ET ingest job from the previous evening is long finished by then.
+
+### The paper plist
+
+Save as `~/Library/LaunchAgents/com.tradepartner.paper.plist`, beside the ingest one. Same `REPO`, `HOME_DIR` and `uv` substitutions as above.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradepartner.paper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>--frozen</string>
+        <string>tradepartner</string>
+        <string>paper</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPO</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TRADEPARTNER_INVOKED_BY</key>
+        <string>scheduler</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>HOME_DIR/Library/Logs/tradepartner/paper.log</string>
+    <key>StandardErrorPath</key>
+    <string>HOME_DIR/Library/Logs/tradepartner/paper.err.log</string>
+</dict>
+</plist>
+```
+
+Everything from "PATH, working directory and `.env`" above applies unchanged: `uv` by absolute path, `WorkingDirectory` the main checkout (so `STORE__PATH` resolves the same as for ingest), `.env` read from the project root, and no secret in the plist — the two `ALPACA_PAPER_API_*` keys and the four `ALERT_*` SMTP settings stay in `.env`, never here and never typed on a command line.
+
+`TRADEPARTNER_INVOKED_BY=scheduler` combined with a non-interactive `stdin` (true for a launchd job, not for a manual run in Terminal) makes the run's `invoked_by` field `scheduler`; only a `scheduler`-invoked, successfully executed rebalance counts toward `paper.min_rebalances` for the phase exit check (`paper check`). A `kickstart` or manual Terminal run is `invoked_by=tty` and does not count, the same distinction the ingest evidence draws between scheduled and manual runs.
+
+Install, test and pause it exactly as for ingest ("Install, test, remove" above), substituting `com.tradepartner.paper` and `paper.log`/`paper.err.log`:
+
+```bash
+mkdir -p ~/Library/Logs/tradepartner
+plutil -lint ~/Library/LaunchAgents/com.tradepartner.paper.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tradepartner.paper.plist
+
+launchctl kickstart gui/$(id -u)/com.tradepartner.paper
+launchctl print gui/$(id -u)/com.tradepartner.paper | grep -E "state|last exit code|runs"
+tail -n 40 ~/Library/Logs/tradepartner/paper.log ~/Library/Logs/tradepartner/paper.err.log
+```
+
+A `kickstart` run is a manual run (`invoked_by=tty`): useful to test the job, but it does not count toward the exit-criteria evidence, and running it close to the open can submit real paper orders. Prefer `uv run tradepartner paper status` **(built by T67)** to check state without placing anything.
+
+### Checking a run
+
+After a scheduled run, before moving on with your day:
+
+```bash
+uv run tradepartner paper status        # (built by T67) prints the operations-page numbers
+```
+
+This shows: the store's "as of" and the run's "last updated" (with a stale chip if S−1 has no run row), the four KPIs including the kill-switch chip, today's plan ranking, fills, the per-order journal chain, alerts, and reconciliation status. Read this, or the operations page, most days — it is the one thing the spec asks the owner to do routinely.
+
+### What each alert kind means, and what you do
+
+Every alert is a row in the `alerts` table (always delivered to `store`; also to `macos` and `email` if `alerts.channels` and the four `ALERT_*` variables are set) before anything else happens. `paper status` and the operations page list them.
+
+| Alert kind | What happened | What you do |
+|---|---|---|
+| `halted` | A system fault (bad data, broker error, clock fault, …) stopped the run partway and engaged the kill switch. | Read the alert message and `paper.err.log` for the underlying exception. Fix the cause (network, broker outage, a bad `.env` value) before resuming. |
+| `stale_data` | Ingest hasn't reached S−1 for the reference symbol yet. | Check the ingest job ran and was `ok`. This does **not** engage the kill switch — once ingest catches up, the next `paper run` proceeds on its own; no resume needed. |
+| `kill_switch` | The switch's engaged/released state changed (a halt, a drawdown trip, your `kill`, or a release). | Confirm which: `paper status` shows current state and the triggering source. |
+| `kill_switch_write_failed` | The kill-switch row itself couldn't be written — the store may be unreliable. | Delivered outside the store (macOS/email only, since the store can't be trusted). Stop and check the store/disk before anything else; do not resume until you've confirmed the store is healthy. |
+| `reconciliation` | The ledger and the broker disagree on a mismatch `reconcile_now` couldn't explain. | Read the mismatch in `paper status`. This halts and engages the switch; see Kill/resume below. |
+| `rejection_cap` | Too many of this run's orders were rejected by the broker. | Check why the broker is rejecting (symbol trading halted, account restriction, bad request shape). The switch is engaged; investigate before resuming. |
+| `skip_cap` | Too many per-name skips in one rebalance (other than `dust`/`untradable`). | Read the skip reasons in the plan/decisions view. The rebalance is abandoned with `missed` reason `skip_cap`; next session plans fresh. |
+| `missed_run` | No `paper_runs` row exists for S−1 — a scheduled run never happened. | Check whether the Mac was off (not asleep) at the scheduled time, or the job was disabled. See "Sleep versus power-off" above; it applies to this job too. |
+| `missed_rebalance` | A rebalance event was logged `missed` (window, kill switch, or skip cap stopped it from trading). | Read the reason in the alert message; usually self-explanatory from the kind that caused it. |
+| `drawdown` | Ledger equity fell more than `risk.max_drawdown` below the window's peak. | This engages the kill switch automatically (a risk rule, not a judgment call). Decide whether to resume (minor, expected drawdown) or `stop`/escalate. |
+| `unspent_cash` | After buys executed, leftover cash exceeded `risk.max_unspent_cash_fraction` of equity. | Informational; check the plan's sizing on `paper status`. Does not engage the switch. |
+| `locked` | A second `paper run` found the store lock held (another run, or a long ingest). | No row was written for this attempt; the lock holder's run proceeds. If it recurs, check for a stuck process. |
+| `no_window` | `paper run` (or `kill`/`resume`/`reconcile`/`abandon`/`override`) ran with no open window. | Normal before the first `paper start` or after `paper stop`. If you expected a window to be open, check `paper status`. |
+
+### Kill switch: engage, and the resume procedure
+
+**Engaging it yourself**, outside an automatic halt or drawdown trip:
+
+```bash
+uv run tradepartner paper kill --reason "why you are stopping trading"   # (built by T67)
+```
+
+`--reason` is required; there is no flag to engage it silently. While engaged, the next scheduled `paper run` still collects outcomes, reconciles and marks (read-only against the broker) but submits nothing — a pending rebalance waits, and is traded after release if the catch-up window still allows it, otherwise logged `missed` reason `kill_switch`.
+
+**Never release the switch without reconciling first.** You don't get a choice about this: `paper resume` runs reconciliation as one of its own steps and refuses to append `released` if it fails — there is no flag that skips it. In order, `paper resume --reason "..."`:
+1. Takes the run lock and closes any unfinished (crashed) run.
+2. **Settles every order a crash left `pending`**: reads it back from the broker and journals its real status, or marks it `cancelled` (`not_received`) if the broker never saw it. This is "a release settles any order a crash left pending" from the spec's Users & usage section — it happens automatically, you do not do anything extra for it.
+3. Collects every non-terminal order.
+4. Runs reconciliation and **refuses to proceed if it fails** — the alert stays, the switch stays engaged, and you need to find out why before trying again.
+5. Appends the `released` row.
+
+```bash
+uv run tradepartner paper resume --reason "root cause and what you checked"   # (built by T67)
+```
+
+**When `--accept-broker-fills` is the right call.** Normally omit it. Add it only when:
+- An order has been `fills_lagging` for `risk.max_fill_lag_sessions` or more sessions (the spec's bound) — the journal's fill total is behind what the broker's `get_order` reports, and the fill-stream has never caught up on its own, **and**
+- You have checked `paper status`/the reconciliation view and confirmed the broker reports that specific order as **finished** (not still open) — an order the broker still holds open is refused even with the flag, since it may yet fill through the normal path.
+
+```bash
+uv run tradepartner paper resume --accept-broker-fills --reason "order <id>: broker reports filled, feed never delivered it after N sessions"   # (built by T67)
+```
+
+With the flag, for each qualifying order `paper resume` journals a synthetic fill for the residual quantity only (broker's `filled_quantity` minus what's already journaled), priced from the implied residual and flagged `price_implied`. If a real fill later arrives for the same order, it is journaled as `superseded_by` the synthetic one — nothing is lost, the synthetic entry is just corrected. Without the flag, resume refuses outright while any such order exists; this is the owner's considered decision to trust the broker's number over a missing feed message, not something to reach for reflexively because resume is otherwise refusing.
+
+### `abandon`: the last resort, and the strictly-flat rule after it
+
+**Pending T64b/T67** — `paper abandon`, the `abandoned` window state and this strictly-flat rule are scheduled as a dated amendment to [the spec](../specs/paper-trading.md) and are not yet built; the shape below is fixed by [T64b](../plans/paper-trading.md)'s plan line and is not yet confirmed CLI behavior.
+
+`paper stop --reason` is the normal, code-driven way to close a window flat: it liquidates through the ordinary wrapper path and only ever carries forward listed residues (`dust`/`untradable`) matched both ways. Reach for `abandon` only when `stop` itself cannot complete — for example, unresolved mismatches or held positions that `reconcile_now` cannot explain and `stop`'s own checks therefore refuse. `abandon` does not place or cancel any order itself: it records a `paper_window_stops` row with `state = abandoned`, your `--reason` as the ADR-style note, and `residues_json` listing every position still held and every unresolved mismatch at that moment. It does not clean anything up.
+
+```bash
+uv run tradepartner paper abandon --reason "why stop could not close this window cleanly"   # (built by T64b/T67)
+```
+
+**After an `abandoned` window, the account must be strictly flat before the next `paper start` — no residue is carried forward, unlike a normal `closed` window.** The owner never trades by hand (charter rule), so the one approved way to reach that strictly-flat state is **resetting the paper account at Alpaca directly** (its paper-account reset in the Alpaca dashboard), not placing manual offsetting trades. Do this before attempting the next `paper start`; it will otherwise refuse on a non-flat account.
 
 ## Placeholder: the `collect` job (after the collectors merge)
 
