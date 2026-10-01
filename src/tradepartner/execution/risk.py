@@ -59,11 +59,13 @@ Equity is the ledger's at `price_of` (the reference price, close(S-1)).
 over 1 + the per-side rate + the per-share commission at the lowest price;
 scale = min(1, spendable / the buys' remainders), so the cost reserve a first
 attempt's target already carries is not deducted twice; notionals are floored
-to the cent and, should the floored batch still need more than the cash under
-`_buy_cash`, spendable steps down a cent at a time, so every sized batch passes
-`check_phase`'s cash rule. A notional buy whose scaled attempt falls below
-`risk.min_order_notional`, or a whole-share buy that floors to no share (or to
-less than the minimum), is deferred and the others rescaled without it;
+to the cent and, should `Decimal` rounding leave the floored batch needing more
+than the cash under `_buy_cash`, the overshoot rounded up to the cent comes off
+the largest notional once (a `ValueError` if that takes it below the minimum),
+so every sized batch passes `check_phase`'s cash rule. A notional buy whose
+scaled attempt falls below `risk.min_order_notional`, or a whole-share buy that
+floors to no share (or to less than the minimum), is deferred and the others
+rescaled without it;
 whole-share buys come last, by floor at the buffered price, while that fits the
 cash left, else deferred.
 """
@@ -75,7 +77,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 import polars as pl
 
@@ -287,6 +289,23 @@ def _buy_cash(
         + shares * _dec(costs.commissions.per_share)
         + _dec(costs.commissions.per_order)
     )
+
+
+def _spendable(cash: Decimal, buys: int, low_price: float, costs: BuyCosts) -> Decimal:
+    """The largest notional `buys` buys can share out of `cash`: cash less one
+    per-order commission per buy, over 1 + the per-side rate + the per-share
+    commission at the lowest price (the most shares per dollar).
+    `costs.buy_notional_after_costs`'s formula in `Decimal` (a test pins the
+    two equal); never below zero."""
+    available = cash - buys * _dec(costs.commissions.per_order)
+    if available <= 0:
+        return Decimal(0)
+    rate = (
+        1
+        + _dec(costs.per_side_bps) / BPS_PER_UNIT
+        + _dec(costs.commissions.per_share) / _dec(low_price)
+    )
+    return available / rate
 
 
 def unfilled_sells(
@@ -558,20 +577,8 @@ def size_buys(
         # Each buy pays its own per-order commission, and the lowest price buys
         # the most shares (the worst case for a per-share one); Alpaca charges
         # neither.
-        low_price = _dec(min(prices[b.decision.security_id] for b in active))
-        rate = (
-            1
-            + _dec(costs.per_side_bps) / BPS_PER_UNIT
-            + _dec(costs.commissions.per_share) / low_price
-        )
-        spendable = (cash_d - len(active) * _dec(costs.commissions.per_order)) / rate
-        notional_buys = [b for b in active if not b.by_whole_shares]
-        while True:
-            scale = min(Decimal(1), max(spendable, Decimal(0)) / total)
-            needed = sum((need(b, scale) for b in notional_buys), Decimal(0))
-            if needed <= cash_d or spendable <= 0:
-                return scale
-            spendable -= _CENT
+        low_price = min(prices[b.decision.security_id] for b in active)
+        return min(Decimal(1), _spendable(cash_d, len(active), low_price, costs) / total)
 
     def below_minimum(buy: BuyToSize, scale: Decimal) -> bool:
         if not buy.by_whole_shares:
@@ -591,6 +598,30 @@ def size_buys(
         deferred.update(id(b) for b in low)
         active = [b for b in active if id(b) not in deferred]
 
+    notionals = {
+        id(b): _dec(attempt(b, scale))
+        for b in decisions
+        if not b.by_whole_shares and id(b) not in deferred
+    }
+    by_id = {id(b): b for b in decisions}
+
+    def notional_need(key: int) -> Decimal:
+        buy = by_id[key]
+        price = prices[buy.decision.security_id]
+        return _buy_cash(float(notionals[key]), None, price, False, frozen, costs)
+
+    # Exact arithmetic keeps the floored batch within cash; `Decimal` rounding
+    # can overshoot by a few units in its last place. One cut, the overshoot
+    # rounded up to the cent, off the largest notional removes at least the
+    # overshoot (a dollar less needs at least a dollar less), so no loop.
+    over = sum((notional_need(k) for k in notionals), Decimal(0)) - cash_d
+    if over > 0:
+        largest = max(notionals, key=lambda k: notionals[k])
+        cut = over.quantize(_CENT, rounding=ROUND_UP)
+        if notionals[largest] - cut < _dec(frozen.min_order_notional):
+            raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")
+        notionals[largest] -= cut
+
     notional_sizings: list[Sizing] = []
     cash_left = cash_d
     for buy in decisions:
@@ -599,8 +630,8 @@ def size_buys(
         if id(buy) in deferred:
             notional_sizings.append(_sizing(buy))
             continue
-        cash_left -= need(buy, scale)
-        notional_sizings.append(_sizing(buy, notional=attempt(buy, scale)))
+        cash_left -= notional_need(id(buy))
+        notional_sizings.append(_sizing(buy, notional=float(notionals[id(buy)])))
 
     whole_sizings: list[Sizing] = []
     for buy in decisions:

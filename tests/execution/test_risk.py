@@ -22,6 +22,7 @@ import math
 import random
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 import polars as pl
@@ -39,6 +40,7 @@ from tradepartner.execution.risk import (
     PhaseOrder,
     Skips,
     Violations,
+    _spendable,
     check_phase,
     round_down,
     size_buys,
@@ -721,6 +723,13 @@ def test_every_sized_batch_passes_the_cash_rule() -> None:
             ),
         )
         sizings = size_buys(buys, cash, _price_of, frozen, costs)
+        low = min(_PRICES[b.decision.security_id] for b in buys)
+        reserved = (n - 1) * costs.commissions.per_order
+        expected = buy_notional_after_costs(
+            max(cash - reserved, 0.0), costs.per_side_bps, costs.commissions, price=low
+        )
+        spendable = float(_spendable(Decimal(repr(cash)), n, low, costs))
+        assert spendable == pytest.approx(expected, rel=1e-12, abs=1e-9)  # one formula
         by_id = {b.decision.decision_id: b for b in buys}
         orders = [
             _order(
@@ -743,3 +752,27 @@ def test_every_sized_batch_passes_the_cash_rule() -> None:
         assert "buys_within_cash" not in (
             _rules(result) if isinstance(result, Violations) else set()
         ), (cash, costs, [(b.decision.security_id, b.remainder.notional) for b in buys])
+
+
+def test_a_rounding_overshoot_comes_off_the_largest_notional_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced: spendable 3 cents above what $100 holds (A 66.58, B 33.29 need
+    $100.02). The overshoot,
+    rounded up to the cent, comes off the largest buy and the batch fits; a
+    cut that would take it below the minimum raises instead."""
+    import tradepartner.execution.risk as risk
+
+    exact = risk._spendable
+    monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.03"))
+    buys = [_buy(1, "A", 80.0), _buy(2, "B", 40.0)]
+    sizings = size_buys(buys, 100.0, _price_of, RiskConfig(), _COSTS)
+    needed = sum(
+        (s.notional or 0.0) + trade_cost(s.notional or 0.0, 0.0, 15.0, _COSTS.commissions)
+        for s in sizings
+    )
+    assert needed <= 100.0
+    assert [s.notional for s in sizings][1] == pytest.approx(40.0 * 99.85 / 120.0, abs=0.01)
+    even = [_buy(1, "A", 60.0), _buy(2, "B", 60.0)]  # 49.94 each, cut 3 cents to 49.91
+    with pytest.raises(ValueError, match="overshoot"):
+        size_buys(even, 100.0, _price_of, RiskConfig(min_order_notional=49.92), _COSTS)
