@@ -689,11 +689,17 @@ def _note(reason: str, command: str) -> str:
 
 def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
     """The open window and its id, or a `no_window` refusal (a store whose
-    journal no write has migrated has no window either)."""
+    journal no write has migrated has no window either), or a
+    `multiple_open_windows` refusal (spec req 14: only one window may ever be
+    open) when the journal has more than one open window. Every command that
+    calls this (`stop`, `abandon`, `kill`, `override`) refuses the same way;
+    none of them has written anything by this point."""
     try:
         window = open_window(conn)
     except JournalNotInitialised:
         window = None
+    except JournalIntegrityError as exc:
+        raise WindowCommandRefused(MULTIPLE_OPEN_WINDOWS, str(exc)) from exc
     if window is None or window.window_id is None:
         raise WindowCommandRefused(NO_WINDOW, "no_window: no paper window is open")
     return window, window.window_id
@@ -1115,10 +1121,7 @@ def kill(
     `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
     with connect() as conn:
-        try:
-            _, window_id = _window_of(conn)
-        except JournalIntegrityError as exc:
-            raise WindowCommandRefused(MULTIPLE_OPEN_WINDOWS, str(exc)) from exc
+        _, window_id = _window_of(conn)
     try:
         engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
     except Exception as exc:  # a bad clock reading, say: still not engaged
