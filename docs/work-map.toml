@@ -564,3 +564,45 @@ why = "The three plans were about 50k tokens, mostly finished tasks; an implemen
 [issue.351]
 what = "Slims the always-loaded STATUS to a board with the last 10 done lines, one bookkeeping fragment per PR, and a CI budget on STATUS and CLAUDE.md."
 why = "Every session re-read a 10k-token STATUS on every turn; a smaller, bounded board keeps each session's context for the work itself."
+
+[issue.460]
+what = "Spec and plan for a merge train: batch the ready PRs, build one combined branch, run CI once, bisect on red, squash-merge only trees that ran green, on the owner's word per batch."
+why = "Green PRs merged one after another broke main twice on 2026-10-01 (#430 after #387, #444 with #429); refreshing each PR costs a 30-minute run per merge, which serialises every window behind the owner."
+unblocks = ["spec:merge-train", "plan:merge-train"]
+
+[spec.merge-train]
+what = "What the merge train does and how we know it works: eligibility, batch order, the combined branch, one full CI run, bisect on red, tree-equality before and after each squash merge, owner authority, reporting, the main ruleset."
+why = "Lets many windows' PRs land together in one tested tree instead of one refresh-and-rerun per PR, without any discretion between the test and the merge."
+unblocks = ["plan:merge-train"]
+
+[plan.merge-train]
+what = "Seven tasks: the script's pure core, its runner with build, its merge command, the CI trigger for train branches, the review-prefix and ask-rule wiring, the ways-of-working update with the ruleset file, and the owner's activation and first real run."
+why = "The build document for the train; the owner's ruleset activation is the edge and gates nothing."
+
+[task.T72]
+what = "The merge train's pure half: records, eligibility reusing ready_pr's checks, batch order, run classification, bisect arithmetic, the mergeable prefix and the comment text."
+why = "Every rule of the spec is a pure function tested without the network, so the merge path has no judgment call in it."
+
+[task.T72b]
+what = "The merge train's runner and the build command: the squash-built train branch, one full run, the confirming rerun, the bisect, the comments and the record, over git and gh in the train's own worktree."
+why = "Everything that tests a batch, and nothing that lands one."
+
+[task.T72c]
+what = "The merge train's merge command (re-verify, head re-read, squash merge with --match-head-commit, retries, tree check, resume), plus status and prune."
+why = "The one command that merges, bound to a frozen batch id and the owner's word; reviewed on its own."
+
+[task.T73]
+what = "CI runs the full suite on train/** branches, one run per SHA."
+why = "The combined branch needs one full run that nothing cancels; the push event already forces the whole suite."
+
+[task.T74]
+what = "ready_pr's safety-review prefixes cover the train script, and settings.json asks before merge_train.py merge."
+why = "The merge path gets the same review gate as the order path, and an agent cannot merge a batch without a prompt."
+
+[task.T75]
+what = "The train in git-workflow, teams, development-process and CLAUDE.md rule 1, plus the non-strict ruleset file."
+why = "The ways of working say how a PR lands now; the ruleset makes main refuse what the train does not do."
+
+[task.T75b]
+what = "The owner activates the main ruleset, pushes a smoke train branch and runs the first real batch."
+why = "The only steps that need the owner's admin rights and a real batch; they gate nothing."

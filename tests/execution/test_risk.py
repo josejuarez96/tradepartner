@@ -9,13 +9,20 @@ violation; rounding never up; a `Settings` override changes nothing, only
 with the cost deducted exactly once and every notional buy scaled alike;
 whole-share buys last and within the buffered cash; deferral. The literal
 check on the module is T50's (`tests/test_no_literals.py`).
+
+T54c (ADR 0010 amendment 2026-09-30): full exits exempt from the per-order
+limit; the post-phase weight of every name bought; one order per (name, side);
+a strict cash rule in `Decimal` that every `size_buys` batch passes; every sell
+order by quantity.
 """
 
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 import polars as pl
@@ -26,12 +33,14 @@ from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, t
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import BuyCosts, Remainder
+from tradepartner.execution.plan import remainder as plan_remainder
 from tradepartner.execution.risk import (
     BuyToSize,
     OpenSell,
     PhaseOrder,
     Skips,
     Violations,
+    _spendable,
     check_phase,
     round_down,
     size_buys,
@@ -172,8 +181,7 @@ def test_an_over_cash_batch_is_a_violation() -> None:
 
 
 def test_buys_are_checked_against_cash_with_their_cost() -> None:
-    """$50 at 15 bp costs $50.075: $50.05 of cash is short by more than the
-    cash tolerance, $50.075 fits."""
+    """$50 at 15 bp costs $50.075: $50.05 of cash is short, $50.075 fits."""
     orders = [_order("C", "buy", 2, notional=50.0, target_weight=0.04)]
     short = _check(orders, account=_account(cash=50.05), costs=_COSTS)
     assert _rules(short) == {"buys_within_cash"}
@@ -248,17 +256,19 @@ def test_a_sell_of_a_name_not_held_is_a_violation() -> None:
     }
 
 
-def test_a_notional_sell_is_measured_in_shares_at_the_reference_price() -> None:
-    assert isinstance(_check([_order("A", "sell", notional=100.0)], _LOOSE), Skips)  # 10 shares
-    assert _rules(_check([_order("A", "sell", notional=101.0)], _LOOSE)) == {
-        "sell_within_holding",
-        "sell_sum_within_holding",
-    }
+def test_a_sell_by_notional_is_refused() -> None:
+    """Every sell order is by quantity (ADR 0010 amendment 2026-09-30): a
+    notional sell is a wrapper fault, refused before any skip or submit."""
+    assert _rules(_check([_order("A", "sell", notional=100.0)], _LOOSE)) == {"sell_by_quantity"}
+    assert _rules(_check([_order("A", "sell", notional=10.005)], _LOOSE)) == {"sell_by_quantity"}
+    tiny = _order("A", "sell", notional=0.5, full_exit=True)  # would be dust by quantity
+    assert _rules(_check([tiny], _LOOSE)) == {"sell_by_quantity"}
 
 
-def test_a_second_full_exit_for_one_name_is_a_violation() -> None:
-    orders = [_order("A", "sell", 1, quantity=10.0), _order("A", "sell", 2, quantity=10.0)]
-    assert _rules(_check(orders, _LOOSE)) == {"sell_sum_within_holding"}
+def test_a_full_exit_beside_an_earlier_open_sell_over_the_holding_is_a_violation() -> None:
+    orders = [_order("A", "sell", 1, quantity=10.0, full_exit=True)]
+    result = _check(orders, _LOOSE, open_sells=[OpenSell("A", 1.0)])
+    assert _rules(result) == {"sell_sum_within_holding"}
 
 
 def test_open_sells_count_only_their_unfilled_part() -> None:
@@ -361,7 +371,7 @@ def test_phase_time_skips_and_their_reasons() -> None:
         _order("D", "buy", 3, quantity=0.0, whole_share=True, target_weight=0.01),
         _order("D", "sell", 4, quantity=0.0, whole_share=True, full_exit=True),
         _order("C", "buy", 5, notional=0.5, target_weight=0.01),
-        _order("A", "sell", 6, notional=0.5, full_exit=True),
+        _order("A", "sell", 6, quantity=0.04, full_exit=True),
         _order("A", "sell", 7, quantity=1.0, listing_ended=True),
         _order("A", "sell", 8, quantity=1.0),
     ]
@@ -385,7 +395,7 @@ def test_the_skip_cap_counts_neither_dust_nor_untradable() -> None:
     orders = [
         _order("C", "buy", 1, notional=0.5, target_weight=0.01),  # counts
         _order("B", "sell", 2, quantity=5.0, decision="forced_exit", full_exit=True),  # untradable
-        _order("A", "sell", 3, notional=0.5, full_exit=True),  # dust
+        _order("A", "sell", 3, quantity=0.04, full_exit=True),  # dust
     ]
     assert isinstance(_check(orders, RiskConfig(max_skips_per_run=1), assets=assets), Skips)
     result = _check(orders, RiskConfig(max_skips_per_run=1), assets=assets, prior_skips=1)
@@ -431,7 +441,8 @@ def test_three_names_are_scaled_alike_with_the_cost_deducted_once() -> None:
     scale = spendable / 1000.0
     assert [s.decision_id for s in sizings] == [1, 2, 3]
     for sizing, remainder in zip(sizings, (400.0, 300.0, 300.0), strict=True):
-        assert sizing.notional == pytest.approx(remainder * scale, rel=1e-12)
+        assert sizing.notional is not None  # floored to the cent
+        assert remainder * scale - 0.01 < sizing.notional <= remainder * scale
         assert sizing.quantity is None and not sizing.deferred
     notionals = [s.notional or 0.0 for s in sizings]
     total = sum(
@@ -517,7 +528,9 @@ def test_a_sized_batch_passes_the_cash_check_with_commissions() -> None:
         )
         for s in sizings
     ]
-    loose = RiskConfig(max_order_notional_fraction=1.0, max_gross_exposure=1.0)
+    loose = RiskConfig(
+        max_order_notional_fraction=1.0, max_gross_exposure=1.0, max_position_weight=1.0
+    )
     ledger = Ledger(positions={}, cash=1000.0, through=_S)
     result = _check(orders, loose, ledger=ledger, account=_account(1000.0), costs=costs)
     assert isinstance(result, Skips), result
@@ -579,6 +592,196 @@ def test_a_delisted_name_the_broker_no_longer_lists_is_skipped_not_a_breach() ->
 
 def test_the_sell_sum_uses_the_holding_rounded_down() -> None:
     ledger = _ledger(A=1.239)
-    orders = [_order("A", "sell", 1, quantity=0.62), _order("A", "sell", 2, quantity=0.615)]
-    result = _check(orders, ledger=ledger, quantity_decimals=2)
+    orders = [_order("A", "sell", 1, quantity=0.62)]
+    result = _check(orders, ledger=ledger, quantity_decimals=2, open_sells=[OpenSell("A", 0.615)])
     assert _rules(result) == {"sell_sum_within_holding"}  # 1.235 over 1.23, under 1.239
+
+
+# --- ADR 0010 amendment 2026-09-30 (T54c) ----------------------------------------------------
+
+
+def test_full_exits_are_exempt_from_the_per_order_limit_and_trims_are_not() -> None:
+    """Equity 1200: the per-order limit is $60. Selling all 10 shares of A
+    ($100) passes as a plan or `window_stop` full exit; the same sell as a trim
+    breaches."""
+    plan_exit = _order("A", "sell", 1, quantity=10.0, full_exit=True)
+    stop_exit = _order("A", "sell", 1, quantity=10.0, decision="forced_exit", full_exit=True)
+    for exit_order in (plan_exit, stop_exit):
+        assert isinstance(_check([exit_order]), Skips)
+    trim = _order("A", "sell", 1, quantity=10.0)
+    assert _rules(_check([trim])) == {"max_order_notional_fraction"}
+
+
+def test_two_buys_of_one_name_breach_the_post_phase_weight() -> None:
+    """Two $40 buys of C at target 0.03 each: $80 after the phase over the $60
+    that 0.05 of equity 1200 allows."""
+    orders = [
+        _order("C", "buy", 1, notional=40.0, target_weight=0.03),
+        _order("C", "buy", 2, notional=40.0, target_weight=0.03),
+    ]
+    assert _rules(_check(orders)) == {"max_position_weight", "one_order_per_name_side"}
+
+
+def test_a_buy_on_a_drifted_holding_breaches_and_a_drifted_name_not_bought_does_not() -> None:
+    """B is held at $100 (0.083 of equity 1200), above 0.05: a $10 buy of it at
+    target 0.04 ends at $110; the passing phase, which does not buy B, passes."""
+    buy_b = [_order("B", "buy", 1, notional=10.0, target_weight=0.04)]
+    assert _rules(_check(buy_b)) == {"max_position_weight"}
+    assert isinstance(_check(_passing_phase()), Skips)
+
+
+def test_a_whole_share_buy_counts_at_the_buffered_price_after_the_phase() -> None:
+    """One share of D: $100 is under 0.0835 x 1200 = $100.2, the buffered $102
+    is not."""
+    orders = [_order("D", "buy", 1, quantity=1.0, whole_share=True, target_weight=0.04)]
+    assets = {**_ASSETS, "D": _asset(fractionable=False)}
+    frozen = RiskConfig(max_position_weight=0.0835, max_order_notional_fraction=1.0)
+    assert _rules(_check(orders, frozen, assets=assets)) == {"max_position_weight"}
+    roomy = RiskConfig(max_position_weight=0.086, max_order_notional_fraction=1.0)
+    assert isinstance(_check(orders, roomy, assets=assets), Skips)
+
+
+def test_two_orders_on_one_name_and_side_breach() -> None:
+    orders = [_order("A", "sell", 1, quantity=1.0), _order("A", "sell", 2, quantity=1.0)]
+    assert _rules(_check(orders)) == {"one_order_per_name_side"}
+    # a buy and a sell of one name are two sides
+    both = [
+        _order("A", "sell", 1, quantity=1.0),
+        _order("A", "buy", 2, notional=5.0, target_weight=0.01),
+    ]
+    assert isinstance(_check(both, ledger=_ledger(A=2.0)), Skips)
+
+
+def test_cash_is_compared_strictly_at_the_cent() -> None:
+    """$50 at 15 bp needs $50.075: that cash passes, one cent less breaches; a
+    notional not in whole cents, or a fractionable buy by quantity, is refused."""
+    orders = [_order("C", "buy", 2, notional=50.0, target_weight=0.04)]
+    assert isinstance(_check(orders, account=_account(50.075), costs=_COSTS), Skips)
+    assert _rules(_check(orders, account=_account(50.065), costs=_COSTS)) == {"buys_within_cash"}
+    tolerant = RiskConfig(reconcile_cash_tolerance=1.0)
+    assert _rules(_check(orders, tolerant, account=_account(50.065), costs=_COSTS)) == {
+        "buys_within_cash"
+    }
+    with pytest.raises(ValueError, match="whole cents"):  # never approved unmeasured
+        _check([replace(orders[0], notional=50.009)], account=_account(50.075), costs=_COSTS)
+    with pytest.raises(ValueError, match="not whole-share"):
+        _check([replace(orders[0], notional=None, quantity=1.0)], costs=_COSTS)
+
+
+def test_a_trim_is_a_quantity_sell_so_a_gap_down_cannot_oversell() -> None:
+    """10 shares of D at $100: a $950 trim sells 9.5 shares and a $300 trim 3,
+    whatever price the open brings."""
+    ledger = _ledger(D=10.0)
+    for planned, shares in ((950.0, 9.5), (300.0, 3.0)):
+        trim = DecisionRow(
+            decision_id=1,
+            run_id=1,
+            rebalance_session=_S,
+            security_id="D",
+            side="sell",
+            planned_notional=planned,
+            whole_share=False,
+            decision="trade",
+            known_at=_NOW,
+            ingested_at=_NOW,
+        )
+        left = plan_remainder(trim, [], [], [], _NO_ACTIONS, _price_of, session=_S)
+        quantity = round_down(left.quantity, 6)
+        assert quantity == shares
+        order = _order("D", "sell", 1, quantity=quantity)
+        assert isinstance(_check([order], _LOOSE, ledger=ledger), Skips)
+
+
+def test_a_whole_share_full_exit_of_one_share_is_submitted_not_dust() -> None:
+    assets = {**_ASSETS, "D": _asset(fractionable=False)}
+    one = _order("D", "sell", 1, quantity=1.0, whole_share=True, full_exit=True)
+    result = _check([one], ledger=_ledger(D=1.0), assets=assets)
+    assert isinstance(result, Skips) and result.skips == ()
+
+
+def test_every_sized_batch_passes_the_cash_rule() -> None:
+    """Property: over random cash, cost rates, commissions and 1 to
+    `risk.max_orders_per_run` buys (whole-share names included), the batch
+    `size_buys` returns never breaches `buys_within_cash`."""
+    rng = random.Random(54)
+    frozen = RiskConfig()
+    loose = RiskConfig(max_order_notional_fraction=1.0)
+    names = list(_PRICES)
+    for _ in range(200):
+        n = rng.randint(1, frozen.max_orders_per_run)
+        buys = [
+            _buy(
+                i + 1,
+                rng.choice(names),
+                round(rng.uniform(0.5, 5000.0), 2),
+                whole_share=rng.random() < 0.3,
+            )
+            for i in range(n)
+        ]
+        cash = round(rng.uniform(0.0, 20000.0), 2)
+        costs = BuyCosts(
+            per_side_bps=rng.choice([0.0, 15.0, rng.uniform(0.0, 100.0)]),
+            commissions=Commissions(
+                per_share=rng.choice([0.0, 0.005]), per_order=rng.choice([0.0, 1.0])
+            ),
+        )
+        sizings = size_buys(buys, cash, _price_of, frozen, costs)
+        low = min(_PRICES[b.decision.security_id] for b in buys)
+        reserved = (n - 1) * costs.commissions.per_order
+        expected = buy_notional_after_costs(
+            max(cash - reserved, 0.0), costs.per_side_bps, costs.commissions, price=low
+        )
+        spendable = float(_spendable(Decimal(repr(cash)), n, low, costs))
+        assert spendable == pytest.approx(expected, rel=1e-12, abs=1e-9)  # one formula
+        by_id = {b.decision.decision_id: b for b in buys}
+        orders = [
+            _order(
+                s.security_id,
+                "buy",
+                s.decision_id,
+                notional=s.notional,
+                quantity=s.quantity,
+                whole_share=by_id[s.decision_id].by_whole_shares,
+                target_weight=0.01,
+            )
+            for s in sizings
+            if not s.deferred
+        ]
+        ledger = Ledger(positions={}, cash=1e9, through=_S)  # no weight or exposure breach
+        assets = {k: _asset(fractionable=True) for k in _PRICES}
+        result = _check(
+            orders, loose, ledger=ledger, account=_account(cash), costs=costs, assets=assets
+        )
+        assert "buys_within_cash" not in (
+            _rules(result) if isinstance(result, Violations) else set()
+        ), (cash, costs, [(b.decision.security_id, b.remainder.notional) for b in buys])
+
+
+def test_a_rounding_overshoot_comes_off_the_largest_notional_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced: spendable a cent above what $100 holds, so two $60 remainders
+    floor to $49.93 each and need $100.0098. The overshoot, rounded up to a
+    cent, comes off one buy and the batch fits; a cut below the minimum, or an
+    overshoot above a cent (not rounding), raises instead."""
+    import tradepartner.execution.risk as risk
+
+    exact = risk._spendable
+    monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.01"))
+    even = [_buy(1, "A", 60.0), _buy(2, "B", 60.0)]
+    sizings = size_buys(even, 100.0, _price_of, RiskConfig(), _COSTS)
+    assert [s.notional for s in sizings] == [49.92, 49.93]
+    orders = [
+        _order(s.security_id, "buy", s.decision_id, notional=s.notional, target_weight=0.01)
+        for s in sizings
+    ]
+    loose = RiskConfig(max_order_notional_fraction=1.0)
+    ledger = Ledger(positions={}, cash=1e6, through=_S)
+    assert isinstance(
+        _check(orders, loose, ledger=ledger, costs=_COSTS, account=_account(100.0)), Skips
+    )
+    with pytest.raises(ValueError, match="overshoot"):
+        size_buys(even, 100.0, _price_of, RiskConfig(min_order_notional=49.93), _COSTS)
+    monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.05"))
+    with pytest.raises(ValueError, match="overshoot"):
+        size_buys(even, 100.0, _price_of, RiskConfig(), _COSTS)
