@@ -74,3 +74,33 @@ Until this is verified, the claim that the universe is reproducible at any histo
 - Bad / accepted risks: market cap from XBRL lags the true value by up to a quarter and is missing for some names (visible via the gap report). Foreign filers are excluded, narrowing the universe versus MTUM's. The $5 floor and top-1000 cut are conventions, not evidence-based; they are logged as config in every trial. Rebalance dates cluster with month-end flows, which may worsen fills; the cost model should be checked against paper fills in Phase 4. Pre-2019 security-type classification will be heuristic.
 - Reversibility: cheap for thresholds (config, subject to the pre-registration guard); moderate for the universe definition, because every registered trial depends on it. Changing the definition after trials exist means new trials, not edited ones.
 - Revisit if: the survivorship gap or the unclassifiable count concentrates near the cap cut; paper fills diverge from the cost model at month end; the strategy spec needs a different formation window; or the Phase 3 strategy spec finds that ~$100 across the chosen position count falls below Alpaca's fractional minimum per order.
+
+## Amendment draft — 2026-09-27: Phase 4 paper execution (T70, #294)
+
+**Status: Proposed; blocked on Probe 3's report (#182).** This is the execution
+half of the [ADR 0005 amendment](0005-objective-benchmark-stop-criteria.md#amendment-draft--2026-09-27-phase-4-residual-tracking-t70-294),
+under the owner's [#247 Q4/Q14 decision](https://github.com/josejuarez96/tradepartner/issues/247#issuecomment-5851267262).
+Both halves and the measured timing defaults must merge before `paper start`.
+
+For Phase 4, this supersedes the cadence paragraph's requirement for the same
+T+1 close in both backtest and paper ("never a mix"). H1's registered
+`execution.fill_price = close` remains frozen: its backtest and benchmarks keep
+the frozen close convention. Paper executes market DAY orders in two phases at
+the NBBO after the open: sells first, then buys after every sell is terminal or
+`paper.sell_wait_seconds` has elapsed since the open, sized from the account's
+then-current cash as specified in paper-trading requirement 2. Paper fills are
+not opening-auction fills or fills at the backtest's close. Signals still use
+only information known at the preceding rebalance cutoff.
+
+[#86's report](../research/2026-09-25-alpaca-open-and-depth.md) documents the
+simulator's NBBO matching and lack of dividends. The ADR 0005 residual check
+accounts for the dividend and fill-timing differences while always showing the
+raw series; missed and override months are excluded and listed under that rule.
+This does not change H1's registration, monthly cadence, universe, or frozen
+backtest fill convention.
+
+[Probe 3 (#182)](https://github.com/josejuarez96/tradepartner/issues/182) must supply
+the measured latency and fill-price gaps before the six runtime timing keys in
+the [spec's Config keys note](../specs/paper-trading.md#t70-amendment-draft--2026-09-27)
+are finalized. No latency has been measured in this draft; the existing values
+remain placeholders and do not establish readiness for T71.

@@ -41,3 +41,40 @@ So a P&L objective would be unmeasurable, and a benchmark-beating objective woul
 - Bad / accepted risks: the project can be a success by its own criteria while underperforming SPY. The owner accepts this. If the owner later wants a return objective, that is a new ADR and a much longer time horizon.
 - Reversibility: cheap on paper, but changing the objective after results are in is exactly the behavior the research warns about (§10, Behavioral). Any amendment must cite results that were not the reason for the change.
 - Revisit if: the LLM layer enters scope (calibration criteria become primary for it); the owner's time or money situation changes materially.
+
+## Amendment draft — 2026-09-27: Phase 4 residual tracking (T70, #294)
+
+**Status: Proposed; blocked on Probe 3's report (#182).** This and the matching
+[ADR 0006 amendment](0006-universe-and-cadence.md#amendment-draft--2026-09-27-phase-4-paper-execution-t70-294)
+are one amendment, to merge together before `paper start` (T71). The owner chose
+this rule in [#247 Q4](https://github.com/josejuarez96/tradepartner/issues/247#issuecomment-5851267262).
+It does not become an accepted amendment or complete T70 until the measured
+report is cited and the six timing defaults and their tests are finalized.
+
+For Phase 4, the first success criterion uses `paper.tracking_rule = residual`:
+`residual = raw + dividend term + fill-timing term`, with the terms and monthly
+boundaries defined in [paper-trading requirement 10](../specs/paper-trading.md).
+The raw difference is paper return minus backtest return. The dividend term adds
+back reinvested backtest dividends paper did not receive; the fill-timing term
+adds back the execution-price difference (positive for a buy above, or a sell
+below, the frozen bar price). These are computed from the recorded data, never
+fitted to make a month pass. The raw series is always printed beside the residual
+and its two attribution terms. The residue contribution is reported separately
+and is never subtracted from the residual.
+
+Each non-excluded month's absolute residual must be at most the window's frozen
+`paper.tracking_k` times that month's modelled cost per rebalance. Months whose
+rebalance has a `missed` event or an override are excluded from the maximum and
+listed with the reason. Months with `skip_*` decisions are listed with the skipped
+names and remain in the check. At least the frozen `paper.min_rebalances` (default
+6) scheduler-executed rebalances and as many compared, non-excluded months are
+required by the spec's exit check. Exclusions do not lower that requirement.
+
+The rule is frozen into `paper_windows` at `paper start`; reports and checks use
+that record, never the current settings. The other three success criteria stand.
+The reason for this amendment is the execution and dividend mismatch documented
+in [#86's report](../research/2026-09-25-alpaca-open-and-depth.md), rather than a
+Phase 4 return result. [Probe 3 (#182)](https://github.com/josejuarez96/tradepartner/issues/182)
+is still pending: its measured latency and fill-price gaps must be added as
+evidence before this amendment is accepted. Paper evidence characterizes the
+simulator, not live execution.
