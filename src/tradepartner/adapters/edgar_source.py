@@ -1807,9 +1807,15 @@ def _fsn_rows(
     quoted, and a bare `"` inside a `txt.tsv` value must not start one).
     A zero-byte member (no header row at all -- a real FSN file never is
     one, but a test fixture may be) has no columns to select and yields no
-    rows rather than a DuckDB binder error."""
+    rows rather than a DuckDB binder error.
+
+    FSN members are not always valid UTF-8 (a 2015 `txt.tsv` note carries a
+    Windows-1252 apostrophe), and DuckDB fails the whole read on one bad
+    byte, so the member is first rewritten in place with each invalid byte
+    replaced by U+FFFD; valid UTF-8 is unchanged (#455)."""
     if path.stat().st_size == 0:
         return []
+    _fsn_replace_invalid_utf8(path)
     column_list = ", ".join(columns)
     sql = (
         f"SELECT {column_list} FROM read_csv(?, delim='\t', header=true, "
@@ -1824,6 +1830,19 @@ def _fsn_rows(
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
     finally:
         connection.close()
+
+
+def _fsn_replace_invalid_utf8(path: Path) -> None:
+    """Rewrite `path` with every invalid UTF-8 byte replaced by U+FFFD,
+    streamed (an FSN member reaches hundreds of MB); line endings and valid
+    UTF-8 are kept byte for byte."""
+    cleaned = path.with_name(path.name + ".utf8")
+    with (
+        path.open(encoding="utf-8", errors="replace", newline="") as source,
+        cleaned.open("w", encoding="utf-8", newline="") as target,
+    ):
+        shutil.copyfileobj(source, target)
+    cleaned.replace(path)
 
 
 def _fsn_validators_dict(headers: httpx.Headers) -> dict[str, str | None]:
