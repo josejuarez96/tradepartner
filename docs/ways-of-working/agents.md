@@ -47,13 +47,26 @@ Any number of Claude Code chat windows may build in parallel; each one is a **te
 
 | Work | Model | Why |
 |---|---|---|
-| Orchestrator window during Build and Review | **Opus 5.5** | Claims, delegation and review triage: capable, and cheaper than Fable |
+| The orchestrator window; a team window on any plan task whose `Review:` field names `safety-reviewer` (sizing, risk checks, order ids, the wrapper, the run, resume, the kill switch included, pure or not); on any issue whose fix touches the paths the next row excludes; or on a task the orchestrator marks as needing it | **Opus 5.5** | Review triage and judgment on the path where a mistake places an order |
+| A team window on a docs-only task; on a plan task whose `Review:` field does **not** name `safety-reviewer` (a pure module, a page, a report); or on a `size:S` issue whose fix stays outside `src/tradepartner/execution/`, the broker and trading adapters, `cli.py`, `config.py`, `errors.py` and anything that handles a secret | **Sonnet 5** | The plan line is the contract; the window claims, hands it to an `implementer`, runs the reviewers and `/ready-pr`. Windows were 56% of all tokens on Opus (#489) |
 | Spec, plan and ADR drafting; phase retros; cross-team conflict resolution; changes to the ways-of-working docs | **Fable 5.1** | Errors here land in every later PR |
 | `implementer`, `backtest-runner` | Sonnet (roster) | One scoped task with a plan line and tests; one scripted fixture run |
 | `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer` | Opus (roster) | Judgment-heavy, read-only or doc-only |
 | `doc-keeper` | Haiku (roster) | Mechanical |
 
-Start a window on Opus 5.5 by default. Escalate to Fable only for the second row, and say so in the PR description when you did.
+The orchestrator names the model in the assignment; a window whose assignment names none starts on Sonnet 5 for the second row's work and on Opus 5.5 otherwise. Escalate to Fable only for the third row, and say so in the PR description when you did. A Sonnet window that meets a judgment call its task line does not settle (a reviewer BLOCKER it cannot resolve, a conflict with another team's line) reports `blocked` to the orchestrator; it does not guess.
+
+`/code-review` forks from the window that runs it and inherits that window's model, so it is run from an Opus or a Sonnet window, never from a Fable one: one round at `medium`, then at most one verification round at `low` (#489).
+
+## Review passes
+
+Added 2026-10-01 (#489). Two PRs on 2026-09-30 took four `safety-reviewer` passes, two `spec-critic` passes and three `/code-review` rounds between them, because every pass re-read the whole diff and found something new in the text the last fix had added. A pass is an Opus session; the cap below would have halved that.
+
+1. **Two passes per reviewer per PR.** Pass 1 is the review. The window fixes every BLOCKER and SHOULD FIX in one commit, not one commit per finding.
+2. **Pass 2 is a verification pass over everything since pass 1.** Every reviewer comment names the head commit it reviewed. The window gives the reviewer its pass-1 comment and asks it to verify the fixes by reading `git diff <pass-1 head>..HEAD`, so no commit pushed after pass 1 goes unreviewed, a merge of `main` included. The verdict is `PASS` only when every pass-1 BLOCKER and SHOULD FIX is fixed and that diff holds no BLOCKER. It is `FAIL` when any pass-1 BLOCKER or SHOULD FIX is not fixed, when the diff holds a BLOCKER, or when the diff holds a new SHOULD FIX on the order path (anything that submits, cancels, halts, resumes or sizes an order, the risk checks, the order ids, the kill switch, the run lock) or a secret: there a SHOULD FIX blocks, it is never a follow-up. Anything else the reviewer notices goes under a "Follow-ups" heading in its comment and does not change the verdict; the window files those as **one** `size:S` issue (plan-shape rule 6) and links it on the PR.
+3. **A third pass needs a `FAIL`.** If pass 2 ends `FAIL`, the window fixes and runs one more verification pass over the diff since pass 2, and says on the PR why. A NIT never causes a pass.
+4. **The order path keeps its floor.** `ready_pr.py`'s gate is unchanged: the latest verdict of each required reviewer must be `PASS`. Follow-ups are therefore NITs and non-blocking findings off the order path only; they are filed before the PR is marked ready.
+5. `spec-critic` follows the same count: `APPROVE WITH CHANGES`, the fixes, one verification pass.
 
 ## Parallelism inside a team
 
