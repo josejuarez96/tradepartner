@@ -100,7 +100,8 @@ reason is the trimmed text.
   the clock's session (`reconcile_run.command_session`) with the frozen risk
   section raises a mismatch (the row is written and the switch engaged with
   source `fault`, as `paper reconcile` does) or ends in any status but `ok`;
-  `not_flat`, naming each name the ledger holds above its residue
+  `not_flat`, naming each short holding (the system is long-only) and each
+  name the ledger holds above its residue
   (`plan.residue`) by more than the frozen
   `risk.reconcile_quantity_tolerance`. Otherwise it appends `state = closed`
   with that reconciliation's id and `residues_json` in the shape above, each
@@ -116,7 +117,9 @@ reason is the trimmed text.
   and does not look at the switch (a window that cannot be released can only
   end this way). It runs a final `reconcile_now`, keeping its row whatever
   its status (a mismatch is the expected case and engages nothing: the
-  window ends here), then appends `state = abandoned` with the owner's note
+  window ends here; but when anything after a mismatch fails, so the window
+  stays open, it engages the switch with source `fault` before re-raising),
+  then appends `state = abandoned` with the owner's note
   as `reason` (#247 Q13's "ADR-style note", also written on #247 or its
   successor), that reconciliation's id and `residues_json` = `{"positions":
   {symbol: quantity per broker.positions()}, "mismatches": [...], "lagging":
@@ -127,7 +130,8 @@ reason is the trimmed text.
   run lock, so the owner can engage while a run holds it, refuses
   `no_window` writing nothing, and appends an `engaged` row with source
   `owner` (`switch.engage`), returning its `event_id`. A row that cannot be
-  written raises `KillWriteFailed`.
+  written, for any reason (the store, or the clock it is stamped with),
+  raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
   share. It reads the clock, then opens one short-lived `open_for_write`
@@ -142,7 +146,6 @@ reason is the trimmed text.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import math
 from collections.abc import Callable
@@ -755,12 +758,12 @@ def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
     return missing
 
 
-def _origin(parts: dict[str, float], tolerance: float, security_id: str) -> str:
+def _origin(parts: dict[str, float], security_id: str) -> str:
     """`untradable` when any counted part is untradable, else `dust` (spec req
     14). Raises `ValueError` when no part is counted at all."""
-    if parts["untradable"] > tolerance or parts["carried_untradable"] > tolerance:
+    if parts["untradable"] > 0 or parts["carried_untradable"] > 0:
         return _UNTRADABLE
-    if parts["dust"] > tolerance or parts["carried_dust"] > tolerance:
+    if parts["dust"] > 0 or parts["carried_dust"] > 0:
         return _DUST
     raise ValueError(f"the residue of {security_id} has no part with an origin")
 
@@ -820,6 +823,10 @@ def _residues(
     listed: dict[str, dict[str, Any]] = {}
     offenders: list[str] = []
     for security_id, held in sorted(ledger.positions.items()):
+        if held < -tolerance:
+            # Long-only: a short the broker agrees with is never "flat".
+            offenders.append(f"{security_id} holds {held:g}, a short position")
+            continue
         if held <= tolerance:
             continue
         quantity = part(security_id, adjustments)
@@ -846,7 +853,7 @@ def _residues(
         }
         listed[security_id] = {
             "quantity": held,
-            "origin": _origin(parts, tolerance, security_id),
+            "origin": _origin(parts, security_id),
         }
     if offenders:
         raise WindowCommandRefused(
@@ -999,8 +1006,8 @@ def abandon(
             window, window_id = _window_of(conn)
         frozen = frozen_risk(window)
         now = _command_clock(clock)
-        # A mismatch row is written before the error: abandon lists it.
-        with contextlib.suppress(ReconciliationError):
+        mismatch: ReconciliationError | None = None
+        try:
             reconcile_now(
                 settings,
                 connect,
@@ -1011,45 +1018,66 @@ def abandon(
                 connect,
                 frozen=frozen,
             )
-        positions = broker.positions()
-        with connect() as conn:
-            reconciliation = _latest_reconciliation(conn, window_id)
-        recorded = json.loads(reconciliation.mismatches_json or "{}")
-        residues_json = json.dumps(
-            {
-                "positions": {
-                    symbol: position.quantity
-                    for symbol, position in sorted(positions.items())
-                    if position.quantity != 0
-                },
-                "mismatches": recorded.get("mismatches", []),
-                "lagging": recorded.get("lagging", []),
-                "pending": recorded.get("pending", []),
+        except ReconciliationError as exc:
+            mismatch = exc  # its row is written before the error: abandon lists it
+        try:
+            return _abandon_row(connect, broker, clock, window_id, note)
+        except Exception:
+            # The window stays open over a mismatch row: engage, as `stop` does,
+            # so it is never left unwatched.
+            if mismatch is not None:
+                _engage_fault(settings, clock, window_id, mismatch)
+            raise
+
+
+def _abandon_row(
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    window_id: int,
+    note: str,
+) -> AbandonResult:
+    """`abandon`'s positions read and its `abandoned` row, after the final
+    reconciliation."""
+    positions = broker.positions()
+    with connect() as conn:
+        reconciliation = _latest_reconciliation(conn, window_id)
+    recorded = json.loads(reconciliation.mismatches_json or "{}")
+    residues_json = json.dumps(
+        {
+            "positions": {
+                symbol: position.quantity
+                for symbol, position in sorted(positions.items())
+                if position.quantity != 0
             },
-            sort_keys=True,
-            allow_nan=False,
+            "mismatches": recorded.get("mismatches", []),
+            "lagging": recorded.get("lagging", []),
+            "pending": recorded.get("pending", []),
+        },
+        sort_keys=True,
+        allow_nan=False,
+    )
+    stamp = _command_clock(clock)
+    if stamp < reconciliation.at:
+        raise ClockError(
+            f"clock went back from {reconciliation.at.isoformat()} to {stamp.isoformat()}"
         )
-        stamp = _command_clock(clock)
-        if stamp < reconciliation.at:
-            raise ClockError(
-                f"clock went back from {reconciliation.at.isoformat()} to {stamp.isoformat()}"
-            )
-        with connect() as conn:
-            _window_of(conn)
-            append(
-                conn,
-                PaperWindowStopRow(
-                    window_id=window_id,
-                    at=stamp,
-                    state=ABANDONED,
-                    reason=note,
-                    reconciliation_id=reconciliation.reconciliation_id,
-                    residues_json=residues_json,
-                    known_at=stamp,
-                    ingested_at=stamp,
-                ),
-            )
-        return AbandonResult(reconciliation.reconciliation_id, reconciliation.status, residues_json)
+    with connect() as conn:
+        _window_of(conn)
+        append(
+            conn,
+            PaperWindowStopRow(
+                window_id=window_id,
+                at=stamp,
+                state=ABANDONED,
+                reason=note,
+                reconciliation_id=reconciliation.reconciliation_id,
+                residues_json=residues_json,
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+    return AbandonResult(reconciliation.reconciliation_id, reconciliation.status, residues_json)
 
 
 def kill(
@@ -1065,7 +1093,10 @@ def kill(
     note = _note(reason, "paper kill")
     with connect() as conn:
         _, window_id = _window_of(conn)
-    engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
+    try:
+        engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
+    except Exception as exc:  # a bad clock reading, say: still not engaged
+        engaged = switch.WriteFailed(f"{type(exc).__name__}: {exc}")
     if isinstance(engaged, switch.WriteFailed):
         raise KillWriteFailed(
             f"the kill switch row could not be written, so it is NOT engaged: {engaged.error}"

@@ -17,6 +17,7 @@ from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
+from tradepartner.execution.reconcile_run import reconcile_now
 from tradepartner.execution.window import (
     KILL_SWITCH,
     NO_WINDOW,
@@ -25,6 +26,7 @@ from tradepartner.execution.window import (
     OVERRIDE,
     REASON,
     RECONCILIATION,
+    KillWriteFailed,
     WindowCommandRefused,
     _parse_residues,
     abandon,
@@ -34,6 +36,7 @@ from tradepartner.execution.window import (
 )
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
+    AdjustmentRow,
     DecisionEventRow,
     DecisionRow,
     OrderEventRow,
@@ -87,12 +90,14 @@ def _frozen_json() -> str:
     return json.dumps(frozen, sort_keys=True)
 
 
-def _new_window(settings: Settings, started: datetime) -> PaperWindowRow:
+def _new_window(
+    settings: Settings, started: datetime, *, starting_cash: float = 100_000.0
+) -> PaperWindowRow:
     row = PaperWindowRow(
         hypothesis_id=1,
         first_rebalance_session=date(2026, 9, 30),
         account_id="PA1",
-        starting_cash=100_000.0,
+        starting_cash=starting_cash,
         starting_equity=100_000.0,
         code_version="test",
         started_at=started,
@@ -165,6 +170,7 @@ def _buy(
     quantity: float,
     *,
     fill: bool = True,
+    side: str = "buy",
 ) -> OrderRow:
     """A buy's decision, order, `pending` and `accepted` events, the fake's
     submit and, with `fill`, its fill collected into the journal."""
@@ -175,7 +181,7 @@ def _buy(
             run_id=run_id,
             rebalance_session=date(2026, 9, 30),
             security_id=SPY,
-            side="buy",
+            side=side,
             planned_quantity=quantity,
             whole_share=False,
             decision="trade",
@@ -190,16 +196,16 @@ def _buy(
         run_id=run_id,
         session=at.date(),
         attempt=1,
-        phase="buy",
+        phase=side,
         security_id=SPY,
         symbol="SPY",
-        side="buy",
+        side=side,
         quantity=quantity,
         sells_in_flight_at_submit=False,
         known_at=at,
         ingested_at=at,
     )
-    placed = fake.submit(OrderRequest(coid, "SPY", Side.BUY, quantity=quantity))
+    placed = fake.submit(OrderRequest(coid, "SPY", Side(side), quantity=quantity))
     _append(
         settings,
         order,
@@ -686,3 +692,367 @@ def test_the_override_writer_refuses_fields_its_kind_does_not_take(
 
     assert excinfo.value.reason == OVERRIDE
     assert _count(journal_settings, "overrides") == 0
+
+
+# --- review pass 1: shorts, carried residues, races, non-ok reconciliations -------
+
+
+def _carried(settings: Settings, window: PaperWindowRow, quantity: float, origin: str) -> None:
+    """A `carried_residue` adjustment as `paper start` journals it."""
+    at = window.started_at
+    _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=date(2026, 9, 29),
+            kind="carried_residue",
+            origin=origin,
+            security_id=SPY,
+            quantity=quantity,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+def _broker_holds(fake: FakeBroker, quantity: float) -> None:
+    """The broker books `quantity` SPY outside the window's orders (a residue
+    carried in from the previous window)."""
+    fake.submit(OrderRequest("prev-1", "SPY", Side.BUY, quantity=quantity))
+    fake.simulate_fill("prev-1")
+
+
+def _untradable_mark(settings: Settings, run_id: int, quantity: float) -> None:
+    at = DAY1 - timedelta(minutes=20)
+    _append(
+        settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            security_id=SPY,
+            quantity=quantity,
+            mark_price=PRICE,
+            value=quantity * PRICE,
+            tradable=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+@pytest.fixture
+def carried_window(journal_settings: Settings) -> PaperWindowRow:
+    """A window whose starting cash already paid for a 4-share residue the
+    broker holds (`_broker_holds(fake, 4.0)`)."""
+    return _new_window(
+        journal_settings,
+        datetime(2026, 9, 29, 12, 0, tzinfo=UTC),
+        starting_cash=100_000.0 - 4 * PRICE,
+    )
+
+
+def test_a_short_holding_the_broker_agrees_with_is_never_flat(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    _buy(journal_settings, fake, fixed_clock, run_id, "tp-s1", 1.0, side="sell")
+    _outcome(journal_settings, "tp-s1", "realised_pnl")
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    reason, message = _refusal(excinfo)
+    assert reason == NOT_FLAT
+    assert f"{SPY} holds -1, a short position" in message
+    assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+
+
+@pytest.mark.parametrize(
+    ("carried_origin", "untradable_mark", "expected"),
+    [
+        ("dust", False, "dust"),
+        ("untradable", True, "untradable"),
+        ("untradable", False, None),  # trades again: no residue, not flat
+    ],
+)
+def test_a_carried_residue_keeps_its_origin_while_it_counts(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    carried_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    carried_origin: str,
+    untradable_mark: bool,
+    expected: str | None,
+) -> None:
+    _carried(journal_settings, carried_window, 4.0, carried_origin)
+    _broker_holds(fake, 4.0)
+    run_id = _run(journal_settings, carried_window, DAY1 - timedelta(hours=1))
+    if untradable_mark:
+        _untradable_mark(journal_settings, run_id, 4.0)
+    _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
+
+    if expected is None:
+        with pytest.raises(WindowCommandRefused) as excinfo:
+            _stop(journal_settings, fake, fixed_clock)
+        assert excinfo.value.reason == NOT_FLAT
+        return
+    _stop(journal_settings, fake, fixed_clock)
+
+    (_, closed) = _stops(journal_settings, carried_window)
+    assert json.loads(closed.residues_json) == {SPY: {"quantity": 4.0, "origin": expected}}
+
+
+def test_untradable_wins_when_a_carried_dust_residue_mixes_with_an_untradable_skip(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    carried_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _carried(journal_settings, carried_window, 1.0, "dust")
+    _broker_holds(fake, 4.0)
+    run_id = _run(journal_settings, carried_window, DAY1 - timedelta(hours=1))
+    _forced_exit_skipped(journal_settings, run_id, "untradable")
+    _untradable_mark(journal_settings, run_id, 4.0)
+    # The ledger holds 4: the carried 1 (dust) plus 3 journaled as a receipt,
+    # all held under the untradable skip, so the parts mix.
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=carried_window.window_id,  # type: ignore[arg-type]
+            session=date(2026, 9, 29),
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=3.0,
+            known_at=carried_window.started_at,
+            ingested_at=carried_window.started_at,
+        ),
+    )
+    _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
+
+    _stop(journal_settings, fake, fixed_clock)
+
+    (_, closed) = _stops(journal_settings, carried_window)
+    assert json.loads(closed.residues_json) == {SPY: {"quantity": 4.0, "origin": "untradable"}}
+
+
+def test_a_carried_residue_is_split_adjusted_through_the_stop_session(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    carried_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    with open_for_write(journal_settings) as conn:
+        conn.execute(
+            "INSERT INTO corporate_actions "
+            "(security_id, action_type, ex_date, ratio_or_amount, source_action_id, "
+            "known_at, ingested_at, source, provenance) "
+            "VALUES (?, 'split', ?, 2.0, '', ?, ?, 'test', 'action')",
+            [SPY, date(2026, 9, 30), carried_window.started_at, carried_window.started_at],
+        )
+    _carried(journal_settings, carried_window, 2.0, "dust")  # 4 after the split
+    _broker_holds(fake, 4.0)
+    _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
+
+    _stop(journal_settings, fake, fixed_clock)
+
+    (_, closed) = _stops(journal_settings, carried_window)
+    assert json.loads(closed.residues_json) == {SPY: {"quantity": 4.0, "origin": "dust"}}
+
+
+def test_a_saturday_stop_states_the_ledger_for_friday_and_closes(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    carried_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _carried(journal_settings, carried_window, 4.0, "dust")
+    _broker_holds(fake, 4.0)
+    _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
+    fixed_clock.now = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)  # Saturday
+
+    result = _stop(journal_settings, fake, fixed_clock)
+
+    assert result.state == "closed"
+    (_, closed) = _stops(journal_settings, carried_window)
+    assert json.loads(closed.residues_json) == {SPY: {"quantity": 4.0, "origin": "dust"}}
+
+
+@pytest.mark.parametrize("engagement", ["kill", "override"])
+def test_an_engagement_written_after_the_first_checks_refuses_the_request(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    engagement: str,
+) -> None:
+    import tradepartner.execution.window as window_module
+
+    original = window_module._command_clock
+    fired: list[bool] = []
+
+    def engage_then_read(clock: Any) -> datetime:
+        if fired:
+            return original(clock)
+        fired.append(True)
+        if engagement == "kill":
+            kill(journal_settings, _connect(journal_settings), clock, "the owner engages it")
+        else:
+            override(journal_settings, clock, "engage_kill_switch", None, None, OVERRIDE_REASON)
+        return original(clock)
+
+    monkeypatch.setattr(window_module, "_command_clock", engage_then_read)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    assert excinfo.value.reason == KILL_SWITCH
+    assert _stops(journal_settings, window) == []
+
+
+@pytest.mark.parametrize("engagement", ["kill", "override"])
+def test_an_engagement_written_during_the_closing_stop_refuses_the_close(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    engagement: str,
+) -> None:
+    import tradepartner.execution.window as window_module
+
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
+    original = window_module._residues
+
+    def residues_then_engage(*args: Any) -> Any:
+        listed = original(*args)
+        if engagement == "kill":
+            kill(journal_settings, _connect(journal_settings), fixed_clock, "the owner engages")
+        else:
+            override(
+                journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON
+            )
+        return listed
+
+    monkeypatch.setattr(window_module, "_residues", residues_then_engage)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    assert excinfo.value.reason == KILL_SWITCH
+    assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+
+
+def test_a_reconciliation_written_during_the_closing_stop_refuses_the_close(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tradepartner.execution.window as window_module
+
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
+    original = window_module._residues
+
+    def residues_then_reconcile(*args: Any) -> Any:
+        listed = original(*args)
+        reconcile_now(
+            journal_settings,
+            _connect(journal_settings),
+            fake,
+            window,
+            DAY1.date(),
+            fixed_clock,
+            _connect(journal_settings),
+            frozen=FROZEN,
+        )
+        return listed
+
+    monkeypatch.setattr(window_module, "_residues", residues_then_reconcile)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    reason, message = _refusal(excinfo)
+    assert reason == RECONCILIATION
+    assert "was written after" in message
+    assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+
+
+@pytest.mark.parametrize("status", ["pending_unresolved", "fills_lagging"])
+def test_a_reconciliation_that_is_not_ok_refuses_the_close(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    import tradepartner.execution.window as window_module
+
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
+    original = window_module.reconcile_now
+
+    def not_ok(*args: Any, **kwargs: Any) -> Any:
+        return replace(original(*args, **kwargs), status=status, pending_ids=("tp-x",))
+
+    monkeypatch.setattr(window_module, "reconcile_now", not_ok)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    reason, message = _refusal(excinfo)
+    assert reason == RECONCILIATION
+    assert status in message and "tp-x" in message
+    assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+
+
+def test_kill_raises_when_its_row_cannot_be_written(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(switch, "engage", lambda *a, **k: switch.WriteFailed("store locked"))
+    with pytest.raises(KillWriteFailed, match="NOT engaged: store locked"):
+        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+
+
+def test_kill_raises_kill_write_failed_for_a_bad_clock(
+    journal_settings: Settings, window: PaperWindowRow
+) -> None:
+    def broken() -> datetime:
+        raise OSError("no clock")
+
+    with pytest.raises(KillWriteFailed, match="NOT engaged"):
+        kill(journal_settings, _connect(journal_settings), broken, NOTE)
+    assert _count(journal_settings, "kill_switch") == 0
+
+
+def test_abandon_engages_the_switch_when_it_fails_after_a_mismatch(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")
+    calls = {"n": 0}
+    original = fake.positions
+
+    def positions_fail_after_reconcile() -> Any:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ConnectionError("broker down")
+        return original()
+
+    monkeypatch.setattr(fake, "positions", positions_fail_after_reconcile)
+
+    with pytest.raises(ConnectionError):
+        abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+
+    assert _stops(journal_settings, window) == []
+    assert _engaged(journal_settings, window)
