@@ -56,8 +56,9 @@ derived quantity, never the stored one, to the live position.
 
 **`residues_json` (settled here; T64b produces it).** A JSON object keyed by
 `security_id`, each value `{"quantity": <float>, "origin": "dust" |
-"untradable" | null}` (spec req 14, Data section: "per name, quantity and
-origin").
+"untradable"}` (spec req 14, Data section: "per name, quantity and
+origin"); `_parse_residues` refuses any other origin, including `null`
+(#522 item 4).
 
 **Spin-off children (open question, flagged in the PR).** The store has no
 column linking a spin-off's child security to its parent (ADR 0009: no
@@ -128,10 +129,11 @@ reason is the trimmed text.
   strictly flat). It releases nothing.
 - **`kill(settings, connect, clock, reason)`** is `paper kill`. It takes no
   run lock, so the owner can engage while a run holds it, refuses
-  `no_window` writing nothing, and appends an `engaged` row with source
-  `owner` (`switch.engage`), returning its `event_id`. A row that cannot be
-  written, for any reason (the store, or the clock it is stamped with),
-  raises `KillWriteFailed`.
+  `no_window` and `multiple_open_windows` (spec req 14: only one window may
+  ever be open; nothing is written for either refusal) and appends an
+  `engaged` row with source `owner` (`switch.engage`), returning its
+  `event_id`. A row that cannot be written, for any reason (the store, or
+  the clock it is stamped with), raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
   share. It reads the clock, then opens one short-lived `open_for_write`
@@ -178,6 +180,7 @@ from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
     TERMINAL_ORDER_STATUSES,
     AdjustmentRow,
+    JournalIntegrityError,
     JournalNotInitialised,
     OverrideRow,
     PaperWindowRow,
@@ -239,7 +242,7 @@ class StartResult:
 class _Residue:
     security_id: str
     quantity: float
-    origin: str | None
+    origin: str  # "dust" or "untradable"; `_parse_residues` refuses anything else
 
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:
@@ -331,8 +334,11 @@ def _parse_residues(residues_json: str | None) -> dict[str, _Residue]:
         if not isinstance(entry, dict) or "quantity" not in entry:
             raise ValueError(f"residues_json entry for {security_id!r} is malformed")
         origin = entry.get("origin")
-        if origin not in (None, _DUST, _UNTRADABLE):
-            raise ValueError(f"residues_json origin for {security_id!r} is {origin!r}")
+        if origin not in (_DUST, _UNTRADABLE):
+            raise ValueError(
+                f"residues_json origin for {security_id!r} is {origin!r}, "
+                f"must be {_DUST!r} or {_UNTRADABLE!r}"
+            )
         quantity = float(entry["quantity"])
         if not math.isfinite(quantity) or quantity < 0:
             raise ValueError(f"residues_json quantity for {security_id!r} is {quantity!r}")
@@ -615,6 +621,7 @@ NOT_READY = "not_ready"
 RECONCILIATION = "reconciliation"
 NOT_FLAT = "not_flat"
 OVERRIDE = "override"
+MULTIPLE_OPEN_WINDOWS = "multiple_open_windows"
 
 REQUESTED = "requested"
 CLOSED = "closed"
@@ -1103,11 +1110,15 @@ def kill(
 ) -> int:
     """`paper kill --reason` (module docstring): the `engaged` row's
     `event_id`. Takes no run lock. Raises `WindowCommandRefused` for a blank
-    reason or no open window (nothing written) and `KillWriteFailed` when the
-    row cannot be written."""
+    reason, no open window, or more than one open window (only one window
+    may ever be open, spec req 14; nothing is written for any of these) and
+    `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
     with connect() as conn:
-        _, window_id = _window_of(conn)
+        try:
+            _, window_id = _window_of(conn)
+        except JournalIntegrityError as exc:
+            raise WindowCommandRefused(MULTIPLE_OPEN_WINDOWS, str(exc)) from exc
     try:
         engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
     except Exception as exc:  # a bad clock reading, say: still not engaged
