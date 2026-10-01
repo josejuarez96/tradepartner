@@ -14,7 +14,8 @@ from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.errors import ReconciliationError
+from tradepartner.errors import ClockError, ReconciliationError
+from tradepartner.execution import reconcile_run, switch
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, OK, PENDING_UNRESOLVED
 from tradepartner.execution.reconcile_run import (
@@ -688,3 +689,168 @@ def test_no_adapter_is_imported() -> None:
     module = Path(__file__).resolve().parents[2] / "src/tradepartner/execution/reconcile_run.py"
     source = module.read_text(encoding="utf-8")
     assert "fake_broker" not in source and "alpaca_broker" not in source
+
+
+# --- review follow-ups: the cash base, dedupe, the reference cut, failures ----
+
+SATURDAY = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)  # paper reconcile states Friday
+
+
+def test_a_second_weekend_reconcile_keeps_the_cash_base(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    fixed_clock.now = SATURDAY
+    fake.extra_cash = 0.009  # broker rounding, inside the cash tolerance
+    assert _command(journal_settings, fake, fixed_clock).status == OK
+
+    fixed_clock.advance(minutes=5)
+    fake.extra_cash = 0.018  # 0.009 past the Saturday base, 0.018 past the start
+    assert _command(journal_settings, fake, fixed_clock).status == OK
+
+
+def test_a_journaled_dividend_is_never_offered_again(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _hold(journal_settings, fake, frozen_window, {(SPY, "SPY"): 10.0})
+    friday = date(2026, 10, 2)
+    _dividend(journal_settings, SPY, 0.5, CUT, ex_date=friday)
+    fixed_clock.now = SATURDAY
+    fake.extra_cash = 5.0
+    assert _command(journal_settings, fake, fixed_clock).status == OK
+
+    fixed_clock.advance(minutes=5)
+    fake.extra_cash = 10.0  # credited a second time
+    with pytest.raises(ReconciliationError, match="cash"):
+        _command(journal_settings, fake, fixed_clock)
+    assert len(_adjustments(journal_settings, frozen_window)) == 1
+
+
+def _bar(settings: Settings, security_id: str, close: float, known_at: datetime) -> None:
+    _fact(
+        settings,
+        "prices_daily",
+        security_id=security_id,
+        session=date(2026, 9, 30),
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=1000,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="alpaca",
+        provenance="bar",
+    )
+
+
+def test_reference_prices_are_bars_known_at_close_of_the_previous_session(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 1.0, (MTUM, "MTUM"): 1.0})
+    stale = _reference(journal_settings, MTUM)
+    _bar(journal_settings, SPY, 77.0, CUT)
+    _bar(journal_settings, MTUM, 123.0, CUT + timedelta(minutes=1))
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.reference_prices == {SPY: 77.0, MTUM: stale}
+
+
+def test_a_dividend_is_owed_on_the_holding_before_its_ex_date(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    on_ex_date = datetime(2026, 10, 1, 13, 30, tzinfo=UTC)
+    _order(journal_settings, run_id, "tp-late", MTUM, "MTUM", 4.0, at=on_ex_date)
+    _order(journal_settings, run_id, "tp-more", SPY, "SPY", 6.0, at=on_ex_date)
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(minutes=1))
+    _dividend(journal_settings, MTUM, 0.7, CUT - timedelta(minutes=1))
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            settings=journal_settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.dividends == pytest.approx({SPY: 5.0})
+
+
+@pytest.mark.parametrize(
+    "engage",
+    [
+        lambda *_a, **_k: switch.WriteFailed("IOException: store locked"),
+        lambda *_a, **_k: (_ for _ in ()).throw(ClockError("clock failed")),
+    ],
+)
+def test_paper_reconcile_still_names_the_mismatch_when_the_switch_cannot_be_written(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+    engage: Any,
+) -> None:
+    monkeypatch.setattr(switch, "engage", engage)
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    with pytest.raises(ReconciliationError, match=r"foreign_order.*could not be written"):
+        _command(journal_settings, fake, fixed_clock)
+
+
+class FailingFake(BookedFake):
+    def account(self) -> Account:
+        raise RuntimeError("transport")
+
+
+def test_a_broker_error_propagates_and_writes_nothing(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    failing = FailingFake(clock=fixed_clock, price_of=lambda _s: PRICE, account_id="PA1")
+    with pytest.raises(RuntimeError, match="transport"):
+        _reconcile(journal_settings, failing, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window) == []
+
+
+def test_a_clock_going_back_is_a_clock_error_and_writes_nothing(
+    journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
+) -> None:
+    readings = iter(
+        [datetime(2026, 10, 1, 14, 0, tzinfo=UTC), datetime(2026, 10, 1, 13, 59, tzinfo=UTC)]
+    )
+    with pytest.raises(ClockError, match="went back"):
+        _reconcile(journal_settings, fake, open_window, lambda: next(readings))  # type: ignore[arg-type]
+    assert _rows(journal_settings, open_window) == []
+
+
+def test_the_row_and_its_adjustments_commit_together(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    fake.extra_cash = 5.0
+
+    def refuse_adjustments(conn: Any, row: Any) -> int | None:
+        if isinstance(row, AdjustmentRow):
+            raise RuntimeError("disk full")
+        return append(conn, row)
+
+    monkeypatch.setattr(reconcile_run, "append", refuse_adjustments)
+    with pytest.raises(RuntimeError, match="disk full"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert _rows(journal_settings, open_window) == []

@@ -11,8 +11,10 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
 2. Read the broker: `positions()`, `open_orders()`, `account()`, and one
    `get_order` per acknowledged non-terminal order, the `lagging` input. A
    `pending` order is never read: only `paper resume` settles it (req 4).
-3. Build the ledger stated through S (`ledger.from_journal`, splits from
-   `live_actions_as_of(close(S-1))`) and the explanations
+3. Build the ledger stated through S, or through the clock's New York date
+   while no session has opened since S (a weekend `paper reconcile`, so its
+   own earlier `ok` row stays the cash base), with splits from
+   `live_actions_as_of(close(S-1))`, and the explanations
    (`explanations_as_of`), then call `compare`.
 4. In one write chunk, append the `reconciliations` row and the `adjustments`
    rows an `ok` result's explanations imply. Each row is stamped with the
@@ -40,11 +42,10 @@ calls it on a truncated store). Every fact it reads is from rows with
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
   ex-date after the cash base's session and on or before S. The base is the
-  window's last `ok` reconciliation, or the window's start. The cash due is
-  the amount per share times the ledger's holding at the session before
-  the ex-date. A dividend journaled at an `ok` reconciliation is therefore
-  never offered again: that reconciliation becomes the base and its session
-  is on or after the ex-date.
+  window's latest `ok` reconciliation stated on or before S, or the window's
+  start. The cash due is the amount per share times the ledger's holding at
+  the session before the ex-date. A dividend the journal already holds as a
+  `dividend_cash` row dated on or after its ex-date is never offered again.
 - `spinoffs`: always empty. The store keeps only splits and cash dividends
   (`adapters.alpaca_prices` reports spin-offs and does not store them), so
   no row can name a spin-off child. A child the broker books is an
@@ -88,6 +89,7 @@ from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.reconcile import (
     MISMATCH,
+    OK,
     Explanations,
     JournalOpenOrder,
     Reconciliation,
@@ -104,11 +106,11 @@ from tradepartner.store.journal import (
     adjustments_for,
     append,
     fills_for,
-    last_ok_reconciliation,
     non_terminal_orders,
     open_window,
     orders_for,
     pending_orders,
+    reconciliations_for,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -116,6 +118,7 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _DIVIDEND = "dividend"
+_DIVIDEND_CASH = "dividend_cash"
 _RISK_PREFIX = "risk."
 _FAULT_TYPE = ReconciliationError.__name__
 
@@ -132,7 +135,14 @@ class _JournalState:
     fills: list[OrderedFill]
     orders: list[OrderRow]
     adjustments: list[AdjustmentRow]
-    last_ok: ReconciliationRow | None
+    ok_rows: list[ReconciliationRow]
+
+    def base(self, through: date) -> ReconciliationRow | None:
+        """The latest `ok` reconciliation stated on or before `through`: the
+        ledger's cash base for that session. A later `ok` row (a weekend
+        `paper reconcile` stated for Friday) cannot state `through`."""
+        stated = [r for r in self.ok_rows if r.at.astimezone(_NEW_YORK).date() <= through]
+        return stated[-1] if stated else None
 
 
 def frozen_risk(window: PaperWindowRow) -> RiskConfig:
@@ -184,12 +194,22 @@ def _cut(session: date) -> datetime:
     return session_close(previous_session(session))
 
 
+def _stated_through(session: date, now: datetime) -> date:
+    """The day the ledger is stated for: the clock's New York date while no
+    session has opened since S (a weekend `paper reconcile` for Friday), else
+    S. No fill, ex-date or split falls between them, so positions are the
+    same; the difference is that an `ok` row written that weekend can still be
+    the cash base of the next one."""
+    day = now.astimezone(_NEW_YORK).date()
+    return day if day > session and command_session(now) == session else session
+
+
 def _journal_state(conn: duckdb.DuckDBPyConnection, window_id: int) -> _JournalState:
     return _JournalState(
         fills=fills_for(conn, window_id=window_id),
         orders=orders_for(conn, window_id=window_id),
         adjustments=adjustments_for(conn, window_id),
-        last_ok=last_ok_reconciliation(conn, window_id),
+        ok_rows=[r for r in reconciliations_for(conn, window_id) if r.status == OK],
     )
 
 
@@ -200,16 +220,12 @@ def _ledger(
     through: date,
     tolerance: float,
 ) -> Ledger:
-    # The cash base must be stated on or before `through` (ledger rule).
-    base = state.last_ok
-    if base is not None and base.at.astimezone(_NEW_YORK).date() > through:
-        base = None
     return from_journal(
         state.fills,
         state.orders,
         state.adjustments,
         actions,
-        base,
+        state.base(through),
         window.starting_cash,
         through,
         window_id=_window_id(window),
@@ -277,13 +293,17 @@ def _dividends(
     window: PaperWindowRow,
     session: date,
     tolerance: float,
+    through: date,
 ) -> dict[str, float]:
-    """Cash due per name for dividends with ex-date in (base session, S]."""
-    base = state.last_ok
-    if base is not None and base.at.astimezone(_NEW_YORK).date() <= session:
-        after = base.at.astimezone(_NEW_YORK).date()
-    else:
-        after = window.started_at.astimezone(_NEW_YORK).date()
+    """Cash due per name for dividends with ex-date in (base session, S], less
+    any the journal already holds as `dividend_cash` on or after the ex-date."""
+    base = state.base(through)
+    stated = base.at if base is not None else window.started_at
+    after = stated.astimezone(_NEW_YORK).date()
+    journaled: dict[str, list[date]] = defaultdict(list)
+    for adjustment in state.adjustments:
+        if adjustment.kind == _DIVIDEND_CASH and adjustment.security_id is not None:
+            journaled[adjustment.security_id].append(adjustment.session)
     rows = actions.filter(
         (pl.col("action_type") == _DIVIDEND)
         & (pl.col("ex_date") > after)
@@ -292,6 +312,8 @@ def _dividends(
     due: dict[str, float] = defaultdict(float)
     holdings: dict[date, Ledger] = {}
     for row in rows.iter_rows(named=True):
+        if any(day >= row["ex_date"] for day in journaled.get(row["security_id"], ())):
+            continue
         before = previous_session(row["ex_date"])
         if before not in holdings:
             holdings[before] = _ledger(state, actions, window, before, tolerance)
@@ -310,6 +332,7 @@ def _explanations(
     settings: Settings,
     broker_symbols: Collection[str],
     tolerance: float,
+    through: date,
 ) -> Explanations:
     cut = _cut(session)
     names = (
@@ -326,7 +349,7 @@ def _explanations(
         symbols=symbols,
         ended=ended,
         spinoffs={},
-        dividends=_dividends(state, actions, window, session, tolerance),
+        dividends=_dividends(state, actions, window, session, tolerance, through),
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
     )
 
@@ -350,7 +373,7 @@ def explanations_as_of(
     state = _journal_state(conn, _window_id(window))
     actions = live_actions_as_of(conn, cut)
     return _explanations(
-        conn, state, actions, window, session, settings, broker_symbols, quantity_tolerance
+        conn, state, actions, window, session, settings, broker_symbols, quantity_tolerance, session
     )
 
 
@@ -410,6 +433,7 @@ def reconcile_now(
     window_id = _window_id(window)
     cut = _cut(session)
     now = _read_clock(clock)
+    through = _stated_through(session, now)
     tolerance = frozen.reconcile_quantity_tolerance
 
     with connect() as conn:
@@ -437,9 +461,9 @@ def reconcile_now(
         state = _journal_state(conn, window_id)
         actions = live_actions_as_of(conn, cut)
         explanations = _explanations(
-            conn, state, actions, window, session, settings, positions.keys(), tolerance
+            conn, state, actions, window, session, settings, positions.keys(), tolerance, through
         )
-    ledger = _ledger(state, actions, window, session, tolerance)
+    ledger = _ledger(state, actions, window, through, tolerance)
     result = compare(
         ledger,
         positions,
@@ -511,8 +535,9 @@ def reconcile_command(
     """`paper reconcile` (module docstring). Raises `LockHeld` while another
     process holds the run lock and `NoWindowError` with no open window, both
     before any broker call or write. On a mismatch, appends the `engaged` row
-    and re-raises `ReconciliationError`; if that row cannot be written, the
-    error says so."""
+    and re-raises `ReconciliationError`; if that row cannot be written (the
+    store, or the clock it is stamped with, failing), the error says so and
+    still names the mismatch."""
     with run_lock(settings):
         with connect() as conn:
             window = open_window(conn)
@@ -525,14 +550,17 @@ def reconcile_command(
                 settings, connect, broker, window, session, clock, connect, frozen=frozen
             )
         except ReconciliationError as exc:
-            engaged = switch.engage(
-                settings,
-                clock,
-                window_id=_window_id(window),
-                source="fault",
-                fault_type=_FAULT_TYPE,
-                reason=str(exc),
-            )
+            try:
+                engaged = switch.engage(
+                    settings,
+                    clock,
+                    window_id=_window_id(window),
+                    source="fault",
+                    fault_type=_FAULT_TYPE,
+                    reason=str(exc),
+                )
+            except Exception as engage_error:  # a bad clock reading, say
+                engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
             if isinstance(engaged, switch.WriteFailed):
                 raise ReconciliationError(
                     f"{exc}; the kill switch row could not be written: {engaged.error}"
