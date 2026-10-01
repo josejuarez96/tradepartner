@@ -38,7 +38,7 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
 | Research → Decide | The report answers the brief's question, with evidence grades and a disconfirmation section | Owner |
 | Decide → Spec | ADR status is `Accepted` | Owner |
 | Spec → Plan | Acceptance criteria are testable, out-of-scope is listed, `spec-critic` has run | Owner |
-| Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines | Owner (can be delegated for size M) |
+| Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines. The plan passes the "Plan shape" list below | Owner (can be delegated for size M) |
 | Build → Merge | CI is green, PR checklist is complete, specialist reviews are done | Owner merges, or explicitly tells the main session to |
 | Phase → next phase | Phase exit criteria are met, retro is written, release is tagged | Owner |
 
@@ -55,6 +55,19 @@ Not every change needs every document. Size is set on the issue.
 | **L** (multi-PR feature or phase) | Backtester, broker integration, LLM layer | Spec + plan docs, and an ADR for any hard-to-reverse choice |
 
 **Always requires an ADR, whatever the size:** choosing a vendor, data source, broker, model, storage format or library that would be painful to swap, plus any change to risk rules or LLM authority.
+
+## Plan shape (many windows, one plan)
+
+Added 2026-09-30 (#388) after the Phase 4 plan serialised eight windows behind a twelve-PR chain: five tasks edited `wrapper.py` in sequence, six edited `run.py`, an owner recording gated twelve tasks transitively, and merges fell from 83 a day to 3. A plan or plan amendment is approved only when it passes this list. `spec-critic` checks it (check 5) and `uv run python scripts/team.py graph` (#389) prints the numbers it needs.
+
+1. **Slice by file, not by step.** A module that would be built in slices is split into pure modules over explicit inputs, each its own task and file, plus one driver task that composes them last. A sequence of tasks that edit one file is allowed only as a declared chain of at most three (the driver and its wiring), named in the plan's lanes paragraph.
+2. **Depth bound.** No chain of open tasks longer than six PRs without a sentence in the approach section saying why.
+3. **File bound.** No file named by more than two unticked tasks unless the lanes paragraph lists those tasks as one chain, in order, or the plan states that they touch disjoint parts (config keys, dated amendment notes) and that whichever lands later merges main first.
+4. **Owner tasks gate the edge, never the middle.** An owner task (keys, the real store, market hours) gates only the task that consumes its artifact: an adapter, a start, a close. A build task that would otherwise wait on it declares the stub on its line: the one call site, the test that names it, and that the follow-up lands by amendment or a size-S issue.
+5. **Handoffs amend the line.** When a PR learns something a later task needs, it edits that task's line in the same PR. A docstring, a PR body or a review comment is not a handoff (#374, #375).
+6. **Fixes on an unbuilt consumer's input go to its line, or one issue per module.** Review findings on a merged module that an unbuilt task consumes are folded into that task's line, or batched as one `size:S` issue per module. Never one issue per finding on one file: each becomes a PR that conflicts with the others.
+7. **Owner items carry what they unblock.** The plan lists them in one place, ordered by what they block, earliest first, so the owner's single-threaded time goes to the earliest gate.
+8. **Numbers in the approach.** The approach section states the longest open chain, the tasks at depth 1 and 2, and the files shared by open tasks, from `team.py graph`, before and after any amendment.
 
 ## Definition of Ready (before BUILD starts)
 
