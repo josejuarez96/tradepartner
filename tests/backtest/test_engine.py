@@ -14,6 +14,7 @@ import polars as pl
 import pytest
 
 from backtest.fake_provider import FakeProvider
+from tradepartner.backtest import engine
 from tradepartner.backtest.costs import Commissions, trade_cost
 from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.fills import apply_trades
@@ -545,3 +546,34 @@ def test_no_stray_numeric_literals(module: str) -> None:
         and node.value not in ALLOWED_LITERALS
     ]
     assert stray == []
+
+
+class TestPublicPlan:
+    """Phase 4 plans with the engine's own function (plan T53): the public `plan`
+    is the one the loop calls, and returns the same plan at every rebalance."""
+
+    def test_the_public_plan_equals_the_loops_plan_at_every_rebalance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded: list[engine.Plan] = []
+        original = engine._plan
+
+        def recording(provider: Any, params: Settings, session: date) -> engine.Plan:
+            result = original(provider, params, session)
+            recorded.append(result)
+            return result
+
+        monkeypatch.setattr(engine, "_plan", recording)
+        _run(_provider(), end=T4)
+        monkeypatch.setattr(engine, "_plan", original)  # the check below calls the real one
+        # Every rebalance but the last is planned, in order, once.
+        assert [p.session for p in recorded] == [T0, T1, T2, T3]
+        for loop_plan in recorded:
+            assert engine.plan(_provider(), _params(), loop_plan.session) == loop_plan
+
+    def test_a_plan_carries_its_targets_and_reads(self) -> None:
+        public = engine.plan(_provider(), _params(), T0)
+        assert isinstance(public, engine.Plan)
+        assert (public.session, public.fill_session) == (T0, F0)
+        assert set(public.targets) == {"A", "B"}
+        assert public.n_universe == 4

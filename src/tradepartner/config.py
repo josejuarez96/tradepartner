@@ -621,3 +621,18 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Load `Settings` fresh from the environment (no process-wide caching)."""
     return Settings()
+
+
+def secret_values(settings: Settings) -> list[str]:
+    """The value of every `SecretStr` field on `settings`, found by type, so a
+    secret added to `Settings` later is redacted without editing a list (#334,
+    #342). Blank values are left out; values are stripped; longest first, so a
+    secret that contains another is redacted whole."""
+    values = []
+    for name in type(settings).model_fields:
+        secret = getattr(settings, name)
+        if isinstance(secret, SecretStr):
+            value = secret.get_secret_value().strip()
+            if value:
+                values.append(value)
+    return sorted(set(values), key=len, reverse=True)
