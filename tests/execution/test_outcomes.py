@@ -9,6 +9,7 @@ of 2026-09-30 is 10,000, so a 100 dollar gain contributes 0.01.
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from itertools import count
 
@@ -239,6 +240,113 @@ def test_an_unexecuted_order_without_prices_has_no_value() -> None:
     book.order("SEC_C", "sell", "expired")
     [outcome] = book.due(DUE)
     assert (outcome.value, outcome.mark_price) == (None, None)
+
+
+_BAD_PRICES = [float("nan"), float("inf"), 0.0, -5.0]
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_positions_daily_mark_is_refused(bad: float) -> None:
+    """A NaN, infinite, zero or negative mark never becomes an outcome, and a
+    zero mark no longer falls back to the raw close (#369)."""
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, bad, 10.0)
+    book.closes[("SEC_A", T_NEXT)] = 110.0
+    with pytest.raises(ValueError, match="mark"):
+        book.due(DUE)
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_horizon_close_is_refused(bad: float) -> None:
+    book = Book()
+    book.order("SEC_C", "buy", "expired")
+    book.closes[("SEC_C", T_I)] = 20.0
+    book.closes[("SEC_C", T_NEXT)] = bad
+    with pytest.raises(ValueError, match="mark"):
+        book.due(DUE)
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_not_executed_start_price_is_refused(bad: float) -> None:
+    book = Book()
+    book.order("SEC_C", "buy", "expired")
+    book.closes[("SEC_C", T_I)] = bad
+    book.closes[("SEC_C", T_NEXT)] = 22.0
+    with pytest.raises(ValueError, match="start"):
+        book.due(DUE)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -10_000.0])
+def test_a_bad_equity_is_refused(bad: float) -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    book.marks[0] = replace(book.marks[0], cash=bad)
+    with pytest.raises(ValueError, match="equity"):
+        book.due(DUE)
+
+
+def _due_without_lots(book: Book, window: OutcomeWindow | None = None) -> list[Outcome]:
+    return due_outcomes(
+        window or OutcomeWindow(window_id=1),
+        book.orders,
+        book.events,
+        book.fills,
+        book.marks,
+        None,
+        book.price_of,
+        DUE,
+    )
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_buy_fill_price_is_refused(bad: float) -> None:
+    """A NaN or infinite fill price, or an average that is not positive, never
+    becomes a position return or a contribution."""
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, bad)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    with pytest.raises(ValueError, match="price"):
+        _due_without_lots(book)
+
+
+def test_an_implied_residual_below_zero_with_a_positive_average_passes() -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(6.0, 100.0), (4.0, -1.0)], implied_last=True)
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    [outcome] = _due_without_lots(book)
+    assert outcome.value == pytest.approx(110.0 / 59.6 - 1)
+
+
+@pytest.mark.parametrize("bad", _BAD_PRICES)
+def test_a_bad_flattening_fill_price_is_refused(bad: float) -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.order("SEC_A", "sell", "filled", [(10.0, bad)], session=date(2026, 10, 20), phase="exit")
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    window = OutcomeWindow(window_id=1, stop_requested=date(2026, 10, 19))
+    with pytest.raises(ValueError, match="flattening"):
+        _due_without_lots(book, window)
+
+
+def test_an_order_with_nothing_left_to_write_reads_no_price() -> None:
+    """A bad mark stops only the outcomes still to be written."""
+    book = Book()
+    coid = book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, float("nan"), 10.0)
+    window = OutcomeWindow(window_id=1, written=frozenset({(coid, "position_return")}))
+    assert _due_without_lots(book, window) == []
+
+
+def test_a_mark_row_without_a_price_still_falls_back_to_the_close() -> None:
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    book.marks[-1] = replace(book.marks[-1], mark_price=None)
+    book.closes[("SEC_A", T_NEXT)] = 105.0
+    [outcome] = book.due(DUE)
+    assert outcome.mark_price == 105.0
 
 
 def test_a_partial_fill_then_expiry_has_both_outcomes() -> None:
@@ -651,6 +759,19 @@ def test_a_stop_horizon_never_ends_before_the_orders_session() -> None:
     )
     [outcome] = book.due(date(2026, 10, 23), window)
     assert (outcome.client_order_id, outcome.through_session) == (coid, late)
+
+
+def test_a_bad_mark_appends_no_outcome(conn: duckdb.DuckDBPyConnection) -> None:
+    """The refusal comes before any outcome is appended (#369)."""
+    book = Book()
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, float("nan"), 10.0)
+    _journal(conn, book)
+    with pytest.raises(ValueError, match="mark"):
+        write_outcomes_and_lots(
+            conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=print
+        )
+    assert _count(conn, "outcomes") == 0
 
 
 def _latest_lots(conn: duckdb.DuckDBPyConnection) -> list[tuple[object, ...]]:
