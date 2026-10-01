@@ -623,15 +623,25 @@ def compare_targets(
     `store` is a read-only connection: `trial_weights` and the fact tables are
     read directly (there is no registry reader for `trial_weights`, and the
     fact tables are read once per differing name, not materialised whole).
-    Raises `ValueError` when `trial.trial_id` is None (the caller must have
-    read it from a real `trials` row), or when a fill session with at least one
-    differing name has no `paper_plans` row recording `store_max_ingested_at`
-    (every fill session paper planned must have been planned by a run)."""
+    Raises `ValueError` only when `trial.trial_id` is None (the caller must
+    have read it from a real `trials` row). A rebalance session never planned
+    at all (a `missed` run, or one not yet due) is skipped, not raised on
+    (quant-auditor finding on PR #525): there is nothing paper decided there
+    to compare. A session that was planned but whose `paper_plans` row lacks
+    `store_max_ingested_at` has no cutoff for the late-data check, so a
+    differing name there defaults to `bug` rather than raising.
+
+    `trial.sessions[-1]` is never compared: like `compare_months`'s
+    `zip(sessions, sessions[1:])`, the trial's last rebalance session has no
+    further session to fill into inside this trial, so the engine never
+    planned it (`trial_weights` carries no row at `fill_session(sessions[-1])`)
+    — comparing it would flag every one of paper's names there `bug` for no
+    reason (quant-auditor finding on PR #525)."""
     if trial.trial_id is None:
         raise ValueError("the trial has no trial_id")
     trial_weights = _trial_weights_at(store, trial.trial_id)
     rows: list[TargetRow] = []
-    for t_i in trial.sessions:
+    for t_i in trial.sessions[:-1]:
         f_i = fill_session(t_i)
         session_decisions = {
             d.security_id: d for d in journal.decisions if d.rebalance_session == t_i
@@ -639,11 +649,17 @@ def compare_targets(
         names = set(session_decisions) | {sid for fs, sid in trial_weights if fs == f_i}
         if not names:
             continue
+        # A rebalance session never planned at all (a `missed` run, or one still
+        # pending) has nothing paper decided to compare: skip it rather than
+        # raise (quant-auditor finding on PR #525 — `paper report` must not
+        # crash on a window with a missed or not-yet-due rebalance). When a
+        # session WAS planned but its row lacks `store_max_ingested_at` (a data
+        # anomaly, not a missed run), the late-data check below has no cutoff
+        # to use and a differing name there defaults to `bug`.
         plan = _latest_plan(journal.plans, t_i)
-        if plan is None or plan.store_max_ingested_at is None:
-            raise ValueError(
-                f"no paper_plans row with store_max_ingested_at for rebalance session {t_i}"
-            )
+        if plan is None:
+            continue
+        max_ingested_at = plan.store_max_ingested_at
         cutoff = session_close(t_i)
         for security_id in sorted(names):
             decision = session_decisions.get(security_id)
@@ -657,7 +673,9 @@ def compare_targets(
             difference: Difference
             if decision is not None and decision.decision == _OVERRIDE:
                 difference = "override"
-            elif _late_data(store, security_id, cutoff, plan.store_max_ingested_at):
+            elif max_ingested_at is not None and _late_data(
+                store, security_id, cutoff, max_ingested_at
+            ):
                 difference = "late_data"
             else:
                 difference = "bug"
@@ -814,6 +832,18 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
     )
 
 
+def _before(session: date) -> date:
+    """The last rebalance session strictly before `session` (spec req 15: "a
+    closed window is checked through its last completed rebalance session
+    before the stop session")."""
+    year, month = session.year, session.month
+    while True:
+        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
+        candidate = last_session_of_month(year, month)
+        if candidate < session:
+            return candidate
+
+
 def report(settings: Settings, connect: Connect) -> Report:
     """`paper report` (spec req 10): opens a `kind=tracking` trial over
     `[T_0, last completed T]` on the real store with the hypothesis's frozen
@@ -825,8 +855,20 @@ def report(settings: Settings, connect: Connect) -> Report:
     `paper_reports`) and the tracking trial's own writes go through `settings`
     directly (`run_hypothesis`, then `store.db.open_for_write`), never held open
     at the same time as a `connect()` read (DuckDB allows one connection mode
-    per file per process). Raises `ValueError` when no window is open, or when
-    the tracking trial does not finish `ok`.
+    per file per process). Raises `ValueError` when no window is open, when the
+    frozen `execution.fill_price` is missing or invalid (read and validated up
+    front, before the tracking trial runs, so a bad freeze fails fast rather
+    than after paying for a trial run; quant-auditor finding on PR #525 — the
+    writer that should populate this key at `paper start`, `execution/window.py`'s
+    `_frozen_params`, does not exist yet: #526), or when the tracking trial does
+    not finish `ok`.
+
+    "Last completed T" is capped strictly before the window's stop session
+    (req 15), when it has one: a stopped window's `last completed T` is never
+    one paper could still have rebalanced at, so a session at or after the
+    stop is never asked of the tracking trial (quant-auditor finding on PR
+    #525 — this also keeps `compare_targets` from ever being asked about a
+    session the window stopped before planning).
     """
     with connect() as conn:
         window = store_journal.latest_window(conn)
@@ -835,10 +877,13 @@ def report(settings: Settings, connect: Connect) -> Report:
         if window.window_id is None:
             raise ValueError("the window has no window_id")
         window_id = window.window_id
+        fill_price_key = _frozen_fill_price(window)
         hypothesis = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
         t0 = window.first_rebalance_session
         last_t = _last_completed_rebalance_session(utc_now())
         stop_session = _stop_session_of(store_journal.window_stops_for(conn, window_id))
+        while stop_session is not None and last_t >= stop_session:
+            last_t = _before(last_t)
 
     outcome = run_hypothesis(
         hypothesis.slug,
@@ -857,7 +902,7 @@ def report(settings: Settings, connect: Connect) -> Report:
         trial = _trial_months(conn, outcome.trial_id)
         journal = _journal_for(conn, window_id)
         actions = conn.execute("SELECT * FROM corporate_actions").pl()
-        prices = _price_of(conn, _frozen_fill_price(window))
+        prices = _price_of(conn, fill_price_key)
         monthly = compare_months(window, trial, journal, actions, prices, stop_session)
         targets = compare_targets(window, trial, journal, conn)
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import itertools
 import json
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 
@@ -34,6 +34,7 @@ from tradepartner.store.schema import init_schema
 WINDOW_ID = 9
 A = "SEC_A"
 T0 = date(2026, 9, 30)
+T1 = date(2026, 10, 30)  # trial.sessions[-1]: never compared (nothing planned past it)
 F0 = fill_session(T0)
 _IDS = itertools.count(200)
 
@@ -76,7 +77,9 @@ def _window() -> PaperWindowRow:
 
 
 def _trial(trial_id: int = 1) -> TrialMonths:
-    return TrialMonths(sessions=(T0,), equity={}, cost_paid={}, trial_id=trial_id)
+    # Two sessions so T0 is not `sessions[-1]` (never compared: nothing is
+    # planned past a trial's last session).
+    return TrialMonths(sessions=(T0, T1), equity={}, cost_paid={}, trial_id=trial_id)
 
 
 def _plan(*, store_max_ingested_at: datetime, run_id: int = 1) -> PaperPlanRow:
@@ -187,6 +190,46 @@ def test_late_ingested_bar_is_late_data(store: duckdb.DuckDBPyConnection) -> Non
     result = compare_targets(_window(), _trial(), journal, store)
     assert len(result.rows) == 1
     assert result.rows[0].difference == "late_data"
+
+
+def test_bar_ingested_at_exactly_the_plan_cutoff_is_not_late_data(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    # `ingested_at` equal to (not strictly after) the plan's `store_max_ingested_at`:
+    # the plan could have seen this very row, so it is not a late-ingested one.
+    _insert_trial_weight(store, 1, F0, 0.5)
+    plan_time = _utc(T0)
+    _insert_late_bar(store, known_at=session_close(T0), ingested_at=plan_time)
+    journal = Journal(
+        positions_daily=(),
+        adjustments=(),
+        decisions=(_decision(0.6),),
+        plans=(_plan(store_max_ingested_at=plan_time),),
+    )
+    result = compare_targets(_window(), _trial(), journal, store)
+    assert len(result.rows) == 1
+    assert result.rows[0].difference == "bug"
+
+
+def test_bar_known_after_the_cutoff_is_not_late_data(store: duckdb.DuckDBPyConnection) -> None:
+    # Known strictly AFTER close(T0): neither paper's plan nor the tracking
+    # trial could have seen this row by T0's close, so it cannot explain a
+    # difference reported at T0 -- `bug`, not `late_data` (a no-look-ahead
+    # boundary; quant-auditor finding on PR #525).
+    _insert_trial_weight(store, 1, F0, 0.5)
+    plan_time = _utc(T0)
+    _insert_late_bar(
+        store, known_at=session_close(T0) + timedelta(seconds=1), ingested_at=_utc(T0, hour=23)
+    )
+    journal = Journal(
+        positions_daily=(),
+        adjustments=(),
+        decisions=(_decision(0.6),),
+        plans=(_plan(store_max_ingested_at=plan_time),),
+    )
+    result = compare_targets(_window(), _trial(), journal, store)
+    assert len(result.rows) == 1
+    assert result.rows[0].difference == "bug"
 
 
 def test_no_trial_id_raises(store: duckdb.DuckDBPyConnection) -> None:
