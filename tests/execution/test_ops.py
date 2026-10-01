@@ -475,6 +475,34 @@ def test_stale_when_s_minus_1_has_no_run(
     assert data.stale is True
 
 
+def test_locked_alerts_with_no_run_still_show_in_the_window(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """`locked` is emitted before any run row exists (`execution.alerts`), so it
+    carries no `run_id` and would be missed by a `run_id IN (window's runs)`
+    filter alone; it belongs to this window once its session is on or after
+    the window's first rebalance (finding 4 of the quant-auditor review on
+    PR #433)."""
+    with open_for_write(journal_settings) as conn:
+        alert_id = append(
+            conn,
+            AlertRow(
+                run_id=None,
+                session=_S,
+                kind="locked",
+                message="the paper run lock was held",
+                at=_at(50),
+                **_stamp(50),
+            ),
+        )
+        assert alert_id is not None
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    kinds = {a.kind for a in data.alerts}
+    assert "locked" in kinds
+    assert len(data.alerts) == 2  # the seeded stale_data alert plus this one
+
+
 @pytest.fixture
 def holder(journal_settings: Settings) -> Iterator[subprocess.Popen[str]]:
     """Another process holding the paper run lock until its stdin closes."""
@@ -680,6 +708,16 @@ def test_page_data_runs_within_half_the_lock_retry_seconds(
             )
             append(
                 conn,
+                OutcomeRow(
+                    client_order_id=client_order_id,
+                    through_session=_S_MINUS_1,
+                    kind="realised_pnl",
+                    value=1.0,
+                    **_stamp(minutes),
+                ),
+            )
+            append(
+                conn,
                 AlertRow(
                     run_id=seeded["run_id"],
                     session=_S_MINUS_1,
@@ -691,7 +729,7 @@ def test_page_data_runs_within_half_the_lock_retry_seconds(
             )
     fast = Settings(
         _env_file=None,
-        store={"path": journal_settings.store.path, "lock_retry_seconds": 4},
+        store={"path": journal_settings.store.path, "lock_retry_seconds": 2},
     )
     with open_read_only(fast) as conn:
         started = time.monotonic()

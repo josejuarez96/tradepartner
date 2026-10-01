@@ -265,27 +265,27 @@ def _order_step(order: OrderRow) -> ChainStep:
 
 
 def _build_chains(
-    conn: duckdb.DuckDBPyConnection,
-    window_id: int,
+    all_orders: Sequence[OrderRow],
+    all_events: Sequence[OrderEventRow],
     fills: Sequence[OrderedFill],
+    all_outcomes: Sequence[OutcomeRow],
     *,
     limit: int,
 ) -> tuple[tuple[OrderChain, ...], bool]:
+    """Built from rows `page_data` already read for `_as_of` (never its own
+    `store.journal` reads: with the window's orders, events and outcomes read
+    once each, not once here and once there)."""
     # Newest order first, so a long window's cap drops its oldest orders, not
     # the current session's (the ones the operator is looking at).
-    orders = sorted(
-        journal.orders_for(conn, window_id=window_id),
-        key=lambda o: (o.known_at, o.client_order_id),
-        reverse=True,
-    )
+    orders = sorted(all_orders, key=lambda o: (o.known_at, o.client_order_id), reverse=True)
     events_by_order: dict[str, list[OrderEventRow]] = {}
-    for event in journal.order_events_for(conn, window_id=window_id):
+    for event in all_events:
         events_by_order.setdefault(event.client_order_id, []).append(event)
     fills_by_order: dict[str, list[OrderedFill]] = {}
     for ordered_fill in fills:
         fills_by_order.setdefault(ordered_fill.fill.client_order_id, []).append(ordered_fill)
     outcomes_by_order: dict[str, list[OutcomeRow]] = {}
-    for outcome in journal.outcomes_for(conn, window_id):
+    for outcome in all_outcomes:
         outcomes_by_order.setdefault(outcome.client_order_id, []).append(outcome)
 
     chains: list[OrderChain] = []
@@ -399,7 +399,11 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     s_minus_1 = _required_run_session(utc_now())
     stale = not any(r.session == s_minus_1 for r in runs if r.session is not None)
 
-    last_session = journal.last_marked_session(conn, window_id)
+    # `all_marks` is already every `positions_daily` row of the window, in
+    # session order (`journal.positions_daily_for`'s contract), so the latest
+    # marked session is its last row's -- `journal.last_marked_session` would
+    # only re-read the same rows.
+    last_session = all_marks[-1].session if all_marks else None
     positions_count = 0
     positions_value = 0.0
     if last_session is not None:
@@ -422,7 +426,7 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         lock_free=not lock.is_held(settings),
     )
 
-    chains, chains_capped = _build_chains(conn, window_id, all_fills, limit=limit)
+    chains, chains_capped = _build_chains(orders, order_events, all_fills, outcomes, limit=limit)
     alerts, alerts_capped = _alerts_for_window(conn, window, limit=limit)
     reconciliation = max(reconciliations, key=lambda r: r.at, default=None)
 
