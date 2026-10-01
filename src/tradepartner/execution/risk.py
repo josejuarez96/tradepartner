@@ -46,8 +46,9 @@ orders left to submit). In order:
      as above;
    - `buys_within_cash`: the buys with their modelled cost, a whole-share buy
      at the reference price x (1 + `risk.whole_share_price_buffer`), within
-     `account().cash` (never `buying_power`), strictly and in `Decimal`, each
-     notional floored to the cent (`_buy_cash`, which `size_buys` uses too);
+     `account().cash` (never `buying_power`), strictly and in `Decimal`
+     (`_buy_cash`, which `size_buys` uses too); a buy notional not in whole
+     cents is refused (`ValueError`: the wrapper floors to the cent first);
    - `asset_missing` and `whole_shares`: an order whose name the broker's
      `assets` read lacks, or a fractional order on a name that is not
      `fractionable` (the wrapper builds it by whole shares), fail closed.
@@ -269,10 +270,11 @@ def _buy_cash(
     frozen: RiskConfig,
     costs: BuyCosts,
 ) -> Decimal:
-    """What one buy takes from cash, in `Decimal`: a notional floored to the
-    cent, or a whole-share quantity at the buffered reference price, plus its
-    modelled cost (`backtest.costs.trade_cost`'s formula; nothing for a buy of
-    nothing). `check_phase` and `size_buys` both use it."""
+    """What one buy takes from cash, in `Decimal`: a notional (floored to the
+    cent; `check_phase` refuses any other), or a whole-share quantity at the
+    buffered reference price, plus its modelled cost (`backtest.costs.
+    trade_cost`'s formula; nothing for a buy of nothing). `check_phase` and
+    `size_buys` both use it."""
     if whole_share:
         assert quantity is not None
         shares = _dec(quantity)
@@ -388,6 +390,12 @@ def check_phase(
         _finite(order.value(), f"size of decision {order.decision_id}")
         if order.side == _BUY and (order.full_exit or order.decision == _FORCED_EXIT):
             raise ValueError(f"buy of decision {order.decision_id} marked as an exit")
+        if order.side == _BUY and order.quantity is not None and not order.whole_share:
+            raise ValueError(f"buy of decision {order.decision_id} by quantity is not whole-share")
+        if order.notional is not None and _dec(order.notional) != _dec(order.notional).quantize(
+            _CENT
+        ):
+            raise ValueError(f"buy of decision {order.decision_id} is not in whole cents")
 
     violations: list[Violation] = []
 
@@ -613,12 +621,13 @@ def size_buys(
     # Exact arithmetic keeps the floored batch within cash; `Decimal` rounding
     # can overshoot by a few units in its last place. One cut, the overshoot
     # rounded up to the cent, off the largest notional removes at least the
-    # overshoot (a dollar less needs at least a dollar less), so no loop.
+    # overshoot (a dollar less needs at least a dollar less), so no loop; an
+    # overshoot above a cent is not rounding, and raises.
     over = sum((notional_need(k) for k in notionals), Decimal(0)) - cash_d
     if over > 0:
         largest = max(notionals, key=lambda k: notionals[k])
         cut = over.quantize(_CENT, rounding=ROUND_UP)
-        if notionals[largest] - cut < _dec(frozen.min_order_notional):
+        if cut > _CENT or notionals[largest] - cut < _dec(frozen.min_order_notional):
             raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")
         notionals[largest] -= cut
 

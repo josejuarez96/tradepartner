@@ -652,8 +652,8 @@ def test_two_orders_on_one_name_and_side_breach() -> None:
 
 
 def test_cash_is_compared_strictly_at_the_cent() -> None:
-    """$50 at 15 bp needs $50.075: that cash passes, one cent less breaches, and
-    a notional is floored to the cent before the comparison."""
+    """$50 at 15 bp needs $50.075: that cash passes, one cent less breaches; a
+    notional not in whole cents, or a fractionable buy by quantity, is refused."""
     orders = [_order("C", "buy", 2, notional=50.0, target_weight=0.04)]
     assert isinstance(_check(orders, account=_account(50.075), costs=_COSTS), Skips)
     assert _rules(_check(orders, account=_account(50.065), costs=_COSTS)) == {"buys_within_cash"}
@@ -661,8 +661,10 @@ def test_cash_is_compared_strictly_at_the_cent() -> None:
     assert _rules(_check(orders, tolerant, account=_account(50.065), costs=_COSTS)) == {
         "buys_within_cash"
     }
-    fractional_cent = [replace(orders[0], notional=50.009)]
-    assert isinstance(_check(fractional_cent, account=_account(50.075), costs=_COSTS), Skips)
+    with pytest.raises(ValueError, match="whole cents"):  # never approved unmeasured
+        _check([replace(orders[0], notional=50.009)], account=_account(50.075), costs=_COSTS)
+    with pytest.raises(ValueError, match="not whole-share"):
+        _check([replace(orders[0], notional=None, quantity=1.0)], costs=_COSTS)
 
 
 def test_a_trim_is_a_quantity_sell_so_a_gap_down_cannot_oversell() -> None:
@@ -757,22 +759,28 @@ def test_every_sized_batch_passes_the_cash_rule() -> None:
 def test_a_rounding_overshoot_comes_off_the_largest_notional_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Forced: spendable 3 cents above what $100 holds (A 66.58, B 33.29 need
-    $100.02). The overshoot,
-    rounded up to the cent, comes off the largest buy and the batch fits; a
-    cut that would take it below the minimum raises instead."""
+    """Forced: spendable a cent above what $100 holds, so two $60 remainders
+    floor to $49.93 each and need $100.0098. The overshoot, rounded up to a
+    cent, comes off one buy and the batch fits; a cut below the minimum, or an
+    overshoot above a cent (not rounding), raises instead."""
     import tradepartner.execution.risk as risk
 
     exact = risk._spendable
-    monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.03"))
-    buys = [_buy(1, "A", 80.0), _buy(2, "B", 40.0)]
-    sizings = size_buys(buys, 100.0, _price_of, RiskConfig(), _COSTS)
-    needed = sum(
-        (s.notional or 0.0) + trade_cost(s.notional or 0.0, 0.0, 15.0, _COSTS.commissions)
+    monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.01"))
+    even = [_buy(1, "A", 60.0), _buy(2, "B", 60.0)]
+    sizings = size_buys(even, 100.0, _price_of, RiskConfig(), _COSTS)
+    assert [s.notional for s in sizings] == [49.92, 49.93]
+    orders = [
+        _order(s.security_id, "buy", s.decision_id, notional=s.notional, target_weight=0.01)
         for s in sizings
+    ]
+    loose = RiskConfig(max_order_notional_fraction=1.0)
+    ledger = Ledger(positions={}, cash=1e6, through=_S)
+    assert isinstance(
+        _check(orders, loose, ledger=ledger, costs=_COSTS, account=_account(100.0)), Skips
     )
-    assert needed <= 100.0
-    assert [s.notional for s in sizings][1] == pytest.approx(40.0 * 99.85 / 120.0, abs=0.01)
-    even = [_buy(1, "A", 60.0), _buy(2, "B", 60.0)]  # 49.94 each, cut 3 cents to 49.91
     with pytest.raises(ValueError, match="overshoot"):
-        size_buys(even, 100.0, _price_of, RiskConfig(min_order_notional=49.92), _COSTS)
+        size_buys(even, 100.0, _price_of, RiskConfig(min_order_notional=49.93), _COSTS)
+    monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.05"))
+    with pytest.raises(ValueError, match="overshoot"):
+        size_buys(even, 100.0, _price_of, RiskConfig(), _COSTS)
