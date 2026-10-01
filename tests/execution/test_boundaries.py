@@ -7,20 +7,25 @@ Static checks over `src/tradepartner/`, tests excepted:
    `adapters.alpaca_broker` or `adapters.fake_broker` module, so `cli.py` can
    only get a broker from `execution.brokers.build_broker` (ADR 0003 rule 7).
 2. No `.submit` or `.cancel` attribute, called or passed on as a bound method,
-   and no `getattr`/`methodcaller` with those names, outside
-   `execution/wrapper.py`, so the risk-gated wrapper is the only code that can
-   place or cancel an order. An unrelated `executor.submit` is refused too, by
-   intent.
+   and no `getattr`/`methodcaller`/`attrgetter`/`__getattribute__` with those
+   names, outside `execution/wrapper.py`, so the risk-gated wrapper is the only
+   code that can place or cancel an order. Those lookups with a non-literal name
+   are refused too (`getattr` only when called on the spot, outside
+   `NON_LITERAL_GETATTR_CALLERS`). An unrelated `executor.submit` is refused
+   too, by intent.
 3. `adapters.alpaca_trading_raw` and `AlpacaTradingRaw` are imported or read
    only by `adapters/alpaca_broker.py` and `cli_record.py` (the owner-run paper
    recorder, T48), re-exports and attribute chains included.
 4. No module other than `store/journal.py` and `store/schema.py` names the
-   `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`, in
-   a comma-separated `FROM` list, optionally schema-qualified and quoted), as
+   `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`,
+   parenthesised or not, or in a comma-separated `FROM` list after `SELECT`,
+   `UPDATE` or `DELETE` or after an upper-case `FROM`, optionally
+   schema-qualified and quoted), as
    a whole string literal, or through `FillRow.TABLE`, so every reader goes
    through `store.journal.fills_for`. Docstrings, identifiers and module names
    such as a `Broker.fills` method do not count.
-5. Nothing under `backtest/` imports `store.journal` or `execution`, reads
+5. Nothing under `backtest/` imports `store.journal` or `execution` (attribute
+   chains through import aliases included), reads
    `JOURNAL_TABLE_NAMES`, or names a journal table in SQL by the same rule,
    so the backtest never reads paper results.
 
@@ -54,6 +59,13 @@ TRADING_RAW_IMPORTERS = frozenset({ALPACA_BROKER_MODULE, "tradepartner.cli_recor
 TRADING_RAW_NAMES = frozenset({"AlpacaTradingRaw", "alpaca_trading_raw"})
 FILLS_SQL_OWNERS = frozenset({"tradepartner.store.journal", "tradepartner.store.schema"})
 _DYNAMIC_IMPORTERS = frozenset({"import_module", "__import__"})
+# Modules allowed to call `getattr(obj, name)(...)` with a non-literal name (#418). Each
+# entry says why; literal order names stay refused there too.
+NON_LITERAL_GETATTR_CALLERS = frozenset(
+    {
+        "tradepartner.ingest",  # `_Recorded._ask`: memoising proxy over a FilingSource
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -141,6 +153,33 @@ def _attribute_chains(module: Module) -> set[str]:
     return {_chain(node) for node in ast.walk(module.tree) if isinstance(node, ast.Attribute)}
 
 
+def _import_aliases(module: Module) -> dict[str, str]:
+    """Local names bound by imports, mapped to the dotted name they stand for:
+    `import a.b as c` gives `c -> a.b`, `from a import b as c` gives `c -> a.b`."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Import):
+            aliases.update({a.asname: a.name for a in node.names if a.asname})
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve(module, node)
+            aliases.update({a.asname or a.name: f"{base}.{a.name}" for a in node.names})
+    return aliases
+
+
+def _resolved_chains(module: Module) -> set[str]:
+    """Attribute chains, plus each one with its head resolved through the
+    module's import aliases (`from tradepartner import store; store.journal`
+    gives `tradepartner.store.journal` too, #406)."""
+    aliases = _import_aliases(module)
+    chains = _attribute_chains(module)
+    resolved = set(chains)
+    for chain in chains:
+        head, dot, rest = chain.partition(".")
+        if head in aliases:
+            resolved.add(aliases[head] + dot + rest)
+    return resolved
+
+
 def _called_name(node: ast.Call) -> str | None:
     func = node.func
     return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
@@ -179,25 +218,58 @@ def broker_class_imports(module: Module) -> list[str]:
     return found + non_literal_dynamic_imports(module)
 
 
+def _name_args(node: ast.Call) -> list[ast.expr]:
+    """The arguments that name an attribute in a by-name lookup call."""
+    called = _called_name(node)
+    if any(isinstance(a, ast.Starred) for a in node.args) and called in (
+        "getattr",
+        "methodcaller",
+        "attrgetter",
+        "__getattribute__",
+    ):
+        return list(node.args)  # the name may be inside the star: never a literal
+    if called == "getattr":
+        return node.args[1:2]
+    if called == "methodcaller":
+        return node.args[:1]
+    if called in ("attrgetter", "__getattribute__"):
+        return list(node.args)
+    return []
+
+
 def order_calls(module: Module) -> list[str]:
     """Any `.submit`/`.cancel` attribute, called or passed on as a bound method,
-    plus `getattr(x, "submit")` and `methodcaller("submit")`, by line."""
+    plus a by-name lookup of those names (`getattr`, `methodcaller`, `attrgetter`,
+    dotted paths included, and `__getattribute__`), by line. A lookup whose name
+    is not a string literal is refused, since no static check can follow it
+    (#418); for `getattr` only when its result is called on the spot, because
+    `getattr(obj, field_name)` field reads are common and harmless."""
+    called_on_the_spot = {
+        id(node.func) for node in ast.walk(module.tree) if isinstance(node, ast.Call)
+    }
     found = []
     for node in ast.walk(module.tree):
         if isinstance(node, ast.Attribute) and node.attr in ORDER_CALLS:
             found.append(f"line {node.lineno}: .{node.attr}")
-        elif isinstance(node, ast.Call):
+        elif isinstance(node, ast.Call) and (args := _name_args(node)):
             called = _called_name(node)
-            args = node.args
-            named = (
-                args[1]
-                if called == "getattr" and len(args) >= 2
-                else args[0]
-                if called == "methodcaller" and args
-                else None
-            )
-            if isinstance(named, ast.Constant) and named.value in ORDER_CALLS:
-                found.append(f"line {node.lineno}: {called} {named.value!r}")
+            literals = [
+                a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            ]
+            # a literal order name is flagged first, whatever else the call passes
+            if any(ORDER_CALLS & set(name.split(".")) for name in literals):
+                found.append(f"line {node.lineno}: {called} {literals!r}")
+            else:
+                # `object.__getattribute__(obj, "x")` passes the object too: one literal will do
+                non_literal = not literals or (
+                    called != "__getattribute__" and len(literals) < len(args)
+                )
+                refused = called != "getattr" or (
+                    id(node) in called_on_the_spot
+                    and module.name not in NON_LITERAL_GETATTR_CALLERS
+                )
+                if non_literal and refused:
+                    found.append(f"line {node.lineno}: {called} with a non-literal name")
     return found
 
 
@@ -250,16 +322,25 @@ _QUALIFIER = r"(?:[\"'`]?\w+[\"'`]?\.)?[\"'`]?"
 
 def sql_table_references(module: Module, tables: tuple[str, ...]) -> list[str]:
     """Tables among `tables` that `module` names in SQL (after `FROM`, `JOIN`,
-    `INTO`, `UPDATE` or `TABLE`, or in a comma-separated `FROM` list) or as a
-    whole string literal."""
+    `INTO`, `UPDATE` or `TABLE`, parenthesised or not, or in a comma-separated
+    `FROM` list after `SELECT`, `UPDATE`, `DELETE` or an upper-case `FROM`) or as
+    a whole string literal."""
     found = []
     strings = _strings(module.tree)
     for table in tables:
         name = re.escape(table)
+        # `FROM (fills)` and `FROM(fills)` count (#407)
         keyword = re.compile(
-            rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+{_QUALIFIER}{name}\b", re.IGNORECASE
+            rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)(?=[\s(])[\s(]*{_QUALIFIER}{name}\b",
+            re.IGNORECASE,
         )
-        from_list = re.compile(rf"\bFROM\b[^;]*?,\s*{_QUALIFIER}{name}\b", re.IGNORECASE)
+        # a comma-separated FROM list: any case after SELECT, UPDATE or DELETE, and an
+        # upper-case FROM anywhere (a query fragment), so lower-case prose such as "from
+        # orders, fills and adjustments" does not count (#407)
+        listed = rf"\bFROM\b[^;]*?,[\s(]*{_QUALIFIER}{name}\b"
+        from_list = re.compile(
+            rf"\b(?:SELECT|UPDATE|DELETE)\b[^;]*?{listed}|(?-i:{listed})", re.IGNORECASE
+        )
         quoted = {table, f'"{table}"', f"'{table}'", f"`{table}`"}
         if any(s.strip() in quoted or keyword.search(s) or from_list.search(s) for s in strings):
             found.append(table)
@@ -282,9 +363,10 @@ _BACKTEST_FORBIDDEN = ("tradepartner.store.journal", "tradepartner.execution")
 
 
 def backtest_journal_references(module: Module) -> list[str]:
-    """`store.journal` or `execution` imports and attribute chains, any
-    `JOURNAL_TABLE_NAMES` reference, and journal tables named in SQL."""
-    names = imported_names(module) | _attribute_chains(module)
+    """`store.journal` or `execution` imports and attribute chains (through
+    import aliases too), any `JOURNAL_TABLE_NAMES` reference, and journal tables
+    named in SQL."""
+    names = imported_names(module) | _resolved_chains(module)
     found = sorted(
         n for n in names if any(_names_module(n, target) for target in _BACKTEST_FORBIDDEN)
     )
@@ -374,6 +456,22 @@ def test_broker_class_checker(source: str, name: str, is_package: bool, expected
         ("retry(broker.cancel, order_id)", True),
         ("operator.methodcaller('submit', request)(broker)", True),
         ("keys = {'submit': 1, 'cancel': 2}", False),
+        # #418: attrgetter, a non-literal name, and __getattribute__
+        ("operator.attrgetter('submit')(broker)(request)", True),
+        ("attrgetter('order.cancel')(self)(order_id)", True),
+        ("name = 'submit'\ngetattr(broker, name)(request)", True),
+        ("getattr(broker, f'sub{x}')(request)", True),
+        ("operator.methodcaller(name, request)(broker)", True),
+        ("operator.attrgetter(name)(broker)", True),
+        ("broker.__getattribute__('submit')(request)", True),
+        ("object.__getattribute__(broker, 'cancel')(order_id)", True),
+        ("broker.__getattribute__(name)(request)", True),
+        ("getattr(func, 'id', None)", False),
+        ("value = getattr(record, field_name)", False),
+        ("getattr(*target)(request)", True),
+        ('m = getattr(*(broker,), "submit")', True),
+        ("operator.attrgetter('price')(row)", False),
+        ("row.__getattribute__('price')", False),
     ],
 )
 def test_order_call_checker(source: str, expected: bool) -> None:
@@ -423,6 +521,15 @@ def test_trading_raw_checker(source: str, name: str, expected: bool) -> None:
         ('conn.execute(f"SELECT * FROM {FillRow.TABLE}")', True),
         ("insert_row(conn, journal.FillRow.TABLE, values)", True),
         ("append(conn, FillRow(broker_fill_id='x'))", False),
+        # #407: a parenthesised table, and prose with a comma list
+        ('conn.execute("SELECT * FROM (fills)")', True),
+        ('conn.execute("SELECT * FROM ( fills ) f")', True),
+        ('conn.execute("SELECT * FROM(fills)")', True),
+        ('conn.execute("SELECT * FROM orders o, (fills) f")', True),
+        ('reason = "positions from orders, fills and adjustments"', False),
+        ('conn.execute("UPDATE orders o SET x = 1 FROM orders p, fills f WHERE 1")', True),
+        ('where = "FROM orders, fills"', True),
+        ('conn.execute("delete from orders using x from y, fills")', True),
     ],
 )
 def test_fills_sql_checker(source: str, expected: bool) -> None:
@@ -445,6 +552,14 @@ def test_fills_sql_checker(source: str, expected: bool) -> None:
         ("from tradepartner.store.schema import JOURNAL_TABLE_NAMES", True),
         ("from tradepartner.store import schema\nnames = schema.JOURNAL_TABLE_NAMES", True),
         ("from tradepartner.store.schema import TABLE_NAMES", False),
+        # #406: attribute chains through an aliased parent-package import
+        ("from tradepartner import store\nstore.journal.fills_for(conn)", True),
+        ("from tradepartner import store as s\ns.journal.fills_for(conn)", True),
+        ("import tradepartner.store as st\nst.journal.fills_for(conn)", True),
+        ("from .. import store\nstore.journal.fills_for(conn)", True),
+        ("import tradepartner as tp\ntp.execution.ledger.from_journal(x)", True),
+        ("from tradepartner import store\nstore.registry.trials(conn)", False),
+        ("import tradepartner.store as st\nst.registry.trials(conn)", False),
     ],
 )
 def test_backtest_checker(source: str, expected: bool) -> None:

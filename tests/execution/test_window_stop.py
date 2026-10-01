@@ -28,13 +28,16 @@ from tradepartner.execution.window import (
     RECONCILIATION,
     KillWriteFailed,
     WindowCommandRefused,
+    _check_flat,
     _parse_residues,
     abandon,
     kill,
     override,
     stop,
 )
+from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
+from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
@@ -722,7 +725,10 @@ def _broker_holds(fake: FakeBroker, quantity: float) -> None:
     fake.simulate_fill("prev-1")
 
 
-def _untradable_mark(settings: Settings, run_id: int, quantity: float) -> None:
+def _untradable_mark(
+    settings: Settings, run_id: int, quantity: float, *, tradable: bool = False
+) -> None:
+    """A run's mark for SPY, `tradable=False` unless the name trades again."""
     at = DAY1 - timedelta(minutes=20)
     _append(
         settings,
@@ -733,7 +739,7 @@ def _untradable_mark(settings: Settings, run_id: int, quantity: float) -> None:
             quantity=quantity,
             mark_price=PRICE,
             value=quantity * PRICE,
-            tradable=False,
+            tradable=tradable,
             known_at=at,
             ingested_at=at,
         ),
@@ -769,11 +775,12 @@ def test_a_short_holding_the_broker_agrees_with_is_never_flat(
 
 
 @pytest.mark.parametrize(
-    ("carried_origin", "untradable_mark", "expected"),
+    ("carried_origin", "tradable_mark", "expected"),
     [
-        ("dust", False, "dust"),
-        ("untradable", True, "untradable"),
-        ("untradable", False, None),  # trades again: no residue, not flat
+        ("dust", None, "dust"),
+        ("untradable", False, "untradable"),
+        ("untradable", None, None),  # no false mark: no residue, not flat
+        ("untradable", True, None),  # trades again: no residue, not flat
     ],
 )
 def test_a_carried_residue_keeps_its_origin_while_it_counts(
@@ -782,14 +789,14 @@ def test_a_carried_residue_keeps_its_origin_while_it_counts(
     carried_window: PaperWindowRow,
     fixed_clock: FixedClock,
     carried_origin: str,
-    untradable_mark: bool,
+    tradable_mark: bool | None,
     expected: str | None,
 ) -> None:
     _carried(journal_settings, carried_window, 4.0, carried_origin)
     _broker_holds(fake, 4.0)
     run_id = _run(journal_settings, carried_window, DAY1 - timedelta(hours=1))
-    if untradable_mark:
-        _untradable_mark(journal_settings, run_id, 4.0)
+    if tradable_mark is not None:
+        _untradable_mark(journal_settings, run_id, 4.0, tradable=tradable_mark)
     _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
 
     if expected is None:
@@ -869,13 +876,28 @@ def test_a_saturday_stop_states_the_ledger_for_friday_and_closes(
     _carried(journal_settings, carried_window, 4.0, "dust")
     _broker_holds(fake, 4.0)
     _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
-    fixed_clock.now = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)  # Saturday
+    saturday = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
+    fixed_clock.now = saturday
 
     result = _stop(journal_settings, fake, fixed_clock)
 
     assert result.state == "closed"
     (_, closed) = _stops(journal_settings, carried_window)
     assert json.loads(closed.residues_json) == {SPY: {"quantity": 4.0, "origin": "dust"}}
+    # The next `paper start` accepts the listed residue against the same broker.
+    with open_read_only(journal_settings) as conn:
+        listings = listing_ends_as_of(conn, saturday, journal_settings)
+        actions = live_actions_as_of(conn, saturday)
+    flat = _check_flat(
+        open_orders=fake.open_orders(),
+        positions=fake.positions(),
+        previous_stop=closed,
+        listings=listings,
+        actions=actions,
+        tolerance=FROZEN.reconcile_quantity_tolerance,
+        now=saturday.date(),
+    )
+    assert [(r.security_id, r.quantity, r.origin) for r in flat.carried] == [(SPY, 4.0, "dust")]
 
 
 @pytest.mark.parametrize("engagement", ["kill", "override"])
@@ -1007,6 +1029,8 @@ def test_a_reconciliation_that_is_not_ok_refuses_the_close(
     assert reason == RECONCILIATION
     assert status in message and "tp-x" in message
     assert [s.state for s in _stops(journal_settings, window)] == ["requested"]
+    assert _count(journal_settings, "kill_switch") == 0
+    assert not _engaged(journal_settings, window)
 
 
 def test_kill_raises_when_its_row_cannot_be_written(
@@ -1056,3 +1080,34 @@ def test_abandon_engages_the_switch_when_it_fails_after_a_mismatch(
 
     assert _stops(journal_settings, window) == []
     assert _engaged(journal_settings, window)
+
+
+def test_abandon_says_the_switch_is_not_engaged_when_its_fault_row_fails(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")
+    calls = {"n": 0}
+    original = fake.positions
+
+    def positions_fail_after_reconcile() -> Any:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ConnectionError("broker down")
+        return original()
+
+    monkeypatch.setattr(fake, "positions", positions_fail_after_reconcile)
+    monkeypatch.setattr(switch, "engage", lambda *a, **k: switch.WriteFailed("store locked"))
+
+    with pytest.raises(ConnectionError) as excinfo:
+        abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+
+    assert any(
+        "kill switch row could not be written, so it is NOT engaged: store locked" in note
+        for note in getattr(excinfo.value, "__notes__", [])
+    )
+    assert _stops(journal_settings, window) == []
