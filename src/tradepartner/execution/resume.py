@@ -404,16 +404,25 @@ def resume(
         except ReconciliationError as exc:
             # A fault found here engages the switch when nothing has (a resume
             # with no engagement to release), as `paper reconcile` does.
+            refusal = [f"reconciliation failed: {exc}"]
             if not _switch(connect, window).engaged:
-                switch.engage(
-                    settings,
-                    clock,
-                    window_id=window_id,
-                    source="fault",
-                    fault_type=ReconciliationError.__name__,
-                    reason=str(exc),
-                )
-            return outcome(REFUSED, f"reconciliation failed: {exc}")
+                try:
+                    engaged = switch.engage(
+                        settings,
+                        clock,
+                        window_id=window_id,
+                        source="fault",
+                        fault_type=ReconciliationError.__name__,
+                        reason=str(exc),
+                    )
+                except Exception as engage_error:  # a bad clock reading, say
+                    engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
+                if isinstance(engaged, switch.WriteFailed):
+                    refusal.append(
+                        f"the kill switch row could not be written, so it is NOT engaged: "
+                        f"{engaged.error}"
+                    )
+            return outcome(REFUSED, *refusal)
         with connect() as conn:
             reconciliation_id = max(
                 r.reconciliation_id or 0 for r in reconciliations_for(conn, window_id)

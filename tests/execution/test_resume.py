@@ -811,3 +811,22 @@ def test_a_last_mark_with_no_positive_equity_refuses(
     assert outcome.status == REFUSED
     assert any("positive equity" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
+
+
+def test_a_failed_fault_engagement_is_named_in_the_refusal(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        switch, "engage", lambda *_a, **_k: switch.WriteFailed("IOException: store locked")
+    )
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("NOT engaged" in r and "store locked" in r for r in outcome.reasons)
