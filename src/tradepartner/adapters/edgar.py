@@ -743,7 +743,7 @@ def _parse_one_fsn_filing(
         if member is None:
             continue
         group, value = groups.setdefault(member, {}), row.get("value") or ""
-        if "�" in value:  # an invalid byte `_fsn_rows` replaced (#455)
+        if "\ufffd" in value:  # an invalid byte `_fsn_rows` replaced (#455)
             raise ValueError(f"{accession}: undecodable byte in {tag} ({member or 'no class'})")
         if group.get(tag, value) != value:  # fail closed, as parse_cover_page does
             raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
