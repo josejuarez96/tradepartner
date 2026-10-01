@@ -174,6 +174,34 @@ def _residues_json(entries: dict[str, tuple[float, str | None]]) -> str:
     )
 
 
+def _insert_action(
+    settings: Settings,
+    *,
+    security_id: str,
+    action_type: str,
+    ex_date: date,
+    ratio_or_amount: float,
+    known_at: datetime,
+    source_action_id: str = "",
+) -> None:
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO corporate_actions "
+            "(security_id, action_type, ex_date, ratio_or_amount, source_action_id, "
+            "known_at, ingested_at, source, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'test', 'action')",
+            [
+                security_id,
+                action_type,
+                ex_date,
+                ratio_or_amount,
+                source_action_id,
+                known_at,
+                known_at,
+            ],
+        )
+
+
 def _write_closed_window(
     settings: Settings,
     hyp: registry.HypothesisRecord,
@@ -491,14 +519,15 @@ def test_accepts_spinoff_child_of_a_residue(
     # keyed by the child, with `source_action_id` naming the parent.
     ex_date = (stop_at + timedelta(days=2)).date()
     known_at = stop_at + timedelta(days=5)
-    with open_for_write(journal_settings) as conn:
-        conn.execute(
-            "INSERT INTO corporate_actions "
-            "(security_id, action_type, ex_date, ratio_or_amount, source_action_id, "
-            "known_at, ingested_at, source, provenance) "
-            "VALUES (?, 'spinoff', ?, 0.2, ?, ?, ?, 'test', 'action')",
-            [CHILD, ex_date, SPY, known_at, known_at],
-        )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=ex_date,
+        ratio_or_amount=0.2,
+        known_at=known_at,
+        source_action_id=SPY,
+    )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 10.0
     fake.extra_quantity["SPLT"] = 2.0  # 10 * 0.2
@@ -567,3 +596,146 @@ def test_prints_the_abandoned_note(
     fake = _fake(fixed_clock)  # strictly flat: no positions seeded
     result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
     assert result.abandoned_note == "the account was reset by hand at Alpaca"
+
+
+# --- split-adjustment, delisting and the spin-off ex-date bound -------------
+
+
+def test_accepts_split_adjusted_residue_match(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """A 2-for-1 split between the residue's stated session and now doubles
+    the quantity `start` must find at the broker; the stored adjustment
+    keeps the original, pre-split quantity (the ledger split-adjusts it)."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (5.0, None)},
+    )
+    _insert_action(
+        journal_settings,
+        security_id=SPY,
+        action_type="split",
+        ex_date=(stop_at + timedelta(days=2)).date(),
+        ratio_or_amount=2.0,
+        known_at=stop_at + timedelta(days=1),
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0  # 5 pre-split shares, doubled
+
+    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    window_id = result.window.window_id
+    assert window_id is not None
+
+    with open_read_only(journal_settings) as conn:
+        adjustments = adjustments_for(conn, window_id=window_id)
+    carried = {a.security_id: a for a in adjustments if a.kind == "carried_residue"}
+    assert carried[SPY].quantity == 5.0  # unadjusted: the ledger applies the split itself
+
+
+def test_refuses_residue_not_held_and_not_delisted(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=fixed_clock() - timedelta(days=1),
+        residues={SPY: (5.0, None)},
+    )
+    fake = _fake(fixed_clock)  # holds nothing, and SPY is not delisted
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"
+
+
+def test_accepts_a_delisted_residue_s_removal(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`tests/fixtures/universe` delists SEC_TRUNC_DELIST in 2018 with no
+    re-listing: a residue in it is explained away when the broker no longer
+    holds it, never refused."""
+    delisted = "SEC_TRUNC_DELIST"
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=fixed_clock() - timedelta(days=1),
+        residues={delisted: (3.0, "untradable")},
+    )
+    fake = _fake(fixed_clock)  # holds nothing: the delisting explains it
+
+    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+
+    window_id = result.window.window_id
+    assert window_id is not None
+    with open_read_only(journal_settings) as conn:
+        adjustments = adjustments_for(conn, window_id=window_id)
+    assert [a for a in adjustments if a.security_id == delisted] == []
+
+
+def test_refuses_spinoff_quantity_mismatch(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (10.0, None)},
+    )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=(stop_at + timedelta(days=2)).date(),
+        ratio_or_amount=0.2,
+        known_at=stop_at + timedelta(days=5),
+        source_action_id=SPY,
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 99.0  # not 10 * 0.2: an unexplained position
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"
+
+
+def test_refuses_a_spinoff_whose_ex_date_is_not_yet_effective(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """A no-look-ahead guard on the spin-off bound: an ex-date after `now`
+    does not explain a position yet, however the corporate action is
+    already known (a corporate action announced ahead of its ex-date)."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (10.0, None)},
+    )
+    _insert_action(
+        journal_settings,
+        security_id=CHILD,
+        action_type="spinoff",
+        ex_date=(fixed_clock() + timedelta(days=5)).date(),  # not yet effective
+        ratio_or_amount=0.2,
+        known_at=stop_at + timedelta(days=5),
+        source_action_id=SPY,
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 2.0  # held already, but the spin-off has no effect yet
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"

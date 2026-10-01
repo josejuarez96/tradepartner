@@ -65,16 +65,24 @@ adapter persists a `spinoff` action at all), so this module reads a
 the *child*, `ratio_or_amount` the child shares received per parent share,
 and `source_action_id` the *parent's* `security_id` -- a convention this
 task introduces for lack of a dedicated column, used only by test fixtures
-until a real source populates it. A broker position in such a child,
-received within the tolerance of a matched residue's quantity times that
-ratio, is accepted and journaled `spinoff_receipt`; the owner should confirm
-this convention (or replace it with a schema change) before it is relied on
-for a real spin-off.
+until a real source populates it. Only a spin-off whose `ex_date` falls
+strictly after the residue's own stated session and on or before now
+explains anything (the same bound `reconcile.py` applies to its own
+explanations); its ratio applies to the parent residue's own holding
+*at the ex-date* (split-adjusted from the residue's session), and the
+result is projected to today by the *child's* own splits since the
+ex-date before it is compared to the live position, so neither the
+parent's nor the child's splits are ever applied twice. A matching broker
+position is accepted and journaled `spinoff_receipt` at the ex-date's own
+share basis (the ledger split-adjusts it forward like any other
+adjustment); the owner should confirm this convention (or replace it with
+a schema change) before it is relied on for a real spin-off.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -208,12 +216,18 @@ def _gap_signoff_ok(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool
 
 
 def _previous_stop(conn: duckdb.DuckDBPyConnection, previous: PaperWindowRow | None) -> Any:
+    """The previous window's closing stop row: any `abandoned` row wins over
+    a `closed` one whatever their order (a window closes or is abandoned
+    once; this does not rely on row order to tell which)."""
     if previous is None or previous.window_id is None:
         return None
     stops = [
         s for s in window_stops_for(conn, previous.window_id) if s.state in CLOSING_STOP_STATES
     ]
-    return stops[-1] if stops else None
+    if not stops:
+        return None
+    abandoned = [s for s in stops if s.state == _ABANDONED]
+    return abandoned[-1] if abandoned else stops[-1]
 
 
 def _parse_residues(residues_json: str | None) -> dict[str, _Residue]:
@@ -232,9 +246,12 @@ def _parse_residues(residues_json: str | None) -> dict[str, _Residue]:
         origin = entry.get("origin")
         if origin not in (None, _DUST, _UNTRADABLE):
             raise ValueError(f"residues_json origin for {security_id!r} is {origin!r}")
+        quantity = float(entry["quantity"])
+        if not math.isfinite(quantity) or quantity < 0:
+            raise ValueError(f"residues_json quantity for {security_id!r} is {quantity!r}")
         residues[security_id] = _Residue(
             security_id=security_id,
-            quantity=float(entry["quantity"]),
+            quantity=quantity,
             origin=origin,
         )
     return residues
@@ -266,11 +283,20 @@ def _split_factor(actions: pl.DataFrame, security_id: str, after: date, through:
     return factor
 
 
-def _spinoffs_of(actions: pl.DataFrame, parent_security_id: str) -> list[dict[str, Any]]:
+def _spinoffs_of(
+    actions: pl.DataFrame, parent_security_id: str, after: date, through: date
+) -> list[dict[str, Any]]:
     """`spinoff` actions this module's convention attributes to
-    `parent_security_id` (module docstring)."""
+    `parent_security_id` (module docstring), with `after < ex_date <=
+    through` (the same "explained only since the last known state" bound
+    `reconcile.py` applies to its own explanations): a spin-off known but not
+    yet effective, or one from before the residue was last stated, explains
+    nothing here."""
     rows = actions.filter(
-        (pl.col("action_type") == _SPINOFF) & (pl.col("source_action_id") == parent_security_id)
+        (pl.col("action_type") == _SPINOFF)
+        & (pl.col("source_action_id") == parent_security_id)
+        & (pl.col("ex_date") > after)
+        & (pl.col("ex_date") <= through)
     )
     return rows.to_dicts()
 
@@ -324,18 +350,33 @@ def _check_flat(
         )
 
     spinoff_receipts: list[tuple[str, float, date]] = []
-    for residue in carried:
-        for spinoff in _spinoffs_of(actions, residue.security_id):
-            child = spinoff["security_id"]
-            ratio = float(spinoff["ratio_or_amount"])
-            child_ticker = current.get(child, {}).get("ticker")
-            if child_ticker is None or child_ticker not in unmatched_symbols:
-                continue
-            expected_child_qty = residue.quantity * ratio
-            received = unmatched_symbols[child_ticker]
-            if abs(received - expected_child_qty) <= tolerance:
-                del unmatched_symbols[child_ticker]
-                spinoff_receipts.append((child, received, spinoff["ex_date"]))
+    if carried and stated_on is not None:
+        for residue in carried:
+            for spinoff in _spinoffs_of(actions, residue.security_id, stated_on, now):
+                child = spinoff["security_id"]
+                ex_date = spinoff["ex_date"]
+                ratio = float(spinoff["ratio_or_amount"])
+                child_ticker = current.get(child, {}).get("ticker")
+                if child_ticker is None or child_ticker not in unmatched_symbols:
+                    continue
+                # The parent's own holding at the ex-date (its splits between
+                # the residue's stated session and the ex-date), times the
+                # ratio: the child quantity received, in the child's
+                # ex-date share basis.
+                parent_at_ex_date = residue.quantity * _split_factor(
+                    actions, residue.security_id, stated_on, ex_date
+                )
+                expected_at_ex_date = parent_at_ex_date * ratio
+                # Projected to today by the child's own splits since the
+                # ex-date, to compare against the live position (never
+                # double counted: the stored adjustment below keeps the
+                # ex-date basis and lets the ledger apply this same factor,
+                # `execution.ledger`'s documented convention).
+                expected_today = expected_at_ex_date * _split_factor(actions, child, ex_date, now)
+                received = unmatched_symbols[child_ticker]
+                if abs(received - expected_today) <= tolerance:
+                    del unmatched_symbols[child_ticker]
+                    spinoff_receipts.append((child, expected_at_ex_date, ex_date))
 
     if unmatched_symbols:
         raise StartRefusedError(
@@ -391,7 +432,8 @@ def start(
             account = broker.account()
         except Exception as exc:
             raise StartRefusedError(
-                "account_unavailable", f"account() failed on the paper endpoint: {exc}"
+                "account_unavailable",
+                f"account() failed on the paper endpoint ({type(exc).__name__})",
             ) from exc
         open_orders = broker.open_orders()
         positions = broker.positions()
