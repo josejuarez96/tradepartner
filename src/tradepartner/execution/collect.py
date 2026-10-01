@@ -39,8 +39,7 @@ path's read, `paper resume`'s settlement). In order:
      the broker's (a feed ahead of `get_order`, or a fill re-issued under a
      new id); reconciliation sees either;
    - the rejection verdicts (below);
-   - one `fill_cursors` row for this invocation, whatever it found, except
-     for the halt path's read (`halt_read=True`), which writes none (below). Its
+   - one `fill_cursors` row for this invocation, whatever it found. Its
      `collected_through` is the latest `filled_at` seen, never earlier than
      the previous cursor; with no fill and no cursor yet, the earliest open
      order's `pending` time, else the clock's reading (the next read's
@@ -81,13 +80,14 @@ when every one of its orders is `rejected`, even below the cap. The caller
 raises `RejectionCapError` with the verdict's message. `collect` judges each
 submitting run with a `rejected` event written by this collection or since
 the latest **run** collection's cursor row. A rejection journaled by a resume
-or a halt read is therefore judged again by the next run (the halt read
-collects as its run but writes no cursor, so the next run's window still
-reaches its rejections; its fills are insert-or-ignore, so the next read
-re-reading them is harmless), while a run's own
-rejections are not judged again by every later read of its other orders. A
-resume or halt-path caller that gets a verdict must not drop it: resume
-refuses to release, and the halt path names it in its alert.
+is therefore judged again by the next run, while a run's own rejections are
+not judged again by every later read of its other orders. The halt path's
+read collects as its run, so the rejections it journals are **not** judged
+again by the next run: the halt alert names its verdict, and `paper resume`
+judges every run its release would clear directly with `rejection_breaches`
+before it can release (#397, owner answer (a)). A resume or halt-path caller
+that gets a verdict must not drop it: resume refuses to release, and the halt
+path names it in its alert.
 """
 
 from __future__ import annotations
@@ -235,7 +235,6 @@ def collect(
     settings: Settings,
     *,
     write_offs: WriteOffContext | None = None,
-    halt_read: bool = False,
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
@@ -243,8 +242,7 @@ def collect(
     `frozen` is the window's frozen `risk.*` section, and `settings` gives the
     run-time `paper.fill_read_overlap_seconds`. `writer_kind` is `run` or
     `resume` and `writer_id` its run or resume id. Raises `ValueError` for a
-    `pending` order, an unknown writer kind, `write_offs` outside a run or
-    a `halt_read` that is not a plain run read (module docstring), and
+    `pending` order, an unknown writer kind or `write_offs` outside a run, and
     `ClockError` for a fill beyond the broker-clock skew, all before any
     write, and `RejectionCapError` when the write-off back-fill fails after
     this collection found a rejection verdict."""
@@ -252,8 +250,6 @@ def collect(
         raise ValueError(f"writer_kind must be one of {WRITER_KINDS}, got {writer_kind!r}")
     if write_offs is not None and writer_kind != _RUN:
         raise ValueError("only a run writes decision_events (the write-off back-fill)")
-    if halt_read and (writer_kind != _RUN or write_offs is not None):
-        raise ValueError("a halt read is a run's read, without the write-off back-fill")
     ids = [o.client_order_id for o in orders]
     repeated = sorted({i for i in ids if ids.count(i) > 1})
     if repeated:
@@ -297,17 +293,16 @@ def collect(
         through = max(
             (t for t in (latest_seen, cursor) if t is not None), default=open_since or stamp
         )
-        if not halt_read:
-            append(
-                conn,
-                FillCursorRow(
-                    writer_kind=writer_kind,
-                    writer_id=writer_id,
-                    collected_through=through,
-                    known_at=stamp,
-                    ingested_at=stamp,
-                ),
-            )
+        append(
+            conn,
+            FillCursorRow(
+                writer_kind=writer_kind,
+                writer_id=writer_id,
+                collected_through=through,
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
 
     written_off: tuple[int, ...] = ()
     if write_offs is not None:

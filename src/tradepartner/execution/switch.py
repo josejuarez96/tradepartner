@@ -166,13 +166,40 @@ def derive(
         result = finished.get(run_id)
         if result is None:
             causes.append(f"run {run_id} unfinished")
-        elif result.status in FAULTED_RUN_STATUSES and not any(
-            at > run.started_at and at > result.finished_at for at in releases
-        ):
+        elif _faulted_uncleared(run, result, releases):
             causes.append(f"run {run_id} {result.status}")
 
     return SwitchState(
         engaged=bool(causes), run_in_progress=in_progress is not None, causes=tuple(causes)
+    )
+
+
+def _faulted_uncleared(
+    run: PaperRunRow, result: PaperRunResultRow, releases: Sequence[datetime]
+) -> bool:
+    """A run that ended faulted with no `released` row after both its
+    `started_at` and its `finished_at` (the rule `derive` engages on)."""
+    return result.status in FAULTED_RUN_STATUSES and not any(
+        at > run.started_at and at > result.finished_at for at in releases
+    )
+
+
+def faulted_runs(
+    window: PaperWindowRow,
+    kill_switch_rows: Sequence[KillSwitchRow],
+    runs: Sequence[PaperRunRow],
+    results: Sequence[PaperRunResultRow],
+) -> tuple[int, ...]:
+    """The window's runs that ended `halted`, `crashed` or `failed` and that no
+    release has cleared, by `derive`'s own rule: the runs a release would clear."""
+    window_id = window.window_id
+    releases = [r.at for r in kill_switch_rows if r.window_id == window_id and r.state == RELEASED]
+    finished = {r.run_id: r for r in results}
+    return tuple(
+        _run_order(run)
+        for run in sorted((r for r in runs if r.window_id == window_id), key=_run_order)
+        if (result := finished.get(_run_order(run))) is not None
+        and _faulted_uncleared(run, result, releases)
     )
 
 
