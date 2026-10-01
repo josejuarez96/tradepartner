@@ -11,6 +11,7 @@ Shape (development-process.md, "Plan shape"): slice by file, not by step; no ope
 
 - [ ] **T1: <title>**. Files: `…` · Tests: `…` · Depends on: n/a · Review: quant-auditor?
 - [ ] **T2: <title>**. Files: `…` · Tests: `…` · Depends on: T1
+<!-- A finished task collapses to one line (#353): - [x] **T1: <title>** (#issue, PR #n) · Files: `…` · Depends on: n/a -->
 
 ## Verification
 <!-- How we'll demonstrate the spec's acceptance criteria end-to-end -->
