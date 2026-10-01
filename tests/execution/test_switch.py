@@ -17,6 +17,7 @@ import pytest
 from tradepartner.config import Settings
 from tradepartner.execution import switch
 from tradepartner.execution.switch import (
+    ReleaseRefused,
     SwitchState,
     WriteFailed,
     derive,
@@ -557,7 +558,7 @@ def test_release_appends_the_released_row_with_the_peak(store: Settings) -> None
 @pytest.mark.parametrize("status", ["mismatch", "pending_unresolved", "fills_lagging"])
 def test_release_refuses_a_reconciliation_that_is_not_ok(store: Settings, status: str) -> None:
     resume_id, reconciliation_id = _resume_and_reconciliation(store, status)
-    with pytest.raises(ValueError, match="not ok"):
+    with pytest.raises(ReleaseRefused, match="not ok"):
         release(
             store,
             _Clock(),
@@ -573,7 +574,7 @@ def test_release_refuses_another_windows_reconciliation_or_an_unknown_resume(
     store: Settings,
 ) -> None:
     resume_id, other_windows = _resume_and_reconciliation(store, "ok", window_id=9)
-    with pytest.raises(ValueError, match="window"):
+    with pytest.raises(ReleaseRefused, match="window"):
         release(
             store,
             _Clock(),
@@ -583,7 +584,7 @@ def test_release_refuses_another_windows_reconciliation_or_an_unknown_resume(
             peak_equity=900.0,
         )
     _, reconciliation_id = _resume_and_reconciliation(store, "ok")
-    with pytest.raises(ValueError, match="resume"):
+    with pytest.raises(ReleaseRefused, match="resume"):
         release(
             store,
             _Clock(),
@@ -624,7 +625,7 @@ def _engaged(settings: Settings) -> None:
 def test_release_refuses_an_unusable_peak(store: Settings, peak: float) -> None:
     _engaged(store)
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
-    with pytest.raises(ValueError, match="peak_equity"):
+    with pytest.raises(ReleaseRefused, match="peak_equity"):
         _release(store, resume_id, reconciliation_id, peak)
     assert [r.state for r in _rows(store)] == ["engaged"]
 
@@ -633,7 +634,7 @@ def test_release_refuses_an_older_ok_reconciliation(store: Settings) -> None:
     _engaged(store)
     resume_id, old_ok = _resume_and_reconciliation(store, "ok")
     _reconciliation(store, "mismatch", minutes=62)
-    with pytest.raises(ValueError, match="latest"):
+    with pytest.raises(ReleaseRefused, match="latest"):
         _release(store, resume_id, old_ok)
     assert [r.state for r in _rows(store)] == ["engaged"]
 
@@ -643,7 +644,7 @@ def test_release_refuses_an_older_resume(store: Settings) -> None:
     old_resume = _resume(store, 60)
     _resume(store, 61)
     reconciliation_id = _reconciliation(store, minutes=62)
-    with pytest.raises(ValueError, match="latest resume"):
+    with pytest.raises(ReleaseRefused, match="latest resume"):
         _release(store, old_resume, reconciliation_id)
 
 
@@ -653,7 +654,7 @@ def test_release_refuses_a_resume_that_already_released(store: Settings) -> None
     _release(store, resume_id, reconciliation_id)
     _engaged(store)
     again = _reconciliation(store, minutes=70)
-    with pytest.raises(ValueError, match="already released"):
+    with pytest.raises(ReleaseRefused, match="already released"):
         _release(store, resume_id, again)
 
 
@@ -662,13 +663,13 @@ def test_release_refuses_a_reconciliation_older_than_the_resume(store: Settings)
     resume_id, reconciliation_id = _resume_and_reconciliation(
         store, "ok", resume_at=60, reconciled_at=59
     )
-    with pytest.raises(ValueError, match="older than resume"):
+    with pytest.raises(ReleaseRefused, match="older than resume"):
         _release(store, resume_id, reconciliation_id)
 
 
 def test_release_refuses_when_nothing_is_engaged(store: Settings) -> None:
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
-    with pytest.raises(ValueError, match="not engaged"):
+    with pytest.raises(ReleaseRefused, match="not engaged"):
         _release(store, resume_id, reconciliation_id)
     assert _rows(store) == []
 
@@ -677,7 +678,7 @@ def test_release_refuses_while_a_run_is_unfinished(store: Settings) -> None:
     with open_for_write(store) as conn:
         append(conn, _run(5, 10))
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
-    with pytest.raises(ValueError, match=r"run\(s\) 5 unfinished"):
+    with pytest.raises(ReleaseRefused, match=r"run\(s\) 5 unfinished"):
         _release(store, resume_id, reconciliation_id)
     assert _rows(store) == []
 
@@ -708,5 +709,98 @@ def test_release_refuses_a_window_that_is_not_open(store: Settings) -> None:
             PaperWindowStopRow(window_id=_WINDOW, at=_at(80), state="closed", **_stamp(80)),
         )
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
-    with pytest.raises(ValueError, match="not the open window"):
+    with pytest.raises(ReleaseRefused, match="not the open window"):
         _release(store, resume_id, reconciliation_id)
+
+
+@pytest.mark.parametrize("release_at", [200, 199])
+def test_release_refuses_a_row_that_would_not_clear_the_switch(
+    store: Settings, release_at: int
+) -> None:
+    """A release stamped at (or, under skew, before) a halted run's
+    `finished_at` would not clear it: nothing is written, so the drawdown peak
+    is not reset while the switch stays engaged (#413)."""
+    with open_for_write(store) as conn:
+        append(conn, _run(5, 10))
+        append(conn, _result(5, "halted", 200))
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ReleaseRefused, match="would not clear"):
+        release(
+            store,
+            lambda: _at(release_at),
+            window_id=_WINDOW,
+            resume_id=resume_id,
+            reconciliation_id=reconciliation_id,
+            peak_equity=900.0,
+        )
+    assert _rows(store) == []
+
+
+def test_release_refuses_a_resume_that_released_another_window(store: Settings) -> None:
+    """`resume_invocations` carry no window, so a resume that released window
+    1 cannot release window 2 (#414)."""
+    _engaged(store)
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    _release(store, resume_id, reconciliation_id)
+    with open_for_write(store) as conn:
+        append(
+            conn,
+            PaperWindowStopRow(window_id=_WINDOW, at=_at(80), state="closed", **_stamp(80)),
+        )
+        append(conn, _window(2))
+        append(
+            conn,
+            KillSwitchRow(window_id=2, at=_at(85), state="engaged", source="owner", **_stamp(85)),
+        )
+    second = _reconciliation(store, window_id=2, minutes=90)
+    with pytest.raises(ReleaseRefused, match="already released"):
+        release(
+            store,
+            _Clock(),
+            window_id=2,
+            resume_id=resume_id,
+            reconciliation_id=second,
+            peak_equity=900.0,
+        )
+    with open_read_only(store) as conn:
+        assert [r.state for r in kill_switch_events_for(conn, 2)] == ["engaged"]
+
+
+def _broken_clock() -> datetime:
+    raise OSError("clock")
+
+
+def test_a_clock_error_in_engage_from_overrides_propagates(store: Settings) -> None:
+    """The clock is read outside the write: its error is not a write failure
+    (#415)."""
+    _override(store, "engage_kill_switch")
+    with pytest.raises(OSError, match="clock"):
+        engage_from_overrides(store, _broken_clock, window_id=_WINDOW, run_id=3)
+    assert _rows(store) == []
+
+
+def test_the_writers_read_the_clock_before_taking_the_store(store: Settings) -> None:
+    """Each writer's clock reading happens with no write connection open:
+    the probe opens a read-only one, which fails while a write one is open
+    (#415)."""
+    _override(store, "engage_kill_switch")
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    clock = _Clock()
+
+    def probing_clock() -> datetime:
+        with open_read_only(store):
+            pass
+        return clock()
+
+    assert engage_from_overrides(store, probing_clock, window_id=_WINDOW, run_id=3) == [1]
+    assert isinstance(
+        release(
+            store,
+            probing_clock,
+            window_id=_WINDOW,
+            resume_id=resume_id,
+            reconciliation_id=reconciliation_id,
+            peak_equity=900.0,
+        ),
+        int,
+    )

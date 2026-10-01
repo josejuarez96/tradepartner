@@ -34,6 +34,7 @@ from tradepartner.execution.plan import (
     Decisions,
     Signal,
     decisions_from,
+    is_full_exit,
     remainder,
 )
 from tradepartner.store.journal import DecisionRow, OverrideRow, SignalRow
@@ -590,3 +591,25 @@ def test_plan_py_imports_no_adapter() -> None:
 
 def test_signal_value_type_is_exported() -> None:
     assert Signal.__name__ == "Signal"
+
+
+def test_is_full_exit_reads_every_sell_decisions_from_writes() -> None:
+    """T54c: `plan.is_full_exit` accepts every decision `decisions_from` writes,
+    true exactly for the whole-holding sells (spec Definitions > Full exit)."""
+    stamp = datetime(2026, 10, 1, 21, tzinfo=UTC)
+    runs = [
+        _run(),  # C left_targets, X left_universe, A and B buys
+        _run(_plan(targets={"A": 0.5, "B": 0.5}), _ledger({"A": 30.0})),  # A a trim
+        _run(overrides=(_override("exclude_name", "A", override_id=11),)),
+    ]
+    seen = set()
+    for result in runs:
+        for d in result.decisions:
+            row = d.row(run_id=1, known_at=stamp, ingested_at=stamp)
+            full = is_full_exit(row)
+            assert full == (d.side == "sell" and d.reason is not None), d
+            seen.add((d.decision, d.side, d.reason, full))
+    assert ("trade", "sell", None, False) in seen
+    assert ("trade", "sell", "left_targets", True) in seen
+    assert ("trade", "sell", "left_universe", True) in seen
+    assert ("override", "sell", "exclude_name", True) in seen
