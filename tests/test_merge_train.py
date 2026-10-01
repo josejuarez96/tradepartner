@@ -624,7 +624,8 @@ def test_build_green_batch_posts_tested_naming_the_full_batch_prefix() -> None:
     fake = _batch(3)
     fake.script_run(fake.base, [GREEN_MAIN])
     fake.script_run("commit3", [GREEN_FULL])
-    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    printed: list[str] = []
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0, say=printed.append)
     assert record.outcome == "green"
     assert record.green_prefixes == [3]
     assert {n for n, _ in fake.comments_posted} == {1, 2, 3}
@@ -632,6 +633,9 @@ def test_build_green_batch_posts_tested_naming_the_full_batch_prefix() -> None:
         assert text.startswith(f"merge-train: TESTED batch {record.batch_id}")
         assert "prefix 3 u" in text
     assert fake.worktrees_added and fake.worktrees_added == fake.worktrees_removed
+    # req 8: "the same text is printed and written to the record" - every posted
+    # comment's first line is echoed through `say` too.
+    assert sum("TESTED batch" in line for line in printed) == 3
 
 
 # -- AC4: a conflict drops only that PR, and never a merge commit -----------------------
@@ -702,6 +706,35 @@ def test_build_is_inconclusive_on_an_infra_failure_and_resume_reattaches() -> No
     assert resumed.outcome == "green"
     assert resumed.green_prefixes == [2]
     assert {n for n, _ in resumer.comments_posted} == {1, 2}
+
+
+def test_the_inconclusive_comment_names_uv_lock_prs_on_build_and_on_resume() -> None:
+    """req 4, AC7: two accepted PRs touching uv.lock are named on an Install failure, and
+    the same holds after `--resume` re-attaches (safety review of #521, SHOULD FIX 5)."""
+    fake = FakeRunner()
+    fake.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"))
+    fake.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"))
+    fake.script_run(fake.base, [GREEN_MAIN])
+    install_failed = _run(
+        run_id=5,
+        conclusion="failure",
+        steps=(mt.Step("Install", "failure"), mt.Step("Hygiene", "skipped")),
+        duration=20.0,
+    )
+    fake.script_run("commit2", [install_failed])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert record.outcome == "inconclusive"
+    text1 = next(t for n, t in fake.comments_posted if n == 1)
+    assert "uv.lock" in text1 and "#1, #2" in text1
+
+    resumer = FakeRunner()
+    resumer.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"))
+    resumer.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"))
+    resumer.script_run(record.train_sha, [install_failed])
+    resumed = mt.run_build_resume(resumer, record.batch_id, timeout_s=10, poll_s=0)
+    assert resumed.outcome == "inconclusive"
+    resumed_text1 = next(t for n, t in resumer.comments_posted if n == 1)
+    assert "uv.lock" in resumed_text1 and "#1, #2" in resumed_text1
 
 
 # -- AC8: the bisect, both halves ---------------------------------------------------------

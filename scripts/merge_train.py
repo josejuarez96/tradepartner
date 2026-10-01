@@ -633,7 +633,7 @@ def _run_bisect(
     elif probes and probes[-1].outcome == "inconclusive":
         record.detail = f"bisect stopped: probe {probes[-1].k} inconclusive"
     _save(record)
-    _report_bisect(r, record, accepted)
+    _report_bisect(r, record, accepted, say)
 
 
 # -- req 8: the comments ------------------------------------------------------------------
@@ -649,12 +649,23 @@ def _green_prefix_urls(record: Record, total: int) -> dict[int, str]:
     return out
 
 
-def _report_tested(r: Runner, record: Record, accepted: list[PrEntry]) -> None:
+def _post(r: Runner, say: Callable[[str], None], number: int, text: str) -> None:
+    """Post one train comment, and print it too: req 8, "the same text is printed and
+    written to the record". `say` is assumed to redact already (`run_build`'s wrapper)."""
+    say(f"#{number}: {text.splitlines()[0]}")
+    r.post_comment(number, text)
+
+
+def _report_tested(
+    r: Runner, record: Record, accepted: list[PrEntry], say: Callable[[str], None]
+) -> None:
     prefixes = _green_prefix_urls(record, len(accepted))
     for idx, pr in enumerate(accepted, start=1):
         at_or_above = {k: url for k, url in prefixes.items() if k >= idx}
         if at_or_above:
-            r.post_comment(
+            _post(
+                r,
+                say,
                 pr.number,
                 comment(
                     "TESTED", record.batch_id, position=idx, head=pr.head, prefixes=at_or_above
@@ -662,13 +673,17 @@ def _report_tested(r: Runner, record: Record, accepted: list[PrEntry]) -> None:
             )
 
 
-def _report_bisect(r: Runner, record: Record, accepted: list[PrEntry]) -> None:
-    _report_tested(r, record, accepted)
+def _report_bisect(
+    r: Runner, record: Record, accepted: list[PrEntry], say: Callable[[str], None]
+) -> None:
+    _report_tested(r, record, accepted, say)
     if record.culprit is not None:
         culprit_entry = next(p for p in accepted if p.number == record.culprit)
         green_before = max(record.green_prefixes, default=0)
         probe_url = next((p.run_url for p in record.probes if p.k == green_before + 1), None)
-        r.post_comment(
+        _post(
+            r,
+            say,
             record.culprit,
             comment(
                 "CULPRIT",
@@ -679,7 +694,9 @@ def _report_bisect(r: Runner, record: Record, accepted: list[PrEntry]) -> None:
             ),
         )
         for number in record.held:
-            r.post_comment(
+            _post(
+                r,
+                say,
                 number,
                 comment("HELD", record.batch_id, reason=f"after the culprit #{record.culprit}"),
             )
@@ -723,9 +740,10 @@ def run_build(
         entries[index_of[number]] = PrEntry(
             number, data.pr.head, data.pr.branch, issue, "ineligible", reason=reason
         )
-        say(f"#{number} ineligible: {reason}")
         if requested is not None:
-            r.post_comment(number, comment("INELIGIBLE", bid, reason=reason))
+            _post(r, say, number, comment("INELIGIBLE", bid, reason=reason))
+        else:
+            say(f"#{number} ineligible: {reason}")
 
     record = Record(
         batch_id=bid,
@@ -752,7 +770,7 @@ def run_build(
         record.trees = trees
         for entry in built_entries:
             if entry.state == "dropped":
-                r.post_comment(entry.number, _dropped_comment(bid, entry))
+                _post(r, say, entry.number, _dropped_comment(bid, entry))
         accepted = record.accepted()
         if not accepted:
             record.outcome, record.detail = "inconclusive", "every PR dropped or already merged"
@@ -774,7 +792,7 @@ def run_build(
             record.outcome, record.detail = "inconclusive", detail
             _save(record)
             for pr in accepted:
-                r.post_comment(pr.number, comment("INCONCLUSIVE", bid, reason=detail or ""))
+                _post(r, say, pr.number, comment("INCONCLUSIVE", bid, reason=detail or ""))
             return record
 
         outcome, info = _classified(r, sha, record.train_branch, timeout_s, poll_s, say)
@@ -784,7 +802,9 @@ def run_build(
 
         if outcome.kind == "inconclusive":
             for pr in accepted:
-                r.post_comment(
+                _post(
+                    r,
+                    say,
                     pr.number,
                     comment(
                         "INCONCLUSIVE", bid, reason=outcome.detail or "", uv_lock_prs=uv_lock_prs
@@ -794,7 +814,7 @@ def run_build(
         if outcome.kind == "green":
             record.green_prefixes = [len(accepted)]
             _save(record)
-            _report_tested(r, record, accepted)
+            _report_tested(r, record, accepted, say)
             return record
 
         _run_bisect(r, record, accepted, wpath, commits, timeout_s, poll_s, say)
@@ -837,15 +857,21 @@ def run_build_resume(
     if outcome.kind == "green":
         record.green_prefixes = [len(accepted)]
         _save(record)
-        _report_tested(r, record, accepted)
+        _report_tested(r, record, accepted, say)
     elif outcome.kind == "red":
         raise StoppedError(
             f"batch {bid} came back red on resume; its worktree is gone, so it cannot be "
             "bisected here: rerun build for a fresh batch"
         )
     else:
+        uv_lock_prs = [p.number for p in accepted if "uv.lock" in r.pr_data(p.number).diff_paths]
         for pr in accepted:
-            r.post_comment(pr.number, comment("INCONCLUSIVE", bid, reason=outcome.detail or ""))
+            _post(
+                r,
+                say,
+                pr.number,
+                comment("INCONCLUSIVE", bid, reason=outcome.detail or "", uv_lock_prs=uv_lock_prs),
+            )
     return record
 
 
