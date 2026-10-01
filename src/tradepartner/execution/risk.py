@@ -50,8 +50,10 @@ orders left to submit). In order:
      (`_buy_cash`, which `size_buys` uses too); a buy notional not in whole
      cents is refused (`ValueError`: the wrapper floors to the cent first);
    - `asset_missing` and `whole_shares`: an order whose name the broker's
-     `assets` read lacks, or a fractional order on a name that is not
-     `fractionable` (the wrapper builds it by whole shares), fail closed.
+     `assets` read lacks, or a fractional order by whole shares, fail closed. A
+     buy or trim of a name no longer `fractionable` goes by whole shares (the
+     wrapper floors it); a full exit goes by its decision's `whole_share` flag
+     alone, so a name that lost `fractionable` is still sold whole (#395).
 
 Equity is the ledger's at `price_of` (the reference price, close(S-1)).
 
@@ -128,8 +130,8 @@ class PhaseOrder:
     """One candidate order of a phase, as the wrapper built it: exactly one of
     `notional` and `quantity`. `decision` is the decision's kind (`trade`,
     `override`, `forced_exit`); `full_exit` marks a sell of the whole remaining
-    holding; `whole_share` is the order's basis (the decision's flag, or the
-    name's lost `fractionable`); `price` is the reference price at close(S-1);
+    holding; `whole_share` is the order's basis (the decision's flag, or, for
+    a buy or trim, the name's lost `fractionable`); `price` is the reference price at close(S-1);
     `target_weight` is a buy decision's; `listing_ended` is true when the
     name's listing ended at close(S-1)."""
 
@@ -203,7 +205,8 @@ class Violations:
 @dataclass(frozen=True)
 class Skips:
     """The batch passes: its skips and the orders left to submit, in input order,
-    each with `whole_share` set when its name is not `fractionable`."""
+    each buy and trim with `whole_share` set when its name is not
+    `fractionable`."""
 
     skips: tuple[Skip, ...]
     orders: tuple[PhaseOrder, ...]
@@ -417,7 +420,8 @@ def check_phase(
         if asset is None:
             breach("asset_missing", f"no asset read for {order.security_id}")
             continue
-        whole = order.whole_share or not asset.fractionable
+        # A full exit keeps its decision's basis and sells the whole holding (#395).
+        whole = order.whole_share or (not asset.fractionable and not order.full_exit)
         reason = _skip_reason(order, asset, frozen, whole)
         if reason is not None:
             skips.append(Skip(order.decision_id, order.security_id, reason))

@@ -15,8 +15,8 @@ be silently loosened; changing it is a charter amendment, not a config edit.
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
 Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` and the `ALERT_SMTP_*`
 credentials) are `SecretStr` so their values never appear in `repr()`/`str()`
-of `Settings`, including `SEC_EDGAR_USER_AGENT` and `ALERT_EMAIL_TO`, which
-embed a personal contact email.
+of `Settings`, including `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and
+`ALERT_EMAIL_FROM`, which embed a personal contact email.
 
 `alpaca.paper` is guarded the same way as `universe.exclude_sic_ranges`: the
 order path reaches the paper endpoint only (Phase 4 spec req 2), and Phase 6
@@ -625,6 +625,8 @@ class Settings(BaseSettings):
     alert_smtp_user: SecretStr | None = Field(default=None)
     alert_smtp_password: SecretStr | None = Field(default=None)
     alert_email_to: SecretStr | None = Field(default=None)
+    # Optional sender for the email channel; the SMTP login when unset (#404).
+    alert_email_from: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

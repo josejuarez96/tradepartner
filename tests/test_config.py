@@ -737,6 +737,7 @@ def test_paper_and_alert_secrets_default_to_none() -> None:
     assert s.alert_smtp_user is None
     assert s.alert_smtp_password is None
     assert s.alert_email_to is None
+    assert s.alert_email_from is None
 
 
 def test_paper_and_alert_secrets_absent_from_repr_and_str(
@@ -748,6 +749,7 @@ def test_paper_and_alert_secrets_absent_from_repr_and_str(
     monkeypatch.setenv("ALERT_SMTP_USER", "alerts-user")
     monkeypatch.setenv("ALERT_SMTP_PASSWORD", "smtp-pass-789")
     monkeypatch.setenv("ALERT_EMAIL_TO", "jose@example.com")
+    monkeypatch.setenv("ALERT_EMAIL_FROM", "alerts-sender@example.com")
     s = _settings()
     assert s.alpaca_paper_api_key is not None
     assert s.alpaca_paper_api_key.get_secret_value() == "pk-paper-abc123"
@@ -756,6 +758,7 @@ def test_paper_and_alert_secrets_absent_from_repr_and_str(
         for secret in ("pk-paper-abc123", "ps-paper-secret456", "alerts-user", "smtp-pass-789"):
             assert secret not in blob
         assert "jose@example.com" not in blob
+        assert "alerts-sender@example.com" not in blob
 
 
 def test_paper_keys_are_separate_from_data_keys(monkeypatch: pytest.MonkeyPatch) -> None:
