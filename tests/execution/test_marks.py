@@ -529,6 +529,64 @@ def test_lapses_reason_is_kill_switch_for_a_crashed_run_with_no_kill_switch_row(
     ]
 
 
+def test_lapses_reason_is_kill_switch_for_a_crash_from_before_the_period_uncleared() -> None:
+    """Second-pass finding on #532 (quant-auditor and safety-reviewer, both
+    FAIL at 54366cf): a run that crashed *before* F_i and was never cleared
+    by a release still has the switch engaged throughout the catch-up
+    period by `execution.switch.derive`'s own rule (it keeps engaging until
+    a `released` row comes after both its `started_at` and its
+    `finished_at`). Every run in the period (F_i and the boundary session)
+    then ends `skipped_kill_switch`, exactly as spec req 5 requires while
+    engaged, with no `kill_switch` row of its own. The reason must still be
+    `kill_switch`, not `catch_up_lapsed`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    crashed = _run(1, before_f0)
+    halted = _result(1, _at(before_f0), "halted")
+    # The runs inside the period itself: skipped by the still-engaged switch,
+    # no kill_switch row of their own, no result in FAULTED_RUN_STATUSES.
+    run_f0 = _run(2, f0)
+    result_f0 = _result(2, _at(f0), "skipped_kill_switch")
+    run_boundary = _run(3, boundary)
+    result_boundary = _result(3, _at(boundary), "skipped_kill_switch")
+
+    assert lapses(
+        window,
+        [crashed, run_f0, run_boundary],
+        [],
+        [],
+        [halted, result_f0, result_boundary],
+        past,
+        frozen,
+    ) == [Missed(rebalance_session=t0, reason="kill_switch")]
+
+    # A release before F_i clears the crash: the period then has nothing
+    # engaging it (its own runs finish `ok`), so the reason reverts to
+    # `catch_up_lapsed`.
+    released = _kill_switch_row(1, session_close(before_f0), "released")
+    run_f0b = _run(4, f0)
+    ok_f0 = _result(4, _at(f0), "ok")
+    run_boundary_b = _run(5, boundary)
+    ok_boundary = _result(5, _at(boundary), "ok")
+    assert lapses(
+        window,
+        [crashed, run_f0b, run_boundary_b],
+        [],
+        [released],
+        [halted, ok_f0, ok_boundary],
+        past,
+        frozen,
+    ) == [Missed(rebalance_session=t0, reason="catch_up_lapsed")]
+
+
 def test_lapses_ignores_kill_switch_rows_of_another_window() -> None:
     from tradepartner.backtest.schedule import fill_session
 

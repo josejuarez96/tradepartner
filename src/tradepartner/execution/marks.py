@@ -32,14 +32,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 import duckdb
 
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.execution.ledger import Ledger
-from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES
+from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.journal import (
     KillSwitchRow,
@@ -279,30 +279,68 @@ def _engaged_during(
     return engaged_before
 
 
+def _uncleared_by(
+    run: PaperRunRow,
+    result: PaperRunResultRow | None,
+    releases: Sequence[datetime],
+    cutoff: datetime,
+) -> bool:
+    """`execution.switch.derive`'s own clearing rule (`_faulted_uncleared`),
+    bounded to releases at or before `cutoff`: a faulted run stays
+    "uncleared as of `cutoff`" unless some release's `at` is after both its
+    `started_at` and its `finished_at`, and at or before `cutoff` itself. An
+    unfinished run (`result is None`) has no `finished_at` to compare
+    against and is never cleared this way -- only `paper resume` closing it
+    `crashed` first, then a release, can end it, so until a result row
+    exists it carries forward through every later `cutoff`."""
+    if result is None:
+        return True
+    return not any(
+        at > run.started_at and at > result.finished_at and at <= cutoff for at in releases
+    )
+
+
 def _faulted_run_in_period(
+    kill_switch_rows: Sequence[KillSwitchRow],
     runs: Sequence[PaperRunRow],
     results: Sequence[PaperRunResultRow],
     window_id: int,
     sessions: Sequence[date],
 ) -> bool:
-    """True when a run of `window_id` started on a session in `sessions`
-    (ascending) ended without a result row (still unfinished -- a crash) or
-    with a result in `execution.switch.FAULTED_RUN_STATUSES` (`halted`,
-    `crashed`, `failed`). `execution.switch.derive` engages the switch for
-    exactly such a run, whether or not it ever wrote a `kill_switch` row (a
-    write failure on the halt path, or a hard crash before it got that far,
-    spec req 5's "no `released` row after that run's `started_at`" clause);
-    `_engaged_during` alone would miss the engagement in that case, so this
-    is checked in addition to it, not instead."""
+    """True when the switch was engaged at any point in the period spanned
+    by `sessions` (ascending) because of a run of `window_id` that ended
+    without a result row (still unfinished -- a crash) or with a result in
+    `execution.switch.FAULTED_RUN_STATUSES` (`halted`, `crashed`, `failed`),
+    whether or not it ever wrote a `kill_switch` row (a write failure on the
+    halt path, or a hard crash before it got that far). `execution.switch.
+    derive` engages the switch for exactly such a run until a release clears
+    it; `_engaged_during` alone would miss this (no row at all), so it is
+    checked in addition, not instead. A run whose own session falls inside
+    the period counts outright (the fault happened at some point in the
+    period, whatever became of it after); a run from before the period
+    counts only while `_uncleared_by` says it still carried forward into the
+    period's start, mirroring `derive`'s own rule rather than resetting at
+    each session like a per-close snapshot would."""
     finished = {r.run_id: r for r in results}
     period = frozenset(sessions)
+    period_start = session_close(previous_session(sessions[0]))
+    releases = [r.at for r in kill_switch_rows if r.window_id == window_id and r.state == RELEASED]
     for run in runs:
-        if run.window_id != window_id or run.session not in period:
+        if run.window_id != window_id:
+            continue
+        if run.session is None:
+            raise ValueError("a paper run has no session")
+        if run.session > sessions[-1]:
             continue
         if run.run_id is None:
             raise ValueError("a paper run has no run_id")
         result = finished.get(run.run_id)
-        if result is None or result.status in FAULTED_RUN_STATUSES:
+        faulted = result is None or result.status in FAULTED_RUN_STATUSES
+        if not faulted:
+            continue
+        if run.session in period:
+            return True
+        if _uncleared_by(run, result, releases, period_start):
             return True
     return False
 
@@ -357,7 +395,7 @@ def lapses(
         period = _period_sessions(fill, boundary)
         engaged = _engaged_during(
             kill_switch_rows, window.window_id, period
-        ) or _faulted_run_in_period(runs, results, window.window_id, period)
+        ) or _faulted_run_in_period(kill_switch_rows, runs, results, window.window_id, period)
         reason = _KILL_SWITCH if engaged else _CATCH_UP_LAPSED
         missed.append(Missed(rebalance_session=rebalance_session, reason=reason))
     return missed
