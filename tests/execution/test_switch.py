@@ -334,8 +334,8 @@ def test_after_a_release_it_refires_only_on_a_new_crossing() -> None:
 
 
 class _Clock:
-    def __init__(self) -> None:
-        self.now = _at(100)
+    def __init__(self, start: int = 100) -> None:
+        self.now = _at(start)
 
     def __call__(self) -> datetime:
         self.now += timedelta(seconds=1)
@@ -489,6 +489,7 @@ def test_an_override_released_stays_consumed(store: Settings) -> None:
         resume_id=resume_id,
         reconciliation_id=reconciliation_id,
         peak_equity=900.0,
+        seen_event_id=_seen(store),
     )
     assert engage_from_overrides(store, _Clock(), window_id=_WINDOW, run_id=5) == []
     assert not derive(_window(), _rows(store), [], [], reading_run=None, lock_free=True).engaged
@@ -500,7 +501,7 @@ def test_engage_from_overrides_returns_a_write_failure_when_locked(locked_store:
 
 
 # Resumes default to minute 200, after every `_Clock` engagement (minute 100
-# on): `release` refuses an engagement stamped at or after its resume (#447).
+# on), and `_release` stamps from minute 300: a coherent timeline.
 def _resume_and_reconciliation(
     settings: Settings,
     status: str,
@@ -548,6 +549,7 @@ def test_release_appends_the_released_row_with_the_peak(store: Settings) -> None
         resume_id=resume_id,
         reconciliation_id=reconciliation_id,
         peak_equity=875.5,
+        seen_event_id=_seen(store),
     )
     rows = _rows(store)
     assert rows[-1].event_id == event_id
@@ -568,6 +570,7 @@ def test_release_refuses_a_reconciliation_that_is_not_ok(store: Settings, status
             resume_id=resume_id,
             reconciliation_id=reconciliation_id,
             peak_equity=900.0,
+            seen_event_id=_seen(store),
         )
     assert _rows(store) == []
 
@@ -584,9 +587,10 @@ def test_release_refuses_another_windows_reconciliation_or_an_unknown_resume(
             resume_id=resume_id,
             reconciliation_id=other_windows,
             peak_equity=900.0,
+            seen_event_id=_seen(store),
         )
     _, reconciliation_id = _resume_and_reconciliation(store, "ok")
-    with pytest.raises(ReleaseRefused, match="resume"):
+    with pytest.raises(ReleaseRefused, match="no resume_invocations row"):
         release(
             store,
             _Clock(),
@@ -594,6 +598,7 @@ def test_release_refuses_another_windows_reconciliation_or_an_unknown_resume(
             resume_id=999,
             reconciliation_id=reconciliation_id,
             peak_equity=900.0,
+            seen_event_id=_seen(store),
         )
     assert _rows(store) == []
 
@@ -604,16 +609,28 @@ def test_the_module_never_updates_or_deletes() -> None:
     assert "DELETE " not in text
 
 
+def _seen(settings: Settings, window_id: int = _WINDOW) -> int:
+    """The window's highest `kill_switch` `event_id` so far: what a resume
+    journaled now would pass as `seen_event_id`."""
+    with open_read_only(settings) as conn:
+        return max((e.event_id or 0 for e in kill_switch_events_for(conn, window_id)), default=0)
+
+
 def _release(
-    settings: Settings, resume_id: int, reconciliation_id: int, peak: float = 900.0
+    settings: Settings,
+    resume_id: int,
+    reconciliation_id: int,
+    peak: float = 900.0,
+    seen: int | None = None,
 ) -> int:
     return release(
         settings,
-        _Clock(),
+        _Clock(300),
         window_id=_WINDOW,
         resume_id=resume_id,
         reconciliation_id=reconciliation_id,
         peak_equity=peak,
+        seen_event_id=_seen(settings) if seen is None else seen,
     )
 
 
@@ -655,7 +672,7 @@ def test_release_refuses_a_resume_that_already_released(store: Settings) -> None
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
     _release(store, resume_id, reconciliation_id)
     _engaged(store)
-    again = _reconciliation(store, minutes=70)
+    again = _reconciliation(store, minutes=210)
     with pytest.raises(ReleaseRefused, match="already released"):
         _release(store, resume_id, again)
 
@@ -734,6 +751,7 @@ def test_release_refuses_a_row_that_would_not_clear_the_switch(
             resume_id=resume_id,
             reconciliation_id=reconciliation_id,
             peak_equity=900.0,
+            seen_event_id=_seen(store),
         )
     assert _rows(store) == []
 
@@ -754,7 +772,7 @@ def test_release_refuses_a_resume_that_released_another_window(store: Settings) 
             conn,
             KillSwitchRow(window_id=2, at=_at(85), state="engaged", source="owner", **_stamp(85)),
         )
-    second = _reconciliation(store, window_id=2, minutes=90)
+    second = _reconciliation(store, window_id=2, minutes=220)
     with pytest.raises(ReleaseRefused, match="already released"):
         release(
             store,
@@ -763,6 +781,7 @@ def test_release_refuses_a_resume_that_released_another_window(store: Settings) 
             resume_id=resume_id,
             reconciliation_id=second,
             peak_equity=900.0,
+            seen_event_id=_seen(store, 2),
         )
     with open_read_only(store) as conn:
         assert [r.state for r in kill_switch_events_for(conn, 2)] == ["engaged"]
@@ -803,36 +822,60 @@ def test_the_writers_read_the_clock_before_taking_the_store(store: Settings) -> 
             resume_id=resume_id,
             reconciliation_id=reconciliation_id,
             peak_equity=900.0,
+            seen_event_id=_seen(store),
         ),
         int,
     )
 
 
-@pytest.mark.parametrize("source", ["drawdown", "fault"])
+def _engagement(minutes: int, source: str = "drawdown") -> KillSwitchRow:
+    return KillSwitchRow(
+        window_id=_WINDOW,
+        at=_at(minutes),
+        state="engaged",
+        source=source,
+        fault_type="ReconciliationError" if source == "fault" else None,
+        **_stamp(minutes),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "stamped_at"),
+    [("drawdown", 65), ("fault", 65), ("drawdown", 55)],  # 55: a clock behind the resume's
+)
 def test_release_refuses_an_engagement_written_after_the_resume(
-    store: Settings, source: str
+    store: Settings, source: str, stamped_at: int
 ) -> None:
     """A drawdown or fault engaged after the owner's resume is one the owner
-    never saw: the release is refused, nothing is written and the switch stays
-    engaged until a new resume (#447)."""
+    never saw: the release is refused by write order, whatever its stamp, so
+    nothing is written and the switch stays engaged until a new resume (#447)."""
     with open_for_write(store) as conn:
         append(conn, _row(1, "engaged", 30, source="owner"))
     resume_id = _resume(store, 60)
+    seen = _seen(store)
     with open_for_write(store) as conn:
-        append(
-            conn,
-            KillSwitchRow(
-                window_id=_WINDOW,
-                at=_at(65),
-                state="engaged",
-                source=source,
-                fault_type="ReconciliationError" if source == "fault" else None,
-                **_stamp(65),
-            ),
-        )
+        append(conn, _engagement(stamped_at, source))
     reconciliation_id = _reconciliation(store, minutes=70)
     with pytest.raises(ReleaseRefused, match="after resume"):
-        _release(store, resume_id, reconciliation_id)
+        _release(store, resume_id, reconciliation_id, seen=seen)
     rows = _rows(store)
     assert [r.state for r in rows] == ["engaged", "engaged"]
     assert derive(_window(), rows, [], [], reading_run=None, lock_free=True).engaged
+
+
+def test_release_clears_engagements_the_resume_saw(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        append(conn, _row(1, "engaged", 30, source="owner"))
+        append(conn, _engagement(40, "fault"))
+    resume_id = _resume(store, 60)
+    seen = _seen(store)
+    reconciliation_id = _reconciliation(store, minutes=70)
+    _release(store, resume_id, reconciliation_id, seen=seen)
+    assert not derive(_window(), _rows(store), [], [], reading_run=None, lock_free=True).engaged
+
+
+def test_release_refuses_a_negative_seen_event_id(store: Settings) -> None:
+    _engaged(store)
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ReleaseRefused, match="seen_event_id"):
+        _release(store, resume_id, reconciliation_id, seen=-1)

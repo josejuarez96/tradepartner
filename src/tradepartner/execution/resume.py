@@ -140,8 +140,10 @@ def _window_id(window: PaperWindowRow) -> int:
 
 def _start(
     connect: Connect, window_id: int, now: datetime, reason: str, accept_broker_fills: bool
-) -> tuple[int, tuple[int, ...], list[OrderRow]]:
-    """The invocation row, the crashed closes and the `pending` orders, in one chunk."""
+) -> tuple[int, int, tuple[int, ...], list[OrderRow]]:
+    """The invocation row, the highest `kill_switch` `event_id` of the window
+    it saw (`switch.release`'s `seen_event_id`), the crashed closes and the
+    `pending` orders, in one chunk."""
     with connect() as conn:
         resume_id = append(
             conn,
@@ -154,6 +156,7 @@ def _start(
             ),
         )
         assert resume_id is not None
+        seen = max((e.event_id or 0 for e in kill_switch_events_for(conn, window_id)), default=0)
         crashed: list[int] = []
         for run in runs_for(conn, window_id):
             if run.result is None and run.run.run_id is not None:
@@ -171,7 +174,7 @@ def _start(
                 )
                 crashed.append(run.run.run_id)
         pending = pending_orders(conn, window_id=window_id)
-    return resume_id, tuple(crashed), pending
+    return resume_id, seen, tuple(crashed), pending
 
 
 def _settle(
@@ -361,7 +364,9 @@ def resume(
         frozen = frozen_risk(window)
         now = _read_clock(clock)
 
-        resume_id, crashed, pending = _start(connect, window_id, now, reason, accept_broker_fills)
+        resume_id, seen, crashed, pending = _start(
+            connect, window_id, now, reason, accept_broker_fills
+        )
         settled = _settle(broker, connect, pending, clock)
         with connect() as conn:
             open_orders = non_terminal_orders(conn, window_id=window_id)
@@ -454,6 +459,7 @@ def resume(
                 resume_id=resume_id,
                 reconciliation_id=reconciliation_id,
                 peak_equity=peak,
+                seen_event_id=seen,
             )
         except switch.ReleaseRefused as exc:
             # `release` re-checks everything in one transaction, including that

@@ -51,9 +51,10 @@ calling a writer; an open one in the same process makes the write fail at once.
   checks, in one transaction, that: the window is open; the reconciliation is
   this window's latest and `ok`, and not older than the resume; the resume is
   the latest `resume_invocations` row and no `released` row cites it yet; no
-  run of the window is unfinished; no `engaged` row of the window is stamped
-  at or after the resume (an engagement the owner did not see when resuming
-  needs a new resume); the switch is engaged (a release with
+  run of the window is unfinished; no `engaged` row of the window was
+  written after the resume (its `event_id` above the caller's
+  `seen_event_id`: an engagement the owner did not see when resuming needs a
+  new resume); the switch is engaged (a release with
   nothing engaged would only reset the drawdown peak) and the new row would
   clear it (a release stamped at or before a faulted run's `finished_at`
   would not); and the peak is a positive finite number. "No `released` row
@@ -275,12 +276,18 @@ def release(
     resume_id: int,
     reconciliation_id: int,
     peak_equity: float,
+    seen_event_id: int,
 ) -> int:
     """Append the `released` row (source `owner`) and return its `event_id`.
+    `seen_event_id` is the highest `kill_switch` `event_id` of the window when
+    the resume row was written, in the same transaction (0 when there was none).
     Raises `ReleaseRefused` (a `ValueError`), writing nothing, when any check in
     the module docstring fails. Store errors propagate: the owner's `paper resume` reports them."""
     if not (math.isfinite(peak_equity) and peak_equity > 0):
         raise ReleaseRefused(f"peak_equity must be positive and finite, got {peak_equity!r}")
+    if seen_event_id < 0:
+        raise ReleaseRefused(f"seen_event_id must not be negative, got {seen_event_id!r}")
+    seen = seen_event_id
     now = clock()
     with open_for_write(settings) as conn:
         window = open_window(conn)
@@ -322,12 +329,14 @@ def release(
             raise ReleaseRefused(
                 f"reconciliation {reconciliation_id} is older than resume {resume_id}"
             )
-        # An engagement stamped at or after the resume is one the owner did not
-        # see when resuming: only a new resume may release it.
-        later = [str(r.event_id) for r in rows if r.state == ENGAGED and r.at >= resume.at]
+        # An engagement written after the resume row is one the owner did not
+        # see when resuming: only a new resume may release it. Write order
+        # (`event_id`), not stamps: a halt row after a `ClockError` carries
+        # `utc_now`, and two clocks can disagree.
+        later = [str(r.event_id) for r in rows if r.state == ENGAGED and _event_order(r) > seen]
         if later:
             raise ReleaseRefused(
-                f"kill_switch event(s) {', '.join(later)} engaged at or after resume "
+                f"kill_switch event(s) {', '.join(later)} engaged after resume "
                 f"{resume_id}: resume again to release them"
             )
         runs = runs_for(conn, window_id)
