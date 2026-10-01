@@ -1,7 +1,7 @@
 """The paper-trading journal: row types, the one writer and the fills accessor
 (Phase 4 spec "Data / interfaces"; plan T49b).
 
-The journal tables (`schema.JOURNAL_TABLE_NAMES`, schema version 5) are append-only:
+The journal tables (`schema.JOURNAL_TABLE_NAMES`, schema version 5 on) are append-only:
 this module inserts and reads, and never updates or deletes, as `store.registry`
 does for the registry. A later fact is a new row, never an edit: an order's next
 state is an `order_events` row, and a real fill arriving after the synthetic
@@ -53,7 +53,7 @@ from tradepartner.store.schema import JOURNAL_TABLE_NAMES
 
 class JournalNotInitialised(RuntimeError):
     """The store has no journal tables: a version-4 store that no write connection
-    has migrated to version 5 yet. Any writing command's `init_schema` migrates it."""
+    has migrated to the current version yet. Any writing command's `init_schema` migrates it."""
 
 
 class JournalIntegrityError(RuntimeError):
@@ -614,7 +614,7 @@ def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
     if present != len(JOURNAL_TABLE_NAMES):
         raise JournalNotInitialised(
             "the store has no paper-trading journal (schema version 4); any writing "
-            "command migrates it to version 5"
+            "command migrates it to the current version"
         )
 
 
