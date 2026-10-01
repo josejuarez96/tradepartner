@@ -419,10 +419,11 @@ def resume(
 
         synthetic: list[tuple[FillRow, OrderReading]] = []
         reasons = [breach.message for breach in collected.rejections]
+        judged = {b.run_id for b in collected.rejections}
         reasons += [
             breach.message
             for breach in _faulted_run_breaches(connect, window, frozen)
-            if breach.run_id not in {b.run_id for b in collected.rejections}
+            if breach.run_id not in judged
         ]
         lag_reasons, synthetic_fills = _lag(
             connect, window_id, collected.lagging, now, frozen, accept_broker_fills

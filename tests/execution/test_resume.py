@@ -522,6 +522,34 @@ def test_resume_judges_a_halted_runs_rejections_its_halt_read_journaled(
     assert any(f"every order of run {run_id} was rejected" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
     assert _count(journal_settings, "reconciliations") == 0
+    # Only a release clears the halted run, so every later resume refuses too.
+    again = _resume(journal_settings, fake, fixed_clock)
+    assert again.status == REFUSED
+    assert any(f"every order of run {run_id} was rejected" in r for r in again.reasons)
+
+
+def test_resume_names_a_crashed_runs_rejection_verdict_once(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    # The run is closed `crashed` by this resume; its collection and the
+    # faulted-run check both find the verdict, and the refusal names it once.
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    for coid in ("tp-c1", "tp-c2"):
+        _order(journal_settings, fake, run_id, coid, 1.0, DAY1 - timedelta(hours=1))
+        fake.apply(coid, Reject())
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert outcome.crashed_runs == (run_id,)
+    assert [r for r in outcome.reasons if f"run {run_id}" in r] == [
+        f"every order of run {run_id} was rejected (2)"
+    ]
+    assert _engaged(journal_settings, window)
+    assert _count(journal_settings, "reconciliations") == 0
 
 
 def test_resume_without_the_flag_is_refused_past_the_lag_bound(

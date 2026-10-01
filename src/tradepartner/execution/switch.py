@@ -191,7 +191,10 @@ def faulted_runs(
     results: Sequence[PaperRunResultRow],
 ) -> tuple[int, ...]:
     """The window's runs that ended `halted`, `crashed` or `failed` and that no
-    release has cleared, by `derive`'s own rule: the runs a release would clear."""
+    release has cleared, by `derive`'s own rule: the runs a release would clear.
+    For a lock holder (resume): it applies none of `derive`'s `reading_run` or
+    run-in-progress exclusions, and leaves out unfinished runs, which resume
+    closes `crashed` first."""
     window_id = window.window_id
     releases = [r.at for r in kill_switch_rows if r.window_id == window_id and r.state == RELEASED]
     finished = {r.run_id: r for r in results}
