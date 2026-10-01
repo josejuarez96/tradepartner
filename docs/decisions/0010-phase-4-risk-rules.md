@@ -25,7 +25,7 @@ We will record the Phase 4 risk rules here. Every limit is a named key under `ri
 |---|---|---|---|
 | per-name target weight; and, for every name the phase buys, its held value after the phase over equity *(amended 2026-09-30)* | `risk.max_position_weight` | 0.05 | batch halts, `LimitBreachError` (every "batch halts" row below raises it) |
 | at most one order per (name, side) in a phase *(amended 2026-09-30)* | none, structural | n/a | batch halts |
-| per-order notional as a fraction of equity, for buys and trims; full exits and forced exits (`stop` liquidations included) are exempt *(amended 2026-09-30)* | `risk.max_order_notional_fraction` | 0.05 | batch halts |
+| per-order notional as a fraction of equity, for buys and trims; full exits (every forced exit, `window_stop` included) are exempt *(amended 2026-09-30)* | `risk.max_order_notional_fraction` | 0.05 | batch halts |
 | gross exposure after the batch (no leverage, the charter's rule) | `risk.max_gross_exposure` | 1.0 | batch halts |
 | every sell quantity ≤ the reconciled holding, rounded down to `alpaca.quantity_decimals` (long-only, no shorts, ever) | none, structural | n/a | batch halts |
 | buys sized after the modelled cost (`costs.*`) within `account().cash`, never `buying_power`, compared strictly with no tolerance *(amended 2026-09-30)* | none, structural | n/a | batch halts |
