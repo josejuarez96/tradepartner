@@ -153,6 +153,8 @@ def test_every_order_path_module_requires_the_safety_review() -> None:
         *(src / "adapters").glob("*broker*.py"),
         src / "adapters" / "alpaca_trading_raw.py",
         src / "cli_record.py",
+        src / "errors.py",  # the kill-switch and halt-path error types
+        REPO / "tests" / "test_ready_pr.py",  # its PLANNED_PREFIXES could hide a rename
     ]
     assert len(modules) > 10
     for m in modules:
