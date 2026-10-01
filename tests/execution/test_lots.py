@@ -409,6 +409,32 @@ def test_a_fill_without_its_order_raises() -> None:
         rebuild(book.fills, [], {}, ACCOUNT)
 
 
+@pytest.mark.parametrize(
+    ("quantity", "price"),
+    [
+        (float("nan"), 10.0),
+        (float("inf"), 10.0),
+        (1.0, float("nan")),
+        (1.0, float("inf")),
+        (1.0, float("-inf")),
+    ],
+)
+def test_a_non_finite_fill_quantity_or_price_raises(quantity: float, price: float) -> None:
+    """A NaN or infinite fill never becomes a lot or a disposal (#372)."""
+    book = Book()
+    book.trade("buy", quantity, price, date(2025, 1, 2))
+    with pytest.raises(LotLedgerError, match="finite"):
+        book.run()
+
+
+def test_a_naive_fill_time_raises() -> None:
+    """A naive `filled_at` is refused, never read in the host's timezone (#373)."""
+    order = _order("o1", "buy")
+    fill = _fill(order, 1.0, 10.0, datetime(2025, 12, 31, 23))  # noqa: DTZ001
+    with pytest.raises(LotLedgerError, match="naive"):
+        rebuild([fill], [order], {}, ACCOUNT)
+
+
 def test_a_superseded_fill_passed_in_raises() -> None:
     book = Book()
     book.trade("buy", 1, 10.0, date(2025, 1, 2))
