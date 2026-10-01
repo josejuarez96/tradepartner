@@ -8,7 +8,8 @@ plan box is open, and fails if the box is ticked but the module is not at
 the planned path.
 
 The Phase 4 execution modules that hold risk limits and money arithmetic
-(`execution/{risk,ids,reconcile,ledger,lots,plan}.py`, Phase 4 plan T50;
+(`execution/{risk,ids,reconcile,ledger,lots,plan}.py`, Phase 4 plan T50,
+and `execution/{phases,reattempts,marks,planning,exits,reserve}.py`, T60c;
 ADR 0010: no risk limit is a literal in code) allow 0, 1, -1 and 2, plus, in
 `lots.py` only, the single positive integer assigned to the one
 `WASH_SALE_WINDOW_DAYS` constant (IRC section 1091). Each task that writes
@@ -39,6 +40,13 @@ EXECUTION_MODULES = {
     "risk.py": "T54",
     "reconcile.py": "T55",
     "lots.py": "T56",
+    # The pure wrapper and run modules (plan T60c, 2026-09-30, #388; reserve.py #469).
+    "phases.py": "T60c",
+    "reattempts.py": "T60d",
+    "marks.py": "T63b",
+    "planning.py": "T63c",
+    "exits.py": "T63e",
+    "reserve.py": "T54d",
 }
 
 
