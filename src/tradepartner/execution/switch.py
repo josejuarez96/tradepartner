@@ -51,7 +51,9 @@ calling a writer; an open one in the same process makes the write fail at once.
   checks, in one transaction, that: the window is open; the reconciliation is
   this window's latest and `ok`, and not older than the resume; the resume is
   the latest `resume_invocations` row and no `released` row cites it yet; no
-  run of the window is unfinished; the switch is engaged (a release with
+  run of the window is unfinished; no `engaged` row of the window is stamped
+  at or after the resume (an engagement the owner did not see when resuming
+  needs a new resume); the switch is engaged (a release with
   nothing engaged would only reset the drawdown peak) and the new row would
   clear it (a release stamped at or before a faulted run's `finished_at`
   would not); and the peak is a positive finite number. "No `released` row
@@ -319,6 +321,14 @@ def release(
         if reconciliation.at < resume.at:
             raise ReleaseRefused(
                 f"reconciliation {reconciliation_id} is older than resume {resume_id}"
+            )
+        # An engagement stamped at or after the resume is one the owner did not
+        # see when resuming: only a new resume may release it.
+        later = [str(r.event_id) for r in rows if r.state == ENGAGED and r.at >= resume.at]
+        if later:
+            raise ReleaseRefused(
+                f"kill_switch event(s) {', '.join(later)} engaged at or after resume "
+                f"{resume_id}: resume again to release them"
             )
         runs = runs_for(conn, window_id)
         unfinished = [str(r.run.run_id) for r in runs if r.result is None]

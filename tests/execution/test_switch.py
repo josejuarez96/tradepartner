@@ -499,18 +499,20 @@ def test_engage_from_overrides_returns_a_write_failure_when_locked(locked_store:
     assert isinstance(outcome, WriteFailed)
 
 
+# Resumes default to minute 200, after every `_Clock` engagement (minute 100
+# on): `release` refuses an engagement stamped at or after its resume (#447).
 def _resume_and_reconciliation(
     settings: Settings,
     status: str,
     window_id: int = _WINDOW,
     *,
-    resume_at: int = 60,
-    reconciled_at: int = 61,
+    resume_at: int = 200,
+    reconciled_at: int = 201,
 ) -> tuple[int, int]:
     return _resume(settings, resume_at), _reconciliation(settings, status, window_id, reconciled_at)
 
 
-def _resume(settings: Settings, minutes: int = 60) -> int:
+def _resume(settings: Settings, minutes: int = 200) -> int:
     with open_for_write(settings) as conn:
         resume_id = append(
             conn,
@@ -523,7 +525,7 @@ def _resume(settings: Settings, minutes: int = 60) -> int:
 
 
 def _reconciliation(
-    settings: Settings, status: str = "ok", window_id: int = _WINDOW, minutes: int = 61
+    settings: Settings, status: str = "ok", window_id: int = _WINDOW, minutes: int = 201
 ) -> int:
     with open_for_write(settings) as conn:
         reconciliation_id = append(
@@ -804,3 +806,33 @@ def test_the_writers_read_the_clock_before_taking_the_store(store: Settings) -> 
         ),
         int,
     )
+
+
+@pytest.mark.parametrize("source", ["drawdown", "fault"])
+def test_release_refuses_an_engagement_written_after_the_resume(
+    store: Settings, source: str
+) -> None:
+    """A drawdown or fault engaged after the owner's resume is one the owner
+    never saw: the release is refused, nothing is written and the switch stays
+    engaged until a new resume (#447)."""
+    with open_for_write(store) as conn:
+        append(conn, _row(1, "engaged", 30, source="owner"))
+    resume_id = _resume(store, 60)
+    with open_for_write(store) as conn:
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=_WINDOW,
+                at=_at(65),
+                state="engaged",
+                source=source,
+                fault_type="ReconciliationError" if source == "fault" else None,
+                **_stamp(65),
+            ),
+        )
+    reconciliation_id = _reconciliation(store, minutes=70)
+    with pytest.raises(ReleaseRefused, match="after resume"):
+        _release(store, resume_id, reconciliation_id)
+    rows = _rows(store)
+    assert [r.state for r in rows] == ["engaged", "engaged"]
+    assert derive(_window(), rows, [], [], reading_run=None, lock_free=True).engaged
