@@ -391,8 +391,12 @@ what = "The residue a name carries (dust, untradable, carried) and the derived s
 why = "A window must be able to close around residues, and a rebalance nobody ran must still lapse on schedule."
 
 [task.T53]
-what = "The backtest engine's plan function made public, tracking-trial windows, and the step that turns a plan into journaled decisions."
+what = "The backtest engine's plan function made public, and tracking-trial windows."
 why = "Paper plans with the same code the backtest ran, so paper and backtest can be compared honestly."
+
+[task.T53b]
+what = "The step that turns a plan into one buy, sell, skip or override decision per name, with the signal rows and the live-capital count."
+why = "Paper trades exactly what the plan says, journaled before any order, so every order can be traced back to its plan."
 
 [task.T54]
 what = "The risk checks on each batch of orders and the rule that sizes buys from the cash the sells raised."
