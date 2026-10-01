@@ -287,7 +287,13 @@ class FakeRunner:
                 return "M x" if self.dirty else ""
             case ("diff", "--name-only", "--diff-filter=U"):
                 return "\n".join(self.files)
-            case ("diff", "--name-only", "--diff-filter=D", _):
+            case ("diff", "--name-only", "--diff-filter=D", _) | (
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "--diff-filter=D",
+                _,
+            ):
                 return "\n".join(self.deleted)
             case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", _):
                 return "\n".join(self.touched)
@@ -621,6 +627,9 @@ SOURCES = {
     "tests/execution/test_sdk_boundary.py": "SRC = ROOT / 'src'\n",
     "tests/test_no_literals.py": "SRC = ROOT / 'src'\n",
     "tests/test_no_forbidden_imports.py": "SRC = ROOT / 'src'\n",
+    "tests/backtest/test_store_provider.py": "from tradepartner.backtest import store_provider\n",
+    "tests/backtest/test_costs.py": "from tradepartner.backtest.costs import cost\n",
+    "tests/test_ci_workflow.py": 'CI = ROOT / ".github" / "workflows" / "ci.yml"\n',
 }
 SRC_WIDE = (
     "tests/execution/test_boundaries.py",
@@ -646,16 +655,19 @@ def test_changed_tests_and_scripts_run_themselves_or_their_tests() -> None:
         "tests/store/test_journal.py",
     )
     assert ready_pr.targeted_tests(["scripts/ready_pr.py"], SOURCES) == ("tests/test_ready_pr.py",)
-    # a deleted test file is not run; the rest of the diff still maps
+    # a deleted or renamed-away test file (not tracked any more) is not run
     assert ready_pr.targeted_tests(
-        ["tests/store/test_gone.py", "tests/store/test_journal.py"],
-        SOURCES,
-        deleted=["tests/store/test_gone.py"],
+        ["tests/store/test_gone.py", "tests/store/test_journal.py"], SOURCES
     ) == ("tests/store/test_journal.py",)
+    # a .github file runs the tests that read it; one no test names maps to nothing
+    assert ready_pr.targeted_tests([".github/workflows/ci.yml"], SOURCES) == (
+        "tests/test_ci_workflow.py",
+    )
+    assert ready_pr.targeted_tests([".github/ISSUE_TEMPLATE/bug.yml"], SOURCES) == ()
 
 
 def test_paths_no_test_can_fail_map_to_nothing() -> None:
-    for paths in (["docs/plans/p.md", "changelog.d/69-x.md"], [".github/workflows/ci.yml"]):
+    for paths in (["docs/plans/p.md", "changelog.d/69-x.md"], [".github/rulesets/main.json"]):
         assert ready_pr.targeted_tests(paths, SOURCES) == (), paths
 
 
@@ -671,12 +683,18 @@ def test_paths_no_test_can_fail_map_to_nothing() -> None:
         "tests/helpers.py",
         "src/tradepartner/store/__init__.py",
         "src/tradepartner/py.typed",
-        "src/tradepartner/backtest/costs.py",  # no test names it: the mapping is unclear
+        "src/tradepartner/backtest/gone.py",  # no test names it: the mapping is unclear
         "scripts/no_tests_name_me.py",
     ],
 )
 def test_unclear_mappings_fall_back_to_the_full_suite(path: str) -> None:
     assert ready_pr.targeted_tests([path, "scripts/ready_pr.py"], SOURCES) is None
+
+
+def test_a_backtest_module_also_runs_the_backtest_subtree_scan() -> None:
+    assert ready_pr.targeted_tests(["src/tradepartner/backtest/costs.py"], SOURCES) == tuple(
+        sorted({"tests/backtest/test_costs.py", "tests/backtest/test_store_provider.py", *SRC_WIDE})
+    )
 
 
 def test_a_deleted_module_falls_back_to_the_full_suite() -> None:
@@ -704,8 +722,30 @@ def test_the_flow_runs_only_the_mapped_tests_unless_full_tests(
     assert ready_pr.ready(unclear, 69, dry_run=True) == 0
     assert unclear.checks_run[-1] == ready_pr.PYTEST_CHECK
 
-    ci_only = FakeRunner(touched=[".github/workflows/ci.yml", "changelog.d/69-x.md"])
+    ci_only = FakeRunner(touched=[".github/ISSUE_TEMPLATE/bug.yml", "changelog.d/69-x.md"])
     ci_only._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
     assert ready_pr.ready(ci_only, 69, dry_run=True) == 0
     assert not _ran_suite(ci_only)
     assert "no test maps" in capsys.readouterr().out
+
+
+def test_a_moved_module_counts_as_deleted_at_its_old_path() -> None:
+    moved = FakeRunner(
+        test_sources=SOURCES,
+        touched=[
+            "src/tradepartner/store/asof.py",
+            "src/tradepartner/store/asof2.py",
+            "changelog.d/69-x.md",
+        ],
+        deleted=["src/tradepartner/store/asof.py"],
+    )
+    assert ready_pr.ready(moved, 69, dry_run=True) == 0
+    assert moved.checks_run[-1] == ready_pr.PYTEST_CHECK
+    assert (
+        "git",
+        "diff",
+        "--no-renames",
+        "--name-only",
+        "--diff-filter=D",
+        "origin/main...HEAD",
+    ) in moved.calls

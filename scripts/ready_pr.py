@@ -151,13 +151,16 @@ PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
 # is unclear. CI always runs the full suite, so a miss here is caught there, later.
 FULL_SUITE_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 DOCS_BUDGET_TEST = "tests/test_docs_budget.py"
-# Static checks that scan all of src/: any src/ change can fail them.
-SRC_WIDE_TESTS = (
-    "tests/execution/test_boundaries.py",
-    "tests/execution/test_sdk_boundary.py",
-    "tests/test_no_forbidden_imports.py",
-    "tests/test_no_literals.py",
-)
+# Static checks that scan a whole subtree: any change under the prefix can fail them.
+TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
+    "src/": (
+        "tests/execution/test_boundaries.py",
+        "tests/execution/test_sdk_boundary.py",
+        "tests/test_no_forbidden_imports.py",
+        "tests/test_no_literals.py",
+    ),
+    "src/tradepartner/backtest/": ("tests/backtest/test_store_provider.py",),
+}
 # A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
 # (pushes to main always run the full suite).
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
@@ -382,14 +385,16 @@ def targeted_tests(
 ) -> tuple[str, ...] | None:
     """The test files a diff maps to, or ``None`` for the full suite (#456).
 
-    ``test_sources`` maps every ``tests/**/test_*.py`` path to its text. A changed test file
-    runs itself; a ``src/`` module runs every test file that imports it by name plus the
-    static checks over all of ``src/``; a ``scripts/<name>.py`` runs the tests that name
-    ``<name>.py``. Anything whose effect cannot be told falls back to the full suite: a
-    ``conftest.py``, a dependency or Python-version file, a non-test file under ``tests/``
-    (fixtures, helpers), a package ``__init__``, a non-Python file under ``src/``, a deleted
-    module, and a module or script no test names. Other paths (docs, ``.github/``) map to
-    nothing. ``tests/test_docs_budget.py`` is left out: it always runs on its own.
+    ``test_sources`` maps every tracked ``tests/**/test_*.py`` path to its text. A changed
+    test file runs itself; a ``src/`` module runs every test file that imports it by name plus
+    the static checks over its subtree (``TREE_SCAN_TESTS``); a file under ``scripts/`` or
+    ``.github/`` runs the tests that name it. Anything whose effect cannot be told falls back
+    to the full suite: a ``conftest.py``, a dependency or Python-version file, a non-test file
+    under ``tests/`` (fixtures, helpers), a package ``__init__``, a non-Python file under
+    ``src/``, a deleted module, and a module or script no test names. A ``.github/`` file no
+    test names, and docs, map to nothing. A test file not in ``test_sources`` (deleted or
+    renamed away) is not run. ``tests/test_docs_budget.py`` is left out: it always runs on
+    its own. Pass ``deleted`` from a ``--no-renames`` diff, so a moved module counts as gone.
     """
     selected: set[str] = set()
     for p in paths:
@@ -399,21 +404,24 @@ def targeted_tests(
         if p.startswith("tests/"):
             if not (name.startswith("test_") and name.endswith(".py")):
                 return None
-            if p not in deleted:
-                selected.add(p)
+            selected.add(p)
         elif p.startswith("src/"):
             if p in deleted or not p.endswith(".py") or name == "__init__.py":
                 return None
             found = _module_tests(p, test_sources)
             if not found:
                 return None
-            selected |= found | set(SRC_WIDE_TESTS)
-        elif p.startswith("scripts/"):
+            selected |= found
+            for prefix, scans in TREE_SCAN_TESTS.items():
+                if p.startswith(prefix):
+                    selected.update(scans)
+        elif p.startswith(("scripts/", ".github/")):
             mention = re.compile(rf"\b{re.escape(name)}\b")
             found = {t for t, text in test_sources.items() if mention.search(text)}
-            if not found:
+            if not found and p.startswith("scripts/"):
                 return None
             selected |= found
+    selected &= set(test_sources)
     selected.discard(DOCS_BUDGET_TEST)
     return tuple(sorted(selected))
 
@@ -518,7 +526,11 @@ def ready(
             for p in r.git("ls-files", "tests").splitlines()
             if p.rpartition("/")[2].startswith("test_") and p.endswith(".py")
         }
-        selected = targeted_tests(touched, sources, deleted)
+        # --no-renames: a module moved within src/ must count as deleted at its old path
+        gone = r.git(
+            "diff", "--no-renames", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD"
+        ).splitlines()
+        selected = targeted_tests(touched, sources, gone)
         if selected is None or (run_tests and not selected):
             say("local pytest: the full suite (the diff's tests cannot be told from its paths)")
             checks.append(PYTEST_CHECK)
