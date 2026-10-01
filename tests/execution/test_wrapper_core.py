@@ -40,7 +40,7 @@ from tradepartner.errors import (
     StaleDataError,
     SystemFaultError,
 )
-from tradepartner.execution import switch, wrapper
+from tradepartner.execution import alerts, switch, wrapper
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import WriteOffContext, collect
 from tradepartner.execution.plan import State, decision_state
@@ -857,11 +857,20 @@ def test_a_repeated_skew_clock_error_in_the_halt_read_leaves_the_halt_standing(
     fixed_clock: FixedClock,
     open_window: PaperWindowRow,
     alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#375 (T58's handoff, #340 finding 8): a broker fill stamped beyond
     `risk.max_broker_clock_skew_seconds` makes every halt read raise
     `ClockError` again. The halt stands: the switch stays engaged, the original
-    fault is re-raised, and the alert and result row name the skew."""
+    fault is re-raised, and the alert and result row name the skew.
+
+    After the first skew the halt stamps by `store.db.utc_now()` (by design), so
+    the wall clock is pinned to the test's start: the fill stays ahead of it
+    whatever the real date (#462: unpinned, this test failed from the moment the
+    real time passed the fixture's `CLOCK_START`)."""
+    pinned = fixed_clock.now
+    monkeypatch.setattr(wrapper, "utc_now", lambda: pinned)
+    monkeypatch.setattr(alerts, "utc_now", lambda: pinned)
     run = _run(journal_settings, open_window, fixed_clock())
     _order(journal_settings, scripted_fake, fixed_clock, run, "tp-a")
     _order(journal_settings, scripted_fake, fixed_clock, run, "tp-b", symbol="BBB")
@@ -890,6 +899,9 @@ def test_a_repeated_skew_clock_error_in_the_halt_read_leaves_the_halt_standing(
     )
     assert "ClockError" in alert
     assert _query(journal_settings, "SELECT COUNT(*) FROM fills") == [(0,)]
+    assert _query(
+        journal_settings, "SELECT known_at FROM paper_run_results WHERE run_id = ?", [run.run_id]
+    ) == [(pinned,)]  # stamped by the (pinned) utc_now() after the skew
     for coid in ("tp-a", "tp-b"):
         assert ("cancel_requested", HALT_REASON) in _events(journal_settings, coid)
 
