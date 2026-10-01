@@ -1,5 +1,16 @@
 # Dashboard theme (docs/design/dashboard.md). Mirrors src/tradepartner/dashboard/theme.py;
 # tests/dashboard/test_health_page.py keeps the two equal. Edit both together.
+#
+# [server] and [browser] (ADR 0011, 2026-09-26, #273): no client but a browser
+# on this machine, and no usage telemetry. `dashboard.app.render_app` refuses
+# to render when the running options differ from these; tests/dashboard/
+# test_app.py pins both values.
+
+[server]
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
 
 [theme]
 font = "sans-serif"
