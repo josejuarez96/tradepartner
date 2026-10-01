@@ -710,3 +710,96 @@ def test_release_refuses_a_window_that_is_not_open(store: Settings) -> None:
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
     with pytest.raises(ValueError, match="not the open window"):
         _release(store, resume_id, reconciliation_id)
+
+
+@pytest.mark.parametrize("release_at", [200, 199])
+def test_release_refuses_a_row_that_would_not_clear_the_switch(
+    store: Settings, release_at: int
+) -> None:
+    """A release stamped at (or, under skew, before) a halted run's
+    `finished_at` would not clear it: nothing is written, so the drawdown peak
+    is not reset while the switch stays engaged (#413)."""
+    with open_for_write(store) as conn:
+        append(conn, _run(5, 10))
+        append(conn, _result(5, "halted", 200))
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    with pytest.raises(ValueError, match="would not clear"):
+        release(
+            store,
+            lambda: _at(release_at),
+            window_id=_WINDOW,
+            resume_id=resume_id,
+            reconciliation_id=reconciliation_id,
+            peak_equity=900.0,
+        )
+    assert _rows(store) == []
+
+
+def test_release_refuses_a_resume_that_released_another_window(store: Settings) -> None:
+    """`resume_invocations` carry no window, so a resume that released window
+    1 cannot release window 2 (#414)."""
+    _engaged(store)
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    _release(store, resume_id, reconciliation_id)
+    with open_for_write(store) as conn:
+        append(
+            conn,
+            PaperWindowStopRow(window_id=_WINDOW, at=_at(80), state="closed", **_stamp(80)),
+        )
+        append(conn, _window(2))
+        append(
+            conn,
+            KillSwitchRow(window_id=2, at=_at(85), state="engaged", source="owner", **_stamp(85)),
+        )
+    second = _reconciliation(store, window_id=2, minutes=90)
+    with pytest.raises(ValueError, match="already released"):
+        release(
+            store,
+            _Clock(),
+            window_id=2,
+            resume_id=resume_id,
+            reconciliation_id=second,
+            peak_equity=900.0,
+        )
+    with open_read_only(store) as conn:
+        assert [r.state for r in kill_switch_events_for(conn, 2)] == ["engaged"]
+
+
+def _broken_clock() -> datetime:
+    raise OSError("clock")
+
+
+def test_a_clock_error_in_engage_from_overrides_propagates(store: Settings) -> None:
+    """The clock is read outside the write: its error is not a write failure
+    (#415)."""
+    _override(store, "engage_kill_switch")
+    with pytest.raises(OSError, match="clock"):
+        engage_from_overrides(store, _broken_clock, window_id=_WINDOW, run_id=3)
+    assert _rows(store) == []
+
+
+def test_the_writers_read_the_clock_before_taking_the_store(store: Settings) -> None:
+    """Each writer's clock reading happens with no write connection open:
+    the probe opens a read-only one, which fails while a write one is open
+    (#415)."""
+    _override(store, "engage_kill_switch")
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
+    clock = _Clock()
+
+    def probing_clock() -> datetime:
+        with open_read_only(store):
+            pass
+        return clock()
+
+    assert engage_from_overrides(store, probing_clock, window_id=_WINDOW, run_id=3) == [1]
+    assert isinstance(
+        release(
+            store,
+            probing_clock,
+            window_id=_WINDOW,
+            resume_id=resume_id,
+            reconciliation_id=reconciliation_id,
+            peak_equity=900.0,
+        ),
+        int,
+    )
