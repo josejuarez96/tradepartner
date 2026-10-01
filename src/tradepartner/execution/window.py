@@ -1007,7 +1007,9 @@ def abandon(
     Raises `WindowCommandRefused` for a blank reason or no open window,
     `LockHeld` while another process holds the run lock, `ClockError` for a
     bad clock reading, and whatever the broker or the store raises (nothing
-    but the reconciliation row is then written)."""
+    but the reconciliation row is then written, plus a `fault` engagement
+    after a mismatch; a note on the error says when that engagement could
+    not be written, so the switch is NOT engaged)."""
     note = _note(reason, "paper abandon")
     with run_lock(settings):
         with connect() as conn:
@@ -1031,11 +1033,15 @@ def abandon(
             mismatch = exc  # its row is written before the error: abandon lists it
         try:
             return _abandon_row(connect, broker, clock, window_id, note)
-        except Exception:
+        except Exception as exc:
             # The window stays open over a mismatch row: engage, as `stop` does,
-            # so it is never left unwatched.
+            # so it is never left unwatched, and say so when that fails too.
             if mismatch is not None:
-                _engage_fault(settings, clock, window_id, mismatch)
+                error = _engage_fault(settings, clock, window_id, mismatch)
+                if error is not None:
+                    exc.add_note(
+                        "the kill switch row could not be written, so it is NOT engaged: " + error
+                    )
             raise
 
 
