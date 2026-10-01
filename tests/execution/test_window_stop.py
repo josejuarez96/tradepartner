@@ -20,6 +20,7 @@ from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import reconcile_now
 from tradepartner.execution.window import (
     KILL_SWITCH,
+    MULTIPLE_OPEN_WINDOWS,
     NO_WINDOW,
     NOT_FLAT,
     NOT_READY,
@@ -537,6 +538,16 @@ def test_the_closed_row_lists_each_residue_with_its_quantity_and_origin(
     assert (parsed.security_id, parsed.quantity, parsed.origin) == (SPY, 3.0, origin)
 
 
+def test_parse_residues_refuses_a_null_origin() -> None:
+    """A residue's origin must be `dust` or `untradable` (spec req 14, Data
+    section); `null` (and anything else) is refused rather than carried
+    forward silently (#522 item 4)."""
+    residues_json = json.dumps({SPY: {"quantity": 3.0, "origin": None}})
+
+    with pytest.raises(ValueError, match="origin"):
+        _parse_residues(residues_json)
+
+
 def test_an_untradable_skip_on_a_name_that_trades_again_is_not_a_residue(
     journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
@@ -626,6 +637,23 @@ def test_kill_appends_an_owner_engagement_even_while_a_run_holds_the_lock(
     assert event.event_id == event_id
     assert (event.state, event.source, event.reason) == ("engaged", "owner", NOTE)
     assert _engaged(journal_settings, window)
+
+
+def test_kill_refuses_more_than_one_open_window(
+    journal_settings: Settings, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Only one window may be open (spec req 14); a second open window (which
+    nothing below `kill` prevents being written) must not let the owner
+    engage the switch against an ambiguous target (#522 item 2)."""
+    _new_window(journal_settings, datetime(2026, 9, 29, 12, 0, tzinfo=UTC))
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+
+    reason, message = _refusal(excinfo)
+    assert reason == MULTIPLE_OPEN_WINDOWS
+    assert "more than one open paper window" in message
+    assert _count(journal_settings, "kill_switch") == 0
 
 
 # --- the override writer ------------------------------------------------------------

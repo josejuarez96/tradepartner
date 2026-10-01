@@ -362,7 +362,7 @@ def test_refuses_residue_quantity_mismatch(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 50.0  # far outside the frozen tolerance
@@ -380,7 +380,7 @@ def test_refuses_unexplained_symbol(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 5.0
@@ -472,7 +472,7 @@ def test_accepted_window_s_first_reconciliation_passes(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 5.0
@@ -513,7 +513,7 @@ def test_accepts_spinoff_child_of_a_residue(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     # The module's documented convention: a `spinoff` corporate_actions row
     # keyed by the child, with `source_action_id` naming the parent.
@@ -614,7 +614,7 @@ def test_accepts_split_adjusted_residue_match(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -646,7 +646,7 @@ def test_refuses_residue_not_held_and_not_delisted(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = _fake(fixed_clock)  # holds nothing, and SPY is not delisted
     with pytest.raises(window.StartRefusedError) as exc:
@@ -690,7 +690,7 @@ def test_refuses_spinoff_quantity_mismatch(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -722,7 +722,7 @@ def test_refuses_a_spinoff_whose_ex_date_is_not_yet_effective(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -755,7 +755,7 @@ def test_refuses_a_spinoff_not_yet_known(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -787,7 +787,7 @@ def test_refuses_a_spinoff_ex_dated_on_the_stop_session(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -823,7 +823,7 @@ def test_accepts_spinoff_with_a_parent_split_before_and_a_child_split_after(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     ex_date = (stop_at + timedelta(days=5)).date()
     _insert_action(
