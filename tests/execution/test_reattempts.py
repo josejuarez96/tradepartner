@@ -202,7 +202,9 @@ def test_an_open_sell_leaves_buys_open_for_re_attempt_against_the_remaining_buys
     assert _ids(scope.attempts) == [2, 3]
     assert [a.remainder.notional for a in scope.attempts] == [600.0, 500.0]
     assert scope.in_flight == () and not scope.last
-    assert write_offs(decisions, states, phase="buy", last=scope.last, halted=False) == []
+    # A sell in flight means more cash can come: a deferral is not a write-off.
+    done = {"last": scope.last, "completed": True}
+    assert write_offs(decisions, states, phase="buy", **done, deferred=[3]) == []
 
 
 def test_sells_filled_below_the_reference_price_make_a_last_phase_that_writes_off_the_rest() -> (
@@ -221,17 +223,18 @@ def test_sells_filled_below_the_reference_price_make_a_last_phase_that_writes_of
     scope = attempt_scope(decisions, start, phase="buy")
     assert scope.last and _ids(scope.attempts) == [2, 3]
 
-    # The phase sizes buy 2 to the cash and defers buy 3; buy 2 fills short and
-    # expires. Its row says no sell was in flight, because the phase was last.
-    buy_order = _order(short, notional=595.0, sells_in_flight=not scope.last)
+    # The phase submits buy 2 and defers buy 3 (the sizing is T60c's); buy 2
+    # fills 11 shares at 49.00 and expires. Its row carries
+    # `sells_in_flight_at_submit = false` (spec acceptance, "Two phases").
+    buy_order = _order(short, notional=597.0, sells_in_flight=False)
     orders = [sell_order, buy_order]
     events = sell_events + _events(buy_order, "expired")
-    fills = [sell_fill, _fill(buy_order, 11.0)]
+    fills = [sell_fill, _fill(buy_order, 11.0, 49.0)]
     end = _states(decisions, orders, events, fills)
 
-    assert buy_order.sells_in_flight_at_submit is False
-    assert write_offs(decisions, end, phase="buy", last=scope.last, halted=False) == [
-        WrittenOff(2, 600.0 - 11.0 * PRICE),
+    done = {"last": scope.last, "completed": True}
+    assert write_offs(decisions, end, phase="buy", **done, deferred=[3]) == [
+        WrittenOff(2, 600.0 - 11.0 * 49.0),
         WrittenOff(3, 400.0),
     ]
     # No later attempt: both buys are closed on the next session.
@@ -246,7 +249,7 @@ def test_sells_filled_below_the_reference_price_make_a_last_phase_that_writes_of
             known_at=stamp,
             ingested_at=stamp,
         )
-        for w in write_offs(decisions, end, phase="buy", last=True, halted=False)
+        for w in write_offs(decisions, end, phase="buy", **done, deferred=[3])
     ]
     later = _states(decisions, orders, events, fills, rows, session=S2)
     assert attempt_scope(decisions, later, phase="buy").attempts == ()
@@ -269,7 +272,7 @@ def test_a_buy_that_expired_with_no_sell_in_flight_is_written_off_not_re_attempt
     states = _states([buy], [order], events, session=S2)
 
     assert attempt_scope([buy], states, phase="buy").attempts == ()
-    assert write_offs([buy], states, phase="buy", last=False, halted=False) == [
+    assert write_offs([buy], states, phase="buy", last=False, completed=True, deferred=()) == [
         WrittenOff(1, 1000.0)
     ]
 
@@ -283,9 +286,9 @@ def test_a_buy_partly_filled_then_cancelled_by_a_halt_is_re_attempted_never_writ
     (attempt,) = attempt_scope([buy], states, phase="buy").attempts
     assert attempt.remainder.notional == 1000.0 - 4.0 * PRICE
     # The halted phase that cancelled it writes it off neither at its end ...
-    assert write_offs([buy], states, phase="buy", last=True, halted=True) == []
+    assert write_offs([buy], states, phase="buy", last=True, completed=False, deferred=()) == []
     # ... nor at collection, whatever `sells_in_flight_at_submit` says.
-    assert write_offs([buy], states, phase="buy", last=False, halted=False) == []
+    assert write_offs([buy], states, phase="buy", last=False, completed=True, deferred=()) == []
 
 
 def test_a_buy_the_broker_never_received_is_open_and_never_written_off_at_collection() -> None:
@@ -296,7 +299,7 @@ def test_a_buy_the_broker_never_received_is_open_and_never_written_off_at_collec
 
     assert states[1].state == State.OPEN
     assert _ids(attempt_scope([buy], states, phase="buy").attempts) == [1]
-    assert write_offs([buy], states, phase="buy", last=False, halted=False) == []
+    assert write_offs([buy], states, phase="buy", last=False, completed=True, deferred=()) == []
 
 
 def test_a_halted_buy_retried_and_deferred_by_a_last_phase_is_written_off() -> None:
@@ -309,7 +312,8 @@ def test_a_halted_buy_retried_and_deferred_by_a_last_phase_is_written_off() -> N
 
     scope = attempt_scope([buy], states, phase="buy")
     assert scope.last
-    assert write_offs([buy], states, phase="buy", last=scope.last, halted=False) == [
+    done = {"last": scope.last, "completed": True}
+    assert write_offs([buy], states, phase="buy", **done, deferred=[1]) == [
         WrittenOff(1, 1000.0 - 4.0 * PRICE)
     ]
 
@@ -346,7 +350,7 @@ def test_a_buy_scaled_by_the_cost_reserve_is_settled_once_filled() -> None:
     scope = attempt_scope([buy], states, phase="buy")
     assert states[1].state == State.SETTLED
     assert scope.attempts == () and scope.in_flight == ()
-    assert write_offs([buy], states, phase="buy", last=True, halted=False) == []
+    assert write_offs([buy], states, phase="buy", last=True, completed=True, deferred=()) == []
 
 
 def test_closed_decisions_are_never_in_scope() -> None:
@@ -364,7 +368,7 @@ def test_closed_decisions_are_never_in_scope() -> None:
     for phase in ("sell", "buy"):
         scope = attempt_scope(decisions, states, phase=phase)
         assert scope.attempts == () and scope.in_flight == ()
-    assert write_offs(decisions, states, phase="buy", last=True, halted=False) == []
+    assert write_offs(decisions, states, phase="buy", last=True, completed=True, deferred=()) == []
 
 
 def test_a_decision_with_a_live_order_is_left_to_collection() -> None:
@@ -374,10 +378,12 @@ def test_a_decision_with_a_live_order_is_left_to_collection() -> None:
 
     scope = attempt_scope([buy], states, phase="buy")
     assert scope.attempts == () and scope.in_flight == (1,)
-    assert write_offs([buy], states, phase="buy", last=True, halted=False) == []
+    assert write_offs([buy], states, phase="buy", last=True, completed=True, deferred=()) == []
 
 
-def test_a_halted_last_phase_writes_off_only_the_derived_write_offs() -> None:
+def test_a_last_phase_that_did_not_complete_writes_off_only_the_derived_write_offs() -> None:
+    # A halt, or a kill switch read before a submit, after the sizing deferred
+    # buy 2: no funding shortfall is proven, so buy 2 stays open for the next run.
     short = _decision(1, "buy", target=600.0)
     order = _order(short, notional=600.0, sells_in_flight=False)
     events = _events(order, "expired")
@@ -385,8 +391,21 @@ def test_a_halted_last_phase_writes_off_only_the_derived_write_offs() -> None:
     decisions = [short, unreached]
     states = _states(decisions, [order], events, [_fill(order, 2.0)])
 
-    assert write_offs(decisions, states, phase="buy", last=True, halted=True) == [
+    stopped = {"last": True, "completed": False}
+    assert write_offs(decisions, states, phase="buy", **stopped, deferred=[2]) == [
         WrittenOff(1, 600.0 - 2.0 * PRICE)
+    ]
+    assert states[2].state == State.OPEN
+
+
+def test_a_completed_last_phase_writes_off_only_the_buys_its_sizing_deferred() -> None:
+    deferred = _decision(1, "buy", target=400.0)
+    other = _decision(2, "buy", target=300.0)
+    states = _states([deferred, other])
+
+    done = {"last": True, "completed": True}
+    assert write_offs([deferred, other], states, phase="buy", **done, deferred=[1]) == [
+        WrittenOff(1, 400.0)
     ]
 
 
@@ -410,7 +429,7 @@ def test_a_sells_phase_is_never_last_and_writes_nothing_off() -> None:
     buy = _decision(1, "buy", target=100.0)
     states = _states([buy])
     assert not attempt_scope([buy], states, phase="sell").last
-    assert write_offs([buy], states, phase="sell", last=True, halted=False) == []
+    assert write_offs([buy], states, phase="sell", last=True, completed=True, deferred=()) == []
 
 
 def test_missing_states_unknown_phases_and_two_rebalances_raise() -> None:
@@ -418,14 +437,49 @@ def test_missing_states_unknown_phases_and_two_rebalances_raise() -> None:
     with pytest.raises(ValueError, match="no derived state for decision 1"):
         attempt_scope([buy], {}, phase="buy")
     with pytest.raises(ValueError, match="no derived state for decision 1"):
-        write_offs([buy], {}, phase="buy", last=True, halted=False)
+        write_offs([buy], {}, phase="buy", last=True, completed=True, deferred=())
     with pytest.raises(ValueError, match="phase must be one of"):
         attempt_scope([buy], _states([buy]), phase="buys")
     with pytest.raises(ValueError, match="phase must be one of"):
-        write_offs([buy], _states([buy]), phase="exit", last=True, halted=False)
+        write_offs([buy], _states([buy]), phase="exit", last=True, completed=True, deferred=())
     other = _decision(2, "buy", target=100.0, rebalance_session=S2)
     with pytest.raises(ValueError, match="more than one rebalance"):
         attempt_scope([buy, other], _states([buy, other]), phase="buy")
-    # A closed buy of another rebalance is not in play and raises nothing.
-    old = _decision(3, "buy", decision="skip_below_minimum", target=0.5, rebalance_session=S2)
-    assert _ids(attempt_scope([buy, old], _states([buy, old]), phase="buy").attempts) == [1]
+
+
+def test_a_repeated_decision_or_a_stale_rebalance_sell_raises() -> None:
+    forced = _decision(
+        1,
+        "sell",
+        decision="forced_exit",
+        reason="delisted",
+        planned_quantity=5.0,
+        rebalance_session=None,
+    )
+    buy = _decision(2, "buy", target=100.0)
+    states = _states([forced, buy])
+    done = {"last": True, "completed": True}
+    # A forced exit passed twice would get two attempts, each with its own id.
+    with pytest.raises(ValueError, match="decision 1 is passed twice"):
+        attempt_scope([forced, buy, forced], states, phase="sell")
+    with pytest.raises(ValueError, match="decision 2 is passed twice"):
+        write_offs([buy, buy], states, phase="buy", **done, deferred=())
+    # An open sell of an earlier (missed) rebalance is never ordered again.
+    stale = _decision(3, "sell", planned_quantity=5.0, reason="left_targets", rebalance_session=S2)
+    with pytest.raises(ValueError, match="more than one rebalance"):
+        attempt_scope([stale, buy], _states([stale, buy]), phase="sell")
+    with pytest.raises(ValueError, match="more than one rebalance"):
+        write_offs([stale, buy], _states([stale, buy]), phase="buy", **done, deferred=())
+    unplanned = _decision(4, "buy", target=100.0, rebalance_session=None)
+    with pytest.raises(ValueError, match="no rebalance session"):
+        attempt_scope([unplanned], _states([unplanned]), phase="buy")
+
+
+def test_a_deferred_id_that_is_not_an_open_buy_of_the_phase_raises() -> None:
+    buy = _decision(1, "buy", target=1000.0)
+    order = _order(buy, notional=1000.0)
+    states = _states([buy], [order], _events(order))  # in flight
+    done = {"last": True, "completed": True}
+    for deferred in ([1], [9]):
+        with pytest.raises(ValueError, match="is not an open buy of the phase"):
+            write_offs([buy], states, phase="buy", **done, deferred=deferred)

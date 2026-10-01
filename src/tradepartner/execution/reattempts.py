@@ -23,30 +23,37 @@ the write-off rule `decision_state` applies from the earlier `orders` row's
 is open or in flight is the rebalance's **last** (`AttemptScope.last`), since
 no more cash can arrive for it; the phase's buy orders therefore journal
 `sells_in_flight_at_submit = not last` when the states are read at the phase's
-start. The rebalance is that of the buys in play (open or in flight); buys of
-two rebalances in play in one phase raise. Forced exits carry no rebalance
-session and never enter the test: their proceeds are cash until the next
-rebalance. `decisions` must therefore hold the rebalance's sells as well as
-its buys, or a phase would look last when it is not.
+start. Forced exits carry no rebalance session and never enter the test:
+their proceeds are cash until the next rebalance. `decisions` must therefore
+hold the rebalance's sells as well as its buys, or a phase would look last when
+it is not.
+
+**One rebalance, each decision once.** Both functions take one pending
+rebalance's decisions plus the open forced exits, and raise `ValueError` when a
+decision id repeats (it would get two attempts, each with its own id) or when
+the decisions other than forced exits carry more than one rebalance session or
+none (an open sell of a `missed` rebalance would otherwise be ordered again).
 
 **`write_offs`** is the end of a buys phase: one `WrittenOff` per buy whose
 derived state is written off but has no `written_off` row yet (an order of the
 phase that ended short, the row collection appends when it sees the order
-first), and, when the phase was the last and was not halted, one per buy still
-open, which in such a phase is a buy it deferred (a deferred buy has no order
-of its own, so this row is its only write-off), each with its remainder's
-notional as the unfunded amount. A halt is not a funding shortfall: a halted
-phase writes off only the derived ones, and `decision_state` never writes off
-a buy whose order carries a halt cancel or ended `cancelled` with reason
-`not_received`, so such a buy stays open and the next in-window run retries it,
-sized from cash like any other.
+first), and, when the phase was the last and **completed** (it sized its buys
+and ran to its end), one per buy its sizing **deferred** (`deferred`, the ids
+`phases.buy_orders` deferred; a deferred buy has no order of its own, so this
+row is its only write-off), each with its remainder's notional as the unfunded
+amount. Only a funding shortfall is written off: a phase that did not complete
+(the halt path, a kill switch read before a submit, a clock or limit stop, any
+exception) writes off only the derived ones, its unreached buys staying open
+for the run after, and `decision_state` never writes off a buy whose order
+carries a halt cancel or ended `cancelled` with reason `not_received`, so such
+a buy stays open and the next in-window run retries it, sized from cash like
+any other; if a completed last phase defers that retry, it is written off.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
 
 from tradepartner.execution.plan import DecisionState, Remainder, State
 from tradepartner.store.journal import DecisionRow
@@ -56,6 +63,7 @@ __all__ = ["PHASES", "Attempt", "AttemptScope", "WrittenOff", "attempt_scope", "
 PHASES = ("sell", "buy")
 _SELL, _BUY = PHASES
 _IN_PLAY = frozenset({State.OPEN, State.IN_FLIGHT})
+_FORCED_EXIT = "forced_exit"
 
 
 @dataclass(frozen=True)
@@ -104,21 +112,26 @@ def _check_phase(phase: str) -> None:
         raise ValueError(f"phase must be one of {PHASES}, got {phase!r}")
 
 
-def _last(decisions: Sequence[DecisionRow], states: Mapping[int, DecisionState]) -> bool:
-    """True when no sell of the in-play buys' rebalance is open or in flight."""
-    rebalances: set[date | None] = {
-        d.rebalance_session
-        for d in decisions
-        if d.side == _BUY and _state(d, states).state in _IN_PLAY
-    }
+def _check_decisions(decisions: Sequence[DecisionRow]) -> None:
+    """Each decision once, and one rebalance among those that are not forced exits."""
+    seen: set[int] = set()
+    for decision in decisions:
+        decision_id = _id(decision)
+        if decision_id in seen:
+            raise ValueError(f"decision {decision_id} is passed twice")
+        seen.add(decision_id)
+    planned = [d for d in decisions if d.decision != _FORCED_EXIT]
+    if any(d.rebalance_session is None for d in planned):
+        raise ValueError("a decision that is not a forced exit has no rebalance session")
+    rebalances = sorted({str(d.rebalance_session) for d in planned})
     if len(rebalances) > 1:
-        shown = sorted(str(r) for r in rebalances)
-        raise ValueError(f"buys of more than one rebalance in one phase: {shown}")
+        raise ValueError(f"decisions of more than one rebalance in one phase: {rebalances}")
+
+
+def _last(decisions: Sequence[DecisionRow], states: Mapping[int, DecisionState]) -> bool:
+    """True when no sell of the rebalance is open or in flight."""
     return not any(
-        d.side == _SELL
-        and d.rebalance_session is not None
-        and d.rebalance_session in rebalances
-        and _state(d, states).state in _IN_PLAY
+        d.side == _SELL and d.decision != _FORCED_EXIT and _state(d, states).state in _IN_PLAY
         for d in decisions
     )
 
@@ -136,10 +149,11 @@ def attempt_scope(
     open forced exits; `states` maps every one's id to its `plan.decision_state`
     on S; `phase` is `"sell"` or `"buy"`. Attempts and in-flight ids are in
     decision-id order. Raises `ValueError` for an unknown phase, a decision
-    without an id or a state, an open decision without a remainder, and a buys
-    phase with buys of two rebalances in play.
+    without an id or a state, a repeated decision, decisions of more than one
+    rebalance, and an open decision without a remainder.
     """
     _check_phase(phase)
+    _check_decisions(decisions)
     attempts: list[Attempt] = []
     in_flight: list[int] = []
     for decision in sorted(decisions, key=_id):
@@ -162,30 +176,38 @@ def write_offs(
     *,
     phase: str,
     last: bool,
-    halted: bool,
+    completed: bool,
+    deferred: Collection[int],
 ) -> list[WrittenOff]:
     """The `written_off` rows at the end of a phase, in decision-id order
     (module docstring).
 
-    `states` are the decisions' `plan.decision_state` after the phase's
-    collection; `last` is the phase's `AttemptScope.last`, decided when it
-    began (a sell that ends during the buys phase does not make it last); and
-    `halted` is true when the phase ended on the halt path. A sells phase
-    writes nothing off. Raises `ValueError` for an unknown phase, a decision
-    without an id or a state, and a buy to write off without a remainder.
+    `decisions` are those `attempt_scope` took; `states` their
+    `plan.decision_state` after the phase's collection; `last` the phase's
+    `AttemptScope.last`, decided when it began (a sell that ends during the buys
+    phase does not make it last); `completed` true only when the phase sized
+    its buys and ran to its end; and `deferred` the ids of the buys its sizing
+    deferred (empty when it sized none). A sells phase writes nothing off.
+    Raises `ValueError` for an unknown phase, a decision without an id or a
+    state, a repeated decision, decisions of more than one rebalance, a deferred
+    id that is not an open buy among `decisions`, and a buy to write off without
+    a remainder.
     """
     _check_phase(phase)
+    _check_decisions(decisions)
+    buys = {_id(d): d for d in decisions if d.side == _BUY}
+    for decision_id in deferred:
+        if decision_id not in buys or _state(buys[decision_id], states).state != State.OPEN:
+            raise ValueError(f"deferred decision {decision_id} is not an open buy of the phase")
     if phase != _BUY:
         return []
+    unfunded = set(deferred) if last and completed else set()
     written: list[WrittenOff] = []
-    for decision in sorted(decisions, key=_id):
-        if decision.side != _BUY:
-            continue
-        state = _state(decision, states)
-        deferred = last and not halted and state.state == State.OPEN
-        if not (state.written_off or deferred):
+    for decision_id in sorted(buys):
+        state = _state(buys[decision_id], states)
+        if not (state.written_off or decision_id in unfunded):
             continue
         if state.remainder is None:
-            raise ValueError(f"buy decision {_id(decision)} has no remainder to write off")
-        written.append(WrittenOff(_id(decision), state.remainder.notional))
+            raise ValueError(f"buy decision {decision_id} has no remainder to write off")
+        written.append(WrittenOff(decision_id, state.remainder.notional))
     return written
