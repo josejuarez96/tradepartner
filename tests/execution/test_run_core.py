@@ -670,3 +670,105 @@ def test_a_rebalance_session_writes_decisions_before_the_trade_stub(
     assert env.results()[run_id][:2] == ("failed", "NotImplementedError")
     assert ("run_failed", run_id, F_0) in env.alerts()
     assert env.count("orders") == 0
+
+
+# --- the broker-facing path halts; secrets are masked ---------------------------------------
+
+
+def _hold_spy(env: Env, window: PaperWindowRow) -> None:
+    """One SPY share in the ledger (a receipt) and at the fake (a filled foreign
+    order, paid from extra cash), so the run's `assets` read has a name."""
+    from tradepartner.store.journal import AdjustmentRow
+
+    env.fake = FakeBroker(
+        clock=env.clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=FAKE_CASH + PRICE,
+        account_id="PA1",
+    )
+    env.clock.now = _at(MON)
+    env.fake.submit(OrderRequest("seed-1", "SPY", Side.BUY, quantity=1.0))
+    env.fake.simulate_fill("seed-1")
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=MON,
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=1.0,
+            known_at=_at(MON),
+            ingested_at=_at(MON),
+        )
+    )
+
+
+@pytest.mark.parametrize("method", ["account", "get_order", "positions", "assets"])
+def test_a_broker_read_that_raises_halts_the_run(
+    env: Env, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    window = _marked(env)
+    if method == "get_order":
+        env.order(env.past_run(window, _at(MON)), "tp-open", _at(MON))
+    if method == "assets":
+        _hold_spy(env, window)
+
+    def broken(*_args: object) -> object:
+        raise ConnectionError(f"{method} endpoint down")
+
+    monkeypatch.setattr(env.fake, method, broken)
+    with pytest.raises(ConnectionError, match=method):
+        env.run(_at(TUE))
+    run_id = env.latest_run()
+    assert env.results()[run_id][:2] == ("halted", "ConnectionError")
+    assert env.engaged() == [("fault", "ConnectionError", run_id, None)]
+    kinds = [kind for kind, alert_run, _ in env.alerts() if alert_run == run_id]
+    assert "halted" in kinds
+    assert "run_failed" not in kinds
+
+
+def test_an_assets_read_that_raises_inside_planning_halts_the_run(
+    rebalance_env: tuple[Env, PaperWindowRow], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, _window = rebalance_env
+    env.ingest(_at(T_0, 21))
+
+    def broken(*_args: object) -> object:
+        raise ConnectionError("assets endpoint down")
+
+    monkeypatch.setattr(env.fake, "assets", broken)  # the window is flat: planning reads it
+    with pytest.raises(ConnectionError):
+        env.run(_at(F_0))
+    run_id = env.latest_run()
+    assert env.results()[run_id][:2] == ("halted", "ConnectionError")
+    assert env.engaged() == [("fault", "ConnectionError", run_id, None)]
+    assert "run_failed" not in [kind for kind, _, _ in env.alerts()]
+    assert {t: env.count(t) for t in ("signals", "decisions", "paper_plans")} == {
+        "signals": 0,
+        "decisions": 0,
+        "paper_plans": 0,
+    }
+
+
+def test_a_secret_in_a_failure_is_masked_in_the_result_row_and_the_alert(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "Ab\\cDef-9876xyz"  # a backslash, so its repr-escaped form differs
+    env.settings = Settings(
+        _env_file=None, store={"path": env.settings.store.path}, alpaca_paper_api_secret=secret
+    )
+    _marked(env)
+
+    def leaky(_context: object) -> None:
+        raise RuntimeError(f"adapter said {secret} / {secret.upper()} / {secret!r}")
+
+    monkeypatch.setattr(run_module, "exits_step", leaky)
+    with pytest.raises(RuntimeError):
+        env.run(_at(TUE))
+    (result,) = env.query("SELECT message FROM paper_run_results")
+    (alert,) = env.query("SELECT message FROM alerts WHERE kind = 'run_failed'")
+    escaped = repr(secret)[1:-1]
+    for text in (result[0], alert[0]):
+        assert "***" in text
+        for form in (secret, secret.upper(), escaped, escaped.upper()):
+            assert form not in text

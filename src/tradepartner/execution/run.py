@@ -79,9 +79,12 @@ does not engage the switch for the next run.
 
 **Connections.** Writes go through `connect` (a write chunk each,
 `store.db.open_for_write`); the run's own reads use short read-only
-connections. None is held across a broker call, a writer or a halt, so the
-override form can write between chunks. Every row is stamped by the wrapper's
-checked clock, which also checks that the clock never goes back.
+connections. None is held across a writer or a halt, and none across a broker
+call but one: the planning step holds its write chunk, with its transaction
+open, across its second `assets_read` (the targets not held), as T63c's
+contract requires; the override form waits for that call. Every row the run
+writes itself is stamped by the wrapper's checked clock, which also checks that
+the clock never goes back.
 """
 
 from __future__ import annotations
@@ -90,10 +93,9 @@ import bisect
 import json
 import math
 import os
-import re
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Any, TypeVar, cast
@@ -106,7 +108,7 @@ from tradepartner import calendar
 from tradepartner.adapters.broker import Asset, Broker
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import all_sessions, is_session, next_session, previous_session
-from tradepartner.config import RiskConfig, Settings, secret_values
+from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import (
     ClockError,
     ReconciliationError,
@@ -202,7 +204,6 @@ _INGEST_OK = "ok"
 #: The lot ledger's account (spec req 13: Phase 4 holds one account, paper).
 _ACCOUNT_TYPE, _ACCOUNT_OWNER = "paper", "self"
 _LAG_BOUND_KIND = "fill_lag_bound"
-_MASK = "***"
 _NEW_YORK = ZoneInfo("America/New_York")
 _T = TypeVar("_T")
 
@@ -310,6 +311,11 @@ class _ChunkAlerter(Alerter):
             alerter = Alerter(self._chunk_settings, conn, self._chunk_clock)
             return alerter.write(kind, run_id, session, message, clock_fault=clock_fault)
 
+    def scrub(self, text: str) -> str:
+        """`text` with every configured secret masked: the `Alerter`'s own
+        masking, so the run's result rows and notes share it."""
+        return self._scrub(text)
+
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:
     """One clock reading, tz-aware UTC, or `ClockError` (ADR 0007 point 4)."""
@@ -327,14 +333,6 @@ def _alert_session(now: datetime) -> date:
     day: the dedupe session of `locked` and `no_window` (spec req 7)."""
     day = now.astimezone(_NEW_YORK).date()
     return day if is_session(day) else next_session(day)
-
-
-def _scrub(settings: Settings, text: str) -> str:
-    """`text` with every configured secret masked (as the wrapper does)."""
-    forms = {form for secret in secret_values(settings) for form in (secret, repr(secret)[1:-1])}
-    for form in sorted(forms, key=len, reverse=True):
-        text = re.sub(re.escape(form), _MASK, text, flags=re.IGNORECASE)
-    return text
 
 
 def _window_id(window: PaperWindowRow) -> int:
@@ -370,16 +368,15 @@ def tracking_run(
     re-raises its fault after the halt path, any other failure propagates
     after the `failed` result row, and a `kill_switch` row that cannot be
     written exits with `SystemExit`."""
-    try:
-        with run_lock(settings):
-            return _locked_run(settings, connect, broker, clock)
-    except LockHeld as exc:
-        now = _read_clock(clock)
-        session = _alert_session(now)
-        _ChunkAlerter(settings, connect, clock).write(
-            LOCKED, None, session, _scrub(settings, f"paper run not started: {exc}")
-        )
-        return RunOutcome(LOCKED, session=session)
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(run_lock(settings))
+        except LockHeld as exc:  # only taking the lock: never a LockHeld from the run
+            session = _alert_session(_read_clock(clock))
+            alerter = _ChunkAlerter(settings, connect, clock)
+            alerter.write(LOCKED, None, session, alerter.scrub(f"paper run not started: {exc}"))
+            return RunOutcome(LOCKED, session=session)
+        return _locked_run(settings, connect, broker, clock)
 
 
 def _locked_run(
@@ -500,7 +497,7 @@ class _Run:
         connect: Connect,
         broker: Broker,
         gate: RiskGatedBroker,
-        alerter: Alerter,
+        alerter: _ChunkAlerter,
         window: PaperWindowRow,
         frozen: RiskConfig,
         run: PaperRunRow,
@@ -542,7 +539,7 @@ class _Run:
         """The `run_failed` alert, then the `failed` result row, best-effort: a
         failure of either is noted on the exception, which still propagates."""
         clock_fault = isinstance(exc, ClockError)
-        message = _scrub(self.settings, f"{type(exc).__name__}: {exc}")
+        message = self.alerter.scrub(f"{type(exc).__name__}: {exc}")
         problems: list[str] = []
         try:
             self.alerter.write(
@@ -569,7 +566,7 @@ class _Run:
         except Exception as write_error:
             problems.append(f"result row not written ({type(write_error).__name__})")
         if problems:
-            exc.add_note(_scrub(self.settings, "failed path: " + "; ".join(problems)))
+            exc.add_note(self.alerter.scrub("failed path: " + "; ".join(problems)))
 
     def _stamp(self, clock_fault: bool) -> tuple[datetime, bool]:
         if not clock_fault:
@@ -589,7 +586,7 @@ class _Run:
                     run_id=self.run_id,
                     finished_at=finished,
                     status=status,
-                    message="; ".join(notes) or None,
+                    message=self.alerter.scrub("; ".join(notes)) or None,
                     clock_fault=False,
                     known_at=finished,
                     ingested_at=finished,
@@ -628,7 +625,7 @@ class _Run:
         return {s: self.assets[s] for s in symbols if s in self.assets}
 
     def _alert(self, kind: str, message: str) -> None:
-        self.alerter.write(kind, self.run_id, self.session, _scrub(self.settings, message))
+        self.alerter.write(kind, self.run_id, self.session, self.alerter.scrub(message))
 
     # --- the steps -----------------------------------------------------------------
 
@@ -1061,7 +1058,7 @@ class _Run:
                 actions=actions,
             )
         if errors:
-            message = _scrub(self.settings, "lot ledger not rebuilt: " + "; ".join(errors))
+            message = self.alerter.scrub("lot ledger not rebuilt: " + "; ".join(errors))
             self.notes.append(message)
             self._alert("lot_ledger", message)
 
