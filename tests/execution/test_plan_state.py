@@ -834,3 +834,12 @@ def test_a_floored_trim_of_a_name_that_lost_fractionable_stays_open_on_its_remai
     assert state.state == State.OPEN
     assert state.remainder is not None
     assert state.remainder.quantity == pytest.approx(0.5)
+    # Worth less than the minimum, the same remainder settles instead.
+    cheap = _state(
+        d,
+        [o],
+        [_event(o, "filled")],
+        [_fill(o, 9, 50.0)],
+        frozen=RiskConfig(min_order_notional=30.0),
+    )
+    assert cheap.state == State.SETTLED
