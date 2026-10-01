@@ -255,12 +255,121 @@ def test_cmd_graph_prints_the_sections_and_respects_max_depth(
 def test_cmd_graph_plan_filter_limits_to_one_plan_file(
     root: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    (root / "docs" / "plans" / "graph-fixture.md").write_text(GRAPH_PLAN)
+    # Task ids are unique project-wide in real plans (PLAN only goes up to T20), so this
+    # second plan uses T91-T97 rather than reusing GRAPH_PLAN's T1-T7 verbatim, which would
+    # collide with PLAN's own T1, T3, T4, T5 and T20 once both plans load into one `tasks`.
+    other_plan = """# Plan: Graph fixture 2 (Phase 9)
+
+## Tasks
+- [x] **T91: Config.** Files: `src/a.py` · Depends on: n/a · Review: qa.
+- [ ] **T92 (owner): Secrets setup.** Files: `src/b.py` · Depends on: T91 · Review: safety-reviewer.
+- [ ] **T93: Branch A.** Files: `src/b.py`, `tests/test_b.py` · Depends on: T92 · Review: qa.
+- [ ] **T94: Branch B.** Files: `src/b.py` · Depends on: T92 · Review: qa.
+- [ ] **T97: Diamond join.** Files: `src/d.py` · Depends on: T93, T94 · Review: qa.
+- [ ] **T95: Chain tail.** Files: `src/c.py` · Depends on: T97 · Review: qa.
+- [x] **T96: Done task sharing file.** Files: `src/b.py` · Depends on: T91 · Review: qa.
+"""
+    (root / "docs" / "plans" / "graph-fixture.md").write_text(other_plan)
     assert team.cmd_graph(root, ref=None, plan="graph-fixture") == 0
     out = capsys.readouterr().out
-    assert "T2 -> T3 -> T7 -> T5" in out
+    assert "T92 -> T93 -> T97 -> T95" in out
     # The data-foundation plan's tasks (T10, T8b, ...) are excluded by the filter.
     assert "T10" not in out
+
+
+# ── graph: code-review follow-ups (#389) ────────────────────────────────────────
+
+
+def test_critical_path_and_depth_levels_raise_systemexit_on_a_dependency_cycle() -> None:
+    plan = """# Plan: Cycle fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Self dependency.** Files: `src/a.py` · Depends on: T1 · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/cycle-fixture.md")
+    with pytest.raises(SystemExit, match="cycle"):
+        team.critical_path(tasks)
+    with pytest.raises(SystemExit, match="cycle"):
+        team.depth_levels(tasks)
+
+
+def test_file_contention_dedupes_a_file_named_twice_by_one_task() -> None:
+    plan = """# Plan: Dedupe fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Repeats a file.** Files: `src/a.py`, `src/a.py` · Depends on: n/a · Review: qa.
+- [ ] **T2: Doesn't touch it.** Files: `src/zzz.py` · Depends on: n/a · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/dedupe-fixture.md")
+    assert team.file_contention(tasks) == {}
+
+
+def test_file_contention_counts_root_level_files_by_extension() -> None:
+    plan = """# Plan: Root file fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Touches the changelog.** Files: `CHANGELOG.md` · Depends on: n/a · Review: qa.
+- [ ] **T2: Also touches the changelog.** Files: `CHANGELOG.md` · Depends on: n/a · Review: qa.
+- [ ] **T3: Names a bare dotfile.** Files: `.unstamped_filings` · Depends on: n/a · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/root-fixture.md")
+    assert team.file_contention(tasks) == {"CHANGELOG.md": ["T1", "T2"]}
+    t3 = next(t for t in tasks if t.id == "T3")
+    assert team.task_files(t3) == []
+
+
+def test_downstream_of_continues_through_a_done_task() -> None:
+    plan = """# Plan: Downstream-through-done fixture (Phase 9)
+
+## Tasks
+- [ ] **T1 (owner): Root.** Files: `src/a.py` · Depends on: n/a · Review: qa.
+- [x] **T2: Done midpoint.** Files: `src/b.py` · Depends on: T1 · Review: qa.
+- [ ] **T3: Behind the done task.** Files: `src/c.py` · Depends on: T2 · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/downstream-done-fixture.md")
+    assert team.downstream_of(tasks, "T1") == ["T3"]
+
+
+def test_owner_gates_reports_an_owner_task_off_the_critical_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan = """# Plan: Owner gates fixture (Phase 9)
+
+## Tasks
+- [ ] **T1 (owner): On the critical path.** Files: `src/a.py` · Depends on: n/a · Review: qa.
+- [ ] **T2: Chain continues.** Files: `src/b.py` · Depends on: T1 · Review: qa.
+- [ ] **T3: Chain tail.** Files: `src/c.py` · Depends on: T2 · Review: qa.
+- [ ] **T4 (owner): Off the critical path.** Files: `src/d.py` · Depends on: n/a · Review: qa.
+- [ ] **T5: Downstream of T4 only.** Files: `src/e.py` · Depends on: T4 · Review: qa.
+- [ ] **T6: Also downstream of T4.** Files: `src/f.py` · Depends on: T4 · Review: qa.
+"""
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    (tmp_path / "docs" / "plans" / "gates-fixture.md").write_text(plan)
+    assert team.cmd_graph(tmp_path, ref=None) == 0
+    out = capsys.readouterr().out
+    # T1 is on the critical path (T1 -> T2 -> T3, length 3) and marked with "*".
+    assert "* T1: T2, T3" in out
+    # T4 is off the critical path (T4 -> T5/T6, length 2) but still reported, unmarked.
+    assert "T4: T5, T6" in out
+    assert "* T4" not in out
+    # T1 is listed before T4 (more downstream tasks first; both have 2 here, so by id).
+    assert out.index("T1: T2, T3") < out.index("T4: T5, T6")
+
+
+def test_task_sort_key_orders_task_ids_numerically_not_lexically() -> None:
+    ids = ["T10", "T2", "T1", "T9b", "T9a"]
+    assert sorted(ids, key=team.task_sort_key) == ["T1", "T2", "T9a", "T9b", "T10"]
+
+
+def test_depth_levels_sorts_same_depth_ids_numerically() -> None:
+    plan = """# Plan: Numeric sort fixture (Phase 9)
+
+## Tasks
+- [ ] **T10: Tenth.** Files: `src/j.py` · Depends on: n/a · Review: qa.
+- [ ] **T2: Second.** Files: `src/b.py` · Depends on: n/a · Review: qa.
+"""
+    tasks = team.parse_plan(plan, "docs/plans/numeric-fixture.md")
+    assert team.depth_levels(tasks) == {1: ["T2", "T10"]}
 
 
 def test_resolve_holder_whole_body_claims_in_order_with_release() -> None:

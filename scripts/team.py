@@ -54,8 +54,24 @@ TASK_LINE_RE = re.compile(
 )
 TITLE_TASK_RE = re.compile(r"^(T\d+[a-z]?)\s*[:(]")
 DEPENDS_RE = re.compile(r"Depends on:\s*([^·]+)")
+TASK_ID_SORT_RE = re.compile(r"^T(\d+)([a-z]*)$")
 FILES_SEGMENT_RE = re.compile(r"Files:\s*(?P<seg>[^·]*)")
-FILE_PATH_RE = re.compile(r"`((?:src|tests|docs|scripts)/[^`]+|\.[^`]+)`")
+FILE_TOKEN_RE = re.compile(r"`([^`]+)`")
+FILE_EXTENSIONS = (
+    ".py",
+    ".md",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".txt",
+    ".csv",
+    ".lock",
+    ".sh",
+    ".cfg",
+    ".ini",
+    ".example",
+)
 PHASE_RE = re.compile(r"\(Phase (\d+)\)")
 BRANCH_ISSUE_RE = re.compile(r"^[a-z]+/(\d+)-")
 EXEMPT_BRANCH_PREFIXES = ("spike/", "dependabot/")
@@ -172,45 +188,77 @@ def ready_tasks(tasks: Sequence[Task]) -> list[Task]:
     return [t for t in tasks if is_ready(t, by_id)]
 
 
-def task_files(task: Task) -> list[str]:
-    """Backticked file paths named in a task line's ``Files:`` segment (#389).
+def task_sort_key(task_id: str) -> tuple[int, str]:
+    """Numeric-aware sort key for a task id (#389 code review): T10 sorts after T2, not
+    before it as a plain string sort would. Ids that don't match ``T<n><letter?>`` sort
+    last, by their own text, so the key stays total and deterministic.
+    """
+    m = TASK_ID_SORT_RE.match(task_id)
+    if not m:
+        return (10**9, task_id)
+    return (int(m.group(1)), m.group(2))
 
-    The segment runs from ``Files:`` to the next `` · ``. A path counts only when it
-    starts with ``src/``, ``tests/``, ``docs/``, ``scripts/`` or a dot (e.g. ``.streamlit/``).
+
+def _is_file_token(token: str) -> bool:
+    """A backticked token is a file path when it has a ``/`` or a known extension (#389
+    code review). A bare dotfile name like ``.unstamped_filings`` has neither and is not
+    a path; ``.env.example``, ``.streamlit/config.toml`` and ``.pre-commit-config.yaml`` do.
+    """
+    return "/" in token or token.endswith(FILE_EXTENSIONS)
+
+
+def task_files(task: Task) -> list[str]:
+    """File paths named in a task line's ``Files:`` segment (#389), deduped per task.
+
+    The segment runs from ``Files:`` to the next `` · ``. A backticked token counts as a
+    file when ``_is_file_token`` says so; a task naming the same file twice contends with
+    other tasks only once.
     """
     m = FILES_SEGMENT_RE.search(task.line)
     if not m:
         return []
-    return FILE_PATH_RE.findall(m.group("seg"))
+    tokens = FILE_TOKEN_RE.findall(m.group("seg"))
+    return list(dict.fromkeys(t for t in tokens if _is_file_token(t)))
 
 
-def _open_chain_tiebreak(chain: Sequence[str]) -> tuple[int, Sequence[str]]:
-    """Sort key: longer chains first, ties broken lexicographically by task id (#389)."""
-    return (-len(chain), chain)
+def _open_chain_tiebreak(chain: Sequence[str]) -> tuple[int, list[tuple[int, str]]]:
+    """Sort key: longer chains first, ties broken by task id, numerically (#389)."""
+    return (-len(chain), [task_sort_key(i) for i in chain])
+
+
+def _cycle_error(visiting: frozenset[str], task_id: str) -> SystemExit:
+    cycle = sorted(visiting | {task_id}, key=task_sort_key)
+    return SystemExit(f"cycle in plan dependencies involving {', '.join(cycle)}")
 
 
 def critical_path(tasks: Sequence[Task]) -> list[Task]:
     """The longest chain of open tasks, counting only open tasks; ties break by task id.
 
     A dependency that is done (or unknown) does not extend the chain; it is treated as
-    already clear, same as ``is_ready``.
+    already clear, same as ``is_ready``. A self-dependency or a cycle among open tasks
+    raises ``SystemExit`` naming the cycle instead of recursing forever (#389).
     """
     by_id = {t.id: t for t in tasks}
     open_tasks = [t for t in tasks if not t.done]
     cache: dict[str, list[str]] = {}
 
-    def chain(task_id: str) -> list[str]:
+    def chain(task_id: str, visiting: frozenset[str]) -> list[str]:
         if task_id in cache:
             return cache[task_id]
+        if task_id in visiting:
+            raise _cycle_error(visiting, task_id)
         task = by_id[task_id]
-        open_deps = sorted(d for d in task.depends_on if d in by_id and not by_id[d].done)
-        candidates = [chain(d) for d in open_deps]
+        open_deps = sorted(
+            (d for d in task.depends_on if d in by_id and not by_id[d].done), key=task_sort_key
+        )
+        next_visiting = visiting | {task_id}
+        candidates = [chain(d, next_visiting) for d in open_deps]
         longest = min(candidates, key=_open_chain_tiebreak, default=[])
         result = [*longest, task_id]
         cache[task_id] = result
         return result
 
-    chains = [chain(t.id) for t in open_tasks]
+    chains = [chain(t.id, frozenset()) for t in open_tasks]
     if not chains:
         return []
     winner = min(chains, key=_open_chain_tiebreak)
@@ -221,17 +269,21 @@ def depth_levels(tasks: Sequence[Task]) -> dict[int, list[str]]:
     """Open tasks by depth; depth 1 = every dependency ticked or absent from the plan.
 
     Done tasks never appear (they are not claimable work); the depth of an open task is
-    one more than the deepest of its still-open dependencies.
+    one more than the deepest of its still-open dependencies. A self-dependency or a cycle
+    among open tasks raises ``SystemExit`` naming the cycle (#389).
     """
     by_id = {t.id: t for t in tasks}
     cache: dict[str, int] = {}
 
-    def depth(task_id: str) -> int:
+    def depth(task_id: str, visiting: frozenset[str]) -> int:
         if task_id in cache:
             return cache[task_id]
+        if task_id in visiting:
+            raise _cycle_error(visiting, task_id)
         task = by_id[task_id]
         open_deps = [d for d in task.depends_on if d in by_id and not by_id[d].done]
-        d = 1 + max((depth(dep) for dep in open_deps), default=0)
+        next_visiting = visiting | {task_id}
+        d = 1 + max((depth(dep, next_visiting) for dep in open_deps), default=0)
         cache[task_id] = d
         return d
 
@@ -239,16 +291,17 @@ def depth_levels(tasks: Sequence[Task]) -> dict[int, list[str]]:
     for t in tasks:
         if t.done:
             continue
-        levels.setdefault(depth(t.id), []).append(t.id)
+        levels.setdefault(depth(t.id, frozenset()), []).append(t.id)
     for ids in levels.values():
-        ids.sort()
+        ids.sort(key=task_sort_key)
     return levels
 
 
 def file_contention(tasks: Sequence[Task]) -> dict[str, list[str]]:
     """Files named in an open task's ``Files:`` segment by two or more open tasks.
 
-    A done task never contributes, even if it shares the path with open tasks.
+    A done task never contributes, even if it shares the path with open tasks. A task
+    naming the same file twice contributes it once, so it never contends with itself.
     """
     by_file: dict[str, list[str]] = {}
     for t in tasks:
@@ -256,29 +309,37 @@ def file_contention(tasks: Sequence[Task]) -> dict[str, list[str]]:
             continue
         for f in task_files(t):
             by_file.setdefault(f, []).append(t.id)
-    return {f: ids for f, ids in by_file.items() if len(ids) >= 2}
+    return {f: sorted(ids, key=task_sort_key) for f, ids in by_file.items() if len(ids) >= 2}
 
 
 def downstream_of(tasks: Sequence[Task], task_id: str) -> list[str]:
-    """Transitive open dependants of ``task_id``, sorted by task id."""
+    """Transitive open dependants of ``task_id``, sorted by task id, numerically.
+
+    Traversal walks through a done dependant to whatever is behind it (#389 code review):
+    only open tasks are excluded from the *result*, never from the walk, so an open task
+    gated behind a done one still shows up.
+    """
     by_id = {t.id: t for t in tasks}
     dependants: dict[str, list[str]] = {}
     for t in tasks:
         for dep in t.depends_on:
             dependants.setdefault(dep, []).append(t.id)
 
-    seen: set[str] = set()
+    visited: set[str] = set()
+    result: set[str] = set()
 
     def visit(tid: str) -> None:
         for child in dependants.get(tid, []):
-            task = by_id.get(child)
-            if task is None or task.done or child in seen:
+            if child in visited:
                 continue
-            seen.add(child)
+            visited.add(child)
+            task = by_id.get(child)
+            if task is not None and not task.done:
+                result.add(child)
             visit(child)
 
     visit(task_id)
-    return sorted(seen)
+    return sorted(result, key=task_sort_key)
 
 
 def resolve_holder(comment_bodies: Iterable[str]) -> str | None:
@@ -900,37 +961,68 @@ def cmd_graph(
     """Read-only shape of the open plan tasks: critical path, depth, file contention,
     owner gates (#389). Computed from ``load_tasks``, the same plan source as ``status``;
     no GitHub call, nothing written.
+
+    ``--plan`` narrows which plan's tasks are *displayed*; the graph itself (critical path,
+    depth, contention, downstream) is always computed over every plan first, so a dependency
+    on another plan's task still counts, then the printed rows are filtered down.
     """
     tasks = load_tasks(root, ref)
-    if plan is not None:
-        tasks = [t for t in tasks if Path(t.plan).stem == plan]
+    by_id = {t.id: t for t in tasks}
+    known_plans = sorted({Path(t.plan).stem for t in tasks})
+    if plan is not None and plan not in known_plans:
+        raise SystemExit(f"no plan named '{plan}'; known plans: {', '.join(known_plans) or 'none'}")
+
+    def shown(task_id: str) -> bool:
+        if plan is None:
+            return True
+        t = by_id.get(task_id)
+        return t is not None and Path(t.plan).stem == plan
 
     path = critical_path(tasks)
+    displayed_path = [t for t in path if shown(t.id)]
     print("CRITICAL PATH (longest chain of open tasks)")
-    print(f"  {' -> '.join(t.id for t in path)}" if path else "  none")
+    print(f"  {' -> '.join(t.id for t in displayed_path)}" if displayed_path else "  none")
 
     print("\nDEPTH LEVELS (open tasks; depth 1 = every dependency ticked or absent)")
     levels = depth_levels(tasks)
-    if levels:
-        for d in sorted(levels):
-            print(f"  {d}: {', '.join(levels[d])}")
+    shown_depths = {
+        d: ids for d, ids in ((d, [i for i in ids if shown(i)]) for d, ids in levels.items()) if ids
+    }
+    if shown_depths:
+        for d in sorted(shown_depths):
+            print(f"  {d}: {', '.join(shown_depths[d])}")
     else:
         print("  none")
 
     print("\nFILE CONTENTION (files named by two or more open tasks)")
     contention = file_contention(tasks)
-    if contention:
-        for f in sorted(contention):
-            print(f"  {f}: {', '.join(contention[f])}")
+    shown_contention = {
+        f: ids
+        for f, ids in ((f, [i for i in ids if shown(i)]) for f, ids in contention.items())
+        if len(ids) >= 2
+    }
+    if shown_contention:
+        for f in sorted(shown_contention):
+            print(f"  {f}: {', '.join(shown_contention[f])}")
     else:
         print("  none")
 
-    print("\nOWNER GATES (owner tasks on the critical path, with open tasks downstream)")
-    owners_on_path = [t for t in path if t.owner]
-    if owners_on_path:
-        for t in owners_on_path:
-            downstream = downstream_of(tasks, t.id)
-            print(f"  {t.id}: {', '.join(downstream) or 'none'}")
+    print(
+        "\nOWNER GATES (open owner tasks with open downstream work, most downstream first; "
+        "* = on the critical path)"
+    )
+    critical_ids = {t.id for t in path}
+    owner_tasks = sorted(
+        (t for t in tasks if not t.done and t.owner and shown(t.id)),
+        key=lambda t: task_sort_key(t.id),
+    )
+    gates = [(t, downstream_of(tasks, t.id)) for t in owner_tasks]
+    gates = [(t, d) for t, d in gates if d]
+    gates.sort(key=lambda pair: (-len(pair[1]), task_sort_key(pair[0].id)))
+    if gates:
+        for t, downstream in gates:
+            marker = "*" if t.id in critical_ids else " "
+            print(f"  {marker} {t.id}: {', '.join(downstream)}")
     else:
         print("  none")
 
@@ -1187,9 +1279,12 @@ def main(argv: Sequence[str] | None = None, gh: GitHub | None = None) -> int:
                 gh, root, args.target, park=args.park, force=args.force, reason=args.reason, ref=ref
             )
         case "graph":
+            # Not given: the same origin/main default as everything else. Given empty
+            # (`--ref ''`): the working tree, same mapping as plan_ref_from_env (#389).
+            graph_ref = ref if args.ref is None else (args.ref or None)
             return cmd_graph(
                 root,
-                ref=args.ref if args.ref is not None else ref,
+                ref=graph_ref,
                 plan=args.plan,
                 max_depth=args.max_depth,
             )
