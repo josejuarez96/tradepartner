@@ -117,6 +117,7 @@ def _spy(
     monkeypatch: pytest.MonkeyPatch,
     fail: str | None = None,
     write_to: Path | None = None,
+    fail_message: str = "injected provider error",
 ) -> Calls:
     calls = Calls()
 
@@ -129,7 +130,7 @@ def _spy(
         def method(self: StoreProvider, *args: Any, **kwargs: Any) -> Any:
             calls.append((name, args[1] if name == "late_dividends" else args[0]))
             if name == fail:
-                raise RuntimeError("injected provider error")
+                raise RuntimeError(fail_message)
             if name == "adjusted_prices" and write_to is not None and not calls.inserted:
                 calls.inserted = True
                 _insert_mid_run(self, write_to)
@@ -271,6 +272,22 @@ def test_injected_provider_error_leaves_failed_and_returns_the_traceback(
     result = _row(read(), "trial_results", outcome.trial_id)
     assert result["status"] == "failed"
     assert result["message"] == "RuntimeError: injected provider error"
+
+
+def test_failed_message_is_scrubbed_before_it_reaches_the_registry(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception's words can carry a configured secret; the registry copy of
+    the failure message is scrubbed at write time, as `ingest._clean` does (#342)."""
+    secret = "fake-smtp-password-for-test-342"
+    monkeypatch.setenv("ALERT_SMTP_PASSWORD", secret)
+    _spy(monkeypatch, fail="universe", fail_message=f"login failed for {secret}")
+    outcome = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
+
+    assert outcome.status == "failed"
+    result = _row(read(), "trial_results", outcome.trial_id)
+    assert secret not in result["message"]
+    assert result["message"].startswith("RuntimeError: ")
 
 
 def test_row_inserted_mid_run_leaves_failed(
