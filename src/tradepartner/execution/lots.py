@@ -44,6 +44,7 @@ substantially-identical policy (only the same `security_id` replaces).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -161,7 +162,8 @@ def rebuild(
     caller reporting the ledger as of an instant t must pass only fills with
     `known_at <= t`; `fills_for` does not filter by `known_at`. Raises
     `LotLedgerError` on a sale beyond the holding, which a split, a spin-off
-    receipt or a stock merger (none of them a fill) produces: a writer must
+    receipt or a stock merger (none of them a fill) produces, and on a fill
+    with a non-finite quantity or price or a naive `filled_at`: a writer must
     catch it and alert rather than fail its run."""
     lot_list: list[Lot] = []
     disposals: list[Disposal] = []
@@ -228,6 +230,13 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
             raise LotLedgerError(f"fill {row.fill_id} has no order {row.client_order_id!r}")
         if item.side not in {"buy", "sell"}:
             raise LotLedgerError(f"fill {row.fill_id} has side {item.side!r}")
+        if not (math.isfinite(row.quantity) and math.isfinite(row.price)):
+            raise LotLedgerError(
+                f"fill {row.fill_id} needs a finite quantity and price: "
+                f"{row.quantity!r}, {row.price!r}"
+            )
+        if row.filled_at.tzinfo is None:
+            raise LotLedgerError(f"fill {row.fill_id} has a naive filled_at")
         by_order.setdefault(row.client_order_id, []).append(item)
     trades: list[_Trade] = []
     for group in by_order.values():

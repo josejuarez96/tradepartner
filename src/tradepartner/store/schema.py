@@ -1253,7 +1253,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def _in_transaction(conn: duckdb.DuckDBPyConnection) -> bool:
+def in_transaction(conn: duckdb.DuckDBPyConnection) -> bool:
     """Whether `conn` has an explicit transaction open. In autocommit mode
     every statement runs in a transaction of its own, so two statements in
     a row see different ids; inside an open transaction they share one.
@@ -1266,11 +1266,11 @@ def _in_transaction(conn: duckdb.DuckDBPyConnection) -> bool:
 
 
 @contextmanager
-def _atomic(conn: duckdb.DuckDBPyConnection) -> Iterator[None]:
+def atomic(conn: duckdb.DuckDBPyConnection) -> Iterator[None]:
     """Run the block in one transaction: the caller's if one is open (it
     commits or rolls back), else a new one committed on success and rolled
     back on any exception."""
-    if _in_transaction(conn):
+    if in_transaction(conn):
         yield
         return
     conn.execute("BEGIN TRANSACTION")
@@ -1405,7 +1405,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         raise SchemaVersionError(
             f"store schema_version is {max_version}, this code expects {CURRENT_SCHEMA_VERSION}"
         )
-    with _atomic(conn):
+    with atomic(conn):
         if max_version in pre_identity:
             _migrate_action_identity(conn)
         if max_version == _PRE_ORDER_EVENT_REASON_VERSION:
