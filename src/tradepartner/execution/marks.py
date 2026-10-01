@@ -134,7 +134,17 @@ def marks_for(
             continue
         held = sorted(book.positions)
         prices = prices_as_of(conn, session_close(session), held)
-        closes = {row["security_id"]: row["close"] for row in prices.iter_rows(named=True)}
+        # `prices_as_of` returns the latest-known revision of *every* session's
+        # bar on or before this close, one row per (security_id, session), not
+        # only `session`'s own: a security missing a bar for `session` would
+        # otherwise be silently priced off an older session's close (a stale
+        # mark). Filtering to `session` here turns that into the same
+        # "no price" `ValueError` as a name with no bar at all.
+        closes = {
+            row["security_id"]: row["close"]
+            for row in prices.iter_rows(named=True)
+            if row["session"] == session
+        }
         for security_id in held:
             if security_id not in closes:
                 raise ValueError(f"no price for {security_id} at close({session})")
@@ -239,6 +249,8 @@ def lapses(
     """
     if window.window_id is None:
         raise ValueError("the window has no window_id")
+    if session < window.first_rebalance_session:
+        return []  # a mark-only session before T_0: no rebalance is due yet
     max_catch_up_sessions = _frozen_int(frozen, _PAPER_MAX_CATCH_UP)
     windows = _run_windows(runs)
     missed: list[Missed] = []

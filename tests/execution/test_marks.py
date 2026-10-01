@@ -290,6 +290,25 @@ def test_missing_price_raises(tmp_path) -> None:
     conn.close()
 
 
+def test_a_stale_earlier_bar_never_stands_in_for_a_missing_one(tmp_path) -> None:
+    """`prices_as_of` returns the latest-known revision of *every* session's
+    bar on or before the one given, one row per (security_id, session), not
+    only the session asked about. A d1-only `closes` dict built without
+    filtering on `session` would therefore silently price a d2 mark off d1's
+    stale close instead of raising "no price" for the missing d2 bar -- a
+    fake return (and, with a split in between, a fake drawdown). This pins
+    that `marks_for` filters to the session itself."""
+    d1 = date(2026, 10, 5)
+    d2 = next_session(d1)
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, d1, 10.0)  # d2 gets no bar at all
+    ledger = _ledger_for({d2: {A: 1.0}})
+    with pytest.raises(ValueError, match="no price"):
+        marks_for(conn, _window(), ledger, [d2], {A: True})
+    conn.close()
+
+
 # --- missed_run -----------------------------------------------------------------
 
 
@@ -317,6 +336,16 @@ def _at(day: date) -> datetime:
 
 
 # --- lapses ---------------------------------------------------------------------
+
+
+def test_lapses_before_the_first_rebalance_session_is_empty() -> None:
+    """A mark-only session before the window's T_0 (e.g. the run right after
+    `paper start`) has no rebalance due yet; `rebalance_sessions(start, end)`
+    raises for `start > end`, so this must be handled before calling it."""
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    before = date(2026, 9, 29)
+    assert lapses(window, [], [], _switch(False), before, {"paper.max_catch_up_sessions": 1}) == []
 
 
 def test_lapses_computed_at_boundary_session_and_not_one_earlier() -> None:
