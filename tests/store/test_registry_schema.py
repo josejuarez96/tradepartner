@@ -161,10 +161,10 @@ _V4_DDL_SHA256 = "0815559c58066e74829be4956dea3f252eeddb03ab612cb3485b588c6f44b5
 
 def test_version_4_fact_ddl_is_pinned() -> None:
     """Stores on disk are built from this DDL. A fact-table change goes to
-    schema version 5 with its own migration, never an edit here (spec req 9)."""
+    the next schema version with its own migration, never an edit here (spec req 9)."""
     digest = hashlib.sha256("".join(schema._TABLE_DDL).encode()).hexdigest()
     assert digest == _V4_DDL_SHA256, (
-        "version-4 fact-table DDL changed: bump to schema version 5 and add a "
+        "version-4 fact-table DDL changed: bump the schema version and add a "
         "migration instead of editing the fact tables"
     )
 
@@ -192,24 +192,24 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
     assert set(schema.REGISTRY_TABLE_NAMES) & set(schema.TABLE_NAMES) == set()
 
 
-def test_current_schema_version_is_5() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 5
+def test_current_schema_version_is_6() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 6
 
 
-def test_fresh_init_creates_every_table_at_version_5() -> None:
+def test_fresh_init_creates_every_table_at_version_6() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     assert _table_names(conn) == (
         set(schema.TABLE_NAMES) | set(schema.REGISTRY_TABLE_NAMES) | set(schema.JOURNAL_TABLE_NAMES)
     )
-    assert [version for version, _ in _versions(conn)] == [5]
+    assert [version for version, _ in _versions(conn)] == [6]
 
 
 def test_fresh_init_twice_keeps_one_version_row() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     schema.init_schema(conn)
-    assert [version for version, _ in _versions(conn)] == [5]
+    assert [version for version, _ in _versions(conn)] == [6]
 
 
 def test_registry_tables_carry_no_fact_columns() -> None:
@@ -228,7 +228,7 @@ def test_registry_tables_carry_no_fact_columns() -> None:
         assert columns.isdisjoint({"known_at", "ingested_at", "provenance"}), table
 
 
-def test_write_open_of_version_2_store_migrates_to_version_5(version_2_store: Path) -> None:
+def test_write_open_of_version_2_store_migrates_to_version_6(version_2_store: Path) -> None:
     conn = duckdb.connect(str(version_2_store))
     try:
         assert _table_names(conn).isdisjoint(schema.REGISTRY_TABLE_NAMES)
@@ -237,13 +237,13 @@ def test_write_open_of_version_2_store_migrates_to_version_5(version_2_store: Pa
         versions = _versions(conn)
     finally:
         conn.close()
-    assert [version for version, _ in versions] == [2, 3, 4, 5]
+    assert [version for version, _ in versions] == [2, 3, 4, 5, 6]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
     assert versions[3][1] == versions[2][1] == versions[1][1]
 
 
-def test_write_open_of_version_3_store_migrates_to_version_5(version_3_store: Path) -> None:
+def test_write_open_of_version_3_store_migrates_to_version_6(version_3_store: Path) -> None:
     conn = duckdb.connect(str(version_3_store))
     try:
         before = _table_snapshot(conn, schema.REGISTRY_TABLE_NAMES)
@@ -254,7 +254,7 @@ def test_write_open_of_version_3_store_migrates_to_version_5(version_3_store: Pa
     finally:
         conn.close()
     assert after == before
-    assert [version for version, _ in versions] == [3, 4, 5]
+    assert [version for version, _ in versions] == [3, 4, 5, 6]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
 
@@ -369,7 +369,9 @@ def test_migrated_store_reopens_without_a_further_version_row(tmp_path: Path, ve
     conn = duckdb.connect(str(path), read_only=True)
     try:
         schema.init_schema(conn)
-        assert [version for version, _ in _versions(conn)] == list(range(version, 6))
+        assert [version for version, _ in _versions(conn)] == list(
+            range(version, schema.CURRENT_SCHEMA_VERSION + 1)
+        )
     finally:
         conn.close()
 
@@ -405,15 +407,15 @@ def test_read_only_open_of_version_3_store_raises_and_changes_nothing(
         conn.close()
 
 
-def test_read_only_open_of_version_5_store_passes(tmp_path: Path) -> None:
-    path = tmp_path / "store_v5.duckdb"
+def test_read_only_open_of_version_6_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "store_v6.duckdb"
     conn = duckdb.connect(str(path))
     schema.init_schema(conn)
     conn.close()
     conn = duckdb.connect(str(path), read_only=True)
     try:
         schema.init_schema(conn)
-        assert [version for version, _ in _versions(conn)] == [5]
+        assert [version for version, _ in _versions(conn)] == [6]
     finally:
         conn.close()
 
@@ -431,14 +433,15 @@ def test_read_only_open_of_uninitialised_store_raises(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("read_only", [False, True])
 def test_unknown_later_version_raises_schema_version_error(tmp_path: Path, read_only: bool) -> None:
-    path = tmp_path / "store_v6.duckdb"
+    later = schema.CURRENT_SCHEMA_VERSION + 1
+    path = tmp_path / f"store_v{later}.duckdb"
     conn = duckdb.connect(str(path))
     schema.init_schema(conn)
-    conn.execute("INSERT INTO schema_version VALUES (6, ?)", [datetime.now(UTC)])
+    conn.execute("INSERT INTO schema_version VALUES (?, ?)", [later, datetime.now(UTC)])
     conn.close()
     conn = duckdb.connect(str(path), read_only=read_only)
     try:
-        with pytest.raises(schema.SchemaVersionError, match="6"):
+        with pytest.raises(schema.SchemaVersionError, match=str(later)):
             schema.init_schema(conn)
     finally:
         conn.close()
