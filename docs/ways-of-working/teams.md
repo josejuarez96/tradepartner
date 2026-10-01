@@ -70,7 +70,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 **During**
 - One `implementer` per claimed task, one writer per branch. Run several in parallel only on tasks with disjoint files. Read-only helpers and the reviewers may run alongside; the table in [agents.md](agents.md#parallelism-inside-a-team) says what goes in parallel and what does not.
 - Reviewers (`spec-critic`, `quant-auditor`, `safety-reviewer`) post their full report as the PR's verdict comment and return a ten-line summary; a window never pastes a report into its own context or its messages (#352).
-- **Two review passes per reviewer per PR** (#489): the review, then one verification pass after the fixes, told to check those fixes only. What the verification pass finds beyond a BLOCKER goes into one follow-up `size:S` issue, not a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
+- **Two review passes per reviewer per PR** (#489): the review, then one verification pass after the fixes, told to check those fixes only. It reads everything pushed since the first pass. An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices goes into one follow-up `size:S` issue, not a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
 - An implementer never claims or releases; it checks that its issue carries the team label and stops if not.
 - Anything you notice outside your task becomes an issue (`gh issue create`), unclaimed, for any team to pick up.
 
@@ -78,6 +78,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 
 Every message wakes the session that receives it, and that session re-reads its whole history to answer. Measured on 2026-10-01, 97% of all tokens were such re-reads, so a message is the most expensive thing a window can send.
 - A window messages the orchestrator for three things only: `ready #<PR>`, `blocked: <on what, on whom>`, or a finding that affects other teams (main is red, a shared file is in conflict, the disk is full). One message, complete, with the evidence in it.
+- **A safety finding is always sent, at once:** an exposed secret (name the variable and the `file:line`, never the value), a defect on the order path or in the kill switch, a run against the wrong account or endpoint, anything that should stop other windows. It is never held for the `ready` message and never dropped as "progress".
 - No acknowledgements, no progress reports, no "confirm you got this", no thanks. Silence means received. A window that was given an assignment starts it; it does not reply first.
 - The orchestrator sends one assignment per window per task and puts everything the window needs in it. Before asking a window for its state it reads `uv run python scripts/team.py status` and the PR; it asks only for what those cannot show.
 - Several notes for one window go in one message. A correction replaces the earlier message in one line; it does not ask for a confirmation either.
