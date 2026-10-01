@@ -466,6 +466,14 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
     "min_override_reason_chars",
 )
 
+# The `execution.*` keys req 14 also freezes into the window at `paper start` (#366
+# Q20, owner): the tracking trial's fill-price convention must be read from the
+# window's `frozen_json`, never live `Settings`, since a config edit mid-window must
+# not silently change what `paper report`'s fill-timing and residue terms compare
+# paper fills against. One key today; `execution/window.py`'s `_frozen_params` is the
+# writer this freezes into (not changed here: out of this task's file list).
+FROZEN_EXECUTION_KEYS: tuple[str, ...] = ("fill_price",)
+
 AlertChannel = Literal["store", "macos", "email"]
 _DEFAULT_ALERT_CHANNELS: tuple[AlertChannel, ...] = ("store", "macos")
 
