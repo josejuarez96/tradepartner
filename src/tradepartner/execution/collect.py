@@ -230,7 +230,7 @@ def collect(
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
-    `connect` opens a write chunk (`lambda: store.db.open_forappend(settings)`),
+    `connect` opens a write chunk (`lambda: store.db.open_for_write(settings)`),
     `frozen` is the window's frozen `risk.*` section, and `settings` gives the
     run-time `paper.fill_read_overlap_seconds`. `writer_kind` is `run` or
     `resume` and `writer_id` its run or resume id. Raises `ValueError` for a
