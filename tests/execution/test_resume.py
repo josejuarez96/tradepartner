@@ -15,6 +15,7 @@ from tradepartner.adapters.broker import Order, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
+from tradepartner.execution import resume as resume_module
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
@@ -910,3 +911,39 @@ def test_a_failed_fault_engagement_is_named_in_the_refusal(
 
     assert outcome.status == REFUSED
     assert any("NOT engaged" in r and "store locked" in r for r in outcome.reasons)
+
+
+def test_an_engagement_written_during_the_resume_refuses_the_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An engagement written after the resume row (a drawdown, say) is one the
+    owner did not see: `release` refuses it, the resume reports REFUSED and the
+    switch stays engaged (#447)."""
+    _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    def reconcile_then_engage(*args: object, **kwargs: object) -> object:
+        result = reconcile_now(*args, **kwargs)  # type: ignore[arg-type]
+        assert isinstance(
+            switch.engage(
+                journal_settings,
+                fixed_clock,
+                window_id=window.window_id,  # type: ignore[arg-type]
+                source="drawdown",
+                reason="drawdown after the resume row",
+            ),
+            int,
+        )
+        return result
+
+    monkeypatch.setattr(resume_module, "reconcile_now", reconcile_then_engage)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("release refused" in r and "after resume" in r for r in outcome.reasons)
+    assert outcome.released_event_id is None
+    assert _engaged(journal_settings, window)
