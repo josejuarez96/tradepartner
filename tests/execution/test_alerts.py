@@ -51,6 +51,7 @@ SPEC_KINDS = (
     "unspent_cash",
     "locked",
     "no_window",
+    "lot_ledger",  # #366 Q5 (a), 2026-10-01
 )
 
 
