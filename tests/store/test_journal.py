@@ -344,12 +344,29 @@ def test_a_bad_superseded_pointer_raises(seeded: duckdb.DuckDBPyConnection, shap
         "dangling": 999,
         "feed-target": feed,
         "other-order": other,
-        "chained": _fill(seeded, "a", "bf-a-2", superseded_by=synthetic),
+        # chained and self targets are live-looking broker_status rows of the same order,
+        # so only `s.superseded_by IS NOT NULL` can catch them (#405)
+        "chained": _fill(
+            seeded,
+            "a",
+            "synthetic:a-2",
+            source="broker_status",
+            price_implied=True,
+            superseded_by=synthetic,
+        ),
         "self": None,
     }[shape]
     if shape == "self":
         target = 10
-        _fill(seeded, "a", "bf-self", fill_id=10, superseded_by=10)
+        _fill(
+            seeded,
+            "a",
+            "synthetic:self",
+            source="broker_status",
+            price_implied=True,
+            fill_id=10,
+            superseded_by=10,
+        )
     else:
         _fill(seeded, "a", f"bf-{shape}", superseded_by=target)
     if shape == "chained":  # a pointer at a row that is itself superseded
