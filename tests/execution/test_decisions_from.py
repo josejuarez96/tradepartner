@@ -511,6 +511,31 @@ def test_a_ledger_not_stated_for_a_session_after_t_i_raises() -> None:
         _run(ledger=Ledger(positions={"A": 1.0}, cash=1.0, through=T))
 
 
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_a_price_that_is_not_positive_and_finite_raises(bad: float) -> None:
+    prices = dict(PRICES, C=bad)
+    with pytest.raises(ValueError, match="C"):
+        decisions_from(
+            _plan(),
+            _ledger({"A": 10.0, "C": 5.0}),
+            (),
+            _assets(),
+            {},
+            frozenset(),
+            FROZEN,
+            SETTINGS,
+            price_of=prices.__getitem__,
+            actions_as_of=_actions(),
+            costs=COSTS,
+        )
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -0.1])
+def test_a_target_weight_that_is_not_finite_and_non_negative_raises(bad: float) -> None:
+    with pytest.raises(ValueError, match="target weight of A"):
+        _run(_plan(targets={"A": bad, "B": 0.5}))
+
+
 def test_a_short_ledger_raises() -> None:
     with pytest.raises(ValueError, match="short"):
         _run(ledger=_ledger({"A": -1.0}))
