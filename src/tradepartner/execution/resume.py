@@ -37,9 +37,11 @@ The only way the kill switch is released. In the req 5 order:
    marked yet; a peak that is not positive refuses. The reconciliation cited
    is the window's highest id, the one this resume wrote. A switch that is
    not engaged has nothing to release: the outcome is `not_engaged`, after
-   the same settlement and reconciliation. After the release the state is
-   derived again, and a switch that still derives engaged (a clock that did
-   not move past the crashed close) is reported refused, not released.
+   the same settlement and reconciliation. A `switch.ReleaseRefused` (one of
+   `release`'s own checks, such as a release that would not clear the switch
+   because the clock did not move past the crashed close) is a refusal with
+   nothing written; the state is also derived again after a release, and a
+   switch that still derives engaged is reported refused, not released.
 
 **The synthetic residual fill** (req 8): quantity = `filled_quantity` minus
 the journaled quantity; price = (`filled_quantity` x `filled_avg_price` minus
@@ -444,14 +446,20 @@ def resume(
                 f"the last mark gives no positive equity for the drawdown peak: {peak!r}",
                 reconciliation_id=reconciliation_id,
             )
-        event_id = switch.release(
-            settings,
-            clock,
-            window_id=window_id,
-            resume_id=resume_id,
-            reconciliation_id=reconciliation_id,
-            peak_equity=peak,
-        )
+        try:
+            event_id = switch.release(
+                settings,
+                clock,
+                window_id=window_id,
+                resume_id=resume_id,
+                reconciliation_id=reconciliation_id,
+                peak_equity=peak,
+            )
+        except switch.ReleaseRefused as exc:
+            # `release` re-checks everything in one transaction, including that
+            # the new row would clear the switch (a clock that did not move past
+            # the crashed close): nothing is written and the switch stays engaged.
+            return outcome(REFUSED, f"release refused: {exc}", reconciliation_id=reconciliation_id)
         after = _switch(connect, window)
         if after.engaged:
             # A clock that did not move past the crashed close (switch.derive

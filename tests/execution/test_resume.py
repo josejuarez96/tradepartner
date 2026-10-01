@@ -767,8 +767,12 @@ def test_a_clock_that_does_not_move_reports_the_switch_still_engaged(
     )
 
     assert outcome.status == REFUSED
-    assert any("still derives engaged" in r for r in outcome.reasons)
+    assert any("release refused" in r and "would not clear" in r for r in outcome.reasons)
+    assert outcome.released_event_id is None
     assert _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        states = [e.state for e in kill_switch_events_for(conn, window.window_id)]  # type: ignore[arg-type]
+    assert "released" not in states
 
 
 def test_a_mismatch_found_with_nothing_engaged_engages_the_switch(
