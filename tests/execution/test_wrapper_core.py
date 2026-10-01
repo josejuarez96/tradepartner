@@ -33,6 +33,7 @@ from tradepartner.adapters.fake_broker import (
     PartialFill,
     Reject,
 )
+from tradepartner.cli import USAGE_ERROR
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import (
     ClockError,
@@ -821,7 +822,9 @@ def test_the_write_failure_path_alerts_outside_the_store_and_exits_non_zero(
         _halt(gate, ValueError("boom"), run)
 
     assert exited.value.code == WRITE_FAILED_EXIT_CODE != 0
-    assert WRITE_FAILED_EXIT_CODE != CRASH_EXIT_CODE  # #515 (ii): launchd/runbook tell them apart
+    # #515 (ii): distinct from a crash's exit code and from the CLI's usage-error
+    # code, so launchd/the runbook can tell a failed halt write apart from either.
+    assert WRITE_FAILED_EXIT_CODE not in (CRASH_EXIT_CODE, USAGE_ERROR)
     assert isinstance(exited.value.__cause__, ValueError)
     [(kind, message)] = spy.sent
     assert kind == "kill_switch_write_failed"

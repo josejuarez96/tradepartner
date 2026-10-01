@@ -336,10 +336,11 @@ This shows: the store's "as of" and the run's "last updated" (with a stale chip 
 | Exit code | Meaning | What you do |
 |---|---|---|
 | 0 | The run ended `ok`, `no_session` or `skipped_kill_switch`. | Nothing; this is routine. |
-| 1 (`CRASH_EXIT_CODE`) | An uncaught exception (`run_failed`/`failed`), a halt (`halted`/`stale_data`), or a run that ended `locked`/`no_window`. Also what an actual process crash (power loss, killed process) exits with, with no alert at all. | Read `paper.err.log` and the alerts list (`paper status`), per "What each alert kind means" below. If there is neither a `paper_run_results` row for S−1 nor an alert, suspect a crash: `paper status` shows the switch engaged, and the next run closes it `crashed`. |
-| 2 (`WRITE_FAILED_EXIT_CODE`) | The halt path could not write the `kill_switch` `engaged` row itself — the store may be unreliable. Deliberately distinct from 1 (#366 Q22 (ii)) so this one case is visible from `launchctl print` alone, before you even open a log. | Stop and check the store/disk before anything else; see the `kill_switch_write_failed` row below. Do not resume until you've confirmed the store is healthy. |
+| 1 (`CRASH_EXIT_CODE`) | An uncaught exception (`run_failed`/`failed`), a halt (`halted`/`stale_data`), or a run that ended `locked`/`no_window`. | Read `paper.err.log` and the alerts list (`paper status`), per "What each alert kind means" below. A power-loss or killed-process crash may show a different, signal-related code (or none at all, if launchd never saw it exit) rather than exactly 1 — in that case there is no `paper_run_results` row for S−1 and no alert either; `paper status` shows the switch engaged, and the next run closes it `crashed`. |
+| 2 | The CLI's usage error (`cli.USAGE_ERROR`): a bad flag or argument, refused before any run started. Unrelated to the paper run itself. | Fix the plist/command line; re-test with a manual `uv run tradepartner paper run` outside the window. |
+| 3 (`WRITE_FAILED_EXIT_CODE`) | The halt path could not write the `kill_switch` `engaged` row itself — the store may be unreliable. Deliberately distinct from both 1 and 2 (#366 Q22 (ii)) so this one case is visible from `launchctl print` alone, before you even open a log. | Stop and check the store/disk before anything else; see the `kill_switch_write_failed` row below. Do not resume until you've confirmed the store is healthy. |
 
-Both constants live next to each other in `src/tradepartner/execution/wrapper.py`.
+`CRASH_EXIT_CODE` and `WRITE_FAILED_EXIT_CODE` live next to each other in `src/tradepartner/execution/wrapper.py`; `USAGE_ERROR` is in `src/tradepartner/cli.py`.
 
 ### What each alert kind means, and what you do
 

@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import Settings
 from tradepartner.execution import alerts
@@ -416,8 +417,11 @@ def test_deliver_without_store_writes_nothing_to_the_store(conn: duckdb.DuckDBPy
 def test_deliver_without_store_never_returns_empty_for_a_valid_config(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
-    """#416/#515: `AlertsConfig` now requires a non-store channel, so a valid
-    `Settings` always gives `deliver_without_store` at least one channel to try."""
+    """#416/#515: `AlertsConfig` now requires a non-store channel, so a `store`-only
+    config is rejected at load, and a valid `Settings` always gives
+    `deliver_without_store` at least one channel to try."""
+    with pytest.raises(ValidationError, match="non-store"):
+        _settings(["store"])
     alerter = _alerter(conn, _settings(["store", "macos"]))
     outcomes = alerter.deliver_without_store("kill_switch_write_failed", "the switch row failed")
     assert outcomes != []

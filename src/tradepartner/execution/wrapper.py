@@ -264,8 +264,9 @@ CRASH_EXIT_CODE = 1
 
 #: The exit status when the `engaged` row itself cannot be written (spec req 4):
 #: distinct from `CRASH_EXIT_CODE` so the launchd plist and the runbook can tell a
-#: failed halt write apart from an ordinary crash (#366 Q22 (ii), #515).
-WRITE_FAILED_EXIT_CODE = 2
+#: failed halt write apart from an ordinary crash (#366 Q22 (ii), #515). Also
+#: distinct from `cli.USAGE_ERROR` (2), so a bad CLI flag never looks like one.
+WRITE_FAILED_EXIT_CODE = 3
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _MASK = "***"
