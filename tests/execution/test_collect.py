@@ -181,6 +181,7 @@ def _collect(
     writer_id: int = 1,
     frozen: RiskConfig = FROZEN,
     write_offs: WriteOffContext | None = None,
+    halt_read: bool = False,
 ) -> Collected:
     return collect(
         fake,
@@ -192,6 +193,7 @@ def _collect(
         frozen,
         settings,
         write_offs=write_offs,
+        halt_read=halt_read,
     )
 
 
@@ -1077,6 +1079,64 @@ def test_rejections_a_resume_journaled_are_judged_by_the_next_run(
     fixed_clock.advance(hours=24)
     later_run = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=submitting + 2)
     assert later_run.rejections == ()
+
+
+def test_rejections_a_halt_read_journaled_are_judged_by_the_next_run(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    # #397: the halt read collects as its run; it must not move the window the
+    # next run judges from, or its rejections are never judged again.
+    halting = _run(journal_settings, open_window, fixed_clock())
+    orders = [
+        _order(journal_settings, scripted_fake, fixed_clock, halting, f"tp-h{i}", quantity=1.0)
+        for i in range(2)
+    ]
+    fixed_clock.advance(minutes=1)
+    _collect(journal_settings, scripted_fake, fixed_clock, orders, writer_id=halting)
+    for order in orders:
+        scripted_fake.apply(order.client_order_id, Reject())
+    fixed_clock.advance(minutes=1)
+    halt = _collect(
+        journal_settings, scripted_fake, fixed_clock, orders, writer_id=halting, halt_read=True
+    )
+    assert [b.run_id for b in halt.rejections] == [halting]
+    assert len(_cursors(journal_settings)) == 1  # the halt read writes no cursor
+    fixed_clock.advance(hours=18)
+    next_run = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=halting + 1)
+    assert [b.run_id for b in next_run.rejections] == [halting]
+    fixed_clock.advance(hours=24)
+    later_run = _collect(journal_settings, scripted_fake, fixed_clock, [], writer_id=halting + 2)
+    assert later_run.rejections == ()
+
+
+@pytest.mark.parametrize("bad", [{"writer_kind": "resume"}, {"write_offs": "context"}])
+def test_a_halt_read_is_a_run_read_without_write_offs(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    bad: dict[str, str],
+) -> None:
+    context = WriteOffContext(
+        window_id=open_window.window_id,  # type: ignore[arg-type]
+        actions_as_of=NO_ACTIONS,
+        price_of=_raising_price,
+        session=THU,
+    )
+    with pytest.raises(ValueError, match="halt read"):
+        _collect(
+            journal_settings,
+            scripted_fake,
+            fixed_clock,
+            [],
+            writer_kind=bad.get("writer_kind", "run"),
+            write_offs=context if "write_offs" in bad else None,
+            halt_read=True,
+        )
+    assert _cursors(journal_settings) == []
 
 
 # --- review fixes: the write-off back-fill judges pending rebalances only ----
