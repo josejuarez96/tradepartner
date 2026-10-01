@@ -63,9 +63,9 @@ difference an allowance absorbs is listed under `allowed`.
 - A credited dividend (`explanations.dividends`: cash due per name) explains a
   cash difference equal to the total due: one `dividend_cash` adjustment per
   name. It is not journaled when the cash does not show it. Beside an ended
-  listing, the dividends come out of the cash before the proceeds are
-  attributed, and the proceeds take it all only when the cash cannot hold
-  both (#400).
+  listing the proceeds take the cash first, and the dividends are journaled
+  beside them only when the cash exceeds the proceeds' cap (#400). A
+  negative amount due raises `ValueError`.
 
 The caller passes only spin-offs and dividends not yet journaled (ex or pay date
 after the window's last `ok` reconciliation). While any order is lagging or
@@ -272,7 +272,7 @@ def compare(
             bands[order.security_id].widen(sign * shares)
             cash_band.widen(-sign * spend)
             continue
-        lag = _lag(item, q_tol, buffer)
+        lag = _lag(item, q_tol, buffer, cash_tol)
         if isinstance(lag, Mismatch):
             mismatches.append(lag)
         elif lag is not None:
@@ -326,6 +326,9 @@ def compare(
         name: _finite(amount, f"dividend due on {name}")
         for name, amount in sorted(explanations.dividends.items())
     }
+    negative = sorted(name for name, amount in dividends.items() if amount < 0)
+    if negative:
+        raise ValueError(f"dividend due is negative for {negative}")
     credited = math.fsum(dividends.values())
     if deferring and dividends:
         # A credit while an allowance is open is allowed, never journaled (#399).
@@ -341,11 +344,12 @@ def compare(
             cash_band.widen(cap)
             cash_ok = cash_band.allows(difference, cash_tol)
         else:
-            # The dividends are taken out of the cash first, so a final dividend
-            # is never booked as merger proceeds; if the cash cannot hold both,
-            # the proceeds take it all (#400).
+            # The proceeds take the cash first: paper is not expected to credit a
+            # dividend (spec req 6), and every dividend due is offered, paid or
+            # not. Only cash beyond the proceeds' cap is read as the dividends
+            # credited beside them (#400).
             cash_ok = False
-            for with_dividends in (True, False) if dividends else (False,):
+            for with_dividends in (False, True) if dividends else (False,):
                 proceeds = difference - (credited if with_dividends else 0.0)
                 if -cash_tol <= proceeds <= cap + cash_tol:
                     cash_ok = True
@@ -457,12 +461,13 @@ def _pending_bounds(
 
 
 def _lag(
-    item: JournalOpenOrder, tolerance: float, buffer: float
+    item: JournalOpenOrder, tolerance: float, buffer: float, cash_tolerance: float
 ) -> tuple[float, float] | Mismatch | None:
     """(unjournaled shares, unjournaled notional) of a lagging order, None when
     it is not lagging, or a `bad_reading` mismatch when the reading cannot
     bound the lag: more shares than a quantity order asked for, or more
-    filled value than a notional order's notional x (1 + `buffer`) (#398)."""
+    filled value than a notional order's notional x (1 + `buffer`), beyond the
+    cash tolerance (#398)."""
     reading, order = item.reading, item.order
     if reading is None or reading.filled_quantity is None:
         return None
@@ -478,7 +483,10 @@ def _lag(
         or price is None
         or not math.isfinite(price)
         or price <= 0
-        or (order.notional is not None and filled * price > abs(order.notional) * (1 + buffer))
+        or (
+            order.notional is not None
+            and filled * price > abs(order.notional) * (1 + buffer) + cash_tolerance
+        )
     ):
         return Mismatch(
             "bad_reading",
