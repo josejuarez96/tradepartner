@@ -35,6 +35,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ALERT_SMTP_USER",
         "ALERT_SMTP_PASSWORD",
         "ALERT_EMAIL_TO",
+        "ALERT_EMAIL_FROM",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -284,6 +285,7 @@ def test_secrets_absent_from_repr_and_str(monkeypatch: pytest.MonkeyPatch) -> No
         assert "sk-live-abc123" not in blob
         assert "sk-live-secret456" not in blob
         assert "jose@example.com" not in blob
+        assert "alerts-sender@example.com" not in blob
 
 
 # --- .env resolution: anchored to the project root, not the CWD -----------
@@ -729,6 +731,7 @@ def test_paper_and_alert_secrets_default_to_none() -> None:
     assert s.alert_smtp_user is None
     assert s.alert_smtp_password is None
     assert s.alert_email_to is None
+    assert s.alert_email_from is None
 
 
 def test_paper_and_alert_secrets_absent_from_repr_and_str(
@@ -740,6 +743,7 @@ def test_paper_and_alert_secrets_absent_from_repr_and_str(
     monkeypatch.setenv("ALERT_SMTP_USER", "alerts-user")
     monkeypatch.setenv("ALERT_SMTP_PASSWORD", "smtp-pass-789")
     monkeypatch.setenv("ALERT_EMAIL_TO", "jose@example.com")
+    monkeypatch.setenv("ALERT_EMAIL_FROM", "alerts-sender@example.com")
     s = _settings()
     assert s.alpaca_paper_api_key is not None
     assert s.alpaca_paper_api_key.get_secret_value() == "pk-paper-abc123"
