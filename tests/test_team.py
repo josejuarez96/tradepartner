@@ -311,6 +311,59 @@ def test_task_files_counts_known_extensionless_root_files() -> None:
     assert team.task_files(tasks[0]) == [".python-version"]
 
 
+def test_file_contention_matches_a_brace_pair_with_its_plain_sibling() -> None:
+    plan = """# Plan: Brace fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Adapters.** Files: `src/tradepartner/adapters/{broker,fake_broker}.py` \
+· Depends on: n/a · r: qa
+- [ ] **T2: Broker only.** Files: `src/tradepartner/adapters/broker.py` · Depends on: n/a · r: qa
+"""
+    tasks = team.parse_plan(plan, "docs/plans/brace-fixture.md")
+    contention = team.file_contention(tasks)
+    assert contention == {"src/tradepartner/adapters/broker.py": ["T1", "T2"]}
+    # fake_broker.py is only named by T1 (via the brace), so it isn't contended.
+    assert "src/tradepartner/adapters/fake_broker.py" not in contention
+
+
+def test_file_contention_matches_a_glob_directory_with_a_file_under_it() -> None:
+    plan = """# Plan: Glob fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Fixtures.** Files: `tests/fixtures/alpaca/paper/*` · Depends on: n/a · r: qa
+- [ ] **T2: One fixture.** Files: `tests/fixtures/alpaca/paper/orders.json` \
+· Depends on: n/a · r: qa
+"""
+    tasks = team.parse_plan(plan, "docs/plans/glob-fixture.md")
+    contention = team.file_contention(tasks)
+    assert contention == {"tests/fixtures/alpaca/paper/orders.json": ["T1", "T2"]}
+
+
+def test_file_contention_matches_a_stem_with_its_full_path() -> None:
+    plan = """# Plan: Stem fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Full path.** Files: `src/tradepartner/execution/wrapper.py` \
+· Depends on: n/a · r: qa
+- [ ] **T2: Bare stem.** Files: `execution/wrapper.py` · Depends on: n/a · r: qa
+"""
+    tasks = team.parse_plan(plan, "docs/plans/stem-fixture.md")
+    contention = team.file_contention(tasks)
+    assert contention == {"src/tradepartner/execution/wrapper.py": ["T1", "T2"]}
+
+
+def test_task_files_ignores_a_url() -> None:
+    plan = """# Plan: URL fixture (Phase 9)
+
+## Tasks
+- [ ] **T1: Docs link.** Files: `https://example.com/foo.py` · Depends on: n/a · r: qa
+- [ ] **T2: Same link.** Files: `https://example.com/foo.py` · Depends on: n/a · r: qa
+"""
+    tasks = team.parse_plan(plan, "docs/plans/url-fixture.md")
+    assert team.task_files(tasks[0]) == []
+    assert team.file_contention(tasks) == {}
+
+
 def test_file_contention_dedupes_a_file_named_twice_by_one_task() -> None:
     plan = """# Plan: Dedupe fixture (Phase 9)
 
@@ -388,6 +441,34 @@ def test_depth_levels_sorts_same_depth_ids_numerically() -> None:
 """
     tasks = team.parse_plan(plan, "docs/plans/numeric-fixture.md")
     assert team.depth_levels(tasks) == {1: ["T2", "T10"]}
+
+
+def test_main_graph_ref_mapping_env_default_and_cli_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Confirms the *mapping* `graph`'s --ref uses when omitted (#389 third code review):
+    # an empty TRADEPARTNER_PLAN_REF means the working tree, same as plan_ref_from_env's
+    # own mapping; an explicit --ref overrides it outright.
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    plan_path = tmp_path / "docs" / "plans" / "mini.md"
+    plan_path.write_text(
+        "# Plan: Mini (Phase 9)\n\n## Tasks\n"
+        "- [ ] **T1: Solo task.** Files: `src/a.py` · Depends on: n/a · Review: qa.\n"
+    )
+    _init_repo(tmp_path)  # commits the plan with T1 open
+    plan_path.write_text(plan_path.read_text().replace("- [ ]", "- [x]"))  # ticked, uncommitted
+    monkeypatch.chdir(tmp_path)
+
+    # TRADEPARTNER_PLAN_REF="" maps to the working tree (plan_ref_from_env's own mapping),
+    # where T1 is now ticked: no open tasks at all.
+    monkeypatch.setenv(team.PLAN_REF_ENV, "")
+    assert team.main(["graph"], gh=FakeGitHub()) == 0
+    assert "LONGEST CHAIN: 0" in capsys.readouterr().out
+
+    # --ref HEAD overrides the env var outright and reads the committed plan, where T1
+    # is still open.
+    assert team.main(["graph", "--ref", "HEAD"], gh=FakeGitHub()) == 0
+    assert "LONGEST CHAIN: 1" in capsys.readouterr().out
 
 
 def test_resolve_holder_whole_body_claims_in_order_with_release() -> None:

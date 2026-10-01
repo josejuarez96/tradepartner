@@ -216,6 +216,9 @@ class PlanGraph:
 
 
 def build_plan_graph(tasks: Sequence[Task]) -> PlanGraph:
+    """Build a ``PlanGraph`` from a task list: the by-id lookup, the not-done ids in plan
+    order, and the dependants map, each built once (#389 third code review).
+    """
     by_id = {t.id: t for t in tasks}
     open_ids = [t.id for t in tasks if not t.done]
     dependants: dict[str, list[str]] = {}
@@ -236,27 +239,107 @@ def task_sort_key(task_id: str) -> tuple[int, str]:
     return (int(m.group(1)), m.group(2))
 
 
-def _is_file_token(token: str) -> bool:
-    """A backticked token is a file path when it has a ``/``, a known extension, or is a
-    known extensionless root file (#389 second code review: ``.python-version`` and
-    ``.gitignore`` have neither a slash nor a listed extension). A bare dotfile name like
-    ``.unstamped_filings`` has none of the three and is not a path.
+_ROOT_PATH_PREFIXES = ("src/", "tests/", "docs/", "scripts/")
+_REJECTED_TOKEN_RE = re.compile(r'[\s("=]')
+_BRACE_RE = re.compile(r"\{([^{}]+)\}")
+
+
+def _reject_file_token(token: str) -> bool:
+    """URLs and code snippets inside a ``Files:`` segment are not paths (#389 third code
+    review): a token starting with ``http``, or containing whitespace, ``(``, ``=`` or
+    ``"``, is rejected before any path normalisation.
     """
-    return "/" in token or token.endswith(FILE_EXTENSIONS) or token in ROOT_FILES
+    return token.startswith("http") or bool(_REJECTED_TOKEN_RE.search(token))
 
 
-def task_files(task: Task) -> list[str]:
-    """File paths named in a task line's ``Files:`` segment (#389), deduped per task.
+def _expand_braces(token: str) -> list[str]:
+    """Expand one, non-nested ``{a,b}`` brace group into a plain token per alternative
+    (#389 third code review), e.g. ``src/x/{a,b}.py`` -> ``src/x/a.py``, ``src/x/b.py``.
+    Plans don't nest braces, so one group is enough.
+    """
+    m = _BRACE_RE.search(token)
+    if not m:
+        return [token]
+    prefix, suffix = token[: m.start()], token[m.end() :]
+    return [f"{prefix}{alt}{suffix}" for alt in m.group(1).split(",")]
 
-    The segment runs from ``Files:`` to the next `` · ``. A backticked token counts as a
-    file when ``_is_file_token`` says so; a task naming the same file twice contends with
-    other tasks only once.
+
+def _classify_file_token(token: str) -> tuple[str, str] | None:
+    """Classify one normalised ``Files:`` token (#389 third code review), or ``None``
+    when it isn't a file at all:
+
+    - ``dir``: a directory or a glob over one (``changelog.d/``, ``tests/fixtures/*``),
+      contending with every path under it.
+    - ``path``: a full path rooted at ``src/``, ``tests/``, ``docs/``, ``scripts/``, or a
+      known root-level file (by extension or the ``ROOT_FILES`` allowlist).
+    - ``stem``: a partial path with no recognised root (``execution/wrapper.py``),
+      matched by suffix against full paths elsewhere.
+    """
+    if token.endswith("/*"):
+        token = token[:-1]
+    if token.endswith("/"):
+        return ("dir", token)
+    if token.startswith(_ROOT_PATH_PREFIXES):
+        return ("path", token)
+    if "/" not in token:
+        if token in ROOT_FILES or token.endswith(FILE_EXTENSIONS):
+            return ("path", token)
+        return None
+    return ("stem", token)
+
+
+def _task_file_entries(task: Task) -> list[tuple[str, str]]:
+    """Classified, deduped ``(kind, value)`` file entries from a task's ``Files:``
+    segment (#389 third code review). The segment runs from ``Files:`` to the next
+    `` · ``. A brace group expands to one entry per alternative; a trailing ``/*`` or
+    ``/`` becomes a directory entry; a URL or code snippet is rejected outright.
     """
     m = FILES_SEGMENT_RE.search(task.line)
     if not m:
         return []
-    tokens = FILE_TOKEN_RE.findall(m.group("seg"))
-    return list(dict.fromkeys(t for t in tokens if _is_file_token(t)))
+    entries: list[tuple[str, str]] = []
+    for token in FILE_TOKEN_RE.findall(m.group("seg")):
+        if _reject_file_token(token):
+            continue
+        for expanded in _expand_braces(token):
+            classified = _classify_file_token(expanded)
+            if classified is not None:
+                entries.append(classified)
+    return list(dict.fromkeys(entries))
+
+
+def task_files(task: Task) -> list[str]:
+    """File paths (or globs, directories and stems) named in a task's ``Files:`` segment
+    (#389), deduped per task. See ``_task_file_entries`` for the normalisation rules.
+    """
+    return [value for _, value in _task_file_entries(task)]
+
+
+def _stem_matches_path(stem: str, path: str) -> bool:
+    """Whether ``path`` ends with ``stem`` at a ``/`` boundary, or equals it outright
+    (#389 third code review), e.g. ``execution/wrapper.py`` matches
+    ``src/tradepartner/execution/wrapper.py``.
+    """
+    return path == stem or path.endswith(f"/{stem}")
+
+
+def _file_entries_match(a: tuple[str, str], b: tuple[str, str]) -> bool:
+    """Whether two classified ``Files:`` entries name overlapping files (#389 third code
+    review): a directory contends with any path under it, and a stem contends with any
+    full path it is a suffix of at a ``/`` boundary.
+    """
+    kind_a, val_a = a
+    kind_b, val_b = b
+    kinds = {kind_a, kind_b}
+    if kind_a == kind_b:
+        return val_a == val_b
+    if kinds == {"dir", "path"}:
+        dir_val, path_val = (val_a, val_b) if kind_a == "dir" else (val_b, val_a)
+        return path_val.startswith(dir_val)
+    if kinds == {"stem", "path"}:
+        stem_val, path_val = (val_a, val_b) if kind_a == "stem" else (val_b, val_a)
+        return _stem_matches_path(stem_val, path_val)
+    return False
 
 
 def _open_chain_tiebreak(chain: Sequence[str]) -> tuple[int, list[tuple[int, str]]]:
@@ -275,14 +358,15 @@ def _cycle_error(path: tuple[str, ...], task_id: str) -> SystemExit:
     return SystemExit(f"cycle in plan dependencies: {' -> '.join(cycle)}")
 
 
-def critical_path(tasks: Sequence[Task], graph: PlanGraph | None = None) -> list[Task]:
-    """The longest chain of open tasks, counting only open tasks; ties break by task id.
-
-    A dependency that is done (or unknown) does not extend the chain; it is treated as
-    already clear, same as ``is_ready``. A self-dependency or a cycle among open tasks
-    raises ``SystemExit`` naming the cycle instead of recursing forever (#389).
+def _longest_open_chains(graph: PlanGraph) -> dict[str, list[str]]:
+    """The longest chain of open tasks ending at each open task, cycle-checked (#389
+    third code review). Shared by ``critical_path`` (the longest overall, tie broken by
+    task id) and ``depth_levels`` (depth = chain length), so the cycle-checked DFS over
+    the plan only runs once, not twice. A dependency that is done (or unknown) does not
+    extend a chain; it is treated as already clear, same as ``is_ready``. A
+    self-dependency or a cycle among open tasks raises ``SystemExit`` naming it instead
+    of recursing forever.
     """
-    graph = graph or build_plan_graph(tasks)
     by_id = graph.by_id
     cache: dict[str, list[str]] = {}
 
@@ -292,49 +376,43 @@ def critical_path(tasks: Sequence[Task], graph: PlanGraph | None = None) -> list
         if task_id in path:
             raise _cycle_error(path, task_id)
         task = by_id[task_id]
-        open_deps = sorted(
-            (d for d in task.depends_on if d in by_id and not by_id[d].done), key=task_sort_key
-        )
+        open_deps = (d for d in task.depends_on if d in by_id and not by_id[d].done)
         next_path = (*path, task_id)
-        candidates = [chain(d, next_path) for d in open_deps]
-        longest = min(candidates, key=_open_chain_tiebreak, default=[])
+        # min(): longer chains first, ties broken by task id, so the dep order below
+        # (whatever order they're written in) never affects the result.
+        longest = min(
+            (chain(d, next_path) for d in open_deps), key=_open_chain_tiebreak, default=[]
+        )
         result = [*longest, task_id]
         cache[task_id] = result
         return result
 
-    chains = [chain(tid, ()) for tid in graph.open_ids]
+    for tid in graph.open_ids:
+        chain(tid, ())
+    return cache
+
+
+def critical_path(tasks: Sequence[Task], graph: PlanGraph | None = None) -> list[Task]:
+    """The longest chain of open tasks, counting only open tasks; ties break by task id."""
+    graph = graph or build_plan_graph(tasks)
+    chains = _longest_open_chains(graph)
     if not chains:
         return []
-    winner = min(chains, key=_open_chain_tiebreak)
-    return [by_id[i] for i in winner]
+    winner = min((chains[tid] for tid in graph.open_ids), key=_open_chain_tiebreak)
+    return [graph.by_id[i] for i in winner]
 
 
 def depth_levels(tasks: Sequence[Task], graph: PlanGraph | None = None) -> dict[int, list[str]]:
     """Open tasks by depth; depth 1 = every dependency ticked or absent from the plan.
 
     Done tasks never appear (they are not claimable work); the depth of an open task is
-    one more than the deepest of its still-open dependencies. A self-dependency or a cycle
-    among open tasks raises ``SystemExit`` naming the cycle (#389).
+    the length of its longest open-task chain (``_longest_open_chains``).
     """
     graph = graph or build_plan_graph(tasks)
-    by_id = graph.by_id
-    cache: dict[str, int] = {}
-
-    def depth(task_id: str, path: tuple[str, ...]) -> int:
-        if task_id in cache:
-            return cache[task_id]
-        if task_id in path:
-            raise _cycle_error(path, task_id)
-        task = by_id[task_id]
-        open_deps = [d for d in task.depends_on if d in by_id and not by_id[d].done]
-        next_path = (*path, task_id)
-        d = 1 + max((depth(dep, next_path) for dep in open_deps), default=0)
-        cache[task_id] = d
-        return d
-
+    chains = _longest_open_chains(graph)
     levels: dict[int, list[str]] = {}
     for tid in graph.open_ids:
-        levels.setdefault(depth(tid, ()), []).append(tid)
+        levels.setdefault(len(chains[tid]), []).append(tid)
     for ids in levels.values():
         ids.sort(key=task_sort_key)
     return levels
@@ -343,23 +421,57 @@ def depth_levels(tasks: Sequence[Task], graph: PlanGraph | None = None) -> dict[
 def file_contention(tasks: Sequence[Task], graph: PlanGraph | None = None) -> dict[str, list[str]]:
     """Files named in an open task's ``Files:`` segment by two or more open tasks.
 
-    A done task never contributes, even if it shares the path with open tasks. A task
-    naming the same file twice contributes it once, so it never contends with itself.
+    A done task never contributes, even if it shares the path with open tasks. Entries
+    are matched across spellings (#389 third code review): a brace pair expands to its
+    plain siblings, a glob or directory contends with every path under it, and a bare
+    stem contends with any full path it is a suffix of (at a ``/`` boundary). A task
+    naming the same file twice, in any spelling, contends with other tasks only once.
     """
     graph = graph or build_plan_graph(tasks)
-    by_file: dict[str, list[str]] = {}
+    entries: list[tuple[str, str, str]] = []  # (task_id, kind, value)
     for t in graph.by_id.values():
         if t.done:
             continue
-        for f in task_files(t):
-            by_file.setdefault(f, []).append(t.id)
-    return {f: sorted(ids, key=task_sort_key) for f, ids in by_file.items() if len(ids) >= 2}
+        for kind, value in _task_file_entries(t):
+            entries.append((t.id, kind, value))
+
+    # Union-find over entry indices: entries that name overlapping files join a cluster,
+    # regardless of which task named them or which spelling they used.
+    parent = list(range(len(entries)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            if _file_entries_match(entries[i][1:], entries[j][1:]):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    clusters: dict[int, list[int]] = {}
+    for idx in range(len(entries)):
+        clusters.setdefault(find(idx), []).append(idx)
+
+    contention: dict[str, list[str]] = {}
+    for members in clusters.values():
+        task_ids = sorted({entries[i][0] for i in members}, key=task_sort_key)
+        if len(task_ids) < 2:
+            continue
+        # Display key: prefer a full path, then a directory, then whatever is left (a stem).
+        by_kind = {entries[i][1]: entries[i][2] for i in members}
+        key = by_kind.get("path") or by_kind.get("dir") or entries[members[0]][2]
+        contention[key] = task_ids
+    return contention
 
 
 def downstream_of(tasks: Sequence[Task], task_id: str, graph: PlanGraph | None = None) -> list[str]:
     """Transitive open dependants of ``task_id``, sorted by task id, numerically.
 
-    Traversal walks through a done dependant to whatever is behind it: only open tasks are
+    Traversal walks through a done dependant to whatever is behind it: done tasks are
     excluded from the *result*, never from the walk, so an open task gated behind a done
     one still shows up. ``task_id`` itself seeds ``visited`` (#389 second code review), so
     a cycle that loops back through a done task cannot report the start as its own
@@ -374,8 +486,9 @@ def downstream_of(tasks: Sequence[Task], task_id: str, graph: PlanGraph | None =
             if child in visited:
                 continue
             visited.add(child)
-            task = graph.by_id.get(child)
-            if task is not None and not task.done:
+            # Every dependant id came from a parsed task (#389 third code review): it is
+            # always some other task's own id, never a dangling reference.
+            if not graph.by_id[child].done:
                 result.add(child)
             visit(child)
 
@@ -1255,7 +1368,14 @@ def build_parser() -> argparse.ArgumentParser:
         "graph",
         help="read-only: critical path, depth levels, file contention, owner gates",
     )
-    p.add_argument("--ref", default=None, help="plan ref to read (default origin/main)")
+    p.add_argument(
+        "--ref",
+        default=None,
+        help=(
+            "plan ref to read; omitted uses plan_ref_from_env() "
+            "(TRADEPARTNER_PLAN_REF if set, else origin/main); '' reads the working tree"
+        ),
+    )
     p.add_argument(
         "--max-depth", type=int, default=None, help="exit 1 when the longest chain exceeds N"
     )
