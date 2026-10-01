@@ -156,6 +156,27 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
     assert {t: s for t, s in shapes.items() if t != "order_events"} == others_before
 
 
+def test_the_migration_keeps_the_reader_order_of_tied_events(tmp_path: Path) -> None:
+    """Readers order an order's events by `known_at`, then rowid; the halt path's
+    `cancel_requested` and `cancel_noop` share a stamp, so the rebuild must not
+    reorder them."""
+    path = _version_5_store(tmp_path / "v5.duckdb")
+    statuses = ["pending", "accepted", "cancel_requested", "cancel_noop", "filled"]
+    reader = "SELECT status FROM order_events ORDER BY known_at, rowid"
+    with duckdb.connect(str(path)) as conn:
+        for status in statuses:
+            conn.execute(
+                "INSERT INTO order_events (client_order_id, status, reason, known_at, "
+                "ingested_at) VALUES ('c1', ?, ?, ?, ?)",
+                [status, schema.HALT_REASON if status == "cancel_requested" else None, _NOW, _NOW],
+            )
+        before = [status for (status,) in conn.execute(reader).fetchall()]
+        schema.init_schema(conn)
+        after = [status for (status,) in conn.execute(reader).fetchall()]
+    assert before == statuses
+    assert after == statuses
+
+
 def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) -> None:
     path = _version_5_store(tmp_path / "v5.duckdb")
     for _ in range(2):

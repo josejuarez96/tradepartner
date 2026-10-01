@@ -1351,7 +1351,12 @@ def _migrate_order_event_reasons(conn: duckdb.DuckDBPyConnection) -> None:
         1,
     )
     conn.execute(staging_ddl)
-    conn.execute(f"INSERT INTO {_ORDER_EVENTS_STAGING_TABLE} BY NAME SELECT * FROM order_events")
+    # Readers break `known_at` ties on rowid (the halt path's `cancel_requested`
+    # and `cancel_noop` share a stamp), so the copy keeps the insertion order.
+    conn.execute(
+        f"INSERT INTO {_ORDER_EVENTS_STAGING_TABLE} BY NAME "
+        "SELECT * FROM order_events ORDER BY rowid"
+    )
     conn.execute("DROP TABLE order_events")
     conn.execute(f"ALTER TABLE {_ORDER_EVENTS_STAGING_TABLE} RENAME TO order_events")
 
