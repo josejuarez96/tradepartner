@@ -11,8 +11,11 @@ plan on the full store:
   inside it. Both are compared with the full store's two-rebalance window: the plan is
   state-free, so a window's plan at T_k is a full run's.
 - Compared: `targets[fill_session(T_k)]` and the T_k `RebalanceRow`'s plan fields
-  (`PLAN_FIELDS`), at every cost level. Fills, exits and valuation after T_k are not:
-  the cut has no strategy bar after T_k, so most fills on F_k are missing, by design.
+  (`PLAN_FIELDS`), at every cost level, and the plan's own `PLAN_READS` (the universe
+  members, the signal scores and the names excluded for no history, which Phase 4's
+  `decisions_from` reads; T53b), recorded around `engine._plan` during the run. Fills,
+  exits and valuation after T_k are not: the cut has no strategy bar after T_k, so most
+  fills on F_k are missing, by design.
 - **Benchmark-exempt cut** (owner decision on #201): a window starting at T_k (k >= 12,
   once SPY and MTUM are known) buys the benchmarks on F_k, which a plain cut has no bar
   for. `BenchmarkExemptStore` keeps benchmark bars past the cut. That is safe only
@@ -87,6 +90,9 @@ PLAN_FIELDS = (
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
 PlanView = dict[float, tuple[dict[str, float], tuple[Any, ...]]]
+Planned = tuple[Results, Mapping[date, engine.Plan]]
+#: The `Plan` fields `decisions_from` reads (T53b), compared like the row's plan fields.
+PLAN_READS = ("members", "scores", "excluded_no_history")
 
 
 @pytest.fixture(autouse=True)
@@ -197,6 +203,22 @@ class Fixture:
         with self.provider(conn) as provider:
             return run(self.settings, provider, start, end, self.handle, COST_LEVELS)
 
+    def planned(self, start: date, end: date, conn: duckdb.DuckDBPyConnection) -> Planned:
+        """`window`, with every plan the run made (by session), recorded around whatever
+        `engine._plan` is at the call (a test's patched copy included)."""
+        plans: dict[date, engine.Plan] = {}
+        planner = engine._plan
+
+        def recording(provider: DataProvider, params: Settings, session: date) -> engine.Plan:
+            plans[session] = planner(provider, params, session)
+            return plans[session]
+
+        engine._plan = recording
+        try:
+            return self.window(start, end, conn), plans
+        finally:
+            engine._plan = planner
+
     def after(self, session: date) -> date:
         return self.sessions[self.sessions.index(session) + 1]
 
@@ -220,18 +242,21 @@ def fixture() -> Iterator[Fixture]:
 def baseline(fixture: Fixture) -> dict[date, PlanView]:
     """The full store's plan at every T_k with a next rebalance (two-rebalance window)."""
     return {
-        t_k: _plan_view(fixture.window(t_k, fixture.after(t_k), fixture.conn), t_k)
+        t_k: _plan_view(fixture.planned(t_k, fixture.after(t_k), fixture.conn), t_k)
         for t_k in fixture.sessions[:-1]
     }
 
 
-def _plan_view(results: Results, t_k: date) -> PlanView:
-    """What the plan at T_k decided, per cost level: its targets and plan fields."""
+def _plan_view(planned: Planned, t_k: date) -> PlanView:
+    """What the plan at T_k decided, per cost level: its targets, the row's plan fields,
+    then the plan's `PLAN_READS` (the same at every level)."""
+    results, plans = planned
+    reads = tuple(getattr(plans[t_k], name) for name in PLAN_READS)
     view: PlanView = {}
     for level, result in results.items():
         [row] = [r for r in result.rebalances if r.session == t_k]
         targets = dict(result.targets[fill_session(t_k)])
-        view[level] = (targets, tuple(getattr(row, name) for name in PLAN_FIELDS))
+        view[level] = (targets, tuple(getattr(row, name) for name in PLAN_FIELDS) + reads)
     return view
 
 
@@ -269,11 +294,11 @@ def test_every_plan_is_unchanged_on_a_store_cut_at_its_own_read(
             cut = exempt.at(read_time(t_k))
             t_next = fixture.after(t_k)
             want = baseline[t_k]
-            got = _plan_view(fixture.window(t_k, t_next, cut), t_k)
+            got = _plan_view(fixture.planned(t_k, t_next, cut), t_k)
             assert got == want, f"plan at {t_k} (before the loop) differs on the cut store"
             if k >= 1:
                 start = fixture.sessions[k - 1]
-                got = _plan_view(fixture.window(start, t_next, cut), t_k)
+                got = _plan_view(fixture.planned(start, t_next, cut), t_k)
                 assert got == want, f"plan at {t_k} (inside the loop) differs on the cut store"
     finally:
         exempt.close()
@@ -303,9 +328,9 @@ def test_a_plan_read_at_the_next_rebalance_fails_the_check_but_not_truncation(
     exempt = BenchmarkExemptStore(fixture.conn)
     try:
         for start in (t_k, fixture.sessions[k - 1]):  # before the loop, inside it
-            full = _plan_view(fixture.window(start, fixture.after(t_k), fixture.conn), t_k)
+            full = _plan_view(fixture.planned(start, fixture.after(t_k), fixture.conn), t_k)
             cut = _plan_view(
-                fixture.window(start, fixture.after(t_k), exempt.at(read_time(t_k))), t_k
+                fixture.planned(start, fixture.after(t_k), exempt.at(read_time(t_k))), t_k
             )
             assert _fields(full, "gap_count_share") != _fields(cut, "gap_count_share"), start
     finally:
@@ -343,6 +368,9 @@ def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
             n_static_listings=provider.static_listing_count(t, members),
             n_excluded_no_history=signal.n_excluded,
             gap=provider.survivorship_gap(t),
+            members=tuple(members),
+            scores=signal.scores,
+            excluded_no_history=signal.excluded,
         )
 
     return plan
@@ -379,8 +407,8 @@ def test_a_late_signal_read_fails_the_check_and_the_engine_passes_it(
         def views() -> list[tuple[PlanView, PlanView]]:
             return [
                 (
-                    _plan_view(fixture.window(start, t_next, revised), t_k),
-                    _plan_view(fixture.window(start, t_next, cut), t_k),
+                    _plan_view(fixture.planned(start, t_next, revised), t_k),
+                    _plan_view(fixture.planned(start, t_next, cut), t_k),
                 )
                 for start in (t_k, anchor)
             ]
