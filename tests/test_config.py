@@ -8,35 +8,29 @@ spec; T1 picked conservative ones under the gitignored `data/` directory.
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from tradepartner.config import FROZEN_PAPER_KEYS, PaperConfig, Settings
+from tradepartner.config import FROZEN_PAPER_KEYS, PaperConfig, Settings, _default_env_file
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate every test from the real shell environment."""
-    for key in (
-        "ALPACA_API_KEY",
-        "ALPACA_API_SECRET",
-        "SEC_EDGAR_USER_AGENT",
-        "TRADEPARTNER_ENV_FILE",
-        "UNIVERSE__EXCLUDE_SIC_RANGES",
-        "HOLDOUT__START",
-        "HOLDOUT__END",
-        "ALPACA__PAPER",
-        "ALPACA_PAPER_API_KEY",
-        "ALPACA_PAPER_API_SECRET",
-        "ALERT_SMTP_HOST",
-        "ALERT_SMTP_USER",
-        "ALERT_SMTP_PASSWORD",
-        "ALERT_EMAIL_TO",
-    ):
-        monkeypatch.delenv(key, raising=False)
+    """Isolate every test from the real shell environment.
+
+    Every variable `Settings` reads is cleared, found from its fields, so a new
+    key or a nested one such as `STORE__PATH` is covered without a list edit (#360).
+    """
+    fields = {name.upper() for name in Settings.model_fields}
+    nested = tuple(f"{name}__" for name in fields)
+    for key in list(os.environ):
+        upper = key.upper()
+        if upper in fields or upper.startswith(nested) or upper == "TRADEPARTNER_ENV_FILE":
+            monkeypatch.delenv(key)
 
 
 def _settings() -> Settings:
@@ -48,8 +42,14 @@ def _settings() -> Settings:
 def test_settings_construct_with_no_env_file_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Import and load succeed with no `.env` present (acceptance criterion)."""
+    """Import and load succeed with no `.env` present (acceptance criterion).
+
+    The loader reads `.env` from the project root, not the CWD, so a checkout
+    with a real `.env` needs the documented override to have none (#360).
+    """
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "absent.env"))
     monkeypatch.chdir(tmp_path)
+    assert not _default_env_file().exists()
     settings = Settings()
     assert settings is not None
     assert settings.store.path == "data/tradepartner.duckdb"
