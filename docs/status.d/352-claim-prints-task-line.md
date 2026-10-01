@@ -1,1 +1,0 @@
-- #352 `team.py claim` prints the task's plan line and its dependencies' lines (`team.py show <Tn>` reprints them); implementers read those plus the cited spec sections, never the whole plan or spec; `spec-critic`, `quant-auditor` and `safety-reviewer` post the full report as the PR's verdict comment and return a ten-line summary

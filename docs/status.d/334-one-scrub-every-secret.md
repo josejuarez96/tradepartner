@@ -1,1 +1,0 @@
-- #334 Secrets: `ingest._clean` redacts every `SecretStr` field of `Settings` (found by type, so a new secret is covered without a list edit); the paper recorder's stderr error goes through `scrub_text`; `_configured_secrets` adds the SMTP AUTH PLAIN and LOGIN base64 forms of the alert credentials

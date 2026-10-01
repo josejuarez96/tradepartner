@@ -1,1 +1,0 @@
-- #358 EDGAR `form.idx` rows with a blank company name (a 1997 SC 13D in the owner's first real backfill) parse with an empty name instead of failing the whole EDGAR source
