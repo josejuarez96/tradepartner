@@ -104,6 +104,10 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Agents: `backtest-runner` runs a hypothesis on a temp fixture store and reports the synthetic trial (T45, #323)
 - Execution: `execution.plan.remainder`, `target_notional` and `decision_state` with `Remainder`, `DecisionState`, `State` and `BuyCosts` (#326)
 - Execution: `plan.residue` and `plan.rebalance_state` with `RebalanceState` (T52b, #337)
+- Phase 4 collectors (T58): `execution.collect.collect`, `lag_verdict` and `rejection_breaches`, per spec reqs 4 and 8, and the shared `tests/execution/conftest.py` fixtures (fixed clock, scripted fake, journal store, open window)
+- Phase 4 risk checks and buy sizing for the wrapper's phases (#336)
+- Paper trading: order outcomes (`execution.outcomes.due_outcomes`, `write_outcomes_and_lots`) and the lot-ledger write (T62, #344)
+- Process: `tests/test_docs_budget.py` fails CI when `docs/STATUS.md` exceeds 2,000 tokens or `CLAUDE.md` 3,000 (#351)
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -134,6 +138,8 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Broker interface completed for Phase 4 (spec req 1, #33): `OPEN` is renamed `ACCEPTED`, requests carry `notional` or `quantity` and no price, `cancel` returns `None`, and `get_order`, `open_orders`, `fills(since)`, `account` and `assets` are new; `FakeBroker` takes a `price_of` function (#277).
 - Docs: Phase 4 plan T68 checkbox ticked, merged as #269 (#276)
 - Docs: STATUS and CHANGELOG fold of the 2026-09-26/27 fragments and board refresh (#293)
+- Process: one bookkeeping fragment per PR (`changelog.d/<issue>-<slug>.md` holds the STATUS line and the CHANGELOG bullets); `fragments.py fold` keeps the last 10 STATUS "Recently done" lines; STATUS is a board (about 1.4k tokens, from 10k); the old `docs/status.d/` layout is still read during the transition (#351)
+- Process: `scripts/team.py show` and the claim printout of the task and dependency lines; implementer and reviewer agent definitions, ready-pr, development-process and teams updated so windows load task lines and reviewer summaries instead of whole plans and reports (#352)
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -146,6 +152,9 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Plan: T11c and T11f size-budget clauses moved in front of `Depends on` so `team.py` reads the real dependencies (#219).
 - `FakeBroker.fills` call log no longer trips the T50 `fills_sql` boundary check (#302)
 - Secrets: the fixture and CLI error scrub now also replaces the `ALERT_SMTP_USER`, `ALERT_SMTP_PASSWORD` and `ALERT_EMAIL_TO` values (#320)
+- Secrets: ingestion run messages redact every configured secret (the paper keys and alert secrets were missed), the paper recorder scrubs its stderr error, and the SMTP login base64 forms are scrubbed (#334)
+- mypy on main: unused type-ignore in `execution/switch.py` (#347)
+- Data: `parse_filing_index` accepts an index row whose company-name column is blank; the owner's first `ingest --backfill` no longer fails the EDGAR source on it (#358)
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
