@@ -20,20 +20,27 @@ pattern: a page shows a state, not a traceback).
 `journal.latest_window` returns `None`; `OpsData` then carries
 `journal_not_initialised=False`, `window=None` and every other field empty.
 
-**Staleness.** "As of" is the latest `known_at` among the rows this function
-reads for the window (never looked up independently, so it can never show a
-time later than what the page itself displays); "last updated" is the latest
-`paper_run_results.finished_at`. `stale` is True when the session before
-today's (S-1, by the New York calendar, mirroring
-`execution.reconcile_run.command_session`) has no run with that `session` in
-this window.
+**Staleness.** "As of" is the latest `known_at` among every row this function
+reads for the window; "last updated" is the latest `paper_run_results.
+finished_at`. `stale` is True when "S-1", the session this run-by-run check
+asks for, has no run with that `session` in this window: when today (by the
+New York calendar) is itself a session, S-1 is the session strictly before
+it (today's own run may not have happened yet); on a non-session day
+(a weekend, a holiday) there is no "today's run" to wait for, so S-1 is the
+latest session at or before today instead — both cases are exactly
+`calendar.previous_session(today)` (`_required_run_session`).
 
 **Row limits.** The alerts list, the chain view and the fills table are each
-capped at `dashboard.page_row_limit` rows (ADR 0011's "Consequences": a
-render's read connection blocks the run's write connections for as long as
-`page_data` takes, so its reads are bounded structurally rather than by how
-large the journal has grown). `OpsData` reports each cap that bit
-(`alerts_capped`, `chains_capped`, `fills_capped`) so the page can say so.
+capped at `dashboard.page_row_limit` rows, newest first (ADR 0011's
+"Consequences": a render's read connection blocks the run's write
+connections for as long as `page_data` takes). `OpsData` reports each cap
+that bit (`alerts_capped`, `chains_capped`, `fills_capped`). The alerts query
+pushes its limit into SQL. `store.journal.fills_for` is documented as the
+*single* reader of `fills`, and the window readers it and the chain view share
+(`orders_for`, `order_events_for`, `outcomes_for`) take no row limit of their
+own, so those three still read the whole window before this module truncates
+in Python; a true per-row SQL bound on them needs a `store/journal.py` change
+this task's file list does not include (left for a follow-up: #435).
 """
 
 from __future__ import annotations
@@ -45,7 +52,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from tradepartner.calendar import is_session, previous_session
+from tradepartner.calendar import previous_session
 from tradepartner.config import Settings
 from tradepartner.execution import lock
 from tradepartner.execution.switch import SwitchState, derive
@@ -55,6 +62,7 @@ from tradepartner.store.journal import (
     AlertRow,
     DecisionRow,
     JournalNotInitialised,
+    KillSwitchRow,
     OrderedFill,
     OrderEventRow,
     OrderRow,
@@ -63,6 +71,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    PositionDailyRow,
     ReconciliationRow,
     SignalRow,
 )
@@ -75,23 +84,35 @@ _NEW_YORK = ZoneInfo("America/New_York")
 _STEP_ORDER: dict[str, int] = {"order": 0, "order_event": 1, "fill": 2, "outcome": 3}
 
 
-def _today_session(now: datetime) -> date:
-    """The New York calendar session `now` falls on, or the one before it when
-    `now` is not a session (`execution.reconcile_run.command_session`'s rule,
-    mirrored here rather than imported, so this read-only module does not pull
-    in the write-side reconciliation module)."""
-    day = now.astimezone(_NEW_YORK).date()
-    return day if is_session(day) else previous_session(day)
+def _required_run_session(now: datetime) -> date:
+    """S-1: the session `stale` requires a run for. When today (the New York
+    calendar date of `now`) is itself a session, that is the session strictly
+    before it, because today's own run may not have happened yet. On a
+    non-session day (a weekend, a holiday) there is no "today's run" to wait
+    for, so it is the latest session at or before today instead. Both cases
+    are `calendar.previous_session(today)`: on a session day that is the
+    session before it; on a non-session day it is already the latest one at
+    or before it (`previous_session` does not require its argument to be a
+    session). Takes `now` so the rule can be tested without the wall clock."""
+    today = now.astimezone(_NEW_YORK).date()
+    return previous_session(today)
 
 
 @dataclass(frozen=True)
 class RankedSignal:
-    """One security's place in the latest plan's ranking (spec req 12 hero)."""
+    """One security's place in the latest plan's ranking (spec req 12 hero):
+    its `signals` reason (`selected`, `below_cut`, `excluded_no_history`), None
+    for a held name the plan's universe pass never scored, and, when a
+    `decisions` row names it, both the decision's own kind (`decision`, e.g.
+    `trade`, `override`, `dust`, `skip_delisted`) and its `reason` (e.g.
+    `left_universe`, `exclude_name`), kept separate so an override's kind and
+    a dust exit's reason are never collapsed into one one string."""
 
     security_id: str
     score: float | None
     rank: int | None
-    signal_reason: str
+    signal_reason: str | None
+    decision: str | None
     decision_reason: str | None
     selected: bool
 
@@ -145,18 +166,25 @@ def _latest(plans: list[PaperPlanRow]) -> PaperPlanRow | None:
 
 
 def _alerts_for_window(
-    conn: duckdb.DuckDBPyConnection, window_id: int, *, limit: int
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, *, limit: int
 ) -> tuple[tuple[AlertRow, ...], bool]:
-    """The window's alerts (run-scoped kinds dedupe on (kind, run), so every
-    alert in scope names a run of this window), newest first, capped at
-    `limit`. `no_window` and `locked` carry no run id and precede any window,
-    so they are never this window's to show."""
+    """The window's alerts, newest first, capped at `limit` in SQL (not just in
+    Python, so a journal with many alerts never pays for more than `limit + 1`
+    rows). Most alert kinds are run-scoped (one per (kind, run)), so a row
+    naming a run of this window belongs to it. `locked` has no run id
+    (`execution.alerts`: emitted at run entry, before any run row exists, when
+    a scheduled `paper run` found the run lock already held) and dedupes on
+    (kind, session) instead; it is this window's when its session is on or
+    after the window's first rebalance, since there is no run to join it to.
+    `no_window` alone has no window to belong to: it fires before the first
+    `paper start`, and this function is never called before one exists."""
     journal.require_journal(conn)
     rows = conn.execute(
         'SELECT alert_id, run_id, session, kind, message, "at", known_at, ingested_at '
         "FROM alerts WHERE run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?) "
-        "ORDER BY alert_id DESC",
-        [window_id],
+        "OR (run_id IS NULL AND kind = 'locked' AND session >= ?) "
+        "ORDER BY alert_id DESC LIMIT ?",
+        [window.window_id, window.first_rebalance_session, limit + 1],
     ).fetchall()
     capped = len(rows) > limit
     kept = rows[:limit]
@@ -176,35 +204,52 @@ def _alerts_for_window(
     return alerts, capped
 
 
-def _decision_reason(decision: DecisionRow) -> str | None:
-    """`decision.reason` when set (`left_universe`, `left_targets`, ...), else
-    `decision.decision` itself (`override`, `skip_delisted`, `trade`, ...)."""
-    return decision.reason if decision.reason is not None else decision.decision
-
-
 def _build_ranking(
     conn: duckdb.DuckDBPyConnection, window_id: int, plan: PaperPlanRow
 ) -> tuple[RankedSignal, ...]:
+    """The latest plan's ranking: every `signals` row, in rank order, each
+    joined to its `decisions` row when one names the same security. A held
+    name the universe pass excludes before scoring (`skip_delisted`, or a
+    `left_universe`/`left_targets` exit) has a `decisions` row but no
+    `signals` row; it is appended after the ranked ones with no score or rank,
+    so a full exit is never silently dropped from the hero (spec req 12 names
+    `left_universe` and `override` as reasons the ranking must show)."""
     signals = journal.signals_for(conn, plan.run_id)
     decisions = journal.decisions_for(conn, window_id, rebalance_session=plan.rebalance_session)
-    decision_reason: dict[str, str | None] = {}
-    for d in decisions:
-        decision_reason[d.decision.security_id] = _decision_reason(d.decision)
+    by_security: dict[str, DecisionRow] = {d.decision.security_id: d.decision for d in decisions}
 
     def _rank_key(s: SignalRow) -> tuple[bool, int]:
         return (s.rank is None, s.rank if s.rank is not None else 0)
 
-    return tuple(
-        RankedSignal(
-            security_id=s.security_id,
-            score=s.score,
-            rank=s.rank,
-            signal_reason=s.reason,
-            decision_reason=decision_reason.get(s.security_id),
-            selected=s.reason == "selected",
+    ranked: list[RankedSignal] = []
+    for s in sorted(signals, key=_rank_key):
+        d = by_security.get(s.security_id)
+        ranked.append(
+            RankedSignal(
+                security_id=s.security_id,
+                score=s.score,
+                rank=s.rank,
+                signal_reason=s.reason,
+                decision=d.decision if d is not None else None,
+                decision_reason=d.reason if d is not None else None,
+                selected=s.reason == "selected",
+            )
         )
-        for s in sorted(signals, key=_rank_key)
-    )
+    scored = {s.security_id for s in signals}
+    for security_id in sorted(set(by_security) - scored):
+        d = by_security[security_id]
+        ranked.append(
+            RankedSignal(
+                security_id=security_id,
+                score=None,
+                rank=None,
+                signal_reason=None,
+                decision=d.decision,
+                decision_reason=d.reason,
+                selected=False,
+            )
+        )
+    return tuple(ranked)
 
 
 def _order_step(order: OrderRow) -> ChainStep:
@@ -220,14 +265,24 @@ def _order_step(order: OrderRow) -> ChainStep:
 
 
 def _build_chains(
-    conn: duckdb.DuckDBPyConnection, window_id: int, *, limit: int
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+    fills: Sequence[OrderedFill],
+    *,
+    limit: int,
 ) -> tuple[tuple[OrderChain, ...], bool]:
-    orders = sorted(journal.orders_for(conn, window_id=window_id), key=lambda o: o.client_order_id)
+    # Newest order first, so a long window's cap drops its oldest orders, not
+    # the current session's (the ones the operator is looking at).
+    orders = sorted(
+        journal.orders_for(conn, window_id=window_id),
+        key=lambda o: (o.known_at, o.client_order_id),
+        reverse=True,
+    )
     events_by_order: dict[str, list[OrderEventRow]] = {}
     for event in journal.order_events_for(conn, window_id=window_id):
         events_by_order.setdefault(event.client_order_id, []).append(event)
     fills_by_order: dict[str, list[OrderedFill]] = {}
-    for ordered_fill in journal.fills_for(conn, window_id=window_id):
+    for ordered_fill in fills:
         fills_by_order.setdefault(ordered_fill.fill.client_order_id, []).append(ordered_fill)
     outcomes_by_order: dict[str, list[OutcomeRow]] = {}
     for outcome in journal.outcomes_for(conn, window_id):
@@ -280,17 +335,33 @@ def _build_chains(
 
 def _as_of(
     window: PaperWindowRow,
+    *,
     runs: Sequence[PaperRunRow],
     results: Sequence[PaperRunResultRow],
     orders: Sequence[OrderRow],
+    order_events: Sequence[OrderEventRow],
     fills: Sequence[OrderedFill],
+    outcomes: Sequence[OutcomeRow],
+    marks: Sequence[PositionDailyRow],
+    kill_switch_rows: Sequence[KillSwitchRow],
+    reconciliations: Sequence[ReconciliationRow],
+    alerts: Sequence[AlertRow],
 ) -> datetime | None:
+    """The latest `known_at` among every row the page shows: everything
+    `page_data` reads for this window, so "as of" can never predate what the
+    page itself displays (e.g. a kill-switch row the KPI row already shows)."""
     candidates = (
         [window.known_at]
         + [r.known_at for r in runs]
         + [r.known_at for r in results]
         + [o.known_at for o in orders]
+        + [e.known_at for e in order_events]
         + [f.fill.known_at for f in fills]
+        + [o.known_at for o in outcomes]
+        + [m.known_at for m in marks]
+        + [k.known_at for k in kill_switch_rows]
+        + [r.known_at for r in reconciliations]
+        + [a.known_at for a in alerts]
     )
     return max(candidates, default=None)
 
@@ -316,23 +387,23 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     runs = [rw.run for rw in runs_with_results]
     results = [rw.result for rw in runs_with_results if rw.result is not None]
     orders = journal.orders_for(conn, window_id=window_id)
+    order_events = journal.order_events_for(conn, window_id=window_id)
+    outcomes = journal.outcomes_for(conn, window_id)
+    all_marks = journal.positions_daily_for(conn, window_id)
     kill_switch_rows = journal.kill_switch_events_for(conn, window_id)
-    fills, fills_capped = _capped_fills(conn, window_id, limit=limit)
+    reconciliations = journal.reconciliations_for(conn, window_id)
+    all_fills = journal.fills_for(conn, window_id=window_id)
+    fills, fills_capped = _capped_fills(all_fills, limit=limit)
 
     last_updated = max((r.finished_at for r in results), default=None)
-    today_session = _today_session(utc_now())
-    s_minus_1 = previous_session(today_session)
+    s_minus_1 = _required_run_session(utc_now())
     stale = not any(r.session == s_minus_1 for r in runs if r.session is not None)
 
     last_session = journal.last_marked_session(conn, window_id)
     positions_count = 0
     positions_value = 0.0
     if last_session is not None:
-        marks = [
-            m
-            for m in journal.positions_daily_for(conn, window_id)
-            if m.session == last_session and m.security_id is not None
-        ]
+        marks = [m for m in all_marks if m.session == last_session and m.security_id is not None]
         positions_count = sum(1 for m in marks if m.quantity != 0)
         positions_value = sum(m.value or 0.0 for m in marks if m.quantity != 0)
 
@@ -351,12 +422,23 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         lock_free=not lock.is_held(settings),
     )
 
-    chains, chains_capped = _build_chains(conn, window_id, limit=limit)
-    alerts, alerts_capped = _alerts_for_window(conn, window_id, limit=limit)
-    reconciliations = journal.reconciliations_for(conn, window_id)
+    chains, chains_capped = _build_chains(conn, window_id, all_fills, limit=limit)
+    alerts, alerts_capped = _alerts_for_window(conn, window, limit=limit)
     reconciliation = max(reconciliations, key=lambda r: r.at, default=None)
 
-    as_of = _as_of(window, runs, results, orders, fills)
+    as_of = _as_of(
+        window,
+        runs=runs,
+        results=results,
+        orders=orders,
+        order_events=order_events,
+        fills=all_fills,
+        outcomes=outcomes,
+        marks=all_marks,
+        kill_switch_rows=kill_switch_rows,
+        reconciliations=reconciliations,
+        alerts=alerts,
+    )
 
     return OpsData(
         journal_not_initialised=False,
@@ -381,9 +463,8 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
 
 
 def _capped_fills(
-    conn: duckdb.DuckDBPyConnection, window_id: int, *, limit: int
+    fills: Sequence[OrderedFill], *, limit: int
 ) -> tuple[tuple[OrderedFill, ...], bool]:
-    all_fills = journal.fills_for(conn, window_id=window_id)
-    ordered = sorted(all_fills, key=lambda f: f.fill.fill_id or 0, reverse=True)
+    ordered = sorted(fills, key=lambda f: f.fill.fill_id or 0, reverse=True)
     capped = len(ordered) > limit
     return tuple(ordered[:limit]), capped
