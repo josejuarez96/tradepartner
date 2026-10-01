@@ -12,7 +12,8 @@ from typing import Any, Protocol
 import pytest
 
 from tradepartner.adapters.broker import Order, OrderRequest, Side
-from tradepartner.adapters.fake_broker import FakeBroker, PartialFill, Reject
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
+from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
@@ -67,7 +68,7 @@ class SkewedFake(FakeBroker):
     def get_order(self, client_order_id: str) -> Order:
         order = super().get_order(client_order_id)
         if client_order_id in self.avg_override:
-            return replace(order, filled_avg_price=self.avg_override[client_order_id])
+            order = replace(order, filled_avg_price=self.avg_override[client_order_id])
         return order
 
 
@@ -262,18 +263,24 @@ def _count(settings: Settings, table: str) -> int:
 
 
 def _lagging_third_fill(
-    settings: Settings, fake: SkewedFake, window: PaperWindowRow, clock: FixedClock, coid: str
+    settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    clock: FixedClock,
+    coid: str,
+    *,
+    last: float = 1.0,
 ) -> OrderRow:
     """An order of three shares: two fills journaled, the third booked at the
     broker (FILLED) but never in `fills()`, listed lagging by a reconciliation
     on DAY1, and the clock moved to DAY2 so the lag is past the bound (1)."""
     run_id = _run(settings, window, DAY1 - timedelta(hours=1), finished=True)
-    order = _order(settings, fake, run_id, coid, 3.0, DAY1 - timedelta(hours=1))
+    order = _order(settings, fake, run_id, coid, 2.0 + last, DAY1 - timedelta(hours=1))
     fake.apply(coid, PartialFill(1.0, 100.0))
     fake.apply(coid, PartialFill(1.0, 101.0))
     _collect(settings, fake, clock, [order])
     fake.lag_fills(None)
-    fake.apply(coid, PartialFill(1.0, 102.0))
+    fake.apply(coid, PartialFill(last, 102.0))
     first = reconcile_now(
         settings,
         lambda: open_for_write(settings),
@@ -675,3 +682,132 @@ def test_a_resume_writes_no_decision_or_rebalance_event(
         _count(journal_settings, "rebalance_events"),
     )
     assert after == before
+
+
+# --- review follow-ups ---------------------------------------------------------
+
+
+def _synthetic_row(settings: Settings, coid: str) -> Any:
+    with open_read_only(settings) as conn:
+        (fill,) = [
+            f.fill
+            for f in fills_for(conn, client_order_ids=[coid])
+            if f.fill.source == "broker_status"
+        ]
+    return fill
+
+
+def test_a_two_share_residual_is_priced_per_share_at_the_brokers_time(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag", last=2.0)
+    broker_filled_at = fake.get_order("tp-lag").filled_at
+    before = fixed_clock()
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept=True)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    fill = _synthetic_row(journal_settings, "tp-lag")
+    assert fill.quantity == pytest.approx(2.0)
+    assert fill.price == pytest.approx((4 * 101.25 - 201.0) / 2)  # 102, not 204
+    assert fill.filled_at == broker_filled_at
+    assert fill.known_at > before  # the write's own clock reading
+
+
+def test_a_synthetic_fill_without_the_brokers_time_takes_the_orders_session_close(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    # A partly filled order that then expired: the broker gives no `filled_at`.
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    order = _order(journal_settings, fake, run_id, "tp-exp", 3.0, DAY1 - timedelta(hours=1))
+    fake.apply("tp-exp", PartialFill(1.0, 100.0))
+    _collect(journal_settings, fake, fixed_clock, [order])
+    fake.lag_fills(None)
+    fake.apply("tp-exp", PartialFill(0.5, 102.0))
+    fake.apply("tp-exp", Expire())
+    assert fake.get_order("tp-exp").filled_at is None
+    reconcile_now(
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        fake,
+        window,
+        DAY1.date(),
+        fixed_clock,
+        lambda: open_for_write(journal_settings),
+        frozen=FROZEN,
+    )
+    fixed_clock.now = DAY2
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept=True)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    fill = _synthetic_row(journal_settings, "tp-exp")
+    assert fill.filled_at == session_close(order.session)
+    assert fill.quantity == pytest.approx(0.5)
+    assert _events(journal_settings, "tp-exp")[-1].status == "expired"
+
+
+def test_a_clock_that_does_not_move_reports_the_switch_still_engaged(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    outcome = resume(
+        journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock, "x", False
+    )
+
+    assert outcome.status == REFUSED
+    assert any("still derives engaged" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_a_mismatch_found_with_nothing_engaged_engages_the_switch(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")
+    assert not _engaged(journal_settings, window)
+
+    assert _resume(journal_settings, fake, fixed_clock).status == REFUSED
+    assert _engaged(journal_settings, window)
+
+
+def test_a_last_mark_with_no_positive_equity_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=-50.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)

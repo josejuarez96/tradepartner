@@ -26,15 +26,20 @@ The only way the kill switch is released. In the req 5 order:
      residual fill and its terminal event; one the broker still holds open
      refuses, since it may yet fill.
 6. `reconcile_now` (T61) for the clock's session. A mismatch refuses (the
-   mismatch row is written, the switch stays engaged). Any other status but
+   mismatch row is written, the switch stays engaged, and is engaged with
+   source `fault` if nothing had engaged it). Any other status but
    `ok` refuses too: `switch.release` takes only an `ok` reconciliation, so
    a lag inside the bound (`fills_lagging`) waits for the feed. That is
    stricter than req 8's "a lag inside the bound passes"; the PR raises it.
 7. Release (`switch.release`) with the `resume_id`, that reconciliation's id
    and the drawdown peak: the ledger equity at the window's last mark (the
    cash row plus every name's value), or the current peak when nothing is
-   marked yet. A switch that is not engaged has nothing to release: the
-   outcome is `not_engaged`, after the same settlement and reconciliation.
+   marked yet; a peak that is not positive refuses. The reconciliation cited
+   is the window's highest id, the one this resume wrote. A switch that is
+   not engaged has nothing to release: the outcome is `not_engaged`, after
+   the same settlement and reconciliation. After the release the state is
+   derived again, and a switch that still derives engaged (a clock that did
+   not move past the crashed close) is reported refused, not released.
 
 **The synthetic residual fill** (req 8): quantity = `filled_quantity` minus
 the journaled quantity; price = (`filled_quantity` x `filled_avg_price` minus
@@ -314,6 +319,22 @@ def _mark_equity(marks: Sequence[PositionDailyRow]) -> float | None:
     return cash[0] + math.fsum(v for v in values if v is not None)
 
 
+def _switch(connect: Connect, window: PaperWindowRow) -> switch.SwitchState:
+    """The window's derived kill-switch state, read by a lock holder."""
+    window_id = _window_id(window)
+    with connect() as conn:
+        runs = runs_for(conn, window_id)
+        events = kill_switch_events_for(conn, window_id)
+    return switch.derive(
+        window,
+        events,
+        [r.run for r in runs],
+        [r.result for r in runs if r.result is not None],
+        reading_run=None,
+        lock_free=True,
+    )
+
+
 def resume(
     settings: Settings,
     connect: Connect,
@@ -381,10 +402,22 @@ def resume(
                 settings, connect, broker, window, session, clock, connect, frozen=frozen
             )
         except ReconciliationError as exc:
+            # A fault found here engages the switch when nothing has (a resume
+            # with no engagement to release), as `paper reconcile` does.
+            if not _switch(connect, window).engaged:
+                switch.engage(
+                    settings,
+                    clock,
+                    window_id=window_id,
+                    source="fault",
+                    fault_type=ReconciliationError.__name__,
+                    reason=str(exc),
+                )
             return outcome(REFUSED, f"reconciliation failed: {exc}")
         with connect() as conn:
-            reconciliation_id = reconciliations_for(conn, window_id)[-1].reconciliation_id
-            runs = runs_for(conn, window_id)
+            reconciliation_id = max(
+                r.reconciliation_id or 0 for r in reconciliations_for(conn, window_id)
+            )
             events = kill_switch_events_for(conn, window_id)
             marks = positions_daily_for(conn, window_id)
         if result.status != OK:
@@ -393,24 +426,15 @@ def resume(
                 f"reconciliation {reconciliation_id} is {result.status}; a release needs ok",
                 reconciliation_id=reconciliation_id,
             )
-        state = switch.derive(
-            window,
-            events,
-            [r.run for r in runs],
-            [r.result for r in runs if r.result is not None],
-            reading_run=None,
-            lock_free=True,
-        )
-        if not state.engaged:
+        if not _switch(connect, window).engaged:
             return outcome(NOT_ENGAGED, reconciliation_id=reconciliation_id)
         peak = _mark_equity(marks) if marks else switch.drawdown_peak(window, events)
-        if peak is None:
+        if peak is None or not (math.isfinite(peak) and peak > 0):
             return outcome(
                 REFUSED,
-                "the last mark gives no equity for the drawdown peak",
+                f"the last mark gives no positive equity for the drawdown peak: {peak!r}",
                 reconciliation_id=reconciliation_id,
             )
-        assert reconciliation_id is not None
         event_id = switch.release(
             settings,
             clock,
@@ -419,4 +443,15 @@ def resume(
             reconciliation_id=reconciliation_id,
             peak_equity=peak,
         )
+        after = _switch(connect, window)
+        if after.engaged:
+            # A clock that did not move past the crashed close (switch.derive
+            # clears a crashed run only for a release stamped after it).
+            return outcome(
+                REFUSED,
+                f"released (event {event_id}) but the switch still derives engaged: "
+                + "; ".join(after.causes),
+                reconciliation_id=reconciliation_id,
+                released_event_id=event_id,
+            )
         return outcome(RELEASED, reconciliation_id=reconciliation_id, released_event_id=event_id)
