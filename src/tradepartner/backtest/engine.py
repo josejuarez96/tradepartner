@@ -93,8 +93,9 @@ class BacktestResult:
 
 
 @dataclass(frozen=True)
-class _Plan:
-    """What the read at close(T_i) decides, identical for every cost level."""
+class Plan:
+    """What the read at close(T_i) decides, identical for every cost level (public for
+    Phase 4's tracking runs, which plan with the engine's own function, plan T53)."""
 
     session: date
     fill_session: date
@@ -157,7 +158,7 @@ def _sessions(first: date, last: date) -> list[date]:
     return list(sessions[bisect.bisect_left(sessions, first) : bisect.bisect_right(sessions, last)])
 
 
-def _plan(provider: DataProvider, params: Settings, session: date) -> _Plan:
+def _plan(provider: DataProvider, params: Settings, session: date) -> Plan:
     t = read_time(session)
     universe = provider.universe(t)
     members = sorted(universe.members["security_id"].to_list())
@@ -170,7 +171,7 @@ def _plan(provider: DataProvider, params: Settings, session: date) -> _Plan:
         strategy.skip_months,
         security_ids=members,
     )
-    return _Plan(
+    return Plan(
         session=session,
         fill_session=fill_session(session),
         targets=target_weights(signal.scores, strategy.top_fraction, strategy.weighting),
@@ -179,6 +180,19 @@ def _plan(provider: DataProvider, params: Settings, session: date) -> _Plan:
         n_excluded_no_history=signal.n_excluded,
         gap=provider.survivorship_gap(t),
     )
+
+
+#: The private name T40b's plan-timing test builds its copy of `_plan` with (kept so
+#: T40 and T40b stay untouched).
+_Plan = Plan
+
+
+def plan(provider: DataProvider, params: Settings, session: date) -> Plan:
+    """The plan at rebalance session `session`, read at close(`session`): universe,
+    momentum signal, targets and the gap, from `params` (the frozen hypothesis
+    parameters). The backtest loop calls exactly this function (`_plan`) at every
+    rebalance it plans."""
+    return _plan(provider, params, session)
 
 
 def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
@@ -270,7 +284,7 @@ def _book_exits(values: pl.DataFrame, exits: Sequence[_Exit]) -> pl.DataFrame:
 
 
 def _benchmark_step(
-    book: _Book, plan: _Plan, end: date, frame: pl.DataFrame, raw: pl.DataFrame, params: Settings
+    book: _Book, plan: Plan, end: date, frame: pl.DataFrame, raw: pl.DataFrame, params: Settings
 ) -> None:
     """Buy (at F_0) or carry each benchmark, then value it through `end`."""
     fill_price = params.execution.fill_price
@@ -314,7 +328,7 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
 
 def _step(
     book: _Book,
-    plan: _Plan,
+    plan: Plan,
     end: date,
     frame: pl.DataFrame,
     raw: pl.DataFrame,

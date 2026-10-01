@@ -16,6 +16,7 @@ from tradepartner.backtest.holdout import (
     Window,
     decide,
     default_in_sample_window,
+    first_tracking_session,
     gap_sessions,
     window_touches_holdout,
 )
@@ -398,3 +399,62 @@ def test_frozen_from_hypothesis_ignores_the_live_environment(
 def test_frozen_from_hypothesis_refuses_a_missing_threshold() -> None:
     with pytest.raises(ValueError, match=r"gap\.count_share_threshold"):
         Frozen.from_hypothesis(_record({}))
+
+
+# --- tracking windows (Phase 4 spec req 10; plan T53) ------------------------------
+
+#: FROZEN's holdout ends on 2026-08-31, a month-end session; tracking starts at the
+#: next rebalance session.
+FIRST_TRACKING = date(2026, 9, 30)
+
+
+def _track(window: Window, flags: Flags = NO_FLAGS, reasons: Reasons = NO_REASONS) -> Decision:
+    return decide(window, FROZEN, flags, reasons, None, (_spend(HYPOTHESIS_ID),), tracking=True)
+
+
+def test_first_tracking_session_is_the_rebalance_after_holdout_end() -> None:
+    assert first_tracking_session(FROZEN) == FIRST_TRACKING
+    mid_month = Frozen(**{**FROZEN.__dict__, "holdout_end": date(2026, 8, 14)})
+    assert first_tracking_session(mid_month) == date(2026, 8, 31)
+    year_end = Frozen(**{**FROZEN.__dict__, "holdout_end": date(2026, 12, 31)})
+    assert first_tracking_session(year_end) == date(2027, 1, 29)
+
+
+@pytest.mark.parametrize(
+    "start",
+    [date(2026, 8, 31), date(2026, 8, 3), date(2026, 9, 1), date(2026, 9, 29), date(2024, 1, 31)],
+)
+def test_a_tracking_window_starting_before_the_first_tracking_session_is_refused(
+    start: date,
+) -> None:
+    """On or before `holdout.end`'s session, or between it and the next rebalance."""
+    decision = _track(Window(start, date(2026, 12, 31)))
+    assert (decision.outcome, decision.kind) == ("refused_window", None)
+    assert "holdout.end" in decision.message
+
+
+def test_a_tracking_window_after_holdout_end_runs_as_tracking_and_spends_nothing() -> None:
+    """Even with a prior spend by the same hypothesis and the holdout flags set."""
+    flags = Flags(spend_holdout=True, holdout_repeat=True, override_gap=True)
+    reasons = Reasons(holdout_reason="not a spend", gap_reason="no gate")
+    for window in (
+        Window(FIRST_TRACKING, date(2027, 3, 31)),
+        Window(date(2026, 11, 30), date(2026, 11, 30)),
+    ):
+        decision = _track(window, flags, reasons)
+        assert (decision.outcome, decision.kind) == ("run", "tracking")
+        assert decision.holdout_repeat is False
+        assert decision.holdout_reason is None
+        assert decision.gap_override_reason is None
+        assert decision.gap_sessions == ()
+
+
+def test_a_tracking_window_ending_before_its_start_is_refused() -> None:
+    decision = _track(Window(date(2026, 11, 30), FIRST_TRACKING))
+    assert decision.outcome == "refused_window"
+
+
+def test_without_the_tracking_flag_a_post_holdout_window_is_still_refused() -> None:
+    """The Phase 3 rule is unchanged: sessions after `holdout.end` belong to tracking."""
+    decision = _decide(Window(FIRST_TRACKING, date(2027, 3, 31)))
+    assert decision.outcome == "refused_window"
