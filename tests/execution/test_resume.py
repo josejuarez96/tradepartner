@@ -15,6 +15,7 @@ from tradepartner.adapters.broker import Order, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
+from tradepartner.execution import resume as resume_module
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
@@ -476,6 +477,82 @@ def test_resume_is_refused_after_an_all_rejected_run_and_the_switch_stays_engage
     assert _count(journal_settings, "reconciliations") == 0
 
 
+def test_resume_judges_a_halted_runs_rejections_its_halt_read_journaled(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    # #397, owner answer (a): the halt read collects as its run, so no later
+    # collection judges these rejections again; resume judges the halted run.
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    orders = [
+        _order(journal_settings, fake, run_id, coid, 1.0, DAY1 - timedelta(hours=1))
+        for coid in ("tp-h1", "tp-h2")
+    ]
+    for order in orders:
+        fake.apply(order.client_order_id, Reject())
+    halt_read = collect(
+        fake,
+        lambda: open_for_write(journal_settings),
+        orders,
+        fixed_clock,
+        "run",
+        run_id,
+        FROZEN,
+        journal_settings,
+    )
+    assert [b.run_id for b in halt_read.rejections] == [run_id]
+    halted_at = fixed_clock.advance(minutes=1)
+    _append(
+        journal_settings,
+        PaperRunResultRow(
+            run_id=run_id,
+            finished_at=halted_at,
+            status="halted",
+            clock_fault=False,
+            known_at=halted_at,
+            ingested_at=halted_at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any(f"every order of run {run_id} was rejected" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+    assert _count(journal_settings, "reconciliations") == 0
+    # Only a release clears the halted run, so every later resume refuses too.
+    again = _resume(journal_settings, fake, fixed_clock)
+    assert again.status == REFUSED
+    assert any(f"every order of run {run_id} was rejected" in r for r in again.reasons)
+
+
+def test_resume_names_a_crashed_runs_rejection_verdict_once(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    # The run is closed `crashed` by this resume; its collection and the
+    # faulted-run check both find the verdict, and the refusal names it once.
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    for coid in ("tp-c1", "tp-c2"):
+        _order(journal_settings, fake, run_id, coid, 1.0, DAY1 - timedelta(hours=1))
+        fake.apply(coid, Reject())
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert outcome.crashed_runs == (run_id,)
+    assert [r for r in outcome.reasons if f"run {run_id}" in r] == [
+        f"every order of run {run_id} was rejected (2)"
+    ]
+    assert _engaged(journal_settings, window)
+    assert _count(journal_settings, "reconciliations") == 0
+
+
 def test_resume_without_the_flag_is_refused_past_the_lag_bound(
     journal_settings: Settings,
     fake: SkewedFake,
@@ -834,3 +911,39 @@ def test_a_failed_fault_engagement_is_named_in_the_refusal(
 
     assert outcome.status == REFUSED
     assert any("NOT engaged" in r and "store locked" in r for r in outcome.reasons)
+
+
+def test_an_engagement_written_during_the_resume_refuses_the_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An engagement written after the resume row (a drawdown, say) is one the
+    owner did not see: `release` refuses it, the resume reports REFUSED and the
+    switch stays engaged (#447)."""
+    _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    def reconcile_then_engage(*args: object, **kwargs: object) -> object:
+        result = reconcile_now(*args, **kwargs)  # type: ignore[arg-type]
+        assert isinstance(
+            switch.engage(
+                journal_settings,
+                fixed_clock,
+                window_id=window.window_id,  # type: ignore[arg-type]
+                source="drawdown",
+                reason="drawdown after the resume row",
+            ),
+            int,
+        )
+        return result
+
+    monkeypatch.setattr(resume_module, "reconcile_now", reconcile_then_engage)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("release refused" in r and "after resume" in r for r in outcome.reasons)
+    assert outcome.released_event_id is None
+    assert _engaged(journal_settings, window)

@@ -3,17 +3,22 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'train/**']
 
-# PR branches cancel superseded runs. Main never does, so every merge gets a completed run
-# (#198): one group per commit, since a shared group would still drop a pending run.
+# PR branches cancel superseded runs. Main and merge-train branches (`train/**`) never do,
+# so every merge and every train batch gets a completed run (#198; merge-train spec req 4):
+# one group per commit, since a shared group would still drop a pending run.
 concurrency:
-  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ci-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/train/')) && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/train/') }}
 
 jobs:
   checks:
     runs-on: ubuntu-latest
+    # Read-only: a `train/**` push runs batch code with the repository's token, and this job
+    # only reads (merge-train spec, CI amendment; req 1 (0) is the first line of defence).
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:

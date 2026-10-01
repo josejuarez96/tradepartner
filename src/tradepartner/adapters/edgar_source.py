@@ -640,6 +640,7 @@ class EdgarFilingSource(FilingSource):
                 members["txt.tsv"],
                 ("adsh", "tag", "dimh", "dimn", "coreg", "value"),
                 where=f"tag IN ({listing_tags})",
+                free_text="value",
             )
             # Only the dimensions a kept row uses: a quarterly dim.tsv is
             # millions of rows, the largest part of peak memory otherwise.
@@ -652,6 +653,7 @@ class EdgarFilingSource(FilingSource):
                     ("dimhash", "segments"),
                     where="list_contains(?, dimhash)",
                     params=[dimhashes],
+                    free_text="segments",
                 )
                 if dimhashes
                 else []
@@ -1799,6 +1801,7 @@ def _fsn_rows(
     *,
     where: str | None = None,
     params: Sequence[object] = (),
+    free_text: str | None = None,
 ) -> list[dict[str, str]]:
     """`columns` of `path` (a tab-separated FSN member) as plain string
     dicts, via DuckDB `read_csv` with every column read as `varchar` (FSN's
@@ -1807,9 +1810,16 @@ def _fsn_rows(
     quoted, and a bare `"` inside a `txt.tsv` value must not start one).
     A zero-byte member (no header row at all -- a real FSN file never is
     one, but a test fixture may be) has no columns to select and yields no
-    rows rather than a DuckDB binder error."""
+    rows rather than a DuckDB binder error.
+
+    DuckDB fails the whole read on one malformed line, so the member is
+    first rewritten in place by `_fsn_normalize_member` (#455, #498);
+    `free_text` names the member's free-text column whose literal tabs may
+    be folded (`txt.tsv`'s `value`, `dim.tsv`'s `segments`), and is `None`
+    for every other member, whose surplus tabs still fail the read."""
     if path.stat().st_size == 0:
         return []
+    _fsn_normalize_member(path, free_text=free_text)
     column_list = ", ".join(columns)
     sql = (
         f"SELECT {column_list} FROM read_csv(?, delim='\t', header=true, "
@@ -1824,6 +1834,46 @@ def _fsn_rows(
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
     finally:
         connection.close()
+
+
+def _fsn_normalize_member(path: Path, *, free_text: str | None = None) -> None:
+    """Rewrite `path`, streamed (an FSN member reaches hundreds of MB), so
+    DuckDB can read it; anything else is kept byte for byte.
+
+    - An invalid UTF-8 byte becomes U+FFFD (FSN members are not always valid
+      UTF-8; #455).
+    - With `free_text` (which must name a header column), a line with more
+      fields than the header keeps its surplus in that column, each surplus
+      tab replaced by U+FFFD: a 2015 `txt.tsv` note carries unquoted tabs in
+      `value`, its last column, and a 2025 `dim.tsv` InvestmentIdentifier
+      in `segments`, its middle one (#498). The U+FFFD makes `parse_fsn`
+      fail an accession whose kept listing value or class member had one.
+      A line with fewer fields, or any surplus without `free_text`, is left
+      for DuckDB to fail loudly: folding a column that is not free text
+      would shift fields silently.
+    """
+    cleaned = path.with_name(path.name + ".normalized")
+    with (
+        path.open(encoding="utf-8", errors="replace", newline="") as source,
+        cleaned.open("w", encoding="utf-8", newline="") as target,
+    ):
+        header = source.readline()
+        target.write(header)
+        names = header.rstrip("\r\n").split("\t")
+        if free_text is not None and free_text not in names:
+            raise ValueError(f"{path.name}: no {free_text!r} column to fold tabs into")
+        column = names.index(free_text) if free_text is not None else -1
+        tabs = len(names) - 1
+        for line in source:
+            if column >= 0 and line.count("\t") > tabs:
+                body = line.rstrip("\r\n")
+                fields = body.split("\t")
+                surplus = len(fields) - len(names)
+                folded = "\ufffd".join(fields[column : column + surplus + 1])
+                fields[column : column + surplus + 1] = [folded]
+                line = "\t".join(fields) + line[len(body) :]
+            target.write(line)
+    cleaned.replace(path)
 
 
 def _fsn_validators_dict(headers: httpx.Headers) -> dict[str, str | None]:
