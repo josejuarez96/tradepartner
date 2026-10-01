@@ -785,3 +785,63 @@ def test_a_rounding_overshoot_comes_off_the_largest_notional_once(
     monkeypatch.setattr(risk, "_spendable", lambda *a: exact(*a) + Decimal("0.05"))
     with pytest.raises(ValueError, match="overshoot"):
         size_buys(even, 100.0, _price_of, RiskConfig(), _COSTS)
+
+
+# --- a name that lost `fractionable` at phase time (#395, owner answer (b)) -------------------
+
+
+def test_a_full_exit_of_a_name_that_lost_fractionable_sells_the_whole_holding() -> None:
+    """#395: the decision was fractionable; the asset no longer is. A full exit
+    still sells all 10.5 shares (by the decision's flag) and never halts on
+    `whole_shares`; the same name's trim goes whole-share, 9.5 floored to 9,
+    and a fractional trim is refused."""
+    assets = {**_ASSETS, "A": _asset(fractionable=False)}
+    ledger = _ledger(A=10.5)
+    for decision in ("trade", "forced_exit"):
+        exit_order = _order("A", "sell", 1, quantity=10.5, decision=decision, full_exit=True)
+        result = _check([exit_order], _LOOSE, ledger=ledger, assets=assets)
+        assert isinstance(result, Skips), result
+        assert [(o.quantity, o.whole_share) for o in result.orders] == [(10.5, False)]
+    trim = _order("A", "sell", 1, quantity=9.0)
+    passed = _check([trim], _LOOSE, ledger=ledger, assets=assets)
+    assert isinstance(passed, Skips)
+    assert [o.whole_share for o in passed.orders] == [True]
+    fractional_trim = _order("A", "sell", 1, quantity=9.5)
+    assert _rules(_check([fractional_trim], _LOOSE, ledger=ledger, assets=assets)) == {
+        "whole_shares"
+    }
+
+
+def test_a_full_exit_below_one_share_of_a_name_that_lost_fractionable_is_sold() -> None:
+    """0.5 share worth $5, above the $1 minimum: sold, not `dust`; a 0.5-share
+    trim of it is `skip_below_one_share`."""
+    assets = {**_ASSETS, "A": _asset(fractionable=False)}
+    ledger = _ledger(A=0.5)
+    exit_order = _order("A", "sell", 1, quantity=0.5, full_exit=True)
+    result = _check([exit_order], ledger=ledger, assets=assets)
+    assert isinstance(result, Skips) and result.skips == ()
+    trim = _order("A", "sell", 1, quantity=0.5)
+    assert _skip_reasons(_check([trim], ledger=ledger, assets=assets)) == {
+        1: "skip_below_one_share"
+    }
+
+
+def test_a_whole_share_decisions_full_exit_still_goes_by_whole_shares() -> None:
+    """A decision journaled `whole_share` sells its whole-share floor (spec
+    req 2); a fractional full exit on it is still a `whole_shares` breach."""
+    assets = {**_ASSETS, "D": _asset(fractionable=False)}
+    ledger = _ledger(D=2.4)
+    floor = _order("D", "sell", 1, quantity=2.0, whole_share=True, full_exit=True)
+    assert isinstance(_check([floor], _LOOSE, ledger=ledger, assets=assets), Skips)
+    fractional = replace(floor, quantity=2.4)
+    assert _rules(_check([fractional], _LOOSE, ledger=ledger, assets=assets)) == {"whole_shares"}
+
+
+def test_a_buy_of_a_name_that_lost_fractionable_flooring_to_zero_is_deferred() -> None:
+    """#395: journaled `whole_share = false`, sized by whole shares since the
+    name lost `fractionable`: $50 of D at the buffered $102 floors to no
+    share, so it is deferred (no order, no skip), not skipped."""
+    lost = replace(_buy(1, "D", 50.0), whole_share=True)
+    assert lost.decision.whole_share is False and lost.by_whole_shares
+    (sizing,) = size_buys([lost], 1000.0, _price_of, RiskConfig(), _NO_COSTS)
+    assert sizing.deferred

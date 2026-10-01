@@ -29,8 +29,12 @@ table), `macos` (an `osascript` notification), `email` (SMTP to `ALERT_EMAIL_TO`
 from the `ALERT_SMTP_*` settings, over STARTTLS; each attempt bounded by
 `alerts.delivery_timeout_seconds`; skipped, as a failed row saying
 so, unless all four are set). `ALERT_SMTP_HOST` may carry a port
-(`smtp.example.com:587`), which `smtplib` parses. No secret value is ever logged
-or journaled (see "Secrets" below).
+(`smtp.example.com:587`; 587, submission, when it has none); the port is split
+off here, because `smtplib` verifies the certificate against the host string it
+was given (#394). The sender is `ALERT_EMAIL_FROM` when set, else the SMTP login
+(a relay whose login is not a mailbox needs it, #404). Once the message is sent,
+the delivery counts as made even if the server answers QUIT badly (#403). No
+secret value is ever logged or journaled (see "Secrets" below).
 
 The clock stamps `at`, `known_at` and `ingested_at` (converted to UTC). On the
 halt path after a `ClockError` the caller passes `clock_fault=True`: the clock
@@ -97,6 +101,9 @@ SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")
 NON_STORE_KINDS: tuple[str, ...] = ("kill_switch_write_failed",)
 
 _MASK = "***"
+#: The SMTP submission port, used when `ALERT_SMTP_HOST` names none.
+_SUBMISSION_PORT = 587
+_MAX_PORT = 65535
 
 
 @dataclass(frozen=True)
@@ -267,18 +274,26 @@ class Alerter:
         s = self._settings
         assert s.alert_smtp_host and s.alert_smtp_user and s.alert_smtp_password
         assert s.alert_email_to
+        host, port = _smtp_address(s.alert_smtp_host)
         user = s.alert_smtp_user.get_secret_value()
+        sender = s.alert_email_from.get_secret_value() if s.alert_email_from else user
         email = EmailMessage()
         email["Subject"] = f"TradePartner alert: {kind}"
-        email["From"] = user
+        email["From"] = sender
         email["To"] = s.alert_email_to.get_secret_value()
         email.set_content(message)
-        with self._smtp(
-            s.alert_smtp_host, timeout=self._settings.alerts.delivery_timeout_seconds
-        ) as client:
+        client = self._smtp(host, port, timeout=self._settings.alerts.delivery_timeout_seconds)
+        try:
             client.starttls(context=ssl.create_default_context())
             client.login(user, s.alert_smtp_password.get_secret_value())
             client.send_message(email)
+        finally:
+            # The message is the server's once `send_message` returns: a bad QUIT
+            # reply must not turn it into a failed delivery, nor mask a send error.
+            try:
+                client.quit()
+            except Exception:
+                client.close()
 
     def _scrub(self, text: str) -> str:
         """`text` with every secret masked, in any case and in its repr-escaped form."""
@@ -290,6 +305,18 @@ class Alerter:
 def _check_kind(kind: str) -> None:
     if kind not in ALERT_KINDS:
         raise ValueError(f"unknown alert kind {kind!r}; expected one of {ALERT_KINDS}")
+
+
+def _smtp_address(setting: str) -> tuple[str, int]:
+    """`ALERT_SMTP_HOST` as (host, port): `host` or `host:port`, the port 587 when
+    absent. `ValueError` (a failed delivery) for an empty host or a bad port."""
+    host, sep, port_text = setting.strip().rpartition(":")
+    if not sep:
+        host, port_text = port_text, str(_SUBMISSION_PORT)
+    host, port_text = host.strip(), port_text.strip()
+    if not host or not port_text.isdigit() or not 0 < int(port_text) <= _MAX_PORT:
+        raise ValueError("ALERT_SMTP_HOST must be host or host:port with a port in 1..65535")
+    return host, int(port_text)
 
 
 def _describe(exc: Exception) -> str:
