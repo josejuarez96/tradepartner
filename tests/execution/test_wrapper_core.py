@@ -957,3 +957,149 @@ def test_a_failed_fetch_on_a_duplicate_halts(
     with pytest.raises(SystemFaultError, match="get_order failed") as raised:
         gate.replay(_request(), DuplicateClientOrderIdError("tp-r"))
     assert isinstance(raised.value.__cause__, UnknownOrderError)
+
+
+# --- store faults on the halt path (safety review on #437) ---------------------------
+
+
+class FlakyJournal:
+    """A `Connect` whose calls numbered in `failing` raise, the others open the
+    store; `calls` counts every call."""
+
+    def __init__(self, settings: Settings, failing: set[int]) -> None:
+        self._settings = settings
+        self._failing = failing
+        self.calls = 0
+
+    def __call__(self) -> Any:
+        self.calls += 1
+        if self.calls in self._failing:
+            raise OSError("store unavailable")
+        return open_for_write(self._settings)
+
+
+def test_a_store_fault_after_the_engaged_row_never_cuts_the_halt_short(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Call 1 reads the open orders, call 2 is tp-a's `cancel_requested` (it
+    fails, so tp-a is never cancelled: no call without its row), and tp-b goes
+    on through its cancel and read. The alert and result row still land, and
+    the original fault is re-raised carrying the failure as a note."""
+    run = _run(journal_settings, open_window, fixed_clock())
+    _order(journal_settings, scripted_fake, fixed_clock, run, "tp-a")
+    _order(journal_settings, scripted_fake, fixed_clock, run, "tp-b", symbol="BBB")
+    gate = RiskGatedBroker(
+        scripted_fake,
+        fixed_clock,
+        FROZEN,
+        journal_settings,
+        FlakyJournal(journal_settings, failing={2}),
+        calendar,
+        Alerter(journal_settings, alerter_conn, fixed_clock),
+    )
+    fault = ValueError("original")
+    with pytest.raises(ValueError) as raised:
+        _halt(gate, fault, run)
+
+    assert raised.value is fault
+    assert any("cancel of tp-a not attempted" in note for note in fault.__notes__)
+    cancels = [c.args[0] for c in scripted_fake.calls if c.method == "cancel"]
+    assert cancels == ["tp-b"]
+    assert _events(journal_settings, "tp-a")[2:] == []
+    assert _events(journal_settings, "tp-b")[2:] == [
+        ("cancel_requested", HALT_REASON),
+        ("cancelled", None),
+    ]
+    [(alert,)] = _query(
+        journal_settings, "SELECT message FROM alerts WHERE run_id = ?", [run.run_id]
+    )
+    assert "cancel of tp-a not attempted" in alert
+    assert _query(
+        journal_settings, "SELECT status FROM paper_run_results WHERE run_id = ?", [run.run_id]
+    ) == [("halted",)]
+
+
+def test_a_store_that_fails_after_the_engaged_row_still_re_raises_the_original_fault(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    run = _run(journal_settings, open_window, fixed_clock())
+    _order(journal_settings, scripted_fake, fixed_clock, run, "tp-a")
+    gate = RiskGatedBroker(
+        scripted_fake,
+        fixed_clock,
+        FROZEN,
+        journal_settings,
+        FlakyJournal(journal_settings, failing=set(range(1, 100))),
+        calendar,
+        Alerter(journal_settings, alerter_conn, fixed_clock),
+    )
+    fault = LocalFault("original")
+    with pytest.raises(LocalFault) as raised:
+        _halt(gate, fault, run)
+    assert raised.value is fault
+    [note] = fault.__notes__
+    assert "open orders not read" in note and "result row not written" in note
+    assert _query(
+        journal_settings, "SELECT state FROM kill_switch WHERE run_id = ?", [run.run_id]
+    ) == [("engaged",)]
+    assert not [c for c in scripted_fake.calls if c.method == "cancel"]
+
+
+class BrokenAlerter(Alerter):
+    def write(self, *args: Any, **kwargs: Any) -> int:
+        raise OSError("alerts table locked")
+
+
+def test_a_failed_alert_write_is_named_in_the_result_row_and_on_the_fault(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    run = _run(journal_settings, open_window, fixed_clock())
+    alerter = BrokenAlerter(journal_settings, alerter_conn, fixed_clock)
+    gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn, alerter=alerter)
+    fault = ValueError("original")
+    with pytest.raises(ValueError):
+        _halt(gate, fault, run)
+    [(message,)] = _query(
+        journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
+    )
+    assert "alert not written (OSError)" in message
+    assert any("alert not written" in note for note in fault.__notes__)
+
+
+def test_the_precheck_refuses_a_naive_last_ok_ingest(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn)
+    with pytest.raises(ValueError, match="last_ok_ingest"):
+        gate.clock_precheck(SESSION, datetime(2026, 10, 1, 1, 0))  # noqa: DTZ001
+
+
+def test_a_clock_error_from_the_replay_fetch_keeps_its_type(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def clock_broken(_coid: str) -> None:
+        raise ClockError("adapter clock failed")
+
+    monkeypatch.setattr(scripted_fake, "get_order", clock_broken)
+    gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn)
+    with pytest.raises(ClockError, match="adapter clock"):
+        gate.replay(_request(), DuplicateClientOrderIdError("tp-r"))

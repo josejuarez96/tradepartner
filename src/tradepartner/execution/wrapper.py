@@ -54,11 +54,19 @@ order:
    too (T58's handoff: a halt-path caller never drops one). With
    `write_offs`, each read back-fills the `written_off` row of a terminal buy
    of a pending rebalance that lacks one (T58);
-4. the alert (`halted`, or `stale_data` for `StaleDataError`), run-scoped. A
-   store error writing it is named in the result row and the halt continues;
+4. the alert (`halted`, or `stale_data` for `StaleDataError`), run-scoped,
+   after one checked clock reading (so a clock gone bad sets `clock_fault`);
 5. the run's `paper_run_results` row, `halted` (or `stale`), with the fault's
    type, the message and `clock_fault`;
 6. re-raises the fault.
+
+**A store fault never cuts the halt short.** After the `engaged` row, every
+write is best-effort: a failed `cancel_requested` row skips that order's cancel
+call (no call without its journal row), any other failed write (an outcome
+event, the alert, the result row) is noted and the halt goes on, and the
+original fault is always the one re-raised, carrying every such failure as an
+exception note (`add_note`), which the run's crash output (T63's `run_failed`)
+reports. The switch is already engaged, so the next run halts whatever is lost.
 
 **Clock faults on the halt path** (Definitions). After a `ClockError`, the
 fault itself or any met on the way (a reading that raises, is malformed or
@@ -288,6 +296,8 @@ class RiskGatedBroker:
         ingestion run's `finished_at` (None when there is none)."""
         if getattr(self._broker, "clock", None) is not self._clock:
             raise ClockError("the wrapper and the adapter do not hold one clock object")
+        if last_ok_ingest is not None:
+            last_ok_ingest = ensure_tz_aware_utc(last_ok_ingest, field_name="last_ok_ingest")
         reading = self.read_clock()
         if last_ok_ingest is not None and reading < last_ok_ingest:
             raise ClockError(
@@ -313,6 +323,8 @@ class RiskGatedBroker:
         coid = request.client_order_id
         try:
             order = self._broker.get_order(coid)
+        except ClockError:
+            raise  # keep the type: the halt path stamps by utc_now() after it
         except Exception as exc:
             raise SystemFaultError(
                 f"duplicate client_order_id {coid}: get_order failed ({type(exc).__name__})"
@@ -378,12 +390,16 @@ class RiskGatedBroker:
                 )
                 raise SystemExit(WRITE_FAILED_EXIT_CODE) from fault
 
-        requested = self._acknowledged_open(run)
-        for order in requested:
-            self._cancel(order, stamp, notes)
-        for order in requested:
+        try:
+            requested = self._acknowledged_open(run)
+        except Exception as exc:
+            requested = []
+            notes.append(f"open orders not read, no cancel attempted ({type(exc).__name__})")
+        cancelled = [order for order in requested if self._cancel(order, stamp, notes)]
+        for order in cancelled:
             self._read(order, run, stamp, notes, write_offs)
 
+        stamp()  # one checked reading first, so a clock gone bad since sets clock_fault
         message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         try:
             self._alerter.write(
@@ -394,22 +410,28 @@ class RiskGatedBroker:
                 clock_fault=stamp.fault,
             )
         except Exception as exc:
-            message = f"{message}; alert not written ({type(exc).__name__})"
+            notes.append(f"alert not written ({type(exc).__name__})")
+            message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
         finished = stamp()
-        with self._journal() as conn:
-            append(
-                conn,
-                PaperRunResultRow(
-                    run_id=run.run_id,
-                    finished_at=finished,
-                    status=_STALE if stale else _HALTED,
-                    fault_type=fault_type,
-                    message=message,
-                    clock_fault=stamp.fault,
-                    known_at=finished,
-                    ingested_at=finished,
-                ),
-            )
+        try:
+            with self._journal() as conn:
+                append(
+                    conn,
+                    PaperRunResultRow(
+                        run_id=run.run_id,
+                        finished_at=finished,
+                        status=_STALE if stale else _HALTED,
+                        fault_type=fault_type,
+                        message=message,
+                        clock_fault=stamp.fault,
+                        known_at=finished,
+                        ingested_at=finished,
+                    ),
+                )
+        except Exception as exc:
+            notes.append(f"result row not written ({type(exc).__name__})")
+        if notes:
+            fault.add_note(self._scrub("halt path: " + "; ".join(dict.fromkeys(notes))))
         raise fault
 
     def _acknowledged_open(self, run: PaperRunRow) -> list[OrderRow]:
@@ -419,17 +441,22 @@ class RiskGatedBroker:
             pending = {o.client_order_id for o in pending_orders(conn, window_id=run.window_id)}
         return [o for o in open_ if o.run_id == run.run_id and o.client_order_id not in pending]
 
-    def _cancel(self, order: OrderRow, stamp: _HaltClock, notes: list[str]) -> None:
+    def _cancel(self, order: OrderRow, stamp: _HaltClock, notes: list[str]) -> bool:
+        """Journal `cancel_requested`, call `cancel`, journal its outcome; return
+        whether the cancel was requested. No call without its journal row."""
         coid = order.client_order_id
-        self._event(coid, _CANCEL_REQUESTED, stamp)
+        if not self._event(coid, _CANCEL_REQUESTED, stamp, notes):
+            notes.append(f"cancel of {coid} not attempted: its cancel_requested row failed")
+            return False
         try:
             self._broker.cancel(coid)
         except Exception as exc:
             if classify(Broker.cancel.__name__, exc) is Verdict.ALLOWED:
-                self._event(coid, _CANCEL_NOOP, stamp)
+                self._event(coid, _CANCEL_NOOP, stamp, notes)
             else:
-                self._event(coid, _CANCEL_FAILED, stamp)
+                self._event(coid, _CANCEL_FAILED, stamp, notes)
                 notes.append(f"cancel of {coid} failed ({type(exc).__name__})")
+        return True
 
     def _read(
         self,
@@ -461,24 +488,33 @@ class RiskGatedBroker:
             stamp.trip()
             return
         except Exception as exc:
-            self._event(coid, _CANCEL_FAILED, stamp)
+            self._event(coid, _CANCEL_FAILED, stamp, notes)
             notes.append(f"halt read of {coid} failed ({type(exc).__name__})")
             return
         notes.extend(breach.message for breach in collected.rejections)
 
-    def _event(self, coid: str, status: str, stamp: Callable[[], datetime]) -> None:
+    def _event(
+        self, coid: str, status: str, stamp: Callable[[], datetime], notes: list[str]
+    ) -> bool:
+        """Journal a halt cancel event; on a store error note it and return False
+        (the halt goes on: a store fault never cuts the halt path short)."""
         now = stamp()
-        with self._journal() as conn:
-            append(
-                conn,
-                OrderEventRow(
-                    client_order_id=coid,
-                    status=status,
-                    reason=HALT_REASON,
-                    known_at=now,
-                    ingested_at=now,
-                ),
-            )
+        try:
+            with self._journal() as conn:
+                append(
+                    conn,
+                    OrderEventRow(
+                        client_order_id=coid,
+                        status=status,
+                        reason=HALT_REASON,
+                        known_at=now,
+                        ingested_at=now,
+                    ),
+                )
+        except Exception as exc:
+            notes.append(f"{status} of {coid} not journaled ({type(exc).__name__})")
+            return False
+        return True
 
     def _session(self, run: PaperRunRow, stamp: Callable[[], datetime]) -> date:
         return run.session if run.session is not None else stamp().astimezone(_NEW_YORK).date()
