@@ -66,7 +66,7 @@ CONFLICT_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 VERDICT_RE = re.compile(
-    r"\A\s*(?P<agent>quant-auditor|safety-reviewer):\s*(?P<verdict>pass(?: with fixes)?|fail)\b",
+    r"\A[ \t]*(?P<agent>quant-auditor|safety-reviewer):(?P<verdict>[^\r\n]*)",
     re.IGNORECASE,
 )
 CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
@@ -253,7 +253,8 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     A verdict is the **first line** of a PR comment, ``<agent>: PASS``, ``PASS WITH FIXES``
     or ``FAIL``; comments are read in order and the latest verdict per agent wins. Only
     ``PASS`` passes: ``PASS WITH FIXES`` leaves SHOULD FIX findings open, so it counts once
-    the re-review after the fixes posts a later ``PASS`` (#356). The PR
+    the re-review after the fixes posts a later ``PASS`` (#356). The whole rest of the first
+    line is the verdict, so ``PASS (with fixes)`` or ``PASS / FAIL`` is not a pass. The PR
     body does not count: the template itself names both agents there. In this solo repo
     every comment comes from the owner's account, so this is a process gate, not an
     authentication boundary.
@@ -262,7 +263,7 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     for c in comments:
         m = VERDICT_RE.match(c)
         if m:
-            latest[m.group("agent").lower()] = m.group("verdict").lower()
+            latest[m.group("agent").lower()] = " ".join(m.group("verdict").split()).lower()
     return sorted(r for r in required if latest.get(r) != "pass")
 
 

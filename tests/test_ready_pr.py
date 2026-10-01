@@ -139,6 +139,19 @@ def test_pass_with_fixes_counts_only_once_a_later_pass_follows() -> None:
         )
         == []
     )
+    # the whole first line is the verdict: a variant of PASS WITH FIXES is not a PASS
+    for line in (
+        "PASS  WITH FIXES",
+        "PASS (with fixes)",
+        "PASS-WITH-FIXES",
+        "PASS / FAIL",
+        "PASSED",
+        "",
+    ):
+        assert ready_pr.missing_reviews(qa, [f"quant-auditor: {line}"]) == ["quant-auditor"], line
+    assert ready_pr.missing_reviews(qa, ["\nquant-auditor: PASS"]) == ["quant-auditor"]
+    for ok in ("quant-auditor:PASS", "  Quant-Auditor:   pass  \r\nbody"):
+        assert ready_pr.missing_reviews(qa, [ok]) == [], ok
 
 
 def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> None:
