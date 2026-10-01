@@ -159,8 +159,6 @@ REPO = Path(__file__).resolve().parents[1]
 PLANNED_PREFIXES = {
     "src/tradepartner/adapters/alpaca_broker",  # T48c
     "src/tradepartner/llm/",  # Phase 5, ADR 0008
-    "src/tradepartner/signals/",  # no plan names it; signals live in backtest/signals.py
-    "src/tradepartner/risk/",  # no plan names it; the checks live in execution/risk.py
 }
 
 
@@ -188,6 +186,15 @@ def test_every_order_path_module_requires_the_safety_review() -> None:
     assert "safety-reviewer" in ready_pr.required_reviews(
         ["src/tradepartner/adapters/alpaca_broker.py", "src/tradepartner/execution/brokers.py"]
     )
+
+
+def test_execution_modules_also_require_the_quant_audit() -> None:
+    # plan.py, outcomes.py and lots.py compute quantities from store data (#381)
+    modules = list((REPO / "src" / "tradepartner" / "execution").glob("*.py"))
+    assert len(modules) > 10
+    for m in modules:
+        path = m.relative_to(REPO).as_posix()
+        assert ready_pr.required_reviews([path]) == {"quant-auditor", "safety-reviewer"}, path
 
 
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
