@@ -21,7 +21,10 @@ def _concurrency_block() -> dict[str, str]:
     return block
 
 
-MAIN_PER_COMMIT = "ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}"
+TRAIN = "startsWith(github.ref, 'refs/heads/train/')"
+MAIN_PER_COMMIT = (
+    "ci-${{ (github.ref == 'refs/heads/main' || " + TRAIN + ") && github.sha || github.ref }}"
+)
 
 
 def test_main_runs_are_never_cancelled() -> None:
@@ -31,7 +34,9 @@ def test_main_runs_are_never_cancelled() -> None:
     one group per commit, and no main run shares a group with another."""
     block = _concurrency_block()
     assert block["group"] == MAIN_PER_COMMIT, block
-    assert block["cancel-in-progress"] == "${{ github.ref != 'refs/heads/main' }}", block
+    assert block["cancel-in-progress"] == (
+        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " }}"
+    ), block
 
 
 def test_pr_branches_still_cancel_superseded_runs() -> None:
@@ -39,3 +44,24 @@ def test_pr_branches_still_cancel_superseded_runs() -> None:
     block = _concurrency_block()
     assert "|| github.ref }}" in block["group"], block
     assert "github.ref != 'refs/heads/main'" in block["cancel-in-progress"], block
+
+
+def test_train_branches_run_on_push_per_commit_and_are_never_cancelled() -> None:
+    """Merge-train spec req 4 (T73): a `train/**` push runs the full suite, in a group of
+    its own commit, so a probe pushed during the batch run cancels nothing."""
+    text = CI.read_text()
+    assert "    branches: [main, 'train/**']" in text
+    block = _concurrency_block()
+    assert TRAIN in block["group"] and "&& github.sha" in block["group"], block
+    assert "!" + TRAIN in block["cancel-in-progress"], block
+
+
+def test_the_checks_job_token_is_read_only() -> None:
+    """T73: the `checks` job runs a train batch's code on a push event, so its token only
+    reads; the `claims` job stays PR-only."""
+    text = CI.read_text()
+    checks = text[text.index("  checks:\n") : text.index("  claims:\n")]
+    assert "    permissions:\n      contents: read\n" in checks
+    assert "write" not in checks
+    claims = text[text.index("  claims:\n") :]
+    assert "if: github.event_name == 'pull_request'" in claims

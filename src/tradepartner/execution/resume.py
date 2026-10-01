@@ -16,9 +16,13 @@ The only way the kill switch is released. In the req 5 order:
    reason `not_received`. Any other broker error propagates.
 5. Collect every non-terminal order of the window (T58, writer `resume`).
    That journals this invocation's `fill_cursors` row, whatever follows.
-   - A rejection-cap verdict from the collection (an all-rejected or
-     over-cap submitting run whose rejection this resume journaled) refuses
-     the release (#374, T58's handoff).
+   - A rejection-cap verdict refuses the release: one from the collection
+     (an all-rejected or over-cap submitting run whose rejection this resume
+     journaled; #374, T58's handoff), or one on a run the release would clear
+     (`switch.faulted_runs`), judged directly with the pure
+     `collect.rejection_breaches`. The second covers rejections the halt
+     path's read journaled: that read collects as its run, so no later
+     collection judges them again (#397).
    - An order still `fills_lagging` past the frozen
      `risk.max_fill_lag_sessions` (`collect.lag_verdict`, anchored on the first
      reconciliation that listed it) refuses without `accept_broker_fills`.
@@ -68,7 +72,14 @@ from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
-from tradepartner.execution.collect import Connect, OrderReading, collect, lag_verdict
+from tradepartner.execution.collect import (
+    Connect,
+    OrderReading,
+    RejectionBreach,
+    collect,
+    lag_verdict,
+    rejection_breaches,
+)
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.reconcile import OK
 from tradepartner.execution.reconcile_run import command_session, frozen_risk, reconcile_now
@@ -84,6 +95,8 @@ from tradepartner.store.journal import (
     kill_switch_events_for,
     non_terminal_orders,
     open_window,
+    order_events_for,
+    orders_for,
     pending_orders,
     positions_daily_for,
     reconciliations_for,
@@ -321,6 +334,24 @@ def _mark_equity(marks: Sequence[PositionDailyRow]) -> float | None:
     return cash[0] + math.fsum(v for v in values if v is not None)
 
 
+def _faulted_run_breaches(
+    connect: Connect, window: PaperWindowRow, frozen: RiskConfig
+) -> tuple[RejectionBreach, ...]:
+    """The rejection verdicts on the window's runs a release would clear."""
+    window_id = _window_id(window)
+    with connect() as conn:
+        runs = runs_for(conn, window_id)
+        events = kill_switch_events_for(conn, window_id)
+        orders = orders_for(conn, window_id=window_id)
+        order_events = order_events_for(conn, window_id=window_id)
+    faulted = switch.faulted_runs(
+        window, events, [r.run for r in runs], [r.result for r in runs if r.result is not None]
+    )
+    return rejection_breaches(
+        faulted, orders, order_events, max_rejections=frozen.max_rejections_per_run
+    )
+
+
 def _switch(connect: Connect, window: PaperWindowRow) -> switch.SwitchState:
     """The window's derived kill-switch state, read by a lock holder."""
     window_id = _window_id(window)
@@ -388,6 +419,12 @@ def resume(
 
         synthetic: list[tuple[FillRow, OrderReading]] = []
         reasons = [breach.message for breach in collected.rejections]
+        judged = {b.run_id for b in collected.rejections}
+        reasons += [
+            breach.message
+            for breach in _faulted_run_breaches(connect, window, frozen)
+            if breach.run_id not in judged
+        ]
         lag_reasons, synthetic_fills = _lag(
             connect, window_id, collected.lagging, now, frozen, accept_broker_fills
         )
