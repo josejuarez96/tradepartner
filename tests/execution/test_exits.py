@@ -21,7 +21,13 @@ from tradepartner.execution.exits import (
     reattempt_exits,
     stop_exits,
 )
-from tradepartner.execution.plan import DecisionState, Remainder, State, decision_state
+from tradepartner.execution.plan import (
+    DecisionState,
+    Remainder,
+    State,
+    decision_state,
+    remainder,
+)
 from tradepartner.execution.risk import OpenSell
 from tradepartner.store.journal import (
     AdjustmentRow,
@@ -36,6 +42,7 @@ S = date(2026, 10, 14)  # a Wednesday session
 PREVIOUS = date(2026, 10, 13)
 NOW = datetime(2026, 10, 14, 13, 0, tzinfo=UTC)
 WINDOW = 1
+PENDING = date(2026, 9, 30)  # the pending rebalance T_i
 
 
 @dataclass(frozen=True)
@@ -126,6 +133,7 @@ def _forced(
         open_sells,
         adjustments,
         session=S,
+        pending_rebalance=PENDING,
     )
 
 
@@ -140,6 +148,7 @@ def test_delisted_name_is_sold_whole() -> None:
             reason="delisted",
             planned_quantity=12.5,
             whole_share=False,
+            session=S,
         )
     ]
 
@@ -221,6 +230,7 @@ def test_spinoff_receipt_is_sold_whole() -> None:
             reason="untargeted_receipt",
             planned_quantity=3.0,
             whole_share=False,
+            session=S,
         )
     ]
 
@@ -381,7 +391,7 @@ def test_negative_or_non_finite_holding_raises() -> None:
 
 def test_session_must_be_a_date() -> None:
     with pytest.raises(ValueError, match="session"):
-        forced_exits({}, {}, {}, (), {}, (), (), session=NOW)  # type: ignore[arg-type]
+        forced_exits({}, {}, {}, (), {}, (), (), session=NOW, pending_rebalance=None)  # type: ignore[arg-type]
 
 
 # --- reattempt_exits ---------------------------------------------------------------
@@ -507,14 +517,15 @@ def _stop(
         open_sells,
         untradable_this_run,
         session=S,
+        quantity_decimals=9,
     )
 
 
 def test_stop_exits_every_held_name() -> None:
     exits = _stop({"BBB": 4.0, "AAA": 2.5})
     assert exits == [
-        ExitDecision("AAA", "window_stop", 2.5, whole_share=False),
-        ExitDecision("BBB", "window_stop", 4.0, whole_share=False),
+        ExitDecision("AAA", "window_stop", 2.5, whole_share=False, session=S),
+        ExitDecision("BBB", "window_stop", 4.0, whole_share=False, session=S),
     ]
     row = exits[0].row(run_id=9, known_at=NOW, ingested_at=NOW)
     assert (row.decision, row.reason, row.side, row.planned_quantity) == (
@@ -536,7 +547,7 @@ def test_stop_listed_residue_gets_no_exit() -> None:
 
 def test_stop_untradable_this_run_gets_no_exit() -> None:
     assert _stop({"AAA": 3.0, "BBB": 1.0}, untradable_this_run=frozenset({"AAA"})) == [
-        ExitDecision("BBB", "window_stop", 1.0, whole_share=False)
+        ExitDecision("BBB", "window_stop", 1.0, whole_share=False, session=S)
     ]
 
 
@@ -547,8 +558,8 @@ def test_stop_whole_share_floor_on_a_flagged_name() -> None:
         assets=_assets("BBB", AAA=Flags(fractionable=False)),
     )
     assert exits == [
-        ExitDecision("AAA", "window_stop", 5.0, whole_share=True),
-        ExitDecision("BBB", "window_stop", 7.6, whole_share=False),
+        ExitDecision("AAA", "window_stop", 5.0, whole_share=True, session=S),
+        ExitDecision("BBB", "window_stop", 7.6, whole_share=False, session=S),
     ]
 
 
@@ -585,3 +596,113 @@ def test_stop_residue_above_holding_or_negative_raises() -> None:
         _stop({"AAA": 3.0}, residues={"AAA": 4.0})
     with pytest.raises(ValueError, match="residue"):
         _stop({"AAA": 3.0}, residues={"AAA": -1.0})
+
+
+# --- review fixes (PR #493) --------------------------------------------------------
+
+
+def test_stop_whole_share_floor_survives_float_error() -> None:
+    """1.4 - 0.4 is 0.9999999999999999 in floats: still one whole share."""
+    (exit_,) = _stop(
+        {"AAA": 1.4}, residues={"AAA": 0.4}, assets=_assets(AAA=Flags(fractionable=False))
+    )
+    assert exit_.planned_quantity == 1.0
+
+
+def test_stop_untradable_this_run_must_not_be_a_str() -> None:
+    with pytest.raises(ValueError, match="untradable_this_run"):
+        stop_exits(
+            {"AAA": 1.0}, {}, _assets("AAA"), (), {}, (), "AAA", session=S, quantity_decimals=9
+        )
+
+
+def test_row_refuses_known_at_on_another_new_york_date() -> None:
+    (exit_,) = _forced({"AAA": 5.0}, listings_at={"AAA": PREVIOUS})
+    # 02:00 UTC on S is still S-1 in New York.
+    with pytest.raises(ValueError, match="New York date"):
+        exit_.row(run_id=1, known_at=datetime(2026, 10, 14, 2, 0, tzinfo=UTC), ingested_at=NOW)
+
+
+def test_exit_on_a_split_ex_date_round_trips_through_remainder() -> None:
+    """A 2:1 split with ex-date S: the holding on S is post-split, and the
+    journaled exit's remainder before any order is exactly that holding."""
+    (exit_,) = _forced({"AAA": 20.0}, listings_at={"AAA": PREVIOUS})
+    row = replace(exit_.row(run_id=1, known_at=NOW, ingested_at=NOW), decision_id=1)
+    actions = pl.DataFrame(
+        {
+            "security_id": ["AAA"],
+            "action_type": ["split"],
+            "ex_date": [S],
+            "ratio_or_amount": [2.0],
+        }
+    )
+    left = remainder(row, [], [], [], actions, lambda _sid: 50.0, session=S)
+    assert left.quantity == 20.0
+
+
+def test_plan_decision_of_another_rebalance_does_not_block() -> None:
+    lapsed = _decision(
+        1, "AAA", decision="trade", reason="left_universe", rebalance_session=date(2026, 8, 31)
+    )
+    exits = _forced(
+        {"AAA": 6.0}, listings_at={"AAA": PREVIOUS}, decisions=(lapsed,), states={1: OPEN}
+    )
+    assert [(e.security_id, e.reason) for e in exits] == [("AAA", "delisted")]
+
+
+def test_settled_plan_decision_spends_the_receipt() -> None:
+    """The plan sold the child at T_i; shares it buys later are the plan's."""
+    receipt = _receipt("KID", known_at=NOW - timedelta(days=20), session=date(2026, 9, 23))
+    plan = _decision(
+        1,
+        "KID",
+        decision="trade",
+        reason="left_universe",
+        rebalance_session=date(2026, 9, 30),
+        known_at=NOW - timedelta(days=14),
+    )
+    assert (
+        _forced({"KID": 4.0}, adjustments=(receipt,), decisions=(plan,), states={1: SETTLED}) == []
+    )
+
+
+def test_plan_decision_before_the_receipt_does_not_spend_it() -> None:
+    plan = _decision(
+        1,
+        "KID",
+        decision="skip_zero",
+        side=None,
+        rebalance_session=date(2026, 8, 31),
+        known_at=NOW - timedelta(days=40),
+    )
+    exits = _forced(
+        {"KID": 3.0},
+        adjustments=(_receipt("KID"),),
+        decisions=(plan,),
+        states={1: DecisionState(State.CLOSED, "skip_zero")},
+    )
+    assert [(e.security_id, e.reason) for e in exits] == [("KID", "untargeted_receipt")]
+
+
+def test_reattempt_and_new_exits_never_name_the_same_security() -> None:
+    """One hand-off per exit: over the same inputs, a name with an open forced
+    exit is re-attempted and gets no new decision."""
+    open_exit = _decision(1, "AAA")
+    decisions = (open_exit,)
+    states = {1: OPEN}
+    new = _forced(
+        {"AAA": 5.0, "BBB": 2.0},
+        listings_at={"AAA": PREVIOUS, "BBB": PREVIOUS},
+        decisions=decisions,
+        states=states,
+    )
+    again = reattempt_exits(decisions, states)
+    assert [e.security_id for e in new] == ["BBB"]
+    assert [d.security_id for d in again] == ["AAA"]
+
+
+def test_reattempt_refuses_repeated_ids_and_two_open_exits_for_one_name() -> None:
+    with pytest.raises(ValueError, match="twice"):
+        reattempt_exits((_decision(1, "AAA"), _decision(1, "AAA")), {1: OPEN})
+    with pytest.raises(ValueError, match="two open forced exits"):
+        reattempt_exits((_decision(1, "AAA"), _decision(2, "AAA")), {1: OPEN, 2: OPEN})

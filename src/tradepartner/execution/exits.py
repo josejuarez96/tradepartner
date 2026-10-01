@@ -12,38 +12,51 @@ phase. No broker, no journal write, no clock.
   `untargeted_receipt`).
 - `reattempt_exits`: the open forced exits of any reason, which the phase
   re-attempts for their remainder (`plan.decision_state`, T52).
+
+**One hand-off per exit.** The caller computes `reattempt_exits` and
+`forced_exits` (or `stop_exits`) over the same `decisions` and `states`, read
+before this run journals any new exit, and hands each list to the sells phase
+once. The two never name the same security, since an open forced exit blocks
+a new one. A new exit journaled by this run is ordered from its own list and
+never re-read through `reattempt_exits` in the same run: that would put two
+sells for one name in one phase.
 - `stop_exits`: on a `stop` run, a `window_stop` exit for each held name, for
   the holding minus its residue (`plan.residue`, T52b), floored to whole shares
   where the name is not fractionable.
 
 **Blocking.** No new forced exit is made for a name that has an open or in-flight
-decision among `decisions` (a plan decision of the pending rebalance, or a
-forced exit: that decision handles the name, or is re-attempted for its
-remainder), or a non-terminal own sell from any session (`open_sells`). A
-`window_stop` exit is blocked by an open or in-flight `forced_exit` decision, a
-non-terminal own sell, or a same-run `untradable` exit (`untradable_this_run`);
-a plan decision does not block it (a `stop` run plans nothing). A settled or
-closed decision, however recent, blocks nothing.
+decision among `decisions` that is a forced exit or a plan decision of the
+pending rebalance `pending_rebalance` (that decision handles the name, or is
+re-attempted for its remainder), or a non-terminal own sell from any session
+(`open_sells`). A plan decision of any other rebalance (one executed or lapsed
+to `missed`) blocks nothing. A `window_stop` exit is blocked by an open or
+in-flight `forced_exit` decision, a non-terminal own sell, or a same-run
+`untradable` exit (`untradable_this_run`); a plan decision does not block it
+(a `stop` run plans nothing). A settled or closed decision, however recent,
+blocks nothing.
 
 **Inputs.** `held` is the ledger's quantity per `security_id` on S (names at
-zero are ignored, a negative or non-finite one raises). `decisions` are the
-decisions that can still act on S: the pending rebalance's and the window's
-forced exits, this run's journaled ones included; `states` maps every one of
-their ids to its `plan.decision_state` (a decision with no state raises, so a
-missing derivation never lets a second sell through). A plan decision of a
-rebalance that is no longer pending must not be passed: it would block.
-`listings_at` maps a name to its listing's last session as read at
-close(S-1), `None` when the end is unknown; a name present with an end on or
-before S-1, or `None`, has ended (`plan.decisions_from` reads it the same way),
-and a name absent from it is listed. `assets` is this run's `assets` read keyed
-by `security_id`; a name that would be decided and is missing from it raises.
+zero are ignored, a negative or non-finite one raises). `decisions` are every
+decision of the open window known to the run, settled and closed ones
+included (a spin-off receipt is spent only by a decision present here), read
+before this run journals a new exit, except that `stop_exits` also takes this
+run's journaled forced exits; `states` maps every one of their ids to its
+`plan.decision_state` (a decision with no state raises, so a missing
+derivation never lets a second sell through). `listings_at` maps a name to its
+listing's last session as read at close(S-1), `None` when the end is unknown;
+a name present with an end on or before S-1, or `None`, has ended
+(`plan.decisions_from` reads it the same way), and a name absent from it is
+listed. `assets` is this run's `assets` read keyed by `security_id`; a name
+that would be decided and is missing from it raises.
 
 **Spin-off receipts.** `adjustments` are the open window's rows; a
 `spinoff_receipt` row dated on or before S makes its name a candidate until it
-is spent: a receipt is spent by an `untargeted_receipt` forced exit of its name
-decided at or after the receipt's `known_at` that is not closed (open, in flight
-or settled), so shares the plan buys after the receipt was sold are never sold
-as a receipt, and a receipt exit closed as `untradable` is re-evaluated. A
+is spent. A receipt is spent by a decision of its name made at or after the
+receipt's `known_at` that is either a plan decision (any kind and state: the
+plan has taken the name in hand) or an `untargeted_receipt` forced exit that is
+not closed (open, in flight or settled). Shares the plan buys after the
+receipt was sold or planned are therefore never sold as a receipt, and a
+receipt exit closed as `untradable` is re-evaluated on the next session. A
 name that is both delisted and a receipt gets one decision, `delisted`.
 """
 
@@ -54,6 +67,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from tradepartner.calendar import previous_session
 from tradepartner.execution.plan import DecisionState, State
@@ -65,6 +79,7 @@ from tradepartner.store.schema import (
     WINDOW_STOP_REASON,
 )
 
+_NEW_YORK = ZoneInfo("America/New_York")
 _FORCED_EXIT = "forced_exit"
 _SELL = "sell"
 _SKIPPED = "skipped"
@@ -92,9 +107,11 @@ class ExitAsset(Protocol):
 class ExitDecision:
     """One new `forced_exit` decision before the run journals it.
 
-    `planned_quantity` is in shares on S (a forced exit has no rebalance
-    session, so `plan.remainder` states it for the New York date of its
-    `known_at`). `skipped_reason` is set (`untradable`) when the decision is
+    `planned_quantity` is in shares on S = `session`, post-split. A forced
+    exit has no rebalance session, so `plan.remainder` reads the quantity as
+    stated for the New York date of its `known_at`; `row` therefore refuses a
+    `known_at` on any other New York date, which would apply a split on S
+    twice. `skipped_reason` is set (`untradable`) when the decision is
     closed at once: the caller writes `event`'s row with it, and nothing is
     ordered for it this run.
     """
@@ -103,10 +120,17 @@ class ExitDecision:
     reason: str
     planned_quantity: float
     whole_share: bool
+    session: date
     skipped_reason: str | None = None
 
     def row(self, *, run_id: int, known_at: datetime, ingested_at: datetime) -> DecisionRow:
-        """The `decisions` row for run `run_id`; its id is assigned on insert."""
+        """The `decisions` row for run `run_id`; its id is assigned on insert.
+        A `known_at` whose New York date is not `session` raises."""
+        if known_at.tzinfo is None or known_at.astimezone(_NEW_YORK).date() != self.session:
+            raise ValueError(
+                f"exit of {self.security_id} is stated for {self.session}; known_at "
+                f"{known_at} is not on that New York date"
+            )
         return DecisionRow(
             run_id=run_id,
             rebalance_session=None,
@@ -173,13 +197,19 @@ def _active(
     decisions: Sequence[DecisionRow],
     states: Mapping[int, DecisionState],
     *,
+    pending_rebalance: date | None,
     forced_only: bool,
 ) -> set[str]:
-    """Names with an open or in-flight decision (a forced exit only, if asked)."""
+    """Names with an open or in-flight forced exit, or (unless `forced_only`)
+    an open or in-flight plan decision of `pending_rebalance`."""
     names: set[str] = set()
     for decision in decisions:
         state = _state(decision, states)
-        if forced_only and decision.decision != _FORCED_EXIT:
+        if decision.decision != _FORCED_EXIT and (
+            forced_only
+            or decision.rebalance_session is None
+            or decision.rebalance_session != pending_rebalance
+        ):
             continue
         if state.state in _ACTIVE:
             names.add(decision.security_id)
@@ -211,9 +241,12 @@ def _unspent_receipts(
     spending = [
         d
         for d in decisions
-        if d.decision == _FORCED_EXIT
-        and d.reason == UNTARGETED_RECEIPT_REASON
-        and _state(d, states).state is not State.CLOSED
+        if d.rebalance_session is not None
+        or (
+            d.decision == _FORCED_EXIT
+            and d.reason == UNTARGETED_RECEIPT_REASON
+            and _state(d, states).state is not State.CLOSED
+        )
     ]
     names: set[str] = set()
     for receipt in receipts:
@@ -238,6 +271,7 @@ def forced_exits(
     adjustments: Sequence[AdjustmentRow],
     *,
     session: date,
+    pending_rebalance: date | None,
 ) -> list[ExitDecision]:
     """The new forced exits of the run on session S = `session` (module
     docstring; spec req 7 step 7), by `security_id`: `delisted` for a held name
@@ -245,12 +279,15 @@ def forced_exits(
     unspent spin-off receipt, each for the whole holding, `whole_share` from
     `assets`; one not tradable now is returned closed (`skipped_reason`
     `untradable`). None for a name with an open or in-flight decision or a
-    non-terminal own sell.
+    non-terminal own sell. `pending_rebalance` is the window's pending
+    rebalance session T_i, or `None` when none is pending.
     """
     _check_session(session)
     holding = _held(held)
     previous = previous_session(session)
-    blocked = _active(decisions, states, forced_only=False) | _open_sell_names(open_sells)
+    blocked = _active(
+        decisions, states, pending_rebalance=pending_rebalance, forced_only=False
+    ) | _open_sell_names(open_sells)
     receipts = _unspent_receipts(adjustments, decisions, states, session)
     exits: list[ExitDecision] = []
     for security_id in sorted(holding):
@@ -269,6 +306,7 @@ def forced_exits(
                 reason=reason,
                 planned_quantity=holding[security_id],
                 whole_share=not asset.fractionable,
+                session=session,
                 skipped_reason=None if asset.tradable else _UNTRADABLE,
             )
         )
@@ -282,13 +320,24 @@ def reattempt_exits(
     `untargeted_receipt`, `window_stop`), by `security_id` then decision id:
     the phase re-attempts each for its remainder (`states[id].remainder`). An
     in-flight one waits for its order, a settled or closed one is done; any
-    other decision is not an exit. A decision with no state raises.
+    other decision is not an exit. A decision with no state raises, and so do
+    a repeated decision id and two open forced exits for one name (never two
+    sells for one name).
     """
     open_: list[DecisionRow] = []
+    seen: set[int] = set()
     for decision in decisions:
         state = _state(decision, states)
+        decision_id = decision.decision_id or 0
+        if decision_id in seen:
+            raise ValueError(f"decision {decision_id} is given twice")
+        seen.add(decision_id)
         if decision.decision == _FORCED_EXIT and state.state is State.OPEN:
             open_.append(decision)
+    names = [d.security_id for d in open_]
+    twice = sorted({n for n in names if names.count(n) > 1})
+    if twice:
+        raise ValueError(f"two open forced exits for {twice}")
     return sorted(open_, key=lambda d: (d.security_id, d.decision_id or 0))
 
 
@@ -302,6 +351,7 @@ def stop_exits(
     untradable_this_run: Collection[str],
     *,
     session: date,
+    quantity_decimals: int,
 ) -> list[ExitDecision]:
     """The `window_stop` exits of a `stop` run on session S = `session` (spec
     req 14), by `security_id`: one per held name with no open or in-flight
@@ -311,9 +361,17 @@ def stop_exits(
     fractionable (`whole_share`). A name whose whole holding is its residue gets
     none; a flagged excess below one share is returned with quantity 0, so the
     sells phase journals it `dust` and `plan.residue` reads it as a residue.
-    Tradability is the phase's to check, as for any sell.
+    Tradability is the phase's to check, as for any sell. The excess is rounded
+    to `quantity_decimals` (the broker's quantity precision, `alpaca.*`) before
+    the floor, so float error never turns a whole share into dust.
     """
     _check_session(session)
+    if isinstance(untradable_this_run, str):
+        raise ValueError("untradable_this_run must be a collection of names, not a str")
+    if isinstance(quantity_decimals, bool) or not (
+        isinstance(quantity_decimals, int) and quantity_decimals >= 0
+    ):
+        raise ValueError(f"quantity_decimals is {quantity_decimals!r}")
     holding = _held(held)
     for security_id, quantity in residues.items():
         if not (math.isfinite(quantity) and quantity >= 0):
@@ -324,7 +382,7 @@ def stop_exits(
                 f"{holding.get(security_id, 0.0)}"
             )
     blocked = (
-        _active(decisions, states, forced_only=True)
+        _active(decisions, states, pending_rebalance=None, forced_only=True)
         | _open_sell_names(open_sells)
         | set(untradable_this_run)
     )
@@ -340,8 +398,11 @@ def stop_exits(
             ExitDecision(
                 security_id=security_id,
                 reason=WINDOW_STOP_REASON,
-                planned_quantity=float(math.floor(excess)) if whole_share else excess,
+                planned_quantity=(
+                    float(math.floor(round(excess, quantity_decimals))) if whole_share else excess
+                ),
                 whole_share=whole_share,
+                session=session,
             )
         )
     return exits
