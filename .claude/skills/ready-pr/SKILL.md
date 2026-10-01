@@ -47,12 +47,18 @@ What runs locally:
 
 | Check | When |
 |---|---|
-| ruff check, ruff format --check, mypy, fragment check | always |
-| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version` |
+| ruff check, ruff format --check, mypy, fragment check, `tests/test_docs_budget.py` | always |
+| pytest, targeted | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version`; then only the test files the diff maps to |
 
-A docs, fragment or process PR skips the local pytest run (the command prints a note), and CI
-skips it on that PR too, by the same rule (`ready_pr.py --tests-needed`). Every push to main
-still runs the full suite. `--tests` forces the local run; `--no-tests` skips it.
+The mapping (#456): a changed test file runs itself; a `src/` module runs the test files that
+import it by name plus the static checks over all of `src/`; a script runs the tests that name
+it. The full suite runs instead when the mapping is unclear: a `conftest.py`, `pyproject.toml`,
+`uv.lock` or `.python-version`, a fixture or helper under `tests/`, a package `__init__`, a
+deleted module, or a module no test names. The command prints which it chose. A test that
+reaches a module only through another one is not run locally, so CI, which runs the full
+suite on every such PR (`ready_pr.py --tests-needed`) and every push to main, catches it
+later. A docs, fragment or process PR skips local pytest, and CI skips it on that PR too.
+`--full-tests` runs the full suite locally; `--tests` forces the local run; `--no-tests` skips it.
 
 ## When it says NOT READY
 

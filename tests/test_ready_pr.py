@@ -260,6 +260,7 @@ class FakeRunner:
         checks_after: Sequence[str] = ("success",),
         draft: bool = True,
         dirty: bool = False,
+        test_sources: dict[str, str] | None = None,
     ) -> None:
         self.branch = branch
         self.contains_main = contains_main
@@ -271,6 +272,7 @@ class FakeRunner:
         self._pr = ready_pr.Pr(69, "feat/69-x", "main", draft, body, tuple(comments))
         self.checks_after = list(checks_after)
         self.dirty = dirty
+        self.test_sources = dict(test_sources or {})
         self.calls: list[tuple[str, ...]] = []
         self.checks_run: list[tuple[str, ...]] = []
         self.readied: list[int] = []
@@ -293,6 +295,8 @@ class FakeRunner:
                 return self.main_files[spec.split(":", 1)[1]]
             case ("rev-parse", "HEAD"):
                 return "abc1234def"
+            case ("ls-files", "tests"):
+                return "\n".join([*self.test_sources, "tests/fixtures/a.json"])
             case ("push", *_):
                 self.pushed.append(args[-1])
         return ""
@@ -312,6 +316,8 @@ class FakeRunner:
         return True
 
     def read(self, path: str) -> str:
+        if path in self.test_sources:
+            return self.test_sources[path]
         if path not in self.files and path.startswith("changelog.d/"):
             return "- #69 done (PR #70)\n### Added\n- x (#69)\n"
         return self.files[path]
@@ -343,7 +349,7 @@ def test_happy_path_pushes_waits_and_marks_ready() -> None:
     assert ready_pr.ready(r, 69, poll_s=0) == 0
     assert r.pushed == ["HEAD:feat/69-x"]
     assert r.readied == [69]
-    assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", "-q"]
+    assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", BUDGET, "-q"]
 
 
 def test_wrong_branch_main_branch_and_dirty_tree_stop_early() -> None:
@@ -487,8 +493,16 @@ def test_tests_needed_only_for_code_tests_scripts_and_deps() -> None:
         assert not ready_pr.tests_needed(docs), docs
 
 
+BUDGET = "tests/test_docs_budget.py"
+
+
 def _ran_pytest(r: FakeRunner) -> bool:
     return any("pytest" in c for c in r.checks_run)
+
+
+def _ran_suite(r: FakeRunner) -> bool:
+    """pytest beyond the always-run docs-budget check."""
+    return any("pytest" in c and c[-1] != BUDGET for c in r.checks_run)
 
 
 def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None:
@@ -496,12 +510,12 @@ def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None
     code = FakeRunner()
     assert ready_pr.ready(code, 69, dry_run=True) == 0
     assert _ran_pytest(code)
-    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", "-q"]
+    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", BUDGET, "-q"]
 
     docs = FakeRunner(touched=docs_only, comments=())
     assert ready_pr.ready(docs, 69, dry_run=True) == 0
-    assert not _ran_pytest(docs)
-    assert [c[-1] for c in docs.checks_run] == [".", ".", "mypy", "check"]
+    assert not _ran_suite(docs)
+    assert [c[-1] for c in docs.checks_run] == [".", ".", "mypy", "check", BUDGET]
 
     forced = FakeRunner(touched=docs_only, comments=())
     assert ready_pr.ready(forced, 69, dry_run=True, run_tests=True) == 0
@@ -509,7 +523,7 @@ def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None
 
     skipped = FakeRunner()
     assert ready_pr.ready(skipped, 69, dry_run=True, run_tests=False) == 0
-    assert not _ran_pytest(skipped)
+    assert not _ran_suite(skipped)
 
 
 def test_pytest_decision_is_printed(capsys: pytest.CaptureFixture[str]) -> None:
@@ -530,6 +544,11 @@ def test_cli_tests_flags_are_exclusive() -> None:
     assert p.parse_args(["5", "--no-tests"]).tests is False
     with pytest.raises(SystemExit):
         p.parse_args(["5", "--tests", "--no-tests"])
+    assert p.parse_args(["5"]).full_tests is False
+    assert p.parse_args(["5", "--full-tests"]).full_tests is True
+    for other in ("--tests", "--no-tests"):
+        with pytest.raises(SystemExit):
+            p.parse_args(["5", "--full-tests", other])
 
 
 def test_cli_tests_needed_reads_paths_from_stdin(
@@ -586,3 +605,107 @@ def test_a_feat_pr_with_a_status_only_fragment_is_not_ready() -> None:
     legacy_only = FakeRunner(touched=["src/tradepartner/x.py", "docs/status.d/69-x.md"])
     with pytest.raises(ready_pr.ReadyError, match="records its change in CHANGELOG"):
         ready_pr.ready(legacy_only, 69, dry_run=True)
+
+
+# ── targeted local tests (#456) ─────────────────────────────────────────────────
+
+SOURCES = {
+    "tests/store/test_asof.py": "from tradepartner.store.asof import as_of\n",
+    "tests/lookahead/test_la.py": "from tradepartner.store import (\n    db,\n    asof,\n)\n",
+    "tests/store/test_journal.py": "from tradepartner.store.journal import fills_for\n",
+    "tests/store/test_other.py": "import tradepartner.store.asof_extra\n",
+    "tests/test_config.py": "from tradepartner.config import Settings\n",
+    "tests/test_ready_pr.py": 'SPEC = ROOT / "scripts" / "ready_pr.py"\n',
+    "tests/test_docs_budget.py": "from tradepartner.config import Settings\n",
+    "tests/execution/test_boundaries.py": "SRC = ROOT / 'src'\n",
+    "tests/execution/test_sdk_boundary.py": "SRC = ROOT / 'src'\n",
+    "tests/test_no_literals.py": "SRC = ROOT / 'src'\n",
+    "tests/test_no_forbidden_imports.py": "SRC = ROOT / 'src'\n",
+}
+SRC_WIDE = (
+    "tests/execution/test_boundaries.py",
+    "tests/execution/test_sdk_boundary.py",
+    "tests/test_no_forbidden_imports.py",
+    "tests/test_no_literals.py",
+)
+
+
+def test_a_changed_module_runs_the_tests_that_import_it_and_the_tree_scans() -> None:
+    got = ready_pr.targeted_tests(["src/tradepartner/store/asof.py"], SOURCES)
+    assert got == tuple(
+        sorted({"tests/store/test_asof.py", "tests/lookahead/test_la.py", *SRC_WIDE})
+    )
+    # a top-level module, and the docs-budget test is never in the targeted list
+    assert ready_pr.targeted_tests(["src/tradepartner/config.py"], SOURCES) == tuple(
+        sorted({"tests/test_config.py", *SRC_WIDE})
+    )
+
+
+def test_changed_tests_and_scripts_run_themselves_or_their_tests() -> None:
+    assert ready_pr.targeted_tests(["tests/store/test_journal.py"], SOURCES) == (
+        "tests/store/test_journal.py",
+    )
+    assert ready_pr.targeted_tests(["scripts/ready_pr.py"], SOURCES) == ("tests/test_ready_pr.py",)
+    # a deleted test file is not run; the rest of the diff still maps
+    assert ready_pr.targeted_tests(
+        ["tests/store/test_gone.py", "tests/store/test_journal.py"],
+        SOURCES,
+        deleted=["tests/store/test_gone.py"],
+    ) == ("tests/store/test_journal.py",)
+
+
+def test_paths_no_test_can_fail_map_to_nothing() -> None:
+    for paths in (["docs/plans/p.md", "changelog.d/69-x.md"], [".github/workflows/ci.yml"]):
+        assert ready_pr.targeted_tests(paths, SOURCES) == (), paths
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/conftest.py",
+        "tests/execution/conftest.py",
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+        "tests/fixtures/alpaca/orders.json",
+        "tests/helpers.py",
+        "src/tradepartner/store/__init__.py",
+        "src/tradepartner/py.typed",
+        "src/tradepartner/backtest/costs.py",  # no test names it: the mapping is unclear
+        "scripts/no_tests_name_me.py",
+    ],
+)
+def test_unclear_mappings_fall_back_to_the_full_suite(path: str) -> None:
+    assert ready_pr.targeted_tests([path, "scripts/ready_pr.py"], SOURCES) is None
+
+
+def test_a_deleted_module_falls_back_to_the_full_suite() -> None:
+    gone = "src/tradepartner/store/asof.py"
+    assert ready_pr.targeted_tests([gone], SOURCES, deleted=[gone]) is None
+
+
+def test_the_flow_runs_only_the_mapped_tests_unless_full_tests(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    targeted = FakeRunner(test_sources=SOURCES)
+    assert ready_pr.ready(targeted, 69, dry_run=True) == 0
+    assert targeted.checks_run[-1] == (
+        *ready_pr.PYTEST_CHECK,
+        *sorted({"tests/store/test_asof.py", "tests/lookahead/test_la.py", *SRC_WIDE}),
+    )
+    assert "targeted" in capsys.readouterr().out
+
+    full = FakeRunner(test_sources=SOURCES)
+    assert ready_pr.ready(full, 69, dry_run=True, full_tests=True) == 0
+    assert full.checks_run[-1] == ready_pr.PYTEST_CHECK
+    assert "--full-tests" in capsys.readouterr().out
+
+    unclear = FakeRunner(test_sources=SOURCES, touched=["uv.lock", "changelog.d/69-x.md"])
+    assert ready_pr.ready(unclear, 69, dry_run=True) == 0
+    assert unclear.checks_run[-1] == ready_pr.PYTEST_CHECK
+
+    ci_only = FakeRunner(touched=[".github/workflows/ci.yml", "changelog.d/69-x.md"])
+    ci_only._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
+    assert ready_pr.ready(ci_only, 69, dry_run=True) == 0
+    assert not _ran_suite(ci_only)
+    assert "no test maps" in capsys.readouterr().out
