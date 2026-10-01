@@ -989,6 +989,7 @@ def test_a_reconciliation_written_during_the_closing_stop_refuses_the_close(
             fixed_clock,
             _connect(journal_settings),
             frozen=FROZEN,
+            as_of=fixed_clock(),
         )
         return listed
 
