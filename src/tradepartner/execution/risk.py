@@ -392,8 +392,10 @@ def check_phase(
             raise ValueError(f"buy of decision {order.decision_id} marked as an exit")
         if order.side == _BUY and order.quantity is not None and not order.whole_share:
             raise ValueError(f"buy of decision {order.decision_id} by quantity is not whole-share")
-        if order.notional is not None and _dec(order.notional) != _dec(order.notional).quantize(
-            _CENT
+        if (
+            order.side == _BUY
+            and order.notional is not None
+            and _dec(order.notional) != _dec(order.notional).quantize(_CENT)
         ):
             raise ValueError(f"buy of decision {order.decision_id} is not in whole cents")
 

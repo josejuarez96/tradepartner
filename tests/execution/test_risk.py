@@ -260,6 +260,7 @@ def test_a_sell_by_notional_is_refused() -> None:
     """Every sell order is by quantity (ADR 0010 amendment 2026-09-30): a
     notional sell is a wrapper fault, refused before any skip or submit."""
     assert _rules(_check([_order("A", "sell", notional=100.0)], _LOOSE)) == {"sell_by_quantity"}
+    assert _rules(_check([_order("A", "sell", notional=10.005)], _LOOSE)) == {"sell_by_quantity"}
     tiny = _order("A", "sell", notional=0.5, full_exit=True)  # would be dust by quantity
     assert _rules(_check([tiny], _LOOSE)) == {"sell_by_quantity"}
 
