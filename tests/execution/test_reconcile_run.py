@@ -678,6 +678,20 @@ def test_frozen_risk_reads_the_dotted_risk_keys() -> None:
             {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
             | {"risk.max_drawdown": 2.0}
         ),
+        # A NaN or negative drawdown limit would make the switch's drawdown
+        # check fail open: frozen_risk builds only through model_validate.
+        json.dumps(
+            {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
+            | {"risk.max_drawdown": float("nan")}
+        ),
+        json.dumps(
+            {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
+            | {"risk.max_drawdown": -0.1}
+        ),
+        json.dumps(
+            {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
+            | {"risk.reconcile_cash_tolerance": float("inf")}
+        ),
     ],
 )
 def test_frozen_risk_refuses_anything_but_the_whole_dotted_section(frozen_json: str) -> None:
