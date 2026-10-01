@@ -40,19 +40,27 @@ Sources run in order, `edgar` then `alpaca`, and **the run stops at the first so
 git fetch origin && git diff HEAD origin/main -- src/tradepartner/store/schema.py | grep CURRENT_SCHEMA_VERSION
 ```
 
-Any output there means the pull migrates the store on its next write. Before that pull, **stop both jobs and copy the store file while neither is running**, so a migration you need to back out of still has a clean pre-migration copy to restore from:
+Any output there means the pull migrates the store on its next write; if you have already pulled a version bump and are not sure whether a write has run against the store since, take the copy anyway — it costs nothing to have an extra one. Before that pull, **stop both jobs, confirm neither is mid-run, and only then copy the store file**, so a migration you need to back out of still has a clean pre-migration copy to restore from:
 
 ```bash
 cd ~/Projects/tradepartner
 launchctl disable gui/$(id -u)/com.tradepartner.ingest
 launchctl disable gui/$(id -u)/com.tradepartner.paper   # once installed
-# confirm neither is mid-run: launchctl print gui/$(id -u)/com.tradepartner.ingest | grep state
+launchctl print gui/$(id -u)/com.tradepartner.ingest | grep state   # confirm not "running"
+launchctl print gui/$(id -u)/com.tradepartner.paper | grep state    # once installed; same check
+
 STORE_PATH=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().store.path)")
 cp "$STORE_PATH" "$STORE_PATH.bak-$(date +%Y%m%d)"
 [ -f "$STORE_PATH.wal" ] && cp "$STORE_PATH.wal" "$STORE_PATH.wal.bak-$(date +%Y%m%d)"
+
+git pull
+launchctl enable gui/$(id -u)/com.tradepartner.ingest
+launchctl enable gui/$(id -u)/com.tradepartner.paper   # once installed
 ```
 
-This reads the path the running settings actually use (respecting `STORE__PATH` in `.env` if you've set it, per "PATH, working directory and `.env`" below) rather than assuming the default `data/tradepartner.duckdb`, and copies no secret — only the store file and its write-ahead log, if DuckDB has left one. Keep the dated copies until you've confirmed the next scheduled `ingest` and `paper run` both completed `ok` on the new version, then re-enable both jobs (`launchctl enable ...`). Restoring from a copy means checking out the matching pre-migration commit too, not just the file — code past the bump expects the new schema — and, if any window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you sort out what the broker did in between.
+`disable`/`enable` persist the on/off state across reboots and are reversed in the same call shape used in "Install, test, remove" and "To pause the job" above; re-enabling immediately after the pull is what lets the next scheduled run actually happen and migrate the store — disabled jobs never run, so there is nothing to wait on before re-enabling. This reads the store path the running settings actually use (respecting `STORE__PATH` in `.env` if you've set it, per "PATH, working directory and `.env`" below) rather than assuming the default `data/tradepartner.duckdb`, and copies no secret — only the store file and its write-ahead log, if DuckDB has left one. Keep the dated copies until you've confirmed the next scheduled `ingest` and `paper run` both completed `ok` on the new version, then delete them.
+
+**To restore from a copy:** `git checkout` the commit the copy predates (code past the bump expects the new, migrated schema, so restoring the file alone is not enough), delete any live `<path>.wal` so DuckDB doesn't replay it onto the restored file, then copy the dated backup (and its `.wal.bak-DATE` counterpart, if one exists) back over the live path. If any window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap — the run halts and the switch engages rather than silently losing track of an order.
 
 ## PATH, working directory and `.env`
 
