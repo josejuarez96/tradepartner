@@ -821,3 +821,16 @@ def test_the_target_refuses_a_negative_cost_rate() -> None:
     bad = BuyCosts(per_side_bps=-20_000.0, commissions=COSTS.commissions)
     with pytest.raises(ValueError, match="per_side_bps"):
         target_notional(buy, 100.0, [], [buy], price_of, bad)
+
+
+def test_a_floored_trim_of_a_name_that_lost_fractionable_stays_open_on_its_remainder() -> None:
+    """#395: a $475 trim (9.5 shares at $50) journaled `whole_share = false`
+    sells 9 whole shares once the name lost `fractionable`; the 0.5-share
+    remainder ($25) is above `risk.min_order_notional`, so the trim stays open
+    (the next attempt floors it to zero and skips it `skip_below_one_share`)."""
+    d = _decision(planned_notional=475.0)
+    o = _order(d, S1, quantity=9.0)
+    state = _state(d, [o], [_event(o, "filled")], [_fill(o, 9, 50.0)])
+    assert state.state == State.OPEN
+    assert state.remainder is not None
+    assert state.remainder.quantity == pytest.approx(0.5)
