@@ -256,15 +256,20 @@ def order_calls(module: Module) -> list[str]:
             literals = [
                 a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)
             ]
-            # `object.__getattribute__(obj, "x")` passes the object too: one literal is enough
-            if not literals or (called != "__getattribute__" and len(literals) < len(args)):
-                if called != "getattr" or (
+            # a literal order name is flagged first, whatever else the call passes
+            if any(ORDER_CALLS & set(name.split(".")) for name in literals):
+                found.append(f"line {node.lineno}: {called} {literals!r}")
+            else:
+                # `object.__getattribute__(obj, "x")` passes the object too: one literal will do
+                non_literal = not literals or (
+                    called != "__getattribute__" and len(literals) < len(args)
+                )
+                refused = called != "getattr" or (
                     id(node) in called_on_the_spot
                     and module.name not in NON_LITERAL_GETATTR_CALLERS
-                ):
+                )
+                if non_literal and refused:
                     found.append(f"line {node.lineno}: {called} with a non-literal name")
-            elif any(ORDER_CALLS & set(name.split(".")) for name in literals):
-                found.append(f"line {node.lineno}: {called} {literals!r}")
     return found
 
 
@@ -464,6 +469,7 @@ def test_broker_class_checker(source: str, name: str, is_package: bool, expected
         ("getattr(func, 'id', None)", False),
         ("value = getattr(record, field_name)", False),
         ("getattr(*target)(request)", True),
+        ('m = getattr(*(broker,), "submit")', True),
         ("operator.attrgetter('price')(row)", False),
         ("row.__getattribute__('price')", False),
     ],
