@@ -80,10 +80,14 @@ when every one of its orders is `rejected`, even below the cap. The caller
 raises `RejectionCapError` with the verdict's message. `collect` judges each
 submitting run with a `rejected` event written by this collection or since
 the latest **run** collection's cursor row. A rejection journaled by a resume
-or a halt read is therefore judged again by the next run, while a run's own
-rejections are not judged again by every later read of its other orders. A
-resume or halt-path caller that gets a verdict must not drop it: resume
-refuses to release, and the halt path names it in its alert.
+is therefore judged again by the next run, while a run's own rejections are
+not judged again by every later read of its other orders. The halt path's
+read collects as its run, so the rejections it journals are **not** judged
+again by the next run: the halt alert names its verdict, and `paper resume`
+judges every run its release would clear directly with `rejection_breaches`
+before it can release (#397, owner answer (a)). A resume or halt-path caller
+that gets a verdict must not drop it: resume refuses to release, and the halt
+path names it in its alert.
 """
 
 from __future__ import annotations
