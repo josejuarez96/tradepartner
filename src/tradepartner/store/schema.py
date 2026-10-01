@@ -890,7 +890,7 @@ CREATE TABLE IF NOT EXISTS signals (
 
 # rebalance_session is NULL for a decision outside a rebalance (a forced
 # exit); side is NULL on a decision that trades nothing (a skip, dust).
-# `reason` is an open set in the spec ("…"), so it has no CHECK.
+# `reason` is a closed set since version 7 (#377).
 # whole_share is the fractionable flag at decision time, read from this row
 # and never from the live asset.
 _CREATE_DECISIONS = f"""
