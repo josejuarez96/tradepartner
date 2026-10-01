@@ -1,1 +1,0 @@
-- #263 T11h: EDGAR per-filing failure policy (skip, record, quarantine after 3 identical days), check_failures() thresholds before the lock, after_commit hook; company-facts 404s counted, not failures

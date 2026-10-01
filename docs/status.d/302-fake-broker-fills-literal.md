@@ -1,1 +1,0 @@
-- #302 Main green again: `FakeBroker` logs its `fills` call by the method name instead of a quoted `"fills"` literal, which T50's `fills_sql` boundary check counted as a journal-table reference

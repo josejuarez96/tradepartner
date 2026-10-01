@@ -142,12 +142,15 @@ def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> N
     assert not ready_pr.is_fold(["docs/STATUS.md"], [])
 
 
-def test_missing_fragments_by_branch_type() -> None:
-    assert ready_pr.missing_fragments("feat/69-x", ["src/a.py"]) == [
-        "docs/status.d/69-<slug>.md",
-        "changelog.d/69-<slug>.md",
-    ]
+def test_missing_fragments_needs_one_file_for_the_issue() -> None:
+    assert ready_pr.missing_fragments("feat/69-x", ["src/a.py"]) == ["changelog.d/69-<slug>.md"]
+    assert ready_pr.missing_fragments("feat/69-x", ["changelog.d/69-x.md"]) == []
+    assert ready_pr.missing_fragments("docs/55-x", ["changelog.d/55-x.md"]) == []
+    # The pre-#351 layout still counts during the transition.
     assert ready_pr.missing_fragments("docs/55-x", ["docs/status.d/55-x.md"]) == []
+    assert ready_pr.missing_fragments("feat/69-x", ["changelog.d/70-x.md"]) == [
+        "changelog.d/69-<slug>.md"
+    ]
     assert ready_pr.missing_fragments("spike/x", []) == []
 
 
@@ -239,6 +242,8 @@ class FakeRunner:
         return True
 
     def read(self, path: str) -> str:
+        if path not in self.files and path.startswith("changelog.d/"):
+            return "- #69 done (PR #70)\n### Added\n- x (#69)\n"
         return self.files[path]
 
     def write(self, path: str, text: str) -> None:
@@ -326,12 +331,12 @@ def test_real_conflict_aborts_the_merge() -> None:
 
 
 def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
-    main = "## Done\n- a\n\n## Blocked\n- none\n"
-    frags = ["docs/status.d/69-x.md", "changelog.d/69-x.md"]
+    main = "## Recently done\n- a\n\n## Blocked\n- none\n"
+    frags = ["changelog.d/69-x.md"]
     added = FakeRunner(
         touched=["docs/STATUS.md", *frags],
         main_files={"docs/STATUS.md": main},
-        conflicted={"docs/STATUS.md": "## Done\n- a\n- mine\n\n## Blocked\n- none\n"},
+        conflicted={"docs/STATUS.md": "## Recently done\n- a\n- mine\n\n## Blocked\n- none\n"},
     )
     with pytest.raises(ready_pr.ReadyError, match="adds lines to the shared lists"):
         ready_pr.ready(added, 69, dry_run=True)
@@ -340,15 +345,15 @@ def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
     blocked_only = FakeRunner(
         touched=["docs/STATUS.md", *frags],
         main_files={"docs/STATUS.md": main},
-        conflicted={"docs/STATUS.md": "## Done\n- a\n\n## Blocked\n- waiting on T3\n"},
+        conflicted={"docs/STATUS.md": "## Recently done\n- a\n\n## Blocked\n- waiting on T3\n"},
     )
     assert ready_pr.ready(blocked_only, 69, dry_run=True) == 0
 
     fold = FakeRunner(
-        touched=["docs/STATUS.md", "docs/status.d/1-a.md", *frags],
-        deleted=["docs/status.d/1-a.md"],
+        touched=["docs/STATUS.md", "changelog.d/1-a.md", *frags],
+        deleted=["changelog.d/1-a.md"],
         main_files={"docs/STATUS.md": main},
-        conflicted={"docs/STATUS.md": "## Done\n- a\n- folded\n\n## Blocked\n- none\n"},
+        conflicted={"docs/STATUS.md": "## Recently done\n- a\n- folded\n\n## Blocked\n- none\n"},
     )
     assert ready_pr.ready(fold, 69, dry_run=True) == 0
 
@@ -358,7 +363,7 @@ def test_added_done_bullets_need_fragments_unless_fold_or_flag() -> None:
 
 def test_missing_fragment_stops_the_run() -> None:
     r = FakeRunner(touched=["src/tradepartner/store/asof.py"])
-    with pytest.raises(ready_pr.ReadyError, match=r"docs/status\.d/69-<slug>\.md"):
+    with pytest.raises(ready_pr.ReadyError, match=r"changelog\.d/69-<slug>\.md"):
         ready_pr.ready(r, 69, dry_run=True)
 
 
@@ -489,3 +494,25 @@ def test_touched_paths_list_both_sides_of_a_rename() -> None:
     for call in touched:
         assert "--no-renames" in call, call
         assert call[1:3] == ("-c", "core.quotePath=false"), call
+
+
+def test_lacks_changelog_bullets_only_matters_on_feat_and_fix() -> None:
+    status_only = "- #69 done (PR #70)\n"
+    full = "- #69 done\n### Fixed\n- f (#69)\n"
+    assert ready_pr.lacks_changelog_bullets("feat/69-x", [status_only])
+    assert ready_pr.lacks_changelog_bullets("fix/69-x", [])
+    assert ready_pr.lacks_changelog_bullets("fix/69-x", ["### Added\n"])
+    assert not ready_pr.lacks_changelog_bullets("fix/69-x", [full])
+    assert not ready_pr.lacks_changelog_bullets("docs/69-x", [status_only])
+
+
+def test_a_feat_pr_with_a_status_only_fragment_is_not_ready() -> None:
+    r = FakeRunner(
+        touched=["src/tradepartner/x.py", "changelog.d/69-x.md"],
+        conflicted={"changelog.d/69-x.md": "- #69 done (PR #70)\n"},
+    )
+    with pytest.raises(ready_pr.ReadyError, match="records its change in CHANGELOG"):
+        ready_pr.ready(r, 69, dry_run=True)
+    legacy_only = FakeRunner(touched=["src/tradepartner/x.py", "docs/status.d/69-x.md"])
+    with pytest.raises(ready_pr.ReadyError, match="records its change in CHANGELOG"):
+        ready_pr.ready(legacy_only, 69, dry_run=True)

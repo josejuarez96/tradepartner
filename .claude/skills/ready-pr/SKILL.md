@@ -9,10 +9,10 @@ Run this when the work on your claimed issue is complete and the draft PR descri
 
 ## Before you run it
 
-1. Bookkeeping goes in **fragments, not the shared files**. If you have not done so:
+1. Bookkeeping goes in **one fragment file, not the shared files**. If you have not done so:
    ```bash
    uv run python scripts/fragments.py add <issue> --slug <short-slug> \
-     --status "<one Done line, with the PR number>" \
+     --status "<one Recently done line, at most 240 characters, with the PR number>" \
      --added "<one CHANGELOG bullet>"      # or --changed / --fixed
    ```
    Do not edit `docs/STATUS.md` or `CHANGELOG.md` yourself. Tick only your plan checkbox.
