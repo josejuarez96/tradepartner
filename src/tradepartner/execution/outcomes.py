@@ -30,10 +30,12 @@ run on a session after its horizon's last session:
   added.
 - **Prices.** The horizon's mark is the flattening fill's price, else the
   `positions_daily` mark of the name on that session, else `prices(security_id,
-  session)` (the raw close). A missing price leaves the value and mark None.
-  Equity is the `positions_daily` rows of one session: the cash of its row
-  without a `security_id` plus every name's value; a missing cash row or value
-  leaves the contribution None.
+  session)` (the raw close). A missing price leaves the value and mark None; a
+  NaN, infinite, zero or negative one (mark, close or start) raises
+  `ValueError` before anything is appended. Equity is the `positions_daily`
+  rows of one session: the cash of its row without a `security_id` plus every
+  name's value; a missing cash row or value leaves the contribution None, and a
+  non-finite or non-positive total raises `ValueError`.
 
 `due_outcomes` is pure. `write_outcomes_and_lots` is its I/O edge: it reads the
 window's rows through `store.journal`, rebuilds the lot ledger over the
@@ -246,16 +248,27 @@ def _equity_before(marks: Sequence[PositionDailyRow], session: date) -> float | 
     values = [m.value for m in rows if m.security_id is not None]
     if len(cash) != 1 or cash[0] is None or any(v is None for v in values):
         return None
-    return cash[0] + sum(v for v in values if v is not None)
+    equity = cash[0] + sum(v for v in values if v is not None)
+    if not (math.isfinite(equity) and equity > 0):
+        raise ValueError(f"equity on {max(earlier)} must be finite and positive: {equity!r}")
+    return equity
 
 
 def _mark(
     marks: Sequence[PositionDailyRow], prices: PriceOf, security_id: str, session: date
 ) -> float | None:
     for row in marks:
-        if row.session == session and row.security_id == security_id and row.mark_price:
-            return row.mark_price
-    return prices(security_id, session)
+        if row.session == session and row.security_id == security_id and row.mark_price is not None:
+            return _price(row.mark_price, f"mark of {security_id} on {session}")
+    return _price(prices(security_id, session), f"mark (close) of {security_id} on {session}")
+
+
+def _price(value: float | None, what: str) -> float | None:
+    """`value` when it is None or a finite positive price, else `ValueError`:
+    a bad price is refused before any outcome is built from it."""
+    if value is not None and not (math.isfinite(value) and value > 0):
+        raise ValueError(f"{what} must be a finite positive price: {value!r}")
+    return value
 
 
 def _terminal_status(events: Iterable[OrderEventRow]) -> dict[str, str]:
@@ -315,7 +328,11 @@ def due_outcomes(
         equity = _equity_before(marks, order.session)
         own = by_order.get(order.client_order_id, [])
         quantity = sum(item.fill.quantity for item in own)
-        mark = fill_mark if fill_mark is not None else _mark(marks, prices, security, through)
+        mark = (
+            _price(fill_mark, f"mark (flattening fill) of {security}")
+            if fill_mark is not None
+            else _mark(marks, prices, security, through)
+        )
         candidates: list[Outcome] = []
         if quantity > 0 and order.side == _BUY:
             cost = sum(i.fill.quantity * i.fill.price for i in own)
@@ -346,10 +363,10 @@ def due_outcomes(
             )
         if status != _FILLED:
             before = previous_session(order.session)
-            start = prices(security, before)
-            if start:
+            start = _price(prices(security, before), f"start price of {security} on {before}")
+            if start is not None:
                 start /= _split_factor(actions, security, before, through)
-            value = None if mark is None or not start else mark / start - 1
+            value = None if mark is None or start is None else mark / start - 1
             candidates.append(
                 Outcome(order.client_order_id, through, NOT_EXECUTED, value, None, mark)
             )
@@ -358,7 +375,7 @@ def due_outcomes(
 
 
 def _share(amount: float | None, equity: float | None) -> float | None:
-    if amount is None or equity is None or equity <= 0:
+    if amount is None or equity is None:
         return None
     return amount / equity
 
