@@ -1809,13 +1809,11 @@ def _fsn_rows(
     one, but a test fixture may be) has no columns to select and yields no
     rows rather than a DuckDB binder error.
 
-    FSN members are not always valid UTF-8 (a 2015 `txt.tsv` note carries a
-    Windows-1252 apostrophe), and DuckDB fails the whole read on one bad
-    byte, so the member is first rewritten in place with each invalid byte
-    replaced by U+FFFD; valid UTF-8 is unchanged (#455)."""
+    DuckDB fails the whole read on one malformed line, so the member is
+    first rewritten in place by `_fsn_normalize_member` (#455, #498)."""
     if path.stat().st_size == 0:
         return []
-    _fsn_replace_invalid_utf8(path)
+    _fsn_normalize_member(path)
     column_list = ", ".join(columns)
     sql = (
         f"SELECT {column_list} FROM read_csv(?, delim='\t', header=true, "
@@ -1832,16 +1830,31 @@ def _fsn_rows(
         connection.close()
 
 
-def _fsn_replace_invalid_utf8(path: Path) -> None:
-    """Rewrite `path` with every invalid UTF-8 byte replaced by U+FFFD,
-    streamed (an FSN member reaches hundreds of MB); line endings and valid
-    UTF-8 are kept byte for byte."""
-    cleaned = path.with_name(path.name + ".utf8")
+def _fsn_normalize_member(path: Path) -> None:
+    """Rewrite `path`, streamed (an FSN member reaches hundreds of MB), so
+    DuckDB can read every line; anything else is kept byte for byte.
+
+    - An invalid UTF-8 byte becomes U+FFFD (FSN members are not always valid
+      UTF-8; #455).
+    - A line with more fields than the header keeps its surplus in the last
+      column, each surplus tab replaced by U+FFFD: a 2015 `txt.tsv` note
+      carries unquoted tabs in `value`, its last column (#498). The U+FFFD
+      makes `parse_fsn` fail an accession whose kept listing value had one.
+    """
+    cleaned = path.with_name(path.name + ".normalized")
     with (
         path.open(encoding="utf-8", errors="replace", newline="") as source,
         cleaned.open("w", encoding="utf-8", newline="") as target,
     ):
-        shutil.copyfileobj(source, target)
+        header = source.readline()
+        target.write(header)
+        tabs = header.count("\t")
+        for line in source:
+            if line.count("\t") > tabs:
+                body = line.rstrip("\r\n")
+                *fields, last = body.split("\t", tabs)
+                line = "\t".join([*fields, last.replace("\t", "\ufffd")]) + line[len(body) :]
+            target.write(line)
     cleaned.replace(path)
 
 

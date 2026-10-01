@@ -820,3 +820,49 @@ def test_fsn_rows_keeps_valid_utf8_unchanged(tmp_path: Path) -> None:
     )
     rows = _fsn_rows(path, ("adsh", "value"), where="tag = 'Security12bTitle'")
     assert rows == [{"adsh": "0000000002-15-000001", "value": value}]
+
+
+# --- #498: FSN txt.tsv values can carry unquoted tabs -------------------------
+
+
+def test_fsn_rows_folds_a_values_embedded_tabs_into_the_last_column(tmp_path: Path) -> None:
+    # As SandRidge's 2015q1 note: 29 tabs on a 20-column line, all in `value`.
+    path = _write_txt_tsv(
+        tmp_path / "txt.tsv",
+        b"0001349436-15-000028\tAmendmentDescription\t0x00\t0\t\tNOTE\t\t\tSandRidge\tInc.\n",
+        b"0001349436-15-000029\tTradingSymbol\t0x00\t0\t\tSD\n",
+    )
+    rows = _fsn_rows(
+        path,
+        ("adsh", "tag", "value"),
+        where="tag IN ('AmendmentDescription', 'TradingSymbol')",
+    )
+    assert [row["value"] for row in rows] == [
+        "NOTE���SandRidge�Inc.",
+        "SD",
+    ]
+
+
+def test_a_listing_value_with_an_embedded_tab_fails_that_accession(tmp_path: Path) -> None:
+    good, bad = "0000000014-15-000001", "0000000015-15-000001"
+    path = _write_txt_tsv(
+        tmp_path / "txt.tsv",
+        *(
+            f"{adsh}\t{tag}\t0x00\t0\t\t{value}\n".encode()
+            for adsh in (good, bad)
+            for tag, value in (
+                ("Security12bTitle", "Common Stock"),
+                ("TradingSymbol", "AB\tC" if adsh == bad else "ABC"),
+                ("SecurityExchangeName", "NYSE"),
+            )
+        ),
+    )
+    txt = _fsn_rows(
+        path,
+        ("adsh", "tag", "dimh", "dimn", "coreg", "value"),
+        where="tag IN ('Security12bTitle', 'TradingSymbol', 'SecurityExchangeName')",
+    )
+    sub = [_sub(good, "14", "10-K"), _sub(bad, "15", "10-K")]
+    parsed = parse_fsn(sub, [], txt, [])
+    assert [r.accession for r in parsed.records] == [good]
+    assert [f.accession for f in parsed.failures] == [bad]
