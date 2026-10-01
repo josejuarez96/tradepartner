@@ -119,6 +119,12 @@ class SwitchState:
     causes: tuple[str, ...]
 
 
+class ReleaseRefused(ValueError):
+    """`release` refused: one of its checks failed and nothing was written, so
+    the switch stays engaged. A `ValueError`, so callers that catch that keep
+    working; `paper resume` catches this type alone and reports a refusal."""
+
+
 @dataclass(frozen=True)
 class WriteFailed:
     """A writer could not reach the store; `error` names the exception."""
@@ -269,60 +275,62 @@ def release(
     peak_equity: float,
 ) -> int:
     """Append the `released` row (source `owner`) and return its `event_id`.
-    Raises `ValueError`, writing nothing, when any check in the module docstring
-    fails. Store errors propagate: the owner's `paper resume` reports them."""
+    Raises `ReleaseRefused` (a `ValueError`), writing nothing, when any check in
+    the module docstring fails. Store errors propagate: the owner's `paper resume` reports them."""
     if not (math.isfinite(peak_equity) and peak_equity > 0):
-        raise ValueError(f"peak_equity must be positive and finite, got {peak_equity!r}")
+        raise ReleaseRefused(f"peak_equity must be positive and finite, got {peak_equity!r}")
     now = clock()
     with open_for_write(settings) as conn:
         window = open_window(conn)
         if window is None or window.window_id != window_id:
-            raise ValueError(f"window {window_id} is not the open window")
+            raise ReleaseRefused(f"window {window_id} is not the open window")
         reconciliations = reconciliations_for(conn, window_id)
         reconciliation = next(
             (r for r in reconciliations if r.reconciliation_id == reconciliation_id),
             None,
         )
         if reconciliation is None:
-            raise ValueError(f"reconciliation {reconciliation_id} is not in window {window_id}")
+            raise ReleaseRefused(f"reconciliation {reconciliation_id} is not in window {window_id}")
         if reconciliation.status != _RECONCILIATION_OK:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"reconciliation {reconciliation_id} is {reconciliation.status!r}, not ok"
             )
         latest = max(r.reconciliation_id or 0 for r in reconciliations)
         if reconciliation_id != latest:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"reconciliation {reconciliation_id} is not the window's latest ({latest})"
             )
         resumes = resume_invocations(conn)
         resume = next((r for r in resumes if r.resume_id == resume_id), None)
         if resume is None:
-            raise ValueError(f"no resume_invocations row {resume_id}")
+            raise ReleaseRefused(f"no resume_invocations row {resume_id}")
         if resume_id != max(r.resume_id or 0 for r in resumes):
-            raise ValueError(f"resume {resume_id} is not the latest resume")
+            raise ReleaseRefused(f"resume {resume_id} is not the latest resume")
         # Resumes carry no window, so a release in any window consumes one.
         cited = conn.execute(
             "SELECT window_id FROM kill_switch WHERE state = ? AND resume_id = ? LIMIT 1",
             [RELEASED, resume_id],
         ).fetchone()
         if cited is not None:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"resume {resume_id} has already released the switch (window {cited[0]})"
             )
         rows = kill_switch_events_for(conn, window_id)
         if reconciliation.at < resume.at:
-            raise ValueError(f"reconciliation {reconciliation_id} is older than resume {resume_id}")
+            raise ReleaseRefused(
+                f"reconciliation {reconciliation_id} is older than resume {resume_id}"
+            )
         runs = runs_for(conn, window_id)
         unfinished = [str(r.run.run_id) for r in runs if r.result is None]
         if unfinished:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"run(s) {', '.join(unfinished)} unfinished: close them as crashed first"
             )
         run_rows = [r.run for r in runs]
         results = [r.result for r in runs if r.result is not None]
         state = derive(window, rows, run_rows, results, reading_run=None, lock_free=True)
         if not state.engaged:
-            raise ValueError(f"the kill switch of window {window_id} is not engaged")
+            raise ReleaseRefused(f"the kill switch of window {window_id} is not engaged")
         row = KillSwitchRow(
             window_id=window_id,
             at=now,
@@ -344,7 +352,7 @@ def release(
             lock_free=True,
         )
         if after.engaged:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"a release at {now.isoformat()} would not clear the switch: "
                 f"{'; '.join(after.causes)}"
             )
