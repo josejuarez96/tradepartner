@@ -76,11 +76,12 @@ off a ledger that is missing a fill.
 **Step 7, forced exits** (T63e, `exits.reattempt_exits` and
 `exits.forced_exits`), read once inside the window and before this run
 journals any exit: the window's decisions with their states, the ledger
-stated for S, the own non-terminal sells, the adjustments, the listings ended
-at close(S-1) and this run's `assets` read, every store fact as of
-close(S-1). The new exits are journaled in one chunk; an untradable one with
-its `skipped` row (event reason `untradable`), which closes it, so it is not
-ordered and the next session re-evaluates it. The open exits (re-attempted
+stated for S, the own non-terminal sells, the adjustments, the listings
+`delisted` at close(S-1) (a transfer is not an end, as the wrapper reads it)
+and this run's `assets` read, every store fact as of close(S-1). The new
+exits are journaled in one chunk; an untradable one with its `skipped` row
+(event reason `untradable`), which closes it, so it is not ordered and the
+next session re-evaluates it. The open exits (re-attempted
 for their remainder) and the new tradable ones go to the wrapper's `execute`
 (T60b) with the plan's decisions on a rebalance or catch-up run, so they join
 its sells phase; on any other run they are a batch of their own, made only
@@ -184,7 +185,7 @@ from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
 from tradepartner.store.db import open_read_only, utc_now
-from tradepartner.store.delistings import LISTED, listing_ends_as_of
+from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
     DecisionRow,
@@ -439,7 +440,7 @@ def _forced_exits(context: StepContext, *, pending_rebalance: date | None) -> li
     }
     new = exits.forced_exits(
         ledger.positions,
-        {sid: row["end_session"] for sid, row in ends.items() if row["status"] != LISTED},
+        {sid: row["end_session"] for sid, row in ends.items() if row["status"] == DELISTED},
         assets,
         decisions,
         states,
