@@ -100,7 +100,17 @@ from tradepartner.store.journal import (
     RebalanceEventRow,
     SignalRow,
 )
-from tradepartner.store.schema import HALT_REASON, NOT_RECEIVED_REASON
+from tradepartner.store.schema import (
+    DELISTED_REASON,
+    EXCLUDE_NAME_REASON,
+    HALT_REASON,
+    KEEP_NAME_REASON,
+    LEFT_TARGETS_REASON,
+    LEFT_UNIVERSE_REASON,
+    NOT_RECEIVED_REASON,
+    UNTARGETED_RECEIPT_REASON,
+    WINDOW_STOP_REASON,
+)
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SPLIT = "split"
@@ -108,7 +118,7 @@ _BUY = "buy"
 _SELL = "sell"
 _OVERRIDE = "override"
 _FORCED_EXIT = "forced_exit"
-_KEEP_NAME = "keep_name"
+_KEEP_NAME = KEEP_NAME_REASON
 _WRITTEN_OFF = "written_off"
 _CLOSING_EVENTS = frozenset({"skipped", _WRITTEN_OFF})
 _SKIP_PREFIX = "skip_"
@@ -123,15 +133,15 @@ _CANCELLED = "cancelled"
 _SKIPPED = "skipped"
 _CARRIED_RESIDUE = "carried_residue"
 _UNTRADABLE = "untradable"
-_WINDOW_STOP = "window_stop"
+_WINDOW_STOP = WINDOW_STOP_REASON
 #: Forced-exit reasons whose `untradable` skip leaves an untradable residue.
-_UNTRADABLE_EXIT_REASONS = frozenset({_WINDOW_STOP, "delisted", "untargeted_receipt"})
+_UNTRADABLE_EXIT_REASONS = frozenset({_WINDOW_STOP, DELISTED_REASON, UNTARGETED_RECEIPT_REASON})
 #: A carried residue's origin (spec req 14: `paper start` copies it from the stop row).
 _RESIDUE_ORIGINS = frozenset({_DUST, _UNTRADABLE})
 #: Full-exit reasons `decisions_from` writes (spec req 3; Definitions > Full exit).
-_LEFT_TARGETS = "left_targets"
-_LEFT_UNIVERSE = "left_universe"
-_EXCLUDE_NAME = "exclude_name"
+_LEFT_TARGETS = LEFT_TARGETS_REASON
+_LEFT_UNIVERSE = LEFT_UNIVERSE_REASON
+_EXCLUDE_NAME = EXCLUDE_NAME_REASON
 _NAME_OVERRIDES = frozenset({_EXCLUDE_NAME, _KEEP_NAME})
 _SKIP_DELISTED = "skip_delisted"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
