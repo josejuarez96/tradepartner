@@ -13,12 +13,15 @@ owns the writes and the alerts this task's outputs feed.
 - `lapses` finds the rebalance sessions a window's catch-up window has run
   out on as of `session`: `catch_up_lapsed` when the frozen
   `paper.max_catch_up_sessions` elapsed with the switch clear throughout,
-  `kill_switch` when the switch was engaged on any session of the catch-up
-  period -- the rebalance session itself through the boundary session,
+  `kill_switch` when the switch was engaged at any point overlapping the
+  catch-up period -- the fill session F_i through the boundary session,
   inclusive -- not only on the session checked (#366 Q19(b): a switch
-  released one session before the lapse still names the cause; spec req 5:
-  "traded after the release if the catch-up window still allows, else
-  becomes missed with reason kill_switch").
+  released one session before the lapse, or within the same session, still
+  names the cause; spec req 5: "traded after the release if the catch-up
+  window still allows, else becomes missed with reason kill_switch"). A
+  run that crashed or was halted in that span with no `kill_switch` row
+  (a halt-path write failure, or a hard crash) counts too, the same rule
+  `execution.switch.derive` uses for a run with no result row.
 - `missed_run` is one lookup: whether S-1 has no `paper_runs` row at all, the
   trigger for a `missed_run` alert (req 7).
 
@@ -36,10 +39,11 @@ import duckdb
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.execution.ledger import Ledger
-from tradepartner.execution.switch import ENGAGED
+from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.journal import (
     KillSwitchRow,
+    PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
     RebalanceEventRow,
@@ -251,20 +255,54 @@ def _event_order(row: KillSwitchRow) -> int:
 def _engaged_during(
     kill_switch_rows: Sequence[KillSwitchRow], window_id: int, sessions: Sequence[date]
 ) -> bool:
-    """True when the window's kill-switch state (the latest `engaged` or
-    `released` row by write order, `event_id`, with `at <= close(session)`)
-    was `engaged` as of the close of any session in `sessions` (ascending).
-    A state from before `sessions[0]` carries forward, so an engagement that
-    started earlier and was never released still counts."""
+    """True when the window's kill-switch state, replayed in write order
+    (`event_id`, matching `execution.switch.derive`'s own "latest is write
+    order" rule), was `engaged` at any point overlapping the period spanned
+    by `sessions` (ascending): from the close of the session before
+    `sessions[0]` (exclusive) through the close of `sessions[-1]`
+    (inclusive). Sampling only at each session's own close would miss an
+    engagement opened and released within one session of the period (the
+    run that trades starts before the open, so a same-day release before a
+    boundary session's close can still have blocked that session's run);
+    checking overlap instead of a per-close snapshot catches it. A state
+    already engaged at the period's start carries forward and counts, even
+    with no `engaged` row inside the period itself."""
     rows = sorted((r for r in kill_switch_rows if r.window_id == window_id), key=_event_order)
-    index = 0
-    engaged = False
-    for session in sessions:
-        boundary = session_close(session)
-        while index < len(rows) and rows[index].at <= boundary:
-            engaged = rows[index].state == ENGAGED
-            index += 1
-        if engaged:
+    period_start = session_close(previous_session(sessions[0]))
+    period_end = session_close(sessions[-1])
+    engaged_before = False
+    for row in rows:
+        if row.at <= period_start:
+            engaged_before = row.state == ENGAGED
+        elif row.at <= period_end and row.state == ENGAGED:
+            return True
+    return engaged_before
+
+
+def _faulted_run_in_period(
+    runs: Sequence[PaperRunRow],
+    results: Sequence[PaperRunResultRow],
+    window_id: int,
+    sessions: Sequence[date],
+) -> bool:
+    """True when a run of `window_id` started on a session in `sessions`
+    (ascending) ended without a result row (still unfinished -- a crash) or
+    with a result in `execution.switch.FAULTED_RUN_STATUSES` (`halted`,
+    `crashed`, `failed`). `execution.switch.derive` engages the switch for
+    exactly such a run, whether or not it ever wrote a `kill_switch` row (a
+    write failure on the halt path, or a hard crash before it got that far,
+    spec req 5's "no `released` row after that run's `started_at`" clause);
+    `_engaged_during` alone would miss the engagement in that case, so this
+    is checked in addition to it, not instead."""
+    finished = {r.run_id: r for r in results}
+    period = frozenset(sessions)
+    for run in runs:
+        if run.window_id != window_id or run.session not in period:
+            continue
+        if run.run_id is None:
+            raise ValueError("a paper run has no run_id")
+        result = finished.get(run.run_id)
+        if result is None or result.status in FAULTED_RUN_STATUSES:
             return True
     return False
 
@@ -274,6 +312,7 @@ def lapses(
     runs: Sequence[PaperRunRow],
     rebalance_events: Sequence[RebalanceEventRow],
     kill_switch_rows: Sequence[KillSwitchRow],
+    results: Sequence[PaperRunResultRow],
     session: date,
     frozen: Mapping[str, object],
 ) -> list[Missed]:
@@ -286,15 +325,18 @@ def lapses(
     the frozen `paper.max_catch_up_sessions` sessions): `session <= boundary`
     is still within the catch-up window and is never reported here ("each
     lapse computed at its boundary session and not one earlier"). The reason
-    is `kill_switch` when the window's kill-switch state was engaged as of
-    the close of any session from T_i's fill session `F_i` through the
-    boundary, inclusive (`#366 Q19(b)`: naming the cause even when the switch
-    was released again before `session`), else `catch_up_lapsed`. `runs`
-    places `rebalance_events` rows in the window (`run_id` ->
-    `paper_runs.window_id`, as `plan.rebalance_state` does); a row of a run
-    not among `runs` raises, so an incomplete run list can never hide an
-    already-resolved rebalance. A T_i already journaled `executed` or
-    `missed` is not reported again.
+    is `kill_switch` when the switch was engaged at any point overlapping
+    T_i's fill session `F_i` through the boundary, inclusive (`#366 Q19(b)`:
+    naming the cause even when the switch was released again before
+    `session`) -- either a `kill_switch` row says so (`_engaged_during`) or a
+    run of the window started in that span ended unfinished or faulted
+    (`_faulted_run_in_period`: `execution.switch.derive`'s own rule for a
+    crash or a halt-path write failure that left no row) -- else
+    `catch_up_lapsed`. `runs` places `rebalance_events` rows in the window
+    (`run_id` -> `paper_runs.window_id`, as `plan.rebalance_state` does); a
+    row of a run not among `runs` raises, so an incomplete run list can
+    never hide an already-resolved rebalance. A T_i already journaled
+    `executed` or `missed` is not reported again.
     """
     if window.window_id is None:
         raise ValueError("the window has no window_id")
@@ -313,7 +355,9 @@ def lapses(
         if session <= boundary:
             continue
         period = _period_sessions(fill, boundary)
-        engaged = _engaged_during(kill_switch_rows, window.window_id, period)
+        engaged = _engaged_during(
+            kill_switch_rows, window.window_id, period
+        ) or _faulted_run_in_period(runs, results, window.window_id, period)
         reason = _KILL_SWITCH if engaged else _CATCH_UP_LAPSED
         missed.append(Missed(rebalance_session=rebalance_session, reason=reason))
     return missed
