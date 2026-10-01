@@ -327,10 +327,13 @@ def test_skip_and_dust_decisions_are_closed(kind: str) -> None:
     assert (state.state, state.reason) == (State.CLOSED, kind)
 
 
-def test_a_keep_name_override_is_closed() -> None:
-    # `keep_name` is an `override` decision with nothing to trade (no side).
-    state = _state(_decision(side=None, decision="override"))
-    assert (state.state, state.reason) == (State.CLOSED, "keep_name")
+@pytest.mark.parametrize("kind", ["keep_name", "exclude_name"])
+def test_a_sideless_override_is_closed_with_its_own_kind(kind: str) -> None:
+    # An `override` decision with nothing to trade (no side): every `keep_name`, and
+    # an `exclude_name` of a name not held (#450). The state names the override's
+    # kind, never `keep_name` for an `exclude_name`.
+    state = _state(_decision(side=None, decision="override", reason=kind))
+    assert (state.state, state.reason) == (State.CLOSED, kind)
 
 
 @pytest.mark.parametrize(
@@ -432,6 +435,7 @@ def test_a_whole_share_full_exit_with_one_share_left_stays_open(kind: str) -> No
         ("sell", "trade", None, False),
         ("buy", "trade", None, False),
         (None, "override", "keep_name", False),
+        (None, "override", "exclude_name", False),  # an unheld exclude_name (#450)
     ],
 )
 def test_is_full_exit_follows_the_spec_table(
