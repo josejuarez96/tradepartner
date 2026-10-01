@@ -463,6 +463,12 @@ def _run(
 GREEN_MAIN = _run()
 GREEN_FULL = _run(steps=(mt.Step("Tests", "success"),))
 RED = _run(conclusion="failure", steps=(mt.Step("Hygiene", "failure"),), duration=300.0)
+# The confirming rerun GitHub reports at a strictly later attempt than the run it reran
+# (SHOULD FIX, safety review of #521): a stale read of the first attempt must never count.
+CONFIRM_RED = _run(
+    attempt=2, conclusion="failure", steps=(mt.Step("Hygiene", "failure"),), duration=300.0
+)
+CONFIRM_GREEN = _run(attempt=2, steps=(mt.Step("Tests", "success"),))
 
 
 class FakeRunner:
@@ -492,24 +498,28 @@ class FakeRunner:
         self.calls: list[str] = []
         self._pending: int | None = None
 
-    def add_pr(self, number: int, *, diff_paths: tuple[str, ...] | None = None) -> None:
+    def add_pr(
+        self, number: int, *, diff_paths: tuple[str, ...] | None = None, **pr_overrides: object
+    ) -> None:
         head = f"head{number}"
         branch = f"feat/{number}-x"
-        pr = mt.PullRequest(
-            number=number,
-            author=OWNER,
-            head_repo=REPO,
-            repo=REPO,
-            state="OPEN",
-            is_draft=False,
-            base="main",
-            labels=(),
-            head=head,
-            branch=branch,
-            body=f"Closes #{number}\n\n- [x] done\n",
-            fragment_texts=(FRAGMENT,),
-            title=f"PR {number}",
-        )
+        fields: dict[str, object] = {
+            "number": number,
+            "author": OWNER,
+            "head_repo": REPO,
+            "repo": REPO,
+            "state": "OPEN",
+            "is_draft": False,
+            "base": "main",
+            "labels": (),
+            "head": head,
+            "branch": branch,
+            "body": f"Closes #{number}\n\n- [x] done\n",
+            "fragment_texts": (FRAGMENT,),
+            "title": f"PR {number}",
+        }
+        fields.update(pr_overrides)
+        pr = mt.PullRequest(**fields)
         data = mt.PrData(
             pr,
             (),
@@ -581,7 +591,7 @@ class FakeRunner:
     def delete_branch(self, branch: str) -> None:
         self.deleted_branches.append(branch)
 
-    def find_run(self, sha: str) -> object:
+    def find_run(self, sha: str, branch: str) -> object:
         queue = self.run_script.get(sha)
         if not queue:
             return mt.RunInfo(None, 0, None, None, None)
@@ -647,6 +657,9 @@ def test_build_drops_a_conflicting_pr_and_the_train_has_no_merge_in_progress() -
         if name == "commit_squash":
             assert fake.calls[i - 1] == "merge_squash"
     assert fake.worktrees_added == fake.worktrees_removed
+    dropped_text = next(t for n, t in fake.comments_posted if n == 2)
+    assert dropped_text.startswith(f"merge-train: DROPPED batch {record.batch_id}")
+    assert "a.py" in dropped_text and "#1" in dropped_text
 
 
 # -- AC5: an already-merged PR is skipped with no comment -------------------------------
@@ -697,10 +710,10 @@ def test_build_is_inconclusive_on_an_infra_failure_and_resume_reattaches() -> No
 def test_build_bisects_to_the_culprit_with_three_probes() -> None:
     fake = _batch(5)
     fake.script_run(fake.base, [GREEN_MAIN])
-    fake.script_run("commit5", [RED, RED])  # the full batch, confirmed red
+    fake.script_run("commit5", [RED, CONFIRM_RED])  # the full batch, confirmed red
     fake.script_run("commit2", [GREEN_FULL])  # probe prefix 2
     fake.script_run("commit3", [GREEN_FULL])  # probe prefix 3
-    fake.script_run("commit4", [RED, RED])  # probe prefix 4, confirmed red
+    fake.script_run("commit4", [RED, CONFIRM_RED])  # probe prefix 4, confirmed red
     record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
     assert [p.k for p in record.probes] == [2, 3, 4]
     assert record.green_prefixes == [2, 3]
@@ -717,7 +730,7 @@ def test_build_bisects_to_the_culprit_with_three_probes() -> None:
 def test_build_is_green_with_no_probe_when_the_only_red_run_is_a_flake() -> None:
     fake = _batch(2)
     fake.script_run(fake.base, [GREEN_MAIN])
-    fake.script_run("commit2", [RED, GREEN_FULL])  # red once, green on the confirming rerun
+    fake.script_run("commit2", [RED, CONFIRM_GREEN])  # red once, green on the confirming rerun
     record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
     assert record.outcome == "green"
     assert record.probes == []
@@ -787,3 +800,45 @@ def test_two_batches_get_two_worktrees() -> None:
     assert fake1.worktrees_added[0] != fake2.worktrees_added[0]
     assert fake1.worktrees_added == fake1.worktrees_removed
     assert fake2.worktrees_added == fake2.worktrees_removed
+
+
+# -- safety review of #521 ---------------------------------------------------------------
+
+
+def test_build_treats_a_fork_pr_as_ineligible_and_never_touches_its_head() -> None:
+    """SHOULD FIX 1: a fork PR must not stop, or be built into, the rest of the batch."""
+    fake = _batch(2)
+    fake.add_pr(3, head_repo="someone/fork")
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit2", [GREEN_FULL])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    by_number = {p.number: p for p in record.prs}
+    assert by_number[3].state == "ineligible"
+    assert (by_number[3].reason or "").startswith("(0)")
+    assert fake.commits == ["base0", "commit1", "commit2"]  # PR3 never entered the train
+    assert record.outcome == "green"
+
+
+def test_classified_never_reads_a_stale_report_of_the_reran_attempt() -> None:
+    """SHOULD FIX 2: a confirming rerun must read a later attempt, never the one it reran,
+    even when `find_run` still briefly reports the old attempt as `completed`/`failure`."""
+    fake = FakeRunner()
+    fake.run_script["sha"] = [RED, RED, CONFIRM_GREEN]  # one stale re-read, then the rerun
+    outcome, info = mt._classified(
+        fake, "sha", "train/x", timeout_s=10, poll_s=0, say=lambda _msg: None
+    )
+    assert outcome.kind == "green"
+    assert info.run_attempt == 2
+    assert fake.rerun_calls == [RED.run_id]
+
+
+def test_shell_runner_refuses_to_push_or_delete_a_non_train_branch(tmp_path: Path) -> None:
+    """SHOULD FIX 4: the push/delete seam refuses anything outside `train/*`, independent
+    of `build` only ever constructing `train/*` names."""
+    subprocess_run = __import__("subprocess").run
+    subprocess_run(["git", "init", "-q", str(tmp_path)], check=True)
+    runner = mt.ShellRunner(tmp_path)
+    with pytest.raises(mt.StoppedError):
+        runner.push(tmp_path, "HEAD", "main")
+    with pytest.raises(mt.StoppedError):
+        runner.delete_branch("main")

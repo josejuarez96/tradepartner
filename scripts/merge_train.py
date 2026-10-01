@@ -397,7 +397,6 @@ def comment(outcome: str, batch: str, **detail: Any) -> str:
 DEFAULT_TIMEOUT_S = 60 * 60
 DEFAULT_POLL_S = 30
 MERGE_TRAIN_DIR_VAR = "TRADEPARTNER_MERGE_TRAIN_DIR"
-_CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
 
 
 class StoppedError(RuntimeError):
@@ -405,8 +404,9 @@ class StoppedError(RuntimeError):
 
 
 def _redact(text: str) -> str:
-    """Strip any `user:token@` from URLs before showing or posting it (ready_pr's rule)."""
-    return _CREDENTIAL_IN_URL_RE.sub("://***@", text.strip())
+    """Strip any `user:token@` from URLs before showing or posting it: `ready_pr`'s own
+    regex, reused (not copied) so the two can never drift apart."""
+    return ready_pr.CREDENTIAL_IN_URL_RE.sub("://***@", text.strip())
 
 
 @dataclass(frozen=True)
@@ -449,7 +449,7 @@ class Runner(Protocol):
     def tree_of(self, worktree: Path) -> str: ...
     def push(self, worktree: Path, ref: str, branch: str) -> None: ...
     def delete_branch(self, branch: str) -> None: ...
-    def find_run(self, sha: str) -> RunInfo: ...
+    def find_run(self, sha: str, branch: str) -> RunInfo: ...
     def rerun(self, run_id: int) -> None: ...
     def post_comment(self, number: int, text: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
@@ -485,31 +485,42 @@ def _save(record: Record) -> None:
 
 
 def _wait_for_run(
-    r: Runner, sha: str, timeout_s: int, poll_s: int, say: Callable[[str], None]
+    r: Runner,
+    sha: str,
+    branch: str,
+    timeout_s: int,
+    poll_s: int,
+    say: Callable[[str], None],
+    min_attempt: int = 0,
 ) -> RunInfo:
+    """Wait for the run on `sha` (pushed to `branch`) to complete, at an attempt strictly
+    after `min_attempt` (Red tree, req 4): a confirming rerun must never read the attempt
+    it reran, even if GitHub still reports that one as `completed` for a few seconds."""
     deadline = time.monotonic() + timeout_s
     say(f"waiting for the run on {sha[:7]} (up to {timeout_s // 60} min)")
-    info = r.find_run(sha)
-    while info.status is None or info.status.lower() != "completed":
+    info = r.find_run(sha, branch)
+    while (
+        info.status is None or info.status.lower() != "completed" or info.run_attempt <= min_attempt
+    ):
         if time.monotonic() >= deadline:
             return info
         r.sleep(poll_s)
-        info = r.find_run(sha)
+        info = r.find_run(sha, branch)
     return info
 
 
 def _classified(
-    r: Runner, sha: str, timeout_s: int, poll_s: int, say: Callable[[str], None]
+    r: Runner, sha: str, branch: str, timeout_s: int, poll_s: int, say: Callable[[str], None]
 ) -> tuple[Outcome, RunInfo]:
     """One run on `sha`, confirmed by a rerun when it comes back red (Red tree, req 4)."""
-    info = _wait_for_run(r, sha, timeout_s, poll_s, say)
+    info = _wait_for_run(r, sha, branch, timeout_s, poll_s, say)
     outcome = classify_run(info.job_steps, info.duration_s, info.status, info.conclusion)
     if outcome.kind != "red":
         return outcome, info
     say(f"{sha[:7]} red once; confirming with a rerun before it counts")
     if info.run_id is not None:
         r.rerun(info.run_id)
-    info2 = _wait_for_run(r, sha, timeout_s, poll_s, say)
+    info2 = _wait_for_run(r, sha, branch, timeout_s, poll_s, say, min_attempt=info.run_attempt)
     outcome2 = classify_run(info2.job_steps, info2.duration_s, info2.status, info2.conclusion)
     return outcome2, info2
 
@@ -518,7 +529,7 @@ def _main_green_at_base(
     r: Runner, base: str, timeout_s: int, poll_s: int, say: Callable[[str], None]
 ) -> tuple[bool | None, str | None]:
     """req 5 precondition: `main`'s latest run at `base`, waited for if still in progress."""
-    info = _wait_for_run(r, base, timeout_s, poll_s, say)
+    info = _wait_for_run(r, base, "main", timeout_s, poll_s, say)
     if info.status is None or info.status.lower() != "completed":
         return None, "main unfinished at base"
     if (info.conclusion or "").lower() == "success":
@@ -592,7 +603,7 @@ def _run_bisect(
         branch = probe_branch(record.batch_id, k)
         sha = commits[k]
         r.push(worktree, sha, branch)
-        outcome, info = _classified(r, sha, timeout_s, poll_s, say)
+        outcome, info = _classified(r, sha, branch, timeout_s, poll_s, say)
         probes.append(
             Probe(
                 k,
@@ -619,6 +630,8 @@ def _run_bisect(
     if red_k - green_k == 1:
         culprit, held = bisect_result(green_k, red_k, [p.number for p in accepted])
         record.culprit, record.held = culprit, held
+    elif probes and probes[-1].outcome == "inconclusive":
+        record.detail = f"bisect stopped: probe {probes[-1].k} inconclusive"
     _save(record)
     _report_bisect(r, record, accepted)
 
@@ -684,6 +697,8 @@ def run_build(
     poll_s: int = DEFAULT_POLL_S,
     say: Callable[[str], None] = print,
 ) -> Record:
+    report = say
+    say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
     base = r.main_sha()
     built_at = r.now()
     bid = batch_id(built_at, base)
@@ -735,11 +750,18 @@ def run_build(
             entries[index_of[data.pr.number]] = entry
         record.prs = [e for e in entries if e is not None]
         record.trees = trees
+        for entry in built_entries:
+            if entry.state == "dropped":
+                r.post_comment(entry.number, _dropped_comment(bid, entry))
         accepted = record.accepted()
         if not accepted:
             record.outcome, record.detail = "inconclusive", "every PR dropped or already merged"
             _save(record)
             return record
+        data_by_number = {d.pr.number: d for d in eligible_data}
+        uv_lock_prs = [
+            p.number for p in accepted if "uv.lock" in data_by_number[p.number].diff_paths
+        ]
 
         sha = r.head_sha(wpath)
         r.push(wpath, "HEAD", record.train_branch)
@@ -755,14 +777,19 @@ def run_build(
                 r.post_comment(pr.number, comment("INCONCLUSIVE", bid, reason=detail or ""))
             return record
 
-        outcome, info = _classified(r, sha, timeout_s, poll_s, say)
+        outcome, info = _classified(r, sha, record.train_branch, timeout_s, poll_s, say)
         record.run_id, record.run_attempt, record.run_url = info.run_id, info.run_attempt, info.url
         record.outcome, record.detail = outcome.kind, outcome.detail
         _save(record)
 
         if outcome.kind == "inconclusive":
             for pr in accepted:
-                r.post_comment(pr.number, comment("INCONCLUSIVE", bid, reason=outcome.detail or ""))
+                r.post_comment(
+                    pr.number,
+                    comment(
+                        "INCONCLUSIVE", bid, reason=outcome.detail or "", uv_lock_prs=uv_lock_prs
+                    ),
+                )
             return record
         if outcome.kind == "green":
             record.green_prefixes = [len(accepted)]
@@ -776,6 +803,15 @@ def run_build(
         r.remove_worktree(wpath)
 
 
+def _dropped_comment(bid: str, entry: PrEntry) -> str:
+    return comment(
+        "DROPPED",
+        bid,
+        paths=", ".join(entry.paths or []),
+        conflicts_with=", ".join(f"#{n}" for n in entry.conflicts_with or []),
+    )
+
+
 def run_build_resume(
     r: Runner,
     bid: str,
@@ -785,6 +821,8 @@ def run_build_resume(
     say: Callable[[str], None] = print,
 ) -> Record:
     """Re-attach to the recorded branch and run instead of rebuilding (req 4, AC7)."""
+    report = say
+    say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
     path = record_path(bid)
     if not path.exists():
         raise StoppedError(f"no record for batch {bid}; run build without --resume")
@@ -792,7 +830,7 @@ def run_build_resume(
     if record.outcome != "inconclusive" or record.train_sha is None:
         raise StoppedError(f"batch {bid} is not inconclusive; nothing to resume")
     accepted = record.accepted()
-    outcome, info = _classified(r, record.train_sha, timeout_s, poll_s, say)
+    outcome, info = _classified(r, record.train_sha, record.train_branch, timeout_s, poll_s, say)
     record.run_id, record.run_attempt, record.run_url = info.run_id, info.run_attempt, info.url
     record.outcome, record.detail = outcome.kind, outcome.detail
     _save(record)
@@ -849,7 +887,7 @@ class ShellRunner:
         return self._repo
 
     def main_sha(self) -> str:
-        self._git(self.root, "fetch", "-q", "origin", "main")
+        self._git_out(self.root, "fetch", "-q", "origin", "main")
         return self._git_out(self.root, "rev-parse", "origin/main")
 
     def open_pr_numbers(self) -> list[int]:
@@ -900,7 +938,15 @@ class ShellRunner:
             Comment(author=str(c.get("author", {}).get("login", "")), body=str(c.get("body", "")))
             for c in raw.get("comments", [])
         )
-        self._git(self.root, "fetch", "-q", "origin", "main")
+        if pr.head_repo != pr.repo or pr.author != pr.owner:
+            # req 1 check (0): a fork or another author is ineligible regardless of its
+            # diff or checks, and its head may not even be an object we can fetch. Stop
+            # here rather than let a crafted fork PR fail this call and block the whole
+            # default build (SHOULD FIX, safety review of #521).
+            return PrData(pr, comments, ready_pr.HeadChecks(pr.head, ()), ())
+        # the owner's own head may never have been fetched into this clone (a push from
+        # another clone, or a GitHub "Update branch"); `refs/pull/<n>/head` always exists.
+        self._git(self.root, "fetch", "-q", "origin", f"refs/pull/{number}/head", check=False)
         diff = self._git_out(
             self.root,
             "-c",
@@ -916,11 +962,15 @@ class ShellRunner:
         self._git_out(self.root, "worktree", "add", "--detach", str(path), base)
 
     def remove_worktree(self, path: Path) -> None:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", str(self.root), "worktree", "remove", "--force", str(path)],
             check=False,
             capture_output=True,
+            text=True,
         )
+        if result.returncode != 0:
+            msg = f"could not remove worktree {path}; run `prune` by hand: {_redact(result.stderr)}"
+            print(f"STOPPED: {msg}")
 
     def merge_squash(self, worktree: Path, head: str) -> bool:
         return self._git(worktree, "merge", "--squash", head, check=False).returncode == 0
@@ -951,20 +1001,28 @@ class ShellRunner:
         return self._git_out(worktree, "rev-parse", "HEAD^{tree}")
 
     def push(self, worktree: Path, ref: str, branch: str) -> None:
+        if not branch.startswith("train/"):
+            raise StoppedError(f"refusing to push a non-train/ branch: {branch}")
         self._git_out(worktree, "push", "origin", f"{ref}:refs/heads/{branch}")
 
     def delete_branch(self, branch: str) -> None:
+        if not branch.startswith("train/"):
+            raise StoppedError(f"refusing to delete a non-train/ branch: {branch}")
         self._git(self.root, "push", "origin", "--delete", branch, check=False)
 
-    def find_run(self, sha: str) -> RunInfo:
+    def find_run(self, sha: str, branch: str) -> RunInfo:
         raw = json.loads(
             self._gh(
                 "run",
                 "list",
+                "--branch",
+                branch,
+                "--event",
+                "push",
                 "--json",
                 "databaseId,headSha,status,conclusion,url,attempt",
                 "-L",
-                "50",
+                "20",
             )
         )
         matches = [run for run in raw if run.get("headSha") == sha]
