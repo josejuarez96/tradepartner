@@ -20,8 +20,9 @@ ex-date is after the date the quantity was stated for and on or before S.
 How decisions are read (T53 writes them this way):
 
 - every `skip_*` kind and `dust` are closed with that reason; an `override`
-  decision with no side is a `keep_name` and closed; an `override` with a side
-  (`exclude_name`) trades like any other decision.
+  decision with no side is closed with its own kind as the reason (every
+  `keep_name`, and an `exclude_name` of a name not held, #450); an `override`
+  with a side (always `exclude_name`) trades like any other decision.
 - A sell with `planned_notional` is a **trim**, measured against that planned
   notional over all its orders, whatever field they carry (every sell order is
   by quantity, ADR 0010 amendment 2026-09-30); a sell with `planned_quantity`
@@ -30,7 +31,7 @@ How decisions are read (T53 writes them this way):
 - A **full exit** (`is_full_exit`, the spec's Definitions > Full exit) is a
   sell that is a `forced_exit`, an `override` (with a side, always
   `exclude_name`), or a `trade` with reason `left_targets` or `left_universe`;
-  a `trade` sell with no reason is a trim.
+  a `trade` sell with no reason is a trim. A sideless override is never one.
 - A decision's quantity before any order is stated for its
   `rebalance_session`, or, for a forced exit (no rebalance session), for the
   New York date of its `known_at`.
@@ -502,7 +503,7 @@ def decision_state(
     if decision.decision.startswith(_SKIP_PREFIX) or decision.decision == _DUST:
         return DecisionState(State.CLOSED, decision.decision)
     if decision.decision == _OVERRIDE and decision.side is None:
-        return DecisionState(State.CLOSED, _KEEP_NAME)
+        return DecisionState(State.CLOSED, decision.reason or _OVERRIDE)
     mine_events = [e for e in decision_events if e.decision_id == decision_id]
     if mine_events:
         latest_event = max(enumerate(mine_events), key=lambda p: (p[1].known_at, p[0]))[1]
@@ -967,7 +968,7 @@ def decisions_from(
       close(S-1) (its end session on or before S-1, or unknown);
     - an `exclude_name` override (`overrides` naming T_i) sells a held name
       whole (`override`, side `sell`, reason `exclude_name`) and buys nothing
-      for an unheld target (`override`, no side), its weight left in cash; a
+      for an unheld target (`override`, no side, reason `exclude_name`), its weight left in cash; a
       `keep_name` override trades nothing (`override`, no side, reason
       `keep_name`); either carries its `override_id`;
     - a held name outside the universe is sold whole by quantity (`trade`,
