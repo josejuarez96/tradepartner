@@ -173,12 +173,26 @@ def test_a_split_on_or_before_the_order_session_is_not_applied_again() -> None:
     assert _reserve([order], actions=actions) == Decimal("510.00")
 
 
-def test_a_split_known_after_close_s_minus_1_is_not_applied() -> None:
+def test_a_split_known_at_close_s_minus_1_applies_and_a_later_one_raises() -> None:
     order = _order(S1, quantity=10.0)
-    late = _splits((A, S, 2.0, CUTOFF + timedelta(minutes=1)))
     on_time = _splits((A, S, 2.0, CUTOFF))
-    assert _reserve([order], actions=late) == Decimal("510.00")
     assert _reserve([order], actions=on_time) == Decimal("1020.00")
+    # a frame read after close(S-1): price_of would be post-split while the
+    # shares stayed pre-split, an under-reserve, so it raises instead of skipping
+    late = _splits((A, S, 2.0, CUTOFF + timedelta(minutes=1)))
+    with pytest.raises(ValueError, match="after close"):
+        _reserve([order], actions=late)
+    other_name = _splits((B, S, 2.0, CUTOFF + timedelta(minutes=1)))
+    with pytest.raises(ValueError, match="after close"):
+        _reserve([order], actions=other_name)
+
+
+def test_a_split_after_s_or_of_another_name_is_not_applied() -> None:
+    order = _order(S1, quantity=10.0)
+    after_s = _splits((A, S + timedelta(days=1), 2.0, _utc(S1, 22)))
+    other = _splits((B, S2, 2.0, _utc(S1, 22)))
+    assert _reserve([order], actions=after_s) == Decimal("510.00")
+    assert _reserve([order], actions=other) == Decimal("510.00")
 
 
 def test_an_order_dated_after_the_session_raises() -> None:
@@ -222,3 +236,51 @@ def test_the_reserve_is_a_decimal_with_cents() -> None:
     result = _reserve([_order(S1, notional=12.5)])
     assert isinstance(result, Decimal)
     assert result == Decimal("12.50")
+
+
+def test_a_fill_of_another_side_or_name_raises() -> None:
+    order = _order(S1, notional=100.0)
+    stray = _fill(order, 1.0, 50.0)
+    wrong = OrderedFill(stray.fill, "sell", order.security_id, order.symbol, 1, 1)
+    with pytest.raises(ValueError, match="disagrees"):
+        _reserve([order], fills=[wrong])
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"notional": -1.0},
+        {"notional": float("nan")},
+        {"quantity": float("inf")},
+    ],
+)
+def test_a_bad_order_amount_raises(bad: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _reserve([_order(S1, **bad)])
+
+
+def test_a_bad_price_or_fill_raises() -> None:
+    order = _order(S1, quantity=1.0, security_id=B)
+    with pytest.raises(ValueError, match="positive"):
+        open_buy_reserve([order], [], [], NO_ACTIONS, lambda _: 0.0, FROZEN, session=S)
+    with pytest.raises(ValueError, match="finite"):
+        _reserve([order], fills=[_fill(order, 1.0, float("nan"))])
+
+
+def test_a_split_with_a_bad_ratio_raises() -> None:
+    order = _order(S1, quantity=1.0)
+    with pytest.raises(ValueError, match="positive"):
+        _reserve([order], actions=_splits((A, S2, 0.0, _utc(S1, 22))))
+
+
+def test_an_actions_row_with_no_known_at_or_ex_date_raises() -> None:
+    order = _order(S1, quantity=1.0)
+    for column in ("known_at", "ex_date"):
+        frame = _splits((A, S2, 2.0, _utc(S1, 22))).with_columns(pl.lit(None).alias(column))
+        with pytest.raises(ValueError, match=f"no {column}"):
+            _reserve([order], actions=frame)
+
+
+def test_a_datetime_session_raises() -> None:
+    with pytest.raises(ValueError, match="must be a date"):
+        open_buy_reserve([], [], [], NO_ACTIONS, price_of, FROZEN, session=_utc(S, 12))  # type: ignore[arg-type]

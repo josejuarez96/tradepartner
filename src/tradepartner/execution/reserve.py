@@ -23,8 +23,10 @@ every sell reserve nothing. Each order's unfilled amount is clamped to
 The sum is computed in `Decimal` from each float's shortest repr and rounded
 **up** to the cent, so the reserve never under-reserves.
 
-No look-ahead: `actions_as_of` is read at close(S-1) and only rows with
-`known_at` <= close(S-1) are applied; an order dated after S raises. The
+No look-ahead: `actions_as_of` must be read at close(S-1); a row with `known_at`
+after close(S-1) raises instead of being skipped, because `price_of` would then be
+post-split while the share count stayed pre-split, an under-reserve. An order
+dated after S raises too. The
 journal's own rows are not cut at close(S-1): a buy submitted earlier on S (a
 same-session re-run) is exactly what the reserve must count. Pure: no broker, no
 clock, no store.
@@ -80,19 +82,35 @@ def _filled(order: OrderRow, fills: Iterable[OrderedFill]) -> tuple[Decimal, Dec
     return quantity, value
 
 
+def _check_actions(actions_as_of: pl.DataFrame, session: date) -> None:
+    """`actions_as_of` carries `known_at` and `ex_date` on every row and no row
+    known after close(S-1), or `ValueError`."""
+    for column in ("known_at", "ex_date"):
+        if column not in actions_as_of.columns:
+            raise ValueError(
+                f"actions_as_of has no {column} column; read it with live_actions_as_of"
+            )
+        if actions_as_of[column].null_count():
+            raise ValueError(f"actions_as_of has a row with no {column}")
+    cutoff = session_close(previous_session(session))
+    for row in actions_as_of.iter_rows(named=True):
+        if row["known_at"] > cutoff:
+            raise ValueError(
+                f"actions_as_of holds a {row['action_type']} of {row['security_id']} known at "
+                f"{row['known_at']}, after close(S-1) {cutoff}: read it at close(S-1)"
+            )
+
+
 def _split_factor(
     actions_as_of: pl.DataFrame, security_id: str, stated_on: date, session: date
 ) -> Decimal:
-    """The product of the ratios of splits with ex-date in (`stated_on`, `session`]
-    known at close(S-1)."""
-    cutoff = session_close(previous_session(session))
+    """The product of the ratios of splits with ex-date in (`stated_on`, `session`]."""
     factor = _ONE
     for row in actions_as_of.iter_rows(named=True):
         if (
             row["security_id"] == security_id
             and row["action_type"] == _SPLIT
             and stated_on < row["ex_date"] <= session
-            and row["known_at"] <= cutoff
         ):
             factor *= _dec(
                 float(row["ratio_or_amount"]), f"split ratio of {security_id}", positive=True
@@ -132,16 +150,16 @@ def open_buy_reserve(
     session: date,
 ) -> Decimal:
     """The unfilled notional of every own non-terminal buy (module docstring),
-    rounded up to the cent. `orders`, `order_events` and `fills` are the
-    window's journal rows (`fills` from `store.journal.fills_for`, so a
-    superseded fill is never counted); `actions_as_of` a
+    rounded up to the cent. `orders`, `order_events` and `fills` are our own
+    journal rows from every session and every window (a buy left open by an
+    earlier window is still ours and still open; `fills` from
+    `store.journal.fills_for`, so a superseded fill is never counted); `actions_as_of` a
     `store.asof.live_actions_as_of` frame read at close(S-1); `price_of` the
     reference price on S; `frozen` the window's `risk` section; `session` is S.
     """
     if isinstance(session, datetime) or not isinstance(session, date):
         raise ValueError(f"session must be a date, got {type(session).__name__}")
-    if "known_at" not in actions_as_of.columns:
-        raise ValueError("actions_as_of has no known_at column; read it with live_actions_as_of")
+    _check_actions(actions_as_of, session)
     buffer = _dec(frozen.whole_share_price_buffer, "risk.whole_share_price_buffer")
     terminal = {e.client_order_id for e in order_events if e.status in TERMINAL_ORDER_STATUSES}
     total = _ZERO
