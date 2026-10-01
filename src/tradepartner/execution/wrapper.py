@@ -537,7 +537,9 @@ class RiskGatedBroker:
         if run.run_id is None or run.session is None:
             raise ValueError("execute needs a journaled run with its session")
         rows = [*decisions, *forced_exits]
-        rebalance = {d.decision_id: d.rebalance_session for d in decisions if d.decision_id}
+        rebalance = {
+            d.decision_id: d.rebalance_session for d in decisions if d.decision_id is not None
+        }
         book = self._read_book(run, rows)
         sold = phases.PhaseOrders((), ())
         submitted: list[str] = []
