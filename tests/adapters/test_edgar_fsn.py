@@ -40,7 +40,7 @@ from tradepartner.adapters.edgar import (
     parse_fsn,
     restore_class_letter_space,
 )
-from tradepartner.adapters.edgar_source import FSN_VERSION, EdgarFilingSource
+from tradepartner.adapters.edgar_source import FSN_VERSION, EdgarFilingSource, _fsn_rows
 from tradepartner.adapters.filings import CoverListing
 from tradepartner.config import Settings
 
@@ -768,3 +768,41 @@ class TestEnsureFsn:
         source._ensure_fsn()
         manifest = json.loads((manifests / "2015q1.json").read_text())
         assert manifest["accessions_extracted"] == ["0000000011-15-000001"]
+
+
+# --- #455: FSN members are not always valid UTF-8 ----------------------------
+
+_TXT_HEADER = b"adsh\ttag\tdimh\tdimn\tcoreg\tvalue\n"
+
+
+def _write_txt_tsv(path: Path, *rows: bytes) -> Path:
+    # Enough valid rows ahead of the bad one that DuckDB's sniffer sample
+    # does not see it, as in the real 2015 txt.tsv (line 6850).
+    filler = b"".join(b"0000000001-15-%06d\tOther\t0x00\t0\t\tok\n" % i for i in range(5000))
+    path.write_bytes(_TXT_HEADER + filler + b"".join(rows))
+    return path
+
+
+def test_fsn_rows_replaces_a_non_utf8_byte_instead_of_failing(tmp_path: Path) -> None:
+    # 0x92 is a Windows-1252 apostrophe, as in SandRidge's 10-K/A note.
+    path = _write_txt_tsv(
+        tmp_path / "txt.tsv",
+        b"0001349436-15-000028\tAmendmentDescription\t0x00\t0\t\tthe Company\x92s note\n",
+        b"0001349436-15-000029\tSecurity12bTitle\t0x00\t0\t\tCommon Stock\x92\n",
+    )
+    rows = _fsn_rows(
+        path,
+        ("adsh", "tag", "value"),
+        where="tag IN ('Security12bTitle', 'AmendmentDescription')",
+    )
+    assert [row["value"] for row in rows] == ["the Company\ufffds note", "Common Stock\ufffd"]
+
+
+def test_fsn_rows_keeps_valid_utf8_unchanged(tmp_path: Path) -> None:
+    value = "Soci\u00e9t\u00e9 G\u00e9n\u00e9rale \u2019A\u2019 Shares \u2014 \u20ac1"
+    path = _write_txt_tsv(
+        tmp_path / "txt.tsv",
+        b"0000000002-15-000001\tSecurity12bTitle\t0x00\t0\t\t" + value.encode() + b"\n",
+    )
+    rows = _fsn_rows(path, ("adsh", "value"), where="tag = 'Security12bTitle'")
+    assert rows == [{"adsh": "0000000002-15-000001", "value": value}]
