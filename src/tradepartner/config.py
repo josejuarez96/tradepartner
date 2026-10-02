@@ -476,6 +476,25 @@ FROZEN_EXECUTION_KEYS: tuple[str, ...] = ("fill_price",)
 
 AlertChannel = Literal["store", "macos", "email"]
 _DEFAULT_ALERT_CHANNELS: tuple[AlertChannel, ...] = ("store", "macos")
+# The `email` channel's required `Settings` fields, paired with the env var name a
+# missing one is reported as (#544): `Settings._validate_alert_channel_is_usable`
+# names exactly these, never a value. `alert_email_from` is the optional sender
+# (#404) and is not required.
+_EMAIL_REQUIRED_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("alert_smtp_host", "ALERT_SMTP_HOST"),
+    ("alert_smtp_user", "ALERT_SMTP_USER"),
+    ("alert_smtp_password", "ALERT_SMTP_PASSWORD"),
+    ("alert_email_to", "ALERT_EMAIL_TO"),
+)
+
+
+def _is_set(value: str | SecretStr | None) -> bool:
+    """`True` iff `value` is a non-blank setting: a `SecretStr`'s stripped value,
+    or a plain string's, never the secret itself."""
+    if value is None:
+        return False
+    text = value.get_secret_value() if isinstance(value, SecretStr) else value
+    return bool(text.strip())
 
 
 class RiskConfig(BaseModel):
@@ -558,6 +577,13 @@ class AlertsConfig(BaseModel):
     which never uses `store`, so a store-only config would reach no channel at all.
     `delivery_timeout_seconds` bounds one `osascript` call, and each SMTP socket
     operation, so a stuck channel cannot hold a run (the spec names no value; T57).
+
+    Listing a channel is not enough for it to actually be *usable* (#544): `macos`
+    needs nothing beyond this section, but `email` also needs its four `ALERT_*`
+    variables, which live on `Settings`, not here, so `Settings` carries a second,
+    cross-field check (`_validate_alert_channel_is_usable`) that refuses a config
+    whose only non-store channel is an unconfigured `email` — naming the missing
+    variable names, never their values.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -653,6 +679,40 @@ class Settings(BaseSettings):
         # (used in tests to disable dotenv loading entirely) still wins.
         kwargs.setdefault("_env_file", _default_env_file())
         super().__init__(**kwargs)
+        # Deliberately *not* a `@model_validator`: a whole-model pydantic validator
+        # that raises is reported in a `ValidationError` whose `input_value` is the
+        # raw constructor input to the *entire* model, including every other secret
+        # passed alongside it (verified against pydantic 2.13's error rendering) —
+        # an unconditional secret leak for any config this check could ever refuse.
+        # Running the check here, after construction, as a plain attribute read and
+        # a plain `raise`, means nothing but the already-validated `self` is ever
+        # touched, so only the env var *names* below can appear in the message.
+        self._validate_alert_channel_is_usable()
+
+    def _validate_alert_channel_is_usable(self) -> None:
+        """#544: `AlertsConfig._validate_channels` only checks that a non-store
+        channel is *listed*; `email`'s required `ALERT_*` variables live on
+        `Settings`, not `AlertsConfig`, so whether it is actually *usable* can only
+        be checked here. `macos` needs no configuration, so it already satisfies
+        the owner's #366 Q22 (iii) "at least one non-store channel" rule by itself;
+        only a config whose *only* non-store channel is `email` is refused when
+        that channel is not fully configured. The missing variable names are
+        named in the error; their values never are (CLAUDE.md non-negotiable 4)."""
+        channels = self.alerts.channels
+        if "email" in channels and "macos" not in channels:
+            missing = [
+                env_name
+                for field, env_name in _EMAIL_REQUIRED_SETTINGS
+                if not _is_set(getattr(self, field))
+            ]
+            if missing:
+                raise ValueError(
+                    "alerts.channels lists 'email' as the only non-store channel, "
+                    f"but {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
+                    "not set, so kill_switch_write_failed (which never touches the "
+                    "store) would reach nobody (#366 Q22 (iii), #544). Set the "
+                    "missing variable(s), add 'macos', or remove 'email'."
+                )
 
 
 def get_settings() -> Settings:

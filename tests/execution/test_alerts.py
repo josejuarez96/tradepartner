@@ -378,8 +378,11 @@ def test_from_defaults_to_the_login_and_follows_alert_email_from(
 
 
 def test_email_is_skipped_when_unset(conn: duckdb.DuckDBPyConnection) -> None:
+    # `macos` is also listed so `Settings` loads (#544: `email` alone with a
+    # partial config now refuses at config load, tested in test_config.py);
+    # `_email_configured` is still exercised here as the delivery-time defense.
     partial = {k: v for k, v in _SECRETS.items() if k != "alert_smtp_password"}
-    alerter = _alerter(conn, _settings(["store", "email"], **partial))
+    alerter = _alerter(conn, _settings(["store", "macos", "email"], **partial))
     alert_id = alerter.write("drawdown", 7, _SESSION, "m")
     assert FakeSMTP.instances == []
     ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
