@@ -17,8 +17,8 @@ from conftest import version_4_store
 
 from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker
-from tradepartner.config import FROZEN_COSTS_KEYS, Settings
-from tradepartner.execution import window
+from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
+from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.store import registry
@@ -588,6 +588,45 @@ def test_frozen_json_carries_the_registered_cost_keys_the_wrapper_reads(
     costs = {k: v for k, v in frozen.items() if k.startswith("costs.")}
     assert costs == {k: v for k, v in ready_hypothesis.params.items() if k.startswith("costs.")}
     assert {k.removeprefix("costs.") for k in costs} == set(FROZEN_COSTS_KEYS)
+
+
+@pytest.mark.parametrize("fill_price", ["close", "open"])
+def test_frozen_json_carries_the_live_execution_fill_price(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    fill_price: str,
+) -> None:
+    """`paper start` freezes `FROZEN_EXECUTION_KEYS` under `execution.` with the
+    live values (#526, #366 Q20), and no other `execution.*` key."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        execution={"fill_price": fill_price},
+    )
+    result = window.start(settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1")
+
+    frozen = json.loads(result.window.frozen_json)
+    execution = {k: v for k, v in frozen.items() if k.startswith("execution.")}
+    assert execution == {"execution.fill_price": fill_price}
+    assert {k.removeprefix("execution.") for k in execution} == set(FROZEN_EXECUTION_KEYS)
+
+
+def test_report_reads_the_fill_price_a_started_window_froze(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`paper report`'s `_frozen_fill_price` reads the value `paper start` wrote,
+    from the stored row, so a real window no longer raises `ValueError` (#526)."""
+    window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    with open_read_only(journal_settings) as conn:
+        stored = latest_window(conn)
+    assert stored is not None
+
+    assert report._frozen_fill_price(stored) == journal_settings.execution.fill_price
 
 
 @pytest.mark.parametrize(

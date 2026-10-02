@@ -31,16 +31,16 @@ Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
 rebalance session strictly after both `holdout_end` and today, per the spec
 Definitions' "Paper window"; `starting_cash` and `starting_equity` from
 `account()`; `code_version`; `frozen_json`/`frozen_sha256`, the canonicalised
-and hashed `risk.*` section plus `FROZEN_PAPER_KEYS` and `FROZEN_COSTS_KEYS`,
-exactly as `registry.canonical_params_json`/`params_sha256` do for hypothesis
-parameters), the `carried_residue` adjustments copied from the previous
-window's listed residues (quantity and origin unchanged, dated at the stop
-row's own session: the ledger itself split-adjusts an adjustment from its
-`session` through any later one, `execution.ledger`'s documented
-convention), and any `spinoff_receipt` adjustments a spin-off explained (see
-below). It takes the run lock (T59) for its writes, and migrates a store
-version 4 has left behind (`init_schema` on the write connection) before
-writing.
+and hashed `risk.*` section plus `FROZEN_PAPER_KEYS`, `FROZEN_COSTS_KEYS` and
+`FROZEN_EXECUTION_KEYS`, exactly as `registry.canonical_params_json`/
+`params_sha256` do for hypothesis parameters), the `carried_residue`
+adjustments copied from the previous window's listed residues (quantity and
+origin unchanged, dated at the stop row's own session: the ledger itself
+split-adjusts an adjustment from its `session` through any later one,
+`execution.ledger`'s documented convention), and any `spinoff_receipt`
+adjustments a spin-off explained (see below). It takes the run lock (T59) for
+its writes, and migrates a store version 4 has left behind (`init_schema` on
+the write connection) before writing.
 
 **Flatness.** With no previous window, or the latest one `abandoned`, the
 account must hold no position at all: an `abandoned` window carries no
@@ -174,7 +174,13 @@ from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.broker import Broker
 from tradepartner.calendar import last_session_of_month, previous_session, session_close
-from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_PAPER_KEYS, RiskConfig, Settings
+from tradepartner.config import (
+    FROZEN_COSTS_KEYS,
+    FROZEN_EXECUTION_KEYS,
+    FROZEN_PAPER_KEYS,
+    RiskConfig,
+    Settings,
+)
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import plan as plan_rules
 from tradepartner.execution import switch
@@ -222,6 +228,7 @@ _NEW_YORK = ZoneInfo("America/New_York")
 _RISK_PREFIX = "risk."
 _PAPER_PREFIX = "paper."
 _COSTS_PREFIX = "costs."
+_EXECUTION_PREFIX = "execution."
 _ABANDONED = "abandoned"
 _DUST = "dust"
 _UNTRADABLE = "untradable"
@@ -289,8 +296,9 @@ def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
 
 def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
-    `FROZEN_PAPER_KEYS` under `paper.*` and `FROZEN_COSTS_KEYS` under `costs.*`
-    (spec req 14; the costs #534).
+    `FROZEN_PAPER_KEYS` under `paper.*`, `FROZEN_COSTS_KEYS` under `costs.*` and
+    `FROZEN_EXECUTION_KEYS` under `execution.*` (spec req 14; the costs #534; the
+    fill price #366 Q20, #526, which `paper report` reads back).
 
     The frozen costs must equal the hypothesis's `registered` parameters,
     which planning sizes the decisions with, so the plan and the wrapper share
@@ -299,6 +307,7 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
     risk = settings.risk.model_dump()
     paper = settings.paper.model_dump()
     costs = settings.costs.model_dump()
+    execution = settings.execution.model_dump()
     drift = [
         f"{_COSTS_PREFIX}{k} live {costs[k]!r} vs registered "
         f"{registered.get(f'{_COSTS_PREFIX}{k}')!r}"
@@ -314,6 +323,7 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
     params: dict[str, Any] = {f"{_RISK_PREFIX}{k}": v for k, v in risk.items()}
     params.update({f"{_PAPER_PREFIX}{k}": paper[k] for k in FROZEN_PAPER_KEYS})
     params.update({f"{_COSTS_PREFIX}{k}": costs[k] for k in FROZEN_COSTS_KEYS})
+    params.update({f"{_EXECUTION_PREFIX}{k}": execution[k] for k in FROZEN_EXECUTION_KEYS})
     return params
 
 

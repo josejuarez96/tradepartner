@@ -477,8 +477,8 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
 # Q20, owner): the tracking trial's fill-price convention must be read from the
 # window's `frozen_json`, never live `Settings`, since a config edit mid-window must
 # not silently change what `paper report`'s fill-timing and residue terms compare
-# paper fills against. One key today; `execution/window.py`'s `_frozen_params` is the
-# writer this freezes into (not changed here: out of this task's file list).
+# paper fills against. One key today; `execution/window.py`'s `_frozen_params` writes
+# it (#526).
 FROZEN_EXECUTION_KEYS: tuple[str, ...] = ("fill_price",)
 
 # The `costs.*` keys req 14 also freezes into the window at `paper start` (#534,
