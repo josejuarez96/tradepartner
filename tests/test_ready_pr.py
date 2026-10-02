@@ -749,3 +749,14 @@ def test_a_moved_module_counts_as_deleted_at_its_old_path() -> None:
         "--diff-filter=D",
         "origin/main...HEAD",
     ) in moved.calls
+
+
+def test_full_suite_runs_in_parallel_only_with_xdist() -> None:
+    """#581: `-n auto` is added to the bare full-suite command, never to a targeted run."""
+    full = ready_pr.PYTEST_CHECK
+    assert ready_pr.parallel_if_full_suite(full, xdist=True) == (*full, "-n", "auto")
+    assert ready_pr.parallel_if_full_suite(full, xdist=False) == full
+    targeted = (*full, "tests/test_cli.py")
+    assert ready_pr.parallel_if_full_suite(targeted, xdist=True) == targeted
+    other = ("uv", "run", "mypy")
+    assert ready_pr.parallel_if_full_suite(other, xdist=True) == other
