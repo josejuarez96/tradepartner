@@ -24,12 +24,16 @@ from execution.test_run_trade import (
     bought,
     delist,
     env,
+    split,
     window,
 )
 from tradepartner.adapters.broker import Asset
 from tradepartner.adapters.fake_broker import Expire
 from tradepartner.calendar import previous_session, session_close
-from tradepartner.store.journal import AdjustmentRow, PaperWindowRow
+from tradepartner.config import RiskConfig
+from tradepartner.execution import run as run_module
+from tradepartner.execution.planning import PlanOutcome
+from tradepartner.store.journal import AdjustmentRow, PaperRunRow, PaperWindowRow
 
 __all__ = ["env", "window"]  # the fixtures, re-exported for this module's tests
 
@@ -230,3 +234,124 @@ def test_on_a_fill_session_exits_join_the_sells_phase(env: Env, window: PaperWin
     assert buys
     assert all(accepted[coid] <= accepted[buy] for buy in buys)
     assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_no_look_ahead_a_filing_after_close_s_minus_1_waits_a_session(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """A Form 25 accepted after close(S-1), before the run on S, is not known
+    to S: no forced exit on S; the next session sells the name whole. A 2:1
+    split with ex-date S known only after close(S-1) is not applied either, so
+    the exit sells the holding the broker reports, not twice it."""
+    bought(env)
+    held = env.held()["TRNS"]
+    after_cut = session_close(previous_session(MAY_3)) + timedelta(hours=1)
+    delist(env, "SEC_TRANSFER", after_cut)
+    outcome = env.run(at(MAY_3))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert exits(env, "SEC_TRANSFER") == []
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    late_split = session_close(previous_session(MAY_6)) + timedelta(hours=1)
+    split(env, "SEC_TRANSFER", MAY_6, 2.0, late_split)
+    nxt = env.run(at(MAY_6))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, _side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, run_id) == ("delisted", nxt.run_id)
+    ((_coid, ordered, _phase, quantity, _session),) = exit_orders(env, "SEC_TRANSFER")
+    assert ordered == decision_id
+    assert quantity == pytest.approx(held)
+
+
+def test_an_exit_journaled_as_the_window_closes_waits_for_the_next_run(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window is checked again just before `execute`: a run whose clock
+    leaves the window while it reads and journals the exits submits nothing,
+    and the next in-window run re-attempts the open exit."""
+    bought(env)
+    ended_before(env, MAY_3)
+    original = run_module._forced_exits
+
+    def slow(context: run_module.StepContext, **kwargs: object) -> object:
+        handed = original(context, **kwargs)  # type: ignore[arg-type]
+        _start, end = run_module.submit_window(env.settings, MAY_3)
+        env.clock.now = end + timedelta(seconds=1)
+        return handed
+
+    monkeypatch.setattr(run_module, "_forced_exits", slow)
+    first = env.run(at(MAY_3, 13, 55))
+    assert first.status == "ok", env.result(env.latest_run())
+    ((decision_id, _reason, _side, _run),) = exits(env, "SEC_TRANSFER")
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert any("outside the submit window" in n for n in first.notes)
+    monkeypatch.setattr(run_module, "_forced_exits", original)
+    second = env.run(at(MAY_6))
+    assert second.status == "ok", env.result(env.latest_run())
+    assert [e[0] for e in exits(env, "SEC_TRANSFER")] == [decision_id]
+    assert [o[1] for o in exit_orders(env, "SEC_TRANSFER")] == [decision_id]
+
+
+class _NoBroker:
+    """A gate or broker that fails the test on any use."""
+
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"{name} used while fills are lagging")
+
+
+def _lagging_context(env: Env, plan: object) -> run_module.StepContext:
+    assert env.window is not None
+    run = PaperRunRow(
+        run_id=1,
+        window_id=env.window.window_id,  # type: ignore[arg-type]
+        session=MAY_3,
+        kind="mark",
+        started_at=at(MAY_3),
+        invoked_by="tty",
+        code_version="test",
+        known_at=at(MAY_3),
+        ingested_at=at(MAY_3),
+    )
+    return run_module.StepContext(
+        settings=env.settings,
+        connect=env.connect,
+        gate=_NoBroker(),  # type: ignore[arg-type]
+        broker=_NoBroker(),  # type: ignore[arg-type]
+        window=env.window,
+        frozen=RiskConfig(),
+        run=run,
+        session=MAY_3,
+        assets={},
+        assets_read=lambda _symbols: {},
+        plan=plan,  # type: ignore[arg-type]
+        lagging=True,
+    )
+
+
+@pytest.fixture
+def no_exit_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refused(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("forced exits read while fills are lagging")
+
+    monkeypatch.setattr(run_module, "_forced_exits", refused)
+
+
+def test_no_forced_exit_while_fills_lag_on_a_non_fill_session(
+    env: Env, window: PaperWindowRow, no_exit_read: None
+) -> None:
+    """Under `fills_lagging` the exits step makes no forced exit: no read, no
+    clock, no batch, a note on the run."""
+    context = _lagging_context(env, None)
+    assert run_module.exits_step(context) is None
+    assert context.notes == ["fills_lagging: no forced exit made"]
+
+
+def test_nothing_traded_while_fills_lag_on_a_fill_session(
+    env: Env, window: PaperWindowRow, no_exit_read: None
+) -> None:
+    """A `lagging` plan outcome: no forced exit, no batch, the rebalance left
+    pending, a note on the run."""
+    context = _lagging_context(env, PlanOutcome(T_0, "lagging"))
+    assert run_module.trade_step(context) is None
+    assert context.notes == [
+        "fills_lagging: nothing planned or traded; the rebalance stays pending"
+    ]

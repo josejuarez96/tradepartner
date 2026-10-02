@@ -85,7 +85,10 @@ next session re-evaluates it. The open exits (re-attempted
 for their remainder) and the new tradable ones go to the wrapper's `execute`
 (T60b) with the plan's decisions on a rebalance or catch-up run, so they join
 its sells phase; on any other run they are a batch of their own, made only
-when there is an exit. Every exception `execute` raises takes the halt path.
+when there is an exit. The window is checked again just before `execute`, so
+the sells phase starts inside it: an exit journaled by a run that has since
+left the window stays open for the next in-window run. Every exception
+`execute` raises takes the halt path.
 
 **Step 7b.** After a batch, this run's acknowledged orders are collected (T58)
 until each is terminal or `paper.accept_wait_seconds` has passed since the
@@ -314,6 +317,8 @@ def trade_step(context: StepContext) -> BatchOutcome | None:
     if not _in_submit_window(context):
         return None
     forced = _forced_exits(context, pending_rebalance=plan.rebalance_session)
+    if not _in_submit_window(context):  # the sells phase must start inside it
+        return None
     return _execute(context, plan.decisions, forced)
 
 
@@ -326,7 +331,7 @@ def exits_step(context: StepContext) -> BatchOutcome | None:
     if not _in_submit_window(context):
         return None
     forced = _forced_exits(context, pending_rebalance=None)
-    if not forced:
+    if not forced or not _in_submit_window(context):
         return None
     return _execute(context, (), forced)
 
@@ -794,7 +799,7 @@ class _Run:
                         finished_at=finished,
                         status=_FAILED,
                         fault_type=type(exc).__name__,
-                        message="; ".join([message, *problems, *self.notes]),
+                        message=self.alerter.scrub("; ".join([message, *problems, *self.notes])),
                         clock_fault=clock_fault,
                         known_at=finished,
                         ingested_at=finished,
