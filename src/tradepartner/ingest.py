@@ -490,6 +490,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
         ("facts_bulk_empty", "empty bulk facts"),  # #566: `{}` companyfacts.zip members
         ("submissions_bulk_empty", "empty bulk submissions"),
+        ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
+        ("submissions_api_empty", "empty API submissions"),
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")
