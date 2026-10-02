@@ -71,7 +71,10 @@ store's `facts_as_of` serves one row per (security, fact name, class,
 accession), the latest ingested, so a re-dated share never appears twice.
 A company-facts 404, or a CIK the bulk zip has no file for, is not a filing
 failure (many issuers have no XBRL facts): counted on `.facts_missing`, its
-empty result cached the same way as a real payload.
+empty result cached the same way as a real payload. A bulk member that is an
+empty object or has no `cik` (SEC ships `{}` members, #566) is treated as
+absent from the zip, counted on `.facts_bulk_empty` (`.submissions_bulk_empty`
+for `submissions.zip`, where an empty older page is likewise absent).
 
 **Failure policy (T11h, owner decision (2)).** A per-document fetch/parse
 that raises `ValueError` (a malformed document, a fact collision) or meets a
@@ -289,6 +292,11 @@ class EdgarFilingSource(FilingSource):
         self.failed_filings = 0
         self.quarantined = 0
         self.facts_missing = 0
+        # #566: bulk zip members that are an empty object or carry no `cik`
+        # (SEC ships `{}` members), treated as absent from the zip and asked
+        # of the per-CIK API instead; counted for the run's summary.
+        self.facts_bulk_empty = 0
+        self.submissions_bulk_empty = 0
         # accession -> (error_class, base_form, message), skipped this run,
         # never yet written to failed_filings.json (that is `record_failures`'s
         # job, after an `ok` commit).
@@ -455,11 +463,21 @@ class EdgarFilingSource(FilingSource):
             for cik, wanted in pending.items():
                 if f"CIK{cik}.json" not in names:
                     continue
-                records, pages = reduce_submissions(json.loads(bulk.read(f"CIK{cik}.json")))
+                payload = json.loads(bulk.read(f"CIK{cik}.json"))
+                if _keyless_member(payload):  # #566: as if absent; stamped per CIK
+                    self.submissions_bulk_empty += 1
+                    continue
+                records, pages = reduce_submissions(payload)
                 for page in pages:
                     if wanted <= records.keys() or page not in names:
                         break
-                    records.update(reduce_submissions(json.loads(bulk.read(page)))[0])
+                    page_payload = json.loads(bulk.read(page))
+                    if isinstance(page_payload, dict) and not page_payload:
+                        # #566: an empty page is absent; the per-CIK top-up
+                        # in `_stamp` fetches it for what is still wanted.
+                        self.submissions_bulk_empty += 1
+                        break
+                    records.update(reduce_submissions(page_payload)[0])
                 new = {a: records[a] for a in wanted if a in records}
                 if new:
                     stamps[cik].update(new)
@@ -1610,7 +1628,12 @@ class EdgarFilingSource(FilingSource):
         if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
             with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
                 bulk_payload = json.loads(bulk.read(f"CIK{cik}.json"))
-            if _holds_accession(bulk_payload, cik, latest):
+            if _keyless_member(bulk_payload):
+                # #566: SEC's zip has `{}` members. As if absent from the zip:
+                # the API is asked, never "no facts" assumed.
+                self.facts_bulk_empty += 1
+                bulk_payload = None
+            elif _holds_accession(bulk_payload, cik, latest):
                 return bulk_payload, True
         try:
             payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
@@ -1624,6 +1647,13 @@ class EdgarFilingSource(FilingSource):
             self.facts_missing += 1
             return None, True  # no XBRL facts at all: an empty result is cached
         return payload, _holds_accession(payload, cik, latest)
+
+
+def _keyless_member(payload: Any) -> bool:
+    """Whether a bulk zip's `CIK##########.json` member is an object with no
+    `cik` (SEC ships empty `{}` members, #566): treated as absent from the
+    zip. Anything that is not an object is left to fail downstream."""
+    return isinstance(payload, dict) and "cik" not in payload
 
 
 def _holds_accession(payload: Any, cik: str, accession: str) -> bool:
