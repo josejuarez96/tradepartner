@@ -91,7 +91,7 @@ from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
-from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     DecisionRow,
     JournalRow,
@@ -124,7 +124,6 @@ _TRACKING: Literal["tracking"] = "tracking"
 _RUN = "run"
 _OK = "ok"
 _SPLIT = "split"
-_LISTED = "listed"
 _FORCED_EXIT = "forced_exit"
 _RUN_BY = "paper run"
 _MAX_CATCH_UP_KEY = "paper.max_catch_up_sessions"
@@ -313,13 +312,16 @@ def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
 def _ended(
     conn: duckdb.DuckDBPyConnection, session: date, names: Sequence[str], params: Settings
 ) -> dict[str, date | None]:
-    """Names whose current listing at close(S-1) is not `listed`, each with its
-    end session (None when unknown): `decisions_from`'s `listings_at`."""
+    """Names whose current listing at close(S-1) is `delisted`, each with its
+    end session (None when unknown): `decisions_from`'s `listings_at`. A
+    `transferred` listing (a Form 25 transfer to another exchange, still
+    trading) is not an end, the same rule the exits use (`run._forced_exits`,
+    `wrapper._listings`): the business keeps trading, just elsewhere."""
     if not names:
         return {}
     frame = listing_ends_as_of(conn, _cut(session), params, list(names))
     current = _current(frame, previous_session(session))
-    return {sid: row["end_session"] for sid, row in current.items() if row["status"] != _LISTED}
+    return {sid: row["end_session"] for sid, row in current.items() if row["status"] == DELISTED}
 
 
 def _symbols(
