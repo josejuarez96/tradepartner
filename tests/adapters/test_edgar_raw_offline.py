@@ -11,6 +11,8 @@ safety-reviewer MUST FIX).
 
 from __future__ import annotations
 
+import io
+import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -21,6 +23,15 @@ from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
 
 _Handler = Callable[[httpx.Request], httpx.Response]
+
+
+def _valid_zip_bytes(member: str = "a.txt", content: bytes = b"hi") -> bytes:
+    """A real, openable zip (unlike a bare `b"PK ..."` placeholder), so tests
+    that aren't about zip-corruption detection don't trip it by accident."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(member, content)
+    return buffer.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -158,14 +169,140 @@ def test_retryable_status_then_success_retries_once(
     assert served == [first_status, 200]
 
 
-def test_503_then_503_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_503_then_503_raises_once_retry_max_attempts_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
     handler, served = _status_sequence_handler([503, 503])
 
     with pytest.raises(httpx.HTTPStatusError):
-        edgar_raw.company_tickers(settings=_settings(), client=_mock_client(handler))
+        edgar_raw.company_tickers(
+            settings=_settings(retry_max_attempts=2), client=_mock_client(handler)
+        )
 
     assert served == [503, 503]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_capped_exponential_backoff_across_several_attempts(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Each retry's sleep doubles (`retry_backoff_seconds * 2 ** attempt`)
+    until `retry_backoff_cap_seconds` caps it, and the request is retried up
+    to `retry_max_attempts` times in total before the status is raised."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([status, status, status, status, 200])
+
+    payload = edgar_raw.company_tickers(
+        settings=_settings(
+            retry_backoff_seconds=1.0,
+            retry_backoff_cap_seconds=3.0,
+            retry_max_attempts=5,
+        ),
+        client=_mock_client(handler),
+    )
+
+    assert payload == {"status": 200}
+    assert served == [status, status, status, status, 200]
+    # `time.sleep` also picks up the rate limiter's own (sub-millisecond,
+    # real-clock) waits between requests; only the backoff sleeps matter here.
+    backoff_sleeps = [s for s in slept if s > 0.5]
+    assert backoff_sleeps == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(3.0),
+        pytest.approx(3.0),
+    ]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_transient_status_fails_after_retry_max_attempts(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    handler, served = _status_sequence_handler([status] * 10)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(
+            settings=_settings(retry_max_attempts=3), client=_mock_client(handler)
+        )
+
+    assert served == [status, status, status]
+
+
+def test_403_waits_the_configured_rate_limit_wait_then_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 200])
+
+    payload = edgar_raw.company_tickers(
+        settings=_settings(rate_limit_wait_seconds=600.0), client=_mock_client(handler)
+    )
+
+    assert payload == {"status": 200}
+    assert served == [403, 200]
+    backoff_sleeps = [s for s in slept if s > 0.5]
+    assert backoff_sleeps == [pytest.approx(600.0)]
+
+
+def test_403_then_403_fails_without_a_second_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second `403` after the one wait-and-retry fails outright: SEC's
+    block lifts only after the rate has stayed below the threshold for a
+    while, so a second immediate retry cannot succeed and would only extend
+    the block (research #572 P2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 200])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(
+            settings=_settings(rate_limit_wait_seconds=600.0, retry_max_attempts=10),
+            client=_mock_client(handler),
+        )
+
+    assert served == [403, 403]
+    backoff_sleeps = [s for s in slept if s > 0.5]
+    assert backoff_sleeps == [pytest.approx(600.0)]
+
+
+def test_a_transport_error_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped connection (or any other `httpx.TransportError`, e.g. a
+    timeout) is retried through the same capped-exponential-backoff policy
+    as `429`/`503` (research #572 P1)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json={"status": 200})
+
+    payload = edgar_raw.company_tickers(settings=_settings(), client=_mock_client(handler))
+
+    assert payload == {"status": 200}
+    assert calls["n"] == 2
+
+
+def test_a_transport_error_raises_after_retry_max_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(httpx.ReadTimeout):
+        edgar_raw.company_tickers(
+            settings=_settings(retry_max_attempts=3), client=_mock_client(handler)
+        )
+
+    assert calls["n"] == 3
 
 
 def test_retry_after_header_honored_over_configured_backoff(
@@ -478,19 +615,20 @@ def test_bulk_zips_stream_into_the_cache_dir_after_one_retry(
     tmp_path: Path, fetch: Callable[..., Path], url_tail: str, name: str
 ) -> None:
     served: list[str] = []
+    zip_bytes = _valid_zip_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         served.append(str(request.url))
         assert request.headers["User-Agent"] == "TradePartner test-agent"
         if len(served) == 1:
             return httpx.Response(503)
-        return httpx.Response(200, content=b"PK zip bytes")
+        return httpx.Response(200, content=zip_bytes)
 
     path = fetch(
         settings=_settings(cache_dir=tmp_path, retry_backoff_seconds=0.001),
         client=_mock_client(handler),
     )
-    assert path == tmp_path / "bulk" / name and path.read_bytes() == b"PK zip bytes"
+    assert path == tmp_path / "bulk" / name and path.read_bytes() == zip_bytes
     assert len(served) == 2 and served[0].endswith(url_tail)
     assert [p.name for p in path.parent.iterdir()] == [name]
 
@@ -511,16 +649,65 @@ class _BrokenStream(httpx.SyncByteStream):
 
 
 def test_a_bulk_download_failing_mid_stream_keeps_the_previous_zip(tmp_path: Path) -> None:
+    """`retry_max_attempts=1` disables the (unrelated) transport-error
+    retry, so this stays a test of atomicity: a failure mid-write must
+    never touch the previously cached zip."""
     previous = tmp_path / "bulk" / "submissions.zip"
     previous.parent.mkdir()
     previous.write_bytes(b"yesterday's zip")
     with pytest.raises(httpx.ReadError):
         edgar_raw.bulk_submissions(
-            settings=_settings(cache_dir=tmp_path),
+            settings=_settings(cache_dir=tmp_path, retry_max_attempts=1),
             client=_mock_client(lambda request: httpx.Response(200, stream=_BrokenStream())),
         )
     assert previous.read_bytes() == b"yesterday's zip"
     assert list(previous.parent.iterdir()) == [previous]
+
+
+def test_a_corrupt_zip_is_redownloaded_once_then_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated/corrupt zip (one that fails to open) is re-downloaded
+    once automatically, without the caller seeing an error (research #572
+    P10)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    served: list[bytes] = []
+    good_zip = _valid_zip_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b"not actually a zip" if len(served) == 0 else good_zip
+        served.append(body)
+        return httpx.Response(200, content=body)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert len(served) == 2
+    assert path.read_bytes() == good_zip
+
+
+def test_a_zip_still_corrupt_after_one_redownload_is_returned_as_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second corrupt download is not retried again: it is returned as
+    the cached file, to fail later when its caller opens it (`backfill`'s
+    pre-flight / `edgar_source`'s `zipfile.ZipFile`), rather than this
+    client looping forever against a source that keeps failing."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    served: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b"not a zip, attempt 1" if len(served) == 0 else b"not a zip, attempt 2"
+        served.append(body)
+        return httpx.Response(200, content=body)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert len(served) == 2
+    assert path.read_bytes() == b"not a zip, attempt 2"
 
 
 # --- FSN data sets (T11c) -----------------------------------------------
@@ -551,18 +738,20 @@ def test_fsn_periods_raises_when_page_has_no_matches() -> None:
 
 
 def test_fsn_zip_streams_into_the_fsn_cache_dir_and_returns_headers(tmp_path: Path) -> None:
+    zip_bytes = _valid_zip_bytes()
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url).endswith("2025_10_notes.zip")
         assert request.headers["User-Agent"] == "TradePartner test-agent"
         return httpx.Response(
-            200, content=b"PK fsn zip bytes", headers={"ETag": '"abc"', "Content-Length": "17"}
+            200, content=zip_bytes, headers={"ETag": '"abc"', "Content-Length": str(len(zip_bytes))}
         )
 
     path, headers = edgar_raw.fsn_zip(
         "2025_10", settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
     )
     assert path == tmp_path / "fsn" / "2025_10_notes.zip"
-    assert path.read_bytes() == b"PK fsn zip bytes"
+    assert path.read_bytes() == zip_bytes
     assert headers["ETag"] == '"abc"'
 
 

@@ -144,6 +144,15 @@ class EdgarConfig(BaseModel):
     added in round 3 (safety-reviewer MUST FIX): an SEC response naming an
     unreasonably large (or non-finite) `Retry-After` must not make
     `edgar_raw` sleep for that long, or at all, on a NaN/infinite value.
+    `retry_max_attempts`/`retry_backoff_cap_seconds`/`rate_limit_wait_seconds`
+    were added in #554 (research #572 pitfalls P1/P2/P10): a single 1-second
+    retry couldn't outlast a real outage or SEC's rate-limit block, and a
+    truncated zip just failed the whole run. `retry_max_attempts` caps the
+    capped-exponential-backoff loop on `429`/`503`/a transport error;
+    `retry_backoff_cap_seconds` caps that backoff's own growth (separately
+    from `max_retry_after_seconds`, which caps how far an SEC-sent
+    `Retry-After` is trusted); `rate_limit_wait_seconds` is the one wait
+    before `403` (SEC's rate-limit block) is retried once, then failed.
     Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
     is nonsensical and would either hang or hot-loop `edgar_raw`.
     """
@@ -154,6 +163,9 @@ class EdgarConfig(BaseModel):
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
     max_retry_after_seconds: float = Field(default=120.0, gt=0)
+    retry_max_attempts: int = Field(default=5, gt=0)
+    retry_backoff_cap_seconds: float = Field(default=60.0, gt=0)
+    rate_limit_wait_seconds: float = Field(default=600.0, gt=0)
     # T11b (#163): the EDGAR `FilingSource`. The full index starts in 1993; a
     # quarter's raw index is cached only once fetched this many days after its
     # Eastern-time end; above this many CIKs to stamp, stamping reads the nightly
