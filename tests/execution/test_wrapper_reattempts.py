@@ -423,6 +423,7 @@ def test_engaged_switch_before_buys_first_submit_writes_off_no_deferred_buy(
         book.costs,
         assets,
         FROZEN,
+        session=S,
     )
     assert (cash, built.orders, built.deferred) == (0.0, (), (buy.decision_id,))
     if engaged:
