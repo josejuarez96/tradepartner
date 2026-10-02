@@ -178,6 +178,7 @@ from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, 
 from tradepartner.execution.reconcile_run import frozen_risk, reconcile_now
 from tradepartner.execution.risk import unfilled_sells
 from tradepartner.execution.wrapper import (
+    CRASH_EXIT_CODE,
     WRITE_FAILED_EXIT_CODE,
     BatchOutcome,
     RiskGatedBroker,
@@ -275,8 +276,11 @@ class RunOutcome:
 
     @property
     def exit_code(self) -> int:
-        """0 for `ok`, `no_session` and `skipped_kill_switch`, else 1."""
-        return 0 if self.status in _CLEAN_EXITS else WRITE_FAILED_EXIT_CODE
+        """0 for `ok`, `no_session` and `skipped_kill_switch`, else `CRASH_EXIT_CODE`
+        (same code an uncaught exception exits with; this outcome returned rather
+        than raised, but is not the halt path's write-failure case, which exits
+        `WRITE_FAILED_EXIT_CODE` instead via `SystemExit`, #515)."""
+        return 0 if self.status in _CLEAN_EXITS else CRASH_EXIT_CODE
 
 
 @dataclass(frozen=True)

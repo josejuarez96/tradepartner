@@ -411,6 +411,23 @@ def test_every_command_is_refused_with_no_window_and_writes_nothing(
         assert _count(journal_settings, table) == 0
 
 
+def test_stop_refuses_more_than_one_open_window(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Only one window may be open (spec req 14); `stop` must refuse the same
+    way `kill` does (#540), before any request is written."""
+    _new_window(journal_settings, datetime(2026, 9, 29, 12, 0, tzinfo=UTC))
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    reason, message = _refusal(excinfo)
+    assert reason == MULTIPLE_OPEN_WINDOWS
+    assert "more than one open paper window" in message
+    assert fake.calls == ()
+    assert _stops(journal_settings, window) == []
+
+
 def test_stop_is_refused_while_the_switch_is_engaged(
     journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
@@ -623,6 +640,24 @@ def test_abandon_under_an_engaged_switch_records_the_note_positions_and_mismatch
     assert _engaged(journal_settings, window)  # abandon releases nothing
 
 
+def test_abandon_refuses_more_than_one_open_window(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Only one window may be open (spec req 14); `abandon` must refuse the
+    same way `kill` does (#540), before any reconciliation or write."""
+    _new_window(journal_settings, datetime(2026, 9, 29, 12, 0, tzinfo=UTC))
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+
+    reason, message = _refusal(excinfo)
+    assert reason == MULTIPLE_OPEN_WINDOWS
+    assert "more than one open paper window" in message
+    assert fake.calls == ()
+    assert _stops(journal_settings, window) == []
+    assert _count(journal_settings, "reconciliations") == 0
+
+
 # --- kill -------------------------------------------------------------------------
 
 
@@ -722,6 +757,22 @@ def test_the_override_writer_refuses_fields_its_kind_does_not_take(
         override(journal_settings, fixed_clock, kind, session, security_id, OVERRIDE_REASON)
 
     assert excinfo.value.reason == OVERRIDE
+    assert _count(journal_settings, "overrides") == 0
+
+
+def test_override_refuses_more_than_one_open_window(
+    journal_settings: Settings, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Only one window may be open (spec req 14); the override writer must
+    refuse the same way `kill` does (#540), before any row is written."""
+    _new_window(journal_settings, datetime(2026, 9, 29, 12, 0, tzinfo=UTC))
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        override(journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON)
+
+    reason, message = _refusal(excinfo)
+    assert reason == MULTIPLE_OPEN_WINDOWS
+    assert "more than one open paper window" in message
     assert _count(journal_settings, "overrides") == 0
 
 

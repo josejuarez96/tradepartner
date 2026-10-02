@@ -12,14 +12,18 @@ Static checks over `src/tradepartner/`, tests excepted:
    code that can place or cancel an order. Those lookups with a non-literal name
    are refused too (`getattr` only when called on the spot, outside
    `NON_LITERAL_GETATTR_CALLERS`). An unrelated `executor.submit` is refused
-   too, by intent.
+   too, by intent. A lookup function renamed on import (`from builtins import
+   getattr as g`) is resolved back to its real name first; a bound
+   `__getattribute__` read but not called on the spot is refused outright
+   (it may be called with any name later); an order name subscripted out of
+   `__dict__` or `vars()` is refused too (#471).
 3. `adapters.alpaca_trading_raw` and `AlpacaTradingRaw` are imported or read
    only by `adapters/alpaca_broker.py` and `cli_record.py` (the owner-run paper
    recorder, T48), re-exports and attribute chains included.
 4. No module other than `store/journal.py` and `store/schema.py` names the
-   `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`,
-   parenthesised or not, or in a comma-separated `FROM` list after `SELECT`,
-   `UPDATE` or `DELETE` or after an upper-case `FROM`, optionally
+   `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE` or
+   `USING`, parenthesised or not, or in a comma-separated `FROM` list after
+   `SELECT`, `UPDATE` or `DELETE` or after an upper-case `FROM`, optionally
    schema-qualified and quoted), as
    a whole string literal, or through `FillRow.TABLE`, so every reader goes
    through `store.journal.fills_for`. Docstrings, identifiers and module names
@@ -218,9 +222,22 @@ def broker_class_imports(module: Module) -> list[str]:
     return found + non_literal_dynamic_imports(module)
 
 
-def _name_args(node: ast.Call) -> list[ast.expr]:
-    """The arguments that name an attribute in a by-name lookup call."""
+def _resolved_called_name(aliases: dict[str, str], node: ast.Call) -> str | None:
+    """`_called_name`, with a bare name resolved through import aliases to the
+    dotted target's last component when it renames one of the by-name lookup
+    functions (`from builtins import getattr as g`, `from operator import
+    attrgetter as ag`, #471). An attribute call's name is already the real
+    one, whatever its module is imported as."""
     called = _called_name(node)
+    if isinstance(node.func, ast.Name) and called in aliases:
+        resolved = aliases[called].rpartition(".")[2]
+        if resolved in ("getattr", "methodcaller", "attrgetter", "__getattribute__"):
+            return resolved
+    return called
+
+
+def _name_args(node: ast.Call, called: str | None) -> list[ast.expr]:
+    """The arguments that name an attribute in a by-name lookup call."""
     if any(isinstance(a, ast.Starred) for a in node.args) and called in (
         "getattr",
         "methodcaller",
@@ -243,7 +260,13 @@ def order_calls(module: Module) -> list[str]:
     dotted paths included, and `__getattribute__`), by line. A lookup whose name
     is not a string literal is refused, since no static check can follow it
     (#418); for `getattr` only when its result is called on the spot, because
-    `getattr(obj, field_name)` field reads are common and harmless."""
+    `getattr(obj, field_name)` field reads are common and harmless. A lookup
+    function renamed on import (`from builtins import getattr as g`) is resolved
+    back to its real name first (#471). A bound `__getattribute__` that is read
+    but not called on the spot is refused outright, since it may be called with
+    any name later and no static check can follow it; so is an order name
+    subscripted out of `__dict__` or `vars()` (#471)."""
+    aliases = _import_aliases(module)
     called_on_the_spot = {
         id(node.func) for node in ast.walk(module.tree) if isinstance(node, ast.Call)
     }
@@ -251,8 +274,27 @@ def order_calls(module: Module) -> list[str]:
     for node in ast.walk(module.tree):
         if isinstance(node, ast.Attribute) and node.attr in ORDER_CALLS:
             found.append(f"line {node.lineno}: .{node.attr}")
-        elif isinstance(node, ast.Call) and (args := _name_args(node)):
-            called = _called_name(node)
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__getattribute__"
+            and id(node) not in called_on_the_spot
+        ):
+            found.append(f"line {node.lineno}: stored __getattribute__")
+        elif isinstance(node, ast.Subscript):
+            key = node.slice
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value in ORDER_CALLS
+            ):
+                value = node.value
+                via_dict = isinstance(value, ast.Attribute) and value.attr == "__dict__"
+                via_vars = isinstance(value, ast.Call) and _called_name(value) == "vars"
+                if via_dict or via_vars:
+                    found.append(f"line {node.lineno}: {key.value!r} via __dict__/vars()")
+        elif isinstance(node, ast.Call) and (
+            args := _name_args(node, called := _resolved_called_name(aliases, node))
+        ):
             literals = [
                 a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)
             ]
@@ -322,16 +364,16 @@ _QUALIFIER = r"(?:[\"'`]?\w+[\"'`]?\.)?[\"'`]?"
 
 def sql_table_references(module: Module, tables: tuple[str, ...]) -> list[str]:
     """Tables among `tables` that `module` names in SQL (after `FROM`, `JOIN`,
-    `INTO`, `UPDATE` or `TABLE`, parenthesised or not, or in a comma-separated
-    `FROM` list after `SELECT`, `UPDATE`, `DELETE` or an upper-case `FROM`) or as
-    a whole string literal."""
+    `INTO`, `UPDATE`, `TABLE` or `USING`, parenthesised or not, or in a
+    comma-separated `FROM` list after `SELECT`, `UPDATE`, `DELETE` or an
+    upper-case `FROM`) or as a whole string literal."""
     found = []
     strings = _strings(module.tree)
     for table in tables:
         name = re.escape(table)
-        # `FROM (fills)` and `FROM(fills)` count (#407)
+        # `FROM (fills)` and `FROM(fills)` count (#407); `DELETE ... USING fills` too (#471)
         keyword = re.compile(
-            rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)(?=[\s(])[\s(]*{_QUALIFIER}{name}\b",
+            rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE|USING)(?=[\s(])[\s(]*{_QUALIFIER}{name}\b",
             re.IGNORECASE,
         )
         # a comma-separated FROM list: any case after SELECT, UPDATE or DELETE, and an
@@ -472,6 +514,20 @@ def test_broker_class_checker(source: str, name: str, is_package: bool, expected
         ('m = getattr(*(broker,), "submit")', True),
         ("operator.attrgetter('price')(row)", False),
         ("row.__getattribute__('price')", False),
+        # #471: renamed builtins resolved through import aliases
+        ("from builtins import getattr as g\ng(broker, 'submit')(request)", True),
+        ("from operator import attrgetter as ag\nag('cancel')(broker)(order_id)", True),
+        ("from operator import attrgetter as ag\nag('price')(row)", False),
+        ("from builtins import getattr as g\nvalue = g(record, field_name)", False),
+        # #471: a bound __getattribute__ stored for later use, not called on the spot
+        ("ga = broker.__getattribute__\nga('submit')(request)", True),
+        ("peek = row.__getattribute__", True),
+        ("broker.__getattribute__('submit')(request)", True),
+        # #471: __dict__/vars() subscripted with an order name
+        ("type(broker).__dict__['submit'](broker, request)", True),
+        ("vars(type(broker))['cancel']", True),
+        ("type(broker).__dict__['price']", False),
+        ("vars(row)['count']", False),
     ],
 )
 def test_order_call_checker(source: str, expected: bool) -> None:
@@ -530,6 +586,9 @@ def test_trading_raw_checker(source: str, name: str, expected: bool) -> None:
         ('conn.execute("UPDATE orders o SET x = 1 FROM orders p, fills f WHERE 1")', True),
         ('where = "FROM orders, fills"', True),
         ('conn.execute("delete from orders using x from y, fills")', True),
+        # #471: DELETE ... USING fills, with no comma-separated FROM list
+        ('conn.execute("DELETE FROM orders USING fills WHERE orders.id = fills.id")', True),
+        ('conn.execute("delete from orders using fills where orders.id = fills.id")', True),
     ],
 )
 def test_fills_sql_checker(source: str, expected: bool) -> None:

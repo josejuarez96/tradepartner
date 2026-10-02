@@ -28,8 +28,9 @@ order:
 1. the `kill_switch` `engaged` row (source `fault`, the fault's type, the
    message as its reason) through T59's `switch.engage`, which retries the
    lock; when the write still fails, the `kill_switch_write_failed` alert goes
-   through every non-store channel and the process exits non-zero
-   (`SystemExit(WRITE_FAILED_EXIT_CODE)`) with nothing else done. The
+   through every non-store channel and the process exits non-zero with a code
+   distinct from a crash's (`SystemExit(WRITE_FAILED_EXIT_CODE)`, `!=
+   CRASH_EXIT_CODE`, #515) with nothing else done. The
    `engaged` row is where the fault is journaled with its type; the result row
    (step 5) repeats the type with the full message. `StaleDataError` writes no
    `engaged` row: it is a data fault the next ingest cures;
@@ -123,12 +124,14 @@ Between the phases the sells are polled until all are terminal or
 `paper.sell_wait_seconds` has passed since the open, then collected (T58); a
 rejection verdict raises `RejectionCapError`. The buys phase reads its facts
 after that collection, so its scope's `last` and every buy's
-`sells_in_flight_at_submit` agree. It ends by collecting its buys and
-appending `reattempts.write_offs`' rows (`completed` only when it sized and
-submitted; a switch read engaged before its first submit writes off no
-deferred buy). Every exception `execute` raises is a fault for the caller's
-halt path (`halt`); `execute` writes no result row: `BatchOutcome.status` is
-the run's to journal.
+`sells_in_flight_at_submit` agree. It ends by collecting its buys with a
+`WriteOffContext` (T58), so a submitted buy that expires unfilled or is
+rejected is `written_off` as soon as that collection returns, then appending
+`reattempts.write_offs`' rows for every buy its sizing deferred (`completed`
+only when it sized and submitted; a switch read engaged before its first
+submit writes off no deferred buy). Every exception `execute` raises is a
+fault for the caller's halt path (`halt`); `execute` writes no result row:
+`BatchOutcome.status` is the run's to journal.
 """
 
 from __future__ import annotations
@@ -217,6 +220,7 @@ __all__ = [
     "ALLOWLISTS",
     "ASSETS_ALLOWLIST",
     "CANCEL_ALLOWLIST",
+    "CRASH_EXIT_CODE",
     "FILLS_ALLOWLIST",
     "GET_ORDER_ALLOWLIST",
     "OPEN_ORDERS_ALLOWLIST",
@@ -256,8 +260,15 @@ ALLOWLISTS: Mapping[str, tuple[type[Exception], ...]] = MappingProxyType(
     }
 )
 
-#: The exit status when the `engaged` row cannot be written (spec req 4).
-WRITE_FAILED_EXIT_CODE = 1
+#: An uncaught exception's exit status (Python/typer's default). Named here so the
+#: two codes are defined side by side and nothing hardcodes `1` to mean "crashed".
+CRASH_EXIT_CODE = 1
+
+#: The exit status when the `engaged` row itself cannot be written (spec req 4):
+#: distinct from `CRASH_EXIT_CODE` so the launchd plist and the runbook can tell a
+#: failed halt write apart from an ordinary crash (#366 Q22 (ii), #515). Also
+#: distinct from `cli.USAGE_ERROR` (2), so a bad CLI flag never looks like one.
+WRITE_FAILED_EXIT_CODE = 3
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _MASK = "***"
@@ -623,10 +634,26 @@ class RiskGatedBroker:
             in_flight=not scope.last,
         )
         submitted = self._submit_all(gated.to_submit)
-        self._collect(run, [row for row, _ in gated.to_submit])
+        collected_written_off = self._collect(
+            run,
+            [row for row, _ in gated.to_submit],
+            write_offs=WriteOffContext(
+                window_id=run.window_id,
+                actions_as_of=book.actions,
+                price_of=book.price_of,
+                session=run.session,
+            ),
+        )
         after = self._read_book(run, rows)
-        written = self._write_offs(
-            run, rows, after, scope.last, completed=True, deferred=built.deferred
+        written = tuple(
+            sorted(
+                {
+                    *collected_written_off,
+                    *self._write_offs(
+                        run, rows, after, scope.last, completed=True, deferred=built.deferred
+                    ),
+                }
+            )
         )
         spent = sum(
             (
@@ -1004,11 +1031,22 @@ class RiskGatedBroker:
             self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
         self._collect(run, sells)
 
-    def _collect(self, run: PaperRunRow, orders: Sequence[OrderRow]) -> None:
+    def _collect(
+        self,
+        run: PaperRunRow,
+        orders: Sequence[OrderRow],
+        *,
+        write_offs: WriteOffContext | None = None,
+    ) -> tuple[int, ...]:
         """Collect this phase's orders (T58); a rejection verdict raises
-        `RejectionCapError` naming the submitting run."""
+        `RejectionCapError` naming the submitting run. `write_offs`, when given,
+        back-fills the `written_off` row of a terminal buy of a pending
+        rebalance that lacks one, visible as soon as this collection returns
+        (spec "Two phases": a submitted buy that expires unfilled or is
+        rejected is written off at collection, not at the phase's end); the
+        decision ids written off that way are returned."""
         if not orders:
-            return
+            return ()
         assert run.run_id is not None
         collected = collect(
             self._broker,
@@ -1019,9 +1057,11 @@ class RiskGatedBroker:
             run.run_id,
             self._frozen,
             self._settings,
+            write_offs=write_offs,
         )
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
+        return collected.written_off
 
     def _write_offs(
         self,
