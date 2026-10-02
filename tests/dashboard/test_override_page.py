@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -266,6 +268,76 @@ def test_a_field_the_kind_does_not_take_is_refused(
     assert not at.exception
     assert _rows(store) == []
     assert "refused" in _text(at).lower()
+
+
+def test_a_second_click_after_a_write_writes_no_second_row(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """The form clears on submit, so a second click (or a double click) finds
+    an empty reason and is refused rather than writing the same row twice."""
+    at = _app(monkeypatch, store)
+    _fill(at)
+    _submit(at)
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert at.text_area(key=override_page.REASON_KEY).value in (None, "")
+
+
+def test_a_write_followed_by_a_busy_render_still_shows_it_was_written(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """The write commits in the callback; if the shell's read then finds the
+    store busy (a scheduled run took the lock in between), the owner still
+    sees that the override was written, once, so they do not resubmit."""
+    import tradepartner.store.db as db
+
+    at = _app(monkeypatch, store)
+    _fill(at)
+
+    @contextmanager
+    def _busy(_settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+        raise db.StoreLockedError("held by a run")
+        yield  # pragma: no cover
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "open_read_only", _busy)
+        _submit(at)
+        assert not at.exception
+        assert len(_rows(store)) == 1
+        assert "written" in _text(at).lower()
+        assert "busy" in _text(at).lower()
+
+    at.run()
+    assert not at.exception
+    assert "written" not in _text(at).lower()
+
+
+def test_the_page_writes_to_the_shells_settings_not_the_environments(
+    monkeypatch: pytest.MonkeyPatch, store: Path, tmp_path: Path
+) -> None:
+    """`render_app(settings)` hands its own `Settings` to the page, so the
+    write lands in the store the shell reads, whatever the environment says."""
+    elsewhere = tmp_path / "elsewhere.duckdb"
+    monkeypatch.setenv("STORE__PATH", str(elsewhere))
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "does-not-exist.env"))
+
+    def _script(path: str) -> None:
+        from tradepartner.config import Settings
+        from tradepartner.dashboard.app import render_app
+
+        render_app(Settings(_env_file=None, store={"path": path}))
+
+    at = AppTest.from_function(_script, args=(str(store),), default_timeout=30)
+    at.run()
+    at.sidebar.radio[0].set_value(_PAGE).run()
+    _fill(at)
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert not elsewhere.exists()
 
 
 def test_store_busy_writes_nothing_and_shows_the_busy_state(

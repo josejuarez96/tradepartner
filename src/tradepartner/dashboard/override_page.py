@@ -13,9 +13,14 @@ script body. The form's submit button carries an `on_click` callback
 (`on_submit`), which Streamlit runs at the start of the rerun, before the
 script body and so before the shell opens its read-only connection; the
 previous render's connection has already closed. The callback stores the
-writer's answer (`Outcome`) in `session_state`, and the page body pops it to
-show it once. That stored value is a result to display, never a trigger: a
-rerun that finds it writes nothing, and only a click runs the callback.
+writer's answer (`Outcome`) in `session_state`, and the shell pops it with
+`show_outcome` before it opens its connection, so the answer is shown once
+even when the read that follows finds the store busy (a written override
+never looks unwritten). That stored value is a result to display, never a
+trigger: a rerun that finds it writes nothing, and only a click runs the
+callback. After a write the reason is emptied (and the form clears on
+submit), so a second click finds no reason and is refused rather than
+writing the same row twice.
 
 **Store busy.** `StoreLockedError` (another process past
 `store.lock_retry_seconds`, or at once another tab of this server
@@ -111,18 +116,30 @@ def on_submit(settings: Settings) -> None:
     """The submit button's `on_click` callback: Streamlit runs it before the
     script body, so before the shell opens its read-only connection (module
     docstring). Reads the form's widgets from `session_state`, writes through
-    `submit`, and leaves the answer for the page body to show once."""
+    `submit`, and leaves the answer for `show_outcome` to show once. After a
+    write it empties the reason, so a second click is refused for a blank
+    reason instead of writing the same row again (the form's
+    `clear_on_submit` does the same in the browser)."""
     state = st.session_state
-    st.session_state[OUTCOME_KEY] = submit(
+    outcome = submit(
         settings,
         state[KIND_KEY],
         state[SESSION_KEY],
         state[NAME_KEY],
         state[REASON_KEY],
     )
+    if outcome.status is OutcomeStatus.WRITTEN:
+        state[REASON_KEY] = ""
+    state[OUTCOME_KEY] = outcome
 
 
-def _render_outcome(outcome: Outcome, settings: Settings) -> None:
+def show_outcome(settings: Settings) -> None:
+    """Show, once, the answer `on_submit` left in `session_state`, if any.
+    The shell calls this before it opens its read-only connection (module
+    docstring); it reads no store."""
+    outcome = st.session_state.pop(OUTCOME_KEY, None)
+    if not isinstance(outcome, Outcome):
+        return
     if outcome.status is OutcomeStatus.WRITTEN:
         st.success(outcome.message)
     elif outcome.status is OutcomeStatus.BUSY:
@@ -149,7 +166,9 @@ def _render_window_state(conn: duckdb.DuckDBPyConnection) -> None:
 
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) -> None:
     """Draw the override form from the shell's read-only connection. Writes
-    nothing itself: the write is `on_submit`'s, before the next render."""
+    nothing itself: the write is `on_submit`'s, before the next render, and
+    its answer is `show_outcome`'s. `settings` is the shell's, so the write
+    lands in the store the shell reads."""
     if settings is None:
         settings = get_settings()
 
@@ -161,13 +180,9 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         "once trimmed."
     )
 
-    outcome = st.session_state.pop(OUTCOME_KEY, None)
-    if isinstance(outcome, Outcome):
-        _render_outcome(outcome, settings)
-
     _render_window_state(conn)
 
-    with st.form(FORM_KEY):
+    with st.form(FORM_KEY, clear_on_submit=True):
         st.selectbox("Kind", KINDS, key=KIND_KEY)
         st.date_input(
             "Rebalance session",

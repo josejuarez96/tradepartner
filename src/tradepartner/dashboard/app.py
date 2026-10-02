@@ -32,10 +32,13 @@ inside `render_app`'s `with` block: the page's submit button carries an
 `on_click` callback (`override_page.on_submit`), which Streamlit runs at the
 start of the rerun, before this script body, so the previous render's
 connection has closed and none is open while T64b's `override` writer runs.
-`render_app` then opens its one read-only connection and the page shows the
-writer's answer. A `session_state` flag consumed by this body is not the
-mechanism (a flag left set would write on every later rerun); the stored
-answer is only displayed. `StoreLockedError` from the writer (another process
+`render_app` then shows the writer's answer (`override_page.show_outcome`)
+*before* it opens its one read-only connection, so a write that committed is
+reported even when that read finds the store busy, and hands its own
+`Settings` to the override page so the write lands in the store it reads.
+A `session_state` flag consumed by this body is not the mechanism (a flag
+left set would write on every later rerun); the stored answer is only
+displayed. `StoreLockedError` from the writer (another process
 past `store.lock_retry_seconds`, or at once another tab mid-render) is the
 busy state; this module still never imports `open_for_write`.
 
@@ -172,12 +175,14 @@ def render_unreadable(settings: Settings, detail: str) -> None:
     st.error(f"The store at `{settings.store.path}` could not be read: {detail}")
 
 
+_OVERRIDE_PAGE = "Override"
+
 _PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "Data health": health_page.render,
     "Backtest": backtest_page.render,
     "Trial registry": trials_page.render,
     "Operations": ops_page.render,
-    "Override": override_page.render,
+    _OVERRIDE_PAGE: override_page.render,
 }
 
 
@@ -225,6 +230,7 @@ def render_app(settings: Settings | None = None) -> None:
         return
 
     page_name = st.sidebar.radio("Navigate", list(_PAGES))
+    override_page.show_outcome(settings)
 
     with open_store_connection(settings) as store:
         if isinstance(store, StoreUnavailable):
@@ -236,7 +242,10 @@ def render_app(settings: Settings | None = None) -> None:
                 render_unreadable(settings, store.detail)
             return
 
-        _PAGES[page_name](store)
+        if page_name == _OVERRIDE_PAGE:
+            override_page.render(store, settings)
+        else:
+            _PAGES[page_name](store)
 
 
 if __name__ == "__main__":
