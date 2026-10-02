@@ -48,6 +48,12 @@ def _event(conn: duckdb.DuckDBPyConnection, reason: str | None, coid: str = "c1"
     )
 
 
+#: `resume_invocations` as versions 5 to 7 created it: no `accept_rejections` (#472).
+_V7_RESUME_INVOCATIONS_DDL = schema._CREATE_RESUME_INVOCATIONS.replace(
+    "    accept_rejections BOOLEAN NOT NULL,\n", ""
+)
+
+
 def _version_5_store(path: Path, reasons: tuple[str | None, ...] = ()) -> Path:
     """A store shaped as version 5 left it (no reason `CHECK`), holding one
     `order_events` row per entry of `reasons`."""
@@ -55,6 +61,9 @@ def _version_5_store(path: Path, reasons: tuple[str | None, ...] = ()) -> Path:
         schema.init_schema(conn)
         conn.execute("DROP TABLE order_events")
         conn.execute(_V5_ORDER_EVENTS_DDL)
+        conn.execute("DROP TABLE resume_acceptances")
+        conn.execute("DROP TABLE resume_invocations")
+        conn.execute(_V7_RESUME_INVOCATIONS_DDL)
         conn.execute("UPDATE schema_version SET version = 5")
         for index, reason in enumerate(reasons):
             _event(conn, reason, coid=f"c{index}")
@@ -127,6 +136,10 @@ def test_fresh_init_records_the_current_version(journal: duckdb.DuckDBPyConnecti
     assert _versions(journal) == [schema.CURRENT_SCHEMA_VERSION]
 
 
+#: The tables the migration from version 5 rebuilds or creates (versions 6 to 8).
+_REBUILT = {"order_events", "decisions", "resume_invocations", "resume_acceptances"}
+
+
 def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
     tmp_path: Path, journal: duckdb.DuckDBPyConnection
 ) -> None:
@@ -137,7 +150,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
         others_before = {
             table: _shape(conn, table)
             for table in schema.JOURNAL_TABLE_NAMES
-            if table != "order_events"
+            if table not in _REBUILT
         }
         schema.init_schema(conn)
         after = conn.execute("SELECT * FROM order_events ORDER BY ALL").fetchall()
@@ -147,9 +160,9 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
             _event(conn, "halted")
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == [5, 6, 7]
+    assert versions == [5, 6, 7, 8]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
-    assert {t: s for t, s in shapes.items() if t != "order_events"} == others_before
+    assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
 
 
 def test_the_migration_keeps_the_reader_order_of_tied_events(tmp_path: Path) -> None:
@@ -180,7 +193,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [5, 6, 7]
+        assert _versions(conn) == [5, 6, 7, 8]
 
 
 def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothing(

@@ -36,6 +36,7 @@ from tradepartner.store.journal import (
     kill_switch_events_for,
     order_events_for,
     reconciliations_for,
+    resume_acceptances,
     resume_invocations,
     runs_for,
 )
@@ -83,7 +84,11 @@ def fake(fixed_clock: FixedClock) -> SkewedFake:
 @pytest.fixture
 def window(journal_settings: Settings) -> PaperWindowRow:
     """An open window with its frozen risk section as `paper start` writes it."""
-    frozen = {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
+    return _open_window(journal_settings, FROZEN)
+
+
+def _open_window(settings: Settings, risk: RiskConfig) -> PaperWindowRow:
+    frozen = {f"risk.{k}": v for k, v in risk.model_dump(mode="json").items()}
     started = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
     row = PaperWindowRow(
         hypothesis_id=1,
@@ -98,7 +103,7 @@ def window(journal_settings: Settings) -> PaperWindowRow:
         known_at=started,
         ingested_at=started,
     )
-    (window_id,) = _append(journal_settings, row)
+    (window_id,) = _append(settings, row)
     return replace(row, window_id=window_id)
 
 
@@ -210,13 +215,24 @@ def _engage(settings: Settings, window: PaperWindowRow, clock: FixedClock) -> No
 
 
 def _resume(
-    settings: Settings, fake: FakeBroker, clock: FixedClock, *, accept: bool = False
+    settings: Settings,
+    fake: FakeBroker,
+    clock: FixedClock,
+    *,
+    accept: bool = False,
+    accept_rejections: bool = False,
 ) -> Any:
     # A real clock moves between reads; the release must be stamped after the
     # crashed close for `switch.derive` to clear the crashed run.
     ticking = lambda: clock.advance(microseconds=1)  # noqa: E731
     return resume(
-        settings, lambda: open_for_write(settings), fake, ticking, "owner checked", accept
+        settings,
+        lambda: open_for_write(settings),
+        fake,
+        ticking,
+        "owner checked",
+        accept,
+        accept_rejections=accept_rejections,
     )
 
 
@@ -382,6 +398,7 @@ def test_resume_closes_an_unfinished_run_crashed_and_releases_with_its_ids(
         ]
     assert run.result is not None and run.result.status == "crashed"
     assert invocation.reason == "owner checked" and not invocation.accept_broker_fills
+    assert not invocation.accept_rejections
     (row,) = released
     assert (row.resume_id, row.reconciliation_id) == (
         invocation.resume_id,
@@ -728,6 +745,7 @@ def test_a_blank_reason_is_refused_before_anything(
             fixed_clock,
             " ",
             False,
+            accept_rejections=False,
         )
     assert _count(journal_settings, "resume_invocations") == 0
 
@@ -843,7 +861,13 @@ def test_a_clock_that_does_not_move_reports_the_switch_still_engaged(
     _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
 
     outcome = resume(
-        journal_settings, lambda: open_for_write(journal_settings), fake, fixed_clock, "x", False
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        fake,
+        fixed_clock,
+        "x",
+        False,
+        accept_rejections=False,
     )
 
     assert outcome.status == REFUSED
@@ -949,4 +973,354 @@ def test_an_engagement_written_during_the_resume_refuses_the_release(
     assert outcome.status == REFUSED
     assert any("release refused" in r and "after resume" in r for r in outcome.reasons)
     assert outcome.released_event_id is None
+    assert _engaged(journal_settings, window)
+
+
+# --- --accept-rejections (#472) ------------------------------------------------
+
+
+def _halted_with_rejections(
+    settings: Settings,
+    fake: FakeBroker,
+    clock: FixedClock,
+    window: PaperWindowRow,
+    coids: tuple[str, ...] = ("tp-h1", "tp-h2"),
+    *,
+    frozen: RiskConfig = FROZEN,
+    others: tuple[OrderRow, ...] = (),
+) -> int:
+    """A run whose halt read journals the rejection of every order in `coids`
+    (and collects `others`, orders of the same run), then ends `halted` with the
+    switch engaged: #451's refusal, which only `--accept-rejections` gets past."""
+    at = DAY1 - timedelta(hours=1)
+    run_id = others[0].run_id if others else _run(settings, window, at, finished=False)
+    orders = [_order(settings, fake, run_id, coid, 1.0, at) for coid in coids]
+    for order in orders:
+        fake.apply(order.client_order_id, Reject())
+    halt_read = collect(
+        fake,
+        lambda: open_for_write(settings),
+        [*others, *orders],
+        clock,
+        "run",
+        run_id,
+        frozen,
+        settings,
+    )
+    assert [b.run_id for b in halt_read.rejections] == [run_id]
+    halted_at = clock.advance(minutes=1)
+    _append(
+        settings,
+        PaperRunResultRow(
+            run_id=run_id,
+            finished_at=halted_at,
+            status="halted",
+            clock_fault=False,
+            known_at=halted_at,
+            ingested_at=halted_at,
+        ),
+    )
+    _engage(settings, window, clock)
+    return run_id
+
+
+def _acceptances(settings: Settings) -> list[tuple[int, list[dict[str, Any]], datetime]]:
+    with open_read_only(settings) as conn:
+        return [
+            (row.resume_id, json.loads(row.accepted_json), row.known_at)
+            for row in resume_acceptances(conn)
+        ]
+
+
+def _verdict(run_id: int, rejected: int, orders: int, *, all_rejected: bool) -> dict[str, Any]:
+    message = (
+        f"every order of run {run_id} was rejected ({rejected})"
+        if all_rejected
+        else (
+            f"run {run_id} had {rejected} of {orders} orders rejected, "
+            "over risk.max_rejections_per_run"
+        )
+    )
+    return {
+        "run_id": run_id,
+        "rejected": rejected,
+        "orders": orders,
+        "all_rejected": all_rejected,
+        "message": message,
+    }
+
+
+def test_without_the_flag_a_halted_runs_rejection_verdict_refuses_and_nothing_is_accepted(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert f"every order of run {run_id} was rejected (2)" in outcome.reasons
+    assert outcome.accepted_rejections == ()
+    assert _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+    assert invocation.accept_rejections is False
+    assert _count(journal_settings, "resume_acceptances") == 0
+
+
+def test_with_the_flag_the_release_proceeds_and_the_journal_names_the_accepted_verdict(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert outcome.accepted_rejections == (f"every order of run {run_id} was rejected (2)",)
+    assert not _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+        (released,) = [
+            e
+            for e in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            if e.state == "released"
+        ]
+    assert invocation.accept_rejections is True and not invocation.accept_broker_fills
+    ((resume_id, accepted, known_at),) = _acceptances(journal_settings)
+    assert resume_id == invocation.resume_id == outcome.resume_id == released.resume_id
+    assert accepted == [_verdict(run_id, 2, 2, all_rejected=True)]
+    # Journal-first: the acceptance is on record before the release.
+    assert invocation.known_at <= known_at < released.known_at
+    assert known_at.utcoffset() == timedelta(0)
+
+
+def test_with_the_flag_an_over_cap_verdict_is_accepted_with_its_counts(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    fixed_clock: FixedClock,
+) -> None:
+    capped = RiskConfig(max_rejections_per_run=1)
+    window = _open_window(journal_settings, capped)
+    at = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, at, finished=False)
+    kept = _order(journal_settings, fake, run_id, "tp-ok", 1.0, at)
+    fake.apply("tp-ok", Expire())
+    _halted_with_rejections(
+        journal_settings, fake, fixed_clock, window, frozen=capped, others=(kept,)
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    ((_, accepted, _),) = _acceptances(journal_settings)
+    assert accepted == [_verdict(run_id, 2, 3, all_rejected=False)]
+
+
+def test_with_the_flag_a_crashed_runs_verdict_is_accepted_once(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    # The resume closes the run `crashed`; its collection and the faulted-run
+    # check both find the verdict, and the flag accepts it once.
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    for coid in ("tp-c1", "tp-c2"):
+        _order(journal_settings, fake, run_id, coid, 1.0, DAY1 - timedelta(hours=1))
+        fake.apply(coid, Reject())
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert outcome.crashed_runs == (run_id,)
+    ((_, accepted, _),) = _acceptances(journal_settings)
+    assert accepted == [_verdict(run_id, 2, 2, all_rejected=True)]
+
+
+def test_with_the_flag_a_reconciliation_mismatch_still_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+    fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))
+    fake.simulate_fill("owner-1")  # a position the ledger lacks
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == REFUSED
+    assert any("broker_only_position" in r for r in outcome.reasons)
+    assert outcome.released_event_id is None
+    assert _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (row,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
+        states = [e.state for e in kill_switch_events_for(conn, window.window_id)]  # type: ignore[arg-type]
+    assert row.status == "mismatch"
+    assert "released" not in states
+    # The acceptance is on record even though the release never came.
+    ((_, accepted, _),) = _acceptances(journal_settings)
+    assert accepted == [_verdict(run_id, 2, 2, all_rejected=True)]
+
+
+def test_with_the_flag_the_lag_bound_still_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == REFUSED
+    assert any("tp-lag" in r and "lag bound" in r for r in outcome.reasons)
+    assert not any(f"run {run_id}" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+    assert _count(journal_settings, "reconciliations") == 1  # _lagging_third_fill's own
+
+
+def test_with_the_flag_an_engagement_written_after_the_resume_still_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#447: an engagement written at or after the resume row is one the owner did
+    not see; the flag accepts verdicts, never that."""
+    _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+
+    def reconcile_then_engage(*args: object, **kwargs: object) -> object:
+        result = reconcile_now(*args, **kwargs)  # type: ignore[arg-type]
+        assert isinstance(
+            switch.engage(
+                journal_settings,
+                fixed_clock,
+                window_id=window.window_id,  # type: ignore[arg-type]
+                source="drawdown",
+                reason="drawdown after the resume row",
+            ),
+            int,
+        )
+        return result
+
+    monkeypatch.setattr(resume_module, "reconcile_now", reconcile_then_engage)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == REFUSED
+    assert any("release refused" in r and "after resume" in r for r in outcome.reasons)
+    assert outcome.released_event_id is None
+    assert _engaged(journal_settings, window)
+
+
+def test_with_the_flag_a_run_with_a_verdict_and_a_lagging_order_is_still_refused(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    fixed_clock: FixedClock,
+) -> None:
+    """One halted run carries both a rejection-cap verdict and an order past the
+    lag bound: the flag accepts the verdict and the lag still refuses."""
+    capped = RiskConfig(max_rejections_per_run=1)
+    window = _open_window(journal_settings, capped)
+    at = DAY1 - timedelta(hours=1)
+    run_id = _run(journal_settings, window, at, finished=False)
+    lagging = _order(journal_settings, fake, run_id, "tp-lag", 3.0, at)
+    fake.apply("tp-lag", PartialFill(1.0, 100.0))
+    fake.apply("tp-lag", PartialFill(1.0, 101.0))
+    _halted_with_rejections(
+        journal_settings, fake, fixed_clock, window, frozen=capped, others=(lagging,)
+    )
+    fake.lag_fills(None)
+    fake.apply("tp-lag", PartialFill(1.0, 102.0))
+    first = reconcile_now(
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        fake,
+        window,
+        DAY1.date(),
+        fixed_clock,
+        lambda: open_for_write(journal_settings),
+        frozen=capped,
+        as_of=fixed_clock(),
+    )
+    assert first.lagging_ids == ("tp-lag",)
+    fixed_clock.now = DAY2
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == REFUSED
+    assert any("tp-lag" in r and "lag bound" in r for r in outcome.reasons)
+    assert not any(f"run {run_id} had" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+    ((_, accepted, _),) = _acceptances(journal_settings)
+    assert accepted == [_verdict(run_id, 2, 3, all_rejected=False)]
+
+
+def test_with_the_flag_a_collection_verdict_on_a_run_that_ended_ok_still_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#374's verdict on a run the release would not clear is not #451's refusal:
+    the flag does not accept it."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=True)
+    for coid in ("tp-r1", "tp-r2"):
+        _order(journal_settings, fake, run_id, coid, 1.0, DAY1 - timedelta(hours=1))
+        fake.apply(coid, Reject())
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == REFUSED
+    assert f"every order of run {run_id} was rejected (2)" in outcome.reasons
+    assert outcome.accepted_rejections == ()
+    assert _engaged(journal_settings, window)
+    assert _count(journal_settings, "reconciliations") == 0
+    ((_, accepted, _),) = _acceptances(journal_settings)
+    assert accepted == []
+
+
+def test_the_flag_with_no_verdict_changes_nothing_and_records_nothing_accepted(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+
+    outcome = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert outcome.crashed_runs == (crashed,)
+    assert outcome.accepted_rejections == ()
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+    assert invocation.accept_rejections is True
+    ((resume_id, accepted, _),) = _acceptances(journal_settings)
+    assert (resume_id, accepted) == (outcome.resume_id, [])
+
+
+def test_the_flag_without_a_verdict_refuses_what_a_plain_resume_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+
+    plain = _resume(journal_settings, fake, fixed_clock)
+    flagged = _resume(journal_settings, fake, fixed_clock, accept_rejections=True)
+
+    assert plain.status == flagged.status == REFUSED
+    assert plain.reasons == flagged.reasons
     assert _engaged(journal_settings, window)

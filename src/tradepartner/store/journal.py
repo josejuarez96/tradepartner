@@ -341,6 +341,21 @@ class ResumeInvocationRow:
     at: datetime
     reason: str
     accept_broker_fills: bool
+    accept_rejections: bool
+    known_at: datetime
+    ingested_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResumeAcceptanceRow:
+    """One `resume_acceptances` row: the rejection-cap verdicts a resume given
+    `--accept-rejections` accepted, as a JSON list (`[]` for none; #472)."""
+
+    TABLE: ClassVar[str] = "resume_acceptances"
+    ID_COLUMN: ClassVar[str | None] = None
+
+    resume_id: int
+    accepted_json: str
     known_at: datetime
     ingested_at: datetime
 
@@ -575,6 +590,7 @@ ROW_TYPES: Mapping[str, type[Any]] = MappingProxyType(
             FillRow,
             FillCursorRow,
             ResumeInvocationRow,
+            ResumeAcceptanceRow,
             OutcomeRow,
             PositionDailyRow,
             AdjustmentRow,
@@ -1102,6 +1118,11 @@ def resume_invocations(conn: duckdb.DuckDBPyConnection) -> list[ResumeInvocation
     """Every `resume_invocations` row in `resume_id` order (the table has no
     window; its outcome is the `kill_switch` row carrying the `resume_id`)."""
     return _select(conn, ResumeInvocationRow, order="t.resume_id")
+
+
+def resume_acceptances(conn: duckdb.DuckDBPyConnection) -> list[ResumeAcceptanceRow]:
+    """Every `resume_acceptances` row in `resume_id` order (#472)."""
+    return _select(conn, ResumeAcceptanceRow, order="t.resume_id")
 
 
 def alerts_for(conn: duckdb.DuckDBPyConnection, *, kind: str, session: date) -> list[AlertRow]:
