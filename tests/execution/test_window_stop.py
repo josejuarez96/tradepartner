@@ -18,12 +18,14 @@ from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import reconcile_now
+from tradepartner.execution.resume import resume
 from tradepartner.execution.window import (
     KILL_SWITCH,
     MULTIPLE_OPEN_WINDOWS,
     NO_WINDOW,
     NOT_FLAT,
     NOT_READY,
+    OPEN_ORDERS,
     OVERRIDE,
     REASON,
     RECONCILIATION,
@@ -656,6 +658,172 @@ def test_abandon_refuses_more_than_one_open_window(
     assert fake.calls == ()
     assert _stops(journal_settings, window) == []
     assert _count(journal_settings, "reconciliations") == 0
+
+
+def _assert_abandon_refused_open(
+    settings: Settings,
+    fake: FakeBroker,
+    clock: FixedClock,
+    window: PaperWindowRow,
+    coid: str,
+) -> None:
+    """`abandon` refuses `open_orders` naming `coid`, with no broker call and
+    no row of any kind written (#542)."""
+    calls = len(fake.calls)
+    counts = {t: _count(settings, t) for t in ("reconciliations", "kill_switch", "order_events")}
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        abandon(settings, _connect(settings), fake, clock, NOTE)
+
+    reason, message = _refusal(excinfo)
+    assert reason == OPEN_ORDERS
+    assert coid in message and "not terminal" in message
+    assert len(fake.calls) == calls  # refused before the final reconciliation
+    assert _stops(settings, window) == []
+    assert {t: _count(settings, t) for t in counts} == counts
+    with open_read_only(settings) as conn:
+        assert open_window(conn) is not None
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_abandon_is_refused_while_an_own_order_is_open_at_the_broker(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    side: str,
+) -> None:
+    """The owner's decision on #542: `abandon` never leaves an own order
+    working at the broker and never cancels one; it refuses, writing nothing."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    _buy(journal_settings, fake, fixed_clock, run_id, f"tp-{side}", 1.0, fill=False, side=side)
+    assert [o.client_order_id for o in fake.open_orders()] == [f"tp-{side}"]
+
+    _assert_abandon_refused_open(journal_settings, fake, fixed_clock, window, f"tp-{side}")
+    assert [o.client_order_id for o in fake.open_orders()] == [f"tp-{side}"]  # not cancelled
+
+
+def test_abandon_is_refused_while_the_journal_shows_an_order_the_broker_filled(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """`stop`'s rule (`not_ready`): an order is open until the journal holds its
+    terminal event, whatever the broker says; collecting it (a run or `paper
+    resume`) is what lets the window end."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    order = _buy(journal_settings, fake, fixed_clock, run_id, "tp-late", 1.0, fill=False)
+    fake.simulate_fill("tp-late")
+    assert fake.open_orders() == []
+
+    _assert_abandon_refused_open(journal_settings, fake, fixed_clock, window, "tp-late")
+
+    _collect(journal_settings, fake, fixed_clock, [order])
+    fixed_clock.advance(minutes=1)
+    abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+    assert [s.state for s in _stops(journal_settings, window)] == ["abandoned"]
+
+
+def test_abandon_is_refused_while_an_order_the_broker_never_received_is_pending(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """A crash between journaling and submitting leaves only a `pending` event:
+    open until `paper resume` settles it (`cancelled`, `not_received`)."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    at = DAY1 - timedelta(hours=1)
+    (decision_id,) = _append(
+        journal_settings,
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=date(2026, 9, 30),
+            security_id=SPY,
+            side="buy",
+            planned_quantity=1.0,
+            whole_share=False,
+            decision="trade",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert decision_id is not None
+    _append(
+        journal_settings,
+        OrderRow(
+            client_order_id="tp-unsent",
+            decision_id=decision_id,
+            run_id=run_id,
+            session=at.date(),
+            attempt=1,
+            phase="buy",
+            security_id=SPY,
+            symbol="SPY",
+            side="buy",
+            quantity=1.0,
+            sells_in_flight_at_submit=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+        OrderEventRow(client_order_id="tp-unsent", status="pending", known_at=at, ingested_at=at),
+    )
+
+    _assert_abandon_refused_open(journal_settings, fake, fixed_clock, window, "tp-unsent")
+
+    ticking = lambda: fixed_clock.advance(microseconds=1)  # noqa: E731
+    resume(
+        journal_settings,
+        _connect(journal_settings),
+        fake,
+        ticking,
+        NOTE,
+        False,
+        accept_rejections=False,
+    )
+    fixed_clock.advance(minutes=1)
+    abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+    assert [s.state for s in _stops(journal_settings, window)] == ["abandoned"]
+
+
+def test_an_open_order_of_another_window_does_not_refuse_abandon(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """The read is per window, as `stop`'s is (#542's PR, open question 2)."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    _buy(journal_settings, fake, fixed_clock, run_id, "tp-old", 1.0, fill=False)
+    _append(
+        journal_settings,
+        PaperWindowStopRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=DAY1 - timedelta(minutes=30),
+            state="abandoned",
+            reason=NOTE,
+            known_at=DAY1 - timedelta(minutes=30),
+            ingested_at=DAY1 - timedelta(minutes=30),
+        ),
+    )
+    later = _new_window(journal_settings, DAY1 - timedelta(minutes=20))
+    fixed_clock.advance(minutes=1)
+
+    abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+
+    assert [s.state for s in _stops(journal_settings, later)] == ["abandoned"]
+
+
+def test_abandon_is_allowed_once_every_order_is_terminal(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Terminal orders do not refuse, even without their outcome rows (those
+    are `stop`'s `not_ready`, not open orders)."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    _buy(journal_settings, fake, fixed_clock, run_id, "tp-filled", 2.0)
+    expired = _buy(journal_settings, fake, fixed_clock, run_id, "tp-expired", 1.0, fill=False)
+    fake.apply("tp-expired", Expire())
+    _collect(journal_settings, fake, fixed_clock, [expired])
+    fixed_clock.advance(minutes=1)
+
+    result = abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
+
+    (row,) = _stops(journal_settings, window)
+    assert row.state == "abandoned"
+    assert row.reconciliation_id == result.reconciliation_id
+    assert json.loads(row.residues_json)["positions"] == {"SPY": 2.0}
 
 
 # --- kill -------------------------------------------------------------------------
