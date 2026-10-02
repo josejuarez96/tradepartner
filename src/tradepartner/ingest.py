@@ -420,7 +420,12 @@ def _ingest_filings(
     clock: Callable[[], datetime],
 ) -> tuple[int, str]:
     recorded = _Recorded(filings)
-    _build_filings(recorded, settings, _FETCH_PASS)
+    # The fetch pass, so `now` is read only after every source answer. When
+    # `filings` is already a frozen fetch pass (`_prefetch`, as both callers
+    # do) nothing is left to fetch and repeating its build would only
+    # recompute it (#564).
+    if not (isinstance(filings, _Recorded) and filings.frozen):
+        _build_filings(recorded, settings, _FETCH_PASS)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
     added = 0

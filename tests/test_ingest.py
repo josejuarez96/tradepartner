@@ -46,6 +46,9 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     _add_rows,
+    _ingest_filings,
+    _prefetch,
+    _Recorded,
     expected_session,
     fact_rows,
     ingest_session,
@@ -813,6 +816,45 @@ def test_a_filing_accepted_while_the_run_fetches_is_stored(settings: Settings) -
         settings, prices=_Prices(), filings=_filings(), source="edgar", clock=lambda: next(ticks)
     )
     assert result.ok
+
+
+def _filing_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
+    tables = ("securities", "listings", "delistings", "classifications", "facts")
+    return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall(), key=repr) for t in tables}
+
+
+def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#564: after `_prefetch`, `_ingest_filings` skips its own fetch pass (a
+    frozen source has nothing left to fetch) and writes exactly the rows the
+    unprefetched path writes, stamped at the same clock."""
+    import tradepartner.ingest as ingest
+
+    builds: list[datetime] = []
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        builds.append(kwargs["ingested_at"])
+        return build_classifications(*args, **kwargs)
+
+    monkeypatch.setattr(ingest, "build_classifications", counting)
+    written = []
+    for prefetch in (False, True):
+        builds.clear()
+        source: FixtureFilingSource | _Recorded = _filings()
+        if prefetch:
+            source = _Recorded(source)
+            _prefetch(source, settings)
+        conn = duckdb.connect(":memory:")
+        conn.execute("SET TimeZone='UTC'")
+        init_schema(conn)
+        added, _ = _ingest_filings(conn, settings, source, lambda: NOW)
+        assert added > 0
+        written.append(_filing_tables(conn))
+        conn.close()
+        assert builds[-1] == NOW
+        assert len(builds) == 2  # one fetch pass, then the build at the clock
+    assert written[0] == written[1]
 
 
 def test_a_filed_value_that_reverts_is_a_third_row(
