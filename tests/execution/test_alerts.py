@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import Settings
 from tradepartner.execution import alerts
@@ -51,6 +52,7 @@ SPEC_KINDS = (
     "unspent_cash",
     "locked",
     "no_window",
+    "lot_ledger",  # #366 Q5 (a), 2026-10-01
 )
 
 
@@ -67,7 +69,7 @@ def conn() -> Iterator[duckdb.DuckDBPyConnection]:
 _TIMEOUT = 7.5
 
 
-def _settings(channels: Sequence[str] = ("store",), **secrets: str) -> Settings:
+def _settings(channels: Sequence[str] = ("store", "macos"), **secrets: str) -> Settings:
     alerts_config = {"channels": list(channels), "delivery_timeout_seconds": _TIMEOUT}
     return Settings(_env_file=None, alerts=alerts_config, **secrets)  # type: ignore[call-arg]
 
@@ -376,8 +378,11 @@ def test_from_defaults_to_the_login_and_follows_alert_email_from(
 
 
 def test_email_is_skipped_when_unset(conn: duckdb.DuckDBPyConnection) -> None:
+    # `macos` is also listed so `Settings` loads (#544: `email` alone with a
+    # partial config now refuses at config load, tested in test_config.py);
+    # `_email_configured` is still exercised here as the delivery-time defense.
     partial = {k: v for k, v in _SECRETS.items() if k != "alert_smtp_password"}
-    alerter = _alerter(conn, _settings(["store", "email"], **partial))
+    alerter = _alerter(conn, _settings(["store", "macos", "email"], **partial))
     alert_id = alerter.write("drawdown", 7, _SESSION, "m")
     assert FakeSMTP.instances == []
     ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
@@ -410,6 +415,19 @@ def test_deliver_without_store_writes_nothing_to_the_store(conn: duckdb.DuckDBPy
     assert conn.execute("SELECT COUNT(*) FROM alert_deliveries").fetchone() == (0,)
     assert len(runner.calls) == 1 and len(FakeSMTP.instances) == 1
     assert [(o.channel, o.ok) for o in outcomes] == [("macos", True), ("email", True)]
+
+
+def test_deliver_without_store_never_returns_empty_for_a_valid_config(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#416/#515: `AlertsConfig` now requires a non-store channel, so a `store`-only
+    config is rejected at load, and a valid `Settings` always gives
+    `deliver_without_store` at least one channel to try."""
+    with pytest.raises(ValidationError, match="non-store"):
+        _settings(["store"])
+    alerter = _alerter(conn, _settings(["store", "macos"]))
+    outcomes = alerter.deliver_without_store("kill_switch_write_failed", "the switch row failed")
+    assert outcomes != []
 
 
 def test_deliver_without_store_never_raises_and_works_on_a_closed_store() -> None:

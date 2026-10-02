@@ -17,11 +17,12 @@ so a run to T_n is exactly the prefix of a longer run.
 
 **Exits** (req 5), decided from step i's read after the fill, on the names still held:
 
-- *Delisting*: the name's current listing at the read (latest `valid_from`) is not
-  `listed` (a transfer whose new listing is known is current and `listed`, so it is
-  held through). It is sold at its last close on its final session, that listing's
-  `end_session` (its last bar in the marking frame when it has none); bars printed
-  after it (an OTC tail) are not marked.
+- *Delisting*: the name's current listing at the read (latest `valid_from`) is
+  `delisted` (a transfer to another exchange, `transferred`, is held through, whether
+  its new listing is already current and `listed` or still pending -- #555/#557). It is
+  sold at its last close on its final session, that listing's `end_session` (its last
+  bar in the marking frame when it has none); bars printed after it (an OTC tail) are
+  not marked.
 - *Stale*: otherwise, no bar in the marking frame on the last
   `backtest.stale_exit_sessions` sessions through T_{i+1}; sold at its last bar's close.
 
@@ -64,11 +65,10 @@ from tradepartner.backtest.valuation import (
 )
 from tradepartner.calendar import all_sessions, previous_session
 from tradepartner.config import Settings
+from tradepartner.store.delistings import DELISTED
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 
 STRATEGY_SERIES = "strategy"
-#: `store.delistings.LISTED`, the status of a listing that has not ended.
-_LISTED = "listed"
 
 _POSITION_SCHEMA = {"security_id": pl.Utf8, "session": pl.Date, "value": pl.Float64}
 
@@ -207,14 +207,18 @@ def plan(provider: DataProvider, params: Settings, session: date) -> Plan:
 
 
 def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
-    """Securities whose current listing at the read has ended, each with its final
+    """Securities whose current listing at the read is `delisted`, each with its final
     session (`end_session`, None when it has none).
 
     The current listing is the row with the latest `valid_from` on or before `session`,
     as in `universe._current_listings`: a filing ends only the listing it names, so an
     earlier listing left behind by a ticker change stays `listed` and must not decide.
-    A known transfer's current listing is the new, `listed` one. Rows without
-    `valid_from` (one listing per security) are taken as they are.
+    A `transferred` listing (a Form 25 transfer to another exchange, still trading) is
+    not an end, the same rule `execution.planning._ended` uses (#555): the business
+    keeps trading, just elsewhere -- including in the narrow window where the new
+    listing is already known but its own `valid_from` has not arrived yet, so the
+    current row is still the old exchange's, status `transferred`, not `listed`. Rows
+    without `valid_from` (one listing per security) are taken as they are.
     """
     dated = "valid_from" in listing_ends.columns
     current: dict[str, tuple[date | None, str, date | None]] = {}
@@ -225,7 +229,7 @@ def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
         held = current.get(row["security_id"])
         if held is None or (valid_from is not None and (held[0] is None or valid_from > held[0])):
             current[row["security_id"]] = (valid_from, row["status"], row["end_session"])
-    return {sid: end for sid, (_, status, end) in current.items() if status != _LISTED}
+    return {sid: end for sid, (_, status, end) in current.items() if status == DELISTED}
 
 
 def _exits(

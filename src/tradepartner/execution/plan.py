@@ -123,7 +123,9 @@ _SPLIT = "split"
 _BUY = "buy"
 _SELL = "sell"
 _OVERRIDE = "override"
-_FORCED_EXIT = "forced_exit"
+#: The `decisions.decision` kind for a forced exit; public so other
+#: execution modules (e.g. `reattempts.py`) share one name (#497).
+FORCED_EXIT = "forced_exit"
 _KEEP_NAME = KEEP_NAME_REASON
 _WRITTEN_OFF = "written_off"
 _CLOSING_EVENTS = frozenset({"skipped", _WRITTEN_OFF})
@@ -221,7 +223,7 @@ def is_full_exit(decision: DecisionRow) -> bool:
     """
     if decision.side != _SELL:
         return False
-    if decision.decision in (_FORCED_EXIT, _OVERRIDE):
+    if decision.decision in (FORCED_EXIT, _OVERRIDE):
         return True
     if decision.decision == _TRADE:
         if decision.reason in _FULL_EXIT_TRADE_REASONS:
@@ -416,7 +418,7 @@ def target_notional(
         raise ValueError("planned_sells and planned_buys hold a missing or repeated decision_id")
     for row in (*planned_sells, *planned_buys):
         if (row.rebalance_session, row.run_id) != (rebalance, decision.run_id) and (
-            row.decision != _FORCED_EXIT
+            row.decision != FORCED_EXIT
         ):
             raise ValueError(
                 f"decision {row.decision_id} is not of rebalance {rebalance} run {decision.run_id}"
@@ -683,7 +685,7 @@ def residue(
     carried = min(_carried(security_id, carried_rows, actions_as_of, through, flag_false), held)
     dust = untradable = 0.0
     latest = _latest_decision(security_id, decisions)
-    if latest is not None and latest.decision == _FORCED_EXIT:
+    if latest is not None and latest.decision == FORCED_EXIT:
         event = _latest_event(latest, decision_events)
         if event is not None and event.status == _SKIPPED:
             if event.reason == _DUST and latest.reason == _WINDOW_STOP:
@@ -747,7 +749,7 @@ def rebalance_state(
         what = f"decision {decision.decision_id}"
         if not _in_window(decision.run_id, windows, window.window_id, what):
             continue
-        if decision.decision == _FORCED_EXIT:
+        if decision.decision == FORCED_EXIT:
             continue
         if decision.rebalance_session is None:
             raise ValueError(f"{what} is not a forced exit and has no rebalance session")

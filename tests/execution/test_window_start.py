@@ -17,7 +17,7 @@ from conftest import version_4_store
 
 from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker
-from tradepartner.config import Settings
+from tradepartner.config import FROZEN_COSTS_KEYS, Settings
 from tradepartner.execution import window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
@@ -61,7 +61,13 @@ def _connect(
 
 
 def _params(**extra: Any) -> dict[str, Any]:
-    return {"costs.per_side_bps": 15.0, "strategy.top_fraction": 0.1, **extra}
+    return {
+        "costs.per_side_bps": 15.0,
+        "costs.commission_per_share": 0.0,
+        "costs.commission_per_order": 0.0,
+        "strategy.top_fraction": 0.1,
+        **extra,
+    }
 
 
 def _register(
@@ -69,6 +75,7 @@ def _register(
     settings: Settings,
     slug: str,
     holdout_end: date,
+    params: dict[str, Any] | None = None,
 ) -> registry.HypothesisRecord:
     return registry.register_hypothesis(
         conn,
@@ -77,7 +84,7 @@ def _register(
         title=f"{slug} title",
         doc_path=f"docs/hypotheses/{slug}.md",
         doc_sha256="d" * 64,
-        params=_params(),
+        params=_params() if params is None else params,
         in_sample_start=date(2016, 1, 29),
         holdout_start=date(2023, 1, 3),
         holdout_end=holdout_end,
@@ -362,7 +369,7 @@ def test_refuses_residue_quantity_mismatch(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 50.0  # far outside the frozen tolerance
@@ -380,7 +387,7 @@ def test_refuses_unexplained_symbol(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 5.0
@@ -472,7 +479,7 @@ def test_accepted_window_s_first_reconciliation_passes(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
     fake.extra_quantity["SPY"] = 5.0
@@ -513,7 +520,7 @@ def test_accepts_spinoff_child_of_a_residue(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     # The module's documented convention: a `spinoff` corporate_actions row
     # keyed by the child, with `source_action_id` naming the parent.
@@ -566,6 +573,71 @@ def test_frozen_hash_stable_across_an_environment_override(
     assert stored.frozen_sha256 == frozen_sha_before
 
 
+def test_frozen_json_carries_the_registered_cost_keys_the_wrapper_reads(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`paper start` freezes `FROZEN_COSTS_KEYS` under `costs.` (#534), equal to
+    the hypothesis's registered costs, and no other `costs.*` key."""
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+
+    frozen = json.loads(result.window.frozen_json)
+    costs = {k: v for k, v in frozen.items() if k.startswith("costs.")}
+    assert costs == {k: v for k, v in ready_hypothesis.params.items() if k.startswith("costs.")}
+    assert {k.removeprefix("costs.") for k in costs} == set(FROZEN_COSTS_KEYS)
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"per_side_bps": 7.5},
+        {"commission_per_share": 0.01},
+        {"commission_per_order": 1.0},
+    ],
+)
+def test_refuses_when_live_costs_differ_from_the_registered_costs(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    live: dict[str, float],
+) -> None:
+    """Planning sizes with the registered costs and the wrapper with the
+    frozen ones, so a live `costs.*` edit before `paper start` refuses the
+    start (`costs_drift`) and writes no window (#534)."""
+    settings = Settings(_env_file=None, store={"path": journal_settings.store.path}, costs=live)
+    fake = _fake(fixed_clock)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+
+    assert refused.value.reason == "costs_drift"
+    assert f"costs.{next(iter(live))}" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_refuses_a_registration_without_the_cost_keys(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A registration that names only `costs.per_side_bps` cannot vouch for
+    the commissions the wrapper reads: refused, never filled from live."""
+    with open_for_write(journal_settings) as conn:
+        params = {"costs.per_side_bps": 15.0, "strategy.top_fraction": 0.1}
+        hyp = _register(conn, journal_settings, "h2", HOLDOUT_END_PAST, params)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h2"
+        )
+
+    assert refused.value.reason == "costs_drift"
+    assert "costs.commission_per_share" in str(refused.value)
+
+
 def test_succeeds_on_a_version_4_store(tmp_path: Path, fixed_clock: FixedClock) -> None:
     path = version_4_store(tmp_path / "v4.duckdb")
     settings = Settings(_env_file=None, store={"path": str(path)})
@@ -614,7 +686,7 @@ def test_accepts_split_adjusted_residue_match(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -646,7 +718,7 @@ def test_refuses_residue_not_held_and_not_delisted(
         journal_settings,
         ready_hypothesis,
         at=fixed_clock() - timedelta(days=1),
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     fake = _fake(fixed_clock)  # holds nothing, and SPY is not delisted
     with pytest.raises(window.StartRefusedError) as exc:
@@ -690,7 +762,7 @@ def test_refuses_spinoff_quantity_mismatch(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -722,7 +794,7 @@ def test_refuses_a_spinoff_whose_ex_date_is_not_yet_effective(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -755,7 +827,7 @@ def test_refuses_a_spinoff_not_yet_known(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -787,7 +859,7 @@ def test_refuses_a_spinoff_ex_dated_on_the_stop_session(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (10.0, None)},
+        residues={SPY: (10.0, "dust")},
     )
     _insert_action(
         journal_settings,
@@ -823,7 +895,7 @@ def test_accepts_spinoff_with_a_parent_split_before_and_a_child_split_after(
         journal_settings,
         ready_hypothesis,
         at=stop_at,
-        residues={SPY: (5.0, None)},
+        residues={SPY: (5.0, "dust")},
     )
     ex_date = (stop_at + timedelta(days=5)).date()
     _insert_action(

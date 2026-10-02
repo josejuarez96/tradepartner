@@ -8,24 +8,25 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import duckdb
 import polars as pl
 import pytest
 
-from tradepartner.calendar import next_session, session_close
+from tradepartner.calendar import next_session, previous_session, session_close, session_open
 from tradepartner.execution import ledger as ledger_module
 from tradepartner.execution.ids import client_order_id
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.marks import Mark, Missed, lapses, marks_for, missed_run
-from tradepartner.execution.switch import SwitchState
 from tradepartner.store import schema
 from tradepartner.store.db import insert_row
 from tradepartner.store.journal import (
     FillRow,
+    KillSwitchRow,
     OrderedFill,
     OrderRow,
+    PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
     RebalanceEventRow,
@@ -59,8 +60,51 @@ def _window(window_id: int = WINDOW, first_rebalance_session: date | None = None
     )
 
 
-def _switch(engaged: bool) -> SwitchState:
-    return SwitchState(engaged=engaged, run_in_progress=False, causes=())
+def _kill_switch_row(event_id: int, at: datetime, state: str) -> KillSwitchRow:
+    return KillSwitchRow(
+        event_id=event_id,
+        window_id=WINDOW,
+        at=at,
+        state=state,
+        source="owner",
+        **_stamp(at),
+    )
+
+
+def _run(run_id: int, session: date, *, window_id: int = WINDOW) -> PaperRunRow:
+    return PaperRunRow(
+        run_id=run_id,
+        window_id=window_id,
+        session=session,
+        started_at=_at(session),
+        invoked_by="tty",
+        code_version="x",
+        **_stamp(_at(session)),
+    )
+
+
+def _null_session_run(run_id: int, started_at: datetime, *, window_id: int = WINDOW) -> PaperRunRow:
+    """A run invoked on a non-session day: `session` and `kind` are both
+    `NULL` in the schema."""
+    return PaperRunRow(
+        run_id=run_id,
+        window_id=window_id,
+        session=None,
+        started_at=started_at,
+        invoked_by="tty",
+        code_version="x",
+        **_stamp(started_at),
+    )
+
+
+def _result(run_id: int, at: datetime, status: str) -> PaperRunResultRow:
+    return PaperRunResultRow(
+        run_id=run_id,
+        finished_at=at,
+        status=status,
+        clock_fault=False,
+        **_stamp(at),
+    )
 
 
 def _bar(conn: duckdb.DuckDBPyConnection, security_id: str, session: date, close: float) -> None:
@@ -345,7 +389,7 @@ def test_lapses_before_the_first_rebalance_session_is_empty() -> None:
     t0 = date(2026, 9, 30)
     window = _window(first_rebalance_session=t0)
     before = date(2026, 9, 29)
-    assert lapses(window, [], [], _switch(False), before, {"paper.max_catch_up_sessions": 1}) == []
+    assert lapses(window, [], [], [], [], before, {"paper.max_catch_up_sessions": 1}) == []
 
 
 def test_lapses_computed_at_boundary_session_and_not_one_earlier() -> None:
@@ -361,16 +405,16 @@ def test_lapses_computed_at_boundary_session_and_not_one_earlier() -> None:
     frozen = {"paper.max_catch_up_sessions": max_catch_up}
 
     # Still inside the catch-up window: no lapse yet.
-    assert lapses(window, [], [], _switch(False), boundary, frozen) == []
+    assert lapses(window, [], [], [], [], boundary, frozen) == []
 
     # The first session past the boundary: lapsed.
     past = next_session(boundary)
-    assert lapses(window, [], [], _switch(False), past, frozen) == [
+    assert lapses(window, [], [], [], [], past, frozen) == [
         Missed(rebalance_session=t0, reason="catch_up_lapsed")
     ]
 
 
-def test_lapses_reason_is_kill_switch_when_the_switch_is_engaged() -> None:
+def test_lapses_reason_is_kill_switch_when_the_switch_is_engaged_at_the_checked_session() -> None:
     from tradepartner.backtest.schedule import fill_session
 
     t0 = date(2026, 9, 30)
@@ -380,8 +424,290 @@ def test_lapses_reason_is_kill_switch_when_the_switch_is_engaged() -> None:
     boundary = next_session(f0)
     past = next_session(boundary)
     frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    # Engaged on the boundary session itself (inside the catch-up period) and
+    # still engaged at `past`.
+    rows = [_kill_switch_row(1, session_close(boundary), "engaged")]
 
-    assert lapses(window, [], [], _switch(True), past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_even_when_released_before_the_lapse() -> None:
+    """#366 Q19(b): a switch released one session before the lapse must still
+    report `kill_switch`, because it was engaged during the catch-up period
+    even though it is clear again by `past`, the session checked."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 2
+    boundary = f0
+    for _ in range(max_catch_up):
+        boundary = next_session(boundary)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    # Engaged during f0 (the first session of the catch-up period), released
+    # on the boundary session -- clear again well before `past`.
+    rows = [
+        _kill_switch_row(1, session_close(f0), "engaged"),
+        _kill_switch_row(2, session_close(boundary), "released"),
+    ]
+
+    assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+
+def test_lapses_reason_is_catch_up_lapsed_when_engaged_only_after_the_period() -> None:
+    """An engagement that starts only once the catch-up window has already
+    run out (on `past` itself, not on any session from F_i through the
+    boundary) did not cause the miss, so the reason stays `catch_up_lapsed`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    rows = [_kill_switch_row(1, session_close(past), "engaged")]
+
+    assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="catch_up_lapsed")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_for_an_engage_and_release_within_one_session() -> None:
+    """Safety/quant review on #532 (reviewed at 3ad42dc): sampling the switch
+    only at each session's own close missed an engagement opened and
+    released within a single session of the catch-up period -- e.g. the
+    owner engages the switch before the boundary session's open (blocking
+    that session's run) and resumes before its close. The reason must still
+    be `kill_switch`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 0
+    boundary = f0  # max_catch_up_sessions = 0: the boundary is F_i itself
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    # Engaged 30 minutes before the boundary session's open, released two
+    # hours later -- both well before that session's close, and well before
+    # `past`.
+    engaged_at = session_open(boundary) - timedelta(minutes=30)
+    released_at = session_open(boundary) + timedelta(hours=2)
+    rows = [
+        _kill_switch_row(1, engaged_at, "engaged"),
+        _kill_switch_row(2, released_at, "released"),
+    ]
+
+    assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_for_a_crashed_run_with_no_kill_switch_row() -> None:
+    """Safety/quant review on #532: a run that crashed (or hit a halt-path
+    write failure) inside the catch-up period engages the switch by
+    `execution.switch.derive`'s own rule even with no `kill_switch` row at
+    all (spec req 5: "no `released` row after that run's `started_at`").
+    `lapses` must still name `kill_switch`, not `catch_up_lapsed`, for a
+    rebalance whose catch-up window ran out while such a run sat uncleared."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    # A run on the boundary session halted; no kill_switch row exists at all
+    # (the halt-path write failed, or the process died before it could try).
+    crashed = _run(1, boundary)
+    halted = _result(1, _at(boundary), "halted")
+
+    assert lapses(window, [crashed], [], [], [halted], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+    # An unfinished run (no result row at all, e.g. a hard crash) counts too.
+    unfinished = _run(2, boundary)
+    assert lapses(window, [unfinished], [], [], [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_for_a_crash_from_before_the_period_uncleared() -> None:
+    """Second-pass finding on #532 (quant-auditor and safety-reviewer, both
+    FAIL at 54366cf): a run that crashed *before* F_i and was never cleared
+    by a release still has the switch engaged throughout the catch-up
+    period by `execution.switch.derive`'s own rule (it keeps engaging until
+    a `released` row comes after both its `started_at` and its
+    `finished_at`). Every run in the period (F_i and the boundary session)
+    then ends `skipped_kill_switch`, exactly as spec req 5 requires while
+    engaged, with no `kill_switch` row of its own. The reason must still be
+    `kill_switch`, not `catch_up_lapsed`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    crashed = _run(1, before_f0)
+    halted = _result(1, _at(before_f0), "halted")
+    # The runs inside the period itself: skipped by the still-engaged switch,
+    # no kill_switch row of their own, no result in FAULTED_RUN_STATUSES.
+    run_f0 = _run(2, f0)
+    result_f0 = _result(2, _at(f0), "skipped_kill_switch")
+    run_boundary = _run(3, boundary)
+    result_boundary = _result(3, _at(boundary), "skipped_kill_switch")
+
+    assert lapses(
+        window,
+        [crashed, run_f0, run_boundary],
+        [],
+        [],
+        [halted, result_f0, result_boundary],
+        past,
+        frozen,
+    ) == [Missed(rebalance_session=t0, reason="kill_switch")]
+
+    # A release before F_i clears the crash: the period then has nothing
+    # engaging it (its own runs finish `ok`), so the reason reverts to
+    # `catch_up_lapsed`.
+    released = _kill_switch_row(1, session_close(before_f0), "released")
+    run_f0b = _run(4, f0)
+    ok_f0 = _result(4, _at(f0), "ok")
+    run_boundary_b = _run(5, boundary)
+    ok_boundary = _result(5, _at(boundary), "ok")
+    assert lapses(
+        window,
+        [crashed, run_f0b, run_boundary_b],
+        [],
+        [released],
+        [halted, ok_f0, ok_boundary],
+        past,
+        frozen,
+    ) == [Missed(rebalance_session=t0, reason="catch_up_lapsed")]
+
+
+def test_lapses_ignores_kill_switch_rows_of_another_window() -> None:
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    other_window_row = KillSwitchRow(
+        event_id=1,
+        window_id=WINDOW + 1,
+        at=session_close(boundary),
+        state="engaged",
+        source="owner",
+        **_stamp(session_close(boundary)),
+    )
+
+    assert lapses(window, [], [], [other_window_row], [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="catch_up_lapsed")
+    ]
+
+
+def test_lapses_reason_is_catch_up_lapsed_when_a_release_has_no_engage_before_it() -> None:
+    """A stray `released` row with nothing engaged before it reads as not
+    engaged, never as a bug that defaults to `kill_switch`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    rows = [_kill_switch_row(1, session_close(f0), "released")]
+
+    assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="catch_up_lapsed")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_when_engaged_before_f0_and_never_released() -> None:
+    """An engagement from before T_i's fill session that is still open when
+    the catch-up period starts carries forward and counts, even with no
+    `kill_switch` row inside the period itself."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    rows = [_kill_switch_row(1, session_close(before_f0), "engaged")]
+
+    assert lapses(window, [], [], rows, [], past, frozen) == [
+        Missed(rebalance_session=t0, reason="kill_switch")
+    ]
+
+
+def test_lapses_does_not_raise_on_a_null_session_run_before_the_period() -> None:
+    """quant-auditor finding on #532 at 8da3e8d: `paper_runs.session` is
+    nullable (a run invoked on a non-session day ends `no_session` with no
+    `session` or `kind`). A routine weekend/holiday invocation before the
+    catch-up period must not raise and must not engage it -- its result is
+    `no_session`, never in `FAULTED_RUN_STATUSES`."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    weekend_run = _null_session_run(1, session_close(before_f0) - timedelta(hours=1))
+    weekend_result = _result(1, session_close(before_f0) - timedelta(hours=1), "no_session")
+
+    assert lapses(window, [weekend_run], [], [], [weekend_result], past, frozen) == [
+        Missed(rebalance_session=t0, reason="catch_up_lapsed")
+    ]
+
+
+def test_lapses_reason_is_kill_switch_for_a_null_session_unfinished_run() -> None:
+    """quant-auditor finding on #532 at 8da3e8d: a null-session run that
+    crashed (no result row at all) and was never released still engages
+    the switch by `execution.switch.derive`'s own rule, whatever its
+    `session`; placed by `started_at` against the period boundaries, it
+    must carry forward into the period the same way a dated run does."""
+    from tradepartner.backtest.schedule import fill_session
+
+    t0 = date(2026, 9, 30)
+    window = _window(first_rebalance_session=t0)
+    f0 = fill_session(t0)
+    max_catch_up = 1
+    boundary = next_session(f0)
+    past = next_session(boundary)
+    frozen = {"paper.max_catch_up_sessions": max_catch_up}
+    before_f0 = previous_session(f0)
+    crashed = _null_session_run(1, session_close(before_f0) - timedelta(hours=1))
+
+    assert lapses(window, [crashed], [], [], [], past, frozen) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -409,7 +735,7 @@ def test_lapses_skips_a_rebalance_already_journaled() -> None:
         rebalance_session=t0, run_id=1, status="executed", **_stamp(_at(t0))
     )
 
-    assert lapses(window, [run], [executed], _switch(False), past, frozen) == []
+    assert lapses(window, [run], [executed], [], [], past, frozen) == []
 
 
 def test_lapses_raises_for_an_event_whose_run_is_not_given() -> None:
@@ -422,7 +748,7 @@ def test_lapses_raises_for_an_event_whose_run_is_not_given() -> None:
     event = RebalanceEventRow(rebalance_session=t0, run_id=99, status="executed", **_stamp(_at(t0)))
 
     with pytest.raises(ValueError, match="not among the runs given"):
-        lapses(window, [], [event], _switch(False), past, {"paper.max_catch_up_sessions": 1})
+        lapses(window, [], [event], [], [], past, {"paper.max_catch_up_sessions": 1})
 
 
 # --- read-only and no-write checks ------------------------------------------------

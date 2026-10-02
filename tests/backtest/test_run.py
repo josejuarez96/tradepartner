@@ -474,3 +474,120 @@ def test_synthetic_accepted_on_a_temp_file(
     assert not live.exists()
     trial = _row(read(), "trials", outcome.trial_id)
     assert trial["synthetic"] is True
+
+
+# --- kind="tracking" (plan T65b; spec req 10, "Tracking trial") ---------------------
+
+#: A holdout ending inside the existing holdout window, chosen so its tracking
+#: window [`TRACKING_START`, `TRACKING_END`] (the first two rebalance sessions
+#: strictly after `TRACKING_SLUG_HOLDOUT_END`) still falls inside the fixture's
+#: price history, which ends 2020-06-30.
+TRACKING_SLUG = "h-tracking"
+TRACKING_SLUG_HOLDOUT_END = date(2019, 6, 28)
+TRACKING_START = date(2019, 7, 31)
+TRACKING_END = date(2019, 9, 30)
+
+
+def _frozen_tracking() -> Settings:
+    return Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        holdout={"start": HOLDOUT[0], "end": TRACKING_SLUG_HOLDOUT_END},
+        gap={"count_share_threshold": 0.05},
+    )
+
+
+@pytest.fixture
+def tracking_store(store: Path) -> Path:
+    """`store` plus a second hypothesis, same family, registered with a holdout
+    ending earlier (module comment) so its tracking window has real bars."""
+    frozen = _frozen_tracking()
+    with open_for_write(_store(store)) as conn:
+        registry.register_hypothesis(
+            conn,
+            slug=TRACKING_SLUG,
+            family="momentum",
+            title="tracking run",
+            doc_path=f"docs/hypotheses/{TRACKING_SLUG}.md",
+            doc_sha256="1" * 64,
+            params=frozen_params_of(frozen),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=TRACKING_SLUG_HOLDOUT_END,
+            registered_by="test",
+            settings=frozen,
+        )
+    return store
+
+
+def test_tracking_run_leaves_family_sharpes_and_holdout_spends_unchanged(
+    tracking_store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before any trial of this family runs, `family_sharpes` counts no
+    in-sample trial and `family_holdout_spends` lists none; a `kind="tracking"`
+    run (`trials.kind = 'tracking'`, filtered out of both queries) must leave
+    both exactly as they were (no read connection opens before the run's write
+    connection, since DuckDB allows only one mode per file per process)."""
+    before_sharpes = registry.FamilySharpes(n_trials=0, raw=(), excess_spy=())
+    before_spends: list[registry.HoldoutSpend] = []
+    _spy(monkeypatch)
+
+    outcome = run_hypothesis(
+        TRACKING_SLUG,
+        TRACKING_START,
+        TRACKING_END,
+        Flags(),
+        synthetic=True,
+        store_path=tracking_store,
+        kind="tracking",
+    )
+
+    assert outcome.status == "ok"
+    conn = read()
+    trial = _row(conn, "trials", outcome.trial_id)
+    assert trial["kind"] == "tracking"
+    assert registry.family_sharpes(conn, "momentum") == before_sharpes
+    assert registry.family_holdout_spends(conn, "momentum") == before_spends
+
+
+def test_tracking_window_on_or_before_holdout_end_is_refused(
+    tracking_store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    outcome = run_hypothesis(
+        TRACKING_SLUG,
+        TRACKING_SLUG_HOLDOUT_END,
+        TRACKING_END,
+        Flags(),
+        synthetic=True,
+        store_path=tracking_store,
+        kind="tracking",
+    )
+
+    assert (outcome.status, outcome.results) == ("refused_window", None)
+    assert calls == []
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert trial["kind"] == "in_sample"
+
+
+def test_tracking_run_needs_an_explicit_start_and_end(tracking_store: Path) -> None:
+    with pytest.raises(ValueError, match="explicit start and end"):
+        run_hypothesis(
+            TRACKING_SLUG,
+            None,
+            TRACKING_END,
+            Flags(),
+            synthetic=True,
+            store_path=tracking_store,
+            kind="tracking",
+        )
+    with pytest.raises(ValueError, match="explicit start and end"):
+        run_hypothesis(
+            TRACKING_SLUG,
+            TRACKING_START,
+            None,
+            Flags(),
+            synthetic=True,
+            store_path=tracking_store,
+            kind="tracking",
+        )

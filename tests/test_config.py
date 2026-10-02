@@ -15,7 +15,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tradepartner.config import FROZEN_PAPER_KEYS, PaperConfig, Settings, _default_env_file
+from tradepartner.config import (
+    FROZEN_EXECUTION_KEYS,
+    FROZEN_PAPER_KEYS,
+    ExecutionConfig,
+    PaperConfig,
+    Settings,
+    _default_env_file,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -696,6 +703,13 @@ def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
 
 
+def test_frozen_execution_keys_cover_fill_price() -> None:
+    """#366 Q20 (owner): `execution.fill_price` freezes into the paper window
+    beside the `paper.*` keys, read from `frozen_json`, never live `Settings`."""
+    assert FROZEN_EXECUTION_KEYS == ("fill_price",)
+    assert set(FROZEN_EXECUTION_KEYS) <= set(ExecutionConfig.model_fields)
+
+
 def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None:
     """ADR 0011, #273: bounds every per-row read a page makes over the journal."""
     assert _settings().dashboard.page_row_limit == 500
@@ -727,6 +741,62 @@ def test_alerts_channels_require_store_once_and_known_names(channels: list[str])
     """`store` is always a channel (spec req 11); a paid push service needs a budget change."""
     with pytest.raises(ValidationError):
         Settings(_env_file=None, alerts={"channels": channels})
+
+
+def test_alerts_channels_require_a_non_store_channel() -> None:
+    """#366 Q22 (iii), #515/#416: `store`-only would make `deliver_without_store`
+    (the halt path's `kill_switch_write_failed` alert, which never touches the
+    store) deliver through nothing at all."""
+    with pytest.raises(ValidationError, match="non-store"):
+        Settings(_env_file=None, alerts={"channels": ["store"]})
+
+
+_ALL_EMAIL_SETTINGS: dict[str, str] = {
+    "alert_smtp_host": "smtp.example.com",
+    "alert_smtp_user": "alerts-user",
+    "alert_smtp_password": "hunter2",
+    "alert_email_to": "owner@example.com",
+}
+
+
+def test_alerts_email_channel_with_nothing_set_refuses() -> None:
+    """#544: `channels=[store, email]` with every `ALERT_*` variable unset passed
+    #543's "at least one non-store channel is listed" check but left
+    `kill_switch_write_failed` reaching nobody, since `email` can never actually
+    deliver. The owner's #366 Q22 (iii) answer requires a *usable* channel.
+
+    This refuses with a plain `ValueError`, not a `ValidationError`: a whole-model
+    pydantic validator's `ValidationError` embeds the raw constructor input (every
+    field, including any other secret passed alongside `alerts=...`) in its
+    `input_value`, which `_validate_alert_channel_is_usable` is deliberately
+    structured to avoid (see its docstring in `config.py`)."""
+    with pytest.raises(ValueError, match="ALERT_SMTP_HOST"):
+        Settings(_env_file=None, alerts={"channels": ["store", "email"]})
+
+
+def test_alerts_email_channel_with_every_setting_loads() -> None:
+    s = Settings(_env_file=None, alerts={"channels": ["store", "email"]}, **_ALL_EMAIL_SETTINGS)
+    assert s.alerts.channels == ["store", "email"]
+
+
+def test_alerts_email_channel_names_the_single_missing_variable() -> None:
+    """Only the actually-missing variable is named; nothing else, and never a value."""
+    partial = {k: v for k, v in _ALL_EMAIL_SETTINGS.items() if k != "alert_smtp_password"}
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, alerts={"channels": ["store", "email"]}, **partial)
+    message = str(exc_info.value)
+    assert "ALERT_SMTP_PASSWORD" in message
+    for other in ("ALERT_SMTP_HOST", "ALERT_SMTP_USER", "ALERT_EMAIL_TO"):
+        assert other not in message
+    for secret in _ALL_EMAIL_SETTINGS.values():
+        assert secret not in message
+
+
+def test_alerts_email_alongside_macos_needs_no_email_config() -> None:
+    """`macos` alone is a usable non-store channel, so a config that also lists
+    `email` (e.g. belt-and-suspenders) is not forced to configure it too."""
+    s = Settings(_env_file=None, alerts={"channels": ["store", "macos", "email"]})
+    assert s.alerts.channels == ["store", "macos", "email"]
 
 
 def test_paper_and_alert_secrets_default_to_none() -> None:

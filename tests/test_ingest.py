@@ -46,6 +46,9 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     _add_rows,
+    _ingest_filings,
+    _prefetch,
+    _Recorded,
     expected_session,
     fact_rows,
     ingest_session,
@@ -492,15 +495,28 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
 
 
 def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
-    """T11h: failed filings, quarantined accessions and facts missing."""
+    """T11h: failed filings, quarantined accessions and facts missing; #566:
+    empty bulk zip members; #576: empty per-CIK API answers; #599: payloads
+    with `facts` but no `cik`."""
 
     class Failing(FixtureFilingSource):
         failed_filings = 2
         quarantined = 1
         facts_missing = 4
+        facts_bulk_empty = 3  # #566
+        submissions_bulk_empty = 5
+        facts_api_empty = 6  # #576
+        submissions_api_empty = 7
+        facts_bulk_keyless = 8  # #599
+        facts_api_keyless = 9
 
     message = _run(settings, filings=_filings(cls=Failing), source="edgar").runs[0].message
-    counts = "; failed filings: 2; quarantined: 1; facts missing: 4; missing"
+    counts = (
+        "; failed filings: 2; quarantined: 1; facts missing: 4"
+        "; empty bulk facts: 3; empty bulk submissions: 5"
+        "; empty API facts: 6; empty API submissions: 7"
+        "; keyless bulk facts: 8; keyless API facts: 9; missing"
+    )
     assert counts in message
 
 
@@ -815,6 +831,45 @@ def test_a_filing_accepted_while_the_run_fetches_is_stored(settings: Settings) -
     assert result.ok
 
 
+def _filing_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
+    tables = ("securities", "listings", "delistings", "classifications", "facts")
+    return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall(), key=repr) for t in tables}
+
+
+def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#564: after `_prefetch`, `_ingest_filings` skips its own fetch pass (a
+    frozen source has nothing left to fetch) and writes exactly the rows the
+    unprefetched path writes, stamped at the same clock."""
+    import tradepartner.ingest as ingest
+
+    builds: list[datetime] = []
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        builds.append(kwargs["ingested_at"])
+        return build_classifications(*args, **kwargs)
+
+    monkeypatch.setattr(ingest, "build_classifications", counting)
+    written = []
+    for prefetch in (False, True):
+        builds.clear()
+        source: FixtureFilingSource | _Recorded = _filings()
+        if prefetch:
+            source = _Recorded(source)
+            _prefetch(source, settings)
+        conn = duckdb.connect(":memory:")
+        conn.execute("SET TimeZone='UTC'")
+        init_schema(conn)
+        added, _ = _ingest_filings(conn, settings, source, lambda: NOW)
+        assert added > 0
+        written.append(_filing_tables(conn))
+        conn.close()
+        assert builds[-1] == NOW
+        assert len(builds) == 2  # one fetch pass, then the build at the clock
+    assert written[0] == written[1]
+
+
 def test_a_filed_value_that_reverts_is_a_third_row(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
@@ -913,6 +968,88 @@ def test_run_messages_are_redacted_cleaned_and_capped(
         assert secret not in message and "owner@example.com" not in message
         assert "[redacted]" in message and "\x1b" not in message
         assert len(message) == 200
+
+
+# --- #573: a failed run row names where the error was raised --------------
+
+
+def test_failed_run_message_names_the_raising_file_line_and_function(
+    settings: Settings,
+) -> None:
+    result = _run(settings, _Prices(fail="bars"))
+    assert result.runs[-1].status == FAILED
+    message = result.runs[-1].message
+    assert "RuntimeError: bars endpoint down" in message
+    assert " | at: " in message
+    where = message.split(" | at: ", 1)[1]
+    assert "test_ingest.py" in where
+    assert " in bars" in where
+
+
+def test_failed_run_message_has_no_local_or_argument_values(settings: Settings) -> None:
+    # The traceback is read for file/line/function only; `_where` never reads
+    # a frame's locals or arguments, so a secret-looking one of each must not
+    # leak even though neither is a configured secret `_clean` would catch.
+    def _inner(argument: str) -> None:
+        local_secret = "sk-local-9f3c21"
+        assert local_secret  # kept "in scope" for the frame, never read back
+        raise ValueError("boom")
+
+    class Boom(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            _inner("sk-argument-7e21aa")
+
+    result = _run(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "ValueError: boom" in message
+    assert "sk-local-9f3c21" not in message
+    assert "sk-argument-7e21aa" not in message
+    assert "_inner" in message
+
+
+def test_failed_run_message_includes_the_chained_causes_frame(settings: Settings) -> None:
+    def _root_cause() -> None:
+        raise KeyError("cik")
+
+    class Boom(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            try:
+                _root_cause()
+            except KeyError as exc:
+                raise RuntimeError("wrapped") from exc
+
+    result = _run(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "RuntimeError: wrapped" in message
+    where = message.split(" | at: ", 1)[1]
+    assert "_root_cause" in where
+    assert "bars" in where
+
+
+def test_failed_run_message_where_is_length_bounded(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        ingest={"max_where_chars": 60},
+    )
+
+    def _deep(n: int) -> None:
+        if n == 0:
+            raise RuntimeError("deep failure")
+        _deep(n - 1)
+
+    class Boom(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            _deep(20)
+
+    result = _run(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    # The error text is never cut to make room for frames.
+    assert "RuntimeError: deep failure" in message
+    assert len(message) <= 60
 
 
 # --- filed-row revisions, decided per key (quant-auditor re-audit on #164) --

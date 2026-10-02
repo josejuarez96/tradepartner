@@ -25,7 +25,7 @@ by column type, before any row reaches these tables.
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
 EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
 If a store records a version this code has no path from (anything other
-than 2, 3, 4, 5, 6 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+than 2, 3, 4, 5, 6, 7 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
 `SchemaVersionError` rather than silently operating against a shape it
 does not know about.
 
@@ -89,7 +89,21 @@ registry; #83 took version 2 first, so the registry is version 3):
   reason is outside the set. A version-5 store gets both rebuilds and both
   version rows, in the one transaction. A read-only connection accepts a
   version-5 or version-6 store (reads do not depend on either `CHECK`).
-- **A later DDL change goes to version 8**, with its own migration and a
+- **Version 8** (#472): `resume_invocations` gains `accept_rejections`
+  (`paper resume --accept-rejections`, the owner's flag), and the new
+  `resume_acceptances` table records, for a resume given the flag, the
+  rejection-cap verdicts it accepted (`accepted_json`, `[]` for none).
+  DuckDB cannot add a NOT NULL column in place, so the migration from
+  version 5, 6 or 7 rebuilds `resume_invocations` with the version-8 DDL,
+  every row kept in insertion order with `accept_rejections = FALSE` (no
+  earlier resume could be given the flag), and the DDL pass creates
+  `resume_acceptances`. A store at version 4 or earlier gets the version-8
+  journal directly. A read-only connection accepts a version-7 store, so
+  every other read keeps working (`store.journal.require_journal` does not
+  ask for `LATER_JOURNAL_TABLE_NAMES`); a `resume_invocations` or
+  `resume_acceptances` read there fails on the missing column or table
+  (only `paper resume`'s write path reads them).
+- **A later DDL change goes to version 9**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -177,7 +191,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 }
 
 #: The schema version `init_schema` records on a fresh store and migrates
-#: a version-2, 3, 4, 5 or 6 store to. Bump and add a migration note (not
+#: a version-2, 3, 4, 5, 6 or 7 store to. Bump and add a migration note (not
 #: silent DDL edits) if the shape of a table changes after data has been
 #: loaded.
 #:
@@ -209,7 +223,11 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #:   (`DECISION_REASONS`). Migration from version 6 (or 5, after the version-6
 #:   step): `decisions` is rebuilt in one transaction with every row kept,
 #:   refused first if a stored reason is outside the set.
-CURRENT_SCHEMA_VERSION = 7
+#: - 8 (#472): `resume_invocations.accept_rejections BOOLEAN NOT NULL` and
+#:   the `resume_acceptances` table. Migration from version 7 (or 5 or 6,
+#:   after their steps): `resume_invocations` is rebuilt in one transaction
+#:   with every row kept and given `accept_rejections = FALSE`.
+CURRENT_SCHEMA_VERSION = 8
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -229,6 +247,10 @@ _PRE_ORDER_EVENT_REASON_VERSION = 5
 #: The last version without the `decisions.reason` `CHECK` (#377): read-only
 #: connections serve every read.
 _PRE_DECISION_REASON_VERSION = 6
+
+#: The last version without `resume_invocations.accept_rejections` and
+#: `resume_acceptances` (#472): read-only connections serve every other read.
+_PRE_ACCEPT_REJECTIONS_VERSION = 7
 
 
 class SchemaVersionError(RuntimeError):
@@ -1012,6 +1034,19 @@ CREATE TABLE IF NOT EXISTS resume_invocations (
     "at" TIMESTAMPTZ NOT NULL,
     reason VARCHAR NOT NULL,
     accept_broker_fills BOOLEAN NOT NULL,
+    accept_rejections BOOLEAN NOT NULL,
+    {_JOURNAL_TIMESTAMPS}
+)
+"""
+
+# One row per resume given `--accept-rejections` (#472), written once its
+# rejection-cap verdicts are judged and before its reconciliation and release:
+# a JSON list of the verdicts the flag accepted, `[]` when there was none. It is
+# not a release: that is the `kill_switch` `released` row citing the resume_id.
+_CREATE_RESUME_ACCEPTANCES = f"""
+CREATE TABLE IF NOT EXISTS resume_acceptances (
+    resume_id BIGINT NOT NULL PRIMARY KEY,
+    accepted_json VARCHAR NOT NULL,
     {_JOURNAL_TIMESTAMPS}
 )
 """
@@ -1209,6 +1244,7 @@ JOURNAL_TABLE_NAMES: tuple[str, ...] = (
     "fills",
     "fill_cursors",
     "resume_invocations",
+    "resume_acceptances",
     "outcomes",
     "positions_daily",
     "adjustments",
@@ -1221,6 +1257,11 @@ JOURNAL_TABLE_NAMES: tuple[str, ...] = (
     "disposals",
     "wash_sale_flags",
 )
+
+#: Journal tables added after version 5 (#472), which a read-only connection to
+#: an older journal store lacks: `store.journal.require_journal` does not ask for
+#: them, so every other journal read keeps working there.
+LATER_JOURNAL_TABLE_NAMES: tuple[str, ...] = ("resume_acceptances",)
 
 _JOURNAL_TABLE_DDL: tuple[str, ...] = (
     _CREATE_PAPER_WINDOWS,
@@ -1238,6 +1279,7 @@ _JOURNAL_TABLE_DDL: tuple[str, ...] = (
     _CREATE_FILLS,
     _CREATE_FILL_CURSORS,
     _CREATE_RESUME_INVOCATIONS,
+    _CREATE_RESUME_ACCEPTANCES,
     _CREATE_OUTCOMES,
     _CREATE_POSITIONS_DAILY,
     _CREATE_ADJUSTMENTS,
@@ -1281,9 +1323,12 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_JOURNAL_VERSION,
         _PRE_ORDER_EVENT_REASON_VERSION,
         _PRE_DECISION_REASON_VERSION,
+        _PRE_ACCEPT_REJECTIONS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
-        return  # version 4 serves fact and registry reads; versions 5 and 6 every read
+        # Version 4 serves fact and registry reads; versions 5 and 6 every read;
+        # version 7 every read but `resume_invocations` and `resume_acceptances`.
+        return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
         raise SchemaVersionError(
             f"store has schema version {max_version}, this code expects "
@@ -1447,9 +1492,34 @@ def _migrate_decision_reasons(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(f"ALTER TABLE {_DECISIONS_STAGING_TABLE} RENAME TO decisions")
 
 
+#: Where `_migrate_resume_flags` builds the version-8 table before it takes the
+#: name `resume_invocations`.
+_RESUME_INVOCATIONS_STAGING_TABLE = "resume_invocations_v8"
+
+
+def _migrate_resume_flags(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild a version-5, 6 or 7 `resume_invocations` (the table did not change
+    from version 5 to 7) with the version-8 DDL (module docstring, "Schema
+    versions"), every row kept in insertion order with `accept_rejections =
+    FALSE`: no resume before version 8 could be given the flag. Runs inside
+    `init_schema`'s transaction."""
+    staging_ddl = _CREATE_RESUME_INVOCATIONS.replace(
+        "CREATE TABLE IF NOT EXISTS resume_invocations (",
+        f"CREATE TABLE {_RESUME_INVOCATIONS_STAGING_TABLE} (",
+        1,
+    )
+    conn.execute(staging_ddl)
+    conn.execute(
+        f"INSERT INTO {_RESUME_INVOCATIONS_STAGING_TABLE} BY NAME "
+        "SELECT *, FALSE AS accept_rejections FROM resume_invocations ORDER BY rowid"
+    )
+    conn.execute("DROP TABLE resume_invocations")
+    conn.execute(f"ALTER TABLE {_RESUME_INVOCATIONS_STAGING_TABLE} RENAME TO resume_invocations")
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2, 3, 4, 5 or 6 store to version 7.
+    version-2, 3, 4, 5, 6 or 7 store to version 8.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -1461,17 +1531,19 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; a version-6 store gets `decisions` rebuilt with
-    the reason `CHECK` (every row kept) and a version-7 row; a version-5 store
-    gets `order_events` rebuilt likewise first, and version-6 and version-7
-    rows; a version-4 store gets the journal tables and version-5 to version-7
-    rows; a version-3 store gets that plus
+    `CURRENT_SCHEMA_VERSION`; a version-7 store gets `resume_invocations`
+    rebuilt with `accept_rejections` (every row kept, `FALSE`), the
+    `resume_acceptances` table and a version-8 row; a version-6 store gets
+    `decisions` rebuilt with the reason `CHECK` (every row kept) first, and
+    version-7 and version-8 rows; a version-5 store gets `order_events` rebuilt
+    likewise before that, and version-6 to version-8 rows; a version-4 store
+    gets the journal tables and version-5 to version-8 rows; a version-3 store gets that plus
     `corporate_actions` rebuilt with the version-4 columns (every row kept)
     and a version-4 row; a version-2 store gets all of that plus the
     registry tables and a version-3 row. Nothing else changes (module
     docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-7, 6 or 5 store
+    On a read-only connection no DDL runs: a version-8, 7, 6 or 5 store
     passes, and so does a version-4 store (fact and registry reads work; the journal
     tables are absent, which `store.journal` reports); a version-2 or
     uninitialised store raises `RegistryNotInitialised`, and a version-3
@@ -1493,6 +1565,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_JOURNAL_VERSION,
         _PRE_ORDER_EVENT_REASON_VERSION,
         _PRE_DECISION_REASON_VERSION,
+        _PRE_ACCEPT_REJECTIONS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -1505,6 +1578,12 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_order_event_reasons(conn)
         if max_version in (_PRE_ORDER_EVENT_REASON_VERSION, _PRE_DECISION_REASON_VERSION):
             _migrate_decision_reasons(conn)
+        if max_version in (
+            _PRE_ORDER_EVENT_REASON_VERSION,
+            _PRE_DECISION_REASON_VERSION,
+            _PRE_ACCEPT_REJECTIONS_VERSION,
+        ):
+            _migrate_resume_flags(conn)
         for ddl in _TABLE_DDL + _REGISTRY_TABLE_DDL + _JOURNAL_TABLE_DDL:
             conn.execute(ddl)
         forget_column_types(conn)
