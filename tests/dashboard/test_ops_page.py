@@ -276,7 +276,13 @@ def test_page_is_in_the_shell_navigation(
 ) -> None:
     at = _app(monkeypatch, seeded_store)
     assert not at.exception
-    assert at.sidebar.radio[0].options == ["Data health", "Backtest", "Trial registry", _PAGE]
+    assert at.sidebar.radio[0].options == [
+        "Data health",
+        "Backtest",
+        "Trial registry",
+        _PAGE,
+        "Override",
+    ]
 
 
 def test_render_journal_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

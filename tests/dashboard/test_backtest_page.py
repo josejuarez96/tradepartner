@@ -317,6 +317,7 @@ def test_page_is_in_the_shell_navigation(
         "Backtest",
         "Trial registry",
         "Operations",
+        "Override",
     ]
 
 
