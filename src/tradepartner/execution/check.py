@@ -72,6 +72,7 @@ _BUY = "buy"
 _SELL = "sell"
 _REBALANCE = "rebalance"
 _CATCH_UP = "catch_up"
+_EXIT_PHASE = "exit"
 _PAPER_MIN_REBALANCES = "paper.min_rebalances"
 _PAPER_MIN_OVERRIDE_REASON_CHARS = "paper.min_override_reason_chars"
 _EXECUTION_FILL_PRICE = "execution.fill_price"
@@ -320,10 +321,41 @@ def _tracking_line(
     return CheckLine(name="tracking", passed=passed, query=query, detail=detail)
 
 
+def _rebalance_before(session: date) -> date:
+    """The last rebalance session (last session of a month) at or before
+    `session` (`outcomes._rebalance_before`, duplicated locally)."""
+    candidate = last_session_of_month(session.year, session.month)
+    if candidate < session:
+        return candidate
+    year, month = (session.year, session.month - 1) if session.month > 1 else (session.year - 1, 12)
+    return last_session_of_month(year, month)
+
+
+def _order_due_threshold(
+    order: store_journal.OrderRow, decision: store_journal.DecisionRow | None
+) -> date:
+    """The session an order's outcome becomes due strictly after
+    (`outcomes._horizon`'s non-stop `base`, duplicated locally): for a `phase
+    = exit` order (a forced exit's own phase, spec req 8's "exit session"),
+    its own session; otherwise T_{i+1} of its rebalance (the decision's
+    `rebalance_session` when it has one, else the rebalance at or before the
+    order's own session - `outcomes.py` falls back the same way for an order
+    whose decision carries none, a forced exit traded inside a rebalance
+    batch with phase `sell`, ADR 0010 amendment 2026-10-01)."""
+    if order.phase == _EXIT_PHASE:
+        return order.session
+    rebalance = (
+        decision.rebalance_session
+        if decision is not None and decision.rebalance_session is not None
+        else _rebalance_before(order.session)
+    )
+    return _next_rebalance_session(rebalance)
+
+
 def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
     query = (
-        "every order's chain (signal -> decision -> order -> terminal event -> "
-        "outcome) once its outcome is due (spec req 8)"
+        "every order's chain (order -> terminal event -> outcome) once its "
+        "outcome is due (spec req 8)"
     )
     orders = store_journal.orders_for(conn, window_id=window_id)
     decisions = {
@@ -351,12 +383,7 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
     incomplete: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
         decision = decisions.get(order.decision_id)
-        rebalance_session = decision.rebalance_session if decision is not None else None
-        threshold = (
-            _next_rebalance_session(rebalance_session)
-            if rebalance_session is not None
-            else order.session
-        )
+        threshold = _order_due_threshold(order, decision)
         due = any(session > threshold for session in run_sessions)
         if not due:
             continue

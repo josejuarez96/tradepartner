@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from tradepartner.calendar import session_close
+from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
 from tradepartner.execution import check as check_module
 from tradepartner.execution.check import check
@@ -413,6 +413,95 @@ def test_chain_not_due_is_not_a_failure(settings: Settings) -> None:
     assert line.passed
 
 
+def test_chain_becomes_due_once_a_run_exists_after_its_threshold(settings: Settings) -> None:
+    """The same 'o2' as `test_chain_not_due_is_not_a_failure`, but with a further
+    run after T_{i+1} = T2: now its missing terminal event and outcome are due,
+    and the check must flag it (pins the `session > threshold` boundary from
+    both sides, not just the "not yet due" one)."""
+    t3 = check_module._next_rebalance_session(T2)
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_decision(conn, 2, 2, T1)
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('o2', 2, 2, ?, 1, 'buy', 'SEC_A', 'SEC_A', "
+            "'buy', 1000.0, FALSE, ?, ?)",
+            [T1, _utc(T1), _utc(T1)],
+        )
+        _insert_run(conn, 4, t3, invoked_by="scheduler", kind="mark")
+    with open_read_only(settings) as conn:
+        lines = check(conn, settings)
+    line = next(line for line in lines if line.name == "chain")
+    assert not line.passed
+    assert "o2" in line.detail
+    assert "is not terminal" in line.detail
+
+
+def test_chain_due_threshold_follows_order_phase_for_a_forced_exit_in_a_rebalance_batch(
+    settings: Settings,
+) -> None:
+    """A forced exit traded inside a rebalance batch is submitted with phase
+    `sell` (`wrapper.py`), not `exit`, and its decision carries no
+    `rebalance_session`: its outcome is due at T_{i+1} of the rebalance it
+    rode along with (`outcomes._horizon`), not right after its own session.
+    Here it fills on a fill session just after T1 (so "right after its own
+    session" would wrongly make it due by T2, the baseline fixture's latest
+    run); the correct threshold, T2 itself, means it is not yet due with no
+    run after T2 in the store."""
+    forced_exit_session = next_session(T1)  # the fill session right after T1, well before T2
+    assert T1 < forced_exit_session < T2
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        conn.execute(
+            "INSERT INTO decisions (decision_id, run_id, rebalance_session, security_id, "
+            "side, planned_notional, whole_share, decision, known_at, ingested_at) "
+            "VALUES (3, 3, NULL, 'SEC_B', 'sell', 500.0, FALSE, 'forced_exit', ?, ?)",
+            [_utc(forced_exit_session), _utc(forced_exit_session)],
+        )
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, "
+            "phase, security_id, symbol, side, notional, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('o3', 3, 3, ?, 1, 'sell', 'SEC_B', 'SEC_B', "
+            "'sell', 500.0, FALSE, ?, ?)",
+            [forced_exit_session, _utc(forced_exit_session), _utc(forced_exit_session)],
+        )
+        conn.execute(
+            "INSERT INTO order_events (client_order_id, event_at, status, known_at, "
+            "ingested_at) VALUES ('o3', ?, 'filled', ?, ?)",
+            [_utc(forced_exit_session), _utc(forced_exit_session), _utc(forced_exit_session)],
+        )
+        append(
+            conn,
+            FillRow(
+                client_order_id="o3",
+                filled_at=_utc(forced_exit_session),
+                quantity=5.0,
+                price=50.0,
+                price_implied=False,
+                broker_fill_id="f3",
+                source="broker_feed",
+                known_at=_utc(forced_exit_session),
+                ingested_at=_utc(forced_exit_session),
+            ),
+        )
+        # A bar for SEC_B on the fill session: `compare_months`'s fill-timing
+        # term (the tracking check, exercised regardless of this test's own
+        # concern) needs one for any fill inside a compared month.
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) VALUES ('SEC_B', ?, 50.0, "
+            "50.0, 50.0, 50.0, 0, ?, ?, 'test', 'bar')",
+            [forced_exit_session, _utc(forced_exit_session), _utc(forced_exit_session)],
+        )
+        # No outcome row for 'o3': due only strictly after T2, not after its own
+        # (mid-T1..T2) session.
+    with open_read_only(settings) as conn:
+        lines = check(conn, settings)
+    line = next(line for line in lines if line.name == "chain")
+    assert line.passed, line.detail
+
+
 def test_override_reason_fails_on_a_whitespace_padded_reason_under_the_minimum(
     settings: Settings,
 ) -> None:
@@ -431,6 +520,9 @@ def test_check_never_reads_the_wash_sale_tables() -> None:
     assert "WashSaleFlagRow" not in source
     assert "DisposalRow" not in source
     assert "LotRow" not in source
+    for table in ("lots", "disposals", "wash_sale_flags"):
+        assert f"FROM {table}" not in source
+        assert f"{table}_for" not in source
 
 
 def test_raises_when_no_window_exists(settings: Settings) -> None:
