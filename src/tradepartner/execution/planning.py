@@ -292,9 +292,10 @@ def reference_prices(
     return prices
 
 
-def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
+def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
     """Per security, its listing row with the latest `valid_from` on or before `day`
-    (the first in frame order on a tie, as `universe_as_of` reads it)."""
+    (the first in frame order on a tie, as `universe_as_of` reads it). The one
+    tie rule planning and the wrapper share (#534)."""
     current: dict[str, dict[str, Any]] = {}
     for row in listings.iter_rows(named=True):
         valid_from = row["valid_from"]
@@ -320,7 +321,7 @@ def _ended(
     if not names:
         return {}
     frame = listing_ends_as_of(conn, _cut(session), params, list(names))
-    current = _current(frame, previous_session(session))
+    current = current_listings(frame, previous_session(session))
     return {sid: row["end_session"] for sid, row in current.items() if row["status"] == DELISTED}
 
 
@@ -331,7 +332,7 @@ def _symbols(
     A name with none raises, since its `assets` read cannot be made."""
     if not names:
         return {}
-    current = _current(listings_as_of(conn, _cut(session), list(names)), session)
+    current = current_listings(listings_as_of(conn, _cut(session), list(names)), session)
     missing = sorted(set(names) - set(current))
     if missing:
         raise ValueError(f"no listing known at close(S-1) for {missing}")

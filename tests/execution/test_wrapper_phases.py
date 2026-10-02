@@ -12,6 +12,7 @@ import inspect
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
 
 import duckdb
@@ -21,7 +22,7 @@ from tradepartner import calendar
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
 from tradepartner.adapters.fake_broker import FakeBroker, FillAt, Reject, Vanish
 from tradepartner.calendar import session_close, session_open
-from tradepartner.config import FROZEN_PAPER_KEYS, RiskConfig, Settings
+from tradepartner.config import FROZEN_PAPER_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import (
     AcknowledgementTimeoutError,
     LimitBreachError,
@@ -450,6 +451,40 @@ def test_a_second_full_exit_for_one_name_is_a_value_error_halt(
         _execute(_gate(env, alerter_conn), env, [exit_], [forced])
     assert "submit" not in [c.method for c in env.fake.calls[calls:]]
     assert _missed(env.settings) == []
+
+
+def test_cash_left_costs_the_verdict_s_whole_share_upgrade(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A buy the verdict returns as `whole_share` is costed at the buffered price
+    in `cash_left`, as the verdict's orders say, not as the built orders did
+    (#534 item 1). `buy_orders` reads the same `assets` as `check_phase`, so the
+    two agree today; the stubs make them disagree: the built buy loses its flag
+    and `check_phase` gives it back, as its upgrade does for a name not
+    `fractionable`."""
+    built_by, checked_by = wrapper.phases.buy_orders, wrapper.check_phase
+
+    def built_without_flag(*args: Any, **kwargs: Any) -> wrapper.phases.PhaseOrders:
+        built = built_by(*args, **kwargs)
+        return replace(built, orders=tuple(replace(o, whole_share=False) for o in built.orders))
+
+    def check_upgrading(candidates: list[Any], *args: Any, **kwargs: Any) -> Any:
+        upgraded = [replace(c, whole_share=c.quantity is not None) for c in candidates]
+        return checked_by(upgraded, *args, **kwargs)
+
+    monkeypatch.setattr(wrapper.phases, "buy_orders", built_without_flag)
+    monkeypatch.setattr(wrapper, "check_phase", check_upgrading)
+
+    buy = _decision(env, A, "buy", notional=3000.0, whole_share=True)
+    outcome = _execute(_gate(env, alerter_conn), env, [buy])
+
+    (request,) = _submits(env.fake)
+    assert request.quantity is not None and request.quantity == int(request.quantity) > 0
+    rate = Decimal(1) + Decimal(str(CostsConfig().per_side_bps)) / Decimal(10_000)
+    buffered = Decimal(str(PRICE)) * (1 + Decimal(str(FROZEN.whole_share_price_buffer)))
+    assert outcome.cash is not None
+    spent = Decimal(str(request.quantity)) * buffered * rate
+    assert outcome.cash_left == pytest.approx(float(Decimal(repr(outcome.cash)) - spent))
 
 
 def test_the_skip_cap_halts_before_any_decision_events_row(
@@ -907,13 +942,20 @@ def test_limits_come_from_frozen_and_run_time_keys_from_settings(
 
 
 def test_the_wrapper_reads_only_risk_keys_from_frozen() -> None:
-    """Every `self._frozen.<key>` is a `RiskConfig` field; no `settings.risk`, and
-    no frozen `paper.*` key, is read from `settings`."""
+    """Every `self._frozen.<key>` is a `RiskConfig` field; no `settings.risk`, no
+    `settings.costs` (the costs are the window's, #534), and no frozen
+    `paper.*` key, is read from `settings`."""
     tree = ast.parse(inspect.getsource(wrapper))
     frozen_keys: set[str] = set()
     settings_sections: set[str] = set()
     paper_keys: set[str] = set()
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "settings"
+        ):
+            settings_sections.add(node.attr)
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute):
             owner = node.value
             if isinstance(owner.value, ast.Name) and owner.value.id == "self":
@@ -925,7 +967,81 @@ def test_the_wrapper_reads_only_risk_keys_from_frozen() -> None:
                 paper_keys.add(node.attr)
     assert frozen_keys and frozen_keys <= set(RiskConfig.model_fields)
     assert "risk" not in settings_sections
+    assert "costs" not in settings_sections
     assert not paper_keys & set(FROZEN_PAPER_KEYS)
+
+
+def test_a_costs_edit_mid_window_does_not_change_the_buys_cash_sizing(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The window froze the default costs; live `costs.*` that would size the
+    buys far smaller change nothing (#534): the buys are scaled to the cash at
+    the frozen per-side rate, and `cash_left` is costed the same way."""
+    cash = Decimal("600.00")
+    env.new_fake(cash=float(cash), round_cash_to_cent=True)
+    env.settings = _settings(
+        env.settings.store.path,
+        costs={"per_side_bps": 500.0, "commission_per_share": 0.5, "commission_per_order": 5.0},
+    )
+    buys = [_decision(env, A, "buy", notional=300.0), _decision(env, B, "buy", notional=300.0)]
+
+    outcome = _execute(_gate(env, alerter_conn), env, buys)
+
+    rate = Decimal(1) + Decimal(str(CostsConfig().per_side_bps)) / Decimal(10_000)
+    per_buy = (cash / rate / Decimal(2)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    assert [r.notional for r in _submits(env.fake)] == [float(per_buy)] * 2
+    assert outcome.cash == float(cash)
+    assert outcome.cash_left == pytest.approx(float(cash - 2 * per_buy * rate))
+
+
+def test_a_window_without_frozen_costs_fails_closed_before_any_broker_call(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window whose `frozen_json` lacks the cost keys (started before #534)
+    raises a `ValueError` naming them; there is no fallback to `settings.costs`,
+    and the broker is never called."""
+    _hold(env, A, 10.0)
+    older = replace(env.window, frozen_json="{}")
+    monkeypatch.setattr(wrapper, "open_window", lambda _conn: older)
+    batch = [_decision(env, A, "sell", notional=500.0), _decision(env, B, "buy", notional=300.0)]
+    calls = len(env.fake.calls)
+
+    with pytest.raises(ValueError, match=r"lacks cost keys \['costs.per_side_bps'"):
+        _execute(_gate(env, alerter_conn), env, batch)
+    assert not env.fake.calls[calls:]
+
+
+@pytest.mark.parametrize(
+    "frozen_json",
+    [
+        "not json",
+        "[]",
+        '{"costs.per_side_bps": -1, "costs.commission_per_share": 0, '
+        '"costs.commission_per_order": 0}',
+        '{"costs.per_side_bps": 15, "costs.commission_per_share": 0}',
+    ],
+)
+def test_frozen_costs_refuse_anything_but_the_three_valid_keys(frozen_json: str) -> None:
+    with pytest.raises(ValueError, match="frozen"):
+        wrapper._frozen_costs(PaperWindowRow(**{**_window_fields(), "frozen_json": frozen_json}))
+
+
+def _window_fields() -> dict[str, Any]:
+    at = CUT - timedelta(days=2)
+    return {
+        "window_id": 7,
+        "hypothesis_id": 1,
+        "first_rebalance_session": T_I,
+        "account_id": "PA1",
+        "starting_cash": 1.0,
+        "starting_equity": 1.0,
+        "code_version": "test",
+        "started_at": at,
+        "frozen_json": "{}",
+        "frozen_sha256": "0" * 64,
+        "known_at": at,
+        "ingested_at": at,
+    }
 
 
 def test_execute_needs_a_journaled_run(env: Env, alerter_conn: duckdb.DuckDBPyConnection) -> None:
