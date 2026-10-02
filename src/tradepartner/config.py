@@ -131,6 +131,13 @@ class IngestConfig(BaseModel):
     # failure message is server-supplied text, capped so a large error page cannot fill
     # `ingestion_runs.message` and the page that shows it.
     max_message_chars: int = Field(default=2000, gt=0)
+    # Added for #573: a failed run's message gets ` | at: <frames>` appended (file:line
+    # in function, innermost first, across the `raise ... from` chain). `max_where_frames`
+    # bounds how many frames are kept; `max_where_chars` bounds the whole message
+    # (error text plus frames) before `max_message_chars`'s own cut, so a long frame
+    # trail is itself truncated rather than crowding out the error text.
+    max_where_frames: int = Field(default=8, gt=0)
+    max_where_chars: int = Field(default=1500, gt=0)
 
 
 class EdgarConfig(BaseModel):
