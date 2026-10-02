@@ -24,7 +24,7 @@ jobs:
         with:
           fetch-depth: 0
       # uv cache keyed on uv.lock (a changed lock misses it). Only main saves it: a `train/**`
-      # or PR run restores but never writes, so a batch's code cannot poison main's cache (#582).
+      # or PR run only restores, so a batch's code cannot poison main's cache (#582).
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
