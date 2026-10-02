@@ -358,6 +358,8 @@ def test_store_busy_writes_nothing_and_shows_the_busy_state(
     assert _rows(store) == []
     assert "busy" in _text(at).lower()
     assert "nothing was written" in _text(at).lower()
+    # Only a write empties the reason: a busy submit keeps it to resubmit.
+    assert at.text_area(key=override_page.REASON_KEY).value == _REASON
 
 
 # --- theme -----------------------------------------------------------------------------

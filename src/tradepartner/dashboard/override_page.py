@@ -18,9 +18,10 @@ writer's answer (`Outcome`) in `session_state`, and the shell pops it with
 even when the read that follows finds the store busy (a written override
 never looks unwritten). That stored value is a result to display, never a
 trigger: a rerun that finds it writes nothing, and only a click runs the
-callback. After a write the reason is emptied (and the form clears on
-submit), so a second click finds no reason and is refused rather than
-writing the same row twice.
+callback. After a write (only then: a busy or refused submit keeps what was
+typed, to resubmit) the reason is emptied, so a second click once the page
+has re-rendered finds no reason and is refused rather than writing the same
+row twice.
 
 **Store busy.** `StoreLockedError` (another process past
 `store.lock_retry_seconds`, or at once another tab of this server
@@ -117,9 +118,9 @@ def on_submit(settings: Settings) -> None:
     script body, so before the shell opens its read-only connection (module
     docstring). Reads the form's widgets from `session_state`, writes through
     `submit`, and leaves the answer for `show_outcome` to show once. After a
-    write it empties the reason, so a second click is refused for a blank
-    reason instead of writing the same row again (the form's
-    `clear_on_submit` does the same in the browser)."""
+    write, and only then, it empties the reason, so a second click once the
+    page has re-rendered is refused for a blank reason instead of writing
+    the same row again."""
     state = st.session_state
     outcome = submit(
         settings,
@@ -182,7 +183,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     _render_window_state(conn)
 
-    with st.form(FORM_KEY, clear_on_submit=True):
+    with st.form(FORM_KEY):
         st.selectbox("Kind", KINDS, key=KIND_KEY)
         st.date_input(
             "Rebalance session",
