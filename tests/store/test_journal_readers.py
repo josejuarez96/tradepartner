@@ -42,6 +42,7 @@ from tradepartner.store.journal import (
     PositionDailyRow,
     RebalanceEventRow,
     ReconciliationRow,
+    ResumeAcceptanceRow,
     ResumeInvocationRow,
     SignalRow,
     append,
@@ -714,9 +715,19 @@ def test_reports_resumes_alerts_and_outcomes(conn: duckdb.DuckDBPyConnection) ->
     assert journal.resume_invocations(conn) == []
     append(
         conn,
-        ResumeInvocationRow(at=_at(1), reason="checked", accept_broker_fills=False, **_stamp(1)),
+        ResumeInvocationRow(
+            at=_at(1),
+            reason="checked",
+            accept_broker_fills=False,
+            accept_rejections=False,
+            **_stamp(1),
+        ),
     )
     assert [r.reason for r in journal.resume_invocations(conn)] == ["checked"]
+
+    assert journal.resume_acceptances(conn) == []
+    append(conn, ResumeAcceptanceRow(resume_id=1, accepted_json="[]", **_stamp(2)))
+    assert [(r.resume_id, r.accepted_json) for r in journal.resume_acceptances(conn)] == [(1, "[]")]
 
     assert journal.alerts_for(conn, kind="no_window", session=_NEXT) == []
     append(conn, AlertRow(session=_NEXT, kind="no_window", message="m", at=_at(1), **_stamp(1)))
