@@ -16,7 +16,13 @@ from decimal import Decimal
 
 import pytest
 
-from execution.test_run_exits import UNTRADABLE, ended_before, exit_orders, exits
+from execution.test_run_exits import (
+    UNTRADABLE,
+    _lagging_context,
+    ended_before,
+    exit_orders,
+    exits,
+)
 from execution.test_run_trade import (
     F_0,
     T_0,
@@ -28,6 +34,8 @@ from execution.test_run_trade import (
 )
 from tradepartner.adapters.broker import Asset
 from tradepartner.adapters.fake_broker import Expire
+from tradepartner.config import Settings
+from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.run import stop_session
 from tradepartner.execution.window import stop
@@ -350,6 +358,29 @@ def test_the_flattening_fill_ends_the_horizon_of_the_window_s_orders(
     assert buy[3] == pytest.approx(fill_price)
 
 
+def test_a_second_stop_run_on_the_flattening_session_leaves_the_horizon_at_the_fill(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """A second stop run on May 2, after the first flattened DUALB that
+    session, writes no outcome ending at close(May 1); the May 3 run writes the
+    F_0 buy's outcome through May 2 at the exit's fill price."""
+    bought(env)
+    request_stop(env, at(F_0, 22, 0))
+    first = env.run(at(MAY_2))
+    assert first.status == "ok", env.result(env.latest_run())
+    (exit_coid,) = (o[0] for o in exit_orders(env, "SEC_DUAL_B"))
+    ((fill_price,),) = env.query("SELECT price FROM fills WHERE client_order_id = ?", [exit_coid])
+    again = env.run(at(MAY_2, 13, 0))
+    assert again.status == "ok", env.result(env.latest_run())
+    assert again.kind == "stop"
+    assert buy_id(env, F_0, "SEC_DUAL_B") not in {r[0] for r in outcomes(env, "SEC_DUAL_B")}
+    nxt = env.run(at(MAY_3))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    buy = {r[0]: r for r in outcomes(env, "SEC_DUAL_B")}[buy_id(env, F_0, "SEC_DUAL_B")]
+    assert (buy[1], buy[2]) == (MAY_2, "position_return")
+    assert buy[3] == pytest.approx(fill_price)
+
+
 def test_close_of_the_next_rebalance_ends_the_horizon_when_the_exit_fills_later(
     env: Env, window: PaperWindowRow
 ) -> None:
@@ -439,4 +470,63 @@ def test_a_crash_inside_a_stop_run_leaves_the_derived_switch_engaged(
     assert nxt.status == "skipped_kill_switch"
     assert nxt.kind == "stop"
     assert env.result(crashed)[0] == "crashed"
+    assert len(env.submits()) == submitted
+
+
+# --- the stop step's guards ----------------------------------------------------------------
+
+
+def test_no_stop_exit_while_fills_lag(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under `fills_lagging` the stop step reads nothing, journals nothing and
+    makes no batch: a note on the run."""
+
+    def refused(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("exit book read while fills are lagging")
+
+    monkeypatch.setattr(run_module, "_exit_book", refused)
+    context = _lagging_context(env, None)
+    assert run_module.stop_step(context) is None
+    assert context.notes == ["fills_lagging: no stop exit made"]
+    assert env.count("decisions") == 0
+
+
+def test_an_unset_quantity_precision_fails_the_stop_run_before_any_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    bought(env)
+    request_stop(env, at(F_0, 22, 0))
+    submitted = len(env.submits())
+    env.settings = Settings(
+        _env_file=None,
+        store={"path": env.settings.store.path},
+        alpaca={"client_order_id_max_length": 48},
+    )
+    assert env.settings.alpaca.quantity_decimals is None
+    with pytest.raises(ValueError, match="quantity_decimals"):
+        env.run(at(MAY_2))
+    assert env.result(env.latest_run())[0] == "failed"
+    assert env.query("SELECT count(*) FROM decisions WHERE decision = 'forced_exit'") == [(0,)]
+    assert len(env.submits()) == submitted
+
+
+def test_a_held_name_missing_from_the_assets_read_fails_the_stop_run_closed(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The broker's `assets` answer lacks DUALB: no `window_stop` exit is
+    journaled or submitted for any name, the run ends `failed`."""
+    bought(env)
+    request_stop(env, at(F_0, 22, 0))
+    submitted = len(env.submits())
+    answer = env.fake.assets
+
+    def without_dualb(symbols: list[str]) -> dict[str, Asset]:
+        return {k: v for k, v in answer(symbols).items() if k != "DUALB"}
+
+    monkeypatch.setattr(env.fake, "assets", without_dualb)
+    with pytest.raises(ValueError, match="SEC_DUAL_B is missing from the assets read"):
+        env.run(at(MAY_2))
+    assert env.result(env.latest_run())[0] == "failed"
+    assert env.query("SELECT count(*) FROM decisions WHERE decision = 'forced_exit'") == [(0,)]
     assert len(env.submits()) == submitted

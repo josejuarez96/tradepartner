@@ -390,7 +390,7 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     if not _in_submit_window(context):
         return None
     decimals = context.settings.alpaca.quantity_decimals
-    if decimals is None:  # the wrapper refuses it too; nothing is journaled first
+    if decimals is None:  # the wrapper refuses it too; no exit is journaled first
         raise ValueError("alpaca.quantity_decimals is unset (T48b records it)")
     handed, untradable = _journal_forced_exits(context, _exit_book(context), pending_rebalance=None)
     # Read again: this run's forced exits block a `window_stop` exit of their name.
@@ -1621,9 +1621,12 @@ class _Run:
         from its residue now, after step 3's collection and step 5's marks (a
         name never held is flat). The ledger is the journal's after step 3, so
         the flatness a run's own step 7b fills make is this test's on the next
-        run. A name keeps no earlier session: the outcome of an order terminal
-        and flat at an earlier `stop` run was written by that run (outcomes
-        are written once, at the first run they are due)."""
+        run. A name with a fill dated S (an earlier run on S flattened it) is
+        left out, so its flattening fill on S, not close(S-1), ends the
+        horizon; the next session's run finds it. A name keeps no earlier
+        session: the outcome of an order terminal and flat at an earlier `stop`
+        run was written by that run (outcomes are written once, at the first
+        run they are due)."""
         with open_read_only(self.settings) as conn:
             stops = window_stops_for(conn, self.window_id)
             requested_rows = [s for s in stops if s.state == _REQUESTED]
@@ -1633,6 +1636,11 @@ class _Run:
                 )
                 return session, {}
             names = sorted({o.security_id for o in orders_for(conn, window_id=self.window_id)})
+            filled_on_s = {
+                f.security_id
+                for f in fills_for(conn, window_id=self.window_id)
+                if f.fill.filled_at.astimezone(_NEW_YORK).date() == self.session
+            }
             adjustments = adjustments_for(conn, self.window_id)
             journaled = decisions_for(conn, self.window_id)
             marks_rows = positions_daily_for(conn, self.window_id)
@@ -1643,6 +1651,8 @@ class _Run:
         tolerance = self.frozen.reconcile_quantity_tolerance
         flat: dict[str, date] = {}
         for security_id in names:
+            if security_id in filled_on_s:
+                continue  # a fill on S ends it there: close(S-1) would come first
             held = ledger.positions.get(security_id, 0.0)
             kept = residue(
                 security_id,
