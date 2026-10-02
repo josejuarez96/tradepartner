@@ -359,6 +359,71 @@ def test_a_split_on_s_known_at_close_s_minus_1_halves_the_reference_price(
     assert outcome.status == "ok"
 
 
+def test_every_book_fact_comes_from_one_close_s_minus_1_actions_read(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#518 items 2 and 5: each phase's book reads `live_actions_as_of` once,
+    at close(S-1), and that same frame builds the ledger, the reference
+    prices, every decision state and every residue, and reaches
+    `sell_orders`' look-ahead check."""
+    reads: list[Any] = []
+    seen: dict[str, list[Any]] = {}
+
+    def spy(name: str, real: Any, position: int) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            seen.setdefault(name, []).append(args[position])
+            return real(*args, **kwargs)
+
+        return wrapped
+
+    def read(conn: Any, cut: datetime) -> Any:
+        assert cut == CUT
+        frame = live_actions(conn, cut)
+        reads.append(frame)
+        return frame
+
+    live_actions = wrapper.live_actions_as_of
+    monkeypatch.setattr(wrapper, "live_actions_as_of", read)
+    monkeypatch.setattr(wrapper, "from_journal", spy("ledger", wrapper.from_journal, 3))
+    monkeypatch.setattr(wrapper, "reference_prices", spy("prices", wrapper.reference_prices, 3))
+    monkeypatch.setattr(wrapper, "decision_state", spy("states", wrapper.decision_state, 5))
+    monkeypatch.setattr(wrapper, "residue", spy("residues", wrapper.residue, 6))
+    sells = wrapper.phases.sell_orders
+    monkeypatch.setattr(wrapper.phases, "sell_orders", spy("sell_orders", sells, 5))
+
+    _hold(env, A, 10.0)
+    trim = _decision(env, A, "sell", notional=300.0)
+    assert _execute(_gate(env, alerter_conn), env, [trim]).status == "ok"
+
+    (frame,) = reads
+    assert set(seen) == {"ledger", "prices", "states", "residues", "sell_orders"}
+    assert all(arg is frame for args in seen.values() for arg in args)
+
+
+def test_cash_left_excludes_a_buy_check_phase_drops_as_skip_delisted(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#518 item 8: `buy_orders` sizes a buy of a name whose listing ended
+    (only `check_phase` knows), so it shrinks the kept buy; `cash_left` is
+    recomputed over the verdict's orders, so it counts the delisted buy's
+    share as unspent."""
+    cash = Decimal("600.00")
+    env.new_fake(cash=float(cash), round_cash_to_cent=True)
+    kept = _decision(env, A, "buy", notional=300.0)
+    delisted = _decision(env, GONE, "buy", notional=300.0)
+
+    outcome = _execute(_gate(env, alerter_conn), env, [kept, delisted])
+
+    (request,) = _submits(env.fake)
+    assert request.symbol == "DUALA" and request.notional is not None
+    assert [s.reason for s in outcome.skips] == ["skip_delisted"]
+    rate = Decimal(1) + Decimal(str(CostsConfig().per_side_bps)) / Decimal(10_000)
+    assert outcome.cash == float(cash)
+    spent = Decimal(str(request.notional)) * rate
+    assert outcome.cash_left == pytest.approx(float(cash - spent))
+    assert outcome.cash_left is not None and outcome.cash_left > float(cash) / 2 - 1
+
+
 # --- the batch limits and the skip cap ---------------------------------------------------
 
 
@@ -878,8 +943,8 @@ def test_a_batch_sized_against_the_full_cash_breaches_the_cash_rule(
     _open_buy(env, C, 2000.0)
     sized = wrapper.phases.buy_orders
 
-    def full_cash(*args: Any) -> Any:
-        return sized(args[0], args[1], 5000.0, *args[3:])
+    def full_cash(*args: Any, **kwargs: Any) -> Any:
+        return sized(args[0], args[1], 5000.0, *args[3:], **kwargs)
 
     monkeypatch.setattr(wrapper.phases, "buy_orders", full_cash)
     calls = len(env.fake.calls)

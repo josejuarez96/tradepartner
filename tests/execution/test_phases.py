@@ -26,7 +26,7 @@ from tradepartner.execution.phases import (
     requests_for,
     sell_orders,
 )
-from tradepartner.execution.plan import BuyCosts, DecisionState, State, decision_state
+from tradepartner.execution.plan import BuyCosts, DecisionState, PriceOf, State, decision_state
 from tradepartner.execution.risk import Skips, check_phase
 from tradepartner.store.journal import (
     DecisionRow,
@@ -100,12 +100,13 @@ def _states(
     orders: Sequence[OrderRow] = (),
     events: Sequence[OrderEventRow] = (),
     fills: Sequence[OrderedFill] = (),
+    price_of: PriceOf = _price,
 ) -> dict[int, DecisionState]:
     out = {}
     for d in decisions:
         assert d.decision_id is not None
         out[d.decision_id] = decision_state(
-            d, (), orders, events, fills, ACTIONS, _price, FROZEN, session=S
+            d, (), orders, events, fills, ACTIONS, price_of, FROZEN, session=S
         )
     return out
 
@@ -123,16 +124,17 @@ def _sells(
     assets: dict[str, Asset] | None = None,
     frozen: RiskConfig = FROZEN,
     actions: pl.DataFrame = ACTIONS,
+    price_of: PriceOf = _price,
 ) -> PhaseOrders:
     rows = [*decisions, *forced]
     return sell_orders(
         decisions,
-        _states(rows),
+        _states(rows, price_of=price_of),
         _ledger(held),
         residues or {},
         forced,
         actions,
-        _price,
+        price_of,
         assets or {d.security_id: TRADABLE for d in rows},
         frozen,
         session=S,
@@ -225,6 +227,72 @@ def test_untradable_names_skip_and_a_forced_exit_is_exempt_from_the_cap() -> Non
     assert result.orders == ()
     assert _reasons(result) == {"SEC_1": "skip_untradable", "SEC_2": "untradable"}
     assert [s.counts_toward_cap for s in result.skips] == [True, False]
+
+
+def test_an_untradable_name_with_no_price_skips_without_halting_the_phase() -> None:
+    """#518 item 1: the tradable skip comes before the price read, so a halted
+    name with no reference price on S skips and the rest of the phase sells."""
+    halted = _d(1, "sell", reason="left_targets", quantity=5.0)
+    exit_ = _d(2, "sell", decision="forced_exit", reason="delisted", quantity=5.0)
+    trim = _d(3, "sell", notional=300.0)
+
+    def price_of(sid: str) -> float:
+        if sid in ("SEC_1", "SEC_2"):
+            raise ValueError(f"no reference price for {sid}")
+        return PRICE
+
+    result = sell_orders(
+        [halted, trim],
+        _states([halted, trim, exit_]),
+        _ledger({"SEC_1": 5.0, "SEC_2": 5.0, "SEC_3": 10.0}),
+        {},
+        [exit_],
+        ACTIONS,
+        price_of,
+        {"SEC_1": HALTED, "SEC_2": HALTED, "SEC_3": TRADABLE},
+        FROZEN,
+        session=S,
+        quantity_decimals=DECIMALS,
+    )
+    assert (_one(result).security_id, _one(result).quantity) == ("SEC_3", 3.0)
+    assert _reasons(result) == {"SEC_1": "skip_untradable", "SEC_2": "untradable"}
+
+
+@pytest.mark.parametrize(("residue", "capped"), [(0.0, 10.0), (0.5, 9.5)])
+def test_a_trim_after_a_price_drop_is_capped_at_the_holding_less_residue(
+    residue: float, capped: float
+) -> None:
+    """#518 item 7 (owner decision): a $950 trim planned at $100 is 19 shares at
+    $50 on S, above the 10 held. It sells the holding less the residue and
+    passes `check_phase`, instead of breaching `sell_within_holding`."""
+    trim = _d(1, "sell", notional=950.0)
+    held = {"SEC_1": 10.0}
+
+    def dropped(_sid: str) -> float:
+        return PRICE / 2
+
+    result = _sells([trim], held, residues={"SEC_1": residue}, price_of=dropped)
+    order = _one(result)
+    assert (order.quantity, order.full_exit) == (capped, False)
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 100_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=dropped,
+        costs=NO_COSTS,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_trim_capped_on_a_whole_share_basis_floors_the_cap() -> None:
+    trim = _d(1, "sell", notional=950.0, whole_share=True)
+    order = _one(
+        _sells([trim], {"SEC_1": 10.0}, residues={"SEC_1": 0.5}, price_of=lambda _s: PRICE / 2)
+    )
+    assert (order.quantity, order.whole_share) == (9.0, True)
 
 
 def test_a_full_exit_below_the_minimum_is_dust() -> None:
@@ -322,6 +390,7 @@ def _buys(
         costs,
         assets or {d.security_id: TRADABLE for d in decisions},
         frozen,
+        session=S,
     )
 
 
@@ -402,6 +471,25 @@ def test_a_buy_of_a_name_the_phase_sells_is_refused() -> None:
         _buys(THREE[:2], 1000.0, sells=sells)
 
 
+def test_a_buy_of_a_name_the_sells_phase_skipped_is_refused() -> None:
+    """#518 item 3: a sells-phase skip of the name counts as selling it."""
+    trim = _d(9, "sell", sid="SEC_2", notional=300.0)
+    sells = _sells([trim], {"SEC_2": 10.0}, assets={"SEC_2": HALTED})
+    assert sells.orders == () and _reasons(sells) == {"SEC_2": "skip_untradable"}
+    with pytest.raises(ValueError, match="both sells and buys \\['SEC_2'\\]"):
+        _buys(THREE[:2], 1000.0, sells=sells)
+
+
+def test_a_buy_of_a_name_with_a_sell_in_flight_is_refused() -> None:
+    """#518 item 3: an in-flight sell decision in `decisions` (an earlier
+    attempt still open at the broker) counts as selling the name."""
+    trim = _d(9, "sell", sid="SEC_2", notional=300.0)
+    order = _order(trim, quantity=3.0)  # no event: in flight
+    rows = [*THREE[:2], trim]
+    with pytest.raises(ValueError, match="both sells and buys \\['SEC_2'\\]"):
+        _buys(rows, 1000.0, states=_states(rows, [order]))
+
+
 # --- requests ---------------------------------------------------------------------
 
 
@@ -459,7 +547,7 @@ LISTINGS = {"SEC_1": "AAA", "SEC_2": "BBB"}
 def test_requests_carry_the_listing_symbol_and_ids_counted_per_attempt() -> None:
     earlier = _order(_d(1, "sell"), quantity=1.0)  # an expired attempt earlier on S
     requests = requests_for(
-        PhaseOrders((SELL, BUY), ()), LISTINGS, "tp", [earlier], None, session=S
+        PhaseOrders((SELL, BUY), (), session=S), LISTINGS, "tp", [earlier], None, session=S
     )
     assert [(r.client_order_id, r.symbol, r.side, r.quantity, r.notional) for r in requests] == [
         ("tp-20261002-SEC_1-sell-2", "AAA", Side.SELL, 3.0, None),
@@ -469,11 +557,13 @@ def test_requests_carry_the_listing_symbol_and_ids_counted_per_attempt() -> None
 
 def test_a_name_unknown_to_the_master_raises_before_any_request() -> None:
     with pytest.raises(ValueError, match="no listing known at close\\(S-1\\) for \\['SEC_2'\\]"):
-        requests_for(PhaseOrders((SELL, BUY), ()), {"SEC_1": "AAA"}, "tp", [], None, session=S)
+        requests_for(
+            PhaseOrders((SELL, BUY), (), session=S), {"SEC_1": "AAA"}, "tp", [], None, session=S
+        )
 
 
 def test_an_over_long_id_is_refused_when_max_length_is_set_and_accepted_when_none() -> None:
-    batch = PhaseOrders((SELL,), ())
+    batch = PhaseOrders((SELL,), (), session=S)
     length = len("tp-20261002-SEC_1-sell-1")
     assert len(requests_for(batch, LISTINGS, "tp", [], length, session=S)) == 1
     assert len(requests_for(batch, LISTINGS, "tp", [], None, session=S)) == 1
@@ -484,7 +574,28 @@ def test_an_over_long_id_is_refused_when_max_length_is_set_and_accepted_when_non
 def test_a_sell_carrying_a_notional_and_a_stray_session_row_are_refused() -> None:
     notional_sell = PhaseOrder(1, "SEC_1", "sell", "trade", PRICE, notional=300.0)
     with pytest.raises(ValueError, match="carries a notional"):
-        requests_for(PhaseOrders((notional_sell,), ()), LISTINGS, "tp", [], None, session=S)
+        requests_for(
+            PhaseOrders((notional_sell,), (), session=S), LISTINGS, "tp", [], None, session=S
+        )
     stray = OrderRow(**{**_order(_d(1, "sell"), quantity=1.0).__dict__, "session": T0})
     with pytest.raises(ValueError, match="not 2026-10-02"):
-        requests_for(PhaseOrders((SELL,), ()), LISTINGS, "tp", [stray], None, session=S)
+        requests_for(PhaseOrders((SELL,), (), session=S), LISTINGS, "tp", [stray], None, session=S)
+
+
+def test_orders_built_for_another_session_are_refused() -> None:
+    """#518 item 4: `requests_for`'s session is the one its orders were built
+    for; orders of T0, or with no session, never get S's client order ids."""
+    for built_for in (T0, None):
+        with pytest.raises(ValueError, match="built for"):
+            requests_for(
+                PhaseOrders((SELL,), (), session=built_for), LISTINGS, "tp", [], None, session=S
+            )
+    assert _sells([_d(1, "sell", notional=300.0)], {"SEC_1": 10.0}).session == S
+    assert _buys(THREE[:1], 1000.0).session == S
+
+
+def test_buys_refuse_a_sells_phase_of_another_session() -> None:
+    trim = _d(9, "sell", sid="SEC_5", notional=300.0)
+    sells = _sells([trim], {"SEC_5": 10.0})
+    with pytest.raises(ValueError, match="sells phase of"):
+        _buys(THREE[:1], 1000.0, sells=PhaseOrders(sells.orders, (), session=T0))
