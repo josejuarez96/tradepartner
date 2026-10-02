@@ -17,7 +17,7 @@ from conftest import version_4_store
 
 from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker
-from tradepartner.config import Settings
+from tradepartner.config import FROZEN_COSTS_KEYS, Settings
 from tradepartner.execution import window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
@@ -564,6 +564,32 @@ def test_frozen_hash_stable_across_an_environment_override(
         stored = latest_window(conn)
     assert stored is not None
     assert stored.frozen_sha256 == frozen_sha_before
+
+
+def test_frozen_json_carries_the_cost_keys_the_wrapper_reads(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`paper start` freezes `FROZEN_COSTS_KEYS` under `costs.` from the live
+    `costs.*` at start (#534), and no other `costs.*` key."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        costs={"per_side_bps": 7.5, "commission_per_share": 0.01, "commission_per_order": 1.0},
+    )
+
+    result = window.start(settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1")
+
+    frozen = json.loads(result.window.frozen_json)
+    assert {k: v for k, v in frozen.items() if k.startswith("costs.")} == {
+        "costs.per_side_bps": 7.5,
+        "costs.commission_per_share": 0.01,
+        "costs.commission_per_order": 1.0,
+    }
+    assert {k.removeprefix("costs.") for k in frozen if k.startswith("costs.")} == set(
+        FROZEN_COSTS_KEYS
+    )
 
 
 def test_succeeds_on_a_version_4_store(tmp_path: Path, fixed_clock: FixedClock) -> None:

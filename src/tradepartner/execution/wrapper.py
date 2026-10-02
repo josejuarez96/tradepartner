@@ -91,7 +91,11 @@ handed to it, each once. Every fact is read once per phase from the journal and
 from the store at close(S-1) (`live_actions_as_of`), so the ledger, the
 residues, the decision states and the reference prices share one frame (#518).
 `price_of` is the close(S-1) close over the split ratios with ex-date in
-(S-1, S] known at close(S-1) (`planning.reference_prices`). Each phase, in order:
+(S-1, S] known at close(S-1) (`planning.reference_prices`). The costs that size
+the buys and the cash rule are the window's frozen `costs.*` keys
+(`config.FROZEN_COSTS_KEYS`, #534), read with each phase's book; a window whose
+`frozen_json` lacks them raises `ValueError` before any broker call, never
+falling back to `settings.costs`. Each phase, in order:
 
 1. its open decisions (`reattempts.attempt_scope`); a phase with none stops here;
 2. the derived switch, after `switch.engage_from_overrides`: engaged ends the
@@ -122,7 +126,10 @@ residues, the decision states and the reference prices share one frame (#518).
 
 Between the phases the sells are polled until all are terminal or
 `paper.sell_wait_seconds` has passed since the open, then collected (T58); a
-rejection verdict raises `RejectionCapError`. The buys phase reads its facts
+rejection verdict raises `RejectionCapError`. A batch with no buys (forced
+exits only, or sells only) returns right after its sells' submits without
+polling or collecting them, so its rejection cap relies on the run's step 7b
+collection (T63d), not on this module (#534). The buys phase reads its facts
 after that collection, so its scope's `last` and every buy's
 `sells_in_flight_at_submit` agree. It ends by collecting its buys with a
 `WriteOffContext` (T58), so a submitted buy that expires unfilled or is
@@ -140,16 +147,17 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, NoReturn, Protocol
+from typing import NoReturn, Protocol
 from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
+from pydantic import ValidationError
 
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
@@ -165,7 +173,13 @@ from tradepartner.adapters.broker import (
 )
 from tradepartner.backtest.costs import Commissions
 from tradepartner.calendar import previous_session, session_close
-from tradepartner.config import RiskConfig, Settings, secret_values
+from tradepartner.config import (
+    FROZEN_COSTS_KEYS,
+    CostsConfig,
+    RiskConfig,
+    Settings,
+    secret_values,
+)
 from tradepartner.errors import (
     AcknowledgementTimeoutError,
     ClockError,
@@ -180,7 +194,7 @@ from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import Connect, WriteOffContext, collect
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state, residue
-from tradepartner.execution.planning import reference_prices
+from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
 from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.risk import Skip, Violations, _buy_cash, check_phase, unfilled_sells
@@ -297,6 +311,7 @@ _UNFUNDED = "unfunded"
 _MISSED = "missed"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
+_COSTS_PREFIX = "costs."
 
 
 class Verdict(StrEnum):
@@ -384,12 +399,14 @@ class BatchOutcome:
 @dataclass(frozen=True)
 class _Book:
     """One phase's read of the journal and the store, every store fact as of
-    close(S-1): the window, the splits, the ledger stated for S, the reference
-    prices, each decision's state and each sold name's residue, the tickers and
-    ended listings of the batch's names, every own order, event and live fill
-    of any window, and the last `ok` ingestion run's `finished_at`."""
+    close(S-1): the window and its frozen costs, the splits, the ledger stated
+    for S, the reference prices, each decision's state and each sold name's
+    residue, the tickers and ended listings of the batch's names, every own
+    order, event and live fill of any window, and the last `ok` ingestion run's
+    `finished_at`."""
 
     window: PaperWindowRow
+    costs: BuyCosts
     actions: pl.DataFrame
     ledger: Ledger
     prices: Mapping[str, float]
@@ -422,8 +439,10 @@ class RiskGatedBroker:
     """The only caller of `Broker.submit` and `Broker.cancel` (module docstring).
 
     `journal` opens a write chunk (`lambda: store.db.open_for_write(settings)`),
-    `frozen` is the window's frozen `risk.*` section (the only limits it reads;
-    every `paper.*`, `alpaca.*` and `costs.*` key comes from `settings`),
+    `frozen` is the window's frozen `risk.*` section (the only limits it reads),
+    the costs are the window's frozen `costs.*` keys (`_frozen_costs`, read with
+    each phase's book, #534), and every `paper.*` and `alpaca.*` key comes from
+    `settings`,
     `alerter` writes the halt's alert, `calendar` gives session opens and
     closes, and `sleep` waits between polls (tests advance a fake clock)."""
 
@@ -617,7 +636,7 @@ class RiskGatedBroker:
         assets = self._phase_assets(run, book, rows, _BUY)
         account = self._broker.account()
         cash = self._buys_cash(account, book, run.session)
-        costs = self._costs()
+        costs = book.costs
         built = phases.buy_orders(
             rows, book.states, cash, sold, book.price_of, costs, assets, self._frozen
         )
@@ -714,7 +733,7 @@ class RiskGatedBroker:
             self._frozen,
             self._decimals(),
             price_of=book.price_of,
-            costs=self._costs(),
+            costs=book.costs,
             open_sells=unfilled_sells(
                 book.orders, book.events, book.fills, book.price_of, book.actions, session=session
             ),
@@ -723,8 +742,17 @@ class RiskGatedBroker:
         )
         if isinstance(verdict, Violations):
             self._refuse(run, verdict, rebalance)
-        left_ids = {o.decision_id for o in verdict.orders}
-        final = phases.PhaseOrders(tuple(o for o in built.orders if o.decision_id in left_ids), ())
+        # The verdict's orders, in its order, each with its basis: `check_phase`
+        # may set `whole_share` on a buy or trim whose name is not `fractionable`
+        # (#534); sizes are the built ones, which the check never changes.
+        built_by_id = {o.decision_id: o for o in built.orders}
+        final = phases.PhaseOrders(
+            tuple(
+                replace(built_by_id[o.decision_id], whole_share=o.whole_share)
+                for o in verdict.orders
+            ),
+            (),
+        )
         requests = self._requests(final, book, session)
         skips = (*built.skips, *verdict.skips)
         stamp = self.read_clock()
@@ -808,6 +836,7 @@ class RiskGatedBroker:
             window = open_window(conn)
             if window is None or window.window_id != run.window_id:
                 raise ValueError(f"run {run.run_id}'s window {run.window_id} is not the open one")
+            costs = _frozen_costs(window)
             window_id = run.window_id
             actions = live_actions_as_of(conn, cut)
             ok = [
@@ -883,6 +912,7 @@ class RiskGatedBroker:
         }
         return _Book(
             window,
+            costs,
             actions,
             ledger,
             prices,
@@ -950,10 +980,6 @@ class RiskGatedBroker:
         if decimals is None:
             raise ValueError("alpaca.quantity_decimals is unset (T48b records it)")
         return decimals
-
-    def _costs(self) -> BuyCosts:
-        costs = self._settings.costs
-        return BuyCosts(costs.per_side_bps, Commissions.from_config(costs))
 
     def _requests(
         self, built: phases.PhaseOrders, book: _Book, session: date
@@ -1273,6 +1299,34 @@ class RiskGatedBroker:
         return text
 
 
+def _frozen_costs(window: PaperWindowRow) -> BuyCosts:
+    """The window's frozen costs: `FROZEN_COSTS_KEYS` under `costs.` in
+    `frozen_json` (spec req 14, #534, owner), never live `Settings`. A window
+    whose `frozen_json` lacks one of them (started before #534), or holds a
+    value `CostsConfig` refuses, raises `ValueError`: there is no fallback to
+    `settings.costs`."""
+    try:
+        parsed = json.loads(window.frozen_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"window {window.window_id} frozen_json is not JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"window {window.window_id} frozen_json is not an object")
+    keys = [f"{_COSTS_PREFIX}{k}" for k in FROZEN_COSTS_KEYS]
+    missing = [k for k in keys if k not in parsed]
+    if missing:
+        raise ValueError(
+            f"window {window.window_id} frozen_json lacks cost keys {missing} (a window "
+            "started before #534 froze no costs; stop it and start a new one)"
+        )
+    try:
+        costs = CostsConfig.model_validate(
+            {k: parsed[f"{_COSTS_PREFIX}{k}"] for k in FROZEN_COSTS_KEYS}
+        )
+    except ValidationError as exc:
+        raise ValueError(f"window {window.window_id} frozen costs: {exc}") from exc
+    return BuyCosts(costs.per_side_bps, Commissions.from_config(costs))
+
+
 def _price_lookup(prices: Mapping[str, float]) -> Callable[[str], float]:
     def price_of(security_id: str) -> float:
         if security_id not in prices:
@@ -1280,23 +1334,6 @@ def _price_lookup(prices: Mapping[str, float]) -> Callable[[str], float]:
         return prices[security_id]
 
     return price_of
-
-
-def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from` on or before
-    `day` (as `planning` and `universe_as_of` read it)."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        valid_from = row["valid_from"]
-        if valid_from is not None and valid_from > day:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or (
-            valid_from is not None
-            and (held["valid_from"] is None or valid_from > held["valid_from"])
-        ):
-            current[row["security_id"]] = row
-    return current
 
 
 def _listings(
@@ -1308,9 +1345,11 @@ def _listings(
     if not names:
         return {}, frozenset()
     cut = session_close(previous_session(session))
-    current = _current(listings_as_of(conn, cut, list(names)), session)
+    current = current_listings(listings_as_of(conn, cut, list(names)), session)
     tickers = {sid: (str(current[sid]["ticker"]) if sid in current else None) for sid in names}
-    ends = _current(listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session))
+    ends = current_listings(
+        listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
+    )
     return tickers, frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
 
 

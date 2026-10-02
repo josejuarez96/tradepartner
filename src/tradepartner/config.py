@@ -474,6 +474,17 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
 # writer this freezes into (not changed here: out of this task's file list).
 FROZEN_EXECUTION_KEYS: tuple[str, ...] = ("fill_price",)
 
+# The `costs.*` keys req 14 also freezes into the window at `paper start` (#534,
+# owner): the wrapper sizes buys and checks the cash rule with the window's frozen
+# costs, never live `Settings`, as #366 Q20 does for `execution.fill_price`. Exactly
+# the keys `BuyCosts` is built from (`per_side_bps` and the two commissions
+# `Commissions.from_config` reads); `sensitivity_per_side_bps` is a backtest key.
+FROZEN_COSTS_KEYS: tuple[str, ...] = (
+    "per_side_bps",
+    "commission_per_share",
+    "commission_per_order",
+)
+
 AlertChannel = Literal["store", "macos", "email"]
 _DEFAULT_ALERT_CHANNELS: tuple[AlertChannel, ...] = ("store", "macos")
 # The `email` channel's required `Settings` fields, paired with the env var name a

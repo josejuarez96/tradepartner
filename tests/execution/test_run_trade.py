@@ -31,7 +31,7 @@ from tradepartner.adapters.broker import Asset, OrderRequest
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import next_session, previous_session, session_close, session_open
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import LimitBreachError
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
@@ -86,6 +86,7 @@ def at(day: date, hour: int = 12, minute: int = 30) -> datetime:
 def frozen_json(frozen: RiskConfig) -> str:
     values: dict[str, Any] = {f"risk.{k}": v for k, v in frozen.model_dump(mode="json").items()}
     values["paper.max_catch_up_sessions"] = MAX_CATCH_UP
+    values.update({f"costs.{k}": getattr(CostsConfig(), k) for k in FROZEN_COSTS_KEYS})
     return json.dumps(values, sort_keys=True)
 
 
