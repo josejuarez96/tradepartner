@@ -329,9 +329,22 @@ uv run tradepartner paper status        # (built by T67) prints the operations-p
 
 This shows: the store's "as of" and the run's "last updated" (with a stale chip if S−1 has no run row), the four KPIs including the kill-switch chip, today's plan ranking, fills, the per-order journal chain, alerts, and reconciliation status. Read this, or the operations page, most days — it is the one thing the spec asks the owner to do routinely.
 
+### What a `paper run` exit code means
+
+`launchctl print gui/$(id -u)/com.tradepartner.paper | grep "last exit code"` and `paper.err.log` are what you have when the job ran unattended; the exit code alone tells you which of these happened:
+
+| Exit code | Meaning | What you do |
+|---|---|---|
+| 0 | The run ended `ok`, `no_session` or `skipped_kill_switch`. | Nothing; this is routine. |
+| 1 (`CRASH_EXIT_CODE`) | An uncaught exception (`run_failed`/`failed`), a halt (`halted`/`stale_data`), or a run that ended `locked`/`no_window`. | Read `paper.err.log` and the alerts list (`paper status`), per "What each alert kind means" below. A power-loss or killed-process crash may show a different, signal-related code (or none at all, if launchd never saw it exit) rather than exactly 1 — in that case there is no `paper_run_results` row for S−1 and no alert either; `paper status` shows the switch engaged, and the next run closes it `crashed`. |
+| 2 | The CLI's usage error (`cli.USAGE_ERROR`): a bad flag or argument, refused before any run started. Unrelated to the paper run itself. | Fix the plist/command line; re-test with a manual `uv run tradepartner paper run` outside the window. |
+| 3 (`WRITE_FAILED_EXIT_CODE`) | The halt path could not write the `kill_switch` `engaged` row itself — the store may be unreliable. Deliberately distinct from both 1 and 2 (#366 Q22 (ii)) so this one case is visible from `launchctl print` alone, before you even open a log. | Stop and check the store/disk before anything else; see the `kill_switch_write_failed` row below. Do not resume until you've confirmed the store is healthy. |
+
+`CRASH_EXIT_CODE` and `WRITE_FAILED_EXIT_CODE` live next to each other in `src/tradepartner/execution/wrapper.py`; `USAGE_ERROR` is in `src/tradepartner/cli.py`.
+
 ### What each alert kind means, and what you do
 
-Every alert is a row in the `alerts` table first (the source of truth), delivered also to `macos` and `email` if `alerts.channels` and, for email, the four `ALERT_*` variables are set — except `kill_switch_write_failed` (see its row below), which never reaches the store and goes out only through the other channels. `paper status` and the operations page list stored alerts. Consider enabling `macos` in `alerts.channels` so a `kill_switch_write_failed` alert still reaches you.
+Every alert is a row in the `alerts` table first (the source of truth), delivered also to `macos` and `email` if `alerts.channels` and, for email, the four `ALERT_*` variables are set — except `kill_switch_write_failed` (see its row below), which never reaches the store and goes out only through the other channels. `paper status` and the operations page list stored alerts. `alerts.channels` must include at least one of `macos`/`email` (enforced at config load, #366 Q22 (iii)), precisely so a `kill_switch_write_failed` alert always reaches you even though it never touches the store.
 
 | Alert kind | What happened | What you do |
 |---|---|---|

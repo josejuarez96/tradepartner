@@ -8,7 +8,8 @@ scripted fake and a fixed clock. Two windows:
   after the close, flat, with the fake's cash.
 - the **rebalance** window: T_0 = 2019-04-30, F_0 = 2019-05-01, on a
   registered hypothesis (set up as `test_planning.py` does), so the run on
-  F_0 plans and then reaches the trade step's stub.
+  F_0 plans and then reaches the trade step (replaced by `step_fails`; the
+  trade step itself is `test_run_trade.py`'s, T63d).
 
 Every run needs an `ok` ingestion run covering S-1 for `SPY` (the fixture's
 reference symbol), seeded per test. The step-5 and planning cases at run level
@@ -285,6 +286,18 @@ def exits_done(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     calls: list[object] = []
     monkeypatch.setattr(run_module, "exits_step", calls.append)
     return calls
+
+
+@pytest.fixture
+def step_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trade and exits steps (T63d) replaced by a step that raises, for the
+    `failed` path of a run past step 5."""
+
+    def broken(_context: object) -> None:
+        raise RuntimeError("the step failed")
+
+    monkeypatch.setattr(run_module, "exits_step", broken)
+    monkeypatch.setattr(run_module, "trade_step", broken)
 
 
 @pytest.fixture
@@ -613,17 +626,19 @@ def test_a_pending_order_does_not_hide_an_unrelated_mismatch(env: Env) -> None:
 # --- steps 5 to 9 ----------------------------------------------------------------------------
 
 
-def test_a_mark_run_writes_marks_then_fails_on_the_exits_stub_alert_first(env: Env) -> None:
+def test_a_mark_run_writes_marks_then_fails_in_the_exits_step_alert_first(
+    env: Env, step_fails: None
+) -> None:
     _marked(env)
     try:
         env.run(_at(TUE))
-    except NotImplementedError:
+    except RuntimeError:
         # The store, inspected before the exception has left the run's caller.
         run_id = env.latest_run()
         assert ("run_failed", run_id, TUE) in env.alerts()
-        assert env.results()[run_id][:2] == ("failed", "NotImplementedError")
+        assert env.results()[run_id][:2] == ("failed", "RuntimeError")
     else:
-        pytest.fail("the exits stub did not raise")
+        pytest.fail("the exits step did not raise")
     marks = env.query("SELECT session, security_id, quantity, cash FROM positions_daily")
     assert marks == [
         (date(2019, 5, 10), None, 0.0, FAKE_CASH),
@@ -633,9 +648,9 @@ def test_a_mark_run_writes_marks_then_fails_on_the_exits_stub_alert_first(env: E
     assert env.engaged() == []  # `failed` engages through the derived state only
 
 
-def test_the_next_run_derives_engaged_from_a_failed_run(env: Env) -> None:
+def test_the_next_run_derives_engaged_from_a_failed_run(env: Env, step_fails: None) -> None:
     _marked(env)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError):
         env.run(_at(TUE))
     env.ingest(_at(TUE, 21))
     assert env.run(_at(WED)).status == "skipped_kill_switch"
@@ -656,18 +671,18 @@ def test_an_ok_run_reconciles_twice_and_ends_ok(env: Env, exits_done: list[objec
     assert "submit" not in env.broker_methods()
 
 
-def test_a_rebalance_session_writes_decisions_before_the_trade_stub(
-    rebalance_env: tuple[Env, PaperWindowRow],
+def test_a_rebalance_session_writes_decisions_before_the_trade_step(
+    rebalance_env: tuple[Env, PaperWindowRow], step_fails: None
 ) -> None:
     env, _window = rebalance_env
     env.ingest(_at(T_0, 21))
-    with pytest.raises(NotImplementedError, match="T63d"):
+    with pytest.raises(RuntimeError, match="the step failed"):
         env.run(_at(F_0))
     run_id = env.latest_run()
     assert env.query("SELECT kind FROM paper_runs WHERE run_id = ?", [run_id]) == [("rebalance",)]
     assert env.count("decisions") > 0
     assert env.query("SELECT rebalance_session FROM paper_plans") == [(T_0,)]
-    assert env.results()[run_id][:2] == ("failed", "NotImplementedError")
+    assert env.results()[run_id][:2] == ("failed", "RuntimeError")
     assert ("run_failed", run_id, F_0) in env.alerts()
     assert env.count("orders") == 0
 

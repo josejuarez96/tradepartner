@@ -25,6 +25,7 @@ from .test_wrapper_phases import (
     T_I,
     A,
     B,
+    C,
     Env,
     S,
     _append,
@@ -33,6 +34,8 @@ from .test_wrapper_phases import (
     _execute,
     _gate,
     _hold,
+    _open_buy,
+    _override,
     _query,
     _run,
     _submits,
@@ -353,7 +356,6 @@ def test_full_exit_cancelled_after_partial_fill_sells_reconciled_remainder(
     _assert_one_live_per_decision(env, exit_.decision_id)  # type: ignore[arg-type]
 
 
-@pytest.mark.xfail(strict=True, reason="#538")
 def test_last_phase_expired_buy_is_written_off_by_collection(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -370,3 +372,38 @@ def test_last_phase_expired_buy_is_written_off_by_collection(
     monkeypatch.setattr(wrapper, "collect", observed_collect)
     _execute(_gate(env, alerter_conn), env, [buy])
     assert at_collection == [(buy.decision_id, "written_off", "unfunded")]
+
+
+def test_expired_buy_is_written_off_once_not_twice(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The `written_off` row the buys phase's own collection appends (#538)
+    must not be appended again by the phase's end-of-phase write-offs."""
+    buy = _decision(env, A, "buy", notional=3000.0)
+    env.fake.script(Expire())
+    outcome = _execute(_gate(env, alerter_conn), env, [buy])
+    assert outcome.written_off == (buy.decision_id,)
+    rows = _query(
+        env.settings,
+        "SELECT decision_id, status FROM decision_events "
+        "WHERE decision_id = ? AND status = 'written_off'",
+        [buy.decision_id],
+    )
+    assert rows == [(buy.decision_id, "written_off")]
+    assert _write_off_amounts(env) == [(buy.decision_id, 3000.0)]
+
+
+def test_engaged_switch_before_buys_first_submit_writes_off_no_deferred_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The T60b pin (#487): a switch read engaged before the buys phase's
+    first submit never collects, so it writes off no deferred buy, even with
+    the collection-time write-off path (#538) now wired in."""
+    env.new_fake(cash=2000.0)
+    _open_buy(env, C, 2000.0)
+    buy = _decision(env, A, "buy", notional=3000.0)
+    _override(env)
+    outcome = _execute(_gate(env, alerter_conn), env, [buy])
+    assert outcome.status == "skipped_kill_switch"
+    assert outcome.written_off == ()
+    assert _decision_events(env.settings) == []
