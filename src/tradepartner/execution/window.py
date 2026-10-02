@@ -22,6 +22,10 @@ req 14 "Entry gate, start and stop", req 5, req 9 and open question 13; ADR
 5. **The account is not flat**: `open_orders()` is non-empty, or a
    position exists that is not explained by the previous window's listed
    residues (see "Flatness" below).
+6. **The live costs differ from the hypothesis's registered costs**
+   (`costs_drift`, #534): every `FROZEN_COSTS_KEYS` value must equal the
+   registration's, which planning sizes with, so the frozen costs the wrapper
+   reads are the plan's.
 
 Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
 rebalance session strictly after both `holdout_end` and today, per the spec
@@ -150,7 +154,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -276,13 +280,30 @@ def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
     return session_close(holdout_end) <= now
 
 
-def _frozen_params(settings: Settings) -> dict[str, Any]:
+def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
     `FROZEN_PAPER_KEYS` under `paper.*` and `FROZEN_COSTS_KEYS` under `costs.*`
-    (spec req 14; the costs #534)."""
+    (spec req 14; the costs #534).
+
+    The frozen costs must equal the hypothesis's `registered` parameters,
+    which planning sizes the decisions with, so the plan and the wrapper share
+    one cost model: a live `costs.*` value that differs from it, or a key the
+    registration lacks, refuses the start (`costs_drift`)."""
     risk = settings.risk.model_dump()
     paper = settings.paper.model_dump()
     costs = settings.costs.model_dump()
+    drift = [
+        f"{_COSTS_PREFIX}{k} live {costs[k]!r} vs registered "
+        f"{registered.get(f'{_COSTS_PREFIX}{k}')!r}"
+        for k in FROZEN_COSTS_KEYS
+        if f"{_COSTS_PREFIX}{k}" not in registered
+        or float(registered[f"{_COSTS_PREFIX}{k}"]) != float(costs[k])
+    ]
+    if drift:
+        raise StartRefusedError(
+            "costs_drift",
+            "the live costs differ from the hypothesis's registered costs: " + "; ".join(drift),
+        )
     params: dict[str, Any] = {f"{_RISK_PREFIX}{k}": v for k, v in risk.items()}
     params.update({f"{_PAPER_PREFIX}{k}": paper[k] for k in FROZEN_PAPER_KEYS})
     params.update({f"{_COSTS_PREFIX}{k}": costs[k] for k in FROZEN_COSTS_KEYS})
@@ -548,7 +569,7 @@ def start(
 
         t_0 = _first_rebalance_session(hyp.holdout_end, today)
         commit, _dirty = registry.code_version()
-        params = _frozen_params(settings)
+        params = _frozen_params(settings, hyp.params)
         frozen_json = registry.canonical_params_json(params)
         frozen_sha256 = registry.params_sha256(params)
 
