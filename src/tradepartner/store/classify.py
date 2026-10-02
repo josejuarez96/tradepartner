@@ -69,6 +69,7 @@ apply earlier must apply the suffix rows at the same time.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -93,6 +94,7 @@ FUND_FORMS = frozenset({"N-CSR", "N-CSRS", "N-PORT", "NPORT-P", "485BPOS", "N-2"
 F6_FORMS = frozenset({"F-6", "F-6EF"})
 DOMESTIC_FORMS = frozenset({"10-K", "10-KT", "10-K405", "10-KSB", "10-Q", "10-QSB", "S-1"})
 FOREIGN_FORMS = frozenset({"20-F", "40-F", "F-1", "6-K"})
+_STATUS_FORMS = DOMESTIC_FORMS | FOREIGN_FORMS
 
 #: Title words, checked in order before the common-equity words.
 _TITLE_TYPES: tuple[tuple[str, str], ...] = (
@@ -161,40 +163,115 @@ def ticker_suffix_type(ticker: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _State:
+    """What a CIK's filings say at one instant: the inputs rules 2-5 and 8 read."""
+
+    fund: bool = False
+    f6: bool = False
+    domestic: bool | None = None  # the latest status form's side; `None` before any
+    sic: int | None = None
+
+
+_NO_STATE = _State()
+
+
+@dataclass(frozen=True)
+class _Timeline:
+    """A CIK's `_State` after all evidence at each instant, kept only where it
+    changes (`stamps` ascending), and its latest evidence instant."""
+
+    stamps: tuple[datetime, ...]
+    states: tuple[_State, ...]
+    last: datetime | None
+
+    def at(self, t: datetime) -> _State:
+        """The state from evidence known at `t` (`known_at <= t`)."""
+        i = bisect_right(self.stamps, t)
+        return self.states[i - 1] if i else _NO_STATE
+
+
+_NO_TIMELINE = _Timeline((), (), None)
+
+
+def _timeline(evidence: _Evidence) -> _Timeline:
+    """One ordered pass over a CIK's evidence. Within one instant forms and
+    SICs apply in `_evidence`'s (instant, accession) order, so the latest
+    status form and SIC there are the last in that order."""
+    forms, sics = evidence.forms, evidence.sics
+    instants = sorted({k for k, _ in forms} | {k for k, _ in sics})
+    stamps: list[datetime] = []
+    states: list[_State] = []
+    fund = f6 = False
+    domestic: bool | None = None
+    sic: int | None = None
+    i = j = 0
+    for t in instants:
+        while i < len(forms) and forms[i][0] <= t:
+            form = forms[i][1]
+            fund = fund or form in FUND_FORMS
+            f6 = f6 or form in F6_FORMS
+            if form in _STATUS_FORMS:
+                domestic = form in DOMESTIC_FORMS
+            i += 1
+        while j < len(sics) and sics[j][0] <= t:
+            sic = sics[j][1]
+            j += 1
+        state = _State(fund, f6, domestic, sic)
+        if not states or state != states[-1]:
+            stamps.append(t)
+            states.append(state)
+    return _Timeline(tuple(stamps), tuple(states), instants[-1] if instants else None)
+
+
 def _classify(
-    t: datetime,
-    evidence: _Evidence,
-    listings: Sequence[Row],
+    state: _State,
+    titled: Row | None,
+    known: Row | None,
     benchmark: Row | None,
 ) -> tuple[str, str, int | None, str]:
-    """(security_type, rule, sic, provenance) from what is known at `t`."""
-    forms = [form for known_at, form in evidence.forms if known_at <= t]
-    sics = [sic for known_at, sic in evidence.sics if known_at <= t]
-    sic = sics[-1] if sics else None
+    """(security_type, rule, sic, provenance) from the issuer's `state` and the
+    class's latest titled and latest listing rows, all known at one instant."""
+    sic = state.sic
     if benchmark is not None:
         return "etf", "benchmark_config", sic, benchmark["provenance"]
-    if any(form in FUND_FORMS for form in forms):
+    if state.fund:
         return "fund", "fund_form", sic, "filing"
-    if any(form in F6_FORMS for form in forms):
+    if state.f6:
         return "depositary", "f6_depositary", sic, "filing"
-    status = [form for form in forms if form in DOMESTIC_FORMS | FOREIGN_FORMS]
-    domestic = bool(status) and status[-1] in DOMESTIC_FORMS
-    if status and not domestic:
+    if state.domestic is False:
         return "foreign", "foreign_form", sic, "filing"
     if sic == SPAC_SIC:
         return "spac", "sic_6770", sic, "filing"
-    known = [row for row in listings if row["known_at"] <= t]
-    titled = [row for row in known if row["class_title"] is not None]
-    if titled:
-        security_type, rule = _title_type(titled[-1]["class_title"])
+    if titled is not None:
+        security_type, rule = _title_type(titled["class_title"])
         return security_type, rule, sic, "filing"
-    if known:
-        suffix_type = ticker_suffix_type(known[-1]["ticker"])
+    if known is not None:
+        suffix_type = ticker_suffix_type(known["ticker"])
         if suffix_type is not None:
             return suffix_type, f"suffix_{suffix_type}", sic, "snapshot_static"
-    if domestic:
+    if state.domestic:
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
+
+
+def _listing_timeline(
+    rows: Sequence[Row],
+) -> tuple[list[datetime], list[tuple[Row | None, Row | None]]]:
+    """A class's (latest titled, latest) listing row after all rows at each
+    instant; `rows` are in `known_at` order (ties in master order)."""
+    stamps: list[datetime] = []
+    states: list[tuple[Row | None, Row | None]] = []
+    titled: Row | None = None
+    for row in rows:
+        if row["class_title"] is not None:
+            titled = row
+        if stamps and stamps[-1] == row["known_at"]:
+            states[-1] = (titled, row)
+        else:
+            stamps.append(row["known_at"])
+            states.append((titled, row))
+    return stamps, states
 
 
 def _evidence(
@@ -228,11 +305,19 @@ def build_classifications(
 
     Pure apart from calling `source`. Raises `ValueError` if any evidence
     is later than `ingested_at` (spec: `known_at <= ingested_at`).
+
+    One ordered pass per CIK and per class (#564): the classification is
+    evaluated at the security's `known_at` and at each later instant its
+    issuer's `_State` or its listings change. Any other evidence instant
+    leaves every input of `_classify` as it was, so it could only repeat the
+    previous row, which is never written.
     """
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     securities = list(master.securities)
     issuers = {row["cik"] for row in securities if not row["benchmark"]}
-    evidence = _evidence(source, issuers, settings)
+    timelines = {
+        cik: _timeline(facts) for cik, facts in _evidence(source, issuers, settings).items()
+    }
     listings: dict[str, list[Row]] = defaultdict(list)
     for row in sorted(master.listings, key=lambda r: r["known_at"]):
         listings[row["security_id"]].append(row)
@@ -241,23 +326,27 @@ def build_classifications(
     for security in sorted(securities, key=lambda r: r["security_id"]):
         security_id = security["security_id"]
         benchmark = security if security["benchmark"] else None
-        facts = evidence.get(security["cik"], _Evidence((), ()))
+        issuer = timelines.get(security["cik"], _NO_TIMELINE)
         if benchmark is not None:
-            facts = _Evidence((), ())
-        stamps = {k for k, _ in facts.forms} | {k for k, _ in facts.sics}
-        stamps |= {row["known_at"] for row in listings[security_id]}
-        late = [stamp for stamp in stamps if stamp > ingested_at]
-        if late:
+            issuer = _NO_TIMELINE
+        listing_stamps, listing_states = _listing_timeline(listings[security_id])
+        latest = max(
+            (stamp for stamp in (issuer.last, *listing_stamps[-1:]) if stamp is not None),
+            default=None,
+        )
+        if latest is not None and latest > ingested_at:
             raise ValueError(
-                f"{security_id}: evidence at {max(late).isoformat()} is after "
+                f"{security_id}: evidence at {latest.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
         start = security["known_at"]
+        changes = {stamp for stamp in issuer.stamps if stamp > start}
+        changes |= {stamp for stamp in listing_stamps if stamp > start}
         previous: tuple[str, str, int | None] | None = None
-        for t in sorted({start} | {stamp for stamp in stamps if stamp > start}):
-            security_type, rule, sic, provenance = _classify(
-                t, facts, listings[security_id], benchmark
-            )
+        for t in sorted({start} | changes):
+            i = bisect_right(listing_stamps, t)
+            titled, known = listing_states[i - 1] if i else (None, None)
+            security_type, rule, sic, provenance = _classify(issuer.at(t), titled, known, benchmark)
             if (security_type, rule, sic) == previous:
                 continue
             previous = (security_type, rule, sic)
