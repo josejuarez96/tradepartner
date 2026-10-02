@@ -70,6 +70,7 @@ from tradepartner.ingest import (
     _run_source,
     _Stale,
     _unwrap,
+    _with_frames,
     _write_run,
     expected_session,
 )
@@ -240,7 +241,7 @@ def _price_chunk(
     except _Stale as exc:
         run = outcome(STALE, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts with a run row
-        run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
+        run = outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))
     return _record_only(settings, run_id, started, clock, run, BACKFILL)
 
 

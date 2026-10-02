@@ -23,7 +23,7 @@ from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
-from tradepartner.ingest import OK, STALE, IngestResult, SourceRun
+from tradepartner.ingest import FAILED, OK, STALE, IngestResult, SourceRun
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.schema import init_schema
 
@@ -136,6 +136,31 @@ def test_ingest_exits_non_zero_when_a_source_is_stale(
     assert result.exit_code == 1
     assert "stale" in result.output
     assert "reference symbol SPY has no bar" in result.output
+
+
+def test_ingest_prints_a_failed_run_messages_where_clause(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    # #573: the frame trail `_with_frames` appends to a failed run's message
+    # is already redacted and capped by `_clean` before it reaches the CLI,
+    # so `_print_result` needs no scrub of its own -- just check it prints.
+    failed = IngestResult(
+        (
+            SourceRun(
+                "alpaca",
+                FAILED,
+                0,
+                "2020-06-30",
+                "KeyError: 'cik' | at: adapters/edgar_source.py:1632 in _holds_accession",
+            ),
+        )
+    )
+    _patched(monkeypatch, "ingest_session", failed)
+    result = _invoke(secrets_set, ["ingest"])
+    assert result.exit_code == 1
+    assert (
+        "KeyError: 'cik' | at: adapters/edgar_source.py:1632 in _holds_accession" in result.output
+    )
 
 
 def test_ingest_passes_source_and_dry_run(
