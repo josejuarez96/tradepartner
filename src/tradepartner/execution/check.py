@@ -322,7 +322,7 @@ def _tracking_line(
 
 
 def _rebalance_before(session: date) -> date:
-    """The last rebalance session (last session of a month) at or before
+    """The last rebalance session (last session of a month) strictly before
     `session` (`outcomes._rebalance_before`, duplicated locally)."""
     candidate = last_session_of_month(session.year, session.month)
     if candidate < session:
@@ -338,8 +338,8 @@ def _order_due_threshold(
     (`outcomes._horizon`'s non-stop `base`, duplicated locally): for a `phase
     = exit` order (a forced exit's own phase, spec req 8's "exit session"),
     its own session; otherwise T_{i+1} of its rebalance (the decision's
-    `rebalance_session` when it has one, else the rebalance at or before the
-    order's own session - `outcomes.py` falls back the same way for an order
+    `rebalance_session` when it has one, else the rebalance strictly before
+    the order's own session - `outcomes.py` falls back the same way for an order
     whose decision carries none, a forced exit traded inside a rebalance
     batch with phase `sell`, ADR 0010 amendment 2026-10-01)."""
     if order.phase == _EXIT_PHASE:
