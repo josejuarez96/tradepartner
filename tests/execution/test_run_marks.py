@@ -29,7 +29,7 @@ import pytest
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import previous_session
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, StepContext, tracking_run
@@ -155,6 +155,7 @@ class Env:
         started = started or at(T_0, 12, 0)
         values: dict[str, Any] = {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
         values["paper.max_catch_up_sessions"] = MAX_CATCH_UP
+        values.update({f"costs.{k}": getattr(CostsConfig(), k) for k in FROZEN_COSTS_KEYS})
         row = PaperWindowRow(
             hypothesis_id=hypothesis.hypothesis_id,
             first_rebalance_session=first,
