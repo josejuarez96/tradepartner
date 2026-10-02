@@ -678,11 +678,33 @@ def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
 _FILL_COLUMNS = tuple(f.name for f in fields(FillRow))
 
 
+def _ids(client_order_ids: Iterable[str] | None) -> list[str] | None:
+    """`client_order_ids` as a sorted SQL list parameter, None for "every order"."""
+    if isinstance(client_order_ids, str):
+        raise TypeError("client_order_ids must be a collection of ids, not one string")
+    return None if client_order_ids is None else sorted(set(client_order_ids))
+
+
+def _check_limit(limit: int | None) -> None:
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+
+
+def _orphan_fill_error(
+    fill_id: int | None, broker_fill_id: str, client_order_id: str, side: str | None, run_id: Any
+) -> JournalIntegrityError:
+    missing = "orders row" if side is None else f"paper_runs row for run {run_id}"
+    return JournalIntegrityError(
+        f"fill {fill_id} ({broker_fill_id}) of {client_order_id!r} has no {missing}"
+    )
+
+
 def fills_for(
     conn: duckdb.DuckDBPyConnection,
     *,
     window_id: int | None = None,
     client_order_ids: Iterable[str] | None = None,
+    limit: int | None = None,
 ) -> list[OrderedFill]:
     """Every live fill (superseded rows hidden), in `fill_id` order, each with
     its order's side and security; optionally only a window's (through the order's
@@ -692,15 +714,19 @@ def fills_for(
     earlier `filled_at`): anything order-sensitive, such as FIFO lots, sorts by
     `(filled.filled_at, fill_id)` itself.
 
+    `limit` (#435, for a page's bounded read; every other caller leaves it None
+    and reads everything) keeps only the `limit` newest live fills in scope, by
+    `fill_id`, bounded in SQL, and returns them newest first (`fill_id` descending).
+
     Fails closed: raises `JournalIntegrityError` when any superseded row points at
     something other than a live `broker_status` fill of its own order (so no fill is
     hidden by a bad pointer), and when a live fill in scope has no `orders` row or
     its order no `paper_runs` row (a fill whose window cannot be told is never
-    filtered out of a window's ledger)."""
+    filtered out of a window's ledger). Both checks cover the whole scope, not
+    only the `limit` rows returned."""
     require_journal(conn)
-    if isinstance(client_order_ids, str):
-        raise TypeError("client_order_ids must be a collection of ids, not one string")
-    ids = None if client_order_ids is None else sorted(set(client_order_ids))
+    ids = _ids(client_order_ids)
+    _check_limit(limit)
     bad = conn.execute(
         "SELECT f.fill_id, f.superseded_by FROM fills f "
         "LEFT JOIN fills s ON s.fill_id = f.superseded_by "
@@ -714,17 +740,30 @@ def fills_for(
             f"fills superseded by something other than a live broker_status fill of "
             f"their own order: {pairs}"
         )
-    selected = ", ".join(f"f.{name}" for name in _FILL_COLUMNS)
-    rows = conn.execute(
-        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id, "
-        "r.window_id "
+    in_scope = (
         "FROM fills f LEFT JOIN orders o USING (client_order_id) "
         "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE f.superseded_by IS NULL "
         "AND (? IS NULL OR r.run_id IS NULL OR r.window_id = ?) "
         "AND (? IS NULL OR list_contains(?, f.client_order_id)) "
-        "ORDER BY f.fill_id",
-        [window_id, window_id, ids, ids],
+    )
+    scope = [window_id, window_id, ids, ids]
+    if limit is not None:
+        # The rows past the limit are never fetched, so check them in SQL first.
+        orphan = conn.execute(
+            "SELECT f.fill_id, f.broker_fill_id, f.client_order_id, o.side, o.run_id "
+            f"{in_scope}AND (o.side IS NULL OR r.run_id IS NULL) "
+            "ORDER BY f.fill_id LIMIT 1",
+            scope,
+        ).fetchone()
+        if orphan is not None:
+            raise _orphan_fill_error(*orphan)
+    selected = ", ".join(f"f.{name}" for name in _FILL_COLUMNS)
+    order = "ORDER BY f.fill_id" if limit is None else "ORDER BY f.fill_id DESC LIMIT ?"
+    rows = conn.execute(
+        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id, "
+        f"r.window_id {in_scope}{order}",
+        scope if limit is None else [*scope, limit],
     ).fetchall()
     width = len(_FILL_COLUMNS)
     result: list[OrderedFill] = []
@@ -732,10 +771,8 @@ def fills_for(
         fill = FillRow(**dict(zip(_FILL_COLUMNS, row[:width], strict=True)))
         side, security_id, symbol, run_id, known_run, fill_window = row[width:]
         if side is None or known_run is None:
-            missing = "orders row" if side is None else f"paper_runs row for run {run_id}"
-            raise JournalIntegrityError(
-                f"fill {fill.fill_id} ({fill.broker_fill_id}) of "
-                f"{fill.client_order_id!r} has no {missing}"
+            raise _orphan_fill_error(
+                fill.fill_id, fill.broker_fill_id, fill.client_order_id, side, run_id
             )
         result.append(OrderedFill(fill, side, security_id, symbol, run_id, fill_window))
     return result
@@ -759,6 +796,10 @@ def all_fill_ids(conn: duckdb.DuckDBPyConnection) -> frozenset[str]:
 # order for a table with its own id; "latest" always means latest by that order,
 # never by a broker instant. No reader applies a `known_at` cutoff: a caller that
 # needs state as of an instant (the ledger at close(S-1), say) filters itself.
+# The one amendment (#435, ADR 0011's bounded page reads): `orders_for` takes an
+# optional `limit` and `order_events_for` and `outcomes_for` an optional
+# `client_order_ids`, so a page reads its capped rows in SQL; left at their
+# defaults, every reader reads everything as before.
 
 #: `order_events` statuses that end an order. Terminal is absorbing: an order with
 #: any of these rows is terminal whatever rows follow it in `known_at` order.
@@ -776,6 +817,9 @@ _ORDER_IN_WINDOW = (
     "(? IS NULL OR t.client_order_id IN (SELECT o.client_order_id FROM orders o "
     "JOIN paper_runs r ON r.run_id = o.run_id WHERE r.window_id = ?))"
 )
+_ORDER_IN_LIST = "(? IS NULL OR list_contains(?, t.client_order_id))"
+#: `orders_for(limit=...)`'s order: newest first, ties by `client_order_id`.
+_NEWEST_ORDER_FIRST = "t.known_at DESC, t.client_order_id DESC"
 
 
 @dataclass(frozen=True)
@@ -818,18 +862,24 @@ def _select[R](
     where: str = "TRUE",
     params: Iterable[Any] = (),
     order: str = _ORDER,
+    limit: int | None = None,
 ) -> list[R]:
-    """Rows of `row_type`'s table (aliased `t`) matching `where`, as row objects.
-    Never `fills`: that table is read only through `fills_for`."""
+    """Rows of `row_type`'s table (aliased `t`) matching `where`, as row objects,
+    at most `limit` of them (in `order`) when given. Never `fills`: that table is
+    read only through `fills_for`."""
     if row_type is FillRow:
         raise TypeError("fills is read only through fills_for")
     require_journal(conn)
+    _check_limit(limit)
     names = [f.name for f in fields(row_type)]  # type: ignore[arg-type]
     columns = ", ".join(f't."{name}"' for name in names)
     table = row_type.TABLE  # type: ignore[attr-defined]
-    rows = conn.execute(
-        f"SELECT {columns} FROM {table} t WHERE {where} ORDER BY {order}", list(params)
-    ).fetchall()
+    sql = f"SELECT {columns} FROM {table} t WHERE {where} ORDER BY {order}"
+    values = list(params)
+    if limit is not None:
+        sql += " LIMIT ?"
+        values.append(limit)
+    rows = conn.execute(sql, values).fetchall()
     return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
 
 
@@ -896,20 +946,45 @@ def _require_orders_have_runs(conn: duckdb.DuckDBPyConnection) -> None:
         raise JournalIntegrityError(f"orders with no paper_runs row: {ids}")
 
 
-def orders_for(conn: duckdb.DuckDBPyConnection, *, window_id: int | None) -> list[OrderRow]:
+def orders_for(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None, limit: int | None = None
+) -> list[OrderRow]:
     """The window's orders (through their run), or every order when `window_id` is
     None (the collectors read own orders account-wide). Raises
-    `JournalIntegrityError` when any order has no run (every order reader does)."""
+    `JournalIntegrityError` when any order has no run (every order reader does).
+
+    `limit` (#435, for a page's bounded read; every other caller leaves it None)
+    keeps only the `limit` newest orders, bounded in SQL, and returns them newest
+    first: `known_at` descending, ties by `client_order_id` descending."""
     _require_orders_have_runs(conn)
-    return _select(conn, OrderRow, _ORDER_IN_WINDOW, [window_id, window_id])
+    if limit is None:
+        return _select(conn, OrderRow, _ORDER_IN_WINDOW, [window_id, window_id])
+    return _select(
+        conn,
+        OrderRow,
+        _ORDER_IN_WINDOW,
+        [window_id, window_id],
+        order=_NEWEST_ORDER_FIRST,
+        limit=limit,
+    )
 
 
 def order_events_for(
-    conn: duckdb.DuckDBPyConnection, *, window_id: int | None
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_id: int | None,
+    client_order_ids: Iterable[str] | None = None,
 ) -> list[OrderEventRow]:
-    """Every `order_events` row of the window's orders (or of every order)."""
+    """Every `order_events` row of the window's orders (or of every order), or,
+    given `client_order_ids` (#435), only those orders' rows within that scope."""
     _require_orders_have_runs(conn)
-    return _select(conn, OrderEventRow, _ORDER_IN_WINDOW, [window_id, window_id])
+    ids = _ids(client_order_ids)
+    return _select(
+        conn,
+        OrderEventRow,
+        f"{_ORDER_IN_WINDOW} AND {_ORDER_IN_LIST}",
+        [window_id, window_id, ids, ids],
+    )
 
 
 def latest_order_events(
@@ -1140,6 +1215,18 @@ def alerts_for(conn: duckdb.DuckDBPyConnection, *, kind: str, session: date) -> 
     )
 
 
-def outcomes_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[OutcomeRow]:
-    """The window's `outcomes` rows (through their order's run)."""
-    return _select(conn, OutcomeRow, _ORDER_IN_WINDOW, [window_id, window_id])
+def outcomes_for(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+    *,
+    client_order_ids: Iterable[str] | None = None,
+) -> list[OutcomeRow]:
+    """The window's `outcomes` rows (through their order's run), or, given
+    `client_order_ids` (#435), only those orders' rows of the window."""
+    ids = _ids(client_order_ids)
+    return _select(
+        conn,
+        OutcomeRow,
+        f"{_ORDER_IN_WINDOW} AND {_ORDER_IN_LIST}",
+        [window_id, window_id, ids, ids],
+    )
