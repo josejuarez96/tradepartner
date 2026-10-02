@@ -291,6 +291,31 @@ def test_an_exit_journaled_as_the_window_closes_waits_for_the_next_run(
     assert [o[1] for o in exit_orders(env, "SEC_TRANSFER")] == [decision_id]
 
 
+def test_a_second_run_on_the_session_leaves_an_accepted_exit_sell_alone(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The forced-exit criterion at run level: the first in-window run's exit
+    sell is still `accepted` (unfilled) at step 7b's deadline; a second run on
+    the same session collects it at step 3, makes no new forced exit and
+    submits nothing for the name (#549)."""
+    bought(env)
+    ended_before(env, MAY_3)
+    env.fill_on_sleep = False
+    first = env.run(at(MAY_3))
+    assert first.status == "ok", env.result(env.latest_run())
+    ((decision_id, _reason, _side, _run),) = exits(env, "SEC_TRANSFER")
+    ((coid, _decision, _phase, _quantity, _session),) = exit_orders(env, "SEC_TRANSFER")
+    assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+    submitted = len(env.submits())
+    second = env.run(at(MAY_3, 12, 45))
+    assert second.status == "ok", env.result(env.latest_run())
+    assert not any("outside the submit window" in n for n in second.notes)
+    assert [e[0] for e in exits(env, "SEC_TRANSFER")] == [decision_id]
+    assert [o[0] for o in exit_orders(env, "SEC_TRANSFER")] == [coid]
+    assert len(env.submits()) == submitted
+    assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+
+
 class _NoBroker:
     """A gate or broker that fails the test on any use."""
 
@@ -315,7 +340,6 @@ def _lagging_context(env: Env, plan: object) -> run_module.StepContext:
         settings=env.settings,
         connect=env.connect,
         gate=_NoBroker(),  # type: ignore[arg-type]
-        broker=_NoBroker(),  # type: ignore[arg-type]
         window=env.window,
         frozen=RiskConfig(),
         run=run,

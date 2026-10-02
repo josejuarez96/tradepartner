@@ -30,9 +30,11 @@ import pytest
 from tradepartner.adapters.broker import Asset, OrderRequest
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.backtest.hypothesis import frozen_params_of
-from tradepartner.calendar import next_session, previous_session, session_open
+from tradepartner.calendar import next_session, previous_session, session_close, session_open
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import LimitBreachError
+from tradepartner.execution import run as run_module
+from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
 from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
@@ -351,6 +353,41 @@ def test_a_later_in_window_run_trades_the_pending_rebalance(
     assert {o[5] for o in env.orders()} == {later.run_id}
     assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
     assert early.run_id != later.run_id
+
+
+def test_a_rebalance_run_that_leaves_the_window_in_its_exits_read_trades_on_the_next_run(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`trade_step` checks the window again just before `execute`: a fill
+    session run whose clock leaves the window while it reads the forced exits
+    submits nothing and leaves the rebalance pending; the next in-window run
+    (the catch-up on F_0 + 1) trades it from the same decisions (#549)."""
+    original = run_module._forced_exits
+
+    def slow(context: run_module.StepContext, **kwargs: object) -> object:
+        handed = original(context, **kwargs)  # type: ignore[arg-type]
+        _start, end = submit_window(env.settings, F_0)
+        env.clock.now = end + timedelta(seconds=1)
+        return handed
+
+    monkeypatch.setattr(run_module, "_forced_exits", slow)
+    first = env.run(at(F_0, 13, 55))
+    assert first.status == "ok", env.result(env.latest_run())
+    assert first.kind == "rebalance"
+    assert env.count("decisions") == 3
+    assert env.count("orders") == 0
+    assert "submit" not in [c.method for c in env.fake.calls]
+    assert env.rebalance_events() == []
+    assert any("outside the submit window" in note for note in first.notes)
+
+    monkeypatch.setattr(run_module, "_forced_exits", original)
+    later = env.run(at(F_0_PLUS_1))
+    assert later.status == "ok", env.result(env.latest_run())
+    assert later.kind == "catch_up"
+    assert env.count("decisions") == 3  # re-used, never re-planned
+    assert sorted(o[1] for o in env.orders()) == sorted(TARGETS)
+    assert {o[5] for o in env.orders()} == {later.run_id}
+    assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
 
 
 def test_the_window_bounds_are_inclusive(env: Env, window: PaperWindowRow) -> None:
@@ -692,3 +729,107 @@ def test_a_limit_breaking_exclude_name_override_halts_the_phase(env: Env, tmp_pa
     assert env.query("SELECT source, fault_type, run_id FROM kill_switch") == [
         ("fault", "LimitBreachError", halted)
     ]
+
+
+# --- the kill switch inside a run (#523) ----------------------------------------------------
+
+
+def test_a_kill_written_during_step_4_is_caught_before_any_submit(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run reads the switch once, before its row; a `paper kill` written
+    while the run is at step 4 (its `positions` read) is caught by the
+    wrapper's own read before the sells phase: nothing is submitted, the run
+    ends `skipped_kill_switch` and the rebalance stays pending (#523)."""
+    assert window.window_id is not None
+    window_id = window.window_id
+    original = env.fake.positions
+    killed: list[int | switch.WriteFailed] = []
+
+    def kill_at_step_4() -> object:
+        if not killed:
+            killed.append(
+                switch.engage(
+                    env.settings,
+                    env.clock,
+                    window_id=window_id,
+                    source="owner",
+                    reason="the owner kills the run at step 4",
+                )
+            )
+        return original()
+
+    monkeypatch.setattr(env.fake, "positions", kill_at_step_4)
+    outcome = env.run(at(F_0))
+    assert [isinstance(k, int) for k in killed] == [True]
+    assert outcome.status == "skipped_kill_switch", env.result(env.latest_run())
+    assert outcome.exit_code == 0
+    assert env.result(env.latest_run())[0] == "skipped_kill_switch"
+    assert "submit" not in [c.method for c in env.fake.calls]
+    assert env.count("orders") == 0
+    assert env.rebalance_events() == []
+
+
+@pytest.mark.parametrize(
+    ("engaged", "reason"),
+    [pytest.param(True, "kill_switch", id="engaged"), pytest.param(False, "catch_up_lapsed")],
+)
+def test_a_rebalance_skipped_past_its_catch_up_bound_lapses_with_its_reason(
+    env: Env, window: PaperWindowRow, engaged: bool, reason: str
+) -> None:
+    """Run level, through `tracking_run`: T_0's rebalance, never traded through
+    F_0 + the frozen `paper.max_catch_up_sessions` (2: 2019-05-03), lapses on
+    the next run's session with reason `kill_switch` when the switch was
+    engaged over that span (the F_0 run skipped by it), else
+    `catch_up_lapsed` (spec req 7; #523, quant-auditor on #519)."""
+    assert window.window_id is not None
+    if engaged:
+        switch.engage(
+            env.settings,
+            env.clock,
+            window_id=window.window_id,
+            source="owner",
+            reason="the owner pauses the window",
+        )
+        skipped = env.run(at(F_0))
+        assert skipped.status == "skipped_kill_switch"
+        assert env.count("orders") == 0
+    later = env.run(at(date(2019, 5, 6)))
+    assert later.status == ("skipped_kill_switch" if engaged else "ok")
+    assert env.rebalance_events() == [(T_0, "missed", reason, later.run_id)]
+    ((run_id, session, message),) = env.alerts("missed_rebalance")
+    assert (run_id, session) == (later.run_id, date(2019, 5, 6))
+    assert reason in message
+    assert env.count("orders") == 0
+
+
+# --- step 8 reads step 7's own fills (#523) --------------------------------------------------
+
+
+def test_step_8_reconciles_against_the_fills_step_7b_journaled(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Step 8's journal cut is a clock reading taken just before it, so the
+    fills step 7b journaled this session (known after close(S-1)) are in the
+    ledger it reconciles; a cut at close(S-1) would drop them while the broker
+    holds the names, and halt (#523, safety-reviewer on #519)."""
+    outcome = bought(env)
+    cut = session_close(previous_session(F_0))
+    known = [
+        r[0]
+        for r in env.query(
+            "SELECT f.known_at FROM fills f JOIN orders o USING (client_order_id) "
+            "WHERE o.run_id = ?",
+            [outcome.run_id],
+        )
+    ]
+    assert len(known) == 3
+    assert all(k > cut for k in known)
+    rows = env.query(
+        'SELECT status, "at" FROM reconciliations WHERE run_id = ? ORDER BY reconciliation_id',
+        [outcome.run_id],
+    )
+    assert [r[0] for r in rows] == ["ok", "ok"]
+    step_4, step_8 = rows[0][1], rows[1][1]
+    assert step_4 < min(known)  # step 4 ran before any fill: an empty book
+    assert step_8 >= max(known)

@@ -53,7 +53,9 @@ any symbol it lacks.
 
 **Step 5.** `marks.marks_for` rows for every session after the window's last
 mark (or from the window's start date) through S-1; the drawdown check (T59)
-engaging with source `drawdown` and its alert; the `missed_run` alert when S-1
+on each session this run marks (and the last marked session), so a crossing on
+a back-filled session is not missed, engaging once with source `drawdown` and
+its alert; the `missed_run` alert when S-1
 is after the window's start date and has no `paper_runs` row; the lapse rows
 from `marks.lapses`, with one `missed_rebalance` alert; the due outcomes and the
 lot-ledger write (T62). A lot-ledger error never fails the run: it is a
@@ -175,6 +177,7 @@ from tradepartner.execution.plan import (
     rebalance_state,
 )
 from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, Reconciliation
+from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import frozen_risk, reconcile_now
 from tradepartner.execution.risk import unfilled_sells
 from tradepartner.execution.wrapper import (
@@ -286,7 +289,8 @@ class RunOutcome:
 @dataclass(frozen=True)
 class StepContext:
     """What the later steps (T63d, T63f) receive from the core: the run's
-    wrapper and broker, the window and its frozen `risk` section, the run row,
+    wrapper (never the raw broker: a step reaches the broker only through
+    `gate` and `assets_read`), the window and its frozen `risk` section, the run row,
     S, this run's `assets` read (symbol to `Asset`) and its reader, the
     planning outcome (None when nothing was planned), the `fills_lagging`
     state, and the run's notes (a step appends to them; they go on the result
@@ -295,7 +299,6 @@ class StepContext:
     settings: Settings
     connect: Connect
     gate: RiskGatedBroker
-    broker: Broker
     window: PaperWindowRow
     frozen: RiskConfig
     run: PaperRunRow
@@ -395,7 +398,7 @@ def _forced_exits(context: StepContext, *, pending_rebalance: date | None) -> li
         ok_rows = [
             r
             for r in reconciliations_for(conn, window_id)
-            if r.status == OK and r.at.astimezone(_NEW_YORK).date() <= session
+            if r.status == RECONCILED and r.at.astimezone(_NEW_YORK).date() <= session
         ]
         ledger = from_journal(
             fills_for(conn, window_id=window_id),
@@ -728,7 +731,7 @@ def _locked_run(
                 )
     run = replace(row, run_id=run_id)
     return _Run(
-        settings, connect, broker, gate, alerter, window, frozen, run, state, sleep
+        settings, connect, broker, gate, alerter, window, frozen, run, state.engaged, sleep
     ).execute()
 
 
@@ -745,7 +748,7 @@ class _Run:
         window: PaperWindowRow,
         frozen: RiskConfig,
         run: PaperRunRow,
-        state: switch.SwitchState,
+        engaged: bool,
         sleep: Callable[[float], None],
     ) -> None:
         assert run.run_id is not None and run.session is not None and run.kind is not None
@@ -761,8 +764,7 @@ class _Run:
         self.run_id: int = run.run_id
         self.session: date = run.session
         self.kind: str = run.kind
-        self.state = state
-        self.engaged = state.engaged
+        self.engaged = engaged
         self.notes: list[str] = []
         self.write_offs: WriteOffContext | None = None
         self.assets: dict[str, Asset] = {}
@@ -902,7 +904,6 @@ class _Run:
             settings=self.settings,
             connect=self.connect,
             gate=self.gate,
-            broker=self.broker,
             window=self.window,
             frozen=self.frozen,
             run=self.run,
@@ -1222,7 +1223,9 @@ class _Run:
             fills = fills_for(conn, window_id=self.window_id)
             orders = orders_for(conn, window_id=self.window_id)
             adjustments = adjustments_for(conn, self.window_id)
-            ok_rows = [r for r in reconciliations_for(conn, self.window_id) if r.status == OK]
+            ok_rows = [
+                r for r in reconciliations_for(conn, self.window_id) if r.status == RECONCILED
+            ]
 
         def ledger(through: date) -> Ledger:
             stated = [r for r in ok_rows if r.at.astimezone(_NEW_YORK).date() <= through]
@@ -1300,26 +1303,37 @@ class _Run:
                             ingested_at=stamp,
                         ),
                     )
-        self._drawdown()
+        self._drawdown({mark.session for mark in rows})
         with open_read_only(self.settings) as conn:
             run_rows = [r.run for r in runs_for(conn, self.window_id)]
         boundary = previous_session(self.session)
         if boundary > self._start_day() and marks.missed_run(run_rows, self.session):
             self._alert("missed_run", f"no paper run on {boundary.isoformat()}")
 
-    def _drawdown(self) -> None:
+    def _drawdown(self, marked: set[date]) -> None:
+        """The drawdown check on each session this run `marked` and on the last
+        marked session, in session order; the first crossing engages, once."""
         with open_read_only(self.settings) as conn:
-            equity = _mark_equity(positions_daily_for(conn, self.window_id))
+            marks_rows = positions_daily_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
-        if equity is None:
+        if not marks_rows:
             return
         peak = switch.drawdown_peak(self.window, rows)
         armed = switch.drawdown_armed(self.window_id, rows)
-        if not switch.drawdown_check(equity, peak, self.frozen.max_drawdown, armed=armed):
+        crossed: tuple[date, float] | None = None
+        for day in sorted(marked | {max(r.session for r in marks_rows)}):
+            equity = _mark_equity(marks_rows, day)
+            if equity is not None and switch.drawdown_check(
+                equity, peak, self.frozen.max_drawdown, armed=armed
+            ):
+                crossed = day, equity
+                break
+        if crossed is None:
             return
+        day, equity = crossed
         reason = (
-            f"ledger equity {equity:.2f} is below the peak {peak:.2f} by more than "
-            f"risk.max_drawdown {self.frozen.max_drawdown}"
+            f"ledger equity {equity:.2f} at {day.isoformat()} is below the peak {peak:.2f} "
+            f"by more than risk.max_drawdown {self.frozen.max_drawdown}"
         )
         engaged = switch.engage(
             self.settings,
@@ -1469,13 +1483,10 @@ def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
     return sorted(sid for sid, row in _current(listings, day).items() if row["ticker"] == ticker)
 
 
-def _mark_equity(rows: Sequence[PositionDailyRow]) -> float | None:
-    """Ledger equity at the last marked session: its cash row plus every name's
+def _mark_equity(rows: Sequence[PositionDailyRow], day: date) -> float | None:
+    """Ledger equity at the marked session `day`: its cash row plus every name's
     value, or None when that session's rows cannot give it."""
-    if not rows:
-        return None
-    last = max(r.session for r in rows)
-    today = [r for r in rows if r.session == last]
+    today = [r for r in rows if r.session == day]
     cash = {r.cash for r in today if r.cash is not None}
     values = [r.value for r in today if r.security_id is not None]
     if len(cash) != 1 or any(v is None for v in values):
