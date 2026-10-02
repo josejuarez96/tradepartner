@@ -99,7 +99,8 @@ registry; #83 took version 2 first, so the registry is version 3):
   earlier resume could be given the flag), and the DDL pass creates
   `resume_acceptances`. A store at version 4 or earlier gets the version-8
   journal directly. A read-only connection accepts a version-7 store, so
-  every other read keeps working; a `resume_invocations` or
+  every other read keeps working (`store.journal.require_journal` does not
+  ask for `LATER_JOURNAL_TABLE_NAMES`); a `resume_invocations` or
   `resume_acceptances` read there fails on the missing column or table
   (only `paper resume`'s write path reads them).
 - **A later DDL change goes to version 9**, with its own migration and a
@@ -1040,7 +1041,8 @@ CREATE TABLE IF NOT EXISTS resume_invocations (
 
 # One row per resume given `--accept-rejections` (#472), written once its
 # rejection-cap verdicts are judged and before its reconciliation and release:
-# a JSON list of the verdicts the flag accepted, `[]` when there was none.
+# a JSON list of the verdicts the flag accepted, `[]` when there was none. It is
+# not a release: that is the `kill_switch` `released` row citing the resume_id.
 _CREATE_RESUME_ACCEPTANCES = f"""
 CREATE TABLE IF NOT EXISTS resume_acceptances (
     resume_id BIGINT NOT NULL PRIMARY KEY,
@@ -1255,6 +1257,11 @@ JOURNAL_TABLE_NAMES: tuple[str, ...] = (
     "disposals",
     "wash_sale_flags",
 )
+
+#: Journal tables added after version 5 (#472), which a read-only connection to
+#: an older journal store lacks: `store.journal.require_journal` does not ask for
+#: them, so every other journal read keeps working there.
+LATER_JOURNAL_TABLE_NAMES: tuple[str, ...] = ("resume_acceptances",)
 
 _JOURNAL_TABLE_DDL: tuple[str, ...] = (
     _CREATE_PAPER_WINDOWS,

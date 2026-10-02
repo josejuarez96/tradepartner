@@ -26,7 +26,8 @@ The only way the kill switch is released. In the req 5 order:
    - **`accept_rejections`** (`--accept-rejections`, #472) accepts the second
      kind only: the verdicts on the runs the release would clear. Its
      `resume_acceptances` row, written once they are judged and before any
-     reconciliation or release, names each accepted verdict (`[]` for none).
+     reconciliation or release, names each accepted verdict (`[]` for none);
+     it is not a release, which still needs everything below.
      A collection verdict on any other run, the lag bound, reconciliation and
      every `switch.ReleaseRefused` still refuse. Only the owner's CLI flag
      sets it: `resume` has no default for it and no config key reaches it.
@@ -169,6 +170,7 @@ def _start(
     now: datetime,
     reason: str,
     accept_broker_fills: bool,
+    *,
     accept_rejections: bool,
 ) -> tuple[int, int, tuple[int, ...], list[OrderRow]]:
     """The invocation row, the highest `kill_switch` `event_id` of the window
@@ -431,13 +433,16 @@ def resume(
     accept_rejections: bool,
 ) -> ResumeOutcome:
     """`paper resume --reason` (module docstring). `accept_rejections` is the
-    owner's `--accept-rejections` and has no default. `connect` opens a write chunk
+    owner's `--accept-rejections` and has no default; anything but a `bool` raises
+    `TypeError` before anything. `connect` opens a write chunk
     (`lambda: store.db.open_for_write(settings)`). Raises `ValueError` for a
     blank `reason` before anything, `LockHeld` while another process holds the
     run lock, `ClockError` for a bad clock reading, and whatever the broker or
     the store raises; a refusal is an outcome, never an exception."""
     if not reason.strip():
         raise ValueError("paper resume needs a non-blank --reason")
+    if not isinstance(accept_rejections, bool):
+        raise TypeError(f"accept_rejections must be a bool, got {type(accept_rejections).__name__}")
     with run_lock(settings):
         with connect() as conn:
             window = open_window(conn)
@@ -448,7 +453,12 @@ def resume(
         now = _read_clock(clock)
 
         resume_id, seen, crashed, pending = _start(
-            connect, window_id, now, reason, accept_broker_fills, accept_rejections
+            connect,
+            window_id,
+            now,
+            reason,
+            accept_broker_fills,
+            accept_rejections=accept_rejections,
         )
         settled = _settle(broker, connect, pending, clock)
         with connect() as conn:
@@ -478,7 +488,7 @@ def resume(
         synthetic: list[tuple[FillRow, OrderReading]] = []
         faulted = _faulted_run_breaches(connect, window, frozen)
         accepted: tuple[RejectionBreach, ...] = ()
-        if accept_rejections is True:
+        if accept_rejections:
             # Only the verdicts on runs the release would clear (#451's refusal).
             # A collection verdict on such a run is the same run's verdict.
             accepted = faulted

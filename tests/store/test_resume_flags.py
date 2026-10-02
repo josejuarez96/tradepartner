@@ -17,6 +17,7 @@ from typing import Any
 import duckdb
 import pytest
 
+from tradepartner.store import journal as store_journal
 from tradepartner.store import schema
 
 _NOW = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
@@ -52,7 +53,7 @@ def _version_7_store(path: Path, resume_ids: tuple[int, ...] = ()) -> Path:
             conn.execute(
                 'INSERT INTO resume_invocations (resume_id, "at", reason, '
                 "accept_broker_fills, known_at, ingested_at) VALUES (?, ?, ?, ?, ?, ?)",
-                [resume_id, at, f"reason {resume_id}", index % 2 == 0, _NOW, _NOW],
+                [resume_id, at, f"reason {resume_id}", index % 2 == 0, at, at + timedelta(1)],
             )
     return path
 
@@ -112,7 +113,10 @@ def test_write_open_of_a_version_7_store_keeps_every_resume_row_without_the_flag
 ) -> None:
     ids = (3, 1, 2)
     path = _version_7_store(tmp_path / "v7.duckdb", ids)
-    reader = 'SELECT resume_id, "at", reason, accept_broker_fills FROM resume_invocations'
+    reader = (
+        'SELECT resume_id, "at", reason, accept_broker_fills, known_at, ingested_at '
+        "FROM resume_invocations"
+    )
     with duckdb.connect(str(path)) as conn:
         before = conn.execute(f"{reader} ORDER BY rowid").fetchall()
         others_before = {
@@ -152,3 +156,10 @@ def test_read_only_open_of_a_version_7_store_passes(tmp_path: Path) -> None:
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
         assert _versions(conn) == [7]
+        store_journal.require_journal(conn)
+        assert store_journal.open_window(conn) is None
+        assert store_journal.kill_switch_events_for(conn, 1) == []
+        with pytest.raises(duckdb.Error):
+            store_journal.resume_invocations(conn)  # no accept_rejections column yet
+        with pytest.raises(duckdb.Error):
+            store_journal.resume_acceptances(conn)  # no table yet

@@ -1310,6 +1310,27 @@ def test_the_flag_with_no_verdict_changes_nothing_and_records_nothing_accepted(
     assert (resume_id, accepted) == (outcome.resume_id, [])
 
 
+@pytest.mark.parametrize("flag", [1, "yes", None])
+def test_a_flag_that_is_not_a_bool_is_refused_before_anything(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    flag: object,
+) -> None:
+    with pytest.raises(TypeError, match="accept_rejections"):
+        resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            fixed_clock,
+            "owner checked",
+            False,
+            accept_rejections=flag,  # type: ignore[arg-type]
+        )
+    assert _count(journal_settings, "resume_invocations") == 0
+
+
 def test_the_flag_without_a_verdict_refuses_what_a_plain_resume_refuses(
     journal_settings: Settings,
     fake: SkewedFake,
