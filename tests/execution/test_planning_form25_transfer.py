@@ -100,7 +100,7 @@ def _ended_for_exits(
     cut = session_close(previous_session(session))
     day = previous_session(session)
     frame = listing_ends_as_of(conn, cut, settings, list(names))
-    current = planning._current(frame, day)
+    current = planning.current_listings(frame, day)
     return {sid for sid, row in current.items() if row["status"] == DELISTED}
 
 
@@ -121,7 +121,9 @@ def test_a_transfer_announced_ahead_of_its_effective_date_does_not_end_the_listi
     # in the future relative to close(S-1)) is indeed "transferred", not
     # "listed" -- otherwise this test would not exercise the bug at all.
     day = previous_session(SESSION)
-    current = planning._current(listing_ends_as_of(conn, session_close(day), settings, [sid]), day)
+    current = planning.current_listings(
+        listing_ends_as_of(conn, session_close(day), settings, [sid]), day
+    )
     assert current[sid]["status"] == "transferred"
 
     assert planning._ended(conn, SESSION, [sid], settings) == {}
