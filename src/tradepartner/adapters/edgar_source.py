@@ -72,14 +72,19 @@ accession), the latest ingested, so a re-dated share never appears twice.
 A company-facts 404, or a CIK the bulk zip has no file for, is not a filing
 failure (many issuers have no XBRL facts): counted on `.facts_missing`, its
 empty result cached the same way as a real payload. A bulk member that is an
-empty object or has no `cik` (SEC ships `{}` members, #566) is treated as
-absent from the zip, counted on `.facts_bulk_empty` (`.submissions_bulk_empty`
-for `submissions.zip`, where an empty older page is likewise absent). A
+empty object (SEC ships `{}` members, #566) is treated as absent from the
+zip, counted on `.facts_bulk_empty` (`.submissions_bulk_empty` for
+`submissions.zip`, where an empty older page is likewise absent). A
 per-CIK companyfacts API answer of 200 `{}` (SEC's answer for those same
 CIKs, #576) is SEC's "no facts", handled exactly like a 404 and also counted
-on `.facts_api_empty`. A per-CIK submissions API answer of 200 `{}` (a CIK
-payload or an older page) lists nothing: the rows it would stamp stay
-unstamped this run and are never cached as unstampable for it, counted on
+on `.facts_api_empty`. A payload that carries `facts` but no `cik` (#599:
+SEC serves this shape for a handful of CIKs, identically from the zip and
+the API) is identified by the CIK it was requested under (the zip member
+name, or the API URL), counted on `.facts_bulk_keyless`/`.facts_api_keyless`,
+and its facts carry that CIK; a `cik` that is present but differs still
+raises. A per-CIK submissions API answer of 200 `{}` (a CIK payload or an
+older page) lists nothing: the rows it would stamp stay unstamped this run
+and are never cached as unstampable for it, counted on
 `.submissions_api_empty`. Any other malformed payload still fails the source.
 
 **Failure policy (T11h, owner decision (2)).** A per-document fetch/parse
@@ -309,6 +314,11 @@ class EdgarFilingSource(FilingSource):
         # #576: per-CIK API answers of 200 `{}` (SEC's "nothing here").
         self.facts_api_empty = 0
         self.submissions_api_empty = 0
+        # #599: a payload with `facts` but no `cik` (SEC ships this shape for
+        # a few CIKs, identically from the zip and the API): identified by
+        # the CIK it was requested under, not treated as absent.
+        self.facts_bulk_keyless = 0
+        self.facts_api_keyless = 0
         # accession -> (error_class, base_form, message), skipped this run,
         # never yet written to failed_filings.json (that is `record_failures`'s
         # job, after an `ok` commit).
@@ -1633,7 +1643,12 @@ class EdgarFilingSource(FilingSource):
         API 200 whose payload is an empty object (#576: SEC's answer for the
         CIKs whose zip member is `{}`) is handled exactly like that 404 and
         counted on `facts_api_empty`; any other payload without `cik` or
-        `facts` still raises."""
+        `facts` still raises. A payload that has `facts` but no `cik` (#599:
+        SEC ships this shape for a few CIKs, identically from the zip and the
+        API) is identified by the CIK it was requested under (the zip member
+        name, or the API URL) rather than treated as absent, and counted on
+        `facts_bulk_keyless`/`facts_api_keyless`; a `cik` that is present but
+        differs still raises."""
         if self._facts_bulk is None:
             stale = 0
             for stamps_path in self._stamps_path("0").parent.glob("*.json"):
@@ -1656,11 +1671,17 @@ class EdgarFilingSource(FilingSource):
             with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
                 bulk_payload = json.loads(bulk.read(f"CIK{cik}.json"))
             if _keyless_member(bulk_payload):
-                # #566: SEC's zip has `{}` members. As if absent from the zip:
-                # the API is asked, never "no facts" assumed.
-                self.facts_bulk_empty += 1
-                bulk_payload = None
-            elif _holds_accession(bulk_payload, cik, latest):
+                if "facts" in bulk_payload:
+                    # #599: has facts despite missing `cik`; identified by the
+                    # zip member name it was read under.
+                    self.facts_bulk_keyless += 1
+                    bulk_payload = _identified(bulk_payload, cik)
+                else:
+                    # #566: SEC's zip has `{}` members. As if absent from the
+                    # zip: the API is asked, never "no facts" assumed.
+                    self.facts_bulk_empty += 1
+                    bulk_payload = None
+            if bulk_payload is not None and _holds_accession(bulk_payload, cik, latest):
                 return bulk_payload, True
         try:
             payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
@@ -1672,6 +1693,10 @@ class EdgarFilingSource(FilingSource):
             absent = _empty_object(payload)
             if absent:
                 self.facts_api_empty += 1  # #576: SEC's 200 `{}` is its 404
+            elif _keyless_member(payload) and "facts" in payload:
+                # #599: as above, identified by the API URL it was requested under.
+                self.facts_api_keyless += 1
+                payload = _identified(payload, cik)
         if absent:
             if bulk_payload is not None:
                 # The zip has this CIK's facts, only trailing `latest`: serve
@@ -1689,10 +1714,21 @@ def _empty_object(payload: Any) -> bool:
 
 
 def _keyless_member(payload: Any) -> bool:
-    """Whether a bulk zip's `CIK##########.json` member is an object with no
-    `cik` (SEC ships empty `{}` members, #566): treated as absent from the
-    zip. Anything that is not an object is left to fail downstream."""
+    """Whether a bulk zip's `CIK##########.json` member, or a per-CIK API
+    payload, is an object with no `cik` (SEC ships empty `{}` members, #566,
+    and a handful of non-empty payloads that carry `facts` but no `cik`,
+    #599). Anything that is not an object is left to fail downstream; the
+    caller tells the two keyless shapes apart by `"facts" in payload`."""
     return isinstance(payload, dict) and "cik" not in payload
+
+
+def _identified(payload: Mapping[str, Any], cik: str) -> dict[str, Any]:
+    """`payload` with its requested CIK substituted for `cik` (#599): when SEC
+    omits `cik` from a payload that otherwise carries `facts`, the zip member
+    name or API URL it was requested under is its only identity. Downstream
+    readers (`_holds_accession`, `parse_company_facts`) then index
+    `payload["cik"]` as usual, so the facts parsed from it carry `cik`."""
+    return {**payload, "cik": cik}
 
 
 def _holds_accession(payload: Any, cik: str, accession: str) -> bool:

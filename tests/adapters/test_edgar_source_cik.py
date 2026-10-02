@@ -1586,18 +1586,11 @@ def _bulk_facts_source(
     return source, router
 
 
-@pytest.mark.parametrize(
-    "member",
-    [b"{}", json.dumps({"entityName": "x", "facts": {}}).encode()],
-    ids=["empty", "no-cik"],
-)
-def test_an_empty_bulk_member_falls_back_to_the_api_and_a_404_is_missing(
-    tmp_path: Path, member: bytes
-) -> None:
+def test_an_empty_bulk_member_falls_back_to_the_api_and_a_404_is_missing(tmp_path: Path) -> None:
     """#566: SEC's zip has `{}` members. One is treated as absent from the zip:
     the per-CIK API is asked, and its 404 is the ordinary `facts_missing`
     path, never "no facts" without asking."""
-    zip_bytes = _bulk_zip_members({APPLE: member})
+    zip_bytes = _bulk_zip_members({APPLE: b"{}"})
     source, router = _bulk_facts_source(tmp_path, zip_bytes, **{APPLE: 404})
     records = _shares(source, APPLE)
     assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
@@ -1672,16 +1665,11 @@ def test_an_empty_api_payload_is_missing_like_a_404_and_cached(tmp_path: Path, b
     assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == 1
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [{"entityName": "x", "facts": {}}, {"cik": 320193}],
-    ids=["no-cik", "no-facts"],
-)
-def test_a_non_empty_api_payload_without_cik_or_facts_still_fails(
-    tmp_path: Path, payload: dict[str, object]
-) -> None:
-    """Fail closed (#576): only an empty object is "no facts"; a non-empty
-    payload missing `cik` or `facts` still fails the source."""
+def test_a_non_empty_api_payload_without_facts_still_fails(tmp_path: Path) -> None:
+    """Fail closed (#576, #599): only an empty object is "no facts", and only
+    a payload with `facts` is identified by its requested CIK; a non-empty
+    payload missing `facts` still fails the source."""
+    payload = {"cik": 320193}
     source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: payload})
     with pytest.raises(KeyError):
         _shares(source, APPLE)
@@ -1704,6 +1692,81 @@ def test_an_api_payload_for_another_cik_still_raises(tmp_path: Path) -> None:
     _seed_apple(source)
     with pytest.raises(ValueError, match="served for"):
         _shares(source, APPLE)
+
+
+# --- a keyless companyfacts payload with facts (#599) --------------------------
+
+
+def _keyless_apple_entries(*entries: dict[str, object]) -> dict[str, object]:
+    """`_apple_entries`, with no `cik` field (SEC ships this shape for a
+    handful of CIKs, identically from the zip and the API, #599)."""
+    return {"entityName": "x", "facts": {"dei": {SHARES: {"units": {"shares": list(entries)}}}}}
+
+
+def test_a_keyless_bulk_member_with_facts_is_used_for_its_cik(tmp_path: Path) -> None:
+    """#599: a zip member with `entityName`/`facts` and no `cik` is served
+    under the CIK it was requested under (the zip member name), counted on
+    `facts_bulk_keyless`, and never asked of the API since it already holds
+    the latest accession."""
+    member = json.dumps(
+        _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    ).encode()
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: member}))
+    [record] = [f for f in _shares(source, APPLE) if f.accession == APPLE_ACCESSION]
+    assert (record.cik, record.value, record.as_of_date) == (
+        APPLE,
+        14_776_353_000.0,
+        date(2025, 10, 17),
+    )
+    assert source.facts_bulk_keyless == 1
+    assert source.facts_bulk_empty == 0
+    assert COMPANY_FACTS_URL.format(cik=APPLE) not in router.urls
+
+
+def test_a_keyless_api_payload_with_facts_is_used_for_its_cik(tmp_path: Path) -> None:
+    """#599: the same shape from the per-CIK API (the zip has no member for
+    the CIK), identified by the API URL it was requested under and counted
+    on `facts_api_keyless`."""
+    payload = _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({}), **{APPLE: payload})
+    [record] = [f for f in _shares(source, APPLE) if f.accession == APPLE_ACCESSION]
+    assert (record.cik, record.value, record.as_of_date) == (
+        APPLE,
+        14_776_353_000.0,
+        date(2025, 10, 17),
+    )
+    assert source.facts_api_keyless == 1
+    assert source.facts_api_empty == 0
+    assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
+
+
+def test_a_keyless_bulk_member_incomplete_falls_back_to_the_api(tmp_path: Path) -> None:
+    """A keyless bulk member that does not yet hold the latest accession (the
+    zip trails the day's filings, as for a normal member) still falls back to
+    the per-CIK API, which here answers with the same keyless shape."""
+    bulk_member = json.dumps(_keyless_apple_entries()).encode()  # holds nothing yet
+    payload = _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    source, router = _bulk_facts_source(
+        tmp_path, _bulk_zip_members({APPLE: bulk_member}), **{APPLE: payload}
+    )
+    [record] = [f for f in _shares(source, APPLE) if f.accession == APPLE_ACCESSION]
+    assert record.cik == APPLE
+    assert (source.facts_bulk_keyless, source.facts_api_keyless) == (1, 1)
+    assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
+
+
+def test_a_keyless_payload_is_cached_under_the_requested_cik(tmp_path: Path) -> None:
+    """The facts cache written for a keyless bulk payload is keyed and
+    readable by the requested CIK: a second source over the same cache
+    directory serves the same records without reading the zip again."""
+    member = json.dumps(
+        _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    ).encode()
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: member}))
+    records = _shares(source, APPLE)
+    again = _source(source._settings, _facts_router())
+    assert _shares(again, APPLE) == records
+    assert router.urls.count(BULK_FACTS_URL) == 1
 
 
 # --- review fixes (#262) -----------------------------------------------------
