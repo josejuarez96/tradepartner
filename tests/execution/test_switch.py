@@ -535,7 +535,11 @@ def _resume(settings: Settings, minutes: int = 200) -> int:
         resume_id = append(
             conn,
             ResumeInvocationRow(
-                at=_at(minutes), reason="checked", accept_broker_fills=False, **_stamp(minutes)
+                at=_at(minutes),
+                reason="checked",
+                accept_broker_fills=False,
+                accept_rejections=False,
+                **_stamp(minutes),
             ),
         )
     assert resume_id is not None

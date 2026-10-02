@@ -104,6 +104,7 @@ def _halt_then_resume(env: Env, gate: wrapper.RiskGatedBroker, decisions: list[o
             at=resume_at,
             reason="reviewed fault and broker state",
             accept_broker_fills=False,
+            accept_rejections=False,
             known_at=resume_at,
             ingested_at=resume_at,
         ),

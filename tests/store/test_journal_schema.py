@@ -1,7 +1,7 @@
 """Tests for the paper-trading journal tables (Phase 4 plan T49, schema version 5).
 
 The journal tables exist after `init_schema` on a fresh store and after a write
-connection opens a version-4 store, which gets appended version-5 to version-7 rows and no
+connection opens a version-4 store, which gets appended version-5 to version-8 rows and no
 other change: fact and registry DDL are pinned by hash and every fact and registry
 table is byte-identical after the migration. A read-only open of a version-4 store
 (`conftest.version_4_store`) still passes the schema check and serves fact and
@@ -45,6 +45,7 @@ _EXPECTED_JOURNAL_TABLES = {
     "fills",
     "fill_cursors",
     "resume_invocations",
+    "resume_acceptances",
     "outcomes",
     "positions_daily",
     "adjustments",
@@ -141,8 +142,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_7() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 7
+def test_current_schema_version_is_8() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 8
 
 
 def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
@@ -155,9 +156,9 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 # --- fresh store and migration --------------------------------------------------------
 
 
-def test_fresh_init_creates_the_journal_at_version_7(journal: duckdb.DuckDBPyConnection) -> None:
+def test_fresh_init_creates_the_journal_at_version_8(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [7]
+    assert _versions(journal) == [8]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -179,7 +180,7 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         conn.close()
     assert after == before
     assert versions[:1] == applied_before
-    assert [row[0] for row in versions] == [4, 5, 6, 7]
+    assert [row[0] for row in versions] == [4, 5, 6, 7, 8]
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES)
 
 
@@ -202,7 +203,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
         conn.close()
     with duckdb.connect(str(v4_path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [4, 5, 6, 7]
+        assert _versions(conn) == [4, 5, 6, 7, 8]
 
 
 def test_an_unknown_later_version_is_refused(tmp_path: Path) -> None:
