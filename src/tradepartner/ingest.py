@@ -488,6 +488,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("failed_filings", "failed filings"),  # T11h: the failure policy
         ("quarantined", "quarantined"),
         ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
+        ("facts_bulk_empty", "empty bulk facts"),  # #566: `{}` companyfacts.zip members
+        ("submissions_bulk_empty", "empty bulk submissions"),
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")

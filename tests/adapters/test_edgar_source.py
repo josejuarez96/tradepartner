@@ -287,6 +287,28 @@ def test_the_bulk_zip_stamps_and_the_per_cik_top_up_follows(tmp_path: Path) -> N
     assert [u.accession for u in source.unstamped_filings] == [MISSING]
 
 
+def test_an_empty_bulk_submissions_member_falls_back_to_the_api(tmp_path: Path) -> None:
+    """#566 sweep: an empty `{}` CIK member or older page in `submissions.zip`
+    is treated as absent, so the CIK is stamped per CIK, never left
+    unstamped or failing the source."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        bulk.write(FIXTURES / SUBMISSIONS[APPLE][0], f"CIK{APPLE}.json")
+        bulk.writestr(f"CIK{APPLE}-submissions-001.json", "{}")
+        bulk.writestr(f"CIK{ALPHABET}.json", "{}")
+    router = _router()
+    router.add(BULK_URL, buffer.getvalue())
+    settings = edgar_settings(tmp_path / "cache", bulk_stamp_threshold_ciks=2)
+    source = _source(settings, router)
+    entries = source.filing_index()
+    assert entries == _source(edgar_settings(tmp_path / "per-cik"), _router()).filing_index()
+    assert source.submissions_bulk_empty == 2
+    assert {"CIK0001652044.json", "CIK0000320193-submissions-001.json"} <= set(
+        _submission_urls(router)
+    )
+    assert [u.accession for u in source.unstamped_filings] == [MISSING]
+
+
 # --- the companies snapshot and provenance ---------------------------------------
 
 
