@@ -120,7 +120,14 @@ reason is the trimmed text.
 - **`abandon(settings, connect, broker, clock, reason)`** is the owner-only
   `paper abandon` (#247 Q13). It takes the run lock, refuses `no_window`,
   and does not look at the switch (a window that cannot be released can only
-  end this way). It runs a final `reconcile_now`, keeping its row whatever
+  end this way). It refuses `open_orders`, naming each one, while any order
+  of the window has no terminal event in the journal (the read `stop`'s
+  `not_ready` makes, so an order the broker filled but the journal has not
+  collected still refuses); it never cancels one (#542: the owner cancels or
+  waits, runs `paper resume` so the journal collects the order, then
+  abandons). Every refusal comes before any broker call or write,
+  and the run lock it holds keeps any run from placing an order meanwhile.
+  It runs a final `reconcile_now`, keeping its row whatever
   its status (a mismatch is the expected case and engages nothing: the
   window ends here; but when anything after a mismatch fails, so the window
   stays open, it engages the switch with source `fault` before re-raising),
@@ -647,6 +654,7 @@ RECONCILIATION = "reconciliation"
 NOT_FLAT = "not_flat"
 OVERRIDE = "override"
 MULTIPLE_OPEN_WINDOWS = "multiple_open_windows"
+OPEN_ORDERS = "open_orders"
 
 REQUESTED = "requested"
 CLOSED = "closed"
@@ -758,6 +766,18 @@ def _refuse_if_engaged(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) 
     causes = _engaged_causes(conn, window)
     if causes:
         raise WindowCommandRefused(KILL_SWITCH, "the kill switch is engaged: " + "; ".join(causes))
+
+
+def _open_orders(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
+    """Every order of the window with no terminal event in the journal
+    (`pending` ones included), whatever the broker says: the same
+    `non_terminal_orders` read `_not_ready` names for `stop` (#542)."""
+    return [
+        f"order {o.client_order_id} ({o.symbol}) is not terminal"
+        for o in sorted(
+            non_terminal_orders(conn, window_id=window_id), key=lambda o: o.client_order_id
+        )
+    ]
 
 
 def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
@@ -1044,7 +1064,8 @@ def abandon(
     reason: str,
 ) -> AbandonResult:
     """`paper abandon --reason`, owner-only (module docstring; #247 Q13).
-    Raises `WindowCommandRefused` for a blank reason or no open window,
+    Raises `WindowCommandRefused` for a blank reason, no open window or an
+    open order of the window (before any broker call or write),
     `LockHeld` while another process holds the run lock, `ClockError` for a
     bad clock reading, and whatever the broker or the store raises (nothing
     but the reconciliation row is then written, plus a `fault` engagement
@@ -1054,6 +1075,13 @@ def abandon(
     with run_lock(settings):
         with connect() as conn:
             window, window_id = _window_of(conn)
+            still_open = _open_orders(conn, window_id)
+        if still_open:
+            raise WindowCommandRefused(
+                OPEN_ORDERS,
+                "cancel or wait for the window's own open orders, run paper resume so "
+                "the journal collects them, then abandon: " + "; ".join(still_open),
+            )
         frozen = frozen_risk(window)
         now = _command_clock(clock)
         mismatch: ReconciliationError | None = None
