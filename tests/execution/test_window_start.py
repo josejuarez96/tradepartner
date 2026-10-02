@@ -65,6 +65,7 @@ def _params(**extra: Any) -> dict[str, Any]:
         "costs.per_side_bps": 15.0,
         "costs.commission_per_share": 0.0,
         "costs.commission_per_order": 0.0,
+        "execution.fill_price": "close",
         "strategy.top_fraction": 0.1,
         **extra,
     }
@@ -594,16 +595,22 @@ def test_frozen_json_carries_the_registered_cost_keys_the_wrapper_reads(
 def test_frozen_json_carries_the_live_execution_fill_price(
     journal_settings: Settings,
     fixed_clock: FixedClock,
-    ready_hypothesis: registry.HypothesisRecord,
+    tmp_path: Path,
     fill_price: str,
 ) -> None:
     """`paper start` freezes `FROZEN_EXECUTION_KEYS` under `execution.` with the
-    live values (#526, #366 Q20), and no other `execution.*` key."""
+    live values, equal to the registered ones (#526, #366 Q20), and no other
+    `execution.*` key."""
     settings = Settings(
         _env_file=None,
         store={"path": journal_settings.store.path},
         execution={"fill_price": fill_price},
     )
+    with open_for_write(settings) as conn:
+        params = _params(**{"execution.fill_price": fill_price})
+        hyp = _register(conn, settings, "h1", HOLDOUT_END_PAST, params)
+        _sign_off(conn, settings, hyp, tmp_path)
+
     result = window.start(settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1")
 
     frozen = json.loads(result.window.frozen_json)
@@ -675,6 +682,49 @@ def test_refuses_a_registration_without_the_cost_keys(
 
     assert refused.value.reason == "costs_drift"
     assert "costs.commission_per_share" in str(refused.value)
+
+
+def test_refuses_when_live_fill_price_differs_from_the_registered_one(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """The tracking trial fills at the registered `execution.fill_price` and
+    `paper report` prices the fill-timing term off the frozen one, so a live
+    edit before `paper start` refuses the start (`execution_drift`) and writes
+    no window (#526)."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        execution={"fill_price": "open"},
+    )
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1")
+
+    assert refused.value.reason == "execution_drift"
+    assert "execution.fill_price live 'open' vs registered 'close'" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_refuses_a_registration_without_the_fill_price(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A registration that lacks `execution.fill_price` cannot vouch for the
+    convention `paper report` compares against: refused, never filled from live."""
+    with open_for_write(journal_settings) as conn:
+        params = {k: v for k, v in _params().items() if k != "execution.fill_price"}
+        hyp = _register(conn, journal_settings, "h2", HOLDOUT_END_PAST, params)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h2"
+        )
+
+    assert refused.value.reason == "execution_drift"
+    assert "execution.fill_price" in str(refused.value)
 
 
 def test_succeeds_on_a_version_4_store(tmp_path: Path, fixed_clock: FixedClock) -> None:

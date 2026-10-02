@@ -26,6 +26,10 @@ req 14 "Entry gate, start and stop", req 5, req 9 and open question 13; ADR
    (`costs_drift`, #534): every `FROZEN_COSTS_KEYS` value must equal the
    registration's, which planning sizes with, so the frozen costs the wrapper
    reads are the plan's.
+7. **The live fill price differs from the hypothesis's registered one**
+   (`execution_drift`, #526): every `FROZEN_EXECUTION_KEYS` value must equal
+   the registration's, which the tracking trial fills at, so `paper report`
+   prices paper fills against the trial's own convention.
 
 Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
 rebalance session strictly after both `holdout_end` and today, per the spec
@@ -303,7 +307,10 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
     The frozen costs must equal the hypothesis's `registered` parameters,
     which planning sizes the decisions with, so the plan and the wrapper share
     one cost model: a live `costs.*` value that differs from it, or a key the
-    registration lacks, refuses the start (`costs_drift`)."""
+    registration lacks, refuses the start (`costs_drift`). Likewise the frozen
+    `execution.*` keys must equal the registered ones, which the tracking trial
+    fills at, so `paper report` compares paper fills against the trial's own
+    convention (`execution_drift`)."""
     risk = settings.risk.model_dump()
     paper = settings.paper.model_dump()
     costs = settings.costs.model_dump()
@@ -319,6 +326,18 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
         raise StartRefusedError(
             "costs_drift",
             "the live costs differ from the hypothesis's registered costs: " + "; ".join(drift),
+        )
+    execution_drift = [
+        f"{_EXECUTION_PREFIX}{k} live {execution[k]!r} vs registered "
+        f"{registered.get(f'{_EXECUTION_PREFIX}{k}')!r}"
+        for k in FROZEN_EXECUTION_KEYS
+        if registered.get(f"{_EXECUTION_PREFIX}{k}") != execution[k]
+    ]
+    if execution_drift:
+        raise StartRefusedError(
+            "execution_drift",
+            "the live execution keys differ from the hypothesis's registered ones: "
+            + "; ".join(execution_drift),
         )
     params: dict[str, Any] = {f"{_RISK_PREFIX}{k}": v for k, v in risk.items()}
     params.update({f"{_PAPER_PREFIX}{k}": paper[k] for k in FROZEN_PAPER_KEYS})
