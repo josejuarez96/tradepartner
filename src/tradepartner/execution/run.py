@@ -42,7 +42,9 @@ halts with `ReconciliationError` the first time; while the switch is already
 engaged the row is the report and the run goes on (spec req 8). Then the
 `executed` test: every due rebalance with no `rebalance_events` row whose
 decisions are all closed or settled (`plan.rebalance_state`) gets its
-`executed` row, before the lapse rule.
+`executed` row, before the lapse rule. Each `executed` row written here (a
+fill collected late, #553) gets the `unspent_cash` test of step 7b, with the
+broker's cash and equity read just after the row is written.
 
 **Step 4.** `reconcile_now` (T61), its journal cut (`as_of`, #488) a clock
 reading taken just before the call, so step 3's collected rows are in it.
@@ -96,10 +98,12 @@ left the window stays open for the next in-window run. Every exception
 until each is terminal or `paper.accept_wait_seconds` has passed since the
 step began (an absolute deadline: an order still open then is step 3's on the
 next run), polling every `paper.poll_interval_seconds`. Then the `executed`
-test of step 3 runs again, and for the batch's rebalance reaching `executed`
-here the `unspent_cash` alert is written when the cash the buys phase left
-(`BatchOutcome.cash_left`) exceeds the frozen `risk.max_unspent_cash_fraction`
-of the broker's equity read at that moment. The batch's status
+test of step 3 runs again, and for each rebalance reaching `executed` here
+the `unspent_cash` alert is written when the cash exceeds the frozen
+`risk.max_unspent_cash_fraction` of the broker's equity read at that moment.
+The cash is the batch's `BatchOutcome.cash_left` for the batch's own
+rebalance when its buys phase read the cash, else the broker's cash read with
+that equity. A rebalance gets one `executed` row, so one alert at most. The batch's status
 (`skipped_kill_switch` when the wrapper read the switch engaged) is the run's.
 
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
@@ -889,7 +893,8 @@ class _Run:
         prices = self._pending_prices(actions)
         self.write_offs = WriteOffContext(self.window_id, actions, prices.__getitem__, self.session)
         collected = self._collect()
-        self._executed(actions, prices)
+        for t_i in self._executed(actions, prices):
+            self._unspent_cash(t_i, None)
         reconciliation = self._reconcile()
         ledger = self._ledger_at(self.session, actions)
         self.assets_read(list(self._symbols(sorted(ledger.positions)).values()))
@@ -933,9 +938,8 @@ class _Run:
             self.write_offs = WriteOffContext(
                 self.window_id, actions, prices.__getitem__, self.session
             )
-            executed = self._executed(actions, prices)
-            if rebalance is not None and rebalance in executed:
-                self._unspent_cash(batch, rebalance)
+            for t_i in self._executed(actions, prices):
+                self._unspent_cash(t_i, batch.cash_left if t_i == rebalance else None)
         self._reconcile()
         return self._finish(OK if batch is None else batch.status)
 
@@ -1181,16 +1185,17 @@ class _Run:
             write_offs=self.write_offs,
         )
 
-    def _unspent_cash(self, batch: BatchOutcome, rebalance: date) -> None:
-        """The `unspent_cash` alert at `executed` (module docstring)."""
-        if batch.cash_left is None:
-            return
+    def _unspent_cash(self, rebalance: date, cash_left: float | None) -> None:
+        """The `unspent_cash` alert at `executed` (module docstring): the cash
+        is `cash_left`, this run's buys phase's for `rebalance`, else the
+        broker's cash read with the equity, after `executed` is written."""
         account = self._broker_call(Broker.account.__name__, self.broker.account)
+        cash = account.cash if cash_left is None else cash_left
         bound = self.frozen.max_unspent_cash_fraction * account.equity
-        if batch.cash_left > bound:
+        if cash > bound:
             self._alert(
                 _UNSPENT_CASH,
-                f"rebalance {rebalance.isoformat()} executed with {batch.cash_left:.2f} cash "
+                f"rebalance {rebalance.isoformat()} executed with {cash:.2f} cash "
                 f"unspent, above risk.max_unspent_cash_fraction "
                 f"{self.frozen.max_unspent_cash_fraction} of equity {account.equity:.2f}",
             )
