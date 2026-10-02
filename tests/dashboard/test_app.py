@@ -210,7 +210,13 @@ def test_render_ok_state_shows_navigation_and_placeholder_page(
     assert not at.info
     assert not at.error
     [nav] = at.sidebar.radio
-    assert nav.options == ["Data health", "Backtest", "Trial registry", "Operations"]
+    assert nav.options == [
+        "Data health",
+        "Backtest",
+        "Trial registry",
+        "Operations",
+        "Override",
+    ]
 
 
 # --- server options (ADR 0011, #273) ---------------------------------------
