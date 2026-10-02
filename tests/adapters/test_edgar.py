@@ -598,6 +598,50 @@ class TestCoverPageFailClosed:
         with pytest.raises(ValueError, match="names 0 entities"):
             _cover(document)
 
+    @pytest.mark.parametrize("cik", ["0002124122x", "\uff11\uff12\uff13", "12345678901"])
+    def test_a_cover_with_no_cover_facts_and_a_malformed_cik_raises(self, cik: str) -> None:
+        """The C3 CIK names cache files downstream: ASCII digits only, 1 to 10."""
+        document = _ixbrl(_context("d1"), _nn("EntityCentralIndexKey", "d1", cik))
+        with pytest.raises(ValueError, match="EntityCentralIndexKey is not a CIK"):
+            _cover(document)
+
+    def test_a_cover_with_no_cover_facts_and_two_ciks_raises(self) -> None:
+        document = _ixbrl(
+            _context("d1") + _context("d2"),
+            _nn("EntityCentralIndexKey", "d1", "0002124122")
+            + _nn("EntityCentralIndexKey", "d2", "0000092122"),
+        )
+        with pytest.raises(ValueError, match="names 0 entities"):
+            _cover(document)
+
+    def test_a_nil_trading_symbol_is_no_listing(self) -> None:
+        """A nil `TradingSymbol` beside a title and an exchange used to give a
+        listing with an empty ticker; skipped as nil, the class has no
+        symbol, so it is not a listing (COVER_VERSION 2 re-parses such
+        cached covers)."""
+        document = _ixbrl(
+            _context("c1") + _context("s1", instant=True),
+            _nn("Security12bTitle", "c1", "Common Stock")
+            + _nn("TradingSymbol", "c1", "", ' xsi:nil="true"')
+            + _nn("SecurityExchangeName", "c1", "NYSE")
+            + _shares("s1", "1000"),
+        )
+        parsed = _cover(document)
+        assert parsed.cover.listings == ()
+        assert parsed.incomplete_listings == 0
+        assert [f.value for f in parsed.facts] == [1000]
+
+    @pytest.mark.parametrize("missing", ["Security12bTitle", "SecurityExchangeName"])
+    def test_a_nil_title_or_exchange_is_an_incomplete_listing(self, missing: str) -> None:
+        facts = {
+            "Security12bTitle": _nn("Security12bTitle", "c1", "Common Stock"),
+            "TradingSymbol": _nn("TradingSymbol", "c1", "SO"),
+            "SecurityExchangeName": _nn("SecurityExchangeName", "c1", "NYSE"),
+        }
+        facts[missing] = _nn(missing, "c1", "", ' xsi:nil="true"')
+        parsed = _cover(_ixbrl(_context("c1"), "".join(facts.values())))
+        assert (parsed.cover.listings, parsed.incomplete_listings) == ((), 1)
+
     def test_failed_format_raises(self) -> None:
         document = _ixbrl(
             _context("s1", instant=True), _shares("s1", "5.822", ' format="ixt:bogus" scale="6"')

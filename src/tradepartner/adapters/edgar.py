@@ -553,7 +553,7 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
     facts = dei.cover
     if not facts and len(dei.ciks) == 1:  # nothing to list or count (#609 C3)
         [raw_cik] = dei.ciks
-        if not re.fullmatch(r"\d{1,10}", raw_cik):
+        if not re.fullmatch(r"[0-9]{1,10}", raw_cik):  # ASCII only: it names cache files
             raise ValueError(f"{accession}: cover-page EntityCentralIndexKey is not a CIK")
         return CoverPageParse(CoverPage(_cik(raw_cik), accession, accepted_at, ()), ())
     entities = {(context.get("scheme"), context.get("entity")) for _, _, context in facts}

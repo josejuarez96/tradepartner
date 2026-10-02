@@ -171,7 +171,7 @@ FSN_VERSION = 2  # 2: #609 (latest ddate per member, NULL shares, title whitespa
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
-COVER_VERSION = 1
+COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and counted)
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
