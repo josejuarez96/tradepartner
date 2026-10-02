@@ -32,7 +32,7 @@ from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
-from tradepartner.execution import planning
+from tradepartner.execution import planning, wrapper
 from tradepartner.execution.planning import (
     PlanTrialError,
     due_rebalance,
@@ -930,3 +930,35 @@ def test_only_the_windows_overrides_naming_t_i_apply(env: Env) -> None:
     override(T_I, env.window.window_id)  # type: ignore[arg-type]
     dual_b = _decisions(env.plan(run=env.run_on(F_I)))["SEC_DUAL_B"]
     assert (dual_b.decision, dual_b.side, dual_b.reason) == ("override", None, "exclude_name")
+
+
+# --- the shared listing tie rule (#534) ---------------------------------------------------
+
+
+def test_current_listings_keeps_the_first_row_on_a_valid_from_tie() -> None:
+    """Two rows of one name with the same `valid_from`: the first in frame
+    order wins; a later `valid_from` on or before the day beats both, and one
+    after the day is not read. The wrapper reads tickers through this same
+    function, so the tie rule cannot diverge."""
+    day = date(2026, 9, 30)
+    frame = pl.DataFrame(
+        {
+            "security_id": ["X", "X", "Y", "Y", "Y"],
+            "ticker": ["FIRST", "SECOND", "OLD", "NEW", "FUTURE"],
+            "valid_from": [
+                date(2026, 1, 2),
+                date(2026, 1, 2),
+                date(2025, 1, 2),
+                date(2026, 3, 2),
+                date(2026, 10, 1),
+            ],
+        }
+    )
+
+    current = planning.current_listings(frame, day)
+
+    assert {sid: row["ticker"] for sid, row in current.items()} == {"X": "FIRST", "Y": "NEW"}
+    flipped = planning.current_listings(frame.slice(1, 1).vstack(frame.slice(0, 1)), day)
+    assert flipped["X"]["ticker"] == "SECOND"
+    assert wrapper.current_listings is planning.current_listings
+    assert not hasattr(wrapper, "_current")

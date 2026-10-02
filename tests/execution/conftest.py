@@ -12,6 +12,7 @@ later tasks keep their helpers local and never edit it).
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from tradepartner.adapters.fake_broker import FakeBroker
-from tradepartner.config import Settings
+from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, Settings
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import PaperWindowRow, append
 
@@ -28,6 +29,11 @@ CLOCK_START = datetime(2026, 10, 1, 14, 0, tzinfo=UTC)
 WINDOW_FIRST_REBALANCE = date(2026, 9, 30)
 ACCOUNT_ID = "PA1"
 REFERENCE_PRICE = 100.0
+# The `costs.*` keys `paper start` freezes (#534), at their defaults: the
+# wrapper reads its costs from the window, so `open_window` carries them.
+FROZEN_COSTS_JSON = json.dumps(
+    {f"costs.{k}": getattr(CostsConfig(), k) for k in FROZEN_COSTS_KEYS}, sort_keys=True
+)
 
 
 class FixedClock:
@@ -75,7 +81,7 @@ def open_window(journal_settings: Settings) -> PaperWindowRow:
         starting_equity=100_000.0,
         code_version="test",
         started_at=CLOCK_START - timedelta(days=2),
-        frozen_json="{}",
+        frozen_json=FROZEN_COSTS_JSON,
         frozen_sha256="0" * 64,
         known_at=CLOCK_START - timedelta(days=2),
         ingested_at=CLOCK_START - timedelta(days=2),
