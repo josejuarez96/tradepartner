@@ -689,6 +689,60 @@ def test_no_unspent_cash_alert_within_the_frozen_fraction(env: Env, window: Pape
     assert env.alerts("unspent_cash") == []
 
 
+def test_the_same_run_unspent_cash_alert_is_written_once_not_again_later(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The alert written at step 7b's `executed` is not repeated by the next
+    run: that rebalance is settled, so its step 3 writes no `executed`."""
+    env.fake.set_asset(
+        "SPFT", Asset(tradable=False, fractionable=True, status="active", cusip=None)
+    )
+    first = env.run(at(F_0))
+    later = env.run(at(F_0_PLUS_1))
+    assert later.status == "ok", env.result(later.run_id)
+    assert env.rebalance_events() == [(T_0, "executed", None, first.run_id)]
+    assert [(r, s) for r, s, _ in env.alerts("unspent_cash")] == [(first.run_id, F_0)]
+
+
+def test_unspent_cash_alerts_when_a_later_runs_step_3_executes_the_rebalance(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#553: F_0's buys are still open at step 7b's deadline, so the rebalance
+    is pending. The next run's step 3 collects their fills and writes
+    `executed`; the account's cash read at that moment (SPFT's third, never
+    bought) is above the frozen fraction of the equity read with it, so that
+    run writes the alert, once."""
+    env.fake.set_asset(
+        "SPFT", Asset(tradable=False, fractionable=True, status="active", cusip=None)
+    )
+    env.fill_on_sleep = False
+    first = env.run(at(F_0))
+    assert first.status == "ok", env.result(first.run_id)
+    assert env.rebalance_events() == []
+    assert env.alerts("unspent_cash") == []
+    env.fill_open()
+    account = env.fake.account()
+    later = env.run(at(F_0_PLUS_1))
+    assert later.status == "ok", env.result(later.run_id)
+    assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (later.run_id, F_0_PLUS_1)
+    assert account.cash > FROZEN.max_unspent_cash_fraction * account.equity
+    assert f"{account.cash:.2f} cash" in message
+    assert "max_unspent_cash_fraction" in message
+
+
+def test_no_unspent_cash_alert_when_a_later_run_executes_within_the_fraction(
+    env: Env, window: PaperWindowRow
+) -> None:
+    env.fill_on_sleep = False
+    env.run(at(F_0))
+    env.fill_open()
+    later = env.run(at(F_0_PLUS_1))
+    assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
+    assert env.alerts("unspent_cash") == []
+
+
 # --- overrides halt like any order ------------------------------------------------------
 
 
