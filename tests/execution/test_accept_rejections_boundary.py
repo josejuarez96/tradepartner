@@ -13,8 +13,10 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
 3. Every `accept_rejections=` keyword passes the caller's own
    `accept_rejections` name on, never a literal or another expression. The name
    is never bound except as a parameter or a dataclass field (no
-   `accept_rejections = True`), never passed positionally (but to `isinstance`
-   or `type`, for `resume`'s own type check), and never spelt as
+   `accept_rejections = True`, no match, except or import capture), every such
+   parameter is keyword-only (so no positional argument can feed it), the name
+   is never passed positionally (but to `isinstance` or `type`, for `resume`'s
+   own type check), and it is never spelt as
    a whole string (no `**{"accept_rejections": True}`).
 4. No module imports `execution.resume` except those in `RESUME_CALLERS`. There
    are none yet: the `paper resume` CLI is T67. T67 adds `cli.py` here and to
@@ -117,8 +119,10 @@ def defaults(tree: ast.Module) -> list[int]:
 
 
 def misuses(tree: ast.Module) -> list[str]:
-    """Rule 3: a keyword passing anything but the caller's own flag, a binding
-    other than a parameter or a field, a positional pass, or a whole-string key."""
+    """Rule 3: a keyword passing anything but the caller's own flag, a parameter
+    that is not keyword-only (so no positional argument can feed it), a binding
+    other than such a parameter or a field, a positional pass, or a whole-string
+    key."""
     fields = {
         id(node.target)
         for node in ast.walk(tree)
@@ -126,7 +130,24 @@ def misuses(tree: ast.Module) -> list[str]:
     }
     found = []
     for node in ast.walk(tree):
-        if (
+        if isinstance(node, ast.arguments):
+            loose = [*node.posonlyargs, *node.args, node.vararg, node.kwarg]
+            found += [
+                f"{a.lineno}: not keyword-only" for a in loose if a is not None and a.arg == FLAG
+            ]
+        elif (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == FLAG) or (
+            isinstance(node, ast.MatchMapping) and node.rest == FLAG
+        ):
+            found.append(f"{node.lineno}: binds the name in a match")
+        elif isinstance(node, ast.ExceptHandler) and node.name == FLAG:
+            found.append(f"{node.lineno}: binds the name in an except")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name) == FLAG for alias in node.names
+        ):
+            found.append(f"{node.lineno}: binds the name in an import")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and FLAG in node.names:
+            found.append(f"{node.lineno}: declares the name {type(node).__name__.lower()}")
+        elif (
             isinstance(node, ast.keyword)
             and node.arg == FLAG
             and not (isinstance(node.value, ast.Name) and node.value.id == FLAG)
@@ -217,6 +238,16 @@ Rule = Callable[[ast.Module], object]
         ("for accept_rejections in (True,): pass", misuses),
         ("_start(c, w, n, r, f, accept_rejections)", misuses),
         ("resume(**{'accept_rejections': True})", misuses),
+        ("def _start(c, accept_rejections: bool): ...", misuses),
+        ("def _start(accept_rejections, /): ...", misuses),
+        ("def _start(*accept_rejections): ...", misuses),
+        ("def _start(**accept_rejections): ...", misuses),
+        ("match x:\n    case accept_rejections: pass", misuses),
+        ("match x:\n    case [*accept_rejections]: pass", misuses),
+        ("match x:\n    case {**accept_rejections}: pass", misuses),
+        ("try: pass\nexcept E as accept_rejections: pass", misuses),
+        ("from flags import x as accept_rejections", misuses),
+        ("def f():\n    global accept_rejections", misuses),
         ("def resume(*, accept_rejections: bool = False): ...", defaults),
         ("def resume(accept_rejections: bool = False): ...", defaults),
         ("class Row:\n    accept_rejections: bool = False", defaults),
