@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-10-02 · **Phase:** 2, Data foundation (30/32) and 3, Backtest (23/24), with 4, Paper trading (43/55) in build · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
+**Updated:** 2026-10-02 · **Phase:** 2, Data foundation (30/32) and 3, Backtest (23/24), with 4, Paper trading (44/55) in build · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Recently done
 The last 10, newest last; older ones are in [CHANGELOG.md](../CHANGELOG.md) and git history, pending ones in `uv run python scripts/fragments.py show` (#351).
@@ -17,25 +17,29 @@ The last 10, newest last; older ones are in [CHANGELOG.md](../CHANGELOG.md) and 
 
 ## Teams
 New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
-Live board: `uv run python scripts/team.py status`. Snapshot 2026-10-02: orchestrator **tradepartner-9c** (atlas, main checkout). tradepartner-9d retiring: holds #577 (#573, team kite). tradepartner-61 holds T45b (#503). Claimed: atlas #534 (PR #574), atlas #583, ibis #535, kite #573 (PR #577), pelican #409/#410, plover #554, tamarind #510 (PR #521), tern #527 (PR #528), wren #517 (PR #520). Parked: #305, #299, #297. Dead claims for `release --force`: `meridian` #258, `eclipse` #182.
+Live board: `uv run python scripts/team.py status`. Snapshot 2026-10-02: orchestrator **tradepartner-9c** (atlas, main checkout); it runs background teams in retired directories (plover #554, atlas-6a this fold #583). tradepartner-9d is retiring and holds only #577 (#573, team kite). tradepartner-61 holds T45b (#503). Other claims: ibis #535, pelican #409/#410, tamarind #510, tern #527, wren #517. Dead claims for the owner's `release --force`: `meridian` #258, `eclipse` #182.
 
 ## In progress
-- **Merged 2026-10-02:** #519 T63, #541 T60e, #547 T63d, #493 T63e, #506 T63g, #525 T65b, #534 frozen costs (#574 ready_pr running), #565 #567 #579 (EDGAR blockers), #539 #537 #548 #546 #543 #550 #556 #558 #559 #561 #562 #570 #575 (fixes).
-- **Ready, owner's merge:** #521 T72b, #528 T74, #520 (spec), then #445 last.
-- **Phase 3:** T45b (owner): backfill rerun after #577 merges; then `health --check`, `hypothesis register`, `backtest h1-momentum-12-1`.
-- **Phase 4:** #574 ready_pr running (atlas #534). Ready frontier: T60e, T63d, T64b, T69, T70 ready to claim; #577 merge unblocks T45b phase-3 backfill.
-- **Process:** merge-train (#521/#528) ready; #445 last. T72/T73 merged. Merge rules: #519 before #547, #519 before #539, #537 before #575 per history.
+- **Merged 2026-10-02:** #519 (T63), #541 (T60e), #547 (T63d), #550 (#472, schema v8), #570 (#542), the EDGAR backfill blockers #565, #567, #579, and #537, #539, #543, #546, #548, #556, #558, #559, #561, #562, #575.
+- **PRs:** #574 (#534 frozen costs; owner approved the `costs_drift` refusal and the spec req 14 sentence) in ready_pr; #577 (#573) in ready_pr; #554 being built (plover).
+- **Owner's merges:** #521 (T72b) → #528 (T74), #520 (spec; unblocks #505 and #516), then #445 last.
+- **Phase 3, T45b (owner):** all known EDGAR blockers are merged; the backfill rerun (`ingest --backfill --since 2016-01-01`) follows #577, then `health --check`, `hypothesis register`, `backtest h1-momentum-12-1`.
 
 ## Ready frontier snapshot (not a claim; only doc-keeper edits this)
-From `team.py status` on 2026-10-02. Claim through the tool, never from this list. Ready: T22, T45b, T48b (owner), T60e, T63d, T64b, T69, T70. Parked: #445 (last, after order-path), #305, #299, #297. Unclaimed size-S: #582, #581, #580, #578, #571, #569, #568, #563, #560, #552, #551, #529, #524, #518, #507, #505, #491, #470, #435, #412, #411, #382, #376, #366, #258, #183, #182, #33.
+Worked out from the plan after this fold's ticks (T60e, T63d, T64b, T69); `team.py status` shows it once the fold merges. Claim through the tool, never from this list; read each task line for "waits for" gates.
+1. ready plan tasks: T63f, T63i, T66, T69b; T70 (#297 parked, gated on Probe 3); T22, T45b, T48b (owner).
+2. parked PRs: #305 (#258), #299 (T48b), #297 (T70).
+3. queued issues: #578 (after #577), #526 (before T71), #507/#560/#563 (run.py, one team), #551/#552, #435, #518 (after #534).
 
 ## Blocked
-Plan tasks by depth: T23, T48c, T63f, T63h, T63i, T66, T67, T69b, T71, T71b, T72c, T75, T75b waiting on their dependencies (team.py). T48c, T67, T71 wait on owner T48b; T70 on Probe 3 #182; T66 on T64b (merging); T63i, T63f, T63h still depend on unmergeable tasks. T23 on T22 evidence. T71/T71b on T60e, T63g, T63h merged; T60e merged 2026-10-02, T63g earlier; T63h suite not started. T72c–T75b depend on earlier merge-train completion (#521, #528, #445).
+- T63h waits on T63f and T66; T67 on T48c, T63f and T66; T71 on T45b, T48c, T63h, T63i, T67, T69b and T70; T71b on T71; T23 on T22's evidence; T48c on the owner's T48b recording.
+- Merge train: T72c on T72b (#521), T75 on T72c, T75b on T74 (#528) and T75.
 
 ## Decisions needed from owner
-- **2026-10-02 decisions:** #534 (frozen costs + costs_drift, spec req 14 sentence approved); #542 (abandon refuses while own orders open, #556 merged); Form 25 transfer is not a listing end (#561 merged); EDGAR quarantine stays fail-closed; #578 pre-flight validation after #577 (kite, in progress); #554 retries after #576 (done #575); #526 (freeze execution.fill_price before T71).
-- **Merges:** #521 (T72b) → #528 (T74) → #445 last; #520 (spec Q19–Q24).
-- **T45b (backfill rerun after #577 merges):** `ingest --backfill --since 2016-01-01`, then `health --check`, `hypothesis register`, `backtest h1-momentum-12-1`.
-- **T48b (owner):** paper responses and broker facts; `cli_record paper <SYMBOL>`, flat account. Probe 3 (#182) for T70 timing keys (submit 09:00–09:15 ET, collect after 09:46).
-- **Open questions:** #416, #470, #411/#412, #473 (spin-offs); #281 strategy-lab 2,8,11; event-data spec (#307).
-- **Housekeeping:** `release --force` #258/#182; `team.py prune --yes`; close #33; `gap_signoff` on H1 before T71; GitHub Pro ruleset and compliance (Phase 6).
+- **Merges:** #521 → #528, #520, then #445 last.
+- **Open on #554:** whether a filing header that still fails after every retry counts against the failed-filings allowance (today it fails the run).
+- After the backfill: `health --check`, T45b, then the ingest plist (runbook) for T22's evidence.
+- A market-hours session for Probe 3 (#182) and the T48b recorder (`cli_record paper <SYMBOL>`, flat paper account).
+- Open questions: #470, #411/#412, #473; #281 strategy-lab questions 2, 8 and 11; event-data spec (#307).
+- `release --force` for #258 and #182; `team.py prune --yes`; close #33; `gap_signoff` on H1 before T71.
+- GitHub Pro server-side ruleset decision; account type and compliance check (Phase 6).
