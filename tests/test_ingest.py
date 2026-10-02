@@ -496,7 +496,8 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
 
 def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
     """T11h: failed filings, quarantined accessions and facts missing; #566:
-    empty bulk zip members; #576: empty per-CIK API answers."""
+    empty bulk zip members; #576: empty per-CIK API answers; #599: payloads
+    with `facts` but no `cik`."""
 
     class Failing(FixtureFilingSource):
         failed_filings = 2
@@ -506,12 +507,15 @@ def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings)
         submissions_bulk_empty = 5
         facts_api_empty = 6  # #576
         submissions_api_empty = 7
+        facts_bulk_keyless = 8  # #599
+        facts_api_keyless = 9
 
     message = _run(settings, filings=_filings(cls=Failing), source="edgar").runs[0].message
     counts = (
         "; failed filings: 2; quarantined: 1; facts missing: 4"
         "; empty bulk facts: 3; empty bulk submissions: 5"
-        "; empty API facts: 6; empty API submissions: 7; missing"
+        "; empty API facts: 6; empty API submissions: 7"
+        "; keyless bulk facts: 8; keyless API facts: 9; missing"
     )
     assert counts in message
 

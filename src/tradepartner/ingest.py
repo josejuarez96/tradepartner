@@ -555,6 +555,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("submissions_bulk_empty", "empty bulk submissions"),
         ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
         ("submissions_api_empty", "empty API submissions"),
+        ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`
+        ("facts_api_keyless", "keyless API facts"),
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")
