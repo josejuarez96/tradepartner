@@ -25,13 +25,19 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pytest
 
 from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill, Reject
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.errors import ReconciliationError, RejectionCapError, StaleDataError
+from tradepartner.errors import (
+    ClockError,
+    ReconciliationError,
+    RejectionCapError,
+    StaleDataError,
+)
 from tradepartner.execution import run as run_module
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.run import RunOutcome, invoked_by, tracking_run
@@ -131,13 +137,14 @@ class Env:
         started: datetime = MARK_START,
         frozen: RiskConfig | None = None,
         hypothesis_id: int = 1,
+        starting_equity: float = FAKE_CASH,
     ) -> PaperWindowRow:
         row = PaperWindowRow(
             hypothesis_id=hypothesis_id,
             first_rebalance_session=first,
             account_id="PA1",
             starting_cash=FAKE_CASH,
-            starting_equity=FAKE_CASH,
+            starting_equity=starting_equity,
             code_version="test",
             started_at=started,
             frozen_json=_frozen_json(frozen or RiskConfig()),
@@ -787,6 +794,145 @@ def test_a_secret_in_a_failure_is_masked_in_the_result_row_and_the_alert(
         assert "***" in text
         for form in (secret, secret.upper(), escaped, escaped.upper()):
             assert form not in text
+
+
+def test_a_secret_never_reaches_the_failed_paths_notes(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `run_failed` alert's own write fails with the secret in its error:
+    the note the failed path adds to the propagating exception, and the
+    result row, name only the error's type (#523)."""
+    secret = "Ab\\cDef-9876xyz"
+    env.settings = Settings(
+        _env_file=None, store={"path": env.settings.store.path}, alpaca_paper_api_secret=secret
+    )
+    _marked(env)
+    original = run_module._ChunkAlerter.write
+
+    def failing(self: run_module._ChunkAlerter, kind: str, *args: Any, **kwargs: Any) -> int:
+        if kind == "run_failed":
+            raise RuntimeError(f"smtp said {secret}")
+        return original(self, kind, *args, **kwargs)
+
+    def broken(_context: object) -> None:
+        raise RuntimeError("the step failed")
+
+    monkeypatch.setattr(run_module._ChunkAlerter, "write", failing)
+    monkeypatch.setattr(run_module, "exits_step", broken)
+    with pytest.raises(RuntimeError, match="the step failed") as raised:
+        env.run(_at(TUE))
+    notes = getattr(raised.value, "__notes__", [])
+    assert notes == ["failed path: run_failed alert not written (RuntimeError)"]
+    (result,) = env.query("SELECT status, message FROM paper_run_results")
+    assert result[0] == "failed"
+    escaped = repr(secret)[1:-1]
+    for text in (*notes, result[1]):
+        for form in (secret, secret.upper(), escaped, escaped.upper()):
+            assert form not in text
+
+
+def test_a_locked_alert_that_cannot_be_written_still_exits_non_zero(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `locked` alert's write chunk fails (the lock holder has the store):
+    the second instance raises, so it exits non-zero, and writes nothing (#523)."""
+    _marked(env)
+
+    def store_busy(*_args: object, **_kwargs: object) -> int:
+        raise duckdb.IOException("Could not set lock on file")
+
+    monkeypatch.setattr(run_module._ChunkAlerter, "write", store_busy)
+    with run_lock(env.settings), pytest.raises(duckdb.IOException):
+        env.run(_at(TUE))
+    assert env.count("paper_runs") == 0
+    assert env.alerts() == []
+    assert env.fake.calls == ()
+
+
+# --- the clock between the steps (#523) ------------------------------------------------------
+
+
+def test_a_clock_going_back_inside_step_4_halts_with_a_clock_error(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clock goes back between `_reconcile`'s `as_of` reading and
+    `reconcile_now`'s own reading: the wrapper's checked clock raises
+    `ClockError`, which takes the halt path, before any reconciliation row
+    (#523, safety-reviewer on #519)."""
+    _marked(env)
+    original = run_module.reconcile_now
+
+    def back(*args: Any, **kwargs: Any) -> object:
+        env.clock.now -= timedelta(seconds=1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "reconcile_now", back)
+    with pytest.raises(ClockError) as raised:
+        env.run(_at(TUE))
+    assert "went back" in str(raised.value.__cause__)
+    run_id = env.latest_run()
+    assert env.results()[run_id][:2] == ("halted", "ClockError")
+    assert env.query("SELECT clock_fault FROM paper_run_results WHERE run_id = ?", [run_id]) == [
+        (True,)
+    ]
+    assert env.engaged() == [("fault", "ClockError", run_id, None)]
+    assert env.count("reconciliations") == 0
+    assert env.count("positions_daily") == 0
+
+
+# --- the drawdown check over back-filled marks (#523) -------------------------------------------
+
+
+def test_a_drawdown_breach_on_a_back_filled_session_engages(
+    env: Env, exits_done: list[object]
+) -> None:
+    """No run on Tuesday: Wednesday's run marks Monday and Tuesday. Ledger
+    equity on Monday is below the peak by more than `risk.max_drawdown`, and
+    back above that line on Tuesday. The check covers every session this run
+    marks, so Monday's crossing engages the switch with source `drawdown`
+    (spec req 5; #523, safety-reviewer on #519)."""
+    shares = 1000.0
+    cash = FAKE_CASH
+    closes = dict(
+        env.query(
+            "SELECT session, close FROM prices_daily WHERE security_id = ? AND session IN (?, ?)",
+            [SPY, MON, TUE],
+        )
+    )
+    assert closes[MON] < closes[TUE]
+    line = cash + shares * (closes[MON] + closes[TUE]) / 2  # between the two equities
+    peak = line / (1 - RiskConfig().max_drawdown)
+    window = env.window(started=_at(MON, 22), starting_equity=peak)
+    env.ingest(_at(TUE, 21))
+    env.fake = FakeBroker(
+        clock=env.clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=cash + shares * PRICE,
+        account_id="PA1",
+    )
+    env.clock.now = _at(MON)
+    env.fake.submit(OrderRequest("seed-1", "SPY", Side.BUY, quantity=shares))
+    env.fake.simulate_fill("seed-1")
+    from tradepartner.store.journal import AdjustmentRow
+
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=MON,
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=shares,
+            known_at=_at(MON, 21),
+            ingested_at=_at(MON, 21),
+        )
+    )
+    outcome = env.run(_at(WED))
+    assert sorted({r[0] for r in env.query("SELECT session FROM positions_daily")}) == [MON, TUE]
+    assert outcome.status == "skipped_kill_switch", env.results()
+    assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
+    assert ("drawdown", outcome.run_id, WED) in env.alerts()
+    assert exits_done == []
 
 
 def test_a_late_fill_collected_at_step_3_does_not_halt_step_4(
