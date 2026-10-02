@@ -1602,6 +1602,7 @@ def test_an_empty_bulk_member_falls_back_to_the_api_and_a_404_is_missing(
     records = _shares(source, APPLE)
     assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
     assert (source.facts_bulk_empty, source.facts_missing, source.failed_filings) == (1, 1, 0)
+    assert source.facts_api_empty == 0  # #576: a 404 is not an empty 200
     # nothing from company facts: FSN's share alone, dated min(ddate, acceptance)
     assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
 
@@ -1637,6 +1638,71 @@ def test_a_bulk_member_that_is_not_json_still_raises(tmp_path: Path) -> None:
     member that is not JSON still fails the source."""
     source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"not json"}))
     with pytest.raises(ValueError):
+        _shares(source, APPLE)
+
+
+# --- a per-CIK companyfacts API 200 `{}` (#576) --------------------------------
+
+
+@pytest.mark.parametrize("bulk", [True, False], ids=["bulk-empty-member", "per-cik"])
+def test_an_empty_api_payload_is_missing_like_a_404_and_cached(tmp_path: Path, bulk: bool) -> None:
+    """#576: SEC's API answers 200 `{}` for the CIKs whose zip member is `{}`.
+    That is SEC's "no XBRL facts", handled exactly like a 404: missing,
+    counted, its empty result cached, and the run goes on."""
+    if bulk:
+        source, router = _bulk_facts_source(
+            tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: {}}
+        )
+        expected_bulk_empty = 1
+    else:
+        settings = _settings(tmp_path)
+        router = _facts_router(**{APPLE: {}})
+        source = _source(settings, router)
+        _seed_apple(source)
+        expected_bulk_empty = 0
+    records = _shares(source, APPLE)
+    counts = (source.facts_bulk_empty, source.facts_api_empty, source.facts_missing)
+    assert counts == (expected_bulk_empty, 1, 1)
+    assert source.failed_filings == 0
+    # exactly what a 404 gives: FSN's share alone, dated min(ddate, acceptance)
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+    # cached: a later run on the same cache does not ask the API again
+    again = _source(source._settings, router)
+    assert _shares(again, APPLE) == records
+    assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"entityName": "x", "facts": {}}, {"cik": 320193}],
+    ids=["no-cik", "no-facts"],
+)
+def test_a_non_empty_api_payload_without_cik_or_facts_still_fails(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    """Fail closed (#576): only an empty object is "no facts"; a non-empty
+    payload missing `cik` or `facts` still fails the source."""
+    source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: payload})
+    with pytest.raises(KeyError):
+        _shares(source, APPLE)
+    assert source.facts_api_empty == 0
+
+
+def test_an_api_payload_that_is_not_an_object_still_fails(tmp_path: Path) -> None:
+    """Fail closed (#576): an empty list is not an empty object."""
+    source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: b"[]"})
+    with pytest.raises(TypeError):
+        _shares(source, APPLE)
+    assert source.facts_api_empty == 0
+
+
+def test_an_api_payload_for_another_cik_still_raises(tmp_path: Path) -> None:
+    """#576 leaves the API's CIK check as it was: another CIK's facts raise."""
+    settings = _settings(tmp_path)
+    router = _facts_router(**{APPLE: load("company_facts_dual_class.json")})
+    source = _source(settings, router)
+    _seed_apple(source)
+    with pytest.raises(ValueError, match="served for"):
         _shares(source, APPLE)
 
 
