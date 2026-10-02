@@ -66,7 +66,14 @@ one, else `min(ddate, acceptance date in New York)`, because FSN's `ddate`
 is a rounded month end (owner decision 2026-09-26, #242); a per-document
 record keeps its cover date. Records are de-duplicated across sources on
 (accession, fact name, class member), the winner keeping its own dates; two
-sources disagreeing on a value is a collision (T11h's policy, below). The
+sources disagreeing on a value is a collision (T11h's policy, below). FSN
+holds 4 decimal places, so a value agrees with FSN's when it is within half
+a unit of the 4th place (#610 X1). A company-facts date after acceptance is
+capped at the Eastern acceptance date; when that cap makes it collide with a
+different value the filing reports for that date, the after-acceptance value
+is dropped and counted on `.facts_capped_dropped` (#610 X2, owner
+2026-10-02); with no value dated on or before acceptance it stays a
+collision. The
 store's `facts_as_of` serves one row per (security, fact name, class,
 accession), the latest ingested, so a re-dated share never appears twice.
 A company-facts 404, or a CIK the bulk zip has no file for, is not a filing
@@ -87,27 +94,53 @@ older page) lists nothing: the rows it would stamp stay unstamped this run
 and are never cached as unstampable for it, counted on
 `.submissions_api_empty`. Any other malformed payload still fails the source.
 
-**Failure policy (T11h, owner decision (2)).** A per-document fetch/parse
-that raises `ValueError` (a malformed document, a fact collision) or meets a
-404/410 for the document or header itself is skipped, not raised: `_guarded`
-records it in `failed_filings.json` (keyed by `FAILURES_VERSION`) with a
-count of consecutive Eastern days it has failed identically, advanced only
-by `record_failures()` (the `after_commit` hook `ingest.py`/`backfill.py`
-call after a committed `ok`, non-dry-run EDGAR chunk). An accession failing
-identically `edgar.max_filing_failures` days running is quarantined: no
-further request until its entry is deleted or `FAILURES_VERSION` changes.
-An FSN accession whose rows failed extraction is recorded in its period's
-manifest instead, counted on `.failed_filings`, never quarantined, and
-retried only when `FSN_VERSION` changes. `check_failures()` (called by
-`ingest.py`'s `_prefetch`, before the lock) raises `FilingFailuresError`
-when an uncommitted FSN period's failure share, or the run's per-document
-failure share, clears both `edgar.min_failed_filings` and
-`edgar.max_failed_filing_share`, or when one (error class, base form) pair
-has at least `edgar.min_failed_filings` distinct non-`accepted` accessions
-across `failed_filings.json` and every FSN manifest together. A fact
-collision withholds only the collided (accession, fact name, class member)
-key, recorded under the accession's base form, counting toward the
-cross-day pair rule only, never the per-document share.
+**Failure policy (T11h, owner decision (2); #610).** A per-document
+fetch/parse that raises `ValueError` (a malformed document, a fact
+collision) or meets a 404/410 for the document or header itself is skipped,
+not raised: `_guarded` records it in `failed_filings.json` (keyed by
+`FAILURES_VERSION`) with a count of consecutive Eastern days it has failed
+identically and its message (redacted, capped at `ingest.max_message_chars`;
+#610 P4). The count advances at most once per Eastern day, by
+`record_failures()` (the `after_commit` hook `ingest.py`/`backfill.py` call
+after a committed `ok`, non-dry-run EDGAR chunk) or by
+`record_failed_check()` (which `ingest._prefetch` calls when
+`check_failures()` raised on a non-dry run; #610 policy 2), so failures are
+recorded, quarantined and accepted even when no run can commit. An
+accession failing identically `edgar.max_filing_failures` days running is
+quarantined: no further request until its entry is deleted or
+`FAILURES_VERSION` changes. An FSN accession whose rows failed extraction is
+recorded, with its message, in its period's manifest instead
+(`fsn/v{FSN_VERSION}/manifests/<period>.json`, `accessions_failed`), counted
+on `.failed_filings`, never quarantined, and retried only when
+`FSN_VERSION` changes.
+
+`check_failures()` (called by `ingest.py`'s `_prefetch`, before the lock)
+raises `FilingFailuresError` when (1) the uncommitted FSN periods' failure
+share, or (2) the run's per-document failure share, clears both
+`edgar.min_failed_filings` and `edgar.max_failed_filing_share`, or (3) one
+(error class, base form) pair has at least `edgar.min_failed_filings`
+distinct non-`accepted` accessions across `failed_filings.json` and this
+run's failures. The per-document denominator is every per-document
+accession the run fetched or read from its per-document cache (#610 policy
+1; quarantined accessions excluded). FSN failures are judged by rule (1)
+only, never pooled into rule (3) (#610 policy 3). A fact collision withholds
+only the collided (accession, fact name, class member) key, recorded under
+the accession's base form, counting toward rule (3) only, never rule (2).
+
+**Accepting a failure (the owner, by hand).** Set `"accepted": true` on its
+entry and leave every other field as it is:
+
+- a per-document failure: the accession's entry under `"entries"` in
+  `edgar.cache_dir/failed_filings.json`. `accepted` holds only while the
+  accession keeps failing with the same `error_class` and `message_hash`; a
+  different failure resets it to `false` and is judged again. An accepted
+  entry leaves rules (2) and (3); it still counts toward quarantine.
+- an FSN failure: the accession's object in `accessions_failed` of its
+  period's manifest. It leaves rule (1); it is re-judged only when
+  `FSN_VERSION` changes (the period is re-extracted).
+
+The file must stay valid JSON: one that does not load fails the run loudly,
+never silently lifting an acceptance (#275).
 """
 
 from __future__ import annotations
@@ -126,6 +159,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
@@ -159,7 +193,7 @@ from tradepartner.adapters.filings import (
     FilingIndexEntry,
     FilingSource,
 )
-from tradepartner.config import Settings
+from tradepartner.config import Settings, secret_values
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Bumped when a parser change must re-stamp every cached accession.
@@ -191,6 +225,15 @@ _REGISTRATION_FORMS = frozenset({"S-1", "F-1", "10-12B"})
 _FSN_SHARES_TAG = "EntityCommonStockSharesOutstanding"
 _FSN_LISTING_TAGS = ("Security12bTitle", "TradingSymbol", "SecurityExchangeName")
 _FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
+#: FSN's `num.tsv` `value` column is DECIMAL(28,4) (SEC's FSN data-set
+#: readme): a share count FSN holds agrees with another source's value when
+#: that value is within half a unit of the 4th decimal place (#610 X1). A
+#: property of the data format, not a tunable threshold.
+_FSN_DECIMALS = 4
+_FSN_HALF_UNIT = Decimal(1).scaleb(-_FSN_DECIMALS) / 2
+#: Control characters replaced in a stored failure message (as `ingest`'s
+#: run messages): the text comes from a server or a filing.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
@@ -319,6 +362,10 @@ class EdgarFilingSource(FilingSource):
         # the CIK it was requested under, not treated as absent.
         self.facts_bulk_keyless = 0
         self.facts_api_keyless = 0
+        # #610 X2: (accession, fact name, capped date) keys where a company
+        # value dated after acceptance was dropped because capping its date
+        # made it collide with the value the filing reports for that date.
+        self.facts_capped_dropped: set[tuple[str, str, date]] = set()
         # accession -> (error_class, base_form, message), skipped this run,
         # never yet written to failed_filings.json (that is `record_failures`'s
         # job, after an `ok` commit).
@@ -330,8 +377,9 @@ class EdgarFilingSource(FilingSource):
         # Accessions whose guarded fetch succeeded this run: their stale
         # failed_filings.json entries are pruned by `record_failures()`.
         self._succeeded_this_run: set[str] = set()
-        # Per-document accessions actually fetched this run (cache hits and
-        # quarantined accessions excluded): `check_failures`'s denominator.
+        # Per-document accessions this run fetched or read from their
+        # per-document cache (#610 policy 1: cache hits count; quarantined
+        # accessions do not): `check_failures`'s per-document denominator.
         self._per_document_attempted: set[str] = set()
         self._failed_filings_cache: dict[str, dict[str, Any]] | None = None
         # FSN accessions newly recorded as failed by this run's own
@@ -738,6 +786,8 @@ class EdgarFilingSource(FilingSource):
                 "accession": f.accession,
                 "error_class": f.error_class,
                 "base_form": form_by_accession.get(f.accession, "").removesuffix("/A"),
+                # P4 (#610): the message, so a failed run is diagnosed from disk
+                "message": self._stored_message(f.error),
                 "accepted": False,
             }
             for f in parsed.failures
@@ -884,6 +934,7 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_cover_cache(accession)
             if cached is not None:
+                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
                 if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
                     yield record, cached
                 continue
@@ -987,6 +1038,7 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_header_cache(cik, accession)
             if cached is not None:
+                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
                 headers.append(
                     FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
                 )
@@ -1138,6 +1190,7 @@ class EdgarFilingSource(FilingSource):
             cik, record, accepted_at = stamped[0]
             cached = self._load_delisting_cache(accession)
             if cached is not None:
+                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
                 results.append(
                     DelistingFiling(
                         cik=cached.cik,
@@ -1321,8 +1374,8 @@ class EdgarFilingSource(FilingSource):
     def record_failures(self) -> None:
         """The `after_commit` hook (T11h): advances `failed_filings.json`'s
         consecutive-counted-day counts for this run's per-document failures
-        (`_pending_failures`), and marks every still-uncommitted FSN
-        manifest `committed: true`.
+        (`_pending_failures`, messages included), and marks every
+        still-uncommitted FSN manifest `committed: true`.
 
         Counts advance at most once per Eastern calendar day, the day read
         from the clock now (commit time). A second writer the same day is
@@ -1331,16 +1384,7 @@ class EdgarFilingSource(FilingSource):
         count to 1 instead of incrementing it; `accepted` (set by hand) is
         preserved across an advance.
         """
-        today = self._now().astimezone(_EASTERN).date().isoformat()
-        with self._failed_filings_lock():
-            # Re-read under the lock, never the copy loaded at the fetch pass:
-            # an owner's hand edit (or another writer) since then is kept (#275).
-            store = dict(self._load_failed_filings())
-            for accession in self._succeeded_this_run - self._pending_failures.keys():
-                store.pop(accession, None)  # it parses now: the old failure is resolved
-            self._merge_pending_failures(store, today)
-            self._save_failed_filings(store)
-        self._failed_filings_cache = store
+        self._write_failure_store()
         for period in self._cached_fsn_periods():
             manifest = self._load_fsn_manifest(period)
             if manifest is not None and not manifest.get("committed", False):
@@ -1351,6 +1395,52 @@ class EdgarFilingSource(FilingSource):
         self._collision_failures.clear()
         self._per_document_attempted.clear()
         self._succeeded_this_run.clear()
+
+    def record_failed_check(self) -> None:
+        """Called by `ingest._prefetch` when `check_failures()` raised, on a
+        non-dry run (#610 policy 2): writes this run's failures to
+        `failed_filings.json` by the same counted-day rule as
+        `record_failures()` (messages included, P4), so they can be
+        quarantined and `accepted` although the run never commits. FSN
+        manifests stay uncommitted (they keep being judged), and the
+        in-memory state is kept: the run is not recorded as a success."""
+        if self._pending_failures or self._succeeded_this_run:
+            self._write_failure_store()
+
+    def _write_failure_store(self) -> None:
+        """Merge this run's failures into `failed_filings.json` under the
+        lock, pruning accessions that parse now; counts advance at most once
+        per Eastern day read from the clock now."""
+        today = self._now().astimezone(_EASTERN).date().isoformat()
+        with self._failed_filings_lock():
+            # Re-read under the lock, never the copy loaded at the fetch pass:
+            # an owner's hand edit (or another writer) since then is kept (#275).
+            store = dict(self._load_failed_filings())
+            for accession in self._succeeded_this_run - self._pending_failures.keys():
+                store.pop(accession, None)  # it parses now: the old failure is resolved
+            self._merge_pending_failures(store, today)
+            self._save_failed_filings(store)
+        self._failed_filings_cache = store
+
+    def _stored_message(self, message: str) -> str:
+        """A failure message as written to disk (P4, #610): every configured
+        secret redacted, control characters replaced, cut to
+        `ingest.max_message_chars` (it is server- or filing-supplied text)."""
+        for value in secret_values(self._settings):
+            message = message.replace(value, "[redacted]")
+        return _CONTROL.sub(" ", message)[: self._settings.ingest.max_message_chars]
+
+    def _accepted(self, accession: str, error_class: str, message: str) -> bool:
+        """Whether this run's failure of `accession` is `accepted`: only when
+        its stored entry is accepted for this same error class and message
+        hash (fail closed: a different failure is judged again)."""
+        entry = self._failure_store().get(accession)
+        return (
+            entry is not None
+            and bool(entry.get("accepted", False))
+            and entry.get("error_class") == error_class
+            and entry.get("message_hash") == _message_hash(message)
+        )
 
     @contextlib.contextmanager
     def _failed_filings_lock(self) -> Iterator[None]:
@@ -1367,7 +1457,7 @@ class EdgarFilingSource(FilingSource):
     def _merge_pending_failures(self, store: dict[str, dict[str, Any]], today: str) -> None:
         """This run's failures into `store`, by the counted-day rule."""
         for accession, (error_class, base_form, message) in self._pending_failures.items():
-            message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            message_hash = _message_hash(message)
             entry = store.get(accession)
             if entry is not None and entry.get("last_counted_day") == today:
                 continue  # already advanced today
@@ -1380,6 +1470,7 @@ class EdgarFilingSource(FilingSource):
                 "error_class": error_class,
                 "base_form": base_form,
                 "message_hash": message_hash,
+                "message": self._stored_message(message),  # P4 (#610)
                 "count": (entry["count"] + 1) if same and entry is not None else 1,
                 "last_counted_day": today,
                 # `accepted` was given for one error: a different one is reviewed again.
@@ -1396,7 +1487,11 @@ class EdgarFilingSource(FilingSource):
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
         if reasons:
-            raise FilingFailuresError("; ".join(reasons))
+            raise FilingFailuresError(
+                "; ".join(reasons)
+                + f"; failure messages in {self._failed_filings_path()} (not on a dry run)"
+                + f" and the FSN manifests under {self._fsn_root() / 'manifests'}"
+            )
 
     def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
         min_n = self._settings.edgar.min_failed_filings
@@ -1427,15 +1522,16 @@ class EdgarFilingSource(FilingSource):
             reasons.append(reason)
 
     def _check_per_document_group(self, reasons: list[str]) -> None:
-        """Per-document's denominator is the accessions attempted this run
-        (cache hits and quarantined accessions excluded); a `facts()`
-        collision counts toward `_check_cross_day_pairs` only, never here."""
-        store = self._failure_store()
+        """Per-document's denominator is the accessions fetched or read from
+        the per-document cache this run (#610 policy 1; quarantined
+        accessions excluded); a `facts()` collision counts toward
+        `_check_cross_day_pairs` only, never here. A failure is excused only
+        by an entry accepted for its same error class and message."""
         failures = sum(
             1
-            for accession in self._pending_failures
+            for accession, (error_class, _form, message) in self._pending_failures.items()
             if accession not in self._collision_failures
-            and not store.get(accession, {}).get("accepted", False)
+            and not self._accepted(accession, error_class, message)
         )
         denominator = len(self._per_document_attempted)
         reason = self._threshold_reason("per-document", failures, denominator)
@@ -1445,23 +1541,19 @@ class EdgarFilingSource(FilingSource):
     def _check_cross_day_pairs(self, reasons: list[str]) -> None:
         """One (error class, base form) pair with at least
         `edgar.min_failed_filings` distinct accessions, `accepted: true`
-        entries excluded, across `failed_filings.json`, this run's not-yet-
-        recorded failures and every FSN manifest's `accessions_failed`."""
+        entries excluded, across `failed_filings.json` and this run's
+        not-yet-recorded failures. FSN manifest failures are not pooled here
+        (#610 policy 3): `_check_fsn_group`'s share rule alone judges them."""
         pairs: dict[tuple[str, str], set[str]] = defaultdict(set)
         store = self._failure_store()
         for accession, entry in store.items():
+            if accession in self._pending_failures:
+                continue  # judged below, by this run's own error
             if not entry.get("accepted", False):
                 pairs[(entry["error_class"], entry["base_form"])].add(accession)
-        for accession, (error_class, base_form, _message) in self._pending_failures.items():
-            if not store.get(accession, {}).get("accepted", False):
+        for accession, (error_class, base_form, message) in self._pending_failures.items():
+            if not self._accepted(accession, error_class, message):
                 pairs[(error_class, base_form)].add(accession)
-        for period in self._cached_fsn_periods():
-            manifest = self._load_fsn_manifest(period)
-            if manifest is None:
-                continue
-            for failure in manifest.get("accessions_failed", []):
-                if not failure.get("accepted", False):
-                    pairs[(failure["error_class"], failure["base_form"])].add(failure["accession"])
         min_n = self._settings.edgar.min_failed_filings
         for (error_class, base_form), accessions in pairs.items():
             if len(accessions) >= min_n:
@@ -1488,8 +1580,9 @@ class EdgarFilingSource(FilingSource):
         **De-duplication across sources** on (accession, fact name, class
         member): a per-document parse wins over company facts, which win over
         FSN; every source's records keep their own `as_of_date` keys within
-        the winner; the same key with different values in two sources is a
-        collision (T11h): only that (accession, fact name, class member) key
+        the winner; the same key with different values in two sources (FSN
+        compared at its 4 decimal places, #610 X1) is a collision (T11h):
+        only that (accession, fact name, class member) key
         is withheld, recorded under the accession's base form, and it counts
         toward `check_failures`'s cross-day (error class, base form) rule
         only; the accession's other facts are still served.
@@ -1546,11 +1639,17 @@ class EdgarFilingSource(FilingSource):
                 for a, b in itertools.combinations(sorted(dated), 2):
                     common = dated[a].keys() & dated[b].keys()
                     if common:  # comparable dates must agree, value for value
-                        clash = [d for d in common if dated[a][d] != dated[b][d]]
+                        clash = [
+                            d for d in common if not _same_value(a, dated[a][d], b, dated[b][d])
+                        ]
                         if clash:
                             days = ", ".join(d.isoformat() for d in sorted(clash))
                             raise ValueError(f"{label} differs between {a} and {b} on {days}")
-                    elif set(dated[a].values()).isdisjoint(dated[b].values()):
+                    elif not any(
+                        _same_value(a, x, b, y)
+                        for x in dated[a].values()
+                        for y in dated[b].values()
+                    ):
                         raise ValueError(f"{label} differs between {a} and {b}: no value in common")
             except ValueError as error:
                 # T11h: a collision withholds only this key, never the whole
@@ -1615,7 +1714,8 @@ class EdgarFilingSource(FilingSource):
                 data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
                 edgar_raw.write_atomic(path, json.dumps(data).encode("utf-8"))
         fsn_cache = self._load_fsn_cache(cik)
-        out: dict[str, list[_CachedFact]] = {}
+        # (accession, name, capped date) -> [(value, dated after acceptance)]
+        kept: dict[tuple[str, str, date], list[tuple[float, bool]]] = {}
         for name, accession, as_of, value in cached:
             record = stamps.get(accession)
             if record is None or record.accepted_at is None or name not in wanted:
@@ -1627,7 +1727,18 @@ class EdgarFilingSource(FilingSource):
                 continue  # the per-document parse names another entity
             eastern = record.accepted_at.astimezone(_EASTERN).date()
             capped = min(as_of, eastern)  # an XBRL date typo never dates a fact after its stamp
-            out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
+            kept.setdefault((accession, name, capped), []).append((value, as_of > eastern))
+        out: dict[str, list[_CachedFact]] = {}
+        for (accession, name, capped), values in kept.items():
+            reported = {value for value, after in values if not after}
+            if reported and any(after and v not in reported for v, after in values):
+                # #610 X2 (owner, 2026-10-02): capping made a value dated after
+                # acceptance collide with one the filing reports on that date;
+                # drop the later-dated one, keep what the filing reports.
+                self.facts_capped_dropped.add((accession, name, capped))
+                values = [(v, after) for v, after in values if not after or v in reported]
+            for value, _after in values:
+                out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
     def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool]:
@@ -1705,6 +1816,21 @@ class EdgarFilingSource(FilingSource):
             self.facts_missing += 1
             return None, True  # no XBRL facts at all: an empty result is cached
         return payload, _holds_accession(payload, cik, latest)
+
+
+def _message_hash(message: str) -> str:
+    """The `failed_filings.json` key `accepted` is bound to (with the error
+    class): the SHA-256 of the raw, unredacted message."""
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+def _same_value(a_source: str, a: float, b_source: str, b: float) -> bool:
+    """Two sources' values for one key and date agree: exactly, or, when one
+    side is FSN, within half a unit of FSN's 4th decimal place (#610 X1:
+    105.1597 from FSN agrees with company facts' 105.159666)."""
+    if "fsn" not in (a_source, b_source):
+        return a == b
+    return abs(Decimal(repr(a)) - Decimal(repr(b))) <= _FSN_HALF_UNIT
 
 
 def _empty_object(payload: Any) -> bool:
