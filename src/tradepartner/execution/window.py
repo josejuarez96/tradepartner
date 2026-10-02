@@ -120,7 +120,8 @@ reason is the trimmed text.
   of the window has no terminal event in the journal (the read `stop`'s
   `not_ready` makes, so an order the broker filled but the journal has not
   collected still refuses); it never cancels one (#542: the owner cancels or
-  waits, then abandons). Both refusals come before any broker call or write,
+  waits, runs `paper resume` so the journal collects the order, then
+  abandons). Every refusal comes before any broker call or write,
   and the run lock it holds keeps any run from placing an order meanwhile.
   It runs a final `reconcile_now`, keeping its row whatever
   its status (a mismatch is the expected case and engages nothing: the
@@ -1053,8 +1054,8 @@ def abandon(
         if still_open:
             raise WindowCommandRefused(
                 OPEN_ORDERS,
-                "cancel or wait for the window's own open orders, then abandon: "
-                + "; ".join(still_open),
+                "cancel or wait for the window's own open orders, run paper resume so "
+                "the journal collects them, then abandon: " + "; ".join(still_open),
             )
         frozen = frozen_risk(window)
         now = _command_clock(clock)
