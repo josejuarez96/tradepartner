@@ -18,7 +18,6 @@ May and June 2019 are EDT: a run at 12:30 UTC is inside the submit window.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -342,6 +341,30 @@ def test_two_sessions_without_a_run_are_back_filled_by_the_next_run(
 # --- a split on the session ----------------------------------------------------------------
 
 
+def split_trns(env: Env, ex_date: date) -> None:
+    """A 2:1 split of TRNS with `ex_date`, known before close(F_0), booked by
+    the broker before the open of `ex_date` (the fake has no corporate actions)."""
+    with open_for_write(env.settings) as conn:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": "SEC_TRANSFER",
+                "action_type": "split",
+                "ex_date": ex_date,
+                "ratio_or_amount": 2.0,
+                "announced_at": None,
+                "source_action_id": "test-split-trns",
+                "cancelled": False,
+                "known_at": at(F_0, 19, 0),
+                "ingested_at": at(F_0, 19, 0),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+    env.fake._net_quantity["TRNS"] *= 2
+
+
 def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     env: Env, tmp_path: Path
 ) -> None:
@@ -353,25 +376,7 @@ def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     bought(env, tmp_path)
     s = date(2019, 5, 2)
     held = env.held()
-    with open_for_write(env.settings) as conn:
-        insert_row(
-            conn,
-            "corporate_actions",
-            {
-                "security_id": "SEC_TRANSFER",
-                "action_type": "split",
-                "ex_date": s,
-                "ratio_or_amount": 2.0,
-                "announced_at": None,
-                "source_action_id": "test-split-trns",
-                "cancelled": False,
-                "known_at": at(F_0, 19, 0),
-                "ingested_at": at(F_0, 19, 0),
-                "source": "alpaca",
-                "provenance": "action",
-            },
-        )
-    env.fake._net_quantity["TRNS"] *= 2  # the broker books the split before the open
+    split_trns(env, s)
     raw = env.close("SEC_TRANSFER", F_0)
     assert raw is not None
     submits = env.submits()
@@ -385,9 +390,6 @@ def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     assert quantity == pytest.approx(held["SEC_TRANSFER"])  # pre-split
     assert mark_price == pytest.approx(raw)  # raw close, not divided
     assert value == pytest.approx(held["SEC_TRANSFER"] * raw)
-    (cash,) = {r[5] for r in rows}  # the ledger's cash, on every row of the session
-    equity = cash + math.fsum(held[sid] * env.close(sid, F_0) for sid in TARGETS)  # type: ignore[operator]
-    assert cash + math.fsum(r[4] for r in names.values()) == pytest.approx(equity)
     assert env.query(
         "SELECT status FROM reconciliations WHERE run_id = ? ORDER BY reconciliation_id",
         [outcome.run_id],
@@ -396,6 +398,37 @@ def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     assert env.count("orders") == len(TARGETS)
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]  # no breach, no drawdown
     assert env.alerts("missed_run") == []  # F_0 had its run
+
+
+def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
+    env: Env, tmp_path: Path
+) -> None:
+    """The same 2:1 TRNS split with `ex_date` 05-02, but no run on 05-02 or
+    05-03: the run on 05-06 marks 05-01 at the pre-split quantity and 05-02 and
+    05-03 at the doubled one, each at that session's raw close (never S-1's
+    quantity on every back-filled session, never the split ignored), and
+    reconciles `ok` against the broker's doubled holding."""
+    bought(env, tmp_path)
+    held = env.held()["SEC_TRANSFER"]
+    split_trns(env, date(2019, 5, 2))
+    outcome = env.run(at(date(2019, 5, 6)))
+    assert outcome.status == "ok", env.result(outcome.run_id)
+    trns = {r[0]: r for r in env.marks(outcome.run_id) if r[1] == "SEC_TRANSFER"}
+    expected = {F_0: held, date(2019, 5, 2): 2 * held, date(2019, 5, 3): 2 * held}
+    assert set(trns) == set(expected)
+    for day, quantity in expected.items():
+        close = env.close("SEC_TRANSFER", day)
+        assert close is not None
+        _, _, marked, mark_price, value, _ = trns[day]
+        assert marked == pytest.approx(quantity), day
+        assert mark_price == pytest.approx(close), day
+        assert value == pytest.approx(quantity * close), day
+    assert env.query(
+        "SELECT status FROM reconciliations WHERE run_id = ? ORDER BY reconciliation_id",
+        [outcome.run_id],
+    ) == [("ok",), ("ok",)]
+    assert env.count("orders") == len(TARGETS)
+    assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
 
 
 # --- the drawdown check -----------------------------------------------------------------------

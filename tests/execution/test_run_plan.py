@@ -384,7 +384,7 @@ def test_an_assets_read_raising_inside_the_planning_step_halts_with_every_halt_r
         env.run(at(F_0))
     run_id = env.latest_run()
     assert env.kind(run_id) == "rebalance"
-    assert len(calls) == 1 and calls[0]  # one read, for the targets
+    assert [sorted(c) for c in calls] == [sorted(SYMBOLS[sid] for sid in TARGETS)]  # the targets
     assert env.engaged() == [("fault", "ConnectionError", run_id)]
     assert env.result(run_id)[:2] == ("halted", "ConnectionError")
     assert "halted" in env.alerts(run_id)
