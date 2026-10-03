@@ -969,8 +969,16 @@ class RiskGatedBroker:
         self, run: PaperRunRow, book: _Book, rows: Sequence[DecisionRow], side: str
     ) -> dict[str, Asset]:
         """The clock pre-check, the refusal of a name with no listing at
-        close(S-1) (before any broker call), then the phase's `assets` read
-        for its open decisions, keyed by `security_id`."""
+        close(S-1) (before any broker call), the reused-ticker check (#568
+        item 2), then the phase's `assets` read for its open decisions,
+        keyed by `security_id`.
+
+        The reused-ticker check runs here, not in `_listings`/`_read_book`:
+        it is scoped to this phase's own attempt scope (only names this
+        phase actually resolves against the broker), so a batch the kill
+        switch skips, or a second run whose exit sell is already accepted
+        and has no attempt left this phase, never halts over a reuse that
+        would never reach the broker anyway."""
         assert run.session is not None
         self.clock_precheck(run.session, book.last_ok_ingest)
         names = sorted(
@@ -979,6 +987,12 @@ class RiskGatedBroker:
         unknown = [sid for sid in names if not book.tickers.get(sid)]
         if unknown:
             raise ValueError(f"no listing known at close(S-1) for {unknown}")
+        delisted = frozenset(sid for sid in names if sid in book.ended)
+        if delisted:
+            cut = session_close(previous_session(run.session))
+            with self._journal() as conn:
+                current = current_listings(listings_as_of(conn, cut, sorted(delisted)), run.session)
+                _refuse_reused_tickers(conn, cut, run.session, current, delisted)
         symbols = {sid: canonical_symbol(str(book.tickers[sid])) for sid in names}
         answer = self._broker.assets(sorted(symbols.values()))
         missing = sorted(sym for sym in symbols.values() if sym not in answer)
@@ -1357,10 +1371,14 @@ def _listings(
     A delisted name's own ticker must not also be a *later* issuer's current
     ticker as of close(S-1): that reuse would otherwise let the `assets`
     read resolve against the new issuer, not the delisted one this read
-    means (#568 item 2). Checked only for a name whose own listing ended
-    (a live name's ticker needs no such check), against the whole universe
-    rather than just `names` (the reusing issuer need not be one of them),
-    and failed closed before any broker call."""
+    means (#568 item 2). That check does not run here: `_listings` backs
+    `_read_book`, which every batch reads before the kill-switch check and
+    before `attempt_scope` decides whether a phase sends anything, so
+    raising here would halt a batch the kill switch would otherwise skip,
+    or a second run whose exit sell was already accepted and needs no
+    further attempt. `_phase_assets` runs the check instead, scoped to the
+    names its own phase's attempt scope actually resolves, right before the
+    broker `assets` call."""
     if not names:
         return {}, frozenset()
     cut = session_close(previous_session(session))
@@ -1370,7 +1388,6 @@ def _listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
     delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
-    _refuse_reused_tickers(conn, cut, session, current, delisted)
     return tickers, delisted
 
 
