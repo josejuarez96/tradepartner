@@ -3,6 +3,7 @@ read that feeds the operations page and `paper status` (T67)."""
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import textwrap
@@ -738,3 +739,218 @@ def test_page_data_runs_within_half_the_lock_retry_seconds(
     assert len(data.alerts) == 201  # the seeded one plus the 200 bulk ones
     assert data.alerts_capped is False  # well under the default page_row_limit (500)
     assert elapsed < fast.store.lock_retry_seconds / 2
+
+
+# --- bounded reads (#435) ---------------------------------------------------------
+
+
+class _Result:
+    """A DuckDB result that records how many rows each fetch hands back."""
+
+    def __init__(self, result: duckdb.DuckDBPyConnection, sql: str, reads: list[tuple[str, int]]):
+        self._result, self._sql, self._reads = result, sql, reads
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        rows = self._result.fetchall()
+        self._reads.append((self._sql, len(rows)))
+        return rows
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        row = self._result.fetchone()
+        self._reads.append((self._sql, 0 if row is None else 1))
+        return row
+
+
+class _CountingConnection:
+    """`page_data`'s connection with every fetched row counted per query."""
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
+        self._conn = conn
+        self.reads: list[tuple[str, int]] = []
+
+    def execute(self, sql: str, params: object = None) -> _Result:
+        result = self._conn.execute(sql) if params is None else self._conn.execute(sql, params)
+        return _Result(result, sql, self.reads)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+def _bulk_orders(
+    journal_settings: Settings,
+    seeded: dict[str, int],
+    count: int,
+    start: int = 30,
+    prefix: str = "bulk",
+) -> None:
+    """`count` terminal orders newer than `seeded`'s, each with two events, a
+    fill and an outcome, all stamped at the order's own minute."""
+    with open_for_write(journal_settings) as conn:
+        for i in range(count):
+            minutes = start + i
+            coid = f"tp-{prefix}-{i:03d}"
+            append(
+                conn,
+                OrderRow(
+                    client_order_id=coid,
+                    decision_id=seeded["decision_buy_id"],
+                    run_id=seeded["run_id"],
+                    session=_S_MINUS_1,
+                    attempt=1,
+                    phase="buy",
+                    security_id="BBB",
+                    symbol="BBB",
+                    side="buy",
+                    quantity=1.0,
+                    sells_in_flight_at_submit=False,
+                    **_stamp(minutes),
+                ),
+            )
+            for status in ("accepted", "filled"):
+                append(conn, OrderEventRow(client_order_id=coid, status=status, **_stamp(minutes)))
+            append(
+                conn,
+                FillRow(
+                    client_order_id=coid,
+                    filled_at=_at(minutes),
+                    quantity=1.0,
+                    price=20.0,
+                    price_implied=True,
+                    broker_fill_id=f"brk-{prefix}-{i}",
+                    source="broker_status",
+                    **_stamp(minutes),
+                ),
+            )
+            append(
+                conn,
+                OutcomeRow(
+                    client_order_id=coid,
+                    through_session=_S_MINUS_1,
+                    kind="realised_pnl",
+                    value=1.0,
+                    **_stamp(minutes),
+                ),
+            )
+
+
+def _limited(journal_settings: Settings, limit: int) -> Settings:
+    return Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        dashboard={"page_row_limit": limit},
+    )
+
+
+def _chain_reads(settings: Settings) -> tuple[ops.OpsData, list[tuple[str, int]]]:
+    """`page_data` on a counting connection, and the rows each query over the
+    order-chain tables handed back."""
+    with open_read_only(settings) as conn:
+        counting = _CountingConnection(conn)
+        data = ops.page_data(counting, settings)  # type: ignore[arg-type]
+    reads = [
+        (sql, rows)
+        for sql, rows in counting.reads
+        if re.search(r"\bFROM\s+(orders|order_events|outcomes|fills)\b", sql)
+    ]
+    return data, reads
+
+
+def test_the_chain_and_fills_reads_are_bounded_in_sql(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """A window with many more orders, events, fills and outcomes than the
+    limit, counted on the connection itself, not on the page's output: no
+    query over those tables hands back more than the kept orders' rows (each
+    bulk order has two events, so `2 * limit`), and doubling the window
+    changes no query's count."""
+    _bulk_orders(journal_settings, seeded, 40)
+    limited = _limited(journal_settings, 3)
+    data, reads = _chain_reads(limited)
+
+    assert reads
+    assert max(rows for _, rows in reads) <= 2 * 3, reads
+    assert data.chains_capped is True
+    assert data.fills_capped is True
+    assert [c.client_order_id for c in data.chains] == ["tp-bulk-039"]
+    assert [f.fill.broker_fill_id for f in data.fills] == [f"brk-bulk-{i}" for i in (39, 38, 37)]
+
+    _bulk_orders(journal_settings, seeded, 40, start=200, prefix="more")  # newer still
+    doubled, doubled_reads = _chain_reads(limited)
+    assert [rows for _, rows in doubled_reads] == [rows for _, rows in reads]
+    assert doubled.chains_capped is True
+
+
+def test_the_chain_views_fills_come_only_from_the_kept_orders(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    seeded: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every `fills_for` call is bounded: by `limit` (the fills table) or by the
+    orders the chain view can keep (never the whole window)."""
+    _bulk_orders(journal_settings, seeded, 10)
+    limited = _limited(journal_settings, 4)
+    calls: list[dict[str, object]] = []
+    real = ops.journal.fills_for
+
+    def spy(conn: duckdb.DuckDBPyConnection, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return real(conn, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ops.journal, "fills_for", spy)
+    with open_read_only(limited) as conn:
+        data = ops.page_data(conn, limited)
+
+    assert all(c.get("limit") is not None or c.get("client_order_ids") is not None for c in calls)
+    (chain_call,) = [c for c in calls if c.get("client_order_ids") is not None]
+    assert sorted(chain_call["client_order_ids"]) == [  # type: ignore[call-overload]
+        f"tp-bulk-{i:03d}" for i in range(6, 10)
+    ]
+    kept = {c.client_order_id for c in data.chains}
+    assert kept <= set(chain_call["client_order_ids"])  # type: ignore[call-overload]
+    fill_steps = [s for c in data.chains for s in c.steps if s.kind == "fill"]
+    assert fill_steps and all("brk-bulk-" in s.detail for s in fill_steps)
+
+
+def test_as_of_covers_a_late_event_on_an_order_past_the_cap(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """The oldest order drops out of a capped chain view, but its late event
+    is still the newest row of the window, so "as of" still shows it."""
+    _bulk_orders(journal_settings, seeded, 3)
+    with open_for_write(journal_settings) as conn:
+        append(conn, OrderEventRow(client_order_id="tp-sell-1", status="cancel_noop", **_stamp(90)))
+    limited = _limited(journal_settings, 1)
+    with open_read_only(limited) as conn:
+        data = ops.page_data(conn, limited)
+    assert [c.client_order_id for c in data.chains] == ["tp-bulk-002"]
+    assert data.as_of == _at(90)
+
+
+def test_under_the_limit_the_bounded_reads_show_every_row(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """Under the cap, the chain view, the fills table and "as of" are what an
+    unbounded read of the whole window gives."""
+    _bulk_orders(journal_settings, seeded, 5)
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+        orders = ops.journal.orders_for(conn, window_id=window_id)
+        events = ops.journal.order_events_for(conn, window_id=window_id)
+        fills = ops.journal.fills_for(conn, window_id=window_id)
+        outcomes = ops.journal.outcomes_for(conn, window_id)
+    expected_chains, capped = ops._build_chains(orders, events, fills, outcomes, limit=500)
+    assert capped is False and data.chains_capped is False
+    assert data.chains == expected_chains
+    assert [f.fill.fill_id for f in data.fills] == sorted(
+        (f.fill.fill_id for f in fills), reverse=True
+    )
+    assert data.as_of == max(
+        [o.known_at for o in orders]
+        + [e.known_at for e in events]
+        + [f.fill.known_at for f in fills]
+        + [o.known_at for o in outcomes]
+        + [_at(12)]  # the seeded alert
+    )

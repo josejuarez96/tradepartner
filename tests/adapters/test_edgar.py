@@ -487,16 +487,160 @@ class TestCoverPageFailClosed:
         parsed = _cover(_ixbrl(_context("s1", instant=True), facts))
         assert [f.value for f in parsed.facts] == [5000]
 
-    @pytest.mark.parametrize("missing", ["Security12bTitle", "SecurityExchangeName"])
-    def test_symbol_without_title_or_exchange_raises(self, missing: str) -> None:
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            ("SecurityExchangeName",),  # #609 C1: NOBH, an OTC name (0001193125-26-391553)
+            ("Security12bTitle",),  # #609 C1: BB (0001070235-26-000115)
+            ("Security12bTitle", "SecurityExchangeName"),  # #609 C1: TMGI (0001683168-26-007174)
+        ],
+    )
+    def test_symbol_without_title_or_exchange_is_skipped_and_counted(
+        self, missing: tuple[str, ...]
+    ) -> None:
+        """Owner decision #224, as the FSN path: an incomplete listing is
+        dropped and counted, and the filing keeps its shares and complete
+        listings (it used to fail the whole accession, #609 C1)."""
         facts = {
-            "Security12bTitle": _nn("Security12bTitle", "c2", "Common Stock"),
-            "TradingSymbol": _nn("TradingSymbol", "c2", "SO"),
-            "SecurityExchangeName": _nn("SecurityExchangeName", "c2", "NYSE"),
+            "Security12bTitle": _nn("Security12bTitle", "c1", "Common Stock"),
+            "TradingSymbol": _nn("TradingSymbol", "c1", "NOBH"),
+            "SecurityExchangeName": _nn("SecurityExchangeName", "c1", "NYSE"),
         }
-        del facts[missing]
-        with pytest.raises(ValueError, match="lacks a title or exchange"):
-            _cover(_ixbrl(_context("c2", _CLASS), "".join(facts.values())))
+        for name in missing:
+            del facts[name]
+        complete = (
+            _nn("Security12bTitle", "c2", "Warrants")
+            + _nn("TradingSymbol", "c2", "NOBHW")
+            + _nn("SecurityExchangeName", "c2", "NYSE")
+        )
+        document = _ixbrl(
+            _context("c1") + _context("c2", _CLASS) + _context("s1", instant=True),
+            "".join(facts.values()) + complete + _shares("s1", "1000"),
+        )
+        parsed = _cover(document)
+        assert [item.ticker for item in parsed.cover.listings] == ["NOBHW"]
+        assert parsed.incomplete_listings == 1
+        assert [f.value for f in parsed.facts] == [1000]
+
+    def test_a_complete_cover_counts_no_incomplete_listing(self) -> None:
+        document = _ixbrl(
+            _context("c1"),
+            _nn("Security12bTitle", "c1", "Common Stock")
+            + _nn("TradingSymbol", "c1", "SO")
+            + _nn("SecurityExchangeName", "c1", "NYSE"),
+        )
+        assert _cover(document).incomplete_listings == 0
+
+    def test_nil_share_facts_are_skipped(self) -> None:
+        """#609 C2 (0001398344-26-014697): two of four unit classes report
+        `xs:nil="true"` share facts with no text; the other two are kept."""
+
+        def units(context: str, member: str) -> str:
+            return _context(
+                context, {"us-gaap:StatementClassOfStockAxis": f"custom:{member}"}, instant=True
+            )
+
+        def nil(context: str, fact_id: str) -> str:
+            return (
+                f'<ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" '
+                f'contextRef="{context}" id="{fact_id}" unitRef="Shares" xs:nil="true">'
+                "</ix:nonFraction>"
+            )
+
+        def number(context: str, fact_id: str, value: str) -> str:
+            return (
+                f'<ix:nonFraction name="dei:EntityCommonStockSharesOutstanding" '
+                f'contextRef="{context}" id="{fact_id}" format="ixt:numdotdecimal" '
+                f'decimals="INF" unitRef="Shares">{value}</ix:nonFraction>'
+            )
+
+        document = _ixbrl(
+            units("A", "ClassAUnitsMember")
+            + units("S", "ClassSUnitsMember")
+            + units("I", "ClassIUnitsMember")
+            + units("M", "ClassMUnitsMember"),
+            nil("A", "xdx2ixbrl0037")
+            + nil("S", "xdx2ixbrl0038")
+            + number("I", "Fact000035", "211,076,548")
+            + number("M", "Fact000036", "377,418"),
+        )
+        parsed = _cover(document)
+        assert {f.class_member: f.value for f in parsed.facts} == {
+            "ClassIUnits": 211_076_548.0,
+            "ClassMUnits": 377_418.0,
+        }
+
+    def test_a_blank_share_fact_that_is_not_nil_still_raises(self) -> None:
+        with pytest.raises(ValueError, match="malformed"):
+            _cover(_ixbrl(_context("s1", instant=True), _shares("s1", "")))
+
+    def test_a_cover_with_no_listing_or_shares_is_empty_for_its_cik(self) -> None:
+        """#609 C3 (0002124122-26-000017, a TRIC 10-Q): the cover carries no
+        listing and no shares fact, only other dei facts such as
+        `EntityCentralIndexKey`. It is an empty parse for that CIK."""
+        document = _ixbrl(
+            _context("From2026-01-01to2026-06-30").replace("0000092122", "0002124122"),
+            _nn("AmendmentFlag", "From2026-01-01to2026-06-30", "false")
+            + _nn("EntityCentralIndexKey", "From2026-01-01to2026-06-30", "0002124122")
+            + _nn("EntityRegistrantName", "From2026-01-01to2026-06-30", "Tric"),
+        )
+        parsed = parse_cover_page(
+            document,
+            accession="0002124122-26-000017",
+            accepted_at=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+        )
+        assert parsed.cover.cik == "0002124122"
+        assert parsed.cover.accession == "0002124122-26-000017"
+        assert (parsed.cover.listings, parsed.facts, parsed.incomplete_listings) == ((), (), 0)
+
+    def test_a_cover_with_no_cover_facts_and_no_cik_still_raises(self) -> None:
+        document = _ixbrl(_context("d1"), _nn("EntityRegistrantName", "d1", "Tric"))
+        with pytest.raises(ValueError, match="names 0 entities"):
+            _cover(document)
+
+    @pytest.mark.parametrize("cik", ["0002124122x", "\uff11\uff12\uff13", "12345678901"])
+    def test_a_cover_with_no_cover_facts_and_a_malformed_cik_raises(self, cik: str) -> None:
+        """The C3 CIK names cache files downstream: ASCII digits only, 1 to 10."""
+        document = _ixbrl(_context("d1"), _nn("EntityCentralIndexKey", "d1", cik))
+        with pytest.raises(ValueError, match="EntityCentralIndexKey is not a CIK"):
+            _cover(document)
+
+    def test_a_cover_with_no_cover_facts_and_two_ciks_raises(self) -> None:
+        document = _ixbrl(
+            _context("d1") + _context("d2"),
+            _nn("EntityCentralIndexKey", "d1", "0002124122")
+            + _nn("EntityCentralIndexKey", "d2", "0000092122"),
+        )
+        with pytest.raises(ValueError, match="names 0 entities"):
+            _cover(document)
+
+    def test_a_nil_trading_symbol_is_no_listing(self) -> None:
+        """A nil `TradingSymbol` beside a title and an exchange used to give a
+        listing with an empty ticker; skipped as nil, the class has no
+        symbol, so it is not a listing (COVER_VERSION 2 re-parses such
+        cached covers)."""
+        document = _ixbrl(
+            _context("c1") + _context("s1", instant=True),
+            _nn("Security12bTitle", "c1", "Common Stock")
+            + _nn("TradingSymbol", "c1", "", ' xsi:nil="true"')
+            + _nn("SecurityExchangeName", "c1", "NYSE")
+            + _shares("s1", "1000"),
+        )
+        parsed = _cover(document)
+        assert parsed.cover.listings == ()
+        assert parsed.incomplete_listings == 0
+        assert [f.value for f in parsed.facts] == [1000]
+
+    @pytest.mark.parametrize("missing", ["Security12bTitle", "SecurityExchangeName"])
+    def test_a_nil_title_or_exchange_is_an_incomplete_listing(self, missing: str) -> None:
+        facts = {
+            "Security12bTitle": _nn("Security12bTitle", "c1", "Common Stock"),
+            "TradingSymbol": _nn("TradingSymbol", "c1", "SO"),
+            "SecurityExchangeName": _nn("SecurityExchangeName", "c1", "NYSE"),
+        }
+        facts[missing] = _nn(missing, "c1", "", ' xsi:nil="true"')
+        parsed = _cover(_ixbrl(_context("c1"), "".join(facts.values())))
+        assert (parsed.cover.listings, parsed.incomplete_listings) == ((), 1)
 
     def test_failed_format_raises(self) -> None:
         document = _ixbrl(
@@ -531,6 +675,37 @@ class TestDelisting:
         )
         assert filing.accepted_at == datetime(2026, 9, 24, 14, 8, 40, tzinfo=UTC)
         assert filing.effective_on is None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "",
+            "<descriptionClassSecurity/>",
+            "<descriptionClassSecurity> </descriptionClassSecurity>",
+        ],
+    )
+    def test_25nse_with_no_class_stays_a_failure_with_a_clear_message(
+        self, description: str
+    ) -> None:
+        """#609 D1 (ACCO Brands, 0000876661-15-000379): a 25-NSE naming no
+        class. Owner 2026-10-02: it stays a failure, the class is never
+        guessed, and the message says so."""
+        xml = (
+            "<notificationOfRemoval><issuer><cik>0000712034</cik></issuer>"
+            f"{description}<exchange><entityName>New York Stock Exchange</entityName></exchange>"
+            "</notificationOfRemoval>"
+        )
+        with pytest.raises(ValueError) as caught:
+            parse_delisting(
+                xml,
+                form="25-NSE",
+                accession="0000876661-15-000379",
+                accepted_at=datetime(2015, 9, 1, 14, 0, tzinfo=UTC),
+            )
+        message = str(caught.value)
+        assert message.startswith("0000876661-15-000379: 25-NSE names no class of security")
+        assert "descriptionClassSecurity" in message
+        assert "not guessed" in message
 
     def test_malformed_xml_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="malformed"):
