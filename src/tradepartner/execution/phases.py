@@ -225,15 +225,18 @@ def _sellable(decision: DecisionRow, ledger: Ledger, residues: Mapping[str, floa
     return held - left
 
 
-def _open_sold(open_sells: Sequence[risk.OpenSell]) -> dict[str, float]:
-    """Each name's open (non-terminal) sells, summed by `security_id`."""
-    totals: dict[str, float] = defaultdict(float)
+def _open_sold(open_sells: Sequence[risk.OpenSell]) -> dict[str, Decimal]:
+    """Each name's open (non-terminal) sells, summed by `security_id` exactly
+    in `Decimal`, as `check_phase`'s `sell_sum_within_holding` sums them: a
+    `float` sum of two or more off-grid open sells can land under the exact
+    one and leave the cap a rounding ulp too high (#605 review pass 2)."""
+    totals: dict[str, Decimal] = defaultdict(Decimal)
     for sell in open_sells:
-        totals[sell.security_id] += sell.unfilled_quantity
+        totals[sell.security_id] += risk._dec(sell.unfilled_quantity)
     return totals
 
 
-def _trim_cap(held: float, residue: float, open_sold: float, quantity_decimals: int) -> float:
+def _trim_cap(held: float, residue: float, open_sold: Decimal, quantity_decimals: int) -> float:
     """A trim's quantity cap, exact in `Decimal` on the `quantity_decimals`
     grid: the holding rounded down first, less the residue, less the name's
     open sells, never below 0. Rounding the holding down *before*
@@ -245,7 +248,7 @@ def _trim_cap(held: float, residue: float, open_sold: float, quantity_decimals: 
     fractional holding or open sell)."""
     step = Decimal(1).scaleb(-quantity_decimals)
     rounded_holding = Decimal(repr(round_down(held, quantity_decimals)))
-    cap = rounded_holding - risk._dec(residue) - risk._dec(open_sold)
+    cap = rounded_holding - risk._dec(residue) - open_sold
     return float(max(cap, Decimal(0)).quantize(step, rounding=ROUND_DOWN))
 
 
@@ -360,8 +363,8 @@ def sell_orders(
             # cap alone) and after it (#605): a skip only the subtraction
             # causes is held, not journaled, so the decision stays open for
             # the next run to re-attempt once the open sell terminates.
-            cap_before = _trim_cap(held, residue, 0.0, quantity_decimals)
-            cap_after = _trim_cap(held, residue, open_sold.get(sid, 0.0), quantity_decimals)
+            cap_before = _trim_cap(held, residue, Decimal(0), quantity_decimals)
+            cap_after = _trim_cap(held, residue, open_sold.get(sid, Decimal(0)), quantity_decimals)
             quantity_before = _trim_quantity(remainder_q, cap_before, whole, quantity_decimals)
             quantity = _trim_quantity(remainder_q, cap_after, whole, quantity_decimals)
             reason_before = _sell_skip(full_exit, whole, quantity_before, price, frozen)

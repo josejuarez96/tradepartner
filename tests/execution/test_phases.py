@@ -350,6 +350,29 @@ def test_a_fractional_trim_capped_by_open_sells_always_passes_check_phase(
     assert isinstance(checked, Skips) and len(checked.orders) == 1
 
 
+def test_a_trim_capped_by_two_off_grid_open_sells_passes_check_phase() -> None:
+    """#605 review pass 2: the name's open sells are summed exactly too. Two
+    off-grid unfilled quantities summed in `float` land under their exact sum,
+    so the cap came out a rounding ulp high and `sell_sum_within_holding`
+    halted the batch."""
+    trim = _d(1, "sell", notional=10_000_000.0)
+    held = {"SEC_1": 437.78}
+    opens = [OpenSell("SEC_1", 54.62566982250126), OpenSell("SEC_1", 120.92920606749875)]
+    order = _one(_sells([trim], held, open_sells=opens))
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=opens,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
 def test_a_trim_cut_to_zero_by_open_sells_alone_is_held_not_skipped() -> None:
     """#605 pass 1 SHOULD FIX: the open-sells subtraction alone (cap would be
     negative, floored at 0) wipes out the trim; a skip here would close the
