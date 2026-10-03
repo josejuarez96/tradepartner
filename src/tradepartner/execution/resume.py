@@ -45,9 +45,10 @@ The only way the kill switch is released. In the req 5 order:
    a lag inside the bound (`fills_lagging`) waits for the feed. That is
    stricter than req 8's "a lag inside the bound passes"; the PR raises it.
 7. Release (`switch.release`) with the `resume_id`, that reconciliation's id
-   and the drawdown peak: the ledger equity at the window's last mark (the
-   cash row plus every name's value), or the current peak when nothing is
-   marked yet; a peak that is not positive refuses. The reconciliation cited
+   and the drawdown peak: the ledger equity at the window's last mark (its
+   `cash`, carried on every row at that session, plus every name's value),
+   or the current peak when nothing is marked yet; a peak that is not
+   positive refuses. The reconciliation cited
    is the window's highest id, the one this resume wrote. A switch that is
    not engaged has nothing to release: the outcome is `not_engaged`, after
    the same settlement and reconciliation. A `switch.ReleaseRefused` (one of
