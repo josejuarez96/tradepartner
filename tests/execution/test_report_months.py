@@ -685,8 +685,13 @@ def test_residue_term_uses_close_even_when_fill_price_is_open() -> None:
     # would land on these open-based numbers and fail the assertion below.
     equity = {T0: 100_000.0, T1: 100_000.0}
     trial = _trial(equity, {T0: 0.0})
-    close_i, close_next = 50.0, 55.0
-    open_i, open_next = 48.0, 53.0
+    close_i, close_next = 50.0, 55.0  # close moves +5
+    open_i, open_next = 48.0, 70.0  # open moves +22: a different delta, so a residue
+    # term computed from the open values lands on a visibly different number than one
+    # computed from the close values, not a coincidentally equal one (quant-auditor
+    # finding on PR #654: the first draft moved both bars by the same +5 and so
+    # could not actually distinguish an open-priced residue term from a close-priced
+    # one).
     closes = _prices({(A, T0): close_i, (A, T1): close_next})
     open_prices = _prices({(A, T0): open_i, (A, T1): open_next})
 
