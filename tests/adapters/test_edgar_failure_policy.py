@@ -297,8 +297,14 @@ def test_policy1_header_cache_hits_count_in_the_per_document_denominator(tmp_pat
     assert source._per_document_attempted == {accession}
 
 
-def test_policy1_a_quarantined_accession_is_still_not_counted(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
+@pytest.mark.parametrize("accepted", [False, True])
+def test_a_quarantined_accession_counts_in_the_share_unless_accepted(
+    tmp_path: Path, accepted: bool
+) -> None:
+    """quant-auditor (#610): a failed check can now quarantine, so a
+    quarantined accession stays in the per-document share: in the
+    denominator always, in the numerator unless its entry is accepted."""
+    settings = _settings(tmp_path, min_failed_filings=1)
     source = _garbage_source(settings, 1)
     entry = {
         "error_class": "ValueError",
@@ -306,7 +312,7 @@ def test_policy1_a_quarantined_accession_is_still_not_counted(tmp_path: Path) ->
         "message_hash": "h",
         "count": settings.edgar.max_filing_failures,
         "last_counted_day": "2026-05-01",
-        "accepted": False,
+        "accepted": accepted,
         "kind": "fetch",
     }
     _store_path(settings).parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +321,12 @@ def test_policy1_a_quarantined_accession_is_still_not_counted(tmp_path: Path) ->
     )
     source.cover_pages(APPLE)
     assert source.quarantined == 1
-    assert source._per_document_attempted == set()
+    assert source._per_document_attempted == set()  # no request was made
+    reasons: list[str] = []
+    source._check_per_document_group(reasons)
+    assert reasons == (
+        [] if accepted else ["per-document: 1 failures of 1 attempted (100.0%, over 1.0%)"]
+    )
 
 
 # --- Policy 2: a failed check records its failures ---------------------------
@@ -401,12 +412,15 @@ def test_policy2_failed_checks_quarantine_without_a_committed_run(tmp_path: Path
     final.cover_pages(APPLE)
     assert final.quarantined == 5
     assert final._per_document_attempted == set()
-    # nothing attempted, so no per-document share; the five un-accepted
-    # entries still trip the pair rule until the owner accepts them
-    with pytest.raises(FilingFailuresError) as raised:
+    # quarantine never excuses on its own (quant-auditor, #610): the five
+    # quarantined, un-accepted accessions still fail the per-document share
+    with pytest.raises(FilingFailuresError, match="per-document: 5 failures of 5"):
         _check(final)
-    assert "per-document" not in str(raised.value)
-    assert "ValueError/10-K: 5 accessions" in str(raised.value)
+    _accept_all(settings)
+    accepted = _garbage_source(settings, 5, clock=datetime(2026, 6, 3 + max_days, 16, tzinfo=UTC))
+    accepted.cover_pages(APPLE)
+    assert accepted.quarantined == 5
+    _check(accepted)  # accepted and quarantined: passes, with no request
 
 
 def test_policy2_a_second_failed_check_the_same_day_counts_once(tmp_path: Path) -> None:

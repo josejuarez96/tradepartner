@@ -1,3 +1,3 @@
 - #610 EDGAR failure policy: FSN 4-place compare, capped-date clash dropped, cache hits in the denominator, failures recorded and acceptable on a failed check, FSN out of the pair rule, messages on disk
 ### Fixed
-- EDGAR failure check (#610): FSN shares compare at 4 decimal places; a company value dated after acceptance that collides once capped is dropped; per-document cache hits count in the denominator; a failed check records its failures (with messages) so they can be quarantined and accepted; FSN failures are judged only by their own share rule
+- EDGAR failure check (#610): FSN shares compare at 4 decimal places; a company value dated after acceptance that collides once capped is dropped; per-document cache hits count in the denominator; a failed check records its failures (with messages) so they can be quarantined and accepted, and a quarantined accession stays in the per-document share until accepted; FSN failures are judged only by their own share rule

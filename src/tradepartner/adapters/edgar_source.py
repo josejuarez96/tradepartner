@@ -122,7 +122,9 @@ share, or (2) the run's per-document failure share, clears both
 distinct non-`accepted` accessions across `failed_filings.json` and this
 run's failures. The per-document denominator is every per-document
 accession the run fetched or read from its per-document cache (#610 policy
-1; quarantined accessions excluded). FSN failures are judged by rule (1)
+1; a co-registrant's cached copy included) plus the quarantined accessions
+it skipped, each of which counts as a failure unless `accepted`: quarantine
+alone never excuses a failure. FSN failures are judged by rule (1)
 only, never pooled into rule (3) (#610 policy 3). A fact collision withholds
 only the collided (accession, fact name, class member) key, recorded under
 the accession's base form, counting toward rule (3) only, never rule (2).
@@ -134,7 +136,8 @@ entry and leave every other field as it is:
   `edgar.cache_dir/failed_filings.json`. `accepted` holds only while the
   accession keeps failing with the same `error_class` and `message_hash`; a
   different failure resets it to `false` and is judged again. An accepted
-  entry leaves rules (2) and (3); it still counts toward quarantine.
+  entry leaves the numerators of rules (2) and (3); it still counts toward
+  quarantine, and a quarantined accession is excused only by `accepted`.
 - an FSN failure: the accession's object in `accessions_failed` of its
   period's manifest. It leaves rule (1); it is re-judged only when
   `FSN_VERSION` changes (the period is re-extracted).
@@ -381,6 +384,11 @@ class EdgarFilingSource(FilingSource):
         # per-document cache (#610 policy 1: cache hits count; quarantined
         # accessions do not): `check_failures`'s per-document denominator.
         self._per_document_attempted: set[str] = set()
+        # Quarantined per-document accessions this run skipped: they stay in
+        # the per-document share (numerator unless `accepted`, denominator
+        # always), since a failed check can now quarantine (#610 policy 2)
+        # and quarantine must never excuse a failure nobody accepted.
+        self._quarantined_this_run: set[str] = set()
         self._failed_filings_cache: dict[str, dict[str, Any]] | None = None
         # FSN accessions newly recorded as failed by this run's own
         # `_extract_fsn_period` calls, folded into `.failed_filings`.
@@ -950,6 +958,7 @@ class EdgarFilingSource(FilingSource):
                 if accession in self._pending_failures:
                     continue  # failed earlier this run (cover_pages, then facts): never twice
                 if self._is_quarantined(accession):
+                    self._quarantined_this_run.add(accession)
                     if count_missing:  # count once per run, on the cover_pages pass
                         self.quarantined += 1
                     continue
@@ -1082,6 +1091,7 @@ class EdgarFilingSource(FilingSource):
         """`_ranged_header`, gated by the quarantine check and wrapped in
         `_guarded` (T11h): a mismatched accession, or a 404/410, is skipped."""
         if self._is_quarantined(accession):
+            self._quarantined_this_run.add(accession)
             self.quarantined += 1
             return None
         return self._guarded(
@@ -1207,6 +1217,7 @@ class EdgarFilingSource(FilingSource):
                 self.pre_xml_delistings += 1
                 continue
             if self._is_quarantined(accession):
+                self._quarantined_this_run.add(accession)
                 self.quarantined += 1
                 continue
             delisting_fetch: Callable[[], DelistingFiling] = partial(
@@ -1394,6 +1405,7 @@ class EdgarFilingSource(FilingSource):
         self._pending_failures.clear()
         self._collision_failures.clear()
         self._per_document_attempted.clear()
+        self._quarantined_this_run.clear()
         self._succeeded_this_run.clear()
 
     def record_failed_check(self) -> None:
@@ -1523,17 +1535,27 @@ class EdgarFilingSource(FilingSource):
 
     def _check_per_document_group(self, reasons: list[str]) -> None:
         """Per-document's denominator is the accessions fetched or read from
-        the per-document cache this run (#610 policy 1; quarantined
-        accessions excluded); a `facts()` collision counts toward
-        `_check_cross_day_pairs` only, never here. A failure is excused only
-        by an entry accepted for its same error class and message."""
+        the per-document cache this run (#610 policy 1), plus the quarantined
+        accessions it skipped; a quarantined accession counts as a failure
+        unless its entry is `accepted` (a failed check can quarantine, #610
+        policy 2, and quarantine never excuses on its own). A `facts()`
+        collision counts toward `_check_cross_day_pairs` only, never here. A
+        pending failure is excused only by an entry accepted for its same
+        error class and message."""
         failures = sum(
             1
             for accession, (error_class, _form, message) in self._pending_failures.items()
             if accession not in self._collision_failures
             and not self._accepted(accession, error_class, message)
         )
-        denominator = len(self._per_document_attempted)
+        # A quarantined accession is a failure no request re-checked this run:
+        # it counts unless its stored entry is accepted (#610 review).
+        store = self._failure_store()
+        quarantined = self._quarantined_this_run - self._per_document_attempted
+        failures += sum(
+            1 for accession in quarantined if not store.get(accession, {}).get("accepted", False)
+        )
+        denominator = len(self._per_document_attempted | quarantined)
         reason = self._threshold_reason("per-document", failures, denominator)
         if reason:
             reasons.append(reason)
