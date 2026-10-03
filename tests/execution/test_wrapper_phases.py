@@ -1057,6 +1057,125 @@ def test_a_reserve_error_halts_the_buys_with_zero_buy_submits(
     assert _submits(env.fake) == []
 
 
+# --- a name with no bar at close(S-1) (#569, owner option (b)) ----------------------------------
+
+NO_BAR = "SEC_NO_BAR"  # no `prices_daily` row at all, so no reference price on S
+
+
+def _stale_order(
+    env: Env, side: str, *, quantity: float | None = None, notional: float | None = None
+) -> None:
+    """A non-terminal order of the earlier run on S-1 for `NO_BAR`, journaled
+    only (accepted, never filled): the stale order #569 says must not halt
+    every batch."""
+    at = CUT - timedelta(hours=2)
+    decision = _decision(
+        env,
+        NO_BAR,
+        side,
+        notional=notional,
+        quantity=quantity,
+        reason="left_targets" if side == "sell" else None,
+    )
+    coid = f"fx-stale-{side}"
+    _append(
+        env.settings,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision.decision_id,  # type: ignore[arg-type]
+            run_id=env.earlier.run_id,
+            session=PREV,
+            attempt=1,
+            phase=side,
+            security_id=NO_BAR,
+            symbol="NOBR",
+            side=side,
+            notional=notional,
+            quantity=quantity,
+            sells_in_flight_at_submit=side == "sell",
+            known_at=at,
+            ingested_at=at,
+        ),
+        OrderEventRow(client_order_id=coid, status="pending", known_at=at, ingested_at=at),
+        OrderEventRow(
+            client_order_id=coid,
+            status="accepted",
+            broker_order_id=f"broker-{coid}",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "quantity", "notional"),
+    [
+        # The reserve takes a notional buy's unfilled notional as it stands.
+        ("buy", None, 500.0),
+        # The open-sell check counts a quantity sell's shares, unpriced.
+        ("sell", 3.0, None),
+    ],
+)
+def test_an_unpriced_open_order_no_number_reads_does_not_halt_the_batch(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+) -> None:
+    """#569 (b): a non-terminal order whose name has no bar at close(S-1), and
+    whose price neither the open-buy reserve nor the open-sell check reads,
+    leaves both phases of the batch to proceed."""
+    env.new_fake(cash=10_000.0)
+    _hold(env, A, 10.0)
+    _stale_order(env, side, quantity=quantity, notional=notional)
+    trim = _decision(env, A, "sell", notional=300.0)
+    buy = _decision(env, B, "buy", notional=1000.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim, buy])
+    assert outcome.status == "ok"
+    assert sorted(r.symbol for r in _submits(env.fake)) == ["DUALA", "DUALB"]
+    assert _missed(env.settings) == []
+
+
+def test_an_unpriced_open_quantity_buy_halts_the_buys_at_the_reserve(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The reserve prices an open quantity buy's unfilled shares at the
+    reference price, so a missing bar there still halts, before any buy."""
+    env.new_fake(cash=10_000.0)
+    _stale_order(env, "buy", quantity=3.0)
+    with pytest.raises(ValueError, match=NO_BAR):
+        _execute(_gate(env, alerter_conn), env, [_decision(env, B, "buy", notional=1000.0)])
+    assert _submits(env.fake) == []
+
+
+def test_an_unpriced_open_notional_sell_halts_at_the_open_sell_check(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The open-sell check turns an open notional sell into shares at the
+    reference price, so a missing bar there still halts, before any sell."""
+    _hold(env, A, 10.0)
+    _stale_order(env, "sell", notional=300.0)
+    with pytest.raises(ValueError, match=NO_BAR):
+        _execute(_gate(env, alerter_conn), env, [_decision(env, A, "sell", notional=300.0)])
+    assert _submits(env.fake) == []
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_a_batch_name_with_no_bar_halts_before_any_broker_call(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, stale: bool
+) -> None:
+    """A name inside the batch is priced at the book read, with or without a
+    stale open order of its own: no bar halts before any broker call."""
+    if stale:
+        _stale_order(env, "buy", notional=500.0)
+    buy = _decision(env, NO_BAR, "buy", notional=1000.0)
+    calls = len(env.fake.calls)
+    with pytest.raises(ValueError, match="no bar on or before"):
+        _execute(_gate(env, alerter_conn), env, [buy])
+    assert not env.fake.calls[calls:]
+
+
 # --- frozen versus settings -------------------------------------------------------------------
 
 
