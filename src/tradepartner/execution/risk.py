@@ -42,8 +42,9 @@ orders left to submit). In order:
    - `sell_within_holding`: each sell at most the reconciled holding rounded
      down to `quantity_decimals` (no short, ever);
    - `sell_sum_within_holding`: a name's sells plus the unfilled quantity of its
-     non-terminal own sells from any session at most the holding, rounded down
-     as above;
+     non-terminal own sells from any session (`open_sold`: each snapped to the
+     `quantity_decimals` grid, summed exactly in `Decimal`) at most the
+     holding, rounded down as above;
    - `buys_within_cash`: the buys with their modelled cost, a whole-share buy
      at the reference price x (1 + `risk.whole_share_price_buffer`), within
      `account().cash` (never `buying_power`), strictly and in `Decimal`
@@ -80,7 +81,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal
 
 import polars as pl
 
@@ -107,6 +108,7 @@ __all__ = [
     "Violation",
     "Violations",
     "check_phase",
+    "open_sold",
     "round_down",
     "size_buys",
     "unfilled_sells",
@@ -249,6 +251,24 @@ def _finite(value: float, what: str, *, positive: bool = False) -> float:
         bound = "positive" if positive else "non-negative"
         raise ValueError(f"{what} is {value}, must be a finite {bound} number")
     return value
+
+
+def open_sold(open_sells: Iterable[OpenSell], quantity_decimals: int) -> dict[str, Decimal]:
+    """Each name's open sells (`unfilled_sells`), summed exactly in `Decimal`
+    by `security_id`, every unfilled quantity first snapped to the nearest
+    step of the `quantity_decimals` grid. A broker quantity and its fills sit on
+    that grid, so the snap removes only the `float` noise of `unfilled_sells`'
+    subtraction (a fully filled sell with no terminal event yet leaves about
+    1e-16, which must not count). `check_phase`'s `sell_sum_within_holding`
+    and `phases.sell_orders`' trim cap both read this one sum (#605)."""
+    if quantity_decimals < 0:
+        raise ValueError(f"decimals must be non-negative, got {quantity_decimals}")
+    step = Decimal(1).scaleb(-quantity_decimals)
+    totals: dict[str, Decimal] = defaultdict(Decimal)
+    for sell in open_sells:
+        left = _dec(_finite(sell.unfilled_quantity, f"open sell of {sell.security_id}"))
+        totals[sell.security_id] += left.quantize(step, rounding=ROUND_HALF_EVEN)
+    return totals
 
 
 def round_down(quantity: float, decimals: int) -> float:
@@ -513,15 +533,17 @@ def check_phase(
     for detail in over_weight.values():
         breach("max_position_weight", detail)
 
-    for sell in open_sells:
-        if sell.security_id in sold:
-            sold[sell.security_id] += sell.unfilled_quantity
+    # Exact in `Decimal`, never `float`, with the open sells summed by the one
+    # helper `phases.sell_orders` caps a trim with (`open_sold`), so a trim
+    # capped there never breaches here on float drift alone (#605).
+    open_by_name = open_sold(open_sells, quantity_decimals)
     for name, total in sold.items():
         holding = round_down(max(ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
-        if total > holding:
+        total_exact = _dec(total) + open_by_name.get(name, Decimal(0))
+        if total_exact > _dec(holding):
             breach(
                 "sell_sum_within_holding",
-                f"{name} sells and open sells of {total} over the holding {holding}",
+                f"{name} sells and open sells of {total_exact} over the holding {holding}",
             )
 
     exposure = (
