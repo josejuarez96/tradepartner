@@ -1442,7 +1442,14 @@ def _derive_bounded_and_full(
     ("started_minutes", "finished_minutes", "release_minutes"),
     [
         (200, 205, 205),  # a release stamped exactly at finished_at
-        (200, 205, 200),  # a release stamped exactly at started_at
+        # a release stamped exactly at started_at, with finished_at BEFORE
+        # started_at (a clock-skewed run, nothing in the schema rules it
+        # out) so the finished_at clause alone could not already keep the
+        # run: only the started_at clause does, isolating it from the first
+        # case (safety-reviewer's verification pass on #651 found the
+        # original (200, 205, 200) case vacuous, since finished_at=205 >
+        # release=200 kept the run through the finished_at clause alone).
+        (205, 200, 205),
     ],
 )
 def test_release_exactly_at_a_runs_stamp_does_not_clear_it(
