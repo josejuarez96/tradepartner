@@ -474,7 +474,7 @@ def test_a_different_account_id_halts_through_the_halt_path(env: Env) -> None:
     run_id = env.latest_run()
     assert env.results()[run_id][:2] == ("halted", "ReconciliationError")
     assert env.engaged() == [("fault", "ReconciliationError", run_id, None)]
-    assert ("halted", run_id, TUE) in env.alerts()
+    assert ("reconciliation", run_id, TUE) in env.alerts()
     assert env.count("reconciliations") == 0  # halted before step 4
     assert env.count("positions_daily") == 0
 
