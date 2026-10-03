@@ -131,11 +131,12 @@ say untradable, so a later `stop` run exits it once it trades again.
 until each is terminal or `paper.accept_wait_seconds` has passed since the
 step began (an absolute deadline: an order still open then is step 3's on the
 next run), polling every `paper.poll_interval_seconds`. Then the `executed`
-test of step 3 runs again (skipped for a `stop` run: the stop already sold to
-cash, so the broker's cash read here would be a false positive, T63f), and
-one `unspent_cash` alert at most, naming every rebalance reaching `executed`
-here whose cash exceeds the frozen `risk.max_unspent_cash_fraction` of the
-broker's equity read at that moment. The cash is the batch's
+test of step 3 runs again (its rows written the same either way); only its
+`unspent_cash` alert is skipped for a `stop` run, since the stop already sold
+to cash and the broker's cash read here would be a false positive (T63f).
+Otherwise one `unspent_cash` alert at most, naming every rebalance reaching
+`executed` here whose cash exceeds the frozen `risk.max_unspent_cash_fraction`
+of the broker's equity read at that moment. The cash is the batch's
 `BatchOutcome.cash_left` for the batch's own rebalance when its buys phase
 read the cash, else the broker's cash read with that equity. A rebalance
 gets one `executed` row, so this call site names it at most once; a run
@@ -1555,9 +1556,10 @@ class _Run:
         the next release, so the trigger fires once per crossing however many
         times a session already checked is checked again: re-checking it is
         idempotent. A run that fails between writing its marks and this check
-        therefore leaves no gap: the marked sessions it wrote are the next
-        run's to check too, since nothing before the last release has been
-        cleared out of this wider set.
+        therefore leaves no gap for the next run to miss, so long as the
+        window is not released in between: the marked sessions it wrote stay
+        in the wider set this method checks until a release narrows that set
+        again.
 
         A crossing on a session dated before the window's last release is
         still checked (erring toward safety: a release elsewhere in the
@@ -1571,8 +1573,13 @@ class _Run:
             return
         peak = switch.drawdown_peak(self.window, rows)
         armed = switch.drawdown_armed(self.window_id, rows)
-        releases = [r.at for r in rows if r.state == switch.RELEASED]
-        last_release = max(releases) if releases else None
+        # The last release in write order (`event_id`), not by `at`: a halt row
+        # after a `ClockError` carries a real-time stamp (switch.py), so `at`
+        # does not always agree with write order.
+        released = sorted(
+            (r for r in rows if r.state == switch.RELEASED), key=lambda r: r.event_id or 0
+        )
+        last_release = released[-1].at if released else None
         known_at_of: dict[date, datetime] = {}
         for row in marks_rows:
             known_at_of[row.session] = min(row.known_at, known_at_of.get(row.session, row.known_at))
