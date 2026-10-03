@@ -16,11 +16,11 @@ Everything a build window types, in order of use. The rules behind each line fol
 | `uv run python scripts/team.py release <Tn\|issue#> [--park]` | When you stop for good on an item: `--park` for a green PR, plain for a red or empty one. Write a handoff comment. |
 | `uv run python scripts/fragments.py add <issue> --slug <slug> --status "…" --added "…"` | Once per PR, before ready: the STATUS line and CHANGELOG bullets as one new file. |
 | `uv run python scripts/ready_pr.py <pr> --timeout-min 45` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
-| `uv run python scripts/merge_train.py build [PR ...] [--order N ...]` | Only when the owner asks for a train, by any window or the orchestrator: tests the ready PRs together on `train/<batch id>`, posts a `merge-train:` comment on each. Merges nothing. `--resume <batch id>` re-attaches to a running batch. |
+| `uv run python scripts/merge_train.py build [PR ...] [--order N [N ...]]` | Only when the owner asks for a train, by any window or the orchestrator: tests the ready PRs together on `train/<batch id>`, posts a `merge-train:` comment on each. Merges nothing. `--resume <batch id>` re-attaches to an unfinished batch (after an inconclusive run). Flags in full: [git-workflow.md](git-workflow.md#the-merge-train). |
 | `uv run python scripts/merge_train.py merge <batch id>` | Only on the owner's "merge train `<batch id>`", by him or the one window he says it to, on the machine that holds the record: lands the batch's longest green prefix, nothing else. This exact spelling is the one `.claude/settings.json` prompts on (#529). `--resume` continues a stopped merge. |
-| `uv run python scripts/merge_train.py status [<batch id>]` | A batch's record, or the list of records. `uv run python scripts/merge_train.py prune` (no flags) deletes finished batches' `train/*` branches and worktrees; run it from the clone that built them, never while a `build` runs there. |
+| `uv run python scripts/merge_train.py status [<batch id>]` | A batch's record, or the list of records. `uv run python scripts/merge_train.py prune` (no flags) deletes finished batches' `train/*` branches and worktrees; run it from the clone that built them (git-workflow.md has the one caveat, #642). |
 
-Owner only: `release --force`, `claim --owner-task`, `prune --yes`, and the word "merge train `<batch id>`" ([git-workflow.md](git-workflow.md#the-merge-train) has the commands in full).
+Owner only: `team.py release --force`, `team.py claim --owner-task`, `team.py prune --yes`, and the word "merge train `<batch id>`".
 
 ## Rules and history
 
@@ -154,7 +154,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Enter another team's directory or the main checkout for any reason.
 - Touch a branch, PR or issue that another team currently **holds** (a released or parked one is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
-- Merge. The merge train is the one way a PR lands: the owner says "merge train `<batch id>`" and runs `merge_train.py merge`, or tells one window to (git-workflow rule 7). Building a train is not merging and happens only when he asks; a hand `gh pr merge` is his, on his word for that one PR.
+- Merge. The merge train is the normal way a PR lands: the owner says "merge train `<batch id>`" and runs `merge_train.py merge`, or tells one window to (git-workflow rule 7). Building a train is not merging and happens only when he asks. A hand `gh pr merge` of one green PR happens only on his word for that specific PR, by him or the window he tells; the ruleset bypass (`--admin`) is never a window's.
 
 ### Model tiers
 
