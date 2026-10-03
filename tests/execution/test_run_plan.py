@@ -433,7 +433,10 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
     """An earlier run's order half filled at the broker, the fill never
     delivered by the feed: the F_0 run finds it `fills_lagging` (inside the
     bound, so no halt), makes no plan (no trial, signal, decision or plan row),
-    submits nothing and leaves T_0 pending; the run still ends `ok`."""
+    submits nothing and leaves T_0 pending; the run still ends `ok`. The
+    seeded `forced_exit` is a sell, as every real one is (`phases.py`'s own
+    `forced_exits holds a decision that is not a forced-exit sell` check), not
+    the earlier buy-side stand-in."""
     window = env.window
     assert window is not None and window.window_id is not None
     earlier_at = at(T_0, 13, 0)
@@ -466,7 +469,7 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
             run_id=earlier,
             rebalance_session=None,
             security_id="SEC_SPY",
-            side="buy",
+            side="sell",
             planned_quantity=2.0,
             whole_share=False,
             decision="forced_exit",
@@ -480,7 +483,7 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
     env.prices["SPY"] = 100.0
     env.clock.now = earlier_at
     env.fake.lag_fills(None)
-    placed = env.fake.submit(OrderRequest(coid, "SPY", Side.BUY, quantity=2.0))
+    placed = env.fake.submit(OrderRequest(coid, "SPY", Side.SELL, quantity=2.0))
     env.append(
         OrderRow(
             client_order_id=coid,
@@ -491,7 +494,7 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
             phase="exit",
             security_id="SEC_SPY",
             symbol="SPY",
-            side="buy",
+            side="sell",
             quantity=2.0,
             sells_in_flight_at_submit=False,
             known_at=earlier_at,
