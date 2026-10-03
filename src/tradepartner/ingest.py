@@ -220,7 +220,7 @@ def ingest_session(
     }
     fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
-        "edgar": lambda: _prefetch(recorded, settings),
+        "edgar": lambda: _prefetch(recorded, settings, dry_run=dry_run),
         "alpaca": lambda: fetched.update(alpaca=_fetch_prices(settings, prices, now, clock)),
     }
     # T11h: `record_failures` (the failure policy's after-commit hook), edgar
@@ -465,14 +465,33 @@ def _unwrap(filings: FilingSource) -> FilingSource:
     return filings
 
 
-def _prefetch(recorded: _Recorded, settings: Settings) -> None:
+def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False) -> None:
     """The fetch pass: every filing question, with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
-    before the lock; then `recorded` answers only from what it holds."""
+    before the lock; then `recorded` answers only from what it holds.
+
+    When `check_failures()` raises on a non-dry run, the source's
+    `record_failed_check()` (if it has one) records the run's failures
+    first, so they can be quarantined and `accepted` although the chunk
+    never commits (#610 policy 2); the check's error is re-raised either
+    way, and a dry run records nothing."""
     _build_filings(recorded, settings, _FETCH_PASS)
-    check_failures = getattr(_unwrap(recorded), "check_failures", None)
+    source = _unwrap(recorded)
+    check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
-        check_failures()
+        try:
+            check_failures()
+        except Exception as check_error:
+            record = getattr(source, "record_failed_check", None)
+            if record is not None and not dry_run:
+                try:
+                    record()
+                except Exception as record_error:
+                    raise RuntimeError(
+                        f"{check_error}; recording the failures also failed: "
+                        f"{type(record_error).__name__}: {record_error}"
+                    ) from record_error
+            raise
     recorded.frozen = True
 
 
@@ -557,6 +576,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("submissions_api_empty", "empty API submissions"),
         ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`
         ("facts_api_keyless", "keyless API facts"),
+        ("facts_capped_dropped", "capped facts dropped"),  # #610 X2
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")
