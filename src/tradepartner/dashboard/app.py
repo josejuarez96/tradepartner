@@ -42,6 +42,16 @@ displayed. `StoreLockedError` from the writer (another process
 past `store.lock_retry_seconds`, or at once another tab mid-render) is the
 busy state; this module still never imports `open_for_write`.
 
+`show_outcome` is only called when the Override page is the one selected
+this rerun: a write can only be queued by that page's own submit button, so
+that page is already showing when `on_click` runs, but a render that leaves
+it pending (store busy, store unreadable, no store, or an exception) does
+not reach this point, and if the owner navigates to another page before the
+next successful render, showing the old answer under a page that never
+wrote it would mislead. `show_outcome` pops, not peeks, so the stored
+answer is untouched when this skips it, and is still shown, once, the next
+time the owner selects the Override page.
+
 **Server options (ADR 0011, 2026-09-26, #273).** Streamlit is itself an HTTP
 and websocket server, bound to every interface unless told otherwise, and
 `.streamlit/config.toml` is only a default: `STREAMLIT_SERVER_ADDRESS` or a
@@ -230,7 +240,8 @@ def render_app(settings: Settings | None = None) -> None:
         return
 
     page_name = st.sidebar.radio("Navigate", list(_PAGES))
-    override_page.show_outcome(settings)
+    if page_name == _OVERRIDE_PAGE:
+        override_page.show_outcome(settings)
 
     with open_store_connection(settings) as store:
         if isinstance(store, StoreUnavailable):

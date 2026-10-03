@@ -403,3 +403,39 @@ def test_journal_calls_raise_journal_not_initialised_on_a_version_4_store(
         pytest.raises(JournalNotInitialised),
     ):
         append(conn, _sample(DecisionRow))
+
+
+def test_a_fills_limit_reads_the_newest_live_fills_newest_first(
+    seeded: duckdb.DuckDBPyConnection,
+) -> None:
+    """#435: `limit` bounds the read in SQL to the newest live fills by `fill_id`."""
+    ids = [_fill(seeded, coid, f"bf-{coid}-{i}") for i in range(3) for coid in ("a", "c", "b")]
+    synthetic = _fill(seeded, "a", "synthetic:a", source="broker_status", price_implied=True)
+    _fill(seeded, "a", "bf-a-late", superseded_by=synthetic)  # hidden, newest id
+    window_1 = [f.fill.fill_id for f in fills_for(seeded, window_id=1)]
+    assert window_1 == sorted(window_1)  # unchanged: fill_id order, every live fill
+    assert len(window_1) == 7
+
+    newest = [f.fill.fill_id for f in fills_for(seeded, window_id=1, limit=3)]
+    assert newest == sorted(window_1, reverse=True)[:3]
+    assert newest[0] == synthetic
+    assert [f.fill.fill_id for f in fills_for(seeded, limit=2)] == [synthetic, ids[-1]]
+    assert [
+        f.fill.client_order_id for f in fills_for(seeded, client_order_ids=["c"], limit=10)
+    ] == ["c", "c", "c"]
+    with pytest.raises(ValueError, match="limit"):
+        fills_for(seeded, limit=0)
+
+
+@pytest.mark.parametrize("window_id", [None, 1])
+def test_a_fills_limit_still_fails_closed_on_an_orphan_past_the_limit(
+    seeded: duckdb.DuckDBPyConnection, window_id: int | None
+) -> None:
+    """The orphan is the oldest fill, so the limited read never fetches its row."""
+    _fill(seeded, "nobody", "bf-orphan")
+    _order(seeded, "lost", run_id=99, side="buy")
+    _fill(seeded, "lost", "bf-lost")
+    for i in range(3):
+        _fill(seeded, "a", f"bf-a-{i}")
+    with pytest.raises(JournalIntegrityError, match=r"nobody.*orders row"):
+        fills_for(seeded, window_id=window_id, limit=1)
