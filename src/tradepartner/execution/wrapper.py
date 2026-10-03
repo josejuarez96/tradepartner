@@ -94,9 +94,12 @@ residues, the decision states and the reference prices share one frame (#518).
 (S-1, S] known at close(S-1) (`planning.reference_prices`). The batch's and the
 ledger's names must have one: a missing bar halts the phase at its read. A name
 only a non-terminal own order brings in is priced if it can be, and a missing
-price halts only when a number reads it, the open-buy reserve (a quantity buy)
-or the open-sell check (a notional sell), so one stale order of an unrelated
-name does not halt every batch (#569, owner option (b)). The costs that size
+price halts only when a number reads it, so one stale order of an unrelated
+name does not halt every batch (#569, owner option (b)). The open-sell check
+reads only the batch's names' open sells (`_open_sells`); the open-buy reserve
+prices every open quantity buy, so a batch with buys runs it once on the first
+book, before any sell is submitted, and halts there on a missing price. The
+costs that size
 the buys and the cash rule are the window's frozen `costs.*` keys
 (`config.FROZEN_COSTS_KEYS`, #534), read with each phase's book; a window whose
 `frozen_json` lacks them raises `ValueError` before any broker call, never
@@ -587,6 +590,19 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
+        if any(d.side == _BUY for d in decisions):
+            # The buys phase's reserve prices every open quantity buy: a name
+            # of one with no price halts here, before any sell is submitted,
+            # not after the sells have gone out (#569).
+            open_buy_reserve(
+                book.orders,
+                book.events,
+                book.fills,
+                book.actions,
+                book.price_of,
+                self._frozen,
+                session=run.session,
+            )
         sold = phases.PhaseOrders((), ())
         submitted: list[str] = []
         skips: tuple[Skip, ...] = ()
@@ -598,14 +614,7 @@ class RiskGatedBroker:
             # Read once so the trim `sell_orders` caps and the `check_phase`
             # that verifies it see the same open sells (#605): both are the
             # same session's read of this same `book`.
-            open_sells = unfilled_sells(
-                book.orders,
-                book.events,
-                book.fills,
-                book.price_of,
-                book.actions,
-                session=run.session,
-            )
+            open_sells = _open_sells(book, {d.security_id for d in rows}, run.session)
             sold = phases.sell_orders(
                 decisions,
                 book.states,
@@ -768,7 +777,8 @@ class RiskGatedBroker:
         from `book`; the sells-phase caller passes the same value it gave
         `phases.sell_orders` (#605), so the trim it just capped is checked
         against the cap it was capped by. Left unset, it is read fresh from
-        `book` here (the buys phase, which never caps a sell)."""
+        `book` here for the phase's own names (the buys phase, which never caps a
+        sell)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
         self._requests(built, book, session)
@@ -778,9 +788,7 @@ class RiskGatedBroker:
         ]
         counted = prior_skips + sum(s.counts_toward_cap for s in built.skips)
         if open_sells is None:
-            open_sells = unfilled_sells(
-                book.orders, book.events, book.fills, book.price_of, book.actions, session=session
-            )
+            open_sells = _open_sells(book, {o.security_id for o in built.orders}, session)
         verdict = check_phase(
             candidates,
             book.ledger,
@@ -1415,6 +1423,22 @@ def _price_lookup(
         return prices[security_id]
 
     return price_of
+
+
+def _open_sells(book: _Book, names: Collection[str], session: date) -> list[OpenSell]:
+    """`risk.unfilled_sells` over the open own sells of `names` only. Its
+    readers (`phases.sell_orders`' trim cap, `check_phase`'s
+    `sell_sum_within_holding`) look up only the names the phase sells, all in
+    `names`, so an unrelated open notional sell is never priced and never
+    halts the batch (#569)."""
+    return unfilled_sells(
+        [o for o in book.orders if o.security_id in names],
+        book.events,
+        book.fills,
+        book.price_of,
+        book.actions,
+        session=session,
+    )
 
 
 def _optional_prices(
