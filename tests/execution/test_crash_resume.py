@@ -8,11 +8,11 @@ file covers the crash/resume mechanics, the transport-error case, the "Two
 phases" criterion's resume half, the fill-lag bound, the chain criterion, the
 cent-rounding tolerance, and the alert-kind suite (spec req 11): eleven of
 the plan line's fifteen kinds with a real trigger (`lot_ledger` through the
-run's own lot-ledger error path), four (`kill_switch`, `reconciliation`,
-`rejection_cap`, `skip_cap`) `xfail`ed because no production path writes them
-yet (#644). A further `xfail` (#653) records a
-real defect found while building the chain criterion: `paper resume` cannot
-release while the window holds a marked position. (#650, found the same way,
+run's own lot-ledger error path); `reconciliation`, `rejection_cap` and
+`skip_cap` became real once #667 fixed #644, and `kill_switch` stays `xfail`
+until #677. `paper resume` releasing while the window holds a marked position
+(#653, found while building the chain criterion) is fixed by #664 and tested
+here. (#650, found the same way,
 was regraded to low-priority hardening reproducible only with a frozen test
 clock, and is not reproduced as a test here.)
 """
@@ -1087,14 +1087,14 @@ def test_paper_stop_is_refused_while_a_run_holds_the_lock(fixture_store_path: Pa
         )
 
 
-# --- the four kinds with no production writer yet (#644) --------------------------------------
+# --- the four fault-specific halt kinds (#644: fixed by #667; kill_switch is #677) -----------
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="#644: wrapper.halt() writes 'halted' for every non-stale SystemFaultError, "
-    "including a kill-switch engagement; no path writes a distinct 'kill_switch' alert row",
+    reason="#677: the halt's own kill-switch engagement writes no distinct 'kill_switch' "
+    "alert row yet (#644's other kinds were fixed by #667)",
 )
 def test_kill_switch_alert_kind_is_not_yet_written(
     alert_fakes: FakeRunner, fixture_store_path: Path, tmp_path: Path
@@ -1112,13 +1112,7 @@ def test_kill_switch_alert_kind_is_not_yet_written(
     assert alerting_env.alerts("kill_switch") != []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#644: a ReconciliationError halt writes 'halted', never a distinct "
-    "'reconciliation' alert row",
-)
-def test_reconciliation_alert_kind_is_not_yet_written(
+def test_reconciliation_alert_row_exists_before_the_exception_propagates(
     alert_fakes: FakeRunner, fixture_store_path: Path, tmp_path: Path
 ) -> None:
     alerting_env = _alerting_env(fixture_store_path)
@@ -1133,13 +1127,7 @@ def test_reconciliation_alert_kind_is_not_yet_written(
     assert alerting_env.alerts("reconciliation") != []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#644: a RejectionCapError halt writes 'halted', never a distinct "
-    "'rejection_cap' alert row",
-)
-def test_rejection_cap_alert_kind_is_not_yet_written(
+def test_rejection_cap_alert_row_exists_before_the_exception_propagates(
     alert_fakes: FakeRunner, fixture_store_path: Path
 ) -> None:
     core_env = _core_env(fixture_store_path)
@@ -1153,12 +1141,7 @@ def test_rejection_cap_alert_kind_is_not_yet_written(
     assert any(kind == "rejection_cap" for kind, _run_id, _session in core_env.alerts())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#644: a SkipCapError halt writes 'halted', never a distinct 'skip_cap' alert row",
-)
-def test_skip_cap_alert_kind_is_not_yet_written(
+def test_skip_cap_alert_row_exists_before_the_exception_propagates(
     alert_fakes: FakeRunner, fixture_store_path: Path, tmp_path: Path
 ) -> None:
     alerting_env = _alerting_env(fixture_store_path)
@@ -1173,26 +1156,17 @@ def test_skip_cap_alert_kind_is_not_yet_written(
     assert alerting_env.alerts("skip_cap") != []
 
 
-# --- a genuine ledger/resume defect found while building the chain criterion ------------------
+# --- resume releases while a position is held (#653, fixed by #664) ------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#653: resume._mark_equity requires a security_id IS NULL row at the window's "
-    "last mark, but marks.marks_for never writes one once anything is held, so resume "
-    "refuses every release while the window holds a position",
-)
 def test_resume_releases_while_the_window_holds_a_marked_position(
     env: Env, window: PaperWindowRow
 ) -> None:
     """A real mark written by a completed run that holds positions (the
-    production path, `marks.marks_for`) never carries a `security_id IS
-    NULL` cash-only row once anything is held (its own docstring: "a
-    session with nothing held gets one [...] row"); `resume._mark_equity`
-    requires exactly one such row to compute the drawdown peak and returns
-    `None` otherwise. `paper resume` should still release (equity is
-    obviously positive — cash plus three held names' values)."""
+    production path, `marks.marks_for`) carries no `security_id IS NULL`
+    cash-only row once anything is held; before #664, `resume._mark_equity`
+    required one and refused the release (#653). `paper resume` releases
+    (equity is cash plus three held names' values)."""
     bought(env)  # DUALB, SPFT, TRNS filled; this run's own mark is cash-only (covers T_0)
     marked = env.run(at(MAY_2))  # a mark run: writes F_0's mark, now with the three positions
     if marked.status != "ok":
