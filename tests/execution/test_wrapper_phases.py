@@ -403,10 +403,11 @@ def test_every_book_fact_comes_from_one_close_s_minus_1_actions_read(
 def test_cash_left_excludes_a_buy_check_phase_drops_as_skip_delisted(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
-    """#518 item 8: `buy_orders` sizes a buy of a name whose listing ended
-    (only `check_phase` knows), so it shrinks the kept buy; `cash_left` is
-    recomputed over the verdict's orders, so it counts the delisted buy's
-    share as unspent."""
+    """#604: `buy_orders` skips a buy of a name whose listing ended
+    (`book.ended`) as `skip_delisted` before sizing, so it takes no share of
+    the kept buy's sizing (the pre-#604 behavior sized it in and had
+    `check_phase` drop it afterward, shrinking the kept buy); `cash_left` is
+    recomputed over the verdict's orders either way."""
     cash = Decimal("600.00")
     env.new_fake(cash=float(cash), round_cash_to_cent=True)
     kept = _decision(env, A, "buy", notional=300.0)
@@ -422,6 +423,32 @@ def test_cash_left_excludes_a_buy_check_phase_drops_as_skip_delisted(
     spent = Decimal(str(request.notional)) * rate
     assert outcome.cash_left == pytest.approx(float(cash - spent))
     assert outcome.cash_left is not None and outcome.cash_left > float(cash) / 2 - 1
+
+
+def test_an_ended_buy_is_skipped_before_sizing_so_the_kept_buys_are_not_shrunk(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#604 wrapper-level: cash (610) comfortably covers the two kept buys'
+    combined target (600, scale 1, full notional) but not that total plus
+    the ended name's (900, which would force scale well under 1). Only
+    excluding the ended buy from sizing, not merely dropping it from
+    `check_phase`'s verdict afterward, leaves the kept buys unshrunk; the
+    ended buy is still journaled `skip_delisted` and counted once toward the
+    skip cap."""
+    env.new_fake(cash=610.0, round_cash_to_cent=True)
+    kept1 = _decision(env, A, "buy", notional=300.0)
+    kept2 = _decision(env, B, "buy", notional=300.0)
+    delisted = _decision(env, GONE, "buy", notional=300.0)
+
+    outcome = _execute(_gate(env, alerter_conn), env, [kept1, kept2, delisted])
+
+    submits = {r.symbol: r for r in _submits(env.fake)}
+    assert set(submits) == {"DUALA", "DUALB"}
+    assert submits["DUALA"].notional == pytest.approx(300.0)
+    assert submits["DUALB"].notional == pytest.approx(300.0)
+    assert [s.reason for s in outcome.skips] == ["skip_delisted"]
+    assert sum(s.counts_toward_cap for s in outcome.skips) == 1
+    assert _decision_events(env.settings) == [(delisted.decision_id, "skipped", "skip_delisted")]
 
 
 # --- the batch limits and the skip cap ---------------------------------------------------
@@ -454,22 +481,58 @@ def test_each_batch_limit_halts_with_zero_submits_and_the_missed_row(
     assert _missed(env.settings) == [("missed", "limit_breach")]
 
 
+@pytest.mark.parametrize(
+    ("held_qty", "open_qty", "notional", "capped"),
+    [
+        (10.0, 8.0, 500.0, 2.0),
+        # Fractional (#605 pass 1's SHOULD FIX): the old `float` cap could
+        # trip `sell_sum_within_holding` by a rounding ulp on exactly this
+        # shape of input; it is now exact in `Decimal` on both sides.
+        (6.21089, 0.859, 540.0, 5.35189),
+    ],
+)
 def test_a_trim_is_capped_by_the_names_open_sell_instead_of_halting_the_batch(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    held_qty: float,
+    open_qty: float,
+    notional: float,
+    capped: float,
 ) -> None:
-    """#605 owner decision: an earlier session's sell of 8 still open, and a
-    trim that would otherwise sell 5 of the 10 held, sum to over the holding.
-    Instead of halting on `sell_sum_within_holding` (the pre-#605 behaviour),
-    the trim's cap subtracts the open sell (10 - 8 = 2) and the batch submits
-    the smaller sell."""
-    _hold(env, A, 10.0)
-    _open_sell(env, A, 8.0)
-    trim = _decision(env, A, "sell", notional=500.0)
+    """#605 owner decision: an earlier session's sell still open, and a trim
+    that would otherwise sell more than what is left of the holding, sum to
+    over the holding. Instead of halting on `sell_sum_within_holding` (the
+    pre-#605 behaviour), the trim's cap subtracts the open sell and the batch
+    submits the smaller sell."""
+    _hold(env, A, held_qty)
+    _open_sell(env, A, open_qty)
+    trim = _decision(env, A, "sell", notional=notional)
     outcome = _execute(_gate(env, alerter_conn), env, [trim])
     assert outcome.status == "ok"
     submits = _submits(env.fake)
     assert len(submits) == 1
-    assert (submits[0].quantity, submits[0].notional) == (2.0, None)
+    assert (submits[0].quantity, submits[0].notional) == (capped, None)
+    assert _missed(env.settings) == []
+
+
+def test_a_trim_wiped_out_by_an_open_sell_is_held_not_skipped(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#605 pass 1's second SHOULD FIX, end to end: without the open sell the
+    trim's cap is the full 10 held, so its 5-share remainder would be a valid
+    whole-share order; the open sell (9.5 of 10) cuts the cap to 0.5, which
+    floors to 0 and would be `skip_below_one_share`. A skip here would close
+    the decision for good; held instead, the run neither halts nor journals
+    `skipped`, so the trim can be re-attempted once the open sell
+    terminates."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 9.5)
+    trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim])
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    assert outcome.skips == ()
+    assert _decision_events(env.settings) == []
     assert _missed(env.settings) == []
 
 

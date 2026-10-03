@@ -513,15 +513,20 @@ def check_phase(
     for detail in over_weight.values():
         breach("max_position_weight", detail)
 
+    # Exact in `Decimal`, never `float`: a trim capped a rounding ulp under the
+    # holding (`phases._trim_cap`) must never breach here on float drift alone
+    # (#605 pass 1's SHOULD FIX).
+    open_by_name: dict[str, Decimal] = defaultdict(Decimal)
     for sell in open_sells:
         if sell.security_id in sold:
-            sold[sell.security_id] += sell.unfilled_quantity
+            open_by_name[sell.security_id] += _dec(sell.unfilled_quantity)
     for name, total in sold.items():
         holding = round_down(max(ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
-        if total > holding:
+        total_exact = _dec(total) + open_by_name[name]
+        if total_exact > _dec(holding):
             breach(
                 "sell_sum_within_holding",
-                f"{name} sells and open sells of {total} over the holding {holding}",
+                f"{name} sells and open sells of {total_exact} over the holding {holding}",
             )
 
     exposure = (

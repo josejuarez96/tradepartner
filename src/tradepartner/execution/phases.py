@@ -18,16 +18,26 @@ never by notional (ADR 0010 amendment 2026-09-30):
 - a **trim** sells its remainder (`DecisionState.remainder`, the trim's notional
   left converted at the reference price; a planned quantity there is already
   adjusted by the splits in (T_i, S]), capped at the holding on S less the
-  name's residue and less the name's open (non-terminal) sells from earlier
-  sessions (`open_sells`, `risk.unfilled_sells`; the cap never goes below 0)
-  (#518 owner decision: after a price drop the converted remainder can exceed
-  the holding, and the cap sells what is held instead of halting the phase on
+  name's residue and less the name's open (non-terminal) sells already
+  journaled (`open_sells`, `risk.unfilled_sells`, read before this phase's own
+  orders are journaled, so every one is from an earlier session or an earlier
+  batch of S; the cap never goes below 0, exact in `Decimal` on the
+  `quantity_decimals` grid so it agrees with `check_phase`'s
+  `sell_sum_within_holding`, which sums the same numbers the same way) (#518
+  owner decision: after a price drop the converted remainder can exceed the
+  holding, and the cap sells what is held instead of halting the phase on
   `sell_within_holding`; #605 owner decision: the same cap also subtracts
-  those open sells, so the trim passes `check_phase`'s
-  `sell_sum_within_holding`, which adds them back onto the name's sells — an
-  under-trim this leaves heals itself next session if the open sell later
-  expires, while a halt does not), by whole shares when the decision's flag is
-  set or the name is no longer `fractionable`.
+  those open sells, so the trim passes `sell_sum_within_holding`, which adds
+  them back onto the name's sells — an under-trim this leaves heals itself
+  next session if the open sell later expires, while a halt does not), by
+  whole shares when the decision's flag is set or the name is no longer
+  `fractionable`. When the open-sells subtraction alone pushes the trim below
+  the minimum (or below one whole share) — not the residue cap, which still
+  skips as before — the trim is **held**: neither an order nor a skip, so the
+  decision stays open and the next run re-attempts the same remainder, the
+  same way an under-minimum buy is `deferred` (#605 owner decision: a skip
+  here would close the decision for good, instead of healing when the open
+  sell expires).
 
 Every quantity is rounded down to `quantity_decimals` (`alpaca.quantity_decimals`)
 and, on a whole-share basis, floored, so no sell exceeds the holding the risk
@@ -38,11 +48,12 @@ The per-name skips of the phase, each a
 a plan full exit of a name not `tradable`, `untradable` for a forced exit;
 `dust` for a full exit below `risk.min_order_notional` or whose whole-share
 floor is zero (a 0.4-share receipt); `skip_below_one_share` for a whole-share
-trim that floors to zero; `skip_below_minimum` for a trim below the minimum.
-At most one sell per name: two sell decisions for one name, attempted or in
-flight, raise `ValueError` (never two sells for one name). Forced exits sell in
-the same list; their proceeds reach the buys only as the cash read after the
-sells, never as a larger target (`buy_orders`).
+trim that floors to zero (unless the open-sells subtraction alone caused it,
+held instead); `skip_below_minimum` for a trim below the minimum (same
+exception). At most one sell per name: two sell decisions for one name,
+attempted or in flight, raise `ValueError` (never two sells for one name).
+Forced exits sell in the same list; their proceeds reach the buys only as the
+cash read after the sells, never as a larger target (`buy_orders`).
 
 **`buy_orders`** sizes the open buys from `cash` (the account's cash after
 the sells, less the open-buy reserve, which the caller computes) through
@@ -76,7 +87,7 @@ from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import polars as pl
 
@@ -222,6 +233,31 @@ def _open_sold(open_sells: Sequence[risk.OpenSell]) -> dict[str, float]:
     return totals
 
 
+def _trim_cap(held: float, residue: float, open_sold: float, quantity_decimals: int) -> float:
+    """A trim's quantity cap, exact in `Decimal` on the `quantity_decimals`
+    grid: the holding rounded down first, less the residue, less the name's
+    open sells, never below 0. Rounding the holding down *before*
+    subtracting (all in `Decimal`, never `float`) is what lets `check_phase`'s
+    `sell_sum_within_holding` — which sums a sell's quantity and its open
+    sells the same exact way and compares with the holding rounded down the
+    same way — never see a total a rounding ulp over the holding (#605, pass
+    1's SHOULD FIX: the original `float` cap could still trip that rule on a
+    fractional holding or open sell)."""
+    step = Decimal(1).scaleb(-quantity_decimals)
+    rounded_holding = Decimal(repr(round_down(held, quantity_decimals)))
+    cap = rounded_holding - risk._dec(residue) - risk._dec(open_sold)
+    return float(max(cap, Decimal(0)).quantize(step, rounding=ROUND_DOWN))
+
+
+def _trim_quantity(
+    remainder_quantity: float, cap: float, whole: bool, quantity_decimals: int
+) -> float:
+    """The trim's final quantity: its remainder, capped, rounded down to
+    `quantity_decimals` and, on a whole-share basis, floored."""
+    quantity = round_down(min(remainder_quantity, cap), quantity_decimals)
+    return float(math.floor(quantity)) if whole else quantity
+
+
 def _sell_skip(
     full_exit: bool, whole: bool, quantity: float, price: float, frozen: RiskConfig
 ) -> str | None:
@@ -259,12 +295,18 @@ def sell_orders(
     phase's `assets` read by `security_id` (a name missing raises), `frozen`
     the window's frozen `risk.*` section and `quantity_decimals` the broker's
     quantity precision. `open_sells` is the name's non-terminal own sells
-    (`risk.unfilled_sells`), read before this phase's own orders are
-    journaled, so every one of them is from an earlier session (#605); a
-    trim's cap subtracts them (never below 0), a full exit's quantity does
-    not. Raises `ValueError` for a forced exit among `decisions`, a
-    non-forced-exit or non-sell among `forced_exits`, two sells for one name,
-    and every malformed input `attempt_scope` refuses.
+    already journaled (`risk.unfilled_sells`), read before this phase's own
+    orders are journaled, so every one of them is from an earlier session or
+    an earlier batch of S (#605); a trim's cap subtracts them, exact in
+    `Decimal` (never below 0, `_trim_cap`), a full exit's quantity does not.
+    When that subtraction alone drops a trim below the minimum or below one
+    whole share, the decision is **held**: no order and no skip for it this
+    run (`_sell_skip` on the trim's quantity *before* the open-sells
+    subtraction is checked too, and only a skip that subtraction alone
+    causes is swallowed), so it stays open and the next run re-attempts the
+    same remainder. Raises `ValueError` for a forced exit among `decisions`,
+    a non-forced-exit or non-sell among `forced_exits`, two sells for one
+    name, and every malformed input `attempt_scope` refuses.
     """
     _check_session(session)
     if ledger.through != session:
@@ -304,16 +346,28 @@ def sell_orders(
         full_exit = is_full_exit(decision)
         sellable = _sellable(decision, ledger, residues)
         if full_exit:
-            quantity = sellable
+            quantity = round_down(sellable, quantity_decimals)
             whole = decision.whole_share
+            if whole:
+                quantity = float(math.floor(quantity))
+            reason = _sell_skip(full_exit, whole, quantity, price, frozen)
         else:
-            cap = max(sellable - open_sold.get(sid, 0.0), 0.0)
-            quantity = min(_finite(attempt.remainder.quantity, f"remainder of {sid}"), cap)
+            held = _finite(ledger.positions.get(sid, 0.0), f"holding of {sid}")
+            residue = _finite(residues.get(sid, 0.0), f"residue of {sid}")
+            remainder_q = _finite(attempt.remainder.quantity, f"remainder of {sid}")
             whole = decision.whole_share or not asset.fractionable
-        quantity = round_down(quantity, quantity_decimals)
-        if whole:
-            quantity = float(math.floor(quantity))
-        reason = _sell_skip(full_exit, whole, quantity, price, frozen)
+            # The trim's quantity before the open-sells subtraction (the #518
+            # cap alone) and after it (#605): a skip only the subtraction
+            # causes is held, not journaled, so the decision stays open for
+            # the next run to re-attempt once the open sell terminates.
+            cap_before = _trim_cap(held, residue, 0.0, quantity_decimals)
+            cap_after = _trim_cap(held, residue, open_sold.get(sid, 0.0), quantity_decimals)
+            quantity_before = _trim_quantity(remainder_q, cap_before, whole, quantity_decimals)
+            quantity = _trim_quantity(remainder_q, cap_after, whole, quantity_decimals)
+            reason_before = _sell_skip(full_exit, whole, quantity_before, price, frozen)
+            reason = _sell_skip(full_exit, whole, quantity, price, frozen)
+            if reason is not None and reason_before is None:
+                continue  # held: the open sells alone caused it, not a real skip
         if reason is not None:
             skips.append(Skip(_id(decision), sid, reason))
             continue

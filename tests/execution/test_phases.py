@@ -314,11 +314,66 @@ def test_a_trim_is_also_capped_by_the_names_open_sells_from_an_earlier_session()
     assert isinstance(checked, Skips) and len(checked.orders) == 1
 
 
-def test_a_trim_cap_from_open_sells_never_goes_negative() -> None:
+@pytest.mark.parametrize(
+    ("held_qty", "open_qty", "notional", "whole"),
+    [
+        (44.138, 11.2, 3300.0, False),  # reviewer's reproduction: float sum is 1 ulp over
+        (62.1089, 8.59, 5400.0, False),
+        (490.58, 201.58, 29_000.0, True),  # a whole-share trim, same float-sum failure
+    ],
+)
+def test_a_fractional_trim_capped_by_open_sells_always_passes_check_phase(
+    held_qty: float, open_qty: float, notional: float, whole: bool
+) -> None:
+    """#605 pass 1 SHOULD FIX: the old `float` cap (`held - residue - open`)
+    could land a rounding ulp over the holding once `check_phase` added the
+    open sells back in `float` too, halting the batch on
+    `sell_sum_within_holding` for the exact case #605 was meant to fix. The
+    cap is now exact in `Decimal` on both sides (`_trim_cap` here,
+    `sell_sum_within_holding`'s own `Decimal` sum in `risk.py`), so this can
+    never happen."""
+    trim = _d(1, "sell", notional=notional, whole_share=whole)
+    held = {"SEC_1": held_qty}
+    result = _sells([trim], held, open_sells=[OpenSell("SEC_1", open_qty)])
+    order = _one(result)
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=[OpenSell("SEC_1", open_qty)],
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_trim_cut_to_zero_by_open_sells_alone_is_held_not_skipped() -> None:
+    """#605 pass 1 SHOULD FIX: the open-sells subtraction alone (cap would be
+    negative, floored at 0) wipes out the trim; a skip here would close the
+    decision for good (`plan._CLOSING_EVENTS`), so instead it is held — no
+    order, no skip — and the next run re-attempts the same remainder once the
+    open sell terminates (the owner's "heals itself" decision)."""
     trim = _d(1, "sell", notional=950.0)
     result = _sells([trim], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 50.0)])
+    assert result.orders == () and result.skips == ()
+
+
+def test_a_trim_below_the_minimum_even_without_open_sells_still_skips() -> None:
+    """A skip the residue cap alone would have produced (not the open-sells
+    subtraction) keeps today's behavior: journaled and closed."""
+    trim = _d(1, "sell", notional=950.0)
+    result = _sells(
+        [trim],
+        {"SEC_1": 10.0},
+        open_sells=[OpenSell("SEC_1", 50.0)],
+        frozen=RiskConfig(min_order_notional=2000.0),
+    )
     assert result.orders == ()
     assert _reasons(result) == {"SEC_1": "skip_below_minimum"}
+    assert result.skips[0].counts_toward_cap
 
 
 def test_a_full_exit_is_unaffected_by_the_names_open_sells() -> None:
