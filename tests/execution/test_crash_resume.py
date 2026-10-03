@@ -6,11 +6,11 @@ End to end on the fixture store with the scripted fake, built on
 alert fakes from `test_alerts.py`, and `test_run_stop.py`'s id helpers. This
 file covers the crash/resume mechanics, the transport-error case, the "Two
 phases" criterion's resume half, the fill-lag bound, the chain criterion, the
-cent-rounding tolerance, and the alert-kind suite (spec req 11): ten of the
-plan line's fourteen kinds with a real trigger, four (`kill_switch`,
-`reconciliation`, `rejection_cap`, `skip_cap`) `xfail`ed because no production
-path writes them yet (#644). `lot_ledger`, in `alerts.ALERT_KINDS` but not the
-plan line's list, is not covered here. A further `xfail` (#653) records a
+cent-rounding tolerance, and the alert-kind suite (spec req 11): eleven of
+the plan line's fifteen kinds with a real trigger (`lot_ledger` through the
+run's own lot-ledger error path), four (`kill_switch`, `reconciliation`,
+`rejection_cap`, `skip_cap`) `xfail`ed because no production path writes them
+yet (#644). A further `xfail` (#653) records a
 real defect found while building the chain criterion: `paper resume` cannot
 release while the window holds a marked position. (#650, found the same way,
 was regraded to low-priority hardening reproducible only with a frozen test
@@ -1021,6 +1021,36 @@ def test_unspent_cash_alert_row_exists_when_the_command_returns(
     ((run_id, session, _message),) = alerting_env.alerts("unspent_cash")
     assert (run_id, session) == (outcome.run_id, F_0)
     _assert_delivered(alert_fakes, "max_unspent_cash_fraction")
+
+
+def test_lot_ledger_alert_row_exists_when_the_command_returns(
+    alert_fakes: FakeRunner,
+    fixture_store_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lot-ledger rebuild error (#366 Q5) is a `lot_ledger` alert and a note,
+    and never fails the run. The real writer runs; only its `on_lot_error`
+    callback is also fed one error, the way the writer reports a sale beyond
+    the fill-built holding (`test_outcomes.py` covers that trigger itself)."""
+    real = run_module.write_outcomes_and_lots
+
+    def failing_lots(*args: object, **kwargs: object) -> object:
+        result = real(*args, **kwargs)  # type: ignore[arg-type]
+        on_lot_error = kwargs["on_lot_error"]
+        assert callable(on_lot_error)
+        on_lot_error("SEC_KID: a sale of more than the ledger holds")
+        return result
+
+    monkeypatch.setattr(run_module, "write_outcomes_and_lots", failing_lots)
+    alerting_env = _alerting_env(fixture_store_path)
+    alerting_env.open_window(tmp_path=tmp_path)
+    outcome = alerting_env.run(at(F_0))
+    assert outcome.status == "ok", alerting_env.result(alerting_env.latest_run())
+    ((run_id, session, message),) = alerting_env.alerts("lot_ledger")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert "more than the ledger holds" in message
+    _assert_delivered(alert_fakes, "lot ledger not rebuilt")
 
 
 def test_locked_alert_row_exists_when_the_command_returns(
