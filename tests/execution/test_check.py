@@ -13,9 +13,18 @@ import pytest
 from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
 from tradepartner.execution import check as check_module
+from tradepartner.execution import outcomes as outcomes_module
 from tradepartner.execution.check import check
 from tradepartner.store.db import open_for_write, open_read_only
-from tradepartner.store.journal import FillRow, OverrideRow, PaperReportRow, PaperWindowRow, append
+from tradepartner.store.journal import (
+    DecisionRow,
+    FillRow,
+    OrderRow,
+    OverrideRow,
+    PaperReportRow,
+    PaperWindowRow,
+    append,
+)
 
 T0 = date(2026, 9, 30)  # a rebalance session, month 0 start
 T1 = date(2026, 10, 30)  # month 0 end / month 1 start
@@ -418,7 +427,7 @@ def test_chain_becomes_due_once_a_run_exists_after_its_threshold(settings: Setti
     run after T_{i+1} = T2: now its missing terminal event and outcome are due,
     and the check must flag it (pins the `session > threshold` boundary from
     both sides, not just the "not yet due" one)."""
-    t3 = check_module._next_rebalance_session(T2)
+    t3 = outcomes_module._rebalance_after(T2)
     with open_for_write(settings) as conn:
         _build_passing_fixture(conn)
         _insert_decision(conn, 2, 2, T1)
@@ -500,6 +509,51 @@ def test_chain_due_threshold_follows_order_phase_for_a_forced_exit_in_a_rebalanc
         lines = check(conn, settings)
     line = next(line for line in lines if line.name == "chain")
     assert line.passed, line.detail
+
+
+def _order(session: date, phase: str) -> OrderRow:
+    return OrderRow(
+        client_order_id="tp-threshold",
+        decision_id=1,
+        run_id=1,
+        session=session,
+        attempt=1,
+        phase=phase,
+        security_id="SEC_A",
+        symbol="SEC_A",
+        side="buy",
+        sells_in_flight_at_submit=False,
+        known_at=_utc(session),
+        ingested_at=_utc(session),
+    )
+
+
+def test_order_due_threshold_is_the_orders_own_session_for_a_forced_exit() -> None:
+    """Pins `_order_due_threshold`'s call-through to the shared
+    `outcomes.outcome_horizon` (#597): a forced exit is due at its own
+    session, whatever decision it carries."""
+    order = _order(T1, phase="exit")
+    assert check_module._order_due_threshold(order, None) == T1
+
+
+def test_order_due_threshold_uses_the_decisions_rebalance_session() -> None:
+    decision = DecisionRow(
+        decision_id=1,
+        run_id=1,
+        rebalance_session=T0,
+        security_id="SEC_A",
+        whole_share=False,
+        decision="trade",
+        known_at=_T0_UTC,
+        ingested_at=_T0_UTC,
+    )
+    order = _order(next_session(T0), phase="buy")
+    assert check_module._order_due_threshold(order, decision) == T1
+
+
+def test_order_due_threshold_falls_back_to_the_rebalance_before_the_order() -> None:
+    order = _order(next_session(T1), phase="buy")
+    assert check_module._order_due_threshold(order, None) == T2
 
 
 def test_override_reason_fails_on_a_whitespace_padded_reason_under_the_minimum(
