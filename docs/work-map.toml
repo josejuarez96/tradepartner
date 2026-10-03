@@ -606,3 +606,33 @@ why = "The ways of working say how a PR lands now; the ruleset makes main refuse
 [task.T75b]
 what = "The owner activates the main ruleset, pushes a smoke train branch and runs the first real batch."
 why = "The only steps that need the owner's admin rights and a real batch; they gate nothing."
+
+[issue.618]
+what = "The first five research artifacts for semantic disclosure features: taxonomy v0, annotation protocol, evidence review, ML validation brief and prospective feature contract."
+why = "Decides, before any model is chosen or any return is tested, whether filing language can be measured reliably and whether it carries economic information; side track, not on the MVP path."
+unblocks = ["phase:5"]
+
+[research.2026-10-03-semantic-taxonomy-v0]
+what = "Defines demand, inventory pressure and liquidity pressure as two-part labels: evidence status, then direction only when evidence is sufficient."
+why = "Humans must be able to label a concept consistently before any model is measured against it."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-disclosure-annotation-protocol]
+what = "A 200-pair, two-annotator pilot (third on 25%) with prespecified agreement gates per dimension and class."
+why = "Shows whether the taxonomy is labelable; a concept that fails is revised or dropped before benchmarking."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-disclosure-change-evidence-review]
+what = "Graded evidence on filing-change, cross-document and LLM disclosure research, with a replication ledger, novelty map and a source audit of the typed-classifiers note."
+why = "Separates what is replicated from what is claimed, so TradePartner tests what is genuinely open."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-ml-validation-methodology-brief]
+what = "Stage gates, splits, multiplicity, calibration and registry rules for the semantic benchmark, economic tests, insider and conditional-PEAD streams."
+why = "Fixes how results will be judged before any are seen, and records which steps ADR 0008 still forbids."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-prospective-semantic-feature-spec]
+what = "The append-only record contract for forward-captured semantic features: versions, probabilities, spans, routing, cost, known_at."
+why = "Prospective frozen outputs are the only evidence free of pretrained-model look-ahead."
+unblocks = ["issue:618"]
