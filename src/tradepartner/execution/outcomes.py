@@ -7,7 +7,11 @@ run on a session after its horizon's last session:
 - **Horizon.** An order of rebalance i runs to close(T_{i+1}), T_i being its
   decision's `rebalance_session` (the last month-end session before the order's
   session when the decision has none or is not given); a forced exit
-  (`phase = exit`) to its own session. In a window with a stop requested it ends
+  (`phase = exit`) to its own session -- `outcome_horizon` is this rule, the
+  one public helper `execution.check`'s `_order_due_threshold` calls so the
+  two cannot drift (`execution.window`'s stop-closed check does not filter by
+  this at all; see `outcome_horizon`'s docstring). In a window with a stop
+  requested it ends
   at the **earliest** of that, the fill that makes the name flat (the first
   filled `exit` sell of the name on or after the request, marked at that order's
   average fill price), and close(S-1) for the first `stop` run on S whose step
@@ -157,6 +161,30 @@ def _rebalance_after(rebalance: date) -> date:
     return last_session_of_month(year, month)
 
 
+def outcome_horizon(order: OrderRow, decision_rebalance: date | None) -> date:
+    """An order's horizon before any stop pulls it in (`_horizon`'s `base`,
+    module docstring's "Horizon"): for a forced exit (`phase = exit`) its own
+    session; otherwise T_{i+1} of its rebalance (`decision_rebalance`, the
+    order's decision's `rebalance_session`, when it has one; else the
+    rebalance session strictly before the order's own session, the same
+    fallback a forced exit traded inside a rebalance batch takes, since it is
+    submitted with phase `sell` and its decision carries no
+    `rebalance_session`, ADR 0010 amendment 2026-10-01).
+
+    `execution.check`'s `_order_due_threshold` calls this directly (it never
+    sees a stop, so this *is* its due-date rule); this module's own `_horizon`
+    calls it for `base` and then narrows it further when the window has a
+    stop requested. `execution.window`'s `_not_ready` (the paper-stop closed
+    check) does **not** call this: it has no due-date filter at all, flagging
+    every order of the window regardless of whether its horizon has passed
+    (a deliberate difference, not a copy that drifted -- see the PR for
+    #597)."""
+    if order.phase == _EXIT:
+        return order.session
+    rebalance = decision_rebalance or _rebalance_before(order.session)
+    return _rebalance_after(rebalance)
+
+
 def _local(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
 
@@ -220,11 +248,7 @@ def _horizon(
 ) -> tuple[date, float | None]:
     """(the horizon's last session, the flattening fill's price when that fill
     ends it)."""
-    if order.phase == _EXIT:
-        base = order.session
-    else:
-        rebalance = rebalance_of.get(order.decision_id) or _rebalance_before(order.session)
-        base = _rebalance_after(rebalance)
+    base = outcome_horizon(order, rebalance_of.get(order.decision_id))
     if window.stop_requested is None:
         return base, None
     # Ties go to the earlier entry: the flattening fill, then close(T_{i+1}).

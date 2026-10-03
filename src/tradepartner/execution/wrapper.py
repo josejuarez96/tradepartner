@@ -152,7 +152,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import NoReturn, Protocol
+from typing import Any, NoReturn, Protocol
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -1005,8 +1005,16 @@ class RiskGatedBroker:
         self, run: PaperRunRow, book: _Book, rows: Sequence[DecisionRow], side: str
     ) -> dict[str, Asset]:
         """The clock pre-check, the refusal of a name with no listing at
-        close(S-1) (before any broker call), then the phase's `assets` read
-        for its open decisions, keyed by `security_id`."""
+        close(S-1) (before any broker call), the reused-ticker check (#568
+        item 2), then the phase's `assets` read for its open decisions,
+        keyed by `security_id`.
+
+        The reused-ticker check runs here, not in `_listings`/`_read_book`:
+        it is scoped to this phase's own attempt scope (only names this
+        phase actually resolves against the broker), so a batch the kill
+        switch skips, or a second run whose exit sell is already accepted
+        and has no attempt left this phase, never halts over a reuse that
+        would never reach the broker anyway."""
         assert run.session is not None
         self.clock_precheck(run.session, book.last_ok_ingest)
         names = sorted(
@@ -1015,6 +1023,12 @@ class RiskGatedBroker:
         unknown = [sid for sid in names if not book.tickers.get(sid)]
         if unknown:
             raise ValueError(f"no listing known at close(S-1) for {unknown}")
+        delisted = frozenset(sid for sid in names if sid in book.ended)
+        if delisted:
+            cut = session_close(previous_session(run.session))
+            with self._journal() as conn:
+                current = current_listings(listings_as_of(conn, cut, sorted(delisted)), run.session)
+                _refuse_reused_tickers(conn, cut, run.session, current, delisted)
         symbols = {sid: canonical_symbol(str(book.tickers[sid])) for sid in names}
         answer = self._broker.assets(sorted(symbols.values()))
         missing = sorted(sym for sym in symbols.values() if sym not in answer)
@@ -1388,7 +1402,19 @@ def _listings(
 ) -> tuple[dict[str, str | None], frozenset[str]]:
     """Each name's ticker (its current listing at S among rows known at
     close(S-1); None without one) and the names whose listing ended
-    (`delisted`) at close(S-1)."""
+    (`delisted`) at close(S-1).
+
+    A delisted name's own ticker must not also be a *later* issuer's current
+    ticker as of close(S-1): that reuse would otherwise let the `assets`
+    read resolve against the new issuer, not the delisted one this read
+    means (#568 item 2). That check does not run here: `_listings` backs
+    `_read_book`, which every batch reads before the kill-switch check and
+    before `attempt_scope` decides whether a phase sends anything, so
+    raising here would halt a batch the kill switch would otherwise skip,
+    or a second run whose exit sell was already accepted and needs no
+    further attempt. `_phase_assets` runs the check instead, scoped to the
+    names its own phase's attempt scope actually resolves, right before the
+    broker `assets` call."""
     if not names:
         return {}, frozenset()
     cut = session_close(previous_session(session))
@@ -1397,7 +1423,49 @@ def _listings(
     ends = current_listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
-    return tickers, frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+    delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+    return tickers, delisted
+
+
+def _refuse_reused_tickers(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    session: date,
+    current: Mapping[str, Mapping[str, Any]],
+    delisted: frozenset[str],
+) -> None:
+    """For each `delisted` name, refuse when some other security's current
+    listing (as of close(S-1), across the whole universe) names the same
+    ticker with a strictly later `valid_from`: a later issuer who reused it.
+    An earlier owner of the same ticker (this name itself took it over from
+    someone even older) is not a collision, and neither is a coincidental
+    match with a security that has never been this name's own listing's
+    ticker since."""
+    if not delisted:
+        return
+    universe = current_listings(listings_as_of(conn, cut), session)
+    collisions: dict[str, tuple[str, list[str]]] = {}
+    for sid in delisted:
+        row = current.get(sid)
+        if row is None:
+            continue
+        ticker = str(row["ticker"])
+        own_valid_from = row["valid_from"]
+        reused_by = sorted(
+            other
+            for other, other_row in universe.items()
+            if other != sid
+            and str(other_row["ticker"]) == ticker
+            and other_row["valid_from"] is not None
+            and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
+        )
+        if reused_by:
+            collisions[sid] = (ticker, reused_by)
+    if collisions:
+        raise ValueError(
+            "ticker reused by a later issuer since close(S-1), the assets read would be "
+            f"ambiguous: {collisions}"
+        )
 
 
 def _last_ok_ingest(conn: duckdb.DuckDBPyConnection) -> datetime | None:
