@@ -152,7 +152,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import NoReturn, Protocol
+from typing import Any, NoReturn, Protocol
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -1354,47 +1354,63 @@ def _listings(
     close(S-1); None without one) and the names whose listing ended
     (`delisted`) at close(S-1).
 
-    A name's own ticker must not also be some other security's current
-    ticker as of close(S-1): a delisted name whose ticker a later issuer
-    reused would otherwise let the `assets` read resolve against the new
-    issuer, not the one this read means (#568 item 2). Checked against the
-    whole universe, not just `names`, and failed closed before any broker
-    call."""
+    A delisted name's own ticker must not also be a *later* issuer's current
+    ticker as of close(S-1): that reuse would otherwise let the `assets`
+    read resolve against the new issuer, not the delisted one this read
+    means (#568 item 2). Checked only for a name whose own listing ended
+    (a live name's ticker needs no such check), against the whole universe
+    rather than just `names` (the reusing issuer need not be one of them),
+    and failed closed before any broker call."""
     if not names:
         return {}, frozenset()
     cut = session_close(previous_session(session))
     current = current_listings(listings_as_of(conn, cut, list(names)), session)
     tickers = {sid: (str(current[sid]["ticker"]) if sid in current else None) for sid in names}
-    _refuse_reused_tickers(conn, cut, session, tickers)
     ends = current_listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
-    return tickers, frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+    delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+    _refuse_reused_tickers(conn, cut, session, current, delisted)
+    return tickers, delisted
 
 
 def _refuse_reused_tickers(
     conn: duckdb.DuckDBPyConnection,
     cut: datetime,
     session: date,
-    tickers: Mapping[str, str | None],
+    current: Mapping[str, Mapping[str, Any]],
+    delisted: frozenset[str],
 ) -> None:
-    """Every ticker in `tickers` must be, as of close(S-1), the current
-    ticker of exactly one security across the whole universe; a ticker two
-    distinct security_ids both currently hold (one of them stale, the other
-    a later issuer who reused it) is ambiguous for the `assets` read and
-    refused before it is made."""
+    """For each `delisted` name, refuse when some other security's current
+    listing (as of close(S-1), across the whole universe) names the same
+    ticker with a strictly later `valid_from`: a later issuer who reused it.
+    An earlier owner of the same ticker (this name itself took it over from
+    someone even older) is not a collision, and neither is a coincidental
+    match with a security that has never been this name's own listing's
+    ticker since."""
+    if not delisted:
+        return
     universe = current_listings(listings_as_of(conn, cut), session)
-    owners: dict[str, set[str]] = {}
-    for sid, row in universe.items():
-        owners.setdefault(str(row["ticker"]), set()).add(sid)
-    collisions = {
-        sid: ticker
-        for sid, ticker in tickers.items()
-        if ticker is not None and len(owners.get(ticker, set())) > 1
-    }
+    collisions: dict[str, tuple[str, list[str]]] = {}
+    for sid in delisted:
+        row = current.get(sid)
+        if row is None:
+            continue
+        ticker = str(row["ticker"])
+        own_valid_from = row["valid_from"]
+        reused_by = sorted(
+            other
+            for other, other_row in universe.items()
+            if other != sid
+            and str(other_row["ticker"]) == ticker
+            and other_row["valid_from"] is not None
+            and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
+        )
+        if reused_by:
+            collisions[sid] = (ticker, reused_by)
     if collisions:
         raise ValueError(
-            "ticker reused by another security as of close(S-1), the assets read would be "
+            "ticker reused by a later issuer since close(S-1), the assets read would be "
             f"ambiguous: {collisions}"
         )
 

@@ -387,6 +387,77 @@ def test_a_reused_ticker_never_resolves_to_the_new_issuers_asset(
     assert len(env.submits()) == submitted_before
     assert exit_orders(env, "SEC_TRANSFER") == []
     assert env.held()["TRNS"] == pytest.approx(held)
+    status, fault_type, _message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "ValueError")
+
+
+def test_an_older_owner_of_a_now_delisted_names_ticker_never_blocks_its_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) fires only for a *later* issuer:
+    a now-dead security that held SEC_TRANSFER's ticker before SEC_TRANSFER
+    itself did (SEC_TRANSFER took the ticker over, not the other way round)
+    never blocks SEC_TRANSFER's own forced exit."""
+    bought(env)
+    ended_before(env, MAY_3)
+    ((own_valid_from,),) = env.query(
+        "SELECT valid_from FROM listings WHERE security_id = 'SEC_TRANSFER' "
+        "ORDER BY valid_from DESC LIMIT 1"
+    )
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=2)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_GHOST_HELD_TRNS_FIRST",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": own_valid_from - timedelta(days=1),
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((_decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_stale_delisted_securitys_shared_ticker_never_blocks_a_live_name(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) only ever looks at a name whose
+    own listing has ended: a dormant, unrelated security that happens to
+    share a currently-held, still-listed name's ticker (SPFT, never
+    delisted in this test) never blocks that name's own run, even though its
+    `valid_from` has the same shape a real reuse would."""
+    bought(env)
+    held = env.held()["SPFT"]
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_GHOST_SHARES_SPFT",
+            "ticker": "SPFT",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert env.held()["SPFT"] == pytest.approx(held)
 
 
 class _NoBroker:
