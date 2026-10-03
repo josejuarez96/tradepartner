@@ -41,11 +41,14 @@ halts with `ReconciliationError` the first time; while the switch is already
 engaged the row is the report and the run goes on (spec req 8). Then the
 `executed` test: every due rebalance with no `rebalance_events` row whose
 decisions are all closed or settled (`plan.rebalance_state`) gets its
-`executed` row, before the lapse rule. Each `executed` row written here (a
-fill collected late, #553) gets the `unspent_cash` test of step 7b, with the
-broker's cash and equity read just after the row is written. A `stop` run then
-writes `missed` with reason `window_stop` for every rebalance still pending
-(F_i <= S, no event), planned or not, so the lapse rule never meets it.
+`executed` row, before the lapse rule. Every `executed` row written here (a
+fill collected late, #553) gets the `unspent_cash` test of step 7b, the
+broker's cash and equity read once just after the rows are written, one alert
+at most naming every rebalance over the bound (the alerter dedupes on
+(kind, run), so this call site and step 7b's own must each write one alert or
+none, never two). A `stop` run then writes `missed` with reason `window_stop`
+for every rebalance still pending (F_i <= S, no event), planned or not, so
+the lapse rule never meets it.
 
 **Step 4.** `reconcile_now` (T61), its journal cut (`as_of`, #488) a clock
 reading taken just before the call, so step 3's collected rows are in it.
@@ -128,13 +131,19 @@ say untradable, so a later `stop` run exits it once it trades again.
 until each is terminal or `paper.accept_wait_seconds` has passed since the
 step began (an absolute deadline: an order still open then is step 3's on the
 next run), polling every `paper.poll_interval_seconds`. Then the `executed`
-test of step 3 runs again, and for each rebalance reaching `executed` here
-the `unspent_cash` alert is written when the cash exceeds the frozen
-`risk.max_unspent_cash_fraction` of the broker's equity read at that moment.
-The cash is the batch's `BatchOutcome.cash_left` for the batch's own
-rebalance when its buys phase read the cash, else the broker's cash read with
-that equity. A rebalance gets one `executed` row, so one alert at most. The batch's status
-(`skipped_kill_switch` when the wrapper read the switch engaged) is the run's.
+test of step 3 runs again (skipped for a `stop` run: the stop already sold to
+cash, so the broker's cash read here would be a false positive, T63f), and
+one `unspent_cash` alert at most, naming every rebalance reaching `executed`
+here whose cash exceeds the frozen `risk.max_unspent_cash_fraction` of the
+broker's equity read at that moment. The cash is the batch's
+`BatchOutcome.cash_left` for the batch's own rebalance when its buys phase
+read the cash, else the broker's cash read with that equity. A rebalance
+gets one `executed` row, so this call site names it at most once; a run
+reaching `executed` for a rebalance at step 3 and another (or the same one)
+here calls `_unspent_cash` twice, and the alerter's (kind, run) dedupe keeps
+only the first of the two alerts (rare under current settings). The batch's
+status (`skipped_kill_switch` when the wrapper read the switch engaged) is
+the run's.
 
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
 `ok`, or the batch's `skipped_kill_switch`.
@@ -1047,8 +1056,7 @@ class _Run:
         prices = self._pending_prices(actions)
         self.write_offs = WriteOffContext(self.window_id, actions, prices.__getitem__, self.session)
         collected = self._collect()
-        for t_i in self._executed(actions, prices):
-            self._unspent_cash(t_i, None)
+        self._unspent_cash(self._executed(actions, prices), {})
         if self.kind == _STOP:
             self._stop_missed()
         reconciliation = self._reconcile()
@@ -1094,8 +1102,10 @@ class _Run:
             self.write_offs = WriteOffContext(
                 self.window_id, actions, prices.__getitem__, self.session
             )
-            for t_i in self._executed(actions, prices):
-                self._unspent_cash(t_i, batch.cash_left if t_i == rebalance else None)
+            executed = self._executed(actions, prices)
+            if self.kind != _STOP:
+                cash_left = {rebalance: batch.cash_left} if rebalance is not None else {}
+                self._unspent_cash(executed, cash_left)
         self._reconcile()
         return self._finish(OK if batch is None else batch.status)
 
@@ -1376,20 +1386,46 @@ class _Run:
             write_offs=self.write_offs,
         )
 
-    def _unspent_cash(self, rebalance: date, cash_left: float | None) -> None:
-        """The `unspent_cash` alert at `executed` (module docstring): the cash
-        is `cash_left`, this run's buys phase's for `rebalance`, else the
-        broker's cash read with the equity, after `executed` is written."""
+    def _unspent_cash(
+        self, rebalances: Sequence[date], cash_left: Mapping[date, float | None]
+    ) -> None:
+        """One `unspent_cash` alert, at most, for every rebalance in
+        `rebalances` reaching `executed` here whose cash exceeds the frozen
+        `risk.max_unspent_cash_fraction` of the broker's equity (module
+        docstring): the cash for a rebalance is `cash_left[rebalance]`, this
+        run's buys phase's, when it is given and not None, else the broker's
+        cash, read once with the equity for every rebalance in this call.
+
+        The alerter dedupes on (kind, run), so a run reaching `executed` for
+        more than one rebalance at one call site must not call `_alert` more
+        than once: every rebalance over the bound is named in one message.
+
+        Known limitation: a run that reaches `executed` at both step 3 and
+        step 7b calls this twice; if step 3's call already wrote an
+        `unspent_cash` alert, step 7b's own call still writes one, but the
+        alerter's dedupe drops it even when it names a different rebalance.
+        Rare under current settings, since catching up more than one
+        rebalance in a run needs `paper.max_catch_up_sessions` turned up."""
+        if not rebalances:
+            return
         account = self._broker_call(Broker.account.__name__, self.broker.account)
-        cash = account.cash if cash_left is None else cash_left
         bound = self.frozen.max_unspent_cash_fraction * account.equity
-        if cash > bound:
-            self._alert(
-                _UNSPENT_CASH,
-                f"rebalance {rebalance.isoformat()} executed with {cash:.2f} cash "
-                f"unspent, above risk.max_unspent_cash_fraction "
-                f"{self.frozen.max_unspent_cash_fraction} of equity {account.equity:.2f}",
-            )
+        over = [
+            (t_i, account.cash if cash_left.get(t_i) is None else cash_left[t_i])
+            for t_i in rebalances
+        ]
+        over = [(t_i, cash) for t_i, cash in over if cash is not None and cash > bound]
+        if not over:
+            return
+        named = "; ".join(
+            f"rebalance {t_i.isoformat()} executed with {cash:.2f} cash unspent"
+            for t_i, cash in over
+        )
+        self._alert(
+            _UNSPENT_CASH,
+            f"{named}, above risk.max_unspent_cash_fraction "
+            f"{self.frozen.max_unspent_cash_fraction} of equity {account.equity:.2f}",
+        )
 
     def _reconcile(self) -> Reconciliation:
         """Steps 4 and 8. The journal cut (`as_of`, #488) is a clock reading

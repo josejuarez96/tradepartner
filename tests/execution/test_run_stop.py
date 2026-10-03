@@ -191,6 +191,25 @@ def test_a_stop_run_sells_every_holding_through_the_wrapper_in_the_window(
     assert [s.side for s in env.submits()][-3:] == ["sell", "sell", "sell"]
 
 
+def test_a_stop_run_skips_step_7bs_unspent_cash_check(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop run sells to cash, so step 7b's broker-cash read there would be
+    a false positive (T63f): the step-7b `unspent_cash` check is skipped in a
+    `stop` run (step 3's own check, before any stop sell, still runs) (#563).
+    `_Run._executed` is stubbed to find nothing at step 3 and a rebalance at
+    step 7b, as a plain run's own fall-back test does; here the run is a
+    `stop`, so no alert is written either way."""
+    bought(env)
+    request_stop(env, at(F_0, 22, 0))
+    calls = iter([[], [T_0]])
+    monkeypatch.setattr(run_module._Run, "_executed", lambda self, actions, prices: next(calls))
+    outcome = env.run(at(MAY_2))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert outcome.kind == "stop"
+    assert env.alerts("unspent_cash") == []
+
+
 def test_an_open_delisted_exit_is_re_attempted_without_a_second_sell(
     env: Env, window: PaperWindowRow
 ) -> None:
