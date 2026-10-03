@@ -10,16 +10,20 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
 2. Nothing gives it a default: no parameter or dataclass field named
    `accept_rejections` has one, so a caller that forgets it fails rather than
    quietly passing a value.
-3. Every `accept_rejections=` keyword passes the caller's own
-   `accept_rejections` name on, never a literal or another expression. The name
-   is never bound except as a parameter or a dataclass field (no
-   `accept_rejections = True`, no match, except, import, global or nonlocal
-   capture, and no `def`, `async def` or `class` named for it), every such
-   parameter is keyword-only (so no positional argument can feed it), the name
-   is never passed positionally, including unwrapped through a starred list,
-   tuple or set display (`*[accept_rejections]`, `*(accept_rejections,)`) but
-   to `isinstance` or `type`, for `resume`'s own type check, and it is never
-   spelt as a whole string (no `**{"accept_rejections": True}`).
+3. The check fails closed: every `Load` of the bare name must sit in one of
+   four safe contexts, or it is reported. The safe contexts are the value of
+   an `accept_rejections=` keyword (passing the caller's own flag on), a
+   direct positional argument to `isinstance` or `type` (`resume`'s own type
+   check), the whole `test` of an `if`, or (for a `Store`) the target of a
+   bare annotated field. Everything else - a literal or other expression
+   under the `accept_rejections=` keyword, the name under any other keyword,
+   a positional pass, smuggling through a starred list/tuple/set/dict
+   display, a multiplied or generator expression, an `IfExp`, an alias bound
+   first and starred later, `del`, or a PEP 695 type parameter named for it
+   - is refused. The name is never otherwise bound (no `accept_rejections =
+   True`, no match, except, import, global or nonlocal capture, and no
+   `def`, `async def` or `class` named for it), and every such parameter is
+   keyword-only (so no positional argument can feed it).
 4. No module imports `execution.resume` except those in `RESUME_CALLERS`. There
    are none yet: the `paper resume` CLI is T67. T67 adds `cli.py` here and to
    `ALLOWED`, with the flag as an explicit `argparse` `store_true` option and one
@@ -91,6 +95,10 @@ def mentions(tree: ast.Module) -> list[int]:
                 and node.name == FLAG
             )
             or (
+                isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple))
+                and node.name == FLAG
+            )
+            or (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and any(s in node.value for s in SPELLINGS)
@@ -124,30 +132,34 @@ def defaults(tree: ast.Module) -> list[int]:
     return lines
 
 
-def _unwrap_display(expr: ast.expr) -> list[ast.expr]:
-    """The bare expressions reachable through nested list/tuple/set displays
-    and the `Starred` elements inside them (`*[accept_rejections]`,
-    `*(accept_rejections,)`), so a positional check can see the name without
-    flagging an arbitrary expression that merely contains it."""
-    if not isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
-        return [expr]
-    found: list[ast.expr] = []
-    for elt in expr.elts:
-        inner = elt.value if isinstance(elt, ast.Starred) else elt
-        found.extend(_unwrap_display(inner))
-    return found
+def _parent_map(tree: ast.Module) -> dict[int, ast.AST]:
+    """Maps each node's `id()` to its parent, so a `Load` of the flag can be
+    classified by where it sits without re-deriving an unwrapper for every
+    new smuggling shape (a display, a generator, an `IfExp`, ...)."""
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    return parents
 
 
 def misuses(tree: ast.Module) -> list[str]:
-    """Rule 3: a keyword passing anything but the caller's own flag, a parameter
-    that is not keyword-only (so no positional argument can feed it), a binding
-    other than such a parameter or a field, a positional pass, or a whole-string
-    key."""
+    """Rule 3, fail closed: a parameter that is not keyword-only (so no
+    positional argument can feed it), a binding other than a keyword-only
+    parameter or a bare annotated field, a PEP 695 type parameter named for
+    it, a whole-string spelling, a keyword passing anything but the caller's
+    own flag under `accept_rejections=`, or (the catch-all) any `Load` of the
+    bare name that is not the value of an `accept_rejections=` keyword, a
+    direct positional argument to `isinstance`/`type`, or the whole `test` of
+    an `if`. Anything else - smuggled through a display, a multiplied or
+    generator expression, an `IfExp`, an alias bound first, another keyword,
+    or `del` - is reported rather than special-cased."""
     fields = {
         id(node.target)
         for node in ast.walk(tree)
         if isinstance(node, ast.AnnAssign) and node.value is None
     }
+    parents = _parent_map(tree)
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.arguments):
@@ -160,6 +172,8 @@ def misuses(tree: ast.Module) -> list[str]:
             and node.name == FLAG
         ):
             found.append(f"{node.lineno}: binds the name in a def/class")
+        elif isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) and node.name == FLAG:
+            found.append(f"{node.lineno}: binds the name in a type parameter")
         elif (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == FLAG) or (
             isinstance(node, ast.MatchMapping) and node.rest == FLAG
         ):
@@ -179,26 +193,36 @@ def misuses(tree: ast.Module) -> list[str]:
         ):
             found.append(f"{node.value.lineno}: passes {ast.unparse(node.value)}")
         elif (
-            isinstance(node, ast.Name)
-            and node.id == FLAG
-            and isinstance(node.ctx, ast.Store)
-            and id(node) not in fields
-        ):
-            found.append(f"{node.lineno}: binds the name")
-        elif isinstance(node, ast.Call) and not (
-            isinstance(node.func, ast.Name) and node.func.id in _TYPE_CHECKS
-        ):
-            for arg in node.args:
-                inner = arg.value if isinstance(arg, ast.Starred) else arg
-                for candidate in _unwrap_display(inner):
-                    if isinstance(candidate, ast.Name) and candidate.id == FLAG:
-                        found.append(f"{candidate.lineno}: passed positionally")
-        elif (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
             and node.value.strip() in SPELLINGS
         ):
             found.append(f"{node.lineno}: spelt as a whole string")
+        elif isinstance(node, ast.Name) and node.id == FLAG:
+            if isinstance(node.ctx, ast.Store):
+                if id(node) not in fields:
+                    found.append(f"{node.lineno}: binds the name")
+            elif isinstance(node.ctx, ast.Load):
+                parent = parents.get(id(node))
+                safe = (
+                    (
+                        isinstance(parent, ast.keyword)
+                        and parent.arg == FLAG
+                        and parent.value is node
+                    )
+                    or (
+                        isinstance(parent, ast.Call)
+                        and isinstance(parent.func, ast.Name)
+                        and parent.func.id in _TYPE_CHECKS
+                        and node in parent.args
+                    )
+                    or (isinstance(parent, ast.If) and parent.test is node)
+                )
+                if not safe:
+                    where = ast.unparse(parent) if parent is not None else ast.unparse(node)
+                    found.append(f"{node.lineno}: unclassified use: {where}")
+            else:
+                found.append(f"{node.lineno}: deletes the name")
     return found
 
 
@@ -280,6 +304,22 @@ Rule = Callable[[ast.Module], object]
         ("class accept_rejections: ...", misuses),
         ("_start(c, *[accept_rejections])", misuses),
         ("_start(c, *(accept_rejections,))", misuses),
+        ("_start(c, *{accept_rejections: 0})", misuses),
+        ("_start(c, **{accept_rejections: 0})", misuses),
+        ("_start(c, *{accept_rejections})", misuses),
+        ("_start(c, *([accept_rejections] * 1))", misuses),
+        ('_start(c, *(accept_rejections for _ in "x"))', misuses),
+        ("_start(c, accept_rejections if x else y)", misuses),
+        ("_start(c, *([accept_rejections] if x else []))", misuses),
+        ("x = [accept_rejections]\n_start(*x)", misuses),
+        ("_start(c, other=accept_rejections)", misuses),
+        ("del accept_rejections", misuses),
+        ("def f[accept_rejections](): ...", misuses),
+        ("def f[accept_rejections](): ...", mentions),
+        ("class C[**accept_rejections]: ...", misuses),
+        ("class C[**accept_rejections]: ...", mentions),
+        ("type A[*accept_rejections] = int", misuses),
+        ("type A[*accept_rejections] = int", mentions),
         ("def accept_rejections(): ...", mentions),
         ("async def accept_rejections(): ...", mentions),
         ("class accept_rejections: ...", mentions),
@@ -298,7 +338,11 @@ def test_each_rule_refuses_a_sample_that_breaks_it(source: str, rule: Rule) -> N
 def test_the_rules_let_the_callers_own_flag_through() -> None:
     allowed = ast.parse(
         "def resume(*, accept_rejections: bool):\n"
+        "    if not isinstance(accept_rejections, bool):\n"
+        "        raise TypeError(f'{type(accept_rejections).__name__}')\n"
         "    _start(c, accept_rejections=accept_rejections)\n"
+        "    if accept_rejections:\n"
+        "        pass\n"
         "class Row:\n"
         "    accept_rejections: bool\n"
     )
