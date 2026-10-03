@@ -55,10 +55,14 @@ marks, the lot ledger, the exits and the planning step; the planning step's
 any symbol it lacks.
 
 **Step 5.** `marks.marks_for` rows for every session after the window's last
-mark (or from the window's start date) through S-1; the drawdown check (T59)
-on each session this run marks (and the last marked session), so a crossing on
-a back-filled session is not missed, engaging once with source `drawdown` and
-its alert; the `missed_run` alert when S-1
+mark (or from the window's start date) through S-1; the drawdown check (T59,
+`_drawdown`) on every marked session whose mark is known after the window's
+last release (all of them when there is none), plus the sessions this run
+marks and the last marked session, so neither a back-filled crossing nor one
+left unchecked by a run that failed between writing its marks and this check
+is missed, engaging once with source `drawdown` and its alert (a crossing
+dated before the last release is still checked, its alert naming it
+back-filled); the `missed_run` alert when S-1
 is after the window's start date and has no `paper_runs` row; the lapse rows
 from `marks.lapses`, with one `missed_rebalance` alert; the due outcomes and the
 lot-ledger write (T62). A lot-ledger error never fails the run: it is a
@@ -1503,8 +1507,27 @@ class _Run:
             self._alert("missed_run", f"no paper run on {boundary.isoformat()}")
 
     def _drawdown(self, marked: set[date]) -> None:
-        """The drawdown check on each session this run `marked` and on the last
-        marked session, in session order; the first crossing engages, once."""
+        """The drawdown check, in session order, on: every marked session whose
+        mark row's `known_at` is after the window's last `released` kill-switch
+        event (all marked sessions when there is none), plus the sessions this
+        run `marked` and the window's last marked session. The first crossing
+        engages, once.
+
+        `switch.drawdown_peak` is constant between releases (the last
+        `released` row's `peak_equity`, else `starting_equity`) and
+        `switch.drawdown_armed` is disarmed from a `drawdown` engagement until
+        the next release, so the trigger fires once per crossing however many
+        times a session already checked is checked again: re-checking it is
+        idempotent. A run that fails between writing its marks and this check
+        therefore leaves no gap: the marked sessions it wrote are the next
+        run's to check too, since nothing before the last release has been
+        cleared out of this wider set.
+
+        A crossing on a session dated before the window's last release is
+        still checked (erring toward safety: a release elsewhere in the
+        window does not excuse a drawdown the owner has not seen), but its
+        alert names it as back-filled and predating that release.
+        """
         with open_read_only(self.settings) as conn:
             marks_rows = positions_daily_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
@@ -1512,8 +1535,19 @@ class _Run:
             return
         peak = switch.drawdown_peak(self.window, rows)
         armed = switch.drawdown_armed(self.window_id, rows)
+        releases = [r.at for r in rows if r.state == switch.RELEASED]
+        last_release = max(releases) if releases else None
+        known_at_of: dict[date, datetime] = {}
+        for row in marks_rows:
+            known_at_of[row.session] = min(row.known_at, known_at_of.get(row.session, row.known_at))
+        to_check = {
+            day
+            for day, known_at in known_at_of.items()
+            if last_release is None or known_at > last_release
+        }
+        to_check |= marked | {max(r.session for r in marks_rows)}
         crossed: tuple[date, float] | None = None
-        for day in sorted(marked | {max(r.session for r in marks_rows)}):
+        for day in sorted(to_check):
             equity = _mark_equity(marks_rows, day)
             if equity is not None and switch.drawdown_check(
                 equity, peak, self.frozen.max_drawdown, armed=armed
@@ -1527,6 +1561,8 @@ class _Run:
             f"ledger equity {equity:.2f} at {day.isoformat()} is below the peak {peak:.2f} "
             f"by more than risk.max_drawdown {self.frozen.max_drawdown}"
         )
+        if last_release is not None and day < last_release.astimezone(_NEW_YORK).date():
+            reason += f" (back-filled session, before the release at {last_release.isoformat()})"
         engaged = switch.engage(
             self.settings,
             self.gate.read_clock,

@@ -39,6 +39,7 @@ from tradepartner.errors import (
     StaleDataError,
 )
 from tradepartner.execution import run as run_module
+from tradepartner.execution import switch
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.run import RunOutcome, invoked_by, tracking_run
 from tradepartner.store import registry
@@ -933,6 +934,105 @@ def test_a_drawdown_breach_on_a_back_filled_session_engages(
     assert outcome.status == "skipped_kill_switch", env.results()
     assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
     assert ("drawdown", outcome.run_id, WED) in env.alerts()
+    (message,) = [r[0] for r in env.query("SELECT message FROM alerts WHERE kind = 'drawdown'")]
+    assert MON.isoformat() in message
+    assert exits_done == []
+
+
+def test_a_crash_between_marks_and_the_drawdown_check_is_caught_by_the_next_run(
+    env: Env, exits_done: list[object]
+) -> None:
+    """A run marks Monday and Tuesday and then fails before the drawdown
+    check (simulated here by writing the marks directly under an earlier,
+    finished run, rather than this run's own): Wednesday's run writes no new
+    mark of its own (Tuesday is already the last marked session) but still
+    checks every marked session, since no release has happened, so Monday's
+    crossing engages the switch with source `drawdown` (#560)."""
+    shares = 1000.0
+    cash = FAKE_CASH
+    closes = dict(
+        env.query(
+            "SELECT session, close FROM prices_daily WHERE security_id = ? AND session IN (?, ?)",
+            [SPY, MON, TUE],
+        )
+    )
+    assert closes[MON] < closes[TUE]
+    line = cash + shares * (closes[MON] + closes[TUE]) / 2
+    peak = line / (1 - RiskConfig().max_drawdown)
+    window = env.window(started=_at(MON, 22), starting_equity=peak)
+    env.ingest(_at(TUE, 21))
+    from tradepartner.store.journal import PositionDailyRow
+
+    failed_run = env.past_run(window, _at(MON), status="ok")
+    for day, close in ((MON, closes[MON]), (TUE, closes[TUE])):
+        env.append(
+            PositionDailyRow(
+                run_id=failed_run,
+                session=day,
+                security_id=SPY,
+                quantity=shares,
+                mark_price=close,
+                value=shares * close,
+                cash=cash,
+                tradable=True,
+                known_at=_at(day, 21),
+                ingested_at=_at(day, 21),
+            )
+        )
+    outcome = env.run(_at(WED))
+    assert sorted({r[0] for r in env.query("SELECT session FROM positions_daily")}) == [MON, TUE]
+    assert outcome.status == "skipped_kill_switch", env.results()
+    assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
+    assert ("drawdown", outcome.run_id, WED) in env.alerts()
+    assert exits_done == []
+
+
+def test_a_back_filled_crossing_while_disarmed_does_not_re_engage(
+    env: Env, exits_done: list[object]
+) -> None:
+    """A drawdown already engaged (no release) disarms the trigger (T59): a
+    later run's back-filled crossing on an earlier session does not re-engage
+    the switch and writes no second `drawdown` alert (#560)."""
+    shares = 1000.0
+    cash = FAKE_CASH
+    (close_mon,) = (
+        r[0]
+        for r in env.query(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session = ?", [SPY, MON]
+        )
+    )
+    peak = 10.0 * (cash + shares * close_mon)
+    window = env.window(started=_at(MON, 22), starting_equity=peak)
+    env.ingest(_at(TUE, 21))
+    seeded = switch.engage(
+        env.settings,
+        lambda: _at(MON, 10),
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="drawdown",
+        reason="seeded: already engaged, no release",
+    )
+    assert isinstance(seeded, int)
+    from tradepartner.store.journal import PositionDailyRow
+
+    earlier = env.past_run(window, _at(MON), status="ok")
+    env.append(
+        PositionDailyRow(
+            run_id=earlier,
+            session=MON,
+            security_id=SPY,
+            quantity=shares,
+            mark_price=close_mon,
+            value=shares * close_mon,
+            cash=cash,
+            tradable=True,
+            known_at=_at(MON, 21),
+            ingested_at=_at(MON, 21),
+        )
+    )
+    outcome = env.run(_at(WED))
+    assert outcome.status == "skipped_kill_switch", env.results()
+    assert env.engaged() == [("drawdown", None, None, None)]  # unchanged: no second engagement
+    assert [a for a in env.alerts() if a[0] == "drawdown"] == []
     assert exits_done == []
 
 
