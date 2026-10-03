@@ -325,7 +325,14 @@ def _parse_tested(body: str) -> tuple[str, int, str, frozenset[int]] | None:
 
 def record_matches_comments(record: Record, owner_comments: Mapping[int, Sequence[str]]) -> bool:
     """Whether the frozen record is the one `build` reported (req 7). `owner_comments`
-    maps each PR number to the bodies its owner-authored comments carry."""
+    maps each PR number to the bodies its owner-authored comments carry. `run_merge`
+    (#642, follow-up 2) only passes bodies for the *accepted* PRs - a dropped, already-
+    merged or ineligible PR carries no `TESTED` comment to check in the first place, so its
+    missing entry here can never make the "a PR outside the accepted list was listed as
+    tested" branch below fire from `merge`. That branch still does its job against a
+    hand-edited record: the prefix-set and position-range checks below still catch a
+    *tested* PR removed from the middle of the accepted list, and dropping only the last
+    tested PR still lands a valid (shorter) tested prefix."""
     accepted = record.accepted()
     numbers = [pr.number for pr in record.prs]
     if len(set(numbers)) != len(numbers):
@@ -1018,7 +1025,8 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
     # accepted PRs are read live (#642, follow-up 2): a dropped/already-merged/ineligible
     # PR is not part of what `merge` lands, so a push to it mid-merge must never abort the
     # whole batch, and its live state (including the fetch-race check in `pr_data`) is
-    # never needed here.
+    # never needed here. `record_matches_comments`'s docstring explains why leaving its
+    # `owner_comments` entry out is still safe.
     owner_comments: dict[int, list[str]] = {}
     pr_data_by_number: dict[int, PrData] = {}
     for pr_entry in accepted:
@@ -1234,7 +1242,13 @@ def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
         # no record yet may belong to a build still in flight. Fail closed: skip it, exactly
         # as an unfinished build's own record would be skipped, rather than guess it is
         # orphaned.
-        if record is None or not _build_finished(record):
+        if record is None:
+            say(
+                f"skipping worktree {wpath}: no batch record (a build may be in flight; "
+                "remove by hand if not)"
+            )
+            continue
+        if not _build_finished(record):
             continue  # a live build (or one that crashed before finishing) owns this
         say(f"removing leftover worktree {wpath}")
         r.remove_worktree(wpath)
@@ -1243,7 +1257,17 @@ def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
             continue
         ok = True
         for branch in (record.train_branch, *(p.branch for p in record.probes)):
-            if not r.delete_branch(branch):
+            # code-review follow-up on #693, item 2: a branch outside `train/*` in a
+            # hand-edited record must be reported, not fatal, the same as follow-up 1 in
+            # `merge` - a refused deletion here must never stop `prune` from moving on to
+            # the next branch or the next record.
+            try:
+                deleted = r.delete_branch(branch)
+            except StoppedError as exc:
+                ok = False
+                say(f"could not delete branch {branch}: {exc}")
+                continue
+            if not deleted:
                 ok = False
                 say(f"could not delete branch {branch}; remove it by hand")
         record.pruned = ok
@@ -1446,8 +1470,12 @@ class ShellRunner:
                 timeout=MERGE_PR_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired:
+            # code-review follow-up on #693, item 5: GitHub may still apply the squash after
+            # the CLI gives up waiting, so the owner must check before assuming it didn't.
             return MergeAttempt(
-                "failed", f"gh pr merge timed out after {MERGE_PR_TIMEOUT_S}s; outcome unknown"
+                "failed",
+                f"gh pr merge timed out after {MERGE_PR_TIMEOUT_S}s; outcome unknown - check "
+                "the PR and main before rerunning build",
             )
         if result.returncode == 0:
             return MergeAttempt("merged")
@@ -1467,7 +1495,17 @@ class ShellRunner:
         )
         if any(phrase in low for phrase in permanent_phrases):
             return MergeAttempt("failed", text)
-        retryable_phrases = ("mergeable state is unknown", "try again", "is in unstable status")
+        # code-review follow-up on #693, item 1: a plain "not mergeable" with none of the
+        # permanent phrases above is GitHub still computing mergeability - exactly what the
+        # train hits by design right after the previous PR lands - so it belongs back on the
+        # retryable list, checked only after the permanent phrases have already ruled out a
+        # real conflict or policy block.
+        retryable_phrases = (
+            "mergeable state is unknown",
+            "try again",
+            "is in unstable status",
+            "not mergeable",
+        )
         retryable = any(phrase in low for phrase in retryable_phrases)
         return MergeAttempt("retryable" if retryable else "failed", text)
 

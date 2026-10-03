@@ -1636,13 +1636,60 @@ def test_shell_runner_merge_pr_still_retries_when_mergeable_state_is_unknown(
     assert attempt.outcome == "retryable"
 
 
+def test_shell_runner_merge_pr_retries_a_plain_not_yet_mergeable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code-review follow-up on #693, item 1: a plain "not mergeable", with none of the
+    permanent-refusal wording, is GitHub still computing mergeability - exactly what the
+    train hits by design right after the previous PR lands - so it must stay retryable."""
+    runner = mt.ShellRunner(tmp_path)
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = "GraphQL: Pull Request is not mergeable (mergePullRequest)"
+
+    monkeypatch.setattr(mt.subprocess, "run", lambda *a, **k: _Result())
+    attempt = runner.merge_pr(5, "abc123")
+    assert attempt.outcome == "retryable"
+
+
 def test_prune_never_removes_a_worktree_with_no_record_yet() -> None:
     """Follow-up 6: `build` creates the worktree before it can save the batch's first
     record; a concurrent `prune` must not guess an unrecorded worktree is orphaned."""
     fake = FakeRunner()
     (mt.record_dir() / "worktree-20261003-000000-0000000").mkdir(parents=True, exist_ok=True)
-    mt.run_prune(fake)
+    printed: list[str] = []
+    mt.run_prune(fake, say=printed.append)
     assert mt.worktree_path("20261003-000000-0000000") not in fake.worktrees_removed
+    # code-review follow-up on #693, item 3: the skip is visible, not silent.
+    assert any("no batch record" in line for line in printed)
+
+
+def test_prune_reports_a_failed_branch_deletion_without_raising() -> None:
+    """Code-review follow-up on #693, item 2: a record hand-edited to name a branch outside
+    `train/*` must not stop `prune` from moving on to the next branch or the next record,
+    the same as follow-up 1 does for `merge`."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    record.probes.append(
+        mt.Probe(
+            k=1,
+            branch="not-a-train-branch",
+            sha="x",
+            run_id=None,
+            run_attempt=None,
+            run_url=None,
+            outcome="green",
+        )
+    )
+    mt._save(record)
+    printed: list[str] = []
+    mt.run_prune(fake, say=printed.append)
+    assert any("not-a-train-branch" in line for line in printed)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.pruned is False
+    assert record.train_branch in fake.deleted_branches
 
 
 def test_prune_refuses_when_a_merge_holds_the_lock() -> None:
