@@ -1549,13 +1549,16 @@ class EdgarFilingSource(FilingSource):
             and not self._accepted(accession, error_class, message)
         )
         # A quarantined accession is a failure no request re-checked this run:
-        # it counts unless its stored entry is accepted (#610 review).
+        # it counts unless its stored entry is accepted (#610 review), even when
+        # another of its documents (a cached header) put it in the attempted
+        # set; one this run already failed is counted above, never twice.
         store = self._failure_store()
-        quarantined = self._quarantined_this_run - self._per_document_attempted
         failures += sum(
-            1 for accession in quarantined if not store.get(accession, {}).get("accepted", False)
+            1
+            for accession in self._quarantined_this_run - self._pending_failures.keys()
+            if not store.get(accession, {}).get("accepted", False)
         )
-        denominator = len(self._per_document_attempted | quarantined)
+        denominator = len(self._per_document_attempted | self._quarantined_this_run)
         reason = self._threshold_reason("per-document", failures, denominator)
         if reason:
             reasons.append(reason)

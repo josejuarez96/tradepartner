@@ -329,6 +329,36 @@ def test_a_quarantined_accession_counts_in_the_share_unless_accepted(
     )
 
 
+def test_a_quarantined_cover_page_still_counts_after_its_header_cache_hit(tmp_path: Path) -> None:
+    """/code-review (#610): a cached SGML header puts the accession in the
+    attempted set, but its quarantined, un-accepted cover page is still a
+    failure: the header hit must not lift it out of the numerator."""
+    settings = _settings(tmp_path, min_failed_filings=1)
+    source = _garbage_source(settings, 1)
+    accession = _garbage_accession(0)
+    entry = {
+        "error_class": "ValueError",
+        "base_form": "10-K",
+        "message_hash": "h",
+        "count": settings.edgar.max_filing_failures,
+        "last_counted_day": "2026-05-01",
+        "accepted": False,
+        "kind": "fetch",
+    }
+    _store_path(settings).parent.mkdir(parents=True, exist_ok=True)
+    _store_path(settings).write_text(
+        json.dumps({"version": FAILURES_VERSION, "entries": {accession: entry}})
+    )
+    _write_header_cache(settings, accession)
+    source.filing_headers(APPLE, ["10-K"])
+    source.cover_pages(APPLE)
+    assert source.quarantined == 1
+    assert source._per_document_attempted == {accession}  # the header cache hit
+    reasons: list[str] = []
+    source._check_per_document_group(reasons)
+    assert reasons == ["per-document: 1 failures of 1 attempted (100.0%, over 1.0%)"]
+
+
 # --- Policy 2: a failed check records its failures ---------------------------
 
 
