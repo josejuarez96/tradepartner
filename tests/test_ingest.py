@@ -497,7 +497,7 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
 def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
     """T11h: failed filings, quarantined accessions and facts missing; #566:
     empty bulk zip members; #576: empty per-CIK API answers; #599: payloads
-    with `facts` but no `cik`."""
+    with `facts` but no `cik`; #610: company values dropped after capping."""
 
     class Failing(FixtureFilingSource):
         failed_filings = 2
@@ -509,13 +509,14 @@ def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings)
         submissions_api_empty = 7
         facts_bulk_keyless = 8  # #599
         facts_api_keyless = 9
+        facts_capped_dropped = frozenset({("acc", "name", "day")})  # #610 X2: dropped keys
 
     message = _run(settings, filings=_filings(cls=Failing), source="edgar").runs[0].message
     counts = (
         "; failed filings: 2; quarantined: 1; facts missing: 4"
         "; empty bulk facts: 3; empty bulk submissions: 5"
         "; empty API facts: 6; empty API submissions: 7"
-        "; keyless bulk facts: 8; keyless API facts: 9; missing"
+        "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; missing"
     )
     assert counts in message
 
@@ -588,6 +589,58 @@ def test_check_failures_raising_fails_the_chunk_with_one_failed_run_row(
     assert result.runs[0].status == FAILED
     assert "too many failures" in result.runs[0].message
     assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
+class _RecordsFailedCheck(FixtureFilingSource):
+    """A source whose `check_failures` raises and that counts the
+    `record_failed_check` calls (#610 policy 2)."""
+
+    recorded = 0
+    fails = True
+
+    def check_failures(self) -> None:
+        if self.fails:
+            raise RuntimeError("too many failures")
+
+    def record_failed_check(self) -> None:
+        type(self).recorded += 1
+
+
+def test_a_failed_check_records_the_failures_before_the_chunk_fails(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#610 policy 2: the failures reach disk although nothing commits, so the
+    owner can accept them; the check's own message is the run's message."""
+    _RecordsFailedCheck.recorded = 0
+    result = _run(settings, filings=_filings(cls=_RecordsFailedCheck), source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "too many failures" in result.runs[0].message
+    assert _RecordsFailedCheck.recorded == 1
+    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
+def test_a_dry_run_or_a_passing_check_records_no_failed_check(settings: Settings) -> None:
+    _RecordsFailedCheck.recorded = 0
+    _run(settings, source="edgar")  # a real run first, so the store exists
+    result = _run(settings, filings=_filings(cls=_RecordsFailedCheck), source="edgar", dry_run=True)
+    assert result.runs[0].status == FAILED
+    assert _RecordsFailedCheck.recorded == 0
+
+    class Passing(_RecordsFailedCheck):
+        fails = False
+
+    assert _run(settings, filings=_filings(cls=Passing), source="edgar").runs[0].status == OK
+    assert _RecordsFailedCheck.recorded == 0
+
+
+def test_a_failing_record_keeps_the_check_message(settings: Settings) -> None:
+    class RecordBoom(_RecordsFailedCheck):
+        def record_failed_check(self) -> None:
+            raise OSError("disk full")
+
+    run = _run(settings, filings=_filings(cls=RecordBoom), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "too many failures" in run.message and "disk full" in run.message
 
 
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:

@@ -19,6 +19,7 @@ simulated days of real `record_failures()` calls.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -202,7 +203,9 @@ def test_a_dry_run_and_a_failed_chunk_advance_nothing(tmp_path: Path) -> None:
     hook for a committed `ok`, non-dry run (`ingest.py`); called directly it
     always advances, so "a dry run advances nothing" means `after_commit`
     (and so `record_failures`) is simply never invoked in those cases -- the
-    adapter's own state is untouched."""
+    adapter's own state is untouched. (#610: a non-dry run whose
+    `check_failures()` raised records through `record_failed_check()`;
+    `test_edgar_failure_policy.py` covers that.)"""
     _clock, clock_fn = _mutable_clock(INSIDE_LAG)
     source, _router = _garbage_source(tmp_path, clock_fn)
     source.cover_pages(APPLE)
@@ -365,7 +368,8 @@ def test_an_accepted_pending_failure_is_excluded_from_the_per_document_share(
         a: {
             "error_class": "ValueError",
             "base_form": "10-K",
-            "message_hash": "h",
+            # #610: `accepted` holds only for the same message hash
+            "message_hash": hashlib.sha256(b"x").hexdigest(),
             "count": 1,
             "last_counted_day": "2026-06-01",
             "accepted": a == accessions[0],
@@ -487,7 +491,12 @@ def test_cross_day_pair_rule_fails_and_accepted_lifts_it(tmp_path: Path) -> None
     source.check_failures()  # 4 distinct non-accepted accessions: below min_failed_filings
 
 
-def test_fsn_manifest_failures_count_toward_the_cross_day_pair_rule(tmp_path: Path) -> None:
+def test_fsn_manifest_failures_are_not_pooled_into_the_cross_day_pair_rule(
+    tmp_path: Path,
+) -> None:
+    """#610 policy 3 (owner, 2026-10-02) reverses T11h's pooling: 3 store
+    entries plus 2 FSN failures of one pair no longer trip the pair rule;
+    FSN failures are judged by `_check_fsn_group`'s share rule only."""
     source = _bare_source(tmp_path)
     store = {
         f"a-{n}": {
@@ -521,8 +530,7 @@ def test_fsn_manifest_failures_count_toward_the_cross_day_pair_rule(tmp_path: Pa
         "committed": True,
     }
     source._save_fsn_manifest("2025_10", manifest)
-    with pytest.raises(FilingFailuresError, match="ValueError/10-K"):
-        source.check_failures()
+    source.check_failures()
 
 
 def test_cross_day_pair_rule_driven_through_several_simulated_days(tmp_path: Path) -> None:
