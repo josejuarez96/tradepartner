@@ -570,6 +570,11 @@ what = "Spec and plan for a merge train: batch the ready PRs, build one combined
 why = "Green PRs merged one after another broke main twice on 2026-10-01 (#430 after #387, #444 with #429); refreshing each PR costs a 30-minute run per merge, which serialises every window behind the owner."
 unblocks = ["spec:merge-train", "plan:merge-train"]
 
+[issue.517]
+what = "Writes the owner's #366 answers of 2026-10-01 (Q4–Q7, Q9, Q19–Q24) into the paper-trading spec: the lot ledger takes adjustments, a lot_ledger alert kind, the stricter release rule, the lapse reason, the frozen fill-price bar, the resume refusal on a lag, and the fault-path exits and channels."
+why = "An answer left in an issue comment is invisible to the next implementer; the spec paragraph a task line cites is what it reads, and #514, #515 and #516 build from these paragraphs."
+unblocks = ["issue:514", "issue:515", "issue:516", "task:T63", "task:T65b"]
+
 [spec.merge-train]
 what = "What the merge train does and how we know it works: eligibility, batch order, the combined branch, one full CI run, bisect on red, tree-equality before and after each squash merge, owner authority, reporting, the main ruleset."
 why = "Lets many windows' PRs land together in one tested tree instead of one refresh-and-rerun per PR, without any discretion between the test and the merge."
@@ -661,3 +666,8 @@ unblocks = ["issue:618"]
 what = "Architecture note: add a research layer (events, features, labels, model runs) on top of the PIT store, deterministic text before LLM features."
 why = "Frames how ML research fits the existing store, registry and holdout without touching execution."
 unblocks = ["issue:618"]
+
+[issue.620]
+what = "A research program page, a graded claims register over every research report, and a ranked hypothesis backlog."
+why = "Answers what the tool should test next and how results flow back into what we believe."
+unblocks = ["phase:3"]
