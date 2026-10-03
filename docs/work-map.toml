@@ -661,3 +661,8 @@ unblocks = ["issue:618"]
 what = "Architecture note: add a research layer (events, features, labels, model runs) on top of the PIT store, deterministic text before LLM features."
 why = "Frames how ML research fits the existing store, registry and holdout without touching execution."
 unblocks = ["issue:618"]
+
+[issue.620]
+what = "A research program page, a graded claims register over every research report, and a ranked hypothesis backlog."
+why = "Answers what the tool should test next and how results flow back into what we believe."
+unblocks = ["phase:3"]
