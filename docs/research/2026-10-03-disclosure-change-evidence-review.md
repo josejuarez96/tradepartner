@@ -177,7 +177,7 @@ The coordinator supplied these findings from the lead session. They were checked
 
 ## Audit of the typed-classifiers note's sources
 
-The 2026-10-03 typed-classifiers note (spike branch, `587cf8a`) is the main input that argues for testing Jev, so its 23 references were checked on 2026-10-03:
+The 2026-10-03 [typed-classifiers research results](2026-10-03-typed-classifiers-financial-disclosures-research.md) is the main input that argues for testing Jev, so its 23 references were checked on 2026-10-03:
 - A separate research agent worked from search-result snippets: all of its primary-page fetches were blocked by the network proxy.
 - The lead session then ran independent searches for the items that agent could not find.
 
@@ -374,4 +374,4 @@ All accessed 2026-10-03, mostly via search-result abstracts (full texts were blo
 - S52 Meursault, Liang, Routledge, Scanlon, "PEAD.txt: Post-Earnings-Announcement Drift Using Text", JFQA 58(6) (2023) (Tier 1; lead session)
 - S53 Aavang et al., "Effective Performance Measurement: Challenges and Opportunities in KPI Extraction from Earnings Calls", ACL Industry Track (2026) (Tier 1; lead session)
 - S47 Critique of S31 (post-cutoff sample): https://aiandfinance.substack.com/p/financial-statement-analysis-with-large-language-models (Tier 3; pointer only)
-- Internal: [handoff §6.1 and §8.4](2026-09-24-initial-research-handoff.md); [ADR 0008](../decisions/0008-llm-role.md); spike inputs on `origin/spike/ml-llm-research-notes`: 2026-10-03-typed-classifiers-financial-disclosures-research.md, 2026-10-03-ml-llm-neglected-equities-research.md, 2026-10-03-claims-pilot.md, 2026-10-03-tradepartner-ml-research-integration.md
+- Internal: [handoff §6.1 and §8.4](2026-09-24-initial-research-handoff.md); [ADR 0008](../decisions/0008-llm-role.md); the 2026-10-03 inputs in this folder: [typed-classifiers research results](2026-10-03-typed-classifiers-financial-disclosures-research.md), [neglected-equities note](2026-10-03-ml-llm-neglected-equities-research.md), [claims pilot](2026-10-03-claims-pilot.md), [integration note](2026-10-03-tradepartner-ml-research-integration.md)

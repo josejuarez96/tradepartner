@@ -6,7 +6,7 @@
 
 **Companion artifacts (#618):** [annotation protocol](2026-10-03-disclosure-annotation-protocol.md) · [evidence review](2026-10-03-disclosure-change-evidence-review.md) · [ML validation brief](2026-10-03-ml-validation-methodology-brief.md) · [prospective feature spec](2026-10-03-prospective-semantic-feature-spec.md).
 
-**Inputs:** the 2026-10-03 notes on branch `spike/ml-llm-research-notes` (commit `587cf8a`, not merged to main): the typed-classifiers research results (cited below as **TC**, §10–11), the neglected-equities note (**NE**, §3–4), the integration note (**INT**) and the claims pilot (**CP**).
+**Inputs:** the 2026-10-03 research in this folder: the [typed-classifiers research results](2026-10-03-typed-classifiers-financial-disclosures-research.md) (cited below as **TC**, §10–11), the [neglected-equities note](2026-10-03-ml-llm-neglected-equities-research.md) (**NE**, §3–4), the [integration note](2026-10-03-tradepartner-ml-research-integration.md) (**INT**) and the [claims pilot](2026-10-03-claims-pilot.md) (**CP**).
 
 ---
 
