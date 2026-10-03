@@ -682,6 +682,35 @@ def test_refuses_a_registration_without_the_cost_keys(
 
     assert refused.value.reason == "costs_drift"
     assert "costs.commission_per_share" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", None], ids=["string", "null"])
+def test_refuses_when_a_registered_cost_value_is_not_a_number(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    bad: object,
+) -> None:
+    """A registered cost value `float()` cannot parse (a string or null)
+    refuses the start the same way a numeric drift does (`costs_drift`),
+    never a plain `ValueError`/`TypeError` escaping from `_frozen_params`,
+    and writes no window either way (#580 item 1)."""
+    with open_for_write(journal_settings) as conn:
+        params = _params(**{"costs.commission_per_share": bad})
+        hyp = _register(conn, journal_settings, "h3", HOLDOUT_END_PAST, params)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h3"
+        )
+
+    assert refused.value.reason == "costs_drift"
+    assert "costs.commission_per_share" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
 
 
 def test_refuses_when_live_fill_price_differs_from_the_registered_one(
