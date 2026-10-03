@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 import polars as pl
 import pytest
 
+from tradepartner.calendar import next_session
 from tradepartner.config import RiskConfig
 from tradepartner.execution.exits import (
     ExitDecision,
@@ -31,6 +32,7 @@ from tradepartner.execution.plan import (
 from tradepartner.execution.risk import OpenSell
 from tradepartner.store.journal import (
     AdjustmentRow,
+    DecisionEventRow,
     DecisionRow,
     FillRow,
     OrderedFill,
@@ -392,6 +394,149 @@ def test_negative_or_non_finite_holding_raises() -> None:
 def test_session_must_be_a_date() -> None:
     with pytest.raises(ValueError, match="session"):
         forced_exits({}, {}, {}, (), {}, (), (), session=NOW, pending_rebalance=None)  # type: ignore[arg-type]
+
+
+# --- dust-blocked forced exits (#505) -----------------------------------------------
+
+
+def test_whole_share_dust_exit_blocks_for_the_next_three_sessions() -> None:
+    """A delisted, non-fractionable name left holding 0.4 shares: session 1
+    makes exactly one exit; the sells phase would close it `skipped`/`dust`
+    (phases._sell_skip); from then on, `forced_exits` makes nothing new for
+    it, forever, not just the next session."""
+    held = {"AAA": 0.4}
+    assets = _assets(AAA=Flags(fractionable=False))
+    exits = _forced(held, listings_at={"AAA": PREVIOUS}, assets=assets)
+    assert len(exits) == 1
+    exit_ = exits[0]
+    assert (exit_.security_id, exit_.planned_quantity, exit_.whole_share) == ("AAA", 0.4, True)
+
+    decision = replace(exit_.row(run_id=1, known_at=NOW, ingested_at=NOW), decision_id=1)
+    dust_event = DecisionEventRow(
+        decision_id=1, run_id=1, status="skipped", reason="dust", known_at=NOW, ingested_at=NOW
+    )
+    state = decision_state(
+        decision,
+        [dust_event],
+        [],
+        [],
+        [],
+        pl.DataFrame(),
+        lambda _sid: 10.0,
+        RiskConfig(),
+        session=S,
+    )
+    assert (state.state, state.event_reason) == (State.CLOSED, "dust")
+
+    session = S
+    for _ in range(3):
+        session = next_session(session)
+        later_exits = forced_exits(
+            held,
+            {"AAA": PREVIOUS},
+            assets,
+            (decision,),
+            {1: state},
+            (),
+            (),
+            session=session,
+            pending_rebalance=PENDING,
+        )
+        assert later_exits == []
+
+
+def test_fractionable_dusted_remainder_blocks_the_next_session() -> None:
+    """A fractionable delisted name whose exit dusted below the minimum: the
+    closing `dust` event still blocks a new exit."""
+    held = {"AAA": 0.004}
+    decision = _decision(1, "AAA", reason="delisted", planned_quantity=0.004)
+    dust_event = DecisionEventRow(
+        decision_id=1, run_id=1, status="skipped", reason="dust", known_at=NOW, ingested_at=NOW
+    )
+    state = decision_state(
+        decision,
+        [dust_event],
+        [],
+        [],
+        [],
+        pl.DataFrame(),
+        lambda _sid: 10.0,
+        RiskConfig(),
+        session=S,
+    )
+    assert (state.state, state.event_reason) == (State.CLOSED, "dust")
+    tomorrow = next_session(S)
+    assert (
+        forced_exits(
+            held,
+            {"AAA": PREVIOUS},
+            _assets("AAA"),
+            (decision,),
+            {1: state},
+            (),
+            (),
+            session=tomorrow,
+            pending_rebalance=PENDING,
+        )
+        == []
+    )
+
+
+def test_settled_remainder_at_the_dust_level_blocks_a_new_exit() -> None:
+    """2.4 shares sold 2 and settled on a 0.4 remainder: still blocked while
+    the holding has not grown past that remainder."""
+    settled_at_dust = DecisionState(State.SETTLED, remainder=Remainder(quantity=0.4, notional=4.0))
+    old = _decision(1, "AAA", reason="delisted", planned_quantity=2.4)
+    assert (
+        _forced(
+            {"AAA": 0.4},
+            listings_at={"AAA": PREVIOUS},
+            decisions=(old,),
+            states={1: settled_at_dust},
+        )
+        == []
+    )
+
+
+def test_holding_grown_past_the_dust_quantity_gets_a_new_exit() -> None:
+    """A split or a new receipt that grows the holding past the dust-closed
+    (or settled) decision's quantity is fail-safe: a new exit is made."""
+    dust_closed = DecisionState(State.CLOSED, "skipped", event_reason="dust")
+    old = _decision(1, "AAA", reason="delisted", planned_quantity=0.4)
+    exits = _forced(
+        {"AAA": 1.4},
+        listings_at={"AAA": PREVIOUS},
+        decisions=(old,),
+        states={1: dust_closed},
+    )
+    assert [(e.security_id, e.reason) for e in exits] == [("AAA", "delisted")]
+
+
+def test_closed_untradable_delisted_exit_is_still_re_evaluated() -> None:
+    """A forced exit closed `untradable` (not `dust`) blocks nothing: the
+    dust block is specific to the `dust` event reason."""
+    exits = _forced(
+        {"AAA": 0.4},
+        listings_at={"AAA": PREVIOUS},
+        decisions=(_decision(1, "AAA", reason="delisted"),),
+        states={1: CLOSED_UNTRADABLE},
+    )
+    assert [(e.security_id, e.reason) for e in exits] == [("AAA", "delisted")]
+
+
+def test_stop_exits_still_sells_the_dust_residue_of_a_dust_closed_name() -> None:
+    """The block is `forced_exits` only: a `stop` run still makes the
+    `window_stop` exit for a dust-closed delisted name, floored to 0 when
+    whole-share, so the residue is counted."""
+    dust_closed = DecisionState(State.CLOSED, "skipped", event_reason="dust")
+    decision = _decision(1, "AAA", reason="delisted", planned_quantity=0.4)
+    exits = _stop(
+        {"AAA": 0.4},
+        assets=_assets(AAA=Flags(fractionable=False)),
+        decisions=(decision,),
+        states={1: dust_closed},
+    )
+    assert exits == [ExitDecision("AAA", "window_stop", 0.0, whole_share=True, session=S)]
 
 
 # --- reattempt_exits ---------------------------------------------------------------
