@@ -6,6 +6,7 @@ No network, no git: every function under test is pure. AC numbers are the spec's
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import importlib.util
 import json
 import re
@@ -920,6 +921,10 @@ def test_bisect_posts_inconclusive_to_untested_prs_after_an_inconclusive_probe()
     held_texts = {n: t for n, t in fake.comments_posted if n in (3, 4, 5)}
     assert set(held_texts) == {3, 4, 5}
     assert all(t.startswith("merge-train: INCONCLUSIVE") for t in held_texts.values())
+    # SHOULD FIX 6 (pass-1 review of #640): `build --resume` refuses a red batch ("nothing
+    # to resume"), so this comment must advise a fresh `build`, not `--resume`.
+    assert all("build --resume" not in t for t in held_texts.values())
+    assert all("rerun `build` for a fresh batch" in t for t in held_texts.values())
 
 
 def test_shell_runner_find_run_filters_by_workflow_file(
@@ -1178,6 +1183,10 @@ def test_merge_stops_when_a_pr_refuses_every_attempt() -> None:
     assert merged.merge is not None and merged.merge.stopped_at_position == 2
     assert {3, 4} <= set(_texts(fake, "HELD"))
     assert 2 not in _texts(fake, "MERGED")
+    # SHOULD FIX 2 (pass-1 review of #640): the report names the landed `main` SHA (PR1's)
+    # as untested at main's head.
+    assert "main1" in (merged.merge.reason or "")
+    assert "untested at main's head" in (merged.merge.reason or "")
 
 
 def test_merge_stops_on_a_landed_tree_mismatch() -> None:
@@ -1214,6 +1223,11 @@ def test_merge_accepts_an_unedited_red_batch_with_a_green_prefix() -> None:
     merged = mt.run_merge(fake, record.batch_id)
     assert fake.merge_calls == [(1, "head1"), (2, "head2")]
     assert merged.merge is not None
+    # SHOULD FIX 5 (pass-1 review of #640): landing the whole available green prefix of a
+    # red batch is complete, not stopped, and `merge` posts no HELD on the culprit or held
+    # PRs that `build` already reported (a HELD there would make the culprit eligible again).
+    assert merged.merge.stopped_at_position is None
+    assert not _texts(fake, "HELD")
 
 
 def test_merge_argparse_takes_only_the_batch_id_and_resume() -> None:
@@ -1289,3 +1303,158 @@ def test_prune_deletes_finished_branches_but_keeps_inconclusive_ones() -> None:
     mt.run_prune(fake)
     assert green.train_branch in fake.deleted_branches
     assert inconclusive.train_branch not in fake.deleted_branches
+
+
+# === pass-1 fix round on PR #640 (safety-reviewer SHOULD FIX 1-10, NITs) ===================
+
+
+def _bare_record(
+    batch_id: str, outcome: str | None, *, culprit: int | None = None, held: Sequence[int] = ()
+) -> object:
+    return mt.Record(
+        batch_id=batch_id,
+        built_at="2026-10-01T09:05:07+00:00",
+        base="base0",
+        main_green_at_base=True,
+        requested="all",
+        prs=[],
+        trees=["t0"],
+        train_branch=f"train/{batch_id}",
+        outcome=outcome,
+        culprit=culprit,
+        held=list(held),
+    )
+
+
+def test_merge_resume_floors_held_start_and_never_moves_stop_backwards() -> None:
+    """SHOULD FIX 1: a resume whose target shrinks below `start` must never post HELD on an
+    already-merged PR, or move `stopped_at_position` backwards."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.script_merge(2, [mt.MergeAttempt("retryable", "nope")] * mt.MERGE_RETRY_ATTEMPTS)
+    stopped = mt.run_merge(fake, record.batch_id)
+    assert stopped.merge is not None and stopped.merge.stopped_at_position == 2
+
+    old = fake.pr_registry[2]
+    fake.pr_registry[2] = mt.PrData(
+        dataclasses.replace(old.pr, head="still-broken"),
+        old.comments,
+        old.head_checks,
+        old.diff_paths,
+    )
+    resumed = mt.run_merge(fake, record.batch_id, resume=True)
+    assert resumed.merge is not None and resumed.merge.stopped_at_position == 2
+    assert 1 not in _texts(fake, "HELD")
+
+
+def test_merge_stops_on_a_tree_mismatch_even_on_the_last_pr() -> None:
+    """SHOULD FIX 3: a parent/tree failure on the LAST PR must stop the merge and name the
+    untested SHA, not report it as complete."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    fake.landed_tree_override[2] = "wrong-tree"
+    merged = mt.run_merge(fake, record.batch_id)
+    assert merged.merge is not None and merged.merge.stopped_at_position is not None
+    assert "untested at main's head" in (merged.merge.reason or "")
+
+
+class _HeadChangingRunner(FakeRunner):
+    """PR2's head changes, in the fake's own PR data, the instant PR1 lands - simulating a
+    push to PR2 that arrives during PR1's merge/retry window."""
+
+    def merge_pr(self, number: int, head: str) -> object:
+        attempt = super().merge_pr(number, head)
+        if number == 1 and attempt.outcome == "merged":
+            old = self.pr_registry[2]
+            self.pr_registry[2] = mt.PrData(
+                dataclasses.replace(old.pr, head="changed-after-pr1"),
+                old.comments,
+                old.head_checks,
+                old.diff_paths,
+            )
+        return attempt
+
+
+def test_merge_rereads_the_head_live_immediately_before_merging() -> None:
+    """SHOULD FIX 4: the snapshot taken before the loop starts is already stale by the time
+    PR2's turn comes; the live re-read must catch a head that changed after PR1 merged."""
+    fake = _batch(4, _HeadChangingRunner())
+    record = _merge_record(fake, 4, [4])
+    merged = mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == [(1, "head1")]
+    assert merged.merge is not None and merged.merge.stopped_at_position == 2
+    assert "head" in (merged.merge.reason or "").lower()
+
+
+class _ParentBreakingRunner(FakeRunner):
+    break_after: int = 0
+
+    def merge_pr(self, number: int, head: str) -> object:
+        attempt = super().merge_pr(number, head)
+        if number == self.break_after and attempt.outcome == "merged":
+            self.parent_for[self.main_history[-1]] = "someone-elses-commit"
+        return attempt
+
+
+def test_merge_names_which_check_failed_parent_or_tree() -> None:
+    """NIT (pass-1 review of #640): a parent mismatch (e.g. a concurrent hand merge) must
+    be named distinctly from a tree mismatch."""
+    runner = _ParentBreakingRunner()
+    runner.break_after = 2
+    fake = _batch(2, runner)
+    record = _merge_record(fake, 2, [2])
+    merged = mt.run_merge(fake, record.batch_id)
+    assert merged.merge is not None
+    assert "parent" in (merged.merge.reason or "")
+
+
+def test_merge_reports_a_failed_branch_deletion_without_raising() -> None:
+    """NIT (pass-1 review of #640): `FakeRunner.fail_delete_branches` is exercised - a
+    failed deletion is reported, not fatal."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    fake.fail_delete_branches.add(record.train_branch)
+    printed: list[str] = []
+    merged = mt.run_merge(fake, record.batch_id, say=printed.append)
+    assert merged.merge is not None and merged.merge.stopped_at_position is None
+    assert any("remove it by hand" in line for line in printed)
+
+
+def test_merge_refuses_when_another_merge_holds_the_lock() -> None:
+    """SHOULD FIX 7: two concurrent `merge` runs on this machine must never interleave."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    lock_path = mt.record_dir() / "merge.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(mt.StoppedError, match="another merge"):
+            mt.run_merge(fake, record.batch_id)
+        assert fake.merge_calls == []
+
+
+def test_prune_skips_in_flight_and_unfinished_bisect_records() -> None:
+    """SHOULD FIX 8: a build still running (`outcome` `None`), or a red run whose bisect
+    hasn't concluded (no culprit, no held), must be left alone; a batch already pruned is
+    not retried."""
+    fake = FakeRunner()
+    in_flight = _bare_record("20261003-000000-0000000", None)
+    unfinished_red = _bare_record("20261003-000001-0000000", "red")
+    finished_red = _bare_record("20261003-000002-0000000", "red", culprit=9)
+    green = _bare_record("20261003-000003-0000000", "green")
+    for rec in (in_flight, unfinished_red, finished_red, green):
+        mt._save(rec)
+    (mt.record_dir() / f"worktree-{in_flight.batch_id}").mkdir(parents=True, exist_ok=True)
+    (mt.record_dir() / f"worktree-{finished_red.batch_id}").mkdir(parents=True, exist_ok=True)
+
+    mt.run_prune(fake)
+    assert in_flight.train_branch not in fake.deleted_branches
+    assert unfinished_red.train_branch not in fake.deleted_branches
+    assert finished_red.train_branch in fake.deleted_branches
+    assert green.train_branch in fake.deleted_branches
+    assert mt.worktree_path(in_flight.batch_id) not in fake.worktrees_removed
+    assert mt.worktree_path(finished_red.batch_id) in fake.worktrees_removed
+
+    fake.deleted_branches.clear()
+    mt.run_prune(fake)
+    assert fake.deleted_branches == []  # already pruned; not retried

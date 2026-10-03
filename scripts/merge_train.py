@@ -18,13 +18,15 @@ The commands (`build`, `merge`, `status`, `prune`) and their runner are T73/T74.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -104,6 +106,7 @@ class Record:
     culprit: int | None = None
     held: list[int] = field(default_factory=list)
     merge: MergeLog | None = None
+    pruned: bool = False
 
     def accepted(self) -> list[PrEntry]:
         return [p for p in self.prs if p.state == "accepted"]
@@ -370,11 +373,17 @@ def comment(outcome: str, batch: str, **detail: Any) -> str:
     if outcome == "INCONCLUSIVE":
         reason = str(detail.pop("reason"))
         uv_lock = [int(n) for n in detail.pop("uv_lock_prs", ())]
-        lines += [
-            reason,
-            "Check GitHub Actions, then rerun: "
-            f"uv run python scripts/merge_train.py build --resume {batch}",
-        ]
+        # a bisect-probe inconclusive stop (#524, follow-up 5) leaves `record.outcome` red,
+        # which `build --resume` refuses ("nothing to resume"); advise a fresh `build` there
+        # instead of the usual `--resume` (SHOULD FIX 6, pass-1 review of #640).
+        rerun = (
+            "Check GitHub Actions, then rerun `build` for a fresh batch: "
+            "uv run python scripts/merge_train.py build"
+            if detail.pop("advise_fresh_build", False)
+            else "Check GitHub Actions, then rerun: "
+            f"uv run python scripts/merge_train.py build --resume {batch}"
+        )
+        lines += [reason, rerun]
         if reason.startswith("Install") and len(uv_lock) >= 2:
             names = ", ".join(f"#{n}" for n in uv_lock)
             lines.append(
@@ -725,7 +734,10 @@ def _report_bisect(
                 say,
                 number,
                 comment(
-                    "INCONCLUSIVE", record.batch_id, reason=record.detail or "bisect inconclusive"
+                    "INCONCLUSIVE",
+                    record.batch_id,
+                    reason=record.detail or "bisect inconclusive",
+                    advise_fresh_build=True,
                 ),
             )
 
@@ -926,11 +938,39 @@ def _merge_with_retries(
     return attempt
 
 
+@contextlib.contextmanager
+def _merge_lock() -> Iterator[None]:
+    """An exclusive, non-blocking lock over all of `run_merge` (pass-1 review of #640,
+    SHOULD FIX 3/7): two concurrent `merge` runs on this machine must never interleave
+    their checks and their `gh pr merge` calls."""
+    record_dir().mkdir(parents=True, exist_ok=True)
+    with open(record_dir() / "merge.lock", "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise StoppedError(
+                "another merge is already running on this machine; wait for it to finish"
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def run_merge(
     r: Runner, bid: str, *, resume: bool = False, say: Callable[[str], None] = print
 ) -> Record:
     """`merge <batch id> [--resume]` (req 6, req 7): land the longest green prefix that
-    still verifies, PR by PR, and stop before the next merge on any failure."""
+    still verifies, PR by PR, and stop before the next merge on any failure. If `gh`
+    reports a merge as failed but it actually landed (an ambiguous answer, e.g. a dropped
+    connection after GitHub applied the squash), the train still stops rather than guess;
+    `--resume` then refuses too (`main` has moved), and the owner reconciles by hand and
+    reruns `build`."""
+    with _merge_lock():
+        return _run_merge_locked(r, bid, resume=resume, say=say)
+
+
+def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str], None]) -> Record:
     report = say
     say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
     path = record_path(bid)
@@ -953,6 +993,7 @@ def run_merge(
                 f"batch {bid}: origin/main does not match the recorded stop point; rerun build"
             )
         record.merge.resumed_at = r.now().isoformat()
+        record.merge.reason = None  # SHOULD FIX 10: the old stop's reason is stale now
     else:
         start, merged_so_far = 1, []
         current = r.main_sha()
@@ -984,38 +1025,88 @@ def run_merge(
             and data.pr.head == entry.head
         )
     target = mergeable_prefix(record, still_valid)
+    green_max = max(record.green_prefixes, default=0)
+    # SHOULD FIX 1: a resume whose target shrank below `start` must never post HELD on an
+    # already-merged PR, or move `stopped_at_position` backwards.
+    held_start = max(target + 1, start)
+    broke = False
 
-    held_start = target + 1
     for pos in range(start, target + 1):
         entry = accepted[pos - 1]
-        if pr_data_by_number[entry.number].pr.head != entry.head:
-            held_start = pos
-            record.merge.reason = f"#{entry.number}'s head changed since build"
-            break
-        attempt = _merge_with_retries(r, entry.number, entry.head, say)
-        if attempt.outcome != "merged":
-            held_start = pos
-            record.merge.reason = f"#{entry.number} could not be merged: {attempt.detail}"
-            break
-        new_main = r.main_sha()
-        expected_tree = record.trees[pos]
         previous_tip = merged_so_far[-1]["main_sha"] if merged_so_far else record.base
-        merged_so_far.append({"number": entry.number, "main_sha": new_main, "tree": expected_tree})
-        record.merge.merged = list(merged_so_far)
-        _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
-        _save(record)
-        if r.parent_of(new_main) != previous_tip or r.tree_of_ref(new_main) != expected_tree:
-            held_start = pos + 1
+
+        # SHOULD FIX 4 (req 6): re-read the head (and eligibility) live, immediately before
+        # merging - the snapshot taken above, before this loop, is already stale by then.
+        fresh = r.pr_data(entry.number)
+        if fresh.pr.head != entry.head or (
+            eligibility(fresh.pr, fresh.head_checks, fresh.diff_paths, fresh.comments) is not None
+        ):
+            held_start, broke = pos, True
+            record.merge.reason = f"#{entry.number}'s head or eligibility changed since build"
+            break
+
+        attempt = _merge_with_retries(r, entry.number, entry.head, say)
+        expected_tree = record.trees[pos]
+        # SHOULD FIX 2: the post-merge fetch, tree and parent checks are wrapped in `try`,
+        # so any of them raising still records the stop position and reason before it
+        # propagates - a stopped merge must always leave a trail, not just an exception.
+        try:
+            new_main = r.main_sha()
+            if attempt.outcome != "merged" and new_main == previous_tip:
+                held_start, broke = pos, True
+                reason = f"#{entry.number} could not be merged: {attempt.detail}"
+                if merged_so_far:  # something has already merged this run or an earlier one
+                    reason += f"; {previous_tip} is untested at main's head"
+                record.merge.reason = reason
+                break
+            if attempt.outcome != "merged":
+                # `gh` reported failure, but `main` moved anyway: an ambiguous answer (e.g. a
+                # dropped connection after GitHub applied the squash). Treat the landing as
+                # real and keep verifying it below, rather than guessing it didn't happen.
+                say(
+                    f"#{entry.number}: gh reported {attempt.outcome!r}, "
+                    f"but main moved to {new_main}"
+                )
+            landed_tree = r.tree_of_ref(new_main)
+            parent_ok = r.parent_of(new_main) == previous_tip
+        except Exception:
+            held_start, broke = max(pos + 1, start), True
             record.merge.reason = (
-                f"the tree landed for #{entry.number} does not match tree_{pos}: "
+                f"could not verify #{entry.number}'s landing after gh pr merge; "
+                "reconcile main by hand and rerun build"
+            )
+            _save(record)
+            raise
+
+        merged_so_far.append(
+            {
+                "number": entry.number,
+                "main_sha": new_main,
+                "tree": expected_tree,  # SHOULD FIX 9: the expected tree, kept distinct
+                "landed_tree": landed_tree,  # ... from what actually landed, for the record
+            }
+        )
+        record.merge.merged = list(merged_so_far)
+        _save(record)  # record the landing before posting it (SHOULD FIX 2)
+        _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
+        if not parent_ok or landed_tree != expected_tree:
+            held_start, broke = pos + 1, True
+            check = "parent" if not parent_ok else "tree"  # SHOULD FIX 11: name which failed
+            record.merge.reason = (
+                f"the landed {check} for #{entry.number} does not match tree_{pos}: "
                 f"{new_main} is untested at main's head"
             )
             break
 
-    record.merge.stopped_at_position = held_start if held_start <= n else None
+    # SHOULD FIX 3/5: "stopped" means either an in-loop failure (`broke`, however far along -
+    # even on the very last PR), or there is still PR within a recorded green prefix left
+    # un-merged; a red batch that lands its whole available green prefix is simply complete.
+    held_upper = min(n, green_max)
+    stopped = broke or held_start <= held_upper
+    record.merge.stopped_at_position = held_start if stopped else None
     _save(record)
     held_reason = record.merge.reason or "not re-verified"
-    for entry in accepted[held_start - 1 :]:
+    for entry in accepted[held_start - 1 : held_upper]:
         _post(r, say, entry.number, comment("HELD", bid, reason=held_reason))
     _save(record)
     say(
@@ -1047,26 +1138,51 @@ def run_status(bid: str | None, say: Callable[[str], None] = print) -> None:
         say(f"{record.batch_id}: {record.outcome} ({len(record.accepted())} accepted)")
 
 
+def _build_finished(record: Record) -> bool:
+    """Whether `build` is done with this record (pass-1 review of #640, SHOULD FIX 8): a
+    `green` run is always done; a `red` one is done once its bisect actually concluded
+    (a culprit found, or `held` populated by an inconclusive-probe stop); `inconclusive`
+    and `None` (still running, or crashed before an outcome was even set) are not -
+    `build --resume` or a human may still need the branch, and a live build's worktree."""
+    if record.outcome == "green":
+        return True
+    if record.outcome == "red":
+        return record.culprit is not None or bool(record.held)
+    return False
+
+
 def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
-    """`prune`: remove leftover worktrees and delete `train/*` branches of finished batches
-    (outcome `green` or `red`; an `inconclusive` batch may still be resumed, so its branch
-    stays)."""
+    """`prune`: remove leftover worktrees and delete `train/*` branches of finished batches.
+    A build still in flight (`outcome` `None` or `inconclusive`, or a `red` run whose bisect
+    hasn't concluded) is left alone - `build --resume` or another window may still need its
+    worktree and branches. A batch already pruned is not retried."""
     report = say
     say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
     rdir = record_dir()
     if not rdir.exists():
         say("nothing to prune")
         return
-    for wpath in sorted(rdir.glob("worktree-*")):
-        say(f"removing leftover worktree {wpath}")
-        r.remove_worktree(wpath)
+    records: dict[str, Record] = {}
     for path in sorted(rdir.glob("*.json")):
         record = Record.from_json(path.read_text())
-        if record.outcome == "inconclusive":
+        records[record.batch_id] = record
+    for wpath in sorted(rdir.glob("worktree-*")):
+        bid = wpath.name.removeprefix("worktree-")
+        record = records.get(bid)
+        if record is not None and not _build_finished(record):
+            continue  # a live build (or one that crashed before finishing) owns this
+        say(f"removing leftover worktree {wpath}")
+        r.remove_worktree(wpath)
+    for record in records.values():
+        if record.pruned or not _build_finished(record):
             continue
+        ok = True
         for branch in (record.train_branch, *(p.branch for p in record.probes)):
             if not r.delete_branch(branch):
+                ok = False
                 say(f"could not delete branch {branch}; remove it by hand")
+        record.pruned = ok
+        _save(record)
 
 
 # -- the real runner ------------------------------------------------------------------------
