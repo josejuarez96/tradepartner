@@ -922,6 +922,7 @@ def run_build_resume(
 
 MERGE_RETRY_ATTEMPTS = 5
 MERGE_RETRY_DELAY_S = 30  # five attempts over about two minutes (four 30s waits)
+MERGE_PR_TIMEOUT_S = 120  # #642, follow-up 3: `gh pr merge` must never hang indefinitely
 
 
 def _merge_with_retries(
@@ -1013,10 +1014,14 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         record.merge = MergeLog(started_at=r.now().isoformat())
     _save(record)
 
-    # req 7: the frozen record must still match the owner's TESTED comments.
+    # req 7: the frozen record must still match the owner's TESTED comments. Only the
+    # accepted PRs are read live (#642, follow-up 2): a dropped/already-merged/ineligible
+    # PR is not part of what `merge` lands, so a push to it mid-merge must never abort the
+    # whole batch, and its live state (including the fetch-race check in `pr_data`) is
+    # never needed here.
     owner_comments: dict[int, list[str]] = {}
     pr_data_by_number: dict[int, PrData] = {}
-    for pr_entry in record.prs:
+    for pr_entry in accepted:
         data = r.pr_data(pr_entry.number)
         pr_data_by_number[pr_entry.number] = data
         owner_comments[pr_entry.number] = owner_bodies(data.comments, data.pr.owner)
@@ -1045,13 +1050,20 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         verified, never from `pos`, so a PR that never landed (or whose landing could not
         be verified) is never skipped on `--resume`. Whenever something is known to have
         merged - including, on the exception path, a best-effort re-read of `main_sha()`
-        that moved but was never verified - the reason names that SHA as untested."""
+        that moved but was never verified - the reason names that SHA as untested.
+        #642, follow-up 10: a second call in the same run (e.g. persisting the first stop
+        itself raises, and the exception handler calls `_stop` again) never replaces the
+        first reason - it is the one that explains what actually went wrong first; a later
+        one is only logged."""
         nonlocal held_start, broke
         held_start, broke = len(merged_so_far) + 1, True
         sha = extra_sha or (merged_so_far[-1]["main_sha"] if merged_so_far else None)
         if sha:
             reason = f"{reason}; {sha} is untested at main's head"
-        record.merge.reason = reason
+        if record.merge.reason is None:
+            record.merge.reason = reason
+        else:
+            say(f"also: {reason}")
         record.merge.stopped_at_position = held_start
         _save(record)
 
@@ -1064,6 +1076,7 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         # `try`, so anything raising after an earlier PR landed still records the stop
         # position and reason before it propagates - a stopped merge must always leave a
         # trail, never just an exception.
+        attempted_merge = False  # #642, follow-up 9: what the exception reason may claim
         try:
             fresh = r.pr_data(entry.number)
             if fresh.pr.head != entry.head or (
@@ -1073,6 +1086,7 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                 _stop(f"#{entry.number}'s head or eligibility changed since build")
                 break
 
+            attempted_merge = True
             attempt = _merge_with_retries(r, entry.number, entry.head, say)
             new_main = r.main_sha()
             if attempt.outcome != "merged" and new_main == previous_tip:
@@ -1098,12 +1112,15 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                 }
             )
             record.merge.merged = list(merged_so_far)
-            _save(record)  # record the landing before posting it (SHOULD FIX 2)
-            _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
+            _save(record)  # record the landing before posting anything about it (SHOULD FIX 2)
             if not parent_ok or landed_tree != expected_tree:
+                # #642, follow-up 7: an unconfirmed landing (parent or tree mismatch, e.g. a
+                # concurrent hand merge) must never be reported to the PR as `MERGED` - the
+                # comment is posted only once the landing is confirmed, below.
                 check = "parent" if not parent_ok else "tree"  # SHOULD FIX 11: name which
                 _stop(f"the landed {check} for #{entry.number} does not match tree_{pos}")
                 break
+            _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
         except Exception:
             # pass-2 review, SHOULD FIX 1: re-read `main_sha()` one more time, best-effort,
             # to name the freshest known head even if the earlier read inside the `try` is
@@ -1114,8 +1131,12 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
             with contextlib.suppress(Exception):
                 current_sha = r.main_sha()
             extra = current_sha if current_sha != previous_tip else None
+            # #642, follow-up 9: the reason must say what actually happened - `pr_data` or
+            # the eligibility re-read can raise before any merge was even attempted for this
+            # PR, and that must never be reported as an unverified merge.
+            when = "after gh pr merge" if attempted_merge else "before attempting to merge it"
             _stop(
-                f"could not verify #{entry.number}'s landing after gh pr merge; "
+                f"could not verify #{entry.number}'s landing {when}; "
                 "reconcile main by hand and rerun build",
                 extra_sha=extra,
             )
@@ -1139,7 +1160,16 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
     )
 
     for branch in (record.train_branch, *(p.branch for p in record.probes)):
-        if not r.delete_branch(branch):
+        # #642, follow-up 1: a record hand-edited to name a branch outside `train/*` makes
+        # `delete_branch` refuse it (same rule as `push`); the merges above already
+        # succeeded, so that refusal is reported and the loop moves on, never turning a
+        # completed merge into an exit code of 1.
+        try:
+            deleted = r.delete_branch(branch)
+        except StoppedError as exc:
+            say(f"could not delete branch {branch}: {exc}")
+            continue
+        if not deleted:
             say(f"could not delete branch {branch}; remove it by hand")
     return record
 
@@ -1178,7 +1208,14 @@ def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
     """`prune`: remove leftover worktrees and delete `train/*` branches of finished batches.
     A build still in flight (`outcome` `None` or `inconclusive`, or a `red` run whose bisect
     hasn't concluded) is left alone - `build --resume` or another window may still need its
-    worktree and branches. A batch already pruned is not retried."""
+    worktree and branches. A batch already pruned is not retried. Takes the same lock
+    `merge` uses (#642, follow-up 8): saving `record.pruned` must never interleave with a
+    concurrent `merge` reading or writing that same record."""
+    with _merge_lock():
+        _run_prune_locked(r, say)
+
+
+def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
     report = say
     say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
     rdir = record_dir()
@@ -1192,7 +1229,12 @@ def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
     for wpath in sorted(rdir.glob("worktree-*")):
         bid = wpath.name.removeprefix("worktree-")
         record = records.get(bid)
-        if record is not None and not _build_finished(record):
+        # #642, follow-up 6: `build` creates the worktree before it can save the batch's
+        # first record (it has nothing to save until the PRs are known), so a worktree with
+        # no record yet may belong to a build still in flight. Fail closed: skip it, exactly
+        # as an unfinished build's own record would be skipped, rather than guess it is
+        # orphaned.
+        if record is None or not _build_finished(record):
             continue  # a live build (or one that crashed before finishing) owns this
         say(f"removing leftover worktree {wpath}")
         r.remove_worktree(wpath)
@@ -1305,10 +1347,15 @@ class ShellRunner:
             return PrData(pr, comments, ready_pr.HeadChecks(pr.head, ()), ())
         # the owner's own head may never have been fetched into this clone (a push from
         # another clone, or a GitHub "Update branch"); `refs/pull/<n>/head` always exists.
-        self._git(self.root, "fetch", "-q", "origin", f"refs/pull/{number}/head", check=False)
+        # #642, follow-up 5: fetched into a private ref, never the shared `FETCH_HEAD` - a
+        # concurrent `merge_train` run in this same clone (e.g. `merge` fetching a different
+        # PR) would otherwise overwrite it between this fetch and the read below.
+        private_ref = f"refs/merge-train/pr-{number}"
+        refspec = f"+refs/pull/{number}/head:{private_ref}"
+        self._git(self.root, "fetch", "-q", "origin", refspec, check=False)
         # #524, follow-up 3: a push to the PR between reading its metadata and this fetch
         # would otherwise compute the diff against a stale head; fail closed instead.
-        fetched = self._git(self.root, "rev-parse", "FETCH_HEAD", check=False)
+        fetched = self._git(self.root, "rev-parse", private_ref, check=False)
         fetched_sha = fetched.stdout.strip() if fetched.returncode == 0 else ""
         if fetched_sha and fetched_sha != pr.head:
             raise StoppedError(
@@ -1387,18 +1434,41 @@ class ShellRunner:
         return result.stdout.strip() if result.returncode == 0 else ""
 
     def merge_pr(self, number: int, head: str) -> MergeAttempt:
-        result = subprocess.run(
-            ["gh", "pr", "merge", str(number), "--squash", "--match-head-commit", head],
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-        )
+        # #642, follow-up 3: a hung `gh pr merge` must never hang `merge` itself, and
+        # whether it actually landed is then unknown - an ambiguous, fail-closed outcome
+        # (never `merged`), so the caller's own post-attempt `main_sha()` check decides.
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "merge", str(number), "--squash", "--match-head-commit", head],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=MERGE_PR_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return MergeAttempt(
+                "failed", f"gh pr merge timed out after {MERGE_PR_TIMEOUT_S}s; outcome unknown"
+            )
         if result.returncode == 0:
             return MergeAttempt("merged")
         text = _redact(((result.stderr or "") + (result.stdout or "")).strip())
         low = text.lower()
-        phrases = ("not mergeable", "mergeable state is unknown", "try again")
-        retryable = any(phrase in low for phrase in phrases)
+        # #642, follow-up 4: a permanent refusal (a real conflict, a branch-protection or
+        # review-policy block) must stop at once, never retry for ~2 minutes as if it were
+        # the transient "GitHub hasn't finished computing mergeability yet" case. Checked
+        # first, since GitHub's own wording for a real conflict still says "not mergeable".
+        permanent_phrases = (
+            "cannot be cleanly created",  # a real conflict
+            "required status check",
+            "review is required",
+            "changes requested",
+            "protected branch",
+            "approving review",
+        )
+        if any(phrase in low for phrase in permanent_phrases):
+            return MergeAttempt("failed", text)
+        retryable_phrases = ("mergeable state is unknown", "try again", "is in unstable status")
+        retryable = any(phrase in low for phrase in retryable_phrases)
         return MergeAttempt("retryable" if retryable else "failed", text)
 
     def find_run(self, sha: str, branch: str) -> RunInfo:
