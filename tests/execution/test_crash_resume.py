@@ -86,6 +86,17 @@ from tradepartner.store.journal import (
 
 __all__ = ["env", "window"]  # the fixtures, re-exported for this module's tests
 
+
+@pytest.fixture(autouse=True)
+def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`test_run_trade.py`'s own autouse fixture, repeated here: importing
+    its `env`/`window` fixtures does not import its autouse ones, and the
+    run path (`StoreProvider` -> `get_settings()`) reads the real `.env`
+    without this."""
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    monkeypatch.delenv("TRADEPARTNER_INVOKED_BY", raising=False)
+
+
 _ALERT_SECRETS = {
     "alert_smtp_host": "smtp.example.test:587",
     "alert_smtp_user": "owner-login@example.test",
@@ -286,7 +297,8 @@ def test_a_crash_midway_through_the_buys_phase_leaves_the_switch_engaged(
     assert env.count("decision_events") == 0  # the accepted order's decision is untouched
     assert _engaged(env, window)
 
-    monkeypatch.undo()
+    env.fake.submit = original_submit  # not monkeypatch.undo(): that would also
+    # revert conftest's autouse _no_network patch (same MonkeyPatch instance)
     nxt = env.run(at(F_0_PLUS_1))
     assert nxt.status == "skipped_kill_switch"
     assert len(env.submits()) == 1  # the crash's own attempt, nothing from this run
@@ -315,14 +327,15 @@ def test_resume_settles_the_pending_order_and_the_next_run_reattempts_only_it(
     monkeypatch.setattr(env.fake, "submit", die_on_third)
     with pytest.raises(Crash):
         env.run(at(F_0))
-    monkeypatch.undo()
+    env.fake.submit = original_submit  # not monkeypatch.undo(): that would also
+    # revert conftest's autouse _no_network patch (same MonkeyPatch instance)
     accepted_securities = {
         env.query("SELECT security_id FROM orders WHERE client_order_id = ?", [c])[0][0]
         for c in accepted
     }
     (crashed_security,) = set(TARGETS) - accepted_securities
-    first_attempt_quantity = env.query(
-        "SELECT quantity FROM orders WHERE security_id = ? AND side = 'buy'", [crashed_security]
+    first_attempt_notional = env.query(
+        "SELECT notional FROM orders WHERE security_id = ? AND side = 'buy'", [crashed_security]
     )[0][0]
     # the fake fills the two accepted orders while the test is not looking,
     # so `resume` finds the crashed run's third order still open or pending.
@@ -354,10 +367,10 @@ def test_resume_settles_the_pending_order_and_the_next_run_reattempts_only_it(
                 for c, _, _ in attempts
             }
             assert len(decisions) == 1
-            second_quantity = env.query(
-                "SELECT quantity FROM orders WHERE client_order_id = ?", [attempts[1][0]]
+            second_notional = env.query(
+                "SELECT notional FROM orders WHERE client_order_id = ?", [attempts[1][0]]
             )[0][0]
-            assert second_quantity == pytest.approx(first_attempt_quantity)
+            assert second_notional == pytest.approx(first_attempt_notional)
         else:
             assert len(attempts) == 1
 
@@ -440,7 +453,8 @@ def test_a_buy_terminal_inside_resume_is_written_off_by_the_next_runs_step_3(
     monkeypatch.setattr(env.fake, "submit", die_on_third)
     with pytest.raises(Crash):
         env.run(at(F_0))
-    monkeypatch.undo()
+    env.fake.submit = original_submit  # not monkeypatch.undo(): that would also
+    # revert conftest's autouse _no_network patch (same MonkeyPatch instance)
     rejected_coid, filled_coid = accepted
     # `filled_coid` fills normally (so its decision settles by a real fill);
     # `rejected_coid` the broker rejects while the run is down: it becomes
@@ -507,35 +521,36 @@ def test_a_buy_terminal_inside_resume_is_written_off_by_the_next_runs_step_3(
 def test_the_fill_lag_bound_halts_and_accept_broker_fills_completes_it(
     env: Env, tmp_path: Path
 ) -> None:
-    """A fill the fake never delivers to `fills()` blocks the next fill
-    session's plan (`risk.max_fill_lag_sessions` = 2 here, so a run between
-    first listing it lagging and the bound is told apart from the halting
-    one); the first collection at or after the bound halts with
-    `ReconciliationError`, with no submit made; `paper resume
-    --accept-broker-fills` completes it with a synthetic fill, and when the
-    real fill the fake was holding back finally surfaces, it is journaled
-    `superseded_by` that synthetic one, so every reader (the fake's own net
-    position and the journal's live, non-superseded fills) counts the
-    position once."""
+    """Every fill of the F_0 batch (all three targets) is hidden from
+    `fills()` from the moment it is recorded (`lag_fills(None)`, before any
+    of them fill): the fake holds them, but the journal never collects
+    them, so none of DUALB, SPFT or TRNS is ever "held" from the ledger's
+    own point of view, and no mark this test makes ever carries a holding
+    (avoiding #653, a separate defect: a mark that does hold something
+    blocks every later `paper resume`). `risk.max_fill_lag_sessions` = 2
+    here, so a run between first listing the lag and the bound is told
+    apart from the halting one; the first collection at or after the bound
+    halts with `ReconciliationError`, with no submit made; `paper resume
+    --accept-broker-fills` completes all three with a synthetic fill each,
+    and when the real fills the fake was holding back finally surface,
+    each is journaled `superseded_by` its synthetic one, so every reader
+    (the fake's own net position and the journal's live, non-superseded
+    fills) counts each position once."""
     env.open_window(
         frozen=FROZEN.model_copy(update={"max_fill_lag_sessions": 2}), tmp_path=tmp_path
     )
     env.fill_on_sleep = False
-    coid = buy_id(env, F_0, "SEC_TRANSFER")
-    env.fake.lag_fills(None)  # every fill from here on is hidden from fills()
+    coids = {s: buy_id(env, F_0, s) for s in ("SEC_DUAL_B", "SEC_SPLIT_FUTURE", "SEC_TRANSFER")}
+    env.fake.lag_fills(None)  # every fill from here on, for every name, is hidden from fills()
 
-    def fill_trns(now: datetime) -> None:
+    def fill_all(now: datetime) -> None:
         for order in env.fake.open_orders():
-            if order.client_order_id == coid:
-                env.fake.simulate_fill(order.client_order_id)
-        for order in env.fake.open_orders():
-            if order.client_order_id != coid:
-                env.fake.simulate_fill(order.client_order_id)
+            env.fake.simulate_fill(order.client_order_id)
 
-    env.on_sleep.append(fill_trns)
+    env.on_sleep.append(fill_all)
     first = env.run(at(F_0))
     assert first.status == "ok", env.result(env.latest_run())
-    assert sorted(o for o in env.held() if o != "TRNS") == ["DUALB", "SPFT"]
+    assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]  # the fake holds all three
     submitted_before = len(env.submits())
 
     # One session lagging (first listed): blocked, not yet halted.
@@ -557,34 +572,45 @@ def test_the_fill_lag_bound_halts_and_accept_broker_fills_completes_it(
 
     outcome = _resume(env, accept_broker_fills=True)
     assert outcome.status == RELEASED, outcome.reasons
-    synthetic = env.query(
-        "SELECT fill_id, quantity FROM fills "
-        "WHERE client_order_id = ? AND source = 'broker_status'",
-        [coid],
-    )
-    assert len(synthetic) == 1
-    synthetic_fill_id, synthetic_quantity = synthetic[0]
+    synthetic_ids: dict[str, int] = {}
+    synthetic_quantities: dict[str, float] = {}
+    for security_id, c in coids.items():
+        synthetic = env.query(
+            "SELECT fill_id, quantity FROM fills "
+            "WHERE client_order_id = ? AND source = 'broker_status'",
+            [c],
+        )
+        assert len(synthetic) == 1, security_id
+        synthetic_ids[security_id], synthetic_quantities[security_id] = synthetic[0]
 
-    # The real fill the fake was holding back now surfaces: it must be
-    # superseded by the synthetic one, counted once, not twice.
+    # The real fills the fake was holding back now surface: each must be
+    # superseded by its synthetic one, counted once, not twice.
     env.fake._fill_hidden_reads = [0 for _ in env.fake._fill_hidden_reads]
     nxt = env.run(at(date(2019, 5, 6)))
     assert nxt.status == "ok", env.result(env.latest_run())
-    real = env.query(
-        "SELECT fill_id, quantity, superseded_by FROM fills "
-        "WHERE client_order_id = ? AND source = 'broker_feed'",
-        [coid],
-    )
-    assert len(real) == 1
-    _real_fill_id, real_quantity, superseded_by = real[0]
-    assert superseded_by == synthetic_fill_id
+    for security_id, c in coids.items():
+        real = env.query(
+            "SELECT fill_id, quantity, superseded_by FROM fills "
+            "WHERE client_order_id = ? AND source = 'broker_feed'",
+            [c],
+        )
+        assert len(real) == 1, security_id
+        _real_fill_id, _real_quantity, superseded_by = real[0]
+        assert superseded_by == synthetic_ids[security_id], security_id
 
-    quantity = env.held().get("TRNS", 0.0)
-    assert quantity == pytest.approx(synthetic_quantity)
-    assert quantity != pytest.approx(synthetic_quantity + real_quantity)  # not double counted
-    with open_read_only(env.settings) as conn:
-        live = fills_for(conn, client_order_ids=[coid])
-    assert sum(f.fill.quantity for f in live) == pytest.approx(quantity)  # the reader agrees
+    # counted once by every reader: the fake's own net position, and the
+    # journal's live (non-superseded) fills through `fills_for`, agree with
+    # the synthetic quantity alone, never the synthetic plus the real one.
+    for symbol, security_id in (
+        ("DUALB", "SEC_DUAL_B"),
+        ("SPFT", "SEC_SPLIT_FUTURE"),
+        ("TRNS", "SEC_TRANSFER"),
+    ):
+        held_quantity = env.held().get(symbol, 0.0)
+        assert held_quantity == pytest.approx(synthetic_quantities[security_id])
+        with open_read_only(env.settings) as conn:
+            live = fills_for(conn, client_order_ids=[coids[security_id]])
+        assert sum(f.fill.quantity for f in live) == pytest.approx(held_quantity)
 
 
 # --- the chain criterion ----------------------------------------------------------------------
@@ -615,8 +641,10 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
     distinct from `not_received`, and DUALB's keeps its partial fill, so
     it earns both req 8 kinds a partial fill can (`position_return` for
     the fill, `not_executed` for the terminal remainder). `paper resume`
-    releases while nothing is held yet (the window's last mark is still
-    cash-only, #653's bug does not apply). The next run re-attempts all
+    releases while this crashed run has not completed any mark yet (its
+    peak falls back to `switch.drawdown_peak`, which does not read
+    `positions_daily`; #653's bug, which needs an *existing* mark with a
+    holding, does not apply here). The next run re-attempts all
     three for the same pending rebalance: DUALB's new order is sized to
     its remainder (target minus the 2 already filled), and is rejected;
     SPFT's expires; TRNS's fills whole (`position_return`, held). A stop
@@ -679,8 +707,11 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
         "SELECT sum(quantity) FROM fills WHERE client_order_id = ?", [dualb_buy_1]
     )[0]
     assert dualb_filled == pytest.approx(partial_quantity)
+    dualb_decision_id = env.query(
+        "SELECT decision_id FROM orders WHERE client_order_id = ?", [dualb_buy_1]
+    )[0][0]
     dualb_target_notional = env.query(
-        "SELECT notional FROM orders WHERE client_order_id = ?", [dualb_buy_1]
+        "SELECT target_notional FROM decisions WHERE decision_id = ?", [dualb_decision_id]
     )[0][0]
 
     released = _resume(env)
@@ -709,7 +740,7 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
         "SELECT notional FROM orders WHERE client_order_id = ?", [dualb_buy_2]
     )[0][0]
     expected_remainder = dualb_target_notional - partial_quantity * float(dualb_price)
-    assert dualb_remainder_notional == pytest.approx(expected_remainder, rel=1e-3)
+    assert dualb_remainder_notional == pytest.approx(expected_remainder, abs=0.01)
     assert dualb_remainder_notional != pytest.approx(dualb_target_notional)
 
     request_stop(env, at(MAY_2, 22, 0))
@@ -792,13 +823,27 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     )
     monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
     env.new_fake(round_cash_to_cent=True)
+    # WNDX delists partway through the window; this test cares about
+    # rounding drift, not delisting handling, so it stays out of the
+    # momentum universe's picks (untradable, never bought).
+    env.fake.set_asset(
+        "WNDX", Asset(tradable=False, fractionable=True, status="active", cusip=None)
+    )
 
     min_rebalances = Settings(_env_file=None).paper.min_rebalances
     sessions = [F_0]
     year, month = F_0.year, F_0.month
     for _ in range(min_rebalances - 1):
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
         sessions.append(next_session(last_session_of_month(year, month)))
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    assert [(s.year, s.month) for s in sessions] == [
+        (2019, 5),
+        (2019, 6),
+        (2019, 7),
+        (2019, 8),
+        (2019, 9),
+        (2019, 10),
+    ]  # six consecutive months' first sessions, none skipped
 
     for session in sessions:
         outcome = env.run(at(session))
@@ -1049,7 +1094,8 @@ def test_reconciliation_alert_kind_is_not_yet_written(
     alerting_env = _alerting_env(fixture_store_path)
     alerting_env.open_window(tmp_path=tmp_path)
     bought_outcome = alerting_env.run(at(F_0))
-    assert bought_outcome.status == "ok"
+    if bought_outcome.status != "ok":
+        pytest.fail(f"setup: F_0 run was not ok: {alerting_env.result(alerting_env.latest_run())}")
     alerting_env.fake.submit(OrderRequest("owner-1", "DUALB", Side.BUY, quantity=1.0))
     alerting_env.fake.simulate_fill("owner-1")  # a position the ledger lacks
     with pytest.raises(ReconciliationError):
@@ -1119,11 +1165,13 @@ def test_resume_releases_while_the_window_holds_a_marked_position(
     obviously positive — cash plus three held names' values)."""
     bought(env)  # DUALB, SPFT, TRNS filled; this run's own mark is cash-only (covers T_0)
     marked = env.run(at(MAY_2))  # a mark run: writes F_0's mark, now with the three positions
-    assert marked.status == "ok", env.result(env.latest_run())
+    if marked.status != "ok":
+        pytest.fail(f"setup: the mark run was not ok: {env.result(env.latest_run())}")
     engaged = switch.engage(
         env.settings, env.clock, window_id=window.window_id, source="owner", reason="test"
     )
-    assert isinstance(engaged, int)
+    if not isinstance(engaged, int):
+        pytest.fail(f"setup: switch.engage did not return an event id: {engaged!r}")
 
     outcome = _resume(env)
     assert outcome.status == RELEASED, outcome.reasons
