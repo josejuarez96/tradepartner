@@ -1,10 +1,11 @@
 """Tracking comparison, monthly decomposition (Phase 4 spec req 10, ADR 0005
 check 1; plan T65).
 
-`compare_months(window, trial, journal, actions, prices, stop_session) ->
-MonthlyComparison` is pure: no clock, no store, no live `Settings` read. Per
-rebalance month i (consecutive sessions `trial.sessions[i]` = T_i and
-`trial.sessions[i + 1]` = T_{i+1}) it computes:
+`compare_months(window, trial, journal, actions, prices, closes,
+stop_session) -> MonthlyComparison` is pure: no clock, no store, no live
+`Settings` read. Per rebalance month i (consecutive sessions
+`trial.sessions[i]` = T_i and `trial.sessions[i + 1]` = T_{i+1}) it
+computes:
 
 - the **raw difference**: paper's return (ledger equity at close(T_{i+1})
   over close(T_i), both from `journal.positions_daily`) minus the trial's
@@ -22,16 +23,18 @@ rebalance month i (consecutive sessions `trial.sessions[i]` = T_i and
   that paid more or a sell that received less than the bar makes the term
   positive (`prices` is the caller's bound accessor for that frozen bar: this
   module never reads `Settings.execution.fill_price` itself: the caller binds
-  `prices` once from the window's frozen key (req 14, #366 Q20, #526),
-  which also serves the raw `close(T_i)`/`close(T_{i+1})` reads the other
-  terms need, since the frozen convention is pinned to `close` by ADR 0007's
-  T3 decision and never varies in practice);
+  `prices` once from the window's frozen key, req 14, #366 Q20, #526);
 - the **residual**: raw + dividend term + fill-timing term;
 - the **residue term**, printed beside the others and never folded into the
   residual: over equity at close(T_i), the sum over names with a residue at
   close(T_i) (`execution.plan.residue`, evaluated on rows known at close(T_i))
   of the residue quantity x (close(T_{i+1}) split-adjusted back to T_i's
-  basis, minus close(T_i));
+  basis, minus close(T_i)) -- `closes` is the caller's separate bound
+  accessor for these close(T_i)/close(T_{i+1}) reads, always the `close`
+  bar regardless of the frozen `execution.fill_price` (#606: a hypothesis
+  registered with `fill_price = open` must not value residues at the open;
+  residues price at the close, like the marks, the same as every other
+  term's close(T_i)/close(T_{i+1}) reads);
 - the **modelled cost**: the trial's base-level `cost_paid` at T_i over the
   trial's own equity at close(T_i) (spec req 10: "the trial's base-level
   `cost_paid` at T_i over its equity at close(T_i)" - "its" is the trial's,
@@ -371,7 +374,7 @@ def _residue_term(
     journal: Journal,
     actions_as_of_i: pl.DataFrame,
     actions_as_of_next: pl.DataFrame,
-    prices: PriceOf,
+    closes: PriceOf,
     window_id: int,
     t_i: date,
     t_next: date,
@@ -410,8 +413,8 @@ def _residue_term(
         )
         if quantity_at_risk == 0.0:
             continue
-        close_i = prices(security_id, t_i)
-        close_next = prices(security_id, t_next)
+        close_i = closes(security_id, t_i)
+        close_next = closes(security_id, t_next)
         if close_i is None or close_next is None:
             raise ValueError(f"no close for {security_id} on {t_i} or {t_next}")
         factor = _split_factor(actions_as_of_next, security_id, t_i, t_next)
@@ -426,6 +429,7 @@ def compare_months(
     journal: Journal,
     actions: pl.DataFrame,
     prices: PriceOf,
+    closes: PriceOf,
     stop_session: date | None,
 ) -> MonthlyComparison:
     """The req 10 tracking comparison, every term per month (module docstring).
@@ -435,6 +439,11 @@ def compare_months(
     own per-month cutoffs, close(T_i) for the residue term and close(T_{i+1})
     for the dividend and split terms, since no single cutoff serves every
     month. `window.window_id` must be set.
+
+    `prices` serves only the fill-timing term's frozen-bar reads; `closes`
+    serves the residue term's close(T_i)/close(T_{i+1}) reads and always
+    reads the `close` bar, whatever `execution.fill_price` froze (#606):
+    residues price at the close, like the marks, regardless of fill_price.
     """
     if window.window_id is None:
         raise ValueError("the window has no window_id")
@@ -468,7 +477,7 @@ def compare_months(
         residual = raw + dividend_term + fill_timing_term
         residue_term = (
             _residue_term(
-                journal, actions_as_of_i, actions_as_of_next, prices, window.window_id, t_i, t_next
+                journal, actions_as_of_i, actions_as_of_next, closes, window.window_id, t_i, t_next
             )
             / paper_equity_i
         )
@@ -740,9 +749,12 @@ def _stop_session_of(stops: Sequence[PaperWindowStopRow]) -> date | None:
 
 def _frozen_fill_price(window: PaperWindowRow) -> Literal["close", "open"]:
     """`execution.fill_price` from `window.frozen_json` (req 14 amendment, #366 Q20,
-    owner): the tracking trial's fill-timing term and the `prices` callable it
-    shares with the dividend and residue terms use the convention frozen at
-    `paper start`, never live `Settings` (`config.FROZEN_EXECUTION_KEYS`)."""
+    owner): the tracking trial's fill-timing term and the `prices` callable
+    it binds use the convention frozen at `paper start`, never live
+    `Settings` (`config.FROZEN_EXECUTION_KEYS`). The residue term is unaffected
+    by this freeze (#606): it always reads through a separate `closes`
+    accessor pinned to `close`, so a window frozen with `fill_price = "open"`
+    still prices residues at the close, like the marks."""
     try:
         parsed = json.loads(window.frozen_json)
     except json.JSONDecodeError as exc:
@@ -902,7 +914,12 @@ def report(settings: Settings, connect: Connect) -> Report:
         journal = _journal_for(conn, window_id)
         actions = conn.execute("SELECT * FROM corporate_actions").pl()
         prices = _price_of(conn, fill_price_key)
-        monthly = compare_months(window, trial, journal, actions, prices, stop_session)
+        #: Residues always price at the close, like the marks, never through
+        #: the frozen `execution.fill_price` bar (#606): bound separately
+        #: from `prices` so a window frozen with `fill_price = "open"` cannot
+        #: value a residue at the open.
+        closes = _price_of(conn, "close")
+        monthly = compare_months(window, trial, journal, actions, prices, closes, stop_session)
         targets = compare_targets(window, trial, journal, conn)
 
     now = utc_now()
