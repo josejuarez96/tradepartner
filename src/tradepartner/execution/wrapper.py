@@ -597,7 +597,9 @@ class RiskGatedBroker:
             gated = self._gate(
                 run, book, sold, assets, nobody, rebalance, _SELL if decisions else _EXIT, 0, 0
             )
-            sold = phases.PhaseOrders(gated.left, ())
+            # The skips ride along: `buy_orders` never buys a name this phase
+            # skipped (#518 item 3).
+            sold = phases.PhaseOrders(gated.left, gated.skips, session=run.session)
             skips, counted = gated.skips, gated.counted
             submitted = self._submit_all(gated.to_submit)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
@@ -638,7 +640,15 @@ class RiskGatedBroker:
         cash = self._buys_cash(account, book, run.session)
         costs = book.costs
         built = phases.buy_orders(
-            rows, book.states, cash, sold, book.price_of, costs, assets, self._frozen
+            rows,
+            book.states,
+            cash,
+            sold,
+            book.price_of,
+            costs,
+            assets,
+            self._frozen,
+            session=run.session,
         )
         gated = self._gate(
             run,
@@ -752,6 +762,7 @@ class RiskGatedBroker:
                 for o in verdict.orders
             ),
             (),
+            session=built.session,
         )
         requests = self._requests(final, book, session)
         skips = (*built.skips, *verdict.skips)

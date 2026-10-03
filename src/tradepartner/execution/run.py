@@ -3,9 +3,8 @@
 
 `tracking_run(settings, connect, broker, clock)` is the whole run, in the req 7
 order. Step 6's trading half and the forced exits are dispatched through the
-module names `trade_step` and `exits_step` (T63d); the `stop` kind through
-`stop_step`, which raises `NotImplementedError` until T63f lands, so a `stop`
-run ends `failed` there rather than skip a step silently.
+module names `trade_step` and `exits_step` (T63d); the `stop` kind's step 7
+through `stop_step` (T63f).
 
 **Entry.** The session is the clock's New York date. The run lock (T59) is
 taken first: a second instance writes a `locked` alert with no run id (its
@@ -44,7 +43,9 @@ engaged the row is the report and the run goes on (spec req 8). Then the
 decisions are all closed or settled (`plan.rebalance_state`) gets its
 `executed` row, before the lapse rule. Each `executed` row written here (a
 fill collected late, #553) gets the `unspent_cash` test of step 7b, with the
-broker's cash and equity read just after the row is written.
+broker's cash and equity read just after the row is written. A `stop` run then
+writes `missed` with reason `window_stop` for every rebalance still pending
+(F_i <= S, no event), planned or not, so the lapse rule never meets it.
 
 **Step 4.** `reconcile_now` (T61), its journal cut (`as_of`, #488) a clock
 reading taken just before the call, so step 3's collected rows are in it.
@@ -61,10 +62,18 @@ its alert; the `missed_run` alert when S-1
 is after the window's start date and has no `paper_runs` row; the lapse rows
 from `marks.lapses`, with one `missed_rebalance` alert; the due outcomes and the
 lot-ledger write (T62). A lot-ledger error never fails the run: it is a
-`lot_ledger` alert (#366 Q5) and a note on the result row.
+`lot_ledger` alert (#366 Q5) and a note on the result row. Once the window has
+a `requested` stop, the outcomes get its **stop session** (`stop_session`: the
+New York date of the row's `at`, or the next session when that date is not
+one), and a `stop` run also passes, as S, every name of the window's orders
+that is flat apart from its residue (`plan.residue`, within the frozen
+`risk.reconcile_quantity_tolerance`) on the ledger after step 3; a name never
+held is flat. The flatness a run's own step 7b fills make is therefore the next
+run's to find, and an order's horizon ends at the earliest of the flattening
+fill, close(T_{i+1}) and close(S-1) of the first such run (T62's `due_outcomes`).
 
 **Step 6.** Under an engaged switch the run ends here, `skipped_kill_switch`.
-Otherwise a `stop` run goes to `stop_step`; a run with a rebalance or catch-up
+Otherwise a `stop` run goes to `stop_step`, which plans nothing; a run with a rebalance or catch-up
 due plans through `planning.plan_rebalance` (with this run's `assets` read and
 the `fills_lagging` state: any order lagging at step 3 or at step 4) and goes
 to `trade_step`; any other run goes to `exits_step`.
@@ -93,6 +102,23 @@ when there is an exit. The window is checked again just before `execute`, so
 the sells phase starts inside it: an exit journaled by a run that has since
 left the window stays open for the next in-window run. Every exception
 `execute` raises takes the halt path.
+
+**The stop run** (`stop_step`, spec req 14). Inside the submit window and not
+under `fills_lagging`, step 7 as above with no pending rebalance (the `stop` run
+missed it): the open forced exits of any reason re-attempted for their
+remainder, the new `delisted` and `untargeted_receipt` exits journaled (an
+untradable one closed with its `skipped` row, event reason `untradable`).
+Then the book is read again, so this run's exits are in it, and
+`exits.stop_exits` gives a `window_stop` exit for every held name with no open
+or in-flight forced exit, no non-terminal own sell and no same-run untradable
+exit, for the holding stated for S (the ledger step 4 reconciled) minus the
+name's `plan.residue`, floored to whole shares where the `assets` read says the
+name is not fractionable; a name whose whole holding is its residue gets none.
+They are journaled in one chunk and handed, with the re-attempts and the new
+tradable forced exits, to the wrapper's sells phase as one batch with no plan
+decision. A name the phase finds untradable is closed there with event reason
+`untradable`, exempt from the skip cap, and reads as a residue while its marks
+say untradable, so a later `stop` run exits it once it trades again.
 
 **Step 7b.** After a batch, this run's acknowledged orders are collected (T58)
 until each is terminal or `paper.accept_wait_seconds` has passed since the
@@ -179,11 +205,12 @@ from tradepartner.execution.plan import (
     RebalanceState,
     decision_state,
     rebalance_state,
+    residue,
 )
 from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, Reconciliation
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import frozen_risk, reconcile_now
-from tradepartner.execution.risk import unfilled_sells
+from tradepartner.execution.risk import OpenSell, unfilled_sells
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
     WRITE_FAILED_EXIT_CODE,
@@ -199,6 +226,8 @@ from tradepartner.store.db import open_read_only, utc_now
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
+    AdjustmentRow,
+    DecisionEventRow,
     DecisionRow,
     OrderRow,
     PaperRunResultRow,
@@ -224,6 +253,7 @@ from tradepartner.store.journal import (
     runs_for,
     window_stops_for,
 )
+from tradepartner.store.schema import WINDOW_STOP_REASON
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
@@ -232,6 +262,7 @@ __all__ = [
     "StepContext",
     "exits_step",
     "invoked_by",
+    "stop_session",
     "stop_step",
     "submit_window",
     "tracking_run",
@@ -348,8 +379,45 @@ def exits_step(context: StepContext) -> BatchOutcome | None:
 
 
 def stop_step(context: StepContext) -> BatchOutcome | None:
-    """The `stop` kind's steps after step 5 (T63f)."""
-    raise NotImplementedError("the stop run lands with T63f")
+    """The `stop` kind's step 7 (module docstring, "The stop run"): inside the
+    submit window, the open forced exits re-attempted, the new forced exits
+    journaled (an untradable one closed), then a `window_stop` exit for each
+    held name `exits.stop_exits` returns, all handed to the wrapper's sells
+    phase as one batch with no plan decision. None when no batch was made."""
+    if context.lagging:
+        context.notes.append("fills_lagging: no stop exit made")
+        return None
+    if not _in_submit_window(context):
+        return None
+    decimals = context.settings.alpaca.quantity_decimals
+    if decimals is None:  # the wrapper refuses it too; no exit is journaled first
+        raise ValueError("alpaca.quantity_decimals is unset (T48b records it)")
+    handed, untradable = _journal_forced_exits(context, _exit_book(context), pending_rebalance=None)
+    # Read again: this run's forced exits block a `window_stop` exit of their name.
+    book = _exit_book(context)
+    stops = exits.stop_exits(
+        book.ledger.positions,
+        _residues(context, book),
+        book.assets,
+        book.decisions,
+        book.states,
+        book.open_sells,
+        untradable,
+        session=context.session,
+        quantity_decimals=decimals,
+    )
+    handed.extend(row for row, _ordered in _journal_exits(context, stops))
+    if not handed or not _in_submit_window(context):
+        return None
+    return _execute(context, (), handed)
+
+
+def stop_session(requested_at: datetime) -> date:
+    """The stop session (spec req 14): the calendar session containing the
+    `requested` row's `at` (its New York date), or the next session when that
+    date is not a session."""
+    day = ensure_tz_aware_utc(requested_at, field_name="requested_at").astimezone(_NEW_YORK).date()
+    return day if is_session(day) else next_session(day)
 
 
 def submit_window(settings: Settings, session: date) -> tuple[datetime, datetime]:
@@ -386,9 +454,29 @@ def _execute(
         raise _Halt(exc) from exc
 
 
-def _forced_exits(context: StepContext, *, pending_rebalance: date | None) -> list[DecisionRow]:
-    """Step 7 (module docstring): the open forced exits to re-attempt and the
-    new tradable ones, journaled; an untradable new one journaled closed."""
+@dataclass(frozen=True)
+class _ExitBook:
+    """Step 7's reads (module docstring), one frame: the window's decisions,
+    their events and states, the ledger stated for S, the adjustments, the
+    store's actions at close(S-1), the own non-terminal sells, the listings
+    ended at close(S-1), this run's `assets` read by `security_id` (held names),
+    the marks and the window's runs."""
+
+    decisions: list[DecisionRow]
+    events: list[DecisionEventRow]
+    states: dict[int, DecisionState]
+    ledger: Ledger
+    adjustments: list[AdjustmentRow]
+    actions: pl.DataFrame
+    open_sells: list[OpenSell]
+    delisted: dict[str, date | None]
+    assets: dict[str, Asset]
+    marks: list[PositionDailyRow]
+    runs: list[PaperRunRow]
+
+
+def _exit_book(context: StepContext) -> _ExitBook:
+    """Step 7's reads, every store fact as of close(S-1)."""
     session = context.session
     window_id = _window_id(context.window)
     cut = calendar.session_close(previous_session(session))
@@ -431,6 +519,8 @@ def _forced_exits(context: StepContext, *, pending_rebalance: date | None) -> li
             else {}
         )
         tickers = _current_tickers(listings_as_of(conn, cut, held), session) if held else {}
+        marks_rows = positions_daily_for(conn, window_id)
+        run_rows = [r.run for r in runs_for(conn, window_id)]
     price_of = _lookup(prices)
     states: dict[int, DecisionState] = {}
     for journaled_decision in journaled:
@@ -447,47 +537,107 @@ def _forced_exits(context: StepContext, *, pending_rebalance: date | None) -> li
             context.frozen,
             session=session,
         )
-    decisions = [d.decision for d in journaled]
-    reattempts = exits.reattempt_exits(decisions, states)
-    assets = {
-        sid: context.assets[canonical_symbol(ticker)]
-        for sid, ticker in tickers.items()
-        if canonical_symbol(ticker) in context.assets
-    }
+    return _ExitBook(
+        decisions=[d.decision for d in journaled],
+        events=[e for d in journaled for e in d.events],
+        states=states,
+        ledger=ledger,
+        adjustments=adjustments,
+        actions=actions,
+        open_sells=unfilled_sells(orders, events, fills, price_of, actions, session=session),
+        delisted={
+            sid: row["end_session"] for sid, row in ends.items() if row["status"] == DELISTED
+        },
+        assets={
+            sid: context.assets[canonical_symbol(ticker)]
+            for sid, ticker in tickers.items()
+            if canonical_symbol(ticker) in context.assets
+        },
+        marks=marks_rows,
+        runs=run_rows,
+    )
+
+
+def _forced_exits(context: StepContext, *, pending_rebalance: date | None) -> list[DecisionRow]:
+    """Step 7 (module docstring): the open forced exits to re-attempt and the
+    new tradable ones, journaled; an untradable new one journaled closed."""
+    handed, _untradable = _journal_forced_exits(
+        context, _exit_book(context), pending_rebalance=pending_rebalance
+    )
+    return handed
+
+
+def _journal_forced_exits(
+    context: StepContext, book: _ExitBook, *, pending_rebalance: date | None
+) -> tuple[list[DecisionRow], set[str]]:
+    """`exits.reattempt_exits` and `exits.forced_exits` over `book`, the new
+    exits journaled: (the decisions to hand to the sells phase, the names whose
+    new exit was journaled closed `untradable`)."""
     new = exits.forced_exits(
-        ledger.positions,
-        {sid: row["end_session"] for sid, row in ends.items() if row["status"] == DELISTED},
-        assets,
-        decisions,
-        states,
-        unfilled_sells(orders, events, fills, price_of, actions, session=session),
-        adjustments,
-        session=session,
+        book.ledger.positions,
+        book.delisted,
+        book.assets,
+        book.decisions,
+        book.states,
+        book.open_sells,
+        book.adjustments,
+        session=context.session,
         pending_rebalance=pending_rebalance,
     )
-    handed = list(reattempts)
-    if new:
-        stamp = context.gate.read_clock()
-        with context.connect() as conn:
-            for exit_ in new:
-                row = exit_.row(run_id=_run_id(context.run), known_at=stamp, ingested_at=stamp)
-                decision_id = append(conn, row)
-                assert decision_id is not None
-                event = exit_.event(
-                    decision_id=decision_id,
-                    run_id=_run_id(context.run),
-                    known_at=stamp,
-                    ingested_at=stamp,
+    handed = list(exits.reattempt_exits(book.decisions, book.states))
+    journaled = _journal_exits(context, new)
+    untradable = {row.security_id for row, ordered in journaled if not ordered}
+    handed.extend(row for row, ordered in journaled if ordered)
+    return handed, untradable
+
+
+def _journal_exits(
+    context: StepContext, new: Sequence[exits.ExitDecision]
+) -> list[tuple[DecisionRow, bool]]:
+    """The new exits journaled in one chunk, each with its id and whether it
+    is to be ordered; one closed at once gets its `skipped` row and a note."""
+    if not new:
+        return []
+    out: list[tuple[DecisionRow, bool]] = []
+    stamp = context.gate.read_clock()
+    with context.connect() as conn:
+        for exit_ in new:
+            row = exit_.row(run_id=_run_id(context.run), known_at=stamp, ingested_at=stamp)
+            decision_id = append(conn, row)
+            assert decision_id is not None
+            event = exit_.event(
+                decision_id=decision_id,
+                run_id=_run_id(context.run),
+                known_at=stamp,
+                ingested_at=stamp,
+            )
+            if event is not None:
+                append(conn, event)
+                context.notes.append(
+                    f"forced exit of {exit_.security_id} ({exit_.reason}) closed: "
+                    f"{exit_.skipped_reason}"
                 )
-                if event is None:
-                    handed.append(replace(row, decision_id=decision_id))
-                else:
-                    append(conn, event)
-                    context.notes.append(
-                        f"forced exit of {exit_.security_id} ({exit_.reason}) closed: "
-                        f"{exit_.skipped_reason}"
-                    )
-    return handed
+            out.append((replace(row, decision_id=decision_id), event is None))
+    return out
+
+
+def _residues(context: StepContext, book: _ExitBook) -> dict[str, float]:
+    """`plan.residue` of every held name, over `book`."""
+    return {
+        security_id: residue(
+            security_id,
+            book.adjustments,
+            book.decisions,
+            book.events,
+            book.marks,
+            book.ledger,
+            book.actions,
+            window_id=_window_id(context.window),
+            runs=book.runs,
+        )
+        for security_id, quantity in sorted(book.ledger.positions.items())
+        if quantity > 0
+    }
 
 
 def _run_id(run: PaperRunRow) -> int:
@@ -895,6 +1045,8 @@ class _Run:
         collected = self._collect()
         for t_i in self._executed(actions, prices):
             self._unspent_cash(t_i, None)
+        if self.kind == _STOP:
+            self._stop_missed()
         reconciliation = self._reconcile()
         ledger = self._ledger_at(self.session, actions)
         self.assets_read(list(self._symbols(sorted(ledger.positions)).values()))
@@ -942,6 +1094,41 @@ class _Run:
                 self._unspent_cash(t_i, batch.cash_left if t_i == rebalance else None)
         self._reconcile()
         return self._finish(OK if batch is None else batch.status)
+
+    def _stop_missed(self) -> None:
+        """A `stop` run's `missed` rows (reason `window_stop`, spec req 14): every
+        pending rebalance (F_i <= S, no `executed` or `missed` event), planned
+        or not, after the `executed` test of step 3 and before the lapse rule."""
+        if fill_session(self.window.first_rebalance_session) > self.session:
+            return
+        with open_read_only(self.settings) as conn:
+            settled = {e.rebalance_session for e in rebalance_events_for(conn, self.window_id)}
+        pending = [
+            t_i
+            for t_i in rebalance_sessions(self.window.first_rebalance_session, self.session)
+            if fill_session(t_i) <= self.session and t_i not in settled
+        ]
+        if not pending:
+            return
+        stamp = self.gate.read_clock()
+        with self.connect() as conn:
+            for t_i in pending:
+                append(
+                    conn,
+                    RebalanceEventRow(
+                        rebalance_session=t_i,
+                        run_id=self.run_id,
+                        status=_MISSED,
+                        reason=WINDOW_STOP_REASON,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
+        self.notes.append(
+            "window stop: rebalance "
+            + ", ".join(t.isoformat() for t in pending)
+            + f" missed ({WINDOW_STOP_REASON})"
+        )
 
     def _staleness(self) -> None:
         """Step 2 (module docstring)."""
@@ -1406,6 +1593,7 @@ class _Run:
         def price(security_id: str, day: date) -> float | None:
             return closes.get((security_id, day))
 
+        requested, flat = self._stop_horizon(actions)
         errors: list[str] = []
         with self.connect() as conn:
             write_outcomes_and_lots(
@@ -1418,11 +1606,68 @@ class _Run:
                 self.gate.read_clock,
                 on_lot_error=errors.append,
                 actions=actions,
+                stop_requested=requested,
+                stop_flat=flat,
             )
         if errors:
             message = self.alerter.scrub("lot ledger not rebuilt: " + "; ".join(errors))
             self.notes.append(message)
             self._alert("lot_ledger", message)
+
+    def _stop_horizon(self, actions: pl.DataFrame) -> tuple[date | None, dict[str, date]]:
+        """The stopped window's outcome horizon inputs (T62, spec req 14): the
+        stop session of the window's `requested` row (None before one), and, on
+        a `stop` run, S for every name of the window's orders that is flat apart
+        from its residue now, after step 3's collection and step 5's marks (a
+        name never held is flat). The ledger is the journal's after step 3, so
+        the flatness a run's own step 7b fills make is this test's on the next
+        run. A name with a fill dated S (an earlier run on S flattened it) is
+        left out, so its flattening fill on S, not close(S-1), ends the
+        horizon; the next session's run finds it. A name keeps no earlier
+        session: the outcome of an order terminal and flat at an earlier `stop`
+        run was written by that run (outcomes are written once, at the first
+        run they are due)."""
+        with open_read_only(self.settings) as conn:
+            stops = window_stops_for(conn, self.window_id)
+            requested_rows = [s for s in stops if s.state == _REQUESTED]
+            if not requested_rows or self.kind != _STOP:
+                session = (
+                    stop_session(min(s.at for s in requested_rows)) if requested_rows else None
+                )
+                return session, {}
+            names = sorted({o.security_id for o in orders_for(conn, window_id=self.window_id)})
+            filled_on_s = {
+                f.security_id
+                for f in fills_for(conn, window_id=self.window_id)
+                if f.fill.filled_at.astimezone(_NEW_YORK).date() == self.session
+            }
+            adjustments = adjustments_for(conn, self.window_id)
+            journaled = decisions_for(conn, self.window_id)
+            marks_rows = positions_daily_for(conn, self.window_id)
+            run_rows = [r.run for r in runs_for(conn, self.window_id)]
+        ledger = self._ledger_at(self.session, actions)
+        decisions = [d.decision for d in journaled]
+        events = [e for d in journaled for e in d.events]
+        tolerance = self.frozen.reconcile_quantity_tolerance
+        flat: dict[str, date] = {}
+        for security_id in names:
+            if security_id in filled_on_s:
+                continue  # a fill on S ends it there: close(S-1) would come first
+            held = ledger.positions.get(security_id, 0.0)
+            kept = residue(
+                security_id,
+                adjustments,
+                decisions,
+                events,
+                marks_rows,
+                ledger,
+                actions,
+                window_id=self.window_id,
+                runs=run_rows,
+            )
+            if held <= kept + tolerance:
+                flat[security_id] = self.session
+        return stop_session(min(s.at for s in requested_rows)), flat
 
     def _due(self) -> planning.RebalanceKind | None:
         with open_read_only(self.settings) as conn:

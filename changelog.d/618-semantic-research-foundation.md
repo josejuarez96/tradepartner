@@ -1,0 +1,3 @@
+- #618 research: semantic disclosure program, first five artifacts (taxonomy v0 for demand/inventory/liquidity, annotation protocol, graded evidence review, ML validation brief, prospective feature contract); no code, ADR 0008 unchanged
+### Added
+- docs/research: semantic taxonomy v0, disclosure annotation protocol, disclosure-change evidence review (with a source audit of the 2026-10-03 typed-classifiers note), ML validation methodology brief and prospective semantic feature spec, plus the five 2026-10-03 input notes (typed-classifiers results, claims pilot, neglected-equities, integration note, quantitative-investing brief) brought in verbatim from the unmerged spike branch (#618)
