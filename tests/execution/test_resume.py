@@ -451,6 +451,112 @@ def test_the_release_resets_the_peak_to_the_equity_at_the_last_mark(
     assert released[0].peak_equity == 93_500.0
 
 
+def test_the_release_resets_the_peak_from_marks_fors_real_row_shape(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Regression for #653: `marks.marks_for`'s own docstring says a session
+    with nothing held gets a `security_id=None` cash row, but once anything
+    is held every row is a per-security row carrying the ledger's `cash`
+    redundantly -- there is never a dedicated null-security row. Build the
+    last marked session in exactly that shape (no cash-only row; every
+    position row carries the same `cash`) and require `resume` to still read
+    the peak from it, rather than refusing because no null-security row
+    exists."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    session = date(2026, 9, 30)
+    cash = 93_000.0
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=50.0,
+            value=500.0,
+            cash=cash,
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id="SEC_OTHER",
+            quantity=4.0,
+            mark_price=25.0,
+            value=100.0,
+            cash=cash,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        released = [
+            e
+            for e in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            if e.state == "released"
+        ]
+    assert released[0].peak_equity == cash + 500.0 + 100.0
+
+
+def test_only_the_max_marked_session_counts(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A broken earlier session (a position row with no value) must not sink
+    the read: only the rows of the highest `session` count."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 29),
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=None,
+            value=None,
+            cash=100_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=50.0,
+            value=500.0,
+            cash=93_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        released = [
+            e
+            for e in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            if e.state == "released"
+        ]
+    assert released[0].peak_equity == 93_500.0
+
+
 # --- refusals -------------------------------------------------------------------
 
 
@@ -908,6 +1014,82 @@ def test_a_last_mark_with_no_positive_equity_refuses(
             session=date(2026, 9, 30),
             quantity=0.0,
             cash=-50.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_two_distinct_cash_values_at_the_last_mark_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Two rows of the same session disagreeing on `cash` cannot be a
+    single ledger reading: refuse rather than pick either one."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    session = date(2026, 9, 30)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=50.0,
+            value=500.0,
+            cash=93_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id="SEC_OTHER",
+            quantity=4.0,
+            mark_price=25.0,
+            value=100.0,
+            cash=92_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_a_held_position_row_with_no_value_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=None,
+            value=None,
+            cash=93_000.0,
             known_at=at,
             ingested_at=at,
         ),

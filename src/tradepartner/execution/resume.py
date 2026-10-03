@@ -344,17 +344,26 @@ def _lag(
 
 
 def _mark_equity(marks: Sequence[PositionDailyRow]) -> float | None:
-    """Ledger equity at the last marked session: its cash row plus every
-    name's value, or None when the session's rows cannot give it."""
+    """Ledger equity at the last marked session: its cash plus every name's
+    value, or None when that session's rows cannot give it.
+
+    `marks_for` (the only writer of `positions_daily`) carries `cash` on
+    every row, not only a dedicated `security_id IS NULL` row: that cash-only
+    row is written only when the window holds nothing. So cash is read from
+    any row at the session, requiring exactly one distinct non-None value
+    across them, mirroring `run._mark_equity` -- the drawdown check's own
+    read of the same table.
+    """
     if not marks:
         return None
     last = max(m.session for m in marks)
     rows = [m for m in marks if m.session == last]
-    cash = [m.cash for m in rows if m.security_id is None]
-    values = [m.value for m in rows if m.security_id is not None]
-    if len(cash) != 1 or cash[0] is None or any(v is None for v in values):
+    cash = {r.cash for r in rows if r.cash is not None}
+    values = [r.value for r in rows if r.security_id is not None]
+    if len(cash) != 1 or any(v is None for v in values):
         return None
-    return cash[0] + math.fsum(v for v in values if v is not None)
+    equity = cash.pop() + math.fsum(v for v in values if v is not None)
+    return equity if math.isfinite(equity) else None
 
 
 def _faulted_run_breaches(
