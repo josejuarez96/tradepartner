@@ -160,6 +160,29 @@ def test_a_stop_run_plans_nothing_and_misses_the_pending_rebalance(
     assert env.rebalance_events() == [(T_0, "missed", "window_stop", outcome.run_id)]
 
 
+def test_a_stop_run_writes_missed_window_stop_rows_even_while_engaged(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Step 3's `_stop_missed` runs before step 6's engaged-switch check: a
+    stop run with the switch already engaged still writes `missed`
+    (`window_stop`) for the pending rebalance, before it ends
+    `skipped_kill_switch` (#598)."""
+    assert window.window_id is not None
+    request_stop(env, at(T_0, 22, 0))
+    engaged = switch.engage(
+        env.settings,
+        lambda: at(T_0, 23, 0),
+        window_id=window.window_id,
+        source="owner",
+        reason="seeded: already engaged",
+    )
+    assert isinstance(engaged, int)
+    outcome = env.run(at(F_0))
+    assert outcome.status == "skipped_kill_switch", env.result(env.latest_run())
+    assert outcome.kind == "stop"
+    assert env.rebalance_events() == [(T_0, "missed", "window_stop", outcome.run_id)]
+
+
 def test_a_stop_run_sells_every_holding_through_the_wrapper_in_the_window(
     env: Env, window: PaperWindowRow
 ) -> None:
@@ -435,7 +458,24 @@ def test_a_not_executed_buy_on_a_name_never_held_is_written_by_the_first_stop_ru
     assert outcomes(env, "SEC_TRANSFER") == []
     first = env.run(at(MAY_2))
     assert first.status == "ok", env.result(env.latest_run())
-    assert [r[1:3] for r in outcomes(env, "SEC_TRANSFER")] == [(F_0, "not_executed")]
+    ((_coid, through, kind, mark_price),) = outcomes(env, "SEC_TRANSFER")
+    assert (through, kind) == (F_0, "not_executed")
+    (close_s_minus_1,) = (
+        r[0]
+        for r in env.query(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session = ?",
+            ["SEC_TRANSFER", F_0],
+        )
+    )
+    (close_s,) = (
+        r[0]
+        for r in env.query(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session = ?",
+            ["SEC_TRANSFER", MAY_2],
+        )
+    )
+    assert close_s_minus_1 != close_s  # a different close(S) is present
+    assert mark_price == pytest.approx(close_s_minus_1)  # the mark is close(S-1)
     # DUALB is still held at that run's step 3 (its exit fills at step 7b): no outcome yet.
     assert outcomes(env, "SEC_DUAL_B") == []
 

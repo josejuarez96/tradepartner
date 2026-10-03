@@ -1653,7 +1653,15 @@ class _Run:
 
     def _outcomes(self, actions: pl.DataFrame) -> None:
         """The due outcomes and the lot-ledger write (T62). A lot-ledger error is
-        a `lot_ledger` alert and a note; it never fails the run."""
+        a `lot_ledger` alert and a note; it never fails the run.
+
+        NIT (#598): `_stop_horizon`'s `flat` (`stop_flat`) is this run's own
+        computation and is not itself stored. A `realised_pnl` this run holds
+        back because the lot ledger could not be rebuilt (a `lot_ledger`
+        alert above) is therefore written later, by whichever run is next due
+        to write it, through that later run's own horizon (recomputed the
+        same way from the stored facts), not through this run's `flat`. The
+        value written is unaffected: only which run ends up writing it."""
         with open_read_only(self.settings) as conn:
             names = sorted({o.security_id for o in orders_for(conn, window_id=self.window_id)})
             bars = prices_as_of(conn, self._cut(), names) if names else pl.DataFrame()
