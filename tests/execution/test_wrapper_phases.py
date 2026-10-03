@@ -454,19 +454,23 @@ def test_each_batch_limit_halts_with_zero_submits_and_the_missed_row(
     assert _missed(env.settings) == [("missed", "limit_breach")]
 
 
-def test_a_sell_above_the_reconciled_holding_halts_with_zero_submits(
+def test_a_trim_is_capped_by_the_names_open_sell_instead_of_halting_the_batch(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
-    """An earlier session's sell of 8 still open, and a trim of 5 of the 10 held:
-    the sum is over the holding."""
+    """#605 owner decision: an earlier session's sell of 8 still open, and a
+    trim that would otherwise sell 5 of the 10 held, sum to over the holding.
+    Instead of halting on `sell_sum_within_holding` (the pre-#605 behaviour),
+    the trim's cap subtracts the open sell (10 - 8 = 2) and the batch submits
+    the smaller sell."""
     _hold(env, A, 10.0)
     _open_sell(env, A, 8.0)
     trim = _decision(env, A, "sell", notional=500.0)
-    submitted = len(_submits(env.fake))
-    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
-        _execute(_gate(env, alerter_conn), env, [trim])
-    assert len(_submits(env.fake)) == submitted
-    assert _missed(env.settings) == [("missed", "limit_breach")]
+    outcome = _execute(_gate(env, alerter_conn), env, [trim])
+    assert outcome.status == "ok"
+    submits = _submits(env.fake)
+    assert len(submits) == 1
+    assert (submits[0].quantity, submits[0].notional) == (2.0, None)
+    assert _missed(env.settings) == []
 
 
 def _open_sell(env: Env, security_id: str, quantity: float) -> None:

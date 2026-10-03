@@ -18,10 +18,16 @@ never by notional (ADR 0010 amendment 2026-09-30):
 - a **trim** sells its remainder (`DecisionState.remainder`, the trim's notional
   left converted at the reference price; a planned quantity there is already
   adjusted by the splits in (T_i, S]), capped at the holding on S less the
-  name's residue (#518 owner decision: after a price drop the converted
-  remainder can exceed the holding, and the cap sells what is held instead of
-  halting the phase on `sell_within_holding`), by whole shares when the
-  decision's flag is set or the name is no longer `fractionable`.
+  name's residue and less the name's open (non-terminal) sells from earlier
+  sessions (`open_sells`, `risk.unfilled_sells`; the cap never goes below 0)
+  (#518 owner decision: after a price drop the converted remainder can exceed
+  the holding, and the cap sells what is held instead of halting the phase on
+  `sell_within_holding`; #605 owner decision: the same cap also subtracts
+  those open sells, so the trim passes `check_phase`'s
+  `sell_sum_within_holding`, which adds them back onto the name's sells — an
+  under-trim this leaves heals itself next session if the open sell later
+  expires, while a halt does not), by whole shares when the decision's flag is
+  set or the name is no longer `fractionable`.
 
 Every quantity is rounded down to `quantity_decimals` (`alpaca.quantity_decimals`)
 and, on a whole-share basis, floored, so no sell exceeds the holding the risk
@@ -40,7 +46,10 @@ sells, never as a larger target (`buy_orders`).
 
 **`buy_orders`** sizes the open buys from `cash` (the account's cash after
 the sells, less the open-buy reserve, which the caller computes) through
-`risk.size_buys`: notional buys first, whole-share buys last. A buy whose
+`risk.size_buys`: notional buys first, whole-share buys last. A name whose
+listing ended at close(S-1) (`ended`) is skipped as `skip_delisted` before
+sizing, so it takes no share of the other buys' scaling, instead of being
+sized in and only then dropped by `risk.check_phase` (#604). A buy whose
 attempt falls below the minimum is **deferred** (its id in `deferred`, no skip
 row, no cap count); a name not `tradable` is `skip_untradable`. A buy of a
 name the sells phase ordered or skipped, or whose sell decision is in flight,
@@ -63,8 +72,8 @@ No numeric literal other than 0, 1, 2 and -1 appears here
 from __future__ import annotations
 
 import math
-from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections import Counter, defaultdict
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -96,6 +105,7 @@ _UNTRADABLE = "untradable"
 _SKIP_UNTRADABLE = "skip_untradable"
 _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
+_SKIP_DELISTED = "skip_delisted"
 
 
 @dataclass(frozen=True)
@@ -204,6 +214,14 @@ def _sellable(decision: DecisionRow, ledger: Ledger, residues: Mapping[str, floa
     return held - left
 
 
+def _open_sold(open_sells: Sequence[risk.OpenSell]) -> dict[str, float]:
+    """Each name's open (non-terminal) sells, summed by `security_id`."""
+    totals: dict[str, float] = defaultdict(float)
+    for sell in open_sells:
+        totals[sell.security_id] += sell.unfilled_quantity
+    return totals
+
+
 def _sell_skip(
     full_exit: bool, whole: bool, quantity: float, price: float, frozen: RiskConfig
 ) -> str | None:
@@ -227,6 +245,7 @@ def sell_orders(
     *,
     session: date,
     quantity_decimals: int,
+    open_sells: Sequence[risk.OpenSell] = (),
 ) -> PhaseOrders:
     """The sells phase's orders and per-name skips on S = `session` (module
     docstring), in decision-id order.
@@ -239,9 +258,13 @@ def sell_orders(
     known later raises), `price_of` is the reference price on S, `assets` the
     phase's `assets` read by `security_id` (a name missing raises), `frozen`
     the window's frozen `risk.*` section and `quantity_decimals` the broker's
-    quantity precision. Raises `ValueError` for a forced exit among
-    `decisions`, a non-forced-exit or non-sell among `forced_exits`, two sells
-    for one name, and every malformed input `attempt_scope` refuses.
+    quantity precision. `open_sells` is the name's non-terminal own sells
+    (`risk.unfilled_sells`), read before this phase's own orders are
+    journaled, so every one of them is from an earlier session (#605); a
+    trim's cap subtracts them (never below 0), a full exit's quantity does
+    not. Raises `ValueError` for a forced exit among `decisions`, a
+    non-forced-exit or non-sell among `forced_exits`, two sells for one name,
+    and every malformed input `attempt_scope` refuses.
     """
     _check_session(session)
     if ledger.through != session:
@@ -266,6 +289,7 @@ def sell_orders(
     if twice:
         raise ValueError(f"two sell decisions for {twice} in one phase")
 
+    open_sold = _open_sold(open_sells)
     orders: list[PhaseOrder] = []
     skips: list[Skip] = []
     for attempt in scope.attempts:
@@ -283,7 +307,8 @@ def sell_orders(
             quantity = sellable
             whole = decision.whole_share
         else:
-            quantity = min(_finite(attempt.remainder.quantity, f"remainder of {sid}"), sellable)
+            cap = max(sellable - open_sold.get(sid, 0.0), 0.0)
+            quantity = min(_finite(attempt.remainder.quantity, f"remainder of {sid}"), cap)
             whole = decision.whole_share or not asset.fractionable
         quantity = round_down(quantity, quantity_decimals)
         if whole:
@@ -319,6 +344,7 @@ def buy_orders(
     frozen: RiskConfig,
     *,
     session: date,
+    ended: Collection[str] = (),
 ) -> PhaseOrders:
     """The buys phase's orders, skips, deferred ids and cash left on S =
     `session` (module docstring).
@@ -330,8 +356,11 @@ def buy_orders(
     proceeds are in `cash` already and whose names, ordered or skipped, are
     never bought (a buy of one raises `ValueError`, as does a buy of a name
     whose sell decision in `decisions` is in flight, and a non-empty
-    `planned_sells` built for another session). Orders are notional buys in
-    decision-id order,
+    `planned_sells` built for another session). `ended` is the names whose
+    listing ended at close(S-1) (`book.ended`): such a buy is skipped as
+    `skip_delisted` before sizing runs, so it takes no share of the other
+    buys' scaling (#604), the same way `risk.check_phase` would skip it, just
+    earlier. Orders are notional buys in decision-id order,
     then whole-share buys; a buy of a name no longer `fractionable` goes by
     whole shares.
     """
@@ -357,9 +386,16 @@ def buy_orders(
     to_size: list[BuyToSize] = []
     for attempt in scope.attempts:
         decision = attempt.decision
-        asset = _asset(decision.security_id, assets)
+        sid = decision.security_id
+        if sid in ended:
+            # Matches `risk.check_phase`'s precedence (listing-ended before
+            # tradable): skipped before sizing, not after, so no other buy
+            # takes a smaller share for this one's sake (#604).
+            skips.append(Skip(_id(decision), sid, _SKIP_DELISTED))
+            continue
+        asset = _asset(sid, assets)
         if not asset.tradable:
-            skips.append(Skip(_id(decision), decision.security_id, _SKIP_UNTRADABLE))
+            skips.append(Skip(_id(decision), sid, _SKIP_UNTRADABLE))
             continue
         lost = True if not asset.fractionable else None
         to_size.append(BuyToSize(decision, attempt.remainder, whole_share=lost))
