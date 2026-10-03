@@ -1,4 +1,4 @@
-- Drawdown crash-gap check widened, unspent_cash alert deduped and skipped in stop runs, stop-run lookahead case added (#560, #563, #598; PR #TBD).
+- Drawdown crash-gap check widened, unspent_cash alert deduped and skipped in stop runs, stop-run lookahead case added (#560, #563, #598; PR #645).
 ### Fixed
 - execution: _drawdown checks every marked session after the last release, not just this run's; back-filled crossings are labeled (#560).
 - execution: _unspent_cash writes one alert per call site naming every rebalance over the bound, and skips step 7b's check in stop runs (#563).
