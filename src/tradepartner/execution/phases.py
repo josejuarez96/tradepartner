@@ -83,7 +83,7 @@ No numeric literal other than 0, 1, 2 and -1 appears here
 from __future__ import annotations
 
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -225,17 +225,6 @@ def _sellable(decision: DecisionRow, ledger: Ledger, residues: Mapping[str, floa
     return held - left
 
 
-def _open_sold(open_sells: Sequence[risk.OpenSell]) -> dict[str, Decimal]:
-    """Each name's open (non-terminal) sells, summed by `security_id` exactly
-    in `Decimal`, as `check_phase`'s `sell_sum_within_holding` sums them: a
-    `float` sum of two or more off-grid open sells can land under the exact
-    one and leave the cap a rounding ulp too high (#605 review pass 2)."""
-    totals: dict[str, Decimal] = defaultdict(Decimal)
-    for sell in open_sells:
-        totals[sell.security_id] += risk._dec(sell.unfilled_quantity)
-    return totals
-
-
 def _trim_cap(held: float, residue: float, open_sold: Decimal, quantity_decimals: int) -> float:
     """A trim's quantity cap, exact in `Decimal` on the `quantity_decimals`
     grid: the holding rounded down first, less the residue, less the name's
@@ -334,7 +323,7 @@ def sell_orders(
     if twice:
         raise ValueError(f"two sell decisions for {twice} in one phase")
 
-    open_sold = _open_sold(open_sells)
+    open_sold = risk.open_sold(open_sells, quantity_decimals)
     orders: list[PhaseOrder] = []
     skips: list[Skip] = []
     for attempt in scope.attempts:

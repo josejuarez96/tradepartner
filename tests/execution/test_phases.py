@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Collection, Sequence
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import polars as pl
 import pytest
@@ -27,7 +28,7 @@ from tradepartner.execution.phases import (
     sell_orders,
 )
 from tradepartner.execution.plan import BuyCosts, DecisionState, PriceOf, State, decision_state
-from tradepartner.execution.risk import OpenSell, Skips, check_phase
+from tradepartner.execution.risk import OpenSell, Skips, check_phase, open_sold
 from tradepartner.store.journal import (
     DecisionRow,
     FillRow,
@@ -405,6 +406,50 @@ def test_a_full_exit_is_unaffected_by_the_names_open_sells() -> None:
     plan = _d(1, "sell", reason="left_targets", quantity=10.0)
     order = _one(_sells([plan], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 4.0)]))
     assert (order.quantity, order.full_exit) == (10.0, True)
+
+
+#: What `unfilled_sells` leaves for a sell of 1.0 filled 0.7 + 0.2 + 0.1 with
+#: no terminal event journaled yet: float noise, not an open sell.
+NOISE = 1.0 - (0.7 + 0.2 + 0.1)
+
+
+def test_open_sold_snaps_float_noise_to_the_quantity_grid() -> None:
+    """#605 /code-review: the exact sum must not count `unfilled_sells`'
+    float noise, on either side of a grid step."""
+    sums = open_sold(
+        [OpenSell("SEC_1", NOISE), OpenSell("SEC_2", 1.0 - 0.7), OpenSell("SEC_2", 0.2)],
+        DECIMALS,
+    )
+    assert NOISE > 0
+    assert sums == {"SEC_1": Decimal(0), "SEC_2": Decimal("0.5")}
+
+
+def test_a_full_exit_beside_a_noise_open_sell_passes_check_phase() -> None:
+    """#605 /code-review: the exact `sell_sum_within_holding` sum must not halt
+    a full exit on the ~1e-16 a fully filled sell leaves before its terminal
+    event (the old `float` sum ignored it)."""
+    plan = _d(1, "sell", reason="left_targets", quantity=10.0)
+    held = {"SEC_1": 10.0}
+    opens = [OpenSell("SEC_1", NOISE)]
+    order = _one(_sells([plan], held, open_sells=opens))
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=opens,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_whole_share_trim_keeps_its_share_beside_a_noise_open_sell() -> None:
+    trim = _d(1, "sell", notional=10_000_000.0, whole_share=True)
+    order = _one(_sells([trim], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", NOISE)]))
+    assert order.quantity == 10.0
 
 
 def test_a_trim_capped_on_a_whole_share_basis_floors_the_cap() -> None:
