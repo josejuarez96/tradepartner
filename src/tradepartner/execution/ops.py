@@ -34,13 +34,20 @@ latest session at or before today instead — both cases are exactly
 capped at `dashboard.page_row_limit` rows, newest first (ADR 0011's
 "Consequences": a render's read connection blocks the run's write
 connections for as long as `page_data` takes). `OpsData` reports each cap
-that bit (`alerts_capped`, `chains_capped`, `fills_capped`). The alerts query
-pushes its limit into SQL. `store.journal.fills_for` is documented as the
-*single* reader of `fills`, and the window readers it and the chain view share
-(`orders_for`, `order_events_for`, `outcomes_for`) take no row limit of their
-own, so those three still read the whole window before this module truncates
-in Python; a true per-row SQL bound on them needs a `store/journal.py` change
-this task's file list does not include (left for a follow-up: #435).
+that bit (`alerts_capped`, `chains_capped`, `fills_capped`). Every one of
+those reads is bounded in SQL, not only truncated in Python (#435): the alerts
+query and `journal.orders_for` read at most `limit + 1` rows, newest first
+(the extra row only tells the cap bit); the chain view's events, fills and
+outcomes are read only for the at most `limit` orders it can keep
+(`client_order_ids`), so they scale with the cap, not the window; and the fills
+table reads the `limit + 1` newest fills by `fill_id` (`journal.fills_for`'s
+`limit`). "As of" stays the latest `known_at` of the window's order chains
+even past the cap: one aggregate over the window's `order_events` and
+`outcomes` (a single row), the newest orders being in the capped read, and
+the fills table's newest rows by `fill_id` standing in for the newest by
+`known_at` (both come from the write that journals a fill: `journal.append`
+hands out the next id and the writer stamps the clock; only a clock running
+backwards between two collections could make them disagree).
 """
 
 from __future__ import annotations
@@ -204,6 +211,23 @@ def _alerts_for_window(
     return alerts, capped
 
 
+def _latest_chain_known_at(conn: duckdb.DuckDBPyConnection, window_id: int) -> datetime | None:
+    """The latest `known_at` among the window's `order_events` and `outcomes`
+    rows (through their order's run), one aggregate row, so "as of" covers the
+    orders past the chain view's cap without reading their rows."""
+    journal.require_journal(conn)
+    row = conn.execute(
+        "SELECT max(t.known_at) FROM (SELECT client_order_id, known_at FROM order_events "
+        "UNION ALL SELECT client_order_id, known_at FROM outcomes) t "
+        "WHERE t.client_order_id IN (SELECT o.client_order_id FROM orders o "
+        "JOIN paper_runs r ON r.run_id = o.run_id WHERE r.window_id = ?)",
+        [window_id],
+    ).fetchone()
+    assert row is not None
+    latest: datetime | None = row[0]
+    return latest
+
+
 def _build_ranking(
     conn: duckdb.DuckDBPyConnection, window_id: int, plan: PaperPlanRow
 ) -> tuple[RankedSignal, ...]:
@@ -346,12 +370,16 @@ def _as_of(
     kill_switch_rows: Sequence[KillSwitchRow],
     reconciliations: Sequence[ReconciliationRow],
     alerts: Sequence[AlertRow],
+    chains_known_at: datetime | None,
 ) -> datetime | None:
     """The latest `known_at` among every row the page shows: everything
     `page_data` reads for this window, so "as of" can never predate what the
-    page itself displays (e.g. a kill-switch row the KPI row already shows)."""
+    page itself displays (e.g. a kill-switch row the KPI row already shows),
+    and `chains_known_at`, so it never predates an event or outcome of an
+    order past the chain view's cap either (module docstring)."""
     candidates = (
         [window.known_at]
+        + ([chains_known_at] if chains_known_at is not None else [])
         + [r.known_at for r in runs]
         + [r.known_at for r in results]
         + [o.known_at for o in orders]
@@ -386,14 +414,20 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     runs_with_results = journal.runs_for(conn, window_id)
     runs = [rw.run for rw in runs_with_results]
     results = [rw.result for rw in runs_with_results if rw.result is not None]
-    orders = journal.orders_for(conn, window_id=window_id)
-    order_events = journal.order_events_for(conn, window_id=window_id)
-    outcomes = journal.outcomes_for(conn, window_id)
+    # Newest first, one past the cap: `_build_chains` can keep at most `limit`
+    # orders (each chain has at least its order step), so only those orders'
+    # events, fills and outcomes are read.
+    orders = journal.orders_for(conn, window_id=window_id, limit=limit + 1)
+    kept_ids = [o.client_order_id for o in orders[:limit]]
+    order_events = journal.order_events_for(conn, window_id=window_id, client_order_ids=kept_ids)
+    outcomes = journal.outcomes_for(conn, window_id, client_order_ids=kept_ids)
+    chain_fills = journal.fills_for(conn, window_id=window_id, client_order_ids=kept_ids)
     all_marks = journal.positions_daily_for(conn, window_id)
     kill_switch_rows = journal.kill_switch_events_for(conn, window_id)
     reconciliations = journal.reconciliations_for(conn, window_id)
-    all_fills = journal.fills_for(conn, window_id=window_id)
-    fills, fills_capped = _capped_fills(all_fills, limit=limit)
+    newest_fills = journal.fills_for(conn, window_id=window_id, limit=limit + 1)
+    fills, fills_capped = _capped_fills(newest_fills, limit=limit)
+    chains_known_at = _latest_chain_known_at(conn, window_id)
 
     last_updated = max((r.finished_at for r in results), default=None)
     s_minus_1 = _required_run_session(utc_now())
@@ -426,7 +460,7 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         lock_free=not lock.is_held(settings),
     )
 
-    chains, chains_capped = _build_chains(orders, order_events, all_fills, outcomes, limit=limit)
+    chains, chains_capped = _build_chains(orders, order_events, chain_fills, outcomes, limit=limit)
     alerts, alerts_capped = _alerts_for_window(conn, window, limit=limit)
     reconciliation = max(reconciliations, key=lambda r: r.at, default=None)
 
@@ -436,8 +470,9 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         results=results,
         orders=orders,
         order_events=order_events,
-        fills=all_fills,
+        fills=[*newest_fills, *chain_fills],
         outcomes=outcomes,
+        chains_known_at=chains_known_at,
         marks=all_marks,
         kill_switch_rows=kill_switch_rows,
         reconciliations=reconciliations,
