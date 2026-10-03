@@ -1496,3 +1496,131 @@ def test_a_backward_step_before_the_journal_cut_does_not_release(
     with open_read_only(journal_settings) as conn:
         states = [e.state for e in kill_switch_events_for(conn, window.window_id)]  # type: ignore[arg-type]
     assert "released" not in states
+
+
+def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Settle stamps T1, collect journals a fill and its terminal event at T3,
+    then the clock steps back to T2 (T1 < T2 < T3) before the journal cut.
+    Without raising the floor from collect's own readings, the raw `as_of`
+    (T2) would exclude the fill collect just journaled from its own
+    reconciliation — a spurious mismatch. `collect`'s readings instead raise
+    the floor (`_MonotonicStamps.observe`), so the cut is clamped to T3 and
+    the reconciliation sees the fill it was stamped to see."""
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(
+        journal_settings,
+        fake,
+        crashed,
+        "tp-p1",
+        2.0,
+        DAY1 - timedelta(hours=1),
+        acknowledge=False,
+    )
+    fake.simulate_fill("tp-p1")
+
+    t1 = DAY1
+    t2 = DAY1 + timedelta(minutes=5)
+    t3 = DAY1 + timedelta(minutes=10)
+    t4 = DAY1 + timedelta(minutes=20)
+    t5 = DAY1 + timedelta(minutes=25)
+    # [resume's now, settle, collect's now, collect's stamp, as_of (backward),
+    #  reconcile_now's now, its stamp, switch.release's own reading]
+    clock = _ScriptedClock(t1, t1, t3, t3, t2, t4, t4, t5)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=False,
+        )
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert "journal cut as_of" in caplog.text
+    assert t2.isoformat() in caplog.text
+    assert t3.isoformat() in caplog.text
+    with open_read_only(journal_settings) as conn:
+        (reconciliation,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert reconciliation.status == "ok"
+
+
+def test_a_skewed_clock_clamps_the_synthetic_fill_stamp_on_a_release_that_proceeds(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`--accept-broker-fills` completes a lagging order with a synthetic
+    residual fill (reusing the `_lagging_third_fill` setup): the clock steps
+    back right before that fill is written, so its stamp is clamped to the
+    floor `collect` already raised, and the resume still reconciles and
+    releases — the clamp on a quiet path, not only on a refusal."""
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+
+    t1 = DAY2
+    t2 = DAY2 + timedelta(minutes=5)
+    t3 = DAY2 + timedelta(minutes=10)
+    t4 = DAY2 + timedelta(minutes=20)
+    t5 = DAY2 + timedelta(minutes=25)
+    t6 = DAY2 + timedelta(minutes=30)
+    # [resume's now, collect's now, collect's stamp, synthetic fill (backward),
+    #  as_of, reconcile_now's now, its stamp, switch.release's own reading]
+    clock = _ScriptedClock(t1, t3, t3, t2, t4, t5, t5, t6)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            True,
+            accept_rejections=False,
+        )
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert outcome.synthetic_fills == ("tp-lag",)
+    assert "synthetic fills" in caplog.text
+    assert t2.isoformat() in caplog.text
+    assert t3.isoformat() in caplog.text
+    fill = _synthetic_row(journal_settings, "tp-lag")
+    assert fill.known_at == t3
+
+
+def test_observe_wraps_collects_clock_without_weakening_its_own_guard(
+    journal_settings: Settings,
+    fake: SkewedFake,
+) -> None:
+    """`_MonotonicStamps.observe` must hand `collect` the raw reading
+    completely unchanged: a backward step between collect's own two readings
+    still raises collect's own "clock went back" `ClockError`, exactly as it
+    would unwrapped."""
+    stamps = resume_module._MonotonicStamps(DAY1)
+    backward = _ScriptedClock(DAY1, DAY1 - timedelta(minutes=1))
+
+    with pytest.raises(ClockError, match="clock went back"):
+        collect(
+            fake,
+            lambda: open_for_write(journal_settings),
+            [],
+            stamps.observe(backward),
+            "run",
+            1,
+            FROZEN,
+            journal_settings,
+        )
+
+    # Neither reading raised the floor: the first tied it, the second was
+    # behind it, and `observe` never lowers the floor either.
+    assert stamps._floor == DAY1

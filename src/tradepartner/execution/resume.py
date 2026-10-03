@@ -82,14 +82,22 @@ earlier invocation wrote (a crashed run's `finished_at`, an earlier
 after a faulted run's `finished_at` (spec req 5, #366 Q7), and clamping across
 that boundary would weaken the guard.
 
-This does **not** reach `collect`, `reconcile_now` or `switch.release`/
-`engage`: those modules keep their own deliberate backward-clock guards
-(`collect.py`'s "clock went back" `ClockError`, `reconcile_run`'s `as_of > now`
-and stamp checks, ADR 0007 point 4) fail-closed, unclamped. One consequence:
-when the clock steps back right before the journal cut, the clamped `as_of`
-ends up later than `reconcile_now`'s own fresh reading, so `reconcile_now`
-raises `ClockError` and the resume does not release — fail closed, not
-silently clamped through.
+`collect`'s own rows stay stamped with its raw, unclamped readings — its
+"clock went back" guard runs exactly as before, on its own two readings only
+— but `collect`'s readings raise the floor (`_MonotonicStamps.observe`), so
+every stamp this invocation writes for itself after collecting (the journal
+cut `as_of`, `resume_acceptances` when accepted after collecting, the
+synthetic fills) is never behind what `collect` just wrote. `reconcile_now`
+and `switch.release`/`engage` still keep their own deliberate backward-clock
+guards (`reconcile_run`'s `as_of > now` and stamp checks, ADR 0007 point 4),
+unclamped and untouched by the floor. One consequence: when the clock stays
+behind through the journal cut, the clamped `as_of` ends up later than
+`reconcile_now`'s own fresh reading, so `reconcile_now` raises `ClockError`
+and the resume does not release — fail closed. That holds only while the
+clock stays behind: if it recovers before `reconcile_now` reads it, the
+resume proceeds as usual, covering every row this invocation wrote. The
+clamp is not a guarantee that a backward step always blocks release, only
+that no stamp this invocation writes for itself is ever backdated.
 """
 
 from __future__ import annotations
@@ -206,6 +214,23 @@ class _MonotonicStamps:
             )
         self._floor = stamp
         return stamp
+
+    def observe(self, clock: Callable[[], datetime]) -> Callable[[], datetime]:
+        """Wrap `clock` for a module this invocation does not stamp through
+        (`collect`): every call still returns the raw reading completely
+        unchanged, so that module's own clock guards (a bad value, a backward
+        step within its own readings) run exactly as if unwrapped. A reading
+        that comes back a tz-aware `datetime` raises the floor to
+        `max(floor, reading)`, so a later call to `next` never hands out a
+        stamp behind what that module just wrote."""
+
+        def wrapped() -> datetime:
+            reading = clock()
+            if isinstance(reading, datetime) and reading.tzinfo is not None:
+                self._floor = max(self._floor, reading)
+            return reading
+
+        return wrapped
 
 
 def _window_id(window: PaperWindowRow) -> int:
@@ -523,7 +548,14 @@ def resume(
         with connect() as conn:
             open_orders = non_terminal_orders(conn, window_id=window_id)
         collected = collect(
-            broker, connect, open_orders, clock, _WRITER, resume_id, frozen, settings
+            broker,
+            connect,
+            open_orders,
+            stamps.observe(clock),
+            _WRITER,
+            resume_id,
+            frozen,
+            settings,
         )
 
         def outcome(
