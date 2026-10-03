@@ -32,6 +32,7 @@ from tradepartner.adapters.fake_broker import Expire
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution import run as run_module
+from tradepartner.execution import switch
 from tradepartner.execution.planning import PlanOutcome
 from tradepartner.store.journal import AdjustmentRow, PaperRunRow, PaperWindowRow
 
@@ -314,6 +315,332 @@ def test_a_second_run_on_the_session_leaves_an_accepted_exit_sell_alone(
     assert [o[0] for o in exit_orders(env, "SEC_TRANSFER")] == [coid]
     assert len(env.submits()) == submitted
     assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+
+
+def test_a_second_run_with_a_reused_ticker_leaves_an_accepted_exit_sell_alone(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Same shape as `test_a_second_run_on_the_session_leaves_an_accepted_exit_sell_alone`,
+    but a later issuer picks up TRNS between the two runs. The second run's
+    sell phase has no attempt left for SEC_TRANSFER (its exit sell is
+    already `accepted`), so the reused-ticker check (#568 item 2), now
+    scoped in `_phase_assets` to the phase's own attempt scope, never looks
+    at it: the run still ends `ok` with the open order untouched, not the
+    halt the check would have raised had it still run in `_read_book` for
+    every name of the batch's rows regardless of whether this phase
+    attempts it (the regression this PR's review caught)."""
+    bought(env)
+    ended_before(env, MAY_3)
+    env.fill_on_sleep = False
+    first = env.run(at(MAY_3))
+    assert first.status == "ok", env.result(env.latest_run())
+    ((decision_id, _reason, _side, _run),) = exits(env, "SEC_TRANSFER")
+    ((coid, _decision, _phase, _quantity, _session),) = exit_orders(env, "SEC_TRANSFER")
+    assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+    submitted = len(env.submits())
+
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    second = env.run(at(MAY_3, 12, 45))
+
+    assert second.status == "ok", env.result(env.latest_run())
+    assert not any("outside the submit window" in n for n in second.notes)
+    assert [e[0] for e in exits(env, "SEC_TRANSFER")] == [decision_id]
+    assert [o[0] for o in exit_orders(env, "SEC_TRANSFER")] == [coid]
+    assert len(env.submits()) == submitted
+    assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+
+
+def test_a_reused_ticker_under_a_kill_engaged_after_the_run_level_check_skips(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reused-ticker check (#568 item 2) must not run before the
+    wrapper's own kill-switch read (`_engaged`, inside `execute`): a kill
+    written after step 6's run-level check (e.g. during step 4's
+    `positions` read, mirroring
+    `test_a_kill_written_during_step_4_is_caught_before_any_submit` in
+    test_run_trade.py) but before the sells phase still ends
+    `skipped_kill_switch`, not a halt, even with a reused ticker present
+    (the regression this PR's review caught: the check used to run in
+    `_read_book`, before `_engaged` was ever read)."""
+    assert window.window_id is not None
+    window_id = window.window_id
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    original = env.fake.positions
+    killed: list[int | switch.WriteFailed] = []
+
+    def kill_at_step_4() -> object:
+        if not killed:
+            killed.append(
+                switch.engage(
+                    env.settings,
+                    env.clock,
+                    window_id=window_id,
+                    source="owner",
+                    reason="the owner kills the run before the sells phase",
+                )
+            )
+        return original()
+
+    monkeypatch.setattr(env.fake, "positions", kill_at_step_4)
+
+    outcome = env.run(at(MAY_3))
+
+    assert [isinstance(k, int) for k in killed] == [True]
+    assert outcome.status == "skipped_kill_switch", env.result(env.latest_run())
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+
+
+def test_an_unanswered_delisted_name_halts_the_whole_sells_phase(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's decision on #410 (2026-10-01) keeps this fail-closed until
+    T48c: a forced-exit name the broker's `assets` read does not answer for
+    (`wrapper._phase_assets`) halts the whole sells phase, the rebalance's
+    sells included, before anything is submitted (#568 item 1)."""
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    original_assets = env.fake.assets
+
+    def unanswering(symbols: list[str]) -> dict[str, Asset]:
+        # The run's own pre-read (`run._Run.assets_read`, for every held
+        # position) must still answer, so only the wrapper's own sells-phase
+        # read (`wrapper._phase_assets`, asked for just the forced-exit
+        # name) goes unanswered.
+        answer = original_assets(symbols)
+        if list(symbols) == ["TRNS"]:
+            answer.pop("TRNS", None)
+        return answer
+
+    monkeypatch.setattr(env.fake, "assets", unanswering)
+
+    with pytest.raises(ValueError, match=r"the assets read did not answer for \['TRNS'\]"):
+        env.run(at(MAY_3))
+
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+    ((_decision_id, reason, side, _run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side) == ("delisted", "sell")
+    status, fault_type, _message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "ValueError")
+
+
+def test_a_reused_ticker_never_resolves_to_the_new_issuers_asset(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """SEC_TRANSFER's ticker (TRNS) is picked up by a new issuer, a listing
+    known at close(S-1): the forced exit for the delisted SEC_TRANSFER must
+    never resolve its `assets` read against that reused symbol, since the
+    broker would answer for the new issuer, not the one this run means. It
+    fails closed instead of submitting anything (#568 item 2)."""
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    with pytest.raises(ValueError, match="TRNS"):
+        env.run(at(MAY_3))
+
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+    status, fault_type, _message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "ValueError")
+
+
+def test_a_reusing_listing_known_after_close_s_minus_1_is_ignored(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) is itself point-in-time: a new
+    issuer's listing known only after close(S-1) (`cut`) is not in the
+    universe this run reads (`listings_as_of`'s own `known_at` filter), so
+    it is no collision and the forced exit still submits normally."""
+    bought(env)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    cut = session_close(previous_session(MAY_3))
+    reused_known_at = cut + timedelta(minutes=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    ((_coid, ordered, phase, quantity, session),) = exit_orders(env, "SEC_TRANSFER")
+    assert (ordered, phase, session) == (decision_id, "exit", MAY_3)
+    assert quantity == pytest.approx(held)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_reusing_listings_valid_from_after_s_is_ignored(env: Env, window: PaperWindowRow) -> None:
+    """Same shape, but the reusing listing is known well before close(S-1)
+    while its own `valid_from` does not take effect until after S:
+    `current_listings` (as of day=S) excludes it on that filter alone, so
+    it is no collision either, and the exit still submits."""
+    bought(env)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    future_valid_from = MAY_3 + timedelta(days=1)
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": future_valid_from,
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    ((_coid, ordered, phase, quantity, session),) = exit_orders(env, "SEC_TRANSFER")
+    assert (ordered, phase, session) == (decision_id, "exit", MAY_3)
+    assert quantity == pytest.approx(held)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_an_older_owner_of_a_now_delisted_names_ticker_never_blocks_its_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) fires only for a *later* issuer:
+    a now-dead security that held SEC_TRANSFER's ticker before SEC_TRANSFER
+    itself did (SEC_TRANSFER took the ticker over, not the other way round)
+    never blocks SEC_TRANSFER's own forced exit."""
+    bought(env)
+    ended_before(env, MAY_3)
+    ((own_valid_from,),) = env.query(
+        "SELECT valid_from FROM listings WHERE security_id = 'SEC_TRANSFER' "
+        "ORDER BY valid_from DESC LIMIT 1"
+    )
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=2)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_GHOST_HELD_TRNS_FIRST",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": own_valid_from - timedelta(days=1),
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((_decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_stale_delisted_securitys_shared_ticker_never_blocks_a_live_name(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) only ever looks at a name whose
+    own listing has ended: a dormant, unrelated security that happens to
+    share a currently-held, still-listed name's ticker (SPFT, never
+    delisted in this test) never blocks that name's own run, even though its
+    `valid_from` has the same shape a real reuse would."""
+    bought(env)
+    held = env.held()["SPFT"]
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_GHOST_SHARES_SPFT",
+            "ticker": "SPFT",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert env.held()["SPFT"] == pytest.approx(held)
 
 
 class _NoBroker:
