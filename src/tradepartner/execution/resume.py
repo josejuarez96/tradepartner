@@ -23,13 +23,22 @@ The only way the kill switch is released. In the req 5 order:
      `collect.rejection_breaches`. The second covers rejections the halt
      path's read journaled: that read collects as its run, so no later
      collection judges them again (#397).
+   - **`accept_rejections`** (`--accept-rejections`, #472) accepts the second
+     kind only: the verdicts on the runs the release would clear. Its
+     `resume_acceptances` row, written once they are judged and before any
+     reconciliation or release, names each accepted verdict (`[]` for none);
+     it is not a release, which still needs everything below.
+     A collection verdict on any other run, the lag bound, reconciliation and
+     every `switch.ReleaseRefused` still refuse. Only the owner's CLI flag
+     sets it: `resume` has no default for it and no config key reaches it.
    - An order still `fills_lagging` past the frozen
      `risk.max_fill_lag_sessions` (`collect.lag_verdict`, anchored on the first
      reconciliation that listed it) refuses without `accept_broker_fills`.
      With it, each such order `get_order` reports finished gets a synthetic
      residual fill and its terminal event; one the broker still holds open
      refuses, since it may yet fill.
-6. `reconcile_now` (T61) for the clock's session. A mismatch refuses (the
+6. `reconcile_now` (T61) for the clock's session, its journal cut (`as_of`)
+   a clock reading taken after every row steps 1 to 5 wrote. A mismatch refuses (the
    mismatch row is written, the switch stays engaged, and is engaged with
    source `fault` if nothing had engaged it). Any other status but
    `ok` refuses too: `switch.release` takes only an `ok` reconciliation, so
@@ -62,6 +71,7 @@ collection runs without the write-off back-fill.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -90,6 +100,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperWindowRow,
     PositionDailyRow,
+    ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
     kill_switch_events_for,
@@ -122,7 +133,8 @@ _BROKER_STATUS = "broker_status"
 class ResumeOutcome:
     """What one `paper resume` did. `reasons` says why it was refused;
     `settled` pairs each `pending` order with `acknowledged` or
-    `not_received`."""
+    `not_received`; `accepted_rejections` names the rejection-cap verdicts
+    `--accept-rejections` accepted."""
 
     status: str
     resume_id: int | None
@@ -132,6 +144,7 @@ class ResumeOutcome:
     synthetic_fills: tuple[str, ...] = ()
     reconciliation_id: int | None = None
     released_event_id: int | None = None
+    accepted_rejections: tuple[str, ...] = ()
 
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:
@@ -152,7 +165,13 @@ def _window_id(window: PaperWindowRow) -> int:
 
 
 def _start(
-    connect: Connect, window_id: int, now: datetime, reason: str, accept_broker_fills: bool
+    connect: Connect,
+    window_id: int,
+    now: datetime,
+    reason: str,
+    accept_broker_fills: bool,
+    *,
+    accept_rejections: bool,
 ) -> tuple[int, int, tuple[int, ...], list[OrderRow]]:
     """The invocation row, the highest `kill_switch` `event_id` of the window
     it saw (`switch.release`'s `seen_event_id`), the crashed closes and the
@@ -164,6 +183,7 @@ def _start(
                 at=now,
                 reason=reason,
                 accept_broker_fills=accept_broker_fills,
+                accept_rejections=accept_rejections,
                 known_at=now,
                 ingested_at=now,
             ),
@@ -355,6 +375,37 @@ def _faulted_run_breaches(
     )
 
 
+def _accept(
+    connect: Connect,
+    resume_id: int,
+    accepted: Sequence[RejectionBreach],
+    clock: Callable[[], datetime],
+) -> None:
+    """Journal the verdicts `--accept-rejections` accepted (`[]` for none) before
+    anything that could lead to a release."""
+    stamp = _read_clock(clock)
+    verdicts = [
+        {
+            "run_id": b.run_id,
+            "rejected": b.rejected,
+            "orders": b.orders,
+            "all_rejected": b.all_rejected,
+            "message": b.message,
+        }
+        for b in accepted
+    ]
+    with connect() as conn:
+        append(
+            conn,
+            ResumeAcceptanceRow(
+                resume_id=resume_id,
+                accepted_json=json.dumps(verdicts, sort_keys=True),
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+
+
 def _switch(connect: Connect, window: PaperWindowRow) -> switch.SwitchState:
     """The window's derived kill-switch state, read by a lock holder."""
     window_id = _window_id(window)
@@ -378,14 +429,20 @@ def resume(
     clock: Callable[[], datetime],
     reason: str,
     accept_broker_fills: bool,
+    *,
+    accept_rejections: bool,
 ) -> ResumeOutcome:
-    """`paper resume --reason` (module docstring). `connect` opens a write chunk
+    """`paper resume --reason` (module docstring). `accept_rejections` is the
+    owner's `--accept-rejections` and has no default; anything but a `bool` raises
+    `TypeError` before anything. `connect` opens a write chunk
     (`lambda: store.db.open_for_write(settings)`). Raises `ValueError` for a
     blank `reason` before anything, `LockHeld` while another process holds the
     run lock, `ClockError` for a bad clock reading, and whatever the broker or
     the store raises; a refusal is an outcome, never an exception."""
     if not reason.strip():
         raise ValueError("paper resume needs a non-blank --reason")
+    if not isinstance(accept_rejections, bool):
+        raise TypeError(f"accept_rejections must be a bool, got {type(accept_rejections).__name__}")
     with run_lock(settings):
         with connect() as conn:
             window = open_window(conn)
@@ -396,7 +453,12 @@ def resume(
         now = _read_clock(clock)
 
         resume_id, seen, crashed, pending = _start(
-            connect, window_id, now, reason, accept_broker_fills
+            connect,
+            window_id,
+            now,
+            reason,
+            accept_broker_fills,
+            accept_rejections=accept_rejections,
         )
         settled = _settle(broker, connect, pending, clock)
         with connect() as conn:
@@ -420,15 +482,24 @@ def resume(
                 synthetic_fills=tuple(f.client_order_id for f, _ in synthetic),
                 reconciliation_id=reconciliation_id,
                 released_event_id=released_event_id,
+                accepted_rejections=tuple(b.message for b in accepted),
             )
 
         synthetic: list[tuple[FillRow, OrderReading]] = []
-        reasons = [breach.message for breach in collected.rejections]
+        faulted = _faulted_run_breaches(connect, window, frozen)
+        accepted: tuple[RejectionBreach, ...] = ()
+        if accept_rejections:
+            # Only the verdicts on runs the release would clear (#451's refusal).
+            # A collection verdict on such a run is the same run's verdict.
+            accepted = faulted
+            _accept(connect, resume_id, accepted, clock)
+        cleared = {b.run_id for b in accepted}
+        reasons = [b.message for b in collected.rejections if b.run_id not in cleared]
         judged = {b.run_id for b in collected.rejections}
         reasons += [
             breach.message
-            for breach in _faulted_run_breaches(connect, window, frozen)
-            if breach.run_id not in judged
+            for breach in faulted
+            if breach.run_id not in judged and breach.run_id not in cleared
         ]
         lag_reasons, synthetic_fills = _lag(
             connect, window_id, collected.lagging, now, frozen, accept_broker_fills
@@ -441,9 +512,20 @@ def resume(
             synthetic = synthetic_fills
 
         session = command_session(now)
+        # The journal cut (#488): a reading after the settlement, the collection
+        # and the synthetic fills, so the ledger sees every row this resume wrote.
+        as_of = _read_clock(clock)
         try:
             result = reconcile_now(
-                settings, connect, broker, window, session, clock, connect, frozen=frozen
+                settings,
+                connect,
+                broker,
+                window,
+                session,
+                clock,
+                connect,
+                frozen=frozen,
+                as_of=as_of,
             )
         except ReconciliationError as exc:
             # A fault found here engages the switch when nothing has (a resume

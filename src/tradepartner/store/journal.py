@@ -48,7 +48,7 @@ from typing import Any, ClassVar, Protocol
 import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
-from tradepartner.store.schema import JOURNAL_TABLE_NAMES
+from tradepartner.store.schema import JOURNAL_TABLE_NAMES, LATER_JOURNAL_TABLE_NAMES
 
 
 class JournalNotInitialised(RuntimeError):
@@ -341,6 +341,22 @@ class ResumeInvocationRow:
     at: datetime
     reason: str
     accept_broker_fills: bool
+    accept_rejections: bool
+    known_at: datetime
+    ingested_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResumeAcceptanceRow:
+    """One `resume_acceptances` row: the rejection-cap verdicts a resume given
+    `--accept-rejections` accepted, as a JSON list (`[]` for none; #472). Not a
+    release: that is the `kill_switch` `released` row citing the `resume_id`."""
+
+    TABLE: ClassVar[str] = "resume_acceptances"
+    ID_COLUMN: ClassVar[str | None] = None
+
+    resume_id: int
+    accepted_json: str
     known_at: datetime
     ingested_at: datetime
 
@@ -575,6 +591,7 @@ ROW_TYPES: Mapping[str, type[Any]] = MappingProxyType(
             FillRow,
             FillCursorRow,
             ResumeInvocationRow,
+            ResumeAcceptanceRow,
             OutcomeRow,
             PositionDailyRow,
             AdjustmentRow,
@@ -603,15 +620,22 @@ class OrderedFill:
     window_id: int
 
 
+#: The tables `require_journal` asks for: every journal table but those a
+#: read-only connection to an older journal store may lack (#472).
+_REQUIRED_TABLES = tuple(t for t in JOURNAL_TABLE_NAMES if t not in LATER_JOURNAL_TABLE_NAMES)
+
+
 def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
-    """Raise `JournalNotInitialised` unless every journal table exists."""
+    """Raise `JournalNotInitialised` unless every journal table exists, those in
+    `schema.LATER_JOURNAL_TABLE_NAMES` aside (a read-only connection to a
+    version-7 store lacks them; a write connection has migrated)."""
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name IN "
-        f"({', '.join('?' for _ in JOURNAL_TABLE_NAMES)})",
-        list(JOURNAL_TABLE_NAMES),
+        f"({', '.join('?' for _ in _REQUIRED_TABLES)})",
+        list(_REQUIRED_TABLES),
     ).fetchone()
-    if present != len(JOURNAL_TABLE_NAMES):
+    if present != len(_REQUIRED_TABLES):
         raise JournalNotInitialised(
             "the store has no paper-trading journal (schema version 4); any writing "
             "command migrates it to the current version"
@@ -1102,6 +1126,11 @@ def resume_invocations(conn: duckdb.DuckDBPyConnection) -> list[ResumeInvocation
     """Every `resume_invocations` row in `resume_id` order (the table has no
     window; its outcome is the `kill_switch` row carrying the `resume_id`)."""
     return _select(conn, ResumeInvocationRow, order="t.resume_id")
+
+
+def resume_acceptances(conn: duckdb.DuckDBPyConnection) -> list[ResumeAcceptanceRow]:
+    """Every `resume_acceptances` row in `resume_id` order (#472)."""
+    return _select(conn, ResumeAcceptanceRow, order="t.resume_id")
 
 
 def alerts_for(conn: duckdb.DuckDBPyConnection, *, kind: str, session: date) -> list[AlertRow]:

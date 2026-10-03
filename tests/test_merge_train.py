@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
@@ -435,3 +436,442 @@ def test_a_green_prefix_outside_the_accepted_list_is_refused() -> None:
         mt.mergeable_prefix(record, [True, True])
     with pytest.raises(ValueError, match="head SHA"):
         mt.comment("CULPRIT", "b", prefix=2)
+
+
+# === the runner and `build` (plan T72b) ====================================================
+
+
+@pytest.fixture(autouse=True)
+def _merge_train_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every record/worktree path a test touches lives under `tmp_path`, never the real
+    `~/.tradepartner/merge_train/`."""
+    monkeypatch.setenv(mt.MERGE_TRAIN_DIR_VAR, str(tmp_path / "merge_train"))
+
+
+def _run(
+    run_id: int = 1,
+    attempt: int = 1,
+    status: str | None = "completed",
+    conclusion: str | None = "success",
+    url: str = "u",
+    steps: tuple[object, ...] = (),
+    duration: float = 900.0,
+) -> object:
+    return mt.RunInfo(run_id, attempt, status, conclusion, url, steps, duration)
+
+
+GREEN_MAIN = _run()
+GREEN_FULL = _run(steps=(mt.Step("Tests", "success"),))
+RED = _run(conclusion="failure", steps=(mt.Step("Hygiene", "failure"),), duration=300.0)
+# The confirming rerun GitHub reports at a strictly later attempt than the run it reran
+# (SHOULD FIX, safety review of #521): a stale read of the first attempt must never count.
+CONFIRM_RED = _run(
+    attempt=2, conclusion="failure", steps=(mt.Step("Hygiene", "failure"),), duration=300.0
+)
+CONFIRM_GREEN = _run(attempt=2, steps=(mt.Step("Tests", "success"),))
+
+
+class FakeRunner:
+    """Scripted git/gh for `build`: no network, no real git. Every tree and commit is a
+    short deterministic label (`commit1`, `commit2`, ...), so a test can pre-script the CI
+    response for the sha a given accepted PR will land on before `build` computes it."""
+
+    def __init__(self, base: str = "base0", now: datetime | None = None) -> None:
+        self.base = base
+        self._now = now or datetime(2026, 10, 1, 9, 5, 7, tzinfo=UTC)
+        self.pr_registry: dict[int, object] = {}
+        self.head_to_number: dict[str, int] = {}
+        self.open_numbers: list[int] = []
+        self.conflicts: dict[int, set[str]] = {}
+        self.ancestors: set[int] = set()
+        self.worktrees_added: list[Path] = []
+        self.worktrees_removed: list[Path] = []
+        self.commits: list[str] = [base]
+        self.trees: list[str] = [f"tree:{base}"]
+        self.pushed: dict[str, str] = {}
+        self.fail_push_branches: set[str] = set()
+        self.deleted_branches: list[str] = []
+        self.run_script: dict[str, list[object]] = {}
+        self.rerun_calls: list[int] = []
+        self.comments_posted: list[tuple[int, str]] = []
+        self.sleeps = 0
+        self.calls: list[str] = []
+        self._pending: int | None = None
+
+    def add_pr(
+        self, number: int, *, diff_paths: tuple[str, ...] | None = None, **pr_overrides: object
+    ) -> None:
+        head = f"head{number}"
+        branch = f"feat/{number}-x"
+        fields: dict[str, object] = {
+            "number": number,
+            "author": OWNER,
+            "head_repo": REPO,
+            "repo": REPO,
+            "state": "OPEN",
+            "is_draft": False,
+            "base": "main",
+            "labels": (),
+            "head": head,
+            "branch": branch,
+            "body": f"Closes #{number}\n\n- [x] done\n",
+            "fragment_texts": (FRAGMENT,),
+            "title": f"PR {number}",
+        }
+        fields.update(pr_overrides)
+        pr = mt.PullRequest(**fields)
+        data = mt.PrData(
+            pr,
+            (),
+            _checks(sha=head),
+            diff_paths or (f"src/mod_{number}.py", f"changelog.d/{number}-x.md"),
+        )
+        self.pr_registry[number] = data
+        self.head_to_number[head] = number
+        self.open_numbers.append(number)
+
+    def script_run(self, sha: str, infos: Sequence[object]) -> None:
+        self.run_script[sha] = list(infos)
+
+    # -- Runner protocol --
+    def main_sha(self) -> str:
+        return self.base
+
+    def open_pr_numbers(self) -> list[int]:
+        return list(self.open_numbers)
+
+    def pr_data(self, number: int) -> object:
+        return self.pr_registry[number]
+
+    def add_worktree(self, path: Path, base: str) -> None:
+        self.calls.append("add_worktree")
+        assert base == self.base
+        self.worktrees_added.append(path)
+
+    def remove_worktree(self, path: Path) -> None:
+        self.calls.append("remove_worktree")
+        self.worktrees_removed.append(path)
+
+    def merge_squash(self, worktree: Path, head: str) -> bool:
+        self.calls.append("merge_squash")
+        number = self.head_to_number[head]
+        self._pending = number
+        return number not in self.conflicts
+
+    def commit_squash(self, worktree: Path, message: str) -> str:
+        self.calls.append("commit_squash")
+        k = len(self.commits)
+        sha = f"commit{k}"
+        self.commits.append(sha)
+        self.trees.append(f"tree{k}")
+        return sha
+
+    def abort_merge(self, worktree: Path) -> None:
+        self.calls.append("abort_merge")
+
+    def conflicted_paths(self, worktree: Path) -> list[str]:
+        self.calls.append("conflicted_paths")
+        return sorted(self.conflicts.get(self._pending, set()))
+
+    def is_ancestor(self, maybe_ancestor: str, ref: str) -> bool:
+        self.calls.append("is_ancestor")
+        return self.head_to_number[maybe_ancestor] in self.ancestors
+
+    def head_sha(self, worktree: Path) -> str:
+        return self.commits[-1]
+
+    def tree_of(self, worktree: Path) -> str:
+        return self.trees[-1]
+
+    def push(self, worktree: Path, ref: str, branch: str) -> None:
+        if branch in self.fail_push_branches:
+            raise RuntimeError(f"push to {branch} failed")
+        self.pushed[branch] = ref
+
+    def delete_branch(self, branch: str) -> None:
+        self.deleted_branches.append(branch)
+
+    def find_run(self, sha: str, branch: str) -> object:
+        queue = self.run_script.get(sha)
+        if not queue:
+            return mt.RunInfo(None, 0, None, None, None)
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    def rerun(self, run_id: int) -> None:
+        self.rerun_calls.append(run_id)
+
+    def post_comment(self, number: int, text: str) -> None:
+        self.comments_posted.append((number, text))
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps += 1
+
+    def now(self) -> datetime:
+        return self._now
+
+
+def _batch(n: int, fake: FakeRunner | None = None) -> FakeRunner:
+    fake = fake or FakeRunner()
+    for i in range(1, n + 1):
+        fake.add_pr(i)
+    return fake
+
+
+# -- AC6: a green run -------------------------------------------------------------------
+
+
+def test_build_green_batch_posts_tested_naming_the_full_batch_prefix() -> None:
+    fake = _batch(3)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit3", [GREEN_FULL])
+    printed: list[str] = []
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0, say=printed.append)
+    assert record.outcome == "green"
+    assert record.green_prefixes == [3]
+    assert {n for n, _ in fake.comments_posted} == {1, 2, 3}
+    for _, text in fake.comments_posted:
+        assert text.startswith(f"merge-train: TESTED batch {record.batch_id}")
+        assert "prefix 3 u" in text
+    assert fake.worktrees_added and fake.worktrees_added == fake.worktrees_removed
+    # req 8: "the same text is printed and written to the record" - every posted
+    # comment's first line is echoed through `say` too.
+    assert sum("TESTED batch" in line for line in printed) == 3
+
+
+# -- AC4: a conflict drops only that PR, and never a merge commit -----------------------
+
+
+def test_build_drops_a_conflicting_pr_and_the_train_has_no_merge_in_progress() -> None:
+    fake = FakeRunner()
+    fake.add_pr(1, diff_paths=("a.py", "changelog.d/1-x.md"))
+    fake.add_pr(2, diff_paths=("a.py", "changelog.d/2-x.md"))
+    fake.add_pr(3, diff_paths=("c.py", "changelog.d/3-x.md"))
+    fake.conflicts[2] = {"a.py"}
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit2", [GREEN_FULL])  # PR1 then PR3 accepted: commit1, commit2
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    by_number = {p.number: p for p in record.prs}
+    assert by_number[2].state == "dropped"
+    assert by_number[2].paths == ["a.py"]
+    assert by_number[2].conflicts_with == [1]
+    assert by_number[1].state == "accepted"
+    assert by_number[3].state == "accepted"
+    # every commit follows a clean squash merge: the train never makes a merge commit
+    for i, name in enumerate(fake.calls):
+        if name == "commit_squash":
+            assert fake.calls[i - 1] == "merge_squash"
+    assert fake.worktrees_added == fake.worktrees_removed
+    dropped_text = next(t for n, t in fake.comments_posted if n == 2)
+    assert dropped_text.startswith(f"merge-train: DROPPED batch {record.batch_id}")
+    assert "a.py" in dropped_text and "#1" in dropped_text
+
+
+# -- AC5: an already-merged PR is skipped with no comment -------------------------------
+
+
+def test_build_skips_an_already_merged_pr_with_no_comment() -> None:
+    fake = _batch(2)
+    fake.ancestors.add(1)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit1", [GREEN_FULL])  # only PR2 is accepted: commit1
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    by_number = {p.number: p for p in record.prs}
+    assert by_number[1].state == "already_merged"
+    assert by_number[1].reason is None
+    assert all(n != 1 for n, _ in fake.comments_posted)
+    assert by_number[2].state == "accepted"
+
+
+# -- AC7: inconclusive, and `--resume` re-attaches to the same branch and run -----------
+
+
+def test_build_is_inconclusive_on_an_infra_failure_and_resume_reattaches() -> None:
+    fake = _batch(2)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    bad = _run(
+        run_id=5,
+        conclusion="failure",
+        steps=(mt.Step("Install", "failure"), mt.Step("Hygiene", "skipped")),
+        duration=20.0,
+    )
+    fake.script_run("commit2", [bad])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert record.outcome == "inconclusive"
+    assert not record.green_prefixes
+    assert fake.worktrees_added == fake.worktrees_removed
+
+    resumer = FakeRunner()
+    resumer.script_run(record.train_sha, [GREEN_FULL])
+    resumed = mt.run_build_resume(resumer, record.batch_id, timeout_s=10, poll_s=0)
+    assert resumed.outcome == "green"
+    assert resumed.green_prefixes == [2]
+    assert {n for n, _ in resumer.comments_posted} == {1, 2}
+
+
+def test_the_inconclusive_comment_names_uv_lock_prs_on_build_and_on_resume() -> None:
+    """req 4, AC7: two accepted PRs touching uv.lock are named on an Install failure, and
+    the same holds after `--resume` re-attaches (safety review of #521, SHOULD FIX 5)."""
+    fake = FakeRunner()
+    fake.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"))
+    fake.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"))
+    fake.script_run(fake.base, [GREEN_MAIN])
+    install_failed = _run(
+        run_id=5,
+        conclusion="failure",
+        steps=(mt.Step("Install", "failure"), mt.Step("Hygiene", "skipped")),
+        duration=20.0,
+    )
+    fake.script_run("commit2", [install_failed])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert record.outcome == "inconclusive"
+    text1 = next(t for n, t in fake.comments_posted if n == 1)
+    assert "uv.lock" in text1 and "#1, #2" in text1
+
+    resumer = FakeRunner()
+    resumer.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"))
+    resumer.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"))
+    resumer.script_run(record.train_sha, [install_failed])
+    resumed = mt.run_build_resume(resumer, record.batch_id, timeout_s=10, poll_s=0)
+    assert resumed.outcome == "inconclusive"
+    resumed_text1 = next(t for n, t in resumer.comments_posted if n == 1)
+    assert "uv.lock" in resumed_text1 and "#1, #2" in resumed_text1
+
+
+# -- AC8: the bisect, both halves ---------------------------------------------------------
+
+
+def test_build_bisects_to_the_culprit_with_three_probes() -> None:
+    fake = _batch(5)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit5", [RED, CONFIRM_RED])  # the full batch, confirmed red
+    fake.script_run("commit2", [GREEN_FULL])  # probe prefix 2
+    fake.script_run("commit3", [GREEN_FULL])  # probe prefix 3
+    fake.script_run("commit4", [RED, CONFIRM_RED])  # probe prefix 4, confirmed red
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert [p.k for p in record.probes] == [2, 3, 4]
+    assert record.green_prefixes == [2, 3]
+    assert record.culprit == 4
+    assert record.held == [5]
+    culprit_text = next(t for n, t in fake.comments_posted if n == 4)
+    assert culprit_text.startswith(f"merge-train: CULPRIT batch {record.batch_id}")
+    held_text = next(t for n, t in fake.comments_posted if n == 5)
+    assert held_text.startswith(f"merge-train: HELD batch {record.batch_id}")
+    assert {n for n, _ in fake.comments_posted if n in (1, 2, 3)} == {1, 2, 3}
+    assert fake.worktrees_added == fake.worktrees_removed
+
+
+def test_build_is_green_with_no_probe_when_the_only_red_run_is_a_flake() -> None:
+    fake = _batch(2)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit2", [RED, CONFIRM_GREEN])  # red once, green on the confirming rerun
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert record.outcome == "green"
+    assert record.probes == []
+    assert fake.rerun_calls == [RED.run_id]
+
+
+# -- AC9: main green at base, all three cases --------------------------------------------
+
+
+def test_main_red_at_base_stops_before_any_probe() -> None:
+    fake = _batch(1)
+    fake.script_run(fake.base, [_run(status="completed", conclusion="failure")])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert record.main_green_at_base is False
+    assert record.outcome == "inconclusive"
+    assert record.detail == "main is red at base"
+    assert record.probes == []
+
+
+def test_main_unfinished_at_base_times_out_inconclusive() -> None:
+    fake = _batch(1)
+    fake.script_run(fake.base, [_run(status="in_progress", conclusion=None)])
+    record = mt.run_build(fake, None, None, timeout_s=0, poll_s=0)
+    assert record.main_green_at_base is None
+    assert record.outcome == "inconclusive"
+    assert record.detail == "main unfinished at base"
+
+
+def test_main_in_progress_then_green_lets_the_batch_proceed() -> None:
+    fake = _batch(1)
+    fake.script_run(fake.base, [_run(status="in_progress", conclusion=None), GREEN_MAIN])
+    fake.script_run("commit1", [GREEN_FULL])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert record.main_green_at_base is True
+    assert record.outcome == "green"
+
+
+# -- the worktree: removed on every exit path, and two batches get two ------------------
+
+
+def test_the_worktree_is_removed_even_when_the_run_raises() -> None:
+    fake = _batch(1)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    base = fake.main_sha()
+    bid = mt.batch_id(fake.now(), base)
+    fake.fail_push_branches.add(f"train/{bid}")
+    with pytest.raises(RuntimeError):
+        mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    assert len(fake.worktrees_added) == 1
+    assert fake.worktrees_added == fake.worktrees_removed
+
+
+def test_two_batches_get_two_worktrees() -> None:
+    fake1 = FakeRunner(now=datetime(2026, 10, 1, 9, 0, 0, tzinfo=UTC))
+    _batch(1, fake1)
+    fake1.script_run(fake1.base, [GREEN_MAIN])
+    fake1.script_run("commit1", [GREEN_FULL])
+    r1 = mt.run_build(fake1, None, None, timeout_s=10, poll_s=0)
+
+    fake2 = FakeRunner(now=datetime(2026, 10, 1, 9, 10, 0, tzinfo=UTC))
+    _batch(1, fake2)
+    fake2.script_run(fake2.base, [GREEN_MAIN])
+    fake2.script_run("commit1", [GREEN_FULL])
+    r2 = mt.run_build(fake2, None, None, timeout_s=10, poll_s=0)
+
+    assert r1.batch_id != r2.batch_id
+    assert fake1.worktrees_added[0] != fake2.worktrees_added[0]
+    assert fake1.worktrees_added == fake1.worktrees_removed
+    assert fake2.worktrees_added == fake2.worktrees_removed
+
+
+# -- safety review of #521 ---------------------------------------------------------------
+
+
+def test_build_treats_a_fork_pr_as_ineligible_and_never_touches_its_head() -> None:
+    """SHOULD FIX 1: a fork PR must not stop, or be built into, the rest of the batch."""
+    fake = _batch(2)
+    fake.add_pr(3, head_repo="someone/fork")
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit2", [GREEN_FULL])
+    record = mt.run_build(fake, None, None, timeout_s=10, poll_s=0)
+    by_number = {p.number: p for p in record.prs}
+    assert by_number[3].state == "ineligible"
+    assert (by_number[3].reason or "").startswith("(0)")
+    assert fake.commits == ["base0", "commit1", "commit2"]  # PR3 never entered the train
+    assert record.outcome == "green"
+
+
+def test_classified_never_reads_a_stale_report_of_the_reran_attempt() -> None:
+    """SHOULD FIX 2: a confirming rerun must read a later attempt, never the one it reran,
+    even when `find_run` still briefly reports the old attempt as `completed`/`failure`."""
+    fake = FakeRunner()
+    fake.run_script["sha"] = [RED, RED, CONFIRM_GREEN]  # one stale re-read, then the rerun
+    outcome, info = mt._classified(
+        fake, "sha", "train/x", timeout_s=10, poll_s=0, say=lambda _msg: None
+    )
+    assert outcome.kind == "green"
+    assert info.run_attempt == 2
+    assert fake.rerun_calls == [RED.run_id]
+
+
+def test_shell_runner_refuses_to_push_or_delete_a_non_train_branch(tmp_path: Path) -> None:
+    """SHOULD FIX 4: the push/delete seam refuses anything outside `train/*`, independent
+    of `build` only ever constructing `train/*` names."""
+    subprocess_run = __import__("subprocess").run
+    subprocess_run(["git", "init", "-q", str(tmp_path)], check=True)
+    runner = mt.ShellRunner(tmp_path)
+    with pytest.raises(mt.StoppedError):
+        runner.push(tmp_path, "HEAD", "main")
+    with pytest.raises(mt.StoppedError):
+        runner.delete_branch("main")

@@ -38,6 +38,12 @@ _V5_ORDER_EVENTS_DDL = schema._CREATE_ORDER_EVENTS.replace(
 )
 
 
+#: `resume_invocations` as versions 5 to 7 created it: no `accept_rejections` (#472).
+_V7_RESUME_INVOCATIONS_DDL = schema._CREATE_RESUME_INVOCATIONS.replace(
+    "    accept_rejections BOOLEAN NOT NULL,\n", ""
+)
+
+
 @pytest.fixture
 def journal() -> Iterator[duckdb.DuckDBPyConnection]:
     conn = duckdb.connect(":memory:")
@@ -69,6 +75,9 @@ def _old_store(path: Path, version: int, reasons: tuple[str | None, ...] = ()) -
         schema.init_schema(conn)
         conn.execute("DROP TABLE decisions")
         conn.execute(_V6_DECISIONS_DDL)
+        conn.execute("DROP TABLE resume_acceptances")
+        conn.execute("DROP TABLE resume_invocations")
+        conn.execute(_V7_RESUME_INVOCATIONS_DDL)
         if version == 5:
             conn.execute("DROP TABLE order_events")
             conn.execute(_V5_ORDER_EVENTS_DDL)
@@ -184,12 +193,12 @@ def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason
 # --- version 7 and the migrations from versions 6 and 5 ----------------------------------
 
 
-def test_current_schema_version_is_7() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 7
+def test_current_schema_version_is_8() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 8
 
 
-def test_fresh_init_records_version_7(journal: duckdb.DuckDBPyConnection) -> None:
-    assert _versions(journal) == [7]
+def test_fresh_init_records_version_8(journal: duckdb.DuckDBPyConnection) -> None:
+    assert _versions(journal) == [8]
 
 
 @pytest.mark.parametrize("version", [5, 6])
@@ -198,7 +207,9 @@ def test_write_open_adds_the_check_and_keeps_every_row(
 ) -> None:
     reasons = (None, *schema.DECISION_REASONS)
     path = _old_store(tmp_path / f"v{version}.duckdb", version, reasons)
-    rebuilt = {"decisions"} | ({"order_events"} if version == 5 else set())
+    rebuilt = {"decisions", "resume_invocations", "resume_acceptances"} | (
+        {"order_events"} if version == 5 else set()
+    )
     with duckdb.connect(str(path)) as conn:
         before = conn.execute("SELECT * FROM decisions ORDER BY ALL").fetchall()
         kept = [table for table in schema.JOURNAL_TABLE_NAMES if table not in rebuilt]
@@ -211,7 +222,7 @@ def test_write_open_adds_the_check_and_keeps_every_row(
             _decision(conn, "left_target", decision_id=99)
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == list(range(version, 8))
+    assert versions == list(range(version, 9))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -239,7 +250,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [6, 7]
+        assert _versions(conn) == [6, 7, 8]
 
 
 @pytest.mark.parametrize("version", [5, 6])

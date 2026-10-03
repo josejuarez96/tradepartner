@@ -22,21 +22,29 @@ req 14 "Entry gate, start and stop", req 5, req 9 and open question 13; ADR
 5. **The account is not flat**: `open_orders()` is non-empty, or a
    position exists that is not explained by the previous window's listed
    residues (see "Flatness" below).
+6. **The live costs differ from the hypothesis's registered costs**
+   (`costs_drift`, #534): every `FROZEN_COSTS_KEYS` value must equal the
+   registration's, which planning sizes with, so the frozen costs the wrapper
+   reads are the plan's.
+7. **The live fill price differs from the hypothesis's registered one**
+   (`execution_drift`, #526): every `FROZEN_EXECUTION_KEYS` value must equal
+   the registration's, which the tracking trial fills at, so `paper report`
+   prices paper fills against the trial's own convention.
 
 Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
 rebalance session strictly after both `holdout_end` and today, per the spec
 Definitions' "Paper window"; `starting_cash` and `starting_equity` from
 `account()`; `code_version`; `frozen_json`/`frozen_sha256`, the canonicalised
-and hashed `risk.*` section plus `FROZEN_PAPER_KEYS`, exactly as
-`registry.canonical_params_json`/`params_sha256` do for hypothesis
-parameters), the `carried_residue` adjustments copied from the previous
-window's listed residues (quantity and origin unchanged, dated at the stop
-row's own session: the ledger itself split-adjusts an adjustment from its
-`session` through any later one, `execution.ledger`'s documented
-convention), and any `spinoff_receipt` adjustments a spin-off explained (see
-below). It takes the run lock (T59) for its writes, and migrates a store
-version 4 has left behind (`init_schema` on the write connection) before
-writing.
+and hashed `risk.*` section plus `FROZEN_PAPER_KEYS`, `FROZEN_COSTS_KEYS` and
+`FROZEN_EXECUTION_KEYS`, exactly as `registry.canonical_params_json`/
+`params_sha256` do for hypothesis parameters), the `carried_residue`
+adjustments copied from the previous window's listed residues (quantity and
+origin unchanged, dated at the stop row's own session: the ledger itself
+split-adjusts an adjustment from its `session` through any later one,
+`execution.ledger`'s documented convention), and any `spinoff_receipt`
+adjustments a spin-off explained (see below). It takes the run lock (T59) for
+its writes, and migrates a store version 4 has left behind (`init_schema` on
+the write connection) before writing.
 
 **Flatness.** With no previous window, or the latest one `abandoned`, the
 account must hold no position at all: an `abandoned` window carries no
@@ -56,8 +64,9 @@ derived quantity, never the stored one, to the live position.
 
 **`residues_json` (settled here; T64b produces it).** A JSON object keyed by
 `security_id`, each value `{"quantity": <float>, "origin": "dust" |
-"untradable" | null}` (spec req 14, Data section: "per name, quantity and
-origin").
+"untradable"}` (spec req 14, Data section: "per name, quantity and
+origin"); `_parse_residues` refuses any other origin, including `null`
+(#522 item 4).
 
 **Spin-off children (open question, flagged in the PR).** The store has no
 column linking a spin-off's child security to its parent (ADR 0009: no
@@ -115,7 +124,14 @@ reason is the trimmed text.
 - **`abandon(settings, connect, broker, clock, reason)`** is the owner-only
   `paper abandon` (#247 Q13). It takes the run lock, refuses `no_window`,
   and does not look at the switch (a window that cannot be released can only
-  end this way). It runs a final `reconcile_now`, keeping its row whatever
+  end this way). It refuses `open_orders`, naming each one, while any order
+  of the window has no terminal event in the journal (the read `stop`'s
+  `not_ready` makes, so an order the broker filled but the journal has not
+  collected still refuses); it never cancels one (#542: the owner cancels or
+  waits, runs `paper resume` so the journal collects the order, then
+  abandons). Every refusal comes before any broker call or write,
+  and the run lock it holds keeps any run from placing an order meanwhile.
+  It runs a final `reconcile_now`, keeping its row whatever
   its status (a mismatch is the expected case and engages nothing: the
   window ends here; but when anything after a mismatch fails, so the window
   stays open, it engages the switch with source `fault` before re-raising),
@@ -128,10 +144,11 @@ reason is the trimmed text.
   strictly flat). It releases nothing.
 - **`kill(settings, connect, clock, reason)`** is `paper kill`. It takes no
   run lock, so the owner can engage while a run holds it, refuses
-  `no_window` writing nothing, and appends an `engaged` row with source
-  `owner` (`switch.engage`), returning its `event_id`. A row that cannot be
-  written, for any reason (the store, or the clock it is stamped with),
-  raises `KillWriteFailed`.
+  `no_window` and `multiple_open_windows` (spec req 14: only one window may
+  ever be open; nothing is written for either refusal) and appends an
+  `engaged` row with source `owner` (`switch.engage`), returning its
+  `event_id`. A row that cannot be written, for any reason (the store, or
+  the clock it is stamped with), raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
   share. It reads the clock, then opens one short-lived `open_for_write`
@@ -148,7 +165,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -161,7 +178,13 @@ from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.broker import Broker
 from tradepartner.calendar import last_session_of_month, previous_session, session_close
-from tradepartner.config import FROZEN_PAPER_KEYS, RiskConfig, Settings
+from tradepartner.config import (
+    FROZEN_COSTS_KEYS,
+    FROZEN_EXECUTION_KEYS,
+    FROZEN_PAPER_KEYS,
+    RiskConfig,
+    Settings,
+)
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import plan as plan_rules
 from tradepartner.execution import switch
@@ -178,6 +201,7 @@ from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
     TERMINAL_ORDER_STATUSES,
     AdjustmentRow,
+    JournalIntegrityError,
     JournalNotInitialised,
     OverrideRow,
     PaperWindowRow,
@@ -207,6 +231,8 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 _NEW_YORK = ZoneInfo("America/New_York")
 _RISK_PREFIX = "risk."
 _PAPER_PREFIX = "paper."
+_COSTS_PREFIX = "costs."
+_EXECUTION_PREFIX = "execution."
 _ABANDONED = "abandoned"
 _DUST = "dust"
 _UNTRADABLE = "untradable"
@@ -239,7 +265,7 @@ class StartResult:
 class _Residue:
     security_id: str
     quantity: float
-    origin: str | None
+    origin: str  # "dust" or "untradable"; `_parse_residues` refuses anything else
 
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:
@@ -272,13 +298,51 @@ def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
     return session_close(holdout_end) <= now
 
 
-def _frozen_params(settings: Settings) -> dict[str, Any]:
+def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
-    `FROZEN_PAPER_KEYS` under `paper.*` (spec req 14)."""
+    `FROZEN_PAPER_KEYS` under `paper.*`, `FROZEN_COSTS_KEYS` under `costs.*` and
+    `FROZEN_EXECUTION_KEYS` under `execution.*` (spec req 14; the costs #534; the
+    fill price #366 Q20, #526, which `paper report` reads back).
+
+    The frozen costs must equal the hypothesis's `registered` parameters,
+    which planning sizes the decisions with, so the plan and the wrapper share
+    one cost model: a live `costs.*` value that differs from it, or a key the
+    registration lacks, refuses the start (`costs_drift`). Likewise the frozen
+    `execution.*` keys must equal the registered ones, which the tracking trial
+    fills at, so `paper report` compares paper fills against the trial's own
+    convention (`execution_drift`)."""
     risk = settings.risk.model_dump()
     paper = settings.paper.model_dump()
+    costs = settings.costs.model_dump()
+    execution = settings.execution.model_dump()
+    drift = [
+        f"{_COSTS_PREFIX}{k} live {costs[k]!r} vs registered "
+        f"{registered.get(f'{_COSTS_PREFIX}{k}')!r}"
+        for k in FROZEN_COSTS_KEYS
+        if f"{_COSTS_PREFIX}{k}" not in registered
+        or float(registered[f"{_COSTS_PREFIX}{k}"]) != float(costs[k])
+    ]
+    if drift:
+        raise StartRefusedError(
+            "costs_drift",
+            "the live costs differ from the hypothesis's registered costs: " + "; ".join(drift),
+        )
+    execution_drift = [
+        f"{_EXECUTION_PREFIX}{k} live {execution[k]!r} vs registered "
+        f"{registered.get(f'{_EXECUTION_PREFIX}{k}')!r}"
+        for k in FROZEN_EXECUTION_KEYS
+        if registered.get(f"{_EXECUTION_PREFIX}{k}") != execution[k]
+    ]
+    if execution_drift:
+        raise StartRefusedError(
+            "execution_drift",
+            "the live execution keys differ from the hypothesis's registered ones: "
+            + "; ".join(execution_drift),
+        )
     params: dict[str, Any] = {f"{_RISK_PREFIX}{k}": v for k, v in risk.items()}
     params.update({f"{_PAPER_PREFIX}{k}": paper[k] for k in FROZEN_PAPER_KEYS})
+    params.update({f"{_COSTS_PREFIX}{k}": costs[k] for k in FROZEN_COSTS_KEYS})
+    params.update({f"{_EXECUTION_PREFIX}{k}": execution[k] for k in FROZEN_EXECUTION_KEYS})
     return params
 
 
@@ -331,8 +395,11 @@ def _parse_residues(residues_json: str | None) -> dict[str, _Residue]:
         if not isinstance(entry, dict) or "quantity" not in entry:
             raise ValueError(f"residues_json entry for {security_id!r} is malformed")
         origin = entry.get("origin")
-        if origin not in (None, _DUST, _UNTRADABLE):
-            raise ValueError(f"residues_json origin for {security_id!r} is {origin!r}")
+        if origin not in (_DUST, _UNTRADABLE):
+            raise ValueError(
+                f"residues_json origin for {security_id!r} is {origin!r}, "
+                f"must be {_DUST!r} or {_UNTRADABLE!r}"
+            )
         quantity = float(entry["quantity"])
         if not math.isfinite(quantity) or quantity < 0:
             raise ValueError(f"residues_json quantity for {security_id!r} is {quantity!r}")
@@ -538,7 +605,7 @@ def start(
 
         t_0 = _first_rebalance_session(hyp.holdout_end, today)
         commit, _dirty = registry.code_version()
-        params = _frozen_params(settings)
+        params = _frozen_params(settings, hyp.params)
         frozen_json = registry.canonical_params_json(params)
         frozen_sha256 = registry.params_sha256(params)
 
@@ -615,6 +682,8 @@ NOT_READY = "not_ready"
 RECONCILIATION = "reconciliation"
 NOT_FLAT = "not_flat"
 OVERRIDE = "override"
+MULTIPLE_OPEN_WINDOWS = "multiple_open_windows"
+OPEN_ORDERS = "open_orders"
 
 REQUESTED = "requested"
 CLOSED = "closed"
@@ -682,11 +751,19 @@ def _note(reason: str, command: str) -> str:
 
 def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
     """The open window and its id, or a `no_window` refusal (a store whose
-    journal no write has migrated has no window either)."""
+    journal no write has migrated has no window either), or a
+    `multiple_open_windows` refusal (spec req 14: only one window may ever be
+    open) when the journal has more than one open window. Every command that
+    calls this (`stop`, `abandon`, `kill`, `override`) refuses the same way.
+    `stop`, `kill` and `override` call it before writing anything; `abandon`'s
+    re-check (after its reconciliation row) still refuses the same way, but
+    by then the reconciliation row is already written."""
     try:
         window = open_window(conn)
     except JournalNotInitialised:
         window = None
+    except JournalIntegrityError as exc:
+        raise WindowCommandRefused(MULTIPLE_OPEN_WINDOWS, str(exc)) from exc
     if window is None or window.window_id is None:
         raise WindowCommandRefused(NO_WINDOW, "no_window: no paper window is open")
     return window, window.window_id
@@ -718,6 +795,18 @@ def _refuse_if_engaged(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) 
     causes = _engaged_causes(conn, window)
     if causes:
         raise WindowCommandRefused(KILL_SWITCH, "the kill switch is engaged: " + "; ".join(causes))
+
+
+def _open_orders(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
+    """Every order of the window with no terminal event in the journal
+    (`pending` ones included), whatever the broker says: the same
+    `non_terminal_orders` read `_not_ready` names for `stop` (#542)."""
+    return [
+        f"order {o.client_order_id} ({o.symbol}) is not terminal"
+        for o in sorted(
+            non_terminal_orders(conn, window_id=window_id), key=lambda o: o.client_order_id
+        )
+    ]
 
 
 def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
@@ -936,7 +1025,15 @@ def stop(
         session = command_session(now)
         try:
             result = reconcile_now(
-                settings, connect, broker, window, session, clock, connect, frozen=frozen
+                settings,
+                connect,
+                broker,
+                window,
+                session,
+                clock,
+                connect,
+                frozen=frozen,
+                as_of=_command_clock(clock),  # every row journaled so far (#488)
             )
         except ReconciliationError as exc:
             message = f"reconciliation failed: {exc}"
@@ -996,7 +1093,8 @@ def abandon(
     reason: str,
 ) -> AbandonResult:
     """`paper abandon --reason`, owner-only (module docstring; #247 Q13).
-    Raises `WindowCommandRefused` for a blank reason or no open window,
+    Raises `WindowCommandRefused` for a blank reason, no open window or an
+    open order of the window (before any broker call or write),
     `LockHeld` while another process holds the run lock, `ClockError` for a
     bad clock reading, and whatever the broker or the store raises (nothing
     but the reconciliation row is then written, plus a `fault` engagement
@@ -1006,6 +1104,13 @@ def abandon(
     with run_lock(settings):
         with connect() as conn:
             window, window_id = _window_of(conn)
+            still_open = _open_orders(conn, window_id)
+        if still_open:
+            raise WindowCommandRefused(
+                OPEN_ORDERS,
+                "cancel or wait for the window's own open orders, run paper resume so "
+                "the journal collects them, then abandon: " + "; ".join(still_open),
+            )
         frozen = frozen_risk(window)
         now = _command_clock(clock)
         mismatch: ReconciliationError | None = None
@@ -1019,6 +1124,7 @@ def abandon(
                 clock,
                 connect,
                 frozen=frozen,
+                as_of=_command_clock(clock),  # every row journaled so far (#488)
             )
         except ReconciliationError as exc:
             mismatch = exc  # its row is written before the error: abandon lists it
@@ -1094,8 +1200,9 @@ def kill(
 ) -> int:
     """`paper kill --reason` (module docstring): the `engaged` row's
     `event_id`. Takes no run lock. Raises `WindowCommandRefused` for a blank
-    reason or no open window (nothing written) and `KillWriteFailed` when the
-    row cannot be written."""
+    reason, no open window, or more than one open window (only one window
+    may ever be open, spec req 14; nothing is written for any of these) and
+    `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
     with connect() as conn:
         _, window_id = _window_of(conn)

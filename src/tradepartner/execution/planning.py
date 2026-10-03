@@ -91,7 +91,7 @@ from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
-from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     DecisionRow,
     JournalRow,
@@ -124,7 +124,6 @@ _TRACKING: Literal["tracking"] = "tracking"
 _RUN = "run"
 _OK = "ok"
 _SPLIT = "split"
-_LISTED = "listed"
 _FORCED_EXIT = "forced_exit"
 _RUN_BY = "paper run"
 _MAX_CATCH_UP_KEY = "paper.max_catch_up_sessions"
@@ -293,9 +292,10 @@ def reference_prices(
     return prices
 
 
-def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
+def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
     """Per security, its listing row with the latest `valid_from` on or before `day`
-    (the first in frame order on a tie, as `universe_as_of` reads it)."""
+    (the first in frame order on a tie, as `universe_as_of` reads it). The one
+    tie rule planning and the wrapper share (#534)."""
     current: dict[str, dict[str, Any]] = {}
     for row in listings.iter_rows(named=True):
         valid_from = row["valid_from"]
@@ -313,13 +313,16 @@ def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
 def _ended(
     conn: duckdb.DuckDBPyConnection, session: date, names: Sequence[str], params: Settings
 ) -> dict[str, date | None]:
-    """Names whose current listing at close(S-1) is not `listed`, each with its
-    end session (None when unknown): `decisions_from`'s `listings_at`."""
+    """Names whose current listing at close(S-1) is `delisted`, each with its
+    end session (None when unknown): `decisions_from`'s `listings_at`. A
+    `transferred` listing (a Form 25 transfer to another exchange, still
+    trading) is not an end, the same rule the exits use (`run._forced_exits`,
+    `wrapper._listings`): the business keeps trading, just elsewhere."""
     if not names:
         return {}
     frame = listing_ends_as_of(conn, _cut(session), params, list(names))
-    current = _current(frame, previous_session(session))
-    return {sid: row["end_session"] for sid, row in current.items() if row["status"] != _LISTED}
+    current = current_listings(frame, previous_session(session))
+    return {sid: row["end_session"] for sid, row in current.items() if row["status"] == DELISTED}
 
 
 def _symbols(
@@ -329,7 +332,7 @@ def _symbols(
     A name with none raises, since its `assets` read cannot be made."""
     if not names:
         return {}
-    current = _current(listings_as_of(conn, _cut(session), list(names)), session)
+    current = current_listings(listings_as_of(conn, _cut(session), list(names)), session)
     missing = sorted(set(names) - set(current))
     if missing:
         raise ValueError(f"no listing known at close(S-1) for {missing}")
