@@ -5,6 +5,7 @@ resume acceptance cases; #374's rejection-cap handoff from T58)."""
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
@@ -15,6 +16,7 @@ from tradepartner.adapters.broker import Order, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
+from tradepartner.errors import ClockError
 from tradepartner.execution import resume as resume_module
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
@@ -210,6 +212,18 @@ def _order(
     return order
 
 
+class _ScriptedClock:
+    """A clock whose calls follow an exact, scripted sequence of readings —
+    one popped per call — used to pin a backward step to one specific
+    internal reading of `resume` (monotonic-stamps tests, #551 item 4)."""
+
+    def __init__(self, *readings: datetime) -> None:
+        self._readings = list(readings)
+
+    def __call__(self) -> datetime:
+        return self._readings.pop(0)
+
+
 def _engage(settings: Settings, window: PaperWindowRow, clock: FixedClock) -> None:
     switch.engage(settings, clock, window_id=window.window_id, source="owner", reason="test")  # type: ignore[arg-type]
 
@@ -380,12 +394,16 @@ def test_resume_closes_an_unfinished_run_crashed_and_releases_with_its_ids(
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
 
-    outcome = _resume(journal_settings, fake, fixed_clock)
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == RELEASED, outcome.reasons
+    # The clock only ever moves forward here: nothing is clamped, nothing logged.
+    assert "clamped" not in caplog.text
     assert outcome.crashed_runs == (crashed,)
     with open_read_only(journal_settings) as conn:
         (run,) = runs_for(conn, window.window_id)  # type: ignore[arg-type]
@@ -1345,3 +1363,136 @@ def test_the_flag_without_a_verdict_refuses_what_a_plain_resume_refuses(
     assert plain.status == flagged.status == REFUSED
     assert plain.reasons == flagged.reasons
     assert _engaged(journal_settings, window)
+
+
+# --- monotonic stamps (#551 item 4) --------------------------------------------
+
+
+def test_a_skewed_clock_clamps_the_resume_acceptances_stamp_to_the_floor(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejection-cap verdict `--accept-rejections` clears, with a lagging
+    order still refusing afterwards (reusing the existing
+    `test_with_the_flag_the_lag_bound_still_refuses` setup): the clock steps
+    back right before the `resume_acceptances` row, so its `known_at` is
+    clamped to the invocation's own first reading instead of preceding it."""
+    fixed_clock.now = DAY1
+    run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+
+    floor = DAY2
+    backward = DAY2 - timedelta(minutes=5)
+    clock = _ScriptedClock(floor, floor, floor, backward)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=True,
+        )
+
+    assert outcome.status == REFUSED
+    assert any("tp-lag" in r and "lag bound" in r for r in outcome.reasons)
+    assert not any(f"run {run_id}" in r for r in outcome.reasons)
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+        (resume_id, _, known_at) = _acceptances(journal_settings)[0]
+    assert resume_id == invocation.resume_id
+    assert known_at == invocation.known_at == floor
+    assert "resume_acceptances" in caplog.text
+    assert backward.isoformat() in caplog.text
+    assert floor.isoformat() in caplog.text
+
+
+def test_a_skewed_clock_clamps_a_settled_orders_stamp_to_the_floor(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pending order from a crashed run is settled while a separate lagging
+    order (past the bound, without `--accept-broker-fills`) refuses the resume
+    afterwards, so the invocation never reaches the reconciliation step where
+    an unscripted clock read could run out. The settle read itself steps
+    back, and is clamped to the invocation's own first reading."""
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+    crashed = _run(journal_settings, window, DAY2 - timedelta(hours=1), finished=False)
+    _order(
+        journal_settings,
+        fake,
+        crashed,
+        "tp-p1",
+        1.0,
+        DAY2 - timedelta(hours=1),
+        acknowledge=False,
+    )
+
+    floor = DAY2
+    backward = DAY2 - timedelta(minutes=5)
+    clock = _ScriptedClock(floor, backward, floor, floor)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=False,
+        )
+
+    assert outcome.status == REFUSED
+    assert any("tp-lag" in r and "lag bound" in r for r in outcome.reasons)
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+    settle_events = [e for e in _events(journal_settings, "tp-p1") if e.status != "pending"]
+    assert settle_events and all(e.known_at == invocation.known_at == floor for e in settle_events)
+    assert "settle order_events" in caplog.text
+    assert backward.isoformat() in caplog.text
+    assert floor.isoformat() in caplog.text
+
+
+def test_a_backward_step_before_the_journal_cut_does_not_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The journal-cut `as_of` is clamped like every other stamp this
+    invocation writes for itself, but `reconcile_now` keeps its own, unclamped
+    backward-clock guard: once the clamped `as_of` is later than its own fresh
+    reading, it raises `ClockError` and the switch stays engaged (module
+    docstring, "Monotonic stamps")."""
+    _engage(journal_settings, window, fixed_clock)
+
+    floor = DAY1
+    backward = DAY1 - timedelta(minutes=5)
+    clock = _ScriptedClock(floor, floor, floor, backward, backward)
+
+    with pytest.raises(ClockError):
+        resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=False,
+        )
+
+    assert _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        states = [e.state for e in kill_switch_events_for(conn, window.window_id)]  # type: ignore[arg-type]
+    assert "released" not in states

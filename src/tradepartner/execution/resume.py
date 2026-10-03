@@ -67,11 +67,35 @@ the collector (T58), so every reader counts the position once.
 
 A resume writes no `decision_events` or `rebalance_events` row: the
 collection runs without the write-off back-fill.
+
+**Monotonic stamps** (#551 item 4, owner decision 2026-10-03): every `known_at`
+this module stamps itself (the `resume_invocations` row's own reading, the
+settle `order_events`, the `resume_acceptances` row, the synthetic fills and
+their terminal events, and the journal cut `as_of` in step 6) is clamped so it
+never goes backwards within one invocation: each stamp is
+`max(reading, floor)`, where `floor` starts at the invocation's first reading
+and advances to every stamp handed out after it. A reading below the floor is
+clamped and a warning is logged naming the row kind and both instants (the raw
+reading and the floor), in ISO form. The floor is never seeded from rows an
+earlier invocation wrote (a crashed run's `finished_at`, an earlier
+`kill_switch` row): `switch.derive` deliberately refuses a release not stamped
+after a faulted run's `finished_at` (spec req 5, #366 Q7), and clamping across
+that boundary would weaken the guard.
+
+This does **not** reach `collect`, `reconcile_now` or `switch.release`/
+`engage`: those modules keep their own deliberate backward-clock guards
+(`collect.py`'s "clock went back" `ClockError`, `reconcile_run`'s `as_of > now`
+and stamp checks, ADR 0007 point 4) fail-closed, unclamped. One consequence:
+when the clock steps back right before the journal cut, the clamped `as_of`
+ends up later than `reconcile_now`'s own fresh reading, so `reconcile_now`
+raises `ClockError` and the resume does not release — fail closed, not
+silently clamped through.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -122,6 +146,8 @@ NOT_ENGAGED = "not_engaged"
 NOT_RECEIVED = "not_received"
 ACKNOWLEDGED = "acknowledged"
 
+_logger = logging.getLogger(__name__)
+
 _WRITER = "resume"
 _CRASHED = "crashed"
 _ACCEPTED = "accepted"
@@ -156,6 +182,30 @@ def _read_clock(clock: Callable[[], datetime]) -> datetime:
         return ensure_tz_aware_utc(reading, field_name="clock")
     except Exception as exc:
         raise ClockError(f"clock failed: {type(exc).__name__}") from exc
+
+
+class _MonotonicStamps:
+    """Keeps every `known_at` stamp this resume invocation writes for itself
+    from going backwards (module docstring, "Monotonic stamps"). `floor`
+    starts at the invocation's own first clock reading and advances to every
+    stamp handed out after it; a reading below the floor is clamped to it,
+    with a warning naming `what` and both instants."""
+
+    def __init__(self, floor: datetime) -> None:
+        self._floor = floor
+
+    def next(self, clock: Callable[[], datetime], what: str) -> datetime:
+        reading = _read_clock(clock)
+        stamp = max(reading, self._floor)
+        if stamp != reading:
+            _logger.warning(
+                "paper resume clamped %s's known_at from %s to %s",
+                what,
+                reading.isoformat(),
+                stamp.isoformat(),
+            )
+        self._floor = stamp
+        return stamp
 
 
 def _window_id(window: PaperWindowRow) -> int:
@@ -211,7 +261,11 @@ def _start(
 
 
 def _settle(
-    broker: Broker, connect: Connect, pending: Sequence[OrderRow], clock: Callable[[], datetime]
+    broker: Broker,
+    connect: Connect,
+    pending: Sequence[OrderRow],
+    clock: Callable[[], datetime],
+    stamps: _MonotonicStamps,
 ) -> tuple[tuple[str, str], ...]:
     """Acknowledge each `pending` order the broker knows, or cancel it
     `not_received` (module docstring, step 4)."""
@@ -225,7 +279,7 @@ def _settle(
             readings[order.client_order_id] = broker.get_order(order.client_order_id)
         except UnknownOrderError:
             readings[order.client_order_id] = None
-    stamp = _read_clock(clock)
+    stamp = stamps.next(clock, "settle order_events")
     for order in pending:
         reading = readings[order.client_order_id]
         if reading is None:
@@ -284,9 +338,12 @@ def _synthetic(reading: OrderReading, tolerance: float) -> FillRow | str:
 
 
 def _write_synthetic(
-    connect: Connect, fills: Sequence[tuple[FillRow, OrderReading]], clock: Callable[[], datetime]
+    connect: Connect,
+    fills: Sequence[tuple[FillRow, OrderReading]],
+    clock: Callable[[], datetime],
+    stamps: _MonotonicStamps,
 ) -> None:
-    stamp = _read_clock(clock)
+    stamp = stamps.next(clock, "synthetic fills")
     with connect() as conn:
         for fill, reading in fills:
             append(conn, replace(fill, known_at=stamp, ingested_at=stamp))
@@ -380,10 +437,11 @@ def _accept(
     resume_id: int,
     accepted: Sequence[RejectionBreach],
     clock: Callable[[], datetime],
+    stamps: _MonotonicStamps,
 ) -> None:
     """Journal the verdicts `--accept-rejections` accepted (`[]` for none) before
     anything that could lead to a release."""
-    stamp = _read_clock(clock)
+    stamp = stamps.next(clock, "resume_acceptances")
     verdicts = [
         {
             "run_id": b.run_id,
@@ -451,6 +509,7 @@ def resume(
         window_id = _window_id(window)
         frozen = frozen_risk(window)
         now = _read_clock(clock)
+        stamps = _MonotonicStamps(now)
 
         resume_id, seen, crashed, pending = _start(
             connect,
@@ -460,7 +519,7 @@ def resume(
             accept_broker_fills,
             accept_rejections=accept_rejections,
         )
-        settled = _settle(broker, connect, pending, clock)
+        settled = _settle(broker, connect, pending, clock, stamps)
         with connect() as conn:
             open_orders = non_terminal_orders(conn, window_id=window_id)
         collected = collect(
@@ -492,7 +551,7 @@ def resume(
             # Only the verdicts on runs the release would clear (#451's refusal).
             # A collection verdict on such a run is the same run's verdict.
             accepted = faulted
-            _accept(connect, resume_id, accepted, clock)
+            _accept(connect, resume_id, accepted, clock, stamps)
         cleared = {b.run_id for b in accepted}
         reasons = [b.message for b in collected.rejections if b.run_id not in cleared]
         judged = {b.run_id for b in collected.rejections}
@@ -508,13 +567,16 @@ def resume(
         if reasons:
             return outcome(REFUSED, *reasons)
         if synthetic_fills:
-            _write_synthetic(connect, synthetic_fills, clock)
+            _write_synthetic(connect, synthetic_fills, clock, stamps)
             synthetic = synthetic_fills
 
         session = command_session(now)
         # The journal cut (#488): a reading after the settlement, the collection
         # and the synthetic fills, so the ledger sees every row this resume wrote.
-        as_of = _read_clock(clock)
+        # Clamped like every other stamp this invocation writes for itself
+        # (module docstring); `reconcile_now` keeps its own unclamped backward
+        # guard, so a clock that steps back here still fails closed there.
+        as_of = stamps.next(clock, "journal cut as_of")
         try:
             result = reconcile_now(
                 settings,
