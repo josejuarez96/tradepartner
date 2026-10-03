@@ -26,6 +26,7 @@ import json
 import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -1139,6 +1140,40 @@ def test_an_fsn_only_month_end_after_acceptance_is_capped_at_the_eastern_date(
     [record] = [f for f in _shares(source, APPLE) if f.accession == accession]
     assert record.as_of_date == date(2026, 3, 20)
     assert record.value == 14_000_000_000.0 and record.accepted_at == accepted
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_shares_at_several_ddates_serve_the_latest_never_after_acceptance(
+    tmp_path: Path, reverse: bool
+) -> None:
+    """#609 F1, no look-ahead: an FSN-only 10-Q reporting the share count at
+    two ddates (the shape of 0001104659-26-008700) is served once, with the
+    latest ddate's value, dated no later than the filing's acceptance in New
+    York even though that month end (2026-03-31) falls after it."""
+    accession = "0000320193-26-000300"
+    rows = [
+        _num(accession, SHARES, "13900000000.0000", "20251231"),
+        _num(accession, SHARES, "14000000000.0000", "20260331"),
+    ]
+    zip_bytes = _fsn_zip_bytes(
+        [_sub(BLANK_SIC_ACCESSION, "320193", "8-K", sic=""), _sub(accession, "320193", "10-Q")],
+        rows[::-1] if reverse else rows,
+        [
+            _txt(BLANK_SIC_ACCESSION, "Security12bTitle", "Common Stock"),
+            _txt(BLANK_SIC_ACCESSION, "TradingSymbol", "AAPL"),
+            _txt(BLANK_SIC_ACCESSION, "SecurityExchangeName", "Nasdaq Stock Market LLC"),
+        ],
+        [],
+    )
+    router = _facts_router()
+    router.add(_fsn_zip_url("2026_03"), zip_bytes)
+    source = _source(_settings(tmp_path), router)
+    accepted = datetime(2026, 3, 21, 0, 30, tzinfo=UTC)  # 2026-03-20 in New York
+    _seed_apple(source, _record(accession, "10-Q", accepted))
+    [record] = [f for f in _shares(source, APPLE) if f.accession == accession]
+    assert record.value == 14_000_000_000.0
+    assert record.as_of_date <= accepted.astimezone(ZoneInfo("America/New_York")).date()
+    assert record.as_of_date == date(2026, 3, 20)
 
 
 def test_a_lag_window_accession_keeps_its_own_cover_date(tmp_path: Path) -> None:
