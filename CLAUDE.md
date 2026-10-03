@@ -44,6 +44,7 @@ Run lint, format and mypy before every push, and the targeted pytest `ready_pr` 
 | Decisions already made | [docs/decisions/](docs/decisions/) |
 | What to build / how | `docs/specs/`, `docs/plans/` |
 | Research and evidence grades | [docs/research/](docs/research/) |
+| What to test next, and what the research says | [hypothesis-backlog.md](docs/research/hypothesis-backlog.md), [claims.toml](docs/research/claims.toml) (read these, not the long reports); the loop: [research-program.md](docs/ways-of-working/research-program.md) |
 | Build agents and when to use them | [docs/ways-of-working/agents.md](docs/ways-of-working/agents.md) |
 | Working alongside other chat windows | [docs/ways-of-working/teams.md](docs/ways-of-working/teams.md) |
 | Doc types and templates | [docs/README.md](docs/README.md) |
