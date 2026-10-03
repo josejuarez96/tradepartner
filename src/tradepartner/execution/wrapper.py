@@ -301,11 +301,11 @@ _CANCEL_NOOP = "cancel_noop"
 _CANCEL_FAILED = "cancel_failed"
 _REPLAY = "replay"
 _READ_CLOCK_NOTE = "halt read stands on ClockError"
-#: The halt alert's kind for a fault with no more specific mapping (owner
-#: decision 2026-10-03, #644, Option A), most specific first: none of these
-#: three is a subclass of another, so checking order among them does not
-#: matter, but a future subclass of one must still be checked before its
-#: parent would be. `StaleDataError` and every other fault keep their own,
+#: The halt alert's kind for a fault type with a more specific mapping than
+#: `_HALTED` (owner decision 2026-10-03, #644, Option A), most specific first:
+#: none of these three is a subclass of another, so checking order among them
+#: does not matter, but a future subclass of one must still be checked before
+#: its parent would be. `StaleDataError` and every other fault keep their own,
 #: unmapped kinds (`_STALE_DATA`, `_HALTED`).
 _FAULT_ALERT_KINDS: tuple[tuple[type[Exception], str], ...] = (
     (ReconciliationError, "reconciliation"),
