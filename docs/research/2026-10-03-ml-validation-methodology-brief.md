@@ -49,12 +49,19 @@ These are what the existing rules already require. This brief does not change th
 - **No document crosses splits:** a filing that appears in any pair belongs to exactly one split, and pairs that would straddle are dropped.
 - **Near-duplicate boilerplate.** Character-shingle MinHash over evidence passages. Any `dev`/`cal` passage with estimated Jaccard ≥ 0.8 to a sealed-test passage is removed from training and calibration (the side that is cheap to trim). The count is reported. The sealed set is never trimmed after it is drawn.
 - **Sealed means sealed.** Prompts, instructions, retrieval settings, features, hyperparameters, calibrators and routing thresholds are all fixed using `dev` and `cal` only. The sealed test is scored once per pre-registered configuration. Every scoring is a registry entry (§10). A second look is a new, flagged entry, as with the backtest holdout.
-- **Size:** set by a power calculation **after** the pilot gives class prevalence, not fixed here. For orientation (TC §15): proving an accepted adverse-label precision with a one-sided 95% lower bound ≥ 0.90 needs on the order of **100+ accepted adverse predictions per dimension** when true precision is near 0.95. For example, 95/100 gives a lower bound of about 0.90, and 60/60 only about 0.951. TC's 900/500/600 allocation is a planning number.
+- **Size:** set by a power calculation **after** the pilot gives class prevalence, not fixed here. Orientation, computed with exact one-sided 95% Clopper–Pearson bounds:
+  - 95/100 accepted adverse predictions correct gives a lower bound of **0.898**, which **fails** a ≥ 0.90 gate.
+  - If true precision is 0.95, the probability that the lower bound clears 0.90 is about **44% at n = 100, 80% at n = 200 and 95% at n = 300** accepted adverse predictions.
+  - Those n are per dimension, and they assume independence. Issuer clustering inflates them by the design effect 1 + (m − 1)ρ, with m pairs per issuer and ρ the within-issuer correlation, both estimated in the pilot.
+  - **Power target:** ≥ 80% for the adverse-precision gate, per dimension.
+
+  That target may be unaffordable for rare adverse classes. If so, the gate is relaxed **before** the test, by pre-registration, or the dimension stays unapproved. TC's 900/500/600 allocation is a planning number and likely too small for this gate.
+- **Pilot pairs are in no test cell.** The pilot frame ends 2023-12-31, before the test period, and pilot issuers are forced into `dev`.
 
 ### 3.2 Economic and return models (stages 5–6)
 
 - **Walk-forward, expanding window.** Each fold trains on all data before its validation year, validates on that year, and tests on the next. Hyperparameters are chosen inside the training window (nested). The test year is never used for choices.
-- **Purging and embargo** (López de Prado 2018, ch. 7). An observation whose **label window** overlaps the test window is purged from training. After each test window, an embargo of `h` sessions (the label horizon) is dropped. Labels are as-filed and timestamped, so a label's window runs from the feature's `known_at` to the end of its horizon.
+- **Purging and embargo** (López de Prado 2018, ch. 7). An observation whose **label window** overlaps a later window is purged: between training and the nested validation year, and between training plus validation and the test year. Labels are as-filed and timestamped, so a label's window runs from the feature's `known_at` to the end of its horizon. In expanding-window walk-forward no training data follow a test window, so an embargo after the test is moot. It applies only if a k-fold variant is ever used.
 - **Overlapping labels.** Event horizons longer than the event spacing (60-session returns on quarterly events; monthly ICs on 3-month returns) are handled in two ways: inference is dependence-aware (§3.3), and effective sample sizes are reported (§3.4).
 - **Final gate.** The existing per-hypothesis holdout ([backtest spec](../specs/backtest.md) reqs 8–12) stays the last gate. For any feature from a **modern pretrained model**, the holdout should be **prospective only**, made of filings after the feature configuration was frozen (§7).
 - **Fit-in-fold.** Vocabularies, IDF weights, dictionary normalizations, embeddings that need fitting, scalers and feature selection are fitted inside each training fold only (TC §19).
@@ -144,13 +151,14 @@ These are what the existing rules already require. This brief does not change th
   - unresolved rate;
   - provenance validity;
   - every metric by document type, period block, cap tercile and sector (exploratory).
-- **Human reference.** Each arm's macro-F1 against adjudicated gold is reported **beside** each annotator's macro-F1 against the same gold. An arm "at human level" means within the annotators' range, not "above 0.85".
+- **Human reference.** Each arm's macro-F1 against adjudicated gold is reported **beside** each annotator's macro-F1 against the same gold. "Human level" means **noninferiority to the mean annotator macro-F1 with a margin of 0.03**, tested with the paired issuer-cluster bootstrap. It never means "within the annotators' range". The gold is adjudicated from the same annotators, which favors them, so this comparison is conservative for the arms.
+- **Core dimensions and primary mode:** the core dimensions are exactly those frozen in taxonomy v1, which are those that passed protocol §8. The primary mode follows the taxonomy §10 tie rule. Both are fixed before any arm is scored.
 
 ### 5.4 Confirmatory comparisons, CIs and acceptance
 
 Prespecified family, Holm-adjusted:
 - **H-M1 to H-M5:** each of arms 5, 6, 7, 8 and 9 beats the **best of arms 2–4** (chosen on `cal`, frozen) on the primary endpoint. Superiority means Δ > 0.
-- **H-M6 (only if cost motivates adoption):** the cheapest arm passing H-M is **noninferior** to the best arm, with margin **0.02 macro-F1** (TC §15).
+- **H-M6:** the cheapest arm by measured `dev` cost is **noninferior** to the best arm, with margin **0.02 macro-F1** (TC §15). The best arm is chosen on `cal`. Whether H-M6 is in the family is **fixed at pre-registration** and never decided after results.
 
 CI method: paired issuer-cluster bootstrap, 10,000 resamples, percentile intervals. One-sided p-values from the bootstrap distribution of Δ, then Holm.
 
@@ -158,7 +166,7 @@ CI method: paired issuer-cluster bootstrap, 10,000 resamples, percentile interva
 
 | Criterion | Proposal | Note |
 |---|---|---|
-| Primary | Within the human annotators' range against gold, and ≥ 0.85 macro-F1 if human agreement allows it | An absolute 0.85 above human agreement is unattainable by construction |
+| Primary | Noninferior to mean annotator macro-F1 (margin 0.03) **and** at or above an absolute floor frozen at pre-registration from the pilot's agreement. Planning value 0.85. | The floor is fixed before scoring. If pilot agreement makes 0.85 unattainable, the floor is lowered **then**, never after a test result. |
 | No hidden dimension | Each core dimension separately meets the same criterion | TC §15 |
 | Accepted adverse precision | ≥ 0.95, one-sided 95% lower bound ≥ 0.90, at directional coverage ≥ 0.50 of eligible representative cases | §3.1 sample-size note |
 | Calibration | Post-calibration top-label ECE ≤ 0.05, adverse-class reliability inspected | §5.5 |
@@ -183,7 +191,7 @@ CI method: paired issuer-cluster bootstrap, 10,000 resamples, percentile interva
 ### 5.6 Selective prediction
 
 - Risk–coverage curves per dimension, with AURC (Geifman & El-Yaniv 2017; max-softmax baseline, Hendrycks & Gimpel 2017).
-- **Threshold selection:** on `cal` only. Choose the routing threshold that maximizes directional coverage subject to accepted adverse precision ≥ 0.95. Freeze it, and never revise it on the sealed test.
+- **Threshold selection:** on `cal` only. Choose the routing threshold that maximizes directional coverage subject to the **one-sided 95% lower bound** of accepted adverse precision on `cal` being ≥ 0.90. A point estimate of exactly 0.95 on a small `cal` set is optimistic (winner's curse). Freeze it, and never revise it on the sealed test.
 - **At each candidate threshold, report:**
   - automated directional coverage;
   - accepted-set accuracy;
@@ -275,7 +283,7 @@ These are computed for every pair and kept forever as the controls that any sema
 | Evidence | Weight | Why |
 |---|---|---|
 | Historical human-label accuracy of a model (stage 3) | Useful | Judged against human labels on supplied text. Still not proof of uncontaminated generalization (TC §13). |
-| Historical economic regressions using **human** labels | Useful | Tests the concept, independent of any model |
+| Historical economic regressions using **human** labels | Useful, with a hindsight caveat | Independent of any model, but **not** of look-ahead: annotators see issuer names and may recall what happened next. Confirmatory only on labels both annotators marked hindsight-free, adjudicated by a non-owner or agreed by A and B (protocol §3, §6). |
 | Historical economic or return tests using **modern model** labels | **Exploratory only** | The model may have seen later filings, outcomes or commentary. Look-ahead bias in pretrained models has been measured directly, and date instructions do not remove it (Sarkar & Vafa 2024; Lopez-Lira, Tang & Zhu 2025; Glasserman & Lin 2023 on the related distraction effect). |
 | Point-in-time ("chronologically consistent") models | Stronger historically | Trained only on text before a vintage date (He, Lv, Manela & Wu 2025). Weaker models; a candidate arm for historical economic tests. |
 | Prospective frozen outputs (prospective spec) | **Strongest** | Generated before the outcomes exist, never regenerated |
@@ -286,16 +294,21 @@ These are computed for every pair and kept forever as the controls that any sema
 
 ### 8.1 First hypothesis (E1): demand deterioration → next-quarter revenue-growth deceleration
 
-- **Unit:** issuer-quarter t with a sufficient D1 observation (primary mode and basis from taxonomy v1).
-- **Outcome:** `Δg_{t+1} = g_{t+1} − g_t`, where `g` = log year-over-year quarterly revenue growth computed from **as-filed** XBRL revenue. `g_t` comes from filing t. `g_{t+1}` comes from filing t+1, known at its acceptance. No restated values; conflicting facts are withheld (EP P13).
+- **Unit:** issuer-quarter t with **any** D1 observation in the primary mode and basis from taxonomy v1, so every evidence status is included. Statuses are modeled as indicators, never dropped.
+- **Outcome:** `Δg_{t+1} = g_{t+1} − g_t`, where `g` = log year-over-year quarterly revenue growth computed from **as-filed** XBRL revenue:
+  - `g_t` comes from filing t; `g_{t+1}` comes from filing t+1, known at its acceptance;
+  - the prior-year comparative is the value **as first filed a year earlier** (first vintage), not the comparative restated in the later filing;
+  - fourth-quarter revenue = the 10-K annual value minus the as-filed Q1–Q3 values, and is flagged;
+  - conflicting facts are withheld (EP P13), and the observation is dropped and counted.
 - **Specifications**, on identical samples and splits:
-  - **A, fundamentals:** `g_t`, `g_{t−1}`, log size, sector × calendar-quarter fixed effects.
+  - **A, fundamentals:** `g_t`, `g_{t−1}`, log size, plus sector × calendar-quarter fixed effects **in the in-sample coefficient test only**. For out-of-sample forecasts they are replaced by sector fixed effects plus the sector's mean `g` known at t, since a test quarter's fixed effect would need that quarter's outcomes.
   - **B = A + deterministic text:** §6 features for the MD&A pair.
   - **C = B + semantic:** indicators for D1 `deteriorated` and `improved` (reference: `unchanged`), plus evidence-status indicators (`not_discussed`, `mixed`, `incomparable`) so that missingness is modeled, not dropped.
-- **Hypothesis:** in C the `deteriorated` coefficient is < 0, one-sided. Two-way clustered SEs (firm, quarter).
-- **Incremental test:** walk-forward out-of-sample MSE of C vs B, with a nested-model forecast comparison test (named in the pre-registration).
+- **Primary criterion (one):** in C, the `deteriorated` coefficient is < 0, one-sided, with two-way clustered SEs (firm, quarter), on the confirmatory label set.
+- **Secondary:** walk-forward out-of-sample MSE of C vs B, with a nested-model forecast comparison test named in the pre-registration.
+- **Entry to stage 6** (§9.1 item 3) requires the primary criterion to pass **and** the out-of-sample MSE of C to be no worse than B's.
 - **Two versions, in order:**
-  - **E1-H** uses **human gold labels** on the annotated benchmark sample. It tests the concept and is power-limited by sample size.
+  - **E1-H** uses **human labels** on the annotated benchmark sample. It tests the concept and is power-limited by sample size. It is **confirmatory only on the hindsight-free subset**: both annotators answered `no` to the hindsight check, and labels were adjudicated by a non-owner or agreed by A and B. The full sample is a sensitivity analysis.
   - **E1-M** uses accepted model labels on the full universe. It is exploratory historically (§7), and confirmatory only on prospective data.
 - **Timing caveat:** the earnings release usually precedes the 10-Q, so `g_t` and part of the narrative are public before the filing (TC §20). This affects returns, not E1, but it is recorded.
 
@@ -317,7 +330,7 @@ These are computed for every pair and kept forever as the controls that any sema
 
 ### 9.2 Design
 
-- **One primary horizon, chosen before testing.** Recommendation: the next **one-month** total return from the first rebalance at or after the feature's `known_at`. This matches ADR 0006's monthly cadence, so a result is something the system could actually trade. Every other horizon (5, 20, 60, 120 sessions) is secondary and Holm-adjusted.
+- **One primary horizon, chosen before testing.** Recommendation: the next **one-month** total return from the first rebalance session **strictly after** the feature's `known_at`. This matches ADR 0006's monthly cadence, so a result is something the system could actually trade. Every other horizon (5, 20, 60, 120 sessions) is secondary and Holm-adjusted.
 - **Primary metric:** the monthly cross-sectional Spearman rank IC within the ADR 0006 universe, with Newey–West inference on the monthly series.
 - **Secondary metrics:**
   - quantile monotonicity;
@@ -364,7 +377,7 @@ The store's registry (`hypotheses`, `trials`, `trial_results`; schema v3) record
 | `outcome` | `ok` / `failed` / `refused` / `abandoned`, plus a message |
 | `code_version`, `code_dirty`, `started_at`, `finished_at`, `run_by` | |
 
-Rows are never deleted or updated. Failed and abandoned runs stay. Until that spec is accepted, experiments that need registration **wait**. The registry is not replaced by an ad-hoc file without an owner decision (the trial-registry note says the registry lives in the store).
+Rows are never deleted or updated. Failed and abandoned runs stay. Until that spec is accepted, experiments that need registration **wait**. The one exception is the annotation pilot's agreement runs: they go in an **owner-approved, append-only interim log** named on #618 before the first run (protocol §10), and are migrated into the registry when it exists. No other ad-hoc file replaces the registry without an owner decision; the trial-registry note says the registry lives in the store.
 
 ## 11. Insider-purchase stream
 
@@ -420,7 +433,7 @@ Each test states a prior centered near zero, as CP HS-2 does. A failed step 1 do
 | Guidance revision, semantic disclosure change | The semantic program | After stage 5 only |
 
 **Design:**
-- One primary horizon, recommended **60 sessions starting the session after `known_at`** of the surprise measure.
+- One primary horizon, recommended **60 sessions starting the session after `known_at`** of the surprise measure. This differs from §9.2's monthly horizon on purpose: this stream first asks the **mechanism** question (is drift present under condition X?), which is an event study. A deployable monthly-rebalance version is a separate, later hypothesis with its own registration.
 - The event's tradability is checked against the monthly cadence; a monthly-rebalance version is secondary.
 - The primary confirmatory family is limited to **three** conditions with available data and the strongest prior: earnings-day congestion, liquidity tercile within the universe, and announcement volume. Holm applies across them.
 - Every other condition is exploratory.
@@ -435,7 +448,7 @@ Each test states a prior centered near zero, as CP HS-2 does. A failed step 1 do
 - Routing sends most cases to the fallback, so the cost advantage disappears.
 - Economic variables are not predicted (stage 5 fails).
 - Incremental information disappears after controls (C ≯ B).
-- Results collapse under minor methodological changes (prespecified sensitivity set).
+- Results collapse under minor methodological changes: a sensitivity set, with its tolerance, frozen in each pre-registration.
 - Realistic costs eliminate the effect.
 - Data quality or licensing prevents honest point-in-time testing (for example the PEAD surprise gap, or analyst data).
 - Model-version changes materially alter classifications (prospective spec §8).
@@ -467,7 +480,7 @@ Taxonomy v0 → pilot → taxonomy v1; the document corpus and section parser; t
 | Garden of forking paths across 9 arms × 3 dimensions × modes × horizons | One primary endpoint, a small Holm family, and everything else exploratory by label |
 | Contaminated historical model results mistaken for evidence | §7 weights; prospective holdout for model features |
 | Selective-labeling bias in economic tests | Routing and missingness indicators; the abstention-concentration report |
-| Short price history (from 2016) | Report effective sample sizes; prefer stage-5 economic targets, which use XBRL from 2009+ |
+| Short price history (from 2016) | Report effective sample sizes. E1-M can use XBRL fundamentals from 2009+, but E1-H is limited to its 2017–2023 pilot and benchmark labels. |
 | Registry gap delays everything | Write the registry spec early, in parallel with the pilot |
 
 ## 18. Recommended next step
@@ -477,7 +490,7 @@ The owner decides §14 items 1–3. Then open, in order:
 2. a research-registry spec;
 3. a document-corpus spec (MD&A and Risk Factors sections, hashes, parser versions).
 
-All three can proceed in parallel with the annotation pilot, which needs none of them except the corpus.
+All three can proceed in parallel with the annotation pilot, which needs only the corpus and the interim run log (§10).
 
 ## Sources
 

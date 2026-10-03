@@ -28,6 +28,7 @@ Find out, per dimension and per measurement mode, whether independent trained an
 
 Rules:
 - **No LLM or other model is an annotator, adjudicator or tie-breaker.** Gold labels are human decisions (ADR 0008 point 3 allows a human decision as a source). A model-assisted label would make the later benchmark circular.
+- Labels feeding a confirmatory economic test come from a **non-owner adjudicator**, or are restricted to observations where A and B agree. The owner designs those hypotheses.
 - **The owner should not be annotator A, B or C.** The owner designs the hypotheses, and an annotator who knows them can label toward them. The owner as adjudicator is acceptable if each adjudication carries a written reason and raw labels are preserved. **Owner decision.**
 - Raw independent labels are **never edited**. Adjudication writes new records that point to the raw ones.
 
@@ -38,8 +39,8 @@ Rules:
 The frame is every eligible (issuer, current filing, previous filing) pair where:
 - the issuer is in the ADR 0006 universe **as of the current filing's acceptance time**, read through the as-of API, not from today's membership;
 - the issuer is not in the financial sector (SIC 6000–6799);
-- both filings are 10-Q or 10-K originals, not amendments, with an MD&A that the section extractor finds;
-- the current filing was accepted between **2017-01-01 and 2025-12-31**.
+- both filings are 10-Q or 10-K originals, not amendments, whose documents are retrievable from EDGAR. MD&A extraction runs **after** sampling, so the parser's failures are counted among sampled pairs (G5) and never silently screen out harder filings;
+- the current filing was accepted between **2017-01-01 and 2023-12-31**. That is before the benchmark's proposed sealed test period ([ML brief §3.1](2026-10-03-ml-validation-methodology-brief.md#31-semantic-benchmark-stages-34)), so refining the manual on pilot pairs cannot touch any test cell.
 
 Amendments are excluded from v0 and logged as a future stratum. The frame is built and counted by a deterministic script before sampling, and its row count per stratum is recorded.
 
@@ -61,7 +62,7 @@ Amendments are excluded from v0 and logged as a future stratum. The frame is bui
 | 10-K vs prior 10-K, `year_over_year` | 30 | |
 | Q1 10-Q vs preceding 10-K | 20 | Measures the cost of taxonomy §4.3's form-mismatch rule |
 
-- **Period blocks:** 2017–2019; 2020; 2021–2022; 2023–2025.
+- **Period blocks:** 2017–2019; 2020; 2021–2022; 2023.
 - **Market-cap terciles:** within the universe on the current filing's date.
 - **Sector:** the store's classification at the filing date (SIC-based), reported but not forced. A sector with fewer than 10 sampled pairs is reported as underpowered.
 
@@ -72,7 +73,7 @@ Amendments are excluded from v0 and logged as a future stratum. The frame is bui
 | Demand-adverse | Deterministic match on a frozen demand-weakness phrase list in the current MD&A, **or** a year-over-year revenue decline in as-filed XBRL facts known at acceptance |
 | Inventory | Phrase list (excess, obsolete, write-down, destock, markdown) **or** a year-over-year rise in the inventory-to-revenue ratio above the threshold, as-filed |
 | Liquidity | Phrase list (going concern, waiver, covenant, substantial doubt, refinancing) **or** negative trailing operating cash flow, as-filed |
-| Hedge / ambiguity | Current MD&A has a frozen hedge-phrase list hit ("despite", "moderation", "selected", "resilient", "softer") near a dimension term, **and** cosine similarity to the previous MD&A is in the frame's lowest quintile |
+| Hedge / ambiguity | Current MD&A has a frozen hedge-phrase list hit ("despite", "moderation", "selected", "resilient", "softer") near a dimension term, **and** cosine similarity to the previous MD&A is in the lowest quintile of an expanding window of frame pairs accepted **before** the current filing, so it uses only information known at acceptance |
 
 Lexical triggers favor lexical systems on C. That is why C is reported apart and never enters the benchmark's primary endpoint ([ML brief §5](2026-10-03-ml-validation-methodology-brief.md#5-semantic-benchmark-statistical-plan-stages-34)).
 
@@ -89,7 +90,7 @@ Lexical triggers favor lexical systems on C. That is why C is reported apart and
 - Raw filing documents are fetched once from EDGAR Archives under the SEC fair-access limits, and stored with sha256 of the raw bytes.
 - MD&A is extracted by a **deterministic, versioned** section parser (`parser_version` recorded). Text is normalized deterministically (whitespace, HTML entities), and character offsets refer to the normalized text, whose sha256 is recorded too.
 - A section-extraction failure is a pair with status `extraction_failure` for all its observations. It is counted, not silently replaced.
-- The store holds no filing bodies today, so the pilot corpus needs either a disposable `spike/` build, per [git-workflow.md](../ways-of-working/git-workflow.md) with findings written up here, or a size-S/M issue. A production document-ingest belongs to a separate spec (the integration note's `filing_documents` / `filing_sections`). **Owner decision** on which.
+- The store holds no filing bodies today. The frame and sampling script define the inclusion probabilities, so they must be **reviewed, merged code** under a size-S/M issue, not a disposable `spike/` build. A spike may prototype the section parser only ([git-workflow.md](../ways-of-working/git-workflow.md)). A production document-ingest belongs to a separate spec (the integration note's `filing_documents` / `filing_sections`). **Owner decision** on which.
 
 ## 5. The annotation manual
 
@@ -121,7 +122,7 @@ The manual is the taxonomy v0 document plus the following. It is **frozen before
 ## 6. Blinding and hindsight controls
 
 - Annotators receive only the two archived sections and the metadata in §3. They are instructed not to look up the company, its prices, later filings or news while labeling, and they sign that instruction.
-- **Hindsight check:** after labeling each pair, the annotator answers "Do you know or recall what happened to this company in the year after the current filing? yes/no". Agreement and the adverse-label rate are reported by that answer. A material difference is a finding to record, not to correct.
+- **Hindsight check:** after labeling each pair, the annotator answers "Do you know or recall what happened to this company in the year after the current filing? yes/no". Agreement and the adverse-label rate are reported by that answer. A material difference is a finding to record, not to correct. **Confirmatory use:** any confirmatory economic test on human labels (E1-H, [ML brief §8.1](2026-10-03-ml-validation-methodology-brief.md#81-first-hypothesis-e1-demand-deterioration--next-quarter-revenue-growth-deceleration)) uses only observations where both A and B answered `no`. The full sample is a sensitivity analysis.
 - Issuer names cannot be removed from MD&A without damaging the text, so they are **not** masked in the pilot. The cost is the hindsight risk above, and the check is how it is measured.
 - Annotators do not know which pairs came from the challenge sample.
 
@@ -149,7 +150,10 @@ Every label carries the taxonomy record fields ([taxonomy §8](2026-10-03-semant
 
 ## 8. Agreement analysis plan (prespecified)
 
-**Unit of analysis:** one total-company observation (pair × dimension × mode). Segment observations are reported descriptively only.
+**Unit of analysis: fixed observation slots.** Before labeling, the tool creates for every pair one slot per dimension × mode at total-company scope. Every annotator labels every slot, so A, B and C always produce the same observation set.
+- In a `cross_document` slot, the comparison basis is fixed by pair type: `sequential` for 10-Q-to-preceding-10-Q pairs and for Q1 vs 10-K, `year_over_year` for the other two types.
+- In a `narrated` slot, the annotator records the basis the text uses. A basis mismatch between annotators counts as disagreement on J.
+- Forward-basis observations (`guidance_revision`, `fixed_future_period`) and segment observations are optional extra slots. They are reported descriptively and never gated.
 
 **Label variables analyzed, per dimension × mode:**
 
@@ -166,18 +170,18 @@ Every label carries the taxonomy record fields ([taxonomy §8](2026-10-03-semant
 - PABAK, and the prevalence and bias indices, to show when κ is depressed or inflated by skewed prevalence (the "kappa paradoxes").
 - A comparison of α(A,B) with α(A,C) and α(B,C) on the subset, to find an idiosyncratic annotator.
 
-**Confidence intervals:** issuer-cluster bootstrap, 2,000 resamples, percentile intervals. The seed is the published one.
+**Confidence intervals:** issuer-cluster bootstrap, 2,000 resamples, percentile intervals. The seed is the published one. **Representativeness:** R's fixed pair-type counts do not follow the frame's proportions, so gates are judged per the rows below, and an inclusion-probability-weighted agreement is reported as a sensitivity check.
 
-**Majority-class guard.** Aggregate α is **never** the only gate. If the modal class of J holds more than 60% of observations, the report puts the per-class specific agreements beside α, and the class-level gates decide.
+**Majority-class guard.** Aggregate α is **never** the only gate. If the modal class of J holds more than 60% of observations, the report puts the per-class specific agreements beside α. The guard **only adds reporting**: G1–G4 must all pass whatever the prevalence, and a class-level result never rescues a failed G1.
 
 **Gates.** These are proposals, frozen with this document. Krippendorff's conventional guidance is the reference point: α ≥ 0.800 for reliable data, 0.667–0.800 for tentative conclusions only. The reference is under verification in the [ML brief sources](2026-10-03-ml-validation-methodology-brief.md#sources).
 
 | Gate | Threshold | Applies to |
 |---|---|---|
-| G1 continue | α(J) ≥ 0.667, lower 95% bound reported | each dimension × mode, sample R |
+| G1 continue | α(J) ≥ 0.667, lower 95% bound reported | each dimension × mode, sample R **excluding the Q1-vs-10-K stratum**, which is mostly `incomparable` by rule and would pad agreement. That stratum is reported on its own. |
 | G2 reliable | α(J) ≥ 0.800 | each dimension × mode, sample R |
-| G3 evidence first | α(S\*) ≥ 0.667 | each dimension × mode, R |
-| G4 adverse | specific agreement on V ≥ 0.70 **and** ≥ 20 observations with ≥1 adverse vote | each dimension × mode, R ∪ C (enrichment allowed here; reported per sample too) |
+| G3 evidence first | α(S\*) ≥ 0.667 | each dimension × mode, R excluding the Q1-vs-10-K stratum |
+| G4 adverse | specific agreement on V ≥ 0.70 on R ∪ C, **and** ≥ 0.60 on R alone, with ≥ 20 observations carrying ≥1 adverse vote in R ∪ C | each dimension × mode. The R-alone floor stops lexically easy challenge cases from carrying the gate. If R alone has fewer than 20 adverse-vote observations, its result is reported as underpowered and the dimension can be at most "tentative". |
 | G5 operational | `extraction_failure` rate ≤ 5% of pairs | the corpus build |
 
 **Decision table:**
@@ -187,7 +191,7 @@ Every label carries the taxonomy record fields ([taxonomy §8](2026-10-03-semant
 | G1–G4 pass, G2 pass | Dimension × mode is eligible for freezing in taxonomy v1. |
 | G1, G3, G4 pass, G2 fails | Eligible as "tentative". Benchmark results on it are reported as such. |
 | G4 has fewer than 20 adverse observations | **Underpowered**, not passed. Label one prespecified extension batch of up to 50 pairs (the 250-pair ceiling), drawn from C's triggers with the same seed stream. |
-| G1 or G3 or G4 fails | Revise the definition (taxonomy §11). Re-test on **fresh** pairs, at most two rounds. Then narrow or drop it, and record the negative result. |
+| G1 or G3 or G4 fails | Revise the definition (taxonomy §11). Re-test on **fresh** pairs, at most two rounds. **Only the final fresh-pair round decides.** A narrowed scope is written down before its fresh round and judged only on that round. Every round is logged (§10 step 6). |
 | G5 fails | Fix the parser before any agreement conclusion. Parser failures are not annotator disagreement. |
 
 A dimension that passes in one mode only is frozen in that mode only.
@@ -231,7 +235,7 @@ This is designed here and piloted **after** D1–D3, on its own pairs. Ordinary 
 3. Write the manual's real-example section from pre-2017 filings, then run the practice round (§5.6).
 4. Freeze the manual and this protocol, and record their hashes on #618.
 5. Independent labeling by A and B (all pairs) and C (the subset). Lock the labels.
-6. Run the agreement analysis by a script, from the locked export only.
+6. Run the agreement analysis by a script, from the locked export only. **Every run of that script, and every revision round, is a logged experiment**, under the charter's integrity criterion (no untracked run). It goes in the research registry ([ML brief §10](2026-10-03-ml-validation-methodology-brief.md#10-research-registry)). Until that exists, it goes in an owner-approved, append-only interim log named on #618 before the first run.
 7. Adjudicate, keeping raw labels.
 8. Write the pilot report as a new `docs/research/` file. The gate decisions per dimension × mode go to the owner.
 
@@ -247,7 +251,7 @@ This is research spend. The charter's $0 ceiling covers spend **by the running s
 
 1. Who annotates, and at what cost? Owner as adjudicator or not? (§3)
 2. Corpus route: a `spike/` build or an issue (§4.5)? Where the label dataset lives (§7)?
-3. The D2 materiality threshold, the trigger phrase lists and the XBRL thresholds for C: drafted from pre-2017 filings, then frozen before sampling.
+3. The D2 materiality threshold, the trigger phrase lists and the XBRL thresholds for C: drafted from pre-2017 filings, **approved by the owner** (each is a value entering the research process, which ADR 0008 point 3 says must come from a human decision), then frozen before sampling.
 4. Whether issuer-name masking is feasible enough to try on a 20-pair side experiment (it would measure the hindsight effect directly).
 5. A transcript source for the prepared-vs-Q&A relation task: none today. Licensing is unknown (CP tension X5 covers analyst data. Transcripts are a separate, open question).
 

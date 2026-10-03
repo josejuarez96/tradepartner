@@ -20,8 +20,15 @@ Make forward-generated semantic features into **the strongest evidence the progr
   2. A research spend ceiling above $0 (ADR 0005, ADR 0008 point 7 by analogy).
   3. Taxonomy v1 is frozen for the captured dimensions × modes (protocol §8 gates passed).
   4. The inference configuration is frozen (§9).
-- **Timing:** start capture **as soon as** 3 and 4 hold, in parallel with the remaining historical work. It does **not** wait for economic or return results (TC §13). Waiting only shortens the prospective record.
-- **Arms 1–4 (no pretrained model) can be captured prospectively without the ADR**, since code computes them. Their records follow the same contract. Capturing them early gives the deterministic baselines a forward record too.
+- **Which preconditions apply to what:**
+
+| What is captured | Needs |
+|---|---|
+| Model arms 5–9 | **All of 1–4** |
+| Arm 1 (majority) and the [ML brief §6](2026-10-03-ml-validation-methodology-brief.md#6-deterministic-baselines-permanent-controls) deterministic change features | Only an approved corpus spec and a research store (no model, no labels) |
+| Arms 2–4 | Taxonomy v1 (3), because they are trained on its labels |
+
+- **Timing:** capture of model arms starts **as soon as all of 1–4 hold**, in parallel with the remaining historical work. It does **not** wait for economic or return results (TC §13). Waiting only shortens the prospective record.
 
 ## 3. Versioned configuration objects
 
@@ -80,7 +87,7 @@ Benchmark gold labels use the [protocol §7](2026-10-03-disclosure-annotation-pr
 
 ### 4.3 `known_at`
 
-`known_at = max(source_available_at, inference_completed_at)`, and for a cascade the **final** record's completion. A feature is never earlier than the filing's acceptance, and never earlier than the moment the system actually had the value. Investability uses the first trading session strictly after `known_at` (ML brief §9.2). A record written late (after an outage, say) keeps its true late `known_at`. It is never back-stamped.
+`known_at = max(source_available_at, inference_completed_at)`, and for a cascade the **final** record's completion. For `routed_human`, completion is the human decision's timestamp. A feature is never earlier than the filing's acceptance, and never earlier than the moment the system actually had the value. Investability uses the first trading session strictly after `known_at` (ML brief §9.2). A record written late (after an outage, say) keeps its true late `known_at`. It is never back-stamped.
 
 ## 5. Routing and fallback
 
@@ -118,7 +125,7 @@ Benchmark gold labels use the [protocol §7](2026-10-03-disclosure-annotation-pr
 - **`model_id_observed` vs `model_id_requested`:** any mismatch raises a research alert and opens a new stream boundary in analysis.
 - **Drift probe** (as ADR 0008 point 6 does for memos): on a fixed schedule, re-send a frozen panel of stored inputs and record label flips and probability shifts against the original records. Probe outputs are stored apart, never used as features, and never displayed as features.
 - **A provider retiring a pinned version ends that stream.** A replacement model is a new stream with its own benchmark entry. It is never a silent substitute.
-- **Stop condition** ([ML brief §13](2026-10-03-ml-validation-methodology-brief.md#13-stop-conditions-any-one-stops-narrows-or-rejects-a-branch-each-is-recorded-as-a-negative-result)): material label changes under the probe at the same requested version mean the stream cannot be treated as one measurement.
+- **Stop condition** ([ML brief §13](2026-10-03-ml-validation-methodology-brief.md#13-stop-conditions-any-one-stops-narrows-or-rejects-a-branch-each-is-recorded-as-a-negative-result)): if the probe's label-flip rate at the same requested version exceeds a threshold frozen in `routing_policy_version`, the stream cannot be treated as one measurement. The threshold is set from the benchmark's test–retest floor.
 
 ## 9. Freeze checklist (capture starts only when every box is true)
 
@@ -136,7 +143,7 @@ Benchmark gold labels use the [protocol §7](2026-10-03-disclosure-annotation-pr
 |---|---|
 | **Evidence** | Modern pretrained models show measurable look-ahead on historical financial text, and date instructions do not remove it (Sarkar & Vafa 2024; Lopez-Lira, Tang & Zhu 2025). Temperature-0 API calls are not reproducible, and vendors re-route models (ADR 0008 context, from the handoff). |
 | **Inference** | Only outputs fixed before outcomes exist avoid both problems. A record that cannot be re-derived from stored raw responses cannot be audited. |
-| **Recommendation** | Capture deterministic arms immediately once a corpus exists. Capture model arms the day the freeze checklist passes. Never regenerate. |
+| **Recommendation** | Capture the deterministic change features once a corpus spec and research store exist; arms 2–4 once taxonomy v1 exists; model arms the day the freeze checklist passes. Never regenerate. |
 | **Unknown** | Prospective sample sizes. At about 1,000 issuers × 4 filings a year, one year gives about 4,000 filing pairs per dimension. Outcomes for a one-quarter fundamentals target mature about a quarter later, and return power stays low for years (QI-1). |
 
 ## 11. Unresolved questions
@@ -176,4 +183,4 @@ The document corpus and section parser (taxonomy §12); taxonomy v1; the researc
 
 ## 16. Recommended next step
 
-Include this contract's §2 preconditions and §7 rules in the research-measurement-boundary ADR draft. Separately, add a "prospective capture of deterministic baselines" line to whichever spec builds the document corpus, since arms 1–4 need no ADR.
+Include this contract's §2 preconditions and §7 rules in the research-measurement-boundary ADR draft. The owner may also want prospective capture of the deterministic features in scope for the future document-corpus spec. That is a scope decision for that spec, raised here as a question, not added by this document.

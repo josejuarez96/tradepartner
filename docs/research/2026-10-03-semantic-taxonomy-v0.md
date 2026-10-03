@@ -218,7 +218,7 @@ The fields below are the minimum. The annotation protocol adds annotation-proces
 
 ## 10. Unresolved questions
 
-1. **Primary mode** (`cross_document` vs `narrated`) and **primary pair type** (sequential vs year-over-year): left to the pilot's agreement results (§11). Owner review is needed if they disagree with the economic hypothesis's needs.
+1. **Primary mode** (`cross_document` vs `narrated`) and **primary pair type** (sequential vs year-over-year): left to the pilot's gates (§11). **Tie rule, fixed now:** if both modes pass, `cross_document` is primary, since disclosure change is what the program studies, and `narrated` is secondary. If only one passes, that one is primary. A pair type is primary only if it passes on its own stratum.
 2. **Q1 vs 10-K pairs:** whether to treat them as `incomparable` by rule (losing about a quarter of pairs) or to allow the annual narrative where the text is explicitly quarterly.
 3. **Intensifier word list** (rule 6): whether a bare "strong" → "solid" shift is evidence. Decided by the pilot's ambiguous-case log.
 4. **D2 materiality threshold:** its value, fixed before sampling.
@@ -229,16 +229,14 @@ The fields below are the minimum. The annotation protocol adds annotation-proces
 
 **Test:** the annotation pilot in the [protocol](2026-10-03-disclosure-annotation-protocol.md), on about 200 pairs.
 
-**Acceptance per dimension × mode** (all thresholds fixed before labeling begins; the protocol §8 is authoritative for the numbers):
-- Krippendorff's α (nominal, on the 7-way joint label) ≥ 0.667 to continue, ≥ 0.80 to call the dimension reliable.
-- Adverse-class **specific agreement** ≥ 0.70, with at least 20 pairs in which at least one annotator chose the adverse label. Fewer than 20 means *underpowered*, not *passed*.
+**Acceptance per dimension × mode:** gates G1–G5 and the decision table in [protocol §8](2026-10-03-disclosure-annotation-protocol.md#8-agreement-analysis-plan-prespecified) are the only authority. They are fixed before labeling begins, and none of their numbers is restated here. In outline: α on the joint label, agreement on sufficiency, and adverse-class specific agreement, all of which must pass whatever the class prevalence.
 - `sufficient` vs not-`sufficient` agreement α ≥ 0.667: humans must agree on *whether* there is evidence before *which* direction counts.
 - Span overlap between annotators, for agreed `sufficient` labels, reported (no gate in v0).
 
 **Outcomes:**
 - **Pass:** freeze as `financial_semantics_v1`, a new document with this one superseded.
-- **Revise:** at most two revision rounds. Each revision is tested on **fresh pairs**, never on the pairs that motivated it.
-- **Fail after two rounds:** narrow (one mode, one basis, or one sector group) or drop the dimension, and record the negative result.
+- **Revise:** at most two revision rounds. Each revision is tested on **fresh pairs**, never on the pairs that motivated it. **Only the final fresh-pair round decides.** Earlier rounds are development.
+- **Fail after two rounds:** drop the dimension, or narrow it (one mode, one basis, or one sector group). A narrowing must be **written down before** a further fresh-pair round and is judged only on that round. Picking whichever subgroup happened to pass is not allowed. Every round is logged (protocol §10) and the negative result recorded.
 
 ## 12. Dependencies
 
