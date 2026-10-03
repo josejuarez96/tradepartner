@@ -40,6 +40,7 @@ from test_edgar_source_cik import APPLE, INSIDE_LAG, _record, _router, _seed_sta
 
 from tradepartner.adapters.edgar_source import (
     FAILURES_VERSION,
+    FSN_VERSION,
     EdgarFilingSource,
     FilingFailuresError,
 )
@@ -393,7 +394,7 @@ def test_thousands_of_clean_fsn_accessions_do_not_dilute_the_per_document_check(
     source._save_fsn_manifest(
         "2025_10",
         {
-            "version": 1,
+            "version": FSN_VERSION,
             "period": "2025_10",
             "content_hash": "x",
             "validators": {},
@@ -411,7 +412,7 @@ def test_thousands_of_clean_fsn_accessions_do_not_dilute_the_per_document_check(
 def test_fsn_group_threshold(tmp_path: Path) -> None:
     source = _bare_source(tmp_path)
     manifest = {
-        "version": 1,
+        "version": FSN_VERSION,
         "period": "2025_10",
         "content_hash": "x",
         "validators": {},
@@ -440,7 +441,7 @@ def test_a_committed_fsn_period_does_not_count_toward_the_fsn_threshold(tmp_path
     committed period entirely."""
     source = _bare_source(tmp_path)
     manifest = {
-        "version": 1,
+        "version": FSN_VERSION,
         "period": "2025_10",
         "content_hash": "x",
         "validators": {},
@@ -501,7 +502,7 @@ def test_fsn_manifest_failures_count_toward_the_cross_day_pair_rule(tmp_path: Pa
     }
     source._failed_filings_cache = store
     manifest = {
-        "version": 1,
+        "version": FSN_VERSION,
         "period": "2025_10",
         "content_hash": "x",
         "validators": {},
