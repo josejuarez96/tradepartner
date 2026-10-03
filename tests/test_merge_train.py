@@ -508,6 +508,9 @@ class FakeRunner:
         self.merge_calls: list[tuple[int, str]] = []
         self.fail_delete_branches: set[str] = set()
         self.landed_tree_override: dict[int, str] = {}
+        self.raise_on_post: set[int] = set()
+        self.raise_on_pr_data_call: dict[int, int] = {}
+        self.pr_data_call_count: dict[int, int] = {}
 
     def add_pr(
         self,
@@ -560,6 +563,10 @@ class FakeRunner:
         return list(self.open_numbers)
 
     def pr_data(self, number: int) -> object:
+        self.pr_data_call_count[number] = self.pr_data_call_count.get(number, 0) + 1
+        fail_at = self.raise_on_pr_data_call.get(number)
+        if fail_at is not None and self.pr_data_call_count[number] == fail_at:
+            raise RuntimeError(f"network error reading #{number}")
         return self.pr_registry[number]
 
     def add_worktree(self, path: Path, base: str) -> None:
@@ -644,6 +651,8 @@ class FakeRunner:
         self.rerun_calls.append(run_id)
 
     def post_comment(self, number: int, text: str) -> None:
+        if number in self.raise_on_post and text.startswith("merge-train: MERGED"):
+            raise RuntimeError(f"network error posting to #{number}")
         self.comments_posted.append((number, text))
 
     def sleep(self, seconds: float) -> None:
@@ -1384,6 +1393,8 @@ def test_merge_rereads_the_head_live_immediately_before_merging() -> None:
     assert fake.merge_calls == [(1, "head1")]
     assert merged.merge is not None and merged.merge.stopped_at_position == 2
     assert "head" in (merged.merge.reason or "").lower()
+    # pass-2 review of #640, SHOULD FIX 1: the reason names PR 1's landed SHA as untested.
+    assert "main1" in (merged.merge.reason or "")
 
 
 class _ParentBreakingRunner(FakeRunner):
@@ -1458,3 +1469,49 @@ def test_prune_skips_in_flight_and_unfinished_bisect_records() -> None:
     fake.deleted_branches.clear()
     mt.run_prune(fake)
     assert fake.deleted_branches == []  # already pruned; not retried
+
+
+# === pass-2 fix round on PR #640 (safety-reviewer verification, SHOULD FIX 1) ==============
+
+
+def test_merge_exception_from_the_merged_post_after_landing_records_the_stop() -> None:
+    """Pass-2 review: an exception raised while posting PR 2's own `MERGED` comment, after
+    it already landed, must still record a stop position derived from what actually landed
+    (`len(merged) + 1 == 3`) and name PR 2's SHA as untested."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.raise_on_post.add(2)
+    with pytest.raises(RuntimeError):
+        mt.run_merge(fake, record.batch_id)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.merge is not None and saved.merge.stopped_at_position == 3
+    assert "main2" in (saved.merge.reason or "")
+    assert "untested at main's head" in (saved.merge.reason or "")
+
+
+def test_merge_exception_from_pr_data_before_landing_does_not_skip_the_pr() -> None:
+    """Pass-2 review: an exception from the live `pr_data` re-read, before PR 2 even
+    attempts to merge, must record `stopped_at_position == 2` - not `3` - so `--resume`
+    retries PR 2 rather than skipping a PR that never landed."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.raise_on_pr_data_call[2] = 2  # 1st call: the req-7 snapshot; 2nd: the live re-read
+    with pytest.raises(RuntimeError):
+        mt.run_merge(fake, record.batch_id)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.merge is not None and saved.merge.stopped_at_position == 2
+    assert "main1" in (saved.merge.reason or "")
+
+
+def test_merge_resume_after_an_exception_posts_no_held_on_merged_prs() -> None:
+    """Pass-2 review: resuming after an exception-caused stop must not post HELD on the
+    PRs that had already, verifiably, landed."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.raise_on_pr_data_call[2] = 2
+    with pytest.raises(RuntimeError):
+        mt.run_merge(fake, record.batch_id)
+    del fake.raise_on_pr_data_call[2]
+    resumed = mt.run_merge(fake, record.batch_id, resume=True)
+    assert resumed.merge is not None and resumed.merge.stopped_at_position is None
+    assert 1 not in _texts(fake, "HELD")

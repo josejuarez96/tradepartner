@@ -983,8 +983,16 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
     if resume:
         if record.merge is None or record.merge.stopped_at_position is None:
             raise StoppedError(f"batch {bid} was not stopped; nothing to resume")
-        start = record.merge.stopped_at_position
         merged_so_far = list(record.merge.merged)
+        # pass-2 review of #640, SHOULD FIX 1: `start` is derived from what actually landed,
+        # never trusted from `stopped_at_position` alone, which a stale or buggy save could
+        # have left pointing past an unlanded PR.
+        start = len(merged_so_far) + 1
+        if start != record.merge.stopped_at_position:
+            raise StoppedError(
+                f"batch {bid}: the recorded stop position does not match what actually "
+                "landed; rerun build"
+            )
         last_sha = merged_so_far[-1]["main_sha"] if merged_so_far else record.base
         last_tree = merged_so_far[-1]["tree"] if merged_so_far else record.trees[0]
         current = r.main_sha()
@@ -1031,33 +1039,44 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
     held_start = max(target + 1, start)
     broke = False
 
+    def _stop(reason: str, *, extra_sha: str | None = None) -> None:
+        """Record a stop (pass-2 review of #640, SHOULD FIX 1): the position to resume from
+        is always `len(merged_so_far) + 1` - derived from what actually landed and was
+        verified, never from `pos`, so a PR that never landed (or whose landing could not
+        be verified) is never skipped on `--resume`. Whenever something is known to have
+        merged - including, on the exception path, a best-effort re-read of `main_sha()`
+        that moved but was never verified - the reason names that SHA as untested."""
+        nonlocal held_start, broke
+        held_start, broke = len(merged_so_far) + 1, True
+        sha = extra_sha or (merged_so_far[-1]["main_sha"] if merged_so_far else None)
+        if sha:
+            reason = f"{reason}; {sha} is untested at main's head"
+        record.merge.reason = reason
+        record.merge.stopped_at_position = held_start
+        _save(record)
+
     for pos in range(start, target + 1):
         entry = accepted[pos - 1]
         previous_tip = merged_so_far[-1]["main_sha"] if merged_so_far else record.base
-
-        # SHOULD FIX 4 (req 6): re-read the head (and eligibility) live, immediately before
-        # merging - the snapshot taken above, before this loop, is already stale by then.
-        fresh = r.pr_data(entry.number)
-        if fresh.pr.head != entry.head or (
-            eligibility(fresh.pr, fresh.head_checks, fresh.diff_paths, fresh.comments) is not None
-        ):
-            held_start, broke = pos, True
-            record.merge.reason = f"#{entry.number}'s head or eligibility changed since build"
-            break
-
-        attempt = _merge_with_retries(r, entry.number, entry.head, say)
         expected_tree = record.trees[pos]
-        # SHOULD FIX 2: the post-merge fetch, tree and parent checks are wrapped in `try`,
-        # so any of them raising still records the stop position and reason before it
-        # propagates - a stopped merge must always leave a trail, not just an exception.
+        # SHOULD FIX 2/4 (req 6): the live head/eligibility re-read, the merge attempt, the
+        # post-merge fetch, the tree and parent checks, and the MERGED post are now ALL one
+        # `try`, so anything raising after an earlier PR landed still records the stop
+        # position and reason before it propagates - a stopped merge must always leave a
+        # trail, never just an exception.
         try:
+            fresh = r.pr_data(entry.number)
+            if fresh.pr.head != entry.head or (
+                eligibility(fresh.pr, fresh.head_checks, fresh.diff_paths, fresh.comments)
+                is not None
+            ):
+                _stop(f"#{entry.number}'s head or eligibility changed since build")
+                break
+
+            attempt = _merge_with_retries(r, entry.number, entry.head, say)
             new_main = r.main_sha()
             if attempt.outcome != "merged" and new_main == previous_tip:
-                held_start, broke = pos, True
-                reason = f"#{entry.number} could not be merged: {attempt.detail}"
-                if merged_so_far:  # something has already merged this run or an earlier one
-                    reason += f"; {previous_tip} is untested at main's head"
-                record.merge.reason = reason
+                _stop(f"#{entry.number} could not be merged: {attempt.detail}")
                 break
             if attempt.outcome != "merged":
                 # `gh` reported failure, but `main` moved anyway: an ambiguous answer (e.g. a
@@ -1069,34 +1088,38 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                 )
             landed_tree = r.tree_of_ref(new_main)
             parent_ok = r.parent_of(new_main) == previous_tip
-        except Exception:
-            held_start, broke = max(pos + 1, start), True
-            record.merge.reason = (
-                f"could not verify #{entry.number}'s landing after gh pr merge; "
-                "reconcile main by hand and rerun build"
-            )
-            _save(record)
-            raise
 
-        merged_so_far.append(
-            {
-                "number": entry.number,
-                "main_sha": new_main,
-                "tree": expected_tree,  # SHOULD FIX 9: the expected tree, kept distinct
-                "landed_tree": landed_tree,  # ... from what actually landed, for the record
-            }
-        )
-        record.merge.merged = list(merged_so_far)
-        _save(record)  # record the landing before posting it (SHOULD FIX 2)
-        _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
-        if not parent_ok or landed_tree != expected_tree:
-            held_start, broke = pos + 1, True
-            check = "parent" if not parent_ok else "tree"  # SHOULD FIX 11: name which failed
-            record.merge.reason = (
-                f"the landed {check} for #{entry.number} does not match tree_{pos}: "
-                f"{new_main} is untested at main's head"
+            merged_so_far.append(
+                {
+                    "number": entry.number,
+                    "main_sha": new_main,
+                    "tree": expected_tree,  # SHOULD FIX 9: the expected tree, kept distinct
+                    "landed_tree": landed_tree,  # ... from what actually landed
+                }
             )
-            break
+            record.merge.merged = list(merged_so_far)
+            _save(record)  # record the landing before posting it (SHOULD FIX 2)
+            _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
+            if not parent_ok or landed_tree != expected_tree:
+                check = "parent" if not parent_ok else "tree"  # SHOULD FIX 11: name which
+                _stop(f"the landed {check} for #{entry.number} does not match tree_{pos}")
+                break
+        except Exception:
+            # pass-2 review, SHOULD FIX 1: re-read `main_sha()` one more time, best-effort,
+            # to name the freshest known head even if the earlier read inside the `try` is
+            # what raised. Never recorded in `merged_so_far` itself: its landing (and tree)
+            # were never verified, so `--resume` must still retry PR #{entry.number}, not
+            # skip past it.
+            current_sha = None
+            with contextlib.suppress(Exception):
+                current_sha = r.main_sha()
+            extra = current_sha if current_sha != previous_tip else None
+            _stop(
+                f"could not verify #{entry.number}'s landing after gh pr merge; "
+                "reconcile main by hand and rerun build",
+                extra_sha=extra,
+            )
+            raise
 
     # SHOULD FIX 3/5: "stopped" means either an in-loop failure (`broke`, however far along -
     # even on the very last PR), or there is still PR within a recorded green prefix left
