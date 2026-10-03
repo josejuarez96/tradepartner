@@ -8,8 +8,9 @@ broker-facing cases are T60b's and T60e's.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import polars as pl
 import pytest
@@ -27,7 +28,7 @@ from tradepartner.execution.phases import (
     sell_orders,
 )
 from tradepartner.execution.plan import BuyCosts, DecisionState, PriceOf, State, decision_state
-from tradepartner.execution.risk import Skips, check_phase
+from tradepartner.execution.risk import OpenSell, Skips, check_phase, open_sold
 from tradepartner.store.journal import (
     DecisionRow,
     FillRow,
@@ -125,6 +126,7 @@ def _sells(
     frozen: RiskConfig = FROZEN,
     actions: pl.DataFrame = ACTIONS,
     price_of: PriceOf = _price,
+    open_sells: Sequence[OpenSell] = (),
 ) -> PhaseOrders:
     rows = [*decisions, *forced]
     return sell_orders(
@@ -139,6 +141,7 @@ def _sells(
         frozen,
         session=S,
         quantity_decimals=DECIMALS,
+        open_sells=open_sells,
     )
 
 
@@ -287,6 +290,168 @@ def test_a_trim_after_a_price_drop_is_capped_at_the_holding_less_residue(
     assert isinstance(checked, Skips) and len(checked.orders) == 1
 
 
+def test_a_trim_is_also_capped_by_the_names_open_sells_from_an_earlier_session() -> None:
+    """#605 owner decision: a trim's cap also subtracts the name's open
+    (non-terminal) sells from earlier sessions, so the sell sum stays within
+    the holding and `check_phase`'s `sell_sum_within_holding` (which adds
+    those open sells back in) passes it."""
+    trim = _d(1, "sell", notional=950.0)  # 9.5 shares at $100 on a 10-share holding
+    held = {"SEC_1": 10.0}
+    # An earlier session's forced exit left 4 shares open at the broker.
+    result = _sells([trim], held, open_sells=[OpenSell("SEC_1", 4.0)])
+    order = _one(result)
+    assert (order.quantity, order.full_exit) == (6.0, False)  # 10 - 4, not 9.5
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 100_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=[OpenSell("SEC_1", 4.0)],
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+@pytest.mark.parametrize(
+    ("held_qty", "open_qty", "notional", "whole"),
+    [
+        (44.138, 11.2, 3300.0, False),  # reviewer's reproduction: float sum is 1 ulp over
+        (62.1089, 8.59, 5400.0, False),
+        (490.58, 201.58, 29_000.0, True),  # a whole-share trim, same float-sum failure
+    ],
+)
+def test_a_fractional_trim_capped_by_open_sells_always_passes_check_phase(
+    held_qty: float, open_qty: float, notional: float, whole: bool
+) -> None:
+    """#605 pass 1 SHOULD FIX: the old `float` cap (`held - residue - open`)
+    could land a rounding ulp over the holding once `check_phase` added the
+    open sells back in `float` too, halting the batch on
+    `sell_sum_within_holding` for the exact case #605 was meant to fix. The
+    cap is now exact in `Decimal` on both sides (`_trim_cap` here,
+    `sell_sum_within_holding`'s own `Decimal` sum in `risk.py`), so this can
+    never happen."""
+    trim = _d(1, "sell", notional=notional, whole_share=whole)
+    held = {"SEC_1": held_qty}
+    result = _sells([trim], held, open_sells=[OpenSell("SEC_1", open_qty)])
+    order = _one(result)
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=[OpenSell("SEC_1", open_qty)],
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_trim_capped_by_two_off_grid_open_sells_passes_check_phase() -> None:
+    """#605 review pass 2: the name's open sells are summed exactly too. Two
+    off-grid unfilled quantities summed in `float` land under their exact sum,
+    so the cap came out a rounding ulp high and `sell_sum_within_holding`
+    halted the batch."""
+    trim = _d(1, "sell", notional=10_000_000.0)
+    held = {"SEC_1": 437.78}
+    opens = [OpenSell("SEC_1", 54.62566982250126), OpenSell("SEC_1", 120.92920606749875)]
+    order = _one(_sells([trim], held, open_sells=opens))
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=opens,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_trim_cut_to_zero_by_open_sells_alone_is_held_not_skipped() -> None:
+    """#605 pass 1 SHOULD FIX: the open-sells subtraction alone (cap would be
+    negative, floored at 0) wipes out the trim; a skip here would close the
+    decision for good (`plan._CLOSING_EVENTS`), so instead it is held — no
+    order, no skip — and the next run re-attempts the same remainder once the
+    open sell terminates (the owner's "heals itself" decision)."""
+    trim = _d(1, "sell", notional=950.0)
+    result = _sells([trim], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 50.0)])
+    assert result.orders == () and result.skips == ()
+
+
+def test_a_trim_below_the_minimum_even_without_open_sells_still_skips() -> None:
+    """A skip the residue cap alone would have produced (not the open-sells
+    subtraction) keeps today's behavior: journaled and closed."""
+    trim = _d(1, "sell", notional=950.0)
+    result = _sells(
+        [trim],
+        {"SEC_1": 10.0},
+        open_sells=[OpenSell("SEC_1", 50.0)],
+        frozen=RiskConfig(min_order_notional=2000.0),
+    )
+    assert result.orders == ()
+    assert _reasons(result) == {"SEC_1": "skip_below_minimum"}
+    assert result.skips[0].counts_toward_cap
+
+
+def test_a_full_exit_is_unaffected_by_the_names_open_sells() -> None:
+    """The #605 owner decision is about trims; a full exit still sells the
+    whole holding less residue regardless of open sells."""
+    plan = _d(1, "sell", reason="left_targets", quantity=10.0)
+    order = _one(_sells([plan], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 4.0)]))
+    assert (order.quantity, order.full_exit) == (10.0, True)
+
+
+#: What `unfilled_sells` leaves for a sell of 1.0 filled 0.7 + 0.2 + 0.1 with
+#: no terminal event journaled yet: float noise, not an open sell.
+NOISE = 1.0 - (0.7 + 0.2 + 0.1)
+
+
+def test_open_sold_snaps_float_noise_to_the_quantity_grid() -> None:
+    """#605 /code-review: the exact sum must not count `unfilled_sells`'
+    float noise, on either side of a grid step."""
+    sums = open_sold(
+        [OpenSell("SEC_1", NOISE), OpenSell("SEC_2", 1.0 - 0.7), OpenSell("SEC_2", 0.2)],
+        DECIMALS,
+    )
+    assert NOISE > 0
+    assert sums == {"SEC_1": Decimal(0), "SEC_2": Decimal("0.5")}
+
+
+def test_a_full_exit_beside_a_noise_open_sell_passes_check_phase() -> None:
+    """#605 /code-review: the exact `sell_sum_within_holding` sum must not halt
+    a full exit on the ~1e-16 a fully filled sell leaves before its terminal
+    event (the old `float` sum ignored it)."""
+    plan = _d(1, "sell", reason="left_targets", quantity=10.0)
+    held = {"SEC_1": 10.0}
+    opens = [OpenSell("SEC_1", NOISE)]
+    order = _one(_sells([plan], held, open_sells=opens))
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=opens,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_whole_share_trim_keeps_its_share_beside_a_noise_open_sell() -> None:
+    trim = _d(1, "sell", notional=10_000_000.0, whole_share=True)
+    order = _one(_sells([trim], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", NOISE)]))
+    assert order.quantity == 10.0
+
+
 def test_a_trim_capped_on_a_whole_share_basis_floors_the_cap() -> None:
     trim = _d(1, "sell", notional=950.0, whole_share=True)
     order = _one(
@@ -379,6 +544,7 @@ def _buys(
     sells: PhaseOrders = NO_SELLS,
     frozen: RiskConfig = FROZEN,
     states: dict[int, DecisionState] | None = None,
+    ended: Collection[str] = (),
 ) -> PhaseOrders:
     prices = {"SEC_1": 100.0, "SEC_2": 40.0, "SEC_3": 50.0}
     return buy_orders(
@@ -391,6 +557,7 @@ def _buys(
         assets or {d.security_id: TRADABLE for d in decisions},
         frozen,
         session=S,
+        ended=ended,
     )
 
 
@@ -449,6 +616,52 @@ def test_an_untradable_buy_skips_and_a_lost_fractionable_one_goes_by_whole_share
     assert _reasons(result) == {"SEC_1": "skip_untradable"}
     order = _one(result)
     assert (order.quantity, order.notional, order.whole_share) == (12.0, None, True)
+
+
+def test_an_ended_name_skips_before_sizing_and_leaves_the_other_buys_unchanged() -> None:
+    """#604: a buy of a name whose listing ended is dropped before `size_buys`
+    runs, so it takes no share of the other buys' sizing (unlike leaving it to
+    `check_phase`, which would size it in, then skip it, shrinking the rest)."""
+    without_ended = _buys(THREE[:2], 1500.0, ended=())
+    with_ended = _buys(THREE, 1500.0, ended={"SEC_3"})
+    assert [(o.security_id, o.notional) for o in with_ended.orders] == [
+        (o.security_id, o.notional) for o in without_ended.orders
+    ]
+    assert _reasons(with_ended) == {"SEC_3": "skip_delisted"}
+    assert with_ended.skips[0].counts_toward_cap
+
+
+def test_an_ended_names_skip_reason_and_cap_count_match_check_phase_today() -> None:
+    """A wrapper-level equivalent: `check_phase` itself would skip an ended
+    buy as `skip_delisted`, counted toward the cap exactly once; `buy_orders`
+    now does the same before sizing, so the counted total is unchanged."""
+    buy = THREE[2]
+    built = _buys([buy], 1000.0, ended={"SEC_3"})
+    assert _reasons(built) == {"SEC_3": "skip_delisted"}
+    assert sum(s.counts_toward_cap for s in built.skips) == 1
+
+    candidate = PhaseOrder(
+        buy.decision_id or 0,
+        "SEC_3",
+        "buy",
+        "trade",
+        PRICE,
+        notional=300.0,
+        target_weight=buy.target_weight,
+    )
+    checked = check_phase(
+        [candidate.to_risk("CCC", listing_ended=True)],
+        _ledger({}, 100_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_3": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+    )
+    assert isinstance(checked, Skips)
+    assert _reasons(PhaseOrders((), checked.skips)) == {"SEC_3": "skip_delisted"}
+    assert sum(s.counts_toward_cap for s in checked.skips) == 1
 
 
 def test_a_whole_share_buy_whose_floor_residue_is_below_one_buffered_share_settles() -> None:

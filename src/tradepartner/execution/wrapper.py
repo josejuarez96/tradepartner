@@ -197,7 +197,14 @@ from tradepartner.execution.plan import BuyCosts, DecisionState, decision_state,
 from tradepartner.execution.planning import current_listings, reference_prices
 from tradepartner.execution.reattempts import attempt_scope, write_offs
 from tradepartner.execution.reserve import open_buy_reserve
-from tradepartner.execution.risk import Skip, Violations, _buy_cash, check_phase, unfilled_sells
+from tradepartner.execution.risk import (
+    OpenSell,
+    Skip,
+    Violations,
+    _buy_cash,
+    check_phase,
+    unfilled_sells,
+)
 from tradepartner.store.asof import listings_as_of, live_actions_as_of
 from tradepartner.store.db import utc_now
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -580,6 +587,17 @@ class RiskGatedBroker:
             if self._engaged(run, book.window):
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
             assets = self._phase_assets(run, book, rows, _SELL)
+            # Read once so the trim `sell_orders` caps and the `check_phase`
+            # that verifies it see the same open sells (#605): both are the
+            # same session's read of this same `book`.
+            open_sells = unfilled_sells(
+                book.orders,
+                book.events,
+                book.fills,
+                book.price_of,
+                book.actions,
+                session=run.session,
+            )
             sold = phases.sell_orders(
                 decisions,
                 book.states,
@@ -592,10 +610,20 @@ class RiskGatedBroker:
                 self._frozen,
                 session=run.session,
                 quantity_decimals=self._decimals(),
+                open_sells=open_sells,
             )
             nobody = Account(book.window.account_id, 0.0, 0.0, 0.0, self.read_clock())
             gated = self._gate(
-                run, book, sold, assets, nobody, rebalance, _SELL if decisions else _EXIT, 0, 0
+                run,
+                book,
+                sold,
+                assets,
+                nobody,
+                rebalance,
+                _SELL if decisions else _EXIT,
+                0,
+                0,
+                open_sells=open_sells,
             )
             # The skips ride along: `buy_orders` never buys a name this phase
             # skipped (#518 item 3).
@@ -649,6 +677,7 @@ class RiskGatedBroker:
             assets,
             self._frozen,
             session=run.session,
+            ended=book.ended,
         )
         gated = self._gate(
             run,
@@ -723,10 +752,15 @@ class RiskGatedBroker:
         prior_skips: int,
         *,
         in_flight: bool = True,
+        open_sells: Sequence[OpenSell] | None = None,
     ) -> _Gated:
         """Validate every request, check the batch and journal it (steps 5 to 7
         of the module docstring); raise the batch's violation after its
-        `missed` row."""
+        `missed` row. `open_sells` is the name's non-terminal own sells read
+        from `book`; the sells-phase caller passes the same value it gave
+        `phases.sell_orders` (#605), so the trim it just capped is checked
+        against the cap it was capped by. Left unset, it is read fresh from
+        `book` here (the buys phase, which never caps a sell)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
         self._requests(built, book, session)
@@ -735,6 +769,10 @@ class RiskGatedBroker:
             for o in built.orders
         ]
         counted = prior_skips + sum(s.counts_toward_cap for s in built.skips)
+        if open_sells is None:
+            open_sells = unfilled_sells(
+                book.orders, book.events, book.fills, book.price_of, book.actions, session=session
+            )
         verdict = check_phase(
             candidates,
             book.ledger,
@@ -744,9 +782,7 @@ class RiskGatedBroker:
             self._decimals(),
             price_of=book.price_of,
             costs=book.costs,
-            open_sells=unfilled_sells(
-                book.orders, book.events, book.fills, book.price_of, book.actions, session=session
-            ),
+            open_sells=open_sells,
             prior_orders=prior_orders,
             prior_skips=counted,
         )
