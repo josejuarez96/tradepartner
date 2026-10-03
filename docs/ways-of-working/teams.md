@@ -70,7 +70,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 **During**
 - One `implementer` per claimed task, one writer per branch. Run several in parallel only on tasks with disjoint files. Read-only helpers and the reviewers may run alongside; the table in [agents.md](agents.md#parallelism-inside-a-team) says what goes in parallel and what does not.
 - Reviewers (`spec-critic`, `quant-auditor`, `safety-reviewer`) post their full report as the PR's verdict comment and return a ten-line summary; a window never pastes a report into its own context or its messages (#352).
-- **Two review passes per reviewer per PR** (#489): the review, then one verification pass after the fixes, told to check those fixes only. It reads everything pushed since the first pass. An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices goes into one follow-up `size:S` issue, not a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
+- **Two review passes per reviewer per PR** (#489): pass 1 is the review; pass 2 verifies the fixes and reads everything pushed to the PR's own files since pass 1 (commits a merge of `main` brought in are skipped). An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices goes into one follow-up `size:S` issue, not a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
 - An implementer never claims or releases; it checks that its issue carries the team label and stops if not.
 - Anything you notice outside your task becomes an issue (`gh issue create`), unclaimed, for any team to pick up.
 
@@ -155,4 +155,4 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 
 ### Model tiers
 
-Which model a window or agent runs on is set in [agents.md](agents.md#orchestrator-windows-and-model-tiers): Opus 5.5 for the orchestrator window and for windows on order-path driver and integration tasks, Sonnet 5 for windows on `size:S` issues, docs-only tasks and pure-module plan tasks (#489), Fable only where a wrong judgment propagates (specs, plans, ADRs, retros, conflict resolution, these docs), roster models unchanged.
+Which model a window or agent runs on is set by the table in [agents.md](agents.md#orchestrator-windows-and-model-tiers) (#489); the orchestrator names it in the assignment. This page does not restate the rows, so the table is the only place to read or change them.
