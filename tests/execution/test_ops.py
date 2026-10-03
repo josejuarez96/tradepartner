@@ -1408,3 +1408,147 @@ def test_a_long_window_reads_at_most_the_bound_of_every_remaining_section(
         if re.search(r"SELECT\s+COUNT\(\*\)\s+FROM\s+orders\b", sql)
     ]
     assert orders_count_reads == [1]
+
+
+def _derive_bounded_and_full(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, *, lock_free: bool = True
+) -> tuple[ops.SwitchState, ops.SwitchState]:
+    """`switch.derive` over `_kill_switch_rows_for`/`_runs_for_switch`'s bounded
+    reads, and over a full, unbounded read of every row of the window --
+    paired, so a test can assert they are the same `SwitchState` and inspect
+    either one."""
+    window_id = window.window_id
+    assert window_id is not None
+    full_rows = ops.journal.kill_switch_events_for(conn, window_id)
+    full_runs_with_results = ops.journal.runs_for(conn, window_id)
+    full_runs = [rw.run for rw in full_runs_with_results]
+    full_results = [rw.result for rw in full_runs_with_results if rw.result is not None]
+    expected = ops.derive(
+        window, full_rows, full_runs, full_results, reading_run=None, lock_free=lock_free
+    )
+
+    bounded_rows = ops._kill_switch_rows_for(conn, window_id)
+    released_at = max((r.at for r in bounded_rows if r.state == "released"), default=None)
+    bounded_runs_with_results = ops._runs_for_switch(conn, window_id, released_at=released_at)
+    bounded_runs = [rw.run for rw in bounded_runs_with_results]
+    bounded_results = [rw.result for rw in bounded_runs_with_results if rw.result is not None]
+    actual = ops.derive(
+        window, bounded_rows, bounded_runs, bounded_results, reading_run=None, lock_free=lock_free
+    )
+    return actual, expected
+
+
+@pytest.mark.parametrize(
+    ("started_minutes", "finished_minutes", "release_minutes"),
+    [
+        (200, 205, 205),  # a release stamped exactly at finished_at
+        (200, 205, 200),  # a release stamped exactly at started_at
+    ],
+)
+def test_release_exactly_at_a_runs_stamp_does_not_clear_it(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    seeded: dict[str, int],
+    started_minutes: int,
+    finished_minutes: int,
+    release_minutes: int,
+) -> None:
+    """`switch._faulted_uncleared` clears a run only on a *strict* `at >
+    started_at and at > finished_at`; a release stamped at exactly one of
+    those two instants must not clear it. `_runs_for_switch`'s SQL expresses
+    "not cleared" as `released_at <= started_at OR released_at <= finished_at`
+    -- the equality case is the one a `<=` -> `<` slip would silently drop
+    from the bounded read while `derive` still calls the run engaged
+    (reviewed in #651: this is the fail-open direction, so it needs its own
+    boundary test rather than relying on the release-strictly-between-stamps
+    case already covered elsewhere in this file)."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        run_id = append(conn, _run(window_id, _S, minutes=started_minutes))
+        append(conn, _result(run_id, "crashed", minutes=finished_minutes))
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(release_minutes),
+                state="released",
+                source="owner",
+                **_stamp(release_minutes + 1),
+            ),
+        )
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+        actual, expected = _derive_bounded_and_full(conn, window)
+    assert actual == expected
+    assert expected.engaged is True
+    assert any(f"run {run_id} crashed" in c for c in expected.causes)
+
+
+def test_the_greatest_release_at_may_not_be_the_latest_by_event_id(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """Two `released` rows written out of `at` order (the halt path's
+    `utc_now()` stamp can run behind an earlier write's clock reading): the
+    first-written row carries the *later* `at` and clears a faulted run the
+    second-written (later `event_id`, earlier `at`) row would not. Neither
+    row is `engaged`, so if this case comes out `engaged=False`, that is only
+    because the switch correctly picked the greatest `at` to clear the run --
+    not because some row's state happened to be `engaged` (every other
+    scenario in this file ends on one)."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        run_id = append(conn, _run(window_id, _S, minutes=500))
+        append(conn, _result(run_id, "failed", minutes=550))
+        # written first, carries the later `at` -- the one that clears the run
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(600),
+                state="released",
+                source="owner",
+                **_stamp(600),
+            ),
+        )
+        # written second (higher event_id), carries the earlier `at` -- does
+        # not clear the run on its own, and is the "last row by event_id"
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(510),
+                state="released",
+                source="owner",
+                **_stamp(601),
+            ),
+        )
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+        actual, expected = _derive_bounded_and_full(conn, window)
+    assert actual == expected
+    assert expected.engaged is False  # the greatest `at` (600) clears the run
+    assert expected.causes == ()
+
+
+def test_switch_engages_from_an_unfinished_run_alone(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """No `kill_switch` row exists at all for this window: `engaged` must
+    still be True from the unfinished run alone (every other scenario in
+    this file has at least one kill-switch row; this is the one where
+    `_kill_switch_rows_for` legitimately returns zero rows)."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        run_id = append(conn, _run(window_id, _S, minutes=900))  # no result: unfinished
+    with open_read_only(journal_settings) as conn:
+        bounded_rows = ops._kill_switch_rows_for(conn, window_id)
+        assert bounded_rows == ()
+        data = ops.page_data(conn, journal_settings)
+    assert data.switch_state is not None
+    assert data.switch_state.engaged is True
+    assert data.switch_state.causes == (f"run {run_id} unfinished",)
