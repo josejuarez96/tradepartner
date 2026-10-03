@@ -285,6 +285,47 @@ def test_a_second_click_after_a_write_writes_no_second_row(
     assert at.text_area(key=override_page.REASON_KEY).value in (None, "")
 
 
+def test_a_same_content_resubmit_that_arrives_stale_writes_no_second_row(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """A fast double-click: the second click's own message can carry the
+    browser's pre-clear widget values, so the reason field is not actually
+    empty when the second rerun's `on_click` reads it (module docstring, "A
+    fast double-click"). Simulated here by restoring the reason after the
+    first write, as the stale second click would. The duplicate guard
+    refuses the second submit by content, not by the (now unreliable) empty
+    reason."""
+    at = _app(monkeypatch, store)
+    _fill(at)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    # The stale second click's message still carries the pre-clear reason.
+    at.text_area(key=override_page.REASON_KEY).set_value(_REASON)
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert "identical" in _text(at).lower()
+
+
+def test_a_resubmit_after_changing_a_field_writes_a_second_row(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """The duplicate guard compares content, so a genuinely different submit
+    (even right after a write) is not refused."""
+    at = _app(monkeypatch, store)
+    _fill(at, name=_NAME)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, name="SEC_QQQ")
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 2
+
+
 def test_a_write_followed_by_a_busy_render_still_shows_it_was_written(
     monkeypatch: pytest.MonkeyPatch, store: Path
 ) -> None:
