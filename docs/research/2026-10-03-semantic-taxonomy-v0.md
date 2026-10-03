@@ -230,7 +230,7 @@ The fields below are the minimum. The annotation protocol adds annotation-proces
 **Test:** the annotation pilot in the [protocol](2026-10-03-disclosure-annotation-protocol.md), on about 200 pairs.
 
 **Acceptance per dimension × mode:** gates G1–G5 and the decision table in [protocol §8](2026-10-03-disclosure-annotation-protocol.md#8-agreement-analysis-plan-prespecified) are the only authority. They are fixed before labeling begins, and none of their numbers is restated here. In outline: α on the joint label, agreement on sufficiency, and adverse-class specific agreement, all of which must pass whatever the class prevalence.
-- `sufficient` vs not-`sufficient` agreement α ≥ 0.667: humans must agree on *whether* there is evidence before *which* direction counts.
+- The sufficiency gate exists because humans must agree on *whether* there is evidence before *which* direction counts.
 - Span overlap between annotators, for agreed `sufficient` labels, reported (no gate in v0).
 
 **Outcomes:**

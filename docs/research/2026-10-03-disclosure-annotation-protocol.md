@@ -179,9 +179,9 @@ Every label carries the taxonomy record fields ([taxonomy §8](2026-10-03-semant
 | Gate | Threshold | Applies to |
 |---|---|---|
 | G1 continue | α(J) ≥ 0.667, lower 95% bound reported | each dimension × mode, sample R **excluding the Q1-vs-10-K stratum**, which is mostly `incomparable` by rule and would pad agreement. That stratum is reported on its own. |
-| G2 reliable | α(J) ≥ 0.800 | each dimension × mode, sample R |
+| G2 reliable | α(J) ≥ 0.800 | each dimension × mode, sample R excluding the Q1-vs-10-K stratum (same rule as G1) |
 | G3 evidence first | α(S\*) ≥ 0.667 | each dimension × mode, R excluding the Q1-vs-10-K stratum |
-| G4 adverse | specific agreement on V ≥ 0.70 on R ∪ C, **and** ≥ 0.60 on R alone, with ≥ 20 observations carrying ≥1 adverse vote in R ∪ C | each dimension × mode. The R-alone floor stops lexically easy challenge cases from carrying the gate. If R alone has fewer than 20 adverse-vote observations, its result is reported as underpowered and the dimension can be at most "tentative". |
+| G4 adverse | specific agreement on V ≥ 0.70 on R ∪ C, **and** ≥ 0.60 on R alone, with ≥ 20 observations carrying ≥1 adverse vote in R ∪ C. Both specific agreements are reported with their denominators and bootstrap CIs. | each dimension × mode. The R-alone floor stops lexically easy challenge cases from carrying the gate. If R alone has fewer than 20 adverse-vote observations, its result is reported as underpowered and the dimension can be at most "tentative". |
 | G5 operational | `extraction_failure` rate ≤ 5% of pairs | the corpus build |
 
 **Decision table:**
@@ -250,7 +250,7 @@ This is research spend. The charter's $0 ceiling covers spend **by the running s
 ## 11. Unresolved questions
 
 1. Who annotates, and at what cost? Owner as adjudicator or not? (§3)
-2. Corpus route: a `spike/` build or an issue (§4.5)? Where the label dataset lives (§7)?
+2. Corpus route: which size-S/M issue builds the reviewed frame and sampling script, and whether a parser spike comes first (§4.5)? Where the label dataset lives (§7)?
 3. The D2 materiality threshold, the trigger phrase lists and the XBRL thresholds for C: drafted from pre-2017 filings, **approved by the owner** (each is a value entering the research process, which ADR 0008 point 3 says must come from a human decision), then frozen before sampling.
 4. Whether issuer-name masking is feasible enough to try on a 20-pair side experiment (it would measure the hindsight effect directly).
 5. A transcript source for the prepared-vs-Q&A relation task: none today. Licensing is unknown (CP tension X5 covers analyst data. Transcripts are a separate, open question).
