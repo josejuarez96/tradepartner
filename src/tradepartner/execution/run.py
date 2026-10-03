@@ -1561,10 +1561,24 @@ class _Run:
         in the wider set this method checks until a release narrows that set
         again.
 
-        A crossing on a session dated before the window's last release is
-        still checked (erring toward safety: a release elsewhere in the
-        window does not excuse a drawdown the owner has not seen), but its
-        alert names it as back-filled and predating that release.
+        Known gap, pending an owner decision: a run that marks sessions and
+        then crashes, followed by `paper resume`, can still drop those
+        sessions from the check. `resume` writes the `released` row itself,
+        and this method only widens past a release's `known_at`, never
+        before it; it does not ask whether every session the crashed run
+        marked was itself checked before that release. Whether `resume`
+        should check the window's unchecked marked sessions before it
+        releases is open (no `resume.py` change is made here).
+
+        A crossing is labeled back-filled, and names the release's time, only
+        when its session is strictly before this run's S-1 (so an ordinary
+        S-1 mark, read the morning after a release, is never mislabeled) and
+        that session's own close (`calendar.session_close`) is at or before
+        the last release's time (so a session the release itself would have
+        seen, or one later than it, is not labeled either). It is still
+        checked and still engages either way (erring toward safety: a release
+        elsewhere in the window does not excuse a drawdown the owner has not
+        seen) — the label only says whether it predates the release.
         """
         with open_read_only(self.settings) as conn:
             marks_rows = positions_daily_for(conn, self.window_id)
@@ -1604,7 +1618,11 @@ class _Run:
             f"ledger equity {equity:.2f} at {day.isoformat()} is below the peak {peak:.2f} "
             f"by more than risk.max_drawdown {self.frozen.max_drawdown}"
         )
-        if last_release is not None and day < last_release.astimezone(_NEW_YORK).date():
+        if (
+            last_release is not None
+            and day < previous_session(self.session)
+            and calendar.session_close(day) <= last_release
+        ):
             reason += f" (back-filled session, before the release at {last_release.isoformat()})"
         engaged = switch.engage(
             self.settings,
@@ -1662,7 +1680,7 @@ class _Run:
         """The due outcomes and the lot-ledger write (T62). A lot-ledger error is
         a `lot_ledger` alert and a note; it never fails the run.
 
-        NIT (#598): `_stop_horizon`'s `flat` (`stop_flat`) is this run's own
+        `_stop_horizon`'s `flat` (`stop_flat`) is this run's own
         computation and is not itself stored. A `realised_pnl` this run holds
         back because the lot ledger could not be rebuilt (a `lot_ledger`
         alert above) is therefore written later, by whichever run is next due

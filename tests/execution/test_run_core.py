@@ -1036,6 +1036,194 @@ def test_a_back_filled_crossing_while_disarmed_does_not_re_engage(
     assert exits_done == []
 
 
+def test_pre_release_marks_below_the_reset_peak_do_not_re_engage(
+    env: Env, exits_done: list[object]
+) -> None:
+    """A drawdown engaged and then released resets the peak (T59): a mark
+    known *before* that release, even one below the reset peak by more than
+    `risk.max_drawdown`, is not re-checked, so it does not re-engage the
+    switch (#560 follow-up, quant-auditor on #645)."""
+    from tradepartner.store.journal import KillSwitchRow, PositionDailyRow
+
+    cash = FAKE_CASH
+    reset_peak = cash  # the flat run's own Tuesday mark (cash only) stays above its bound
+    below_bound_equity = cash * 0.5  # well below reset_peak * (1 - max_drawdown)
+    assert below_bound_equity < reset_peak * (1 - RiskConfig().max_drawdown)
+    window = env.window(started=_at(MON, 22), starting_equity=1.0)  # overridden by the release
+    env.ingest(_at(TUE, 21))
+    assert window.window_id is not None
+    engaged = switch.engage(
+        env.settings,
+        lambda: _at(MON, 10),
+        window_id=window.window_id,
+        source="drawdown",
+        reason="seeded: the engagement the release below clears",
+    )
+    assert isinstance(engaged, int)
+    released_at = _at(TUE, 20)
+    env.append(
+        KillSwitchRow(
+            window_id=window.window_id,
+            at=released_at,
+            state="released",
+            source="owner",
+            peak_equity=reset_peak,
+            known_at=released_at,
+            ingested_at=released_at,
+        )
+    )
+    earlier = env.past_run(window, _at(MON), status="ok")
+    env.append(
+        PositionDailyRow(
+            run_id=earlier,
+            session=MON,
+            security_id=None,
+            quantity=0.0,
+            cash=below_bound_equity,
+            known_at=_at(MON, 21),  # before released_at
+            ingested_at=_at(MON, 21),
+        )
+    )
+    outcome = env.run(_at(WED))
+    assert outcome.status == "ok", env.results()
+    assert env.engaged() == [("drawdown", None, None, None)]  # unchanged: no new engagement
+    assert [a for a in env.alerts() if a[0] == "drawdown"] == []
+    assert len(exits_done) == 1  # not skipped: the run reaches exits_step
+
+
+def test_a_crossing_on_a_mark_written_after_the_release_still_engages(
+    env: Env, exits_done: list[object]
+) -> None:
+    """A release seeded before the window's own marks begin does not shield a
+    later crossing: Wednesday's run marks Monday and Tuesday, both known
+    well after the release, and Monday's crossing against the release's
+    reset peak still engages (#560 follow-up, quant-auditor on #645)."""
+    from tradepartner.store.journal import AdjustmentRow, KillSwitchRow
+
+    shares = 1000.0
+    cash = FAKE_CASH
+    closes = dict(
+        env.query(
+            "SELECT session, close FROM prices_daily WHERE security_id = ? AND session IN (?, ?)",
+            [SPY, MON, TUE],
+        )
+    )
+    assert closes[MON] < closes[TUE]
+    line = cash + shares * (closes[MON] + closes[TUE]) / 2
+    peak = line / (1 - RiskConfig().max_drawdown)
+    window = env.window(started=_at(MON, 22), starting_equity=1.0)  # overridden by the release
+    env.ingest(_at(TUE, 21))
+    assert window.window_id is not None
+    released_at = _at(MON, 22)  # before any mark of this window is written
+    env.append(
+        KillSwitchRow(
+            window_id=window.window_id,
+            at=released_at,
+            state="released",
+            source="owner",
+            peak_equity=peak,
+            known_at=released_at,
+            ingested_at=released_at,
+        )
+    )
+    env.fake = FakeBroker(
+        clock=env.clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=cash + shares * PRICE,
+        account_id="PA1",
+    )
+    env.clock.now = _at(MON)
+    env.fake.submit(OrderRequest("seed-1", "SPY", Side.BUY, quantity=shares))
+    env.fake.simulate_fill("seed-1")
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,
+            session=MON,
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=shares,
+            known_at=_at(MON, 21),
+            ingested_at=_at(MON, 21),
+        )
+    )
+    outcome = env.run(_at(WED))
+    assert sorted({r[0] for r in env.query("SELECT session FROM positions_daily")}) == [MON, TUE]
+    assert outcome.status == "skipped_kill_switch", env.results()
+    assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
+    assert ("drawdown", outcome.run_id, WED) in env.alerts()
+    (message,) = [r[0] for r in env.query("SELECT message FROM alerts WHERE kind = 'drawdown'")]
+    # Monday is strictly before Tuesday (S-1) and its close precedes the release: labeled.
+    assert "back-filled session, before the release" in message
+    assert exits_done == []
+
+
+def test_an_ordinary_s_minus_1_crossing_after_a_morning_of_s_release_is_not_labeled(
+    env: Env, exits_done: list[object]
+) -> None:
+    """A release the morning of S does not make an ordinary S-1 crossing
+    'back-filled': Wednesday's run marks only Tuesday (S-1), which crosses
+    the release's reset peak, but the alert names no release, since an
+    ordinary S-1 mark is never labeled (#560 follow-up, /code-review on
+    #645)."""
+    from tradepartner.store.journal import AdjustmentRow, KillSwitchRow
+
+    shares = 1000.0
+    cash = FAKE_CASH
+    (close_tue,) = (
+        r[0]
+        for r in env.query(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session = ?", [SPY, TUE]
+        )
+    )
+    equity = cash + shares * close_tue
+    peak = equity / (1 - RiskConfig().max_drawdown) * 1.1  # a clear margin below the threshold
+    window = env.window(started=_at(TUE, 22), starting_equity=1.0)  # overridden by the release
+    env.ingest(_at(TUE, 21))
+    assert window.window_id is not None
+    released_at = _at(WED, 8)  # the morning of S, before this run executes
+    env.append(
+        KillSwitchRow(
+            window_id=window.window_id,
+            at=released_at,
+            state="released",
+            source="owner",
+            peak_equity=peak,
+            known_at=released_at,
+            ingested_at=released_at,
+        )
+    )
+    env.fake = FakeBroker(
+        clock=env.clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=cash + shares * PRICE,
+        account_id="PA1",
+    )
+    env.clock.now = _at(TUE)
+    env.fake.submit(OrderRequest("seed-1", "SPY", Side.BUY, quantity=shares))
+    env.fake.simulate_fill("seed-1")
+    env.append(
+        AdjustmentRow(
+            window_id=window.window_id,
+            session=TUE,
+            kind="spinoff_receipt",
+            security_id=SPY,
+            quantity=shares,
+            known_at=_at(TUE, 21),
+            ingested_at=_at(TUE, 21),
+        )
+    )
+    outcome = env.run(_at(WED, 15))
+    assert sorted({r[0] for r in env.query("SELECT session FROM positions_daily")}) == [TUE]
+    assert outcome.status == "skipped_kill_switch", env.results()
+    assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
+    (message,) = [r[0] for r in env.query("SELECT message FROM alerts WHERE kind = 'drawdown'")]
+    assert TUE.isoformat() in message
+    assert "back-filled" not in message
+    assert exits_done == []
+
+
 def test_a_late_fill_collected_at_step_3_does_not_halt_step_4(
     env: Env, exits_done: list[object]
 ) -> None:
