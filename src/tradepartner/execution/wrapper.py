@@ -55,8 +55,12 @@ order:
    too (T58's handoff: a halt-path caller never drops one). With
    `write_offs`, each read back-fills the `written_off` row of a terminal buy
    of a pending rebalance that lacks one (T58);
-4. the alert (`halted`, or `stale_data` for `StaleDataError`), run-scoped,
-   after one checked clock reading (so a clock gone bad sets `clock_fault`);
+4. the alert, run-scoped, after one checked clock reading (so a clock gone bad
+   sets `clock_fault`): `stale_data` for `StaleDataError`; else, by
+   `_FAULT_ALERT_KINDS`, `reconciliation` for a `ReconciliationError`,
+   `rejection_cap` for a `RejectionCapError`, `skip_cap` for a `SkipCapError`,
+   and `halted` for any other fault (owner decision 2026-10-03, #644, Option
+   A: one alert per halt, never a second `halted`);
 5. the run's `paper_run_results` row, `halted` (or `stale`), with the fault's
    type, the message and `clock_fault`;
 6. re-raises the fault.
@@ -184,6 +188,7 @@ from tradepartner.errors import (
     AcknowledgementTimeoutError,
     ClockError,
     LimitBreachError,
+    ReconciliationError,
     RejectionCapError,
     SkipCapError,
     StaleDataError,
@@ -296,6 +301,29 @@ _CANCEL_NOOP = "cancel_noop"
 _CANCEL_FAILED = "cancel_failed"
 _REPLAY = "replay"
 _READ_CLOCK_NOTE = "halt read stands on ClockError"
+#: The halt alert's kind for a fault with no more specific mapping (owner
+#: decision 2026-10-03, #644, Option A), most specific first: none of these
+#: three is a subclass of another, so checking order among them does not
+#: matter, but a future subclass of one must still be checked before its
+#: parent would be. `StaleDataError` and every other fault keep their own,
+#: unmapped kinds (`_STALE_DATA`, `_HALTED`).
+_FAULT_ALERT_KINDS: tuple[tuple[type[Exception], str], ...] = (
+    (ReconciliationError, "reconciliation"),
+    (RejectionCapError, "rejection_cap"),
+    (SkipCapError, "skip_cap"),
+)
+
+
+def _alert_kind(fault: Exception) -> str:
+    """`_FAULT_ALERT_KINDS`'s kind for `fault`'s most specific mapped type, else
+    `_HALTED`. Not used for `StaleDataError`, which the caller maps to
+    `_STALE_DATA` itself."""
+    for cls, kind in _FAULT_ALERT_KINDS:
+        if isinstance(fault, cls):
+            return kind
+    return _HALTED
+
+
 #: The `Order` fields a replay must match exactly.
 _REPLAY_FIELDS = ("client_order_id", "symbol", "side", "notional", "quantity")
 _OK = "ok"
@@ -1182,9 +1210,10 @@ class RiskGatedBroker:
 
         stamp()  # one checked reading first, so a clock gone bad since sets clock_fault
         message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
+        alert_kind = _STALE_DATA if stale else _alert_kind(fault)
         try:
             self._alerter.write(
-                _STALE_DATA if stale else _HALTED,
+                alert_kind,
                 run.run_id,
                 self._session(run, stamp),
                 message,
