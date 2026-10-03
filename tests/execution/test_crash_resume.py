@@ -35,7 +35,7 @@ from execution.test_run_core import Clock as CoreClock
 from execution.test_run_core import Env as CoreEnv
 from execution.test_run_core import _at as core_at
 from execution.test_run_core import _marked as core_marked
-from execution.test_run_stop import buy_id
+from execution.test_run_stop import buy_id, request_stop, sell_id
 from execution.test_run_trade import (
     F_0,
     F_0_PLUS_1,
@@ -44,11 +44,19 @@ from execution.test_run_trade import (
     Clock,
     Env,
     at,
+    bought,
     env,
     window,
 )
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
-from tradepartner.adapters.fake_broker import Expire, FakeBroker, Reject, TransportFault
+from tradepartner.adapters.fake_broker import (
+    Expire,
+    FakeBroker,
+    PartialFill,
+    Reject,
+    TransportFault,
+)
+from tradepartner.calendar import last_session_of_month, next_session, previous_session
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ReconciliationError, RejectionCapError, SkipCapError, StaleDataError
 from tradepartner.execution import alerts as alerts_module
@@ -57,7 +65,7 @@ from tradepartner.execution import resume as resume_module
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN
+from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
 from tradepartner.execution.resume import RELEASED
 from tradepartner.execution.window import stop as window_stop
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
@@ -589,12 +597,21 @@ def _check_frozen_json(window: PaperWindowRow) -> str:
 def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_reopens_it(
     env: Env, window: PaperWindowRow
 ) -> None:
-    """DUALB's F_0 buy is rejected (no fill), SPFT's expires outright (no
-    fill), TRNS's fills whole: once each one's horizon is due, `paper
-    check`'s chain query returns zero incomplete chains, each outcome row
-    carries the req 8 kind that fits its terminal state and side, and a
-    deliberately deleted terminal event makes the query return that order
-    again."""
+    """F_0: TRNS's buy is scripted a transport fault (never received,
+    submitted last; settled `not_received` by `paper resume`); DUALB's and
+    SPFT's buys, already `accepted`, are cancelled by the halt's own
+    best-effort cancel (reason `halt`) — the sixth fate (`cancelled`),
+    distinct from `not_received`. `paper resume` releases while nothing is
+    held yet (the window's last mark is still cash-only, #653's bug does
+    not apply). The next run re-attempts all three for the same pending
+    rebalance: DUALB's is rejected, SPFT's expires, TRNS's fills whole
+    (`position_return`, held). A stop then sells TRNS, filling whole
+    (`realised_pnl`, a sell) — covering every fate the plan line lists
+    except the partial fill (its own `xfail`ed test, below, found a real
+    ledger defect, #650). Once every outcome is due, `paper check`'s chain
+    query returns zero incomplete chains, each outcome row carries the req
+    8 kind that fits its terminal state and side, and a deliberately
+    deleted terminal event makes the query return that order again."""
     assert window.window_id is not None
     with env.connect() as conn:
         conn.execute(
@@ -602,18 +619,55 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
             [_check_frozen_json(window), window.window_id],
         )
 
-    dualb_coid = buy_id(env, F_0, "SEC_DUAL_B")
-    spft_coid = buy_id(env, F_0, "SEC_SPLIT_FUTURE")
-    trns_coid = buy_id(env, F_0, "SEC_TRANSFER")
-    env.fake.script(Reject(), client_order_id=dualb_coid)
-    env.fake.script(Expire(), client_order_id=spft_coid)
+    trns_buy_1 = buy_id(env, F_0, "SEC_TRANSFER")
+    dualb_buy_1 = buy_id(env, F_0, "SEC_DUAL_B")
+    spft_buy_1 = buy_id(env, F_0, "SEC_SPLIT_FUTURE")
+    env.fake.script(TransportFault(), client_order_id=trns_buy_1)
+    with pytest.raises(Exception, match="transport error"):
+        env.run(at(F_0))
+    # DUALB's and SPFT's buys, submitted before TRNS's, are accepted then
+    # cancelled by the halt (reason `halt`); TRNS's never reaches the fake.
+    for coid in (dualb_buy_1, spft_buy_1):
+        statuses = [
+            s
+            for (s,) in env.query(
+                "SELECT status FROM order_events WHERE client_order_id = ? ORDER BY known_at",
+                [coid],
+            )
+        ]
+        assert statuses[1] == "accepted" and statuses[-1] == "cancelled"
+    assert [
+        s
+        for (s,) in env.query(
+            "SELECT status FROM order_events WHERE client_order_id = ? ORDER BY known_at",
+            [trns_buy_1],
+        )
+    ] == ["pending"]
 
-    first = env.run(at(F_0))
-    assert first.status == "ok", env.result(env.latest_run())
-    assert env.held().get("TRNS", 0.0) > 0.0
-    assert "DUALB" not in env.held() and "SPFT" not in env.held()
+    released = _resume(env)
+    assert released.status == RELEASED, released.reasons
+    last = env.query(
+        "SELECT status, reason FROM order_events WHERE client_order_id = ? ORDER BY known_at",
+        [trns_buy_1],
+    )
+    assert last[-1] == ("cancelled", "not_received")
 
-    nxt = env.run(at(date(2019, 6, 3)))  # well past T_0's due threshold (T_1)
+    dualb_buy_2 = buy_id(env, MAY_2, "SEC_DUAL_B")
+    spft_buy_2 = buy_id(env, MAY_2, "SEC_SPLIT_FUTURE")
+    trns_buy_2 = buy_id(env, MAY_2, "SEC_TRANSFER")
+    env.fake.script(Reject(), client_order_id=dualb_buy_2)
+    env.fake.script(Expire(), client_order_id=spft_buy_2)
+    reattempt = env.run(at(MAY_2))
+    assert reattempt.status == "ok", env.result(env.latest_run())
+    assert sorted(env.held()) == ["TRNS"]
+
+    request_stop(env, at(MAY_2, 22, 0))
+    trns_sell_1 = sell_id(env, MAY_3, "SEC_TRANSFER")
+    stop_outcome = env.run(at(MAY_3))
+    assert stop_outcome.status == "ok", env.result(env.latest_run())
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+    nxt = env.run(at(date(2019, 7, 31)))  # well past every order's due threshold
     assert nxt.status == "ok", env.result(env.latest_run())
 
     with env.connect() as conn:
@@ -626,45 +680,80 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
             k for (k,) in env.query("SELECT kind FROM outcomes WHERE client_order_id = ?", [coid])
         }
 
-    assert kinds_of(dualb_coid) == {NOT_EXECUTED}  # rejected, zero fill
-    assert kinds_of(spft_coid) == {NOT_EXECUTED}  # expired, zero fill
-    assert kinds_of(trns_coid) == {POSITION_RETURN}  # filled whole
+    assert kinds_of(trns_buy_1) == {NOT_EXECUTED}  # cancelled (not_received), zero fill
+    assert kinds_of(dualb_buy_1) == {NOT_EXECUTED}  # cancelled (halt), zero fill
+    assert kinds_of(spft_buy_1) == {NOT_EXECUTED}  # cancelled (halt), zero fill
+    assert kinds_of(dualb_buy_2) == {NOT_EXECUTED}  # rejected, zero fill
+    assert kinds_of(spft_buy_2) == {NOT_EXECUTED}  # expired, zero fill
+    assert kinds_of(trns_buy_2) == {POSITION_RETURN}  # filled whole, held
+    assert kinds_of(trns_sell_1) == {REALISED_PNL}  # filled whole, a sell
 
     with env.connect() as conn:
         conn.execute(
             "DELETE FROM order_events WHERE client_order_id = ? AND status = 'rejected'",
-            [dualb_coid],
+            [dualb_buy_2],
         )
     with env.connect() as conn:
         lines = check_module.check(conn, env.settings)
     chain = next(line for line in lines if line.name == "chain")
     assert not chain.passed
-    assert dualb_coid in chain.detail
+    assert dualb_buy_2 in chain.detail
 
 
 # --- cent rounding stays within the reconcile tolerance -------------------------------------
 
 
+def _price_every_symbol(env: Env, session: date) -> None:
+    """`Env.price_at`'s job, but for every ticker with a price that session,
+    not just the fixed `SYMBOLS` set: the real momentum universe can pick a
+    name outside that set over several real months."""
+    rows = env.query(
+        "SELECT l.ticker, p.close FROM prices_daily p "
+        "JOIN listings l ON l.security_id = p.security_id "
+        "WHERE p.session = ? AND l.valid_from = ("
+        "  SELECT max(l2.valid_from) FROM listings l2 "
+        "  WHERE l2.security_id = l.security_id AND l2.valid_from <= p.session"
+        ")",
+        [previous_session(session)],
+    )
+    for ticker, close in rows:
+        env.prices[ticker] = float(close)
+
+
 def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
-    env: Env, window: PaperWindowRow
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fake that rounds each fill to the cent (`round_cash_to_cent=True`)
-    stays within `risk.reconcile_cash_tolerance` over the fixed 3-name
-    universe's F_0 rebalance and its next month's catch-up, with the
-    rounding actually exercised (at least one fill not an exact cent
-    itself). Running the full `paper.min_rebalances` (6) span is not done
-    here: `Env.price_at` only prices the fixed `SYMBOLS` set (module
-    docstring), and a later month's momentum universe can pick a name
-    outside it (observed: `SEC_SPLIT_BETWEEN`/SPBT), which needs a broader
-    `Env` than this file builds; flagged as a follow-up, not fixed here."""
+    stays within `risk.reconcile_cash_tolerance` over `paper.min_rebalances`
+    (6, the config default) months of fills, with the rounding actually
+    exercised (at least one fill not an exact cent itself). Position limits
+    are loosened to 1.0 (the other tests' `FROZEN` is tuned for a fixed
+    3-name, one-third-each portfolio, not whatever the real momentum
+    universe picks each month), and `price_at` is widened to every ticker
+    with a price that session, not just the fixed `SYMBOLS` set, so a later
+    month's pick is never missing a price."""
+    env.open_window(
+        frozen=FROZEN.model_copy(
+            update={"max_position_weight": 1.0, "max_order_notional_fraction": 1.0}
+        ),
+        tmp_path=tmp_path,
+    )
+    monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
     env.new_fake(round_cash_to_cent=True)
 
-    for session in (F_0, date(2019, 6, 3)):
+    min_rebalances = Settings().paper.min_rebalances
+    sessions = [F_0]
+    year, month = F_0.year, F_0.month
+    for _ in range(min_rebalances - 1):
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+        sessions.append(next_session(last_session_of_month(year, month)))
+
+    for session in sessions:
         outcome = env.run(at(session))
         assert outcome.status == "ok", env.result(env.latest_run())
 
     rows = env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id")
-    assert len(rows) >= 2  # not a vacuous pass on an empty table
+    assert len(rows) >= min_rebalances  # not a vacuous pass on an empty table
     assert all(status == "ok" for (status,) in rows)
 
     fills = env.query("SELECT price, quantity FROM fills")
@@ -950,3 +1039,64 @@ def test_skip_cap_alert_kind_is_not_yet_written(
     with pytest.raises(SkipCapError):
         alerting_env.run(at(F_0))
     assert alerting_env.alerts("skip_cap") != []
+
+
+# --- a genuine ledger/resume defect found while building the chain criterion ------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#653: resume._mark_equity requires a security_id IS NULL row at the window's "
+    "last mark, but marks.marks_for never writes one once anything is held, so resume "
+    "refuses every release while the window holds a position",
+)
+def test_resume_releases_while_the_window_holds_a_marked_position(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """A real mark written by a completed run that holds positions (the
+    production path, `marks.marks_for`) never carries a `security_id IS
+    NULL` cash-only row once anything is held (its own docstring: "a
+    session with nothing held gets one [...] row"); `resume._mark_equity`
+    requires exactly one such row to compute the drawdown peak and returns
+    `None` otherwise. `paper resume` should still release (equity is
+    obviously positive — cash plus three held names' values)."""
+    bought(env)  # DUALB, SPFT, TRNS filled; this run's own mark is cash-only (covers T_0)
+    marked = env.run(at(MAY_2))  # a mark run: writes F_0's mark, now with the three positions
+    assert marked.status == "ok", env.result(env.latest_run())
+    engaged = switch.engage(
+        env.settings, env.clock, window_id=window.window_id, source="owner", reason="test"
+    )
+    assert isinstance(engaged, int)
+
+    outcome = _resume(env)
+    assert outcome.status == RELEASED, outcome.reasons
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#650: ledger.from_journal drops a fill whose known_at ties the cash base "
+    "reconciliation's own known_at, undercounting cash spent and causing a false "
+    "ReconciliationError on the next reconciliation",
+)
+def test_a_partial_fill_at_submit_time_does_not_cause_a_false_cash_mismatch(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """SPFT's buy is scripted a 1-share partial fill, applied inside its own
+    `submit()` call (before any `sleep()`), so it is journaled with the same
+    `known_at` as step 4's reconciliation, which ran moments earlier with
+    the static test clock. `fill_open()` then fills the remainder during
+    `sleep()`. Both fills are correctly journaled (`fills_for` sums to the
+    full notional, matching the broker's own cash), but
+    `ledger.from_journal`'s `after_base` uses a strict `>`, excluding the
+    tied first fill from the ledger's incremental cash delta — a $23.90
+    (one share's price) false `cash` mismatch on this fixture. The run
+    should end `ok`."""
+    spft_coid = buy_id(env, F_0, "SEC_SPLIT_FUTURE")
+    spft_price = env.query(
+        "SELECT close FROM prices_daily WHERE security_id = 'SEC_SPLIT_FUTURE' AND session = ?",
+        [date(2019, 4, 30)],
+    )[0][0]
+    env.fake.script(PartialFill(1.0, float(spft_price)), client_order_id=spft_coid)
+
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
