@@ -298,6 +298,18 @@ def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
     return session_close(holdout_end) <= now
 
 
+def _cost_drifted(registered_value: Any, live_value: float) -> bool:
+    """Whether a registered cost value differs from the live one, true also
+    for a registered value `float()` cannot parse (a string or null): that is
+    drift too, refused the same way as a numeric mismatch (`costs_drift`,
+    #580 item 1), never a plain `ValueError`/`TypeError` escaping to the
+    caller."""
+    try:
+        return float(registered_value) != float(live_value)
+    except (TypeError, ValueError):
+        return True
+
+
 def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
     `FROZEN_PAPER_KEYS` under `paper.*`, `FROZEN_COSTS_KEYS` under `costs.*` and
@@ -320,7 +332,7 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
         f"{registered.get(f'{_COSTS_PREFIX}{k}')!r}"
         for k in FROZEN_COSTS_KEYS
         if f"{_COSTS_PREFIX}{k}" not in registered
-        or float(registered[f"{_COSTS_PREFIX}{k}"]) != float(costs[k])
+        or _cost_drifted(registered[f"{_COSTS_PREFIX}{k}"], costs[k])
     ]
     if drift:
         raise StartRefusedError(

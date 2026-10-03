@@ -1352,16 +1352,51 @@ def _listings(
 ) -> tuple[dict[str, str | None], frozenset[str]]:
     """Each name's ticker (its current listing at S among rows known at
     close(S-1); None without one) and the names whose listing ended
-    (`delisted`) at close(S-1)."""
+    (`delisted`) at close(S-1).
+
+    A name's own ticker must not also be some other security's current
+    ticker as of close(S-1): a delisted name whose ticker a later issuer
+    reused would otherwise let the `assets` read resolve against the new
+    issuer, not the one this read means (#568 item 2). Checked against the
+    whole universe, not just `names`, and failed closed before any broker
+    call."""
     if not names:
         return {}, frozenset()
     cut = session_close(previous_session(session))
     current = current_listings(listings_as_of(conn, cut, list(names)), session)
     tickers = {sid: (str(current[sid]["ticker"]) if sid in current else None) for sid in names}
+    _refuse_reused_tickers(conn, cut, session, tickers)
     ends = current_listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
     return tickers, frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+
+
+def _refuse_reused_tickers(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    session: date,
+    tickers: Mapping[str, str | None],
+) -> None:
+    """Every ticker in `tickers` must be, as of close(S-1), the current
+    ticker of exactly one security across the whole universe; a ticker two
+    distinct security_ids both currently hold (one of them stale, the other
+    a later issuer who reused it) is ambiguous for the `assets` read and
+    refused before it is made."""
+    universe = current_listings(listings_as_of(conn, cut), session)
+    owners: dict[str, set[str]] = {}
+    for sid, row in universe.items():
+        owners.setdefault(str(row["ticker"]), set()).add(sid)
+    collisions = {
+        sid: ticker
+        for sid, ticker in tickers.items()
+        if ticker is not None and len(owners.get(ticker, set())) > 1
+    }
+    if collisions:
+        raise ValueError(
+            "ticker reused by another security as of close(S-1), the assets read would be "
+            f"ambiguous: {collisions}"
+        )
 
 
 def _last_ok_ingest(conn: duckdb.DuckDBPyConnection) -> datetime | None:

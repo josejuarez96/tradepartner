@@ -316,6 +316,79 @@ def test_a_second_run_on_the_session_leaves_an_accepted_exit_sell_alone(
     assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
 
 
+def test_an_unanswered_delisted_name_halts_the_whole_sells_phase(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's decision on #410 (2026-10-01) keeps this fail-closed until
+    T48c: a forced-exit name the broker's `assets` read does not answer for
+    (`wrapper._phase_assets`) halts the whole sells phase, the rebalance's
+    sells included, before anything is submitted (#568 item 1)."""
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    original_assets = env.fake.assets
+
+    def unanswering(symbols: list[str]) -> dict[str, Asset]:
+        # The run's own pre-read (`run._Run.assets_read`, for every held
+        # position) must still answer, so only the wrapper's own sells-phase
+        # read (`wrapper._phase_assets`, asked for just the forced-exit
+        # name) goes unanswered.
+        answer = original_assets(symbols)
+        if list(symbols) == ["TRNS"]:
+            answer.pop("TRNS", None)
+        return answer
+
+    monkeypatch.setattr(env.fake, "assets", unanswering)
+
+    with pytest.raises(ValueError, match=r"the assets read did not answer for \['TRNS'\]"):
+        env.run(at(MAY_3))
+
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+    ((_decision_id, reason, side, _run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side) == ("delisted", "sell")
+    status, fault_type, _message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "ValueError")
+
+
+def test_a_reused_ticker_never_resolves_to_the_new_issuers_asset(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """SEC_TRANSFER's ticker (TRNS) is picked up by a new issuer, a listing
+    known at close(S-1): the forced exit for the delisted SEC_TRANSFER must
+    never resolve its `assets` read against that reused symbol, since the
+    broker would answer for the new issuer, not the one this run means. It
+    fails closed instead of submitting anything (#568 item 2)."""
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    with pytest.raises(ValueError, match="TRNS"):
+        env.run(at(MAY_3))
+
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+
+
 class _NoBroker:
     """A gate or broker that fails the test on any use."""
 
