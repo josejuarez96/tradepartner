@@ -5,7 +5,9 @@ No network, no git: every function under test is pure. AC numbers are the spec's
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import json
 import re
 import sys
 from collections.abc import Sequence
@@ -497,9 +499,22 @@ class FakeRunner:
         self.sleeps = 0
         self.calls: list[str] = []
         self._pending: int | None = None
+        # -- merge (plan T72c) --
+        self.main_history: list[str] = [base]
+        self.tree_for: dict[str, str] = {base: f"tree:{base}"}
+        self.parent_for: dict[str, str] = {}
+        self.merge_script: dict[int, list[object]] = {}
+        self.merge_calls: list[tuple[int, str]] = []
+        self.fail_delete_branches: set[str] = set()
+        self.landed_tree_override: dict[int, str] = {}
 
     def add_pr(
-        self, number: int, *, diff_paths: tuple[str, ...] | None = None, **pr_overrides: object
+        self,
+        number: int,
+        *,
+        diff_paths: tuple[str, ...] | None = None,
+        comments: tuple[object, ...] = (),
+        **pr_overrides: object,
     ) -> None:
         head = f"head{number}"
         branch = f"feat/{number}-x"
@@ -522,7 +537,7 @@ class FakeRunner:
         pr = mt.PullRequest(**fields)
         data = mt.PrData(
             pr,
-            (),
+            comments,
             _checks(sha=head),
             diff_paths or (f"src/mod_{number}.py", f"changelog.d/{number}-x.md"),
         )
@@ -533,9 +548,12 @@ class FakeRunner:
     def script_run(self, sha: str, infos: Sequence[object]) -> None:
         self.run_script[sha] = list(infos)
 
+    def script_merge(self, number: int, outcomes: Sequence[object]) -> None:
+        self.merge_script[number] = list(outcomes)
+
     # -- Runner protocol --
     def main_sha(self) -> str:
-        return self.base
+        return self.main_history[-1]
 
     def open_pr_numbers(self) -> list[int]:
         return list(self.open_numbers)
@@ -588,8 +606,32 @@ class FakeRunner:
             raise RuntimeError(f"push to {branch} failed")
         self.pushed[branch] = ref
 
-    def delete_branch(self, branch: str) -> None:
+    def delete_branch(self, branch: str) -> bool:
         self.deleted_branches.append(branch)
+        return branch not in self.fail_delete_branches
+
+    def tree_of_ref(self, ref: str) -> str:
+        sha = self.main_history[-1] if ref in ("origin/main", "HEAD") else ref
+        return self.tree_for.get(sha, f"tree:{sha}")
+
+    def parent_of(self, sha: str) -> str:
+        return self.parent_for.get(sha, "")
+
+    def merge_pr(self, number: int, head: str) -> object:
+        self.merge_calls.append((number, head))
+        queue = self.merge_script.get(number)
+        attempt = (
+            queue.pop(0)
+            if queue and len(queue) > 1
+            else (queue[0] if queue else mt.MergeAttempt("merged"))
+        )
+        if attempt.outcome == "merged":
+            pos = len(self.main_history)
+            new_sha = f"main{pos}"
+            self.tree_for[new_sha] = self.landed_tree_override.get(number, f"t{pos}")
+            self.parent_for[new_sha] = self.main_history[-1]
+            self.main_history.append(new_sha)
+        return attempt
 
     def find_run(self, sha: str, branch: str) -> object:
         queue = self.run_script.get(sha)
@@ -852,6 +894,98 @@ def test_build_treats_a_fork_pr_as_ineligible_and_never_touches_its_head() -> No
     assert record.outcome == "green"
 
 
+def test_post_prints_the_full_comment_text_not_just_its_first_line() -> None:
+    """#524, follow-up 4: req 8 says "the same text is printed and written to the record"."""
+    fake = FakeRunner()
+    printed: list[str] = []
+    text = "merge-train: HELD batch b\nreason: x\nmore detail on a later line"
+    mt._post(fake, printed.append, 5, text)
+    assert "reason: x" in printed[0]
+    assert "more detail on a later line" in printed[0]
+    assert fake.comments_posted == [(5, text)]
+
+
+def test_bisect_posts_inconclusive_to_untested_prs_after_an_inconclusive_probe() -> None:
+    """#524, follow-up 5: an inconclusive probe (not a confirmed red) stops the bisect with
+    no culprit; the PRs beyond the last green prefix get the `INCONCLUSIVE` comment req 8
+    names for that case, not just a note in the record's `detail`."""
+    fake = _batch(5)
+    fake.script_run(fake.base, [GREEN_MAIN])
+    fake.script_run("commit5", [RED, CONFIRM_RED])  # the full batch, confirmed red
+    fake.script_run("commit2", [GREEN_FULL])  # probe prefix 2: green
+    fake.script_run("commit3", [_run(status="in_progress", conclusion=None)])  # probe 3
+    record = mt.run_build(fake, None, None, timeout_s=0, poll_s=0)
+    assert record.culprit is None
+    assert record.held == [3, 4, 5]
+    held_texts = {n: t for n, t in fake.comments_posted if n in (3, 4, 5)}
+    assert set(held_texts) == {3, 4, 5}
+    assert all(t.startswith("merge-train: INCONCLUSIVE") for t in held_texts.values())
+
+
+def test_shell_runner_find_run_filters_by_workflow_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#524, follow-up 2: a second workflow must never be matched here by accident."""
+    runner = mt.ShellRunner(tmp_path)
+    captured: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str) -> str:
+        captured.append(args)
+        return json.dumps([])
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    runner.find_run("sha", "train/x")
+    assert captured and "--workflow" in captured[0] and "ci.yml" in captured[0]
+
+
+class _Proc:
+    def __init__(self, returncode: int, stdout: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_shell_runner_pr_data_fails_closed_on_a_fetch_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#524, follow-up 3: a push to the PR between reading its metadata and fetching its
+    head must fail closed rather than diff against a stale head."""
+    runner = mt.ShellRunner(tmp_path)
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"nameWithOwner": REPO})
+        if args[:2] == ("pr", "view"):
+            return json.dumps(
+                {
+                    "number": 7,
+                    "author": {"login": OWNER},
+                    "isCrossRepository": False,
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "headRefName": "feat/7-x",
+                    "headRefOid": "a" * 40,
+                    "body": "",
+                    "labels": [],
+                    "comments": [],
+                    "title": "x",
+                }
+            )
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    def fake_git(cwd: Path, *args: str, check: bool = True) -> _Proc:
+        if args[:2] == ("fetch", "-q"):
+            return _Proc(0, "")
+        if args[:2] == ("rev-parse", "FETCH_HEAD"):
+            return _Proc(0, "b" * 40 + "\n")  # a different sha: the PR moved underneath us
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    monkeypatch.setattr(runner, "_git", fake_git)
+    with pytest.raises(mt.StoppedError, match="stale head"):
+        runner.pr_data(7)
+
+
 def test_classified_never_reads_a_stale_report_of_the_reran_attempt() -> None:
     """SHOULD FIX 2: a confirming rerun must read a later attempt, never the one it reran,
     even when `find_run` still briefly reports the old attempt as `completed`/`failure`."""
@@ -865,6 +999,54 @@ def test_classified_never_reads_a_stale_report_of_the_reran_attempt() -> None:
     assert fake.rerun_calls == [RED.run_id]
 
 
+def test_shell_runner_pr_data_never_fetches_a_fork_prs_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#524, follow-up 1: a `ShellRunner`-level regression test for the fork-PR ordering fix
+    (SHOULD FIX 1, safety review of #521). `gh` is stubbed (no network); `git` is real
+    against a local temp repo, so a fetch of the fork PR's head would actually run here if
+    the ordering ever regressed."""
+    subprocess_run = __import__("subprocess").run
+    subprocess_run(["git", "init", "-q", str(tmp_path)], check=True)
+    runner = mt.ShellRunner(tmp_path)
+    git_calls: list[tuple[str, ...]] = []
+    real_git = runner._git
+
+    def spying_git(cwd: Path, *args: str, check: bool = True) -> object:
+        git_calls.append(args)
+        return real_git(cwd, *args, check=check)
+
+    monkeypatch.setattr(runner, "_git", spying_git)
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"nameWithOwner": REPO})
+        if args[:2] == ("pr", "view"):
+            return json.dumps(
+                {
+                    "number": 42,
+                    "author": {"login": "someone-else"},
+                    "isCrossRepository": True,
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "headRefName": "feat/42-x",
+                    "headRefOid": "f" * 40,
+                    "body": "",
+                    "labels": [],
+                    "comments": [],
+                    "title": "x",
+                }
+            )
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    data = runner.pr_data(42)
+    assert data.pr.head_repo != data.pr.repo
+    assert data.diff_paths == ()
+    assert not any(call[:1] == ("fetch",) for call in git_calls)
+
+
 def test_shell_runner_refuses_to_push_or_delete_a_non_train_branch(tmp_path: Path) -> None:
     """SHOULD FIX 4: the push/delete seam refuses anything outside `train/*`, independent
     of `build` only ever constructing `train/*` names."""
@@ -875,3 +1057,235 @@ def test_shell_runner_refuses_to_push_or_delete_a_non_train_branch(tmp_path: Pat
         runner.push(tmp_path, "HEAD", "main")
     with pytest.raises(mt.StoppedError):
         runner.delete_branch("main")
+
+
+# === `merge`, `status`, `prune` (plan T72c) ================================================
+
+
+def _merge_record(fake: FakeRunner, n: int, green: Sequence[int]) -> object:
+    """A frozen `Record` matching a `FakeRunner` batch of `n` PRs, with the real `TESTED`
+    comments it would carry injected into each PR's fake comments (req 7), and written to
+    the (test-private) record directory so `run_merge` can load it."""
+    prs = [
+        mt.PrEntry(
+            number=i,
+            head=fake.pr_registry[i].pr.head,
+            branch=fake.pr_registry[i].pr.branch,
+            issue=i,
+            state="accepted",
+        )
+        for i in range(1, n + 1)
+    ]
+    record = mt.Record(
+        batch_id="20261001-090507-0123456",
+        built_at="2026-10-01T09:05:07+00:00",
+        base=fake.base,
+        main_green_at_base=True,
+        requested="all",
+        prs=prs,
+        trees=[f"t{k}" for k in range(n + 1)],
+        train_branch="train/20261001-090507-0123456",
+        outcome="green" if list(green) == [n] else "red",
+        green_prefixes=list(green),
+    )
+    for number, texts in _tested(record).items():
+        comments = tuple(mt.Comment(author=OWNER, body=t) for t in texts)
+        old = fake.pr_registry[number]
+        fake.pr_registry[number] = mt.PrData(old.pr, comments, old.head_checks, old.diff_paths)
+    mt._save(record)
+    return record
+
+
+def _texts(fake: FakeRunner, outcome: str) -> dict[int, str]:
+    return {n: t for n, t in fake.comments_posted if t.startswith(f"merge-train: {outcome}")}
+
+
+# -- AC10: a green batch merges in order, and nothing merges before verification --------
+
+
+def test_merge_lands_a_green_batch_in_order_with_match_head_commit() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    merged = mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == [(i, f"head{i}") for i in range(1, 5)]
+    assert merged.merge is not None and merged.merge.stopped_at_position is None
+    assert [m["number"] for m in merged.merge.merged] == [1, 2, 3, 4]
+    assert set(_texts(fake, "MERGED")) == {1, 2, 3, 4}
+    assert fake.deleted_branches == [record.train_branch]
+
+
+def test_merge_never_calls_gh_before_the_record_check_passes() -> None:
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    old = fake.pr_registry[2]
+    fake.pr_registry[2] = mt.PrData(old.pr, (), old.head_checks, old.diff_paths)  # drop TESTED
+    with pytest.raises(mt.StoppedError, match="TESTED"):
+        mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == []
+
+
+# -- AC11: a head changed since build, and `main` no longer at `base` -------------------
+
+
+def test_merge_shrinks_to_a_green_probe_when_a_head_changed() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [2, 4])
+    old = fake.pr_registry[3]
+    fake.pr_registry[3] = mt.PrData(
+        dataclasses.replace(old.pr, head="newhead3"), old.comments, old.head_checks, old.diff_paths
+    )
+    merged = mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == [(1, "head1"), (2, "head2")]
+    assert merged.merge is not None and merged.merge.stopped_at_position == 3
+    assert set(_texts(fake, "HELD")) == {3, 4}
+
+
+def test_merge_refuses_when_main_no_longer_equals_base() -> None:
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    fake.main_history = ["somewhere-else"]
+    with pytest.raises(mt.StoppedError, match="rerun build"):
+        mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == []
+
+
+# -- AC12: retried, refused on every attempt, and a landed-tree mismatch ----------------
+
+
+def test_merge_retries_a_not_yet_mergeable_pr_then_succeeds() -> None:
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    fake.script_merge(
+        2,
+        [
+            mt.MergeAttempt("retryable", "x"),
+            mt.MergeAttempt("retryable", "x"),
+            mt.MergeAttempt("merged"),
+        ],
+    )
+    merged = mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls.count((2, "head2")) == 3
+    assert merged.merge is not None and merged.merge.stopped_at_position is None
+    assert fake.sleeps == 2
+
+
+def test_merge_stops_when_a_pr_refuses_every_attempt() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.script_merge(2, [mt.MergeAttempt("retryable", "nope")] * mt.MERGE_RETRY_ATTEMPTS)
+    merged = mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls.count((2, "head2")) == mt.MERGE_RETRY_ATTEMPTS
+    assert merged.merge is not None and merged.merge.stopped_at_position == 2
+    assert {3, 4} <= set(_texts(fake, "HELD"))
+    assert 2 not in _texts(fake, "MERGED")
+
+
+def test_merge_stops_on_a_landed_tree_mismatch() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.landed_tree_override[2] = "wrong-tree"
+    merged = mt.run_merge(fake, record.batch_id)
+    assert merged.merge is not None and merged.merge.stopped_at_position == 3
+    assert set(_texts(fake, "MERGED")) == {1, 2}
+    assert set(_texts(fake, "HELD")) == {3, 4}
+    assert "untested at main's head" in (merged.merge.reason or "")
+
+
+# -- AC13: an edited record refuses before any merge; an unedited red batch's green ------
+# -- prefix merges; `merge` takes no PR numbers or order flags --------------------------
+
+
+def test_merge_refuses_an_edited_record_before_any_merge() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    edited = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    edited.prs[0], edited.prs[1] = edited.prs[1], edited.prs[0]
+    mt._save(edited)
+    with pytest.raises(mt.StoppedError, match="TESTED"):
+        mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == []
+
+
+def test_merge_accepts_an_unedited_red_batch_with_a_green_prefix() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [2])
+    record.outcome, record.culprit, record.held = "red", 3, [4]
+    mt._save(record)
+    merged = mt.run_merge(fake, record.batch_id)
+    assert fake.merge_calls == [(1, "head1"), (2, "head2")]
+    assert merged.merge is not None
+
+
+def test_merge_argparse_takes_only_the_batch_id_and_resume() -> None:
+    parser = mt.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["merge", "20261001-090507-0123456", "5"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["merge", "20261001-090507-0123456", "--order", "1", "2"])
+    args = parser.parse_args(["merge", "20261001-090507-0123456", "--resume"])
+    assert args.batch_id == "20261001-090507-0123456"
+    assert args.resume is True
+
+
+# -- AC17: `merge --resume`, both halves, and a landed-tree mismatch refuses -------------
+
+
+def test_merge_resume_continues_after_a_stop() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.script_merge(3, [mt.MergeAttempt("retryable", "x")] * mt.MERGE_RETRY_ATTEMPTS)
+    stopped = mt.run_merge(fake, record.batch_id)
+    assert stopped.merge is not None and stopped.merge.stopped_at_position == 3
+    del fake.merge_script[3]
+    resumed = mt.run_merge(fake, record.batch_id, resume=True)
+    assert resumed.merge is not None and resumed.merge.stopped_at_position is None
+    assert [m["number"] for m in resumed.merge.merged] == [1, 2, 3, 4]
+
+
+def test_merge_resume_refuses_when_main_moved() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.script_merge(3, [mt.MergeAttempt("retryable", "x")] * mt.MERGE_RETRY_ATTEMPTS)
+    mt.run_merge(fake, record.batch_id)
+    fake.main_history.append("somewhere-else")
+    with pytest.raises(mt.StoppedError, match="rerun build"):
+        mt.run_merge(fake, record.batch_id, resume=True)
+
+
+def test_merge_resume_refuses_a_landed_tree_mismatch() -> None:
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.landed_tree_override[2] = "wrong-tree"
+    stopped = mt.run_merge(fake, record.batch_id)
+    assert stopped.merge is not None and stopped.merge.stopped_at_position == 3
+    with pytest.raises(mt.StoppedError, match="rerun build"):
+        mt.run_merge(fake, record.batch_id, resume=True)
+
+
+# -- `status` and `prune` ----------------------------------------------------------------
+
+
+def test_status_prints_one_record_or_lists_every_record() -> None:
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    printed: list[str] = []
+    mt.run_status(record.batch_id, say=printed.append)
+    assert record.batch_id in printed[0]
+    printed.clear()
+    mt.run_status(None, say=printed.append)
+    assert any(record.batch_id in line for line in printed)
+    with pytest.raises(mt.StoppedError):
+        mt.run_status("no-such-batch")
+
+
+def test_prune_deletes_finished_branches_but_keeps_inconclusive_ones() -> None:
+    fake = _batch(2)
+    green = _merge_record(fake, 2, [2])
+    inconclusive = mt.Record.from_json(green.to_json())
+    inconclusive.batch_id = "20261002-000000-0000000"
+    inconclusive.outcome = "inconclusive"
+    inconclusive.train_branch = "train/20261002-000000-0000000"
+    mt._save(inconclusive)
+    mt.run_prune(fake)
+    assert green.train_branch in fake.deleted_branches
+    assert inconclusive.train_branch not in fake.deleted_branches

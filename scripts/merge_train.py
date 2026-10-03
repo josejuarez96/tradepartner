@@ -420,6 +420,14 @@ class PrData:
 
 
 @dataclass(frozen=True)
+class MergeAttempt:
+    """What `gh pr merge --squash --match-head-commit` answered for one PR (req 6)."""
+
+    outcome: str  # merged | retryable | failed
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class RunInfo:
     """One CI run as `build` sees it while polling (`status` None: no run found yet)."""
 
@@ -448,12 +456,15 @@ class Runner(Protocol):
     def head_sha(self, worktree: Path) -> str: ...
     def tree_of(self, worktree: Path) -> str: ...
     def push(self, worktree: Path, ref: str, branch: str) -> None: ...
-    def delete_branch(self, branch: str) -> None: ...
+    def delete_branch(self, branch: str) -> bool: ...
     def find_run(self, sha: str, branch: str) -> RunInfo: ...
     def rerun(self, run_id: int) -> None: ...
     def post_comment(self, number: int, text: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
     def now(self) -> datetime: ...
+    def tree_of_ref(self, ref: str) -> str: ...
+    def parent_of(self, sha: str) -> str: ...
+    def merge_pr(self, number: int, head: str) -> MergeAttempt: ...
 
 
 # -- the record directory and worktree (spec Data / interfaces) -------------------------
@@ -631,7 +642,10 @@ def _run_bisect(
         culprit, held = bisect_result(green_k, red_k, [p.number for p in accepted])
         record.culprit, record.held = culprit, held
     elif probes and probes[-1].outcome == "inconclusive":
+        # the bisect itself stopped on an inconclusive probe (#524, follow-up 5): every PR
+        # beyond the last green prefix is untested, not just noted in the record's detail.
         record.detail = f"bisect stopped: probe {probes[-1].k} inconclusive"
+        record.held = [p.number for p in accepted[green_k:]]
     _save(record)
     _report_bisect(r, record, accepted, say)
 
@@ -650,9 +664,10 @@ def _green_prefix_urls(record: Record, total: int) -> dict[int, str]:
 
 
 def _post(r: Runner, say: Callable[[str], None], number: int, text: str) -> None:
-    """Post one train comment, and print it too: req 8, "the same text is printed and
-    written to the record". `say` is assumed to redact already (`run_build`'s wrapper)."""
-    say(f"#{number}: {text.splitlines()[0]}")
+    """Post one train comment, and print the same text too (req 8: "the same text is
+    printed and written to the record" - the full body, not just its first line, #524).
+    `say` is assumed to redact already (`run_build`'s wrapper)."""
+    say(f"#{number}:\n{text}")
     r.post_comment(number, text)
 
 
@@ -699,6 +714,19 @@ def _report_bisect(
                 say,
                 number,
                 comment("HELD", record.batch_id, reason=f"after the culprit #{record.culprit}"),
+            )
+    elif record.held:
+        # the bisect itself stopped on an inconclusive probe, with no culprit found (#524,
+        # follow-up 5): every PR beyond the last green prefix is untested, not a HELD-after-
+        # a-culprit PR, so it gets the INCONCLUSIVE comment req 8 names for that case.
+        for number in record.held:
+            _post(
+                r,
+                say,
+                number,
+                comment(
+                    "INCONCLUSIVE", record.batch_id, reason=record.detail or "bisect inconclusive"
+                ),
             )
 
 
@@ -875,6 +903,172 @@ def run_build_resume(
     return record
 
 
+# -- `merge`, `status`, `prune` (plan T72c) --------------------------------------------------
+#
+# `merge` is the only command that lands anything (reqs 6 and 7). It needs no worktree: the
+# tree checks read `origin/main^{tree}` after a fetch (`main_sha`) in the clone it ran in.
+
+MERGE_RETRY_ATTEMPTS = 5
+MERGE_RETRY_DELAY_S = 30  # five attempts over about two minutes (four 30s waits)
+
+
+def _merge_with_retries(
+    r: Runner, number: int, head: str, say: Callable[[str], None]
+) -> MergeAttempt:
+    attempt = MergeAttempt("retryable", "never attempted")
+    for i in range(MERGE_RETRY_ATTEMPTS):
+        attempt = r.merge_pr(number, head)
+        if attempt.outcome != "retryable":
+            return attempt
+        if i < MERGE_RETRY_ATTEMPTS - 1:
+            say(f"#{number} not yet mergeable ({attempt.detail}); retrying")
+            r.sleep(MERGE_RETRY_DELAY_S)
+    return attempt
+
+
+def run_merge(
+    r: Runner, bid: str, *, resume: bool = False, say: Callable[[str], None] = print
+) -> Record:
+    """`merge <batch id> [--resume]` (req 6, req 7): land the longest green prefix that
+    still verifies, PR by PR, and stop before the next merge on any failure."""
+    report = say
+    say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
+    path = record_path(bid)
+    if not path.exists():
+        raise StoppedError(f"no record for batch {bid}; run build first")
+    record = Record.from_json(path.read_text())
+    accepted = record.accepted()
+    n = len(accepted)
+
+    if resume:
+        if record.merge is None or record.merge.stopped_at_position is None:
+            raise StoppedError(f"batch {bid} was not stopped; nothing to resume")
+        start = record.merge.stopped_at_position
+        merged_so_far = list(record.merge.merged)
+        last_sha = merged_so_far[-1]["main_sha"] if merged_so_far else record.base
+        last_tree = merged_so_far[-1]["tree"] if merged_so_far else record.trees[0]
+        current = r.main_sha()
+        if current != last_sha or r.tree_of_ref(current) != last_tree:
+            raise StoppedError(
+                f"batch {bid}: origin/main does not match the recorded stop point; rerun build"
+            )
+        record.merge.resumed_at = r.now().isoformat()
+    else:
+        start, merged_so_far = 1, []
+        current = r.main_sha()
+        if current != record.base:
+            raise StoppedError(
+                f"batch {bid}: origin/main ({current[:7]}) is not base {record.base[:7]}; "
+                "rerun build"
+            )
+        record.merge = MergeLog(started_at=r.now().isoformat())
+    _save(record)
+
+    # req 7: the frozen record must still match the owner's TESTED comments.
+    owner_comments: dict[int, list[str]] = {}
+    pr_data_by_number: dict[int, PrData] = {}
+    for pr_entry in record.prs:
+        data = r.pr_data(pr_entry.number)
+        pr_data_by_number[pr_entry.number] = data
+        owner_comments[pr_entry.number] = owner_bodies(data.comments, data.pr.owner)
+    if not record_matches_comments(record, owner_comments):
+        raise StoppedError(f"batch {bid}'s record no longer matches its TESTED comments")
+
+    # req 6: re-verify every PR from `start` on; PRs already landed stay trivially valid.
+    still_valid = [True] * n
+    for idx in range(start - 1, n):
+        entry = accepted[idx]
+        data = pr_data_by_number[entry.number]
+        still_valid[idx] = (
+            eligibility(data.pr, data.head_checks, data.diff_paths, data.comments) is None
+            and data.pr.head == entry.head
+        )
+    target = mergeable_prefix(record, still_valid)
+
+    held_start = target + 1
+    for pos in range(start, target + 1):
+        entry = accepted[pos - 1]
+        if pr_data_by_number[entry.number].pr.head != entry.head:
+            held_start = pos
+            record.merge.reason = f"#{entry.number}'s head changed since build"
+            break
+        attempt = _merge_with_retries(r, entry.number, entry.head, say)
+        if attempt.outcome != "merged":
+            held_start = pos
+            record.merge.reason = f"#{entry.number} could not be merged: {attempt.detail}"
+            break
+        new_main = r.main_sha()
+        expected_tree = record.trees[pos]
+        previous_tip = merged_so_far[-1]["main_sha"] if merged_so_far else record.base
+        merged_so_far.append({"number": entry.number, "main_sha": new_main, "tree": expected_tree})
+        record.merge.merged = list(merged_so_far)
+        _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
+        _save(record)
+        if r.parent_of(new_main) != previous_tip or r.tree_of_ref(new_main) != expected_tree:
+            held_start = pos + 1
+            record.merge.reason = (
+                f"the tree landed for #{entry.number} does not match tree_{pos}: "
+                f"{new_main} is untested at main's head"
+            )
+            break
+
+    record.merge.stopped_at_position = held_start if held_start <= n else None
+    _save(record)
+    held_reason = record.merge.reason or "not re-verified"
+    for entry in accepted[held_start - 1 :]:
+        _post(r, say, entry.number, comment("HELD", bid, reason=held_reason))
+    _save(record)
+    say(
+        f"batch {bid}: merge complete"
+        if record.merge.stopped_at_position is None
+        else f"STOPPED: {record.merge.reason or 'merge stopped'}"
+    )
+
+    for branch in (record.train_branch, *(p.branch for p in record.probes)):
+        if not r.delete_branch(branch):
+            say(f"could not delete branch {branch}; remove it by hand")
+    return record
+
+
+def run_status(bid: str | None, say: Callable[[str], None] = print) -> None:
+    """`status [<batch id>]`: print one record, or list every record on this machine."""
+    if bid:
+        path = record_path(bid)
+        if not path.exists():
+            raise StoppedError(f"no record for batch {bid}")
+        say(path.read_text())
+        return
+    rdir = record_dir()
+    if not rdir.exists():
+        say("no batches recorded")
+        return
+    for path in sorted(rdir.glob("*.json")):
+        record = Record.from_json(path.read_text())
+        say(f"{record.batch_id}: {record.outcome} ({len(record.accepted())} accepted)")
+
+
+def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
+    """`prune`: remove leftover worktrees and delete `train/*` branches of finished batches
+    (outcome `green` or `red`; an `inconclusive` batch may still be resumed, so its branch
+    stays)."""
+    report = say
+    say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
+    rdir = record_dir()
+    if not rdir.exists():
+        say("nothing to prune")
+        return
+    for wpath in sorted(rdir.glob("worktree-*")):
+        say(f"removing leftover worktree {wpath}")
+        r.remove_worktree(wpath)
+    for path in sorted(rdir.glob("*.json")):
+        record = Record.from_json(path.read_text())
+        if record.outcome == "inconclusive":
+            continue
+        for branch in (record.train_branch, *(p.branch for p in record.probes)):
+            if not r.delete_branch(branch):
+                say(f"could not delete branch {branch}; remove it by hand")
+
+
 # -- the real runner ------------------------------------------------------------------------
 
 
@@ -973,6 +1167,15 @@ class ShellRunner:
         # the owner's own head may never have been fetched into this clone (a push from
         # another clone, or a GitHub "Update branch"); `refs/pull/<n>/head` always exists.
         self._git(self.root, "fetch", "-q", "origin", f"refs/pull/{number}/head", check=False)
+        # #524, follow-up 3: a push to the PR between reading its metadata and this fetch
+        # would otherwise compute the diff against a stale head; fail closed instead.
+        fetched = self._git(self.root, "rev-parse", "FETCH_HEAD", check=False)
+        fetched_sha = fetched.stdout.strip() if fetched.returncode == 0 else ""
+        if fetched_sha and fetched_sha != pr.head:
+            raise StoppedError(
+                f"PR #{number}'s head changed between reading it ({pr.head[:7]}) and "
+                f"fetching it ({fetched_sha[:7]}); refusing a diff against a stale head"
+            )
         diff = self._git_out(
             self.root,
             "-c",
@@ -1031,12 +1234,37 @@ class ShellRunner:
             raise StoppedError(f"refusing to push a non-train/ branch: {branch}")
         self._git_out(worktree, "push", "origin", f"{ref}:refs/heads/{branch}")
 
-    def delete_branch(self, branch: str) -> None:
+    def delete_branch(self, branch: str) -> bool:
         if not branch.startswith("train/"):
             raise StoppedError(f"refusing to delete a non-train/ branch: {branch}")
-        self._git(self.root, "push", "origin", "--delete", branch, check=False)
+        result = self._git(self.root, "push", "origin", "--delete", branch, check=False)
+        return result.returncode == 0
+
+    def tree_of_ref(self, ref: str) -> str:
+        return self._git_out(self.root, "rev-parse", f"{ref}^{{tree}}")
+
+    def parent_of(self, sha: str) -> str:
+        result = self._git(self.root, "rev-parse", f"{sha}^", check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def merge_pr(self, number: int, head: str) -> MergeAttempt:
+        result = subprocess.run(
+            ["gh", "pr", "merge", str(number), "--squash", "--match-head-commit", head],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return MergeAttempt("merged")
+        text = _redact(((result.stderr or "") + (result.stdout or "")).strip())
+        low = text.lower()
+        phrases = ("not mergeable", "mergeable state is unknown", "try again")
+        retryable = any(phrase in low for phrase in phrases)
+        return MergeAttempt("retryable" if retryable else "failed", text)
 
     def find_run(self, sha: str, branch: str) -> RunInfo:
+        # Filtered by workflow file too (#524, follow-up 2): safe today since ci.yml is the
+        # only workflow, but this keeps a second one from ever being matched here by mistake.
         raw = json.loads(
             self._gh(
                 "run",
@@ -1045,6 +1273,8 @@ class ShellRunner:
                 branch,
                 "--event",
                 "push",
+                "--workflow",
+                "ci.yml",
                 "--json",
                 "databaseId,headSha,status,conclusion,url,attempt",
                 "-L",
@@ -1094,7 +1324,7 @@ class ShellRunner:
         return datetime.now(UTC)
 
 
-# -- entry point (`build` only; `merge`, `status`, `prune` are T72c) ------------------------
+# -- entry point ------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1108,15 +1338,19 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--timeout-min", type=int, default=DEFAULT_TIMEOUT_S // 60)
     build.add_argument("--poll-s", type=int, default=DEFAULT_POLL_S)
     build.add_argument("--resume", metavar="BATCH_ID", help="re-attach to a batch's branch/run")
+    merge = sub.add_parser("merge", help="land the longest green prefix that still verifies")
+    merge.add_argument("batch_id")
+    merge.add_argument("--resume", action="store_true", help="continue a stopped merge")
+    status = sub.add_parser("status", help="print a record, or list every record")
+    status.add_argument("batch_id", nargs="?")
+    sub.add_parser("prune", help="delete train/* branches of finished batches")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command != "build":
-        parser.error(f"unknown command {args.command!r}")
-    if args.resume and (args.prs or args.order):
+    if args.command == "build" and args.resume and (args.prs or args.order):
         parser.error("--resume takes no PR list or --order")
     root = Path(
         subprocess.run(
@@ -1124,22 +1358,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         ).stdout.strip()
     )
     r = ShellRunner(root)
-    timeout_s = args.timeout_min * 60
     try:
-        if args.resume:
-            record = run_build_resume(r, args.resume, timeout_s=timeout_s, poll_s=args.poll_s)
-        else:
-            record = run_build(
-                r, args.prs or None, args.order, timeout_s=timeout_s, poll_s=args.poll_s
-            )
+        if args.command == "build":
+            timeout_s = args.timeout_min * 60
+            if args.resume:
+                record = run_build_resume(r, args.resume, timeout_s=timeout_s, poll_s=args.poll_s)
+            else:
+                record = run_build(
+                    r, args.prs or None, args.order, timeout_s=timeout_s, poll_s=args.poll_s
+                )
+            print(record.to_json())
+            if record.outcome == "green":
+                return 0
+            detail = record.detail or (f"culprit #{record.culprit}" if record.culprit else "")
+            print(f"STOPPED: {record.outcome}{f' ({detail})' if detail else ''}")
+            return 1
+        if args.command == "merge":
+            record = run_merge(r, args.batch_id, resume=args.resume)
+            print(record.to_json())
+            if record.merge is not None and record.merge.stopped_at_position is not None:
+                print(f"STOPPED: {record.merge.reason or 'merge stopped'}")
+                return 1
+            return 0
+        if args.command == "status":
+            run_status(args.batch_id)
+            return 0
+        if args.command == "prune":
+            run_prune(r)
+            return 0
     except StoppedError as exc:
         print(f"STOPPED: {exc}")
         return 1
-    print(record.to_json())
-    if record.outcome == "green":
-        return 0
-    detail = record.detail or (f"culprit #{record.culprit}" if record.culprit else "")
-    print(f"STOPPED: {record.outcome}{f' ({detail})' if detail else ''}")
+    parser.error(f"unknown command {args.command!r}")
     return 1
 
 
