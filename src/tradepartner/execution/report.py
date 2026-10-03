@@ -21,8 +21,8 @@ rebalance month i (consecutive sessions `trial.sessions[i]` = T_i and
   fill's session) x filled quantity, less the same sum over sells], so a buy
   that paid more or a sell that received less than the bar makes the term
   positive (`prices` is the caller's bound accessor for that frozen bar: this
-  module never reads `Settings.execution.fill_price` itself, since req 14
-  does not freeze that key into the window - the caller binds `prices` once,
+  module never reads `Settings.execution.fill_price` itself: the caller binds
+  `prices` once from the window's frozen key (req 14, #366 Q20, #526),
   which also serves the raw `close(T_i)`/`close(T_{i+1})` reads the other
   terms need, since the frozen convention is pinned to `close` by ADR 0007's
   T3 decision and never varies in practice);
@@ -858,10 +858,9 @@ def report(settings: Settings, connect: Connect) -> Report:
     per file per process). Raises `ValueError` when no window is open, when the
     frozen `execution.fill_price` is missing or invalid (read and validated up
     front, before the tracking trial runs, so a bad freeze fails fast rather
-    than after paying for a trial run; quant-auditor finding on PR #525 — the
-    writer that should populate this key at `paper start`, `execution/window.py`'s
-    `_frozen_params`, does not exist yet: #526), or when the tracking trial does
-    not finish `ok`.
+    than after paying for a trial run; quant-auditor finding on PR #525; `paper
+    start` writes it since #526, so only a window started earlier lacks it), or
+    when the tracking trial does not finish `ok`.
 
     "Last completed T" is capped strictly before the window's stop session
     (req 15), when it has one: a stopped window's `last completed T` is never
