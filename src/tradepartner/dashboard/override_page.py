@@ -37,11 +37,20 @@ carries the browser's pre-clear reason, which overwrites the just-emptied
 value before that rerun's callback reads it — so "empty the reason after a
 write" alone does not stop a same-content resubmit arriving this way. The
 guard is content, not timing: `on_submit` also remembers the exact
-`(kind, rebalance_session, name, reason)` it last wrote in `session_state`
-(`LAST_WRITTEN_KEY`), and refuses, without calling the writer, a submit whose
-fields match that tuple exactly. Changing any field (including retyping the
-same reason after an intervening edit) submits normally; only an
-unmodified resubmit of what was just written is refused.
+`(kind, rebalance_session, name, reason)` (trimmed, so surrounding
+whitespace alone cannot evade it) it last wrote in `session_state`
+(`LAST_WRITTEN_KEY`), and refuses, without calling the writer, a later
+submit whose fields match that tuple exactly, however long after the write
+it arrives — not just the very next rerun. `LAST_WRITTEN_KEY` only ever
+changes when a *different* submit is itself written, so a deliberate,
+unmodified resubmit of exactly what was last written is refused even after
+other edits in between; nothing resets it on a field change alone (an
+`on_change` reset would also fire on the stale second click's own message
+and disarm the guard it exists to be). `engage_kill_switch` takes neither a
+session nor a name, so a repeat engagement differs only in the reason text,
+if at all; a second logged engagement is harmless (the writer, not this
+guard, is what would make re-engaging consequential), so the duplicate
+check does not apply to it.
 
 What the page draws comes from the shell's read-only connection: whether a
 window is open, so the owner sees before submitting that the writer would
@@ -75,10 +84,16 @@ NAME_KEY = "override_name"
 REASON_KEY = "override_reason"
 SUBMIT_KEY = "override_submit"
 OUTCOME_KEY = "override_outcome"
-#: The `(kind, rebalance_session, name, reason)` last written this session
-#: (module docstring, "A fast double-click"); `None` once nothing has been
-#: written yet, or once a field changes so a later identical submit is new.
+#: The trimmed `(kind, rebalance_session, name, reason)` last written this
+#: session (module docstring, "A fast double-click"); `None` until the first
+#: write. Changes only when a *different* submit is itself written — never
+#: on a field edit alone — so an exact resubmit of it stays refused until
+#: something else is written in its place.
 LAST_WRITTEN_KEY = "override_last_written"
+#: Kinds the duplicate guard does not apply to: re-engaging the kill switch
+#: a second time is harmless, and the kind takes no session or name to vary
+#: the signature with (module docstring, "A fast double-click").
+_DUPLICATE_GUARD_EXEMPT_KINDS = frozenset({"engage_kill_switch"})
 
 
 class OutcomeStatus(StrEnum):
@@ -140,16 +155,17 @@ def submit(
 def on_submit(settings: Settings) -> None:
     """The submit button's `on_click` callback: Streamlit runs it before the
     script body, so before the shell opens its read-only connection (module
-    docstring). Reads the form's widgets from `session_state`, and first
-    compares them against `LAST_WRITTEN_KEY`: an exact repeat of the override
-    just written this session is refused as a `DUPLICATE` without calling the
-    writer (module docstring, "A fast double-click"). Otherwise it writes
-    through `submit` and leaves the answer for `show_outcome` to show once.
-    After a write, and only then, it records this submit's fields as
-    `LAST_WRITTEN_KEY` and empties the reason, so a second click once the
-    page has re-rendered is refused for a blank reason instead of writing
-    the same row again, and a same-content click that arrives first is
-    refused by the duplicate check instead."""
+    docstring). Reads the form's widgets from `session_state`, and, unless
+    `kind` is exempt (`_DUPLICATE_GUARD_EXEMPT_KINDS`), first compares the
+    trimmed fields against `LAST_WRITTEN_KEY`: an exact repeat of the
+    override just written this session is refused as a `DUPLICATE` without
+    calling the writer (module docstring, "A fast double-click"). Otherwise
+    it writes through `submit` and leaves the answer for `show_outcome` to
+    show once. After a write, and only then, it records this submit's
+    (trimmed) fields as `LAST_WRITTEN_KEY` and empties the reason, so a
+    second click once the page has re-rendered is refused for a blank
+    reason instead of writing the same row again, and a same-content click
+    that arrives first is refused by the duplicate check instead."""
     state = st.session_state
     kind, rebalance_session, name, reason = (
         state[KIND_KEY],
@@ -157,8 +173,8 @@ def on_submit(settings: Settings) -> None:
         state[NAME_KEY],
         state[REASON_KEY],
     )
-    signature = (kind, rebalance_session, name, reason)
-    if signature == state.get(LAST_WRITTEN_KEY):
+    signature = (kind, rebalance_session, (name or "").strip(), (reason or "").strip())
+    if kind not in _DUPLICATE_GUARD_EXEMPT_KINDS and signature == state.get(LAST_WRITTEN_KEY):
         state[OUTCOME_KEY] = Outcome(
             OutcomeStatus.DUPLICATE,
             "Identical to the override just written in this session; nothing "

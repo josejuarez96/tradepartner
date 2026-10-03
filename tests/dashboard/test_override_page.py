@@ -326,6 +326,65 @@ def test_a_resubmit_after_changing_a_field_writes_a_second_row(
     assert len(_rows(store)) == 2
 
 
+def test_a_resubmit_differing_only_by_surrounding_whitespace_is_still_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """The signature trims the reason and name before comparing, so padding
+    either with whitespace does not evade the guard."""
+    at = _app(monkeypatch, store)
+    _fill(at, name=_NAME, reason=_REASON)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, name=f"  {_NAME} ", reason=f" {_REASON}\n")
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert "identical" in _text(at).lower()
+
+
+def test_a_deliberate_unmodified_resubmit_later_is_still_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """`LAST_WRITTEN_KEY` only changes when a *different* submit is itself
+    written, not on every edit: editing a field and then retyping exactly
+    what was last written is still refused, since nothing resets the guard
+    on a field change alone (module docstring)."""
+    at = _app(monkeypatch, store)
+    _fill(at, name=_NAME, reason=_REASON)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, name="SEC_QQQ")  # an intervening edit, not submitted
+    _fill(at, name=_NAME, reason=_REASON)  # back to exactly what was written
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert "identical" in _text(at).lower()
+
+
+def test_a_repeat_kill_switch_engagement_is_not_treated_as_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """`engage_kill_switch` takes neither a session nor a name, so a repeat
+    engagement would otherwise be flagged a duplicate on reason text alone;
+    the guard exempts it since a second logged engagement is harmless
+    (module docstring)."""
+    at = _app(monkeypatch, store)
+    _fill(at, kind="engage_kill_switch", session=None, name="", reason=_REASON)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, kind="engage_kill_switch", session=None, name="", reason=_REASON)
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 2
+    assert "identical" not in _text(at).lower()
+
+
 def test_a_write_followed_by_a_busy_render_still_shows_it_was_written(
     monkeypatch: pytest.MonkeyPatch, store: Path
 ) -> None:
