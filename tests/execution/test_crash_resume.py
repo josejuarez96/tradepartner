@@ -6,9 +6,15 @@ End to end on the fixture store with the scripted fake, built on
 alert fakes from `test_alerts.py`, and `test_run_stop.py`'s id helpers. This
 file covers the crash/resume mechanics, the transport-error case, the "Two
 phases" criterion's resume half, the fill-lag bound, the chain criterion, the
-cent-rounding tolerance, and the alert-kind suite (spec req 11): eleven kinds
-with a real trigger, four (`kill_switch`, `reconciliation`, `rejection_cap`,
-`skip_cap`) `xfail`ed because no production path writes them yet (#644).
+cent-rounding tolerance, and the alert-kind suite (spec req 11): ten of the
+plan line's fourteen kinds with a real trigger, four (`kill_switch`,
+`reconciliation`, `rejection_cap`, `skip_cap`) `xfail`ed because no production
+path writes them yet (#644). `lot_ledger`, in `alerts.ALERT_KINDS` but not the
+plan line's list, is not covered here. A further `xfail` (#653) records a
+real defect found while building the chain criterion: `paper resume` cannot
+release while the window holds a marked position. (#650, found the same way,
+was regraded to low-priority hardening reproducible only with a frozen test
+clock, and is not reproduced as a test here.)
 """
 
 from __future__ import annotations
@@ -597,21 +603,29 @@ def _check_frozen_json(window: PaperWindowRow) -> str:
 def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_reopens_it(
     env: Env, window: PaperWindowRow
 ) -> None:
-    """F_0: TRNS's buy is scripted a transport fault (never received,
-    submitted last; settled `not_received` by `paper resume`); DUALB's and
-    SPFT's buys, already `accepted`, are cancelled by the halt's own
-    best-effort cancel (reason `halt`) — the sixth fate (`cancelled`),
-    distinct from `not_received`. `paper resume` releases while nothing is
-    held yet (the window's last mark is still cash-only, #653's bug does
-    not apply). The next run re-attempts all three for the same pending
-    rebalance: DUALB's is rejected, SPFT's expires, TRNS's fills whole
-    (`position_return`, held). A stop then sells TRNS, filling whole
-    (`realised_pnl`, a sell) — covering every fate the plan line lists
-    except the partial fill (its own `xfail`ed test, below, found a real
-    ledger defect, #650). Once every outcome is due, `paper check`'s chain
-    query returns zero incomplete chains, each outcome row carries the req
-    8 kind that fits its terminal state and side, and a deliberately
-    deleted terminal event makes the query return that order again."""
+    """F_0: DUALB's buy (submitted first) gets a 2-share partial fill, its
+    clock reading moved on afterwards so the fill does not tie step 4's
+    reconciliation the way a real clock's gap between separate writes
+    already would (#650 is the latent, frozen-clock-only mechanism this
+    sidesteps); TRNS's buy (submitted last) is scripted a transport fault
+    (never received, settled
+    `not_received` by `paper resume`); DUALB's partial-filled order and
+    SPFT's plain `accepted` one are cancelled by the halt's own
+    best-effort cancel (reason `halt`) — a sixth fate (`cancelled`),
+    distinct from `not_received`, and DUALB's keeps its partial fill, so
+    it earns both req 8 kinds a partial fill can (`position_return` for
+    the fill, `not_executed` for the terminal remainder). `paper resume`
+    releases while nothing is held yet (the window's last mark is still
+    cash-only, #653's bug does not apply). The next run re-attempts all
+    three for the same pending rebalance: DUALB's new order is sized to
+    its remainder (target minus the 2 already filled), and is rejected;
+    SPFT's expires; TRNS's fills whole (`position_return`, held). A stop
+    then sells TRNS, filling whole (`realised_pnl`, a sell) — covering
+    every fate the plan line lists. Once every outcome is due, `paper
+    check`'s chain query returns zero incomplete chains, each outcome row
+    carries the req 8 kind that fits its terminal state and side, and a
+    deliberately deleted terminal event makes the query return that order
+    again."""
     assert window.window_id is not None
     with env.connect() as conn:
         conn.execute(
@@ -622,11 +636,29 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
     trns_buy_1 = buy_id(env, F_0, "SEC_TRANSFER")
     dualb_buy_1 = buy_id(env, F_0, "SEC_DUAL_B")
     spft_buy_1 = buy_id(env, F_0, "SEC_SPLIT_FUTURE")
+    dualb_price = env.query(
+        "SELECT close FROM prices_daily WHERE security_id = 'SEC_DUAL_B' AND session = ?",
+        [date(2019, 4, 30)],
+    )[0][0]
+    partial_quantity = 2.0
+
+    def on_submit(request: object) -> None:
+        # DUALB submits first; apply its partial fill (and move the clock
+        # on) just before the next order (SPFT) submits, so a real clock's
+        # gap between separate journal writes is modelled honestly.
+        if request.client_order_id == spft_buy_1:  # type: ignore[attr-defined]
+            env.clock.now += timedelta(seconds=1)
+            env.fake.apply(dualb_buy_1, PartialFill(partial_quantity, float(dualb_price)))
+            env.clock.now += timedelta(seconds=1)
+
+    env.fake.on_submit = on_submit
     env.fake.script(TransportFault(), client_order_id=trns_buy_1)
     with pytest.raises(Exception, match="transport error"):
         env.run(at(F_0))
+    env.fake.on_submit = None
     # DUALB's and SPFT's buys, submitted before TRNS's, are accepted then
     # cancelled by the halt (reason `halt`); TRNS's never reaches the fake.
+    # DUALB's cancel keeps its partial fill.
     for coid in (dualb_buy_1, spft_buy_1):
         statuses = [
             s
@@ -643,6 +675,13 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
             [trns_buy_1],
         )
     ] == ["pending"]
+    (dualb_filled,) = env.query(
+        "SELECT sum(quantity) FROM fills WHERE client_order_id = ?", [dualb_buy_1]
+    )[0]
+    assert dualb_filled == pytest.approx(partial_quantity)
+    dualb_target_notional = env.query(
+        "SELECT notional FROM orders WHERE client_order_id = ?", [dualb_buy_1]
+    )[0][0]
 
     released = _resume(env)
     assert released.status == RELEASED, released.reasons
@@ -659,7 +698,19 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
     env.fake.script(Expire(), client_order_id=spft_buy_2)
     reattempt = env.run(at(MAY_2))
     assert reattempt.status == "ok", env.result(env.latest_run())
-    assert sorted(env.held()) == ["TRNS"]
+    # DUALB still holds its 2-share partial fill (only the remainder's new
+    # order was rejected); SPFT holds nothing (expired); TRNS is held whole.
+    assert sorted(env.held()) == ["DUALB", "TRNS"]
+    assert env.held()["DUALB"] == pytest.approx(partial_quantity)
+
+    # the remainder, not the full target: DUALB's new attempt is sized to
+    # what the partial fill left, not what the original order asked for.
+    dualb_remainder_notional = env.query(
+        "SELECT notional FROM orders WHERE client_order_id = ?", [dualb_buy_2]
+    )[0][0]
+    expected_remainder = dualb_target_notional - partial_quantity * float(dualb_price)
+    assert dualb_remainder_notional == pytest.approx(expected_remainder, rel=1e-3)
+    assert dualb_remainder_notional != pytest.approx(dualb_target_notional)
 
     request_stop(env, at(MAY_2, 22, 0))
     trns_sell_1 = sell_id(env, MAY_3, "SEC_TRANSFER")
@@ -681,9 +732,10 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
         }
 
     assert kinds_of(trns_buy_1) == {NOT_EXECUTED}  # cancelled (not_received), zero fill
-    assert kinds_of(dualb_buy_1) == {NOT_EXECUTED}  # cancelled (halt), zero fill
+    # cancelled (halt), with a kept 2-share partial fill: earns both kinds.
+    assert kinds_of(dualb_buy_1) == {POSITION_RETURN, NOT_EXECUTED}
     assert kinds_of(spft_buy_1) == {NOT_EXECUTED}  # cancelled (halt), zero fill
-    assert kinds_of(dualb_buy_2) == {NOT_EXECUTED}  # rejected, zero fill
+    assert kinds_of(dualb_buy_2) == {NOT_EXECUTED}  # rejected, zero fill (the remainder)
     assert kinds_of(spft_buy_2) == {NOT_EXECUTED}  # expired, zero fill
     assert kinds_of(trns_buy_2) == {POSITION_RETURN}  # filled whole, held
     assert kinds_of(trns_sell_1) == {REALISED_PNL}  # filled whole, a sell
@@ -741,7 +793,7 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
     env.new_fake(round_cash_to_cent=True)
 
-    min_rebalances = Settings().paper.min_rebalances
+    min_rebalances = Settings(_env_file=None).paper.min_rebalances
     sessions = [F_0]
     year, month = F_0.year, F_0.month
     for _ in range(min_rebalances - 1):
@@ -965,6 +1017,7 @@ def test_paper_stop_is_refused_while_a_run_holds_the_lock(fixture_store_path: Pa
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#644: wrapper.halt() writes 'halted' for every non-stale SystemFaultError, "
     "including a kill-switch engagement; no path writes a distinct 'kill_switch' alert row",
 )
@@ -986,6 +1039,7 @@ def test_kill_switch_alert_kind_is_not_yet_written(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#644: a ReconciliationError halt writes 'halted', never a distinct "
     "'reconciliation' alert row",
 )
@@ -1005,6 +1059,7 @@ def test_reconciliation_alert_kind_is_not_yet_written(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#644: a RejectionCapError halt writes 'halted', never a distinct "
     "'rejection_cap' alert row",
 )
@@ -1024,6 +1079,7 @@ def test_rejection_cap_alert_kind_is_not_yet_written(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#644: a SkipCapError halt writes 'halted', never a distinct 'skip_cap' alert row",
 )
 def test_skip_cap_alert_kind_is_not_yet_written(
@@ -1046,6 +1102,7 @@ def test_skip_cap_alert_kind_is_not_yet_written(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#653: resume._mark_equity requires a security_id IS NULL row at the window's "
     "last mark, but marks.marks_for never writes one once anything is held, so resume "
     "refuses every release while the window holds a position",
@@ -1070,33 +1127,3 @@ def test_resume_releases_while_the_window_holds_a_marked_position(
 
     outcome = _resume(env)
     assert outcome.status == RELEASED, outcome.reasons
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="#650: ledger.from_journal drops a fill whose known_at ties the cash base "
-    "reconciliation's own known_at, undercounting cash spent and causing a false "
-    "ReconciliationError on the next reconciliation",
-)
-def test_a_partial_fill_at_submit_time_does_not_cause_a_false_cash_mismatch(
-    env: Env, window: PaperWindowRow
-) -> None:
-    """SPFT's buy is scripted a 1-share partial fill, applied inside its own
-    `submit()` call (before any `sleep()`), so it is journaled with the same
-    `known_at` as step 4's reconciliation, which ran moments earlier with
-    the static test clock. `fill_open()` then fills the remainder during
-    `sleep()`. Both fills are correctly journaled (`fills_for` sums to the
-    full notional, matching the broker's own cash), but
-    `ledger.from_journal`'s `after_base` uses a strict `>`, excluding the
-    tied first fill from the ledger's incremental cash delta — a $23.90
-    (one share's price) false `cash` mismatch on this fixture. The run
-    should end `ok`."""
-    spft_coid = buy_id(env, F_0, "SEC_SPLIT_FUTURE")
-    spft_price = env.query(
-        "SELECT close FROM prices_daily WHERE security_id = 'SEC_SPLIT_FUTURE' AND session = ?",
-        [date(2019, 4, 30)],
-    )[0][0]
-    env.fake.script(PartialFill(1.0, float(spft_price)), client_order_id=spft_coid)
-
-    outcome = env.run(at(F_0))
-    assert outcome.status == "ok", env.result(env.latest_run())
