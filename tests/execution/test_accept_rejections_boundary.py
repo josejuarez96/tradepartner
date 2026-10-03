@@ -13,11 +13,13 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
 3. Every `accept_rejections=` keyword passes the caller's own
    `accept_rejections` name on, never a literal or another expression. The name
    is never bound except as a parameter or a dataclass field (no
-   `accept_rejections = True`, no match, except or import capture), every such
+   `accept_rejections = True`, no match, except, import, global or nonlocal
+   capture, and no `def`, `async def` or `class` named for it), every such
    parameter is keyword-only (so no positional argument can feed it), the name
-   is never passed positionally (but to `isinstance` or `type`, for `resume`'s
-   own type check), and it is never spelt as
-   a whole string (no `**{"accept_rejections": True}`).
+   is never passed positionally, including unwrapped through a starred list,
+   tuple or set display (`*[accept_rejections]`, `*(accept_rejections,)`) but
+   to `isinstance` or `type`, for `resume`'s own type check, and it is never
+   spelt as a whole string (no `**{"accept_rejections": True}`).
 4. No module imports `execution.resume` except those in `RESUME_CALLERS`. There
    are none yet: the `paper resume` CLI is T67. T67 adds `cli.py` here and to
    `ALLOWED`, with the flag as an explicit `argparse` `store_true` option and one
@@ -85,6 +87,10 @@ def mentions(tree: ast.Module) -> list[int]:
             or (isinstance(node, ast.keyword) and node.arg == FLAG)
             or (isinstance(node, ast.arg) and node.arg == FLAG)
             or (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name == FLAG
+            )
+            or (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and any(s in node.value for s in SPELLINGS)
@@ -118,6 +124,20 @@ def defaults(tree: ast.Module) -> list[int]:
     return lines
 
 
+def _unwrap_display(expr: ast.expr) -> list[ast.expr]:
+    """The bare expressions reachable through nested list/tuple/set displays
+    and the `Starred` elements inside them (`*[accept_rejections]`,
+    `*(accept_rejections,)`), so a positional check can see the name without
+    flagging an arbitrary expression that merely contains it."""
+    if not isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        return [expr]
+    found: list[ast.expr] = []
+    for elt in expr.elts:
+        inner = elt.value if isinstance(elt, ast.Starred) else elt
+        found.extend(_unwrap_display(inner))
+    return found
+
+
 def misuses(tree: ast.Module) -> list[str]:
     """Rule 3: a keyword passing anything but the caller's own flag, a parameter
     that is not keyword-only (so no positional argument can feed it), a binding
@@ -135,6 +155,11 @@ def misuses(tree: ast.Module) -> list[str]:
             found += [
                 f"{a.lineno}: not keyword-only" for a in loose if a is not None and a.arg == FLAG
             ]
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == FLAG
+        ):
+            found.append(f"{node.lineno}: binds the name in a def/class")
         elif (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == FLAG) or (
             isinstance(node, ast.MatchMapping) and node.rest == FLAG
         ):
@@ -165,8 +190,9 @@ def misuses(tree: ast.Module) -> list[str]:
         ):
             for arg in node.args:
                 inner = arg.value if isinstance(arg, ast.Starred) else arg
-                if isinstance(inner, ast.Name) and inner.id == FLAG:
-                    found.append(f"{arg.lineno}: passed positionally")
+                for candidate in _unwrap_display(inner):
+                    if isinstance(candidate, ast.Name) and candidate.id == FLAG:
+                        found.append(f"{candidate.lineno}: passed positionally")
         elif (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
@@ -248,6 +274,15 @@ Rule = Callable[[ast.Module], object]
         ("try: pass\nexcept E as accept_rejections: pass", misuses),
         ("from flags import x as accept_rejections", misuses),
         ("def f():\n    global accept_rejections", misuses),
+        ("def f():\n    def g():\n        nonlocal accept_rejections", misuses),
+        ("def accept_rejections(): ...", misuses),
+        ("async def accept_rejections(): ...", misuses),
+        ("class accept_rejections: ...", misuses),
+        ("_start(c, *[accept_rejections])", misuses),
+        ("_start(c, *(accept_rejections,))", misuses),
+        ("def accept_rejections(): ...", mentions),
+        ("async def accept_rejections(): ...", mentions),
+        ("class accept_rejections: ...", mentions),
         ("def resume(*, accept_rejections: bool = False): ...", defaults),
         ("def resume(accept_rejections: bool = False): ...", defaults),
         ("class Row:\n    accept_rejections: bool = False", defaults),

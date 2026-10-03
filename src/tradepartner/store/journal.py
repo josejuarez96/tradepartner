@@ -637,8 +637,8 @@ def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
     ).fetchone()
     if present != len(_REQUIRED_TABLES):
         raise JournalNotInitialised(
-            "the store has no paper-trading journal (schema version 4); any writing "
-            "command migrates it to the current version"
+            "the store has no paper-trading journal (a journal table is missing); "
+            "any writing command migrates it to the current version"
         )
 
 
