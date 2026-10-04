@@ -34,7 +34,7 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 | Term | Meaning |
 |---|---|
-| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who approves every merge ([git-workflow rule 7](git-workflow.md): his "merge train `<batch id>`", or "merge" on one specific PR). The session he types in is a team like any other. |
+| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human whose word lands every class-B PR ([git-workflow rule 7](git-workflow.md): "merge" on one specific PR, or his "merge train `<batch id>`"); class-A PRs are landed by the orchestrator session under that rule. The session he types in is a team like any other. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
 | **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
