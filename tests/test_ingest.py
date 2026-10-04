@@ -7,6 +7,7 @@ with a `FixtureFilingSource` of synthetic filings and `_Prices`, a stub
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
@@ -19,6 +20,7 @@ from typing import Any
 import duckdb
 import pytest
 
+from tradepartner.adapters.edgar_validation import ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -652,6 +654,93 @@ def test_a_failing_record_keeps_the_check_message(settings: Settings) -> None:
     run = _run(settings, filings=_filings(cls=RecordBoom), source="edgar").runs[0]
     assert run.status == FAILED
     assert "too many failures" in run.message and "disk full" in run.message
+
+
+class _Validating(_RecordsFailedCheck):
+    """A source that records `bad` parse failures on its validation
+    collector during the fetch pass (#578), as the EDGAR adapter does. Its
+    `check_failures` raises, so a test sees whether the gate ran first."""
+
+    bad: tuple[tuple[str, str, Exception], ...] = ()
+    facts_bulk_empty = 62  # #566: counted, never failed
+    validation_failures: ValidationFailures
+
+    def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+        for input, key, error in self.bad:
+            self.validation_failures.record(input, key, error)
+        self.bad = ()  # once per pass, like a cached payload
+        return super().facts(cik, names)
+
+
+#: Parse failures that crashed past backfills (#599, #609 C3 and F3).
+_CRASHES = (
+    ("companyfacts.zip member", "0001786835", KeyError("cik")),
+    ("cover page", "0002124122-26-000017", ValueError("cover page names 0 entities")),
+    ("FSN period", "2026q1", TypeError("conversion from NoneType to Decimal")),
+)
+
+
+def _validating(
+    tmp_path: Path, bad: Sequence[tuple[str, str, Exception]], *, fails: bool = True
+) -> FixtureFilingSource:
+    def make(**kwargs: Any) -> _Validating:
+        source = _Validating(**kwargs)
+        source.validation_failures = ValidationFailures(tmp_path / "validation", lambda: NOW)
+        source.bad, source.fails = tuple(bad), fails
+        return source
+
+    return _filings(cls=make)
+
+
+def test_input_validation_fails_the_run_before_any_store_write(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#578: three different bad inputs fail the run once, listing all three,
+    with no data row written and the failure policy's check never reached."""
+    _RecordsFailedCheck.recorded = 0
+    run = _run(settings, filings=_validating(tmp_path, _CRASHES), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "InputValidationError: EDGAR input validation: 3 input(s)" in run.message
+    assert "counted, not failed: empty bulk facts 62" in run.message
+    (listed,) = (tmp_path / "validation").glob("failures-*.json")
+    assert f"full list: {listed.resolve()}" in run.message
+    assert len(json.loads(listed.read_text())["failures"]) == 3
+    assert _RecordsFailedCheck.recorded == 0  # check_failures/record_failed_check not called
+    assert set(_counts(read).values()) == {0}
+    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
+def test_input_validation_runs_on_a_dry_run_and_writes_the_list(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    _run(settings, source="edgar")  # a real run first, so the store exists
+    before = (_counts(read), read("SELECT count(*) FROM ingestion_runs"))
+    filings = _validating(tmp_path, _CRASHES[:1])
+    run = _run(settings, filings=filings, source="edgar", dry_run=True).runs[0]
+    assert run.status == FAILED and "1 input(s) failed to parse" in run.message
+    assert len(list((tmp_path / "validation").glob("failures-*.json"))) == 1
+    assert (_counts(read), read("SELECT count(*) FROM ingestion_runs")) == before
+
+
+def test_a_clean_validation_passes_straight_through(settings: Settings, tmp_path: Path) -> None:
+    run = _run(settings, filings=_validating(tmp_path, (), fails=False), source="edgar").runs[0]
+    assert run.status == OK  # 62 empty bulk facts are counted, never failed
+    assert not (tmp_path / "validation").exists()
+
+
+def test_input_validation_fails_before_a_write_time_collision(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#687 failed at the write (a listings PRIMARY KEY collision); with
+    parse failures recorded, the gate fails the run before that write runs."""
+
+    def collide(*args: Any) -> tuple[int, str]:
+        raise duckdb.ConstraintException('duplicate key "0000864270:0-750pct-medium-term-notes"')
+
+    monkeypatch.setattr("tradepartner.ingest._ingest_filings", collide)
+    run = _run(settings, filings=_validating(tmp_path, _CRASHES), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "InputValidationError" in run.message and "ConstraintException" not in run.message
 
 
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:

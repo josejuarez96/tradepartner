@@ -151,6 +151,11 @@ entry and leave every other field as it is:
 
 The file must stay valid JSON: one that does not load fails the run loudly,
 never silently lifting an acceptance (#275).
+
+**Input validation (#578).** `.validation_failures` collects the fetch pass's
+parse failures (`edgar_validation`) for `ingest._prefetch`'s gate, which
+fails the run before any store write and lists them all in
+`edgar.cache_dir/validation/`.
 """
 
 from __future__ import annotations
@@ -194,6 +199,7 @@ from tradepartner.adapters.edgar import (
     parse_fsn,
     parse_sgml_header,
 )
+from tradepartner.adapters.edgar_validation import ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -334,6 +340,8 @@ class EdgarFilingSource(FilingSource):
         self._client.event_hooks = hooks
         self._clock = clock or (lambda: datetime.now(UTC))
         self._cache = Path(settings.edgar.cache_dir)
+        # #578: the fetch pass's parse failures, for `ingest._prefetch`'s gate.
+        self.validation_failures = ValidationFailures(self._cache / "validation", self._clock)
         self._submissions: dict[str, _Submissions] = {}
         self._open_quarters: dict[Quarter, str] = {}
         self.requests = 0

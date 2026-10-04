@@ -211,6 +211,10 @@ class EdgarConfig(BaseModel):
     # trips it.
     min_failed_filings: int = Field(default=5, gt=0)
     max_failed_filing_share: float = Field(default=0.01, gt=0, le=1)
+    # #578: how many of the fetch pass's parse failures the run message names
+    # (the full list goes to a file under `cache_dir/validation/` whose path
+    # the message gives), so a run with thousands stays readable.
+    max_validation_listed: int = Field(default=20, gt=0)
 
     @property
     def header_start_year(self) -> int:
