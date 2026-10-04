@@ -196,6 +196,42 @@ Owner answers that set these values (spec open questions, answered on #156):
   no registration exists on the owner's store for the new hash to differ from. #839
   registered the #156 version on its store copies only (params sha256 `2152b671…`), and
   those copies are gone.
+
+  **The iXBRL phase-in bias, stated (owner decision on PR #852, 2026-10-04, option 2:
+  keep 2019-11-29 and disclose).** Inline-XBRL cover-page tagging, the only pre-snapshot
+  source of listings and of the `dei` shares fact rule 7 reads, phased in by filer size:
+  large accelerated filers from fiscal periods ending 2019-06-15, accelerated filers from
+  2020-06-15, all other filers from 2021-06-15. So the pool the top-1000 cut binds against
+  is itself growing for the first nine rebalances. On the same store copy, the companies
+  passing rules 1–7 number **1065 at 2019-11-29**, 1177 at 2020-06-30, **1483 at
+  2020-08-31** (the accelerated filers' first iXBRL 10-Qs), 1704 at 2020-12-31 and about
+  1850 from 2021-06 on, flat after 2021-08. The rank-1000 cap cutoff divided by the median
+  member cap steps from 0.17–0.22 (2019-11 to 2020-06) to 0.30–0.33 from 2020-08 and never
+  moves again: pool expansion, not the market. Two proxies bracket how many members
+  differ from a full-pool top 1000: at 2019-11-29, **60 of 1000 (6%)** of the 2021-12-31
+  universe's companies were already trading but had no listing known at close(T), and
+  **116 (12%)** members sat below the cutoff ratio the full pool imposes from 2020-08 (the
+  names a full pool would push out); at 2020-06-30, 27 and 102; at 2020-08-31, 13 and 0;
+  from 2021-06, none. The mid-2021 phase (non-accelerated filers) adds about 370 companies
+  to the pool and changes nothing at the top-1000 line. Full table: PR #852, "iXBRL
+  phase-in check". **Why this is point-in-time and not look-ahead or survivorship:** every
+  rebalance reads only listings and shares facts known at close(T), so the 2019-11 to
+  2020-07 universes are exactly what an investor with this data source would have held on
+  those dates; no later fact leaks in, and the names missing from the pool are missing
+  because their filings did not yet carry the tag, not because they later failed or
+  succeeded (the ref-invisible set is the one proxy that looks forward, and it is a
+  measurement of the bias, not an input to any rebalance). The bias is in the universe's
+  composition: for nine of the 50 in-sample rebalances (2019-11-29 to 2020-07-31) the
+  bottom 6–12% of the book's eligible names is set by filer size, not by market cap, and
+  the top decile the signal selects is drawn from a slightly smaller, larger-filer-tilted
+  pool. **How to read 2019-11 to 2020-07 results:** as a top-1000-of-large-filers
+  momentum portfolio, not yet the ADR 0006 universe in substance; up to about one
+  candidate in ten in those months could differ under a full pool. From 2020-08-31 the
+  universe is the ADR 0006 top 1000 in substance. The first-trial metrics that the
+  retirement condition reads cover all 50 rebalances; a reader comparing the first nine
+  months with the rest should expect a universe-composition difference there before
+  looking for a signal difference. Starting at 2020-08-31 (41 sessions, 40 returns) or
+  2021-06-30 (31, 30) was considered and declined, as above.
 - **Q10, statistical threshold:** option (a), no numeric cut-off. The retirement condition
   is stated in words at the end of this file. DSR is shown on both bases, never adjudicated
   (ADR 0005: beating a benchmark is never a phase-exit criterion).
