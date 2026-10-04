@@ -289,7 +289,9 @@ def test_render_journal_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_pat
     store_path = version_4_store(tmp_path / "v4.duckdb")
     at = _app(monkeypatch, store_path)
     assert not at.exception
-    assert "journal not initialised" in _text(at).lower()
+    text = _text(at).lower()
+    assert "journal not initialised" in text
+    assert "version 4" not in text
 
 
 def test_render_no_window_yet(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

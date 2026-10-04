@@ -10,8 +10,8 @@ What TradePartner should test next, and why, in proposed order. An entry here is
 
 | # | Item | Claims it tests (grade) | Data | Engine | Cost | Status |
 |---|---|---|---|---|---|---|
-| B1 | 12-1 momentum, long-only, monthly (H1) | HO-1 SUPPORTED vs G1-1, QI-3 MIXED | have | have | — | **registered**, run pending (T45b) |
-| B2 | Trend filter on H1 (hold cash when the market is below its 10-month average) | TT-1, HO-5 MIXED | have | small | S | proposed |
+| B1 | 12-1 momentum, long-only, monthly (H1) | HO-1 SUPPORTED vs G1-1, QI-3 MIXED | have | have | — | hypothesis file on `main`; `hypothesis register` and the run are the owner's T45b |
+| B2 | Trend filter on H1 (hold cash when the market is below its 10-month average) | TT-1, HO-5 MIXED | have | small | S | **parked** (#659) |
 | B3 | Profitability tilt (gross profit / assets), slow, long-only | QI-6 SUPPORTED (narrow); QI-16 MIXED | **add 4 XBRL facts** | new family | M | proposed |
 | B4 | Momentum + profitability combined | G4-2 MIXED; G4-1 SUPPORTED (long-short only) | after B1, B3 | small | S | after B1 and B3 |
 | B5 | Filing change (deterministic text) → next-quarter fundamentals | ER-4, ER-5 INSUFFICIENT; INT-4 | **filing text ingest** | research regression, not the backtester | L | proposed |
@@ -23,13 +23,14 @@ Parked ideas are listed at the end with the reason.
 
 ## Items
 
-### B1. 12-1 momentum (H1): registered
+### B1. 12-1 momentum (H1): file written, registration waits on T45b
 - **Tests:** HO-1 (SUPPORTED, handoff) against G1-1 and QI-3 (MIXED under a modern, net, post-2010 standard). The conflict is recorded in both claims.
 - **Prior:** near zero excess over MTUM and SPY. H1 is mainly a **systems test**: engine, costs, holdout, registry.
-- **Kill / outcome:** as registered in [h1-momentum-12-1](../hypotheses/h1-momentum-12-1.md).
+- **Kill / outcome:** as written in [h1-momentum-12-1](../hypotheses/h1-momentum-12-1.md). Not registered yet: `hypothesis register` runs on the owner's store in T45b.
 - **Information value:** the engine is proven end to end, and every later item depends on that. Regrades G1-1 with our own data (a `TP-` claim).
 
-### B2. Trend filter overlay on H1
+### B2. Trend filter overlay on H1 (parked)
+- **Parked 2026-10-03 (owner decision, #659):** a higher Sharpe at a lower return is not an acceptable objective under [ADR 0005](../decisions/0005-objective-benchmark-stop-criteria.md), whose objective is return against the benchmark, and the [trend-timing review](2026-09-25-trend-timing.md)'s best out-of-sample net result (a Sharpe gain of 7% or less at a lower return) leans weaker than the register's MIXED grades on TT-1 and HO-5; the decision calls it near NOT SUPPORTED. Revisit only with an ADR 0005 amendment; the design below stays for that case.
 - **Tests:** TT-1 and HO-5 (MIXED: shallower crashes, but lag and whipsaw; independent tests show at best a marginal gain).
 - **Data:** prices only (have).
 - **Engine:** a market-regime switch to cash inside the momentum family. It fits the strategy-lab sweep design ([strategy-lab spec](../specs/strategy-lab.md), draft).
@@ -86,6 +87,7 @@ Parked ideas are listed at the end with the reason.
 
 | Idea | Why parked | Claims |
 |---|---|---|
+| Trend filter overlay on H1 (B2) | Owner decision 2026-10-03 (#659): a higher Sharpe at a lower return is not an acceptable objective under ADR 0005, and the best out-of-sample net result is a Sharpe gain of 7% or less at a lower return. Revisit only with an ADR 0005 amendment. | TT-1, HO-5 MIXED |
 | Earnings drift (PEAD), conditional or not | Gone outside microcaps since about 2006. The surprise at announcement needs press-release parsing, and the analyst variables need paid data. | HO-4 NOT SUPPORTED; NE-1, NE-2; CP-X5 |
 | Search-volume and attention signals | No post-publication net evidence in non-microcaps | G5-A NOT SUPPORTED; G5-B, HO-7 INSUFFICIENT |
 | Retail-herding avoidance filter | MIXED; the data source needed is not available to us | HO-6 MIXED |
@@ -102,4 +104,5 @@ Parked ideas are listed at the end with the reason.
 
 - **Add an item:** cite its claim ids, prior, data, engine work, cost, kill criterion and information value. An idea with no graded claim behind it enters as "needs research" with a brief proposed.
 - **Reorder:** the owner only. An agent proposes the new order and its reason in a PR.
+- **Park an item:** the owner only, by a linked decision. The item keeps its section, marked parked with the reason first, and gains a row in the Parked table.
 - **Close an item:** link the `TP-` claim that records the result. Retired items stay in the file, struck through, with that link.

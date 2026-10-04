@@ -155,6 +155,13 @@ def test_the_name_override_kinds_are_the_shared_constants() -> None:
     assert schema.KEEP_NAME_REASON in kinds
 
 
+def test_the_kill_switch_kind_is_the_shared_constant() -> None:
+    """#636: the dashboard's duplicate guard exemption must name the same kind the
+    `overrides.kind` enum uses, not a hardcoded literal that could drift from it."""
+    assert schema.ENGAGE_KILL_SWITCH_KIND == "engage_kill_switch"
+    assert schema.ENGAGE_KILL_SWITCH_KIND in schema.JOURNAL_ENUMS["overrides", "kind"]
+
+
 def test_plan_reads_and_writes_the_shared_constants() -> None:
     """`decisions_from` writes these and `decision_state` matches on them."""
     assert plan._LEFT_TARGETS is schema.LEFT_TARGETS_REASON

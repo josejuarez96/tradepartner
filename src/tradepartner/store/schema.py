@@ -670,6 +670,8 @@ LEFT_UNIVERSE_REASON = "left_universe"
 EXCLUDE_NAME_REASON = "exclude_name"
 #: `decisions.reason` (and `overrides.kind`) of a `keep_name` override decision.
 KEEP_NAME_REASON = "keep_name"
+#: `overrides.kind` of an owner kill-switch engagement.
+ENGAGE_KILL_SWITCH_KIND = "engage_kill_switch"
 #: `decisions.reason` of a forced exit of a delisted holding.
 DELISTED_REASON = "delisted"
 #: `decisions.reason` of a forced exit of a holding received but never targeted.
@@ -767,7 +769,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ("reconciliations", "status"): ("ok", "mismatch", "pending_unresolved", "fills_lagging"),
     ("kill_switch", "state"): ("engaged", "released"),
     ("kill_switch", "source"): ("owner", "fault", "drawdown"),
-    ("overrides", "kind"): (EXCLUDE_NAME_REASON, KEEP_NAME_REASON, "engage_kill_switch"),
+    ("overrides", "kind"): (EXCLUDE_NAME_REASON, KEEP_NAME_REASON, ENGAGE_KILL_SWITCH_KIND),
 }
 
 NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
