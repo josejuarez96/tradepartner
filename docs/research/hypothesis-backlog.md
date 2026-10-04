@@ -30,7 +30,7 @@ Parked ideas are listed at the end with the reason.
 - **Information value:** the engine is proven end to end, and every later item depends on that. Regrades G1-1 with our own data (a `TP-` claim).
 
 ### B2. Trend filter overlay on H1 (parked)
-- **Parked 2026-10-03 (owner decision, #659):** a higher Sharpe at a lower return is not an acceptable objective under [ADR 0005](../decisions/0005-objective-benchmark-stop-criteria.md), whose objective is return against the benchmark, and the [trend-timing review](2026-09-25-trend-timing.md) grades the evidence near NOT SUPPORTED. Revisit only with an ADR 0005 amendment; the design below stays for that case.
+- **Parked 2026-10-03 (owner decision, #659):** a higher Sharpe at a lower return is not an acceptable objective under [ADR 0005](../decisions/0005-objective-benchmark-stop-criteria.md), whose objective is return against the benchmark, and the [trend-timing review](2026-09-25-trend-timing.md)'s best out-of-sample net result (a Sharpe gain of 7% or less at a lower return) leans weaker than the register's MIXED grades on TT-1 and HO-5; the decision calls it near NOT SUPPORTED. Revisit only with an ADR 0005 amendment; the design below stays for that case.
 - **Tests:** TT-1 and HO-5 (MIXED: shallower crashes, but lag and whipsaw; independent tests show at best a marginal gain).
 - **Data:** prices only (have).
 - **Engine:** a market-regime switch to cash inside the momentum family. It fits the strategy-lab sweep design ([strategy-lab spec](../specs/strategy-lab.md), draft).
@@ -104,4 +104,5 @@ Parked ideas are listed at the end with the reason.
 
 - **Add an item:** cite its claim ids, prior, data, engine work, cost, kill criterion and information value. An idea with no graded claim behind it enters as "needs research" with a brief proposed.
 - **Reorder:** the owner only. An agent proposes the new order and its reason in a PR.
+- **Park an item:** the owner only, by a linked decision. The item keeps its section, marked parked with the reason first, and gains a row in the Parked table.
 - **Close an item:** link the `TP-` claim that records the result. Retired items stay in the file, struck through, with that link.
