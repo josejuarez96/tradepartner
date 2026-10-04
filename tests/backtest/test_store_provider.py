@@ -48,6 +48,8 @@ T_AFTER_DELIST = datetime(2019, 7, 31, 20, 0, tzinfo=UTC)
 T_JAN = datetime(2019, 1, 31, 21, 0, tzinfo=UTC)
 T_FEB = datetime(2019, 2, 28, 21, 0, tzinfo=UTC)
 T_MAR = datetime(2019, 3, 29, 20, 0, tzinfo=UTC)
+ZERO_VOLUME_ID = "SEC_DIV_REVISED"
+ZERO_VOLUME_SESSION = date(2019, 3, 5)
 
 
 def _settings(path: Path, **universe: Any) -> Settings:
@@ -143,6 +145,17 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Store:
                 "source": "alpaca",
                 "provenance": "action",
             },
+        )
+        # A zero-volume revision (#787): SEC_DIV_REVISED's 2019-03-05 bar is
+        # re-fetched on 2019-03-06 with no volume, so the provider drops it.
+        (bar,) = (
+            prices_as_of(conn, T_MAR, [ZERO_VOLUME_ID])
+            .filter(pl.col("session") == ZERO_VOLUME_SESSION)
+            .iter_rows(named=True)
+        )
+        revised = datetime(2019, 3, 6, 21, 0, tzinfo=UTC)
+        insert_row(
+            conn, "prices_daily", bar | {"volume": 0, "known_at": revised, "ingested_at": revised}
         )
     finally:
         conn.close()
@@ -263,7 +276,12 @@ def test_adjusted_prices_equal_the_as_of_read(store: Store, include_dividends: b
         got = provider.adjusted_prices(T_MAR, ids, include_dividends)
     with store.direct() as conn:
         want = adjusted_prices_as_of(
-            conn, T_MAR, ids, include_dividends=include_dividends, settings=store.settings
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=include_dividends,
+            settings=store.settings,
+            traded_only=True,
         )
     assert got.equals(want)
     assert _ids(got) == set(ids)
@@ -276,7 +294,7 @@ def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
     with store.provider() as provider:
         got = provider.raw_prices(T_MAR, ids)
     with store.direct() as conn:
-        want = prices_as_of(conn, T_MAR, ids)
+        want = prices_as_of(conn, T_MAR, ids, traded_only=True)
     assert got.equals(want)
     assert _ids(got) == set(ids)
     # Unadjusted: the 3:1 split on SEC_SPLIT_BETWEEN (ex-date 2019-01-11) leaves the
@@ -285,6 +303,27 @@ def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
         pl.col("session") == date(2019, 1, 10)
     )
     assert got.filter(split_eve)["close"].item() == 58.39
+
+
+def test_a_zero_volume_bar_is_missing_from_both_frames(store: Store) -> None:
+    """#787: a bar whose latest revision has no volume is neither a mark, a fill
+    nor a signal anchor; before the revision is known it is an ordinary bar."""
+    ids = [ZERO_VOLUME_ID]
+    bar = pl.col("session") == ZERO_VOLUME_SESSION
+    with store.provider() as provider:
+        frames = [
+            provider.raw_prices(T_MAR, ids),
+            provider.adjusted_prices(T_MAR, ids, True),
+            provider.adjusted_prices(T_MAR, ids, False),
+        ]
+        before = provider.raw_prices(datetime(2019, 3, 5, 21, 0, tzinfo=UTC), ids)
+    with store.direct() as conn:
+        stored = prices_as_of(conn, T_MAR, ids).filter(bar)
+    assert stored["volume"].to_list() == [0]
+    for frame in frames:
+        assert frame.filter(bar).is_empty()
+        assert frame.filter(pl.col("session") > ZERO_VOLUME_SESSION).height > 0
+    assert before.filter(bar).height == 1
 
 
 def test_raw_prices_exclude_a_revision_not_yet_known(store: Store) -> None:

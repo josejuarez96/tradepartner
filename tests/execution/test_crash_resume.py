@@ -588,10 +588,7 @@ def test_the_fill_lag_bound_halts_and_accept_broker_fills_completes_it(
 
     # The real fills the fake was holding back now surface: each must be
     # superseded by its synthetic one, counted once, not twice.
-    # FakeBroker has no public hook to reveal already-recorded hidden-lag
-    # fills (`lag_fills` only affects fills recorded after the call), so
-    # this reaches into the private counter directly; tracked as #742.
-    env.fake._fill_hidden_reads = [0 for _ in env.fake._fill_hidden_reads]
+    env.fake.reveal_hidden_fills()
     nxt = env.run(at(date(2019, 5, 6)))
     assert nxt.status == "ok", env.result(env.latest_run())
     for security_id, c in coids.items():

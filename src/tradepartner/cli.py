@@ -8,8 +8,11 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   the price side first fetches (`StorePriceSource`), so it sees the listings the
   EDGAR chunk has just committed. It prints one line per source and exits with
   the result's code: 0 when every source is `ok`, 1 otherwise.
-- `tradepartner health [--check]` prints `health.health_report` at the current
-  time. `--check` exits 1 when any integrity rule fails and names the rules. It
+- `tradepartner health [--check] [--jumps-before DATE]` prints
+  `health.health_report` at the current time; `--jumps-before` limits the
+  price-jump review list (#787) to sessions before DATE, so the owner can
+  review a hypothesis's in-sample jumps without reading its holdout period.
+  `--check` exits 1 when any integrity rule fails and names the rules. It
   also warns, without failing, when the latest EDGAR run row reports
   quarantined accessions (the T11h failure policy): those filings get no
   further request until the owner clears them.
@@ -255,6 +258,14 @@ def _print_report(report: HealthReport) -> None:
     echo(f"delisted names: {report.delisted.count}")
     for row in report.delisted.frame.iter_rows(named=True):
         echo(f"  {row['security_id']} {row['ticker']} {row['exchange']} ended {row['end_session']}")
+    jumps = report.price_jumps
+    shown = "" if jumps.before is None else f" before {jumps.before.isoformat()}"
+    echo(f"price jumps{shown}: {jumps.pending.height} to review, {jumps.frame.height} in all")
+    for row in jumps.pending.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']}@{row['session']} {row['prev_close']} -> {row['close']} "
+            f"(x{row['ratio']:.2f} since {row['prev_session']})"
+        )
     echo(f"settings: {report.settings}")
     echo("integrity:")
     for check in report.integrity:
@@ -457,15 +468,22 @@ def make_app(
         check: Annotated[
             bool, typer.Option(help="exit non-zero if any integrity rule fails")
         ] = False,
+        jumps_before: Annotated[
+            str | None,
+            typer.Option(
+                help="list only price jumps before this day (a holdout start), YYYY-MM-DD"
+            ),
+        ] = None,
     ) -> None:
         """Print the data-health report."""
+        cutoff = _parse_day("--jumps-before", jumps_before)
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
         t = ensure_tz_aware_utc(clock(), field_name="clock()")
         try:
             with open_read_only(s) as conn:
-                report = health_report(conn, t, s)
+                report = health_report(conn, t, s, jumps_before=cutoff)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         except (duckdb.CatalogException, duckdb.BinderException) as exc:

@@ -186,7 +186,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.calendar import all_sessions
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, parse_accepted_jump
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Natural key (excluding `known_at`) each table's rows are keyed by for
@@ -327,6 +327,8 @@ def prices_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     security_ids: Sequence[str] | None = None,
+    *,
+    traded_only: bool = False,
 ) -> pl.DataFrame:
     """Raw `prices_daily` rows known by `t`: one per `(security_id,
     session)`, the latest revision as of `t` (spec acceptance: "A bar
@@ -334,9 +336,110 @@ def prices_as_of(
     `prices_as_of` returns each in its interval" -- i.e. calling this with a
     `t` before the revision's `known_at` returns the original row, and with
     a `t` at or after it returns the revision).
+
+    `traded_only=True` drops bars whose latest revision has zero volume
+    (#787): a session nobody traded is missing, not a price. The universe and
+    the backtest provider read with it; a later revision with volume brings
+    the bar back.
     """
     t = _validate_t(t)
-    return _latest_as_of(conn, "prices_daily", _PRICE_KEY, t, security_ids)
+    frame = _latest_as_of(conn, "prices_daily", _PRICE_KEY, t, security_ids)
+    return _traded(frame) if traded_only else frame
+
+
+def _traded(frame: pl.DataFrame) -> pl.DataFrame:
+    """`frame` without its zero-volume bars (#787)."""
+    return frame.filter(pl.col("volume") > 0)
+
+
+#: `price_jumps_as_of`'s columns, in order.
+_JUMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "prev_session": pl.Date,
+    "session": pl.Date,
+    "prev_close": pl.Float64,
+    "close": pl.Float64,
+    "ratio": pl.Float64,
+    "accepted": pl.Boolean,
+}
+
+
+def price_jumps_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Unexplained one-day price jumps known at `t` (#787), sorted by
+    `(security_id, session)`.
+
+    Over each security's traded bars known at `t` (latest revision, volume
+    above zero, as `prices_as_of(traded_only=True)`), a bar whose raw close
+    over the previous traded bar's close (`ratio`) is above
+    `universe.max_jump_ratio` or below `universe.min_jump_ratio` is a jump
+    unless the splits and dividends known at `t` with an ex-date in
+    `(prev_session, session]` explain it: `(close + dividends) * split
+    ratios / prev_close` is back inside the bounds. `accepted` is true when
+    `universe.accepted_price_jumps` names `<security_id>@<session>`.
+    `settings` defaults to `get_settings()`.
+
+    Only rows known at `t` are read, so the list at `t` never depends on a
+    later bar or a later-known action: a split first known after `t` leaves
+    its jump on the list at `t`.
+    """
+    t = _validate_t(t)
+    cfg = (settings if settings is not None else get_settings()).universe
+    params: list[Any] = [t]
+    security_filter = _security_filter(security_ids, params)
+    params += [cfg.max_jump_ratio, cfg.min_jump_ratio]
+    sql = f"""
+        WITH latest AS (
+            SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                PARTITION BY security_id, session ORDER BY known_at DESC
+            ) AS _rn
+            FROM prices_daily
+            WHERE known_at <= ?
+            {security_filter}
+        ), traded AS (
+            SELECT security_id, session, close,
+                LAG(session) OVER w AS prev_session,
+                LAG(close) OVER w AS prev_close
+            FROM latest
+            WHERE _rn = 1 AND volume > 0
+            WINDOW w AS (PARTITION BY security_id ORDER BY session)
+        )
+        SELECT security_id, prev_session, session, prev_close, close,
+            close / prev_close AS ratio
+        FROM traded
+        WHERE prev_close > 0 AND (close / prev_close > ? OR close / prev_close < ?)
+        ORDER BY security_id, session
+    """
+    candidates = conn.execute(sql, params).pl()
+    if candidates.is_empty():
+        return pl.DataFrame(schema=_JUMP_SCHEMA)
+    actions = live_actions_as_of(conn, t, candidates["security_id"].unique().sort().to_list())
+    by_security: dict[str, list[tuple[str, date, float]]] = {}
+    for sid, kind, ex_date, amount in actions.select(
+        "security_id", "action_type", "ex_date", "ratio_or_amount"
+    ).iter_rows():
+        by_security.setdefault(sid, []).append((kind, ex_date, amount))
+    accepted = {parse_accepted_jump(entry) for entry in cfg.accepted_price_jumps}
+    rows: list[dict[str, Any]] = []
+    for row in candidates.iter_rows(named=True):
+        splits, dividends = 1.0, 0.0
+        for kind, ex_date, amount in by_security.get(row["security_id"], []):
+            if not row["prev_session"] < ex_date <= row["session"]:
+                continue
+            if kind == "split":
+                splits *= amount
+            elif kind == "dividend":
+                dividends += amount
+        explained = (row["close"] + dividends) * splits / row["prev_close"]
+        if cfg.min_jump_ratio <= explained <= cfg.max_jump_ratio:
+            continue
+        rows.append(row | {"accepted": (row["security_id"], row["session"]) in accepted})
+    return pl.DataFrame(rows, schema=_JUMP_SCHEMA)
 
 
 def facts_as_of(
@@ -582,6 +685,7 @@ def adjusted_prices_as_of(
     *,
     include_dividends: bool = False,
     settings: Settings | None = None,
+    traded_only: bool = False,
 ) -> pl.DataFrame:
     """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
     `close` adjusted for every split known by `t` with `ex_date <= t`
@@ -601,6 +705,11 @@ def adjusted_prices_as_of(
     Raises `ValueError` if any known, effective event's own factor is
     non-positive or non-finite (a split `ratio_or_amount` of `0`, or a
     dividend `amount >= prior_close`), or a dividend amount is negative.
+
+    `traded_only=True` drops zero-volume bars after adjusting, as
+    `prices_as_of(traded_only=True)` (#787); the factors themselves are
+    computed over every stored bar, so a dividend's prior close is the one
+    the unfiltered read would use.
     """
     t = _validate_t(t)
     common_ctes, params = _adjusted_params(
@@ -608,7 +717,8 @@ def adjusted_prices_as_of(
     )
     with _sessions_registered(conn, include_dividends=include_dividends):
         _raise_on_invalid_factor(conn, common_ctes, params)
-        return conn.execute(_adjusted_select(common_ctes), params).pl()
+        frame = conn.execute(_adjusted_select(common_ctes), params).pl()
+    return _traded(frame) if traded_only else frame
 
 
 def _raise_on_invalid_factor(

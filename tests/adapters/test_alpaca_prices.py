@@ -1148,6 +1148,8 @@ class TestAlpacaSymbols:
             ("GEF-B", "GEF.B"),
             ("BRK/B", "BRK.B"),
             ("crd-a", "CRD.A"),
+            ("BF.B", "BF.B"),
+            ("bf-b", "BF.B"),
         ],
     )
     def test_safe_spellings_become_the_alpaca_symbol(self, ticker: str, symbol: str) -> None:
@@ -1176,6 +1178,37 @@ class TestAlpacaSymbols:
     )
     def test_anything_else_is_not_an_alpaca_symbol(self, ticker: str) -> None:
         assert alpaca_symbol(ticker) is None
+
+    @pytest.mark.parametrize(
+        "ticker", ["C27C", "PG25", "PCAR26", "DE22B", "PTN1", "CK0000731288", "ABC.B1", "AB1-C"]
+    )
+    def test_a_ticker_with_a_digit_is_not_an_alpaca_symbol(self, ticker: str) -> None:
+        # #792: from 2019-08 cover pages bring 510 tickers with digits (notes
+        # such as Citi's C27C); Alpaca rejected every one alone, none had bars.
+        assert alpaca_symbol(ticker) is None
+
+    def test_a_note_ticker_is_never_sent_and_is_named(self) -> None:
+        listings = [
+            _listing("SEC_AAPL", "AAPL", START),
+            _listing("SEC_C_NOTE", "C27C", START),
+            _listing("SEC_BRK", "BRK.B", START),
+        ]
+        calls: list[list[str]] = []
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._bars_under({"BRK.B": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(
+            ["SEC_AAPL", "SEC_C_NOTE", "SEC_BRK"], date(2020, 8, 3), date(2020, 8, 7)
+        )
+        assert calls == [["AAPL", "BRK.B"]]
+        assert {b.security_id for b in bars} == {"SEC_AAPL", "SEC_BRK"}
+        assert source.last_excluded_symbols == ("C27C",)
+        assert "'C27C'" in source.symbol_summary()
 
     @staticmethod
     def _bars_under(symbols: dict[str, str]) -> dict[str, Any]:

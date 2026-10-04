@@ -1045,7 +1045,9 @@ class _Run:
         """The `kill_switch` alert, then the `skipped_kill_switch` result row
         (owner decision on #644, #677). Run-scoped, so one alert per run while
         the switch stays engaged; the message names the latest `engaged` row's
-        source and reason, and every cause the derived state gives."""
+        source and reason, and every cause the derived state gives. That row is
+        `switch.derive`'s own `engaged_row`, so the alert and the derivation
+        share one definition of "latest" (#699)."""
         with open_read_only(self.settings) as conn:
             rows = kill_switch_events_for(conn, self.window_id)
             runs = runs_for(conn, self.window_id)
@@ -1057,11 +1059,8 @@ class _Run:
             reading_run=self.run_id,
             lock_free=True,
         )
-        own = sorted(
-            (r for r in rows if r.window_id == self.window_id), key=lambda r: r.event_id or 0
-        )
-        if own and own[-1].state == switch.ENGAGED:
-            latest = own[-1]
+        latest = state.engaged_row
+        if latest is not None:
             fault = f", fault {latest.fault_type}" if latest.fault_type else ""
             row = (
                 f"kill_switch event {latest.event_id}: source {latest.source}{fault}, "

@@ -97,6 +97,22 @@ CASES = [
     ),
     # The dual-class company ranks first; both its classes stay.
     Case("top_n_by_cap", 1, removed={"SEC_SPLIT_BETWEEN": (8, "top_n_by_cap")}),
+    # Price-quality gate (#787). SEC_SPLIT_BETWEEN's largest one-day rise in the
+    # window is x1.01506 (2019-04-05); the dual classes' stay under x1.015.
+    Case("max_jump_ratio", 1.015, removed={"SEC_SPLIT_BETWEEN": (6, "price_jump")}),
+    # SEC_DUAL_A falls x0.98501 on 2018-12-27, SEC_SPLIT_BETWEEN x0.98501 on
+    # 2019-01-30 (its 3:1 split day is explained); SEC_DUAL_B stays above.
+    Case(
+        "min_jump_ratio",
+        0.9851,
+        removed={sid: (6, "price_jump") for sid in ("SEC_DUAL_A", "SEC_SPLIT_BETWEEN")},
+    ),
+    Case(
+        "accepted_price_jumps",
+        ["SEC_SPLIT_BETWEEN@2019-04-05"],
+        base={"max_jump_ratio": 1.015},
+        admitted={"SEC_SPLIT_BETWEEN"},
+    ),
 ]
 
 
