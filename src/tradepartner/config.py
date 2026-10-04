@@ -302,6 +302,15 @@ class ExecutionConfig(BaseModel):
     fill_price: Literal["close", "open"] = "close"
 
 
+def parse_accepted_jump(entry: str) -> tuple[str, date]:
+    """`"<security_id>@<YYYY-MM-DD>"` (an `universe.accepted_price_jumps` entry) as
+    `(security_id, session)`. Raises `ValueError` on any other shape."""
+    security_id, sep, session = entry.rpartition("@")
+    if not sep or not security_id:
+        raise ValueError(f"accepted price jump {entry!r} is not '<security_id>@<YYYY-MM-DD>'")
+    return security_id, date.fromisoformat(session)
+
+
 class UniverseConfig(BaseModel):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
@@ -320,6 +329,21 @@ class UniverseConfig(BaseModel):
     min_history_months: int = 12
     max_shares_age_days: int = 400
     top_n_by_cap: int = 1000
+    # Price-quality gate (#787), part of rule 6: a close-to-close ratio between two
+    # consecutive traded bars above `max_jump_ratio` or below `min_jump_ratio`, that no
+    # split or dividend known at T explains, fails rule 6 while its session is in the
+    # `min_history_months` window, unless the owner lists it in `accepted_price_jumps`
+    # as "<security_id>@<YYYY-MM-DD>" (the jump's session). `health` lists every jump.
+    max_jump_ratio: float = Field(default=2.5, gt=1, allow_inf_nan=False)
+    min_jump_ratio: float = Field(default=0.4, gt=0, lt=1)
+    accepted_price_jumps: list[str] = Field(default_factory=list)
+
+    @field_validator("accepted_price_jumps")
+    @classmethod
+    def _check_accepted_price_jumps(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_accepted_jump(entry)
+        return value
 
     @field_validator("exclude_sic_ranges")
     @classmethod

@@ -364,6 +364,44 @@ def test_health_check_exits_non_zero_naming_the_failed_rule(
     assert "bars_on_sessions" in checked.output
 
 
+def test_health_prints_the_price_jump_review_list(tmp_path: Path, fixture_store_path: Path) -> None:
+    """#787: an unexplained jump is listed for the owner; it is no integrity failure."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert "price jumps: 0 to review, 0 in all" in plain.output
+    session, revised = date(2019, 3, 15), datetime(2019, 3, 18, 12, 0, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        (bar,) = (
+            conn.execute(
+                "SELECT * FROM prices_daily WHERE security_id = 'SEC_DUAL_A' AND session = ?",
+                [session],
+            )
+            .pl()
+            .iter_rows(named=True)
+        )
+        insert_row(
+            conn,
+            "prices_daily",
+            bar
+            | {
+                "close": bar["close"] * 3,
+                "high": bar["close"] * 3,
+                "known_at": revised,
+                "ingested_at": revised,
+            },
+        )
+    checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert checked.exit_code == 0, checked.output
+    assert "price jumps: 2 to review, 2 in all" in checked.output
+    assert "SEC_DUAL_A@2019-03-15" in checked.output
+    assert "SEC_DUAL_A@2019-03-18" in checked.output
+    capped = _invoke(settings, ["health", "--jumps-before", "2019-03-18"], clock=lambda: T_END)
+    assert "price jumps before 2019-03-18: 1 to review, 1 in all" in capped.output
+    assert "SEC_DUAL_A@2019-03-18" not in capped.output
+    bad = _invoke(settings, ["health", "--jumps-before", "2019-13-01"], clock=lambda: T_END)
+    assert bad.exit_code == 2
+
+
 def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

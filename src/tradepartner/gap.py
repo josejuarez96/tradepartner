@@ -262,7 +262,7 @@ def survivorship_gap(
             continue
         if r["rule_name"] == "security_type" and r["reason"] in MISSING_DATA_REASONS:
             side["unclassifiable"].append(r["security_id"])
-        elif r["rule_name"] in side:
+        elif r["rule_name"] in side and r["reason"] in MISSING_DATA_REASONS:
             side[r["rule_name"]].append(r["security_id"])
 
     return SurvivorshipGap(
