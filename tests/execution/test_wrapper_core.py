@@ -612,7 +612,7 @@ def test_a_failed_cancel_and_a_failed_read_each_journal_cancel_failed(
         journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
     )
     assert "cancel of tp-a failed" in message
-    assert "halt read of tp-a failed" in message
+    assert "halt read of tp-a failed (FakeTransportError: read lost)" in message  # #730
 
 
 def test_a_rejection_verdict_the_halt_read_finds_is_named_in_the_alert(

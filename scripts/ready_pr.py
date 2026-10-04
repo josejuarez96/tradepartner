@@ -94,6 +94,7 @@ QUANT_PREFIXES = (
     "src/tradepartner/adapters/fixture_",
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
+    "src/tradepartner/adapters/edgar_source.py",
     "src/tradepartner/calendar.py",
     "src/tradepartner/config.py",
     "src/tradepartner/timeutil.py",
@@ -102,8 +103,8 @@ QUANT_PREFIXES = (
     "src/tradepartner/ingest.py",
     "src/tradepartner/backfill.py",
     "src/tradepartner/health.py",
-    "src/tradepartner/signals/",
     "src/tradepartner/backtest/",
+    "src/tradepartner/execution/",
     "scripts/make_fixture_universe.py",
     "tests/lookahead/",
     "tests/fixtures/universe/",
@@ -123,7 +124,6 @@ SAFETY_PREFIXES = (
     "src/tradepartner/ingest.py",
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
-    "src/tradepartner/risk/",
     "src/tradepartner/llm/",
     "scripts/ready_pr.py",
     "tests/test_ready_pr.py",
@@ -142,6 +142,7 @@ SAFETY_PREFIXES = (
     ".claude/settings.json",
     ".pre-commit-config.yaml",
     "pyproject.toml",
+    "uv.lock",
 )
 LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "check", "."),

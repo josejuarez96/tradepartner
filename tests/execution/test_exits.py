@@ -18,6 +18,7 @@ from tradepartner.calendar import next_session
 from tradepartner.config import RiskConfig
 from tradepartner.execution.exits import (
     ExitDecision,
+    MissingAssetRefused,
     forced_exits,
     reattempt_exits,
     stop_exits,
@@ -376,6 +377,13 @@ def test_delisted_receipt_gets_one_decision() -> None:
 
 def test_missing_asset_for_a_candidate_raises() -> None:
     with pytest.raises(ValueError, match="assets"):
+        _forced({"AAA": 1.0}, listings_at={"AAA": PREVIOUS}, assets={})
+
+
+def test_missing_asset_for_a_candidate_is_a_named_refusal() -> None:
+    """A held name missing from the `assets` read raises `MissingAssetRefused`
+    (a `ValueError`), naming it (owner decision on #648 item 2, #733)."""
+    with pytest.raises(MissingAssetRefused, match="AAA is missing from the assets read"):
         _forced({"AAA": 1.0}, listings_at={"AAA": PREVIOUS}, assets={})
 
 

@@ -37,6 +37,7 @@ from tradepartner.adapters.fake_broker import Expire
 from tradepartner.config import Settings
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
+from tradepartner.execution.exits import MissingAssetRefused
 from tradepartner.execution.run import stop_session
 from tradepartner.execution.window import stop
 from tradepartner.store.db import open_read_only
@@ -584,7 +585,7 @@ def test_a_held_name_missing_from_the_assets_read_fails_the_stop_run_closed(
         return {k: v for k, v in answer(symbols).items() if k != "DUALB"}
 
     monkeypatch.setattr(env.fake, "assets", without_dualb)
-    with pytest.raises(ValueError, match="SEC_DUAL_B is missing from the assets read"):
+    with pytest.raises(MissingAssetRefused, match="SEC_DUAL_B is missing from the assets read"):
         env.run(at(MAY_2))
     assert env.result(env.latest_run())[0] == "failed"
     assert env.query("SELECT count(*) FROM decisions WHERE decision = 'forced_exit'") == [(0,)]

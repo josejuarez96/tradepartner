@@ -71,7 +71,7 @@ def _c(body: str, author: str = OWNER) -> object:
 
 
 PATHS = ("scripts/team.py", "changelog.d/12-thing.md")
-SAFETY_PATHS = ("src/tradepartner/execution/wrapper.py", "changelog.d/12-thing.md")
+SAFETY_PATHS = ("src/tradepartner/adapters/fake_broker.py", "changelog.d/12-thing.md")
 
 
 def _eligible(
@@ -776,12 +776,16 @@ def test_build_is_inconclusive_on_an_infra_failure_and_resume_reattaches() -> No
     assert {n for n, _ in resumer.comments_posted} == {1, 2}
 
 
+# uv.lock needs the safety review (#382)
+LOCK_PASS = (_c("safety-reviewer: PASS"),)
+
+
 def test_the_inconclusive_comment_names_uv_lock_prs_on_build_and_on_resume() -> None:
     """req 4, AC7: two accepted PRs touching uv.lock are named on an Install failure, and
     the same holds after `--resume` re-attaches (safety review of #521, SHOULD FIX 5)."""
     fake = FakeRunner()
-    fake.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"))
-    fake.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"))
+    fake.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"), comments=LOCK_PASS)
+    fake.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"), comments=LOCK_PASS)
     fake.script_run(fake.base, [GREEN_MAIN])
     install_failed = _run(
         run_id=5,
@@ -796,8 +800,8 @@ def test_the_inconclusive_comment_names_uv_lock_prs_on_build_and_on_resume() -> 
     assert "uv.lock" in text1 and "#1, #2" in text1
 
     resumer = FakeRunner()
-    resumer.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"))
-    resumer.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"))
+    resumer.add_pr(1, diff_paths=("uv.lock", "changelog.d/1-x.md"), comments=LOCK_PASS)
+    resumer.add_pr(2, diff_paths=("uv.lock", "changelog.d/2-x.md"), comments=LOCK_PASS)
     resumer.script_run(record.train_sha, [install_failed])
     resumed = mt.run_build_resume(resumer, record.batch_id, timeout_s=10, poll_s=0)
     assert resumed.outcome == "inconclusive"

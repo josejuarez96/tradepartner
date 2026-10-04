@@ -162,6 +162,7 @@ fault for the caller's halt path (`halt`); `execute` writes no result row:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -310,6 +311,7 @@ CRASH_EXIT_CODE = 1
 #: distinct from `cli.USAGE_ERROR` (2), so a bad CLI flag never looks like one.
 WRITE_FAILED_EXIT_CODE = 3
 
+_logger = logging.getLogger(__name__)
 _NEW_YORK = ZoneInfo("America/New_York")
 _MASK = "***"
 _FAULT = "fault"
@@ -485,6 +487,25 @@ class _Gated:
     skips: tuple[Skip, ...]
     counted: int
     left: tuple[phases.PhaseOrder, ...]
+
+
+def _log_held(run: PaperRunRow, held: Sequence[phases.HeldSell]) -> None:
+    """One structured warning per sell the sells phase held (#719 item 2): a
+    hold writes no order and no journal row, so this line is what explains a
+    rebalance left `pending` before it lapses `missed`. Ids and quantities
+    only, never a secret."""
+    for sell in held:
+        _logger.warning(
+            "sell held: run_id=%s session=%s decision_id=%s security_id=%s "
+            "uncapped_quantity=%r capped_quantity=%r capped_skip=%s",
+            run.run_id,
+            run.session.isoformat() if run.session is not None else None,
+            sell.decision_id,
+            sell.security_id,
+            sell.uncapped_quantity,
+            sell.capped_quantity,
+            sell.capped_skip,
+        )
 
 
 class RiskGatedBroker:
@@ -665,6 +686,7 @@ class RiskGatedBroker:
                 quantity_decimals=self._decimals(),
                 open_sells=open_sells,
             )
+            _log_held(run, sold.held)
             nobody = Account(book.window.account_id, 0.0, 0.0, 0.0, self.read_clock())
             gated = self._gate(
                 run,
@@ -678,9 +700,9 @@ class RiskGatedBroker:
                 0,
                 open_sells=open_sells,
             )
-            # The skips ride along: `buy_orders` never buys a name this phase
-            # skipped (#518 item 3).
-            sold = phases.PhaseOrders(gated.left, gated.skips, session=run.session)
+            # The skips and the held sells ride along: `buy_orders` never buys
+            # a name this phase skipped (#518 item 3) or held (#719 item 4).
+            sold = phases.PhaseOrders(gated.left, gated.skips, session=run.session, held=sold.held)
             skips, counted = gated.skips, gated.counted
             submitted = self._submit_all(gated.to_submit)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
@@ -1377,7 +1399,11 @@ class RiskGatedBroker:
             return
         except Exception as exc:
             self._event(coid, _CANCEL_FAILED, stamp, notes)
-            notes.append(f"halt read of {coid} failed ({type(exc).__name__})")
+            # The message is kept (scrubbed): a refusal such as #650's names
+            # the timestamps that explain it (#730).
+            notes.append(
+                f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
+            )
             return
         notes.extend(breach.message for breach in collected.rejections)
 

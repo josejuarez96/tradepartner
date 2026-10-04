@@ -5,21 +5,44 @@ thin adapter wiring them to the raw client (spec req 6, plan T12).
 store keys by `security_id` (spec req 3: adapters never resolve by bare
 ticker). `ListingResolver` maps `(ticker, session)` to the security whose
 listing carried that ticker on that session, from the master's `listings`
-rows (`security_id`, `ticker`, `valid_from`):
+rows (`security_id`, `ticker`, `valid_from`, `class_title`):
 
 - a security holds a ticker from a listing's `valid_from` until its next
   listing with a different ticker (a ticker change), so one security has
   one span per ticker it traded under;
+- only equity classes hold tickers (#735). A span with a listing under a
+  placeholder ticker (`is_placeholder_ticker`: '', 'N/A', 'None', '-',
+  ...) or of a non-equity class (`store.classify.listing_kind`: notes,
+  preferred, warrants, rights, units, from the row's own class title, else
+  its ticker suffix) holds nothing; its first row still ends the security's
+  previous span. A non-equity span still **shadows** another company's
+  older span from its own start (the ticker resolves to nothing rather than
+  back to the older company), but never its own company's, so a company's
+  notes listed under its common ticker never take or hide it;
+- a security listing two different tickers on equity rows of one day
+  (FutureFuel's cover page naming Ford's `F` beside its own `FF`) holds
+  neither ticker, nor any later one, from that day: its rows are not
+  assigned, and the tickers resolve as if it had never listed them;
 - a ticker reused by another company belongs to whichever span started
   most recently on or before the session, so an old company's bars stop
   resolving once the new company's listing starts;
-- two spans of one ticker starting on the same day are ambiguous and raise;
+- within one company (one CIK: ids `<cik>` and `<cik>:<class>`) the
+  class that held a ticker first keeps it: a span starting while another
+  class of the company already holds the ticker never holds it, not even
+  after that class moves on (a Class B listed under the Class A's ticker);
+  it shadows other companies like a non-equity span;
+- two spans of one ticker starting on the same day, of two securities,
+  are **ambiguous**: the ticker resolves to nothing while they are the
+  latest, and the run goes on;
 - a span is **contested** when its ticker is later taken by another
   security that arrived at it through a rename (Roundhill's `META` ETF,
-  then Facebook's `FB` -> `META`). Alpaca serves a renamed company's history
-  under its new symbol as well (#104), so rows under that ticker on the old
-  holder's dates may be the renamed company's. They resolve to nothing and
-  are reported, never assigned; `contested_spans` lists them.
+  then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
+  history under its new symbol as well (#104), so rows under that ticker
+  on the old holder's dates may be the renamed company's. They resolve to
+  nothing and are reported, never assigned; `contested_spans` lists them.
+
+`ListingResolver.report` counts every listing and span left out by these
+rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
 
 The resolver is a key mapping built from the master, like the delisting
 resolution in `store.delistings`; it never makes a record visible early,
@@ -61,6 +84,21 @@ no-op under `prices.revision_of`.
 raises, so ingest can never mix feeds for a security unnoticed
 (`tests/fixtures/README.md`). Actions are `alpaca`.
 
+**Symbols sent (#737).** alpaca-py comma-joins every symbol into the one
+`symbols=` parameter of one request and raises `APIError` for the whole
+call on any error status, so one invalid symbol is taken to fail the whole
+chunk (whether Alpaca's server rejects it or drops it is not established).
+A master ticker is therefore sent only in Alpaca's form (`alpaca_symbol`):
+trimmed of spaces and quotes, upper-cased, and a one-letter class suffix
+after `-` or `/` written with `.` (`CRD-A` -> `CRD.A`). Anything else
+(`BAX (NYSE)`, `C/28`, `F&G`) is not sent, so its security gets no rows
+under it, never a guessed mapping's; `last_excluded_symbols` and
+`symbol_summary` name those tickers, last on `resolution_summary`'s line.
+`ListingResolver` keys every listing by that form (an invalid ticker or a
+placeholder as written), so the spellings of one symbol
+(`META ` and `META`, `CRD-A` and `CRD.A`) are one ticker to all of its
+rules, and the payload's symbols resolve as they are.
+
 **Not returned as data, reported instead:**
 
 - a zero-volume placeholder bar (`v == 0` and `n == 0`) that Alpaca can
@@ -80,9 +118,10 @@ from __future__ import annotations
 
 import functools
 import itertools
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -99,6 +138,7 @@ from tradepartner.adapters.prices import (
 )
 from tradepartner.calendar import is_session, previous_session
 from tradepartner.config import Settings, get_settings
+from tradepartner.store.classify import EQUITY, listing_kind
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _FEEDS = frozenset({"sip", "iex"})
@@ -123,6 +163,29 @@ def _fail_closed[**P, R](parse: Callable[P, R]) -> Callable[P, R]:
     return wrapper
 
 
+#: Alpaca's US-equity symbol grammar: letters and digits from a letter, with
+#: at most one `.`-separated suffix (`BRK.B`).
+_ALPACA_SYMBOL = re.compile(r"[A-Z][A-Z0-9]*(\.[A-Z0-9]+)?")
+#: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
+_CLASS_SUFFIX = re.compile(r"([A-Z][A-Z0-9]*)[-/]([A-Z])")
+
+
+def alpaca_symbol(ticker: str) -> str | None:
+    """`ticker` in Alpaca's symbol form, or `None` when it has none.
+
+    Spaces and quotes at both ends are trimmed, letters upper-cased and a
+    one-letter class suffix after `-` or `/` written with `.`; a non-ASCII
+    ticker, or whatever then falls outside `_ALPACA_SYMBOL`, is `None`,
+    never a guessed symbol."""
+    trimmed = ticker.strip().strip("\"'").strip()
+    if not trimmed.isascii():  # upper() folds some letters into ASCII ('\ufb01' -> 'FI')
+        return None
+    norm = trimmed.upper()
+    if match := _CLASS_SUFFIX.fullmatch(norm):
+        norm = f"{match[1]}.{match[2]}"
+    return norm if _ALPACA_SYMBOL.fullmatch(norm) else None
+
+
 # --- resolution ----------------------------------------------------------
 
 
@@ -140,34 +203,132 @@ class TickerSpan:
         return self.start <= session and (self.end is None or session < self.end)
 
 
+#: Ticker fields that name no ticker, compared upper-cased after trimming
+#: spaces, quotes and brackets at both ends; a field with no letter is one
+#: too ('-', '0'). `NA` is on the list although Nano Labs trades as `NA`:
+#: filers also write it for "not applicable", and a later such row would
+#: take Nano Labs' bars (#736 review), so `NA` is left out and counted.
+PLACEHOLDER_TICKERS = frozenset({"", "N/A", "NA", "NONE", "NOT APPLICABLE", "TRADING SYMBOL"})
+#: Words that are placeholders unless written in capitals: XBRL booleans
+#: and filers' words come in lower or mixed case ('true', 'No'), while a
+#: real symbol is upper-case (TrueCar's `TRUE`).
+PLACEHOLDER_WORDS = frozenset({"TRUE", "FALSE", "YES", "NO"})
+
+
+def is_placeholder_ticker(ticker: str) -> bool:
+    """True for a ticker field that names no ticker (`PLACEHOLDER_TICKERS`,
+    `PLACEHOLDER_WORDS` not in capitals, or no letter at all)."""
+    trimmed = ticker.strip().strip("\"'()").strip()
+    norm = trimmed.upper()
+    if norm in PLACEHOLDER_WORDS:
+        return trimmed != norm
+    return norm in PLACEHOLDER_TICKERS or not any("A" <= c <= "Z" for c in norm)
+
+
+@dataclass(frozen=True)
+class ResolverReport:
+    """What `ListingResolver` leaves unassigned, for the run row: listing
+    rows under a placeholder ticker, of a non-equity class (by kind, see
+    `store.classify.listing_kind`), of a security listing two tickers on
+    one day (from that day), and spans that are later-class (another class
+    of the company already held the ticker), ambiguous (another security's
+    span of the ticker starts the same day) or contested."""
+
+    placeholder: int = 0
+    non_equity: Mapping[str, int] = field(default_factory=dict)
+    same_day_securities: int = 0
+    same_day_listings: int = 0
+    later_class_spans: int = 0
+    ambiguous_spans: int = 0
+    contested_spans: int = 0
+
+    def summary(self) -> str:
+        """One line for an `ingestion_runs` message."""
+        kinds = ", ".join(f"{n} {kind}" for kind, n in sorted(self.non_equity.items()))
+        return (
+            f"resolver left out {self.placeholder} placeholder-ticker and "
+            f"{sum(self.non_equity.values())} non-equity listings ({kinds or 'none'}), "
+            f"{self.same_day_listings} listings of {self.same_day_securities} securities "
+            f"listing two tickers on one day; {self.later_class_spans} later-class, "
+            f"{self.ambiguous_spans} ambiguous and "
+            f"{self.contested_spans} contested spans unassigned"
+        )
+
+
+@dataclass(frozen=True)
+class _Row:
+    day: date
+    ticker: str
+    kind: str  # EQUITY or the non-equity kind; "placeholder" for no ticker
+
+
+_PLACEHOLDER = "placeholder"
+
+
 class ListingResolver:
     """`(ticker, session) -> security_id` from master `listings` rows; see
-    the module docstring for the rules."""
+    the module docstring for the rules. A row's `class_title` is optional
+    (an untitled row is judged by its ticker suffix)."""
 
     def __init__(self, listings: Iterable[Mapping[str, Any]]) -> None:
-        by_security: dict[str, list[tuple[date, str]]] = defaultdict(list)
+        by_security: dict[str, list[_Row]] = defaultdict(list)
         for row in listings:
-            by_security[str(row["security_id"])].append((row["valid_from"], str(row["ticker"])))
+            ticker = str(row["ticker"])
+            kind = (
+                _PLACEHOLDER
+                if is_placeholder_ticker(ticker)
+                else listing_kind(ticker, row.get("class_title"))
+            )
+            if kind != _PLACEHOLDER:  # one ticker per Alpaca symbol (#737)
+                ticker = alpaca_symbol(ticker) or ticker
+            by_security[str(row["security_id"])].append(_Row(row["valid_from"], ticker, kind))
         self._by_ticker: dict[str, list[TickerSpan]] = defaultdict(list)
         self._by_security: dict[str, list[TickerSpan]] = defaultdict(list)
+        self._history: dict[str, list[TickerSpan]] = defaultdict(list)  # no placeholders
+        # Spans that hold no ticker but shadow other companies' older spans.
+        self._blockers: dict[str, list[TickerSpan]] = defaultdict(list)
+        placeholder = same_day_listings = 0
+        same_day_securities: set[str] = set()
+        non_equity: dict[str, int] = defaultdict(int)
         for security_id, rows in by_security.items():
-            rows.sort()
-            for (day, ticker), (next_day, next_ticker) in itertools.pairwise(rows):
-                if day == next_day and ticker != next_ticker:
-                    raise ValueError(
-                        f"{security_id} lists {ticker!r} and {next_ticker!r} "
-                        f"from the same day {day}"
-                    )
+            # A placeholder or non-equity row sorts first on its day, so it
+            # never ends the span of an equity ticker listed that same day.
+            rows.sort(key=lambda r: (r.day, r.kind == EQUITY, r.ticker))
+            pair_day = _same_day_pair(rows)
             index = 0
             while index < len(rows):
-                start, ticker = rows[index]
+                first = index
+                start, ticker = rows[index].day, rows[index].ticker
                 index += 1
-                while index < len(rows) and rows[index][1] == ticker:
+                while index < len(rows) and rows[index].ticker == ticker:
                     index += 1  # the same ticker again (a second exchange): one span
-                end = rows[index][0] if index < len(rows) else None
+                end = rows[index].day if index < len(rows) else None
                 span = TickerSpan(security_id, ticker, start, end)
-                self._by_ticker[ticker].append(span)
                 self._by_security[security_id].append(span)
+                kinds = {r.kind for r in rows[first:index]}
+                if _PLACEHOLDER in kinds:
+                    placeholder += index - first
+                    continue
+                self._history[security_id].append(span)
+                if kinds != {EQUITY}:
+                    kind = min(kinds - {EQUITY})
+                    non_equity[kind] += index - first
+                    self._blockers[ticker].append(span)
+                elif pair_day is not None and start >= pair_day:
+                    same_day_securities.add(security_id)
+                    same_day_listings += index - first
+                else:
+                    self._by_ticker[ticker].append(span)
+        later_class = {
+            span
+            for spans in self._by_ticker.values()
+            for span in spans
+            if any(_holds_before(other, span) for other in spans)
+        }
+        for spans in self._by_ticker.values():
+            spans[:] = [span for span in spans if span not in later_class]
+        for span in later_class:
+            self._blockers[span.ticker].append(span)
         self._contested = frozenset(
             span
             for spans in self._by_ticker.values()
@@ -179,12 +340,28 @@ class ListingResolver:
                 for other in spans
             )
         )
+        ambiguous = {
+            span
+            for spans in self._by_ticker.values()
+            for span in spans
+            if any(o.security_id != span.security_id and o.start == span.start for o in spans)
+        }
+        self._assigned_spans = frozenset(s for spans in self._by_ticker.values() for s in spans)
+        self.report = ResolverReport(
+            placeholder=placeholder,
+            non_equity=dict(non_equity),
+            same_day_securities=len(same_day_securities),
+            same_day_listings=same_day_listings,
+            later_class_spans=len(later_class),
+            ambiguous_spans=len(ambiguous),
+            contested_spans=len(self._contested),
+        )
 
     def _renamed_into(self, span: TickerSpan) -> bool:
         """True if `span`'s security traded under another ticker before it."""
         return any(
             earlier.start < span.start and earlier.ticker != span.ticker
-            for earlier in self._by_security[span.security_id]
+            for earlier in self._history[span.security_id]
         )
 
     @property
@@ -193,18 +370,29 @@ class ListingResolver:
         return tuple(sorted(self._contested, key=lambda s: (s.ticker, s.start)))
 
     def resolve(self, ticker: str, session: date) -> str | None:
-        """The security trading under `ticker` on `session`, or `None`."""
+        """The security trading under `ticker` on `session`, or `None` when
+        none does; when the span holding it is contested or shares its start
+        with another security's span (ambiguous); or when another company's
+        span that holds no ticker (non-equity or later-class) started on or
+        after it and is live: an older company never gets the bars of a
+        newer listing just because that listing is left out."""
         live = [span for span in self._by_ticker.get(ticker, []) if span.covers(session)]
         if not live:
             return None
         latest = max(span.start for span in live)
         winners = [span for span in live if span.start == latest]
         owners = {span.security_id for span in winners}
-        if len(owners) > 1:
-            raise ValueError(f"ticker {ticker!r} on {session} is ambiguous: {sorted(owners)}")
-        if any(span in self._contested for span in winners):
+        if len(owners) > 1 or any(span in self._contested for span in winners):
             return None
-        return owners.pop()
+        owner = owners.pop()
+        if any(
+            block.start >= latest
+            and block.covers(session)
+            and _company(block.security_id) != _company(owner)
+            for block in self._blockers.get(ticker, [])
+        ):
+            return None
+        return owner
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
         """Every ticker `security_id` traded under at some day in
@@ -212,12 +400,43 @@ class ListingResolver:
         out: list[str] = []
         for span in self._by_security.get(security_id, []):
             overlaps = span.start <= end and (span.end is None or start < span.end)
-            if overlaps and span.ticker not in out:
+            if overlaps and span.ticker not in out and self._assigned(span):
                 out.append(span.ticker)
         return out
 
+    def _assigned(self, span: TickerSpan) -> bool:
+        return span in self._assigned_spans
+
     def knows(self, security_id: str) -> bool:
+        """True for any security with a listing row, assigned or not."""
         return security_id in self._by_security
+
+
+def _company(security_id: str) -> str:
+    """The CIK of a `<cik>` or `<cik>:<class>` id; any other id is its own."""
+    head, sep, _ = security_id.partition(":")
+    return head if sep and head.isdigit() else security_id
+
+
+def _holds_before(holder: TickerSpan, span: TickerSpan) -> bool:
+    """True if `holder`, another class of `span`'s company, already held the
+    ticker when `span` started: `span` never holds it (a later class of one
+    company never takes over its ticker, not even once `holder` ends)."""
+    return (
+        holder.security_id != span.security_id
+        and _company(holder.security_id) == _company(span.security_id)
+        and holder.start < span.start
+        and holder.covers(span.start)
+    )
+
+
+def _same_day_pair(rows: Sequence[_Row]) -> date | None:
+    """The first day a security's sorted rows list two different tickers on
+    equity rows (placeholder and non-equity rows aside), or `None`."""
+    for row, following in itertools.pairwise(r for r in rows if r.kind == EQUITY):
+        if row.day == following.day and row.ticker != following.ticker:
+            return row.day
+    return None
 
 
 # --- bars ------------------------------------------------------------------
@@ -423,18 +642,33 @@ class AlpacaPriceSource(PriceSource):
         self._lag = timedelta(days=(settings or get_settings()).alpaca.actions_process_lag_days)
         self.last_bars_report: BarsParse | None = None
         self.last_actions_report: ActionsParse | None = None
+        self.last_excluded_symbols: tuple[str, ...] = ()
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
     ) -> tuple[set[str], list[str]]:
+        self.last_excluded_symbols = ()
         ids = set(check_request(security_ids, start, end))
         unknown = sorted(i for i in ids if not self._resolver.knows(i))
         if unknown:
             raise UnknownSecurityIdError(
                 f"unknown security_id(s) {unknown}; resolve tickers through the security master"
             )
-        symbols = sorted({s for i in ids for s in self._resolver.symbols(i, symbols_from, end)})
-        return ids, symbols
+        tickers = {t for i in ids for t in self._resolver.symbols(i, symbols_from, end)}
+        symbols = {t: alpaca_symbol(t) for t in tickers}
+        self.last_excluded_symbols = tuple(sorted(t for t, s in symbols.items() if s is None))
+        return ids, sorted({s for s in symbols.values() if s is not None})
+
+    def symbol_summary(self) -> str:
+        """The latest call's master tickers not sent to Alpaca, as one line
+        for the run row's message; `""` when there are none."""
+        if not self.last_excluded_symbols:
+            return ""
+        named = ", ".join(repr(t) for t in self.last_excluded_symbols)
+        return (
+            f"{len(self.last_excluded_symbols)} master ticker(s) not sent to Alpaca, "
+            f"not Alpaca symbols: {named}"
+        )
 
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
         self.last_bars_report = None
@@ -444,6 +678,19 @@ class AlpacaPriceSource(PriceSource):
         parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolver.resolve)
         self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
+
+    def resolution_summary(self) -> str:
+        """The resolver's `ResolverReport` line, plus the rows of the latest
+        `bars` and `corporate_actions` calls that resolved to no security,
+        and last (the run row's length cut takes it first) `symbol_summary`."""
+        line = self._resolver.report.summary()
+        if self.last_bars_report is not None:
+            line += f"; {len(self.last_bars_report.unresolved)} bar rows unresolved"
+        if self.last_actions_report is not None:
+            line += f"; {len(self.last_actions_report.unresolved)} action rows unresolved"
+        if symbols := self.symbol_summary():
+            line += f"; {symbols}"
+        return line
 
     def corporate_actions(
         self, security_ids: Sequence[str], start: date, end: date

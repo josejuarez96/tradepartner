@@ -296,6 +296,23 @@ def test_store_price_source_resolves_tickers_from_the_listings_known_when_first_
     assert symbols == ["SPY"]
 
 
+def test_store_price_source_reports_what_its_resolver_left_out(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    source = cli.StorePriceSource(
+        settings,
+        clock=lambda: T_END,
+        fetch_bars=lambda *a: {"feed": "sip", "bars": {}},
+        fetch_actions=lambda *a: {},
+    )
+    assert source.resolution_summary() == ""
+    source.bars(["SEC_SPY"], date(2020, 6, 30), date(2020, 6, 30))
+    summary = source.resolution_summary()
+    assert summary.startswith("resolver left out ")
+    assert summary.endswith("; 0 bar rows unresolved")
+
+
 def test_store_price_source_reads_nothing_until_called(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     cli.StorePriceSource(settings, clock=lambda: NOW)

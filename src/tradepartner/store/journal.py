@@ -674,11 +674,11 @@ def _require_after_reconciliations(conn: duckdb.DuckDBPyConnection, known_at: da
 
 def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
     """Insert `row` into its table and return its own id (assigned when None), or
-    None for a table without one. Raises `ValueError` for a naive timestamp or
-    `known_at` after `ingested_at` or a fill not stamped after every reconciliation,
-    `JournalNotInitialised` on a store without the
-    journal, and DuckDB's constraint errors for anything the schema refuses. Runs in
-    the caller's transaction."""
+    None for a table without one. Raises `ValueError` for a naive timestamp,
+    `known_at` after `ingested_at`, or a fill not stamped after every
+    reconciliation; `JournalNotInitialised` on a store without the journal; and
+    DuckDB's constraint errors for anything the schema refuses. Runs in the
+    caller's transaction."""
     if type(row) not in ROW_TYPES.values():
         raise TypeError(f"not a journal row type: {type(row).__name__}")
     table, id_column = type(row).TABLE, type(row).ID_COLUMN

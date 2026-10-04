@@ -1014,6 +1014,47 @@ def test_a_clock_that_goes_back_before_the_write_is_a_clock_error(
     assert _cursors(journal_settings) == []
 
 
+def test_a_fill_tied_with_the_latest_reconciliation_rolls_the_whole_collection_back(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """#650/#730: under a clock that has not moved past the latest
+    reconciliation, `append` refuses the fill and the `ValueError` leaves
+    `collect`, so the write chunk rolls back whole: no fill, no terminal event
+    and no cursor. The next collection, on a clock that has moved, picks the
+    fill up again."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    order = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    tied = fixed_clock.advance(minutes=5)
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            at=tied,
+            status="ok",
+            mismatches_json=json.dumps({"lagging": [], "mismatches": []}),
+            known_at=tied,
+            ingested_at=tied,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not after the latest reconciliation"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+
+    assert _fills(journal_settings) == []
+    assert _statuses(journal_settings, "tp-a") == ["pending", "accepted"]
+    assert _cursors(journal_settings) == []
+
+    fixed_clock.advance(microseconds=1)
+    _collect(journal_settings, scripted_fake, fixed_clock, [order], writer_id=run_id)
+    assert [f.fill.client_order_id for f in _fills(journal_settings)] == ["tp-a"]
+    assert _statuses(journal_settings, "tp-a") == ["pending", "accepted", "filled"]
+    assert len(_cursors(journal_settings)) == 1
+
+
 def test_an_order_passed_twice_is_refused(
     journal_settings: Settings,
     open_window: PaperWindowRow,

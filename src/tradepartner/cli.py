@@ -155,6 +155,10 @@ class StorePriceSource(PriceSource):
         """`AlpacaPriceSource.corporate_actions` over the store's listings."""
         return self._source().corporate_actions(security_ids, start, end)
 
+    def resolution_summary(self) -> str:
+        """`AlpacaPriceSource.resolution_summary`, `""` before the first fetch."""
+        return "" if self._inner is None else self._inner.resolution_summary()
+
 
 def _blank(value: Any) -> bool:
     return value is None or not value.get_secret_value().strip()

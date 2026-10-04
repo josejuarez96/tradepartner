@@ -46,6 +46,22 @@ the next-submit queue's head, like any unscripted id. Scripting calls are
 not `Broker` methods: they are not logged and read no clock unless they
 fill.
 
+**Account scripts (#753, spec req 17).** `apply_account(instruction)` changes
+the whole book rather than one order; like the other scripting calls it is not
+a `Broker` method, is not logged in `calls` and reads no clock. `Reset()` is a
+paper-account reset as Alpaca does it: it forgets **every** order, filled or
+not, and empties the positions and the fill stream (lagging fills included)
+together, so a forgotten order never holds a position or a fill the real
+broker could not show. It is the one exception to the rule above that an order
+with fills cannot be forgotten. Cash is left as it was (a test that needs a
+reset's cash sets it through the constructor of a new fake), every id is free
+again, the broker order ids stay unique, and scripts queued for future
+submits are kept. `SetPosition(symbol, quantity)` sets one name's net
+quantity (`None` or `0` drops it), touching no order, fill or cash: a
+`FILLED` order whose fill lags with the name held at the ledger's quantity,
+or a `Vanish` with the name still held, since the fake otherwise books a
+position on every fill.
+
 **Account.** `cash` starts at the constructor's value and moves by
 `quantity * price` per fill (a buy debits, a sell credits), exact in
 `Decimal`, or rounded half-up to the cent per fill with
@@ -193,11 +209,36 @@ class HoldCancel:
     fill: PartialFill | None = None
 
 
+@dataclass(frozen=True)
+class Reset:
+    """A paper-account reset: every order, position and fill is forgotten
+    (module docstring, "Account scripts")."""
+
+
+@dataclass(frozen=True)
+class SetPosition:
+    """Set `symbol`'s net quantity to `quantity`, or drop it when `None` or
+    zero (module docstring, "Account scripts")."""
+
+    symbol: str
+    quantity: float | None
+
+    def __post_init__(self) -> None:
+        quantity = self.quantity
+        if quantity is not None and (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int | float)
+            or not math.isfinite(quantity)
+        ):
+            raise ValueError(f"quantity must be a finite number or None, got {quantity!r}")
+
+
 SubmitOutcome = Accept | FillAt | PartialFill | Expire | Reject | Vanish | TransportFault
 BookInstruction = FillAt | PartialFill | Expire | Reject | Vanish | HoldCancel
 Instruction = SubmitOutcome | HoldCancel
 _SUBMIT_OUTCOMES = (Accept, FillAt, PartialFill, Expire, Reject, Vanish, TransportFault)
 _BOOK_INSTRUCTIONS = (FillAt, PartialFill, Expire, Reject, Vanish, HoldCancel)
+AccountInstruction = Reset | SetPosition
 
 
 @dataclass(frozen=True)
@@ -299,6 +340,27 @@ class FakeBroker(Broker):
             self._set_order(replace(order, status=status))
         else:
             self._fill(order, instruction, self._now())
+
+    def apply_account(self, instruction: AccountInstruction) -> None:
+        """Apply `Reset` or `SetPosition` to the whole book (module
+        docstring, "Account scripts"). Raises `ValueError` for anything else."""
+        if isinstance(instruction, Reset):
+            self._orders.clear()
+            self._filled.clear()
+            self._fills.clear()
+            self._fill_hidden_reads.clear()
+            self._net_quantity.clear()
+            self._cancel_holds.clear()
+            self._cancel_pending.clear()
+            return
+        if isinstance(instruction, SetPosition):
+            key = canonical_symbol(instruction.symbol)
+            if instruction.quantity is None or instruction.quantity == 0:
+                self._net_quantity.pop(key, None)
+            else:
+                self._net_quantity[key] = Decimal(repr(float(instruction.quantity)))
+            return
+        raise ValueError(f"not an account instruction: {instruction!r}")
 
     def complete_cancel(self, client_order_id: str) -> None:
         """Complete a held cancel: the order becomes `CANCELLED`, keeping
