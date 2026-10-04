@@ -492,7 +492,7 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
     and value) is kept once; the same concept and context with two values,
     or a value whose iXBRL format did not apply, raises: either would give
     a silently wrong record. A nil fact (`xsi:nil="true"`, #609 C2) reports
-    nothing and is skipped."""
+    nothing and is skipped; a nil fact that also has text raises (#615)."""
     # Imported here: loading `edgar` pulls in the whole package, which only
     # cover-page parsing needs.
     from edgar.documents.strategies.xbrl_extraction import XBRLExtractor
@@ -510,7 +510,12 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
         if name == _CIK_CONCEPT:
             ciks.add(str(fact.value).strip())
             continue
-        if name not in _COVER_CONCEPTS or _is_nil(element):
+        if name not in _COVER_CONCEPTS:
+            continue
+        if _is_nil(element):
+            text = "".join(element.itertext()).strip()
+            if text:  # #615: an XBRL inconsistency, never a silent skip
+                raise ValueError(f"{accession}: dei:{name} is nil but has text {text[:40]!r}")
             continue
         issue = (fact.metadata or {}).get("format_issue")
         if issue:
@@ -539,10 +544,11 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
     title with no symbol (notes with `NoTradingSymbolFlag`) is not a
     listing; a symbol with no title or no exchange is skipped and counted
     in `incomplete_listings` (owner decision #224, as the FSN path); a fact
-    with no context raises. A nil fact (`xsi:nil="true"`) is skipped. A
-    context dimensioned by any axis other than the class axis (a
-    co-registrant in a combined filing) is skipped and returned in
-    `other_contexts`: its shares and listings are not the filer's.
+    with no context raises. A nil fact (`xsi:nil="true"`) is skipped, and
+    one that also has text raises (#615). A context dimensioned by any axis
+    other than the class axis (a co-registrant in a combined filing) is
+    skipped and returned in `other_contexts`: its shares and listings are
+    not the filer's.
 
     A cover with no listing, shares or title fact at all (a registrant
     with no listed class that reports no share count) is an empty parse for

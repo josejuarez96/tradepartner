@@ -71,7 +71,7 @@ def _c(body: str, author: str = OWNER) -> object:
 
 
 PATHS = ("scripts/team.py", "changelog.d/12-thing.md")
-SAFETY_PATHS = ("src/tradepartner/execution/wrapper.py", "changelog.d/12-thing.md")
+SAFETY_PATHS = ("src/tradepartner/adapters/fake_broker.py", "changelog.d/12-thing.md")
 
 
 def _eligible(
