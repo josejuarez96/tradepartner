@@ -117,6 +117,13 @@ In this order:
 
 Chains are a preference, not a lock. Every task is still claimed individually.
 
+**The planning team.** Added 2026-10-04 (#782, [orchestration layer audit](../retros/2026-10-04-orchestration-layer-audit.md) item 6). Once a plan is consumed the frontier has no owner: on 2026-10-04 the agent-claimable frontier was zero, 36 unclaimed `size:S` follow-ups filled the gap, and none of the roadmap's idle-capacity items had an issue. The planning team is that duty on a trigger: a team like any other, spawned by the orchestrator, not a standing architect agent and not a new agent file.
+- **Trigger.** The orchestrator spawns it when the agent-claimable frontier (`status`, after the owner's and the owner-gated tasks are taken out) is below two tasks, or when three or more unclaimed issues name one shared module (`run.py`, `window.py`, `wrapper.py`, `resume.py`).
+- **Model.** Fable, by the tier table's spec, plan and ADR drafting row ([agents.md](agents.md#orchestrator-windows-and-model-tiers)).
+- **Inputs.** [roadmap.md](../roadmap.md), the plans, `uv run python scripts/team.py graph`, the open issues, STATUS "Decisions needed from owner".
+- **Outputs, one PR at a time.** (a) The next item of roadmap.md "Calendar-bound phases" (the Phase 5 spec and plan, Phase 6 preparation, the `data-validator` and `journal-analyst` agents), as a spec or plan PR; or a plan amendment that chains the shared-module issues in order, with a `Files:` and a `Depends on:` line on each, so `graph` shows the contention and `claim` refuses the next until the one before is merged (plan-shape rules 1, 3 and 6). (b) A decision memo per open owner question, as one comment on that question's issue: lettered options and a recommendation. Its PRs go through `spec-critic` before ready, as item 3 above says; the owner accepts by merging.
+- **Caps.** It never messages a team; teams read its output at claim time, from the plan line and the issue. One PR in flight. Never more than one phase ahead of the build. It stops when three spec, plan, ADR or process PRs are waiting for the owner's word, its own or anyone's. It files no code issues.
+
 ### Shared files: how N PRs avoid conflicts
 
 Until 2026-09-25 every PR appended one line to `docs/STATUS.md` ("Done") and one to `CHANGELOG.md` (`[Unreleased]`) at the same anchor. Git cannot merge two insertions at one spot, so every merge to `main` conflicted every other open PR, and each team looped: merge main, resolve, push, wait for CI, main moves, repeat (#70). The fix is that a PR **adds files, never lines**:
