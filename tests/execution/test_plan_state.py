@@ -346,6 +346,22 @@ def test_a_decision_event_closes_the_decision(status: str, reason: str) -> None:
     assert not state.written_off
 
 
+def test_a_closing_event_carries_its_reason_as_event_reason() -> None:
+    d = _decision(side="sell", planned_quantity=0.4, decision="forced_exit", reason="delisted")
+    state = _state(d, decision_events=[_decision_event(d, "skipped", "dust")])
+    assert (state.state, state.event_reason) == (State.CLOSED, "dust")
+
+
+def test_event_reason_is_none_when_no_closing_event_closed_the_state() -> None:
+    # Closed by the decision's own kind (a skip/dust decision), not by an event.
+    state = _state(_decision(side=None, decision="dust"))
+    assert state.event_reason is None
+    # Open: no closing event at all.
+    d = _decision(side="buy", planned_notional=100.0, target=100.0)
+    open_state = _state(d)
+    assert open_state.event_reason is None
+
+
 def test_a_deferred_buy_is_open_with_no_row() -> None:
     d = _decision(side="buy", planned_notional=100.0, target=100.0)
     state = _state(d)
