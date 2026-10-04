@@ -889,6 +889,13 @@ def _filing_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any,
     return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall(), key=repr) for t in tables}
 
 
+def test_prefetch_requires_dry_run_by_keyword(settings: Settings) -> None:
+    """#629: `dry_run` has no default, so a future dry caller cannot record
+    failures by leaving it out."""
+    with pytest.raises(TypeError, match="dry_run"):
+        _prefetch(_Recorded(_filings()), settings)  # type: ignore[call-arg]
+
+
 def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -910,7 +917,7 @@ def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
         source: FixtureFilingSource | _Recorded = _filings()
         if prefetch:
             source = _Recorded(source)
-            _prefetch(source, settings)
+            _prefetch(source, settings, dry_run=False)
         conn = duckdb.connect(":memory:")
         conn.execute("SET TimeZone='UTC'")
         init_schema(conn)

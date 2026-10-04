@@ -32,6 +32,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -740,6 +741,19 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Load `Settings` fresh from the environment (no process-wide caching)."""
     return Settings()
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def clean_message(message: str, settings: Settings) -> str:
+    """`message` with every configured secret redacted, control characters
+    replaced by a space, and cut to `ingest.max_message_chars`: the one
+    cleaning for server- or filing-supplied text that is stored (the run row
+    and the EDGAR adapter's `failed_filings.json` and FSN manifests, #629)."""
+    for value in secret_values(settings):
+        message = message.replace(value, "[redacted]")
+    return _CONTROL_CHARS.sub(" ", message)[: settings.ingest.max_message_chars]
 
 
 def secret_values(settings: Settings) -> list[str]:

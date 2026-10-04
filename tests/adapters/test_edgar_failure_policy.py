@@ -637,3 +637,37 @@ def test_p4_stored_messages_are_redacted_cleaned_and_capped(tmp_path: Path) -> N
     assert len(message) <= settings.ingest.max_message_chars
     # the hash is still of the raw message, so acceptance matches the next run
     assert entry["message_hash"] == hashlib.sha256(long.encode("utf-8")).hexdigest()
+
+
+def test_p4_stored_messages_and_run_rows_share_one_redaction(tmp_path: Path) -> None:
+    """#629: `failed_filings.json` and the run row clean a message with one
+    helper, so the two paths cannot drift."""
+    from tradepartner import ingest
+    from tradepartner.config import clean_message
+
+    settings = _settings(tmp_path)
+    source = _garbage_source(settings, 0)
+    message = f"bad {USER_AGENT}\x00\x1b[31m " + "x" * 10_000
+    assert ingest._clean is clean_message
+    assert source._stored_message(message) == clean_message(message, settings)
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        (float("nan"), 1.0, False),
+        (1.0, float("nan"), False),
+        (float("nan"), float("nan"), False),
+        (float("inf"), float("inf"), True),
+        (float("inf"), float("-inf"), False),
+        (float("inf"), 1.0, False),
+    ],
+)
+def test_a_non_finite_value_compares_without_raising(a: float, b: float, same: bool) -> None:
+    """#629: a NaN or infinite value against FSN raised
+    `decimal.InvalidOperation`, failing the whole source; it now compares
+    (NaN never agrees), so a disagreement withholds one key."""
+    from tradepartner.adapters.edgar_source import _same_value
+
+    assert _same_value("fsn", a, "company", b) is same
+    assert _same_value("company", a, "fsn", b) is same
