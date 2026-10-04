@@ -442,6 +442,68 @@ def test_an_engage_kill_switch_override_engages_at_a_mark_run_once(env: Env) -> 
     assert TUE in {r[0] for r in env.query("SELECT session FROM positions_daily")}
 
 
+def _kill_switch_alerts(env: Env) -> list[tuple[int | None, date, str]]:
+    return [
+        (r[0], r[1], r[2])
+        for r in env.query(
+            "SELECT run_id, session, message FROM alerts WHERE kind = 'kill_switch' "
+            "ORDER BY alert_id"
+        )
+    ]
+
+
+def test_every_run_skipped_by_the_switch_writes_one_kill_switch_alert(env: Env) -> None:
+    """Owner decision on #644 (option 2, #677): a run that ends
+    `skipped_kill_switch` writes one run-scoped `kill_switch` alert, deduped on
+    (kind, run), naming the engaged row's source and reason; the next skipped
+    run writes its own."""
+    window = _marked(env)
+    made = _at(MON, 23)
+    env.append(
+        OverrideRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            made_at=made,
+            kind="engage_kill_switch",
+            reason="owner pauses trading for the test",
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+    first = env.run(_at(TUE))
+    assert first.status == "skipped_kill_switch"
+    env.ingest(_at(TUE, 21))
+    second = env.run(_at(WED))
+    assert second.status == "skipped_kill_switch"
+
+    alerts = _kill_switch_alerts(env)
+    assert [(run_id, session) for run_id, session, _ in alerts] == [
+        (first.run_id, TUE),
+        (second.run_id, WED),
+    ]
+    for _, _, message in alerts:
+        assert "source owner" in message
+        assert "owner pauses trading for the test" in message
+
+
+def test_a_run_skipped_by_a_crashed_run_alerts_kill_switch_naming_the_cause(env: Env) -> None:
+    """Engaged by derivation alone (no `engaged` row): the alert names the
+    crashed run as the cause and says no row is engaged."""
+    window = _marked(env)
+    crashed = env.past_run(window, _at(MON), status=None)
+    outcome = env.run(_at(TUE))
+    assert outcome.status == "skipped_kill_switch"
+    ((run_id, session, message),) = _kill_switch_alerts(env)
+    assert (run_id, session) == (outcome.run_id, TUE)
+    assert f"run {crashed} crashed" in message
+    assert "no engaged kill_switch row" in message
+
+
+def test_an_ok_run_writes_no_kill_switch_alert(env: Env, exits_done: list[object]) -> None:
+    _marked(env)
+    assert env.run(_at(TUE)).status == "ok"
+    assert _kill_switch_alerts(env) == []
+
+
 def test_invoked_by_is_scheduler_only_with_the_variable_and_no_tty() -> None:
     assert invoked_by({"TRADEPARTNER_INVOKED_BY": "scheduler"}, stdin_is_tty=False) == "scheduler"
     assert invoked_by({"TRADEPARTNER_INVOKED_BY": "scheduler"}, stdin_is_tty=True) == "tty"
