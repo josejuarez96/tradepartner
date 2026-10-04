@@ -120,6 +120,7 @@ from typing import Any
 import duckdb
 import polars as pl
 
+from tradepartner.adapters.alpaca_prices import is_same_day_typo, same_alpaca_symbol
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
@@ -748,13 +749,36 @@ def _same_line(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return bool(a["valid_from"] == b["valid_from"] and a["ticker"] == b["ticker"])
 
 
+def _same_day_typo_pair(
+    ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
+) -> bool:
+    """True when `current`/`following`'s same-start pair is a cover
+    page's filer noise, not a genuine overlap (#846): the ticker the
+    security held just before is one of the tied tickers (the resolver's
+    own rule, `is_same_day_typo`, shared here, never copied), or the two
+    tickers are one Alpaca symbol under different filer spellings
+    (`same_alpaca_symbol`; `MOTV U`/`MOTV.U`)."""
+    day = current["valid_from"]
+    tickers = {current["ticker"], following["ticker"]}
+    held = next((r["ticker"] for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
+    return is_same_day_typo(held, tickers) or same_alpaca_symbol(
+        current["ticker"], following["ticker"]
+    )
+
+
 def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for sid, ordered in sorted(_by_security(listings).items()):
         for i, current in enumerate(ordered[:-1]):
             following = ordered[i + 1]
             same_start = current["valid_from"] == following["valid_from"]
-            flagged = following if same_start and not _same_line(current, following) else None
+            flagged = (
+                following
+                if same_start
+                and not _same_line(current, following)
+                and not _same_day_typo_pair(ordered, i, current, following)
+                else None
+            )
             filed = current["delisting_filed_at"]
             filing_session = None if filed is None else _filing_session(filed)
             if flagged is None and filing_session is not None:

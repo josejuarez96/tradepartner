@@ -150,7 +150,7 @@ import functools
 import itertools
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -737,6 +737,34 @@ def _same_day_pair(rows: Sequence[_Row]) -> date | None:
     return None
 
 
+def is_same_day_typo(held: str | None, tickers: Collection[str]) -> bool:
+    """True when `held` (a security's ticker just before a same-day,
+    two-ticker listing day) is one of `tickers` (the tickers tied that
+    day): the pair is a cover page's typo (#819; spec req 11 amendment
+    #822 part 2), and the security keeps `held`, never a genuine
+    same-start listing. Shared with `health._overlapping_listings`
+    (#846), so the two rules can never drift apart."""
+    return held is not None and held in tickers
+
+
+_INTERNAL_WHITESPACE = re.compile(r"\s+")
+
+
+def same_alpaca_symbol(one: str, other: str) -> bool:
+    """True when `one` and `other` are the one Alpaca symbol under two
+    filer spellings (#846): `alpaca_symbol` already folds a `-` or `/`
+    one-letter class suffix into `.` (`CRD-A`, `CRD.A`); a run of spaces
+    before such a suffix is the same filer slip (`MOTV U`, `MOTV.U`) and
+    is folded the same way here, for comparison only -- `alpaca_symbol`
+    itself, and what it sends Alpaca, is unchanged."""
+
+    def folded(ticker: str) -> str | None:
+        return alpaca_symbol(_INTERNAL_WHITESPACE.sub("-", ticker.strip()))
+
+    left, right = folded(one), folded(other)
+    return left is not None and left == right
+
+
 def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]:
     """A security's sorted rows less each same-day typo (#819), and the
     first same-day pair day left, or `None`.
@@ -751,7 +779,7 @@ def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]
         before = [r for r in kept if r.day < day]
         held = before[-1].ticker if before and before[-1].kind == EQUITY else None
         tickers = {r.ticker for r in kept if r.day == day and r.kind == EQUITY}
-        if held not in tickers:
+        if not is_same_day_typo(held, tickers):
             return kept, day
         kept = [r for r in kept if not (r.day == day and r.kind == EQUITY and r.ticker != held)]
     return kept, None
