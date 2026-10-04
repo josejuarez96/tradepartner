@@ -8,6 +8,11 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   the price side first fetches (`StorePriceSource`), so it sees the listings the
   EDGAR chunk has just committed. It prints one line per source and exits with
   the result's code: 0 when every source is `ok`, 1 otherwise.
+  `--backfill --since DATE --source alpaca --fill-holes [--dry-run]` runs
+  `backfill.fill_holes` instead (#831): the dry run lists the (security,
+  month) holes in the backfill's committed months, needs no Alpaca secret
+  and fetches nothing; the real run refetches them and exits 0 only when
+  every month it fetched is `filled`.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -86,7 +91,7 @@ from tradepartner.adapters import alpaca_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.backfill import BenchmarkSeed, backfill, backfill_benchmark
+from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
 from tradepartner.backtest.holdout import GAP_THRESHOLD_KEY, Flags, Reasons
 from tradepartner.backtest.hypothesis import HypothesisFileError, register
 from tradepartner.backtest.metrics import METRIC_KEYS
@@ -199,6 +204,34 @@ def _print_result(result: IngestResult) -> None:
             f"{run.source}: {run.status}, {run.rows_added} rows, "
             f"cursor {run.chunk_cursor}: {run.message}"
         )
+
+
+def _print_holes(result: HoleFill) -> None:
+    """Any run rows (a real run's months, or a locked store), then a dry
+    run's holes: the summary and one line per security."""
+    for run in result.runs:
+        typer.echo(
+            f"{run.source}: {run.status}, {run.rows_added} rows, "
+            f"cursor {run.chunk_cursor}: {run.message}"
+        )
+    if result.dry_run and result.exit_code == 0:
+        typer.echo(f"alpaca: holes as of now: {result.summary()}")
+        for line in result.lines():
+            typer.echo(line)
+    elif not result.runs:
+        typer.echo("alpaca: no holes to fill")
+
+
+class _NoPrices(PriceSource):
+    """The price source of a hole-fill dry run, which fetches nothing."""
+
+    def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+        raise RuntimeError("a hole-fill dry run fetches no bars")
+
+    def corporate_actions(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[CorporateAction]:
+        raise RuntimeError("a hole-fill dry run fetches no actions")
 
 
 def _store_missing(settings: Settings) -> typer.Exit | None:
@@ -422,6 +455,13 @@ def make_app(
         ] = False,
         since: Annotated[str | None, typer.Option(help="backfill start, YYYY-MM-DD")] = None,
         dry_run: Annotated[bool, typer.Option(help="roll every chunk back")] = False,
+        fill_holes_: Annotated[
+            bool,
+            typer.Option(
+                "--fill-holes",
+                help="with --backfill: refetch committed months' missing bars (#831)",
+            ),
+        ] = False,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
@@ -430,7 +470,11 @@ def make_app(
             )
         if backfill_ != (since is not None):
             raise _fail("--backfill and --since go together", USAGE_ERROR)
-        if backfill_ and dry_run:
+        if fill_holes_ and not backfill_:
+            raise _fail("--fill-holes needs --backfill and --since", USAGE_ERROR)
+        if fill_holes_ and source != "alpaca":
+            raise _fail("--fill-holes refetches prices only: pass --source alpaca", USAGE_ERROR)
+        if backfill_ and dry_run and not fill_holes_:
             raise _fail("--dry-run is not available with --backfill", USAGE_ERROR)
         start: date | None = None
         if since is not None:
@@ -439,6 +483,13 @@ def make_app(
             except ValueError:
                 raise _fail(f"--since must be YYYY-MM-DD, got {since!r}", USAGE_ERROR) from None
         s = settings()
+        if fill_holes_ and start is not None:
+            if (absent := _store_missing(s)) is not None:
+                raise absent
+            if dry_run:  # fetches nothing: no secret needed
+                listed = fill_holes(s, prices=_NoPrices(), since=start, clock=clock, dry_run=True)
+                _print_holes(listed)
+                raise typer.Exit(listed.exit_code)
         missing = _missing_secrets(s, source)
         if missing:
             raise _fail(
@@ -448,6 +499,10 @@ def make_app(
             )
         filings = EdgarFilingSource(s, client=edgar_client, clock=clock)
         prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
+        if fill_holes_ and start is not None:
+            filled = fill_holes(s, prices=prices, since=start, clock=clock)
+            _print_holes(filled)
+            raise typer.Exit(filled.exit_code)
         if start is not None:
             result = backfill(
                 s, prices=prices, filings=filings, since=start, source=source, clock=clock

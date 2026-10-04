@@ -38,7 +38,30 @@ written by `ingest`'s rules (only what changes an as-of read), so a
 repeated window, or a daily run over a backfilled session, adds nothing.
 Resume freezes committed months: a listing a later EDGAR run adds for an
 earlier month (a better snapshot match, #35) gets its bars only from a
-backfill with a new, earlier `since`.
+backfill with a new, earlier `since`, or from `fill_holes`.
+
+**Holes** (#831). `fill_holes(settings, prices=..., since=...)` refetches
+the committed months of the backfill for `since` (before `_resume_from`)
+where a security the code now counts as fetched in the month
+(`_window_names` at the clock, so a corrected listing end or a new listing
+row counts) has no bar known at the clock: a stale listing end once kept
+the backfill from fetching it (KKR 2018-08..2019-07). A dry run lists
+those (security, month) holes and fetches nothing. A real run takes the
+months in order, re-reading the holes as of the clock when each starts,
+and fetches only that month's holes plus the reference symbol, through the
+same chunk as the backfill: the store read before the fetch with no
+connection open, the reference-gap and missing-share staleness rules
+(over the stored bars and the fetched ones together), rows written by
+`ingest`'s rules (a first-seen bar keeps the timing rule's `known_at`, the
+fetch's clock is `ingested_at`, an unchanged bar adds nothing, absence is
+never a withdrawal) and the month's rows committed in one transaction. Each
+month it fetches writes its own `ingestion_runs` row: mode `holes`, cursor
+`holes;since=<since>;through=<last day>` (never a resume point for
+`backfill`), status `filled` when committed. `filled` is never `ok`, so a
+hole fill never counts as a fresh ingest for health, the cockpit or
+execution. It halts at the first month that is not `filled`. A re-run reads
+the holes again: filled months drop out, a hole the source still cannot
+fill is fetched again.
 
 **One benchmark** (#840): `backfill_benchmark(settings, prices=...,
 symbol=..., since=...)` is the owner's one-off for a configured benchmark
@@ -65,6 +88,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -109,6 +133,7 @@ from tradepartner.ingest import (
     _write_run,
     expected_session,
 )
+from tradepartner.store.asof import listings_as_of
 from tradepartner.store.benchmarks import (
     BenchmarkIdentityError,
     benchmark_candidates,
@@ -122,6 +147,9 @@ from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 BACKFILL = "backfill"
+#: `fill_holes`' run mode, and the status of a month it committed (never `ok`).
+HOLES = "holes"
+FILLED = "filled"
 
 
 def month_windows(start: date, end: date) -> list[tuple[date, date]]:
@@ -181,11 +209,175 @@ def backfill(
             )
             return IngestResult((*runs, run))
         for window in month_windows(start, expected_session(now, settings)):
-            run = _price_chunk(settings, prices, since, window, clock)
-            runs.append(run)
-            if run.status != OK:
+            chunk = _price_chunk(settings, prices, since, window, clock)
+            if chunk is None:  # only a hole fill skips a month
+                continue
+            runs.append(chunk)
+            if chunk.status != OK:
                 break
     return IngestResult(tuple(runs))
+
+
+@dataclass(frozen=True)
+class Hole:
+    """A month in which `security_id` is fetched but the store has no bar.
+
+    `ticker` is its listing's on the month's last day (else its first);
+    `between` is whether it has a stored bar before and after the month."""
+
+    security_id: str
+    ticker: str | None
+    window: tuple[date, date]
+    between: bool
+
+
+@dataclass(frozen=True)
+class HoleFill:
+    """`fill_holes`' outcome: the holes a dry run found, or the runs of a
+    real one (one per month fetched, halted after one not `filled`)."""
+
+    holes: tuple[Hole, ...]
+    runs: tuple[SourceRun, ...]
+    dry_run: bool
+
+    @property
+    def exit_code(self) -> int:
+        """0 when every month fetched was `filled` (or none was), else 1."""
+        return 0 if all(run.status == FILLED for run in self.runs) else 1
+
+    def summary(self) -> str:
+        """One line: how many holes, over how many securities and months."""
+        securities = {hole.security_id for hole in self.holes}
+        months = {hole.window for hole in self.holes}
+        between = [hole for hole in self.holes if hole.between]
+        return (
+            f"{len(self.holes)} holes (security, month) over {len(securities)} securities "
+            f"in {len(months)} months; {len(between)} of them between a security's stored "
+            f"bars ({len({hole.security_id for hole in between})} securities)"
+        )
+
+    def lines(self) -> list[str]:
+        """One line per security, months grouped into runs of consecutive
+        months; those with holes between stored bars first."""
+        by_security: dict[str, list[Hole]] = defaultdict(list)
+        for hole in self.holes:
+            by_security[hole.security_id].append(hole)
+
+        def order(sid: str) -> tuple[int, str]:
+            return (-sum(hole.between for hole in by_security[sid]), sid)
+
+        out = []
+        for sid in sorted(by_security, key=order):
+            holes = sorted(by_security[sid], key=lambda hole: hole.window)
+            spans: list[list[date]] = []
+            for hole in holes:
+                month = hole.window[0].replace(day=1)
+                if spans and _next_month(spans[-1][-1]) == month:
+                    spans[-1].append(month)
+                else:
+                    spans.append([month])
+            shown = ", ".join(
+                _month(span[0]) if len(span) == 1 else f"{_month(span[0])}..{_month(span[-1])}"
+                for span in spans
+            )
+            between = sum(hole.between for hole in holes)
+            out.append(
+                f"  {sid} {holes[0].ticker or '-'}: {shown} ({len(holes)} months, "
+                f"{between} between its stored bars)"
+            )
+        return out
+
+
+def _next_month(month: date) -> date:
+    return date(month.year + month.month // 12, month.month % 12 + 1, 1)
+
+
+def _month(month: date) -> str:
+    return month.strftime("%Y-%m")
+
+
+def fill_holes(
+    settings: Settings,
+    *,
+    prices: PriceSource,
+    since: date,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> HoleFill:
+    """Refetch the holes in the committed months of the backfill for
+    `since` (the module docstring's **Holes**); with `dry_run`, list them
+    and fetch nothing."""
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError(f"since must be a date, got {since!r}")
+    cursor = f"{HOLES};since={since.isoformat()}"
+    try:
+        end = _resume_from(settings, since)
+    except StoreLockedError as exc:
+        run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
+        return HoleFill((), (run,), dry_run)
+    windows = month_windows(since, end - timedelta(days=1)) if end > since else []
+    if dry_run:
+        try:
+            holes = _holes(settings, windows, ensure_tz_aware_utc(clock(), field_name="clock()"))
+        except StoreLockedError as exc:
+            run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
+            return HoleFill((), (run,), dry_run)
+        return HoleFill(tuple(holes), (), dry_run)
+    runs: list[SourceRun] = []
+    for window in windows:
+        chunk = _price_chunk(settings, prices, since, window, clock, fill=True)
+        if chunk is None:
+            continue
+        runs.append(chunk)
+        if chunk.status != FILLED:
+            break
+    return HoleFill((), tuple(runs), dry_run)
+
+
+def _holes(settings: Settings, windows: list[tuple[date, date]], t: datetime) -> list[Hole]:
+    """Every hole in `windows` as of `t`, a short read per month."""
+    if not windows:
+        return []
+    with _read(settings) as conn:
+        tickers: dict[str, list[tuple[date, str]]] = defaultdict(list)
+        for row in listings_as_of(conn, t).iter_rows(named=True):
+            tickers[row["security_id"]].append((row["valid_from"], row["ticker"]))
+        spans = {
+            sid: (lo, hi)
+            for sid, lo, hi in conn.execute(
+                "SELECT security_id, min(session), max(session) FROM prices_daily "
+                "WHERE known_at <= ? GROUP BY ALL",
+                [t],
+            ).fetchall()
+        }
+    holes: list[Hole] = []
+    for window in windows:
+        first, last = window
+        with _read(settings) as conn:
+            ids, *_ = _window_names(conn, t, window, settings)
+            stored = _with_bars(conn, t, window)
+        for sid in ids:
+            if sid in stored:
+                continue
+            rows = sorted(tickers.get(sid, []))
+            live = [ticker for start, ticker in rows if start <= last]
+            ticker = live[-1] if live else (rows[0][1] if rows else None)
+            lo, hi = spans.get(sid, (None, None))
+            between = lo is not None and hi is not None and lo < first and hi > last
+            holes.append(Hole(sid, ticker, window, between))
+    return holes
+
+
+def _with_bars(conn: duckdb.DuckDBPyConnection, t: datetime, window: tuple[date, date]) -> set[str]:
+    """Securities with a bar known at `t` on a session in `window`."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT security_id FROM prices_daily "
+            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+            [*window, t],
+        ).fetchall()
+    }
 
 
 def _cursor(since: date, through: date) -> str:
@@ -217,13 +409,19 @@ def _price_chunk(
     since: date,
     window: tuple[date, date],
     clock: Callable[[], datetime],
-) -> SourceRun:
+    *,
+    fill: bool = False,
+) -> SourceRun | None:
     """One month. The store is read as of the clock when the month starts
     (after the EDGAR chunk committed) and rows are stamped with the clock
     after the fetch returns, so a revision is never dated before it was
-    fetched."""
+    fetched. With `fill` (a hole fill), only the names with no bar known
+    then are fetched, with the reference; the stored bars count toward the
+    staleness share; and a month with no hole is skipped (`None`)."""
     first, last = window
-    run_id, cursor = uuid.uuid4().hex, _cursor(since, last)
+    mode, done = (HOLES, FILLED) if fill else (BACKFILL, OK)
+    cursor = f"{HOLES};{_cursor(since, last)}" if fill else _cursor(since, last)
+    run_id = uuid.uuid4().hex
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
 
     def outcome(status: str, rows: int, message: str) -> SourceRun:
@@ -234,6 +432,12 @@ def _price_chunk(
             ids, listed, static_only, may_count, reference = _window_names(
                 conn, started, window, settings
             )
+            stored = _with_bars(conn, started, window) if fill else set()
+        holes = [sid for sid in ids if sid not in stored]
+        if fill:
+            if not holes:
+                return None
+            ids = sorted({*holes, *([reference] if reference is not None else [])})
         symbol = settings.ingest.reference_symbol
         if reference is None:
             raise LookupError(f"reference symbol {symbol} has no listing in {first}..{last}")
@@ -250,7 +454,7 @@ def _price_chunk(
         if gaps:
             shown = ", ".join(day.isoformat() for day in gaps[:10])
             raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {shown}")
-        with_bars = {bar.security_id for bar in bars}
+        with_bars = {bar.security_id for bar in bars} | stored
         counted, missing, reported = _staleness(listed, with_bars, static_only, may_count)
         share = len(missing) / len(counted) if counted else 0.0
         limit = settings.ingest.max_missing_share
@@ -272,15 +476,16 @@ def _price_chunk(
                 params=[first, last],
             )
             added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
+            filled = f"holes of {len(holes)} names with no stored bar: " if fill else ""
             message = (
-                f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
+                f"{filled}{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
                 f"{len(missing)} of {len(counted)} listed names without a bar"
                 f"{_reported_note(reported)}"
             )
             if resolution := prices.resolution_summary():
                 message += f"; {resolution}"
-            run = outcome(OK, added, message)
-            _write_run(conn, run_id, started, clock(), run, BACKFILL)
+            run = outcome(done, added, message)
+            _write_run(conn, run_id, started, clock(), run, mode)
         return run
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
@@ -288,7 +493,7 @@ def _price_chunk(
         run = outcome(STALE, 0, str(exc))
     except Exception as exc:  # any source or parse failure halts with a run row
         run = outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))
-    return _record_only(settings, run_id, started, clock, run, BACKFILL)
+    return _record_only(settings, run_id, started, clock, run, mode)
 
 
 def _window_names(
