@@ -196,12 +196,19 @@ class DecisionState:
     `closed`, reason `written_off`) although no `written_off` decision event
     exists yet: the run step that sees it appends that row with the remainder's
     notional as `unfunded_notional`.
+
+    `event_reason` is the reason of the `decision_events` row that closed the
+    state, when a closing event is what closed it (e.g. `dust` or
+    `untradable`); it is `None` when the state is closed for any other
+    reason (a `skip_*`/`dust` decision kind, a no-side `override`, a buy
+    write-off, or a state that is not closed at all).
     """
 
     state: State
     reason: str | None = None
     remainder: Remainder | None = None
     written_off: bool = False
+    event_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -510,7 +517,9 @@ def decision_state(
     if mine_events:
         latest_event = max(enumerate(mine_events), key=lambda p: (p[1].known_at, p[0]))[1]
         if latest_event.status in _CLOSING_EVENTS:
-            return DecisionState(State.CLOSED, latest_event.status)
+            return DecisionState(
+                State.CLOSED, latest_event.status, event_reason=latest_event.reason
+            )
 
     mine = _orders_of(decision, orders)
     events_by_order: dict[str, list[OrderEventRow]] = {o.client_order_id: [] for o in mine}
