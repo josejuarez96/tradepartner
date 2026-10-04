@@ -660,12 +660,18 @@ def test_phase_time_skips_are_journaled_while_the_rest_submits(
 def test_a_forced_exits_only_batch_that_halts_leaves_the_rebalance_pending(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
+    """A full exit's own open sell no longer trips `sell_sum_within_holding`
+    (#647 item 5; see
+    `test_a_full_exit_nets_out_its_own_open_sell_instead_of_halting_the_batch`
+    below), so an unrelated batch limit exercises the same claim here: a
+    halt in a forced-exits-only phase still leaves the rebalance pending."""
     _hold(env, A, 10.0)
-    _open_sell(env, A, 8.0)
-    _decision(env, B, "buy", notional=3000.0)  # the pending rebalance, not in this batch
+    _hold(env, B, 5.0)  # untouched this batch; breaches the tightened cap below
+    _decision(env, C, "buy", notional=3000.0)  # the pending rebalance, not in this batch
     forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
-    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
-        _execute(_gate(env, alerter_conn), env, [], [forced])
+    gate = _gate(env, alerter_conn, FROZEN.model_copy(update={"max_gross_exposure": 0.0}))
+    with pytest.raises(LimitBreachError, match="max_gross_exposure"):
+        _execute(gate, env, [], [forced])
     assert _missed(env.settings) == []
 
 
@@ -676,13 +682,53 @@ def test_a_sells_phase_breach_marks_a_held_buys_only_rebalance_missed(
     phase holds only the exit, and its breach still marks the rebalance
     `missed` (ADR 0010 point 2: per batch, not per phase)."""
     _hold(env, A, 10.0)
-    _open_sell(env, A, 8.0)
-    buy = _decision(env, B, "buy", notional=3000.0)
+    _hold(env, B, 5.0)  # untouched this batch; breaches the tightened cap below
+    buy = _decision(env, C, "buy", notional=3000.0)
     forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
-    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
-        _execute(_gate(env, alerter_conn), env, [buy], (forced,))
+    gate = _gate(env, alerter_conn, FROZEN.model_copy(update={"max_gross_exposure": 0.0}))
+    with pytest.raises(LimitBreachError, match="max_gross_exposure"):
+        _execute(gate, env, [buy], (forced,))
     assert _missed(env.settings) == [("missed", "limit_breach")]
     assert _submits(env.fake) == []
+
+
+def test_a_full_exit_nets_out_its_own_open_sell_instead_of_halting_the_batch(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#647 item 5 owner decision, end to end: this is the exact shape the
+    two tests above used to exercise pre-#647 (10 held, 8 open-sold: the old
+    full exit sold the whole 10 and tripped `sell_sum_within_holding` at 18
+    over the 10 held). Now the full exit nets the open sell out and submits
+    the smaller sell, so the batch neither halts nor skips."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 8.0)
+    forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
+    outcome = _execute(_gate(env, alerter_conn), env, [], [forced])
+    assert outcome.status == "ok"
+    submits = _submits(env.fake)
+    assert len(submits) == 1
+    assert (submits[0].quantity, submits[0].notional) == (2.0, None)  # 10 - 0 - 8
+    assert _missed(env.settings) == []
+
+
+def test_several_holding_capped_trims_already_at_residue_do_not_trip_the_skip_cap(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#647 item 7 owner decision, end to end: a broad price drop can leave
+    several trims already sold down to their residue (here, simply never
+    held at all, which caps each one's quantity at 0 just the same). Before
+    #647 each one's holding-capped quantity closed as a real skip and
+    counted toward the cap (the #602-era bug); now each is held instead, so
+    more of them than `max_skips_per_run` never trips `SkipCapError`, writes
+    no skip `decision_events` row, and leaves every decision open."""
+    trims = [_decision(env, sid, "sell", notional=300.0) for sid in (A, B, C)]
+    gate = _gate(env, alerter_conn, FROZEN.model_copy(update={"max_skips_per_run": 0}))
+    outcome = _execute(gate, env, trims)
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    assert outcome.skips == ()
+    assert _decision_events(env.settings) == []
+    assert _missed(env.settings) == []
 
 
 # --- the journal before the broker ---------------------------------------------------------
