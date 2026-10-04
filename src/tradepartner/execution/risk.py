@@ -91,6 +91,7 @@ from tradepartner.adapters.broker import Account, Asset
 from tradepartner.backtest.costs import BPS_PER_UNIT
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.plan import _SPLIT as _SPLIT_ACTION
 from tradepartner.execution.plan import BuyCosts, Remainder, _split_factor
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
@@ -169,10 +170,14 @@ class PhaseOrder:
 
 @dataclass(frozen=True)
 class OpenSell:
-    """The unfilled quantity of one non-terminal own sell, any session."""
+    """The unfilled quantity of one non-terminal own sell, any session.
+    `split_ratios` is how many `float` split ratios `unfilled_sells`
+    multiplied into it: each one widens the `float` noise `open_sold` snaps
+    away (#719 item 1 /code-review: chained splits)."""
 
     security_id: str
     unfilled_quantity: float
+    split_ratios: int = 0
 
 
 @dataclass(frozen=True)
@@ -273,7 +278,9 @@ def open_sold(open_sells: Iterable[OpenSell], quantity_decimals: int) -> dict[st
     totals: dict[str, Decimal] = defaultdict(Decimal)
     for sell in open_sells:
         left = _dec(_finite(sell.unfilled_quantity, f"open sell of {sell.security_id}"))
-        totals[sell.security_id] += _on_grid(left, step)
+        if sell.split_ratios < 0:
+            raise ValueError(f"open sell of {sell.security_id} has {sell.split_ratios} splits")
+        totals[sell.security_id] += _on_grid(left, step, sell.split_ratios)
     return totals
 
 
@@ -281,14 +288,17 @@ def open_sold(open_sells: Iterable[OpenSell], quantity_decimals: int) -> dict[st
 _FLOAT_EPSILON = Decimal(sys.float_info.epsilon)
 
 
-def _on_grid(left: Decimal, step: Decimal) -> Decimal:
+def _on_grid(left: Decimal, step: Decimal, split_ratios: int) -> Decimal:
     """`left` (non-negative) on the grid of `step`: the nearest step when the
-    distance to it is at most `float` noise, machine epsilon times the larger
-    of `left` and one share (`unfilled_sells` subtracts exactly, so what is
-    left is the rounding of its `float` result and of a split factor's
-    product), else rounded **up**."""
+    distance to it is at most `float` noise, else rounded **up**. The noise
+    bound is machine epsilon times the larger of `left` and one share, times
+    `split_ratios` + 2: `unfilled_sells` subtracts exactly, so what is left
+    is each split ratio's own rounding and their `float` product (under one
+    epsilon each), plus storing the result as a `float` and reading it back
+    through `repr` (under two together)."""
     nearest = left.quantize(step, rounding=ROUND_HALF_EVEN)
-    if abs(left - nearest) <= _FLOAT_EPSILON * max(left, Decimal(1)):
+    noise = _FLOAT_EPSILON * max(left, Decimal(1)) * (split_ratios + 2)
+    if abs(left - nearest) <= noise:
         return nearest
     return left.quantize(step, rounding=ROUND_UP)
 
@@ -385,8 +395,10 @@ def unfilled_sells(
         if order.side != _SELL or order.client_order_id in terminal:
             continue
         coid = order.client_order_id
+        ratios = 0
         if order.quantity is not None:
             factor = _split_factor(actions_as_of, order.security_id, order.session, session)
+            ratios = _split_count(actions_as_of, order.security_id, order.session, session)
             left = (_dec(order.quantity) - filled_quantity[coid]) * _dec(factor)
         elif order.notional is not None:
             price = _finite(price_of(order.security_id), "price", positive=True)
@@ -394,8 +406,23 @@ def unfilled_sells(
         else:
             raise ValueError(f"order {coid!r} has neither quantity nor notional")
         if left > 0:
-            result.append(OpenSell(order.security_id, float(left)))
+            result.append(OpenSell(order.security_id, float(left), ratios))
     return result
+
+
+def _split_count(
+    actions_as_of: pl.DataFrame, security_id: str, stated_on: date, session: date
+) -> int:
+    """How many split ratios `plan._split_factor` multiplies for the same
+    arguments: the name's `split` rows with ex-date in (`stated_on`,
+    `session`]."""
+    return sum(
+        1
+        for row in actions_as_of.iter_rows(named=True)
+        if row["security_id"] == security_id
+        and row["action_type"] == _SPLIT_ACTION
+        and stated_on < row["ex_date"] <= session
+    )
 
 
 def _skip_reason(

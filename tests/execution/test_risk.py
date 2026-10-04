@@ -311,7 +311,7 @@ def test_open_sells_count_only_their_unfilled_part() -> None:
     # A 2:1 split between the order's session and S doubles the unfilled part:
     # the holding is on S's basis, so counting 2 would let a batch oversell.
     (split_sell,) = unfilled_sells([order], [accepted], [fill], _price_of, _split(_S), session=_S)
-    assert split_sell == OpenSell("A", 4.0)
+    assert split_sell == OpenSell("A", 4.0, split_ratios=1)
     before = unfilled_sells(
         [order], [accepted], [fill], _price_of, _split(date(2026, 9, 30)), session=_S
     )
@@ -396,6 +396,51 @@ def test_an_open_notional_sell_estimate_counts_up_to_the_grid() -> None:
     )
     assert open_sold([left], 9) == {"A": Decimal("2.333333334")}
     assert open_sold([left], 2) == {"A": Decimal("2.34")}
+
+
+def _splits(*ratios: float) -> pl.DataFrame:
+    """Splits of A with ex-dates in (the open sell's session 2026-09-30, S]."""
+    return pl.DataFrame(
+        {
+            "security_id": ["A"] * len(ratios),
+            "action_type": ["split"] * len(ratios),
+            "ex_date": [_S] * len(ratios),
+            "ratio_or_amount": list(ratios),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("quantity", "filled", "ratios", "decimals", "expected"),
+    [
+        (60.0, (), (3 / 2, 1 / 10), 0, "9"),  # float product: 9.000000000000002
+        (81.0, (), (1 / 3, 5 / 3), 0, "45"),  # 45.00000000000001
+        (65.0, (1.7,), (1 / 15,), 9, "4.22"),  # 4.220000000000001 once stored
+        (10.0, (), (1 / 3,), 9, "3.333333334"),  # truly off the grid: up
+    ],
+)
+def test_a_split_adjusted_open_sell_on_the_grid_is_not_counted_a_step_up(
+    quantity: float,
+    filled: tuple[float, ...],
+    ratios: tuple[float, ...],
+    decimals: int,
+    expected: str,
+) -> None:
+    """#719 item 1, /code-review on PR #745: an open sell whose true unfilled
+    quantity is on the grid after one or more splits carries the `float`
+    rounding of each ratio, of their product and of its own storage; that
+    noise widens with the split count and still snaps to the nearest step,
+    so a whole-share trim beside it never loses a share."""
+    (left,) = unfilled_sells(
+        [_open_sell_row(quantity=quantity)],
+        [_ACCEPTED],
+        _sell_fills(*filled),
+        _price_of,
+        _splits(*ratios),
+        session=_S,
+    )
+    assert left.split_ratios == len(ratios)
+    assert open_sold([left], decimals) == {"A": Decimal(expected)}
 
 
 @pytest.mark.parametrize(
