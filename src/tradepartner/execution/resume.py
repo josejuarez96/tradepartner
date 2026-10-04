@@ -676,9 +676,7 @@ def resume(
             )
         if not _switch(connect, window).engaged:
             return outcome(NOT_ENGAGED, reconciliation_id=reconciliation_id)
-        crossing = drawdown.check(
-            window, marks, events, frozen.max_drawdown, set(), command_session(now)
-        )
+        crossing = drawdown.check(window, marks, events, frozen.max_drawdown, set(), session)
         if crossing is not None:
             # The window's marks before this release, checked the same way a
             # run checks its own (#648): a crashed run's marks are not

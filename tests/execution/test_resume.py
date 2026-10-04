@@ -1306,6 +1306,135 @@ def test_a_pre_release_crossing_mark_is_not_re_checked_by_resume(
     assert released[-1].peak_equity == in_bound
 
 
+def test_an_earlier_crossing_of_the_crashed_run_refuses_though_its_last_mark_is_in_bound(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The crashed run marks two sessions after the window's last release: the
+    earlier one crosses the drawdown, the last one is back in bound. Checking
+    only the last mark would release; `resume` checks every mark known after
+    the release, so it refuses and names the earlier session (#648)."""
+    _engage(journal_settings, window, fixed_clock)
+    first = _resume(journal_settings, fake, fixed_clock)
+    assert first.status == RELEASED, first.reasons
+
+    at = fixed_clock.now + timedelta(seconds=1)  # strictly after the release above
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 29),
+            quantity=0.0,
+            cash=50_000.0,  # below starting_equity * (1 - max_drawdown) = 70,000
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),  # the window's last marked session
+            quantity=0.0,
+            cash=93_000.0,  # in bound
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("drawdown" in r and "2026-09-29" in r for r in outcome.reasons), outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert sum(e.state == "released" for e in events) == 1
+    drawdown_rows = [e for e in events if e.source == "drawdown"]
+    assert len(drawdown_rows) == 1 and "2026-09-29" in (drawdown_rows[0].reason or "")
+    assert _engaged(journal_settings, window)
+
+
+def test_a_finite_non_positive_last_mark_refuses_once_the_drawdown_is_disarmed(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """After a `drawdown` engagement the trigger is disarmed, so a last mark of
+    -50 cash reaches the peak's own validation: no positive equity refuses."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=-50.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="drawdown",
+        reason="test",
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons), outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert sum(e.source == "drawdown" for e in events) == 1  # no second engagement
+    assert _engaged(journal_settings, window)
+
+
+def test_a_drawdown_row_that_cannot_be_written_still_refuses_and_names_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crossing whose `drawdown` engagement fails to write still refuses the
+    release (fail closed) and names the failed write."""
+    at = DAY1 - timedelta(days=1)
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=50_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    real_engage = switch.engage
+
+    def engage(*args: Any, **kwargs: Any) -> int | switch.WriteFailed:
+        if kwargs.get("source") == "drawdown":
+            return switch.WriteFailed("IOException: disk full")
+        return real_engage(*args, **kwargs)
+
+    monkeypatch.setattr(switch, "engage", engage)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("drawdown" in r for r in outcome.reasons)
+    assert any("could not be written" in r for r in outcome.reasons), outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert not any(e.state == "released" for e in events)
+    assert _engaged(journal_settings, window)
+
+
 def test_a_failed_fault_engagement_is_named_in_the_refusal(
     journal_settings: Settings,
     fake: SkewedFake,

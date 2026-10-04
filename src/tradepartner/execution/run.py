@@ -1784,8 +1784,3 @@ def _current_tickers(listings: pl.DataFrame, day: date) -> dict[str, str]:
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
     """The securities whose listing current on `day` has `ticker`."""
     return sorted(sid for sid, row in _current(listings, day).items() if row["ticker"] == ticker)
-
-
-#: Kept importable: `execution.drawdown.mark_equity` is the one definition
-#: (moved there for #648, shared with `resume`).
-_mark_equity = drawdown.mark_equity
