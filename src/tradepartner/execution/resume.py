@@ -51,11 +51,20 @@ The only way the kill switch is released. In the req 5 order:
    positive refuses. The reconciliation cited
    is the window's highest id, the one this resume wrote. A switch that is
    not engaged has nothing to release: the outcome is `not_engaged`, after
-   the same settlement and reconciliation. A `switch.ReleaseRefused` (one of
-   `release`'s own checks, such as a release that would not clear the switch
-   because the clock did not move past the crashed close) is a refusal with
-   nothing written; the state is also derived again after a release, and a
-   switch that still derives engaged is reported refused, not released.
+   the same settlement and reconciliation. Before the peak is computed, the
+   window's own marks run through `execution.drawdown.check` (#648, owner
+   decision 2026-10-03): a crashed run's marks never reached its own
+   drawdown check and this release would otherwise widen past them
+   unchecked, so this step checks them first. A crossing engages the switch
+   (source `drawdown`, no `run_id`) and refuses, without computing the peak
+   or releasing; `drawdown_armed` is then False, so the owner's *next*
+   `resume` releases normally, resetting the peak to the last mark's
+   equity, exactly as after a run's own drawdown engagement. A
+   `switch.ReleaseRefused` (one of `release`'s own checks, such as a
+   release that would not clear the switch because the clock did not move
+   past the crashed close) is a refusal with nothing written; the state is
+   also derived again after a release, and a switch that still derives
+   engaged is reported refused, not released.
 
 **The synthetic residual fill** (req 8): quantity = `filled_quantity` minus
 the journaled quantity; price = (`filled_quantity` x `filled_avg_price` minus
@@ -114,7 +123,7 @@ from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, Unkno
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
-from tradepartner.execution import switch
+from tradepartner.execution import drawdown, switch
 from tradepartner.execution.collect import (
     Connect,
     OrderReading,
@@ -434,8 +443,8 @@ def _mark_equity(marks: Sequence[PositionDailyRow]) -> float | None:
     every row, not only a dedicated `security_id IS NULL` row: that cash-only
     row is written only when the window holds nothing. So cash is read from
     any row at the session, requiring exactly one distinct non-None value
-    across them, mirroring `run._mark_equity` -- the drawdown check's own
-    read of the same table.
+    across them, mirroring `execution.drawdown.mark_equity` -- the drawdown
+    check's own read of the same table.
     """
     if not marks:
         return None
@@ -667,6 +676,30 @@ def resume(
             )
         if not _switch(connect, window).engaged:
             return outcome(NOT_ENGAGED, reconciliation_id=reconciliation_id)
+        crossing = drawdown.check(window, marks, events, frozen.max_drawdown, set(), session)
+        if crossing is not None:
+            # The window's marks before this release, checked the same way a
+            # run checks its own (#648): a crashed run's marks are not
+            # dropped just because this resume is about to release.
+            refusal = [f"drawdown: {crossing.reason}"]
+            try:
+                engaged = switch.engage(
+                    settings,
+                    clock,
+                    window_id=window_id,
+                    source="drawdown",
+                    reason=crossing.reason,
+                )
+            except Exception as engage_error:  # a bad clock reading, say
+                engaged = switch.WriteFailed(f"{type(engage_error).__name__}: {engage_error}")
+            if isinstance(engaged, switch.WriteFailed):
+                # The switch stays engaged either way (we are on the engaged
+                # path already); this only means the drawdown row itself,
+                # and its own reason, could not be written.
+                refusal.append(
+                    f"the drawdown kill-switch row could not be written: {engaged.error}"
+                )
+            return outcome(REFUSED, *refusal, reconciliation_id=reconciliation_id)
         peak = _mark_equity(marks) if marks else switch.drawdown_peak(window, events)
         if peak is None or not (math.isfinite(peak) and peak > 0):
             return outcome(

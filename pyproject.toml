@@ -32,6 +32,7 @@ dev = [
     "pandas-stubs>=3.0.5.260914",
     "types-python-dateutil>=2.9.0.20260807",
     "bt==1.2.3",
+    "pytest-xdist>=3.8.0",
 ]
 
 [build-system]

@@ -23,7 +23,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # uv cache keyed on uv.lock (a changed lock misses it). Only main saves it: a `train/**`
+      # or PR run only restores, so a batch's code cannot poison main's cache (#582).
       - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
       - name: Install
         run: uv sync --locked
       - name: Hygiene (pre-commit hooks)
@@ -55,7 +61,8 @@ jobs:
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
       - name: Tests
         if: steps.scope.outputs.needed != 'no'
-        run: uv run pytest
+        # xdist: one worker per core; each test already gets its own tmp_path (#581)
+        run: uv run pytest -n auto
 
   claims:
     if: github.event_name == 'pull_request'

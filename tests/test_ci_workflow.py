@@ -65,3 +65,20 @@ def test_the_checks_job_token_is_read_only() -> None:
     assert "write" not in checks
     claims = text[text.index("  claims:\n") :]
     assert "if: github.event_name == 'pull_request'" in claims
+
+
+def test_tests_run_in_parallel_inside_the_single_checks_job() -> None:
+    """#581: the suite runs with xdist inside the one `checks` job, so the check name the
+    merge train and branch protection read does not change."""
+    text = CI.read_text()
+    assert "run: uv run pytest -n auto" in text
+    assert "\n  checks:\n" in text
+
+
+def test_uv_cache_is_keyed_on_the_lock_and_only_main_saves_it() -> None:
+    """#582: restore everywhere, save only on main, so a train batch cannot poison it."""
+    text = CI.read_text()
+    assert "enable-cache: true" in text
+    assert "cache-dependency-glob: uv.lock" in text
+    assert "save-cache: ${{ github.ref == 'refs/heads/main' }}" in text
+    assert "uv sync --locked" in text
