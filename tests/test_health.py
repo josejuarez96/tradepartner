@@ -655,6 +655,59 @@ def test_a_held_ticker_from_a_non_equity_row_does_not_excuse_an_equity_pair(
     assert "SEC_MIXED_KIND" in check.violations["security_id"].to_list()
 
 
+def test_a_held_non_equity_ticker_does_not_excuse_a_mixed_kind_pair(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Regression (quant-auditor pass 2 on #846): the gate must trigger
+    # when EITHER row of a same-start pair is equity, not only the one
+    # that happens to sort first alphabetically. WARR (warrant) continues
+    # its own non-equity ticker from before; ZNEW is a brand-new equity
+    # ticker the same day. WARR sorts before ZNEW, so gating on "current"
+    # alone (the pre-fix code) let WARR's non-equity history wrongly
+    # excuse ZNEW, an equity row the resolver's EQUITY-only path would
+    # never treat as a typo of a warrant's ticker.
+    known_before = session_close(date(2018, 1, 2))
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_MIXED_PAIR",
+            "ticker": "WARR",
+            "exchange": "NASDAQ",
+            "class_title": "Warrants to purchase Common Stock",
+            "valid_from": date(2018, 1, 2),
+            "known_at": known_before,
+            "ingested_at": known_before,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    known_pair = session_close(date(2019, 6, 3))
+    for ticker, class_title in (
+        ("WARR", "Warrants to purchase Common Stock"),
+        ("ZNEW", "Common Stock"),
+    ):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_MIXED_PAIR",
+                "ticker": ticker,
+                "exchange": "NASDAQ",
+                "class_title": class_title,
+                "valid_from": date(2019, 6, 3),
+                "known_at": known_pair,
+                "ingested_at": known_pair,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_MIXED_PAIR" in check.violations["security_id"].to_list()
+
+
 def test_held_ticker_matches_through_a_class_suffix_spelling(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

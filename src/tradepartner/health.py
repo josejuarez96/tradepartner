@@ -780,12 +780,13 @@ def _held_ticker(
 ) -> str | None:
     """The ticker (resolver-folded) `ordered[index]`'s security held just
     before `day`, by the resolver's own rule: the row immediately before
-    `day`, and only when that row is the pair's own kind too (an equity
-    pair reads a non-equity row's ticker no more than the resolver's
-    `_same_day_pair` does, #846) -- except a non-equity pair, which the
-    resolver's EQUITY-only path never examines in the first place, so
-    there is no resolver opinion for health to drift from; its own last
-    ticker, of whatever kind, decides."""
+    `day`, and only when that row is itself `EQUITY` too while
+    `pair_kind` is `EQUITY` (either of the pair's own rows; a pair reads
+    a non-equity row's ticker no more than the resolver's
+    `_same_day_pair` does, #846) -- except a pair with neither row
+    `EQUITY`, which the resolver's EQUITY-only path never examines in the
+    first place, so there is no resolver opinion for health to drift
+    from; its own last ticker, of whatever kind, decides."""
     previous = next((r for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
     if previous is None:
         return None
@@ -809,7 +810,13 @@ def _same_day_typo_pair(
         _resolver_ticker(str(current["ticker"])),
         _resolver_ticker(str(following["ticker"])),
     }
-    held = _held_ticker(ordered, index, day, _row_kind(current))
+    # Either row being equity puts the pair on the resolver's EQUITY-only
+    # path (quant-auditor pass 2 on #846): gating on `current` alone let a
+    # mixed equity/non-equity pair's gate depend on which ticker happened
+    # to sort first in `ordered`, not on kind.
+    current_kind, following_kind = _row_kind(current), _row_kind(following)
+    pair_kind = EQUITY if EQUITY in (current_kind, following_kind) else current_kind
+    held = _held_ticker(ordered, index, day, pair_kind)
     return is_same_day_typo(held, tickers) or same_alpaca_symbol(
         str(current["ticker"]), str(following["ticker"])
     )
