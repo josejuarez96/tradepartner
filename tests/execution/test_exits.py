@@ -482,9 +482,37 @@ def test_fractionable_dusted_remainder_blocks_the_next_session() -> None:
     )
 
 
-def test_settled_remainder_at_the_dust_level_blocks_a_new_exit() -> None:
-    """2.4 shares sold 2 and settled on a 0.4 remainder: still blocked while
-    the holding has not grown past that remainder."""
+def test_settled_whole_share_exit_leaves_one_more_decision_then_dust_blocks() -> None:
+    """2.4 shares, an order for the floor of 2 filled: the decision settles with
+    a remainder of 0 (measured against that order), so the 0.4 left gets one
+    more exit, which the phase closes `dust`; after that no new exit is made."""
+    settled = DecisionState(State.SETTLED, remainder=Remainder(quantity=0.0, notional=0.0))
+    first = _decision(1, "AAA", reason="delisted", planned_quantity=2.4)
+    exits = _forced(
+        {"AAA": 0.4},
+        listings_at={"AAA": PREVIOUS},
+        decisions=(first,),
+        states={1: settled},
+        assets=_assets(AAA=Flags(fractionable=False)),
+    )
+    assert [(e.security_id, e.planned_quantity) for e in exits] == [("AAA", 0.4)]
+    dusted = _decision(2, "AAA", reason="delisted", planned_quantity=0.4, known_at=NOW)
+    assert (
+        _forced(
+            {"AAA": 0.4},
+            listings_at={"AAA": PREVIOUS},
+            decisions=(first, dusted),
+            states={
+                1: settled,
+                2: DecisionState(State.CLOSED, "skipped", event_reason="dust"),
+            },
+        )
+        == []
+    )
+
+
+def test_settled_remainder_not_below_the_holding_blocks_a_new_exit() -> None:
+    """A settled exit whose remainder covers the holding blocks a new one."""
     settled_at_dust = DecisionState(State.SETTLED, remainder=Remainder(quantity=0.4, notional=4.0))
     old = _decision(1, "AAA", reason="delisted", planned_quantity=2.4)
     assert (
