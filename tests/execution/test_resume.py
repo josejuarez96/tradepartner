@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Protocol
 
 import pytest
@@ -2119,4 +2119,43 @@ def test_observe_wraps_collects_clock_without_weakening_its_own_guard(
 
     # Neither reading raised the floor: the first tied it, the second was
     # behind it, and `observe` never lowers the floor either.
+    assert stamps._floor == DAY1
+
+
+def test_observe_normalises_a_non_utc_reading_before_raising_the_floor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #682: a tz-aware reading in another zone raises the floor as its
+    UTC instant, so the floor, every stamp clamped to it and the clamp
+    warning are UTC, while `collect` still gets the raw reading unchanged."""
+    eastern = timezone(timedelta(hours=-4))
+    ahead = (DAY1 + timedelta(minutes=5)).astimezone(eastern)
+    stamps = resume_module._MonotonicStamps(DAY1)
+
+    assert stamps.observe(lambda: ahead)() is ahead
+    assert stamps._floor == ahead
+    assert stamps._floor.tzinfo is UTC
+
+    caplog.set_level(logging.WARNING, logger=resume_module.__name__)
+    stamp = stamps.next(lambda: DAY1, "the journal cut")
+
+    assert stamp == ahead
+    assert stamp.tzinfo is UTC
+    assert ahead.astimezone(UTC).isoformat() in caplog.text
+    assert "-04:00" not in caplog.text
+
+
+def test_observe_leaves_the_floor_alone_on_a_reading_without_a_utc_offset() -> None:
+    """A reading whose tzinfo gives no offset is not a usable instant: it
+    passes through to `collect` (whose own guard rejects it) and never
+    raises the floor."""
+
+    class _NoOffset(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta | None:
+            return None
+
+    odd = datetime(2026, 10, 1, 15, 0, tzinfo=_NoOffset())
+    stamps = resume_module._MonotonicStamps(DAY1)
+
+    assert stamps.observe(lambda: odd)() is odd
     assert stamps._floor == DAY1
