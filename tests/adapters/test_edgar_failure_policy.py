@@ -658,16 +658,17 @@ def test_p4_stored_messages_and_run_rows_share_one_redaction(tmp_path: Path) -> 
         (float("nan"), 1.0, False),
         (1.0, float("nan"), False),
         (float("nan"), float("nan"), False),
-        (float("inf"), float("inf"), True),
+        (float("inf"), float("inf"), False),
         (float("inf"), float("-inf"), False),
         (float("inf"), 1.0, False),
     ],
 )
 def test_a_non_finite_value_compares_without_raising(a: float, b: float, same: bool) -> None:
     """#629: a NaN or infinite value against FSN raised
-    `decimal.InvalidOperation`, failing the whole source; it now compares
-    (NaN never agrees), so a disagreement withholds one key."""
+    `decimal.InvalidOperation`, failing the whole source; a non-finite value
+    now never agrees, from any source, so the key is withheld."""
     from tradepartner.adapters.edgar_source import _same_value
 
     assert _same_value("fsn", a, "company", b) is same
     assert _same_value("company", a, "fsn", b) is same
+    assert _same_value("company", a, "document", b) is same

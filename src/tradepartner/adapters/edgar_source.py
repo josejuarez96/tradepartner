@@ -1853,10 +1853,13 @@ def _message_hash(message: str) -> str:
 def _same_value(a_source: str, a: float, b_source: str, b: float) -> bool:
     """Two sources' values for one key and date agree: exactly, or, when one
     side is FSN, within half a unit of FSN's 4th decimal place (#610 X1:
-    105.1597 from FSN agrees with company facts' 105.159666)."""
-    if "fsn" not in (a_source, b_source) or not (math.isfinite(a) and math.isfinite(b)):
-        # #629: NaN never agrees and an infinity only with itself, as floats
-        # compare; `Decimal` would raise `InvalidOperation` and fail the source.
+    105.1597 from FSN agrees with company facts' 105.159666). A NaN or an
+    infinity never agrees (#629)."""
+    if not (math.isfinite(a) and math.isfinite(b)):
+        # #629: a NaN or an infinity never agrees, so the key is withheld;
+        # `Decimal` would raise `InvalidOperation` and fail the whole source.
+        return False
+    if "fsn" not in (a_source, b_source):
         return a == b
     return abs(Decimal(repr(a)) - Decimal(repr(b))) <= _FSN_HALF_UNIT
 
