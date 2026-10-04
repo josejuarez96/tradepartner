@@ -189,3 +189,98 @@ def test_daily_bars_sends_a_repeated_symbol_once(monkeypatch: pytest.MonkeyPatch
 
     assert sent == [["A", "B"]]
     assert sum(len(v) for v in out["bars"].values()) == 2
+
+
+# --- #816: an action naming two symbols comes back in both symbols' batches ---
+
+# The live record that stopped the owner's backfill at 2026-03: Alpaca returns
+# it to the batch holding `symbol` (GMGI) and to the batch holding `new_symbol`
+# (MRDN), byte-identical both times.
+_GMGI_REVERSE_SPLIT: dict[str, Any] = {
+    "ex_date": "2026-03-03",
+    "id": "b1b6b98c-3e47-4a29-b2a3-be259155ddc3",
+    "new_cusip": "381098409",
+    "new_rate": 1,
+    "new_symbol": "MRDN",
+    "old_cusip": "381098300",
+    "old_rate": 12,
+    "payable_date": "2026-03-03",
+    "process_date": "2026-03-03",
+    "record_date": "2026-03-03",
+    "symbol": "GMGI",
+}
+
+
+def _actions_by_batch(
+    monkeypatch: pytest.MonkeyPatch, responses: dict[str, dict[str, Any]]
+) -> list[list[str]]:
+    """Patch the SDK call to answer each batch with `responses[<first symbol>]`."""
+    sent: list[list[str]] = []
+
+    def fake_get_corporate_actions(
+        self: CorporateActionsClient, request_params: CorporateActionsRequest
+    ) -> dict[str, Any]:
+        symbols = list(request_params.symbols or [])
+        sent.append(symbols)
+        return responses[symbols[0]]
+
+    monkeypatch.setattr(CorporateActionsClient, "get_corporate_actions", fake_get_corporate_actions)
+    return sent
+
+
+def test_corporate_actions_drops_an_identical_action_repeated_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dividend = {"id": "d-1", "symbol": "AAPL", "rate": 0.26, "ex_date": "2026-03-09"}
+    sent = _actions_by_batch(
+        monkeypatch,
+        {
+            "GMGI": {"reverse_splits": [dict(_GMGI_REVERSE_SPLIT)], "cash_dividends": [dividend]},
+            "MRDN": {"reverse_splits": [dict(_GMGI_REVERSE_SPLIT)], "cash_dividends": []},
+        },
+    )
+
+    out = alpaca_raw.corporate_actions(
+        ["GMGI", "AAPL", "MRDN"],
+        date(2026, 2, 15),
+        date(2026, 5, 15),
+        settings=_batched_settings(2),
+    )
+
+    assert sent == [["GMGI", "AAPL"], ["MRDN"]]
+    assert out == {"reverse_splits": [_GMGI_REVERSE_SPLIT], "cash_dividends": [dividend]}
+
+
+def test_corporate_actions_fails_on_differing_records_with_one_id_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revised = {**_GMGI_REVERSE_SPLIT, "old_rate": 10}
+    _actions_by_batch(
+        monkeypatch,
+        {
+            "GMGI": {"reverse_splits": [dict(_GMGI_REVERSE_SPLIT)]},
+            "MRDN": {"reverse_splits": [revised]},
+        },
+    )
+
+    with pytest.raises(ValueError, match="b1b6b98c-3e47-4a29-b2a3-be259155ddc3"):
+        alpaca_raw.corporate_actions(
+            ["GMGI", "MRDN"], date(2026, 2, 15), date(2026, 5, 15), settings=_batched_settings(1)
+        )
+
+
+def test_corporate_actions_keeps_a_repeat_within_one_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only repeats across batches are a batching artefact; a repeat inside one
+    # Alpaca response passes through for the parser to refuse.
+    _actions_by_batch(
+        monkeypatch,
+        {"GMGI": {"reverse_splits": [dict(_GMGI_REVERSE_SPLIT), dict(_GMGI_REVERSE_SPLIT)]}},
+    )
+
+    out = alpaca_raw.corporate_actions(
+        ["GMGI", "MRDN"], date(2026, 2, 15), date(2026, 5, 15), settings=_batched_settings(2)
+    )
+
+    assert out == {"reverse_splits": [_GMGI_REVERSE_SPLIT, _GMGI_REVERSE_SPLIT]}
