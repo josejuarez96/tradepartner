@@ -198,9 +198,16 @@ def _state(decision: DecisionRow, states: Mapping[int, DecisionState]) -> Decisi
     return states[decision.decision_id]
 
 
+class MissingAssetRefused(ValueError):
+    """A held name that would be decided is missing from this run's `assets`
+    read: the exit is refused and nothing is journaled or submitted for it. A
+    `ValueError`, so callers that catch that keep working; the run still ends
+    `failed` (fail closed), not the `SystemFaultError` halt path."""
+
+
 def _asset(security_id: str, assets: Mapping[str, ExitAsset]) -> ExitAsset:
     if security_id not in assets:
-        raise ValueError(f"{security_id} is missing from the assets read")
+        raise MissingAssetRefused(f"{security_id} is missing from the assets read")
     return assets[security_id]
 
 
