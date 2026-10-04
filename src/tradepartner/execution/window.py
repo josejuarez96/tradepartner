@@ -227,7 +227,12 @@ from tradepartner.store.journal import (
     unconsumed_kill_switch_overrides,
     window_stops_for,
 )
-from tradepartner.store.schema import JOURNAL_ENUMS, SETTLE_ORDER_KIND, init_schema
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_ENUMS,
+    SETTLE_ORDER_KIND,
+    init_schema,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -704,7 +709,7 @@ OPEN_ORDERS = "open_orders"
 REQUESTED = "requested"
 CLOSED = "closed"
 ABANDONED = _ABANDONED
-_ENGAGE_KILL_SWITCH = "engage_kill_switch"
+_ENGAGE_KILL_SWITCH = ENGAGE_KILL_SWITCH_KIND
 _OWNER = "owner"
 _FAULT = "fault"
 _FILLED = "filled"

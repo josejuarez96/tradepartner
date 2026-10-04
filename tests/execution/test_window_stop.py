@@ -5,8 +5,10 @@ override writer, open question 13's `paper abandon`)."""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 import pytest
@@ -15,6 +17,7 @@ from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import switch
+from tradepartner.execution import window as window_module
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import reconcile_now
@@ -39,6 +42,7 @@ from tradepartner.execution.window import (
     override,
     stop,
 )
+from tradepartner.store import schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.delistings import listing_ends_as_of
@@ -1495,3 +1499,12 @@ def test_abandon_says_the_switch_is_not_engaged_when_its_fault_row_fails(
         for note in getattr(excinfo.value, "__notes__", [])
     )
     assert _stops(journal_settings, window) == []
+
+
+def test_the_engage_kind_is_the_shared_schema_constant() -> None:
+    """#691: the window's `engage_kill_switch` checks read `schema.ENGAGE_KILL_SWITCH_KIND`,
+    never a quoted copy of it, so a renamed kind cannot leave the window matching a
+    stale string."""
+    assert window_module._ENGAGE_KILL_SWITCH is schema.ENGAGE_KILL_SWITCH_KIND
+    code = re.sub(r'"""[\s\S]*?"""', "", Path(window_module.__file__).read_text())
+    assert f'"{schema.ENGAGE_KILL_SWITCH_KIND}"' not in code

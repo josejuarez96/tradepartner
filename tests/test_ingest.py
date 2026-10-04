@@ -1181,6 +1181,89 @@ def test_a_late_filing_behind_a_stored_revision_is_one_row_at_ingested_at() -> N
     assert rows == [("A", T1), ("B", one), ("C", two)]
 
 
+def test_cover_page_duplicate_pair_does_not_abort_the_listings_write() -> None:
+    """#687: `build_master` must never hand `_add_rows` two `listings` rows
+    with the same (security_id, ticker, exchange, valid_from, known_at)
+    key, or the store's UNIQUE constraint aborts the whole EDGAR write
+    (the failing path of the 2026-10-03 backfill rerun). Real shapes:
+    Honda (CIK 0000864270) 10-Q accepted 2021-11-09, two 0.750%
+    medium-term notes both tagged HMC/26A on one cover page; Moatable
+    (CIK 0001509223) 10-Q accepted 2023-08-14, Class A ordinary shares and
+    their ADS both retickered to MTBL on one cover page."""
+    notes_cik = "0000900001"
+    ads_cik = "0000900002"
+    ads_title = "American depositary shares, each representing 45 Class A ordinary shares"
+    class_a_title = "Class A ordinary shares, par value $0.001 per share*"
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(notes_cik, "Honda-like Co", "10-K", f"{notes_cik}-1", _at(2015, 3, 1)),
+            FilingIndexEntry(ads_cik, "Moatable-like Inc", "10-K", f"{ads_cik}-1", _at(2015, 3, 1)),
+        ],
+        cover_pages=[
+            CoverPage(
+                notes_cik,
+                f"{notes_cik}-2",
+                _at(2021, 3, 1),
+                (CoverListing("Common Stock, par value $0.50 per share", "HMC", "NYSE"),),
+            ),
+            CoverPage(
+                notes_cik,
+                f"{notes_cik}-3",
+                datetime(2021, 11, 9, 17, 59, 52, tzinfo=UTC),
+                (
+                    CoverListing("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                    CoverListing(
+                        "0.750% Medium-Term Notes, Series ADue November 25, 2026",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    CoverListing(
+                        "0.750% Medium-Term Notes, Series ADue January 17, 2024",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    CoverListing(
+                        "1.100% Medium-Term Notes, Series BDue October 1, 2025",
+                        "HMC/25B",
+                        "NYSE",
+                    ),
+                ),
+            ),
+            CoverPage(
+                ads_cik, f"{ads_cik}-2", _at(2020, 3, 1), (CoverListing(ads_title, "RENN", "NYSE"),)
+            ),
+            CoverPage(
+                ads_cik,
+                f"{ads_cik}-3",
+                _at(2023, 3, 31),
+                (
+                    CoverListing(class_a_title, "RENN", "NYSE"),
+                    CoverListing(ads_title, "RENN", "NYSE"),
+                ),
+            ),
+            CoverPage(
+                ads_cik,
+                f"{ads_cik}-4",
+                datetime(2023, 8, 14, 20, 56, 14, tzinfo=UTC),
+                (
+                    CoverListing(class_a_title, "MTBL", "NYSE"),
+                    CoverListing(ads_title, "MTBL", "NYSE"),
+                ),
+            ),
+        ],
+    )
+    ingested_at = datetime(2023, 8, 15, tzinfo=UTC)
+    master = build_master(source, Settings(_env_file=None), ingested_at=ingested_at)
+    conn = _store()
+    added = _add_rows(conn, "listings", master.listings, ingested_at=ingested_at, current=False)
+    assert added == len(master.listings)
+    rows = conn.execute(
+        "SELECT security_id, ticker, exchange, valid_from, known_at, COUNT(*) AS n "
+        "FROM listings GROUP BY 1, 2, 3, 4, 5 HAVING COUNT(*) > 1"
+    ).fetchall()
+    assert rows == []
+
+
 def test_fact_class_uses_the_classification_known_at_acceptance(settings: Settings) -> None:
     # A class classified common only after the fact was accepted cannot take it.
     source = _filings()
