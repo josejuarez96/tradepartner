@@ -285,6 +285,106 @@ def test_a_second_click_after_a_write_writes_no_second_row(
     assert at.text_area(key=override_page.REASON_KEY).value in (None, "")
 
 
+def test_a_same_content_resubmit_that_arrives_stale_writes_no_second_row(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """A fast double-click: the second click's own message can carry the
+    browser's pre-clear widget values, so the reason field is not actually
+    empty when the second rerun's `on_click` reads it (module docstring, "A
+    fast double-click"). Simulated here by restoring the reason after the
+    first write, as the stale second click would. The duplicate guard
+    refuses the second submit by content, not by the (now unreliable) empty
+    reason."""
+    at = _app(monkeypatch, store)
+    _fill(at)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    # The stale second click's message still carries the pre-clear reason.
+    at.text_area(key=override_page.REASON_KEY).set_value(_REASON)
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert "identical" in _text(at).lower()
+
+
+def test_a_resubmit_after_changing_a_field_writes_a_second_row(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """The duplicate guard compares content, so a genuinely different submit
+    (even right after a write) is not refused."""
+    at = _app(monkeypatch, store)
+    _fill(at, name=_NAME)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, name="SEC_QQQ")
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 2
+
+
+def test_a_resubmit_differing_only_by_surrounding_whitespace_is_still_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """The signature trims the reason and name before comparing, so padding
+    either with whitespace does not evade the guard."""
+    at = _app(monkeypatch, store)
+    _fill(at, name=_NAME, reason=_REASON)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, name=f"  {_NAME} ", reason=f" {_REASON}\n")
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert "identical" in _text(at).lower()
+
+
+def test_a_deliberate_unmodified_resubmit_later_is_still_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """`LAST_WRITTEN_KEY` only changes when a *different* submit is itself
+    written, not on every edit: editing a field and then retyping exactly
+    what was last written is still refused, since nothing resets the guard
+    on a field change alone (module docstring)."""
+    at = _app(monkeypatch, store)
+    _fill(at, name=_NAME, reason=_REASON)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, name="SEC_QQQ")  # an intervening edit, not submitted
+    _fill(at, name=_NAME, reason=_REASON)  # back to exactly what was written
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 1
+    assert "identical" in _text(at).lower()
+
+
+def test_a_repeat_kill_switch_engagement_is_not_treated_as_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """`engage_kill_switch` takes neither a session nor a name, so a repeat
+    engagement would otherwise be flagged a duplicate on reason text alone;
+    the guard exempts it since a second logged engagement is harmless
+    (module docstring)."""
+    at = _app(monkeypatch, store)
+    _fill(at, kind="engage_kill_switch", session=None, name="", reason=_REASON)
+    _submit(at)
+    assert len(_rows(store)) == 1
+
+    _fill(at, kind="engage_kill_switch", session=None, name="", reason=_REASON)
+    _submit(at)
+
+    assert not at.exception
+    assert len(_rows(store)) == 2
+    assert "identical" not in _text(at).lower()
+
+
 def test_a_write_followed_by_a_busy_render_still_shows_it_was_written(
     monkeypatch: pytest.MonkeyPatch, store: Path
 ) -> None:
@@ -368,3 +468,17 @@ def test_store_busy_writes_nothing_and_shows_the_busy_state(
 def test_no_colour_literal_in_page_code() -> None:
     source = Path(override_page.__file__).read_text(encoding="utf-8")
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b", source)
+
+
+# --- shared constants -------------------------------------------------------------
+
+
+def test_duplicate_guard_exemption_is_the_shared_kind_constant() -> None:
+    """#636: the exemption must reference `schema.ENGAGE_KILL_SWITCH_KIND`, not a
+    hardcoded literal, and must stay a subset of the `overrides.kind` enum so drift
+    between the two fails this test instead of silently exempting a stale kind."""
+    assert schema.ENGAGE_KILL_SWITCH_KIND in override_page._DUPLICATE_GUARD_EXEMPT_KINDS
+    assert (
+        set(schema.JOURNAL_ENUMS["overrides", "kind"])
+        >= override_page._DUPLICATE_GUARD_EXEMPT_KINDS
+    )

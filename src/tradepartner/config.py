@@ -153,10 +153,14 @@ class EdgarConfig(BaseModel):
     `edgar_raw` sleep for that long, or at all, on a NaN/infinite value.
     Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
     is nonsensical and would either hang or hot-loop `edgar_raw`.
+
+    `requests_per_second` defaults to 9, not 10 (#656, research #572 E3):
+    SEC's 10 req/s is a ceiling, not a target; secedgar users saw 429s at
+    9.7 req/s and edgartools defaults to 9.
     """
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = Field(default=10.0, gt=0)
+    requests_per_second: float = Field(default=9.0, gt=0)
     retry_backoff_seconds: float = Field(default=1.0, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
@@ -477,8 +481,8 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
 # Q20, owner): the tracking trial's fill-price convention must be read from the
 # window's `frozen_json`, never live `Settings`, since a config edit mid-window must
 # not silently change what `paper report`'s fill-timing and residue terms compare
-# paper fills against. One key today; `execution/window.py`'s `_frozen_params` is the
-# writer this freezes into (not changed here: out of this task's file list).
+# paper fills against. One key today; `execution/window.py`'s `_frozen_params` writes
+# it (#526).
 FROZEN_EXECUTION_KEYS: tuple[str, ...] = ("fill_price",)
 
 # The `costs.*` keys req 14 also freezes into the window at `paper start` (#534,

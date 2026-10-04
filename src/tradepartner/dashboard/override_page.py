@@ -27,6 +27,31 @@ row twice.
 `store.lock_retry_seconds`, or at once another tab of this server
 mid-render) becomes the busy outcome: nothing was written, resubmit.
 
+**A fast double-click.** Two clicks close enough together can both reach the
+server carrying the *same* pre-clear widget values: Streamlit queues each
+click as its own rerun, and a rerun's `on_click` callback is handed whatever
+the browser last sent for every widget, including the reason, before this
+rerun's script body runs. The first rerun writes and empties
+`REASON_KEY` in `session_state`, but the second click's own message still
+carries the browser's pre-clear reason, which overwrites the just-emptied
+value before that rerun's callback reads it — so "empty the reason after a
+write" alone does not stop a same-content resubmit arriving this way. The
+guard is content, not timing: `on_submit` also remembers the exact
+`(kind, rebalance_session, name, reason)` (trimmed, so surrounding
+whitespace alone cannot evade it) it last wrote in `session_state`
+(`LAST_WRITTEN_KEY`), and refuses, without calling the writer, a later
+submit whose fields match that tuple exactly, however long after the write
+it arrives — not just the very next rerun. `LAST_WRITTEN_KEY` only ever
+changes when a *different* submit is itself written, so a deliberate,
+unmodified resubmit of exactly what was last written is refused even after
+other edits in between; nothing resets it on a field change alone (an
+`on_change` reset would also fire on the stale second click's own message
+and disarm the guard it exists to be). `engage_kill_switch` takes neither a
+session nor a name, so a repeat engagement differs only in the reason text,
+if at all; a second logged engagement is harmless (the writer, not this
+guard, is what would make re-engaging consequential), so the duplicate
+check does not apply to it.
+
 What the page draws comes from the shell's read-only connection: whether a
 window is open, so the owner sees before submitting that the writer would
 refuse with `no_window`. The form renders whatever else the store holds or
@@ -47,7 +72,7 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.execution import window
 from tradepartner.store.db import StoreLockedError, utc_now
 from tradepartner.store.journal import JournalIntegrityError, JournalNotInitialised, open_window
-from tradepartner.store.schema import JOURNAL_ENUMS
+from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS
 
 #: The kinds the schema allows, in its order (spec req 9).
 KINDS: tuple[str, ...] = JOURNAL_ENUMS[("overrides", "kind")]
@@ -59,6 +84,16 @@ NAME_KEY = "override_name"
 REASON_KEY = "override_reason"
 SUBMIT_KEY = "override_submit"
 OUTCOME_KEY = "override_outcome"
+#: The trimmed `(kind, rebalance_session, name, reason)` last written this
+#: session (module docstring, "A fast double-click"); `None` until the first
+#: write. Changes only when a *different* submit is itself written — never
+#: on a field edit alone — so an exact resubmit of it stays refused until
+#: something else is written in its place.
+LAST_WRITTEN_KEY = "override_last_written"
+#: Kinds the duplicate guard does not apply to: re-engaging the kill switch
+#: a second time is harmless, and the kind takes no session or name to vary
+#: the signature with (module docstring, "A fast double-click").
+_DUPLICATE_GUARD_EXEMPT_KINDS = frozenset({ENGAGE_KILL_SWITCH_KIND})
 
 
 class OutcomeStatus(StrEnum):
@@ -67,6 +102,10 @@ class OutcomeStatus(StrEnum):
     WRITTEN = "written"
     REFUSED = "refused"
     BUSY = "busy"
+    DUPLICATE = "duplicate"
+    """Refused by this page, before calling the writer, because its fields
+    exactly match the override `on_submit` just wrote this session (module
+    docstring, "A fast double-click")."""
 
 
 @dataclass(frozen=True)
@@ -116,20 +155,35 @@ def submit(
 def on_submit(settings: Settings) -> None:
     """The submit button's `on_click` callback: Streamlit runs it before the
     script body, so before the shell opens its read-only connection (module
-    docstring). Reads the form's widgets from `session_state`, writes through
-    `submit`, and leaves the answer for `show_outcome` to show once. After a
-    write, and only then, it empties the reason, so a second click once the
-    page has re-rendered is refused for a blank reason instead of writing
-    the same row again."""
+    docstring). Reads the form's widgets from `session_state`, and, unless
+    `kind` is exempt (`_DUPLICATE_GUARD_EXEMPT_KINDS`), first compares the
+    trimmed fields against `LAST_WRITTEN_KEY`: an exact repeat of the
+    override just written this session is refused as a `DUPLICATE` without
+    calling the writer (module docstring, "A fast double-click"). Otherwise
+    it writes through `submit` and leaves the answer for `show_outcome` to
+    show once. After a write, and only then, it records this submit's
+    (trimmed) fields as `LAST_WRITTEN_KEY` and empties the reason, so a
+    second click once the page has re-rendered is refused for a blank
+    reason instead of writing the same row again, and a same-content click
+    that arrives first is refused by the duplicate check instead."""
     state = st.session_state
-    outcome = submit(
-        settings,
+    kind, rebalance_session, name, reason = (
         state[KIND_KEY],
         state[SESSION_KEY],
         state[NAME_KEY],
         state[REASON_KEY],
     )
+    signature = (kind, rebalance_session, (name or "").strip(), (reason or "").strip())
+    if kind not in _DUPLICATE_GUARD_EXEMPT_KINDS and signature == state.get(LAST_WRITTEN_KEY):
+        state[OUTCOME_KEY] = Outcome(
+            OutcomeStatus.DUPLICATE,
+            "Identical to the override just written in this session; nothing "
+            "was written. Change a field to submit again.",
+        )
+        return
+    outcome = submit(settings, kind, rebalance_session, name, reason)
     if outcome.status is OutcomeStatus.WRITTEN:
+        state[LAST_WRITTEN_KEY] = signature
         state[REASON_KEY] = ""
     state[OUTCOME_KEY] = outcome
 
@@ -149,6 +203,8 @@ def show_outcome(settings: Settings) -> None:
             "process, or read by another dashboard tab); nothing was written. "
             "Submit again in a moment."
         )
+    elif outcome.status is OutcomeStatus.DUPLICATE:
+        st.warning(outcome.message)
     else:
         st.error(f"Refused ({outcome.refusal}): {outcome.message}. Nothing was written.")
 

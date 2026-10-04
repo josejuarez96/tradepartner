@@ -13,8 +13,8 @@ status chip); the ranking hero (the latest plan's targets in the accent,
 everything else muted, in/out reasons on hover and in the table below);
 fills; the chain detail view, one order at a time; alerts; reconciliation
 status. Two states short-circuit the rest, each its own panel rather than a
-traceback (the T43/T44 "registry not initialised" pattern): a version-4
-store `page_data` has not migrated yet (`journal_not_initialised`), and a
+traceback (the T43/T44 "registry not initialised" pattern): a store with
+no paper-trading journal yet (`journal_not_initialised`), and a
 migrated store with no `paper start` yet (`window is None`).
 """
 
@@ -76,8 +76,9 @@ _CHAIN_SCHEMA: dict[str, pl.DataType] = {
 
 def _render_journal_not_initialised() -> None:
     st.info(
-        "Journal not initialised: this store is still at schema version 4; "
-        "any writing command (e.g. `tradepartner paper start`) migrates it."
+        "Journal not initialised: this store has no paper-trading journal yet; "
+        "any writing command (e.g. `tradepartner paper start`) migrates it to "
+        "the current version."
     )
 
 

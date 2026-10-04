@@ -28,7 +28,7 @@ import pytest
 
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.backtest.hypothesis import frozen_params_of
-from tradepartner.calendar import previous_session
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
@@ -184,10 +184,13 @@ class Env:
         return int(self.query(f"SELECT count(*) FROM {table}")[0][0])
 
     def close(self, security_id: str, session: date) -> float | None:
+        """The raw close known by close(`session`) -- the same cut the run reads
+        a mark price with (step 5's `_mark`, which never sees a revision booked
+        after that session's own close)."""
         rows = self.query(
             "SELECT close FROM prices_daily WHERE security_id = ? AND session = ? "
-            "ORDER BY known_at DESC LIMIT 1",
-            [security_id, session],
+            "AND known_at <= ? ORDER BY known_at DESC LIMIT 1",
+            [security_id, session, session_close(session)],
         )
         return float(rows[0][0]) if rows else None
 
@@ -363,7 +366,7 @@ def split_trns(env: Env, ex_date: date) -> None:
                 "provenance": "action",
             },
         )
-    env.fake._net_quantity["TRNS"] *= 2
+    env.fake.apply_split("TRNS", 2.0)
 
 
 def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
@@ -397,7 +400,15 @@ def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     ) == [("ok",), ("ok",)]
     assert env.submits() == submits  # no sell
     assert env.count("orders") == len(TARGETS)
-    assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]  # no breach, no drawdown
+    # "No drawdown change" straight from the marks the split run wrote, not
+    # merely an empty kill_switch table: F_0's equity (cash plus every name's
+    # value) is the same reading `_drawdown` would make, and it does not cross
+    # the window's own threshold.
+    cash_values = {r[5] for r in rows}
+    assert len(cash_values) == 1
+    equity = cash_values.pop() + sum(r[4] for r in rows if r[1] is not None)
+    assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True)
+    assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
     assert env.alerts("missed_run") == []  # F_0 had its run
 
 
@@ -414,7 +425,8 @@ def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
     split_trns(env, date(2019, 5, 2))
     outcome = env.run(at(date(2019, 5, 6)))
     assert outcome.status == "ok", env.result(outcome.run_id)
-    trns = {r[0]: r for r in env.marks(outcome.run_id) if r[1] == "SEC_TRANSFER"}
+    rows = env.marks(outcome.run_id)
+    trns = {r[0]: r for r in rows if r[1] == "SEC_TRANSFER"}
     expected = {F_0: held, date(2019, 5, 2): 2 * held, date(2019, 5, 3): 2 * held}
     assert set(trns) == set(expected)
     for day, quantity in expected.items():
@@ -429,6 +441,16 @@ def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
         [outcome.run_id],
     ) == [("ok",), ("ok",)]
     assert env.count("orders") == len(TARGETS)
+    # "No drawdown change" straight from each day's own equity, not merely an
+    # empty kill_switch table: each back-filled session's quantity * price
+    # (TRNS's own included, doubled quantity against its halved raw price)
+    # gives an equity that never crosses the window's drawdown threshold.
+    cash_values = {r[5] for r in rows}
+    assert len(cash_values) == 1
+    cash = cash_values.pop()
+    for day in expected:
+        equity = cash + sum(r[4] for r in rows if r[0] == day and r[1] is not None)
+        assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True), day
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
 
 
@@ -468,6 +490,25 @@ def test_the_drawdown_check_engages_with_source_drawdown_and_its_alert(
     assert again.status == "skipped_kill_switch"
     assert env.engaged() == [("drawdown", None, outcome.run_id)]  # once per crossing
     assert len(env.alerts("drawdown")) == 1
+
+
+def test_the_drawdown_check_also_skips_a_due_rebalance_with_nothing_planned_or_submitted(
+    env: Env, tmp_path: Path
+) -> None:
+    """The same breach (divisor 0.69 from the parametrized case above), but on
+    the rebalance window's very first run (F_0, a due rebalance, kind
+    `rebalance` not `mark`): step 5's drawdown check still runs before step 6's
+    plan/trade step, so the switch engages and nothing is decided or
+    submitted -- the engagement is not specific to mark runs."""
+    env.open_window(tmp_path, starting_equity=FAKE_CASH / 0.69)
+    outcome = env.run(at(F_0))
+    assert outcome.kind == "rebalance"
+    assert outcome.status == "skipped_kill_switch", env.result(outcome.run_id)
+    assert env.engaged() == [("drawdown", None, outcome.run_id)]
+    assert env.alerts("drawdown") != []
+    assert env.count("decisions") == 0
+    assert env.count("orders") == 0
+    assert env.submits() == 0
 
 
 # --- the lapses -------------------------------------------------------------------------------
@@ -512,7 +553,13 @@ def test_a_rebalance_skipped_by_the_switch_lapses_with_reason_kill_switch(
 ) -> None:
     """The switch engaged over F_0's span: T_0's lapse on the next run past the
     catch-up bound carries reason `kill_switch`, with its alert, although that
-    run ends `skipped_kill_switch` at step 6."""
+    run ends `skipped_kill_switch` at step 6.
+
+    Unlike `test_two_lapsed_rebalances_...`, this is asserted only after the
+    run returns, not snapshotted at a step hook: `_lapses()` runs before the
+    engaged-switch check that short-circuits the run, so every public step
+    function (`trade_step`, `exits_step`, `stop_step`) is skipped entirely on
+    this path and there is no non-private seam left to hook before return."""
     window = env.open_window(tmp_path)
     assert window.window_id is not None
     switch.engage(

@@ -34,20 +34,56 @@ latest session at or before today instead — both cases are exactly
 capped at `dashboard.page_row_limit` rows, newest first (ADR 0011's
 "Consequences": a render's read connection blocks the run's write
 connections for as long as `page_data` takes). `OpsData` reports each cap
-that bit (`alerts_capped`, `chains_capped`, `fills_capped`). The alerts query
-pushes its limit into SQL. `store.journal.fills_for` is documented as the
-*single* reader of `fills`, and the window readers it and the chain view share
-(`orders_for`, `order_events_for`, `outcomes_for`) take no row limit of their
-own, so those three still read the whole window before this module truncates
-in Python; a true per-row SQL bound on them needs a `store/journal.py` change
-this task's file list does not include (left for a follow-up: #435).
+that bit (`alerts_capped`, `chains_capped`, `fills_capped`). Every one of
+those reads is bounded in SQL, not only truncated in Python (#435): the alerts
+query and `journal.orders_for` read at most `limit + 1` rows, newest first
+(the extra row only tells the cap bit); the chain view's events, fills and
+outcomes are read only for the at most `limit` orders it can keep
+(`client_order_ids`), so they scale with the cap, not the window; and the fills
+table reads the `limit + 1` newest fills by `fill_id` (`journal.fills_for`'s
+`limit`). "As of" stays the latest `known_at` of the window's order chains
+even past the cap: one aggregate over the window's `order_events` and
+`outcomes` (a single row), the newest orders being in the capped read, and
+the fills table's newest rows by `fill_id` standing in for the newest by
+`known_at` (both come from the write that journals a fill: `journal.append`
+hands out the next id and the writer stamps the clock; only a clock running
+backwards between two collections could make them disagree).
+
+Every other whole-window read page_data used to make is bounded too (#613):
+marks are read only for the window's latest marked session
+(`_last_marked_session`, one aggregate, then `journal.positions_daily_for`
+with `after=last_session - timedelta(days=1)`, never `previous_session(...)`:
+`after` is exclusive (`session > after`) and `last_session` is the maximum
+session, so this reads exactly `session == last_session` whatever the
+trading calendar does between the two, including a mark on a date the
+calendar never scheduled as a session, #652); the kill-switch rows are at most two
+(`_kill_switch_rows_for`): the window's last row by `event_id` and the
+`released` row with the greatest `at`, the only two `switch.derive` can ever
+draw a cause or a clearing timestamp from; the reconciliation shown is the
+one row `_latest_reconciliation` picks in SQL, the same row Python's
+`max(..., key=lambda r: r.at)` would; the non-terminal order count is one
+`COUNT(*)` (`_open_orders_count`) over `journal._orders_where`'s predicate,
+never `len(journal.non_terminal_orders(...))`; and `stale` and
+`last_updated` are each one aggregate (`_stale_and_last_updated`). The run
+set `_runs_for_switch` reads for `switch.derive` is **not** capped at a
+fixed row count, because every run it could still show is a live cause of
+the engaged switch for the *current* incident: every run with no result row
+(unfinished -- closed by `paper resume` before a release), every faulted run
+(`switch.FAULTED_RUN_STATUSES`) a release has not yet cleared (cleared by
+`paper resume`'s release once the incident ends), and the window's latest
+run (for the in-progress rule). A quiet window reads at most a handful of
+rows there; a long-running window with no open incident reads none. "As of"
+folds in one further aggregate, `_bounded_known_at`, over the window's whole
+`paper_runs`, `paper_run_results`, `positions_daily`, `kill_switch` and
+`reconciliations` rows, so it still reflects a row of any of those left out
+of the bounded reads above.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -55,10 +91,11 @@ import duckdb
 from tradepartner.calendar import previous_session
 from tradepartner.config import Settings
 from tradepartner.execution import lock
-from tradepartner.execution.switch import SwitchState, derive
+from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.store import journal
 from tradepartner.store.db import utc_now
 from tradepartner.store.journal import (
+    TERMINAL_ORDER_STATUSES,
     AlertRow,
     DecisionRow,
     JournalNotInitialised,
@@ -71,8 +108,8 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
-    PositionDailyRow,
     ReconciliationRow,
+    RunWithResult,
     SignalRow,
 )
 
@@ -202,6 +239,23 @@ def _alerts_for_window(
         for r in kept
     )
     return alerts, capped
+
+
+def _latest_chain_known_at(conn: duckdb.DuckDBPyConnection, window_id: int) -> datetime | None:
+    """The latest `known_at` among the window's `order_events` and `outcomes`
+    rows (through their order's run), one aggregate row, so "as of" covers the
+    orders past the chain view's cap without reading their rows."""
+    journal.require_journal(conn)
+    row = conn.execute(
+        "SELECT max(t.known_at) FROM (SELECT client_order_id, known_at FROM order_events "
+        "UNION ALL SELECT client_order_id, known_at FROM outcomes) t "
+        "WHERE t.client_order_id IN (SELECT o.client_order_id FROM orders o "
+        "JOIN paper_runs r ON r.run_id = o.run_id WHERE r.window_id = ?)",
+        [window_id],
+    ).fetchone()
+    assert row is not None
+    latest: datetime | None = row[0]
+    return latest
 
 
 def _build_ranking(
@@ -336,34 +390,276 @@ def _build_chains(
 def _as_of(
     window: PaperWindowRow,
     *,
-    runs: Sequence[PaperRunRow],
-    results: Sequence[PaperRunResultRow],
+    bounded_known_at: datetime | None,
     orders: Sequence[OrderRow],
     order_events: Sequence[OrderEventRow],
     fills: Sequence[OrderedFill],
     outcomes: Sequence[OutcomeRow],
-    marks: Sequence[PositionDailyRow],
-    kill_switch_rows: Sequence[KillSwitchRow],
-    reconciliations: Sequence[ReconciliationRow],
     alerts: Sequence[AlertRow],
+    chains_known_at: datetime | None,
 ) -> datetime | None:
     """The latest `known_at` among every row the page shows: everything
     `page_data` reads for this window, so "as of" can never predate what the
-    page itself displays (e.g. a kill-switch row the KPI row already shows)."""
+    page itself displays (e.g. a kill-switch row the KPI row already shows),
+    `chains_known_at`, so it never predates an event or outcome of an order
+    past the chain view's cap either, and `bounded_known_at`
+    (`_bounded_known_at`'s single aggregate over the window's whole
+    `paper_runs`, `paper_run_results`, `positions_daily`, `kill_switch` and
+    `reconciliations` rows), so it never predates one of those left out of
+    the bounded reads below (module docstring)."""
     candidates = (
         [window.known_at]
-        + [r.known_at for r in runs]
-        + [r.known_at for r in results]
+        + ([chains_known_at] if chains_known_at is not None else [])
+        + ([bounded_known_at] if bounded_known_at is not None else [])
         + [o.known_at for o in orders]
         + [e.known_at for e in order_events]
         + [f.fill.known_at for f in fills]
         + [o.known_at for o in outcomes]
-        + [m.known_at for m in marks]
-        + [k.known_at for k in kill_switch_rows]
-        + [r.known_at for r in reconciliations]
         + [a.known_at for a in alerts]
     )
     return max(candidates, default=None)
+
+
+def _last_marked_session(conn: duckdb.DuckDBPyConnection, window_id: int) -> date | None:
+    """The latest session the window has a `positions_daily` row for, one
+    aggregate row, so the page never reads an older session's marks to find
+    it (module docstring, item 1)."""
+    journal.require_journal(conn)
+    row = conn.execute(
+        "SELECT max(session) FROM positions_daily WHERE run_id IN "
+        "(SELECT run_id FROM paper_runs WHERE window_id = ?)",
+        [window_id],
+    ).fetchone()
+    assert row is not None
+    session: date | None = row[0]
+    return session
+
+
+_KILL_SWITCH_FIELDS: tuple[str, ...] = (
+    "event_id",
+    "window_id",
+    "at",
+    "state",
+    "source",
+    "fault_type",
+    "reason",
+    "run_id",
+    "override_id",
+    "resume_id",
+    "reconciliation_id",
+    "peak_equity",
+    "known_at",
+    "ingested_at",
+)
+
+
+def _kill_switch_rows_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> tuple[KillSwitchRow, ...]:
+    """At most two of the window's `kill_switch` rows: the last one by
+    `event_id`, whatever its state (`switch.derive`'s "latest row"
+    `rows[-1]` rule), and the `released` row with the greatest `at`. `derive`
+    only ever reads a release's `at` through `any(at > started_at and at >
+    finished_at for at in releases)`, a comparison that is monotonic in
+    `at`: if the greatest release clears a run, every smaller one would too,
+    and if it does not, no smaller one could, so only the greatest matters
+    (module docstring, item 2). The two rows can coincide (the last by
+    `event_id` is itself the greatest release), in which case one is kept."""
+    journal.require_journal(conn)
+    columns = ", ".join(f'"{name}"' if name == "at" else name for name in _KILL_SWITCH_FIELDS)
+    last = conn.execute(
+        f"SELECT {columns} FROM kill_switch WHERE window_id = ? ORDER BY event_id DESC LIMIT 1",
+        [window_id],
+    ).fetchall()
+    released = conn.execute(
+        f"SELECT {columns} FROM kill_switch WHERE window_id = ? AND state = 'released' "
+        'ORDER BY "at" DESC LIMIT 1',
+        [window_id],
+    ).fetchall()
+    by_event_id: dict[int, KillSwitchRow] = {}
+    for values in (*last, *released):
+        row = KillSwitchRow(**dict(zip(_KILL_SWITCH_FIELDS, values, strict=True)))
+        assert row.event_id is not None
+        by_event_id[row.event_id] = row
+    return tuple(by_event_id.values())
+
+
+_RUN_FIELDS: tuple[str, ...] = (
+    "run_id",
+    "window_id",
+    "session",
+    "kind",
+    "started_at",
+    "invoked_by",
+    "code_version",
+    "code_dirty",
+    "known_at",
+    "ingested_at",
+)
+_RESULT_FIELDS: tuple[str, ...] = (
+    "run_id",
+    "finished_at",
+    "status",
+    "fault_type",
+    "message",
+    "clock_fault",
+    "known_at",
+    "ingested_at",
+)
+
+
+def _runs_for_switch(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, released_at: datetime | None
+) -> list[RunWithResult]:
+    """The runs `switch.derive` can possibly draw a cause from (module
+    docstring, item 3): every run with no result row (unfinished); every
+    faulted run (`switch.FAULTED_RUN_STATUSES`) that `released_at` -- the
+    greatest `released` row's `at`, from `_kill_switch_rows_for` -- has not
+    cleared (`released_at` is None, or at or before the run's `started_at`,
+    or at or before its `finished_at`: the negation of `switch.
+    _faulted_uncleared`'s clearing rule); and the window's latest run by
+    `run_id`, for `derive`'s in-progress rule (`unfinished[-1] is
+    own_runs[-1]`), whichever of the first two groups it falls into or not.
+    Every run left out is cleared or ordinary and contributes no cause, so
+    `derive`'s output over this set is `derive`'s output over every run of
+    the window. Not capped at a fixed count: each uncleared faulted or
+    unfinished run is a live cause the page must show for the current
+    incident (module docstring)."""
+    journal.require_journal(conn)
+    run_columns = ", ".join(f"r.{name}" for name in _RUN_FIELDS)
+    result_columns = ", ".join(f"s.{name}" for name in _RESULT_FIELDS)
+    rows = conn.execute(
+        f"SELECT {run_columns}, {result_columns} FROM paper_runs r "
+        "LEFT JOIN paper_run_results s ON s.run_id = r.run_id "
+        "WHERE r.window_id = ? AND ("
+        "s.run_id IS NULL "
+        "OR (list_contains(?, s.status) "
+        "AND (? IS NULL OR ? <= r.started_at OR ? <= s.finished_at)) "
+        "OR r.run_id = (SELECT max(run_id) FROM paper_runs WHERE window_id = ?)"
+        ") ORDER BY r.run_id",
+        [
+            window_id,
+            list(FAULTED_RUN_STATUSES),
+            released_at,
+            released_at,
+            released_at,
+            window_id,
+        ],
+    ).fetchall()
+    width = len(_RUN_FIELDS)
+    out: list[RunWithResult] = []
+    for row in rows:
+        run = PaperRunRow(**dict(zip(_RUN_FIELDS, row[:width], strict=True)))
+        result_values = row[width:]
+        result = (
+            None
+            if result_values[0] is None
+            else PaperRunResultRow(**dict(zip(_RESULT_FIELDS, result_values, strict=True)))
+        )
+        out.append(RunWithResult(run, result))
+    return out
+
+
+def _stale_and_last_updated(
+    conn: duckdb.DuckDBPyConnection, window_id: int, s_minus_1: date
+) -> tuple[bool, datetime | None]:
+    """`stale` (no run of the window has `session == s_minus_1`) and
+    `last_updated` (the max `paper_run_results.finished_at` over the
+    window's runs), each one aggregate row, so neither reads the whole run
+    set `_runs_for_switch` already bounds away (module docstring, item 3)."""
+    journal.require_journal(conn)
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM paper_runs WHERE window_id = ? AND session = ?), "
+        "(SELECT max(s.finished_at) FROM paper_run_results s "
+        "JOIN paper_runs r ON r.run_id = s.run_id WHERE r.window_id = ?)",
+        [window_id, s_minus_1, window_id],
+    ).fetchone()
+    assert row is not None
+    has_run, last_updated = row
+    return not bool(has_run), last_updated
+
+
+_RECONCILIATION_FIELDS: tuple[str, ...] = (
+    "reconciliation_id",
+    "window_id",
+    "run_id",
+    "at",
+    "status",
+    "broker_cash",
+    "mismatches_json",
+    "known_at",
+    "ingested_at",
+)
+
+
+def _latest_reconciliation(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> ReconciliationRow | None:
+    """The one row `max(journal.reconciliations_for(conn, window_id), key=
+    lambda r: r.at)` would pick. `reconciliations_for`'s order is `(known_at,
+    ingested_at, rowid)` ascending, and Python's `max` keeps the *first*
+    maximal element it scans, so among rows sharing the greatest `at` it is
+    the one with the smallest `(known_at, ingested_at, rowid)` -- exactly
+    `ORDER BY "at" DESC, known_at, ingested_at, rowid LIMIT 1` (module
+    docstring, item 4)."""
+    journal.require_journal(conn)
+    columns = ", ".join(f'"{n}"' if n == "at" else n for n in _RECONCILIATION_FIELDS)
+    row = conn.execute(
+        f"SELECT {columns} FROM reconciliations WHERE window_id = ? "
+        'ORDER BY "at" DESC, known_at, ingested_at, rowid LIMIT 1',
+        [window_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return ReconciliationRow(**dict(zip(_RECONCILIATION_FIELDS, row, strict=True)))
+
+
+def _open_orders_count(conn: duckdb.DuckDBPyConnection, window_id: int) -> int:
+    """`len(journal.non_terminal_orders(conn, window_id=window_id))`, as one
+    `COUNT(*)`: the window's orders (through their run,
+    `journal._ORDER_IN_WINDOW`'s join) with no terminal `order_events` row
+    (`journal._orders_where`'s predicate, `journal.TERMINAL_ORDER_STATUSES`;
+    module docstring, item 5). `journal.orders_for` is still called
+    elsewhere in `page_data` for the chain view, so the orphan-order fail
+    closed check (`journal._require_orders_have_runs`) still runs."""
+    journal.require_journal(conn)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM orders o JOIN paper_runs r ON r.run_id = o.run_id "
+        "WHERE r.window_id = ? AND o.client_order_id NOT IN "
+        "(SELECT client_order_id FROM order_events WHERE list_contains(?, status))",
+        [window_id, list(TERMINAL_ORDER_STATUSES)],
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _bounded_known_at(conn: duckdb.DuckDBPyConnection, window_id: int) -> datetime | None:
+    """The latest `known_at` among the window's *whole* `paper_runs`,
+    `paper_run_results`, `positions_daily`, `kill_switch` and
+    `reconciliations` rows, one aggregate, so "as of" still covers every row
+    of those tables even though `_runs_for_switch`, `_last_marked_session`,
+    `_kill_switch_rows_for` and `_latest_reconciliation` each read only a
+    bounded slice of them (module docstring, item 6)."""
+    journal.require_journal(conn)
+    row = conn.execute(
+        "SELECT max(known_at) FROM ("
+        "SELECT known_at FROM paper_runs WHERE window_id = ? "
+        "UNION ALL "
+        "SELECT s.known_at FROM paper_run_results s JOIN paper_runs r ON r.run_id = s.run_id "
+        "WHERE r.window_id = ? "
+        "UNION ALL "
+        "SELECT known_at FROM positions_daily WHERE run_id IN "
+        "(SELECT run_id FROM paper_runs WHERE window_id = ?) "
+        "UNION ALL "
+        "SELECT known_at FROM kill_switch WHERE window_id = ? "
+        "UNION ALL "
+        "SELECT known_at FROM reconciliations WHERE window_id = ?"
+        ") t",
+        [window_id, window_id, window_id, window_id, window_id],
+    ).fetchone()
+    assert row is not None
+    latest: datetime | None = row[0]
+    return latest
 
 
 def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
@@ -383,35 +679,46 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     window_id = window.window_id
     assert window_id is not None
 
-    runs_with_results = journal.runs_for(conn, window_id)
+    # Newest first, one past the cap: `_build_chains` can keep at most `limit`
+    # orders (each chain has at least its order step), so only those orders'
+    # events, fills and outcomes are read.
+    orders = journal.orders_for(conn, window_id=window_id, limit=limit + 1)
+    kept_ids = [o.client_order_id for o in orders[:limit]]
+    order_events = journal.order_events_for(conn, window_id=window_id, client_order_ids=kept_ids)
+    outcomes = journal.outcomes_for(conn, window_id, client_order_ids=kept_ids)
+    chain_fills = journal.fills_for(conn, window_id=window_id, client_order_ids=kept_ids)
+    newest_fills = journal.fills_for(conn, window_id=window_id, limit=limit + 1)
+    fills, fills_capped = _capped_fills(newest_fills, limit=limit)
+    chains_known_at = _latest_chain_known_at(conn, window_id)
+
+    kill_switch_rows = _kill_switch_rows_for(conn, window_id)
+    released_at = max((r.at for r in kill_switch_rows if r.state == "released"), default=None)
+    runs_with_results = _runs_for_switch(conn, window_id, released_at=released_at)
     runs = [rw.run for rw in runs_with_results]
     results = [rw.result for rw in runs_with_results if rw.result is not None]
-    orders = journal.orders_for(conn, window_id=window_id)
-    order_events = journal.order_events_for(conn, window_id=window_id)
-    outcomes = journal.outcomes_for(conn, window_id)
-    all_marks = journal.positions_daily_for(conn, window_id)
-    kill_switch_rows = journal.kill_switch_events_for(conn, window_id)
-    reconciliations = journal.reconciliations_for(conn, window_id)
-    all_fills = journal.fills_for(conn, window_id=window_id)
-    fills, fills_capped = _capped_fills(all_fills, limit=limit)
 
-    last_updated = max((r.finished_at for r in results), default=None)
     s_minus_1 = _required_run_session(utc_now())
-    stale = not any(r.session == s_minus_1 for r in runs if r.session is not None)
+    stale, last_updated = _stale_and_last_updated(conn, window_id, s_minus_1)
 
-    # `all_marks` is already every `positions_daily` row of the window, in
-    # session order (`journal.positions_daily_for`'s contract), so the latest
-    # marked session is its last row's -- `journal.last_marked_session` would
-    # only re-read the same rows.
-    last_session = all_marks[-1].session if all_marks else None
+    last_session = _last_marked_session(conn, window_id)
     positions_count = 0
     positions_value = 0.0
     if last_session is not None:
-        marks = [m for m in all_marks if m.session == last_session and m.security_id is not None]
+        # `after` is exclusive and `last_session` is the maximum session
+        # (`_last_marked_session`), so `after=last_session - timedelta(days=1)`
+        # reads exactly `session == last_session`, with no dependency on
+        # which dates the trading calendar schedules as sessions (#652).
+        marks = [
+            m
+            for m in journal.positions_daily_for(
+                conn, window_id, after=last_session - timedelta(days=1)
+            )
+            if m.security_id is not None
+        ]
         positions_count = sum(1 for m in marks if m.quantity != 0)
         positions_value = sum(m.value or 0.0 for m in marks if m.quantity != 0)
 
-    open_orders_count = len(journal.non_terminal_orders(conn, window_id=window_id))
+    open_orders_count = _open_orders_count(conn, window_id)
 
     plan = _latest(journal.plans_for(conn, window_id))
     targets_count = plan.n_targets if plan is not None else 0
@@ -426,21 +733,19 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         lock_free=not lock.is_held(settings),
     )
 
-    chains, chains_capped = _build_chains(orders, order_events, all_fills, outcomes, limit=limit)
+    chains, chains_capped = _build_chains(orders, order_events, chain_fills, outcomes, limit=limit)
     alerts, alerts_capped = _alerts_for_window(conn, window, limit=limit)
-    reconciliation = max(reconciliations, key=lambda r: r.at, default=None)
+    reconciliation = _latest_reconciliation(conn, window_id)
+    bounded_known_at = _bounded_known_at(conn, window_id)
 
     as_of = _as_of(
         window,
-        runs=runs,
-        results=results,
+        bounded_known_at=bounded_known_at,
         orders=orders,
         order_events=order_events,
-        fills=all_fills,
+        fills=[*newest_fills, *chain_fills],
         outcomes=outcomes,
-        marks=all_marks,
-        kill_switch_rows=kill_switch_rows,
-        reconciliations=reconciliations,
+        chains_known_at=chains_known_at,
         alerts=alerts,
     )
 

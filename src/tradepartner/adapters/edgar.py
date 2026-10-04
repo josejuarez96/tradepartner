@@ -75,6 +75,7 @@ _DELISTING_FORMS = frozenset({"25", "25-NSE"})
 _SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 _CLASS_AXIS = "us-gaap:StatementClassOfStockAxis"
 _CIK_SCHEME = "http://www.sec.gov/CIK"
+_CIK_CONCEPT = "EntityCentralIndexKey"
 _COVER_CONCEPTS = frozenset(
     {"Security12bTitle", "TradingSymbol", "SecurityExchangeName", _SHARES_CONCEPT}
 )
@@ -461,14 +462,37 @@ class CoverPageParse:
     #: Contexts dimensioned by anything but the class axis (a co-registrant's
     #: `dei:LegalEntityAxis`): reported, never read as the filer's own.
     other_contexts: tuple[str, ...] = ()
+    #: Listings with a trading symbol but no title or exchange, skipped and
+    #: counted (owner decision #224, as `FsnFiling.incomplete_listings`;
+    #: #609 C1): the filing's shares and complete listings are kept.
+    incomplete_listings: int = 0
 
 
-def _dei_facts(document: bytes, accession: str) -> list[tuple[str, str, dict[str, Any]]]:
+def _is_nil(element: Any) -> bool:
+    """Whether an iXBRL fact element carries `xsi:nil="true"` (any prefix:
+    filers write `xs:nil` too): a fact that reports no value."""
+    return any(
+        str(key).rsplit(":", 1)[-1].lower() == "nil" and str(value).strip().lower() == "true"
+        for key, value in element.attrib.items()
+    )
+
+
+@dataclass(frozen=True)
+class _DeiFacts:
+    #: (local name, value, context) of each cover concept, in document order.
+    cover: list[tuple[str, str, dict[str, Any]]]
+    #: The `dei:EntityCentralIndexKey` values, read only to name the filer
+    #: of a cover that carries no cover concept (#609 C3).
+    ciks: set[str]
+
+
+def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
     """(local name, value, context) of each cover-page `dei:` fact this
     module reads, in document order. A repeated fact (same concept, context
     and value) is kept once; the same concept and context with two values,
     or a value whose iXBRL format did not apply, raises: either would give
-    a silently wrong record."""
+    a silently wrong record. A nil fact (`xsi:nil="true"`, #609 C2) reports
+    nothing and is skipped."""
     # Imported here: loading `edgar` pulls in the whole package, which only
     # cover-page parsing needs.
     from edgar.documents.strategies.xbrl_extraction import XBRLExtractor
@@ -477,12 +501,16 @@ def _dei_facts(document: bytes, accession: str) -> list[tuple[str, str, dict[str
     extractor = XBRLExtractor()  # type: ignore[no-untyped-call]
     seen: dict[tuple[str, str], str] = {}
     out: list[tuple[str, str, dict[str, Any]]] = []
+    ciks: set[str] = set()
     for element in tree.iter():
         fact = extractor.extract_fact(element)
         if fact is None or not fact.concept.startswith("dei:"):
             continue
         name = fact.concept.removeprefix("dei:")
-        if name not in _COVER_CONCEPTS:
+        if name == _CIK_CONCEPT:
+            ciks.add(str(fact.value).strip())
+            continue
+        if name not in _COVER_CONCEPTS or _is_nil(element):
             continue
         issue = (fact.metadata or {}).get("format_issue")
         if issue:
@@ -495,7 +523,7 @@ def _dei_facts(document: bytes, accession: str) -> list[tuple[str, str, dict[str
             continue
         seen[key] = fact.value
         out.append((name, fact.value, context))
-    return out
+    return _DeiFacts(out, ciks)
 
 
 @_fail_closed
@@ -509,12 +537,25 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
     Each class is one context holding one title, one symbol and one
     exchange; a class listed on a second exchange is a second context. A
     title with no symbol (notes with `NoTradingSymbolFlag`) is not a
-    listing; a symbol with no title or no exchange, or a fact with no
-    context, raises. A context dimensioned by any axis other than the class
-    axis (a co-registrant in a combined filing) is skipped and returned in
-    `other_contexts`: its shares and listings are not the filer's."""
+    listing; a symbol with no title or no exchange is skipped and counted
+    in `incomplete_listings` (owner decision #224, as the FSN path); a fact
+    with no context raises. A nil fact (`xsi:nil="true"`) is skipped. A
+    context dimensioned by any axis other than the class axis (a
+    co-registrant in a combined filing) is skipped and returned in
+    `other_contexts`: its shares and listings are not the filer's.
+
+    A cover with no listing, shares or title fact at all (a registrant
+    with no listed class that reports no share count) is an empty parse for
+    the one CIK its `dei:EntityCentralIndexKey` names; with no such CIK it
+    raises."""
     accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
-    facts = _dei_facts(document, accession)
+    dei = _dei_facts(document, accession)
+    facts = dei.cover
+    if not facts and len(dei.ciks) == 1:  # nothing to list or count (#609 C3)
+        [raw_cik] = dei.ciks
+        if not re.fullmatch(r"[0-9]{1,10}", raw_cik):  # ASCII only: it names cache files
+            raise ValueError(f"{accession}: cover-page EntityCentralIndexKey is not a CIK")
+        return CoverPageParse(CoverPage(_cik(raw_cik), accession, accepted_at, ()), ())
     entities = {(context.get("scheme"), context.get("entity")) for _, _, context in facts}
     if len(entities) != 1:
         raise ValueError(f"{accession}: cover page names {len(entities)} entities")
@@ -549,18 +590,21 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
             )
 
     listings: list[CoverListing] = []
-    for context_id, group in classes.items():
+    incomplete = 0
+    for group in classes.values():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
         if symbol is None:
             continue  # notes and other classes with no trading symbol
         if title is None or exchange is None:
-            raise ValueError(
-                f"{accession}: symbol {symbol!r} ({context_id}) lacks a title or exchange"
-            )
+            incomplete += 1  # skipped and counted, not a failure (owner, #224; #609 C1)
+            continue
         listings.append(CoverListing(title, symbol, normalize_exchange(exchange)))
     return CoverPageParse(
-        CoverPage(cik, accession, accepted_at, tuple(listings)), tuple(shares), tuple(sorted(other))
+        CoverPage(cik, accession, accepted_at, tuple(listings)),
+        tuple(shares),
+        tuple(sorted(other)),
+        incomplete,
     )
 
 
@@ -588,10 +632,20 @@ def parse_delisting(
             raise ValueError(f"{accession}: {form} has no {path}")
         return found.strip()
 
+    class_title = (root.findtext("descriptionClassSecurity") or "").strip()
+    if not class_title:
+        # Owner 2026-10-02 (#609 D1): which class is removed is never
+        # guessed (ACCO Brands' 25-NSE names none while the issuer stays
+        # listed), so the notice stays a failure for the owner to accept.
+        raise ValueError(
+            f"{accession}: {form} names no class of security (descriptionClassSecurity is "
+            "missing or blank); the class is not guessed, so the notice is not recorded"
+        )
+
     return DelistingFiling(
         cik=_cik(text("issuer/cik")),
         form=form,
-        class_title=text("descriptionClassSecurity"),
+        class_title=class_title,
         exchange=normalize_exchange(text("exchange/entityName")),
         accession=accession,
         accepted_at=accepted_at,
@@ -620,7 +674,10 @@ class FsnShare:
     end**: Alphabet's cover date 2026-01-28 arrives as 2026-01-31, Apple's
     2025-10-17 as 2025-10-31 (recorded fixtures, #224). It is not the cover's
     own date, it can fall after the filing's acceptance, and it is never a
-    `known_at`; T11e decides how FSN shares are dated and de-duplicated."""
+    `known_at`; T11e decides how FSN shares are dated and de-duplicated.
+    When a filing reports a member's count at several ddates, only the
+    latest is kept (#609 F1); `facts()` still caps it at the acceptance
+    date."""
 
     class_member: str
     value: float
@@ -674,6 +731,23 @@ def restore_class_letter_space(title: str) -> str:
     2026_02, #224), which ingest's class-letter rule would not match. Pure;
     other lost NBSPs are left as FSN gives them."""
     return _CLASS_LETTER_NO_SPACE.sub(r"Class \1", title)
+
+
+def _fsn_title_key(title: str) -> str:
+    """`title` with the class-letter space restored and all whitespace
+    removed: two FSN copies of one title that differ only by a dropped
+    non-breaking space ("ClassA" / "Class A", "No ParValue" / "No Par
+    Value", #609 F4) have the same key."""
+    return "".join(restore_class_letter_space(title).split())
+
+
+def _fsn_spaced_title(first: str, second: str) -> str:
+    """Of two titles with the same `_fsn_title_key`, the one that kept its
+    spaces (the longer once whitespace runs are collapsed), whatever their
+    order; a tie keeps the larger string, so the result never depends on
+    row order."""
+    candidates = (" ".join(restore_class_letter_space(t).split()) for t in (first, second))
+    return max(candidates, key=lambda t: (len(t), t))
 
 
 def _fsn_segments(raw: str) -> dict[str, str] | None:
@@ -755,8 +829,12 @@ def _parse_one_fsn_filing(
             raise ValueError(
                 f"{accession}: undecodable byte or embedded tab in {tag} ({member or 'no class'})"
             )
-        if group.get(tag, value) != value:  # fail closed, as parse_cover_page does
-            raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
+        held = group.get(tag, value)
+        if held != value:
+            if tag != "Security12bTitle" or _fsn_title_key(held) != _fsn_title_key(value):
+                # fail closed, as parse_cover_page does
+                raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
+            value = _fsn_spaced_title(held, value)  # FSN dropped a space in one copy (#609 F4)
         group[tag] = value
 
     listings: list[CoverListing] = []
@@ -773,19 +851,28 @@ def _parse_one_fsn_filing(
             CoverListing(restore_class_letter_space(title), symbol, normalize_exchange(exchange))
         )
 
-    shares: dict[str, FsnShare] = {}
+    # member -> ddate -> value. A filing may report its share count at several
+    # ddates (a prior year-end beside the cover date, #609 F1): every ddate is
+    # checked, and the latest is kept per member.
+    dated: dict[str, dict[date, float]] = {}
     for row in num_rows:
         if row.get("tag") != _SHARES_CONCEPT or _fsn_is_coreg(row):
             continue
         member = _fsn_class_member(row, dim_segments)
         if member is None:
             continue
-        share = FsnShare(member, float(Decimal(row["value"])), _fsn_ddate(row["ddate"]))
-        if shares.get(member, share) != share:  # fail closed, as for listing tags
-            raise ValueError(f"{accession}: two share values for {member or 'no class'}")
-        shares[member] = share
+        raw_value = row.get("value")
+        if raw_value is None or not str(raw_value).strip():
+            continue  # FSN's NULL: an `xsi:nil` fact reports no count (#609 F3)
+        ddate, count = _fsn_ddate(row["ddate"]), float(Decimal(raw_value))
+        # Fail closed: nothing in the rows read picks one of two counts (#609 F2).
+        if dated.setdefault(member, {}).setdefault(ddate, count) != count:
+            raise ValueError(
+                f"{accession}: two share values for {member or 'no class'} on {ddate.isoformat()}"
+            )
+    shares = tuple(FsnShare(m, values[max(values)], max(values)) for m, values in dated.items())
 
-    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares.values()), incomplete)
+    return FsnFiling(accession, cik, form, sic, tuple(listings), shares, incomplete)
 
 
 def parse_fsn(
