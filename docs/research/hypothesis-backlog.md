@@ -42,12 +42,12 @@ Parked ideas are listed at the end with the reason.
 ### B3. Profitability tilt: file drafted, waits on the family and T78
 - **Tests:** QI-6, the only SUPPORTED stock-selection claim in the register, narrowly: slow, liquid, diversified profitability. QI-16: broader quality bundles are MIXED, so stay with plain gross profitability.
 - **Data:** the five as-filed statement facts of the data-foundation amendment #660 (`revenue`, `cost_of_revenue`, `gross_profit` with a derived fallback, `total_assets`, `operating_cash_flow`): first vintage only, `known_at` = the filing's acceptance, conflicts withheld (EP-P12, EP-P13). The spec is merged; the store holds the rows once the owner runs T78. B3 reads `gross_profit` and `total_assets`; the cash-based variant reads `operating_cash_flow`.
-- **Engine:** a new `profitability` family: an annual signal with a monthly rebalance, inside the ADR 0006 universe. Specified as a draft amendment of the [backtest spec](../specs/backtest.md#amendment-2026-10-03-720-the-profitability-family-draft) (#720): what the engine reads, the point-in-time rule for annual facts, the `profitability.*` keys, the counts and the proposed tasks T85 to T85e.
+- **Engine:** a new `profitability` family: an annual signal with a monthly rebalance, inside the ADR 0006 universe. Specified as a draft amendment of the [backtest spec](../specs/backtest.md#amendment-2026-10-03-720-the-profitability-family-draft) (#720): what the engine reads, the point-in-time rule for annual facts, the `profitability.*` keys, the counts and the proposed tasks T85 to T85f.
 - **Hypothesis file:** [b3-gross-profitability](../hypotheses/b3-gross-profitability.md) (draft, #720): prior, kill, power arithmetic, prior-evidence disclosure and the family's trial budget, with eight open questions for the owner (B3-1 to B3-8). Not registrable until the family exists and T78 lands.
 - **Prior:** small positive excess, well below published magnitudes (0 to +0.5 pp/yr over SPY; range −2 to +2). Expect long flat stretches and a sector-shaped book.
 - **Kill:** the file's retirement rule (first audited in-sample trial with net excess over SPY below −1 pp/yr and `dsr_excess` below 0.5); the momentum-and-market spanning check is a pre-declared diagnostic, a registered research run, not part of the rule (B3-8).
 - **Information value:** high. It is the best-evidenced idea, it is the first non-price signal, and it proves the fundamentals pipeline that B5 and the E1 economic test also need (revenue).
-- **Cost:** M (one data extension, merged as a spec; one family, four agent tasks and one owner run).
+- **Cost:** M (one data extension, merged as a spec; one family, five agent tasks and one owner run).
 
 ### B4. Momentum + profitability combined
 - **Tests:** G4-2 (MIXED for long-only, liquid portfolios); G4-1 (SUPPORTED for long-short or unconstrained only).

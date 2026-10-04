@@ -41,8 +41,12 @@ and pre/post-original out-of-sample tests, and two cost studies (Novy-Marx–Vel
 institutional cost evidence). The brief's own sketch for a modest account (its "(a)
 Individual with a modest account", item 2) is this signal: "rank latest as-filed gross
 profits/total assets" inside "a contemporaneously investable large/mid-cap universe", and
-it names the main failure modes this file designs against: "restated accounting, sector
-bets or confusing the market's return with tilt alpha".
+it names the main failure modes: "restated accounting, sector bets or confusing the
+market's return with tilt alpha". This file closes the first at the schema (first
+vintage), **exposes** the second rather than bounding it (the brief's sketch has sector
+and position bounds and cap-relative weights; this construction does not, see B3-5, and
+its sector tilt is reported, not controlled), and measures the third with a pre-declared
+spanning diagnostic (Retirement condition).
 
 Why the effect exists is contested. The brief's Q1 table ("Economic mechanisms and the
 other side") offers both a mispricing story (investors underweight durable earnings and
@@ -62,8 +66,10 @@ empirical record only.
   profitability only**, no quality composite.
 - QI-2 (UNGRADED, McLean & Pontiff): published anomalies lose about 58% of their return
   after publication; the brief warns against one universal haircut.
-- G2-S10 (UNGRADED, Chen & Welch 2026): post-2005, non-microcap anomaly returns have a
-  median of 7 bp/month, long-short.
+- G2-S10 (UNGRADED, Chen & Welch 2026): post-2005, non-microcap anomaly returns are
+  near zero, a median of 7 bp/month (the claim's scope as stored: about 200 anomalies,
+  top 3,000 stocks, post-2005; whether the figure is long-short or gross is not in the
+  register).
 - QI-18 (MIXED): a defensive portfolio may just repackage profitability and investment
   exposure, so a profitability tilt's return is partly a low-beta return in disguise;
   the backlog parks low-beta on the ground that B3 tests it.
@@ -71,8 +77,8 @@ empirical record only.
 **What the register does not give.** No report in `docs/research/` extracts a number for
 the gross-profitability spread, for a long-only version of it, or for its turnover. The
 brief's source 22 (Novy-Marx, *The Other Side of Value*) is the primary paper; its
-figures are **not** in the register and are not cited here as support (research-program
-§7, reading order item 3). Where this file needs a scale below, it says that it is a
+figures are **not** in the register and are not cited here as support (research-program,
+"How agents use this", item 3). Where this file needs a scale below, it says that it is a
 placeholder and that the owner verifies it before registration.
 
 **Design.** Annual fact, monthly rebalance, inside the ADR 0006 universe, the H1
@@ -106,15 +112,21 @@ The domain trap in this family is that an annual fact exists long before anyone 
 read it. These rules are the hypothesis's, written here so the engine amendment and the
 tests have one source:
 
-1. **A fact is usable at `t` only from its filing's acceptance.** `statement_facts`
-   rows carry `known_at` = the filing's SEC acceptance timestamp (never the
-   companyfacts `filed` date, never the period end), and `statement_facts_as_of(t)`
-   returns rows with `known_at ≤ t` only. A 10-K accepted at 17:30 New York time on
-   the rebalance session T (after `close(T)`) is **invisible** at that read and enters
-   the next month's read; one accepted at 15:00 on T is visible, as it was to anyone
-   reading EDGAR before the close. No fact is ever pulled forward to its period end, and
-   the engine never back-fills a step with a fact it learned later (one frame per step,
-   spec req 2 and req 13).
+1. **A fact is usable at `t` only from its filing's acceptance, and `t` is the
+   session's official close.** `statement_facts` rows carry `known_at` = the filing's
+   SEC acceptance timestamp (never the companyfacts `filed` date, never the period
+   end), and `statement_facts_as_of(t)` returns rows with `known_at ≤ t` only, where
+   `t = calendar.session_close(T)` (the boundary `known_at == t` is visible). A 10-K
+   accepted after that instant on the rebalance session T is **invisible** at that
+   read and enters the next month's read; one accepted before it is visible, as it was
+   to anyone reading EDGAR before the close. The close is the calendar's, not 16:00 New
+   York: two month-ends in the windows are half days (2019-11-29 in sample, 2024-11-29 in
+   the holdout, close 13:00 New York), where a 14:00 acceptance is invisible. The signal
+   function takes `t` itself and filters `known_at ≤ t` again, so a frame that carries a
+   later row (a fake provider in a test, a provider bug) cannot score it (amendment
+   #720, "The signal"). No fact is ever pulled forward to its period end, and the engine
+   never back-fills a step with a fact it learned later (one frame per step, spec req 2
+   and req 13).
 2. **The ratio's `known_at` is the later of its two rows'.** Gross profit and total
    assets may come from different filings (a derived gross profit from the 10-K, assets
    from the same 10-K in the common case; from a 10-K/A in a rare one). Because both
@@ -252,10 +264,14 @@ H1's where the question is the same):
   never adjudicated.
 - **Facts**: `gross_profit` and `total_assets`, two of the five names #660 ingests.
   Data-foundation open question 8 asked whether the first profitability hypothesis needs
-  a name not on the list: **it does not**. The cash-based variant (operating cash flow
-  over assets, Ball, Gerakos, Linnainmaa and Nikolaev, JFE 2016, named in #660 decision
-  (a) and not graded in any report) needs only `operating_cash_flow`, already stored;
-  it would be registered as `basis = "cash"` once the config literal gains the value.
+  a name not on the list: **B3 itself does not**. The pre-declared cash variant below
+  uses operating cash flow over assets, which needs only `operating_cash_flow`, already
+  stored; that ratio is a **proxy**, not the cash-based operating profitability of
+  Ball, Gerakos, Linnainmaa and Nikolaev (JFE 2016; #660 decision (a) names the paper),
+  whose measure adjusts operating profitability for accruals and would need names the
+  list does not carry (SG&A, working-capital changes). Neither is graded in any report.
+  The proxy would be registered as `basis = "cash"` once the config literal gains the
+  value; the paper's measure would reopen data-foundation open question 8.
 
 ## Expected magnitudes and red flags
 
@@ -265,15 +281,18 @@ disconfirmable, with the arithmetic shown so the owner can replace any input.
 
 **Net excess return over SPY (base cost level).** Prior centred on **0 to +0.5
 pp/yr**; plausible ten-year range **−2 to +2 pp/yr**. The arithmetic: G2-S10's median
-post-2005 anomaly return of 7 bp/month (about 0.8 pp/yr, long-short, gross, top 3000
-names) is the modern base rate; QI-6 puts profitability among the few themes with
-favourable slow, liquid, cost-study evidence, so take it above that median; a long-only
-top decile from the top 1000 keeps roughly the long leg's share (the brief's "Long leg
-versus short leg": the split is unknown, and H1's sources put momentum's at about
-half); costs at 15 bp per side on a low-turnover book take a few tenths of a point.
+post-2005 anomaly return of 7 bp/month (about 0.8 pp/yr; scope as stored: about 200
+anomalies, top 3,000 stocks, post-2005) is the modern base rate; QI-6 puts
+profitability among the few themes with favourable slow, liquid, cost-study evidence,
+so take it above that median; a long-only top decile from the top 1000 keeps some share
+of a long-short spread (the brief's "Long leg versus short leg": the split is unknown;
+H1's file quotes Israel & Moskowitz for momentum's long leg carrying about half, and
+nothing in the register says the same for profitability, so "half" is an unverified
+analogy); costs at 15 bp per side on a low-turnover book take a few tenths of a point.
 Single-year gaps against SPY of **±10 pp** are normal for a 70-to-90-name equal-weighted
-book that is structurally light in asset-heavy sectors (energy, telecoms, utilities are
-out by rule, financials out by scope) and heavy in asset-light ones (software,
+book that is structurally light in asset-heavy sectors (utilities are out of the
+universe by ADR 0006 rule 3, financials out of the ranking by scope, and energy and
+telecoms rank low on GP/A while staying in) and heavy in asset-light ones (software,
 pharmaceuticals, branded consumer goods); the gap is mostly sector weight, not stock
 selection, which is the brief's "confusing the market's return with tilt alpha".
 
@@ -285,16 +304,19 @@ SPY's large-cap growth weight. Expect ours between 5 and 9%/yr.
 new 10-Ks moving ranks (once a year per name, spread over the filing season), universe
 churn at the cap cut, names entering or leaving scope (a stale pair, a new filer), and
 equal-weight rebalancing of drift. Prior: **one-sided monthly turnover of 3 to 8%**,
-with a seasonal peak in March and April when most December fiscal-year 10-Ks are
-accepted; cost drag at 15 bp of roughly 0.1 to 0.3 pp/yr, at the 100 bp rung roughly
-0.7 to 2 pp/yr. The literature's low-turnover classification of profitability (the
-brief's E5 row quotes Novy-Marx–Velikov's "50% turnover per month" only as a threshold
-below which anomalies tend to survive costs) is consistent with this but gives no number.
+with a seasonal peak at the **February, March and April** rebalances, when December
+fiscal-year 10-Ks are accepted: the SEC deadlines are 60, 75 and 90 days after year end
+for large accelerated, accelerated and non-accelerated filers (SEC rules, not register
+evidence), and a top-1000-by-cap universe is almost all large accelerated filers, whose
+10-Ks land in February and the first days of March. Cost drag at 15 bp of roughly 0.1
+to 0.3 pp/yr, at the 100 bp rung roughly 0.7 to 2 pp/yr. The literature's low-turnover
+classification of profitability (the brief's E5 row quotes Novy-Marx–Velikov's "50%
+turnover per month" only as a threshold below which anomalies tend to survive costs) is
+consistent with this but gives no number.
 
-**Losses.** A long-only equity book: a full-crisis drawdown about the market's (about
-−35% in 1Q20 for an equal-weighted large-cap book; −55% in 2007–09 is outside the
-window). No source in the repo gives a worst quarter for this construction; the run
-computes it.
+**Losses.** A long-only equity book: a full-crisis drawdown about the market's. No
+source in the repo gives a worst quarter or a peak-to-trough for this construction; the
+run computes it.
 
 **Red flags** (a prompt for a look-ahead and data audit, never a gate):
 
@@ -302,9 +324,10 @@ computes it.
   marks the trial `red_flag`. Nothing in the register supports a net long-only excess of
   that size.
 - One-sided `turnover_monthly` above 10% on average, or any month above 25% outside the
-  March–April filing season: the signal is flickering (a period band that misses 52/53
-  week years, pairs going stale and coming back, derived rows appearing and vanishing),
-  not ranking.
+  February–April filing season (the rebalances of 2024-02-29, 2024-03-28 and 2024-04-30
+  and their counterparts in other years): the signal is flickering (a period band that
+  misses 52/53 week years, pairs going stale and coming back, derived rows appearing and
+  vanishing), not ranking.
 - Ranked names below 60% of the universe at any rebalance (`n_ranked` against
   `n_universe`), or `n_excluded_no_facts` rising over time: coverage, not selection
   (`statement_none`, IFRS filers, held keys, the tag lists being too short; #660 open
@@ -360,14 +383,17 @@ question 11, a root family).
 
 **Trial budget** (research-program §4 item 4; QI-11: a dozen prespecified variants, all
 counted). Proposed, for the owner to set (open question B3-7): this registration, one
-run over the default in-sample window and one holdout spend; at most **three
-pre-declared variants**, each a new file in this family and counted in its N: (i)
-`basis = "cash"` (operating cash flow over assets); (ii) `include_derived = false`
-(reported gross profit only); (iii) the brief's construction, top third of the scored
-names, cap-weighted, if the strategy lab adds `weighting = "cap"` (today `equal` is the
-only value). B4 (momentum plus profitability by equal ranks) is a fourth file whose
-family is open question B3-7(b). Reruns for logged bugs are counted as the spec counts
-them. Nothing else runs in this family without a backlog entry and an owner decision.
+run over the default in-sample window and one holdout spend; **one spanning
+diagnostic** per audited in-sample trial (the `return`-kind research run of the
+Retirement condition, counted in this family's N under the research-registry spec); at
+most **three pre-declared variants**, each a new file in this family and counted in its
+N: (i) `basis = "cash"` (operating cash flow over assets, a proxy for cash-based
+profitability, not Ball et al.'s measure); (ii) `include_derived = false` (reported
+gross profit only); (iii) the brief's construction, top third of the scored names,
+cap-weighted, if the strategy lab adds `weighting = "cap"` (today `equal` is the only
+value). B4 (momentum plus profitability by equal ranks) is a fourth file whose family is
+open question B3-7(b). Reruns for logged bugs are counted as the spec counts them.
+Nothing else runs in this family without a backlog entry and an owner decision.
 
 ## Prior-evidence disclosure
 
@@ -444,15 +470,22 @@ its job is to be a line drawn before the run.
 backlog says B3 is killed when its excess is "explained away by momentum and market
 exposure". The engine stores no spanning regression (req 7's metric keys are fixed), so
 that reading cannot be committed to a stored value here. It is operationalised as a
-pre-declared **diagnostic**: a regression of B3's monthly excess returns over SPY on
-MTUM's monthly excess returns over SPY, from the trial's stored `trial_equity`, with its
-alpha and its t-statistic reported beside the trial. Under the research-registry spec
-(draft, #661) that computation reads returns and is a `return`-kind run in the
-`profitability` family, registered before it runs and counted in N (its req 9); until the
-registry exists it is not run. Its result informs the B4 decision (whether the two
-signals are worth combining) and the backlog's next ranking, never this retirement.
-Whether to make it part of the retirement rule by adding a metric key is open question
-B3-8.
+pre-declared **diagnostic**, specified now so it cannot be re-specified after a look:
+a regression of B3's monthly returns (over cash; `metrics.risk_free_rate = 0`, so the
+raw monthly returns) on **SPY's monthly returns and MTUM's monthly returns in excess of
+SPY's, jointly**, from the three `trial_equity` series of the retirement trial; reported:
+the intercept, its t-statistic and both loadings. Regressing B3's excess over SPY on
+MTUM's excess over SPY alone would force B3's market beta to 1 and put a low-beta tilt
+(QI-18) into the alpha, the brief's "confusing the market's return with tilt alpha".
+It runs on the **in-sample retirement trial only**, never on a holdout trial. Under the
+research-registry spec (draft, #661) that computation reads returns and is a
+`return`-kind run in the `profitability` family, registered before it runs and counted
+in N (its req 9; it is in the trial budget above); until the registry exists it is not
+run, and whether a registry table (`trial_equity`) is an allowed input for a `return`
+run is a question for that spec (its req 4 names the as-of API). Its result informs the
+B4 decision (whether the two signals are worth combining) and the backlog's next
+ranking, never this retirement. Whether to make it part of the retirement rule by adding
+a metric key is open question B3-8.
 
 **Nothing promotes B3.** No result passes it, and no DSR value is a threshold. Whether it
 goes to paper or live is an owner decision under ADR 0005 after H1's paper period and the
@@ -478,25 +511,45 @@ N. This file is never edited after registration to fit a result.
   (the strategy-lab spec's `FROZEN_KEY_DEFAULTS` and `frozen_values`, or a minimal
   equivalent), because adding a frozen section today makes H1's registration unrunnable
   until re-registered, which the lab spec forbids (amendment #720, "Frozen keys").
-- **B3-2. The holdout under the strategy lab's overlap rule.** The lab spec's Definitions
-  say a new family's holdout "may not overlap any existing non-oracle family's holdout",
-  which would forbid this file's `[2024-01-01, 2026-09-30]` once the lab migration has
-  run. Options: (a) register B3 before the lab migration, as a pre-lab registration
-  (grandfathered); (b) amend the lab rule to what it protects against, "no family holds
-  out months any existing family has run in sample", which this file satisfies (its in-
-  sample window ends 2023-12-29, as H1's does); (c) a holdout from 2026-10-01, which
-  would not be a completed window for about two years. Recommendation: (b), recorded as
-  a sentence in the lab spec's amendment list when the owner accepts it; (a) if the
-  timing works out that way. Note that a shared window means an H1 holdout spend is
-  holdout-period evidence this file must disclose at registration (above).
-- **B3-3. `max_fact_age_days`.** Options: (a) 548 (18 months, the Fama–French
-  convention's maximum gap between a fiscal year end and its first use; a December
-  fiscal year's 10-K accepted at the 90-day deadline is 455 days old by the following
-  March, so 548 keeps every timely filer scored through the next filing season); (b)
-  455 (one year plus the longest 10-K deadline; a late filer drops out, which is
-  arguably information); (c) 400, ADR 0006 rule 7's bound for shares outstanding, which
-  the arithmetic above shows excludes most December fiscal-year names at every February
-  month-end. Recommendation: (a); (c) is wrong for annual facts.
+- **B3-2. Registering B3 beside the strategy lab.** Two of the lab spec's rules bear
+  on this file once its migration has run. First, its Definitions say a new family's
+  holdout "may not overlap any existing non-oracle family's holdout", which forbids
+  `[2024-01-01, 2026-09-30]`. Second, its req 1 and req 5(b) say `hypothesis register`
+  then accepts only an unchanged re-registration or a **promoted** file, and a holdout
+  spend by a hypothesis that is not pre-lab needs a `promotion` decision: a new
+  hypothesis enters as a one-value sweep with a `[lab]` block, is run, and is promoted
+  before it can spend. Options: (a) register B3 **before** the lab migration, as a
+  pre-lab registration: this file as written, the Phase 3 rules for its runs and its
+  one spend, grandfathered by `pre_lab_hypotheses`; the plan orders T85f before the lab's
+  migration task; (b) register B3 **after** it: this file is re-cast as a one-value
+  sweep file under `docs/sweeps/` (same block plus `[lab]`, `schedule.rebalance_cadence
+  = "month_end"`), run through `sweep run`, promoted with `sweep promote` before any
+  holdout spend, and the overlap rule is amended to what it protects against, in both
+  directions: "a new family's holdout overlaps no months any existing non-oracle family
+  has run in sample, and its in-sample window overlaps no existing family's holdout",
+  which this file satisfies (in-sample to 2023-12-29, holdout from 2024-01-01, as H1);
+  (c) a holdout from 2026-10-01, which would not be a completed window for about two
+  years, under either route. Recommendation: (a) if T85 to T85f land before the lab's
+  migration, else (b); the owner decides when the plan is amended (spec open question
+  13 records the lab sentences each route changes). Under every option a shared window
+  means two families can spend one holdout: the amendment marks a spend whose window
+  overlaps another family's recorded spend (`holdout_seen_family`, reported, not a
+  gate), and an H1 holdout result is evidence this file must disclose at registration
+  (above); ADR 0005 means no holdout result selects between the two families either way.
+- **B3-3. `max_fact_age_days`.** The filing calendar (SEC deadlines, not register
+  evidence): a 10-K is due 60, 75 or 90 days after fiscal year end for large
+  accelerated, accelerated and non-accelerated filers, so a December fiscal year's
+  10-K lands between mid-February and the end of March, and at the February month-end
+  most filers due about 1 March have not filed yet, when their prior year's row (period
+  end 2023-12-31 at the 2025-02-28 rebalance, say) is 425 days old. Options: (a) 548,
+  an engineering bound of one year plus six months: every timely filer stays scored on
+  last year's row until this year's 10-K is accepted, including a 90-day filer's 455
+  days; (b) 455 (one year plus the longest 10-K deadline; a late filer drops out, which
+  is arguably information); (c) 400, ADR 0006 rule 7's bound for shares outstanding,
+  which excludes the filers due in March at every February month-end and rebuilds the
+  book each spring. Recommendation: (a); (c) is wrong for annual facts. No option is a
+  literature convention: the Fama–French June-to-June alignment is a different device
+  (a fixed six-to-eighteen-month lag) that acceptance-timed facts do not need.
 - **B3-4. Sector scope.** Options: (a) `profitability.exclude_sic_ranges = [[6000,
   6999]]` as a frozen signal key (above); (b) no scope key, financials excluded only
   when their facts are missing (rule 5), accepting that a bank with a tagged
