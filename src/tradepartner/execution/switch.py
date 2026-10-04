@@ -115,11 +115,15 @@ class SwitchState:
 
     `causes` names every reason it is engaged, in order: the latest row when it
     is `engaged`, then each faulted or unfinished run. `run_in_progress` is only
-    ever set for a reader without the lock."""
+    ever set for a reader without the lock. `engaged_row` is that latest row
+    (write order) when it is `engaged`, else None: the one definition of "the
+    latest `engaged` row" a reader such as the run's `kill_switch` alert uses
+    (#699)."""
 
     engaged: bool
     run_in_progress: bool
     causes: tuple[str, ...]
+    engaged_row: KillSwitchRow | None = None
 
 
 class ReleaseRefused(ValueError):
@@ -153,8 +157,9 @@ def derive(
     releases = [r.at for r in rows if r.state == RELEASED]
 
     causes: list[str] = []
-    if rows and rows[-1].state == ENGAGED:
-        causes.append(f"kill_switch event {rows[-1].event_id} {ENGAGED} ({rows[-1].source})")
+    engaged_row = rows[-1] if rows and rows[-1].state == ENGAGED else None
+    if engaged_row is not None:
+        causes.append(f"kill_switch event {engaged_row.event_id} {ENGAGED} ({engaged_row.source})")
 
     in_progress = None
     if not lock_free:
@@ -173,7 +178,10 @@ def derive(
             causes.append(f"run {run_id} {result.status}")
 
     return SwitchState(
-        engaged=bool(causes), run_in_progress=in_progress is not None, causes=tuple(causes)
+        engaged=bool(causes),
+        run_in_progress=in_progress is not None,
+        causes=tuple(causes),
+        engaged_row=engaged_row,
     )
 
 
