@@ -204,6 +204,28 @@ def test_the_first_fact_of_a_security_passes(fixture_store: duckdb.DuckDBPyConne
     assert pick.outliers.is_empty()  # every fixture security has one fact
 
 
+def test_a_non_positive_fact_is_never_a_baseline(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # quant-auditor on #849: a zero first fact must not make every later
+    # correct fact an outlier.
+    new = "SEC_ZERO_FIRST"
+    _fact(fixture_store, new, date(2019, 1, 31), 0, _known(date(2019, 2, 1)))
+    first = shares_as_of(fixture_store, _known(date(2019, 2, 1)), [new], _settings())
+    assert new not in first.shares
+    _fact(fixture_store, new, SPIKE, 8_000_000, _known(date(2019, 3, 1)))
+    _fact(fixture_store, new, date(2019, 5, 31), 8_100_000, _known(date(2019, 6, 3)))
+    _fact(fixture_store, new, date(2019, 6, 14), -1, _known(date(2019, 6, 17)))
+    settings = _settings(accepted_shares_facts=[f"{new}@2019-06-14"])
+    pick = shares_as_of(fixture_store, T_LATE, [new], settings)
+    assert pick.shares[new] == (date(2019, 5, 31), 8_100_000)
+    assert pick.outliers.select("as_of_date", "accepted").rows() == [
+        (date(2019, 1, 31), False),
+        (date(2019, 6, 14), False),
+    ]
+    assert pick.fallbacks["used_as_of"].to_list() == [date(2019, 5, 31)]
+
+
 def test_the_ambiguous_latest_date_is_still_ambiguous(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -224,6 +246,9 @@ def _later_rows(fixture_store: duckdb.DuckDBPyConnection) -> None:
     _fact(fixture_store, SID, SPIKE, MOVED * 1000, _known(date(2019, 3, 1)))
     _fact(fixture_store, SID, date(2019, 6, 28), MOVED * 1.01, _known(date(2019, 7, 15)))
     _fact(fixture_store, SID, date(2019, 9, 30), MOVED * 1000, _known(date(2019, 10, 15)))
+    # A 2-for-1 split ex 2019-08-15 known only on 2019-08-20: it moves the
+    # baseline for the 2019-09-30 fact from then on, never before.
+    _split(fixture_store, date(2019, 8, 15), 2, _known(date(2019, 8, 20)))
 
 
 @pytest.fixture
@@ -245,6 +270,8 @@ def test_later_filings_never_change_the_pick_at_t(
         _known(date(2019, 3, 1)),
         T_LATE,
         _known(date(2019, 7, 15)),
+        _known(date(2019, 8, 19)),
+        _known(date(2019, 8, 20)),
         _known(date(2019, 10, 15)),
     ]
     for t in probes:

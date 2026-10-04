@@ -129,7 +129,9 @@ _MEMBER_SCHEMA: dict[str, Any] = {
     "company_rank": pl.Int64,
 }
 #: `SharesPick.outliers`: a fact out of line with the last accepted earlier
-#: fact (`baseline_*`, raw), `ratio` = value over the baseline moved by splits.
+#: fact (`baseline_*`, raw), `ratio` = value over the baseline moved by splits;
+#: a zero or negative value has a null `ratio` (and null `baseline_*` when it
+#: comes first).
 SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "as_of_date": pl.Date,
@@ -281,7 +283,8 @@ def shares_as_of(
 
     Per security (every one when `ids` is `None`), its `shares_outstanding`
     facts known at `t` are walked in `as_of_date` order. The first is
-    accepted. Each later one is compared with the last accepted fact moved by
+    accepted, unless it is zero or negative: such a value is always
+    rejected and never a baseline. Each later one is compared with the last accepted fact moved by
     every split known at `t` with `accepted_as_of < ex_date <= as_of_date`:
     a ratio above `universe.max_shares_ratio` or below its inverse is out of
     line and rejected, unless `universe.accepted_shares_facts` names it. A
@@ -313,6 +316,21 @@ def shares_as_of(
             latest_ok = False
             if value is None:
                 continue
+            if value <= 0:
+                # Not a share count: always rejected, never a baseline, and no
+                # owner entry accepts it.
+                outliers.append(
+                    {
+                        "security_id": sid,
+                        "as_of_date": as_of,
+                        "value": value,
+                        "baseline_as_of": base[0] if base else None,
+                        "baseline_value": base[1] if base else None,
+                        "ratio": None,
+                        "accepted": False,
+                    }
+                )
+                continue
             if base is None:
                 base, latest_ok = (as_of, value), True
                 continue
@@ -320,7 +338,7 @@ def shares_as_of(
             for ex_date, ratio in splits.get(sid, []):
                 if base[0] < ex_date <= as_of:
                     moved *= ratio
-            change = value / moved if moved else float("inf")
+            change = value / moved if moved > 0 else float("inf")
             out_of_line = not (1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio)
             owner_ok = (sid, as_of) in accepted_list
             if out_of_line:

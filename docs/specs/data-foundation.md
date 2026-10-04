@@ -236,7 +236,7 @@ A `snapshot_static` span trusted only from its first continuous traded bar (the 
 **Amendment 2026-10-04 (#845): shares plausibility.** Filers sometimes tag `EntityCommonStockSharesOutstanding` at the wrong scale: ×1,000 or ×1,000,000 ([research #174](../research/2026-09-25-cover-page-facts-at-scale.md) F22). AJG, SKY, VCEL and CCRN then ranked among the largest companies at some rebalances. The check runs at read time, and nothing is re-ingested (owner decision (A) on #845).
 
 *The check.* `universe.shares_as_of(T, ids, settings)` walks each security's shares facts known at T in `as_of_date` order. Each fact gets the value rule 7 would read for its date, and a date with two class rows is skipped.
-- The first fact is accepted.
+- The first fact is accepted. A value of zero or less is never a share count: it is always rejected, is never a baseline and cannot be accepted.
 - Each later fact is compared with the **last accepted** fact, moved by every split known at T with an ex-date after that fact's `as_of_date` and on or before this one's.
 - A fact is out of line when that ratio is above `universe.max_shares_ratio` (100) or below its inverse. An out-of-line fact is rejected unless `universe.accepted_shares_facts` names it as `"<security_id>@<as_of_date>"`. An accepted fact becomes the new baseline.
 
@@ -251,6 +251,8 @@ Comparing with the last *accepted* fact, not the previous one, also rejects a se
 *Point in time.* Only facts and splits known at T are read. A correcting filing known after T never changes the pick at T, and a split first known after T leaves a split-explained move rejected until it is known.
 
 *Accepted risk.* A genuine move of more than 100× in reported shares is rejected until the owner accepts it, for at most `max_shares_age_days`. Such moves are rare: a large reverse split is explained by its split action, and only a de-SPAC or a huge issuance would trigger it. A switch between an undimensioned total and a class row on consecutive dates is compared as is.
+
+*When the first fact is the bad one* (possibly WMG), there is nothing earlier to compare with. The first fact becomes the baseline, and the correct later facts show on the review list as out of line. The owner then accepts the **first correct fact** in `universe.accepted_shares_facts`. Each later fact is compared with it, so one entry repairs the series.
 
 **Interfaces** (`src/tradepartner/adapters/`): `PriceSource.bars(ids, start, end)`, `.corporate_actions(ids, start, end)`; `FilingSource.filing_index(since)`, `.companies_snapshot()`, `.facts(cik, names)`, `.statement_facts(cik)` (#660: `StatementFactRecord` = cik, fact_name, xbrl_tag, period_start, period_end, value, unit, form, accession, accepted_at (None for an accession with no stamp record), filed (the companyfacts date, read by the ingest's hold rule only, never stored), comparative, reported values only; the parser keys and flags, the adapter stamps, emits unstamped entries rather than dropping them, and withholds conflicts onto its `statement_conflict_keys` list (accession, fact, period, values), the ingest keeps the first vintage, holds and derives gross profit), `.filing_headers(cik, forms)`, `.cover_pages(cik)`, `.delistings(since)`; raw clients `alpaca_raw.*`, `edgar_raw.*` return raw payloads; `Broker.submit/cancel/positions/fills`.
 
