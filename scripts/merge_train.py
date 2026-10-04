@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -1452,7 +1452,25 @@ class ShellRunner:
             "--name-only",
             f"origin/main...{pr.head}",
         )
-        return PrData(pr, comments, self._head_checks(number), tuple(diff.splitlines()))
+        paths = tuple(diff.splitlines())
+        # #764: (h) reads the branch's own fragments, at the recorded head SHA (never the
+        # branch tip, so a push after this read cannot change what was checked).
+        deleted = self._git_out(
+            self.root,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=D",
+            f"origin/main...{pr.head}",
+        ).splitlines()
+        texts = tuple(
+            self._git_out(self.root, "show", f"{pr.head}:{path}")
+            for path in ready_pr.own_changelog_fragments(pr.branch, paths, deleted)
+        )
+        pr = replace(pr, fragment_texts=texts)
+        return PrData(pr, comments, self._head_checks(number), paths)
 
     def add_worktree(self, path: Path, base: str) -> None:
         self._git_out(self.root, "worktree", "add", "--detach", str(path), base)
