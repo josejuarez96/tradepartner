@@ -655,6 +655,52 @@ def test_a_held_ticker_from_a_non_equity_row_does_not_excuse_an_equity_pair(
     assert "SEC_MIXED_KIND" in check.violations["security_id"].to_list()
 
 
+def test_held_ticker_matches_through_a_class_suffix_spelling(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Regression (code-review on #846): `ListingResolver` folds every
+    # ticker through `alpaca_symbol` (BF-A -> BF.A) before comparing the
+    # held ticker against a same-day pair; health must fold the same way,
+    # not compare raw spellings, or a held `BF-A` would not excuse a
+    # `BF.A`/`BF.B` pair the resolver already treats as the held ticker.
+    known_before = session_close(date(2018, 1, 2))
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_SUFFIX_FOLD",
+            "ticker": "BF-A",
+            "exchange": "NYSE",
+            "class_title": "Class A Common Stock",
+            "valid_from": date(2018, 1, 2),
+            "known_at": known_before,
+            "ingested_at": known_before,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    known_pair = session_close(date(2019, 6, 3))
+    for ticker in ("BF.A", "BF.B"):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_SUFFIX_FOLD",
+                "ticker": ticker,
+                "exchange": "NYSE",
+                "class_title": "Class A Common Stock",
+                "valid_from": date(2019, 6, 3),
+                "known_at": known_pair,
+                "ingested_at": known_pair,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_SUFFIX_FOLD" not in check.violations["security_id"].to_list()
+
+
 def test_same_day_pair_is_one_alpaca_symbol_is_not_an_overlap(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

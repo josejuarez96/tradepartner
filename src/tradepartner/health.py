@@ -121,6 +121,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.adapters.alpaca_prices import (
+    alpaca_symbol,
     is_placeholder_ticker,
     is_same_day_typo,
     same_alpaca_symbol,
@@ -766,23 +767,31 @@ def _row_kind(row: dict[str, Any]) -> str:
     return listing_kind(ticker, row.get("class_title"))
 
 
+def _resolver_ticker(ticker: str) -> str:
+    """`ticker` as `ListingResolver` keys it (#846): `alpaca_symbol`'s
+    spelling fold (`BF-A` -> `BF.A`), or the raw ticker when it has none,
+    so health compares the same strings the resolver's own same-day-typo
+    rule does."""
+    return alpaca_symbol(ticker) or ticker
+
+
 def _held_ticker(
     ordered: list[dict[str, Any]], index: int, day: date, pair_kind: str
 ) -> str | None:
-    """The ticker `ordered[index]`'s security held just before `day`, by
-    the resolver's own rule: the row immediately before `day`, and only
-    when that row is the pair's own kind too (an equity pair reads a
-    non-equity row's ticker no more than the resolver's `_same_day_pair`
-    does, #846) -- except a non-equity pair, which the resolver's
-    EQUITY-only path never examines in the first place, so there is no
-    resolver opinion for health to drift from; its own last ticker, of
-    whatever kind, decides."""
+    """The ticker (resolver-folded) `ordered[index]`'s security held just
+    before `day`, by the resolver's own rule: the row immediately before
+    `day`, and only when that row is the pair's own kind too (an equity
+    pair reads a non-equity row's ticker no more than the resolver's
+    `_same_day_pair` does, #846) -- except a non-equity pair, which the
+    resolver's EQUITY-only path never examines in the first place, so
+    there is no resolver opinion for health to drift from; its own last
+    ticker, of whatever kind, decides."""
     previous = next((r for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
     if previous is None:
         return None
     if pair_kind == EQUITY and _row_kind(previous) != EQUITY:
         return None
-    return str(previous["ticker"])
+    return _resolver_ticker(str(previous["ticker"]))
 
 
 def _same_day_typo_pair(
@@ -791,14 +800,18 @@ def _same_day_typo_pair(
     """True when `current`/`following`'s same-start pair is a cover
     page's filer noise, not a genuine overlap (#846): the ticker the
     security held just before is one of the tied tickers (the resolver's
-    own rule, `is_same_day_typo`, shared here, never copied), or the two
-    tickers are one Alpaca symbol under different filer spellings
-    (`same_alpaca_symbol`; `MOTV U`/`MOTV.U`)."""
+    own rule, `is_same_day_typo`, shared here, never copied, over the
+    same resolver-folded ticker spellings), or the two tickers are one
+    Alpaca symbol under different filer spellings (`same_alpaca_symbol`;
+    `MOTV U`/`MOTV.U`)."""
     day = current["valid_from"]
-    tickers = {current["ticker"], following["ticker"]}
+    tickers = {
+        _resolver_ticker(str(current["ticker"])),
+        _resolver_ticker(str(following["ticker"])),
+    }
     held = _held_ticker(ordered, index, day, _row_kind(current))
     return is_same_day_typo(held, tickers) or same_alpaca_symbol(
-        current["ticker"], following["ticker"]
+        str(current["ticker"]), str(following["ticker"])
     )
 
 
