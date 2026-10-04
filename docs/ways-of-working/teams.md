@@ -41,6 +41,7 @@ This document adds the missing layer so that **any number of Claude Code windows
 | **Ready frontier** | Unclaimed plan tasks whose dependencies are all ticked in the plan **as merged on `origin/main`**. The tool fetches and reads the plan from there, never from your working tree, so a checkbox ticked inside an unmerged PR does not open the next task. |
 | **Chain** | Consecutive dependent tasks that one team should keep (listed per plan). |
 | **Parked** | Label on a green PR whose team stopped. Re-claim its issue and continue the branch. |
+| **Orchestrator** | The one session Jose is typing to. It spawns the teams and hands over through the "Orchestrator log" issue ([Orchestrator](#orchestrator)). |
 
 ### Set up a team (once per session)
 
@@ -91,6 +92,14 @@ Every message wakes the session that receives it, and that session re-reads its 
 1. Push; update the draft PR description with the current state.
 1. Done with the task: `/ready-pr` (runs `uv run python scripts/ready_pr.py <pr>`): merges `main` in, runs the checks, verifies the template and the specialist reviews, waits for CI on that commit and marks the PR ready. It never merges. Do not mark a PR ready by hand.
 2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after bringing `main` in with `/ready-pr`), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas. If the window is done for good, say so there; the owner prunes its directory when convenient.
+
+### Orchestrator
+
+Added 2026-10-04 (#780, [orchestration layer audit](../retros/2026-10-04-orchestration-layer-audit.md) item 1). Between 2026-10-01 and 10-04 eight sessions acted as orchestrator and three were live at once. Each handover was a private memory note that no other agent, and not Jose on his phone, could read; the teams of a retired session kept reporting to it, so their `ready` and `blocked` lines reached nobody.
+
+- **The orchestrator is the session Jose is typing to.** It spawns the teams, sends each one its assignment, triages their `ready` and `blocked` lines, and reports to him. It claims and builds like any team when it does so (the vocabulary row above), and it is the only session that spawns teams. **Exactly one orchestrator session at a time:** a session Jose opens while one is live takes work as a team, or waits for the handover; it spawns no teams of its own.
+- **It retires only after the handover is complete**, in this order: (a) list every live team with its issue, its PR and its state (building, in review, ready, blocked), and the model it runs on; (b) release or park, through `team.py release <n> [--park]` with the handoff comment on the issue, everything its dead teams still hold; (c) write the handover as a comment on the one standing **"Orchestrator log"** issue (the first orchestrator to hand over opens it, once; it stays open), never as a memory note. The comment carries the list from (a), the owner decisions pending and the ones he made in chat that no issue records yet, and the merge queue in order. A memory note may point at the comment; it never replaces it.
+- **The successor starts from that comment.** Before `team.py status` it reads the latest "Orchestrator log" comment, then re-spawns each live team of the retired orchestrator from that team's own directory with "continue PR #N" and the team's assignment. A team's final report reaches only the session that spawned it, so a team left under a retired orchestrator is a team nobody hears from. Nothing else changes for the teams: the same claim, the same branch, the same PR.
 
 ### The claim protocol, exactly
 
