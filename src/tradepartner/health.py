@@ -120,13 +120,17 @@ from typing import Any
 import duckdb
 import polars as pl
 
-from tradepartner.adapters.alpaca_prices import is_same_day_typo, same_alpaca_symbol
+from tradepartner.adapters.alpaca_prices import (
+    is_placeholder_ticker,
+    is_same_day_typo,
+    same_alpaca_symbol,
+)
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
 from tradepartner.store.asof import _validate_t, price_jumps_as_of
-from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
+from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
@@ -145,6 +149,9 @@ _COMMON = "common"
 #: registered with no exchange ("None") or quoted over the counter: a row on
 #: one of them is never a second exchange line (#822).
 OFF_EXCHANGE: frozenset[str] = frozenset({"NONE", "OTC"})
+#: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
+#: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
+_PLACEHOLDER_KIND = "placeholder"
 
 KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
@@ -749,6 +756,35 @@ def _same_line(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return bool(a["valid_from"] == b["valid_from"] and a["ticker"] == b["ticker"])
 
 
+def _row_kind(row: dict[str, Any]) -> str:
+    """`row`'s kind by the resolver's own classification (`EQUITY` or one
+    of `NON_EQUITY_KINDS`, or placeholder for no ticker), shared, never
+    copied, so a row health reads the same way the resolver would."""
+    ticker = str(row["ticker"])
+    if is_placeholder_ticker(ticker):
+        return _PLACEHOLDER_KIND
+    return listing_kind(ticker, row.get("class_title"))
+
+
+def _held_ticker(
+    ordered: list[dict[str, Any]], index: int, day: date, pair_kind: str
+) -> str | None:
+    """The ticker `ordered[index]`'s security held just before `day`, by
+    the resolver's own rule: the row immediately before `day`, and only
+    when that row is the pair's own kind too (an equity pair reads a
+    non-equity row's ticker no more than the resolver's `_same_day_pair`
+    does, #846) -- except a non-equity pair, which the resolver's
+    EQUITY-only path never examines in the first place, so there is no
+    resolver opinion for health to drift from; its own last ticker, of
+    whatever kind, decides."""
+    previous = next((r for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
+    if previous is None:
+        return None
+    if pair_kind == EQUITY and _row_kind(previous) != EQUITY:
+        return None
+    return str(previous["ticker"])
+
+
 def _same_day_typo_pair(
     ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
 ) -> bool:
@@ -760,7 +796,7 @@ def _same_day_typo_pair(
     (`same_alpaca_symbol`; `MOTV U`/`MOTV.U`)."""
     day = current["valid_from"]
     tickers = {current["ticker"], following["ticker"]}
-    held = next((r["ticker"] for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
+    held = _held_ticker(ordered, index, day, _row_kind(current))
     return is_same_day_typo(held, tickers) or same_alpaca_symbol(
         current["ticker"], following["ticker"]
     )

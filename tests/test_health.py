@@ -620,6 +620,41 @@ def test_same_day_pair_with_no_held_ticker_match_still_fails_its_rule(
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
 
 
+def test_a_held_ticker_from_a_non_equity_row_does_not_excuse_an_equity_pair(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Regression (code-review on #846): the resolver's own rule reads the
+    # held ticker off the row just before only when that row is itself an
+    # equity row (`ListingResolver._drop_same_day_typos`); a warrant row
+    # naming XYZ does not excuse a later XYZ/XYZQ equity pair the way an
+    # equity row would -- health must not disagree with the resolver here.
+    for ticker, class_title, valid_from in (
+        ("XYZ", "Warrants to purchase Common Stock", date(2018, 1, 2)),
+        ("XYZ", "Common Stock", date(2019, 6, 3)),
+        ("XYZQ", "Common Stock", date(2019, 6, 3)),
+    ):
+        known = session_close(valid_from)
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_MIXED_KIND",
+                "ticker": ticker,
+                "exchange": "NASDAQ",
+                "class_title": class_title,
+                "valid_from": valid_from,
+                "known_at": known,
+                "ingested_at": known,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_MIXED_KIND" in check.violations["security_id"].to_list()
+
+
 def test_same_day_pair_is_one_alpaca_symbol_is_not_an_overlap(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
