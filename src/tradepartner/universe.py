@@ -28,10 +28,6 @@ reported once, under the first rule it fails:
    (`missing_bars`), and no session in them carries a price jump
    (`price_jump`, #787): `store.asof.price_jumps_as_of` at `t`, not in
    `universe.accepted_price_jumps`. `price_jump` is not missing data.
-
-Every rule reads bars with `traded_only=True` (#787): a zero-volume bar is
-missing, not a price, so it fails rule 6 and is no close for rules 4 and 8
-and no dollar volume for rule 5.
 7. `shares`: the latest `shares_outstanding` fact known at `t` is at most
    `universe.max_shares_age_days` old at the session. Rows sharing that
    `as_of_date` are never summed: the one row with a class member wins
@@ -47,6 +43,10 @@ and no dollar volume for rule 5.
    (rules 4-6) the class's, so a class failing liquidity or history does
    not shrink its company (ADR 0006: "summed over all classes"). Ties rank
    by `cik`.
+
+Every rule reads bars with `traded_only=True` (#787): a zero-volume bar is
+missing, not a price, so it fails rule 6 and is no close for rules 4 and 8
+and no dollar volume for rule 5.
 
 Rules 1, 6 and 7 are the missing-data exclusions the survivorship-gap
 report (T15) counts: their reasons are `MISSING_DATA_REASONS`. Rule 1's

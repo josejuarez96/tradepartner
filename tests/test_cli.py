@@ -390,6 +390,11 @@ def test_health_prints_the_price_jump_review_list(tmp_path: Path, fixture_store_
     assert "price jumps: 2 to review, 2 in all" in checked.output
     assert "SEC_DUAL_A@2019-03-15" in checked.output
     assert "SEC_DUAL_A@2019-03-18" in checked.output
+    capped = _invoke(settings, ["health", "--jumps-before", "2019-03-18"], clock=lambda: T_END)
+    assert "price jumps before 2019-03-18: 1 to review, 1 in all" in capped.output
+    assert "SEC_DUAL_A@2019-03-18" not in capped.output
+    bad = _invoke(settings, ["health", "--jumps-before", "2019-13-01"], clock=lambda: T_END)
+    assert bad.exit_code == 2
 
 
 def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(

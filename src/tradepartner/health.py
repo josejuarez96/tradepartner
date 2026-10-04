@@ -53,6 +53,8 @@ here is this module's and is stated once:
   split or dividend known at `t` explains, with `accepted` from
   `universe.accepted_price_jumps`. An unaccepted jump fails universe rule 6
   while it is in the history window; accepting one is a config change.
+  `jumps_before`, when given, keeps only jumps on sessions before it (a
+  hypothesis's `holdout.start`), so the list never shows the holdout period.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
@@ -279,9 +281,11 @@ class DelistedNames:
 
 @dataclass(frozen=True, eq=False)
 class PriceJumps:
-    """The price-jump review list at `t` (#787), one row per jump."""
+    """The price-jump review list at `t` (#787), one row per jump, only sessions
+    before `before` when it is set."""
 
     frame: pl.DataFrame
+    before: date | None = None
 
     @property
     def pending(self) -> pl.DataFrame:
@@ -331,11 +335,16 @@ class HealthReport:
 
 
 def health_report(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings | None = None,
+    *,
+    jumps_before: date | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
-    ends, securities and classifications are read once and shared."""
+    ends, securities and classifications are read once and shared.
+    `jumps_before` limits the price-jump list to sessions before it."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -353,13 +362,22 @@ def health_report(
         unclassifiable=_unclassifiable(securities, classes),
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
-        price_jumps=PriceJumps(price_jumps_as_of(conn, t, settings=settings)),
+        price_jumps=_price_jumps(conn, t, settings, jumps_before),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
         },
         integrity=_integrity_checks(conn, t, settings, listings),
     )
+
+
+def _price_jumps(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> PriceJumps:
+    frame = price_jumps_as_of(conn, t, settings=settings)
+    if before is not None:
+        frame = frame.filter(pl.col("session") < before)
+    return PriceJumps(frame, before)
 
 
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:

@@ -18,6 +18,7 @@ import pytest
 from lookahead.harness import TruncatedStore
 from pydantic import ValidationError
 
+from tradepartner.backtest.valuation import carry_to_fill
 from tradepartner.config import Settings, parse_accepted_jump
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import health_report
@@ -245,6 +246,35 @@ def test_health_lists_every_jump_and_marks_the_accepted(
     assert accepted.price_jumps.frame.height == 2
     assert accepted.price_jumps.pending["session"].to_list() == [BACK]
     assert report.ok  # a review list, not an integrity failure
+
+
+def test_health_can_hide_jumps_from_a_holdout_start(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _revise(fixture_store, close_times=3.0)
+    report = health_report(fixture_store, T_LATE, _settings(), jumps_before=BACK)
+    assert report.price_jumps.before == BACK
+    assert report.price_jumps.frame["session"].to_list() == [JUMP]
+
+
+def test_a_zero_volume_revision_of_a_marked_bar_fails_the_carry(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A position marked at a bar that a later revision leaves untraded is a
+    retracted mark: valuation refuses it (backtest req 2) instead of re-marking."""
+    _revise(fixture_store, volume=0)
+    frame = adjusted_prices_as_of(
+        fixture_store, T_LATE, [SID], include_dividends=True, traded_only=True
+    )
+    with pytest.raises(ValueError, match="no bar for SEC_DUAL_A on its last mark"):
+        carry_to_fill(
+            {SID: 100.0},
+            frame,
+            JUMP,
+            BACK,
+            fill_price="close",
+            marked_at={SID: JUMP},
+        )
 
 
 # --- config -----------------------------------------------------------------------------
