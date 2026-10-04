@@ -721,18 +721,27 @@ NO_BAR = "SEC_NO_BAR"  # no `prices_daily` row at all: no reference price on any
 NO_BAR_SYMBOL = "NOBR"
 
 
-def stale_order(env: Env, made: datetime) -> str:
-    """An earlier run's non-terminal quantity buy of `NO_BAR`, accepted by the
-    broker and never filled: the stale order #569 says must not stop the run.
-    Its name is neither held nor in a pending rebalance."""
+def stale_order(
+    env: Env,
+    made: datetime,
+    *,
+    side: str = "buy",
+    quantity: float | None = 2.0,
+    notional: float | None = None,
+) -> str:
+    """An earlier run's non-terminal order of `NO_BAR` (a quantity buy unless
+    told otherwise), accepted by the broker and never filled: the stale order
+    #569 says must not stop the run. Its name is neither held nor in a
+    pending rebalance."""
     run_id = env.latest_run()
     (decision_id,) = env.append(
         DecisionRow(
             run_id=run_id,
             rebalance_session=None,
             security_id=NO_BAR,
-            side="buy",
-            planned_quantity=2.0,
+            side=side,
+            planned_quantity=quantity,
+            planned_notional=notional,
             whole_share=False,
             decision="forced_exit",
             reason="delisted",
@@ -740,9 +749,17 @@ def stale_order(env: Env, made: datetime) -> str:
             ingested_at=made,
         )
     )
-    coid = "tp-stale-no-bar"
+    coid = f"tp-stale-no-bar-{side}"
     env.prices[NO_BAR_SYMBOL] = 10.0
-    placed = env.fake.submit(OrderRequest(coid, NO_BAR_SYMBOL, Side.BUY, quantity=2.0))
+    placed = env.fake.submit(
+        OrderRequest(
+            coid,
+            NO_BAR_SYMBOL,
+            Side.BUY if side == "buy" else Side.SELL,
+            quantity=quantity,
+            notional=notional,
+        )
+    )
     env.append(
         OrderRow(
             client_order_id=coid,
@@ -753,8 +770,9 @@ def stale_order(env: Env, made: datetime) -> str:
             phase="exit",
             security_id=NO_BAR,
             symbol=NO_BAR_SYMBOL,
-            side="buy",
-            quantity=2.0,
+            side=side,
+            quantity=quantity,
+            notional=notional,
             sells_in_flight_at_submit=False,
             known_at=made,
             ingested_at=made,
@@ -783,14 +801,27 @@ def fill_all_but(env: Env, coid: str) -> None:
     env.on_sleep.append(fill)
 
 
+@pytest.mark.parametrize(
+    ("side", "quantity", "notional"),
+    [
+        pytest.param("buy", 2.0, None, id="quantity-buy"),
+        # `unfilled_sells` would price a notional sell; step 7's open sells
+        # are the held names' only, so this one is never priced (#685).
+        pytest.param("sell", None, 30.0, id="notional-sell"),
+    ],
+)
 def test_an_unrelated_stale_order_with_no_bar_does_not_stop_a_mark_run(
-    env: Env, window: PaperWindowRow
+    env: Env,
+    window: PaperWindowRow,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
 ) -> None:
     """Step 7's read prices the held names strictly; a name only a stale open
     order (and its in-flight decision) brings in, with no bar at close(S-1),
     is priced only if a number reads it, and none does here (#685)."""
     bought(env)
-    stale_order(env, at(F_0_PLUS_1, 15, 0))
+    stale_order(env, at(F_0_PLUS_1, 15, 0), side=side, quantity=quantity, notional=notional)
     outcome = env.run(at(MAY_3))
     assert outcome.status == "ok", env.result(env.latest_run())
     assert outcome.kind == "mark"
@@ -832,5 +863,33 @@ def test_a_held_name_with_no_bar_still_halts_step_7(
 
     monkeypatch.setattr(run_module.planning, "reference_prices", no_trns)
     with pytest.raises(ValueError, match="SEC_TRANSFER"):
+        env.run(at(MAY_3))
+    assert exits(env, "SEC_TRANSFER") == []
+
+
+def test_an_open_decision_of_a_name_with_no_bar_raises_its_reason_when_read(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Deferred, not dropped (#685): an open decision of a name with no bar,
+    whose remainder step 7 must price, still stops the run, with the reason
+    the price read failed, before any exit is journaled."""
+    bought(env)
+    made = at(F_0_PLUS_1, 15, 0)
+    env.append(
+        DecisionRow(
+            run_id=env.latest_run(),
+            rebalance_session=None,
+            security_id=NO_BAR,
+            side="sell",
+            planned_notional=30.0,
+            whole_share=False,
+            decision="forced_exit",
+            reason="delisted",
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+    ended_before(env, MAY_3)
+    with pytest.raises(ValueError, match=r"no reference price for SEC_NO_BAR: no bar on or before"):
         env.run(at(MAY_3))
     assert exits(env, "SEC_TRANSFER") == []
