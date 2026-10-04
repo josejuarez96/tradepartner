@@ -448,7 +448,7 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
         PaperRunRow(
             window_id=window.window_id,
             session=T_0,
-            kind="rebalance",
+            kind="mark",
             started_at=bought_at,
             invoked_by="scheduler",
             code_version="test",

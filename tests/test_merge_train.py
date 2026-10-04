@@ -511,6 +511,10 @@ class FakeRunner:
         self.raise_on_post: set[int] = set()
         self.raise_on_pr_data_call: dict[int, int] = {}
         self.pr_data_call_count: dict[int, int] = {}
+        # -- prune's `refs/merge-train/*` cleanup (#694) --
+        self.merge_train_refs = 0
+        self.ref_cleanups = 0
+        self.raise_on_unconfirmed_post = False
 
     def add_pr(
         self,
@@ -646,6 +650,11 @@ class FakeRunner:
             self.main_history.append(new_sha)
         return attempt
 
+    def delete_merge_train_refs(self) -> int:
+        self.ref_cleanups += 1
+        removed, self.merge_train_refs = self.merge_train_refs, 0
+        return removed
+
     def find_run(self, sha: str, branch: str) -> object:
         queue = self.run_script.get(sha)
         if not queue:
@@ -657,6 +666,8 @@ class FakeRunner:
 
     def post_comment(self, number: int, text: str) -> None:
         if number in self.raise_on_post and text.startswith("merge-train: MERGED"):
+            raise RuntimeError(f"network error posting to #{number}")
+        if self.raise_on_unconfirmed_post and text.startswith("merge-train: UNCONFIRMED"):
             raise RuntimeError(f"network error posting to #{number}")
         self.comments_posted.append((number, text))
 
@@ -1743,3 +1754,201 @@ def test_merge_keeps_the_first_stop_reason_when_a_second_stop_follows(
     assert saved.merge is not None
     assert "head or eligibility changed" in (saved.merge.reason or "")
     assert "could not verify" not in (saved.merge.reason or "")
+
+
+# === #694: follow-ups from the #642 safety review ==========================================
+
+
+def test_merge_posts_unconfirmed_on_a_landed_tree_mismatch() -> None:
+    """#694: a PR whose code landed but failed the tree/parent check gets its own
+    `UNCONFIRMED` comment (never `MERGED`), naming the landed SHA and which check failed."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.landed_tree_override[2] = "wrong-tree"
+    merged = mt.run_merge(fake, record.batch_id)
+    unconfirmed = _texts(fake, "UNCONFIRMED")
+    assert set(unconfirmed) == {2}
+    assert unconfirmed[2].splitlines()[0] == f"merge-train: UNCONFIRMED batch {record.batch_id}"
+    assert "main_sha: main2" in unconfirmed[2]
+    assert "landed tree for #2 does not match tree_2" in unconfirmed[2]
+    assert set(_texts(fake, "MERGED")) == {1}
+    assert set(_texts(fake, "HELD")) == {3, 4}
+    assert merged.merge is not None and merged.merge.stopped_at_position == 3
+
+
+def test_merge_still_stops_cleanly_when_the_unconfirmed_post_fails() -> None:
+    """#694: a failed `UNCONFIRMED` post is reported, never turned into an exception that
+    skips the `HELD` comments on the rest of the batch."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.landed_tree_override[2] = "wrong-tree"
+    fake.raise_on_unconfirmed_post = True
+    printed: list[str] = []
+    merged = mt.run_merge(fake, record.batch_id, say=printed.append)
+    assert any("could not post UNCONFIRMED on #2" in line for line in printed)
+    assert set(_texts(fake, "HELD")) == {3, 4}
+    assert merged.merge is not None and merged.merge.stopped_at_position == 3
+    assert "does not match tree_2" in (merged.merge.reason or "")
+
+
+def test_merge_reason_after_a_failed_merged_post_says_the_landing_was_verified() -> None:
+    """#694: when only posting `MERGED` fails, after the landing was verified and recorded,
+    the reason must not claim the landing is unverified, and `--resume` goes on from the
+    next PR."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.raise_on_post.add(2)
+    with pytest.raises(RuntimeError):
+        mt.run_merge(fake, record.batch_id)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.merge is not None
+    reason = saved.merge.reason or ""
+    assert "could not verify" not in reason
+    assert "#2 landed and was verified" in reason
+    assert "--resume" in reason
+
+    fake.raise_on_post.clear()
+    resumed = mt.run_merge(fake, record.batch_id, resume=True)
+    assert [m["number"] for m in resumed.merge.merged] == [1, 2, 3, 4]
+    assert fake.merge_calls.count((2, "head2")) == 1
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "GraphQL: Pull Request is still a draft (mergePullRequest)",
+        "GraphQL: Pull Request is not mergeable: changes must be made through the merge "
+        "queue (mergePullRequest)",
+    ],
+)
+def test_shell_runner_merge_pr_stops_at_once_on_a_draft_or_merge_queue_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str
+) -> None:
+    """#694: a draft PR or a merge-queue requirement never clears by waiting, so it is
+    `failed` at once, not retried for about two minutes."""
+    runner = mt.ShellRunner(tmp_path)
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+
+    _Result.stderr = stderr  # type: ignore[attr-defined]
+    monkeypatch.setattr(mt.subprocess, "run", lambda *a, **k: _Result())
+    assert runner.merge_pr(5, "abc123").outcome == "failed"
+
+
+def test_prune_deletes_merge_train_refs_when_no_build_is_in_flight() -> None:
+    fake = _batch(2)
+    _merge_record(fake, 2, [2])
+    fake.merge_train_refs = 3
+    printed: list[str] = []
+    mt.run_prune(fake, say=printed.append)
+    assert fake.ref_cleanups == 1
+    assert any("deleted 3 refs/merge-train/*" in line for line in printed)
+    assert not any("nothing to prune" in line for line in printed)
+
+
+def test_prune_keeps_merge_train_refs_while_a_build_is_in_flight() -> None:
+    """#694: an unfinished record, or a worktree with no record yet, may be a build still
+    reading PRs into those refs: they are left alone."""
+    fake = FakeRunner()
+    mt._save(_bare_record("20261003-000000-0000000", None))
+    fake.merge_train_refs = 2
+    mt.run_prune(fake)
+    assert fake.ref_cleanups == 0
+
+    mt.record_path("20261003-000000-0000000").unlink()
+    (mt.record_dir() / "worktree-20261003-000001-0000000").mkdir(parents=True)
+    mt.run_prune(fake)
+    assert fake.ref_cleanups == 0
+
+
+def test_prune_says_nothing_to_prune_on_an_empty_record_directory() -> None:
+    """#694: `_merge_lock` creates the record directory first, so "nothing to prune" must
+    come from what prune found, not from a missing directory."""
+    fake = FakeRunner()
+    printed: list[str] = []
+    mt.run_prune(fake, say=printed.append)
+    assert printed == ["nothing to prune"]
+    assert fake.ref_cleanups == 1
+
+
+def _git_repo(path: Path) -> None:
+    run = __import__("subprocess").run
+    run(["git", "init", "-q", str(path)], check=True)
+    run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        check=True,
+    )
+
+
+def test_shell_runner_deletes_only_merge_train_refs(tmp_path: Path) -> None:
+    """#694: real git against a local temp repo: `refs/merge-train/*` go, nothing else."""
+    run = __import__("subprocess").run
+    _git_repo(tmp_path)
+    for ref in ("refs/merge-train/pr-1", "refs/merge-train/pr-2", "refs/heads/keep"):
+        run(["git", "-C", str(tmp_path), "update-ref", ref, "HEAD"], check=True)
+    runner = mt.ShellRunner(tmp_path)
+    assert runner.delete_merge_train_refs() == 2
+    left = run(
+        ["git", "-C", str(tmp_path), "for-each-ref", "--format=%(refname)"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert "refs/heads/keep" in left
+    assert not any(ref.startswith("refs/merge-train/") for ref in left)
+    assert runner.delete_merge_train_refs() == 0
+
+
+def test_shell_runner_pr_data_fails_closed_when_its_ref_vanishes_after_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#694: `prune` now deletes `refs/merge-train/*`; a ref gone right after a successful
+    fetch must stop, never silently skip the stale-head check."""
+    runner = mt.ShellRunner(tmp_path)
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"nameWithOwner": REPO})
+        return json.dumps(
+            {
+                "number": 7,
+                "author": {"login": OWNER},
+                "isCrossRepository": False,
+                "baseRefName": "main",
+                "state": "OPEN",
+                "isDraft": False,
+                "headRefName": "feat/7-x",
+                "headRefOid": "a" * 40,
+                "body": "",
+                "labels": [],
+                "comments": [],
+                "title": "x",
+            }
+        )
+
+    def fake_git(cwd: Path, *args: str, check: bool = True) -> _Proc:
+        if args[:2] == ("fetch", "-q"):
+            return _Proc(0, "")
+        if args[:1] == ("rev-parse",):
+            return _Proc(128, "")  # the ref is gone
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    monkeypatch.setattr(runner, "_git", fake_git)
+    with pytest.raises(mt.StoppedError, match="vanished"):
+        runner.pr_data(7)

@@ -100,7 +100,11 @@ off a ledger that is missing a fill.
 journals any exit: the window's decisions with their states, the ledger
 stated for S, the own non-terminal sells, the adjustments, the listings
 `delisted` at close(S-1) (a transfer is not an end, as the wrapper reads it)
-and this run's `assets` read, every store fact as of close(S-1). The new
+and this run's `assets` read, every store fact as of close(S-1). The held
+names' reference prices are read strictly (a missing bar stops the run); a
+name only a decision or a non-terminal order brings in is priced if it can
+be, and a missing price raises only where a number reads it, and the open
+sells are the held names' only (#685, #569 owner option (b)). The new
 exits are journaled in one chunk; an untradable one with its `skipped` row
 (event reason `untradable`), which closes it, so it is not ordered and the
 next session re-evaluates it. The open exits (re-attempted
@@ -179,7 +183,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -520,15 +524,21 @@ def _exit_book(context: StepContext) -> _ExitBook:
             quantity_tolerance=context.frozen.reconcile_quantity_tolerance,
         )
         terminal = {e.client_order_id for e in events if e.status in TERMINAL_ORDER_STATUSES}
-        names = (
-            {d.decision.security_id for d in journaled}
-            | set(ledger.positions)
-            | {o.security_id for o in orders if o.client_order_id not in terminal}
-        )
-        prices = planning.reference_prices(conn, session, names, actions)
+        # The ledger's names are priced here: a missing bar stops step 7. A
+        # name only a journaled decision or a non-terminal order brings in is
+        # priced if it can be; a missing price raises only where a number
+        # reads it (a decision's remainder), so one stale order of an
+        # unrelated name does not stop every run (#685, #569 owner option (b)).
+        strict = set(ledger.positions)
+        prices = planning.reference_prices(conn, session, strict, actions)
+        others = {d.decision.security_id for d in journaled} | {
+            o.security_id for o in orders if o.client_order_id not in terminal
+        }
+        optional, unpriced = _optional_prices(conn, session, others - strict, actions)
+        prices = {**prices, **optional}
         held = sorted(name for name, quantity in ledger.positions.items() if quantity > 0)
         ends = (
-            _current(
+            planning.current_listings(
                 listing_ends_as_of(conn, cut, context.settings, held), previous_session(session)
             )
             if held
@@ -537,7 +547,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
         tickers = _current_tickers(listings_as_of(conn, cut, held), session) if held else {}
         marks_rows = positions_daily_for(conn, window_id)
         run_rows = [r.run for r in runs_for(conn, window_id)]
-    price_of = _lookup(prices)
+    price_of = _lookup(prices, unpriced)
     states: dict[int, DecisionState] = {}
     for journaled_decision in journaled:
         decision = journaled_decision.decision
@@ -560,7 +570,16 @@ def _exit_book(context: StepContext) -> _ExitBook:
         ledger=ledger,
         adjustments=adjustments,
         actions=actions,
-        open_sells=unfilled_sells(orders, events, fills, price_of, actions, session=session),
+        # Its readers (`exits.forced_exits`, `exits.stop_exits`) look up held
+        # names only, so an unrelated open notional sell is never priced (#685).
+        open_sells=unfilled_sells(
+            [o for o in orders if o.security_id in strict],
+            events,
+            fills,
+            price_of,
+            actions,
+            session=session,
+        ),
         delisted={
             sid: row["end_session"] for sid, row in ends.items() if row["status"] == DELISTED
         },
@@ -662,13 +681,41 @@ def _run_id(run: PaperRunRow) -> int:
     return run.run_id
 
 
-def _lookup(prices: Mapping[str, float]) -> Callable[[str], float]:
+def _lookup(
+    prices: Mapping[str, float], unpriced: Mapping[str, str] | None = None
+) -> Callable[[str], float]:
+    """`price_of` over `prices`: a name in `unpriced` raises `ValueError` with
+    the reason its read failed, any other name not read a plain one."""
+    reasons = unpriced or {}
+
     def price_of(security_id: str) -> float:
+        if security_id in reasons:
+            raise ValueError(f"no reference price for {security_id}: {reasons[security_id]}")
         if security_id not in prices:
             raise ValueError(f"no reference price read for {security_id}")
         return prices[security_id]
 
     return price_of
+
+
+def _optional_prices(
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Collection[str],
+    actions: pl.DataFrame,
+) -> tuple[dict[str, float], dict[str, str]]:
+    """The reference prices of `names`, each read on its own so one name with
+    no bar at close(S-1) does not stop the rest; a name that fails lands in
+    the second map with its `ValueError` message, which `_lookup` raises only
+    if something reads that name's price (#685, as `wrapper._optional_prices`)."""
+    priced: dict[str, float] = {}
+    unpriced: dict[str, str] = {}
+    for security_id in sorted(names):
+        try:
+            priced.update(planning.reference_prices(conn, session, [security_id], actions))
+        except ValueError as exc:
+            unpriced[security_id] = str(exc)
+    return priced, unpriced
 
 
 def invoked_by(environ: Mapping[str, str], *, stdin_is_tty: bool) -> str:
@@ -1802,26 +1849,14 @@ def _rebalance_kind(
     )
 
 
-def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from` on or before `day`."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        valid_from = row["valid_from"]
-        if valid_from is not None and valid_from > day:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or (
-            valid_from is not None
-            and (held["valid_from"] is None or valid_from > held["valid_from"])
-        ):
-            current[row["security_id"]] = row
-    return current
-
-
 def _current_tickers(listings: pl.DataFrame, day: date) -> dict[str, str]:
-    return {sid: row["ticker"] for sid, row in _current(listings, day).items()}
+    return {sid: row["ticker"] for sid, row in planning.current_listings(listings, day).items()}
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
     """The securities whose listing current on `day` has `ticker`."""
-    return sorted(sid for sid, row in _current(listings, day).items() if row["ticker"] == ticker)
+    return sorted(
+        sid
+        for sid, row in planning.current_listings(listings, day).items()
+        if row["ticker"] == ticker
+    )

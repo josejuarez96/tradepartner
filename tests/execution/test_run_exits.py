@@ -11,7 +11,7 @@ corporate actions of its own.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -27,14 +27,21 @@ from execution.test_run_trade import (
     split,
     window,
 )
-from tradepartner.adapters.broker import Asset
+from tradepartner.adapters.broker import Asset, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.planning import PlanOutcome
-from tradepartner.store.journal import AdjustmentRow, PaperRunRow, PaperWindowRow
+from tradepartner.store.journal import (
+    AdjustmentRow,
+    DecisionRow,
+    OrderEventRow,
+    OrderRow,
+    PaperRunRow,
+    PaperWindowRow,
+)
 
 __all__ = ["env", "window"]  # the fixtures, re-exported for this module's tests
 
@@ -706,3 +713,183 @@ def test_nothing_traded_while_fills_lag_on_a_fill_session(
     assert context.notes == [
         "fills_lagging: nothing planned or traded; the rebalance stays pending"
     ]
+
+
+# --- an open order's name with no bar (#685, #569 owner option (b)) ---------------------
+
+NO_BAR = "SEC_NO_BAR"  # no `prices_daily` row at all: no reference price on any S
+NO_BAR_SYMBOL = "NOBR"
+
+
+def stale_order(
+    env: Env,
+    made: datetime,
+    *,
+    side: str = "buy",
+    quantity: float | None = 2.0,
+    notional: float | None = None,
+) -> str:
+    """An earlier run's non-terminal order of `NO_BAR` (a quantity buy unless
+    told otherwise), accepted by the broker and never filled: the stale order
+    #569 says must not stop the run. Its name is neither held nor in a
+    pending rebalance."""
+    run_id = env.latest_run()
+    (decision_id,) = env.append(
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=None,
+            security_id=NO_BAR,
+            side=side,
+            planned_quantity=quantity,
+            planned_notional=notional,
+            whole_share=False,
+            decision="forced_exit",
+            reason="delisted",
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+    coid = f"tp-stale-no-bar-{side}"
+    env.prices[NO_BAR_SYMBOL] = 10.0
+    placed = env.fake.submit(
+        OrderRequest(
+            coid,
+            NO_BAR_SYMBOL,
+            Side.BUY if side == "buy" else Side.SELL,
+            quantity=quantity,
+            notional=notional,
+        )
+    )
+    env.append(
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,  # type: ignore[arg-type]
+            run_id=run_id,
+            session=made.date(),
+            attempt=1,
+            phase="exit",
+            security_id=NO_BAR,
+            symbol=NO_BAR_SYMBOL,
+            side=side,
+            quantity=quantity,
+            notional=notional,
+            sells_in_flight_at_submit=False,
+            known_at=made,
+            ingested_at=made,
+        ),
+        OrderEventRow(client_order_id=coid, status="pending", known_at=made, ingested_at=made),
+        OrderEventRow(
+            client_order_id=coid,
+            status="accepted",
+            broker_order_id=placed.broker_order_id,
+            known_at=made,
+            ingested_at=made,
+        ),
+    )
+    return coid
+
+
+def fill_all_but(env: Env, coid: str) -> None:
+    """Fill every open order but `coid` when the run sleeps."""
+    env.fill_on_sleep = False
+
+    def fill(_now: datetime) -> None:
+        for order in env.fake.open_orders():
+            if order.client_order_id != coid:
+                env.fake.simulate_fill(order.client_order_id)
+
+    env.on_sleep.append(fill)
+
+
+@pytest.mark.parametrize(
+    ("side", "quantity", "notional"),
+    [
+        pytest.param("buy", 2.0, None, id="quantity-buy"),
+        # `unfilled_sells` would price a notional sell; step 7's open sells
+        # are the held names' only, so this one is never priced (#685).
+        pytest.param("sell", None, 30.0, id="notional-sell"),
+    ],
+)
+def test_an_unrelated_stale_order_with_no_bar_does_not_stop_a_mark_run(
+    env: Env,
+    window: PaperWindowRow,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+) -> None:
+    """Step 7's read prices the held names strictly; a name only a stale open
+    order (and its in-flight decision) brings in, with no bar at close(S-1),
+    is priced only if a number reads it, and none does here (#685)."""
+    bought(env)
+    stale_order(env, at(F_0_PLUS_1, 15, 0), side=side, quantity=quantity, notional=notional)
+    outcome = env.run(at(MAY_3))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert outcome.kind == "mark"
+
+
+def test_an_unrelated_stale_order_with_no_bar_does_not_block_a_forced_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """End to end (#685, #569 (b)): the stale order neither halts step 7 nor the
+    wrapper's sells-only exit batch; the delisted name is sold whole."""
+    bought(env)
+    coid = stale_order(env, at(F_0_PLUS_1, 15, 0))
+    fill_all_but(env, coid)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    outcome = env.run(at(MAY_3))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, _side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, run_id) == ("delisted", outcome.run_id)
+    ((_coid, ordered, _phase, quantity, _session),) = exit_orders(env, "SEC_TRANSFER")
+    assert ordered == decision_id
+    assert quantity == pytest.approx(held)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_held_name_with_no_bar_still_halts_step_7(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The held names stay strict: a held name whose reference price cannot be
+    read still stops the run at step 7's read, before any exit is journaled."""
+    bought(env)
+    ended_before(env, MAY_3)
+    real = run_module.planning.reference_prices
+
+    def no_trns(conn: object, session: date, names: object, actions: object) -> object:
+        if "SEC_TRANSFER" in set(names):  # type: ignore[call-overload]
+            raise ValueError("no reference price for SEC_TRANSFER")
+        return real(conn, session, names, actions)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(run_module.planning, "reference_prices", no_trns)
+    with pytest.raises(ValueError, match="SEC_TRANSFER"):
+        env.run(at(MAY_3))
+    assert exits(env, "SEC_TRANSFER") == []
+
+
+def test_an_open_decision_of_a_name_with_no_bar_raises_its_reason_when_read(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Deferred, not dropped (#685): an open decision of a name with no bar,
+    whose remainder step 7 must price, still stops the run, with the reason
+    the price read failed, before any exit is journaled."""
+    bought(env)
+    made = at(F_0_PLUS_1, 15, 0)
+    env.append(
+        DecisionRow(
+            run_id=env.latest_run(),
+            rebalance_session=None,
+            security_id=NO_BAR,
+            side="sell",
+            planned_notional=30.0,
+            whole_share=False,
+            decision="forced_exit",
+            reason="delisted",
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+    ended_before(env, MAY_3)
+    with pytest.raises(ValueError, match=r"no reference price for SEC_NO_BAR: no bar on or before"):
+        env.run(at(MAY_3))
+    assert exits(env, "SEC_TRANSFER") == []

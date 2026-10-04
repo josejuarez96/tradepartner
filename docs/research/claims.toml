@@ -1452,6 +1452,7 @@ grade = "SUPPORTED"
 scope = "slow, liquid, diversified profitability tilts only; not every quality bundle or short book"
 source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
 section = "End-of-Q2 survival table"
+bears_on = ["backlog:B3", "hyp:b3-gross-profitability"]
 note = "Graded SUPPORTED narrowly; pure modern all-cost magnitude unknown."
 
 [[claim]]
@@ -1550,6 +1551,7 @@ grade = "MIXED"
 scope = "multi-ingredient quality packages, as opposed to slow profitability"
 source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
 section = "Q1. Economic mechanisms and the other side"
+bears_on = ["backlog:B3", "hyp:b3-gross-profitability"]
 
 [[claim]]
 id = "QI-17"
