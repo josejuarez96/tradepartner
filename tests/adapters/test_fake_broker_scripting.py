@@ -457,6 +457,31 @@ def test_a_fill_lagged_forever_is_never_delivered() -> None:
         broker.lag_fills(-1)
 
 
+def test_reveal_hidden_fills_delivers_already_recorded_fills_on_the_next_read() -> None:
+    """#742: the feed catches up. Fills recorded under a finite or a forever
+    lag surface on the next `fills()`; the lag for later fills is kept, and
+    the hook is not a `Broker` call."""
+    broker, clock = make_broker()
+    broker.lag_fills(None)
+    broker.script(FillAt())
+    broker.submit(buy("forever"))
+    broker.lag_fills(3)
+    clock.now = T0 + timedelta(minutes=1)
+    broker.script(FillAt())
+    broker.submit(buy("three"))
+    assert broker.fills() == []
+    calls_before = len(broker.calls)
+
+    broker.reveal_hidden_fills()
+
+    assert len(broker.calls) == calls_before
+    assert [f.client_order_id for f in broker.fills()] == ["forever", "three"]
+    clock.now = T0 + timedelta(minutes=2)
+    broker.script(FillAt())
+    broker.submit(buy("later"))  # still recorded under lag_fills(3)
+    assert [f.client_order_id for f in broker.fills()] == ["forever", "three"]
+
+
 # --- assets per session ------------------------------------------------------------
 
 
