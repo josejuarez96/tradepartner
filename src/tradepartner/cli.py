@@ -211,19 +211,18 @@ def _print_result(result: IngestResult) -> None:
 
 
 def _print_holes(result: HoleFill) -> None:
-    """A dry run's holes (summary, then one line per security), or a real
-    run's month rows."""
-    if result.dry_run:
-        typer.echo(f"alpaca: holes as of now: {result.summary()}")
-        for line in result.lines():
-            typer.echo(line)
-        return
+    """Any run rows (a real run's months, or a locked store), then a dry
+    run's holes: the summary and one line per security."""
     for run in result.runs:
         typer.echo(
             f"{run.source}: {run.status}, {run.rows_added} rows, "
             f"cursor {run.chunk_cursor}: {run.message}"
         )
-    if not result.runs:
+    if result.dry_run and result.exit_code == 0:
+        typer.echo(f"alpaca: holes as of now: {result.summary()}")
+        for line in result.lines():
+            typer.echo(line)
+    elif not result.runs:
         typer.echo("alpaca: no holes to fill")
 
 

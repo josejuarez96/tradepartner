@@ -993,3 +993,40 @@ def test_hole_lines_group_months_and_mark_those_between_stored_bars(settings: Se
         f"  {ACME} ACME: 2019-05 (1 months, 1 between its stored bars)",
         f"  {DUAL} DUA: 2019-05..2019-06 (2 months, 0 between its stored bars)",
     ]
+
+
+def test_a_listing_that_now_runs_on_makes_a_hole_that_the_fill_refetches(
+    settings: Settings,
+) -> None:
+    # End to end: a Form 25 ended ACME in May, so June was never fetched.
+    # A later EDGAR run learns that ACME moved to NASDAQ instead (a cover
+    # page accepted before the Form 25 took effect): ACME now runs on
+    # through June, which the store has no bar for.
+    form_25 = DelistingFiling(
+        ACME, "25", "Common Stock", "NYSE", f"{ACME}-19-000025", _at(2019, 5, 6), date(2019, 5, 16)
+    )
+    gone = {(ACME, s) for s in _sessions(date(2019, 5, 17), date(2019, 6, 30))}
+    assert _backfill(settings, _History(gaps=gone), filings=_filings(delistings=[form_25])).ok
+    moved = CoverPage(
+        ACME,
+        f"{ACME}-19-000030",
+        _at(2019, 5, 8),
+        (CoverListing("Common Stock", "ACME", "NASDAQ"),),
+    )
+    filings = _filings(delistings=[form_25])
+    filings._cover_pages = sorted(
+        [*filings._cover_pages, moved], key=lambda e: (e.accepted_at, e.accession)
+    )
+    assert _backfill(settings, _History(), filings=filings, now=LATER, source="edgar").ok
+    clock = LATER + timedelta(hours=1)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: clock, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    prices = _History()
+    result = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: clock)
+    assert [r.status for r in result.runs] == [FILLED]
+    assert prices.fetched == {date(2019, 6, 1): {ACME, SPY}}
+    assert _read(
+        settings,
+        f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-06-01' AND DATE '2019-06-28'",
+    ) == [(len(_sessions(*JUNE_WINDOW)),)]

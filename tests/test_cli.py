@@ -269,6 +269,18 @@ def test_a_fill_holes_run_prints_each_month_and_exits_on_its_status(
     assert _invoke(secrets_set, args).exit_code == 0
 
 
+def test_a_fill_holes_dry_run_on_a_locked_store_says_so_and_lists_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    locked = SourceRun("alpaca", "locked", 0, "holes;since=2016-01-01", "store is locked")
+    monkeypatch.setattr(cli, "fill_holes", lambda *_, **__: HoleFill((), (locked,), True))
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca"]
+    result = _invoke(_with_store(_settings(tmp_path)), [*args, "--fill-holes", "--dry-run"])
+    assert result.exit_code == 1
+    assert "alpaca: locked" in result.output and "store is locked" in result.output
+    assert "holes as of now" not in result.output
+
+
 def test_a_real_fill_holes_run_needs_the_alpaca_secrets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
