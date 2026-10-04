@@ -101,10 +101,16 @@ only a non-terminal own order brings in is priced if it can be, and a missing
 price halts only when a number reads it, so one stale order of an unrelated
 name does not halt every batch (#569, owner option (b)). The open-sell check
 reads only the batch's names' open sells (`_open_sells`); the open-buy reserve
-prices every open quantity buy, so a batch with buys runs it once on the first
-book, before any sell is submitted, and halts there on a missing price. The
-costs that size
-the buys and the cash rule are the window's frozen `costs.*` keys
+prices every open quantity buy, so a batch holding any buy decision (whether
+or not a buy is still open) runs it once on the first book, before any sell is
+submitted, and halts there on a missing price. That pre-check runs only after
+one read of the derived switch (`_engaged`) finds it clear: an engaged switch
+skips the pre-check, and the phases' own reads (step 2) end the batch
+`skipped_kill_switch` (or `ok`, nothing submitted, when no phase has an
+attempt), never a fault from a price a skipped batch would not read (#692,
+owner Q1 = B; keyed on any buy decision, owner Q2). Only a run-lock holder
+releases the switch, so it cannot clear between those reads. The costs that
+size the buys and the cash rule are the window's frozen `costs.*` keys
 (`config.FROZEN_COSTS_KEYS`, #534), read with each phase's book; a window whose
 `frozen_json` lacks them raises `ValueError` before any broker call, never
 falling back to `settings.costs`. Each phase, in order:
@@ -618,10 +624,12 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
-        if any(d.side == _BUY for d in decisions):
+        if any(d.side == _BUY for d in decisions) and not self._engaged(run, book.window):
             # The buys phase's reserve prices every open quantity buy: a name
             # of one with no price halts here, before any sell is submitted,
-            # not after the sells have gone out (#569).
+            # not after the sells have gone out (#569). Only once the switch
+            # reads clear (#692, owner Q1 = B): an engaged switch goes on to
+            # the phases' own reads and ends `skipped_kill_switch`.
             open_buy_reserve(
                 book.orders,
                 book.events,

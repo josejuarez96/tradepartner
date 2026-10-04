@@ -315,6 +315,38 @@ def test_overrides_of_another_rebalance_or_the_kill_switch_are_ignored() -> None
     assert _by_name(result) == _by_name(_run())
 
 
+def _settle_order(security_id: str, *, override_id: int) -> OverrideRow:
+    """A `settle_order` row (spec req 17, #571) on rebalance T's order of a name."""
+    return replace(
+        _override("settle_order", security_id, override_id=override_id),
+        client_order_id=f"tp-{security_id}",
+    )
+
+
+def test_a_settle_order_override_makes_no_decision() -> None:
+    """Spec req 17: `plan.decisions_from` ignores `settle_order` rows; no
+    `override` decision exists for them, held or target, on their own session."""
+    settlements = (_settle_order("A", override_id=22), _settle_order("B", override_id=23))
+    result = _run(overrides=settlements)
+    assert _by_name(result) == _by_name(_run())
+    assert all(d.decision != "override" for d in _by_name(result).values())
+
+
+def test_a_settle_order_row_does_not_clash_with_a_name_override() -> None:
+    """A settlement on a name the owner also excludes is not a second override of
+    the name (only `exclude_name` and `keep_name` are)."""
+    alone = _by_name(_run(overrides=(_override("exclude_name", "A", override_id=24),)))
+    both = _by_name(
+        _run(
+            overrides=(
+                _override("exclude_name", "A", override_id=24),
+                _settle_order("A", override_id=25),
+            )
+        )
+    )
+    assert both == alone
+
+
 def test_an_override_naming_no_decided_name_makes_no_decision() -> None:
     got = _by_name(_run(overrides=(_override("keep_name", "D", override_id=17),)))
     assert "D" not in got
