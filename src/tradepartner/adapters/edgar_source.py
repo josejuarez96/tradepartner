@@ -69,7 +69,8 @@ one, else `min(ddate, acceptance date in New York)`, because FSN's `ddate`
 is a rounded month end (owner decision 2026-09-26, #242); a per-document
 record keeps its cover date. Records are de-duplicated across sources on
 (accession, fact name, class member), the winner keeping its own dates; two
-sources disagreeing on a value is a collision (T11h's policy, below). FSN
+sources disagreeing on a value, or a NaN or infinite value from any source
+(#749), is a collision (T11h's policy, below). FSN
 holds 4 decimal places, so a value agrees with FSN's when it is within half
 a unit of the 4th place (#610 X1). A company-facts date after acceptance is
 capped at the Eastern acceptance date; when that cap makes it collide with a
@@ -1623,7 +1624,8 @@ class EdgarFilingSource(FilingSource):
         member): a per-document parse wins over company facts, which win over
         FSN; every source's records keep their own `as_of_date` keys within
         the winner; the same key with different values in two sources (FSN
-        compared at its 4 decimal places, #610 X1) is a collision (T11h):
+        compared at its 4 decimal places, #610 X1), or a NaN or infinite
+        value in any source, even the only one (#749), is a collision (T11h):
         only that (accession, fact name, class member) key
         is withheld, recorded under the accession's base form, and it counts
         toward `check_failures`'s cross-day (error class, base form) rule
@@ -1673,6 +1675,12 @@ class EdgarFilingSource(FilingSource):
                 dated: dict[str, dict[date, float]] = {}
                 for source, facts in sources.items():
                     for fact in facts:
+                        if not math.isfinite(fact.value):
+                            # #749: a key only one source supplies is never
+                            # compared by `_same_value`, so check it here.
+                            raise ValueError(
+                                f"{label} {source} value on {fact.as_of_date} is not finite"
+                            )
                         held = dated.setdefault(source, {}).setdefault(fact.as_of_date, fact.value)
                         if held != fact.value:  # one source, one date, two values
                             raise ValueError(
