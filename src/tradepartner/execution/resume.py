@@ -232,12 +232,21 @@ class _MonotonicStamps:
         step within its own readings) run exactly as if unwrapped. A reading
         that comes back a tz-aware `datetime` raises the floor to
         `max(floor, reading)`, so a later call to `next` never hands out a
-        stamp behind what that module just wrote."""
+        stamp behind what that module just wrote. The floor is raised by the
+        reading's UTC instant (`ensure_tz_aware_utc`), so the floor, every
+        stamp clamped to it and the clamp warning are always UTC (issue
+        #682); a reading that is not a usable UTC instant (no offset, or out
+        of range in UTC) leaves the floor alone and is left to that module's
+        own guard."""
 
         def wrapped() -> datetime:
             reading = clock()
-            if isinstance(reading, datetime) and reading.tzinfo is not None:
-                self._floor = max(self._floor, reading)
+            if isinstance(reading, datetime):
+                try:
+                    instant = ensure_tz_aware_utc(reading, field_name="clock")
+                except ValueError:
+                    return reading
+                self._floor = max(self._floor, instant)
             return reading
 
         return wrapped

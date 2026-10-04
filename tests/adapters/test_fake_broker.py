@@ -15,7 +15,8 @@ aware timestamp that overflows once converted to UTC (issue #43) raising
 `ValueError` (not `OverflowError`) from `Order`/`Fill` construction, and a
 bad clock (naive, overflowing, not a `datetime`, or raising) making
 `submit`/`simulate_fill`/`account` raise `ClockError` with no state changed
-(ADR 0007 point 4, T46).
+(ADR 0007 point 4, T46), and the account scripts `Reset` and `SetPosition`
+(#753, spec req 17).
 """
 
 from __future__ import annotations
@@ -42,7 +43,14 @@ from tradepartner.adapters.broker import (
     Side,
     UnknownOrderError,
 )
-from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.adapters.fake_broker import (
+    FakeBroker,
+    HoldCancel,
+    PartialFill,
+    Reset,
+    SetPosition,
+    Vanish,
+)
 from tradepartner.errors import ClockError, SystemFaultError
 
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
@@ -955,3 +963,112 @@ def test_apply_split_of_a_netted_to_zero_symbol_raises() -> None:
 
     with pytest.raises(ValueError, match="AAPL"):
         broker.apply_split("AAPL", 2.0)
+
+
+# --- account scripts: Reset and SetPosition (#753, spec req 17) -------------
+
+
+def test_reset_forgets_every_order_and_empties_positions_and_the_fill_stream() -> None:
+    """A paper-account reset (spec req 17 case (i)): the orders, filled or
+    not, the positions and the fill stream go together, the one exception to
+    the rule that an order with fills cannot be forgotten."""
+    broker, _ = make_broker(auto_fill=False)
+    broker.submit(make_request(client_order_id="filled", symbol="AAPL", quantity=10))
+    broker.simulate_fill("filled")
+    broker.submit(make_request(client_order_id="open", symbol="MSFT", quantity=5))
+    cash_before = broker.account().cash
+    calls_before = broker.calls
+
+    broker.apply_account(Reset())
+
+    assert broker.calls == calls_before  # a script, not a `Broker` call
+    for coid in ("filled", "open"):
+        with pytest.raises(UnknownOrderError):
+            broker.get_order(coid)
+    assert broker.open_orders() == []
+    assert broker.positions() == {}
+    assert broker.fills() == []
+    assert broker.account().cash == cash_before  # cash is left as it was
+
+
+def test_reset_frees_the_ids_and_keeps_broker_order_ids_unique() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    first = broker.submit(make_request(client_order_id="a", quantity=1))
+    broker.apply_account(Reset())
+
+    again = broker.submit(make_request(client_order_id="a", quantity=1))
+
+    assert again.broker_order_id != first.broker_order_id
+    assert [o.client_order_id for o in broker.open_orders()] == ["a"]
+
+
+def test_reset_drops_a_lagging_fill_and_a_held_cancel() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    broker.lag_fills(None)
+    broker.submit(make_request(client_order_id="a", quantity=2))
+    broker.apply("a", PartialFill(1, 100.0))
+    broker.apply("a", HoldCancel())
+
+    broker.apply_account(Reset())
+    broker.lag_fills(0)
+    broker.submit(make_request(client_order_id="b", quantity=1))
+    broker.simulate_fill("b")
+
+    assert [f.client_order_id for f in broker.fills()] == ["b"]
+    broker.submit(make_request(client_order_id="a", quantity=2))
+    broker.cancel("a")  # no hold survives the reset
+    assert broker.get_order("a").status is OrderStatus.CANCELLED
+
+
+def test_vanish_still_refuses_a_filled_order() -> None:
+    """Reset is the only way to forget a filled order."""
+    broker, _ = make_broker(auto_fill=False)
+    broker.submit(make_request(client_order_id="a", quantity=2))
+    broker.apply("a", PartialFill(1, 100.0))
+
+    with pytest.raises(ValueError, match="has fills"):
+        broker.apply("a", Vanish())
+
+
+def test_set_position_sets_and_drops_one_name_only() -> None:
+    """The positions hook (#753): a lagging `FILLED` order with the name held
+    at the ledger's quantity, or a `Vanish` with a held name."""
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="a", symbol="AAPL", quantity=10))
+    broker.submit(make_request(client_order_id="m", symbol="MSFT", quantity=1))
+    cash_before = broker.account().cash
+
+    broker.apply_account(SetPosition("aapl", 4.5))
+    assert broker.positions()["AAPL"].quantity == 4.5
+    broker.apply_account(SetPosition("AAPL", None))
+    assert "AAPL" not in broker.positions()
+    broker.apply_account(SetPosition("BRK.B", 3))
+    assert broker.positions()["BRK.B"].quantity == 3
+
+    assert broker.positions()["MSFT"].quantity == 1
+    assert broker.account().cash == cash_before
+    assert {c.method for c in broker.calls} == {"submit", "account", "positions"}
+    assert broker.get_order("a").status is OrderStatus.FILLED  # orders untouched
+    assert [f.client_order_id for f in broker.fills()] == ["a", "m"]  # fills untouched
+
+
+def test_set_position_to_zero_drops_the_name() -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="a", symbol="AAPL", quantity=10))
+
+    broker.apply_account(SetPosition("AAPL", 0))
+
+    assert broker.positions() == {}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "1"])
+def test_set_position_refuses_a_non_finite_or_non_numeric_quantity(bad: Any) -> None:
+    with pytest.raises(ValueError, match="quantity"):
+        SetPosition("AAPL", bad)
+
+
+def test_apply_account_refuses_an_order_instruction() -> None:
+    broker, _ = make_broker()
+
+    with pytest.raises(ValueError, match="account"):
+        broker.apply_account(Vanish())  # type: ignore[arg-type]
