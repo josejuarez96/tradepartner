@@ -63,7 +63,11 @@ remainder itself, un-capped by anything — so a trim the holding cap alone
 turns into a skip (e.g. a price drop that leaves it already sold down to its
 residue) is held too, not just one the open sells alone would have caused.
 A trim whose own uncapped remainder is already below the minimum (or below
-one whole share) still skips as before.
+one whole share) still skips as before. Every hold is reported in
+`PhaseOrders.held` (`HeldSell`, both quantities and the skip the capped one
+would have been): the wrapper logs one line per hold, and `buy_orders`
+counts a held name as sold, like an ordered or skipped one (#719 items 2
+and 4).
 
 Every quantity is rounded down to `quantity_decimals` (`alpaca.quantity_decimals`)
 and, on a whole-share basis, floored, so no sell exceeds the holding the risk
@@ -130,7 +134,7 @@ from tradepartner.execution.risk import BuyToSize, Skip, round_down, size_buys
 from tradepartner.store.journal import DecisionRow, OrderRow
 from tradepartner.store.schema import DELISTED_REASON, UNTARGETED_RECEIPT_REASON
 
-__all__ = ["PhaseOrder", "PhaseOrders", "buy_orders", "requests_for", "sell_orders"]
+__all__ = ["HeldSell", "PhaseOrder", "PhaseOrders", "buy_orders", "requests_for", "sell_orders"]
 
 _BUY = "buy"
 _SELL = "sell"
@@ -183,17 +187,35 @@ class PhaseOrder:
 
 
 @dataclass(frozen=True)
+class HeldSell:
+    """A sell `sell_orders` **held** (module docstring): no order and no skip
+    this run, the decision left open. `uncapped_quantity` and
+    `capped_quantity` are the two quantities the hold rule compared, and
+    `capped_skip` the skip reason the capped one would have been (#719 items
+    2 and 4: the wrapper logs one line per hold, and `buy_orders` counts the
+    name as sold)."""
+
+    decision_id: int
+    security_id: str
+    uncapped_quantity: float
+    capped_quantity: float
+    capped_skip: str
+
+
+@dataclass(frozen=True)
 class PhaseOrders:
     """A phase's orders and per-name skips; for a buys phase also the ids its
     sizing deferred and the cash its orders leave (`None` for a sells phase).
     `session` is the session S the orders were built for (`None` for an empty
-    placeholder); `requests_for` refuses any other."""
+    placeholder); `requests_for` refuses any other. `held` is a sells phase's
+    held sells (`HeldSell`), empty for a buys phase."""
 
     orders: tuple[PhaseOrder, ...]
     skips: tuple[Skip, ...]
     deferred: tuple[int, ...] = ()
     cash_left: float | None = None
     session: date | None = None
+    held: tuple[HeldSell, ...] = ()
 
 
 def _check_session(session: date) -> None:
@@ -371,6 +393,7 @@ def sell_orders(
     open_sold = risk.open_sold(open_sells, quantity_decimals)
     orders: list[PhaseOrder] = []
     skips: list[Skip] = []
+    held_sells: list[HeldSell] = []
     for attempt in scope.attempts:
         decision = attempt.decision
         sid = decision.security_id
@@ -407,7 +430,9 @@ def sell_orders(
         reason_before = _sell_skip(full_exit, whole, quantity_before, price, frozen)
         reason = _sell_skip(full_exit, whole, quantity, price, frozen)
         if reason is not None and reason_before is None:
-            continue  # held: the capping alone caused it, not a real skip
+            # Held: the capping alone caused it, not a real skip.
+            held_sells.append(HeldSell(_id(decision), sid, quantity_before, quantity, reason))
+            continue
         if reason is not None:
             skips.append(Skip(_id(decision), sid, reason))
             continue
@@ -424,7 +449,7 @@ def sell_orders(
                 target_weight=decision.target_weight,
             )
         )
-    return PhaseOrders(tuple(orders), tuple(skips), session=session)
+    return PhaseOrders(tuple(orders), tuple(skips), session=session, held=tuple(held_sells))
 
 
 def buy_orders(
@@ -447,8 +472,8 @@ def buy_orders(
     forced exits), with their `plan.decision_state` on S in `states`; `cash`
     is the account's cash read after the sells less the open-buy reserve, at
     least 0; `planned_sells` is this run's sells phase (`sell_orders`), whose
-    proceeds are in `cash` already and whose names, ordered or skipped, are
-    never bought (a buy of one raises `ValueError`, as does a buy of a name
+    proceeds are in `cash` already and whose names, ordered, skipped or held
+    (#719 item 4), are never bought (a buy of one raises `ValueError`, as does a buy of a name
     whose sell decision in `decisions` is in flight, and a non-empty
     `planned_sells` built for another session). `ended` is the names whose
     listing ended at close(S-1) (`book.ended`): such a buy is skipped as
@@ -460,7 +485,9 @@ def buy_orders(
     """
     _check_session(session)
     _finite(cash, "cash")
-    if (planned_sells.orders or planned_sells.skips) and planned_sells.session != session:
+    if (
+        planned_sells.orders or planned_sells.skips or planned_sells.held
+    ) and planned_sells.session != session:
         raise ValueError(
             f"planned_sells is a sells phase of {planned_sells.session}, not {session}"
         )
@@ -470,6 +497,7 @@ def buy_orders(
     sold = (
         {order.security_id for order in planned_sells.orders}
         | {skip.security_id for skip in planned_sells.skips}
+        | {held.security_id for held in planned_sells.held}
         | {by_id[i].security_id for i in selling.in_flight}
     )
     both = sorted(sold & {a.decision.security_id for a in scope.attempts})

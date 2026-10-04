@@ -1046,3 +1046,59 @@ def test_a_stop_run_s_outcomes_and_exits_are_unchanged_on_the_cut(
     # sell, so the stop gets an exit for it too.
     late_exits = _stop_exits_for(fixture, fixture.full, None)
     assert {e.security_id for e in late_exits} == set(fixture.held)
+
+
+# --- `paper settle` (T84b, spec req 17, #571) --------------------------------------------
+
+
+class _SettleClock:
+    """A settable clock (the base `Ticking` moves)."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def test_a_cut_at_the_settle_gates_reading_does_not_see_its_rows(
+    fixture_store_path: Path,
+) -> None:
+    """Both rows `paper settle` writes are stamped after the gate's clock
+    reading, so the journal cut at that reading shows the order still
+    non-terminal and no `settle_order` override; past the stamp it shows both."""
+    from execution.test_window_settle import DAY1, NOTE, Settle, Ticking, new_window
+
+    from tradepartner.adapters.fake_broker import FakeBroker, Vanish
+    from tradepartner.execution.window import settle_order
+    from tradepartner.store.db import open_read_only
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    base = _SettleClock(DAY1)
+    fake = FakeBroker(clock=base, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1")
+    s = Settle(settings, base, fake, new_window(settings))
+    s.place("tp-settle")
+    fake.apply("tp-settle", Vanish())
+    s.engage()
+    clock = Ticking(base)
+    result = settle_order(settings, s.connect, fake, clock, "tp-settle", NOTE)
+    gate = clock.readings[0]
+    assert result.known_at > gate
+
+    def seen(conn: duckdb.DuckDBPyConnection) -> tuple[int, int, list[str]]:
+        (overrides,) = conn.execute(  # type: ignore[misc]
+            "SELECT count(*) FROM overrides WHERE kind = 'settle_order'"
+        ).fetchone()
+        (events,) = conn.execute(  # type: ignore[misc]
+            "SELECT count(*) FROM order_events WHERE reason = 'owner_settled_unknown'"
+        ).fetchone()
+        open_ids = [o.client_order_id for o in journal.non_terminal_orders(conn, window_id=None)]
+        return int(overrides), int(events), open_ids
+
+    with open_read_only(settings) as full:
+        store = TruncatedStore(full, tables=CUT_TABLES)
+        try:
+            assert seen(store.at(gate)) == (0, 0, ["tp-settle"])
+            assert seen(store.at(result.known_at)) == (1, 1, [])
+        finally:
+            store.close()

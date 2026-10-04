@@ -20,7 +20,7 @@ import pytest
 
 from tradepartner import calendar
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
-from tradepartner.adapters.fake_broker import FakeBroker, FillAt, Reject, Vanish
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, Reject, Vanish
 from tradepartner.calendar import session_close, session_open
 from tradepartner.config import FROZEN_PAPER_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import (
@@ -516,7 +516,7 @@ def test_a_trim_is_capped_by_the_names_open_sell_instead_of_halting_the_batch(
 
 
 def test_a_trim_wiped_out_by_an_open_sell_is_held_not_skipped(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, caplog: pytest.LogCaptureFixture
 ) -> None:
     """#605 pass 1's second SHOULD FIX, end to end: without the open sell the
     trim's cap is the full 10 held, so its 5-share remainder would be a valid
@@ -528,11 +528,86 @@ def test_a_trim_wiped_out_by_an_open_sell_is_held_not_skipped(
     _hold(env, A, 10.0)
     _open_sell(env, A, 9.5)
     trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
-    outcome = _execute(_gate(env, alerter_conn), env, [trim])
+    gate = _gate(env, alerter_conn)
+    with caplog.at_level("WARNING", logger=wrapper.__name__):
+        outcome = _execute(gate, env, [trim])
     assert outcome.status == "ok"
     assert _submits(env.fake) == []
     assert outcome.skips == ()
     assert _decision_events(env.settings) == []
+    assert _missed(env.settings) == []
+    # #719 item 3: the decision is still open after the run.
+    book = gate._read_book(env.run, [trim])
+    assert book.states[trim.decision_id].state is State.OPEN  # type: ignore[index]
+    # #719 item 2: one structured line per held sell, with both quantities.
+    (record,) = [r for r in caplog.records if r.name == wrapper.__name__]
+    assert record.levelname == "WARNING"
+    assert record.getMessage() == (
+        f"sell held: run_id={env.run.run_id} session={S.isoformat()} "
+        f"decision_id={trim.decision_id} security_id={A} "
+        "uncapped_quantity=5.0 capped_quantity=0.0 capped_skip=skip_below_one_share"
+    )
+
+
+def test_a_trim_after_a_gap_down_sells_the_holding_with_no_limit_breach(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#719 item 6 acceptance, end to end: a $950 trim planned at $100 is 19
+    shares at the $50 reference price after a gap-down, above the 10 held. It
+    sells the holding less the residue (none here; the residue case is
+    `test_phases`' `test_a_trim_after_a_price_drop_is_capped_at_the_holding_less_residue`)
+    and the batch never halts on `limit_breach`."""
+    _hold(env, A, 10.0)
+    _query(env.settings, "UPDATE prices_daily SET close = ? WHERE security_id = ?", [50.0, A])
+    trim = _decision(env, A, "sell", notional=950.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim])
+    assert outcome.status == "ok"
+    (request,) = _submits(env.fake)
+    assert (request.quantity, request.notional) == (10.0, None)
+    assert _missed(env.settings) == []
+    assert _decision_events(env.settings) == []
+
+
+def test_a_held_trim_sells_the_rest_once_the_open_sell_expires(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#719 item 6 acceptance, end to end: a trim beside an earlier session's
+    open own sell is held (no order, no `decision_events` row, no skip count,
+    decision open); once that sell expires, the next run trims the rest."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 9.5)
+    trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
+    gate = _gate(env, alerter_conn)
+    held = _execute(gate, env, [trim])
+    assert (held.status, held.skips, _submits(env.fake)) == ("ok", (), [])
+    assert _decision_events(env.settings) == []
+    assert gate._read_book(env.run, [trim]).states[trim.decision_id].state is State.OPEN  # type: ignore[index]
+
+    env.fake.apply(f"fx-open-{A}", Expire())
+    at = env.clock.now
+    _append(
+        env.settings,
+        OrderEventRow(
+            client_order_id=f"fx-open-{A}", status="expired", known_at=at, ingested_at=at
+        ),
+    )
+    _append(
+        env.settings,
+        PaperRunResultRow(
+            run_id=env.run.run_id,  # type: ignore[arg-type]
+            finished_at=at,
+            status="ok",
+            clock_fault=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    env.clock.advance(seconds=1)
+    env.run = _run(env.settings, env.window, S, env.clock.now)
+    rest = _execute(_gate(env, alerter_conn), env, [trim])
+    assert rest.status == "ok"
+    (request,) = _submits(env.fake)
+    assert (request.quantity, request.notional) == (5.0, None)  # the whole $500 remainder
     assert _missed(env.settings) == []
 
 
