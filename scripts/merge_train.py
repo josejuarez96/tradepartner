@@ -1507,7 +1507,10 @@ class ShellRunner:
             try:
                 raw = json.loads(self._gh("api", "graphql", *args))
                 threads = raw["data"]["repository"]["pullRequest"]["reviewThreads"]
-                unresolved += sum(1 for t in threads["nodes"] if not t["isResolved"])
+                states = [t["isResolved"] for t in threads["nodes"]]
+                if not all(isinstance(state, bool) for state in states):
+                    raise TypeError("isResolved is not a boolean")
+                unresolved += states.count(False)
                 more = bool(threads["pageInfo"]["hasNextPage"])
                 cursor = threads["pageInfo"]["endCursor"]
             except (KeyError, TypeError, ValueError) as exc:

@@ -2141,3 +2141,49 @@ def test_eligibility_fails_closed_when_review_threads_were_never_read() -> None:
     """#731: `unresolved_threads=None` means nobody read them (the #764 trap: a field only
     tests fill); that is ineligible, never eligible."""
     assert _eligible(_pr(unresolved_threads=None)) == "(j) review threads not read"
+
+
+@pytest.mark.parametrize(
+    ("pages", "match"),
+    [
+        # the PR is missing from the answer (`pullRequest: null`)
+        (
+            [json.dumps({"data": {"repository": {"pullRequest": None}}})],
+            "unreadable review threads",
+        ),
+        # a thread without `isResolved`, and one with a non-boolean value
+        (
+            [
+                json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequest": {
+                                    "reviewThreads": {
+                                        "nodes": [{}],
+                                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+            ],
+            "unreadable review threads",
+        ),
+        (
+            [_threads_page([True], None).replace("true", "null")],
+            "unreadable review threads",
+        ),
+        (["not json"], "unreadable review threads"),
+        # says more pages follow but gives no cursor to read them with
+        ([_threads_page([True], "")], "no end cursor"),
+    ],
+)
+def test_shell_runner_pr_data_stops_on_an_unreadable_or_incomplete_thread_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pages: list[str], match: str
+) -> None:
+    """#731 (spec req 1 (j)): a failed or incomplete review-thread read stops the run with
+    `STOPPED:` (fail closed), never counts as zero unresolved threads."""
+    with pytest.raises(mt.StoppedError, match=match):
+        _real_pr_data(tmp_path, monkeypatch, pages, [])
