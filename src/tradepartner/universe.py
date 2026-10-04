@@ -32,7 +32,12 @@ reported once, under the first rule it fails:
    `universe.max_shares_age_days` old at the session. Rows sharing that
    `as_of_date` are never summed: the one row with a class member wins
    over an undimensioned total (`''`); two class-member rows on one
-   security are `ambiguous_shares`.
+   security are `ambiguous_shares`. A fact out of line with the
+   security's last accepted earlier fact (ratio, after the splits known
+   at `t` between them, above `universe.max_shares_ratio` or below its
+   inverse) is rejected unless `universe.accepted_shares_facts` names it,
+   and the last accepted fact is used instead, its age judged the same
+   way (#845, `shares_as_of`; `Universe.shares_fallbacks` lists them).
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -62,7 +67,8 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import cache
 from typing import Any
@@ -71,7 +77,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.calendar import last_completed_session, previous_session, sessions_in_month_window
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, parse_accepted_shares_fact
 from tradepartner.store.asof import (
     _validate_t,
     facts_as_of,
@@ -122,6 +128,27 @@ _MEMBER_SCHEMA: dict[str, Any] = {
     "company_cap": pl.Float64,
     "company_rank": pl.Int64,
 }
+#: `SharesPick.outliers`: a fact out of line with the last accepted earlier
+#: fact (`baseline_*`, raw), `ratio` = value over the baseline moved by splits.
+SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "as_of_date": pl.Date,
+    "value": pl.Float64,
+    "baseline_as_of": pl.Date,
+    "baseline_value": pl.Float64,
+    "ratio": pl.Float64,
+    "accepted": pl.Boolean,
+}
+#: `SharesPick.fallbacks` and `Universe.shares_fallbacks`: the rejected latest
+#: fact (`as_of_date`, `value`, `ratio`) and the accepted one used instead.
+SHARES_FALLBACK_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "as_of_date": pl.Date,
+    "value": pl.Float64,
+    "used_as_of": pl.Date,
+    "used_value": pl.Float64,
+    "ratio": pl.Float64,
+}
 _EXCLUSION_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "rule": pl.Int64,
@@ -138,7 +165,11 @@ class Universe:
     `security_id`. `exclusions`: one row per excluded security, with the
     first rule it failed (`rule` 1-8, `rule_name`) and a `reason`.
     `rules_enabled`: every rule by name. `settings`: the `universe` config
-    and `execution.fill_price` the result was built with.
+    and `execution.fill_price` the result was built with. `shares_fallbacks`:
+    the classes that passed rules 1-3 whose latest shares fact was rejected
+    as out of line (#845), with the fact used instead
+    (`SHARES_FALLBACK_SCHEMA`); such a class may still fail rule 7 as
+    `stale_shares` when that fact is too old.
     """
 
     t: datetime
@@ -147,6 +178,9 @@ class Universe:
     exclusions: pl.DataFrame
     rules_enabled: dict[str, bool]
     settings: dict[str, Any]
+    shares_fallbacks: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=SHARES_FALLBACK_SCHEMA)
+    )
 
 
 @cache
@@ -204,32 +238,142 @@ def _split_factors(
     return out
 
 
-def latest_shares_as_of(
-    conn: duckdb.DuckDBPyConnection, t: datetime, ids: list[str]
-) -> tuple[dict[str, tuple[date, float]], set[str]]:
-    """Per security, `(as_of_date, value)` of its latest `shares_outstanding`
-    fact known at `t` (rule 7's selection), and the ids whose latest
-    `as_of_date` is ambiguous (two class-member rows)."""
-    latest: dict[str, list[dict[str, Any]]] = defaultdict(list)
+@dataclass(frozen=True)
+class SharesPick:
+    """`shares_as_of`'s result.
+
+    `shares`: per security, `(as_of_date, value)` of the fact rules 7 and 8
+    use, raw (not split-moved). `ambiguous`: the ids whose latest
+    `as_of_date` holds two class-member rows. `outliers`: every fact known at
+    `t` out of line with its last accepted earlier fact, accepted by the
+    owner or not (`SHARES_OUTLIER_SCHEMA`). `fallbacks`: the securities whose
+    latest fact was rejected, with the fact used instead
+    (`SHARES_FALLBACK_SCHEMA`).
+    """
+
+    shares: dict[str, tuple[date, float]]
+    ambiguous: set[str]
+    outliers: pl.DataFrame
+    fallbacks: pl.DataFrame
+
+
+def _date_picks(rows: list[dict[str, Any]]) -> dict[date, float | None]:
+    """Per `as_of_date`, the one value rule 7 reads (a class row wins over an
+    undimensioned total), or `None` when two class rows make it ambiguous."""
+    by_date: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_date[row["as_of_date"]].append(row)
+    picks: dict[date, float | None] = {}
+    for as_of in sorted(by_date):
+        classed = [r for r in by_date[as_of] if r["class_member"]]
+        chosen = classed or by_date[as_of]
+        picks[as_of] = chosen[0]["value"] if len(chosen) == 1 else None
+    return picks
+
+
+def shares_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    ids: Sequence[str] | None,
+    settings: Settings,
+) -> SharesPick:
+    """Rule 7's shares selection at `t` with the plausibility check (#845).
+
+    Per security (every one when `ids` is `None`), its `shares_outstanding`
+    facts known at `t` are walked in `as_of_date` order. The first is
+    accepted. Each later one is compared with the last accepted fact moved by
+    every split known at `t` with `accepted_as_of < ex_date <= as_of_date`:
+    a ratio above `universe.max_shares_ratio` or below its inverse is out of
+    line and rejected, unless `universe.accepted_shares_facts` names it. A
+    date with two class rows is skipped by the walk. The latest date decides:
+    ambiguous, its own value when accepted, else the last accepted fact.
+    Only facts and splits known at `t` are read, never a later filing.
+    """
+    cfg = settings.universe
+    accepted_list = {parse_accepted_shares_fact(e) for e in cfg.accepted_shares_facts}
+    rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in facts_as_of(conn, t, ids).iter_rows(named=True):
-        if row["fact_name"] != SHARES_FACT:
-            continue
-        held = latest[row["security_id"]]
-        if held and row["as_of_date"] < held[0]["as_of_date"]:
-            continue
-        if held and row["as_of_date"] > held[0]["as_of_date"]:
-            held.clear()
-        held.append(row)
+        if row["fact_name"] == SHARES_FACT:
+            rows[row["security_id"]].append(row)
+    splits: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    split_ids = None if ids is None else sorted(rows)
+    for action in live_actions_as_of(conn, t, split_ids).iter_rows(named=True):
+        if action["action_type"] == "split":
+            splits[action["security_id"]].append((action["ex_date"], action["ratio_or_amount"]))
+
     shares: dict[str, tuple[date, float]] = {}
     ambiguous: set[str] = set()
-    for sid, rows in latest.items():
-        classed = [r for r in rows if r["class_member"]]
-        chosen = classed or rows
-        if len(chosen) != 1:
+    outliers: list[dict[str, Any]] = []
+    fallbacks: list[dict[str, Any]] = []
+    for sid in sorted(rows):
+        picks = _date_picks(rows[sid])
+        base: tuple[date, float] | None = None
+        latest_ok = False
+        for as_of, value in picks.items():
+            latest_ok = False
+            if value is None:
+                continue
+            if base is None:
+                base, latest_ok = (as_of, value), True
+                continue
+            moved = base[1]
+            for ex_date, ratio in splits.get(sid, []):
+                if base[0] < ex_date <= as_of:
+                    moved *= ratio
+            change = value / moved if moved else float("inf")
+            out_of_line = not (1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio)
+            owner_ok = (sid, as_of) in accepted_list
+            if out_of_line:
+                outliers.append(
+                    {
+                        "security_id": sid,
+                        "as_of_date": as_of,
+                        "value": value,
+                        "baseline_as_of": base[0],
+                        "baseline_value": base[1],
+                        "ratio": change,
+                        "accepted": owner_ok,
+                    }
+                )
+            if not out_of_line or owner_ok:
+                base, latest_ok = (as_of, value), True
+        latest_as_of = max(picks)
+        latest_value = picks[latest_as_of]
+        if latest_value is None:
             ambiguous.add(sid)
             continue
-        shares[sid] = (chosen[0]["as_of_date"], chosen[0]["value"])
-    return shares, ambiguous
+        if base is None:
+            continue
+        shares[sid] = base
+        if not latest_ok:
+            fallbacks.append(
+                {
+                    "security_id": sid,
+                    "as_of_date": latest_as_of,
+                    "value": latest_value,
+                    "used_as_of": base[0],
+                    "used_value": base[1],
+                    "ratio": outliers[-1]["ratio"],
+                }
+            )
+    return SharesPick(
+        shares=shares,
+        ambiguous=ambiguous,
+        outliers=pl.DataFrame(outliers, schema=SHARES_OUTLIER_SCHEMA).sort(
+            "security_id", "as_of_date"
+        ),
+        fallbacks=pl.DataFrame(fallbacks, schema=SHARES_FALLBACK_SCHEMA).sort("security_id"),
+    )
+
+
+def latest_shares_as_of(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ids: Sequence[str], settings: Settings
+) -> tuple[dict[str, tuple[date, float]], set[str]]:
+    """Per security, `(as_of_date, value)` of the shares fact rule 7 uses at
+    `t` (`shares_as_of`: the latest accepted fact), and the ids whose latest
+    `as_of_date` is ambiguous (two class-member rows)."""
+    pick = shares_as_of(conn, t, ids, settings)
+    return pick.shares, pick.ambiguous
 
 
 def universe_as_of(
@@ -320,7 +464,8 @@ def universe_as_of(
     )
     apply("history", dict.fromkeys(jumps["security_id"].to_list(), "price_jump"))
 
-    latest_shares, ambiguous = latest_shares_as_of(conn, t, sized)
+    pick = shares_as_of(conn, t, sized, settings)
+    latest_shares, ambiguous = pick.shares, pick.ambiguous
 
     def shares_reason(sid: str) -> str:
         if sid in ambiguous:
@@ -375,4 +520,5 @@ def universe_as_of(
             "universe": cfg.model_dump(mode="json"),
             "fill_price": settings.execution.fill_price,
         },
+        shares_fallbacks=pick.fallbacks,
     )

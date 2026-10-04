@@ -55,6 +55,13 @@ here is this module's and is stated once:
   while it is in the history window; accepting one is a config change.
   `jumps_before`, when given, keeps only jumps on sessions before it (a
   hypothesis's `holdout.start`), so the list never shows the holdout period.
+- **Shares outliers** (`shares_outliers`): the owner's review list (#845),
+  `universe.shares_as_of` at `t` over every security: each shares fact out
+  of line with the security's last accepted earlier fact (ratio after the
+  splits known at `t` outside `universe.max_shares_ratio`), with `accepted`
+  from `universe.accepted_shares_facts`. Universe rules 7 and 8 use the last
+  accepted fact instead of an unaccepted one. `jumps_before` keeps only
+  facts with an `as_of_date` before it.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
@@ -136,6 +143,7 @@ from tradepartner.store.delistings import (
 )
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
+from tradepartner.universe import shares_as_of
 
 STATIC = "snapshot_static"
 #: The classification ingest's staleness check counts, with benchmarks.
@@ -313,6 +321,20 @@ class PriceJumps:
 
 
 @dataclass(frozen=True, eq=False)
+class SharesOutliers:
+    """The shares-outlier review list at `t` (#845), one row per out-of-line
+    fact, only `as_of_date`s before `before` when it is set."""
+
+    frame: pl.DataFrame
+    before: date | None = None
+
+    @property
+    def pending(self) -> pl.DataFrame:
+        """The out-of-line facts the owner has not accepted."""
+        return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
 
@@ -339,6 +361,7 @@ class HealthReport:
     static_reliance: StaticReliance
     delisted: DelistedNames
     price_jumps: PriceJumps
+    shares_outliers: SharesOutliers
     settings: dict[str, Any]
     integrity: tuple[IntegrityCheck, ...]
 
@@ -363,7 +386,8 @@ def health_report(
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
     ends, securities and classifications are read once and shared.
-    `jumps_before` limits the price-jump list to sessions before it."""
+    `jumps_before` limits the price-jump list to sessions before it, and the
+    shares-outlier list to `as_of_date`s before it."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -382,6 +406,7 @@ def health_report(
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
+        shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
@@ -397,6 +422,15 @@ def _price_jumps(
     if before is not None:
         frame = frame.filter(pl.col("session") < before)
     return PriceJumps(frame, before)
+
+
+def _shares_outliers(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> SharesOutliers:
+    frame = shares_as_of(conn, t, None, settings).outliers
+    if before is not None:
+        frame = frame.filter(pl.col("as_of_date") < before)
+    return SharesOutliers(frame, before)
 
 
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:

@@ -313,13 +313,25 @@ class ExecutionConfig(BaseModel):
     fill_price: Literal["close", "open"] = "close"
 
 
+def _parse_id_at_day(entry: str, what: str) -> tuple[str, date]:
+    """`"<security_id>@<YYYY-MM-DD>"` as `(security_id, day)`; `what` names the
+    list in the error. Raises `ValueError` on any other shape."""
+    security_id, sep, day = entry.rpartition("@")
+    if not sep or not security_id:
+        raise ValueError(f"{what} {entry!r} is not '<security_id>@<YYYY-MM-DD>'")
+    return security_id, date.fromisoformat(day)
+
+
 def parse_accepted_jump(entry: str) -> tuple[str, date]:
     """`"<security_id>@<YYYY-MM-DD>"` (an `universe.accepted_price_jumps` entry) as
     `(security_id, session)`. Raises `ValueError` on any other shape."""
-    security_id, sep, session = entry.rpartition("@")
-    if not sep or not security_id:
-        raise ValueError(f"accepted price jump {entry!r} is not '<security_id>@<YYYY-MM-DD>'")
-    return security_id, date.fromisoformat(session)
+    return _parse_id_at_day(entry, "accepted price jump")
+
+
+def parse_accepted_shares_fact(entry: str) -> tuple[str, date]:
+    """`"<security_id>@<YYYY-MM-DD>"` (an `universe.accepted_shares_facts` entry)
+    as `(security_id, as_of_date)`. Raises `ValueError` on any other shape."""
+    return _parse_id_at_day(entry, "accepted shares fact")
 
 
 class UniverseConfig(BaseModel):
@@ -339,6 +351,14 @@ class UniverseConfig(BaseModel):
     liquidity_window: int = 20
     min_history_months: int = 12
     max_shares_age_days: int = 400
+    # Shares plausibility (#845), part of rule 7: a shares fact whose value over the
+    # security's last accepted earlier fact (moved by the splits known at T between
+    # the two `as_of_date`s) is above `max_shares_ratio` or below its inverse is
+    # rejected, unless the owner lists it in `accepted_shares_facts` as
+    # "<security_id>@<YYYY-MM-DD>" (its `as_of_date`); rules 7 and 8 then use the last
+    # accepted fact, still subject to `max_shares_age_days`. `health` lists them all.
+    max_shares_ratio: float = Field(default=100, gt=1, allow_inf_nan=False)
+    accepted_shares_facts: list[str] = Field(default_factory=list)
     top_n_by_cap: int = 1000
     # Price-quality gate (#787), part of rule 6: a close-to-close ratio between two
     # consecutive traded bars above `max_jump_ratio` or below `min_jump_ratio`, that no
@@ -354,6 +374,13 @@ class UniverseConfig(BaseModel):
     def _check_accepted_price_jumps(cls, value: list[str]) -> list[str]:
         for entry in value:
             parse_accepted_jump(entry)
+        return value
+
+    @field_validator("accepted_shares_facts")
+    @classmethod
+    def _check_accepted_shares_facts(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_accepted_shares_fact(entry)
         return value
 
     @field_validator("exclude_sic_ranges")

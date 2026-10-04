@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +27,17 @@ import pytest
 from pydantic import ValidationError
 
 from tradepartner.config import Settings, UniverseConfig, get_settings
+from tradepartner.store.db import insert_row
 from tradepartner.universe import Universe, universe_as_of
 
 T_LATE = datetime(2019, 6, 28, 20, 0, tzinfo=UTC)
+
+#: SEC_SPLIT_BETWEEN's 5M (2018-10-29) is 15M after its 3-for-1 split; a fact
+#: of 15.3M as of 2019-01-31 is x1.02 over it. With a 200-day age limit the
+#: new fact is fresh at T_LATE (148 days) and the old one stale (242).
+SHARES_MOVE = (
+    ("SEC_SPLIT_BETWEEN", date(2019, 1, 31), 15_300_000.0, datetime(2019, 2, 7, 21, 0, tzinfo=UTC)),
+)
 
 #: Default members at T_LATE: SEC_DUAL_A/B (one company, rank 1, NYSE),
 #: SEC_SPLIT_BETWEEN (rank 2, NYSE).
@@ -47,6 +55,9 @@ class Case:
     admitted: set[str] = field(default_factory=set)
     removed: dict[str, tuple[int, str]] = field(default_factory=dict)
     base: dict[str, Any] = field(default_factory=dict)
+    #: Extra shares facts `(security_id, as_of_date, value, known_at)` the
+    #: store-backed test inserts first; the fixture has one fact per name.
+    facts: tuple[tuple[str, date, float, datetime], ...] = ()
 
     @property
     def id(self) -> str:
@@ -107,6 +118,22 @@ CASES = [
         0.9851,
         removed={sid: (6, "price_jump") for sid in ("SEC_DUAL_A", "SEC_SPLIT_BETWEEN")},
     ),
+    # Shares plausibility (#845): x1.02 is out of line at 1.01, so the fallback
+    # to the stale 2018 fact fails rule 7.
+    Case(
+        "max_shares_ratio",
+        1.01,
+        base={"max_shares_age_days": 200},
+        facts=SHARES_MOVE,
+        removed={"SEC_SPLIT_BETWEEN": (7, "stale_shares")},
+    ),
+    Case(
+        "accepted_shares_facts",
+        ["SEC_SPLIT_BETWEEN@2019-01-31"],
+        base={"max_shares_age_days": 200, "max_shares_ratio": 1.01},
+        facts=SHARES_MOVE,
+        admitted={"SEC_SPLIT_BETWEEN"},
+    ),
     Case(
         "accepted_price_jumps",
         ["SEC_SPLIT_BETWEEN@2019-04-05"],
@@ -156,6 +183,23 @@ def test_default_members_at_t_late(fixture_store: duckdb.DuckDBPyConnection) -> 
 def test_override_via_settings_changes_membership_as_expected(
     fixture_store: duckdb.DuckDBPyConnection, case: Case
 ) -> None:
+    for security_id, as_of, value, known in case.facts:
+        insert_row(
+            fixture_store,
+            "facts",
+            {
+                "security_id": security_id,
+                "fact_name": "shares_outstanding",
+                "as_of_date": as_of,
+                "class_member": "",
+                "value": value,
+                "filing_accession": f"case-{security_id}-{as_of.isoformat()}",
+                "known_at": known,
+                "ingested_at": known,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
     before = universe_as_of(fixture_store, T_LATE, _settings(**case.base))
     after = universe_as_of(fixture_store, T_LATE, _settings(**case.base, **{case.key: case.value}))
     assert after.settings["universe"][case.key] == case.value
