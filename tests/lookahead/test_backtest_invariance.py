@@ -87,7 +87,10 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 def _frozen() -> Settings:
-    return Settings(_env_file=None, strategy={"top_fraction": 0.5})
+    # Every run starts in 2017, before the fixture benchmarks' first bar (2018-01-02).
+    # Benchmarks are read by symbol (#840) and the engine refuses one with no bar at
+    # F_0, so these runs name none, as they effectively did before (master rows unknown).
+    return Settings(_env_file=None, strategy={"top_fraction": 0.5}, benchmarks=[])
 
 
 def _store() -> duckdb.DuckDBPyConnection:

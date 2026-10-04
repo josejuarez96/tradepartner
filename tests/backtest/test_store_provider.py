@@ -255,7 +255,9 @@ def test_transfer_is_delisted_until_the_new_listing_is_known(store: Store) -> No
 def test_benchmark_ids_from_securities_benchmark(store: Store) -> None:
     with store.provider() as provider:
         assert provider.benchmark_ids(T_JAN) == {"MTUM": "SEC_MTUM", "SPY": "SEC_SPY"}
-        assert provider.benchmark_ids(datetime(2017, 6, 30, 20, tzinfo=UTC)) == {}
+        # By symbol (#840): before the master rows are known too; the bars stay as-of.
+        early = datetime(2017, 6, 30, 20, tzinfo=UTC)
+        assert provider.benchmark_ids(early) == {"MTUM": "SEC_MTUM", "SPY": "SEC_SPY"}
     only_spy = Settings(_env_file=None, store={"path": str(store.path)}, benchmarks=["SPY"])
     with store.provider(only_spy) as provider:
         assert provider.benchmark_ids(T_JAN) == {"SPY": "SEC_SPY"}

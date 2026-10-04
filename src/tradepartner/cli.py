@@ -8,6 +8,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   the price side first fetches (`StorePriceSource`), so it sees the listings the
   EDGAR chunk has just committed. It prints one line per source and exits with
   the result's code: 0 when every source is `ok`, 1 otherwise.
+- `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
+  --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
+  for a configured benchmark the store lacks (MTUM), seeded from the three
+  options when no benchmark security lists the symbol, then fetched month by
+  month through the same `StorePriceSource`. It needs the Alpaca keys, prints
+  one line per month and exits like `ingest`; a refused symbol or identity is
+  a usage error (2), with nothing fetched.
 - `tradepartner health [--check] [--jumps-before DATE]` prints
   `health.health_report` at the current time; `--jumps-before` limits the
   price-jump review list (#787) to sessions before DATE, so the owner can
@@ -79,7 +86,7 @@ from tradepartner.adapters import alpaca_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.backfill import backfill
+from tradepartner.backfill import BenchmarkSeed, backfill, backfill_benchmark
 from tradepartner.backtest.holdout import GAP_THRESHOLD_KEY, Flags, Reasons
 from tradepartner.backtest.hypothesis import HypothesisFileError, register
 from tradepartner.backtest.metrics import METRIC_KEYS
@@ -450,6 +457,53 @@ def make_app(
                 s, prices=prices, filings=filings, source=source, clock=clock, dry_run=dry_run
             )
         _print_result(result)
+        raise typer.Exit(result.exit_code)
+
+    @app.command("backfill-benchmark")
+    def backfill_benchmark_(
+        symbol: Annotated[str, typer.Argument(help="a configured benchmark, e.g. MTUM")],
+        since: Annotated[str, typer.Option(help="first day to fetch, YYYY-MM-DD")],
+        cik: Annotated[
+            str | None, typer.Option(help="10-digit CIK, to seed a benchmark the store lacks")
+        ] = None,
+        name: Annotated[str | None, typer.Option(help="security name, to seed it")] = None,
+        exchange: Annotated[str | None, typer.Option(help="listing exchange, to seed it")] = None,
+    ) -> None:
+        """Seed (if missing) and backfill one configured benchmark's bars (#840)."""
+        start = _parse_day("--since", since) or date.min
+        given = [cik, name, exchange]
+        if any(v is not None for v in given) and not all(v is not None for v in given):
+            raise _fail("--cik, --name and --exchange go together", USAGE_ERROR)
+        seed: BenchmarkSeed | None = None
+        if cik is not None and name is not None and exchange is not None:
+            try:
+                seed = BenchmarkSeed(cik=cik, name=name, exchange=exchange)
+            except ValueError as exc:
+                raise _fail(str(exc), USAGE_ERROR) from None
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        missing = _missing_secrets(s, "alpaca")
+        if missing:
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
+        try:
+            result = backfill_benchmark(
+                s, prices=prices, symbol=symbol, since=start, seed=seed, clock=clock
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        state = "seeded" if result.seeded else "already in the store"
+        if not result.seeded and seed is not None:
+            state += "; --cik, --name and --exchange not used"
+        typer.echo(f"{result.symbol}: {result.security_id} {state}")
+        _print_result(IngestResult(result.runs))
         raise typer.Exit(result.exit_code)
 
     @app.command("repair-resolution")
