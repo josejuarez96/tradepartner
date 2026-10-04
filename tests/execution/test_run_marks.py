@@ -366,7 +366,7 @@ def split_trns(env: Env, ex_date: date) -> None:
                 "provenance": "action",
             },
         )
-    env.fake._net_quantity["TRNS"] *= 2
+    env.fake.apply_split("TRNS", 2.0)
 
 
 def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(

@@ -52,7 +52,11 @@ backwards between two collections could make them disagree).
 Every other whole-window read page_data used to make is bounded too (#613):
 marks are read only for the window's latest marked session
 (`_last_marked_session`, one aggregate, then `journal.positions_daily_for`
-with `after=previous_session(...)`); the kill-switch rows are at most two
+with `after=last_session - timedelta(days=1)`, never `previous_session(...)`:
+`after` is exclusive (`session > after`) and `last_session` is the maximum
+session, so this reads exactly `session == last_session` whatever the
+trading calendar does between the two, including a mark on a date the
+calendar never scheduled as a session, #652); the kill-switch rows are at most two
 (`_kill_switch_rows_for`): the window's last row by `event_id` and the
 `released` row with the greatest `at`, the only two `switch.derive` can ever
 draw a cause or a clearing timestamp from; the reconciliation shown is the
@@ -79,7 +83,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -700,10 +704,14 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     positions_count = 0
     positions_value = 0.0
     if last_session is not None:
+        # `after` is exclusive and `last_session` is the maximum session
+        # (`_last_marked_session`), so `after=last_session - timedelta(days=1)`
+        # reads exactly `session == last_session`, with no dependency on
+        # which dates the trading calendar schedules as sessions (#652).
         marks = [
             m
             for m in journal.positions_daily_for(
-                conn, window_id, after=previous_session(last_session)
+                conn, window_id, after=last_session - timedelta(days=1)
             )
             if m.security_id is not None
         ]
