@@ -24,6 +24,7 @@ from test_ingest import (
     DUAL,
     DUAL_B,
     NEWCO,
+    NOT_COMMON,
     NOW,
     OTC_B,
     SPY,
@@ -568,6 +569,21 @@ def test_an_otc_common_name_is_not_counted_in_a_months_staleness(
     prices = _History(gaps={(missing, s) for s in MAY})
     result = _backfill(settings, prices, filings=_filings(dual_listings=OTC_B))
     assert result.runs[-1].status == status, result.runs[-1].message
+
+
+def test_a_month_fetches_only_common_names_on_universe_exchanges_and_benchmarks(
+    settings: Settings,
+) -> None:
+    # #794: a note, a preferred and an OTC listing are never fetched; a
+    # common NYSE name and a benchmark are.
+    prices = _History()
+    filings = _filings(acme_extra=NOT_COMMON, dual_listings=OTC_B)
+    result = _backfill(settings, prices, filings=filings)
+    assert result.runs[-1].status == OK, result.runs[-1].message
+    for fetched in prices.fetched.values():
+        assert {ACME, SPY} <= fetched
+        assert DUAL_B not in fetched
+        assert not any(sid.startswith(f"{ACME}:") for sid in fetched)  # preferred, note
 
 
 def test_a_snapshot_static_only_name_with_no_rows_in_a_month_is_reported_not_counted(

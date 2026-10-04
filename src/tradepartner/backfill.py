@@ -268,8 +268,9 @@ def _window_names(
     window: tuple[date, date],
     settings: Settings,
 ) -> tuple[list[str], list[str], set[str], set[str] | None, str | None]:
-    """From listings known at `t`: securities with a listing live at some
-    point in `window` (to fetch), the benchmark names and the common names
+    """From listings known at `t`: securities with a `_counted` listing
+    live at some point in `window`, and the reference (to fetch), the
+    benchmark names and the common names
     on one of `universe.exchanges` listed through the whole window,
     including any delisted only later (the staleness denominator), those
     of them (benchmarks never) whose every listing live in the window is
@@ -306,7 +307,8 @@ def _window_names(
         )
         if ended or status not in (LISTED, DELISTED, TRANSFERRED):
             continue
-        ids.add(sid)
+        if _counted(sid, row, benchmarks, kinds, settings):
+            ids.add(sid)  # #794: no note, preferred or OTC listing
         if row["provenance"] != STATIC:
             filed.add(sid)
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= last))
@@ -319,6 +321,8 @@ def _window_names(
             listed.add(sid)  # today's status must not drop a name delisted later
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
+    if reference is not None:
+        ids.add(reference)
     static_only = listed - filed - benchmarks
     before = first - timedelta(days=1)
     may_count = _may_count(conn, t, (before.replace(day=1), before), earliest, benchmarks)

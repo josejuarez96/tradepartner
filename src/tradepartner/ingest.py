@@ -890,7 +890,8 @@ def _reported_note(reported: Mapping[str, list[str]]) -> str:
 def _price_names(
     conn: duckdb.DuckDBPyConnection, now: datetime, session: date, settings: Settings
 ) -> tuple[set[str], set[str], set[str], set[str] | None, str | None]:
-    """Names to fetch, listed common and benchmark names (the staleness
+    """Names to fetch (`_counted` listings live or delisted from `session`
+    on, and the reference), listed common and benchmark names (the staleness
     denominator), the listed names whose current listing is
     `snapshot_static` (benchmarks never), `_may_count` over the previous
     session, and the reference symbol's `security_id`, from each
@@ -928,8 +929,11 @@ def _price_names(
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
         effective = row["effective_on"]
-        if live or (status == DELISTED and effective is not None and effective >= session):
-            fetch.add(sid)
+        ending = status == DELISTED and effective is not None and effective >= session
+        if (live or ending) and _counted(sid, row, benchmarks, kinds, settings):
+            fetch.add(sid)  # #794: no note, preferred or OTC listing
+    if reference is not None:
+        fetch.add(reference)
     before = previous_session(session)
     may_count = _may_count(conn, now, (before, before), earliest, benchmarks)
     return fetch, listed, static_only, may_count, reference

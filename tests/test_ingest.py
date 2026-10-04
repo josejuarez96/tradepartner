@@ -1051,6 +1051,27 @@ def test_an_otc_common_name_is_not_in_the_staleness_denominator(
         assert "0 of 3 listed names missing" in result.runs[-1].message
 
 
+NOT_COMMON = (
+    CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE"),
+    CoverListing("5.25% Notes due 2030", "ACME30", "NYSE"),
+)
+
+
+def test_only_common_names_on_universe_exchanges_and_benchmarks_are_fetched(
+    settings: Settings,
+) -> None:
+    # #794: a note, a preferred and an OTC listing are never fetched; a
+    # common NYSE name and a benchmark are, and every counted name is.
+    prices = _Prices()
+    result = _run(settings, prices, filings=_filings(acme_extra=NOT_COMMON, dual_listings=OTC_B))
+    assert result.ok, result.runs[-1].message
+    fetched = set(next(c for c in prices.calls if c[0] == "bars")[1])
+    assert {ACME, SPY} <= fetched
+    assert DUAL_B not in fetched
+    assert not any(sid.startswith(f"{ACME}:") for sid in fetched)  # preferred, note
+    assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
 def test_the_staleness_exchange_filter_comes_from_config(settings: Settings) -> None:
     exchanges = [*settings.universe.exchanges, "OTC"]
     tuned = settings.model_copy(
