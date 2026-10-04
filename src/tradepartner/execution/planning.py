@@ -63,7 +63,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import partial
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -87,6 +87,7 @@ from tradepartner.execution.plan import (
     decision_state,
     decisions_from,
 )
+from tradepartner.execution.plan import current_listings as current_listings
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
@@ -290,24 +291,6 @@ def reference_prices(
             raise ValueError(f"reference price of {sid} is {price}")
         prices[sid] = price
     return prices
-
-
-def current_listings(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from` on or before `day`
-    (the first in frame order on a tie, as `universe_as_of` reads it). The one
-    tie rule planning and the wrapper share (#534)."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        valid_from = row["valid_from"]
-        if valid_from is not None and valid_from > day:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or (
-            valid_from is not None
-            and (held["valid_from"] is None or valid_from > held["valid_from"])
-        ):
-            current[row["security_id"]] = row
-    return current
 
 
 def _ended(
