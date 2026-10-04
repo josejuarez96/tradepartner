@@ -400,13 +400,22 @@ def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     ) == [("ok",), ("ok",)]
     assert env.submits() == submits  # no sell
     assert env.count("orders") == len(TARGETS)
-    # "No drawdown change" straight from the marks the split run wrote, not
-    # merely an empty kill_switch table: F_0's equity (cash plus every name's
-    # value) is the same reading `_drawdown` would make, and it does not cross
-    # the window's own threshold.
+    # "No drawdown change" against an equity computed independently of the
+    # marks the split run wrote (cash plus each held, pre-split quantity
+    # times its own raw close), not merely an empty kill_switch table: a
+    # mis-handled split that moved equity by less than the window's own
+    # threshold would still pass a bare `drawdown_check`, but not this exact
+    # value.
     cash_values = {r[5] for r in rows}
     assert len(cash_values) == 1
-    equity = cash_values.pop() + sum(r[4] for r in rows if r[1] is not None)
+    cash = cash_values.pop()
+    equity = cash + sum(r[4] for r in rows if r[1] is not None)
+    expected_equity = cash
+    for name, quantity in held.items():
+        close = env.close(name, F_0)
+        assert close is not None
+        expected_equity += quantity * close
+    assert equity == pytest.approx(expected_equity)
     assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True)
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
     assert env.alerts("missed_run") == []  # F_0 had its run
@@ -421,7 +430,8 @@ def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
     quantity on every back-filled session, never the split ignored), and
     reconciles `ok` against the broker's doubled holding."""
     bought(env, tmp_path)
-    held = env.held()["SEC_TRANSFER"]
+    held_all = env.held()
+    held = held_all["SEC_TRANSFER"]
     split_trns(env, date(2019, 5, 2))
     outcome = env.run(at(date(2019, 5, 6)))
     assert outcome.status == "ok", env.result(outcome.run_id)
@@ -441,15 +451,24 @@ def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
         [outcome.run_id],
     ) == [("ok",), ("ok",)]
     assert env.count("orders") == len(TARGETS)
-    # "No drawdown change" straight from each day's own equity, not merely an
-    # empty kill_switch table: each back-filled session's quantity * price
-    # (TRNS's own included, doubled quantity against its halved raw price)
-    # gives an equity that never crosses the window's drawdown threshold.
+    # "No drawdown change" against each day's equity computed independently
+    # of the marks the split run wrote (cash plus every held quantity times
+    # its own raw close, TRNS's doubled, back-filled quantity included), not
+    # merely an empty kill_switch table: a mis-handled split that moved
+    # equity by less than the window's own threshold would still pass a bare
+    # `drawdown_check`, but not this exact value.
     cash_values = {r[5] for r in rows}
     assert len(cash_values) == 1
     cash = cash_values.pop()
-    for day in expected:
+    for day, quantity in expected.items():
         equity = cash + sum(r[4] for r in rows if r[0] == day and r[1] is not None)
+        expected_equity = cash
+        for name, other_quantity in held_all.items():
+            close = env.close(name, day)
+            assert close is not None
+            held_quantity = quantity if name == "SEC_TRANSFER" else other_quantity
+            expected_equity += held_quantity * close
+        assert equity == pytest.approx(expected_equity), day
         assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True), day
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
 
