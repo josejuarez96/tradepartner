@@ -85,7 +85,11 @@ class ValidationFailures:
         return iter(self._failures)
 
     def record(self, input: str, key: str, error: BaseException) -> None:
-        """Record that `input` `key` failed to parse with `error`."""
+        """Record that `input` `key` failed to parse with `error`. A tripped
+        path-safety guard (`InvalidFilingReferenceError`, a `ValueError`) is
+        never a parse failure: it is re-raised, never recorded (#275)."""
+        if isinstance(error, InvalidFilingReferenceError):
+            raise error
         self._failures.append(ValidationFailure(input, key, f"{type(error).__name__}: {error}"))
 
     def collect(self, input: str, key: str, parse: Callable[[], _T]) -> _T | None:
@@ -94,9 +98,7 @@ class ValidationFailures:
         failure and propagates (#275), as does any other exception."""
         try:
             return parse()
-        except InvalidFilingReferenceError:
-            raise
-        except PARSE_ERRORS as error:
+        except PARSE_ERRORS as error:  # `record` re-raises a path-safety trip
             self.record(input, key, error)
             return None
 
@@ -109,7 +111,9 @@ class ValidationFailures:
         cuts them, then the first `edgar.max_validation_listed` failures.
         Every error text is cleaned with `config.clean_message` (secrets
         redacted, control characters replaced, cut to
-        `ingest.max_message_chars`), in the file and in the message."""
+        `ingest.max_message_chars`), in the file and in the message. A file
+        that cannot be written is named as such in the message, which still
+        fails the run with every failure counted."""
         if not self._failures:
             return
         failures = [
@@ -121,13 +125,16 @@ class ValidationFailures:
             for f in self._failures
         ]
         counts = {name: n for name, n in (counted or {}).items() if n}
-        path = self._write(failures, counts)
+        try:
+            where = str(self._write(failures, counts))
+        except OSError as error:  # the failures still fail the run, unlisted on disk
+            where = clean_message(f"not written ({type(error).__name__}: {error})", settings)
         by_input = Counter(f.input for f in failures)
         limit = settings.edgar.max_validation_listed
         parts = [
             f"EDGAR input validation: {len(failures)} input(s) failed to parse, "
             "nothing was written to the store",
-            f"full list: {path}",
+            f"full list: {where}",
             "by input: " + ", ".join(f"{name} {n}" for name, n in sorted(by_input.items())),
         ]
         if counts:

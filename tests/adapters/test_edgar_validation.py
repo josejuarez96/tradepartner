@@ -170,3 +170,26 @@ def test_the_edgar_source_collects_under_its_cache_dir(tmp_path: Path) -> None:
     with pytest.raises(InputValidationError, match="full list: "):
         source.validation_failures.raise_if_any(settings)
     assert _list_file(tmp_path)["failures"][0]["key"] == "2019q1"
+
+
+def test_record_refuses_a_path_safety_trip(tmp_path: Path) -> None:
+    """#275: a call site catching `PARSE_ERRORS` itself must not hide the guard."""
+    failures = _collector(tmp_path)
+    with pytest.raises(InvalidFilingReferenceError):
+        failures.record("form.idx", "2019q1", InvalidFilingReferenceError("guard"))
+    assert len(failures) == 0
+
+
+def test_an_unwritable_list_still_fails_with_the_validation_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def disk_full(path: Path, data: bytes) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("tradepartner.adapters.edgar_validation.write_atomic", disk_full)
+    failures = _collector(tmp_path)
+    failures.record("cover page", EMPTY_COVER, ValueError("names 0 entities"))
+    with pytest.raises(InputValidationError) as raised:
+        failures.raise_if_any(_settings(tmp_path))
+    assert "full list: not written (OSError: disk full)" in str(raised.value)
+    assert f"cover page {EMPTY_COVER}" in str(raised.value)
