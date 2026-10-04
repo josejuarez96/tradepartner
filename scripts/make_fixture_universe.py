@@ -1573,7 +1573,7 @@ def _statement_facts_plain_issuer(rows: Rows) -> None:
     cik (`CIK0001000002`) rather than inventing a bare one."""
     cik = "CIK0001000002"
     accession = _statement_accession(cik, 2020, 1)
-    known_at = _filing_acceptance(date(2020, 2, 15))
+    known_at = _filing_acceptance(_session_on_or_after(date(2020, 2, 15)))
     rows.statement_fact(
         cik,
         "revenue",
@@ -1608,7 +1608,7 @@ def _statement_facts_plain_issuer(rows: Rows) -> None:
     )
 
     q1_accession = _statement_accession(cik, 2020, 2)
-    q1_known_at = _filing_acceptance(date(2020, 5, 10))
+    q1_known_at = _filing_acceptance(_session_on_or_after(date(2020, 5, 10)))
     rows.statement_fact(
         cik,
         "revenue",
@@ -1742,7 +1742,7 @@ def _statement_facts_restated_revenue(rows: Rows) -> None:
     row. Reuses `SEC_BOUNDARY_DELIST`'s cik (`CIK0001000005`)."""
     cik = "CIK0001000005"
     accession = _statement_accession(cik, 2019, 1)
-    known_at = _filing_acceptance(date(2019, 2, 10))
+    known_at = _filing_acceptance(_session_on_or_after(date(2019, 2, 10)))
     rows.statement_fact(
         cik,
         "revenue",
@@ -1772,7 +1772,7 @@ def _statement_facts_10ka_first_carrier(rows: Rows) -> None:
     revenue case above."""
     cik = "CIK0001000005"
     accession = _statement_accession(cik, 2020, 2)
-    known_at = _filing_acceptance(date(2020, 3, 1))
+    known_at = _filing_acceptance(_session_on_or_after(date(2020, 3, 1)))
     rows.statement_fact(
         cik,
         "total_assets",
@@ -1800,7 +1800,7 @@ def _statement_facts_dual_class(rows: Rows) -> None:
     `SEC_DUAL_A`/`SEC_DUAL_B`/`SEC_DUAL_PFD`)."""
     cik = "CIK0001000006"
     accession = _statement_accession(cik, 2020, 1)
-    known_at = _filing_acceptance(date(2020, 2, 1))
+    known_at = _filing_acceptance(_session_on_or_after(date(2020, 2, 1)))
     rows.statement_fact(
         cik,
         "revenue",

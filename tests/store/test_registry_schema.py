@@ -85,7 +85,12 @@ def _make_old_store(path: Path, version: int) -> None:
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
-        for ddl in schema._TABLE_DDL:
+        # `_STATEMENT_FACTS_TABLE_DDL` (version 9, #660) is anachronistic for
+        # a true version-1/2/3 store, but `load_universe_fixtures` below
+        # loads every fixture CSV generically, `statement_facts.csv`
+        # included, so the table must exist for that call to succeed —
+        # the same simplification `conftest.version_4_store` makes.
+        for ddl in schema._TABLE_DDL + schema._STATEMENT_FACTS_TABLE_DDL:
             conn.execute(ddl)
         if version >= 3:
             for ddl in schema._REGISTRY_TABLE_DDL:
@@ -155,7 +160,11 @@ def _table_snapshot(conn: duckdb.DuckDBPyConnection, tables: tuple[str, ...]) ->
 
 
 #: SHA-256 of `"".join(schema._TABLE_DDL)` at version 4 (#108's
-#: `corporate_actions` on top of #83's fact tables).
+#: `corporate_actions` on top of #83's fact tables). Frozen forever by design
+#: (quant-auditor review of #660/T76, PR #729): `statement_facts` (version 9)
+#: lives in its own `_STATEMENT_FACTS_TABLE_DDL` with its own pin
+#: (`test_schema.py`), never folded into this tuple, so this hash never has
+#: to move again.
 _V4_DDL_SHA256 = "0815559c58066e74829be4956dea3f252eeddb03ab612cb3485b588c6f44b54a"
 
 

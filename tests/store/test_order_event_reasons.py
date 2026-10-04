@@ -160,7 +160,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
             _event(conn, "halted")
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == [5, 6, 7, 8]
+    assert versions == [5, 6, 7, 8, 9]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
 
@@ -193,7 +193,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [5, 6, 7, 8]
+        assert _versions(conn) == [5, 6, 7, 8, 9]
 
 
 def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothing(

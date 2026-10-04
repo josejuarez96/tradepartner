@@ -59,12 +59,13 @@ _EXPECTED_JOURNAL_TABLES = {
     "wash_sale_flags",
 }
 
-#: SHA-256 of `"".join(schema._TABLE_DDL)` and `"".join(schema._REGISTRY_TABLE_DDL)`.
-#: Registry DDL has never changed since version 3; fact DDL changed once, at
-#: version 9 (#660, T76: `statement_facts` is purely additive, so this is the
-#: *only* legitimate reason to touch this constant since version 4 -- any other
-#: change here means a fact table was edited in place instead of migrated.
-_V4_FACT_DDL_SHA256 = "026ac1af04072f18899a20ad7f6c333e9362de15048a92d8c0b22216ec8c4387"
+#: SHA-256 of `"".join(schema._TABLE_DDL)` and `"".join(schema._REGISTRY_TABLE_DDL)`
+#: at version 4, which version 5 must leave as they are -- frozen forever by
+#: design (quant-auditor review of #660/T76, PR #729): `statement_facts`
+#: (version 9) is additive to the *store*, not to this tuple, which is why it
+#: lives in its own `_STATEMENT_FACTS_TABLE_DDL` with its own pin
+#: (`test_schema.py`) instead of changing the hash below.
+_V4_FACT_DDL_SHA256 = "0815559c58066e74829be4956dea3f252eeddb03ab612cb3485b588c6f44b54a"
 _V4_REGISTRY_DDL_SHA256 = "d8152e9e8bd289b606b7de2e976da4ff9b679648a28f4735d54216bca50cd1db"
 
 _NOW = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
@@ -150,10 +151,12 @@ def test_current_schema_version_is_9() -> None:
 
 
 def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
-    """Version 5 adds journal tables only; version 9 adds the new `statement_facts`
-    fact table (#660, T76), itself purely additive. Any other fact or registry
-    change goes to the next version with its own migration, never an edit of this
-    DDL -- which is what these two pinned hashes guard."""
+    """Version 5 adds journal tables only. `statement_facts` (version 9, #660,
+    T76) is a new fact table but lives outside `_TABLE_DDL`
+    (`_STATEMENT_FACTS_TABLE_DDL`, pinned separately in `test_schema.py`), so
+    this pin never has to move for it either. Any other fact or registry
+    change goes to the next version with its own migration, never an edit of
+    this DDL."""
     assert _sha256(schema._TABLE_DDL) == _V4_FACT_DDL_SHA256
     assert _sha256(schema._REGISTRY_TABLE_DDL) == _V4_REGISTRY_DDL_SHA256
 

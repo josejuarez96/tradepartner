@@ -11,6 +11,7 @@ and the connection's extension auto-install/auto-load settings.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 import textwrap
@@ -507,6 +508,23 @@ def test_statement_facts_keyed_by_cik_not_security_id(
     columns = {row[1] for row in info}
     assert "security_id" not in columns
     assert "cik" in columns
+
+
+#: SHA-256 of `"".join(schema._STATEMENT_FACTS_TABLE_DDL)` at version 9
+#: (#660, T76). Deliberately a tuple of its own, never folded into
+#: `_TABLE_DDL` (whose version-4 pin in `test_journal_schema.py` and
+#: `test_registry_schema.py` must never move again, quant-auditor review
+#: of PR #729): a later edit of this table's DDL goes to the next schema
+#: version with its own migration, never a silent change here.
+_V9_STATEMENT_FACTS_DDL_SHA256 = "7b68b590db31163266c3ec13d227be93381ff113e30c57cc094a76c5f0342416"
+
+
+def test_statement_facts_ddl_is_pinned_at_version_9() -> None:
+    digest = hashlib.sha256("".join(schema._STATEMENT_FACTS_TABLE_DDL).encode()).hexdigest()
+    assert digest == _V9_STATEMENT_FACTS_DDL_SHA256, (
+        "statement_facts DDL changed: bump the schema version and add a "
+        "migration instead of editing the table in place"
+    )
 
 
 # --- lock-error detection -----------------------------------------------

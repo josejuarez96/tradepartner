@@ -116,8 +116,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   each key for ever, and a later filing carrying the same key (an
   identical comparative or a differing restatement) is never stored, so
   there is no revision to key on. A read-only connection accepts a
-  version-8 store (every other read keeps working; `statement_facts`
-  there fails on the missing table).
+  version-8 store without migrating it; a direct `statement_facts` read
+  there fails on the missing table, as does anything that loops over
+  every `TABLE_NAMES` table expecting them all to exist (`health.py`,
+  `registry.store_max_ingested_at`) — loudly, and the next writable
+  `init_schema` call migrates the store.
 - **A later DDL change goes to version 10**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
@@ -530,6 +533,13 @@ TABLE_NAMES: tuple[str, ...] = (
     "schema_version",
 )
 
+#: Frozen at version 4 (#108's `corporate_actions` on top of #83's fact
+#: tables) and pinned by hash in `tests/store/test_journal_schema.py` and
+#: `tests/store/test_registry_schema.py` -- quant-auditor review of #660/T76
+#: (PR #729): a *new* fact table must never be folded into this tuple, since
+#: the pin exists precisely so this blob never has to change again; it gets
+#: its own tuple and its own pin instead (`_STATEMENT_FACTS_TABLE_DDL` below,
+#: added to version 9).
 _TABLE_DDL: tuple[str, ...] = (
     _CREATE_SECURITIES,
     _CREATE_LISTINGS,
@@ -539,10 +549,17 @@ _TABLE_DDL: tuple[str, ...] = (
     _CREATE_CORPORATE_ACTIONS,
     _CREATE_CORPORATE_ACTIONS_IDENTITY_INDEX,
     _CREATE_FACTS,
-    _CREATE_STATEMENT_FACTS,
     _CREATE_INGESTION_RUNS,
     _CREATE_SCHEMA_VERSION,
 )
+
+#: `statement_facts` (#660, T76), added at version 9: its own tuple rather
+#: than folded into `_TABLE_DDL` above, so that tuple's version-4 pin never
+#: has to move again (quant-auditor review of PR #729). Pinned by hash in
+#: `tests/store/test_schema.py`; a later edit of this table's DDL goes to
+#: the next schema version with its own migration, exactly as `_TABLE_DDL`
+#: itself is guarded.
+_STATEMENT_FACTS_TABLE_DDL: tuple[str, ...] = (_CREATE_STATEMENT_FACTS,)
 
 
 # Trial registry (schema version 3; Phase 3 spec "Data / interfaces" >
@@ -1675,7 +1692,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _PRE_ACCEPT_REJECTIONS_VERSION,
         ):
             _migrate_resume_flags(conn)
-        for ddl in _TABLE_DDL + _REGISTRY_TABLE_DDL + _JOURNAL_TABLE_DDL:
+        for ddl in (
+            _TABLE_DDL + _REGISTRY_TABLE_DDL + _JOURNAL_TABLE_DDL + _STATEMENT_FACTS_TABLE_DDL
+        ):
             conn.execute(ddl)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:

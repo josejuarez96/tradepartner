@@ -229,7 +229,7 @@ def test_write_open_adds_the_check_and_keeps_every_row(
             _decision(conn, "left_target", decision_id=99)
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == list(range(version, 9))
+    assert versions == list(range(version, 10))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -257,7 +257,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [6, 7, 8]
+        assert _versions(conn) == [6, 7, 8, 9]
 
 
 @pytest.mark.parametrize("version", [5, 6])

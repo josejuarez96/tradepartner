@@ -199,13 +199,16 @@ def test_statement_fact_accepted_at_naive_still_raises() -> None:
         )
 
 
-def test_statement_fact_filed_the_day_after_acceptance_carries_no_trace_of_filed() -> None:
+def test_statement_fact_filed_the_day_after_acceptance_is_served_by_accepted_at_alone() -> None:
     """A fixture entry whose companyfacts `filed` date differs from its
-    acceptance date (an after-hours filing): the record is visible from
-    `accepted_at`, and `filed` plays no role beyond the ingest's hold rule
-    -- `statement_facts` has no `filed` column at all (spec "Statement
-    facts" > Interfaces), so nothing downstream of this record could read
-    it even if it wanted to."""
+    acceptance date (an after-hours filing): the fixture adapter serves it
+    keyed by `cik` only, with both fields intact, so a future ingest's
+    hold rule (the only reader of `filed`) sees exactly what the record
+    carries rather than something the adapter derived or dropped.
+    `statement_facts` itself has no `filed` column at all (spec
+    "Statement facts" > Interfaces; `tests/store/test_schema.py` checks
+    the table's column set), so this record-level field is as far as
+    `filed` travels in this PR."""
     accepted_at = datetime(2019, 2, 13, 23, 55, tzinfo=UTC)
     filed_the_next_day = date(2019, 2, 14)
     record = StatementFactRecord(
@@ -222,8 +225,9 @@ def test_statement_fact_filed_the_day_after_acceptance_carries_no_trace_of_filed
         filed_the_next_day,
         False,
     )
-    assert record.accepted_at == accepted_at
-    assert record.filed == filed_the_next_day
+    (served,) = FixtureFilingSource(statement_facts=[record]).statement_facts(CIK)
+    assert served.accepted_at == accepted_at
+    assert served.filed == filed_the_next_day
 
 
 def test_statement_facts_served_per_cik() -> None:
