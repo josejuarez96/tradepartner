@@ -8,7 +8,7 @@ iXBRL, never here.
 
 SEC requires every request to declare a `User-Agent` with a name and
 contact ("Verify before the Phase 2 plan", ADR 0003) and rate-limits to
-roughly `edgar.requests_per_second` (default 10) requests/second.
+roughly `edgar.requests_per_second` (default 9) requests/second.
 `_RateLimiter` enforces that floor between requests made through this
 module's shared client (a simple token/timestamp limiter, `threading.Lock`
 -guarded: it remembers the last request time and sleeps off the remainder

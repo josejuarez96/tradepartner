@@ -55,8 +55,12 @@ order:
    too (T58's handoff: a halt-path caller never drops one). With
    `write_offs`, each read back-fills the `written_off` row of a terminal buy
    of a pending rebalance that lacks one (T58);
-4. the alert (`halted`, or `stale_data` for `StaleDataError`), run-scoped,
-   after one checked clock reading (so a clock gone bad sets `clock_fault`);
+4. the alert, run-scoped, after one checked clock reading (so a clock gone bad
+   sets `clock_fault`): `stale_data` for `StaleDataError`; else, by
+   `_FAULT_ALERT_KINDS`, `reconciliation` for a `ReconciliationError`,
+   `rejection_cap` for a `RejectionCapError`, `skip_cap` for a `SkipCapError`,
+   and `halted` for any other fault (owner decision 2026-10-03, #644, Option
+   A: one alert per halt, never a second `halted`);
 5. the run's `paper_run_results` row, `halted` (or `stale`), with the fault's
    type, the message and `clock_fault`;
 6. re-raises the fault.
@@ -91,7 +95,15 @@ handed to it, each once. Every fact is read once per phase from the journal and
 from the store at close(S-1) (`live_actions_as_of`), so the ledger, the
 residues, the decision states and the reference prices share one frame (#518).
 `price_of` is the close(S-1) close over the split ratios with ex-date in
-(S-1, S] known at close(S-1) (`planning.reference_prices`). The costs that size
+(S-1, S] known at close(S-1) (`planning.reference_prices`). The batch's and the
+ledger's names must have one: a missing bar halts the phase at its read. A name
+only a non-terminal own order brings in is priced if it can be, and a missing
+price halts only when a number reads it, so one stale order of an unrelated
+name does not halt every batch (#569, owner option (b)). The open-sell check
+reads only the batch's names' open sells (`_open_sells`); the open-buy reserve
+prices every open quantity buy, so a batch with buys runs it once on the first
+book, before any sell is submitted, and halts there on a missing price. The
+costs that size
 the buys and the cash rule are the window's frozen `costs.*` keys
 (`config.FROZEN_COSTS_KEYS`, #534), read with each phase's book; a window whose
 `frozen_json` lacks them raises `ValueError` before any broker call, never
@@ -146,13 +158,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import NoReturn, Protocol
+from typing import Any, NoReturn, Protocol
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -184,6 +196,7 @@ from tradepartner.errors import (
     AcknowledgementTimeoutError,
     ClockError,
     LimitBreachError,
+    ReconciliationError,
     RejectionCapError,
     SkipCapError,
     StaleDataError,
@@ -303,6 +316,29 @@ _CANCEL_NOOP = "cancel_noop"
 _CANCEL_FAILED = "cancel_failed"
 _REPLAY = "replay"
 _READ_CLOCK_NOTE = "halt read stands on ClockError"
+#: The halt alert's kind for a fault type with a more specific mapping than
+#: `_HALTED` (owner decision 2026-10-03, #644, Option A), most specific first:
+#: none of these three is a subclass of another, so checking order among them
+#: does not matter, but a future subclass of one must still be checked before
+#: its parent would be. `StaleDataError` and every other fault keep their own,
+#: unmapped kinds (`_STALE_DATA`, `_HALTED`).
+_FAULT_ALERT_KINDS: tuple[tuple[type[Exception], str], ...] = (
+    (ReconciliationError, "reconciliation"),
+    (RejectionCapError, "rejection_cap"),
+    (SkipCapError, "skip_cap"),
+)
+
+
+def _alert_kind(fault: Exception) -> str:
+    """`_FAULT_ALERT_KINDS`'s kind for `fault`'s most specific mapped type, else
+    `_HALTED`. Not used for `StaleDataError`, which the caller maps to
+    `_STALE_DATA` itself."""
+    for cls, kind in _FAULT_ALERT_KINDS:
+        if isinstance(fault, cls):
+            return kind
+    return _HALTED
+
+
 #: The `Order` fields a replay must match exactly.
 _REPLAY_FIELDS = ("client_order_id", "symbol", "side", "notional", "quantity")
 _OK = "ok"
@@ -407,7 +443,8 @@ class BatchOutcome:
 class _Book:
     """One phase's read of the journal and the store, every store fact as of
     close(S-1): the window and its frozen costs, the splits, the ledger stated
-    for S, the reference prices, each decision's state and each sold name's
+    for S, the reference prices (and, for a name only an open order brings in
+    that has none, the reason, raised when read: #569), each decision's state and each sold name's
     residue, the tickers and ended listings of the batch's names, every own
     order, event and live fill of any window, and the last `ok` ingestion run's
     `finished_at`."""
@@ -417,6 +454,7 @@ class _Book:
     actions: pl.DataFrame
     ledger: Ledger
     prices: Mapping[str, float]
+    unpriced: Mapping[str, str]
     states: Mapping[int, DecisionState]
     residues: Mapping[str, float]
     tickers: Mapping[str, str | None]
@@ -427,8 +465,9 @@ class _Book:
     last_ok_ingest: datetime | None
 
     def price_of(self, security_id: str) -> float:
-        """The reference price on S, or `ValueError` for a name not read."""
-        return _price_lookup(self.prices)(security_id)
+        """The reference price on S, or `ValueError` for a name not read or
+        read without one (`unpriced`, #569)."""
+        return _price_lookup(self.prices, self.unpriced)(security_id)
 
 
 @dataclass(frozen=True)
@@ -579,6 +618,19 @@ class RiskGatedBroker:
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
         book = self._read_book(run, rows)
+        if any(d.side == _BUY for d in decisions):
+            # The buys phase's reserve prices every open quantity buy: a name
+            # of one with no price halts here, before any sell is submitted,
+            # not after the sells have gone out (#569).
+            open_buy_reserve(
+                book.orders,
+                book.events,
+                book.fills,
+                book.actions,
+                book.price_of,
+                self._frozen,
+                session=run.session,
+            )
         sold = phases.PhaseOrders((), ())
         submitted: list[str] = []
         skips: tuple[Skip, ...] = ()
@@ -590,14 +642,7 @@ class RiskGatedBroker:
             # Read once so the trim `sell_orders` caps and the `check_phase`
             # that verifies it see the same open sells (#605): both are the
             # same session's read of this same `book`.
-            open_sells = unfilled_sells(
-                book.orders,
-                book.events,
-                book.fills,
-                book.price_of,
-                book.actions,
-                session=run.session,
-            )
+            open_sells = _open_sells(book, {d.security_id for d in rows}, run.session)
             sold = phases.sell_orders(
                 decisions,
                 book.states,
@@ -760,7 +805,8 @@ class RiskGatedBroker:
         from `book`; the sells-phase caller passes the same value it gave
         `phases.sell_orders` (#605), so the trim it just capped is checked
         against the cap it was capped by. Left unset, it is read fresh from
-        `book` here (the buys phase, which never caps a sell)."""
+        `book` here for the phase's own names (the buys phase, which never caps a
+        sell)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
         self._requests(built, book, session)
@@ -770,9 +816,7 @@ class RiskGatedBroker:
         ]
         counted = prior_skips + sum(s.counts_toward_cap for s in built.skips)
         if open_sells is None:
-            open_sells = unfilled_sells(
-                book.orders, book.events, book.fills, book.price_of, book.actions, session=session
-            )
+            open_sells = _open_sells(book, {o.security_id for o in built.orders}, session)
         verdict = check_phase(
             candidates,
             book.ledger,
@@ -907,12 +951,15 @@ class RiskGatedBroker:
             fills = fills_for(conn)
             journaled = decisions_for(conn, window_id)
             terminal = {e.client_order_id for e in events if e.status in TERMINAL_ORDER_STATUSES}
-            names = (
-                {d.security_id for d in rows}
-                | set(ledger.positions)
-                | {o.security_id for o in orders if o.client_order_id not in terminal}
-            )
+            # The batch's and the ledger's names are priced here: a missing
+            # bar halts the phase. A non-terminal order's other name is priced
+            # if it can be; a missing one halts only where a number reads it
+            # (the reserve, the open-sell check), via `price_of` (#569 (b)).
+            names = {d.security_id for d in rows} | set(ledger.positions)
             prices = reference_prices(conn, session, names, actions)
+            open_names = {o.security_id for o in orders if o.client_order_id not in terminal}
+            optional, unpriced = _optional_prices(conn, session, open_names - names, actions)
+            prices = {**prices, **optional}
             tickers, ended = _listings(
                 conn, session, sorted({d.security_id for d in rows}), self._settings
             )
@@ -923,7 +970,7 @@ class RiskGatedBroker:
             )
             last_ok_ingest = _last_ok_ingest(conn)
         events_of = {d.decision.decision_id: d.events for d in journaled}
-        price_of = _price_lookup(prices)
+        price_of = _price_lookup(prices, unpriced)
         states: dict[int, DecisionState] = {}
         for row in rows:
             if row.decision_id is None or row.decision_id not in events_of:
@@ -963,6 +1010,7 @@ class RiskGatedBroker:
             actions,
             ledger,
             prices,
+            unpriced,
             states,
             residues,
             tickers,
@@ -1005,8 +1053,16 @@ class RiskGatedBroker:
         self, run: PaperRunRow, book: _Book, rows: Sequence[DecisionRow], side: str
     ) -> dict[str, Asset]:
         """The clock pre-check, the refusal of a name with no listing at
-        close(S-1) (before any broker call), then the phase's `assets` read
-        for its open decisions, keyed by `security_id`."""
+        close(S-1) (before any broker call), the reused-ticker check (#568
+        item 2), then the phase's `assets` read for its open decisions,
+        keyed by `security_id`.
+
+        The reused-ticker check runs here, not in `_listings`/`_read_book`:
+        it is scoped to this phase's own attempt scope (only names this
+        phase actually resolves against the broker), so a batch the kill
+        switch skips, or a second run whose exit sell is already accepted
+        and has no attempt left this phase, never halts over a reuse that
+        would never reach the broker anyway."""
         assert run.session is not None
         self.clock_precheck(run.session, book.last_ok_ingest)
         names = sorted(
@@ -1015,6 +1071,12 @@ class RiskGatedBroker:
         unknown = [sid for sid in names if not book.tickers.get(sid)]
         if unknown:
             raise ValueError(f"no listing known at close(S-1) for {unknown}")
+        delisted = frozenset(sid for sid in names if sid in book.ended)
+        if delisted:
+            cut = session_close(previous_session(run.session))
+            with self._journal() as conn:
+                current = current_listings(listings_as_of(conn, cut, sorted(delisted)), run.session)
+                _refuse_reused_tickers(conn, cut, run.session, current, delisted)
         symbols = {sid: canonical_symbol(str(book.tickers[sid])) for sid in names}
         answer = self._broker.assets(sorted(symbols.values()))
         missing = sorted(sym for sym in symbols.values() if sym not in answer)
@@ -1218,9 +1280,10 @@ class RiskGatedBroker:
 
         stamp()  # one checked reading first, so a clock gone bad since sets clock_fault
         message = self._scrub("; ".join([headline, *dict.fromkeys(notes)]))
+        alert_kind = _STALE_DATA if stale else _alert_kind(fault)
         try:
             self._alerter.write(
-                _STALE_DATA if stale else _HALTED,
+                alert_kind,
                 run.run_id,
                 self._session(run, stamp),
                 message,
@@ -1374,8 +1437,16 @@ def _frozen_costs(window: PaperWindowRow) -> BuyCosts:
     return BuyCosts(costs.per_side_bps, Commissions.from_config(costs))
 
 
-def _price_lookup(prices: Mapping[str, float]) -> Callable[[str], float]:
+def _price_lookup(
+    prices: Mapping[str, float], unpriced: Mapping[str, str] | None = None
+) -> Callable[[str], float]:
+    """`price_of` over `prices`: a name in `unpriced` raises `ValueError` with
+    the reason its read failed, any other name not read a plain one."""
+    reasons = unpriced or {}
+
     def price_of(security_id: str) -> float:
+        if security_id in reasons:
+            raise ValueError(f"no reference price for {security_id}: {reasons[security_id]}")
         if security_id not in prices:
             raise ValueError(f"no reference price read for {security_id}")
         return prices[security_id]
@@ -1383,12 +1454,61 @@ def _price_lookup(prices: Mapping[str, float]) -> Callable[[str], float]:
     return price_of
 
 
+def _open_sells(book: _Book, names: Collection[str], session: date) -> list[OpenSell]:
+    """`risk.unfilled_sells` over the open own sells of `names` only. Its
+    readers (`phases.sell_orders`' trim cap, `check_phase`'s
+    `sell_sum_within_holding`) look up only the names the phase sells, all in
+    `names`, so an unrelated open notional sell is never priced and never
+    halts the batch (#569)."""
+    return unfilled_sells(
+        [o for o in book.orders if o.security_id in names],
+        book.events,
+        book.fills,
+        book.price_of,
+        book.actions,
+        session=session,
+    )
+
+
+def _optional_prices(
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Collection[str],
+    actions: pl.DataFrame,
+) -> tuple[dict[str, float], dict[str, str]]:
+    """The reference prices of the names only a non-terminal order brings into
+    the book (#569, owner option (b)): each priced on its own, so one name
+    with no bar at close(S-1) (or no valid price) does not stop the rest. A
+    name that fails lands in the second map with its `ValueError` message;
+    `price_of` raises it only if something reads that name's price."""
+    priced: dict[str, float] = {}
+    unpriced: dict[str, str] = {}
+    for security_id in sorted(names):
+        try:
+            priced.update(reference_prices(conn, session, [security_id], actions))
+        except ValueError as exc:
+            unpriced[security_id] = str(exc)
+    return priced, unpriced
+
+
 def _listings(
     conn: duckdb.DuckDBPyConnection, session: date, names: Sequence[str], settings: Settings
 ) -> tuple[dict[str, str | None], frozenset[str]]:
     """Each name's ticker (its current listing at S among rows known at
     close(S-1); None without one) and the names whose listing ended
-    (`delisted`) at close(S-1)."""
+    (`delisted`) at close(S-1).
+
+    A delisted name's own ticker must not also be a *later* issuer's current
+    ticker as of close(S-1): that reuse would otherwise let the `assets`
+    read resolve against the new issuer, not the delisted one this read
+    means (#568 item 2). That check does not run here: `_listings` backs
+    `_read_book`, which every batch reads before the kill-switch check and
+    before `attempt_scope` decides whether a phase sends anything, so
+    raising here would halt a batch the kill switch would otherwise skip,
+    or a second run whose exit sell was already accepted and needs no
+    further attempt. `_phase_assets` runs the check instead, scoped to the
+    names its own phase's attempt scope actually resolves, right before the
+    broker `assets` call."""
     if not names:
         return {}, frozenset()
     cut = session_close(previous_session(session))
@@ -1397,7 +1517,49 @@ def _listings(
     ends = current_listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
-    return tickers, frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+    delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
+    return tickers, delisted
+
+
+def _refuse_reused_tickers(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    session: date,
+    current: Mapping[str, Mapping[str, Any]],
+    delisted: frozenset[str],
+) -> None:
+    """For each `delisted` name, refuse when some other security's current
+    listing (as of close(S-1), across the whole universe) names the same
+    ticker with a strictly later `valid_from`: a later issuer who reused it.
+    An earlier owner of the same ticker (this name itself took it over from
+    someone even older) is not a collision, and neither is a coincidental
+    match with a security that has never been this name's own listing's
+    ticker since."""
+    if not delisted:
+        return
+    universe = current_listings(listings_as_of(conn, cut), session)
+    collisions: dict[str, tuple[str, list[str]]] = {}
+    for sid in delisted:
+        row = current.get(sid)
+        if row is None:
+            continue
+        ticker = str(row["ticker"])
+        own_valid_from = row["valid_from"]
+        reused_by = sorted(
+            other
+            for other, other_row in universe.items()
+            if other != sid
+            and str(other_row["ticker"]) == ticker
+            and other_row["valid_from"] is not None
+            and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
+        )
+        if reused_by:
+            collisions[sid] = (ticker, reused_by)
+    if collisions:
+        raise ValueError(
+            "ticker reused by a later issuer since close(S-1), the assets read would be "
+            f"ambiguous: {collisions}"
+        )
 
 
 def _last_ok_ingest(conn: duckdb.DuckDBPyConnection) -> datetime | None:
