@@ -145,7 +145,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Labels of retired teams are harmless; delete them when convenient.
 - **Directories of retired teams are pruned ad hoc, never automatically.** A team may take another claim later, so its directory stays while it is touched. When the disk or the board looks cluttered: `uv run python scripts/team.py prune` prints which directories have no open claim and have been idle for six hours or more (`--hours` to change); `--yes` removes them with `git worktree remove` and prunes the worktree list. Directories with uncommitted changes are listed and skipped, never removed (#167). Agents never run it.
 - Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
-- You are not a role in the tool. You approve every merge (your "merge train `<batch id>`" lets the window you say it to run `merge_train.py merge`; git-workflow rule 7), you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
+- You are not a role in the tool. You approve every class-B merge (your word on that PR, or your "merge train `<batch id>`", which lets the window you say it to run `merge_train.py merge`; git-workflow rule 7); class-A PRs are landed by the orchestrator session under that rule. You decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
 ### Never
 
@@ -154,7 +154,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Enter another team's directory or the main checkout for any reason.
 - Touch a branch, PR or issue that another team currently **holds** (a released or parked one is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
-- Merge. The merge train is the normal way a PR lands: the owner says "merge train `<batch id>`" and runs `merge_train.py merge`, or tells one window to (git-workflow rule 7). Building a train is not merging and happens only when he asks. A hand `gh pr merge` of one green PR happens only on his word for that specific PR, by him or the window he tells; the ruleset bypass (`--admin`) is never a window's.
+- Merge, except the orchestrator session landing a class-A PR under git-workflow rule 7 (ready, `checks` green on its head, every required verdict `PASS`, trial-merged against current `main` and said so on the PR). A class-B PR lands only on the owner's word for that specific PR, by him or the window he tells; a train only on his "merge train `<batch id>`", run by him or the window he says it to (building a train is not merging and happens only when he asks); the ruleset bypass (`--admin`) is never a window's.
 
 ### Model tiers
 

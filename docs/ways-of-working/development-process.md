@@ -24,7 +24,7 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
   3. SPEC     (what and why, acceptance criteria)→ docs/specs/<feature>.md
   4. PLAN     (how: ordered tasks, 1 task = 1 PR)→ docs/plans/<feature>.md
   5. BUILD    (branch, tests first, PR)         → code + tests
-  6. REVIEW   (CI + specialist agents + owner)  → merged PR; each agent's full report is a PR comment, its return a ten-line summary
+  6. REVIEW   (CI + specialist agents + the owner for class B)  → merged PR; each agent's full report is a PR comment, its return a ten-line summary
   7. RECORD   (STATUS, CHANGELOG, plan ticks)   → docs/STATUS.md
                               │
   per phase:                  ▼
@@ -39,7 +39,7 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
 | Decide → Spec | ADR status is `Accepted` | Owner |
 | Spec → Plan | Acceptance criteria are testable, out-of-scope is listed, `spec-critic` has run | Owner |
 | Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines. The plan passes the "Plan shape" list below | Owner (can be delegated for size M) |
-| Build → Merge | CI is green on the PR, the PR checklist is complete, specialist reviews are done, and CI is green on the batch's train run for a prefix that contains the PR (the full batch run or a green probe; `merge_train.py build`, [git-workflow.md](git-workflow.md#the-merge-train)), or, for a hand merge of one PR, CI green on that PR's head | [git-workflow rule 7](git-workflow.md#the-rules-in-one-screen): a class-A PR (code, tests, research, retros, runbooks, fragments) by the orchestrator after a trial merge; a class-B PR (specs, plans, ADRs, ways-of-working, `.claude/`, `.github/`, the process scripts, deps, or labelled `hold`) on the owner's word for that PR; a train on his "merge train `<batch id>`" |
+| Build → Merge | CI is green on the PR, the PR checklist is complete, specialist reviews are done, and CI is green on the batch's train run for a prefix that contains the PR (the full batch run or a green probe; `merge_train.py build`, [git-workflow.md](git-workflow.md#the-merge-train)), or, for a hand merge of one PR, CI green on that PR's head | [git-workflow rule 7](git-workflow.md#the-rules-in-one-screen): a class-A PR (only `src/`, `tests/`, research, retros, runbooks, fragments) by the orchestrator after a trial merge; every other PR is class B (specs, plans, ADRs, ways-of-working, `.claude/`, `.github/`, `CLAUDE.md`, the process scripts, deps, anything else, or labelled `hold`) and lands on the owner's word for that PR; a train on his "merge train `<batch id>`" |
 | Phase → next phase | Phase exit criteria are met, retro is written, release is tagged | Owner |
 
 The owner's word is required for every class-B PR (rule 7): he merges it, tells a window to merge that specific PR, or names it in a "merge train `<batch id>`", which lands exactly the PRs the train's record names. A class-A PR is landed by the orchestrator under the written rule. Specs, plans and ADRs are class B, and they land through PRs like code does, so **the approval is recorded in git history.**
