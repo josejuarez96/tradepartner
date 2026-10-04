@@ -1012,6 +1012,60 @@ def test_marks_read_only_the_latest_marked_session(
     assert max(rows for _, rows in reads) == len(full_marks)
 
 
+def test_marks_filter_does_not_depend_on_the_trading_calendar(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """The latest marked session is the first session after the seeded
+    marks' `_S_MINUS_1` that follows a non-session date (a weekend or a
+    holiday); a stray mark row sits on the calendar day before it, between
+    `previous_session(last_session)` and `last_session` itself. The old
+    filter, `after=previous_session(last_session)`, reads every row with
+    `session > previous_session(last_session)`, which catches the stray row
+    too, since the calendar has no session that day to keep the two apart
+    (#652); the fix must still read only the last session's row, whatever
+    mark the calendar never scheduled sits in between. Dates derive from
+    `_S_MINUS_1` so the test does not depend on the day it runs."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    last_session = next_session(_S_MINUS_1)
+    while last_session - previous_session(last_session) <= timedelta(days=1):
+        last_session = next_session(last_session)
+    stray_session = last_session - timedelta(days=1)  # not a session
+    assert previous_session(last_session) < stray_session < last_session
+
+    with open_for_write(journal_settings) as conn:
+        append(
+            conn,
+            PositionDailyRow(
+                run_id=seeded["run_id"],
+                session=stray_session,
+                security_id="QQQ",
+                quantity=99.0,
+                mark_price=1.0,
+                value=999.0,
+                **_stamp(90),
+            ),
+        )
+        append(
+            conn,
+            PositionDailyRow(
+                run_id=seeded["run_id"],
+                session=last_session,
+                security_id="BBB",
+                quantity=3.0,
+                mark_price=10.0,
+                value=30.0,
+                **_stamp(91),
+            ),
+        )
+
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+
+    assert data.positions_count == 1
+    assert data.positions_value == 30.0
+
+
 def test_kill_switch_read_is_at_most_two_rows_and_matches_derive(
     journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
 ) -> None:
@@ -1408,6 +1462,20 @@ def test_a_long_window_reads_at_most_the_bound_of_every_remaining_section(
         if re.search(r"SELECT\s+COUNT\(\*\)\s+FROM\s+orders\b", sql)
     ]
     assert orders_count_reads == [1]
+
+    # `_runs_for_switch` is the one read this task leaves uncapped at a fixed
+    # row count (module docstring, item 3), but it must still read far fewer
+    # than the window's 21 runs: none of the 20 extra runs is unfinished,
+    # faulted or uncleared, so only the window's latest run (the
+    # in-progress-rule row) should come back.
+    with open_read_only(journal_settings) as conn:
+        released_at = max(
+            (r.at for r in ops._kill_switch_rows_for(conn, window_id) if r.state == "released"),
+            default=None,
+        )
+        bounded_runs = ops._runs_for_switch(conn, window_id, released_at=released_at)
+    assert len(bounded_runs) < len(full_runs_with_results)
+    assert len(bounded_runs) <= 2
 
 
 def _derive_bounded_and_full(
