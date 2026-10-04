@@ -827,10 +827,11 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     """A fake that rounds each fill to the cent (`round_cash_to_cent=True`)
     stays within `risk.reconcile_cash_tolerance` over the window's frozen
     `paper.min_rebalances` months of fills, with the rounding actually
-    exercised (at least one fill not an exact cent itself) and the
-    cumulative drift across the whole window, not just each month's own
-    reconciliation, kept under the same tolerance. Position limits are
-    loosened to 1.0 (the other tests' `FROZEN` is tuned for a fixed
+    exercised (at least one fill not an exact cent itself), and each
+    month's own signed rounding drift (buy and sell cash residues carry
+    opposite signs), not just its reconciliation status, is reported and
+    checked against the same tolerance. Position limits are loosened to
+    1.0 (the other tests' `FROZEN` is tuned for a fixed
     3-name, one-third-each portfolio, not whatever the real momentum
     universe picks each month), and `price_at` is widened to every ticker
     with a price that session, not just the fixed `SYMBOLS` set, so a later
@@ -881,14 +882,13 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     ]  # six consecutive months' first sessions, none skipped
 
     cash_tolerance = Decimal(repr(FROZEN.reconcile_cash_tolerance))
-    cumulative_drift = Decimal("0")
     any_fill_needed_rounding = False
     sessions_with_fills = 0
     for session in sessions:
         outcome = env.run(at(session))
         assert outcome.status == "ok", env.result(env.latest_run())
         session_fills = env.query(
-            "SELECT f.price, f.quantity FROM fills f "
+            "SELECT f.price, f.quantity, o.side FROM fills f "
             "JOIN orders o ON o.client_order_id = f.client_order_id "
             "WHERE o.run_id = ?",
             [outcome.run_id],
@@ -898,18 +898,25 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
         # whole does (checked below).
         if session_fills:
             sessions_with_fills += 1
-        for price, quantity in session_fills:
+        # The month's own cash drift: a buy's rounded cost understates or
+        # overstates the exact one by `exact - rounded`; a sell's effect on
+        # cash is the opposite sign. Kept per session, not accumulated
+        # across sessions: reconciliation resets the ledger to the
+        # broker's own cash every run (`ledger.py`'s "built from the
+        # broker's cash", not a carried-forward residual), so there is no
+        # production invariant that sums this across months, only one that
+        # bounds it within each one, the same tolerance each reconciliation
+        # already enforces.
+        session_drift = Decimal("0")
+        for price, quantity, side in session_fills:
             exact = Decimal(repr(price)) * Decimal(repr(quantity))
             rounded = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             if exact != rounded:
                 any_fill_needed_rounding = True
-            cumulative_drift += exact - rounded
-        # the drift accumulated over every month so far, not just this
-        # month's own reconciliation, stays inside the tolerance the
-        # reconciliation itself enforces per run
-        assert abs(cumulative_drift) <= cash_tolerance, (
-            f"cumulative rounding drift {cumulative_drift} through {session.isoformat()} "
-            f"exceeded risk.reconcile_cash_tolerance ({cash_tolerance})"
+            session_drift += (exact - rounded) if side == "buy" else (rounded - exact)
+        assert abs(session_drift) <= cash_tolerance, (
+            f"{session.isoformat()}'s rounding drift {session_drift} exceeded "
+            f"risk.reconcile_cash_tolerance ({cash_tolerance})"
         )
 
     rows = env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id")
