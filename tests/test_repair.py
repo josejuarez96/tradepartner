@@ -11,10 +11,17 @@ import duckdb
 import pytest
 from typer.testing import CliRunner
 
-from tradepartner import cli
+from tradepartner import cli, repair
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import Settings
-from tradepartner.repair import REPAIR, REPAIRED, misattributed, repair_resolution, store_resolver
+from tradepartner.repair import (
+    REPAIR,
+    REPAIRED,
+    RepairRefused,
+    misattributed,
+    repair_resolution,
+    store_resolver,
+)
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.schema import init_schema
 
@@ -145,7 +152,7 @@ def test_a_dry_run_counts_and_changes_nothing(store: Settings) -> None:
 
 
 def test_the_repair_deletes_every_revision_of_a_misattributed_row(store: Settings) -> None:
-    result = repair_resolution(store, clock=lambda: RUN)
+    result = repair_resolution(store, clock=lambda: RUN, expect=(3, 1))
     assert (result.bar_rows, result.action_rows) == (3, 1)
     assert _bars(store) == [
         (DEAD, date(2021, 5, 27), 10.0, "alpaca_sip"),
@@ -158,7 +165,7 @@ def test_the_repair_deletes_every_revision_of_a_misattributed_row(store: Setting
 
 
 def test_the_repair_is_recorded_and_never_reads_as_a_fresh_ingest(store: Settings) -> None:
-    result = repair_resolution(store, clock=lambda: RUN)
+    result = repair_resolution(store, clock=lambda: RUN, expect=(3, 1))
     [(source, status, mode, message)] = _rows(
         store, "SELECT source, status, mode, message FROM ingestion_runs"
     )
@@ -169,8 +176,8 @@ def test_the_repair_is_recorded_and_never_reads_as_a_fresh_ingest(store: Setting
 
 
 def test_a_second_repair_deletes_nothing(store: Settings) -> None:
-    repair_resolution(store, clock=lambda: RUN)
-    again = repair_resolution(store, clock=lambda: RUN)
+    repair_resolution(store, clock=lambda: RUN, expect=(3, 1))
+    again = repair_resolution(store, clock=lambda: RUN, expect=(0, 0))
     assert (again.bar_rows, again.action_rows) == (0, 0)
     assert again.found.securities == ()
 
@@ -195,7 +202,17 @@ def test_the_command_dry_run_and_repair(store: Settings) -> None:
     dry = runner.invoke(app, ["repair-resolution", "--dry-run"])
     assert dry.exit_code == 0, dry.output
     assert dry.output.startswith("would delete 3 bar rows")
-    done = runner.invoke(app, ["repair-resolution"])
+    assert f"  {DEAD}: 3 bar rows 2021-06-01..2021-06-02, 1 action rows" in dry.output
+    unguarded = runner.invoke(app, ["repair-resolution"])
+    assert unguarded.exit_code != 0
+    assert len(_bars(store)) == 6
+    stale = ["repair-resolution", "--expect-bar-rows", "2", "--expect-action-rows", "1"]
+    refused = runner.invoke(app, stale)
+    assert refused.exit_code == 1
+    assert "repair refused" in refused.output
+    assert len(_bars(store)) == 6
+    expect = ["--expect-bar-rows", "3", "--expect-action-rows", "1"]
+    done = runner.invoke(app, ["repair-resolution", *expect])
     assert done.exit_code == 0, done.output
     assert done.output.startswith("deleted 3 bar rows")
     assert len(_bars(store)) == 3
@@ -203,5 +220,37 @@ def test_the_command_dry_run_and_repair(store: Settings) -> None:
 
 def test_the_command_refuses_a_missing_store(settings: Settings) -> None:
     app = cli.make_app(settings=lambda: settings, clock=lambda: RUN)
-    result = CliRunner().invoke(app, ["repair-resolution"])
-    assert result.exit_code != 0
+    result = CliRunner().invoke(
+        app, ["repair-resolution", "--expect-bar-rows", "0", "--expect-action-rows", "0"]
+    )
+    assert result.exit_code == 1
+    assert "no store" in result.output
+
+
+def test_a_repair_needs_the_dry_runs_counts(store: Settings) -> None:
+    before = _bars(store)
+    with pytest.raises(ValueError, match="dry run"):
+        repair_resolution(store, clock=lambda: RUN)
+    with pytest.raises(RepairRefused):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 0))
+    assert _bars(store) == before
+    assert _rows(store, "SELECT count(*) FROM corporate_actions") == [(2,)]
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_a_delete_that_misses_its_count_rolls_everything_back(
+    store: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # safety-reviewer on #830: never a partial repair.
+    real = repair._delete
+
+    def short(*args: Any, **kwargs: Any) -> int:
+        return real(*args, **kwargs) - 1
+
+    monkeypatch.setattr(repair, "_delete", short)
+    before = _bars(store)
+    with pytest.raises(RuntimeError, match="rolled back"):
+        repair_resolution(store, clock=lambda: RUN, expect=(3, 1))
+    assert _bars(store) == before
+    assert _rows(store, "SELECT count(*) FROM corporate_actions") == [(2,)]
+    assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]

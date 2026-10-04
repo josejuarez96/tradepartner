@@ -26,6 +26,9 @@ What the repair is and is not:
 - **One transaction.** The key reads, the verdicts and the deletes run on
   one write connection, so no ingest can add a row in between, and a
   failure deletes nothing.
+- **Only what a dry run showed.** A real run takes the dry run's bar and
+  action row counts and refuses, deleting nothing, on any other count; the
+  terminal lists every security found with its counts.
 - **Recorded.** It writes one `ingestion_runs` row (source `alpaca`, mode
   `repair`, status `repaired`) whose message gives the counts and the first
   securities. Status `repaired` is never `ok`, so it never counts as a
@@ -43,6 +46,7 @@ What the repair is and is not:
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -153,6 +157,29 @@ class RepairResult:
             f"resolver no longer assigns to their security, on {len(named)} securities{shown}"
         )
 
+    def lines(self) -> list[str]:
+        """One line per security found, for the terminal: its bar rows and
+        their first and last session, and its action rows."""
+        bars: dict[str, list[date]] = defaultdict(list)
+        rows: dict[str, int] = defaultdict(int)
+        for (sid, day), n in self.found.bars.items():
+            bars[sid].append(day)
+            rows[sid] += n
+        actions: dict[str, int] = defaultdict(int)
+        for (sid, _), n in self.found.actions.items():
+            actions[sid] += n
+        out = []
+        for sid in self.found.securities:
+            days = bars.get(sid, [])
+            span = f" {min(days)}..{max(days)}" if days else ""
+            out.append(f"  {sid}: {rows[sid]} bar rows{span}, {actions[sid]} action rows")
+        return out
+
+
+class RepairRefused(ValueError):
+    """The repair found other counts than the dry run the owner approved;
+    nothing was deleted."""
+
 
 class _Counted:
     """`(security_id, day, rows)` per stored key of one table and source
@@ -209,12 +236,19 @@ def repair_resolution(
     *,
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
+    expect: tuple[int, int] | None = None,
 ) -> RepairResult:
     """Delete the Alpaca bars and actions that the resolver built as of
     `clock()` does not assign to their security, and record the run (module
     docstring); with `dry_run`, find and count them on a read-only
-    connection and change nothing. Raises `StoreLockedError` like ingest
-    when the store stays locked."""
+    connection and change nothing.
+
+    A real run deletes only what a dry run showed: `expect` is that dry
+    run's `(bar_rows, action_rows)`, and any other count raises
+    `RepairRefused` before anything is deleted. Raises `StoreLockedError`
+    like ingest when the store stays locked."""
+    if not dry_run and expect is None:
+        raise ValueError("a repair deletes only the counts of a dry run: pass expect")
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
     opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
         _read(settings) if dry_run else open_for_write(settings)
@@ -233,6 +267,11 @@ def repair_resolution(
             dry_run=dry_run,
         )
         if not dry_run:
+            if (result.bar_rows, result.action_rows) != expect:
+                raise RepairRefused(
+                    f"found {result.bar_rows} bar rows and {result.action_rows} action rows, "
+                    f"not the expected {expect}; nothing deleted, run --dry-run again"
+                )
             deleted = (
                 _delete(conn, "prices_daily", "session", bar_sources, found.bars),
                 _delete(conn, "corporate_actions", "ex_date", [ACTIONS_SOURCE], found.actions),

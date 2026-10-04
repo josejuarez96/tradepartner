@@ -88,7 +88,7 @@ from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
-from tradepartner.repair import repair_resolution, store_resolver
+from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
 from tradepartner.store import registry, schema
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -457,16 +457,35 @@ def make_app(
         dry_run: Annotated[
             bool, typer.Option(help="count what would be deleted and change nothing")
         ] = False,
+        expect_bar_rows: Annotated[
+            int | None, typer.Option(help="the dry run's bar row count (required to delete)")
+        ] = None,
+        expect_action_rows: Annotated[
+            int | None, typer.Option(help="the dry run's action row count (required to delete)")
+        ] = None,
     ) -> None:
         """Delete Alpaca bars and actions the resolver no longer assigns to their security."""
+        expect = None
+        if not dry_run:
+            if expect_bar_rows is None or expect_action_rows is None:
+                raise _fail(
+                    "run --dry-run first, then pass its counts as --expect-bar-rows and "
+                    "--expect-action-rows",
+                    USAGE_ERROR,
+                )
+            expect = (expect_bar_rows, expect_action_rows)
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
-            result = repair_resolution(s, clock=clock, dry_run=dry_run)
+            result = repair_resolution(s, clock=clock, dry_run=dry_run, expect=expect)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
         typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
 
     @app.command()
     def health(

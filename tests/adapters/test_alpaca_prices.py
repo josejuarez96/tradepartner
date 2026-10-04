@@ -767,12 +767,22 @@ class TestRegistrantCheck:
         assert evidence.left_on(AEP, date(1994, 5, 16)) is None
         assert evidence.delisted_on == {"0000000001:class-a": (date(2021, 1, 4),)}
         assert evidence.delisted_listings == {
-            "0000000001:class-a": ((date(1994, 1, 3), date(2021, 1, 4)),)
+            "0000000001:class-a": ((date(1994, 1, 3), "XA", date(2021, 1, 4)),)
         }
         # quiet: no share count for more than 180 days before the run
         assert evidence.left_on("0000000001:class-b", date(2019, 1, 2)) == date(2020, 1, 4)
         assert evidence.left_on("0000000001:class-a", date(2019, 1, 2)) == date(2020, 1, 4)
         assert evidence.left_on("0000000001:class-a", date(2020, 6, 1)) == date(2020, 1, 4)
+
+    def test_a_leaving_day_is_never_before_the_form_25_is_accepted(self) -> None:
+        # quant-auditor on #830: a stated effective day before the filing's
+        # acceptance would end sessions before anyone knew of the Form 25.
+        row = {
+            **_ended("0000000001", "XA", "Common Stock", date(2021, 1, 4)),
+            "delisting_filed_at": datetime(2021, 1, 8, 21, tzinfo=UTC),
+        }
+        evidence = registrant_evidence([], [row], as_of=RUN_DAY, quiet_after_days=180)
+        assert evidence.delisted_on == {"0000000001": (date(2021, 1, 9),)}
 
 
 class TestOwnDelisting:
@@ -932,6 +942,8 @@ class TestOwnDelisting:
         assert resolver.resolve("C", date(2016, 1, 4)) == citi
         assert resolver.resolve("C", date(2026, 9, 30)) == citi
         assert resolver.report.ended_spans == 0
+        assert resolver.report.kept_spans == 1
+        assert "1 kept through one by a later row" in resolver.report.summary()
 
     def test_a_reorganized_security_with_a_new_row_keeps_its_ticker(self) -> None:
         # CMPR (#820): a reorganization's Form 25 ends the old shares'
@@ -954,6 +966,67 @@ class TestOwnDelisting:
         # Without the new row (before #820), the span ends at the delisting.
         alone = ListingResolver(listings[:1], _evidence(facts, ends))
         assert alone.resolve("CMPR", date(2019, 12, 20)) is None
+
+    def test_a_delisted_co_registrant_never_blanks_the_holders_ticker(self) -> None:
+        # code-review on #830: AEP Texas never held AEP (co-registrant); its
+        # own listing's delisting must not shadow AEP from then on.
+        ends = [
+            _ended(
+                AEP_TEXAS,
+                "AEP",
+                "Common Stock",
+                date(2026, 9, 1),
+                valid_from=date(2026, 7, 30),
+            )
+        ]
+        resolver = ListingResolver(AEP_LISTINGS, _evidence(AEP_FACTS, ends))
+        assert resolver.report.co_registrant_spans == 1
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+        assert resolver.report.ended_spans == 0
+
+    def test_a_later_placeholder_row_never_hands_the_ticker_back(self) -> None:
+        # code-review on #830: a delisted shell keeps filing with trading
+        # symbol "None"; the older company does not get REUSE back then.
+        older, dead = "0000000001", "0000000002"
+        resolver = ListingResolver(
+            [
+                _listing(older, "REUSE", date(2005, 1, 3), "Common Stock"),
+                _listing(dead, "REUSE", date(2018, 3, 1), "Common Stock"),
+                _listing(dead, "None", date(2022, 3, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        dead,
+                        "REUSE",
+                        "Common Stock",
+                        date(2021, 6, 1),
+                        valid_from=date(2018, 3, 1),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("REUSE", date(2021, 6, 1)) is None
+        assert resolver.resolve("REUSE", date(2023, 1, 3)) is None
+
+    def test_a_delisted_typo_listing_never_ends_the_held_tickers_span(self) -> None:
+        # code-review on #830: the dropped typo row shares its day with the
+        # held ticker's row; its delisting must not end FutureFuel's FF.
+        day = date(2024, 5, 10)
+        resolver = ListingResolver(
+            [
+                _listing("0001337298", "FF", date(2020, 8, 7), "Common Stock"),
+                _listing("0001337298", "F", day, "Common Stock"),
+                _listing("0001337298", "FF", day, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [_ended("0001337298", "F", "Common Stock", date(2024, 6, 1), valid_from=day)],
+            ),
+        )
+        assert resolver.resolve("FF", date(2024, 7, 1)) == "0001337298"
+        assert resolver.report.ended_spans == 0
 
     def test_the_cut_acts_only_from_the_effective_day(self) -> None:
         # No look-ahead: the Form 25 is accepted before its effective day,
