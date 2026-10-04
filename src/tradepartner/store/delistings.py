@@ -11,7 +11,8 @@ stated date, else the acceptance's New York date plus 10 days (Rule
 12d2-2); it never sets an end, and only the re-tag rule below reads it.
 
 **One class per filing.** A filing names a class, not a company, so it is
-resolved to the `security_id` of its CIK whose listing on the filing's
+resolved to the `security_id` of its CIK (known by the filing's acceptance,
+and not yet succeeded by new equity, #820) whose listing on the filing's
 exchange has the same title up to the first comma (master's
 `_norm_title`). Failing that, a filing whose title is plain common equity
 (master's `_is_common`, and no warrant, right, unit, preferred or
@@ -93,6 +94,9 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 # Amendments too (owner decision 2026-09-26, #262): EDGAR's history has them,
 # and `derive_listing_ends`' earliest-filing rule means an amendment never
 # moves a listing's end, while a 25/A whose original is missing still ends it.
+# An amendment after a filing already counted for that security and exchange
+# is ignored at read time, so it never ends a relisting row opened after the
+# original (#820). Limit: a later delisting known only by its /A is missed.
 DELISTING_FORMS = frozenset({"25", "25-NSE", "25/A", "25-NSE/A"})
 
 #: Days from filing to effect when the filing states none (Rule 12d2-2).
@@ -178,10 +182,20 @@ _OFF_EXCHANGE = frozenset({"", "NONE", "OTC"})
 
 def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
     """The `security_id` `filing` delists, or `None` if it is not certain."""
+    # #820: never a successor known later. An original Form 25 after a
+    # succession names the successor; an amendment amends the old class's.
+    known = [s for s in master.successions if s.known_at <= filing.accepted_at]
+    if filing.form.endswith("/A"):
+        excluded = {s.security_id for s in known}
+    else:
+        excluded = {s.predecessor_id for s in known}
     candidates: set[str] = {
         row["security_id"]
         for row in master.securities
-        if row["cik"] == filing.cik and not row.get("benchmark", False)
+        if row["cik"] == filing.cik
+        and not row.get("benchmark", False)
+        and row["known_at"] <= filing.accepted_at
+        and row["security_id"] not in excluded
     }
     on_exchange = [
         row
@@ -340,8 +354,16 @@ def derive_listing_ends(
         bars[security_id].append(session)
 
     ended: dict[int, Row] = {}  # listing index -> the filing that ends it
+    counted: set[tuple[str, str]] = set()  # (security_id, exchange) with a filing
     for delisting in sorted(delistings.to_dicts(), key=lambda r: (r["filed_at"], r["form"])):
         security_id = delisting["security_id"]
+        key = (security_id, delisting["exchange"])
+        if delisting["form"].endswith("/A") and key in counted:
+            # Amends a filing already counted. `_ended_listing`'s already-ended
+            # skip misses a late /A after a relisting (#820): its target is
+            # then the new row, which no filing ended yet.
+            continue
+        counted.add(key)
         target = _ended_listing(
             by_security.get(security_id, []),
             delisting,

@@ -33,7 +33,7 @@ from edgar_transport import (
 from tradepartner.adapters.edgar import acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import EdgarFilingSource
-from tradepartner.adapters.filings import CoverPage, FilingIndexEntry
+from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
 from tradepartner.config import Settings
 from tradepartner.store.master import build_master
 
@@ -351,6 +351,9 @@ def test_the_master_stamps_filing_and_snapshot_provenance(tmp_path: Path) -> Non
     class NoCovers(EdgarFilingSource):
         def cover_pages(self, cik: str) -> list[CoverPage]:
             return []
+
+        def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
+            return []  # the master reads Form 25s for relistings (#820); none here
 
     settings = edgar_settings(tmp_path)
     settings = settings.model_copy(
