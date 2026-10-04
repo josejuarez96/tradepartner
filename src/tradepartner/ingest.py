@@ -650,7 +650,8 @@ def fact_rows(
     """`facts` rows for `records`, and the records no security could take.
 
     Candidates are the CIK's **common** classes, by the classification in
-    force at the fact's acceptance (no later knowledge picks the class);
+    force at the fact's acceptance (no later knowledge picks the class),
+    without a class whose successor is known by then (`MasterBuild.successions`);
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
@@ -667,11 +668,15 @@ def fact_rows(
     for row in master.securities:
         if not row["benchmark"]:
             by_cik[row["cik"]].append(row["security_id"])
+    succeeded = {s.predecessor_id: s.known_at for s in master.successions}
 
     def common_at(cik: str, t: datetime) -> list[str]:
-        """The CIK's classes classified `common` by the latest row known at `t`."""
+        """The CIK's classes classified `common` by the latest row known at
+        `t`, less any whose successor (new equity, #820) is known at `t`."""
         out = []
         for sid in by_cik.get(cik, []):
+            if sid in succeeded and succeeded[sid] <= t:
+                continue
             known = [kind for at, kind in kinds[sid] if at <= t]
             if known and known[-1] == "common":
                 out.append(sid)

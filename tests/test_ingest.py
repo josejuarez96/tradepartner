@@ -957,6 +957,50 @@ def test_a_class_member_needs_a_matching_title_even_for_one_class(settings: Sett
     assert (ACME, 7) in {(r["security_id"], r["value"]) for r in matched[0]}
 
 
+def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:
+    # #820: post-bankruptcy equity is a new security; the old common no
+    # longer takes the company's share count once the successor is known.
+    cik = "0000000099"
+    ingested_at = datetime(2021, 6, 1, tzinfo=UTC)
+
+    def shares(value: float, accession: str, at: datetime) -> FactRecord:
+        return FactRecord(
+            cik, "EntityCommonStockSharesOutstanding", at.date(), "", value, accession, at
+        )
+
+    before = shares(49_000_000, "a1", datetime(2020, 8, 6, 21, tzinfo=UTC))
+    after = shares(83_000_000, "a2", datetime(2020, 11, 5, 22, tzinfo=UTC))
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(cik, "Crc Co", "10-K", "k1", datetime(2018, 3, 1, tzinfo=UTC)),
+            FilingIndexEntry(cik, "Crc Co", "8-A12B", "r1", datetime(2020, 10, 27, tzinfo=UTC)),
+        ],
+        cover_pages=[
+            CoverPage(cik, "c1", datetime(2019, 8, 1, 21, tzinfo=UTC), (_common("CRC"),)),
+            CoverPage(cik, "a1", before.accepted_at, ()),
+            CoverPage(cik, "a2", after.accepted_at, (_common("CRC"),)),
+        ],
+        delistings=[
+            DelistingFiling(
+                cik, "25-NSE", "Common Stock", "NYSE", "d1", datetime(2020, 7, 31, 18, tzinfo=UTC)
+            )
+        ],
+        facts=[before, after],
+    )
+    master = build_master(source, settings, ingested_at=ingested_at)
+    classes = build_classifications(source, master, settings, ingested_at=ingested_at)
+    rows, unmatched = fact_rows([before, after], master, classes, ingested_at=ingested_at)
+    assert [(r["security_id"], r["value"]) for r in rows] == [
+        (cik, 49_000_000),
+        (f"{cik}@2020-11-05", 83_000_000),
+    ]
+    assert unmatched == ()
+
+
+def _common(ticker: str) -> CoverListing:
+    return CoverListing("Common Stock", ticker, "NYSE")
+
+
 def test_shares_reach_the_as_of_read(settings: Settings) -> None:
     _run(settings)
     with duckdb.connect(settings.store.path, read_only=True) as conn:

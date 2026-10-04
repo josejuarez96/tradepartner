@@ -11,7 +11,8 @@ the filing's stated date, else the acceptance's New York date plus 10
 days (Rule 12d2-2).
 
 **One class per filing.** A filing names a class, not a company, so it is
-resolved to the `security_id` of its CIK whose listing on the filing's
+resolved to the `security_id` of its CIK (known by the filing's acceptance,
+so never new equity listed after it, #820) whose listing on the filing's
 exchange has the same title up to the first comma (master's
 `_norm_title`). Failing that, a filing whose title is plain common equity
 (master's `_is_common`, and no warrant, right, unit, preferred or
@@ -120,7 +121,9 @@ def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
     candidates: set[str] = {
         row["security_id"]
         for row in master.securities
-        if row["cik"] == filing.cik and not row.get("benchmark", False)
+        if row["cik"] == filing.cik
+        and not row.get("benchmark", False)
+        and row["known_at"] <= filing.accepted_at  # never a successor known later (#820)
     }
     on_exchange = [
         row
