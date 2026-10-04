@@ -7,8 +7,13 @@ Merging this file does not register it. The owner runs
 10, [backtest spec](../specs/backtest.md); plan T45b), **on or after 2026-10-01**, so that
 `holdout.end` is a completed month-end. Before registering, the owner re-checks
 `docs/research/` for holdout-period results published since this file was written and adds
-them to the disclosure below; an edit before registration is not a new hypothesis. The
-registry hashes the whole file, so any edit after registration makes a new hypothesis.
+them to the disclosure below, and re-runs the Q8 amendment's coverage check on the store he
+registers on (`universe_as_of` at close of 2019-10-31 and of 2019-11-29: the top-1000 cut
+must not bind at the first and must bind at the second; the date was pinned on the
+pre-repair store, and the listing repairs since #818 can move either count). If the first
+binding month-end moved, he re-pins `in_sample_start` and the counts in this file first. An
+edit before registration is not a new hypothesis. The registry hashes the whole file, so any
+edit after registration makes a new hypothesis.
 
 ## Economic rationale
 
@@ -159,17 +164,27 @@ Owner answers that set these values (spec open questions, answered on #156):
   | 2020-03-31 | 1000 | 1122 | 122 | 3,941 |
 
   **The rule:** the first month-end at which ADR 0006's size rule binds, that is, at
-  which at least `universe.top_n_by_cap` (1000) companies pass rules 1–7 and the universe
-  is the top 1000 by market cap rather than "every company with a cover page so far".
-  Non-zero is not enough: from 2019-07 to 2019-10 the cut never bound, so those universes
-  are the coverage ramp, not a top-1000, and a run starting there would hold a book whose
-  membership is set by filing arrival, not by size. That month-end is **2019-11-29**, so
-  `in_sample_start = 2019-11-29`. Its 1065 companies above the cut are within 5% of the
-  next four month-ends (1094–1122), and the dry run found 1000–1008 members at every later
-  rebalance it sampled (2020-06-30 to 2023-12-29). The 1000th company at 2019-11-29 sits a
-  little lower in the cap ranking than in later months (65 companies of headroom against
-  about 100); that is noted, not corrected. The first rebalance's signal reads closes from
-  2018-11-30 (`formation_months = 12`: close(month-end of T − 12) to close(month-end of
+  which at least `universe.top_n_by_cap` (1000) companies pass rules 1–7, so the universe
+  is a top 1000 by market cap **among the companies whose cover page is known at T**, and
+  no longer "every company with a cover page so far". The owner's decision said
+  "populated" and left the threshold open; "the cut binds, not merely non-zero" is the
+  team's reading (orchestrator brief for #842), confirmed by the owner's merge of this
+  amendment. Non-zero is not enough: from 2019-07 to 2019-10 the cut never bound, so
+  those universes are the coverage ramp, not a top-1000, and a run starting there would
+  hold a book whose membership is set by filing arrival, not by size. That month-end is
+  **2019-11-29**, so `in_sample_start = 2019-11-29`. Coverage is still ramping after it:
+  listing rows known grow from 3,438 to 3,941 and companies reaching rule 8 from 1065 to
+  1122 by 2020-03, so a late filer that would outrank the 1000th company can still be
+  missing at the first rebalances. That residual bias is accepted and reported, not
+  removed; the 1065 at 2019-11-29 are within 6% of the next four month-ends (1094–1122),
+  and the dry run found 1000–1008 members at every later rebalance it sampled (2020-06-30
+  to 2023-12-29). The 1000th company at 2019-11-29 sits a little lower in the cap ranking
+  than in later months (65 companies of headroom against about 100); that is noted, not
+  corrected. **No trial result was seen before this choice:** every #839 backtest failed
+  before `write_results` (the benchmark read, #840, or the CG dividend, #841), so no
+  in-sample return, turnover or metric exists for any window on any store, and the sweep
+  above counted universe members and exclusions only. The first rebalance's signal reads
+  closes from 2018-11-30 (`formation_months = 12`: close(month-end of T − 12) to close(month-end of
   T − 1), 2019-10-31) and rule 6 needs bars from December 2018; the store holds Alpaca
   bars from January 2016 (ADR 0009), so the lookback has about three years of slack and
   the start is set by listings, not by prices. Two open data issues (#845, share-count
@@ -177,9 +192,10 @@ Owner answers that set these values (spec open questions, answered on #156):
   benchmark rows) were found on the same store and are not addressed here; neither changes
   which month-end the cut first binds. H1 is not registered on the owner's store, so this
   edit changes the file before its first registration and is not a new hypothesis. The
-  registry hashes the whole file, so the hash changes; that matters only because no
-  registration exists to match it against: #839 registered the #156 version on its store
-  copies (params sha256 `2152b671…`), never on the owner's store, and those copies are gone.
+  registry hashes the whole file, so this edit changes H1's hash; that is harmless because
+  no registration exists on the owner's store for the new hash to differ from. #839
+  registered the #156 version on its store copies only (params sha256 `2152b671…`), and
+  those copies are gone.
 - **Q10, statistical threshold:** option (a), no numeric cut-off. The retirement condition
   is stated in words at the end of this file. DSR is shown on both bases, never adjudicated
   (ADR 0005: beating a benchmark is never a phase-exit criterion).
@@ -238,16 +254,21 @@ back-tested). No Tier 1 source gives a post-2010 peak-to-trough; the run compute
 - A survivorship gap above `gap.count_share_threshold` at any rebalance: not a flag of
   an edge, but of a biased universe, and the holdout cannot be spent over it without a
   logged owner decision.
-- A non-zero `n_static_listings` at any rebalance, or a universe below
-  `universe.top_n_by_cap` members at any rebalance. Before the #842 amendment this bullet
-  watched for "a large static-listing count in 2017–2018", the years the universe was
-  expected to lean on `snapshot_static` rows (#35). That reading is moot: the window now
-  starts 2019-11-29, after the cover-page era began, and under #35 the `snapshot_static`
-  rows (known 2026-10-03) are invisible at every in-sample T anyway, so the count is zero
-  by construction. A non-zero count would mean a `known_at` on a static row earlier than
-  its fetch: a point-in-time bug, not a universe property. A universe short of 1000 would
-  mean the size cut did not bind, the condition the start date was chosen to rule out
-  (Q8 amendment), so listing coverage has a hole inside the window.
+- On the owner's store: a non-zero `n_static_listings` at any rebalance, or an
+  `n_universe` below `universe.top_n_by_cap` at any rebalance. Before the #842 amendment
+  this bullet watched for "a large static-listing count in 2017–2018", the years the
+  universe was expected to lean on `snapshot_static` rows (#35). That reading is moot: the
+  window now starts 2019-11-29, after the cover-page era began, and under #35 the owner's
+  store's `snapshot_static` rows (known 2026-10-03, after `holdout.end`) are invisible at
+  every in-sample T anyway, so the count is zero by construction. A non-zero count there
+  would mean a `known_at` on a static row earlier than its fetch: a point-in-time bug, not
+  a universe property. (The fixture store is different: its `snapshot_static` row for
+  PRE9 is known 2020-01-15, so a `backtest-runner` smoke run over 2019-11-29 to 2020-06-30
+  counts it legitimately.) `n_universe` counts securities and rule 8 cuts companies, so with
+  multi-class companies admitted it runs 1000–1008; a value below 1000 is a sufficient,
+  not a necessary, sign that fewer than 1000 companies reached rule 8, that is, that the
+  size cut did not bind, the condition the start date was chosen to rule out (Q8
+  amendment), so listing coverage has a hole inside the window.
 
 ## Power arithmetic
 

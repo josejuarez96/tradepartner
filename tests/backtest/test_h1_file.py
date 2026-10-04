@@ -1,8 +1,8 @@
 """The H1 hypothesis file parses through `backtest.hypothesis` (plan T35b, spec req 18).
 
 `docs/hypotheses/h1-momentum-12-1.md` must name every required key with `family=momentum`
-and the owner's answers to spec open questions 1, 2 and 8 (#156). Nothing here registers
-it: the owner does that on the real store after merge (T45b).
+and the owner's answers to spec open questions 1, 2 and 8 (#156; Q8 amended on #842).
+Nothing here registers it: the owner does that on the real store after merge (T45b).
 """
 
 from __future__ import annotations
