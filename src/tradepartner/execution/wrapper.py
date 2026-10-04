@@ -1377,7 +1377,11 @@ class RiskGatedBroker:
             return
         except Exception as exc:
             self._event(coid, _CANCEL_FAILED, stamp, notes)
-            notes.append(f"halt read of {coid} failed ({type(exc).__name__})")
+            # The message is kept (scrubbed): a refusal such as #650's names
+            # the timestamps that explain it (#730).
+            notes.append(
+                f"halt read of {coid} failed ({type(exc).__name__}: {self._scrub(str(exc))})"
+            )
             return
         notes.extend(breach.message for breach in collected.rejections)
 
