@@ -23,6 +23,7 @@ from tradepartner.execution.outcomes import (
     Outcome,
     OutcomeWindow,
     due_outcomes,
+    outcome_horizon,
     write_outcomes_and_lots,
 )
 from tradepartner.store import journal, schema
@@ -173,6 +174,40 @@ class Book:
 
 def _by_kind(outcomes: Sequence[Outcome]) -> dict[tuple[str, str], Outcome]:
     return {(o.client_order_id, o.kind): o for o in outcomes}
+
+
+def _order(session: date, phase: str) -> OrderRow:
+    return OrderRow(
+        client_order_id="tp-horizon",
+        decision_id=1,
+        run_id=1,
+        session=session,
+        attempt=1,
+        phase=phase,
+        security_id="SEC_A",
+        symbol="SEC_A",
+        side="buy",
+        sells_in_flight_at_submit=False,
+        known_at=_utc(session),
+        ingested_at=_utc(session),
+    )
+
+
+def test_outcome_horizon_is_the_orders_own_session_for_a_forced_exit() -> None:
+    """Pins `outcome_horizon` (#597), the one place `_horizon`'s non-stop
+    `base` and `check._order_due_threshold` both read it from."""
+    order = _order(F_I, phase="exit")
+    assert outcome_horizon(order, None) == F_I
+
+
+def test_outcome_horizon_uses_the_decision_rebalance_when_given() -> None:
+    order = _order(date(2026, 11, 2), phase="buy")
+    assert outcome_horizon(order, T_I) == T_NEXT
+
+
+def test_outcome_horizon_falls_back_to_the_rebalance_before_the_orders_session() -> None:
+    order = _order(F_I, phase="buy")
+    assert outcome_horizon(order, None) == T_NEXT
 
 
 def test_a_filled_buy_has_its_position_return_and_contribution() -> None:
