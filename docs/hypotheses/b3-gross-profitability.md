@@ -1,6 +1,6 @@
 # Hypothesis: B3, long-only gross profitability (GP/A) tilt, monthly
 
-**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers pending  ·  **Date:** 2026-10-03  ·  **Status:** draft, not registrable
+**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 pending  ·  **Date:** 2026-10-03  ·  **Status:** draft, not registrable
 
 Merging this file does not register it, and today it **cannot** be registered: the
 `profitability` family, its frozen keys and its signal do not exist in the engine (the
@@ -9,7 +9,8 @@ says what must be built), and the statement facts it reads reach the owner's sto
 with plan task T78 ([data-foundation spec](../specs/data-foundation.md), amendment #660).
 The owner runs `tradepartner hypothesis register docs/hypotheses/b3-gross-profitability.md`
 after both, on or after a date at which `holdout.end` is a completed month-end. Before
-registering, the owner answers the open questions at the end of this file, re-checks
+registering, the owner answers the questions still open at the end of this file (B3-3
+to B3-8; B3-1 and B3-2 are decided), re-checks
 `docs/research/` and the trial registry for holdout-period results seen since this draft
 (H1's holdout spend included, since the two windows coincide) and adds them to the
 disclosure; an edit before registration is not a new hypothesis. The registry hashes the
@@ -196,16 +197,17 @@ compared.
 
 The block below is the only part the registry parses. It is **proposed**: the
 `profitability` section, the family name and the per-family required-keys rule do not
-exist in `backtest/hypothesis.py` or `config.py` yet (amendment #720, open question B3-1),
-so registering this file today fails on `family` and on unknown keys. Whether the file
-must also name the inert `strategy.*` keys is open question B3-1; they are left out here
-on the amendment's recommendation. The three other frozen keys H1 pins are pinned here
-for the same reasons (`universe.top_n_by_cap`, `execution.fill_price`,
+exist in `backtest/hypothesis.py` or `config.py` yet (amendment #720, spec open question
+11, decided), so registering this file today fails on `family` and on unknown keys. The
+file does not name the inert `strategy.*` keys: the required sections are keyed per
+family (B3-1, decided (a) by the owner, 2026-10-03). The three other frozen keys H1 pins
+are pinned here for the same reasons (`universe.top_n_by_cap`, `execution.fill_price`,
 `alpaca.historical_feed`); every other frozen key takes its live config value at
-registration and is printed with the rest. Under the strategy-lab spec (draft, #281) the
-first registration in a family fixes its **family rules**; the holdout, `in_sample_start`,
-costs, universe and fill convention below are H1's so that the two families are one
-data-and-cost world (open question B3-2 on the lab's holdout-overlap rule).
+registration and is printed with the rest. The holdout, `in_sample_start`, costs,
+universe and fill convention below are H1's so that the two families are one
+data-and-cost world; B3 registers **before** the strategy lab's migration (B3-2, decided
+(a) by the owner, 2026-10-03), so the lab's family rules, once they exist, are fixed from
+this registration, and its overlap and standalone-file rules do not apply to it.
 
 ```toml hypothesis
 slug = "b3-gross-profitability"
@@ -499,43 +501,31 @@ audit, and the hypothesis stays unresolved until the audit ends.
 or the weighting, is a new file with a new slug, counted in the profitability family's
 N. This file is never edited after registration to fit a result.
 
-## Open questions for the owner (answers on #720; none is decided here)
+## Open questions for the owner (answers on #720; B3-1 and B3-2 decided 2026-10-03, the rest open)
 
-- **B3-1. How the family's keys enter the file.** `backtest/hypothesis.py` requires
-  every `strategy.*` key and refuses unknown keys; `StrategyConfig` forbids extras.
-  Options: (a) a new frozen section `profitability` required in full when
-  `family = "profitability"`, with the required sections keyed per family (`momentum`:
+- **B3-1. How the family's keys enter the file.** Decided (a), owner, 2026-10-03 (with
+  spec open question 11): a new frozen section `profitability` required in full when
+  `family = "profitability"`, the required sections keyed per family (`momentum`:
   `strategy`; `profitability`: `profitability`; `costs` always), as the block above
-  assumes; (b) the file names the inert `strategy.*` keys too, under the current rule.
-  Recommendation: (a). Either way the new section must land with a defaults mechanism
-  (the strategy-lab spec's `FROZEN_KEY_DEFAULTS` and `frozen_values`, or a minimal
-  equivalent), because adding a frozen section today makes H1's registration unrunnable
-  until re-registered, which the lab spec forbids (amendment #720, "Frozen keys").
-- **B3-2. Registering B3 beside the strategy lab.** Two of the lab spec's rules bear
-  on this file once its migration has run. First, its Definitions say a new family's
-  holdout "may not overlap any existing non-oracle family's holdout", which forbids
-  `[2024-01-01, 2026-09-30]`. Second, its req 1 and req 5(b) say `hypothesis register`
-  then accepts only an unchanged re-registration or a **promoted** file, and a holdout
-  spend by a hypothesis that is not pre-lab needs a `promotion` decision: a new
-  hypothesis enters as a one-value sweep with a `[lab]` block, is run, and is promoted
-  before it can spend. Options: (a) register B3 **before** the lab migration, as a
-  pre-lab registration: this file as written, the Phase 3 rules for its runs and its
-  one spend, grandfathered by `pre_lab_hypotheses`; the plan orders T85f before the lab's
-  migration task; (b) register B3 **after** it: this file is re-cast as a one-value
-  sweep file under `docs/sweeps/` (same block plus `[lab]`, `schedule.rebalance_cadence
-  = "month_end"`), run through `sweep run`, promoted with `sweep promote` before any
-  holdout spend, and the overlap rule is amended to what it protects against, in both
-  directions: "a new family's holdout overlaps no months any existing non-oracle family
-  has run in sample, and its in-sample window overlaps no existing family's holdout",
-  which this file satisfies (in-sample to 2023-12-29, holdout from 2024-01-01, as H1);
-  (c) a holdout from 2026-10-01, which would not be a completed window for about two
-  years, under either route. Recommendation: (a) if T85 to T85f land before the lab's
-  migration, else (b); the owner decides when the plan is amended (spec open question
-  13 records the lab sentences each route changes). Under every option a shared window
-  means two families can spend one holdout: the amendment marks a spend whose window
-  overlaps another family's recorded spend (`holdout_seen_family`, reported, not a
-  gate), and an H1 holdout result is evidence this file must disclose at registration
-  (above); ADR 0005 means no holdout result selects between the two families either way.
+  assumes; the file never names the inert `strategy.*` keys. The section lands with a
+  defaults mechanism (the strategy-lab spec's `FROZEN_KEY_DEFAULTS` and `frozen_values`,
+  or a minimal equivalent in T85), because adding a frozen section today makes H1's
+  registration unrunnable until re-registered, which the lab spec forbids (amendment
+  #720, "Frozen keys").
+- **B3-2. Registering B3 beside the strategy lab.** Decided (a), owner, 2026-10-03
+  (with spec open question 13): B3 is registered **before** the lab migration, as a
+  pre-lab registration, this file as written, under the Phase 3 rules for its runs and
+  its one spend, grandfathered by `pre_lab_hypotheses`; the plan orders T85f before the
+  lab's migration task (the strategy-lab plan is not written, #281 open). So neither the
+  lab's holdout-overlap rule nor its standalone-file refusal applies to B3, and the one
+  lab-spec sentence this draft changes is the fingerprint one (`family` and the family's
+  own section in the fingerprint). Rejected: re-casting the file as a one-value sweep
+  plus a promotion, with the overlap rule amended in both directions; a holdout from
+  2026-10-01. A shared window still means two families can spend one holdout: the
+  amendment marks a spend whose window overlaps another family's recorded spend
+  (`holdout_seen_family`, reported, not a gate), an H1 holdout result is evidence this
+  file must disclose at registration (above), and ADR 0005 means no holdout result
+  selects between the two families.
 - **B3-3. `max_fact_age_days`.** The filing calendar (SEC deadlines, not register
   evidence): a 10-K is due 60, 75 or 90 days after fiscal year end for large
   accelerated, accelerated and non-accelerated filers, so a December fiscal year's
