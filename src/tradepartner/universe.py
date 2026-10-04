@@ -283,7 +283,7 @@ def shares_as_of(
 
     Per security (every one when `ids` is `None`), its `shares_outstanding`
     facts known at `t` are walked in `as_of_date` order. The first is
-    accepted, unless it is zero or negative: such a value is always
+    accepted, unless it is zero, negative or NaN: such a value is always
     rejected and never a baseline. Each later one is compared with the last accepted fact moved by
     every split known at `t` with `accepted_as_of < ex_date <= as_of_date`:
     a ratio above `universe.max_shares_ratio` or below its inverse is out of
@@ -316,7 +316,7 @@ def shares_as_of(
             latest_ok = False
             if value is None:
                 continue
-            if value <= 0:
+            if not value > 0:  # zero, negative or NaN
                 # Not a share count: always rejected, never a baseline, and no
                 # owner entry accepts it.
                 outliers.append(

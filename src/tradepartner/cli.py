@@ -264,11 +264,13 @@ def _print_report(report: HealthReport) -> None:
         f"{outliers.frame.height} in all"
     )
     for row in outliers.pending.iter_rows(named=True):
-        echo(
-            f"  {row['security_id']}@{row['as_of_date']} {row['value']:.0f} "
-            f"(x{row['ratio']:.4g} over {row['baseline_value']:.0f} "
-            f"as of {row['baseline_as_of']})"
+        why = (
+            "not a share count"
+            if row["ratio"] is None
+            else f"x{row['ratio']:.4g} over {row['baseline_value']:.0f} "
+            f"as of {row['baseline_as_of']}"
         )
+        echo(f"  {row['security_id']}@{row['as_of_date']} {row['value']:.0f} ({why})")
     echo(f"settings: {report.settings}")
     echo("integrity:")
     for check in report.integrity:
