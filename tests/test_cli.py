@@ -19,6 +19,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tradepartner import cli
+from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import session_close
@@ -242,12 +243,15 @@ def test_missing_alpaca_keys_refuse_a_price_run_but_not_an_edgar_one(
 
 
 def test_ingest_builds_the_edgar_source_from_settings_with_the_injected_client(
-    secrets_set: Settings,
+    secrets_set: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real `ingest_session` over a real `EdgarFilingSource`: every request
     goes through the injected transport with the declared User-Agent; SEC
     refusing it fails the EDGAR chunk, which writes only its failed run row,
-    and the command exits non-zero without echoing the User-Agent."""
+    and the command exits non-zero without echoing the User-Agent. The one
+    `403` wait (`edgar.rate_limit_wait_seconds`, #554) is recorded, not slept."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -266,6 +270,7 @@ def test_ingest_builds_the_edgar_source_from_settings_with_the_injected_client(
         rows = conn.execute("SELECT source, status FROM ingestion_runs").fetchall()
         assert rows == [("edgar", "failed")]
         assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
+    assert secrets_set.edgar.rate_limit_wait_seconds in slept
 
 
 # --- the price source the CLI builds -------------------------------------------
