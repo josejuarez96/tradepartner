@@ -16,10 +16,19 @@ never by notional (ADR 0010 amendment 2026-09-30):
   (`open_sells`, same as a trim's cap, below; #647 item 5 owner decision: a
   full exit nets them out exactly like a trim, computed with the same
   `_trim_cap`, and never halts `check_phase`'s `sell_sum_within_holding` on
-  its own open sells). A re-attempt after a partial fill sells the holding
-  that is left, so the first attempt and every later one follow one rule. Its
-  whole-share basis is the decision's journaled `whole_share` flag alone
-  (#395);
+  its own open sells). The netting is the trim's arithmetic, but the
+  under-sell heals differently: a full exit's remainder is its latest
+  order's quantity less its fills, so once the netted order fills the
+  decision is settled, and if the other open sell then expires unfilled the
+  name is still held with no open decision (never a short). A `delisted`
+  holding heals on the next run (`exits.py` makes a new forced exit once no
+  own sell is open); an `untargeted_receipt` (its settled exit spends the
+  receipt) and a plan full exit (`left_targets`, `left_universe`,
+  `exclude_name`) heal only at the next rebalance's `plan.decisions_from`;
+  a `window_stop` exit is never made beside an open own sell (#647 review).
+  A re-attempt after a partial fill sells the holding that is left, so the
+  first attempt and every later one follow one rule. Its whole-share basis
+  is the decision's journaled `whole_share` flag alone (#395);
 - a **trim** sells its remainder (`DecisionState.remainder`, the trim's notional
   left converted at the reference price; a planned quantity there is already
   adjusted by the splits in (T_i, S]), capped at the holding on S less the
