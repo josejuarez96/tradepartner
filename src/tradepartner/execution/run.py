@@ -79,7 +79,9 @@ held is flat. The flatness a run's own step 7b fills make is therefore the next
 run's to find, and an order's horizon ends at the earliest of the flattening
 fill, close(T_{i+1}) and close(S-1) of the first such run (T62's `due_outcomes`).
 
-**Step 6.** Under an engaged switch the run ends here, `skipped_kill_switch`.
+**Step 6.** Under an engaged switch the run ends here, `skipped_kill_switch`,
+after one `kill_switch` alert naming the latest `engaged` row's source and
+reason and the derived causes (#677; a batch the wrapper skips writes it too).
 Otherwise a `stop` run goes to `stop_step`, which plans nothing; a run with a rebalance or catch-up
 due plans through `planning.plan_rebalance` (with this run's `assets` read and
 the `fills_lagging` state: any order lagging at step 3 or at step 4) and goes
@@ -147,7 +149,7 @@ status (`skipped_kill_switch` when the wrapper read the switch engaged) is
 the run's.
 
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
-`ok`, or the batch's `skipped_kill_switch`.
+`ok`, or the batch's `skipped_kill_switch` (after its `kill_switch` alert, as at step 6).
 
 **Exits.** Every broker read the run makes itself, the collection, both
 reconciliations and the planning step's `assets` reads go through one path: an
@@ -306,6 +308,7 @@ _LAGGING = "lagging"
 _UNSPENT_CASH = "unspent_cash"
 _RUN_WRITER = "run"
 _DRAWDOWN = "drawdown"
+_KILL_SWITCH = "kill_switch"
 _INGEST_OK = "ok"
 #: The lot ledger's account (spec req 13: Phase 4 holds one account, paper).
 _ACCOUNT_TYPE, _ACCOUNT_OWNER = "paper", "self"
@@ -992,6 +995,42 @@ class _Run:
                 pass
         return utc_now(), True
 
+    def _skipped(self) -> RunOutcome:
+        """The `kill_switch` alert, then the `skipped_kill_switch` result row
+        (owner decision on #644, #677). Run-scoped, so one alert per run while
+        the switch stays engaged; the message names the latest `engaged` row's
+        source and reason, and every cause the derived state gives."""
+        with open_read_only(self.settings) as conn:
+            rows = kill_switch_events_for(conn, self.window_id)
+            runs = runs_for(conn, self.window_id)
+        state = switch.derive(
+            self.window,
+            rows,
+            [r.run for r in runs],
+            [r.result for r in runs if r.result is not None],
+            reading_run=self.run_id,
+            lock_free=True,
+        )
+        own = sorted(
+            (r for r in rows if r.window_id == self.window_id), key=lambda r: r.event_id or 0
+        )
+        if own and own[-1].state == switch.ENGAGED:
+            latest = own[-1]
+            fault = f", fault {latest.fault_type}" if latest.fault_type else ""
+            row = (
+                f"kill_switch event {latest.event_id}: source {latest.source}{fault}, "
+                f"reason {latest.reason or 'none given'}"
+            )
+        else:
+            row = "no engaged kill_switch row"
+        causes = "; ".join(state.causes) or "no cause derived at the alert"
+        self._alert(
+            _KILL_SWITCH,
+            f"paper run {self.run_id} on {self.session.isoformat()} skipped: the kill switch "
+            f"is engaged ({row}; causes: {causes})",
+        )
+        return self._finish(SKIPPED_KILL_SWITCH)
+
     def _finish(self, status: str) -> RunOutcome:
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
@@ -1067,7 +1106,7 @@ class _Run:
         self._lapses()
         self._outcomes(actions)
         if self.engaged:
-            return self._finish(SKIPPED_KILL_SWITCH)
+            return self._skipped()
 
         lagging = bool(collected.lagging) or reconciliation.status == FILLS_LAGGING
         context = StepContext(
@@ -1108,6 +1147,8 @@ class _Run:
                 cash_left = {rebalance: batch.cash_left} if rebalance is not None else {}
                 self._unspent_cash(executed, cash_left)
         self._reconcile()
+        if batch is not None and batch.status == SKIPPED_KILL_SWITCH:
+            return self._skipped()
         return self._finish(OK if batch is None else batch.status)
 
     def _stop_missed(self) -> None:
