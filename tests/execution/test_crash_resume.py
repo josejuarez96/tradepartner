@@ -343,7 +343,7 @@ def test_resume_settles_the_pending_order_and_the_next_run_reattempts_only_it(
     # `open_orders()` is every order not in a terminal status, which (per
     # `broker.py`'s `TERMINAL_STATUSES`) is exactly `accepted`, so this is
     # the public equivalent of the private `_orders` reach it replaces.
-    for order in list(env.fake.open_orders()):
+    for order in env.fake.open_orders():  # already a new list, not a live view
         env.fake.simulate_fill(order.client_order_id)
 
     outcome = _resume(env, accept_broker_fills=True)
@@ -802,7 +802,10 @@ def _price_every_symbol(env: Env, session: date) -> None:
     a restatement gives `(security_id, session)` more than one `known_at`
     (schema.py's `UNIQUE (security_id, session, known_at)`), which could
     read a later-known price into the fake's fill and silently violate
-    point-in-time."""
+    point-in-time. `store.asof.prices_as_of` does the same `known_at`
+    pick, but over every session at once, as a polars frame with no
+    ticker; a raw query stays simpler here, where exactly one session is
+    wanted and the result must join to `listings` for the ticker anyway."""
     as_of = at(previous_session(session), 21, 0)
     rows = env.query(
         "SELECT l.ticker, p.close FROM prices_daily p "
@@ -856,7 +859,13 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     # `FROZEN_PAPER_KEYS`), so give this window's frozen value the same key
     # production would, and read the loop bound back from it rather than
     # from `Settings()` (which the owner's environment, not the window,
-    # controls).
+    # controls). This is done with a direct `UPDATE`, not by having the
+    # shared `frozen_json()` helper freeze every `FROZEN_PAPER_KEYS` key
+    # from `PaperConfig()` the way `window.py`'s `_frozen_params` does:
+    # that helper's `paper.max_catch_up_sessions` is deliberately set to
+    # the test constant `MAX_CATCH_UP` (2), not the config default (5), so
+    # a blanket default-filling loop there would silently change every
+    # other test's catch-up-session behavior.
     assert window.window_id is not None
     frozen_values = json.loads(window.frozen_json)
     frozen_values["paper.min_rebalances"] = PaperConfig().min_rebalances
@@ -883,21 +892,20 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
 
     cash_tolerance = Decimal(repr(FROZEN.reconcile_cash_tolerance))
     any_fill_needed_rounding = False
-    sessions_with_fills = 0
     for session in sessions:
         outcome = env.run(at(session))
         assert outcome.status == "ok", env.result(env.latest_run())
+        # `superseded_by IS NULL`: every journal reader (`journal.fills_for`,
+        # `journal.py`'s own "the only reader of `fills`" contract) hides a
+        # superseded row. This test's fills are never superseded (no lagging
+        # fill, no resume in this test), so the filter changes nothing here
+        # today, but a raw query should still match what production reads.
         session_fills = env.query(
             "SELECT f.price, f.quantity, o.side FROM fills f "
             "JOIN orders o ON o.client_order_id = f.client_order_id "
-            "WHERE o.run_id = ?",
+            "WHERE o.run_id = ? AND f.superseded_by IS NULL",
             [outcome.run_id],
         )
-        # a rebalance that already matches its target makes no order, so
-        # not every one of the six sessions need fill; the window as a
-        # whole does (checked below).
-        if session_fills:
-            sessions_with_fills += 1
         # The month's own cash drift: a buy's rounded cost understates or
         # overstates the exact one by `exact - rounded`; a sell's effect on
         # cash is the opposite sign. Kept per session, not accumulated
@@ -921,7 +929,9 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     rows = env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id")
     assert len(rows) >= min_rebalances  # not a vacuous pass on an empty table
     assert all(status == "ok" for (status,) in rows)
-    assert sessions_with_fills > 0  # fills were actually made somewhere in the window
+    # vacuous-pass guard: `any_fill_needed_rounding` can only be True if at
+    # least one fill was made somewhere in the window, so this alone also
+    # proves fills were made, not just that rounding was exercised.
     assert any_fill_needed_rounding  # at least one fill's exact notional needed cent rounding
 
 
