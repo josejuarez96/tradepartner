@@ -901,12 +901,11 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
         # The month's own cash drift: a buy's rounded cost understates or
         # overstates the exact one by `exact - rounded`; a sell's effect on
         # cash is the opposite sign. Kept per session, not accumulated
-        # across sessions: reconciliation resets the ledger to the
-        # broker's own cash every run (`ledger.py`'s "built from the
-        # broker's cash", not a carried-forward residual), so there is no
-        # production invariant that sums this across months, only one that
-        # bounds it within each one, the same tolerance each reconciliation
-        # already enforces.
+        # across sessions: `ledger.py` builds cash from the window's last
+        # `ok` reconciliation's `broker_cash` plus only what's known after
+        # it, so there is no production invariant that sums this drift
+        # across months, only one that bounds it within each one, the same
+        # tolerance each reconciliation already enforces.
         session_drift = Decimal("0")
         for price, quantity, side in session_fills:
             exact = Decimal(repr(price)) * Decimal(repr(quantity))
