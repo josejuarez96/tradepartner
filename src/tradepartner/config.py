@@ -226,6 +226,14 @@ class MasterConfig(BaseModel):
     """Security-master construction rules."""
 
     transfer_window_sessions: int = 5
+    #: Sessions either side of a Form 25's filing session in which an 8-K12B
+    #: (successor issuer) or a Form 15 (deregistration) belongs to it (#834):
+    #: the real cases sit 6 sessions before to 9 after.
+    reorganisation_window_sessions: int = 10
+    #: Days after a Form 25's effective day before a companies snapshot still
+    #: naming the ticker counts as listing evidence (#834), so a fetch before
+    #: SEC drops a delisted ticker never relists it.
+    snapshot_relisting_lag_days: int = 30
     issuer_forms: list[str] = Field(
         default_factory=lambda: [
             "10-K",

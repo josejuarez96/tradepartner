@@ -1310,3 +1310,58 @@ class TestListingEvidenceAfterForm25:
             (cik, "CTO", date(2020, 11, 5), _at(2020, 11, 5), "filing"),
             (cik, "CTO", date(2021, 3, 5), _at(2021, 3, 5), "filing"),
         ]
+
+    @pytest.mark.parametrize(
+        "fetched_at",
+        [_at(2026, 6, 10), _at(2026, 6, 16), _at(2026, 7, 14)],
+        ids=["before-effective", "day-after-effective", "inside-lag"],
+    )
+    def test_a_snapshot_inside_the_lag_relists_nothing(self, fetched_at: datetime) -> None:
+        # safety-reviewer and quant-auditor on #835: a daily fetch before SEC
+        # drops a delisted ticker must not relist it (effective 2026-06-15,
+        # lag 30 days: first eligible fetch 2026-07-15).
+        build = build_master(
+            self._sa(fetched_at=fetched_at), _settings(), ingested_at=self.INGESTED
+        )
+        assert [r[2] for r in self._rows(build)] == [date(2026, 3, 27)]
+
+    def test_a_snapshot_after_a_form_15_relists_nothing(self) -> None:
+        # An acquired company deregisters; a fetch that still shows its
+        # ticker is no listing evidence.
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2026, 5, 7), ("Common Stock", "GORO", "NYSE_AMERICAN"))],
+            DelistingFiling(
+                cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
+            ),
+            forms=(("15-12G", _at(2026, 7, 30, 20, 1)),),
+            snapshot=(_snap(cik, "GOLD RESOURCE", "GORO", "NYSE_AMERICAN", _at(2026, 10, 4)),),
+        )
+        assert [r[2] for r in self._rows(build)] == [date(2026, 5, 7)]
+
+    def test_an_8k12b_years_after_the_form_25_relists_nothing(self) -> None:
+        # safety-reviewer and quant-auditor on #835: an unrelated 8-K12B long
+        # after an old Form 25 (a redeemed class) must not revive it.
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2015, 3, 2), ("Common Stock", "OLD", "NYSE"))],
+            DelistingFiling(cik, "25-NSE", "Common Stock", "NYSE", "25-old", _at(2015, 6, 1)),
+            forms=(("8-K12B", _at(2020, 6, 1)),),
+        )
+        assert [r["valid_from"] for r in build.listings] == [date(2015, 3, 2)]
+
+    def test_a_late_form_15_never_vetoes_new_equity(self) -> None:
+        # quant-auditor on #835: a bankruptcy whose Form 15 comes months after
+        # the Form 25 (outside the reorganisation window) is still new equity.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 1), ("Common Stock", "CRC", "NYSE")),
+                _cover(cik, _at(2020, 11, 5), ("Common Stock", "CRC", "NYSE")),
+            ],
+            DelistingFiling(
+                cik, "25-NSE", "Common Stock", "NYSE", "25-crc", _at(2020, 7, 31), date(2020, 8, 10)
+            ),
+            forms=(("15-12B", _at(2020, 10, 1)), ("8-A12B", _at(2020, 10, 27))),
+        )
+        assert [s.security_id for s in build.successions] == [f"{cik}@2020-11-05"]

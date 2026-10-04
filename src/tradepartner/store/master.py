@@ -61,7 +61,8 @@ none of the five reorganisations above did). The successor gets the id
 the old class's titles, and a row starting no earlier than the session
 after the Form 25's effective day (that cover page may precede it).
 The old class takes no later cover-page item, so no listing joins the two
-and no return spans the gap. A Form 15 (15-12B or 15-12G) in the same span vetoes
+and no return spans the gap. A Form 15 (15-12B or 15-12G) within
+`master.reorganisation_window_sessions` sessions of the Form 25 vetoes
 it: the old class was exchanged in a reorganisation or merger, so the
 8-A12B registers the same holders' shares (WSC's merger, #834; every
 reorganisation above filed one, no bankruptcy did). `MasterBuild.successions` records each pair.
@@ -81,7 +82,13 @@ CTO's transfer), known at the later of it and the Form 25
 (FRT, whose later cover pages parse with no listing; OKE before its next
 cover page); else the earliest companies snapshot fetched after the Form
 25 that still names the ticker on that exchange, `provenance =
-snapshot`, known at the fetch (SA). The same new-equity test applies. A
+snapshot`, known at the fetch (SA). The 8-K12B must fall inside
+`master.reorganisation_window_sessions` sessions of the Form 25's filing
+session (so an old Form 25 is never revived years later), and the fetch
+must come `master.snapshot_relisting_lag_days` after the effective day
+with no Form 15 in that window (so a fetch before SEC drops a delisted or
+acquired name's ticker never relists it). Fetches are judged in time
+order with the cover pages, against what was known at the fetch. The same new-equity test applies. A
 company acquired into another CIK (GORO, STRR) has neither, and stays
 delisted: its ticker's later bars belong to the other CIK.
 
@@ -188,17 +195,29 @@ class _Stop:
     window_start: date  # the earliest session of an 8-A12B that marks new equity
     filed_at: datetime  # the Form 25's acceptance
     since: datetime | None  # the last cover page showing the class before it
+    effective_on: date  # the day the delisting took effect
+    reorg_start: date  # sessions of an 8-K12B or Form 15 that belong to it
+    reorg_end: date
 
 
 #: Acceptances per marker form (`_MARKER_FORMS`) of one CIK.
 _Marks = Mapping[str, Sequence[datetime]]
 
 
-def _near(stop: _Stop, until: datetime, marks: _Marks, forms: frozenset[str]) -> bool:
-    """True when one of `forms` was accepted from `stop.window_start` to `until`."""
+def _registered(stop: _Stop, until: datetime, marks: _Marks) -> bool:
+    """An 8-A12B accepted from `stop.window_start` to `until`."""
     return any(
         stop.window_start <= _session_of(at) and at <= until
-        for form in forms
+        for form in _NEW_REGISTRATION_FORMS
+        for at in marks.get(form, ())
+    )
+
+
+def _deregistered(stop: _Stop, until: datetime, marks: _Marks) -> bool:
+    """A Form 15 accepted by `until` inside the stop's reorganisation window."""
+    return any(
+        stop.reorg_start <= _session_of(at) <= stop.reorg_end and at <= until
+        for form in _DEREGISTRATION_FORMS
         for at in marks.get(form, ())
     )
 
@@ -206,10 +225,8 @@ def _near(stop: _Stop, until: datetime, marks: _Marks, forms: frozenset[str]) ->
 def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     """True when the shares listed again after `stop` (evidence accepted at
     `until`) are new equity: an 8-A12B from `stop.window_start` to `until`
-    and no Form 15 in that span (#820, #834)."""
-    return _near(stop, until, marks, _NEW_REGISTRATION_FORMS) and not _near(
-        stop, until, marks, _DEREGISTRATION_FORMS
-    )
+    and no Form 15 in the reorganisation window (#820, #834)."""
+    return _registered(stop, until, marks) and not _deregistered(stop, until, marks)
 
 
 _Pairs = frozenset[tuple[str, str]]
@@ -310,16 +327,35 @@ def _delisted_class(classes: Sequence[_Class], filing: DelistingFiling) -> _Clas
     return common[0] if len(common) == 1 else None
 
 
-def _stop(filing: DelistingFiling, window_sessions: int, since: datetime | None) -> _Stop:
+def _sessions_around(session: date, sessions: int) -> tuple[date, date]:
+    low = high = session
+    for _ in range(sessions):
+        low, high = previous_session(low), next_session(high)
+    return low, high
+
+
+def _stop(filing: DelistingFiling, settings: Settings, since: datetime | None) -> _Stop:
     session = _session_of(filing.accepted_at)
     filed_on = filing.accepted_at.astimezone(_EXCHANGE_TZ).date()
     effective = filing.effective_on or filed_on + timedelta(days=_DEFAULT_EFFECTIVE_DAYS)
-    window_start = session
-    for _ in range(window_sessions):
-        window_start = previous_session(window_start)
-    return _Stop(
-        next_session(session), next_session(effective), window_start, filing.accepted_at, since
+    window_start, _ = _sessions_around(session, settings.master.transfer_window_sessions)
+    reorg_start, reorg_end = _sessions_around(
+        session, settings.master.reorganisation_window_sessions
     )
+    return _Stop(
+        next_session(session),
+        next_session(effective),
+        window_start,
+        filing.accepted_at,
+        since,
+        effective,
+        reorg_start,
+        reorg_end,
+    )
+
+
+#: One dated record in a CIK's timeline: a Form 25, an 8-K12B, a snapshot fetch.
+_Event = tuple[datetime, int, str, "DelistingFiling | CompanySnapshotEntry | None"]
 
 
 def _row(known_at: datetime, ingested_at: datetime, source: str, provenance: str) -> Row:
@@ -388,19 +424,20 @@ class _Builder:
         pages: Sequence[CoverPage],
         delistings: Sequence[DelistingFiling] = (),
         marks: _Marks | None = None,
+        fetches: Sequence[CompanySnapshotEntry] = (),
     ) -> list[_Class]:
         """Classes and their cover-page listings for one CIK; `delistings`
-        are its Form 25s and `marks` its marker filings (`_MARKER_FORMS`)."""
+        are its Form 25s, `marks` its marker filings (`_MARKER_FORMS`) and
+        `fetches` its companies-snapshot entries (every fetch)."""
         cik = first.cik
         marks = marks or {}
         classes: list[_Class] = []
-        # Form 25s and 8-K12Bs in acceptance order (a Form 25 first on a tie).
-        events: list[tuple[datetime, int, str, DelistingFiling | None]] = [
-            (f.accepted_at, 0, f.accession, f) for f in delistings
-        ]
+        # Form 25s, 8-K12Bs and snapshot fetches in time order (in that order on a tie).
+        events: list[_Event] = [(f.accepted_at, 0, f.accession, f) for f in delistings]
         events += [
             (at, 1, "", None) for form in _SUCCESSOR_ISSUER_FORMS for at in marks.get(form, ())
         ]
+        events += [(e.fetched_at, 2, e.ticker, e) for e in fetches]
         events.sort(key=lambda e: e[:3])
         for page in sorted(pages, key=lambda p: (p.accepted_at, p.accession)):
             while events and events[0][0] < page.accepted_at:
@@ -462,35 +499,48 @@ class _Builder:
         return classes
 
     def _event(
-        self,
-        first: FilingIndexEntry,
-        classes: list[_Class],
-        event: tuple[datetime, int, str, DelistingFiling | None],
-        marks: _Marks,
+        self, first: FilingIndexEntry, classes: list[_Class], event: _Event, marks: _Marks
     ) -> None:
         """A Form 25 (recorded, and relisted at once if an 8-K12B since the
-        class's last cover page precedes it) or an 8-K12B (relists every
-        class a Form 25 left pending). Not with an 8-A12B near the Form 25:
-        that registers another exchange (a transfer) or new equity, which
-        only a cover page settles (CTO, #834)."""
-        at, _, _, filing = event
-        if filing is not None:
-            stopped = self._delisting(classes, filing)
+        class's last cover page and inside its reorganisation window precedes
+        it), an 8-K12B inside a pending Form 25's window (relists it), or a
+        snapshot fetch (relists a pending Form 25's ticker; see the module
+        docstring). Never an 8-K12B with an 8-A12B near the Form 25: that
+        registers another exchange (a transfer) or new equity, which only a
+        cover page settles (CTO, #834)."""
+        at, _, _, record = event
+        if isinstance(record, DelistingFiling):
+            stopped = self._delisting(classes, record)
             if stopped is None:
                 return
             cls, stop = stopped
             successor_issuer = any(
-                (stop.since is None or a > stop.since) and a <= at
+                (stop.since is None or a > stop.since)
+                and a <= at
+                and stop.reorg_start <= _session_of(a)
                 for form in _SUCCESSOR_ISSUER_FORMS
                 for a in marks.get(form, ())
             )
-            if successor_issuer and not _near(stop, at, marks, _NEW_REGISTRATION_FORMS):
-                self._relist(first, classes, cls, filing.exchange, at, "filing", marks)
+            if successor_issuer and not _registered(stop, at, marks):
+                self._relist(first, classes, cls, record.exchange, at, "filing", marks)
             return
+        lag = timedelta(days=self.settings.master.snapshot_relisting_lag_days)
         for cls in [c for c in classes if not c.retired]:
             for exchange, stop in list(cls.ended.items()):
-                if stop.filed_at < at and not _near(stop, at, marks, _NEW_REGISTRATION_FORMS):
-                    self._relist(first, classes, cls, exchange, at, "filing", marks)
+                if stop.filed_at >= at:
+                    continue
+                if record is None:  # an 8-K12B
+                    if _session_of(at) <= stop.reorg_end and not _registered(stop, at, marks):
+                        self._relist(first, classes, cls, exchange, at, "filing", marks)
+                    continue
+                tickers = {ticker for ticker, ex in cls.pairs if ex == exchange}
+                if (
+                    record.exchange == exchange
+                    and record.ticker in tickers
+                    and at.astimezone(_EXCHANGE_TZ).date() >= stop.effective_on + lag
+                    and not _deregistered(stop, at, marks)
+                ):
+                    self._relist(first, classes, cls, exchange, at, "snapshot", marks)
 
     def _relist(
         self,
@@ -521,29 +571,6 @@ class _Builder:
             self.listing(target.security_id, *pair, title, start, known_at, provenance=provenance)
             target.exchanges.add(exchange)
 
-    def relist_from_snapshot(
-        self,
-        first: FilingIndexEntry,
-        classes: list[_Class],
-        entries: Sequence[CompanySnapshotEntry],
-        marks: _Marks,
-    ) -> None:
-        """A companies snapshot fetched after a Form 25 still naming the
-        class's ticker on that exchange lists it again, known at the fetch
-        (#834); the earliest such fetch counts."""
-        for cls in [c for c in classes if not c.retired]:
-            for exchange, stop in list(cls.ended.items()):
-                tickers = {ticker for ticker, ex in cls.pairs if ex == exchange}
-                fetched = [
-                    e.fetched_at
-                    for e in entries
-                    if e.exchange == exchange
-                    and e.ticker in tickers
-                    and e.fetched_at > stop.filed_at
-                ]
-                if fetched:
-                    self._relist(first, classes, cls, exchange, min(fetched), "snapshot", marks)
-
     def _delisting(
         self, classes: list[_Class], filing: DelistingFiling
     ) -> tuple[_Class, _Stop] | None:
@@ -555,7 +582,7 @@ class _Builder:
             return None  # amends a Form 25 already counted
         cls.delisted_on.add(filing.exchange)
         since = cls.history[-1][0] if cls.history else None
-        stop = _stop(filing, self.settings.master.transfer_window_sessions, since)
+        stop = _stop(filing, self.settings, since)
         cls.ended[filing.exchange] = stop
         return cls, stop
 
@@ -744,9 +771,8 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         builder.security(primary_security_id(cik), cik, entry.company_name, entry.accepted_at)
         cik_marks = marks.get(cik, {})
         classes = builder.cover_pages(
-            entry, source.cover_pages(cik), delistings.get(cik, ()), cik_marks
+            entry, source.cover_pages(cik), delistings.get(cik, ()), cik_marks, fetches.get(cik, ())
         )
-        builder.relist_from_snapshot(entry, classes, fetches.get(cik, []), cik_marks)
         builder.snapshot(classes, by_cik.pop(cik, []))
     for entries in by_cik.values():  # snapshot names with no issuer filing
         builder.unmatched.extend(entries)
