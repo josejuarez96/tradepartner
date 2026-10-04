@@ -26,10 +26,14 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    while the names they trust are what they say, so the fence refuses
    outright: any rebinding of `isinstance`, `type` or `bool`, a star import
    (which could rebind them unseen), any attribute store to one of those
-   names (`builtins.isinstance = f`), any use of `builtins`,
-   `__builtins__`, `globals` or `locals`, and, in a module that passes the
-   keyword, any binding of a reviewed callee but its own `def _start(...,
-   *, accept_rejections)` with no `**kwargs` or
+   names or to any attribute of one of them or of a reviewed callee
+   (`builtins.isinstance = f`, `_start.__code__ = g`), any use or import of
+   `builtins`, any use of `__builtins__`, `__import__`, `globals`,
+   `locals` or a bare `vars()`, any `__builtins__` or `__globals__`
+   attribute, a `__dict__` attribute other than as a `**` unpacking source,
+   and, in a module that passes the keyword, any binding of a reviewed
+   callee but its own undecorated `def _start(..., *, accept_rejections)`
+   with no `**kwargs` or
    `from tradepartner.store.journal import ResumeInvocationRow`. Any
    attribute named for the flag (`row.accept_rejections`) is refused in any
    position. Everything else - a literal or other expression under the
@@ -55,8 +59,9 @@ accept_rejections: f = True`) breaks the name-based premise entirely, and
 `resume`'s own `if accept_rejections:` body is exactly such a laundering,
 by design; a reviewed callee is trusted to do what its review says with the
 flag; and the interpreter's machinery can still be reached in ways no static
-scan sees: `sys.modules[...]`, `importlib`, `vars(module)`, `setattr` on a
-module object obtained some other way, `exec`/`eval` of a built string, or
+scan sees: `sys.modules[...]`, `importlib`, `vars(module)`, `setattr` or
+`delattr` on a module or callee obtained some other way, frame objects
+(`sys._getframe().f_globals`), `exec`/`eval` of a built string, or
 `getattr` with a computed name (the journal's own row writer reads every
 field this way, including the flag, to store it).
 
@@ -98,7 +103,11 @@ _TYPE_CHECKS = frozenset({"isinstance", "type", "bool"})
 #: Names that reach the builtins or a module's own namespace, through which
 #: `isinstance`, `type` or `bool` could be patched without a binding the
 #: fence sees (`builtins.isinstance = f`, `globals()["bool"] = Spy`).
-_REACH = frozenset({"builtins", "__builtins__", "globals", "locals"})
+_REACH = frozenset({"builtins", "__builtins__", "__import__", "globals", "locals"})
+#: Attributes that reach a module's namespace or the builtins' from any
+#: object (`os.__builtins__`, `_start.__globals__`); `__dict__` is allowed
+#: only as the source of a `**` unpacking (`{**row.__dict__}`), a read.
+_REACH_ATTRIBUTES = frozenset({"__builtins__", "__globals__", "__dict__"})
 #: The only callees the flag may be passed on to under `accept_rejections=`:
 #: `resume`'s own `_start` and the journal row. Any other callee (`dict`, an
 #: alias of it, `OrderedDict`, `SimpleNamespace`, a local `def f(**kw)`) could
@@ -232,12 +241,14 @@ def _bound(node: ast.AST) -> list[tuple[str, str]]:
 
 def _is_reviewed_callee_binding(node: ast.AST, name: str) -> bool:
     """Whether `node` is the one reviewed way to bind a `_KEYWORD_CALLEES`
-    name: `def _start(..., *, accept_rejections, ...)` with no `**kwargs`
+    name: an undecorated `def _start(..., *, accept_rejections, ...)` with
+    no `**kwargs`
     (`resume`'s own), or `ResumeInvocationRow` imported under its own name
     from the journal."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return (
             name == "_start"
+            and not node.decorator_list
             and node.args.kwarg is None
             and any(a.arg == FLAG for a in node.args.kwonlyargs)
         )
@@ -250,6 +261,15 @@ def _is_reviewed_callee_binding(node: ast.AST, name: str) -> bool:
             and node.module == JOURNAL_MODULE
         )
     return False
+
+
+def _is_unpacked(node: ast.expr, parents: dict[int, ast.AST]) -> bool:
+    """Whether `node` is the source of a `**` unpacking, in a dict display
+    (`{**x}`) or a call (`f(**x)`): a read of its items, never a write."""
+    parent = parents.get(id(node))
+    if isinstance(parent, ast.Dict):
+        return any(k is None and v is node for k, v in zip(parent.keys, parent.values, strict=True))
+    return isinstance(parent, ast.keyword) and parent.arg is None and parent.value is node
 
 
 def misuses(tree: ast.Module) -> list[str]:
@@ -289,14 +309,38 @@ def misuses(tree: ast.Module) -> list[str]:
                 found.append(f"{getattr(node, 'lineno', 0)}: rebinds {name} in {how}")
         if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
             found.append(f"{node.lineno}: a star import can rebind {', '.join(sorted(pinned))}")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (node.module if isinstance(node, ast.ImportFrom) else alias.name) == "builtins"
+            for alias in node.names
+        ):
+            found.append(f"{node.lineno}: imports from builtins")
         elif (
             isinstance(node, ast.Attribute)
-            and node.attr in _TYPE_CHECKS | _KEYWORD_CALLEES
             and not isinstance(node.ctx, ast.Load)
+            and (
+                node.attr in _TYPE_CHECKS | _KEYWORD_CALLEES
+                or (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id in _TYPE_CHECKS | _KEYWORD_CALLEES
+                )
+            )
         ):
             found.append(f"{node.lineno}: patches {ast.unparse(node)}")
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr in _REACH_ATTRIBUTES
+            and not (node.attr == "__dict__" and _is_unpacked(node, parents))
+        ):
+            found.append(f"{node.lineno}: reaches a namespace through {ast.unparse(node)}")
         elif isinstance(node, ast.Name) and node.id in _REACH:
             found.append(f"{node.lineno}: reaches the namespace through {node.id}")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "vars"
+            and not node.args
+        ):
+            found.append(f"{node.lineno}: reaches the namespace through vars()")
         elif isinstance(node, ast.Attribute) and node.attr == FLAG:
             found.append(f"{node.lineno}: names the flag as an attribute: {ast.unparse(node)}")
         elif isinstance(node, ast.arguments):
@@ -496,6 +540,20 @@ Rule = Callable[[ast.Module], object]
         ("__builtins__['bool'] = Spy", misuses),
         ("globals()['isinstance'] = _start", misuses),
         ("locals()", misuses),
+        ("vars()['bool'] = Spy", misuses),
+        ("b = __import__('builtins')", misuses),
+        ("import builtins as b\nsetattr(b, 'bool', Spy)", misuses),
+        ("from builtins import isinstance as i", misuses),
+        ("import os\nos.__builtins__['isinstance'] = _start", misuses),
+        ("_start.__globals__['bool'] = Spy", misuses),
+        ("resume.__dict__['isinstance'] = _start", misuses),
+        ("_start.__code__ = f.__code__", misuses),
+        ("ResumeInvocationRow.__init__ = spy", misuses),
+        (
+            "@spy\ndef _start(c, *, accept_rejections): ...\n"
+            "_start(c, accept_rejections=accept_rejections)",
+            misuses,
+        ),
         ("def accept_rejections(): ...", mentions),
         ("async def accept_rejections(): ...", mentions),
         ("class accept_rejections: ...", mentions),
