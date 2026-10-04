@@ -39,7 +39,21 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
   history under its new symbol as well (#104), so rows under that ticker
   on the old holder's dates may be the renamed company's. They resolve to
-  nothing and are reported, never assigned; `contested_spans` lists them.
+  nothing and are reported, never assigned; `contested_spans` lists them;
+- another company's span that starts while a holder's span of the ticker
+  is live takes it only from a holder that has left it (#793). With
+  `registrant_evidence` (per company, from its cover-page share counts and
+  Forms 25), a holder that still files a share count on or after the
+  claimant's start and its latest one, with no Form 25 for an equity class
+  since its span began, has not left: a claimant reporting the holder's
+  share count for one date (a combined filing: AEP Texas listing AEP's
+  stock) is a **co-registrant** and holds nothing; any other claimant is
+  **disputed** and shadows the holder (MG&E listing MGE Energy's `MGEE`).
+  Either claim waits: it holds the ticker only from the holder's span end
+  (Aaron's SpinCo takes `AAN` once Aaron's Holdings moves to `PRG`), and
+  a disputed one shadows only until then. A holding-company successor (Xerox
+  Holdings, NorthWestern Energy Group) takes the ticker as before, since
+  its predecessor's common was delisted or the predecessor went quiet.
 
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
@@ -121,7 +135,7 @@ import itertools
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -139,6 +153,7 @@ from tradepartner.adapters.prices import (
 from tradepartner.calendar import is_session, previous_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.classify import EQUITY, listing_kind
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _FEEDS = frozenset({"sip", "iex"})
@@ -231,7 +246,8 @@ class ResolverReport:
     rows under a placeholder ticker, of a non-equity class (by kind, see
     `store.classify.listing_kind`), of a security listing two tickers on
     one day (from that day), and spans that are later-class (another class
-    of the company already held the ticker), ambiguous (another security's
+    of the company already held the ticker), co-registrant or disputed (a
+    claim on a live holder's ticker, #793), ambiguous (another security's
     span of the ticker starts the same day) or contested."""
 
     placeholder: int = 0
@@ -241,6 +257,8 @@ class ResolverReport:
     later_class_spans: int = 0
     ambiguous_spans: int = 0
     contested_spans: int = 0
+    co_registrant_spans: int = 0
+    disputed_spans: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -250,9 +268,55 @@ class ResolverReport:
             f"{sum(self.non_equity.values())} non-equity listings ({kinds or 'none'}), "
             f"{self.same_day_listings} listings of {self.same_day_securities} securities "
             f"listing two tickers on one day; {self.later_class_spans} later-class, "
+            f"{self.co_registrant_spans} co-registrant, {self.disputed_spans} disputed, "
             f"{self.ambiguous_spans} ambiguous and "
             f"{self.contested_spans} contested spans unassigned"
         )
+
+
+@dataclass(frozen=True)
+class RegistrantEvidence:
+    """What one company's own filings say about whether it still trades
+    under its ticker (#793): the day its latest cover-page share count was
+    filed, every `(as_of_date, value)` share count it reported, and the
+    effective days of its Forms 25 for an equity class."""
+
+    last_filed: date | None = None
+    share_counts: frozenset[tuple[date, float]] = frozenset()
+    equity_delisted_on: tuple[date, ...] = ()
+
+
+def registrant_evidence(
+    facts: Iterable[Mapping[str, Any]], delistings: Iterable[Mapping[str, Any]]
+) -> dict[str, RegistrantEvidence]:
+    """`RegistrantEvidence` per company (the CIK of `<cik>` and
+    `<cik>:<class>` ids) from `facts` rows (`shares_outstanding` only; the
+    UTC day of `known_at` is the filing day) and `delistings` rows (an
+    equity class only, by `store.classify.listing_kind`; `effective_on`,
+    else the UTC day of `filed_at`)."""
+    last: dict[str, date] = {}
+    counts: dict[str, set[tuple[date, float]]] = defaultdict(set)
+    for row in facts:
+        if row["fact_name"] != _SHARES_FACT:
+            continue
+        company = _company(str(row["security_id"]))
+        filed = ensure_tz_aware_utc(row["known_at"], field_name="known_at").date()
+        last[company] = max(last.get(company, filed), filed)
+        counts[company].add((row["as_of_date"], float(row["value"])))
+    delisted: dict[str, set[date]] = defaultdict(set)
+    for row in delistings:
+        if listing_kind("", row["class_title"]) != EQUITY:
+            continue
+        effective = row["effective_on"] or (
+            ensure_tz_aware_utc(row["filed_at"], field_name="filed_at").date()
+        )
+        delisted[_company(str(row["security_id"]))].add(effective)
+    return {
+        company: RegistrantEvidence(
+            last.get(company), frozenset(counts[company]), tuple(sorted(delisted[company]))
+        )
+        for company in last.keys() | delisted.keys()
+    }
 
 
 @dataclass(frozen=True)
@@ -263,6 +327,9 @@ class _Row:
 
 
 _PLACEHOLDER = "placeholder"
+_SHARES_FACT = "shares_outstanding"
+_CO_REGISTRANT = "co-registrant"
+_DISPUTED = "disputed"
 
 
 class ListingResolver:
@@ -270,7 +337,12 @@ class ListingResolver:
     the module docstring for the rules. A row's `class_title` is optional
     (an untitled row is judged by its ticker suffix)."""
 
-    def __init__(self, listings: Iterable[Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        listings: Iterable[Mapping[str, Any]],
+        evidence: Mapping[str, RegistrantEvidence] | None = None,
+    ) -> None:
+        self._evidence = evidence or {}
         by_security: dict[str, list[_Row]] = defaultdict(list)
         for row in listings:
             ticker = str(row["ticker"])
@@ -329,6 +401,22 @@ class ListingResolver:
             spans[:] = [span for span in spans if span not in later_class]
         for span in later_class:
             self._blockers[span.ticker].append(span)
+        claims = {
+            span: claim
+            for spans in self._by_ticker.values()
+            for span in spans
+            if (claim := self._claim(span, spans)) is not None
+        }
+        for spans in self._by_ticker.values():
+            spans[:] = [span for span in spans if span not in claims]
+        for span, (verdict, until) in claims.items():
+            if verdict == _DISPUTED:  # shadows the holder while it holds the ticker
+                self._blockers[span.ticker].append(replace(span, end=until))
+            if until is not None and (span.end is None or until < span.end):
+                held = replace(span, start=until)  # the claim waits for the holder
+                self._by_ticker[span.ticker].append(held)
+                own = self._by_security[span.security_id]
+                own[own.index(span)] = held
         self._contested = frozenset(
             span
             for spans in self._by_ticker.values()
@@ -355,7 +443,43 @@ class ListingResolver:
             later_class_spans=len(later_class),
             ambiguous_spans=len(ambiguous),
             contested_spans=len(self._contested),
+            co_registrant_spans=sum(v == _CO_REGISTRANT for v, _ in claims.values()),
+            disputed_spans=sum(v == _DISPUTED for v, _ in claims.values()),
         )
+
+    def _claim(
+        self, span: TickerSpan, spans: Sequence[TickerSpan]
+    ) -> tuple[str, date | None] | None:
+        """`(verdict, until)` when `span` starts while another company's
+        span in `spans` holds the ticker and that holder has not left it
+        (see the module docstring): `_DISPUTED` if any such holder makes it
+        so, else `_CO_REGISTRANT`, and the day the last such holder's span
+        ends (`None` while one is open). `None` when there is no claim."""
+        holders = [
+            (verdict, holder)
+            for holder in spans
+            if _company(holder.security_id) != _company(span.security_id)
+            and holder.start < span.start
+            and holder.covers(span.start)
+            and (verdict := self._verdict(holder, span)) is not None
+        ]
+        if not holders:
+            return None
+        ends = [holder.end for _, holder in holders]
+        until = None if None in ends else max(end for end in ends if end is not None)
+        verdicts = {verdict for verdict, _ in holders}
+        return (_DISPUTED if _DISPUTED in verdicts else _CO_REGISTRANT), until
+
+    def _verdict(self, holder: TickerSpan, claimant: TickerSpan) -> str | None:
+        own = self._evidence.get(_company(holder.security_id))
+        other = self._evidence.get(_company(claimant.security_id)) or RegistrantEvidence()
+        if own is None or own.last_filed is None:
+            return None
+        if own.last_filed < max(claimant.start, other.last_filed or claimant.start):
+            return None  # the holder went quiet: a successor or a reuse
+        if any(day >= holder.start for day in own.equity_delisted_on):
+            return None  # the holder's common left its exchange
+        return _CO_REGISTRANT if own.share_counts & other.share_counts else _DISPUTED
 
     def _renamed_into(self, span: TickerSpan) -> bool:
         """True if `span`'s security traded under another ticker before it."""

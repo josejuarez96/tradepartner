@@ -24,6 +24,7 @@ from tradepartner.adapters.alpaca_prices import (
     feed_source,
     parse_bars,
     parse_corporate_actions,
+    registrant_evidence,
 )
 from tradepartner.adapters.prices import (
     ActionType,
@@ -392,6 +393,230 @@ class TestResolver:
         assert resolver.symbols("SEC_META", date(2022, 1, 3), date(2022, 12, 30)) == ["FB", "META"]
         assert resolver.symbols("SEC_META", date(2023, 1, 3), date(2023, 12, 29)) == ["META"]
         assert resolver.symbols("SEC_NONE", date(2023, 1, 3), date(2023, 12, 29)) == []
+
+
+def _shares(security_id: str, as_of: date, value: float, known: date) -> dict[str, object]:
+    return {
+        "security_id": security_id,
+        "fact_name": "shares_outstanding",
+        "as_of_date": as_of,
+        "value": value,
+        "known_at": datetime(known.year, known.month, known.day, 16, tzinfo=UTC),
+    }
+
+
+def _delisting(security_id: str, class_title: str, effective_on: date) -> dict[str, object]:
+    return {
+        "security_id": security_id,
+        "class_title": class_title,
+        "effective_on": effective_on,
+        "filed_at": datetime(effective_on.year, effective_on.month, 1, 16, tzinfo=UTC),
+    }
+
+
+# Real cases from backfill pre-flight F (#793), store values as filed.
+AEP, AEP_TEXAS = "0000004904", "0001721781"
+AEP_LISTINGS = [
+    _listing(AEP, "AEP", date(1994, 5, 16)),
+    _listing(AEP, "AEP", date(2025, 2, 13), "Common Stock, $6.50 par value"),
+    _listing(AEP_TEXAS, "AEP", date(2026, 7, 30), "Common Stock, $6.50 par value"),
+]
+AEP_FACTS = [
+    _shares(AEP, date(2026, 5, 5), 544104955, date(2026, 5, 5)),
+    _shares(AEP, date(2026, 7, 30), 544397352, date(2026, 7, 30)),
+    _shares(AEP_TEXAS, date(2026, 7, 30), 544397352, date(2026, 7, 30)),
+]
+
+
+class TestRegistrantCheck:
+    """Rule 6 (#793): another company's later span of a ticker takes it only
+    from a holder that has left it (an equity delisting) or gone quiet."""
+
+    def test_a_subsidiary_citing_the_parents_ticker_never_takes_it(self) -> None:
+        # AEP Texas's cover page of 2026-07-30 lists AEP's common stock and
+        # reports AEP's share count: a co-registrant, AEP keeps its bars.
+        resolver = ListingResolver(AEP_LISTINGS, registrant_evidence(AEP_FACTS, []))
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+        assert resolver.symbols(AEP_TEXAS, date(2026, 1, 2), date(2026, 9, 30)) == []
+        assert resolver.report.co_registrant_spans == 1
+        assert "1 co-registrant" in resolver.report.summary()
+
+    def test_an_operating_partnership_citing_the_reits_ticker_never_takes_it(self) -> None:
+        maa, maa_lp = "0000912595", "0001581776"
+        resolver = ListingResolver(
+            [
+                _listing(maa, "MAA", date(1996, 5, 14)),
+                _listing(maa, "MAA", date(2019, 10, 31), "Common Stock, par value $.01"),
+                _listing(maa_lp, "MAA", date(2025, 10, 31), "Common Stock, par value $.01"),
+            ],
+            registrant_evidence(
+                [
+                    _shares(maa_lp, date(2013, 11, 4), 74776229, date(2013, 11, 7)),
+                    _shares(maa, date(2025, 10, 27), 117081742, date(2025, 10, 31)),
+                    _shares(maa_lp, date(2025, 10, 27), 117081742, date(2025, 10, 31)),
+                    _shares(maa, date(2026, 7, 30), 116021957, date(2026, 7, 30)),
+                ],
+                # A preferred class's Form 25 is not the common leaving.
+                [_delisting(maa, "8.50% Series I Preferred Stock", date(2026, 10, 11))],
+            ),
+        )
+        assert resolver.resolve("MAA", date(2026, 9, 15)) == maa
+
+    def test_a_claim_on_a_live_holders_ticker_without_proof_is_disputed(self) -> None:
+        # Madison Gas & Electric lists MGE Energy's MGEE from 2026-02-27 but
+        # reports its own share count: nothing shows which registrant's
+        # stock trades, so the ticker resolves to nothing while both last.
+        mgee, mge = "0001161728", "0000061339"
+        resolver = ListingResolver(
+            [
+                _listing(mgee, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value"),
+                _listing(mge, "MGEE", date(2026, 2, 27), "Common Stock, $1 Par Value"),
+            ],
+            registrant_evidence(
+                [
+                    _shares(mge, date(2015, 7, 31), 34668370, date(2015, 8, 6)),
+                    _shares(mge, date(2026, 2, 20), 17347894, date(2026, 2, 27)),
+                    _shares(mgee, date(2026, 7, 31), 37784012, date(2026, 8, 5)),
+                ],
+                [],
+            ),
+        )
+        assert resolver.resolve("MGEE", date(2026, 2, 26)) == mgee
+        assert resolver.resolve("MGEE", date(2026, 9, 15)) is None
+        assert resolver.symbols(mge, date(2026, 1, 2), date(2026, 9, 30)) == []
+        assert resolver.report.disputed_spans == 1
+        assert "1 disputed" in resolver.report.summary()
+
+    def test_a_disputed_claim_waits_for_the_holder_to_move_off_the_ticker(self) -> None:
+        # Aaron's SpinCo lists AAN from 2021-02-23; Aaron's Holdings, still
+        # filing, moves to PRG on 2021-02-25. The spin-off holds AAN from then.
+        holdings, spinco = "0001808834", "0001821393"
+        resolver = ListingResolver(
+            [
+                _listing(holdings, "AAN", date(2020, 10, 29), "Common Stock"),
+                _listing(holdings, "PRG", date(2021, 2, 25), "Common Stock"),
+                _listing(spinco, "AAN", date(2021, 2, 23), "Common Stock"),
+            ],
+            registrant_evidence(
+                [
+                    _shares(spinco, date(2021, 2, 19), 33000000, date(2021, 2, 23)),
+                    _shares(spinco, date(2024, 7, 31), 31000000, date(2024, 8, 5)),
+                    _shares(holdings, date(2026, 7, 24), 39000000, date(2026, 7, 29)),
+                ],
+                [],
+            ),
+        )
+        assert resolver.resolve("AAN", date(2021, 2, 23)) is None
+        assert resolver.resolve("AAN", date(2021, 2, 25)) == spinco
+        assert resolver.resolve("AAN", date(2022, 1, 14)) == spinco
+        assert resolver.symbols(spinco, date(2021, 1, 4), date(2021, 2, 24)) == []
+        assert resolver.symbols(spinco, date(2021, 1, 4), date(2021, 3, 31)) == ["AAN"]
+        assert resolver.report.disputed_spans == 1
+
+    def test_a_holding_company_successor_takes_the_ticker_after_the_old_common_is_delisted(
+        self,
+    ) -> None:
+        # NorthWestern Energy Group (2023 reorganization): the old company's
+        # common had a 25-NSE and it stopped filing a share count.
+        nwe, group = "0000073088", "0001993004"
+        resolver = ListingResolver(
+            [
+                _listing(nwe, "NWE", date(2019, 7, 23), "Common stock"),
+                _listing(nwe, "NWE", date(2020, 10, 21), "Common stock"),
+                _listing(group, "NWE", date(2023, 10, 26), "Common stock"),
+            ],
+            registrant_evidence(
+                [
+                    _shares(nwe, date(2023, 10, 20), 61242238, date(2023, 10, 26)),
+                    _shares(group, date(2023, 10, 20), 61242238, date(2023, 10, 26)),
+                    _shares(group, date(2026, 7, 24), 61517850, date(2026, 7, 29)),
+                ],
+                [_delisting(nwe, "Common Stock", date(2023, 10, 9))],
+            ),
+        )
+        assert resolver.resolve("NWE", date(2023, 10, 25)) == nwe
+        assert resolver.resolve("NWE", date(2024, 1, 16)) == group
+        assert resolver.report.co_registrant_spans == 0
+        assert resolver.report.disputed_spans == 0
+
+    def test_a_successor_takes_the_ticker_once_the_old_company_goes_quiet(self) -> None:
+        # Xerox Holdings (2019) and First Seacoast's second step (2023): the
+        # old registrant's last share count comes before the new one's.
+        old, new = "0000108772", "0001770450"
+        resolver = ListingResolver(
+            [
+                _listing(old, "XRX", date(2019, 8, 6), "Common Stock, $1 par value"),
+                _listing(new, "XRX", date(2019, 11, 6), "Common Stock, $1 par value"),
+            ],
+            registrant_evidence(
+                [
+                    _shares(old, date(2019, 7, 31), 221283933, date(2019, 8, 6)),
+                    _shares(new, date(2019, 10, 31), 216188261, date(2019, 11, 6)),
+                    _shares(new, date(2026, 7, 31), 131314511, date(2026, 8, 6)),
+                ],
+                [],
+            ),
+        )
+        assert resolver.resolve("XRX", date(2022, 1, 14)) == new
+        old, new = "0001769267", "0001943802"
+        resolver = ListingResolver(
+            [
+                _listing(old, "FSEA", date(2019, 8, 13), "Common Stock"),
+                _listing(new, "FSEA", date(2022, 9, 13), "Common Stock"),
+            ],
+            registrant_evidence(
+                [  # the same count on the same day, but the old one went quiet
+                    _shares(old, date(2023, 3, 14), 5075345, date(2023, 3, 24)),
+                    _shares(new, date(2023, 3, 14), 5075345, date(2023, 3, 24)),
+                    _shares(new, date(2026, 8, 3), 4704425, date(2026, 8, 7)),
+                ],
+                [],
+            ),
+        )
+        assert resolver.resolve("FSEA", date(2024, 1, 16)) == new
+
+    def test_a_holder_whose_common_was_delisted_loses_the_ticker_though_it_still_files(
+        self,
+    ) -> None:
+        # Crane: the old registrant's common had a 25-NSE in 2022 and the
+        # company still files; the new Crane Co takes CR as before.
+        old, new = "0000025445", "0001944013"
+        resolver = ListingResolver(
+            [
+                _listing(old, "CR", date(2019, 7, 30), "Common Stock"),
+                _listing(new, "CR", date(2022, 12, 15), "Common Stock"),
+            ],
+            registrant_evidence(
+                [
+                    _shares(old, date(2026, 7, 31), 57561304, date(2026, 8, 5)),
+                    _shares(new, date(2026, 7, 29), 57800356, date(2026, 7, 31)),
+                ],
+                [_delisting(old, "Common Stock", date(2022, 5, 27))],
+            ),
+        )
+        assert resolver.resolve("CR", date(2024, 1, 16)) == new
+
+    def test_without_evidence_the_newer_company_still_wins(self) -> None:
+        resolver = ListingResolver(AEP_LISTINGS)
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP_TEXAS
+        assert resolver.report.co_registrant_spans == 0
+
+    def test_registrant_evidence_reads_shares_and_equity_delistings_per_company(self) -> None:
+        evidence = registrant_evidence(
+            [
+                *AEP_FACTS,
+                _shares("0000000001:class-b", date(2020, 1, 2), 5, date(2020, 1, 3)),
+                {**_shares(AEP, date(2027, 1, 2), 9, date(2027, 1, 2)), "fact_name": "revenue"},
+            ],
+            [
+                _delisting("0000000001:class-a", "Class A Common Stock", date(2021, 1, 4)),
+                _delisting("0000000001", "5.25% Notes due 2030", date(2022, 1, 4)),
+            ],
+        )
+        assert evidence[AEP].last_filed == date(2026, 7, 30)
+        assert (date(2026, 7, 30), 544397352.0) in evidence[AEP].share_counts
+        assert evidence["0000000001"].last_filed == date(2020, 1, 3)
+        assert evidence["0000000001"].equity_delisted_on == (date(2021, 1, 4),)
 
 
 class TestBars:
