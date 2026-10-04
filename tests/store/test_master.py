@@ -494,4 +494,101 @@ class TestNoLookAhead:
             write_master(partial, partial_build)
             for read in (securities_as_of, listings_as_of):
                 assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
-            partial.close()
+
+
+class TestDuplicatePairPerPage:
+    """#687: a cover page that lists one class's (ticker, exchange) pair
+    under two titles (a filer's duplicate) must build and insert exactly
+    one `listings` row for that pair, not two rows that collide on the
+    store's UNIQUE (security_id, ticker, exchange, valid_from, known_at)
+    key. Real shapes: Honda (CIK 0000864270) 10-Q accepted 2021-11-09, two
+    0.750% medium-term notes both tagged HMC/26A; Moatable (CIK 0001509223)
+    10-Q accepted 2023-08-14, Class A ordinary shares and their ADS both
+    retickered to MTBL."""
+
+    NOTES_CIK = "0000900001"
+    ADS_CIK = "0000900002"
+
+    def _keys(self, build: MasterBuild) -> list[tuple[object, ...]]:
+        return [
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"], row["known_at"])
+            for row in build.listings
+        ]
+
+    def test_two_notes_typo_the_same_ticker_on_one_page(self) -> None:
+        # The 0.750% Nov-2026 note is new on the bug page (first time this
+        # class shows any pair at all): its pair is not yet in `cls.pairs`,
+        # so the typo'd Jan-2024 note matching the same class and the same
+        # (ticker, exchange) is the within-page duplicate #687 is about.
+        cik = self.NOTES_CIK
+        source = FixtureFilingSource(
+            index=[_filing(cik, "Honda-like Co", "10-K", _at(2015, 3, 1))],
+            cover_pages=[
+                _cover(
+                    cik,
+                    _at(2021, 3, 1),
+                    ("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                ),
+                _cover(
+                    cik,
+                    datetime(2021, 11, 9, 17, 59, 52, tzinfo=UTC),
+                    ("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                    (
+                        "0.750% Medium-Term Notes, Series ADue November 25, 2026",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    (
+                        "0.750% Medium-Term Notes, Series ADue January 17, 2024",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    (
+                        "1.100% Medium-Term Notes, Series BDue October 1, 2025",
+                        "HMC/25B",
+                        "NYSE",
+                    ),
+                ),
+            ],
+        )
+        ingested_at = datetime(2021, 11, 10, tzinfo=UTC)
+        build = build_master(source, _settings(), ingested_at=ingested_at)
+        keys = self._keys(build)
+        assert len(keys) == len(set(keys))
+        conn = _new_store()
+        write_master(conn, build)  # must not raise duckdb.ConstraintException
+        conn.close()
+
+    def test_ads_and_underlying_typo_the_same_ticker_on_one_page(self) -> None:
+        cik = self.ADS_CIK
+        ads_title = "American depositary shares, each representing 45 Class A ordinary shares"
+        class_a_title = "Class A ordinary shares, par value $0.001 per share*"
+        source = FixtureFilingSource(
+            index=[_filing(cik, "Moatable-like Inc", "10-K", _at(2015, 3, 1))],
+            cover_pages=[
+                _cover(cik, _at(2020, 3, 1), (ads_title, "RENN", "NYSE")),
+                _cover(
+                    cik,
+                    _at(2023, 3, 31),
+                    (class_a_title, "RENN", "NYSE"),
+                    (ads_title, "RENN", "NYSE"),
+                ),
+                _cover(
+                    cik,
+                    datetime(2023, 8, 14, 20, 56, 14, tzinfo=UTC),
+                    (class_a_title, "MTBL", "NYSE"),
+                    (ads_title, "MTBL", "NYSE"),
+                ),
+            ],
+        )
+        ingested_at = datetime(2023, 8, 15, tzinfo=UTC)
+        build = build_master(source, _settings(), ingested_at=ingested_at)
+        keys = self._keys(build)
+        assert len(keys) == len(set(keys))
+        mtbl_rows = [row for row in build.listings if row["ticker"] == "MTBL"]
+        assert len(mtbl_rows) == 1
+        assert mtbl_rows[0]["class_title"] == class_a_title
+        assert mtbl_rows[0]["security_id"] == primary_security_id(cik)
+        conn = _new_store()
+        write_master(conn, build)  # must not raise duckdb.ConstraintException
+        conn.close()
