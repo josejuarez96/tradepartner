@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+import polars as pl
 import pytest
 
 from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
@@ -353,6 +354,39 @@ def test_a_broker_symbol_the_journal_never_held_maps_through_its_listing(
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
     assert found.symbols == {SPY: "SPY", MTUM: "MTUM"}
+
+
+def test_explanations_read_a_listing_with_no_valid_from_as_the_shared_rule_does(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listing row with no `valid_from` is read by `planning.current_listings`'
+    rule (#705): it never beats a dated row, so the name keeps its dated
+    ticker instead of the read raising `TypeError`."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 1.0})
+    real = reconcile_run.listing_ends_as_of
+
+    def with_undated_row(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        listings = real(*args, **kwargs)
+        undated = listings.filter(pl.col("security_id") == SPY).with_columns(
+            pl.lit("SPY_UNDATED").alias("ticker"), pl.lit(None, dtype=pl.Date).alias("valid_from")
+        )
+        return pl.concat([undated, listings])
+
+    monkeypatch.setattr(reconcile_run, "listing_ends_as_of", with_undated_row)
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            as_of=CUT,
+            settings=journal_settings,
+            broker_symbols=["SPY"],
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.symbols == {SPY: "SPY"}
 
 
 def test_a_split_known_at_close_of_the_previous_session_explains_the_new_quantity(

@@ -103,6 +103,7 @@ from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import run_lock
+from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
     MISMATCH,
     OK,
@@ -257,18 +258,6 @@ def _ledger(
     )
 
 
-def _current_listings(listings: pl.DataFrame, session: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from <= session`."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        if row["valid_from"] > session:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or row["valid_from"] > held["valid_from"]:
-            current[row["security_id"]] = row
-    return current
-
-
 def _symbols(
     names: Iterable[str],
     order_symbols: Mapping[str, str],
@@ -365,7 +354,7 @@ def _explanations(
         | {a.security_id for a in state.adjustments if a.security_id is not None}
     )
     order_symbols = {o.security_id: o.symbol for o in state.orders}
-    current = _current_listings(listing_ends_as_of(conn, cut, settings), session)
+    current = current_listings(listing_ends_as_of(conn, cut, settings), session)
     symbols = _symbols(names, order_symbols, current, broker_symbols)
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))

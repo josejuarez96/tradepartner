@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+import polars as pl
 import pytest
 
 from tradepartner.adapters.broker import OrderRequest, Side
@@ -1284,6 +1285,42 @@ def test_a_saturday_stop_states_the_ledger_for_friday_and_closes(
         tolerance=FROZEN.reconcile_quantity_tolerance,
         now=saturday.date(),
     )
+    assert [(r.security_id, r.quantity, r.origin) for r in flat.carried] == [(SPY, 4.0, "dust")]
+
+
+def test_the_flatness_check_reads_a_listing_with_no_valid_from_as_the_shared_rule_does(
+    journal_settings: Settings,
+    fake: FakeBroker,
+    carried_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A listing row with no `valid_from` is read by `planning.current_listings`'
+    rule (#705): it never beats a dated row, so the residue still matches its
+    dated ticker instead of the check raising `TypeError`."""
+    _carried(journal_settings, carried_window, 4.0, "dust")
+    _broker_holds(fake, 4.0)
+    _requested(journal_settings, carried_window, DAY1 - timedelta(minutes=50))
+    saturday = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
+    fixed_clock.now = saturday
+    _stop(journal_settings, fake, fixed_clock)
+    (_, closed) = _stops(journal_settings, carried_window)
+    with open_read_only(journal_settings) as conn:
+        listings = listing_ends_as_of(conn, saturday, journal_settings)
+        actions = live_actions_as_of(conn, saturday)
+    undated = listings.filter(pl.col("security_id") == SPY).with_columns(
+        pl.lit("SPY_UNDATED").alias("ticker"), pl.lit(None, dtype=pl.Date).alias("valid_from")
+    )
+
+    flat = _check_flat(
+        open_orders=fake.open_orders(),
+        positions=fake.positions(),
+        previous_stop=closed,
+        listings=pl.concat([undated, listings]),
+        actions=actions,
+        tolerance=FROZEN.reconcile_quantity_tolerance,
+        now=saturday.date(),
+    )
+
     assert [(r.security_id, r.quantity, r.origin) for r in flat.carried] == [(SPY, 4.0, "dust")]
 
 
