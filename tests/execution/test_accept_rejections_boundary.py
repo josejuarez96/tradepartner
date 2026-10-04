@@ -18,9 +18,10 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    argument of a 1-arg `type` call or the sole, unkeyworded, by-identity
    first-of-2 argument of a 2-arg `isinstance(x, bool)` call, its second
    argument the bare name `bool` (`resume`'s own type check; a module that
-   rebinds either name, or uses a star import that could, is refused
-   outright - this makes the calls the builtins in every module this fence
-   can see, not in every module there is), the whole `test` of an `if`, or
+   rebinds `isinstance`, `type` or `bool`, or uses a star import that
+   could, is refused outright - this makes the calls the builtins in every
+   module this fence can see, not in every module there is), the whole
+   `test` of an `if`, or
    (for a `Store`) the target of a bare annotated field. Everything else -
    a literal or other expression under the `accept_rejections=` keyword,
    the name under any other keyword, a positional pass, smuggling through
@@ -41,13 +42,14 @@ Known limits (#696), not checked here: a value laundered through control
 flow into a new name (`if accept_rejections: f = True`) breaks the name-based
 premise entirely; a positional `ast.Attribute` load (`row.accept_rejections`)
 inside an `ALLOWED` module is not checked the way a bare `Name` is; and the
-`isinstance`/`type` exemption still trusts the interpreter's own builtins and
-import machinery - a `**kwargs` collector other than `dict` by name (an alias
-of `dict`, `builtins.dict`, `collections.OrderedDict`, `SimpleNamespace`, or
-any plain function taking `**kwargs`), a class keyword (`accept_rejections`
-passed as `metaclass=...` or similar), patching `builtins.isinstance` itself,
-or reaching either name through `globals()[...]` all sit outside what a
-static AST scan can see.
+`isinstance`, `type` or `bool` exemption still trusts the interpreter's own
+builtins and import machinery - a `**kwargs` collector other than `dict` by
+name (an alias of `dict`, `builtins.dict`, `collections.OrderedDict`,
+`SimpleNamespace`, or any plain function taking `**kwargs`), a class keyword
+(`accept_rejections` passed as `metaclass=...` or similar), patching
+`builtins.isinstance` or `builtins.bool` itself, or reaching any of these
+names through `globals()[...]` all sit outside what a static AST scan can
+see.
 
 `test_each_rule_refuses_a_sample_that_breaks_it` runs each rule on a sample
 source that breaks it, so a rule that silently stops matching fails too.
@@ -80,8 +82,10 @@ ALLOWED = frozenset(
     }
 )
 RESUME_CALLERS: frozenset[str] = frozenset()
-#: Builtins the flag may be passed to positionally: `resume`'s own type check.
-_TYPE_CHECKS = frozenset({"isinstance", "type"})
+#: Names the fence refuses to see rebound anywhere: `resume`'s own type
+#: check (`isinstance`, `type`) and the type `isinstance` is always checked
+#: against here (`bool`), so a custom `__instancecheck__` can't see the flag.
+_TYPE_CHECKS = frozenset({"isinstance", "type", "bool"})
 
 
 def _modules() -> dict[str, ast.Module]:
@@ -189,8 +193,9 @@ def misuses(tree: ast.Module) -> list[str]:
     parameter or a bare annotated field, a PEP 695 type parameter named for
     it, a whole-string spelling, a keyword passing anything but the caller's
     own flag under `accept_rejections=` to a callee other than `dict`, any
-    rebinding of `isinstance` or `type` (the type-check exemption below only
-    holds if those names are still the builtins), or (the catch-all) any
+    rebinding of `isinstance`, `type` or `bool` (the type-check exemption
+    below only holds if those names are still the builtins), or (the
+    catch-all) any
     `Load` of the bare name that is not the value of such a keyword, the
     checked argument of `resume`'s own `isinstance`/`type` call, or the whole
     `test` of an `if`. Anything else - smuggled through a display, a
@@ -407,6 +412,8 @@ Rule = Callable[[ast.Module], object]
         ("_start(c, *dict(accept_rejections=accept_rejections).values())", misuses),
         ("from m import *\nisinstance(accept_rejections, bool)", misuses),
         ("isinstance(accept_rejections, Spy)", misuses),
+        ("bool = Spy\nisinstance(accept_rejections, bool)", misuses),
+        ("from m import Spy as bool\nisinstance(accept_rejections, bool)", misuses),
         ("def accept_rejections(): ...", mentions),
         ("async def accept_rejections(): ...", mentions),
         ("class accept_rejections: ...", mentions),
