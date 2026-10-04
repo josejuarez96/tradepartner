@@ -1155,22 +1155,16 @@ def test_paper_stop_is_refused_while_a_run_holds_the_lock(fixture_store_path: Pa
         )
 
 
-# --- the four fault-specific halt kinds (#644: fixed by #667; kill_switch is #741) -----------
+# --- the fault-specific halt kinds (#644: fixed by #667; a halt's own engagement, #741) -------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#741: #677/#698 fixed only the skipped_kill_switch path (a later run finding "
-    "the switch already engaged); the halt's OWN engagement here writes no distinct "
-    "'kill_switch' alert row yet (#644's other kinds were fixed by #667)",
-)
-def test_kill_switch_alert_kind_is_not_yet_written(
+def test_halt_writes_exactly_one_halted_alert_and_no_kill_switch_alert(
     alert_fakes: FakeRunner, fixture_store_path: Path, tmp_path: Path
 ) -> None:
-    """The trigger picked (#644): the halt path's own `engage()` call, the
-    only kill-switch engagement every halt makes (spec req 4: 'appends the
-    kill_switch engaged row ... writes the alert (req 11)')."""
+    """A halt's own `engage()` writes no `kill_switch` alert (#741, owner
+    decision (a)): spec req 4 says a halt writes **one** alert, `halted` for
+    a transport fault (#644 Option A), and req 11 scopes `kill_switch` alerts
+    to runs that end `skipped_kill_switch` (#644 option 2, #677)."""
     alerting_env = _alerting_env(fixture_store_path)
     alerting_env.open_window(tmp_path=tmp_path)
     alerting_env.fake.script(
@@ -1178,7 +1172,14 @@ def test_kill_switch_alert_kind_is_not_yet_written(
     )
     with pytest.raises(Exception, match="transport error"):
         alerting_env.run(at(F_0))
-    assert alerting_env.alerts("kill_switch") != []
+    run_id = alerting_env.latest_run()
+    assert alerting_env.query("SELECT source, run_id FROM kill_switch WHERE state = 'engaged'") == [
+        ("fault", run_id)
+    ]  # the halt did engage the switch
+    assert alerting_env.query("SELECT kind, run_id FROM alerts ORDER BY alert_id") == [
+        ("halted", run_id)
+    ]
+    assert alerting_env.alerts("kill_switch") == []
 
 
 def test_reconciliation_alert_row_exists_before_the_exception_propagates(
