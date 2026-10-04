@@ -105,6 +105,7 @@ from tradepartner.adapters.filings import (
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session, previous_session
 from tradepartner.config import Settings, clean_message
+from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
     build_classifications,
@@ -845,6 +846,49 @@ def _counted(
     )
 
 
+def _types_known(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, set[str]]:
+    """Every `security_type` of each security in a `classifications` row
+    known at `t`: every revision, not only the latest, so a window before a
+    later reclassification still fetches the name (#794). A bare date
+    raises `TypeError`, a naive datetime `ValueError`."""
+    t = _validate_t(t)
+    types: dict[str, set[str]] = defaultdict(set)
+    for sid, kind in conn.execute(
+        "SELECT DISTINCT security_id, security_type FROM classifications WHERE known_at <= ?",
+        [t],
+    ).fetchall():
+        types[sid].add(kind)
+    return types
+
+
+#: Classifier labels never fetched unless `universe.security_types` admits
+#: them: debt (notes, debentures), preferreds, warrants, units and rights.
+#: Everything else on `universe.exchanges` is fetched (owner, #802).
+NOT_EQUITY = frozenset({"debt", "preferred", "warrant", "unit", "right"})
+
+
+def _fetched(
+    sid: str,
+    row: Row,
+    benchmarks: set[str],
+    types: Mapping[str, set[str]],
+    settings: Settings,
+) -> bool:
+    """Whether a listing `row` puts `sid` in the price fetch (#794): a
+    benchmark, or a listing on one of `universe.exchanges` whose security
+    has no classification yet or a `types` entry outside `NOT_EQUITY` (or
+    in `universe.security_types`). Common, unclassifiable, spac, foreign,
+    fund and depositary names are fetched; no OTC listing. Wider than
+    `_counted`, so every counted name is fetched."""
+    if sid in benchmarks:
+        return True
+    if row["exchange"] not in settings.universe.exchanges:
+        return False
+    known = types.get(sid)
+    skipped = NOT_EQUITY - set(settings.universe.security_types)
+    return not known or not known <= skipped
+
+
 def _may_count(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -912,7 +956,8 @@ def _reported_note(reported: Mapping[str, list[str]]) -> str:
 def _price_names(
     conn: duckdb.DuckDBPyConnection, now: datetime, session: date, settings: Settings
 ) -> tuple[set[str], set[str], set[str], set[str] | None, str | None]:
-    """Names to fetch, listed common and benchmark names (the staleness
+    """Names to fetch (`_fetched` listings live or delisted from `session`
+    on, and the reference), listed common and benchmark names (the staleness
     denominator), the listed names whose current listing is
     `snapshot_static` (benchmarks never), `_may_count` over the previous
     session, and the reference symbol's `security_id`, from each
@@ -936,6 +981,7 @@ def _price_names(
         for row in securities_as_of(conn, now).iter_rows(named=True)
         if row["benchmark"]
     }
+    types = _types_known(conn, now)
     fetch: set[str] = set()
     listed: set[str] = set()
     static_only: set[str] = set()
@@ -950,8 +996,11 @@ def _price_names(
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
         effective = row["effective_on"]
-        if live or (status == DELISTED and effective is not None and effective >= session):
+        ending = status == DELISTED and effective is not None and effective >= session
+        if (live or ending) and _fetched(sid, row, benchmarks, types, settings):
             fetch.add(sid)
+    if reference is not None:
+        fetch.add(reference)
     before = previous_session(session)
     may_count = _may_count(conn, now, (before, before), earliest, benchmarks)
     return fetch, listed, static_only, may_count, reference

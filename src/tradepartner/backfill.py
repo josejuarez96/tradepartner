@@ -68,6 +68,7 @@ from tradepartner.ingest import (
     _bar_row,
     _clean,
     _counted,
+    _fetched,
     _ingest_filings,
     _may_count,
     _prefetch,
@@ -80,6 +81,7 @@ from tradepartner.ingest import (
     _run_source,
     _Stale,
     _staleness,
+    _types_known,
     _unwrap,
     _with_frames,
     _write_run,
@@ -268,8 +270,9 @@ def _window_names(
     window: tuple[date, date],
     settings: Settings,
 ) -> tuple[list[str], list[str], set[str], set[str] | None, str | None]:
-    """From listings known at `t`: securities with a listing live at some
-    point in `window` (to fetch), the benchmark names and the common names
+    """From listings known at `t`: securities with a `_fetched` listing
+    live at some point in `window`, and the reference (to fetch), the
+    benchmark names and the common names
     on one of `universe.exchanges` listed through the whole window,
     including any delisted only later (the staleness denominator), those
     of them (benchmarks never) whose every listing live in the window is
@@ -290,6 +293,7 @@ def _window_names(
         for row in securities_as_of(conn, t).iter_rows(named=True)
         if row["benchmark"]
     }
+    types = _types_known(conn, t)
     ids: set[str] = set()
     listed: set[str] = set()
     filed: set[str] = set()  # with a filing-based listing live in the window
@@ -306,7 +310,8 @@ def _window_names(
         )
         if ended or status not in (LISTED, DELISTED, TRANSFERRED):
             continue
-        ids.add(sid)
+        if _fetched(sid, row, benchmarks, types, settings):
+            ids.add(sid)
         if row["provenance"] != STATIC:
             filed.add(sid)
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= last))
@@ -319,6 +324,8 @@ def _window_names(
             listed.add(sid)  # today's status must not drop a name delisted later
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
+    if reference is not None:
+        ids.add(reference)
     static_only = listed - filed - benchmarks
     before = first - timedelta(days=1)
     may_count = _may_count(conn, t, (before.replace(day=1), before), earliest, benchmarks)

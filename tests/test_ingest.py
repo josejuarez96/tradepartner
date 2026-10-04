@@ -48,9 +48,11 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     _add_rows,
+    _fetched,
     _ingest_filings,
     _prefetch,
     _Recorded,
+    _types_known,
     expected_session,
     fact_rows,
     ingest_session,
@@ -1138,6 +1140,81 @@ def test_an_otc_common_name_is_not_in_the_staleness_denominator(
     assert result.ok is ok, result.runs[-1].message
     if ok:
         assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+NOT_COMMON = (
+    CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE"),
+    CoverListing("5.25% Notes due 2030", "ACME30", "NYSE"),
+)
+
+
+def test_notes_preferreds_and_otc_listings_are_not_fetched(
+    settings: Settings,
+) -> None:
+    # #794: a note, a preferred and an OTC listing are not fetched; a
+    # common NYSE name and a benchmark are, and every counted name is.
+    prices = _Prices()
+    result = _run(settings, prices, filings=_filings(acme_extra=NOT_COMMON, dual_listings=OTC_B))
+    assert result.ok, result.runs[-1].message
+    fetched = set(next(c for c in prices.calls if c[0] == "bars")[1])
+    assert {ACME, SPY} <= fetched
+    assert DUAL_B not in fetched
+    assert not any(sid.startswith(f"{ACME}:") for sid in fetched)  # preferred, note
+    assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+def test_the_fetched_security_types_come_from_config(settings: Settings) -> None:
+    # #794: a type the universe admits is fetched; a note still is not.
+    types = [*settings.universe.security_types, "preferred"]
+    tuned = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"security_types": types})}
+    )
+    prices = _Prices()
+    _run(tuned, prices, filings=_filings(acme_extra=NOT_COMMON))
+    fetched = set(next(c for c in prices.calls if c[0] == "bars")[1])
+    assert f"{ACME}:6-00pct-series-a-preferred-stock" in fetched
+    assert f"{ACME}:5-25pct-notes-due-2030" not in fetched
+
+
+@pytest.mark.parametrize(
+    ("sid", "exchange", "types", "fetched"),
+    [
+        ("X", "NYSE", {}, True),  # no classification row yet
+        ("X", "NYSE", {"X": {"unclassifiable"}}, True),  # e.g. before a spin-off's first 10-Q
+        ("X", "NYSE", {"X": {"debt", "common"}}, True),  # common in one revision
+        ("X", "NYSE", {"X": {"spac"}}, True),  # #802 owner: blocklist, not allowlist
+        ("X", "NYSE", {"X": {"foreign"}}, True),
+        ("X", "NYSE", {"X": {"fund"}}, True),
+        ("X", "NYSE", {"X": {"depositary"}}, True),
+        ("X", "NYSE", {"X": {"debt"}}, False),
+        ("X", "NYSE", {"X": {"preferred"}}, False),
+        ("X", "NYSE", {"X": {"warrant"}}, False),
+        ("X", "NYSE", {"X": {"unit"}}, False),
+        ("X", "NYSE", {"X": {"right"}}, False),
+        ("X", "OTC", {"X": {"common"}}, False),
+        (SPY, "OTC", {}, True),  # a benchmark whatever its listing
+    ],
+)
+def test_the_fetch_predicate(
+    settings: Settings, sid: str, exchange: str, types: dict[str, set[str]], fetched: bool
+) -> None:
+    assert _fetched(sid, {"exchange": exchange}, {SPY}, types, settings) is fetched
+
+
+def test_types_known_has_every_revision_known_at_t_and_none_after(settings: Settings) -> None:
+    _run(settings, source="edgar")
+    later = NOW + timedelta(days=1)
+    with open_for_write(settings) as conn:
+        cursor = conn.execute("SELECT * FROM classifications WHERE security_id = ?", [ACME])
+        names = [d[0] for d in cursor.description]
+        row = dict(zip(names, cursor.fetchone() or (), strict=True))
+        insert_row(
+            conn,
+            "classifications",
+            {**row, "security_type": "foreign", "known_at": later, "ingested_at": later},
+        )
+        assert _types_known(conn, NOW)[ACME] == {"common"}  # no look-ahead
+        assert _types_known(conn, later)[ACME] == {"common", "foreign"}
 
 
 def test_the_staleness_exchange_filter_comes_from_config(settings: Settings) -> None:
