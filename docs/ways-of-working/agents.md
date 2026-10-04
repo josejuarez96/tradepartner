@@ -14,7 +14,7 @@ This doc covers build agents only. Whether TradePartner has an LLM layer at all 
 
 ## Roster
 
-Seven agents. That is deliberately few: each one owns a job the main session does badly or inconsistently. Add an agent only after doing the same job by hand about three times and seeing it go wrong.
+Eight agents. That is deliberately few: each one owns a job the main session does badly or inconsistently. Add an agent only after doing the same job by hand about three times and seeing it go wrong.
 
 | Agent | Stage | Job | Writes? | Model |
 |---|---|---|---|---|
@@ -25,6 +25,7 @@ Seven agents. That is deliberately few: each one owns a job the main session doe
 | `safety-reviewer` | Review | Audits diffs touching the broker, orders, secrets, or LLM inputs/outputs: order isolation, idempotency, kill switch, prompt injection, key handling | No (read-only) | opus |
 | `backtest-runner` | Build / Review | Runs **one** hypothesis file on a temp-file copy of the fixture store it builds itself (`store_path` always set, so its trials are synthetic and never reach the owner's registry), inside the fixture's 2018-2020 window, and reports metrics, gap and refusals. Never passes a holdout or override flag, never enters the main checkout. Its scripts run through `uv run python`, which must stay off the allow list | Only its scratchpad | sonnet |
 | `doc-keeper` | Record | After a merge or at session end: updates `STATUS.md`, `CHANGELOG.md` and plan checkboxes, and flags drift between docs and code | Only `docs/`, `CHANGELOG.md` | haiku |
+| `flow-auditor` | Improve | Hand-triggered, read-only audit of the owner ↔ orchestrator ↔ system loop: measures the baseline in [continuous-improvement.md](continuous-improvement.md), classifies each friction as keep / streamline / automate / remove, designs what runs unattended or from the phone, ranks the top 10 with at most three "do now". Never adds a gate, never weakens one without naming it an owner decision, never files issues or merges | Only `docs/retros/flow-audit-*.md` | opus |
 
 **General code review** uses the built-in `/code-review` command. We don't need our own generic reviewer.
 
@@ -39,6 +40,7 @@ Spec/Plan: main session drafts ──► spec-critic ──► owner merges
 Build:     team claims task (scripts/team.py) ──► implementer × N (parallel worktrees, non-overlapping tasks) ──► draft PRs
 Review:    /code-review + quant-auditor and/or safety-reviewer (by paths touched) ──► owner merges
 Record:    doc-keeper
+Improve:   owner or orchestrator triggers ──► flow-auditor (read-only) ──► report PR ──► inbox entries and size:S issues
 ```
 
 ## Orchestrator windows and model tiers
@@ -51,7 +53,7 @@ Any number of Claude Code chat windows may build in parallel; each one is a **te
 | A team window on a docs-only task that neither the row above nor the Fable row names; on a plan task whose `Review:` field does **not** name `safety-reviewer` (a pure module, a page, a report); or on a `size:S` issue whose fix touches no path in `SAFETY_PREFIXES` (`scripts/ready_pr.py`; that constant is the list, this row does not repeat it) and nothing that handles a secret | **Sonnet 5** | The plan line is the contract; the window claims, hands it to an `implementer`, runs the reviewers and `/ready-pr`. Windows were 56% of all tokens on Opus (#489) |
 | Spec, plan and ADR drafting; phase retros; cross-team conflict resolution; changes to the ways-of-working docs | **Fable 5.1** | Errors here land in every later PR |
 | `implementer`, `backtest-runner` | Sonnet (roster) | One scoped task with a plan line and tests; one scripted fixture run |
-| `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer` | Opus (roster) | Judgment-heavy, read-only or doc-only |
+| `researcher`, `spec-critic`, `quant-auditor`, `safety-reviewer`, `flow-auditor` | Opus (roster) | Judgment-heavy, read-only or doc-only |
 | `doc-keeper` | Haiku (roster) | Mechanical |
 
 The orchestrator names the model in the assignment; a window whose assignment names none starts on Sonnet 5 for the second row's work and on Opus 5.5 otherwise. Escalate to Fable only for the third row, and say so in the PR description when you did. A Sonnet window that meets a judgment call its task line does not settle (a reviewer BLOCKER it cannot resolve, a conflict with another team's line) reports `blocked` to the orchestrator; it does not guess.
@@ -83,7 +85,7 @@ What stays true regardless of how many agents run:
 - Subagents never claim, release, mark ready or merge. The window does those, through `scripts/team.py` and `/ready-pr`.
 - Work outside the claim becomes an issue, not an extra agent.
 - New agent types land only through a PR the owner merges (see "Adding or changing an agent"). A window does not invent one mid-task.
-- A subagent cannot spawn subagents; the platform removes that tool from them. Depth is one level, breadth is the window's call within these rows.
+- Depth is two: the window spawns team agents and helpers; a team agent spawns its reviewers and read-only helpers; reviewers, implementers and helpers spawn nothing. The platform allows deeper nesting (three levels below the window by default, `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`), so this is a rule, not a tool limit (corrected 2026-10-04, #769; the earlier text said subagents could not spawn at all). A background subagent's own helpers hand back to the window, not to it, so a team agent runs its reviewers in the foreground (`run_in_background: false`, in parallel in one message) and posts the verdicts itself; a stray hand-back that reaches the window is forwarded to the team in one message, never re-run. Breadth is the window's call within these rows.
 - Parallelism is bounded by the plan's dependency graph. When the frontier is one task, one window is enough; the rest pick research, decision or docs issues ([teams.md](teams.md), Picking work).
 
 ## Guardrails against agents "running wild"

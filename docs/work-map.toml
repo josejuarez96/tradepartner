@@ -681,3 +681,8 @@ unblocks = ["issue:618"]
 what = "Draft the research-experiment registry spec (runs that are not backtests), with its plan task lines, as a spec only."
 why = "Answers the ML validation brief's registry proposal and the annotation protocol's interim log before any such run happens."
 unblocks = ["spec:research-registry"]
+
+[issue.769]
+what = "A read-only flow auditor, the continuous-improvement page and the first audit: where the owner, the orchestrator and the system stall, what to keep, streamline, automate or remove, and what runs while the owner is away from the laptop."
+why = "The owner's minutes and the days with no merges are the project's rate limit; the audit cuts the accidental friction and leaves the gates on money, orders and point-in-time data as they are."
+unblocks = ["phase:4"]

@@ -1,0 +1,105 @@
+# Flow audit 1: the owner, the orchestrator and the system (2026-10-04)
+
+**Status:** first audit, hand-triggered  ·  **Issue:** #769  ·  **Window:** 2026-09-24 to 2026-10-04 (9 active days, 315 merged PRs)  ·  **Next:** after the three items below land, or at ~50 more merges ([continuous-improvement.md](../ways-of-working/continuous-improvement.md))
+
+The question Jose asked: where do he, the orchestrator and the system stall, which of that friction is load-bearing, and what keeps moving when he is away from the laptop. Short answer: the gates that protect money, orders, secrets and point-in-time data are all cheap and stay; most of the owner's minutes go to being a **relay** (commands only he can run, approvals re-granted every session, decisions scattered over a dozen threads), and the system has **no phone-reachable surface** at all. Three changes fix most of that without touching a gate.
+
+## Do now (three)
+
+**1. Drive the orchestrator from your phone: turn on Remote Control and its push notifications.** Claude Code has this today (`/remote-control` in the orchestrator window, then the Code tab in the Claude phone app; `/config` turns notifications on). You get a push when a window needs a decision, and you answer the permission prompt or type "merge train `<id>`" from the phone. Nothing about the gates changes: the window keeps its permission mode, the phone cannot select bypass, and `merge_train.py merge` still prompts. Constraint: the Mac must stay awake (plugged in, "prevent automatic sleeping on power adapter", or `caffeinate -s`). *Size: 10 minutes, you. Decides: you. Cuts: every "I'm back, what happened?" round trip and the hours a ready batch waits.*
+
+**2. One owner inbox: a single pinned issue you answer from the phone with one line.** Every open owner question (today 11 issues plus the stale #366 digest and the "Decisions needed" list in STATUS, last refreshed 2026-10-02) is regenerated into one issue, ordered by what it blocks, each with lettered options and the drafting agent's recommendation. You answer by comment: `#750: b`, `#731: 1`, `hold #729`, `merge train <id>`. The orchestrator polls it (`/loop 15m`) and writes each answer back on the source issue; a rule change still lands as an ADR or spec amendment PR, as now. Only comments by your login count. *Size: S (a `team.py inbox` subcommand or `scripts/inbox.py`; a window builds it). Decides: you pick the label and the answer format.*
+
+**3. Write the standing merge approval down, by PR class, instead of re-granting it in chat every session.** You have granted "merge what is ready and green" to four orchestrators in a row (9c, 03, 1c, 3f); each new one has to ask again, and nothing says which PRs it covers. Proposal, as an ADR 0002 amendment: class A (docs, tests, research, pure modules off the order path, every required verdict `PASS`, train green) may be landed by the orchestrator's `merge_train.py merge` under a written standing approval; class B (anything under `SAFETY_PREFIXES`, `config.py`, `.claude/settings.json`, CI, rulesets, ADRs and specs that change a rule, and any PR you label `hold`) waits for your word per batch, as today. Kill switch: a `hold` label on any PR or a comment "stop merges" in the inbox; cap of two unattended trains per day; one digest comment per train in the inbox. **This relaxes git-workflow rule 7 for class A and is yours to decide**; it does not change what a train tests. *Size: S docs (ADR amendment, rule 7, teams.md), spec-critic. Decides: you.*
+
+## What the numbers say
+
+- **Throughput is high and bursty:** 7, 83, 20, 35, 7, 0, 0, 69, 26, 27, 41 merges per day. The two zero days are the owner's days off: nothing lands without him.
+- **When he is present, approval is fast:** ready→merged median 22 min, p75 55 min on the last 60 merged PRs (47 under an hour, 12 in 1–4 h, one at 71 h). Created→merged median 1.2 h. Approval latency is not the problem while he is at the keyboard; absence is.
+- **The owner is at the keyboard in two blocks** (roughly 15:00–03:00 UTC), near zero 09:00–12:00 UTC. The system has no way to reach him in between and no way for him to answer from the phone.
+- **CI is the wall-clock floor:** `checks` median 36 min, p90 45 min on PRs that run pytest; a train adds another full run. 118 of the last 300 runs were cancelled (superseded pushes), 6 failed (none on `main`), 2 were three-second billing failures.
+- **Reviews are already capped and mostly first-pass clean:** first verdicts on the last 60 PRs: 29 `PASS`, 21 `PASS WITH FIXES`, 4 `FAIL`. 39 follow-up issues filed, 9 open. This costs tokens, not owner minutes.
+- **The owner relay:** 44 auto-mode classifier denials across 86 sessions; about one in five on read-only commands (`gh pr view` batches, reading a task's output file), the rest on cleanup (`git worktree remove`, `git branch -D`, `git push --delete`, `team.py prune`, `release --force`) and one `gh api -X POST` (the ruleset). The memory note on this has eight dated updates since 09-24: the same lesson re-learned per session.
+- **Decisions are scattered:** 57 open issues, 11 owner-decision-shaped, 10 with no size label (unclaimable until he sizes them), the #366 digest open since 09-30 with four comments and one answer.
+- **Window-to-window messages are the most expensive thing a session does** (97% of tokens were re-reads on 10-01, #489); the "ready / blocked only" rule holds, but background helpers of a team hand back to the orchestrator, not to the team, so teams stall or the orchestrator forwards by hand.
+- **Tooling that exists and is unused here:** Remote Control, phone notifications, Routines (cloud cron), cloud sessions from the phone, `PermissionRequest` and `Notification` hooks, `/loop`. No hook is configured; `allow_auto_merge` is off; the only workflow is `ci.yml`.
+
+## Top 10, ranked
+
+Ranked by owner minutes and wall-clock hours saved per unit of work, with the gate each one touches. "Decides" names who says yes.
+
+| # | Change | Cuts | Size · decides |
+|---|---|---|---|
+| 1 | **Remote Control + push notifications** on the orchestrator window; Mac awake on power | Round trips after absences; batch wait while away | 10 min · owner |
+| 2 | **Owner inbox** issue, regenerated, answered by one-line comments; orchestrator polls with `/loop` | The scattered decision queue; sizing stalls | S · owner (format), window (build) |
+| 3 | **Standing merge approval by class**, written into ADR 0002 and rule 7, with `hold` and a daily cap | Re-granting every session; class-A batches waiting overnight | S docs · **owner (relaxes rule 7 for class A)** |
+| 4 | **Auto-mode allow list for cleanup and read-only reads** in `~/.claude/settings.json` (`/auto-mode-setup`): `git worktree prune`, `team.py prune --yes`, `git push origin --delete`, `team.py release --force`, `gh api` GET prefixes; writes stay denied by pattern (`-X`, `--method`, `-f`, `-F`, `--input`). Plus `setopt interactivecomments` in `.zshrc`, and paste blocks with no `#` lines (teams.md) | The relay for hygiene; broken pastes | 15 min · owner |
+| 5 | **Train build on a trigger** (≥3 eligible PRs, or every 2 h while one is eligible); `build` merges nothing | A ready PR waiting for someone to ask for a train | M · **owner (reverses merge-train decision 5)**; record must live where `merge` runs, see below |
+| 6 | **PR CI runs the targeted tests; the full suite moves to `train/**` and `main`**; a hand merge of one PR needs a full-suite run on its head (`ready_pr --full-tests`) | PR CI from ~36 to ~10 min; fewer cancelled runs | S (`ci.yml`, `ready_pr.py`) · owner (moves a gate, same strength) |
+| 7 | **`ready_pr.py` default `--timeout-min 45`** (CI takes 36–45 min; the 25-min default loops) | Timeout loops, repeated merges of `main` | S · none needed |
+| 8 | **Daily fold** when ≥10 fragments are pending (`doc-keeper`, one docs PR, rides the train) | STATUS staleness; the "fold when stale" ask | S rule · owner |
+| 9 | **Notification hook → ntfy/phone** for `blocked:` and `ready` from every window (payload: PR numbers and one line; topic in user settings, never the repo) | Blind spots item 1 does not cover (windows other than the orchestrator) | S · owner installs; safety-reviewer on the settings diff |
+| 10 | **Follow-up issues are `size:S` by default**; unsized issues appear in the inbox; a window never waits on sizing for a follow-up it filed | The 10 unclaimable issues; sizing round trips | S docs · owner |
+
+Not ranked, worth a line: a nightly `ingest` launchd job on the awake Mac that posts its result to an issue (the runbook exists; owner-installed; read-only data; `.env` stays local) would let a team pick up backfill failures (#687, #710, #735 cost three days) without him at the keyboard.
+
+## Away from the laptop: the design
+
+Each candidate was checked against the Claude Code docs on 2026-10-04 rather than assumed. "Awake" means the Mac must be on; "cloud" runs without it.
+
+| Candidate | Status | Use it for | Guardrail |
+|---|---|---|---|
+| **Remote Control** (phone drives a local window) | Exists; awake | Approvals, prompts, "merge train `<id>`", steering | Permission mode unchanged; no bypass from the phone; `ask` entries still prompt |
+| **Phone push notifications** | Exists for Remote Control sessions only | "Needs a decision", "finished" | Nothing to guard; it is read-only |
+| **Owner inbox** (GitHub issue) | Build, size S | Every owner question, answered by one line | Only the owner's login counts; closed answer vocabulary; answers copied to the source issue; rule changes still land as ADR/spec PRs |
+| **GitHub-mobile comment commands** (`merge train <id>` as a comment) | Works with items 1 and 2 | Approving a batch from the phone | The window runs `merge_train.py merge`, which still hits the `ask` prompt; the owner answers it over Remote Control or moves that entry to `allow` (**that is a weakened gate; his decision, say so in writing**) |
+| **Standing approval by class** | Decide, size S docs | Class-A batches landing unattended | Class list in the ADR; `hold` label; daily cap; digest per train |
+| **Auto-build train when N are ready** | Decide, size M | Removing the "build a train" ask | `build` merges nothing; one at a time. The record lives in `~/.tradepartner/merge_train/` on the machine that built, and `merge` must run there, so this runs on the awake Mac (`/loop` in the orchestrator, or launchd), not in the cloud, until a spec amendment makes the record reconstructible from the PR comments |
+| **Permission allow-rules for read-only commands** | Exists; user-level `autoMode.allow`, not the repo file | Ending the relay for `gh` reads and cleanup | Rules match command text, not HTTP method: keep `gh api` write flags in `deny`; `gh pr merge`, `merge_train.py merge`, `--admin`, pushes to `main` and `.env` stay as they are |
+| **Hooks** (`Notification`, `Stop`, `PermissionRequest`) | Exist; local, or HTTP to an always-on service | Push to the phone from any window; later, auto-answering a closed class of prompts | A `PermissionRequest` hook that answers `allow` is a gate removal: not proposed now; if ever, only for the cleanup class in item 4 |
+| **Routines** (cloud cron) | Exist (Pro/Max); cloud; repo via the Claude GitHub app | Read-only jobs: this audit's GitHub half, a drift check, a stale-PR sweep, a daily digest comment | No local transcripts, no `.env`, branches are `claude/…` (fails the claims guard unless renamed), so first uses post comments only: no claim, no merge, no PR |
+| **Cloud sessions from the phone** | Exist | Starting a one-off cloud task from the phone | Same `claude/` branch caveat; no local store; keep to docs and research |
+| **Claude GitHub Action** (`@claude` in comments) | Exists | Not now | Needs an API key in GitHub secrets (a second credential surface) and duplicates the windows; revisit when no window is running |
+| **Decision page as an artifact** | Possible | Rejected | GitHub is the source of truth (teams.md rule 1); a second store of answers would drift |
+
+What this gives when Jose is away: windows keep building and reviewing (unchanged); class-A batches land under the standing approval (item 3) once a train has run (item 5 or a window asked for one); everything else queues in the inbox (item 2) and he answers from the phone (items 1 and 2); the Mac stays awake so the train record and the ingest job are reachable. What still needs his hands: keys, the real store, order-path and config merges, rule changes, the ruleset, `--admin`.
+
+## Friction inventory
+
+Verdicts: **keep** (load-bearing: removing it lets one mistake reach money, orders, secrets, `main` or the point-in-time rule) · **streamline** · **automate** · **remove**.
+
+| Friction | Evidence | Verdict |
+|---|---|---|
+| Owner's word on every merge (rule 7) | 0 merges on his days off; approval fast when present | **Keep** for class B; **streamline** for class A via item 3 |
+| Train built on request only (decision 5) | #764 first real build hit an unexercised path; batches wait for the ask | **Automate** the build (item 5); the merge stays his |
+| Owner as relay for cleanup and `gh api -X POST` | 44 denials; 8 memory updates; zsh ate `#` lines in pastes | **Remove** via item 4; the ruleset `POST` was one-off |
+| Classifier denials on read-only reads | ~1 in 5 denials; blocked teams wait or re-ask | **Remove** via item 4 |
+| Standing approval re-granted per orchestrator | 4 grants in chat, none in the repo | **Streamline** via item 3 |
+| Decisions scattered across issues, PRs, STATUS | 11 decision issues; #366 since 09-30; STATUS stale 2 days | **Automate** via item 2 |
+| Unsized issues unclaimable | 10 open without `size:` | **Streamline** via item 10 |
+| Full pytest on every code PR, then again on the train | 36–45 min per run; 118/300 cancelled | **Streamline** via items 6 and 7 |
+| Two review passes per reviewer, verification diff | 36% first-pass `PASS WITH FIXES`; tokens, not minutes | **Keep** (#489 already capped it) |
+| Claim before branch, one fragment per PR, template boxes, work-map entry | Prevents the 09-24 duplicates and the shared-file conflicts; seconds each | **Keep** |
+| Owner tasks: keys, real store, recordings, Probe 3 | Backfill chain cost three days (#687, #710, #735) | **Keep** the ownership; **automate** the nightly run on the awake Mac |
+| Background helpers hand back to the orchestrator, not the team | ibis on #532 idled; `/code-review` finders report empty | **Streamline**: the rule is in every brief; it now sits in agents.md (this PR) |
+| agents.md said subagents cannot spawn subagents | Teams spawn reviewers daily; docs allow depth 3 | **Remove** the stale line (this PR) |
+| Window messages wake and re-read whole sessions | 97% of tokens (#489) | **Keep** the "ready / blocked only" rule |
+| `ask` on `gh pr merge` and `merge_train.py merge`; `deny` on `main`, `.env`, `--no-verify` | The last local layer before the ruleset | **Keep** |
+| Ruleset on `main`; the owner-only `--admin` bypass | Active since 10-04 | **Keep** |
+| Holdout flag; trial registry; `known_at` everywhere | Charter | **Keep** |
+
+## Agents: keep / change / delete
+
+`spec-critic`, `quant-auditor`, `safety-reviewer`, `implementer`, `backtest-runner`, `researcher`: keep, in use daily. `doc-keeper`: keep; give it the daily fold (item 8). New: `flow-auditor` (this PR), read-only, hand-triggered; judge it at the next audit by whether the three do-now items landed and the baseline moved.
+
+## Changes to ways of working (made in this PR)
+
+1. `flow-auditor` added to the roster and the stage diagram ([agents.md](../ways-of-working/agents.md)).
+2. The stale "a subagent cannot spawn subagents" line replaced by the verified rule: depth is two (window → team agent → its reviewers and helpers), and a team runs reviewers in the foreground because a background helper's hand-back goes to the window ([agents.md](../ways-of-working/agents.md), Parallelism inside a team).
+3. [continuous-improvement.md](../ways-of-working/continuous-improvement.md): cadence, inputs, scoring, how findings become inbox entries or issues, and the baseline table this audit starts.
+
+Nothing in this PR changes a script, CI, a hook or a permission rule; every such change above is a proposal with an owner.
+
+## Method and caveats
+
+Inputs: `gh` (336 PRs, 300 CI runs, 57 open issues, timelines of the 60 most recent merged PRs), the ways-of-working docs and scripts, ADR 0002, the merge-train spec, the memory notes, and the local Claude Code transcripts (86 session files, streamed with a stdlib script; counts only, two one-line quotes, no values). Claude Code capabilities were checked against the product docs on 2026-10-04 by the `claude-code-guide` agent. Caveats: about half the "human" turns in the transcripts are window-to-window messages the harness tags as human, so per-day message counts are upper bounds; the ready→merge pairing in chat is approximate (the GitHub timeline numbers above are the reliable ones); the read-only share of denials is an undercount (compound `cd … && grep` commands were scored as mutating). Raw counts are in the session scratchpad, not in the repo.

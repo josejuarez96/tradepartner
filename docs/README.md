@@ -17,7 +17,7 @@ docs/
 ├── specs/                ← what & why per feature: <feature>.md
 ├── plans/                ← how per feature: <feature>.md (tasks → PRs)
 ├── hypotheses/           ← pre-registered backtest hypotheses: <slug>.md, frozen once registered
-├── retros/               ← phase-N.md
+├── retros/               ← phase-N.md, flow-audit-<date>.md
 └── templates/            ← copy these; don't edit in place
 ```
 
@@ -34,6 +34,7 @@ docs/
 | **Architecture** | How do the pieces fit today? | Phase 1+ | Living; updated when structure changes | n/a |
 | **Hypothesis** | What exactly are we testing, with which parameters and holdout, and what would retire it? | Before any backtest run of a new idea | **Frozen** once registered: any edit is a new hypothesis | [hypothesis](templates/hypothesis.md) |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
+| **Flow audit** | Where does the owner ↔ orchestrator ↔ system loop stall, and what to keep, streamline, automate or remove? | On the cadence in [continuous-improvement.md](ways-of-working/continuous-improvement.md) | Frozen; the next audit reports the same baseline rows | the headings of the latest `retros/flow-audit-*.md` |
 | **CHANGELOG** | What changed, per version? | Every PR | One fragment per PR in `changelog.d/` (its STATUS line and CHANGELOG bullets), folded by doc-keeper | n/a |
 | **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | When an issue, research brief, ADR, spec or plan is opened | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
 
