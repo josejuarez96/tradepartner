@@ -219,6 +219,20 @@ def test_backfill_check_failures_raising_fails_the_edgar_chunk(settings: Setting
     assert "too many failures" in result.runs[0].message
 
 
+def test_backfill_input_validation_fails_the_edgar_chunk(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578: the backfill runs the same `_prefetch` gate (the crashes it
+    exists for were backfills: #599, #609)."""
+    from test_ingest import _CRASHES, _validating
+
+    filings = _validating(tmp_path, _CRASHES)
+    result = _backfill(settings, _History(), filings=filings, source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "3 input(s) failed to parse" in result.runs[0].message
+    assert _read(settings, "SELECT count(*) FROM securities") == [(0,)]
+
+
 def test_actions_are_fetched_per_month_window(settings: Settings) -> None:
     ex = date(2019, 5, 15)
     div = CorporateAction(

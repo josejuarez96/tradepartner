@@ -476,9 +476,21 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
     first, so they can be quarantined and `accepted` although the chunk
     never commits (#610 policy 2); the check's error is re-raised either
     way, and a dry run records nothing. `dry_run` has no default (#629), so
-    a caller cannot record failures by leaving it out."""
+    a caller cannot record failures by leaving it out.
+
+    Before `check_failures()`, the input-validation gate (#578): if the
+    source exposes `validation_failures` (`edgar_validation`) and the pass
+    recorded any parse failure, the run fails here with one bounded message
+    naming the full list's file, before any store write, on a dry run too.
+    `check_failures()` and `record_failed_check()` are then not called: a
+    pass with absent inputs must not advance the per-document failure
+    counts."""
     _build_filings(recorded, settings, _FETCH_PASS)
     source = _unwrap(recorded)
+    validation = getattr(source, "validation_failures", None)
+    if validation is not None:
+        counted = {label: getattr(source, attribute, 0) for attribute, label in _EMPTY_COUNTS}
+        validation.raise_if_any(settings, counted)
     check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
         try:
@@ -495,6 +507,16 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
                     ) from record_error
             raise
     recorded.frozen = True
+
+
+#: The source's counts of empty `{}` payloads (#566, #576): counted, never
+#: failed, and shown next to a failed validation's list (#578).
+_EMPTY_COUNTS: tuple[tuple[str, str], ...] = (
+    ("facts_bulk_empty", "empty bulk facts"),
+    ("submissions_bulk_empty", "empty bulk submissions"),
+    ("facts_api_empty", "empty API facts"),
+    ("submissions_api_empty", "empty API submissions"),
+)
 
 
 def _ingest_filings(
