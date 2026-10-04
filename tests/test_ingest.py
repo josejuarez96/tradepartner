@@ -473,12 +473,13 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
         fsn_duplicates = 1
         fsn_reissue_undetected = 3
         fsn_incomplete_listings = 4
+        cover_incomplete_listings = 6  # #612: per-document cover parses
         fsn_missing = 5
 
     message = _run(settings, filings=_filings(cls=Fsn), source="edgar").runs[0].message
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
-        "FSN incomplete listings: 4; FSN missing: 5; missing"
+        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; missing"
     )
     assert counts in message
 
