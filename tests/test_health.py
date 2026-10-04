@@ -20,7 +20,7 @@ import polars as pl
 import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
-from tradepartner.calendar import last_session_of_month, session_close
+from tradepartner.calendar import all_sessions, last_session_of_month, session_close
 from tradepartner.config import Settings
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
@@ -536,14 +536,15 @@ def test_duplicate_bar_fails_its_rule(loose_store: duckdb.DuckDBPyConnection) ->
 
 
 def test_overlapping_listing_fails_its_rule(fixture_store: duckdb.DuckDBPyConnection) -> None:
-    # A second SEC_DUAL_A listing from the same session on another exchange.
+    # A second SEC_DUAL_A listing from the same session on another exchange
+    # under another ticker: two lines, not one line tagged twice (#822).
     known = datetime(2017, 1, 3, 21, 0, tzinfo=UTC)
     insert_row(
         fixture_store,
         "listings",
         {
             "security_id": "SEC_DUAL_A",
-            "ticker": "DUALA",
+            "ticker": "DUALX",
             "exchange": "NASDAQ",
             "class_title": "Class A Common Stock",
             "valid_from": date(2017, 1, 3),
@@ -618,6 +619,112 @@ def test_ticker_change_and_transfer_are_not_overlaps(
     assert check.passed
 
 
+def _listing_row(
+    sid: str, ticker: str, exchange: str, valid_from: date, class_title: str = "Common Stock"
+) -> dict[str, Any]:
+    known = session_close(valid_from)
+    return {
+        "security_id": sid,
+        "ticker": ticker,
+        "exchange": exchange,
+        "class_title": class_title,
+        "valid_from": valid_from,
+        "known_at": known,
+        "ingested_at": known,
+        "source": "fixture",
+        "provenance": "filing",
+    }
+
+
+def _form25_row(sid: str, exchange: str, filed_on: date, effective_on: date) -> dict[str, Any]:
+    filed = session_close(filed_on)
+    return {
+        "security_id": sid,
+        "form": "25",
+        "class_title": "Common Stock",
+        "exchange": exchange,
+        "filed_at": filed,
+        "effective_on": effective_on,
+        "known_at": filed,
+        "ingested_at": filed,
+        "source": "fixture",
+        "provenance": "filing",
+    }
+
+
+@pytest.mark.parametrize("successor_exchange", ["NONE", "OTC"])
+def test_late_form25_after_a_move_off_exchange_is_not_an_overlap(
+    fixture_store: duckdb.DuckDBPyConnection, successor_exchange: str
+) -> None:
+    # SCON/BPTH (#822): suspended, quoted OTC (a NONE or OTC row) from
+    # 2018-06-01, Form 25 filed months later. No second exchange line.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_SPLIT_BACKFILLED", "BKFL", successor_exchange, date(2018, 6, 1)),
+    )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row("SEC_SPLIT_BACKFILLED", "NYSE", date(2019, 1, 10), date(2019, 1, 20)),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_late_form25_is_checked_against_the_next_exchange_line_past_an_otc_row(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # An OTC row between the NYSE line and a NASDAQ line does not hide the
+    # NYSE line still being live seven months into the NASDAQ one.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_SPLIT_BACKFILLED", "BKFL", "OTC", date(2018, 3, 1)),
+    )
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_SPLIT_BACKFILLED", "BKFL", "NASDAQ", date(2018, 6, 1)),
+    )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row("SEC_SPLIT_BACKFILLED", "NYSE", date(2019, 1, 10), date(2019, 1, 20)),
+    )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    [row] = check.violations.to_dicts()
+    assert (row["exchange"], row["next_exchange"]) == ("NYSE", "NASDAQ")
+    assert row["next_valid_from"] == date(2018, 6, 1)
+
+
+@pytest.mark.parametrize("late_form25", [False, True])
+@pytest.mark.parametrize("class_title", ["Class A Common Stock", "CLASS A COMMON STOCK, $0.01 PAR"])
+def test_same_day_rows_differing_only_in_exchange_tag_are_tolerated(
+    fixture_store: duckdb.DuckDBPyConnection, late_form25: bool, class_title: str
+) -> None:
+    # INTT/PLAG/PRPB.U/CEI (#822): the same ticker filed on the same day
+    # under two exchange tags (and in CEI's case two wordings of the class
+    # title) is one line tagged twice, also when a Form 25 later ends one of
+    # the two rows.
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row("SEC_DUAL_A", "DUALA", "NASDAQ", date(2017, 1, 3), class_title),
+    )
+    if late_form25:
+        insert_row(
+            fixture_store,
+            "delistings",
+            _form25_row("SEC_DUAL_A", "NYSE", date(2020, 6, 30), date(2020, 7, 10)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
 def test_bar_after_a_delisting_takes_effect_fails_its_rule(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -664,6 +771,93 @@ def test_bar_on_a_later_listing_of_the_same_security_is_allowed(
     insert_row(fixture_store, "prices_daily", _bar("SEC_TRUNC_DELIST", date(2019, 3, 4)))
     checks = integrity_checks(fixture_store, T_END, _settings())
     assert _failed(checks) == set()
+
+
+_TRHX = "SEC_TRUNC_DELIST"
+#: TRHX's Form 25 takes effect on this Sunday; its last fixture bar is
+#: 2018-05-25 (fixture README).
+_TRHX_EFFECTIVE = date(2018, 6, 24)
+
+
+def _sessions(first: date, last: date) -> list[date]:
+    return [s for s in all_sessions() if first <= s <= last]
+
+
+def _violating_sessions(conn: duckdb.DuckDBPyConnection, settings: Settings) -> list[date]:
+    checks = integrity_checks(conn, T_END, settings)
+    check = next(c for c in checks if c.rule == NO_BARS_AFTER_DELISTING)
+    return list(check.violations["session"])
+
+
+def test_trading_that_continues_past_the_effective_date_is_allowed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # CMPR (#822): the old shares' Form 25 takes effect and the same line
+    # keeps trading without a break. The listing's end is its last bar.
+    for session in _sessions(date(2018, 5, 29), date(2018, 9, 28)):
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, _settings()) == []
+
+
+def test_bars_resuming_after_a_gap_past_the_effective_date_fail(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # EGLE (#822): the line trades on to 2018-06-29, stops, and bars come
+    # back months later: every resumed bar fails, the tail before does not.
+    for session in _sessions(date(2018, 5, 29), date(2018, 6, 29)):
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    resumed = _sessions(date(2018, 10, 1), date(2018, 10, 5))
+    for session in resumed:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, _settings()) == resumed
+
+
+@pytest.mark.parametrize("off_exchange", ["NONE", "OTC"])
+def test_an_otc_row_before_the_effective_date_does_not_end_the_check(
+    fixture_store: duckdb.DuckDBPyConnection, off_exchange: str
+) -> None:
+    # Suspension sequence: TRHX quoted OTC from 2018-06-01, before its Form
+    # 25 takes effect. Bars resuming months later still fail.
+    insert_row(
+        fixture_store, "listings", _listing_row(_TRHX, "TRHX", off_exchange, date(2018, 6, 1))
+    )
+    resumed = _sessions(date(2018, 10, 1), date(2018, 10, 5))
+    for session in resumed:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, _settings()) == resumed
+
+
+@pytest.mark.parametrize("window", [1, 5])
+def test_a_gap_up_to_the_transfer_window_continues_the_tail(
+    fixture_store: duckdb.DuckDBPyConnection, window: int
+) -> None:
+    settings = _settings(master={"transfer_window_sessions": window})
+    tail = _sessions(date(2018, 5, 29), date(2018, 6, 29))
+    after = _sessions(date(2018, 7, 2), date(2018, 8, 31))
+    for session in tail:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    # `window` missing sessions, then trading again: still the tail.
+    for session in after[window : window + 3]:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, settings) == []
+    # One more missing session: the bars after it resume, and fail.
+    late = after[window + 3 + window + 1 :]
+    for session in late:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, settings) == late
+
+
+@pytest.mark.parametrize(
+    ("first_bar", "fails"), [(date(2018, 6, 25), False), (date(2018, 7, 9), True)]
+)
+def test_with_no_earlier_bar_the_gap_counts_from_the_effective_date(
+    fixture_store: duckdb.DuckDBPyConnection, first_bar: date, fails: bool
+) -> None:
+    fixture_store.execute("DELETE FROM prices_daily WHERE security_id = ?", [_TRHX])
+    bars = _sessions(first_bar, first_bar + timedelta(days=14))
+    for session in bars:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, _settings()) == (bars if fails else [])
 
 
 def test_changed_guarded_sic_default_fails_its_rule(
