@@ -484,7 +484,8 @@ research-registry spec (draft, #661) that computation reads returns and is a
 `return`-kind run in the `profitability` family, registered before it runs and counted
 in N (its req 9; it is in the trial budget above); until the registry exists it is not
 run, and whether a registry table (`trial_equity`) is an allowed input for a `return`
-run is that spec's open question 7 (its req 4 names the as-of API; #728 filed it). Its result informs the
+run is that spec's open question 7 (its req 4 names the as-of API;
+#728 filed it). Its result informs the
 B4 decision (whether the two signals are worth combining) and the backlog's next
 ranking, never this retirement. Whether to make it part of the retirement rule by adding
 a metric key is open question B3-8.
