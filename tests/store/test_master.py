@@ -21,7 +21,7 @@ import polars as pl
 import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
-from tradepartner.adapters.alpaca_prices import ListingResolver
+from tradepartner.adapters.alpaca_prices import ListingResolver, registrant_evidence
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -1064,3 +1064,213 @@ class TestNewEquityAfterForm25:
             (cik, DELISTED),
             (f"{cik}@2020-11-05", LISTED),
         ]
+
+
+class TestListingEvidenceAfterForm25:
+    """#834: reorganised securities that #826 still left delisted on the
+    owner's store. Real shapes: WSC (merger: 8-A12B and 15-12B, the same
+    shares reclassified), FRT (8-K12B the day of the Form 25, then cover
+    pages that parse with no listing), OKE (8-K12B before the Form 25, no
+    cover page since), SA (no filing; the companies snapshot still lists
+    it), and GORO (acquired: 15-12G, no ticker left) which stays delisted."""
+
+    CIK = "0000900005"
+    INGESTED = datetime(2026, 10, 5, tzinfo=UTC)
+
+    def _build(
+        self,
+        covers: list[CoverPage],
+        filing: DelistingFiling,
+        *,
+        forms: tuple[tuple[str, datetime], ...] = (),
+        snapshot: tuple[CompanySnapshotEntry, ...] = (),
+    ) -> MasterBuild:
+        return build_master(
+            self._source(covers, filing, forms, snapshot), _settings(), ingested_at=self.INGESTED
+        )
+
+    def _source(
+        self,
+        covers: list[CoverPage],
+        filing: DelistingFiling,
+        forms: tuple[tuple[str, datetime], ...],
+        snapshot: tuple[CompanySnapshotEntry, ...],
+    ) -> FixtureFilingSource:
+        cik = self.CIK
+        return FixtureFilingSource(
+            index=[
+                _filing(cik, "Reorg Co", "10-K", _at(2018, 3, 1)),
+                *(_filing(cik, "Reorg Co", form, at) for form, at in forms),
+            ],
+            cover_pages=covers,
+            delistings=[filing],
+            snapshot=snapshot,
+        )
+
+    def _rows(self, build: MasterBuild) -> list[tuple[object, ...]]:
+        return [
+            (r["security_id"], r["ticker"], r["valid_from"], r["known_at"], r["provenance"])
+            for r in build.listings
+            if r["provenance"] != "snapshot_static"
+        ]
+
+    def test_a_merger_with_a_form_15_is_not_new_equity(self) -> None:
+        # WSC: 8-A12B 2020-07-01, Form 25 the same day, 15-12B 2020-07-13.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2020, 5, 6), ("Class A common stock, par value", "WSC", "NASDAQ")),
+                _cover(cik, _at(2020, 8, 10), ("Common Stock, par value $0.0001", "WSC", "NASDAQ")),
+            ],
+            DelistingFiling(
+                cik, "25-NSE", "Class A Common Stock", "NASDAQ", "25-wsc", _at(2020, 7, 1, 15, 0)
+            ),
+            forms=(("8-A12B", _at(2020, 7, 1, 14, 0)), ("15-12B", _at(2020, 7, 13))),
+        )
+        assert build.successions == ()
+        assert self._rows(build) == [
+            (cik, "WSC", date(2020, 5, 6), _at(2020, 5, 6), "filing"),
+            (cik, "WSC", date(2020, 8, 10), _at(2020, 8, 10), "filing"),
+        ]
+
+    def test_an_8k12b_relists_without_a_cover_page(self) -> None:
+        # FRT: 8-K12B and Form 25 on 2022-01-03 (effective 2022-01-13); every
+        # later cover page parses with no listing.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(
+                    cik, _at(2021, 11, 4), ("Common Shares of Beneficial Interest", "FRT", "NYSE")
+                ),
+                _cover(cik, _at(2022, 2, 10)),
+                _cover(cik, _at(2022, 5, 5)),
+            ],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Shares of Beneficial Interest",
+                "NYSE",
+                "25-frt",
+                _at(2022, 1, 3, 21, 0),
+                date(2022, 1, 13),
+            ),
+            forms=(("8-K12B", _at(2022, 1, 3, 13, 30)),),
+        )
+        assert self._rows(build) == [
+            (cik, "FRT", date(2021, 11, 4), _at(2021, 11, 4), "filing"),
+            (cik, "FRT", date(2022, 1, 14), _at(2022, 1, 3, 21, 0), "filing"),
+        ]
+
+    def _oke(self) -> FixtureFilingSource:
+        cik = self.CIK
+        return self._source(
+            [_cover(cik, _at(2026, 8, 4), ("Common stock, par value of $0.01", "OKE", "NYSE"))],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Stock",
+                "NYSE",
+                "25-oke",
+                _at(2026, 9, 18, 13, 35),
+                date(2026, 9, 28),
+            ),
+            (("8-K12B", _at(2026, 9, 10, 20, 47)), ("15-12G", _at(2026, 9, 28, 21, 9))),
+            (),
+        )
+
+    def test_an_8k12b_before_the_form_25_relists_at_the_form_25(self) -> None:
+        cik = self.CIK
+        build = build_master(self._oke(), _settings(), ingested_at=self.INGESTED)
+        assert self._rows(build) == [
+            (cik, "OKE", date(2026, 8, 4), _at(2026, 8, 4), "filing"),
+            (cik, "OKE", date(2026, 9, 29), _at(2026, 9, 18, 13, 35), "filing"),
+        ]
+
+    def test_the_resolver_keeps_a_relisted_security_trading(self) -> None:
+        # End to end with #830's own-delisting rule: OKE's bars after the
+        # Form 25's effective day stay on OKE.
+        cik = self.CIK
+        source = self._oke()
+        build = build_master(source, _settings(), ingested_at=self.INGESTED)
+        delistings = build_delistings(source.delistings(), build, ingested_at=self.INGESTED)
+        bars = [date(2026, 9, 25), date(2026, 9, 28), date(2026, 9, 30), date(2026, 10, 2)]
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik] * len(bars), "session": bars}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        evidence = registrant_evidence(
+            [], ends.to_dicts(), as_of=date(2026, 10, 4), quiet_after_days=180
+        )
+        resolver = ListingResolver(build.listings, evidence)
+        assert [resolver.resolve("OKE", day) for day in bars] == [cik] * len(bars)
+
+    def _sa(self, *, fetched_at: datetime | None) -> FixtureFilingSource:
+        cik = self.CIK
+        snapshot = (
+            () if fetched_at is None else (_snap(cik, "SEABRIDGE", "SA", "NYSE", fetched_at),)
+        )
+        return self._source(
+            [_cover(cik, _at(2026, 3, 27), ("Common Shares", "SA", "NYSE"))],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Shares",
+                "NYSE",
+                "25-sa",
+                _at(2026, 6, 5, 16, 47),
+                date(2026, 6, 15),
+            ),
+            (),
+            snapshot,
+        )
+
+    def test_a_snapshot_after_the_form_25_relists(self) -> None:
+        cik = self.CIK
+        build = build_master(
+            self._sa(fetched_at=_at(2026, 10, 4)), _settings(), ingested_at=self.INGESTED
+        )
+        assert self._rows(build)[-1] == (cik, "SA", date(2026, 6, 16), _at(2026, 10, 4), "snapshot")
+
+    def test_without_evidence_the_form_25_stands(self) -> None:
+        build = build_master(self._sa(fetched_at=None), _settings(), ingested_at=self.INGESTED)
+        assert [r["valid_from"] for r in build.listings] == [date(2026, 3, 27)]
+
+    def test_a_snapshot_before_the_form_25_relists_nothing(self) -> None:
+        build = build_master(
+            self._sa(fetched_at=_at(2026, 6, 1)), _settings(), ingested_at=self.INGESTED
+        )
+        assert [
+            r["provenance"] for r in build.listings if r["valid_from"] > date(2026, 3, 27)
+        ] == []
+
+    def test_an_acquired_company_stays_delisted(self) -> None:
+        # GORO: Form 25, 8-K (2.01), 15-12G; the ticker left the CIK.
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2026, 5, 7), ("Common Stock", "GORO", "NYSE_AMERICAN"))],
+            DelistingFiling(
+                cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
+            ),
+            forms=(("15-12G", _at(2026, 7, 30, 20, 1)),),
+        )
+        assert [r["valid_from"] for r in build.listings] == [date(2026, 5, 7)]
+
+    @pytest.mark.parametrize("case", ["oke", "sa"])
+    def test_the_relisting_is_known_only_from_its_evidence(self, case: str) -> None:
+        source = self._oke() if case == "oke" else self._sa(fetched_at=_at(2026, 10, 4))
+        settings = _settings()
+        full = _new_store()
+        write_master(full, build_master(source, settings, ingested_at=self.INGESTED))
+        probes = sorted(
+            {k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)}
+        )
+        for t in probes:
+            partial = _new_store()
+            write_master(
+                partial, build_master(source.known_by(t), settings, ingested_at=self.INGESTED)
+            )
+            assert listings_as_of(full, t).equals(listings_as_of(partial, t)), f"T={t!r}"
+            partial.close()
+        full.close()
