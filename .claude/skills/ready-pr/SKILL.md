@@ -79,6 +79,6 @@ Each message names one fix. Do that fix, commit, and run the command again:
 ## Never
 
 - Pass `--allow-shared-files` unless your PR is a fold host the owner asked for (doc-keeper folding fragments and refreshing the STATUS snapshot sections) or a process change that must edit those files.
-- Merge the PR. The owner merges, or tells the main session to.
+- Merge the PR. PRs land through the merge train, and only on the owner's "merge train `<batch id>`"; a single PR is merged by hand only when the owner says to merge that specific PR ([git-workflow rule 7](../../../docs/ways-of-working/git-workflow.md)).
 - Force-push. The command does not need it and neither do you.
 - Run it in another team's directory or the main checkout.

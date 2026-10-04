@@ -42,4 +42,4 @@ Worked out from the plan after this fold's ticks (T60e, T63d, T64b, T69); `team.
 - A market-hours session for Probe 3 (#182) and the T48b recorder (`cli_record paper <SYMBOL>`, flat paper account).
 - Open questions: #470, #411/#412, #473; #281 strategy-lab questions 2, 8 and 11; event-data spec (#307).
 - `release --force` for #258 and #182; `team.py prune --yes`; close #33; `gap_signoff` on H1 before T71.
-- GitHub Pro server-side ruleset decision; account type and compliance check (Phase 6).
+- Account type and compliance check (Phase 6).

@@ -34,7 +34,7 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 | Term | Meaning |
 |---|---|
-| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who merges. The session he types in is a team like any other. |
+| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who approves every merge ([git-workflow rule 7](git-workflow.md): his "merge train `<batch id>`", or "merge" on one specific PR). The session he types in is a team like any other. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
 | **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
@@ -145,7 +145,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Labels of retired teams are harmless; delete them when convenient.
 - **Directories of retired teams are pruned ad hoc, never automatically.** A team may take another claim later, so its directory stays while it is touched. When the disk or the board looks cluttered: `uv run python scripts/team.py prune` prints which directories have no open claim and have been idle for six hours or more (`--hours` to change); `--yes` removes them with `git worktree remove` and prunes the worktree list. Directories with uncommitted changes are listed and skipped, never removed (#167). Agents never run it.
 - Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
-- You are not a role in the tool. You merge, you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
+- You are not a role in the tool. You approve every merge (your "merge train `<batch id>`" lets the window you say it to run `merge_train.py merge`; git-workflow rule 7), you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
 ### Never
 
