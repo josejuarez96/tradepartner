@@ -70,9 +70,10 @@ trimmed of spaces and quotes, upper-cased, and a one-letter class suffix
 after `-` or `/` written with `.` (`CRD-A` -> `CRD.A`). Anything else
 (`BAX (NYSE)`, `C/28`, `F&G`) is not sent, so its security gets no rows
 under it, never a guessed mapping's; `last_excluded_symbols` and
-`symbol_summary` name those tickers. A row served under a symbol resolves
-through every master spelling of it, and to nothing when two spellings
-name two securities on that session.
+`symbol_summary` name those tickers. `ListingResolver` keys every listing
+by that form (an invalid ticker as written), so the spellings of one symbol
+(`META ` and `META`, `CRD-A` and `CRD.A`) are one ticker to all of its
+rules, and the payload's symbols resolve as they are.
 
 **Not returned as data, reported instead:**
 
@@ -137,6 +138,29 @@ def _fail_closed[**P, R](parse: Callable[P, R]) -> Callable[P, R]:
     return wrapper
 
 
+#: Alpaca's US-equity symbol grammar: letters and digits from a letter, with
+#: at most one `.`-separated suffix (`BRK.B`).
+_ALPACA_SYMBOL = re.compile(r"[A-Z][A-Z0-9]*(\.[A-Z0-9]+)?")
+#: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
+_CLASS_SUFFIX = re.compile(r"([A-Z][A-Z0-9]*)[-/]([A-Z])")
+
+
+def alpaca_symbol(ticker: str) -> str | None:
+    """`ticker` in Alpaca's symbol form, or `None` when it has none.
+
+    Spaces and quotes at both ends are trimmed, letters upper-cased and a
+    one-letter class suffix after `-` or `/` written with `.`; a non-ASCII
+    ticker, or whatever then falls outside `_ALPACA_SYMBOL`, is `None`,
+    never a guessed symbol."""
+    trimmed = ticker.strip().strip("\"'").strip()
+    if not trimmed.isascii():  # upper() folds some letters into ASCII ('\ufb01' -> 'FI')
+        return None
+    norm = trimmed.upper()
+    if match := _CLASS_SUFFIX.fullmatch(norm):
+        norm = f"{match[1]}.{match[2]}"
+    return norm if _ALPACA_SYMBOL.fullmatch(norm) else None
+
+
 # --- resolution ----------------------------------------------------------
 
 
@@ -161,7 +185,9 @@ class ListingResolver:
     def __init__(self, listings: Iterable[Mapping[str, Any]]) -> None:
         by_security: dict[str, list[tuple[date, str]]] = defaultdict(list)
         for row in listings:
-            by_security[str(row["security_id"])].append((row["valid_from"], str(row["ticker"])))
+            ticker = str(row["ticker"])
+            ticker = alpaca_symbol(ticker) or ticker  # one ticker per Alpaca symbol (#737)
+            by_security[str(row["security_id"])].append((row["valid_from"], ticker))
         self._by_ticker: dict[str, list[TickerSpan]] = defaultdict(list)
         self._by_security: dict[str, list[TickerSpan]] = defaultdict(list)
         for security_id, rows in by_security.items():
@@ -408,25 +434,6 @@ def _default_fetch_actions(symbols: list[str], start: date, end: date) -> Mappin
     return payload
 
 
-#: Alpaca's US-equity symbol grammar: letters and digits from a letter, with
-#: at most one `.`-separated suffix (`BRK.B`).
-_ALPACA_SYMBOL = re.compile(r"[A-Z][A-Z0-9]*(\.[A-Z0-9]+)?")
-#: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
-_CLASS_SUFFIX = re.compile(r"([A-Z][A-Z0-9]*)[-/]([A-Z])")
-
-
-def alpaca_symbol(ticker: str) -> str | None:
-    """`ticker` in Alpaca's symbol form, or `None` when it has none.
-
-    Spaces and quotes at both ends are trimmed, letters upper-cased and a
-    one-letter class suffix after `-` or `/` written with `.`; whatever then
-    falls outside `_ALPACA_SYMBOL` is `None`, never a guessed symbol."""
-    norm = ticker.strip().strip("\"'").strip().upper()
-    if match := _CLASS_SUFFIX.fullmatch(norm):
-        norm = f"{match[1]}.{match[2]}"
-    return norm if _ALPACA_SYMBOL.fullmatch(norm) else None
-
-
 class AlpacaPriceSource(PriceSource):
     """`PriceSource` over Alpaca: asks for every symbol the requested
     securities traded under in the range, parses, and keeps only the
@@ -457,13 +464,6 @@ class AlpacaPriceSource(PriceSource):
         self.last_bars_report: BarsParse | None = None
         self.last_actions_report: ActionsParse | None = None
         self.last_excluded_symbols: tuple[str, ...] = ()
-        # Every master spelling of each Alpaca symbol, over all securities.
-        spellings: dict[str, set[str]] = defaultdict(set)
-        for spans in resolver._by_security.values():
-            for span in spans:
-                if (symbol := alpaca_symbol(span.ticker)) is not None:
-                    spellings[symbol].add(span.ticker)
-        self._spellings = {symbol: sorted(names) for symbol, names in spellings.items()}
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
@@ -479,15 +479,6 @@ class AlpacaPriceSource(PriceSource):
         symbols = {t: alpaca_symbol(t) for t in tickers}
         self.last_excluded_symbols = tuple(sorted(t for t, s in symbols.items() if s is None))
         return ids, sorted({s for s in symbols.values() if s is not None})
-
-    def _resolve(self, symbol: str, session: date) -> str | None:
-        """`ListingResolver.resolve` over every master spelling of the
-        Alpaca `symbol`; `None` when they name two securities."""
-        spellings = self._spellings.get(symbol, [symbol])
-        if len(spellings) == 1:
-            return self._resolver.resolve(spellings[0], session)
-        owners = {self._resolver.resolve(t, session) for t in spellings} - {None}
-        return owners.pop() if len(owners) == 1 else None
 
     def symbol_summary(self) -> str:
         """The latest call's master tickers not sent to Alpaca, as one line
@@ -505,7 +496,7 @@ class AlpacaPriceSource(PriceSource):
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
             return []
-        parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolve)
+        parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolver.resolve)
         self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
 
@@ -520,6 +511,6 @@ class AlpacaPriceSource(PriceSource):
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
         payload = self._fetch_actions(symbols, start - self._lag, end + self._lag)
-        parsed = parse_corporate_actions(payload, self._resolve)
+        parsed = parse_corporate_actions(payload, self._resolver.resolve)
         self.last_actions_report = parsed
         return [a for a in parsed.actions if a.security_id in ids and start <= a.ex_date <= end]

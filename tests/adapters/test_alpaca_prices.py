@@ -589,6 +589,7 @@ class TestAlpacaSymbols:
             ("CRD-A", "CRD.A"),
             ("GEF-B", "GEF.B"),
             ("BRK/B", "BRK.B"),
+            ("crd-a", "CRD.A"),
         ],
     )
     def test_safe_spellings_become_the_alpaca_symbol(self, ticker: str, symbol: str) -> None:
@@ -611,6 +612,8 @@ class TestAlpacaSymbols:
             "BRK.",
             ".B",
             "CRD-A-B",
+            "\ufb01t",  # the ligature 'fi' upper-cases to 'FIT'
+            "\u00c9CO",
         ],
     )
     def test_anything_else_is_not_an_alpaca_symbol(self, ticker: str) -> None:
@@ -679,9 +682,9 @@ class TestAlpacaSymbols:
         assert calls == [["CRD.A"]]
         assert [(a.security_id, a.ex_date) for a in actions] == [("SEC_CRD", date(2020, 8, 7))]
 
-    def test_two_spellings_held_by_two_securities_resolve_to_nothing(self) -> None:
-        # 'CRD-A' and 'CRD.A' are one Alpaca symbol; when both are live for
-        # two securities, its rows are nobody's rather than a guess.
+    def test_two_spellings_are_one_ticker_to_the_resolver(self) -> None:
+        # 'CRD-A' and 'CRD.A' are one Alpaca symbol, so one ticker: the
+        # newer listing takes it, as for any reused ticker.
         listings = [
             _listing("SEC_OLD", "CRD-A", START),
             _listing("SEC_NEW", "CRD.A", date(2020, 1, 2)),
@@ -693,9 +696,30 @@ class TestAlpacaSymbols:
         source = AlpacaPriceSource(
             ListingResolver(listings), fetch_bars=fetch, settings=_settings()
         )
-        assert source.bars(["SEC_OLD", "SEC_NEW"], date(2020, 8, 3), date(2020, 8, 7)) == []
-        assert source.last_bars_report is not None
-        assert ("CRD.A", date(2020, 8, 3)) in source.last_bars_report.unresolved
+        bars = source.bars(["SEC_OLD", "SEC_NEW"], date(2020, 8, 3), date(2020, 8, 7))
+        assert {b.security_id for b in bars} == {"SEC_NEW"}
+
+    def test_a_spelling_variant_is_still_contested(self) -> None:
+        # quant-auditor pass 1 on #760: X held 'META ' (trailing space) before
+        # FB renamed into META. Alpaca serves FB's history under META on X's
+        # dates; they must stay unassigned, as they do for X spelled 'META'.
+        for spelling in ("META", "META ", "meta"):
+            listings = [
+                _listing("SEC_X", spelling, START),
+                _listing("SEC_X", "XNEW", date(2020, 9, 1)),
+                _listing("SEC_FB", "FB", START),
+                _listing("SEC_FB", "META", date(2020, 10, 1)),
+            ]
+
+            def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+                return self._bars_under({"META": "KO"})
+
+            source = AlpacaPriceSource(
+                ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+            )
+            assert source.bars(["SEC_X"], date(2020, 8, 3), date(2020, 8, 7)) == [], spelling
+            assert source.last_bars_report is not None
+            assert ("META", date(2020, 8, 3)) in source.last_bars_report.unresolved
 
     def test_two_spellings_of_one_security_resolve_to_it(self) -> None:
         listings = [
