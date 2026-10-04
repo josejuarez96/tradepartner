@@ -153,10 +153,14 @@ class EdgarConfig(BaseModel):
     `edgar_raw` sleep for that long, or at all, on a NaN/infinite value.
     Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
     is nonsensical and would either hang or hot-loop `edgar_raw`.
+
+    `requests_per_second` defaults to 9, not 10 (#656, research #572 E3):
+    SEC's 10 req/s is a ceiling, not a target; secedgar users saw 429s at
+    9.7 req/s and edgartools defaults to 9.
     """
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = Field(default=10.0, gt=0)
+    requests_per_second: float = Field(default=9.0, gt=0)
     retry_backoff_seconds: float = Field(default=1.0, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)

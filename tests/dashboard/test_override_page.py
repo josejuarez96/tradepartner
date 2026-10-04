@@ -468,3 +468,17 @@ def test_store_busy_writes_nothing_and_shows_the_busy_state(
 def test_no_colour_literal_in_page_code() -> None:
     source = Path(override_page.__file__).read_text(encoding="utf-8")
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b", source)
+
+
+# --- shared constants -------------------------------------------------------------
+
+
+def test_duplicate_guard_exemption_is_the_shared_kind_constant() -> None:
+    """#636: the exemption must reference `schema.ENGAGE_KILL_SWITCH_KIND`, not a
+    hardcoded literal, and must stay a subset of the `overrides.kind` enum so drift
+    between the two fails this test instead of silently exempting a stale kind."""
+    assert schema.ENGAGE_KILL_SWITCH_KIND in override_page._DUPLICATE_GUARD_EXEMPT_KINDS
+    assert (
+        set(schema.JOURNAL_ENUMS["overrides", "kind"])
+        >= override_page._DUPLICATE_GUARD_EXEMPT_KINDS
+    )

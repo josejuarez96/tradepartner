@@ -41,11 +41,14 @@ halts with `ReconciliationError` the first time; while the switch is already
 engaged the row is the report and the run goes on (spec req 8). Then the
 `executed` test: every due rebalance with no `rebalance_events` row whose
 decisions are all closed or settled (`plan.rebalance_state`) gets its
-`executed` row, before the lapse rule. Each `executed` row written here (a
-fill collected late, #553) gets the `unspent_cash` test of step 7b, with the
-broker's cash and equity read just after the row is written. A `stop` run then
-writes `missed` with reason `window_stop` for every rebalance still pending
-(F_i <= S, no event), planned or not, so the lapse rule never meets it.
+`executed` row, before the lapse rule. Every `executed` row written here (a
+fill collected late, #553) gets the `unspent_cash` test of step 7b, the
+broker's cash and equity read once just after the rows are written, one alert
+at most naming every rebalance over the bound (the alerter dedupes on
+(kind, run), so this call site and step 7b's own must each write one alert or
+none, never two). A `stop` run then writes `missed` with reason `window_stop`
+for every rebalance still pending (F_i <= S, no event), planned or not, so
+the lapse rule never meets it.
 
 **Step 4.** `reconcile_now` (T61), its journal cut (`as_of`, #488) a clock
 reading taken just before the call, so step 3's collected rows are in it.
@@ -55,10 +58,14 @@ marks, the lot ledger, the exits and the planning step; the planning step's
 any symbol it lacks.
 
 **Step 5.** `marks.marks_for` rows for every session after the window's last
-mark (or from the window's start date) through S-1; the drawdown check (T59)
-on each session this run marks (and the last marked session), so a crossing on
-a back-filled session is not missed, engaging once with source `drawdown` and
-its alert; the `missed_run` alert when S-1
+mark (or from the window's start date) through S-1; the drawdown check (T59,
+`_drawdown`) on every marked session whose mark is known after the window's
+last release (all of them when there is none), plus the sessions this run
+marks and the last marked session, so neither a back-filled crossing nor one
+left unchecked by a run that failed between writing its marks and this check
+is missed, engaging once with source `drawdown` and its alert (a crossing
+dated before the last release is still checked, its alert naming it
+back-filled); the `missed_run` alert when S-1
 is after the window's start date and has no `paper_runs` row; the lapse rows
 from `marks.lapses`, with one `missed_rebalance` alert; the due outcomes and the
 lot-ledger write (T62). A lot-ledger error never fails the run: it is a
@@ -72,7 +79,9 @@ held is flat. The flatness a run's own step 7b fills make is therefore the next
 run's to find, and an order's horizon ends at the earliest of the flattening
 fill, close(T_{i+1}) and close(S-1) of the first such run (T62's `due_outcomes`).
 
-**Step 6.** Under an engaged switch the run ends here, `skipped_kill_switch`.
+**Step 6.** Under an engaged switch the run ends here, `skipped_kill_switch`,
+after one `kill_switch` alert naming the latest `engaged` row's source and
+reason and the derived causes (#677; a batch the wrapper skips writes it too).
 Otherwise a `stop` run goes to `stop_step`, which plans nothing; a run with a rebalance or catch-up
 due plans through `planning.plan_rebalance` (with this run's `assets` read and
 the `fills_lagging` state: any order lagging at step 3 or at step 4) and goes
@@ -124,16 +133,23 @@ say untradable, so a later `stop` run exits it once it trades again.
 until each is terminal or `paper.accept_wait_seconds` has passed since the
 step began (an absolute deadline: an order still open then is step 3's on the
 next run), polling every `paper.poll_interval_seconds`. Then the `executed`
-test of step 3 runs again, and for each rebalance reaching `executed` here
-the `unspent_cash` alert is written when the cash exceeds the frozen
-`risk.max_unspent_cash_fraction` of the broker's equity read at that moment.
-The cash is the batch's `BatchOutcome.cash_left` for the batch's own
-rebalance when its buys phase read the cash, else the broker's cash read with
-that equity. A rebalance gets one `executed` row, so one alert at most. The batch's status
-(`skipped_kill_switch` when the wrapper read the switch engaged) is the run's.
+test of step 3 runs again (its rows written the same either way); only its
+`unspent_cash` alert is skipped for a `stop` run, since the stop already sold
+to cash and the broker's cash read here would be a false positive (T63f).
+Otherwise one `unspent_cash` alert at most, naming every rebalance reaching
+`executed` here whose cash exceeds the frozen `risk.max_unspent_cash_fraction`
+of the broker's equity read at that moment. The cash is the batch's
+`BatchOutcome.cash_left` for the batch's own rebalance when its buys phase
+read the cash, else the broker's cash read with that equity. A rebalance
+gets one `executed` row, so this call site names it at most once; a run
+reaching `executed` for a rebalance at step 3 and another (or the same one)
+here calls `_unspent_cash` twice, and the alerter's (kind, run) dedupe keeps
+only the first of the two alerts (rare under current settings). The batch's
+status (`skipped_kill_switch` when the wrapper read the switch engaged) is
+the run's.
 
 **Steps 8 and 9.** `reconcile_now` again, cut the same way, then the result row:
-`ok`, or the batch's `skipped_kill_switch`.
+`ok`, or the batch's `skipped_kill_switch` (after its `kill_switch` alert, as at step 6).
 
 **Exits.** Every broker read the run makes itself, the collection, both
 reconciliations and the planning step's `assets` reads go through one path: an
@@ -292,6 +308,7 @@ _LAGGING = "lagging"
 _UNSPENT_CASH = "unspent_cash"
 _RUN_WRITER = "run"
 _DRAWDOWN = "drawdown"
+_KILL_SWITCH = "kill_switch"
 _INGEST_OK = "ok"
 #: The lot ledger's account (spec req 13: Phase 4 holds one account, paper).
 _ACCOUNT_TYPE, _ACCOUNT_OWNER = "paper", "self"
@@ -978,6 +995,42 @@ class _Run:
                 pass
         return utc_now(), True
 
+    def _skipped(self) -> RunOutcome:
+        """The `kill_switch` alert, then the `skipped_kill_switch` result row
+        (owner decision on #644, #677). Run-scoped, so one alert per run while
+        the switch stays engaged; the message names the latest `engaged` row's
+        source and reason, and every cause the derived state gives."""
+        with open_read_only(self.settings) as conn:
+            rows = kill_switch_events_for(conn, self.window_id)
+            runs = runs_for(conn, self.window_id)
+        state = switch.derive(
+            self.window,
+            rows,
+            [r.run for r in runs],
+            [r.result for r in runs if r.result is not None],
+            reading_run=self.run_id,
+            lock_free=True,
+        )
+        own = sorted(
+            (r for r in rows if r.window_id == self.window_id), key=lambda r: r.event_id or 0
+        )
+        if own and own[-1].state == switch.ENGAGED:
+            latest = own[-1]
+            fault = f", fault {latest.fault_type}" if latest.fault_type else ""
+            row = (
+                f"kill_switch event {latest.event_id}: source {latest.source}{fault}, "
+                f"reason {latest.reason or 'none given'}"
+            )
+        else:
+            row = "no engaged kill_switch row"
+        causes = "; ".join(state.causes) or "no cause derived at the alert"
+        self._alert(
+            _KILL_SWITCH,
+            f"paper run {self.run_id} on {self.session.isoformat()} skipped: the kill switch "
+            f"is engaged ({row}; causes: {causes})",
+        )
+        return self._finish(SKIPPED_KILL_SWITCH)
+
     def _finish(self, status: str) -> RunOutcome:
         finished = self.gate.read_clock()
         notes = tuple(dict.fromkeys(self.notes))
@@ -1043,8 +1096,7 @@ class _Run:
         prices = self._pending_prices(actions)
         self.write_offs = WriteOffContext(self.window_id, actions, prices.__getitem__, self.session)
         collected = self._collect()
-        for t_i in self._executed(actions, prices):
-            self._unspent_cash(t_i, None)
+        self._unspent_cash(self._executed(actions, prices), {})
         if self.kind == _STOP:
             self._stop_missed()
         reconciliation = self._reconcile()
@@ -1054,7 +1106,7 @@ class _Run:
         self._lapses()
         self._outcomes(actions)
         if self.engaged:
-            return self._finish(SKIPPED_KILL_SWITCH)
+            return self._skipped()
 
         lagging = bool(collected.lagging) or reconciliation.status == FILLS_LAGGING
         context = StepContext(
@@ -1090,9 +1142,13 @@ class _Run:
             self.write_offs = WriteOffContext(
                 self.window_id, actions, prices.__getitem__, self.session
             )
-            for t_i in self._executed(actions, prices):
-                self._unspent_cash(t_i, batch.cash_left if t_i == rebalance else None)
+            executed = self._executed(actions, prices)
+            if self.kind != _STOP:
+                cash_left = {rebalance: batch.cash_left} if rebalance is not None else {}
+                self._unspent_cash(executed, cash_left)
         self._reconcile()
+        if batch is not None and batch.status == SKIPPED_KILL_SWITCH:
+            return self._skipped()
         return self._finish(OK if batch is None else batch.status)
 
     def _stop_missed(self) -> None:
@@ -1372,20 +1428,46 @@ class _Run:
             write_offs=self.write_offs,
         )
 
-    def _unspent_cash(self, rebalance: date, cash_left: float | None) -> None:
-        """The `unspent_cash` alert at `executed` (module docstring): the cash
-        is `cash_left`, this run's buys phase's for `rebalance`, else the
-        broker's cash read with the equity, after `executed` is written."""
+    def _unspent_cash(
+        self, rebalances: Sequence[date], cash_left: Mapping[date, float | None]
+    ) -> None:
+        """One `unspent_cash` alert, at most, for every rebalance in
+        `rebalances` reaching `executed` here whose cash exceeds the frozen
+        `risk.max_unspent_cash_fraction` of the broker's equity (module
+        docstring): the cash for a rebalance is `cash_left[rebalance]`, this
+        run's buys phase's, when it is given and not None, else the broker's
+        cash, read once with the equity for every rebalance in this call.
+
+        The alerter dedupes on (kind, run), so a run reaching `executed` for
+        more than one rebalance at one call site must not call `_alert` more
+        than once: every rebalance over the bound is named in one message.
+
+        Known limitation: a run that reaches `executed` at both step 3 and
+        step 7b calls this twice; if step 3's call already wrote an
+        `unspent_cash` alert, step 7b's own call still writes one, but the
+        alerter's dedupe drops it even when it names a different rebalance.
+        Rare under current settings, since catching up more than one
+        rebalance in a run needs `paper.max_catch_up_sessions` turned up."""
+        if not rebalances:
+            return
         account = self._broker_call(Broker.account.__name__, self.broker.account)
-        cash = account.cash if cash_left is None else cash_left
         bound = self.frozen.max_unspent_cash_fraction * account.equity
-        if cash > bound:
-            self._alert(
-                _UNSPENT_CASH,
-                f"rebalance {rebalance.isoformat()} executed with {cash:.2f} cash "
-                f"unspent, above risk.max_unspent_cash_fraction "
-                f"{self.frozen.max_unspent_cash_fraction} of equity {account.equity:.2f}",
-            )
+        over = [
+            (t_i, account.cash if cash_left.get(t_i) is None else cash_left[t_i])
+            for t_i in rebalances
+        ]
+        over = [(t_i, cash) for t_i, cash in over if cash is not None and cash > bound]
+        if not over:
+            return
+        named = "; ".join(
+            f"rebalance {t_i.isoformat()} executed with {cash:.2f} cash unspent"
+            for t_i, cash in over
+        )
+        self._alert(
+            _UNSPENT_CASH,
+            f"{named}, above risk.max_unspent_cash_fraction "
+            f"{self.frozen.max_unspent_cash_fraction} of equity {account.equity:.2f}",
+        )
 
     def _reconcile(self) -> Reconciliation:
         """Steps 4 and 8. The journal cut (`as_of`, #488) is a clock reading
@@ -1503,8 +1585,42 @@ class _Run:
             self._alert("missed_run", f"no paper run on {boundary.isoformat()}")
 
     def _drawdown(self, marked: set[date]) -> None:
-        """The drawdown check on each session this run `marked` and on the last
-        marked session, in session order; the first crossing engages, once."""
+        """The drawdown check, in session order, on: every marked session whose
+        mark row's `known_at` is after the window's last `released` kill-switch
+        event (all marked sessions when there is none), plus the sessions this
+        run `marked` and the window's last marked session. The first crossing
+        engages, once.
+
+        `switch.drawdown_peak` is constant between releases (the last
+        `released` row's `peak_equity`, else `starting_equity`) and
+        `switch.drawdown_armed` is disarmed from a `drawdown` engagement until
+        the next release, so the trigger fires once per crossing however many
+        times a session already checked is checked again: re-checking it is
+        idempotent. A run that fails between writing its marks and this check
+        therefore leaves no gap for the next run to miss, so long as the
+        window is not released in between: the marked sessions it wrote stay
+        in the wider set this method checks until a release narrows that set
+        again.
+
+        Known gap, pending an owner decision: a run that marks sessions and
+        then crashes, followed by `paper resume`, can still drop those
+        sessions from the check. `resume` writes the `released` row itself,
+        and this method only widens past a release's `known_at`, never
+        before it; it does not ask whether every session the crashed run
+        marked was itself checked before that release. Whether `resume`
+        should check the window's unchecked marked sessions before it
+        releases is open (no `resume.py` change is made here).
+
+        A crossing is labeled back-filled, and names the release's time, only
+        when its session is strictly before this run's S-1 (so an ordinary
+        S-1 mark, read the morning after a release, is never mislabeled) and
+        that session's own close (`calendar.session_close`) is at or before
+        the last release's time (so a session the release itself would have
+        seen, or one later than it, is not labeled either). It is still
+        checked and still engages either way (erring toward safety: a release
+        elsewhere in the window does not excuse a drawdown the owner has not
+        seen) — the label only says whether it predates the release.
+        """
         with open_read_only(self.settings) as conn:
             marks_rows = positions_daily_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
@@ -1512,8 +1628,24 @@ class _Run:
             return
         peak = switch.drawdown_peak(self.window, rows)
         armed = switch.drawdown_armed(self.window_id, rows)
+        # The last release in write order (`event_id`), not by `at`: a halt row
+        # after a `ClockError` carries a real-time stamp (switch.py), so `at`
+        # does not always agree with write order.
+        released = sorted(
+            (r for r in rows if r.state == switch.RELEASED), key=lambda r: r.event_id or 0
+        )
+        last_release = released[-1].at if released else None
+        known_at_of: dict[date, datetime] = {}
+        for row in marks_rows:
+            known_at_of[row.session] = min(row.known_at, known_at_of.get(row.session, row.known_at))
+        to_check = {
+            day
+            for day, known_at in known_at_of.items()
+            if last_release is None or known_at > last_release
+        }
+        to_check |= marked | {max(r.session for r in marks_rows)}
         crossed: tuple[date, float] | None = None
-        for day in sorted(marked | {max(r.session for r in marks_rows)}):
+        for day in sorted(to_check):
             equity = _mark_equity(marks_rows, day)
             if equity is not None and switch.drawdown_check(
                 equity, peak, self.frozen.max_drawdown, armed=armed
@@ -1527,6 +1659,12 @@ class _Run:
             f"ledger equity {equity:.2f} at {day.isoformat()} is below the peak {peak:.2f} "
             f"by more than risk.max_drawdown {self.frozen.max_drawdown}"
         )
+        if (
+            last_release is not None
+            and day < previous_session(self.session)
+            and calendar.session_close(day) <= last_release
+        ):
+            reason += f" (back-filled session, before the release at {last_release.isoformat()})"
         engaged = switch.engage(
             self.settings,
             self.gate.read_clock,
@@ -1581,7 +1719,15 @@ class _Run:
 
     def _outcomes(self, actions: pl.DataFrame) -> None:
         """The due outcomes and the lot-ledger write (T62). A lot-ledger error is
-        a `lot_ledger` alert and a note; it never fails the run."""
+        a `lot_ledger` alert and a note; it never fails the run.
+
+        `_stop_horizon`'s `flat` (`stop_flat`) is this run's own
+        computation and is not itself stored. A `realised_pnl` this run holds
+        back because the lot ledger could not be rebuilt (a `lot_ledger`
+        alert above) is therefore written later, by whichever run is next due
+        to write it, through that later run's own horizon (recomputed the
+        same way from the stored facts), not through this run's `flat`. The
+        value written is unaffected: only which run ends up writing it."""
         with open_read_only(self.settings) as conn:
             names = sorted({o.security_id for o in orders_for(conn, window_id=self.window_id)})
             bars = prices_as_of(conn, self._cut(), names) if names else pl.DataFrame()

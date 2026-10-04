@@ -72,7 +72,7 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.execution import window
 from tradepartner.store.db import StoreLockedError, utc_now
 from tradepartner.store.journal import JournalIntegrityError, JournalNotInitialised, open_window
-from tradepartner.store.schema import JOURNAL_ENUMS
+from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS
 
 #: The kinds the schema allows, in its order (spec req 9).
 KINDS: tuple[str, ...] = JOURNAL_ENUMS[("overrides", "kind")]
@@ -93,7 +93,7 @@ LAST_WRITTEN_KEY = "override_last_written"
 #: Kinds the duplicate guard does not apply to: re-engaging the kill switch
 #: a second time is harmless, and the kind takes no session or name to vary
 #: the signature with (module docstring, "A fast double-click").
-_DUPLICATE_GUARD_EXEMPT_KINDS = frozenset({"engage_kill_switch"})
+_DUPLICATE_GUARD_EXEMPT_KINDS = frozenset({ENGAGE_KILL_SWITCH_KIND})
 
 
 class OutcomeStatus(StrEnum):

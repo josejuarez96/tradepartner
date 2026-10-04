@@ -39,10 +39,10 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
 | Decide → Spec | ADR status is `Accepted` | Owner |
 | Spec → Plan | Acceptance criteria are testable, out-of-scope is listed, `spec-critic` has run | Owner |
 | Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines. The plan passes the "Plan shape" list below | Owner (can be delegated for size M) |
-| Build → Merge | CI is green, PR checklist is complete, specialist reviews are done | Owner merges, or explicitly tells the main session to |
+| Build → Merge | CI is green on the PR, the PR checklist is complete, specialist reviews are done, and CI is green on the batch's train run for a prefix that contains the PR (the full batch run or a green probe; `merge_train.py build`, [git-workflow.md](git-workflow.md#the-merge-train)), or, for a hand merge of one PR, CI green on that PR's head | Owner: "merge train `<batch id>`", run by him or the one window he tells; a single PR merged by hand is his word for that PR |
 | Phase → next phase | Phase exit criteria are met, retro is written, release is tagged | Owner |
 
-The owner approves by merging the PR that contains the artifact, or by explicitly telling the main session to merge it. Specs, plans and ADRs all land through PRs like code does, so **the approval is recorded in git history.**
+The owner approves by naming the batch ("merge train `<batch id>`" lands exactly the PRs the train's record names, by his hand or the window he tells) or, for one PR, by explicitly telling a window to merge that specific PR. Specs, plans and ADRs all land through PRs like code does, so **the approval is recorded in git history.**
 
 ## Right-size the ceremony
 
