@@ -1,6 +1,6 @@
 # Hypothesis: H1, long-only 12-1 momentum, monthly
 
-**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25
+**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration)
 
 Merging this file does not register it. The owner runs
 `tradepartner hypothesis register docs/hypotheses/h1-momentum-12-1.md` after merge (spec req
@@ -78,7 +78,7 @@ registration and is printed with the rest, so the full frozen set is on record e
 slug = "h1-momentum-12-1"
 family = "momentum"
 title = "H1: long-only 12-1 momentum, top 10% equal weight, monthly"
-in_sample_start = 2017-01-31
+in_sample_start = 2019-11-29
 
 [holdout]
 start = 2024-01-01
@@ -128,6 +128,58 @@ Owner answers that set these values (spec open questions, answered on #156):
   2022 and 2024, spin-offs in 2019, 2023 and 2024, and AAPL and KO cash dividends (four a
   year) in every year 2016–2025. That narrows the corporate-actions worry behind option (b)
   for large caps; it says nothing about the smaller names in the universe.
+
+  **Amendment, 2026-10-04 (#842; owner decision (b), recorded on #842).** The answer
+  above stands as written on #156; the value it chose does not. The real-data dry run
+  (#839) found the universe **empty at every rebalance from 2017-01-31 to 2019-06-28**:
+  under the #35 decision (strict `known_at`, `store/asof.py`), the only listings that
+  cover those years are the `snapshot_static` rows, known at their 2026-10-03 fetch and so
+  invisible at every earlier T, and every security fails rule 2 (`exchange`). Listings
+  become known as inline-XBRL cover pages arrive from mid-2019. The owner chose (b), to
+  move `in_sample_start` to the first month-end rebalance at which the universe is
+  populated, over (a) revisiting #35 for the backtest (the `snapshot_static` rows are
+  today's survivors, so admitting them adds survivorship bias) and (c) keeping the cash
+  years (about 30 cash months would dominate the trial's metrics). The date is pinned from
+  the store: `universe_as_of(conn, read_time(T), settings)` on a read-only copy of the
+  owner's store (sha1 `3c9d1bfd…`, the state #839 ran on, before any repair) at every
+  month-end rebalance from 2019-05 to 2020-03:
+
+  | T | members | companies reaching rule 8 | cut by rule 8 (size) | listing rows known at T |
+  |---|---|---|---|---|
+  | 2019-05-31 | 0 | 0 | 0 | 0 |
+  | 2019-06-28 | 0 | 0 | 0 | 5 |
+  | 2019-07-31 | 263 | 263 | 0 | 632 |
+  | 2019-08-30 | 823 | 823 | 0 | 2,397 |
+  | 2019-09-30 | 898 | 898 | 0 | 2,517 |
+  | 2019-10-31 | 944 | 944 | 0 | 2,771 |
+  | **2019-11-29** | **1000** | **1065** | **65** | 3,438 |
+  | 2019-12-31 | 1000 | 1104 | 104 | 3,493 |
+  | 2020-01-31 | 1000 | 1094 | 94 | 3,535 |
+  | 2020-02-28 | 1000 | 1118 | 118 | 3,728 |
+  | 2020-03-31 | 1000 | 1122 | 122 | 3,941 |
+
+  **The rule:** the first month-end at which ADR 0006's size rule binds, that is, at
+  which at least `universe.top_n_by_cap` (1000) companies pass rules 1–7 and the universe
+  is the top 1000 by market cap rather than "every company with a cover page so far".
+  Non-zero is not enough: from 2019-07 to 2019-10 the cut never bound, so those universes
+  are the coverage ramp, not a top-1000, and a run starting there would hold a book whose
+  membership is set by filing arrival, not by size. That month-end is **2019-11-29**, so
+  `in_sample_start = 2019-11-29`. Its 1065 companies above the cut are within 5% of the
+  next four month-ends (1094–1122), and the dry run found 1000–1008 members at every later
+  rebalance it sampled (2020-06-30 to 2023-12-29). The 1000th company at 2019-11-29 sits a
+  little lower in the cap ranking than in later months (65 companies of headroom against
+  about 100); that is noted, not corrected. The first rebalance's signal reads closes from
+  2018-11-30 (`formation_months = 12`: close(month-end of T − 12) to close(month-end of
+  T − 1), 2019-10-31) and rule 6 needs bars from December 2018; the store holds Alpaca
+  bars from January 2016 (ADR 0009), so the lookback has about three years of slack and
+  the start is set by listings, not by prices. Two open data issues (#845, share-count
+  scale errors that put a few small names at the top of the cap ranking; #840, the
+  benchmark rows) were found on the same store and are not addressed here; neither changes
+  which month-end the cut first binds. H1 is not registered on the owner's store, so this
+  edit changes the file before its first registration and is not a new hypothesis. The
+  registry hashes the whole file, so the hash changes; that matters only because no
+  registration exists to match it against: #839 registered the #156 version on its store
+  copies (params sha256 `2152b671…`), never on the owner's store, and those copies are gone.
 - **Q10, statistical threshold:** option (a), no numeric cut-off. The retirement condition
   is stated in words at the end of this file. DSR is shown on both bases, never adjudicated
   (ADR 0005: beating a benchmark is never a phase-exit criterion).
@@ -183,9 +235,19 @@ back-tested). No Tier 1 source gives a post-2010 peak-to-trough; the run compute
   rises with the cost level: a cost-model bug.
 - A result that changes when the run is truncated (the spec's truncation and prefix
   invariance suites): look-ahead.
-- A survivorship gap above `gap.count_share_threshold` at any rebalance, or a large
-  static-listing count in 2017–2018: not a flag of an edge, but of a biased universe, and
-  the holdout cannot be spent over it without a logged owner decision.
+- A survivorship gap above `gap.count_share_threshold` at any rebalance: not a flag of
+  an edge, but of a biased universe, and the holdout cannot be spent over it without a
+  logged owner decision.
+- A non-zero `n_static_listings` at any rebalance, or a universe below
+  `universe.top_n_by_cap` members at any rebalance. Before the #842 amendment this bullet
+  watched for "a large static-listing count in 2017–2018", the years the universe was
+  expected to lean on `snapshot_static` rows (#35). That reading is moot: the window now
+  starts 2019-11-29, after the cover-page era began, and under #35 the `snapshot_static`
+  rows (known 2026-10-03) are invisible at every in-sample T anyway, so the count is zero
+  by construction. A non-zero count would mean a `known_at` on a static row earlier than
+  its fetch: a point-in-time bug, not a universe property. A universe short of 1000 would
+  mean the size cut did not bind, the condition the start date was chosen to rule out
+  (Q8 amendment), so listing coverage has a hole inside the window.
 
 ## Power arithmetic
 
@@ -193,30 +255,36 @@ Rebalance sessions are counted with `backtest.schedule.rebalance_sessions` on th
 calendar; `tests/backtest/test_h1_file.py` checks the counts.
 
 - **In-sample run:** the spec's default window, `in_sample_start` to the last rebalance
-  session before `holdout.start`: 2017-01-31 to 2023-12-29. That is **84 rebalance
-  sessions** and **83 monthly returns** (the first holding month is February 2017; the
-  2023-12-29 rebalance fills on 2024-01-02, inside the holdout, so its month is not in
-  sample). The spec's "~84 months" counts sessions; the arithmetic below uses 83 returns.
+  session before `holdout.start`: 2019-11-29 to 2023-12-29 (since the #842 amendment;
+  2017-01-31 to 2023-12-29, 84 sessions and 83 returns, before it). That is **50 rebalance
+  sessions** and **49 monthly returns** (the first rebalance fills on 2019-12-02, so the
+  first holding month is December 2019; the 2023-12-29 rebalance fills on 2024-01-02,
+  inside the holdout, so its month is not in sample). The spec's "~84 months" was written
+  for the old start and counts sessions; the arithmetic below uses 49 returns.
 - **Holdout run**, pinned here so that January 2024 belongs to a window:
   `--start 2023-12-29 --end 2026-09-30`, from the last in-sample rebalance to
   `holdout.end`. The window overlaps the frozen holdout, so it needs `--spend-holdout` and
   runs as `kind=holdout` (spec req 11). That is **34 rebalance sessions** and **33 monthly
-  returns**, January 2024 to September 2026. In-sample and holdout together cover February
-  2017 to September 2026, 116 monthly returns, with no gap and no overlap.
+  returns**, January 2024 to September 2026, unchanged by #842. In-sample and holdout
+  together cover December 2019 to September 2026, 82 monthly returns, with no gap and no
+  overlap.
 
 **t-statistic** (handoff D1 and ADR 0005: t ≈ SR × √years, here the excess Sharpe, the
 excess return over its tracking error):
 
 | Window | Months | Years | t for +1 pp/yr at 8.4% tracking error | Excess needed for t ≈ 2 |
 |---|---|---|---|---|
-| In-sample | 83 | 6.9 | **0.31** | **6.4 pp/yr** |
+| In-sample | 49 | 4.1 | **0.24** | **8.3 pp/yr** |
 | Holdout | 33 | 2.75 | **0.20** | 10.1 pp/yr |
-| Both | 116 | 9.7 | 0.37 | 5.4 pp/yr |
+| Both | 82 | 6.8 | 0.31 | 6.4 pp/yr |
 
-A +1 pp/yr excess, the top of the prior range, would need about 280 years of data to
-reach t ≈ 2. Any in-sample excess large enough to be significant (about +6 pp/yr) is
-twice the red-flag threshold and above every live or gross window G1 found, so it would
-read as a bug before it read as an edge. **The test cannot reach significance for any
+(Before #842 the in-sample row read 83 months, 6.9 years, t 0.31, 6.4 pp/yr, and the
+Both row 116 months, 9.7 years, 0.37, 5.4 pp/yr. The shorter window weakens an already
+powerless test; it does not change the conclusion below.) A +1 pp/yr excess, the top of
+the prior range, would need about 280 years of data to reach t ≈ 2. Any in-sample excess
+large enough to be significant (about +8 pp/yr) is nearly three times the red-flag
+threshold and above every live or gross window G1 found, so it would read as a bug before
+it read as an edge. **The test cannot reach significance for any
 result the prior allows.** That is why open question 10 takes option (a): a pass/fail
 cut-off would be theatre. What the in-sample run can show is whether the engine is
 correct (spec req 18, the oracle and the look-ahead suites) and whether the result sits
@@ -305,7 +373,8 @@ Stated before any run, per open question 10 (a).
 the base-level `excess_cagr_spy` and the run-time `dsr_excess` in `trial_results` (N and V
 at run time), not the page's recomputation with today's N and V. The trial is the **first**
 `ok`, non-synthetic, `in_sample` trial of this hypothesis over the full default window
-[2017-01-31, 2023-12-29] that passed `quant-auditor` (plan T45b). A later trial replaces
+[2019-11-29, 2023-12-29] (the `in_sample_start` of the Q8 amendment, #842) that passed
+`quant-auditor` (plan T45b). A later trial replaces
 it only when an audit logged a bug in the earlier one. Shorter or later-start in-sample
 runs never count. The holdout run neither retires nor promotes H1; its result is reported
 only.
@@ -317,10 +386,10 @@ roadmap names the MVP strategy as the first paper strategy, and ADR 0005 makes P
 test of process, not of returns.
 
 **The −1 pp/yr line is a decision rule committed in advance, not a statistical finding.**
-Each pp/yr of excess is worth about t ≈ 0.3 over the in-sample window, so −1 pp/yr is
-inside one standard error of zero. The number is the bottom of G1's plausible ten-year
-range applied to a seven-year window, which is not like for like; live five-year windows
-as low as −2.8 pp/yr count as normal above. The rule retires H1 anyway, because its job is
+Each pp/yr of excess is worth about t ≈ 0.24 over the in-sample window (0.31 before
+#842), so −1 pp/yr is inside one standard error of zero. The number is the bottom of G1's
+plausible ten-year range applied to a four-year window, which is not like for like; live
+five-year windows as low as −2.8 pp/yr count as normal above. The rule retires H1 anyway, because its job is
 to be a line drawn before the run, nothing more. The DSR half: `dsr_excess` below 0.5
 means the excess Sharpe is below SR*, the expected maximum Sharpe across the family's
 trials under no edge; with fewer than two distinct (parameter hash, window) pairs, SR* = 0
