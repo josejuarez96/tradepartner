@@ -107,8 +107,6 @@ from tradepartner.calendar import last_completed_session, previous_session
 from tradepartner.config import Settings, clean_message
 from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import (
-    COMMON,
-    UNCLASSIFIABLE,
     ClassificationBuild,
     build_classifications,
     classifications_as_of,
@@ -841,6 +839,12 @@ def _types_known(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, set[
     return types
 
 
+#: Classifier labels never fetched unless `universe.security_types` admits
+#: them: debt (notes, debentures), preferreds, warrants, units and rights.
+#: Everything else on `universe.exchanges` is fetched (owner, #802).
+NOT_EQUITY = frozenset({"debt", "preferred", "warrant", "unit", "right"})
+
+
 def _fetched(
     sid: str,
     row: Row,
@@ -850,17 +854,17 @@ def _fetched(
 ) -> bool:
     """Whether a listing `row` puts `sid` in the price fetch (#794): a
     benchmark, or a listing on one of `universe.exchanges` whose security
-    is not classified yet (no row, or `unclassifiable`) or has a `types`
-    entry that is common or one of `universe.security_types`. No note,
-    preferred (unless configured) or OTC listing; wider than `_counted`, so
-    every counted name is fetched."""
+    has no classification yet or a `types` entry outside `NOT_EQUITY` (or
+    in `universe.security_types`). Common, unclassifiable, spac, foreign,
+    fund and depositary names are fetched; no OTC listing. Wider than
+    `_counted`, so every counted name is fetched."""
     if sid in benchmarks:
         return True
     if row["exchange"] not in settings.universe.exchanges:
         return False
     known = types.get(sid)
-    wanted = {COMMON, UNCLASSIFIABLE, *settings.universe.security_types}
-    return not known or not known.isdisjoint(wanted)
+    skipped = NOT_EQUITY - set(settings.universe.security_types)
+    return not known or not known <= skipped
 
 
 def _may_count(

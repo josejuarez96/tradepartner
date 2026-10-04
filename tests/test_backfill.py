@@ -571,7 +571,7 @@ def test_an_otc_common_name_is_not_counted_in_a_months_staleness(
     assert result.runs[-1].status == status, result.runs[-1].message
 
 
-def test_a_month_fetches_only_common_names_on_universe_exchanges_and_benchmarks(
+def test_a_month_fetches_no_notes_preferreds_or_otc_listings(
     settings: Settings,
 ) -> None:
     # #794: a note, a preferred and an OTC listing are never fetched; a

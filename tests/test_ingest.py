@@ -1059,10 +1059,10 @@ NOT_COMMON = (
 )
 
 
-def test_only_common_names_on_universe_exchanges_and_benchmarks_are_fetched(
+def test_notes_preferreds_and_otc_listings_are_not_fetched(
     settings: Settings,
 ) -> None:
-    # #794: a note, a preferred and an OTC listing are never fetched; a
+    # #794: a note, a preferred and an OTC listing are not fetched; a
     # common NYSE name and a benchmark are, and every counted name is.
     prices = _Prices()
     result = _run(settings, prices, filings=_filings(acme_extra=NOT_COMMON, dual_listings=OTC_B))
@@ -1092,8 +1092,16 @@ def test_the_fetched_security_types_come_from_config(settings: Settings) -> None
     [
         ("X", "NYSE", {}, True),  # no classification row yet
         ("X", "NYSE", {"X": {"unclassifiable"}}, True),  # e.g. before a spin-off's first 10-Q
-        ("X", "NYSE", {"X": {"foreign", "common"}}, True),  # common in an earlier revision
+        ("X", "NYSE", {"X": {"debt", "common"}}, True),  # common in one revision
+        ("X", "NYSE", {"X": {"spac"}}, True),  # #802 owner: blocklist, not allowlist
+        ("X", "NYSE", {"X": {"foreign"}}, True),
+        ("X", "NYSE", {"X": {"fund"}}, True),
+        ("X", "NYSE", {"X": {"depositary"}}, True),
         ("X", "NYSE", {"X": {"debt"}}, False),
+        ("X", "NYSE", {"X": {"preferred"}}, False),
+        ("X", "NYSE", {"X": {"warrant"}}, False),
+        ("X", "NYSE", {"X": {"unit"}}, False),
+        ("X", "NYSE", {"X": {"right"}}, False),
         ("X", "OTC", {"X": {"common"}}, False),
         (SPY, "OTC", {}, True),  # a benchmark whatever its listing
     ],
