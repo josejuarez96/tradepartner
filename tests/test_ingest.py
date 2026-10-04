@@ -83,6 +83,10 @@ def _filings(
     dual_listings: tuple[CoverListing, ...] | None = None,
     delistings: Sequence[DelistingFiling] = (),
     extra_facts: Sequence[FactRecord] = (),
+    extra_index: Sequence[FilingIndexEntry] = (),
+    extra_headers: Sequence[FilingHeader] = (),
+    extra_snapshot: Sequence[CompanySnapshotEntry] = (),
+    extra_covers: Sequence[CoverPage] = (),
 ) -> FixtureFilingSource:
     dual = dual_listings or (
         CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
@@ -93,6 +97,7 @@ def _filings(
         index=[
             FilingIndexEntry(ACME, "Acme Corp", "10-K", f"{ACME}-18-000001", _at(2018, 3, 1)),
             FilingIndexEntry(DUAL, "Dual Corp", "10-K", f"{DUAL}-18-000001", _at(2018, 3, 2)),
+            *extra_index,
         ],
         cover_pages=[
             CoverPage(
@@ -107,10 +112,12 @@ def _filings(
                 _at(2019, 3, 4),
                 dual,
             ),
+            *extra_covers,
         ],
         headers=[
             FilingHeader(ACME, f"{ACME}-19-000001", "10-K", 3571, _at(2019, 3, 1)),
             FilingHeader(DUAL, f"{DUAL}-19-000001", "10-K", 7372, _at(2019, 3, 4)),
+            *extra_headers,
         ],
         facts=[
             _fact(ACME, "", 5_000_000, f"{ACME}-19-000001", _at(2019, 3, 1)),
@@ -118,7 +125,10 @@ def _filings(
             _fact(DUAL, "us-gaap:CommonClassBMember", 1_000_000, f"{DUAL}-19-1", _at(2019, 3, 4)),
             *extra_facts,
         ],
-        snapshot=[CompanySnapshotEntry(SPY_TRUST, "SPDR S&P 500", "SPY", "NYSE_ARCA", fetched_at)],
+        snapshot=[
+            CompanySnapshotEntry(SPY_TRUST, "SPDR S&P 500", "SPY", "NYSE_ARCA", fetched_at),
+            *extra_snapshot,
+        ],
     )
 
 
@@ -1003,6 +1013,68 @@ def test_a_listed_preferred_is_not_in_the_staleness_denominator(settings: Settin
     prices = _Prices(missing={f"{ACME}:6-00pct-series-a-preferred-stock"})
     result = _run(settings, prices, filings=_filings(acme_extra=(pref,)))
     assert result.ok, result.runs[-1].message
+
+
+OTC_B = (
+    CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
+    CoverListing("Class B Common Stock", "DUB", "OTC"),
+)
+STAT = "0000000003"  # no cover page: its only listing is snapshot_static
+
+
+def _with_stat(*, cover: bool = False, **kwargs: Any) -> FixtureFilingSource:
+    """`_filings` plus STAT, a common name listed only by a `snapshot_static`
+    span, or also by a cover page (a filing-based span) if `cover`."""
+    accession = f"{STAT}-18-000001"
+    page = CoverPage(
+        STAT, f"{STAT}-19-000001", _at(2019, 3, 6), (CoverListing("Common Stock", "STAT", "NYSE"),)
+    )
+    return _filings(
+        extra_index=[FilingIndexEntry(STAT, "Stat Corp", "10-K", accession, _at(2018, 3, 5))],
+        extra_headers=[FilingHeader(STAT, accession, "10-K", 3571, _at(2018, 3, 5))],
+        extra_facts=[_fact(STAT, "", 3_000_000, accession, _at(2018, 3, 5))],
+        extra_snapshot=[CompanySnapshotEntry(STAT, "Stat Corp", "STAT", "NYSE", FETCHED_AT)],
+        extra_covers=[page] if cover else [],
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(("missing", "ok"), [(DUAL_B, True), (ACME, False)])
+def test_an_otc_common_name_is_not_in_the_staleness_denominator(
+    settings: Settings, missing: str, ok: bool
+) -> None:
+    # #784: OTC is not one of `universe.exchanges` and the SIP feed has no
+    # OTC bars; a NYSE name with no bar still counts (1 of 3 is stale).
+    result = _run(settings, _Prices(missing={missing}), filings=_filings(dual_listings=OTC_B))
+    assert result.ok is ok, result.runs[-1].message
+    if ok:
+        assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+def test_the_staleness_exchange_filter_comes_from_config(settings: Settings) -> None:
+    exchanges = [*settings.universe.exchanges, "OTC"]
+    tuned = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"exchanges": exchanges})}
+    )
+    result = _run(tuned, _Prices(missing={DUAL_B}), filings=_filings(dual_listings=OTC_B))
+    assert result.runs[-1].status == STALE
+
+
+def test_a_snapshot_static_only_name_with_no_bar_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    # #784 (owner option a): its back-dated ticker may not be the one it traded under.
+    result = _run(settings, _Prices(missing={STAT}), filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    message = result.runs[-1].message
+    assert "0 of 4 listed names missing" in message
+    assert f"1 snapshot-only names with no rows (not counted): {STAT}" in message
+
+
+def test_a_name_with_a_filing_based_span_and_no_bar_still_counts(settings: Settings) -> None:
+    result = _run(settings, _Prices(missing={STAT}), filings=_with_stat(cover=True))
+    assert result.runs[-1].status == STALE and STAT in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
 
 
 def test_run_messages_are_redacted_cleaned_and_capped(

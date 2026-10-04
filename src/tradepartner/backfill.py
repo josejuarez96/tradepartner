@@ -18,8 +18,11 @@ source, `edgar` then `alpaca`, halting at the first chunk that is not `ok`:
   being fetched. The store is read as of the clock when the month starts,
   and rows are stamped with the clock once its fetch returns. A month is
   stale if the reference symbol lacks a bar on any of its sessions, or if
-  more than `ingest.max_missing_share` of the listed common and benchmark
-  names live through the month have no bar in it.
+  more than `ingest.max_missing_share` of the listed benchmark names and
+  common names on one of `universe.exchanges` live through the month have
+  no bar in it. A common name whose every listing live in the month is
+  `snapshot_static` and that has no bar in it is named in the run message
+  with its own count, not counted (#784).
 
 The EDGAR chunk is fetched with no store connection open (a recording
 pass) and committed in one short write transaction.
@@ -54,12 +57,14 @@ from tradepartner.ingest import (
     OK,
     SOURCES,
     STALE,
+    STATIC,
     IngestResult,
     SourceRun,
     _add_actions,
     _add_rows,
     _bar_row,
     _clean,
+    _counted,
     _ingest_filings,
     _prefetch,
     _read,
@@ -67,8 +72,10 @@ from tradepartner.ingest import (
     _Recorded,
     _replay_actions,
     _replay_plan,
+    _reported_note,
     _run_source,
     _Stale,
+    _staleness,
     _unwrap,
     _with_frames,
     _write_run,
@@ -191,7 +198,7 @@ def _price_chunk(
 
     try:
         with _read(settings) as conn:
-            ids, listed, reference = _window_names(conn, started, window, settings)
+            ids, listed, static_only, reference = _window_names(conn, started, window, settings)
         symbol = settings.ingest.reference_symbol
         if reference is None:
             raise LookupError(f"reference symbol {symbol} has no listing in {first}..{last}")
@@ -209,13 +216,14 @@ def _price_chunk(
             shown = ", ".join(day.isoformat() for day in gaps[:10])
             raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {shown}")
         with_bars = {bar.security_id for bar in bars}
-        missing = sorted(set(listed) - with_bars)
-        share = len(missing) / len(listed) if listed else 0.0
+        counted, missing, reported = _staleness(listed, with_bars, static_only)
+        share = len(missing) / len(counted) if counted else 0.0
         limit = settings.ingest.max_missing_share
         if share > limit:
             raise _Stale(
-                f"{len(missing)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
+                f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
                 f"have no bar in {first}..{last}: {', '.join(missing[:10])}"
+                f"{_reported_note(reported)}"
             )
         with open_for_write(settings) as conn:
             init_schema(conn)
@@ -231,7 +239,8 @@ def _price_chunk(
             added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
             message = (
                 f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
-                f"{len(missing)} of {len(listed)} listed names without a bar"
+                f"{len(missing)} of {len(counted)} listed names without a bar"
+                f"{_reported_note(reported)}"
             )
             if resolution := prices.resolution_summary():
                 message += f"; {resolution}"
@@ -252,12 +261,13 @@ def _window_names(
     t: datetime,
     window: tuple[date, date],
     settings: Settings,
-) -> tuple[list[str], list[str], str | None]:
+) -> tuple[list[str], list[str], set[str], str | None]:
     """From listings known at `t`: securities with a listing live at some
-    point in `window` (to fetch), the common and benchmark names listed
-    through the whole window, including any delisted only later (the
-    staleness denominator), and the reference
-    symbol's `security_id`.
+    point in `window` (to fetch), the benchmark names and the common names
+    on one of `universe.exchanges` listed through the whole window,
+    including any delisted only later (the staleness denominator), those
+    of them (benchmarks never) whose every listing live in the window is
+    `snapshot_static`, and the reference symbol's `security_id`.
 
     A listing counts from its `valid_from`; a delisted or transferred one
     still counts while its end session (last bar known) or `effective_on`
@@ -275,6 +285,7 @@ def _window_names(
     }
     ids: set[str] = set()
     listed: set[str] = set()
+    filed: set[str] = set()  # with a filing-based listing live in the window
     reference = None
     for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         if row["valid_from"] > last:
@@ -287,11 +298,17 @@ def _window_names(
         if ended or status not in (LISTED, DELISTED, TRANSFERRED):
             continue
         ids.add(sid)
+        if row["provenance"] != STATIC:
+            filed.add(sid)
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= last))
         through = live or (status == DELISTED and effective is not None and effective > last)
-        counted = sid in benchmarks or kinds.get(sid) == "common"
-        if through and row["valid_from"] <= first and counted:
+        if (
+            through
+            and row["valid_from"] <= first
+            and _counted(sid, row, benchmarks, kinds, settings)
+        ):
             listed.add(sid)  # today's status must not drop a name delisted later
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
-    return sorted(ids), sorted(listed), reference
+    static_only = listed - filed - benchmarks
+    return sorted(ids), sorted(listed), static_only, reference

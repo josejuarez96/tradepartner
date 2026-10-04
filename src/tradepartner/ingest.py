@@ -20,10 +20,12 @@ row at all (there is no way to write one) and status `locked`.
 **Staleness** (price side): stale if the bar for `ingest.reference_symbol`
 is missing at the expected session, or if more than
 `ingest.max_missing_share` of listed names lack one. Listed names are the
-securities whose current listing at the session is `listed`, or
-`transferred` and not yet ended. Delisted names whose `effective_on` is
-not past are still fetched (their bars fix the listing's end) but not
-counted.
+benchmarks and the common names on one of `universe.exchanges` whose
+current listing at the session is `listed`, or `transferred` and not yet
+ended. Delisted names whose `effective_on` is not past are still fetched
+(their bars fix the listing's end) but not counted. A common name whose
+current listing is `snapshot_static` and that has no bar is named in the
+run message with its own count, not counted (#784).
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -703,12 +705,13 @@ def _fetch_prices(
     reference: str | None = None
     fetch: set[str] = set()
     listed: set[str] = set()
+    static_only: set[str] = set()
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
             # rows are stamped at their fetch time, which can be after the run began).
             read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
-            fetch, listed, reference = _price_names(conn, read_at, session, settings)
+            fetch, listed, static_only, reference = _price_names(conn, read_at, session, settings)
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
@@ -722,16 +725,16 @@ def _fetch_prices(
     have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
-    missing = sorted(listed - have)
-    share, limit = len(missing) / len(listed), settings.ingest.max_missing_share
+    counted, missing, reported = _staleness(listed, have, static_only)
+    share, limit = len(missing) / len(counted), settings.ingest.max_missing_share
     if share > limit:
         raise _Stale(
-            f"{len(missing)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
-            f"have no bar for {session}: {', '.join(missing[:10])}"
+            f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
+            f"have no bar for {session}: {', '.join(missing[:10])}{_reported_note(reported)}"
         )
     message = (
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
-        f"{len(missing)} of {len(listed)} listed names missing"
+        f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}"
     )
     if resolution := prices.resolution_summary():
         message += f"; {resolution}"
@@ -800,12 +803,50 @@ def _read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
         return
 
 
+STATIC = "snapshot_static"
+
+
+def _counted(
+    sid: str, row: Row, benchmarks: set[str], kinds: dict[str, str], settings: Settings
+) -> bool:
+    """Whether a live listing `row` puts `sid` in the staleness denominator:
+    a benchmark, or a common name on one of `universe.exchanges` (OTC is not
+    one, and the SIP feed has no OTC bars; #784)."""
+    return sid in benchmarks or (
+        kinds.get(sid) == "common" and row["exchange"] in settings.universe.exchanges
+    )
+
+
+def _staleness(
+    listed: Iterable[str], have: set[str], static_only: set[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """`(counted, missing, reported)`: a listed name in `static_only` (listed
+    only by `snapshot_static` spans, never a benchmark) with no bar at all is
+    reported, not counted, since its back-dated ticker may not be the one it
+    traded under then (#784, owner option a); every other listed name counts
+    and is missing if it has no bar."""
+    reported = sorted(sid for sid in listed if sid in static_only and sid not in have)
+    counted = sorted(set(listed) - set(reported))
+    return counted, [sid for sid in counted if sid not in have], reported
+
+
+def _reported_note(reported: list[str]) -> str:
+    """The run-message clause naming `_staleness`'s reported names, or `""`."""
+    if not reported:
+        return ""
+    return (
+        f"; {len(reported)} snapshot-only names with no rows (not counted): "
+        f"{', '.join(reported[:10])}"
+    )
+
+
 def _price_names(
     conn: duckdb.DuckDBPyConnection, now: datetime, session: date, settings: Settings
-) -> tuple[set[str], set[str], str | None]:
+) -> tuple[set[str], set[str], set[str], str | None]:
     """Names to fetch, listed common and benchmark names (the staleness
-    denominator) and the reference symbol's `security_id`, from each
-    security's current listing."""
+    denominator), the listed names whose current listing is
+    `snapshot_static` (benchmarks never), and the reference symbol's
+    `security_id`, from each security's current listing."""
     current: dict[str, Row] = {}
     for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
         held = current.get(row["security_id"])
@@ -824,18 +865,21 @@ def _price_names(
     }
     fetch: set[str] = set()
     listed: set[str] = set()
+    static_only: set[str] = set()
     reference = None
     for sid, row in current.items():
         status, end = row["status"], row["end_session"]
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= session))
-        if live and (sid in benchmarks or kinds.get(sid) == "common"):
+        if live and _counted(sid, row, benchmarks, kinds, settings):
             listed.add(sid)
+            if row["provenance"] == STATIC and sid not in benchmarks:
+                static_only.add(sid)
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
         effective = row["effective_on"]
         if live or (status == DELISTED and effective is not None and effective >= session):
             fetch.add(sid)
-    return fetch, listed, reference
+    return fetch, listed, static_only, reference
 
 
 def _bar_row(bar: Bar, ingested_at: datetime) -> Row:

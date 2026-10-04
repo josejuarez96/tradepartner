@@ -19,7 +19,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from test_ingest import ACME, DUAL, DUAL_B, NOW, SPY, _at, _filings
+from test_ingest import ACME, DUAL, DUAL_B, NOW, OTC_B, SPY, STAT, _at, _filings, _with_stat
 
 from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling
 from tradepartner.adapters.prices import (
@@ -541,6 +541,49 @@ def test_a_name_delisted_after_the_month_still_counts_toward_its_staleness(
         "since=2019-04-10;through=2019-05-31",
     )
     assert ACME in result.runs[-1].message
+
+
+MAY = _sessions(date(2019, 5, 1), date(2019, 5, 31))
+
+
+@pytest.mark.parametrize(("missing", "status"), [(DUAL_B, OK), (ACME, STALE)])
+def test_an_otc_common_name_is_not_counted_in_a_months_staleness(
+    settings: Settings, missing: str, status: str
+) -> None:
+    # #784: OTC is not one of `universe.exchanges`; a NYSE name still counts.
+    prices = _History(gaps={(missing, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_filings(dual_listings=OTC_B))
+    assert result.runs[-1].status == status, result.runs[-1].message
+
+
+def test_a_snapshot_static_only_name_with_no_rows_in_a_month_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    prices = _History(gaps={(STAT, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 4 listed names without a bar" in may.message
+    assert f"1 snapshot-only names with no rows (not counted): {STAT}" in may.message
+
+
+def test_a_name_with_a_filing_based_span_in_the_month_still_counts(settings: Settings) -> None:
+    prices = _History(gaps={(STAT, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_with_stat(cover=True))
+    assert result.runs[-1].status == STALE and STAT in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+def test_a_snapshot_static_only_name_with_some_rows_follows_the_existing_rule(
+    settings: Settings,
+) -> None:
+    # Bars on some May sessions: not missing, so neither counted nor reported.
+    prices = _History(gaps={(STAT, s) for s in MAY[1:]})
+    result = _backfill(settings, prices, filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 5 listed names without a bar" in may.message
+    assert "snapshot-only" not in may.message
 
 
 def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
