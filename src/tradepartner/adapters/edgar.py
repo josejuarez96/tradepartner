@@ -492,7 +492,7 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
     and value) is kept once; the same concept and context with two values,
     or a value whose iXBRL format did not apply, raises: either would give
     a silently wrong record. A nil fact (`xsi:nil="true"`, #609 C2) reports
-    nothing and is skipped."""
+    nothing and is skipped; a nil fact that also has text raises (#615)."""
     # Imported here: loading `edgar` pulls in the whole package, which only
     # cover-page parsing needs.
     from edgar.documents.strategies.xbrl_extraction import XBRLExtractor
@@ -510,7 +510,12 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
         if name == _CIK_CONCEPT:
             ciks.add(str(fact.value).strip())
             continue
-        if name not in _COVER_CONCEPTS or _is_nil(element):
+        if name not in _COVER_CONCEPTS:
+            continue
+        if _is_nil(element):
+            text = "".join(element.itertext()).strip()
+            if text:  # #615: an XBRL inconsistency, never a silent skip
+                raise ValueError(f"{accession}: dei:{name} is nil but has text {text[:40]!r}")
             continue
         issue = (fact.metadata or {}).get("format_issue")
         if issue:
