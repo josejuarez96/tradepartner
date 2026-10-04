@@ -164,16 +164,25 @@ class TickerSpan:
         return self.start <= session and (self.end is None or session < self.end)
 
 
-#: Ticker fields that name no ticker (compared stripped of spaces, quotes
-#: and brackets, upper-cased); a field with no letter is one too ('-',
-#: '0'). Only words no exchange uses as a symbol: `NA`, `NO` and `TRUE`
-#: are real tickers.
-PLACEHOLDER_TICKERS = frozenset({"", "N/A", "NONE", "NOT APPLICABLE", "TRADING SYMBOL"})
+#: Ticker fields that name no ticker, compared upper-cased after trimming
+#: spaces, quotes and brackets at both ends; a field with no letter is one
+#: too ('-', '0'). `NA` is on the list although Nano Labs trades as `NA`:
+#: filers also write it for "not applicable", and a later such row would
+#: take Nano Labs' bars (#736 review), so `NA` is left out and counted.
+PLACEHOLDER_TICKERS = frozenset({"", "N/A", "NA", "NONE", "NOT APPLICABLE", "TRADING SYMBOL"})
+#: Words that are placeholders unless written in capitals: XBRL booleans
+#: and filers' words come in lower or mixed case ('true', 'No'), while a
+#: real symbol is upper-case (TrueCar's `TRUE`).
+PLACEHOLDER_WORDS = frozenset({"TRUE", "FALSE", "YES", "NO"})
 
 
 def is_placeholder_ticker(ticker: str) -> bool:
-    """True for a ticker field that names no ticker (`PLACEHOLDER_TICKERS`)."""
-    norm = ticker.strip().strip("\"'()").strip().upper()
+    """True for a ticker field that names no ticker (`PLACEHOLDER_TICKERS`,
+    `PLACEHOLDER_WORDS` not in capitals, or no letter at all)."""
+    trimmed = ticker.strip().strip("\"'()").strip()
+    norm = trimmed.upper()
+    if norm in PLACEHOLDER_WORDS:
+        return trimmed != norm
     return norm in PLACEHOLDER_TICKERS or not any("A" <= c <= "Z" for c in norm)
 
 

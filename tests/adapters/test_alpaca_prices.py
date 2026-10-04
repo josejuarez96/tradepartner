@@ -221,7 +221,8 @@ class TestResolver:
         assert resolver.report.later_class_spans == 0
 
     @pytest.mark.parametrize(
-        "ticker", ["", "N/A", "n/a", "None", "NONE", "Not applicable", "-", " 0 "]
+        "ticker",
+        ["", "N/A", "n/a", "NA", "None", "NONE", "Not applicable", "-", " 0 ", "true", "No"],
     )
     def test_placeholder_tickers_are_left_out(self, ticker: str) -> None:
         resolver = ListingResolver(
@@ -280,10 +281,35 @@ class TestResolver:
         )
         assert resolver.contested_spans == ()
 
-    @pytest.mark.parametrize("ticker", ["TRUE", "NA", "NO"])
-    def test_a_real_ticker_that_reads_as_a_word_resolves(self, ticker: str) -> None:
+    @pytest.mark.parametrize("ticker", ["TRUE", "NO"])
+    def test_a_word_ticker_in_capitals_resolves(self, ticker: str) -> None:
         resolver = ListingResolver([_listing("0000000001", ticker, START, "Common Stock")])
         assert resolver.resolve(ticker, date(2020, 1, 2)) == "0000000001"
+
+    def test_a_later_not_applicable_row_never_takes_na(self) -> None:
+        # #736 review: Nano Labs trades as NA; Courtside's cover page (2023,
+        # exchange NONE) and BioCancell's untraded ordinary shares (2024)
+        # also write NA. NA holds nothing: no row goes to the wrong company.
+        resolver = ListingResolver(
+            [
+                _listing(
+                    "0001872302",
+                    "NA",
+                    date(2022, 6, 10),
+                    "American depositary shares, each representing two Class A shares",
+                ),
+                _listing("0001940177", "NA", date(2023, 8, 14), "NA"),
+                _listing(
+                    "0001534248:ordinary-shares",
+                    "NA",
+                    date(2024, 3, 28),
+                    "Ordinary shares, no par-value",
+                ),
+            ]
+        )
+        for session in (date(2022, 7, 1), date(2023, 8, 15), date(2024, 3, 29), date(2026, 9, 30)):
+            assert resolver.resolve("NA", session) is None
+        assert resolver.report.placeholder == 3
 
     def test_a_left_out_listing_still_shadows_an_older_company(self) -> None:
         # Company 3's units take T in 2015: company 1's span (2005, never

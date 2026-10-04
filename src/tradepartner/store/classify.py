@@ -177,16 +177,21 @@ _INCLUDED_IN_UNITS = re.compile(r"\s+included\b.*\bunits?\b.*$")
 #: rights plan attached to it after that ("Common Shares (including Rights
 #: under Shareholder Rights Plan)", "Common Stock ... Preferred Share
 #: Purchase Rights"): the rights trade with the shares, so the row is the
-#: common's. A head going on with "purchase", "rights" or "warrants" right
-#: after the class ("Common Stock Purchase Rights") is the instrument itself.
+#: common's. Only a plan-shaped clause is stripped ("including",
+#: "together with", "associated" ... rights; "... stock purchase rights"),
+#: never one naming a warrant or unit ("Class A Common Stock and one Right"
+#: stays a right). A head going on with "purchase", "rights" or "warrants"
+#: right after the class ("Common Stock Purchase Rights") is the
+#: instrument itself.
 _COMMON_HEAD = re.compile(
     r"^((class|series) [a-z0-9] )?(common|ordinary|capital) (stock|shares?)\b"
 )
 _INSTRUMENT = re.compile(r"^\s*(purchase|rights?|warrants?)\b")
 _RIGHTS_PLAN = re.compile(
-    r"\b(including|associated|together with|with|and)\b.*\brights?\b.*$"
+    r"\(?\s*\b(including|together with|and associated|associated)\b[^()]*\brights?\b.*$"
     r"|\b(preferred|preference|common) (stock|shares?) purchase rights?\b.*$"
 )
+_OWN_INSTRUMENT = re.compile(r"\b(warrants?|units?)\b")
 _DEPOSITARY_SHARE = re.compile(r"\bdepos[a-z]*ry ?shares?\b")
 _ADS = re.compile(r"\b(american|global)\b")
 _UNIT = re.compile(r"\bunits?\b")
@@ -205,9 +210,10 @@ def _listing_head(class_title: str) -> str:
     if common is None:
         return head
     rest = head[common.end() :]
-    if _INSTRUMENT.match(rest):
+    plan = _RIGHTS_PLAN.search(rest)
+    if _INSTRUMENT.match(rest) or plan is None or _OWN_INSTRUMENT.search(plan.group()):
         return head
-    return head[: common.end()] + _RIGHTS_PLAN.sub("", rest)
+    return head[: common.end()] + rest[: plan.start()]
 
 
 def listing_kind(ticker: str, class_title: str | None) -> str:
@@ -217,7 +223,8 @@ def listing_kind(ticker: str, class_title: str | None) -> str:
     first comma, less an "included as part of the units" clause and a
     rights plan attached to a common class):
 
-    - a `%` in the head is a coupon instrument (`coupon`: notes, preferred);
+    - a `%` in the head, or anywhere in a title whose head is not a common
+      class, is a coupon instrument (`coupon`: notes, preferred);
     - else a head naming preferred, debt (note, debenture, bond), a warrant
       or a right is that kind;
     - else a depositary *share* that is not American or Global is read as a
@@ -234,7 +241,9 @@ def listing_kind(ticker: str, class_title: str | None) -> str:
         suffix = ticker_suffix_type(ticker)
         return suffix if suffix in _NON_EQUITY_SUFFIXES else EQUITY
     head = _listing_head(class_title)
-    if "%" in head:
+    # A coupon anywhere in the title, unless the head is a common class (a
+    # `%` after its first comma belongs to another class listed with it).
+    if "%" in head or ("%" in class_title and _COMMON_HEAD.match(head) is None):
         return "coupon"
     for pattern, kind in _LISTING_WORDS:
         if pattern.search(head):

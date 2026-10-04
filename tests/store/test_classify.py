@@ -531,7 +531,13 @@ class TestNoLookAhead:
         ("Class A Common Stock and one Redeemable Warrant", "warrant"),
         ("Depository Shares", "preferred"),
         ("6.75% Series C Cumulative Redeemable PreferredShares of Beneficial Interest", "coupon"),
-        ("Preferred Stock, Par Value $25 Per Share, 4%, Noncumulative", "preferred"),
+        ("Preferred Stock, Par Value $25 Per Share, 4%, Noncumulative", "coupon"),
+        ("Dep Shr, 1/1000th int. per shr of 5.85% Fix-to-Float Non-Cum. Perpetual", "coupon"),
+        ("Guarantee of Aon plc, 3.500% Senior Notes due 2024", "coupon"),
+        ("Class A Common Stock and one Right", "right"),
+        ("Ordinary Shares and one Right to receive one-tenth of a share", "right"),
+        ("Common Stock and Warrants to purchase Common Stock and Rights", "warrant"),
+        ("Common stock and contingent value rights", "right"),
     ],
 )
 def test_listing_kind_reads_the_class_title(title: str, kind: str) -> None:
