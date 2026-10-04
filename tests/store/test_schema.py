@@ -11,6 +11,7 @@ and the connection's extension auto-install/auto-load settings.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 import textwrap
@@ -46,6 +47,7 @@ FACT_TABLES: tuple[str, ...] = (
     "prices_daily",
     "corporate_actions",
     "facts",
+    "statement_facts",
 )
 
 
@@ -120,6 +122,21 @@ def _minimal_row(table: str, *, known_at: datetime, ingested_at: datetime) -> di
             "class_member": "",  # '' = no class dimension; see schema.py
             "value": 1_000_000.0,
             "filing_accession": "0000000001-20-000001",
+        }
+    elif table == "statement_facts":
+        business = {
+            "cik": "0000000001",
+            "fact_name": "revenue",
+            "xbrl_tag": "us-gaap:Revenues",
+            "period_start": date(2019, 1, 1),
+            "period_end": date(2019, 12, 31),
+            "period_days": 364,
+            "value": 1_000_000.0,
+            "unit": "USD",
+            "form": "10-K",
+            "filing_accession": "0000000001-20-000001",
+            "basis": "reported",
+            "comparative": False,
         }
     else:
         raise ValueError(f"no minimal row defined for {table!r}")
@@ -423,6 +440,148 @@ def test_bar_with_later_known_at_is_a_new_row_not_rejected(
     insert_row(fixture_store, "prices_daily", revised)
     (after,) = fixture_store.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     assert after == before + 2
+
+
+# --- statement_facts (#660, T76) ---------------------------------------
+
+
+def test_statement_fact_with_later_known_at_still_raises(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Unlike `prices_daily` above, `statement_facts`' UNIQUE key excludes
+    `known_at`: a second row for an already-stored key is rejected even
+    with a later `known_at` — one vintage per key for ever (spec
+    "First vintage"), the deliberate exception to the "Definitions"
+    revision rule."""
+    now = _now()
+    row = _minimal_row("statement_facts", known_at=now, ingested_at=now)
+    insert_row(fixture_store, "statement_facts", row)
+    revised = dict(row)
+    revised["known_at"] = now + timedelta(days=1)
+    revised["ingested_at"] = now + timedelta(days=1)
+    revised["value"] = 999.0
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "statement_facts", revised)
+
+
+@pytest.mark.parametrize(
+    ("period_start", "period_days"),
+    [
+        (date(2019, 1, 2), 0),  # non-NULL period_start but period_days = 0
+        (None, 364),  # NULL period_start but period_days != 0
+    ],
+)
+def test_period_start_null_iff_period_days_is_zero(
+    fixture_store: duckdb.DuckDBPyConnection, period_start: date | None, period_days: int
+) -> None:
+    """Spec "Statement facts" > Schema: `period_start` is NULL exactly
+    when `period_days = 0` (an instant fact); the mismatched combinations
+    above are refused by the table's own `CHECK`."""
+    now = _now()
+    row = _minimal_row("statement_facts", known_at=now, ingested_at=now)
+    row["period_start"] = period_start
+    row["period_days"] = period_days
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "statement_facts", row)
+
+
+def test_statement_fact_basis_restricted_to_reported_or_derived(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    now = _now()
+    row = _minimal_row("statement_facts", known_at=now, ingested_at=now)
+    row["basis"] = "not-a-real-basis"
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "statement_facts", row)
+
+
+def test_statement_fact_basis_values_are_reported_and_derived() -> None:
+    assert schema.STATEMENT_FACT_BASIS_VALUES == ("reported", "derived")
+
+
+def test_statement_facts_keyed_by_cik_not_security_id(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`statement_facts` has no `security_id` column at all (spec decision
+    (c): a statement is the issuer's, not a share class's)."""
+    info = fixture_store.execute("PRAGMA table_info('statement_facts')").fetchall()
+    columns = {row[1] for row in info}
+    assert "security_id" not in columns
+    assert "cik" in columns
+
+
+#: SHA-256 of `"".join(schema._STATEMENT_FACTS_TABLE_DDL)` at version 10
+#: (#660, T76; renumbered from 9 at ready time, T84/#714 landed version 9
+#: first). Deliberately a tuple of its own, never folded into
+#: `_TABLE_DDL` (whose version-4 pin in `test_journal_schema.py` and
+#: `test_registry_schema.py` must never move again, quant-auditor review
+#: of PR #729): a later edit of this table's DDL goes to the next schema
+#: version with its own migration, never a silent change here.
+_V10_STATEMENT_FACTS_DDL_SHA256 = "7b68b590db31163266c3ec13d227be93381ff113e30c57cc094a76c5f0342416"
+
+
+def test_statement_facts_ddl_is_pinned_at_version_10() -> None:
+    digest = hashlib.sha256("".join(schema._STATEMENT_FACTS_TABLE_DDL).encode()).hexdigest()
+    assert digest == _V10_STATEMENT_FACTS_DDL_SHA256, (
+        "statement_facts DDL changed: bump the schema version and add a "
+        "migration instead of editing the table in place"
+    )
+
+
+def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> None:
+    """Unlike `conftest.version_4_store` and
+    `test_registry_schema._make_old_store` (which both pre-create
+    `statement_facts` so `load_universe_fixtures` can load
+    `statement_facts.csv` into them -- code-review of PR #729: that makes
+    their own before/after snapshots of this table vacuously equal), this
+    builds a store with none of version 10's DDL at all, so migrating it
+    (through T84/#714's version-9 settle-order step on the way) is the
+    only way the table can appear."""
+    conn = duckdb.connect(":memory:")
+    try:
+        configure_connection(conn)
+        for ddl in schema._TABLE_DDL + schema._REGISTRY_TABLE_DDL + schema._JOURNAL_TABLE_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (8, TIMESTAMPTZ "
+            "'2026-09-26 12:00:00+00')"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = 'statement_facts'"
+            ).fetchone()[0]  # type: ignore[index]
+            == 0
+        )
+        schema.init_schema(conn)
+        info = conn.execute("PRAGMA table_info('statement_facts')").fetchall()
+        columns = {row[1] for row in info}
+        assert columns == {
+            "cik",
+            "fact_name",
+            "xbrl_tag",
+            "period_start",
+            "period_end",
+            "period_days",
+            "value",
+            "unit",
+            "form",
+            "filing_accession",
+            "basis",
+            "comparative",
+            "known_at",
+            "ingested_at",
+            "source",
+            "provenance",
+        }
+        constraints = conn.execute(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'statement_facts' AND constraint_type = 'UNIQUE'"
+        ).fetchall()
+        assert len(constraints) == 1
+        assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (10,)
+    finally:
+        conn.close()
 
 
 # --- lock-error detection -----------------------------------------------
@@ -813,8 +972,10 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `order_events.reason` CHECK is version 6; #377's `decisions.reason` CHECK
     is version 7; #472's `resume_invocations.accept_rejections` is version 8;
     #571's owner settlement (`settle_order`, `owner_settled_unknown`,
-    `overrides.client_order_id`) is version 9."""
-    assert schema.CURRENT_SCHEMA_VERSION == 9
+    `overrides.client_order_id`) is version 9; #660's `statement_facts`
+    (T76) is version 10 (renumbered from 9 at ready time, T84/#714 landed
+    version 9 first)."""
+    assert schema.CURRENT_SCHEMA_VERSION == 10
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------

@@ -209,6 +209,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.config import Settings, clean_message
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -1727,6 +1728,19 @@ class EdgarFilingSource(FilingSource):
             key=lambda f: (f.accepted_at, f.accession, f.fact_name, f.class_member, f.as_of_date)
         )
         return out
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        """As-filed statement facts (amendment 2026-10-03, #660).
+
+        Placeholder for T76 (schema/records/fixture adapter only): always
+        empty. `edgar.statement_facts_enabled` defaults to `false`, so no
+        caller reaches this yet; the real companyfacts parse, cache and
+        stamping (reading `companyfacts.zip`/the per-CIK API, the
+        `statement_facts/v<N>/<cik>.json` cache, `statement_conflicts` and
+        the other plain-attribute counts) is T77a's.
+        """
+        _validate_cik(cik)
+        return []
 
     def _facts_cache_key(
         self, stamps: Mapping[str, SubmissionRecord], cover_forms: set[str]

@@ -434,6 +434,18 @@ def test_open_trial_captures_the_store_max_ingested_at(
     assert stored == _T0
 
 
+def test_store_max_ingested_at_tolerates_a_missing_fact_table(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Defensive guard added alongside `health`'s (#660/T76 code review):
+    every caller here migrates first today, so `statement_facts` always
+    exists in practice, but `store_max_ingested_at` itself must not raise
+    `duckdb.CatalogException` if some future caller does not."""
+    _insert_fact(conn, _T0)
+    conn.execute("DROP TABLE statement_facts")
+    assert registry.store_max_ingested_at(conn) == _T0
+
+
 def _insert_fact(conn: duckdb.DuckDBPyConnection, ingested_at: datetime) -> None:
     insert_row(
         conn,

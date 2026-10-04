@@ -101,6 +101,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session, previous_session
@@ -457,6 +458,20 @@ class _Recorded(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        """Memoized like every other question above, but not yet asked
+        anywhere: `#660`'s switch defaults off, and no caller reaches this
+        until T77b wires a per-CIK call into `_build_filings`'s fetch
+        pass. That wiring is not free of this class's own rules, despite
+        the shared `_ask` cache: the proxy's memo would otherwise hold
+        every record in memory (the spec's "Ingest" section says the
+        fetch pass must record only *which* CIKs were filled, never the
+        records themselves, for a payload the shares path already reads
+        once per CIK). T77b's wiring therefore cannot simply call this
+        method and keep the answer; it needs a dedicated memo keyed on
+        "CIK filled: yes/no", not the generic `_ask` cache used here."""
+        return list(self._ask("statement_facts", cik))
 
 
 def _unwrap(filings: FilingSource) -> FilingSource:

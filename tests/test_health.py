@@ -155,6 +155,24 @@ def test_fixture_store_passes_every_integrity_rule(
         assert check.violations.is_empty(), check.rule
 
 
+def test_health_report_on_a_version_8_store_does_not_crash_on_the_missing_table(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A read-only connection never migrates (`store.schema.init_schema`), so
+    the owner's store sits at version 8 -- no `statement_facts` table yet --
+    from the moment this PR (#660/T76) merges until the next `tradepartner
+    ingest` run. `health._count_per_table`/`_bad_provenance` loop over every
+    `TABLE_PROVENANCE_VALUES` table, `statement_facts` now included; before
+    the fix in this PR, that raised `duckdb.CatalogException` on exactly this
+    shape instead of reporting normally (code-review of PR #729)."""
+    fixture_store.execute("DELETE FROM schema_version WHERE version = 9")
+    fixture_store.execute("DROP TABLE statement_facts")
+    report = health_report(fixture_store, T_END, settings)
+    assert isinstance(report, HealthReport)
+    assert [check.rule for check in report.integrity] == list(INTEGRITY_RULES)
+    assert report.ok, report.failures
+
+
 def test_report_carries_every_metric(
     fixture_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
