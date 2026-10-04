@@ -494,6 +494,7 @@ class TestNoLookAhead:
             write_master(partial, partial_build)
             for read in (securities_as_of, listings_as_of):
                 assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
+            partial.close()
 
 
 class TestDuplicatePairPerPage:
