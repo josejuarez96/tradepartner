@@ -11,8 +11,11 @@ corporate actions of its own.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import date, datetime, timedelta
 
+import duckdb
+import polars as pl
 import pytest
 
 from execution.test_run_trade import (
@@ -34,6 +37,9 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.planning import PlanOutcome
+from tradepartner.execution.window import stop
+from tradepartner.store.asof import live_actions_as_of
+from tradepartner.store.db import open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionRow,
@@ -893,3 +899,112 @@ def test_an_open_decision_of_a_name_with_no_bar_raises_its_reason_when_read(
     with pytest.raises(ValueError, match=r"no reference price for SEC_NO_BAR: no bar on or before"):
         env.run(at(MAY_3))
     assert exits(env, "SEC_TRANSFER") == []
+
+
+# --- the deferred names priced in one batched read (#712) ---------------------------------
+
+PRICED = ("SEC_DUAL_A", "SEC_DUAL_B", "SEC_SPLIT_FUTURE", "SEC_SPY", "SEC_TRANSFER")
+
+
+def per_name(
+    conn: duckdb.DuckDBPyConnection, session: date, names: Collection[str], actions: pl.DataFrame
+) -> tuple[dict[str, float], dict[str, str]]:
+    """The #685 reads `_optional_prices` made before #712: one per name."""
+    priced: dict[str, float] = {}
+    unpriced: dict[str, str] = {}
+    for security_id in sorted(names):
+        try:
+            read = run_module.planning.reference_prices(conn, session, [security_id], actions)
+            priced.update(read)
+        except ValueError as exc:
+            unpriced[security_id] = str(exc)
+    return priced, unpriced
+
+
+def counted(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Each `reference_prices` call's names, in call order."""
+    calls: list[list[str]] = []
+    real = run_module.planning.reference_prices
+
+    def spy(
+        conn: duckdb.DuckDBPyConnection,
+        session: date,
+        names: Collection[str],
+        actions: pl.DataFrame,
+    ) -> dict[str, float]:
+        calls.append(sorted(names))
+        return real(conn, session, names, actions)
+
+    monkeypatch.setattr(run_module.planning, "reference_prices", spy)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("names", "reads"),
+    [
+        pytest.param(PRICED, 1, id="all-priced-one-batched-read"),
+        pytest.param((*PRICED, NO_BAR), 1 + len(PRICED) + 1, id="one-unpriced-falls-back"),
+        pytest.param((), 0, id="no-names-no-read"),
+    ],
+)
+def test_the_deferred_names_read_returns_what_the_per_name_reads_did(
+    env: Env,
+    window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+    names: tuple[str, ...],
+    reads: int,
+) -> None:
+    """One batched read over the deferred names (#712), the same rows the #685
+    per-name reads gave; a batch that raises (a name with no bar) falls back
+    to one read per name, so the priced names stay priced and the unpriced
+    one keeps its reason."""
+    bought(env)
+    assert env.run(at(MAY_3)).status == "ok", env.result(env.latest_run())
+    with open_read_only(env.settings) as conn:
+        actions = live_actions_as_of(conn, session_close(previous_session(MAY_3)))
+        expected = per_name(conn, MAY_3, names, actions)
+        calls = counted(monkeypatch)
+        got = run_module._optional_prices(conn, MAY_3, set(names), actions)
+    assert got == expected
+    assert len(calls) == reads
+    if reads:
+        assert calls[0] == sorted(names)
+    assert set(got[0]) == set(names) - {NO_BAR}
+    assert set(got[1]) == {NO_BAR} & set(names)
+
+
+def test_a_stop_runs_two_reads_price_the_deferred_names_alike(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop run reads step 7's book twice (before and after its forced exits
+    are journaled); on a flat account the bought names are deferred, and both
+    reads price them in one batched read each, with the per-name reads' rows."""
+    bought(env)
+    env.clock.now = at(F_0, 22, 0)
+    assert stop(env.settings, env.connect, env.fake, env.clock, "test").state == "requested"
+    assert env.run(at(MAY_3)).status == "ok", env.result(env.latest_run())  # sells all
+    seen: list[tuple[set[str], tuple[dict[str, float], dict[str, str]]]] = []
+    real = run_module._optional_prices
+
+    def recorded(
+        conn: duckdb.DuckDBPyConnection,
+        session: date,
+        names: Collection[str],
+        actions: pl.DataFrame,
+    ) -> tuple[dict[str, float], dict[str, str]]:
+        got = real(conn, session, names, actions)
+        assert got == per_name(conn, session, names, actions)
+        seen.append((set(names), got))
+        return got
+
+    monkeypatch.setattr(run_module, "_optional_prices", recorded)
+    calls = counted(monkeypatch)
+    outcome = env.run(at(MAY_6))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert outcome.kind == "stop"
+    assert len(seen) == 2
+    (first, first_rows), (second, second_rows) = seen
+    assert first == second == {"SEC_DUAL_B", "SEC_SPLIT_FUTURE", "SEC_TRANSFER"}
+    assert first_rows == second_rows
+    assert first_rows[1] == {}
+    assert [c for c in calls if c == sorted(first)] == [sorted(first)] * 2
