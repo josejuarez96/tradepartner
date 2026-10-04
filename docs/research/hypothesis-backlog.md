@@ -48,6 +48,7 @@ Parked ideas are listed at the end with the reason.
 - **Kill:** the file's retirement rule (first audited in-sample trial with net excess over SPY below −1 pp/yr and `dsr_excess` below 0.5); the momentum-and-market spanning check is a pre-declared diagnostic, a registered research run, not part of the rule (B3-8).
 - **Information value:** high. It is the best-evidenced idea, it is the first non-price signal, and it proves the fundamentals pipeline that B5 and the E1 economic test also need (revenue).
 - **Cost:** M (one data extension, merged as a spec; one family, five agent tasks and one owner run).
+- **Follow-ups from the #726 reviews, settled (#728):** the health page's coverage bound stays `universe.max_shares_age_days`, with a note that it under-reports what a wider `profitability.max_fact_age_days` can use (data-foundation spec, "Health"); whether a `return` run may read a registry table (the spanning diagnostic's `trial_equity`) is the research-registry spec's new open question 7, left for the owner; `n_excluded_no_facts` stays one count, with the latest ingest run's per-cause counts shown beside it on the backtest page for context, not a per-rebalance split (backtest spec, T85d).
 
 ### B4. Momentum + profitability combined
 - **Tests:** G4-2 (MIXED for long-only, liquid portfolios); G4-1 (SUPPORTED for long-short or unconstrained only).

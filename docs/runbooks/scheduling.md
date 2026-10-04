@@ -63,6 +63,19 @@ launchctl enable gui/$(id -u)/com.tradepartner.paper   # once installed
 
 **To restore from a copy:** disable both jobs and confirm neither is mid-run (as above), `git checkout` the commit recorded in the matching `.commit` file (the code you were on when you took that copy — code past the migration expects the new schema, so restoring the file alone is not enough), delete any live `<path>.wal` so DuckDB doesn't replay it onto the restored file, then copy the dated backup (and its `.wal.bak-DATE` counterpart, if one exists) back over the live path. Re-enable the jobs only once you've decided which code they should run next. If any window traded between the copy and the restore, expect a `reconciliation` alert on the next run until you have sorted out what the broker did in the gap — the run halts and the switch engages rather than silently losing track of an order.
 
+## After an EDGAR cache version bump
+
+The EDGAR adapter keeps each per-document and per-CIK cache under a versioned directory in `edgar.cache_dir`: `fsn/v{FSN_VERSION}`, `cover/v{COVER_VERSION}`, `header/v{HEADER_VERSION}`, `delisting/v{DELISTING_VERSION}`, and `stamps/` and `facts/` under `v{PARSER_VERSION}` (the constants are in `src/tradepartner/adapters/edgar_source.py`). A pull that bumps one of them makes the next run rebuild that tree under the new number. **Nothing deletes the old tree** (#615): it stays on disk until you remove it. `fsn/v1` was about 21.5 GB, and the disk filled on 2026-10-02. After the first run on the new version has finished `ok`, compare the trees on disk with the current constants, then delete only the superseded trees:
+
+```bash
+CACHE=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().edgar.cache_dir)")
+uv run python -c "from tradepartner.adapters import edgar_source as e; print(f'fsn v{e.FSN_VERSION}, cover v{e.COVER_VERSION}, header v{e.HEADER_VERSION}, delisting v{e.DELISTING_VERSION}, stamps+facts v{e.PARSER_VERSION}')"
+du -sh "$CACHE"/*/v*
+rm -rf "$CACHE/fsn/v1"   # example: a tree whose number is below its constant
+```
+
+Never delete a tree whose number matches its constant, `failed_filings.json` (it holds your accepted failures), or `bulk/` and `index/`, which are not versioned. If you might roll back to the old code, keep the old tree until you're sure you won't.
+
 ## PATH, working directory and `.env`
 
 launchd starts jobs with a minimal environment: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, the working directory `/`, and none of your shell profile. Three things follow:
