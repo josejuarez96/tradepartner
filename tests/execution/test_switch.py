@@ -43,6 +43,7 @@ from tradepartner.store.journal import (
     append,
     kill_switch_events_for,
     runs_for,
+    unconsumed_kill_switch_overrides,
 )
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -493,6 +494,33 @@ def test_an_override_engages_exactly_once(store: Settings) -> None:
     ]
     assert engage_from_overrides(store, clock, window_id=_WINDOW, run_id=4) == []
     assert len(_rows(store)) == 2
+
+
+def test_the_derivation_ignores_a_settle_order_row(store: Settings) -> None:
+    """Spec req 17 (#571): a `settle_order` override is no engagement and no release:
+    nothing consumes it into a `kill_switch` row, and the derived state is what it
+    was before it, engaged or not."""
+    with open_for_write(store) as conn:
+        append(
+            conn,
+            OverrideRow(
+                window_id=_WINDOW,
+                made_at=_at(50),
+                security_id="S1",
+                client_order_id="tp-1",
+                kind="settle_order",
+                reason="the broker no longer knows the order",
+                **_stamp(50),
+            ),
+        )
+        assert unconsumed_kill_switch_overrides(conn, _WINDOW) == []
+    assert engage_from_overrides(store, _Clock(), window_id=_WINDOW, run_id=3) == []
+    assert _rows(store) == []
+    assert not derive(_window(), _rows(store), [], [], reading_run=None, lock_free=True).engaged
+
+    engage(store, _Clock(), window_id=_WINDOW, source="owner", reason="kill first")
+    assert engage_from_overrides(store, _Clock(), window_id=_WINDOW, run_id=4) == []
+    assert derive(_window(), _rows(store), [], [], reading_run=None, lock_free=True).engaged
 
 
 def test_an_override_released_stays_consumed(store: Settings) -> None:

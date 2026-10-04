@@ -1,4 +1,5 @@
-"""Tests for the closed `order_events.reason` set (#332, schema version 6).
+"""Tests for the closed `order_events.reason` set (#332, schema version 6; #571,
+version 9).
 
 `plan.decision_state` keeps a halted or never-received buy open by matching
 `order_events.reason` against `halt` and `not_received`; a writer that spelt either
@@ -7,6 +8,11 @@ column a nullable closed set built from the shared constants, and the migration
 from version 5 rebuilds `order_events` with every row kept, refusing (and changing
 nothing) if a stored reason is outside the set. A read-only connection still opens
 a version-5 store, since the `CHECK` only guards writes.
+
+Version 9 (#571, spec req 17) adds `owner_settled_unknown`, the reason of the
+`cancelled` event `paper settle` journals, and rebuilds `order_events` and
+`overrides` (the `settle_order` kind and its `client_order_id`) from version 8 with
+every row kept.
 """
 
 from __future__ import annotations
@@ -98,7 +104,12 @@ def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
     """Spec "Data / interfaces" > Tables: `reason ∈ {null, not_received, halt}`."""
     assert schema.HALT_REASON == "halt"
     assert schema.NOT_RECEIVED_REASON == "not_received"
-    assert schema.ORDER_EVENT_REASONS == (schema.HALT_REASON, schema.NOT_RECEIVED_REASON)
+    assert schema.OWNER_SETTLED_UNKNOWN_REASON == "owner_settled_unknown"
+    assert schema.ORDER_EVENT_REASONS == (
+        schema.HALT_REASON,
+        schema.NOT_RECEIVED_REASON,
+        schema.OWNER_SETTLED_UNKNOWN_REASON,
+    )
 
 
 def test_the_check_is_built_from_the_shared_constants() -> None:
@@ -110,12 +121,13 @@ def test_decision_state_matches_on_the_shared_constants() -> None:
     """The reader whose protection the `CHECK` backs uses the same spelling."""
     assert plan._HALT is schema.HALT_REASON
     assert plan._NOT_RECEIVED is schema.NOT_RECEIVED_REASON
+    assert plan._OWNER_SETTLED_UNKNOWN is schema.OWNER_SETTLED_UNKNOWN_REASON
 
 
 # --- the CHECK ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("reason", [None, schema.HALT_REASON, schema.NOT_RECEIVED_REASON])
+@pytest.mark.parametrize("reason", [None, *schema.ORDER_EVENT_REASONS])
 def test_every_listed_reason_and_null_is_accepted(
     journal: duckdb.DuckDBPyConnection, reason: str | None
 ) -> None:
@@ -123,7 +135,10 @@ def test_every_listed_reason_and_null_is_accepted(
     assert journal.execute("SELECT reason FROM order_events").fetchall() == [(reason,)]
 
 
-@pytest.mark.parametrize("reason", ["halted", "Halt", "not received", "notreceived", ""])
+@pytest.mark.parametrize(
+    "reason",
+    ["halted", "Halt", "not received", "notreceived", "", "owner_settled", "settled_unknown"],
+)
 def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason: str) -> None:
     with pytest.raises(duckdb.ConstraintException):
         _event(journal, reason)
@@ -137,9 +152,9 @@ def test_fresh_init_records_the_current_version(journal: duckdb.DuckDBPyConnecti
 
 
 #: The tables the migration from version 5 rebuilds or creates (versions 6 to
-#: 8; version 9, #660, adds `statement_facts` but rebuilds nothing, so the
+#: 9; version 10, #660, adds `statement_facts` but rebuilds nothing, so the
 #: set stops growing here).
-_REBUILT = {"order_events", "decisions", "resume_invocations", "resume_acceptances"}
+_REBUILT = {"order_events", "decisions", "resume_invocations", "resume_acceptances", "overrides"}
 
 
 def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
@@ -162,7 +177,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
             _event(conn, "halted")
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == [5, 6, 7, 8, 9]
+    assert versions == [5, 6, 7, 8, 9, 10]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
 
@@ -195,7 +210,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [5, 6, 7, 8, 9]
+        assert _versions(conn) == [5, 6, 7, 8, 9, 10]
 
 
 def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothing(
@@ -221,3 +236,121 @@ def test_read_only_open_of_a_version_5_store_passes(tmp_path: Path) -> None:
         schema.init_schema(conn)
         assert _versions(conn) == [5]
         assert conn.execute("SELECT reason FROM order_events").fetchall() == [("halt",)]
+
+
+# --- version 9 and the migration from version 8 (#571) -------------------------------
+
+#: `order_events` as versions 6 to 8 created it: the reason set without
+#: `owner_settled_unknown`.
+_V8_ORDER_EVENTS_DDL = schema._CREATE_ORDER_EVENTS.replace(
+    schema._check("order_events", "reason"),
+    "CHECK (reason IS NULL OR reason IN ('halt', 'not_received'))",
+)
+#: `overrides` as versions 5 to 8 created it: no `client_order_id`, no
+#: `settle_order`.
+_V8_OVERRIDES_DDL = (
+    schema._CREATE_OVERRIDES.replace("    client_order_id VARCHAR,\n", "")
+    .replace(",\n    CHECK ((kind = 'settle_order') = (client_order_id IS NOT NULL))", "")
+    .replace(
+        schema._check("overrides", "kind"),
+        "CHECK (kind IN ('exclude_name', 'keep_name', 'engage_kill_switch'))",
+    )
+)
+
+
+def _version_8_store(path: Path, reasons: tuple[str | None, ...] = ()) -> Path:
+    """A store shaped as version 8 left it, holding one `order_events` row per entry
+    of `reasons` and one `overrides` row of each pre-9 kind, in that order."""
+    with duckdb.connect(str(path)) as conn:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE order_events")
+        conn.execute(_V8_ORDER_EVENTS_DDL)
+        conn.execute("DROP TABLE overrides")
+        conn.execute(_V8_OVERRIDES_DDL)
+        conn.execute("UPDATE schema_version SET version = 8")
+        for index, reason in enumerate(reasons):
+            _event(conn, reason, coid=f"c{index}")
+        for override_id, kind in ((3, "keep_name"), (1, "engage_kill_switch"), (2, "exclude_name")):
+            conn.execute(
+                "INSERT INTO overrides (override_id, window_id, made_at, kind, reason, "
+                "known_at, ingested_at) VALUES (?, 1, ?, ?, ?, ?, ?)",
+                [override_id, _NOW, kind, f"reason {override_id}", _NOW, _NOW],
+            )
+    return path
+
+
+def test_the_version_8_shapes_are_what_version_8_created(tmp_path: Path) -> None:
+    """The helper's tables really lack version 9's set, column and `CHECK`."""
+    path = _version_8_store(tmp_path / "v8.duckdb")
+    with duckdb.connect(str(path)) as conn:
+        columns = [
+            name
+            for (name,) in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'overrides'"
+            ).fetchall()
+        ]
+        assert "client_order_id" not in columns
+        with pytest.raises(duckdb.ConstraintException):
+            _event(conn, schema.OWNER_SETTLED_UNKNOWN_REASON)
+
+
+def test_write_open_of_a_version_8_store_migrates_to_9_and_keeps_every_row(
+    tmp_path: Path, journal: duckdb.DuckDBPyConnection
+) -> None:
+    reasons = (None, schema.HALT_REASON, schema.NOT_RECEIVED_REASON)
+    path = _version_8_store(tmp_path / "v8.duckdb", reasons)
+    events_reader = "SELECT * FROM order_events ORDER BY rowid"
+    overrides_reader = (
+        "SELECT override_id, window_id, made_at, rebalance_session, security_id, kind, "
+        "reason, known_at, ingested_at FROM overrides ORDER BY rowid"
+    )
+    rebuilt = {"order_events", "overrides"}
+    with duckdb.connect(str(path)) as conn:
+        events_before = conn.execute(events_reader).fetchall()
+        overrides_before = conn.execute(overrides_reader).fetchall()
+        others_before = {
+            table: _shape(conn, table)
+            for table in schema.JOURNAL_TABLE_NAMES
+            if table not in rebuilt
+        }
+        schema.init_schema(conn)
+        events_after = conn.execute(events_reader).fetchall()
+        overrides_after = conn.execute(overrides_reader).fetchall()
+        order_ids = conn.execute("SELECT client_order_id FROM overrides").fetchall()
+        shapes = {table: _shape(conn, table) for table in schema.JOURNAL_TABLE_NAMES}
+        versions = _versions(conn)
+        _event(conn, schema.OWNER_SETTLED_UNKNOWN_REASON, coid="settled")
+        conn.execute(
+            "INSERT INTO overrides (override_id, window_id, made_at, client_order_id, kind, "
+            "reason, known_at, ingested_at) VALUES (9, 1, ?, 'tp-1', 'settle_order', 'r', ?, ?)",
+            [_NOW, _NOW, _NOW],
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            _event(conn, "halted")
+    assert events_after == events_before
+    assert len(events_after) == len(reasons)
+    assert overrides_after == overrides_before
+    assert [row[0] for row in overrides_after] == [3, 1, 2]
+    assert order_ids == [(None,)] * 3
+    assert versions == [8, 9, 10]
+    assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
+    assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
+
+
+def test_a_version_8_store_reopens_at_current_without_another_version_row(tmp_path: Path) -> None:
+    path = _version_8_store(tmp_path / "v8.duckdb")
+    for _ in range(2):
+        with duckdb.connect(str(path)) as conn:
+            schema.init_schema(conn)
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [8, 9, 10]
+
+
+def test_read_only_open_of_a_version_8_store_passes(tmp_path: Path) -> None:
+    """Every read but `overrides` works on a store no write has migrated yet."""
+    path = _version_8_store(tmp_path / "v8.duckdb", (schema.NOT_RECEIVED_REASON,))
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [8]
+        assert conn.execute("SELECT reason FROM order_events").fetchall() == [("not_received",)]

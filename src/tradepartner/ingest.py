@@ -100,7 +100,7 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session
-from tradepartner.config import Settings, secret_values
+from tradepartner.config import Settings, clean_message
 from tradepartner.store.classify import (
     ClassificationBuild,
     build_classifications,
@@ -323,7 +323,6 @@ def _record_only(
     return run
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 
 
@@ -381,12 +380,9 @@ def _with_frames(message: str, exc: BaseException, settings: Settings) -> str:
     return f"{message} | at: {frames[:budget]}"
 
 
-def _clean(message: str, settings: Settings) -> str:
-    """`message` with every configured secret redacted, control characters
-    replaced by a space, and cut to `ingest.max_message_chars`."""
-    for value in secret_values(settings):
-        message = message.replace(value, "[redacted]")
-    return _CONTROL.sub(" ", message)[: settings.ingest.max_message_chars]
+#: The run row's message cleaning, shared with the EDGAR adapter's stored
+#: failure messages so the two cannot drift (#629).
+_clean = clean_message
 
 
 def _write_run(
@@ -480,7 +476,7 @@ def _unwrap(filings: FilingSource) -> FilingSource:
     return filings
 
 
-def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False) -> None:
+def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
     """The fetch pass: every filing question, with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
     before the lock; then `recorded` answers only from what it holds.
@@ -489,7 +485,8 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False)
     `record_failed_check()` (if it has one) records the run's failures
     first, so they can be quarantined and `accepted` although the chunk
     never commits (#610 policy 2); the check's error is re-raised either
-    way, and a dry run records nothing."""
+    way, and a dry run records nothing. `dry_run` has no default (#629), so
+    a caller cannot record failures by leaving it out."""
     _build_filings(recorded, settings, _FETCH_PASS)
     source = _unwrap(recorded)
     check_failures = getattr(source, "check_failures", None)
@@ -579,6 +576,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_duplicates", "FSN duplicates"),
         ("fsn_reissue_undetected", "FSN re-issues unchecked"),
         ("fsn_incomplete_listings", "FSN incomplete listings"),
+        ("cover_incomplete_listings", "cover incomplete listings"),  # #612: per-document
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
         ("unstamped_delistings", "unstamped delistings"),  # T11f

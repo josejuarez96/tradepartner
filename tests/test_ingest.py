@@ -473,12 +473,13 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
         fsn_duplicates = 1
         fsn_reissue_undetected = 3
         fsn_incomplete_listings = 4
+        cover_incomplete_listings = 6  # #612: per-document cover parses
         fsn_missing = 5
 
     message = _run(settings, filings=_filings(cls=Fsn), source="edgar").runs[0].message
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
-        "FSN incomplete listings: 4; FSN missing: 5; missing"
+        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; missing"
     )
     assert counts in message
 
@@ -889,6 +890,13 @@ def _filing_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any,
     return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall(), key=repr) for t in tables}
 
 
+def test_prefetch_requires_dry_run_by_keyword(settings: Settings) -> None:
+    """#629: `dry_run` has no default, so a future dry caller cannot record
+    failures by leaving it out."""
+    with pytest.raises(TypeError, match="dry_run"):
+        _prefetch(_Recorded(_filings()), settings)  # type: ignore[call-arg]
+
+
 def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -910,7 +918,7 @@ def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
         source: FixtureFilingSource | _Recorded = _filings()
         if prefetch:
             source = _Recorded(source)
-            _prefetch(source, settings)
+            _prefetch(source, settings, dry_run=False)
         conn = duckdb.connect(":memory:")
         conn.execute("SET TimeZone='UTC'")
         init_schema(conn)

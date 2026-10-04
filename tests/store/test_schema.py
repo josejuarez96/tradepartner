@@ -510,31 +510,33 @@ def test_statement_facts_keyed_by_cik_not_security_id(
     assert "cik" in columns
 
 
-#: SHA-256 of `"".join(schema._STATEMENT_FACTS_TABLE_DDL)` at version 9
-#: (#660, T76). Deliberately a tuple of its own, never folded into
+#: SHA-256 of `"".join(schema._STATEMENT_FACTS_TABLE_DDL)` at version 10
+#: (#660, T76; renumbered from 9 at ready time, T84/#714 landed version 9
+#: first). Deliberately a tuple of its own, never folded into
 #: `_TABLE_DDL` (whose version-4 pin in `test_journal_schema.py` and
 #: `test_registry_schema.py` must never move again, quant-auditor review
 #: of PR #729): a later edit of this table's DDL goes to the next schema
 #: version with its own migration, never a silent change here.
-_V9_STATEMENT_FACTS_DDL_SHA256 = "7b68b590db31163266c3ec13d227be93381ff113e30c57cc094a76c5f0342416"
+_V10_STATEMENT_FACTS_DDL_SHA256 = "7b68b590db31163266c3ec13d227be93381ff113e30c57cc094a76c5f0342416"
 
 
-def test_statement_facts_ddl_is_pinned_at_version_9() -> None:
+def test_statement_facts_ddl_is_pinned_at_version_10() -> None:
     digest = hashlib.sha256("".join(schema._STATEMENT_FACTS_TABLE_DDL).encode()).hexdigest()
-    assert digest == _V9_STATEMENT_FACTS_DDL_SHA256, (
+    assert digest == _V10_STATEMENT_FACTS_DDL_SHA256, (
         "statement_facts DDL changed: bump the schema version and add a "
         "migration instead of editing the table in place"
     )
 
 
-def test_migrating_a_genuine_pre_version_9_store_creates_statement_facts() -> None:
+def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> None:
     """Unlike `conftest.version_4_store` and
     `test_registry_schema._make_old_store` (which both pre-create
     `statement_facts` so `load_universe_fixtures` can load
     `statement_facts.csv` into them -- code-review of PR #729: that makes
     their own before/after snapshots of this table vacuously equal), this
-    builds a store with none of version 9's DDL at all, so migrating it is
-    the only way the table can appear."""
+    builds a store with none of version 10's DDL at all, so migrating it
+    (through T84/#714's version-9 settle-order step on the way) is the
+    only way the table can appear."""
     conn = duckdb.connect(":memory:")
     try:
         configure_connection(conn)
@@ -577,7 +579,7 @@ def test_migrating_a_genuine_pre_version_9_store_creates_statement_facts() -> No
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (9,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (10,)
     finally:
         conn.close()
 
@@ -969,8 +971,65 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     """#108 took version 4; the Phase 4 journal (T49) is version 5; #332's
     `order_events.reason` CHECK is version 6; #377's `decisions.reason` CHECK
     is version 7; #472's `resume_invocations.accept_rejections` is version 8;
-    #660's `statement_facts` (T76) is version 9."""
-    assert schema.CURRENT_SCHEMA_VERSION == 9
+    #571's owner settlement (`settle_order`, `owner_settled_unknown`,
+    `overrides.client_order_id`) is version 9; #660's `statement_facts`
+    (T76) is version 10 (renumbered from 9 at ready time, T84/#714 landed
+    version 9 first)."""
+    assert schema.CURRENT_SCHEMA_VERSION == 10
+
+
+# --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
+
+_OVERRIDE_AT = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
+
+
+def _override(
+    conn: duckdb.DuckDBPyConnection, override_id: int, kind: str, client_order_id: str | None
+) -> None:
+    conn.execute(
+        "INSERT INTO overrides (override_id, window_id, made_at, security_id, "
+        "client_order_id, kind, reason, known_at, ingested_at) "
+        "VALUES (?, 1, ?, 'S1', ?, ?, 'a reason long enough', ?, ?)",
+        [override_id, _OVERRIDE_AT, client_order_id, kind, _OVERRIDE_AT, _OVERRIDE_AT],
+    )
+
+
+def test_settle_order_is_an_override_kind_spelt_as_the_spec_names_it() -> None:
+    """Spec "Data / interfaces" > Tables: `kind ∈ {exclude_name, keep_name,
+    engage_kill_switch, settle_order}`."""
+    assert schema.SETTLE_ORDER_KIND == "settle_order"
+    assert schema.JOURNAL_ENUMS["overrides", "kind"] == (
+        "exclude_name",
+        "keep_name",
+        "engage_kill_switch",
+        schema.SETTLE_ORDER_KIND,
+    )
+
+
+def test_a_settle_order_override_with_its_order_is_accepted() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    _override(conn, 1, schema.SETTLE_ORDER_KIND, "tp-1")
+    assert conn.execute("SELECT kind, client_order_id FROM overrides").fetchall() == [
+        ("settle_order", "tp-1")
+    ]
+
+
+def test_a_settle_order_override_without_an_order_is_refused() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    with pytest.raises(duckdb.ConstraintException):
+        _override(conn, 1, schema.SETTLE_ORDER_KIND, None)
+
+
+@pytest.mark.parametrize("kind", ["exclude_name", "keep_name", "engage_kill_switch"])
+def test_only_a_settle_order_override_may_carry_an_order(kind: str) -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    with pytest.raises(duckdb.ConstraintException):
+        _override(conn, 1, kind, "tp-1")
+    _override(conn, 2, kind, None)
+    assert conn.execute("SELECT client_order_id FROM overrides").fetchall() == [(None,)]
 
 
 def test_two_source_ids_may_share_an_ex_date_and_known_at(

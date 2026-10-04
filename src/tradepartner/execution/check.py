@@ -32,7 +32,15 @@ The four `CheckLine`s, in order:
    terminal event -> outcome, ADR 0005) is incomplete once its outcome is
    due: at the first run after close(T_{i+1}) for an order of rebalance i,
    or after the order's own session for a forced exit with no rebalance
-   (spec req 8's last sentence).
+   (spec req 8's last sentence); and (#571, req 17) no order with a **live**
+   fill (`superseded_by` null: the rows `store.journal.fills_for` returns)
+   whose `known_at` is after its first terminal event's, whatever its outcome
+   rows and whether or not its outcome is due yet, so an owner settlement
+   (`paper settle`) can never silently absorb a real fill. A fill journaled
+   with its terminal event shares its stamp and is not after it; a feed fill
+   that arrives after req 8's synthetic fill is journaled superseded and is not
+   live. `paper stop`'s readiness read (`window._not_ready`) applies the same
+   rule.
 4. **`override_reason`**: no `overrides` row whose trimmed `reason` is
    shorter than `paper.min_override_reason_chars`.
 
@@ -330,7 +338,8 @@ def _order_due_threshold(
 def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
     query = (
         "every order's chain (order -> terminal event -> outcome) once its "
-        "outcome is due (spec req 8)"
+        "outcome is due (spec req 8), and no live fill journaled after its "
+        "order's terminal event (req 17)"
     )
     orders = store_journal.orders_for(conn, window_id=window_id)
     decisions = {
@@ -343,20 +352,30 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
         o.client_order_id for o in store_journal.non_terminal_orders(conn, window_id=window_id)
     }
     terminal: dict[str, str] = {}
+    terminal_at: dict[str, datetime] = {}
     for event in sorted(
         store_journal.order_events_for(conn, window_id=window_id),
         key=lambda e: (e.known_at, e.ingested_at),
     ):
         if event.status in store_journal.TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
+            terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
+    late: set[str] = set()
     for item in store_journal.fills_for(conn, window_id=window_id):
         coid = item.fill.client_order_id
         filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
+        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+            late.add(coid)
     written = {(o.client_order_id, o.kind) for o in store_journal.outcomes_for(conn, window_id)}
 
     incomplete: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
+        if order.client_order_id in late:
+            incomplete.append(
+                f"order {order.client_order_id} ({order.symbol}) has a live fill "
+                "journaled after its terminal event"
+            )
         decision = decisions.get(order.decision_id)
         threshold = _order_due_threshold(order, decision)
         due = any(session > threshold for session in run_sessions)
