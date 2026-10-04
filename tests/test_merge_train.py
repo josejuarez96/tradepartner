@@ -615,6 +615,11 @@ class FakeRunner:
         self.pushed[branch] = ref
 
     def delete_branch(self, branch: str) -> bool:
+        # Mirrors `ShellRunner.delete_branch` (#642, follow-up 1): a branch outside
+        # `train/*` - e.g. a record hand-edited to name a probe id that was never a real
+        # branch - is refused the same way the real runner refuses it.
+        if not branch.startswith("train/"):
+            raise mt.StoppedError(f"refusing to delete a non-train/ branch: {branch}")
         self.deleted_branches.append(branch)
         return branch not in self.fail_delete_branches
 
@@ -987,10 +992,15 @@ def test_shell_runner_pr_data_fails_closed_on_a_fetch_race(
             )
         raise AssertionError(f"unexpected gh call: {args}")
 
+    private_ref = "refs/merge-train/pr-7"
+
     def fake_git(cwd: Path, *args: str, check: bool = True) -> _Proc:
         if args[:2] == ("fetch", "-q"):
+            # #642, follow-up 5: fetched into a private ref, never the shared `FETCH_HEAD`,
+            # which a concurrent `merge_train` run in the same clone could overwrite.
+            assert args[-1] == f"+refs/pull/7/head:{private_ref}"
             return _Proc(0, "")
-        if args[:2] == ("rev-parse", "FETCH_HEAD"):
+        if args[:2] == ("rev-parse", private_ref):
             return _Proc(0, "b" * 40 + "\n")  # a different sha: the PR moved underneath us
         raise AssertionError(f"unexpected git call: {args}")
 
@@ -1204,7 +1214,9 @@ def test_merge_stops_on_a_landed_tree_mismatch() -> None:
     fake.landed_tree_override[2] = "wrong-tree"
     merged = mt.run_merge(fake, record.batch_id)
     assert merged.merge is not None and merged.merge.stopped_at_position == 3
-    assert set(_texts(fake, "MERGED")) == {1, 2}
+    # #642, follow-up 7: PR 2's own landing is unconfirmed (its tree does not match), so it
+    # never gets a `MERGED` comment - only PR 1's confirmed landing does.
+    assert set(_texts(fake, "MERGED")) == {1}
     assert set(_texts(fake, "HELD")) == {3, 4}
     assert "untested at main's head" in (merged.merge.reason or "")
 
@@ -1515,3 +1527,219 @@ def test_merge_resume_after_an_exception_posts_no_held_on_merged_prs() -> None:
     resumed = mt.run_merge(fake, record.batch_id, resume=True)
     assert resumed.merge is not None and resumed.merge.stopped_at_position is None
     assert 1 not in _texts(fake, "HELD")
+
+
+# === follow-up fixes from the #640 safety/quant reviews (#642) ============================
+
+
+def test_merge_continues_after_an_edited_probe_branch_refuses_deletion() -> None:
+    """Follow-up 1: a record hand-edited to name a non-`train/` branch (e.g. a pasted probe
+    id) must not turn a successful merge into exit 1 - the refusal is reported, not fatal."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    record.probes.append(
+        mt.Probe(
+            k=1,
+            branch="not-a-train-branch",
+            sha="x",
+            run_id=None,
+            run_attempt=None,
+            run_url=None,
+            outcome="green",
+        )
+    )
+    mt._save(record)
+    printed: list[str] = []
+    merged = mt.run_merge(fake, record.batch_id, say=printed.append)
+    assert merged.merge is not None and merged.merge.stopped_at_position is None
+    assert any("not-a-train-branch" in line for line in printed)
+    assert "not-a-train-branch" not in fake.deleted_branches
+
+
+def test_merge_skips_pr_data_for_dropped_and_already_merged_prs() -> None:
+    """Follow-up 2: `merge` must not read live `pr_data` for a PR outside the accepted list
+    - a push to a dropped PR during `merge` must never abort the whole batch."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    record.prs.append(
+        mt.PrEntry(
+            number=99,
+            head="deadbeef",
+            branch="feat/99-x",
+            issue=99,
+            state="dropped",
+            reason="conflict",
+        )
+    )
+    mt._save(record)
+    fake.raise_on_pr_data_call[99] = 1
+    merged = mt.run_merge(fake, record.batch_id)
+    assert merged.merge is not None and merged.merge.stopped_at_position is None
+    assert fake.pr_data_call_count.get(99, 0) == 0
+
+
+def test_shell_runner_merge_pr_treats_a_timeout_as_failed_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Follow-up 3: a `gh pr merge` that times out is an ambiguous outcome (fail closed),
+    never `merged`, and the call carries an explicit timeout."""
+    runner = mt.ShellRunner(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        captured["timeout"] = kwargs.get("timeout")
+        raise mt.subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr(mt.subprocess, "run", fake_run)
+    attempt = runner.merge_pr(5, "abc123")
+    assert attempt.outcome != "merged"
+    assert captured["timeout"] is not None
+
+
+def test_shell_runner_merge_pr_treats_a_conflict_as_non_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Follow-up 4: GitHub's permanent refusals (a real conflict, a policy block) also say
+    "not mergeable", so they must stop the merge at once, not retry it for ~2 minutes as if
+    it were the transient "mergeable state unknown" race."""
+    runner = mt.ShellRunner(tmp_path)
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = (
+            "GraphQL: Pull Request is not mergeable: the merge commit cannot be cleanly "
+            "created. (mergePullRequest)"
+        )
+
+    monkeypatch.setattr(mt.subprocess, "run", lambda *a, **k: _Result())
+    attempt = runner.merge_pr(5, "abc123")
+    assert attempt.outcome == "failed"
+
+
+def test_shell_runner_merge_pr_still_retries_when_mergeable_state_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Follow-up 4, the other side: the genuinely transient race is still retryable."""
+    runner = mt.ShellRunner(tmp_path)
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = (
+            "GraphQL: Pull Request is not mergeable: the mergeable state is unknown. "
+            "Please check back later. (mergePullRequest)"
+        )
+
+    monkeypatch.setattr(mt.subprocess, "run", lambda *a, **k: _Result())
+    attempt = runner.merge_pr(5, "abc123")
+    assert attempt.outcome == "retryable"
+
+
+def test_shell_runner_merge_pr_retries_a_plain_not_yet_mergeable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code-review follow-up on #693, item 1: a plain "not mergeable", with none of the
+    permanent-refusal wording, is GitHub still computing mergeability - exactly what the
+    train hits by design right after the previous PR lands - so it must stay retryable."""
+    runner = mt.ShellRunner(tmp_path)
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = "GraphQL: Pull Request is not mergeable (mergePullRequest)"
+
+    monkeypatch.setattr(mt.subprocess, "run", lambda *a, **k: _Result())
+    attempt = runner.merge_pr(5, "abc123")
+    assert attempt.outcome == "retryable"
+
+
+def test_prune_never_removes_a_worktree_with_no_record_yet() -> None:
+    """Follow-up 6: `build` creates the worktree before it can save the batch's first
+    record; a concurrent `prune` must not guess an unrecorded worktree is orphaned."""
+    fake = FakeRunner()
+    (mt.record_dir() / "worktree-20261003-000000-0000000").mkdir(parents=True, exist_ok=True)
+    printed: list[str] = []
+    mt.run_prune(fake, say=printed.append)
+    assert mt.worktree_path("20261003-000000-0000000") not in fake.worktrees_removed
+    # code-review follow-up on #693, item 3: the skip is visible, not silent.
+    assert any("no batch record" in line for line in printed)
+
+
+def test_prune_reports_a_failed_branch_deletion_without_raising() -> None:
+    """Code-review follow-up on #693, item 2: a record hand-edited to name a branch outside
+    `train/*` must not stop `prune` from moving on to the next branch or the next record,
+    the same as follow-up 1 does for `merge`."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    record.probes.append(
+        mt.Probe(
+            k=1,
+            branch="not-a-train-branch",
+            sha="x",
+            run_id=None,
+            run_attempt=None,
+            run_url=None,
+            outcome="green",
+        )
+    )
+    mt._save(record)
+    printed: list[str] = []
+    mt.run_prune(fake, say=printed.append)
+    assert any("not-a-train-branch" in line for line in printed)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.pruned is False
+    assert record.train_branch in fake.deleted_branches
+
+
+def test_prune_refuses_when_a_merge_holds_the_lock() -> None:
+    """Follow-up 8: `prune` must take the same lock `merge` uses before touching any record,
+    so the two can never interleave."""
+    fake = _batch(2)
+    record = _merge_record(fake, 2, [2])
+    lock_path = mt.record_dir() / "merge.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(mt.StoppedError, match="another merge"):
+            mt.run_prune(fake)
+    assert record.batch_id  # the record is untouched; nothing to assert beyond the refusal
+
+
+def test_merge_exception_before_merging_names_what_actually_happened() -> None:
+    """Follow-up 9: an exception from the live `pr_data` re-read, before any merge attempt
+    for that PR, must not claim a merge happened."""
+    fake = _batch(4)
+    record = _merge_record(fake, 4, [4])
+    fake.raise_on_pr_data_call[2] = 2  # 1st call: the req-7 snapshot; 2nd: the live re-read
+    with pytest.raises(RuntimeError):
+        mt.run_merge(fake, record.batch_id)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.merge is not None
+    assert "after gh pr merge" not in (saved.merge.reason or "")
+    assert "before attempting to merge" in (saved.merge.reason or "")
+
+
+def test_merge_keeps_the_first_stop_reason_when_a_second_stop_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Follow-up 10: if persisting the first stop's reason itself raises, and the exception
+    handler then calls `_stop` again, the second call must not replace the first reason."""
+    fake = _batch(4, _HeadChangingRunner())
+    record = _merge_record(fake, 4, [4])
+    real_save = mt._save
+    calls = {"n": 0}
+
+    def flaky_save(rec: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("disk full")
+        real_save(rec)
+
+    monkeypatch.setattr(mt, "_save", flaky_save)
+    with pytest.raises(RuntimeError, match="disk full"):
+        mt.run_merge(fake, record.batch_id)
+    saved = mt.Record.from_json(mt.record_path(record.batch_id).read_text())
+    assert saved.merge is not None
+    assert "head or eligibility changed" in (saved.merge.reason or "")
+    assert "could not verify" not in (saved.merge.reason or "")
