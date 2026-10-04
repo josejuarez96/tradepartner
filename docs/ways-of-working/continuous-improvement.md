@@ -40,8 +40,8 @@ Classification of what exists today:
 
 ## From findings to changes
 
-1. The report leads with at most **three "do now" items**, each sized (minutes for an owner action, S or M for a build) and naming who decides. These go to the owner inbox, not to issues.
-2. Every other ranked item becomes **one `size:S` issue per change**, unclaimed, filed by the window that ran the audit, linked from the report PR. Never one issue per finding on one file (plan-shape rule 6).
+1. The report leads with at most **three "do now" items**, each sized (minutes for an owner action, S or M for a build) and naming who decides. These go to the owner inbox, not to issues. Until the inbox exists, they live in the report, and each one that is a build gets one tracking issue so a window can claim it.
+2. Every other ranked item becomes **one issue per change** (`size:S`, or `size:M` when the change is one PR of that size), unclaimed, filed by the window that ran the audit, linked from the report PR. Never one issue per finding on one file (plan-shape rule 6).
 3. A change that **relaxes a gate** (a class of PR that lands under a standing approval, an `ask` entry moved to `allow`, a scheduled job that writes) is an **owner decision**: the report says so in those words, and it lands as an ADR amendment or a dated spec amendment, never as a side effect of a script PR.
 4. A change to a script, CI, a hook or a permission rule goes through its own PR with the reviewers `ready_pr.py` requires for those paths; the audit PR itself is docs only.
 5. The next audit opens with the baseline table and says what moved.
