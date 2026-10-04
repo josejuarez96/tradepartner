@@ -46,10 +46,13 @@ the store lacks (MTUM is in no EDGAR snapshot, so the master never seeds
 it). It refuses a symbol outside `benchmarks`. If no benchmark security
 lists the symbol it seeds one first, from the owner's `BenchmarkSeed`
 (cik, name, exchange): `BENCH:<symbol>`, `benchmark = TRUE`, source
-`config`, and a `snapshot_static` listing from the calendar's first
-session, both stamped at the clock, like the master's own benchmark rows;
-it refuses when another security holds the ticker or `BENCH:<symbol>` is
-taken. Then it fetches that one security's bars and actions month by month
+`config`, a `snapshot_static` listing from the calendar's first session
+and an `etf` classification (rule `benchmark_config`), all stamped at the
+clock, like the master's own benchmark rows (`store.classify` builds only
+from the master, which never holds this one). It refuses a `since` that
+leaves no session to fetch, before writing anything, and it refuses
+when another security holds the ticker or `BENCH:<symbol>` is taken.
+Then it fetches that one security's bars and actions month by month
 from `since` to the expected session, written by `ingest`'s rules (bars
 keep their session-close `known_at`; a repeat adds nothing). A month with
 any session lacking a bar is stale and halts the run with nothing written
@@ -359,6 +362,8 @@ def _window_names(
 # --- one benchmark (#840) -----------------------------------------------------
 
 _CIK = re.compile(r"\d{10}")
+#: `store.classify`'s rule for a config-seeded benchmark.
+_BENCH_RULE = "benchmark_config"
 
 
 @dataclass(frozen=True)
@@ -417,11 +422,16 @@ def backfill_benchmark(
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    if since < _first_session(settings):
+        raise ValueError(f"since {since} is before the calendar's first session")
+    windows = month_windows(since, expected_session(now, settings))
+    if not windows:
+        raise ValueError(f"since {since} leaves no session to fetch")
     with open_for_write(settings) as conn:
         init_schema(conn)
         security_id, seeded = _seed_benchmark(conn, settings, symbol, seed, now)
     runs: list[SourceRun] = []
-    for window in month_windows(since, expected_session(now, settings)):
+    for window in windows:
         run = _benchmark_chunk(settings, prices, security_id, since, window, clock)
         runs.append(run)
         if run.status != OK:
@@ -476,6 +486,13 @@ def _seed_benchmark(
             "class_title": None,
             "valid_from": start,
         }
+        | common,
+    )
+    # As `store.classify` does for a seeded benchmark: an `etf` by config.
+    insert_row(
+        conn,
+        "classifications",
+        {"security_id": security_id, "sic": None, "security_type": "etf", "rule": _BENCH_RULE}
         | common,
     )
     return security_id, True

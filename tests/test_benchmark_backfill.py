@@ -199,3 +199,39 @@ def test_the_command_needs_the_alpaca_keys(settings: Settings) -> None:
     assert "ALPACA_API_KEY" in result.output
     assert "test-key" not in result.output
     assert prices.calls == []
+
+
+def test_the_seed_is_classified_an_etf(settings: Settings) -> None:
+    """`store.classify` never sees this benchmark (it is in no master build), so the
+    seed writes its classification: never `unclassified`, never a universe member."""
+    _run(settings, _History())
+    assert _read(
+        settings, "SELECT security_id, security_type, rule, known_at FROM classifications"
+    ) == [(MTUM, "etf", "benchmark_config", NOW)]
+
+
+@pytest.mark.parametrize("since", [date(1980, 1, 2), date(2019, 7, 1)])
+def test_a_since_with_nothing_to_fetch_is_refused_before_seeding(
+    settings: Settings, since: date
+) -> None:
+    prices = _History()
+    with pytest.raises(ValueError, match="since"):
+        backfill_benchmark(
+            settings, prices=prices, symbol="MTUM", since=since, seed=SEED, clock=lambda: NOW
+        )
+    assert prices.calls == []
+    assert _read(settings, "SELECT count(*) FROM securities") == [(0,)]
+
+
+class _Leaky(_History):
+    def corporate_actions(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[CorporateAction]:
+        raise RuntimeError("401 for key test-key")
+
+
+def test_a_fetch_error_is_printed_with_the_key_redacted(settings: Settings) -> None:
+    result = _invoke(settings, ["MTUM", "--since", "2019-04-10", *SEED_ARGS], _Leaky())
+    assert result.exit_code == 1
+    assert "alpaca: failed" in result.output
+    assert "test-key" not in result.output

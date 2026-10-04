@@ -23,7 +23,7 @@ uv run tradepartner backfill-benchmark MTUM --since 2016-01-01 \
 
 What it does:
 1. It refuses a symbol that is not in `benchmarks`. It also refuses one that another security already lists, or whose `BENCH:<symbol>` id is taken. A refusal exits 2, with nothing written and nothing fetched.
-2. If the store has no MTUM benchmark security, it writes `BENCH:MTUM` (`benchmark = TRUE`, source `config`), plus a `snapshot_static` listing from the calendar's first session. Both rows are stamped now, the same as the master's own SPY rows.
+2. If the store has no MTUM benchmark security, it writes `BENCH:MTUM` (`benchmark = TRUE`, source `config`), a `snapshot_static` listing from the calendar's first session, and an `etf` classification. All three rows are stamped now, the same as the master's own SPY rows. A `--since` that leaves no session to fetch is refused before anything is written.
 3. It fetches MTUM's bars and actions one calendar month at a time, up to the expected session, and writes them by the ingest rules. Bars keep their session-close `known_at`. A rerun adds nothing it already has.
 4. It prints `MTUM: BENCH:MTUM seeded` (or `already in the store`), then one `alpaca: <status>, <rows> rows, …` line per month. It exits 0 when every month is `ok`.
 
