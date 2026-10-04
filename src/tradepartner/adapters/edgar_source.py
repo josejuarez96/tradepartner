@@ -53,7 +53,10 @@ inside the lag window also gets one, so a de-SPAC's new SIC still
 arrives with its 8-K. Each per-document result is cached by accession,
 its stamp stripped, under its own version constant (`COVER_VERSION`,
 `HEADER_VERSION`): a cached entry always wins over FSN for its accession,
-until the version bumps or the cache is cleared.
+until the version bumps or the cache is cleared. A cover parse's skipped
+listings (no title or exchange, #609) are written to its cache entry and
+counted on `.cover_incomplete_listings` when it is parsed, never on a cache
+hit (#612), as FSN's are on `.fsn_incomplete_listings` when extracted.
 
 **Facts (T11e).** `facts` joins two sources, both stamped at read time from
 `_load_stamps(cik)`: company facts (`companyfacts.zip` above the stamping
@@ -333,6 +336,9 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
+        # #612: listings skipped (no title or exchange, #609) by this run's
+        # per-document cover parses; as FSN's count, cache hits add nothing.
+        self.cover_incomplete_listings = 0
         self.fsn_missing = 0
         self._filing_index_ran = False
         self._fsn_ready = False
@@ -990,6 +996,7 @@ class EdgarFilingSource(FilingSource):
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing
         self._save_cover_cache(accession, cik, parsed)
+        self.cover_incomplete_listings += parsed.incomplete_listings
         return parsed
 
     def _cover_cache_path(self, accession: str) -> Path:
@@ -1022,6 +1029,10 @@ class EdgarFilingSource(FilingSource):
                 [item.title, item.ticker, item.exchange] for item in parsed.cover.listings
             ],
             "facts": [_fact_to_json(f) for f in parsed.facts],
+            # #612: the listings the parse skipped, so they are diagnosable
+            # from disk as an FSN manifest's are. Not read back: an entry
+            # written before #612 lacks it and still loads (no version bump).
+            "incomplete_listings": parsed.incomplete_listings,
         }
         edgar_raw.write_atomic(self._cover_cache_path(accession), json.dumps(data).encode("utf-8"))
 
