@@ -61,8 +61,11 @@ missing from the next `n` calls of `fills()` and delivered from the one
 after (`None`: never delivered), while `get_order` already shows it.
 `on_submit(request)` runs at the start of every `submit`, before anything is
 checked or recorded, so a test can assert the store state at submit time.
-`calls` is every `Broker` method called, in order, with its arguments as
-passed.
+`apply_split(symbol, ratio)` books a broker-side forward/reverse split (the
+fake has no corporate actions) by multiplying the symbol's net quantity by
+`ratio`, leaving cash untouched; it is not a `Broker` call and is not
+logged in `calls`. `calls` is every `Broker` method called, in order, with
+its arguments as passed.
 
 **Clock.** All timestamps come from an injectable `clock: Callable[[],
 datetime]` supplied at construction and exposed as `.clock` (the wrapper's
@@ -339,6 +342,20 @@ class FakeBroker(Broker):
         current = self._assets.get(key, [(date.min, _DEFAULT_ASSET)])
         schedule = [e for e in current if e[0] != from_session] + [(from_session, asset)]
         self._assets[key] = sorted(schedule, key=lambda entry: entry[0])
+
+    def apply_split(self, symbol: str, ratio: float) -> None:
+        """Book a broker-side forward/reverse split (the fake has no
+        corporate actions): multiplies `symbol`'s net quantity by `ratio`,
+        leaving cash untouched. Not a `Broker` call: not logged in `calls`.
+        Raises `ValueError` for a non-finite or non-positive `ratio`, and
+        for a symbol with no position (or one netted to zero): a split of
+        nothing is a test bug."""
+        validate_positive_finite(ratio, field_name="ratio")
+        key = canonical_symbol(symbol)
+        current = self._net_quantity.get(key, Decimal(0))
+        if current == 0:
+            raise ValueError(f"no position to split for {key!r}")
+        self._net_quantity[key] = current * Decimal(repr(float(ratio)))
 
     @property
     def calls(self) -> tuple[BrokerCall, ...]:
