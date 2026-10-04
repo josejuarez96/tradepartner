@@ -5,7 +5,7 @@ Personal, local US-equity trading research system: point-in-time data, honest ba
 **Start every session by reading [docs/STATUS.md](docs/STATUS.md)** and `uv run python scripts/fragments.py show` (recently done entries not folded in yet), then run `uv run python scripts/team.py status`. STATUS tells you the phase; the board tells you who holds what and what is ready.
 
 ## Non-negotiables
-1. **Never commit to or push `main`.** Branch `<type>/<issue#>-<slug>` from the latest main and open a PR. Never force-push shared branches or use `--no-verify`. Merge a PR only when the owner explicitly tells you to merge that specific PR (squash, CI green); otherwise never merge. Subagents never merge. See [git-workflow.md](docs/ways-of-working/git-workflow.md).
+1. **Never commit to or push `main`.** Branch `<type>/<issue#>-<slug>` from the latest main and open a PR. Never force-push shared branches or use `--no-verify`. PRs land through the merge train: build one only when the owner asks, and run `merge_train.py merge <batch id>` only when he says "merge train `<batch id>`" to you, for that id; merge a PR by hand only when the owner explicitly tells you to merge that specific PR (squash, CI green); otherwise never merge. Subagents never merge. See [git-workflow.md](docs/ways-of-working/git-workflow.md).
 2. **No code without an approved plan task** unless the issue is size S, or the branch is `spike/`. See [development-process.md](docs/ways-of-working/development-process.md).
 3. **Stay in scope.** Do the task you were given. Put anything else in a new issue (`gh issue create`), not in this PR.
 4. **Secrets live only in `.env`** (gitignored, and you may not read it). Add new variables to `.env.example`. Never log secrets or send them to an LLM.
@@ -44,6 +44,7 @@ Run lint, format and mypy before every push, and the targeted pytest `ready_pr` 
 | Decisions already made | [docs/decisions/](docs/decisions/) |
 | What to build / how | `docs/specs/`, `docs/plans/` |
 | Research and evidence grades | [docs/research/](docs/research/) |
+| What to test next, and what the research says | [hypothesis-backlog.md](docs/research/hypothesis-backlog.md), [claims.toml](docs/research/claims.toml) (read these, not the long reports); the loop: [research-program.md](docs/ways-of-working/research-program.md) |
 | Build agents and when to use them | [docs/ways-of-working/agents.md](docs/ways-of-working/agents.md) |
 | Working alongside other chat windows | [docs/ways-of-working/teams.md](docs/ways-of-working/teams.md) |
 | Doc types and templates | [docs/README.md](docs/README.md) |

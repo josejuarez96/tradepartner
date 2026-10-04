@@ -570,6 +570,11 @@ what = "Spec and plan for a merge train: batch the ready PRs, build one combined
 why = "Green PRs merged one after another broke main twice on 2026-10-01 (#430 after #387, #444 with #429); refreshing each PR costs a 30-minute run per merge, which serialises every window behind the owner."
 unblocks = ["spec:merge-train", "plan:merge-train"]
 
+[issue.517]
+what = "Writes the owner's #366 answers of 2026-10-01 (Q4–Q7, Q9, Q19–Q24) into the paper-trading spec: the lot ledger takes adjustments, a lot_ledger alert kind, the stricter release rule, the lapse reason, the frozen fill-price bar, the resume refusal on a lag, and the fault-path exits and channels."
+why = "An answer left in an issue comment is invisible to the next implementer; the spec paragraph a task line cites is what it reads, and #514, #515 and #516 build from these paragraphs."
+unblocks = ["issue:514", "issue:515", "issue:516", "task:T63", "task:T65b"]
+
 [spec.merge-train]
 what = "What the merge train does and how we know it works: eligibility, batch order, the combined branch, one full CI run, bisect on red, tree-equality before and after each squash merge, owner authority, reporting, the main ruleset."
 why = "Lets many windows' PRs land together in one tested tree instead of one refresh-and-rerun per PR, without any discretion between the test and the merge."
@@ -606,3 +611,73 @@ why = "The ways of working say how a PR lands now; the ruleset makes main refuse
 [task.T75b]
 what = "The owner activates the main ruleset, pushes a smoke train branch and runs the first real batch."
 why = "The only steps that need the owner's admin rights and a real batch; they gate nothing."
+
+[issue.618]
+what = "The first five research artifacts for semantic disclosure features: taxonomy v0, annotation protocol, evidence review, ML validation brief and prospective feature contract."
+why = "Decides, before any model is chosen or any return is tested, whether filing language can be measured reliably and whether it carries economic information; side track, not on the MVP path."
+unblocks = ["phase:5"]
+
+[research.2026-10-03-semantic-taxonomy-v0]
+what = "Defines demand, inventory pressure and liquidity pressure as two-part labels: evidence status, then direction only when evidence is sufficient."
+why = "Humans must be able to label a concept consistently before any model is measured against it."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-disclosure-annotation-protocol]
+what = "A 200-pair, two-annotator pilot (third on 25%) with prespecified agreement gates per dimension and class."
+why = "Shows whether the taxonomy is labelable; a concept that fails is revised or dropped before benchmarking."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-disclosure-change-evidence-review]
+what = "Graded evidence on filing-change, cross-document and LLM disclosure research, with a replication ledger, novelty map and a source audit of the typed-classifiers note."
+why = "Separates what is replicated from what is claimed, so TradePartner tests what is genuinely open."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-ml-validation-methodology-brief]
+what = "Stage gates, splits, multiplicity, calibration and registry rules for the semantic benchmark, economic tests, insider and conditional-PEAD streams."
+why = "Fixes how results will be judged before any are seen, and records which steps ADR 0008 still forbids."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-prospective-semantic-feature-spec]
+what = "The append-only record contract for forward-captured semantic features: versions, probabilities, spans, routing, cost, known_at."
+why = "Prospective frozen outputs are the only evidence free of pretrained-model look-ahead."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-typed-classifiers-financial-disclosures-research]
+what = "Desk research on typed decision models (Jev) vs generative LLMs for structured disclosure extraction; recommends a provider-neutral pilot and a cascade hypothesis."
+why = "The main argument for testing Jev; its sources are audited in the disclosure-change evidence review."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-claims-pilot]
+what = "Hand-built claims-and-evidence graph over five reports, surfacing tensions X1 to X5 (universe, ADR 0008, insider evidence, momentum grade, analyst data)."
+why = "Records the owner's X1 decision (test inside the ADR 0006 universe) and the ADR 0008 conflict the semantic program must resolve."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-ml-llm-neglected-equities-research]
+what = "Research note on neglected equities: conditional PEAD, insider purchase context, filing-text extraction and cross-document change."
+why = "Source of the insider, conditional-PEAD and cross-document hypotheses the ML validation brief designs tests for."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-quantitative-investing-research-brief]
+what = "Graded brief on the fundamentals of quantitative investing: where returns come from, what survives costs, how to tell an edge is real, and where ML fits."
+why = "Supplies the publication-decay and power priors every new hypothesis must state."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-tradepartner-ml-research-integration]
+what = "Architecture note: add a research layer (events, features, labels, model runs) on top of the PIT store, deterministic text before LLM features."
+why = "Frames how ML research fits the existing store, registry and holdout without touching execution."
+unblocks = ["issue:618"]
+
+[issue.620]
+what = "A research program page, a graded claims register over every research report, and a ranked hypothesis backlog."
+why = "Answers what the tool should test next and how results flow back into what we believe."
+unblocks = ["phase:3"]
+
+[spec.research-registry]
+what = "What the research-experiment registry records and refuses: pre-registered agreement runs, classifier benchmarks, regressions and feature studies as append-only rows with known_at, beside the backtest trial registry, with protected windows, run budgets and the family's N raised by any run on return data."
+why = "The charter halts a phase on any untracked run; without this the annotation pilot, B5 and E1 have nowhere to register and cannot start honestly."
+unblocks = ["issue:618"]
+
+[issue.661]
+what = "Draft the research-experiment registry spec (runs that are not backtests), with its plan task lines, as a spec only."
+why = "Answers the ML validation brief's registry proposal and the annotation protocol's interim log before any such run happens."
+unblocks = ["spec:research-registry"]

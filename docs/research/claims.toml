@@ -1,0 +1,2579 @@
+# Claims register: every decision-relevant finding in docs/research/, one entry each.
+# How it is used: docs/ways-of-working/research-program.md. Agents read this file, not the
+# long reports; open a report only at the section a claim names.
+#
+# Fields (one [[claim]] table per claim):
+#   id         <PREFIX>-<n>, unique. Prefix = source report (see the section comments).
+#              TP-<n> is reserved for TradePartner's own test results.
+#   statement  one sentence, faithful to the source and never stronger than it
+#   kind       empirical | fact (data, tooling, legal) | principle (design or governance position)
+#   grade      SUPPORTED | MIXED | NOT SUPPORTED | INSUFFICIENT  (handoff §6.1, as the source graded it)
+#              UNGRADED  (stated without a grade: never counts as support)
+#              n/a       (principles only)
+#   scope      the conditions under which the grade holds
+#   source     the report; section (optional) the heading inside it
+#   bears_on   optional links: adr:NNNN, hyp:<docs/hypotheses slug>, spec:<docs/specs stem>,
+#              backlog:<id in hypothesis-backlog.md>
+#   note       optional: caveat, conflicting claim id, verification level, superseded-by
+#
+# Rules: entries are faithful extracts, not new evidence. A grade changes only with new
+# evidence (a newer report or a TP- result), with the old grade kept in note. Conflicting
+# claims both stay and name each other. First extraction: 2026-10-03 (#620), by agents,
+# from the reports as written; spot-check against the source before relying on one.
+
+# Claims register fragment A. Grades are the source report's own; UNGRADED where the report asserts without a grade.
+
+# ===== 2026-09-24-initial-research-handoff.md =====
+
+[[claim]]
+id = "HO-1"
+statement = "Cross-sectional 12-1 month momentum, rebalanced monthly, has strong average returns that survived publication net of trading costs."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "US equities, long-only low-frequency framing; no clean post-2010 long-only net-of-cost US magnitude found"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.2, §6.3"
+section = "H1 — Momentum (SUPPORTED)"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Conflicts with G1-1, which grades the post-2010 long-only net version MIXED."
+
+[[claim]]
+id = "HO-2"
+statement = "Momentum suffers infrequent severe crashes after high-volatility market declines (static long-short WML lost -88.48% in Jul-Aug 1932 and -45.60% in Mar-Apr 2009), and a volatility-aware version roughly doubled the Sharpe ratio."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Long-short winners-minus-losers portfolio, historical"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H1 — Momentum (SUPPORTED)"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Daniel & Moskowitz (JFE 2016), Tier 1; evidence cited under H1, not separately graded."
+
+[[claim]]
+id = "HO-3"
+statement = "Clustered or opportunistic insider purchases (Form 4) predict positive abnormal returns for an outside investor."
+kind = "empirical"
+grade = "MIXED"
+scope = "US equities; evidence is pre-1997 and small-firm heavy; no post-2010 filing-timed non-microcap net test found"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H2 — Insider purchase clusters (MIXED)"
+note = "Disconfirmation search not run; the 5.2% six-month and 7.4% cluster figures are vendor/blog only and unverified."
+
+[[claim]]
+id = "HO-4"
+statement = "Post-earnings announcement drift is not reliably present outside microcaps: it disappeared from non-microcap stocks by 2006, and excluding microcaps gives t = 1.43 over 2001-2024."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Investable, non-microcap US universe"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H3 — PEAD (NOT SUPPORTED outside microcaps)"
+bears_on = ["adr:0006"]
+note = "Counterpoint: Hirshleifer-Peng-Wang (RFS 2025) find strong drift without filtering microcaps."
+
+[[claim]]
+id = "HO-5"
+statement = "A market trend filter (10-month or 200-day moving average) reduces crash depth but lags in bull markets and whipsaws in choppy ones, with the benefit concentrated in a few bear markets."
+kind = "empirical"
+grade = "MIXED"
+scope = "US equity index timing; supporting out-of-sample evidence is the author's own (Faber), contrary evidence Tier 3"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H4 — Market trend filter (MIXED)"
+note = "Disconfirmation search not run; see TT-1 for the independent G3 follow-up (also MIXED)."
+
+[[claim]]
+id = "HO-6"
+statement = "Intense retail (Robinhood) herding into a stock forecasts negative returns, about -4.7% abnormal over 20 days for top-purchased stocks (May 2018-Aug 2020)."
+kind = "empirical"
+grade = "MIXED"
+scope = "US stocks with extreme daily retail attention spikes"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H5 — Retail attention reversal (MIXED)"
+note = "Data constraint: the Robintrack feed ended August 13, 2020 and substitute proxies are unvalidated."
+
+[[claim]]
+id = "HO-7"
+statement = "Product-level Google Trends search volume predicts tradable stock returns."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "No post-publication return test or cost analysis found"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H6 — Google Trends / product buzz (INSUFFICIENT)"
+note = "Search volume nowcasts revenue surprises, but that is not a return test; disconfirmation not run."
+
+[[claim]]
+id = "HO-8"
+statement = "Stocks hit by mutual-fund fire sales reverse afterwards, but after correcting the flow-pressure measure the decline is negligible with no subsequent reversal, and 13F data arrives up to 45 days after quarter end, too late for retail detection."
+kind = "empirical"
+grade = "MIXED"
+scope = "US equities, fund-outflow fire sales"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H7 — Fire-sale reversals (MIXED)"
+
+[[claim]]
+id = "HO-9"
+statement = "LLM text analysis adds predictive value for stock returns; in-sample results are distorted by look-ahead, and predictive power loses significance after the model's training cutoff."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "LLM text signals; no study tested an LLM as a veto layer on quant signals"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H8 — LLM text layer (INSUFFICIENT)"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "HO-10"
+statement = "Combining multiple signals improves results; the only source shows in-sample choice of weights and spreads raised average anomaly net returns from 5 to 38 bp/month, illustrating selection inflation."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "Single source; disconfirmation not run"
+source = "docs/research/2026-09-24-initial-research-handoff.md §6.3"
+section = "H9 — Combining signals (INSUFFICIENT)"
+note = "G4 states it replaces H9 and grades the long-only case MIXED (G4-2); the 5 to 38 bp figure was verified there."
+
+[[claim]]
+id = "HO-11"
+statement = "By t approx SR x sqrt(years), confirming an annualized Sharpe of 0.5 against zero at t approx 2 takes about 16 years, and an excess Sharpe of 0.3 over a benchmark about 44 years."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Sharpe-ratio sampling error rule of thumb"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D1 — Backtesting methodology"
+bears_on = ["adr:0005"]
+note = "The report's own inference, not a sourced result."
+
+[[claim]]
+id = "HO-12"
+statement = "Complete the research design before backtesting, count every backtest run, and correct for multiple testing (Deflated Sharpe Ratio, Probability of Backtest Overfitting); simple hold-outs can be unreliable."
+kind = "principle"
+grade = "n/a"
+scope = "All backtest evaluation"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D1 — Backtesting methodology"
+
+[[claim]]
+id = "HO-13"
+statement = "Alpaca fractional orders support market, limit, stop and stop-limit with DAY time-in-force only, no fractional short sales, and expected fill at the NBBO with no price improvement."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Alpaca fractional trading, 2025-2026"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D2 — Retail execution (2025–2026)"
+note = "From official Alpaca docs; bracket/OCO unavailability for fractional orders is Tier 3 only."
+
+[[claim]]
+id = "HO-14"
+statement = "Assume trading costs of at least 5-10 bp per side plus half the spread for liquid large/mid caps, far more for small caps, and treat paper fills as optimistic."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Retail execution, US large/mid caps"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D2 — Retail execution (2025–2026)"
+note = "Report inference; no primary slippage study found, and PFOF and fractional fill quality were not researched."
+
+[[claim]]
+id = "HO-15"
+statement = "Google Trends data access is fragile: the official API entered application-gated alpha on July 24, 2025 and pytrends was archived April 17, 2025, leaving manual CSV export."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Google Trends access as of Sept 2026"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D3 — Data availability"
+
+[[claim]]
+id = "HO-16"
+statement = "SEC EDGAR is a free, authoritative source for Form 4, 13F and XBRL financials, and Form 4 must be filed within 2 business days of the transaction."
+kind = "fact"
+grade = "UNGRADED"
+scope = "US public-company filings"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D3 — Data availability"
+
+[[claim]]
+id = "HO-17"
+statement = "Assume free price APIs are not survivorship-bias-free unless they document delisted coverage."
+kind = "principle"
+grade = "n/a"
+scope = "Price data sourcing"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D3 — Data availability"
+bears_on = ["adr:0009"]
+note = "A free or low-cost survivorship-free adjusted price source was not verified."
+
+[[claim]]
+id = "HO-18"
+statement = "Of the surveyed open-source tools, Backtrader is dormant upstream, OpenBB is AGPL-3.0, vectorbt is Apache 2.0 with Commons Clause, and NautilusTrader v2 release candidates are not recommended for live money."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tooling status as of Sept 2026"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D4 — Open-source tooling status"
+bears_on = ["adr:0004"]
+note = "Tier 3 sources, approximate; see TS claims for the raw GitHub survey."
+
+[[claim]]
+id = "HO-19"
+statement = "The Pattern Day Trader designation and $25,000 minimum were eliminated (SEC approval April 14, 2026; effective June 4, 2026, with phase-in allowed until October 20, 2027)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "US retail margin rules (FINRA Rule 4210)"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D5 — Tax and regulatory"
+
+[[claim]]
+id = "HO-20"
+statement = "Gains on positions held one year or less are taxed at ordinary income rates, so monthly-turnover strategies generate mostly short-term gains."
+kind = "fact"
+grade = "UNGRADED"
+scope = "US taxable accounts"
+source = "docs/research/2026-09-24-initial-research-handoff.md §7"
+section = "D5 — Tax and regulatory"
+bears_on = ["adr:0005"]
+note = "Holding-period rules were verified against IRS primary sources in G7-5."
+
+[[claim]]
+id = "HO-21"
+statement = "LLM backtests on dates before the model's training cutoff are inflated by memorization; instructions to respect historical boundaries do not prevent recall and masking fails because models reconstruct entities and dates."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "LLM-based financial prediction and backtests"
+source = "docs/research/2026-09-24-initial-research-handoff.md §8.4"
+section = "8.4 Contamination (look-ahead) evidence"
+bears_on = ["adr:0008"]
+note = "Multiple arXiv sources (Lopez-Lira et al., MemGuard-Alpha, Lookahead Propensity); handoff §11 lists LLM contamination among Tier 1-backed verdicts."
+
+[[claim]]
+id = "HO-22"
+statement = "Temperature-0 API calls are not bit-reproducible (hosted closed and open-weight alike); self-hosted open weights with batch-invariant kernels gave bit-identical outputs at a 34-62% throughput cost."
+kind = "fact"
+grade = "UNGRADED"
+scope = "LLM inference reproducibility"
+source = "docs/research/2026-09-24-initial-research-handoff.md §8.6"
+section = "8.6 Reproducibility and determinism"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "HO-23"
+statement = "More capable LLMs show better calibration and document analysis, but there is no consistent evidence that capability translates into trading P&L."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Frontier and open-weight LLMs on trading benchmarks (Alpha Arena, StockBench, CLQT)"
+source = "docs/research/2026-09-24-initial-research-handoff.md §8.7"
+section = "8.7 Frontier vs open-weight vs point-in-time: tradeoffs found"
+bears_on = ["adr:0008"]
+note = "Alpha Arena per-model results come from news relays, not Nof1 primary data."
+
+[[claim]]
+id = "HO-24"
+statement = "Point-in-time LLMs are verified leak-free by construction but are 1-4B parameters with weak instruction-following (IFEval about 25-31%), and their positive results come only from simple tasks such as headline sentiment or embeddings."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Chronologically consistent models (ChronoGPT, DatedGPT, Kelly et al.)"
+source = "docs/research/2026-09-24-initial-research-handoff.md §8.5"
+section = "8.5 Point-in-time (chronologically consistent) models"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "HO-25"
+statement = "Material non-public information learned through the owner's work must never be used, and the employer's personal-trading policy may apply; utilities are excluded partly for this reason."
+kind = "principle"
+grade = "n/a"
+scope = "All personal trading by the owner"
+source = "docs/research/2026-09-24-initial-research-handoff.md §10"
+section = "Compliance and employment"
+bears_on = ["adr:0006"]
+
+# ===== 2026-09-24-tooling-survey.md =====
+
+[[claim]]
+id = "TS-1"
+statement = "Backtrader (mementum/backtrader) had its last push on 2024-08-19, has no GitHub release, and is GPL-3.0."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GitHub API snapshot, 2026-09-24"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+[[claim]]
+id = "TS-2"
+statement = "OpenBB (checked from LICENSE) and backtesting.py are AGPL-3.0."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GitHub API snapshot, 2026-09-24"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+[[claim]]
+id = "TS-3"
+statement = "vectorbt is Apache 2.0 with Commons Clause (no selling), per its LICENSE file; latest release v1.1.0 (2026-07-05)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GitHub snapshot, 2026-09-24"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+[[claim]]
+id = "TS-4"
+statement = "NautilusTrader is LGPL-3.0 and actively pushed (v1.231.0, 2026-08-02)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GitHub snapshot, 2026-09-24"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+[[claim]]
+id = "TS-5"
+statement = "The core data and broker libraries surveyed (duckdb, polars, edgartools, exchange_calendars, alpaca-py) are permissively licensed (MIT or Apache-2.0) and were pushed in September 2026."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GitHub snapshot, 2026-09-24"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+[[claim]]
+id = "TS-6"
+statement = "The stefan-jansen reloaded packages (zipline, pyfolio, alphalens, empyrical) are Apache-2.0 but had no push since December 2025 to January 2026."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GitHub snapshot, 2026-09-24"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+[[claim]]
+id = "TS-7"
+statement = "GitHub stars measure interest, not fitness, when choosing tools."
+kind = "principle"
+grade = "n/a"
+scope = "Tool selection"
+source = "docs/research/2026-09-24-tooling-survey.md"
+bears_on = ["adr:0004"]
+
+# ===== 2026-09-25-g1-momentum-post-2010.md =====
+
+[[claim]]
+id = "G1-1"
+statement = "A long-only, monthly 12-1 momentum portfolio of liquid US large/mid caps has earned a positive return over the market, net of costs, since 2010."
+kind = "empirical"
+grade = "MIXED"
+scope = "US large/mid caps, long-only, post-2010, net of costs"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Answer"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Not NOT SUPPORTED because live products matched the market rather than falling clearly below it; conflicts with HO-1 (SUPPORTED)."
+
+[[claim]]
+id = "G1-2"
+statement = "Two live long-only large/mid-cap momentum products (AQR, MTUM) earned net excess returns of -2.79 to +1.09 pp/yr across 10 windows of five years or more in 2009-2025, with the four 10-year windows at +0.04, -0.27, -0.65 and +0.08 pp/yr."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Live funds, net of fund fees and trading costs, not of investor costs or taxes"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Reported returns by sample period"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Tier 1 SEC filings; neither product is a plain monthly 12-1 equal-weight design."
+
+[[claim]]
+id = "G1-3"
+statement = "The US long-short momentum factor fell from 0.92%/month (1987 to mid-2002) to 0.16%/month (mid-2002 to 2018), gross, and post-2005 modern-era long-short anomalies average about 4 bp/month net."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US long-short factor returns, gross (Ben-David et al.) and net (Chen & Velikov abstract)"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Answer"
+bears_on = ["hyp:h1-momentum-12-1"]
+
+[[claim]]
+id = "G1-4"
+statement = "Value-weighted 12-1 decile long-short momentum netted 0.68%/month over 1963-2012 with costs consuming about half the gross spread (0.65 of 1.33%/month), and a 10%/20% buy/hold buffer cut turnover from 34.5% to 18.8% per side per month and raised net return to 0.85%/month."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US long-short, pre-2013, historical effective spreads"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Implications for the Phase 3 spec"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Novy-Marx & Velikov (RFS 2016), Tier 1; whether to use a buffer is an owner design decision."
+
+[[claim]]
+id = "G1-5"
+statement = "A prior for net excess return over the benchmark centred near 0 pp/yr with a plausible 10-year range of -1 to +1 pp/yr fits the live record."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Long-only US large/mid-cap momentum vs broad index, 10-year horizon"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Implications for the Phase 3 spec"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Candidate input for the owner, not a decision."
+
+[[claim]]
+id = "G1-6"
+statement = "A 2010+ momentum backtest showing net excess over SPY above about +3 pp/yr exceeds every live and gross-index window found (max +1.10) and could trigger a look-ahead or cost-model audit."
+kind = "principle"
+grade = "n/a"
+scope = "Backtest sanity check for H1"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Implications for the Phase 3 spec"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "The +3 threshold is the agent's framing, offered as a candidate."
+
+[[claim]]
+id = "G1-7"
+statement = "Post-2010 live momentum products lost about 18-19% in a single quarter or calendar year in three separate episodes plus 2022, and the back-tested 2007-09 drawdown was about -55.6%, about the same as the market's -54.9%."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "MTUM, AQR fund and MSCI momentum indices"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Drawdown summary"
+bears_on = ["hyp:h1-momentum-12-1", "adr:0005"]
+note = "No Tier 1/2 source gives a post-2010 peak-to-trough; an absolute stop tighter than about -20% would have been at or near its trigger at least three times."
+
+[[claim]]
+id = "G1-8"
+statement = "Momentum indices ran about 8.3-8.4%/yr tracking error against their parent, with live calendar-year shortfalls of -13.5 pp (2021) and -18.0 pp (2023)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "MSCI USA momentum indices and MTUM vs MSCI USA"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Implications for the Phase 3 spec"
+bears_on = ["hyp:h1-momentum-12-1", "adr:0005"]
+note = "A relative-underperformance stop must sit well outside these; level is the owner's decision."
+
+[[claim]]
+id = "G1-9"
+statement = "A +1 pp/yr excess with 8.4% tracking error (information ratio about 0.12) gives t approx 0.45 over 14 years, so neither a backtest nor paper trading can separate the strategy from its benchmark."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Detectability of long-only momentum vs benchmark"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Implications for the Phase 3 spec"
+bears_on = ["hyp:h1-momentum-12-1", "adr:0005"]
+note = "Agent computation."
+
+[[claim]]
+id = "G1-10"
+statement = "Despite tax management, the AQR momentum fund's 10-year return to 2025 fell from 13.94% before taxes to 10.57% after taxes on distributions."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Taxable account, live fund"
+source = "docs/research/2026-09-25-g1-momentum-post-2010.md"
+section = "Implications for the Phase 3 spec"
+bears_on = ["adr:0005"]
+note = "The report says this bears on the ADR 0005 account-type question."
+
+# ===== 2026-09-25-g4-signal-combination.md =====
+
+[[claim]]
+id = "G4-1"
+statement = "Combining many published signals beats a single signal or few-factor portfolio out of sample and net of costs in long-short or unconstrained portfolios (51-characteristic OOS net Sharpe 1.356 vs 0.675 for size/value/momentum, 1980-2014)."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "US long-short or unconstrained, excluding bottom 20% by market cap, net of proportional costs; OOS window is not post-publication"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "§6.1 check (Claim A)"
+
+[[claim]]
+id = "G4-2"
+statement = "Combining published signals beats a single signal for a long-only retail portfolio of liquid US large/mid caps, net of costs."
+kind = "empirical"
+grade = "MIXED"
+scope = "Long-only, liquid US large/mid caps, net of costs"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Answer"
+note = "Replaces HO-10 (handoff H9, INSUFFICIENT); only positive long-only evidence is a Tier 2 in-sample AQR backtest (G4-6)."
+
+[[claim]]
+id = "G4-3"
+statement = "Under a short-sale constraint, the many-characteristic portfolio's higher Sharpe over the value-weighted market is not statistically significant, and its gains over small-signal portfolios are significant only in the smallest 60% of stocks."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "DeMiguel et al. (RFS 2020) internet appendix, 1980-2014"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Evidence"
+bears_on = ["adr:0006"]
+
+[[claim]]
+id = "G4-4"
+statement = "Post-publication and post-2005, the average cost-optimized anomaly nets about 8 bp/month (4 bp value-weighted), the best quartile selected in advance 11-21 bp, and combination methods about 20 bp, all long-short."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US long-short anomalies, net of effective spreads, excluding price impact and short fees"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Candidate Phase 3 inputs, for the owner to decide"
+note = "The 8 and 11-21 bp figures are from the FEDS WP; the ~20 bp combination figure is JFQA abstract only."
+
+[[claim]]
+id = "G4-5"
+statement = "Multi-signal backtests carry a large overfitting bias: choosing the best 3 of 20 signals is as biased as the single best of 1,250, and best 5 of 50 about 900,000, with random-signal critical t-statistics above 7."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Backtests of signal combinations (Novy-Marx, NBER WP 21329)"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Evidence"
+note = "The source says this argues against trusting combinations that backtest well, not against combining itself."
+
+[[claim]]
+id = "G4-6"
+statement = "In a long-only developed large-cap backtest (1993-2015, net of estimated costs), an integrated value+momentum score had information ratio 0.87 vs 0.44 for momentum alone, 0.21 for value alone and 0.62 for a mix of the two portfolios."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Roughly MSCI World universe, monthly, in-sample, institutional scale"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Evidence"
+note = "Tier 2, AQR authors who sell multi-style products; not out of sample; FAJ 2018 (S7, abstract) conflicts on integrate vs mix at low-to-moderate tracking error."
+
+[[claim]]
+id = "G4-7"
+statement = "Post-publication decay is larger for portfolios of larger, more liquid stocks, and published signals become more correlated with each other after publication, eroding diversification."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "McLean & Pontiff author WP (82 characteristics), long-short, gross"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Evidence"
+bears_on = ["adr:0006"]
+note = "That combinations of published signals retain less diversification is the report's inference, not a tested result."
+
+[[claim]]
+id = "G4-8"
+statement = "Anomalies with one-sided monthly turnover under 50% continue to generate significant net spreads, while netting trades across signals saves only about 5-10% one-sided turnover a year."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US anomalies (Novy-Marx & Velikov abstract); long-only multi-style (AQR, Tier 2)"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Candidate Phase 3 inputs, for the owner to decide"
+
+[[claim]]
+id = "G4-9"
+statement = "Any single signal should clear t > 3, and combinations a higher hurdle per the multi-signal critical values."
+kind = "principle"
+grade = "n/a"
+scope = "Significance hurdle for signal tests"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Candidate Phase 3 inputs, for the owner to decide"
+note = "Candidate input, not an owner decision."
+
+[[claim]]
+id = "G4-10"
+statement = "Cap the number of combined signals at a small k chosen before any backtest, fix or register the weighting approach, and log every candidate in the trial registry so the number of trials is on record."
+kind = "principle"
+grade = "n/a"
+scope = "Multi-signal strategy design"
+source = "docs/research/2026-09-25-g4-signal-combination.md"
+section = "Candidate Phase 3 inputs, for the owner to decide"
+note = "Presented as options for the owner, not recommendations."
+
+# ===== 2026-09-25-trend-timing.md =====
+
+[[claim]]
+id = "TT-1"
+statement = "Independent evaluations of simple trend-timing rules (10-month/200-day MA, time-series momentum) show at best a marginal improvement over buy-and-hold for a long-only monthly overlay on US large caps."
+kind = "empirical"
+grade = "MIXED"
+scope = "US equity index, long/cash, monthly, non-Faber Tier 1 sources"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Answer"
+bears_on = ["adr:0006", "adr:0005"]
+note = "Report says it sits near the MIXED / NOT SUPPORTED boundary."
+
+[[claim]]
+id = "TT-2"
+statement = "Out of sample with 0.50% one-way costs, SMA timing on the S&P Composite had a Sharpe only 7% higher than buy-and-hold with 20% lower mean return; momentum timing +0% and SMA on the DJIA -11%."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S&P Composite and DJIA, 1930-2012, bootstrap over split points (Zakamulin 2014 WP)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Evidence"
+note = "Strongest disconfirming study; working-paper version, published figures may differ."
+
+[[claim]]
+id = "TT-3"
+statement = "The out-of-sample trend-timing verdict flips with the split point, gains come from four bear markets (1930-31, 1973-74, 2001-02, 2007-08), and timing was inferior over 1975-1999."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S&P Composite (Zakamulin 2014 WP)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Evidence"
+note = "The report flags the evaluation window as a degree of freedom for trial counting."
+
+[[claim]]
+id = "TT-4"
+statement = "Glabadanidis's reported MA-timing gains came from look-ahead (trading on the same month's return); corrected, MA(10) on the top-momentum decile has Sharpe 0.62 vs 0.57 buy-and-hold (p = 0.83) and 1.4 pp/yr lower return."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US value-weighted decile portfolios, 1960-2011, 0.5% one-way costs (Zakamulin 2018 WP)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Evidence"
+note = "Report calls this weak evidence that a trend overlay does not help the momentum long leg."
+
+[[claim]]
+id = "TT-5"
+statement = "An end-of-month 10-month MA on the S&P 500 (1952-2011, net of 0.2% per trade) raised the Sharpe to 0.54 from 0.39 at equal return (10.50% vs 10.54%), via lower volatility."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "In-sample, no holdout or significance test (Clare et al. 2013)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Strongest supporting study"
+note = "Whether its buy-and-hold is total return is UNVERIFIED; a price-only benchmark would flatter timing."
+
+[[claim]]
+id = "TT-6"
+statement = "The S&P 500's past 12-month return shows no out-of-sample predictability for next month (R2_OS -1.78%, 2000-2015), and its trend strategy Sharpe of 0.15 does not beat 0.16 for a strategy needing no predictability."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S&P 500 futures, gross of costs (Huang et al. JFE 2020)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Evidence"
+
+[[claim]]
+id = "TT-7"
+statement = "On the largest CRSP size quintile, MA and TSMOM timing rules break even only at one-way costs of about -10 to 15 bp, against an estimated 40 bp."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US large caps, daily rules, long/T-bill, 1963-2013 (Marshall et al. WP)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Evidence"
+bears_on = ["adr:0006"]
+
+[[claim]]
+id = "TT-8"
+statement = "Across 7,846 technical rules including 200-day MA, no positive DJIA performance is detected over 1962-2011 even at zero transaction costs, and outperforming rules cannot be selected ex ante."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Daily DJIA, long/neutral/short rules (Bajgrowicz & Scaillet JFE 2012)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Evidence"
+
+[[claim]]
+id = "TT-9"
+statement = "Multi-asset time-series momentum Sharpe above 1 depends on diversification across 55-67 futures and on shorting, and transfers poorly to a single long-only index: only 26% of instruments significantly beat always-long."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Moskowitz-Ooi-Pedersen 2012 and Hurst-Ooi-Pedersen 2017, gross (MOP)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "How far each finding transfers to this project"
+
+[[claim]]
+id = "TT-10"
+statement = "Every US-index trend-timing study found lower volatility with equal or lower return, so against total-return benchmarks a trend overlay should be expected to show lower terminal wealth."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US equity index trend timing vs SPY/MTUM total-return benchmarks"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Caveats & gaps"
+bears_on = ["adr:0005"]
+note = "Whether a Sharpe gain at lower return is a valid objective is left as an owner decision."
+
+[[claim]]
+id = "TT-11"
+statement = "Tests of trend timing on a single US index have low statistical power, so neither a positive nor a negative result is decisive."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S&P Composite (Zakamulin & Giner 2022, abstract only)"
+source = "docs/research/2026-09-25-trend-timing.md"
+section = "Caveats & gaps"
+bears_on = ["adr:0005"]
+
+# ===== 2026-09-25-g7-wash-sales.md =====
+
+[[claim]]
+id = "G7-1"
+statement = "A loss on stock or securities is disallowed if substantially identical stock or securities are acquired within 30 days before or after the sale (a 61-day window)."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "US federal tax, IRC §1091(a), non-dealers"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Answer"
+note = "Confirmed by five Tier 1 primary sources; the window crosses December 31 (Pub 550 example)."
+
+[[claim]]
+id = "G7-2"
+statement = "Wash-sale triggers include buying in a fully taxable trade, acquiring a contract or option to buy (including cash-settled), buying for your IRA or Roth IRA, and a purchase by your spouse or a corporation you control."
+kind = "fact"
+grade = "UNGRADED"
+scope = "IRC §1091, Pub 550 (2025)"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Plain-language rules (R2, R3, R5)"
+note = "Quoted from Tier 1 primary sources; spouse/controlled-corporation rule is from Pub 550 only."
+
+[[claim]]
+id = "G7-3"
+statement = "A disallowed loss is added to the basis of the replacement shares, except when the replacement was bought in an IRA or Roth IRA, where the loss is disallowed and the IRA basis is not increased."
+kind = "fact"
+grade = "UNGRADED"
+scope = "IRC §1091(d), Rev. Rul. 2008-5, Pub 550"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Plain-language rules (R9, R16)"
+
+[[claim]]
+id = "G7-4"
+statement = "The replacement shares' holding period includes the holding period of the shares sold at a disallowed loss."
+kind = "fact"
+grade = "UNGRADED"
+scope = "IRC §1223(3), Pub 550"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Plain-language rules (R10)"
+
+[[claim]]
+id = "G7-5"
+statement = "Holding more than 1 year makes a gain or loss long-term; the holding period starts the day after the trade date and includes the sale's trade date, using trade dates not settlement dates, and the tax year of a sale follows its trade date."
+kind = "fact"
+grade = "UNGRADED"
+scope = "IRC §1222, Pub 550, Form 8949 instructions"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Plain-language rules (R18-R20)"
+
+[[claim]]
+id = "G7-6"
+statement = "Replacement shares are matched to losses in order of acquisition (earliest first), each replacement share absorbs only one loss, and a wash-sale loss cannot offset gains on identical blocks sold the same day."
+kind = "fact"
+grade = "UNGRADED"
+scope = "26 CFR 1.1091-1, Pub 550"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Plain-language rules (R11-R14)"
+
+[[claim]]
+id = "G7-7"
+statement = "Brokers must report wash sales only when both trades are in the same account with the same CUSIP, but the loss is disallowed whether or not reported and the taxpayer must report it on Form 8949 with code W."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Form 1099-B instructions (2026), Pub 550, Form 8949 instructions (2025)"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Plain-language rules (R22, R23)"
+
+[[claim]]
+id = "G7-8"
+statement = "A monthly-rebalanced system must keep its own lot ledger across all related accounts (taxable, IRA, Roth, spouse, controlled corporation) with CUSIP, trade date, quantity including fractions and basis, and rerun a 61-day window scan on each loss sale as later purchases arrive, including into the next tax year."
+kind = "principle"
+grade = "n/a"
+scope = "Lot and tax logging for automated trading"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "What a monthly-rebalanced system must log to handle wash sales"
+
+[[claim]]
+id = "G7-9"
+statement = "The wash-sale rule has no intent test and no carve-out for automated rebalancing; the only exemption is for dealers."
+kind = "fact"
+grade = "UNGRADED"
+scope = "IRC §1091(a), Pub 550"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Disconfirmation"
+note = "The handoff's claim that rebalancing triggers wash sales routinely is an inference, not stated by the IRS."
+
+[[claim]]
+id = "G7-10"
+statement = "The primary sources are silent on whether two ETFs or index funds on the same index are substantially identical, on trades wholly inside an IRA, and on fractional shares and DRIP purchases as replacements, so the owner's policy must be written down and applied consistently."
+kind = "fact"
+grade = "UNGRADED"
+scope = "IRC §1091, Pub 550, Rev. Rul. 2008-5"
+source = "docs/research/2026-09-25-g7-wash-sales.md"
+section = "Disconfirmation"
+note = "Substantially identical is a facts-and-circumstances test with no fund-level guidance; these items are UNVERIFIED."
+
+# Claims register fragment B. Grades are the source report's own; UNGRADED = stated without a grade.
+
+# ===== 2026-09-25-alpaca-delisted-bars.md =====
+[[claim]]
+id = "AD-1"
+statement = "The Alpaca free plan returns raw SIP daily bars for delisted names up to their last regular session: 8 of 8 probed names (5 acquired, 3 failed, delisted 2019-2023)."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "Sample of 8 well-known names; not a completeness census; 2016-2018 delistings, small caps and reused tickers not probed"
+source = "docs/research/2026-09-25-alpaca-delisted-bars.md"
+section = "Answer"
+bears_on = ["adr:0003", "adr:0009"]
+note = "Supersedes the price-vendors grade 'Absent (not documented)' for Alpaca with 'Observed, sample of 8'."
+
+[[claim]]
+id = "AD-2"
+statement = "Alpaca daily bars start on 2016-01-04; nothing earlier is returned (SPY and KO)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "SPY and KO probed; completeness of 2016 across all names not measured"
+source = "docs/research/2026-09-25-alpaca-delisted-bars.md"
+section = "Evidence"
+bears_on = ["adr:0003", "adr:0009"]
+
+[[claim]]
+id = "AD-3"
+statement = "A zero-volume placeholder bar (v=0, n=0, open=close=prior close) can follow a name's last real session, so ingest must treat such a bar as no trade, not as a price."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed once (ATVI) in the sample of 8"
+source = "docs/research/2026-09-25-alpaca-delisted-bars.md"
+section = "Consequences for the build"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "AD-4"
+statement = "After a ticker change, Alpaca serves the pre-rename history under both the old and the new symbol, so the security master must key on identity (CUSIP or CIK), never on ticker."
+kind = "fact"
+grade = "UNGRADED"
+scope = "FB to META, queried without the asof parameter"
+source = "docs/research/2026-09-25-alpaca-delisted-bars.md"
+section = "Evidence"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "AD-5"
+statement = "Failed companies disappear from the Alpaca assets endpoint (404) while acquired ones stay as inactive, so the list of delisted names must come from EDGAR (Form 25) or another source."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Sample of 8 names"
+source = "docs/research/2026-09-25-alpaca-delisted-bars.md"
+section = "Consequences for the build"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "AD-6"
+statement = "Alpaca bars stop at the exchange delisting; post-delisting OTC trading is not returned, so a delisting return must come from another source."
+kind = "fact"
+grade = "UNGRADED"
+scope = "SIVB, BBBY probed"
+source = "docs/research/2026-09-25-alpaca-delisted-bars.md"
+section = "Caveats & gaps"
+bears_on = ["spec:backtest", "adr:0009"]
+
+# ===== 2026-09-25-alpaca-missing-bars.md =====
+[[claim]]
+id = "AM-1"
+statement = "Across 20 sessions and 8,814 listed names, SIP daily bar rows were absent for at most 0.03% of expected names on any session (median 0.01%); names with no trades still get a zero-volume placeholder row."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "History and next-day check, late summer 2026; same-day live case pending (#183)"
+source = "docs/research/2026-09-25-alpaca-missing-bars.md"
+section = "Answer"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "AM-2"
+statement = "Staleness should be measured as rows absent (placeholders count as present); on that reading the tightening rule gives ingest.max_missing_share = 0.010 instead of 0.05."
+kind = "principle"
+grade = "n/a"
+scope = "Recommendation for the owner, pending the live case; owner sets the value"
+source = "docs/research/2026-09-25-alpaca-missing-bars.md"
+section = "Recommendation for the owner"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "AM-3"
+statement = "About 7% of listed names (median 0.0704) have no traded bar on a normal day, so counting placeholders as missing would flag every session as stale at 0.05."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "All listed NYSE/Nasdaq/AMEX names incl. warrants, units, rights; common-like only is about 1.8%"
+source = "docs/research/2026-09-25-alpaca-missing-bars.md"
+section = "Evidence"
+note = "Placeholder-as-missing stays right for a delisting check, wrong for the market-wide share."
+
+# ===== 2026-09-25-alpaca-open-and-depth.md =====
+[[claim]]
+id = "AO-1"
+statement = "Alpaca fills NMS fractional orders from its own inventory as principal, priced against the NBBO, so a pure fractional order cannot take part in the opening auction; OPG is not available for fractional orders."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 Alpaca documents; which NBBO snapshot prices a queued pre-open order is not documented"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Answer"
+bears_on = ["spec:paper-trading"]
+
+[[claim]]
+id = "AO-2"
+statement = "Whether a queued pre-open whole-share DAY market order is filled in the primary opening auction or against the NBBO just after the open is not documented, and Alpaca staff statements conflict."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Only a live test can settle it; paper has no auction"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Answer"
+note = "100% of non-directed orders route to four wholesalers (2026 Q2 606 report)."
+
+[[claim]]
+id = "AO-3"
+statement = "Paper trading matches against the NBBO, simulates OPG as a market order and omits price improvement and latency slippage, so paper cannot reproduce auction fills and measures only its own simulator."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 paper-trading doc plus Tier 2 staff answers"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Answer"
+bears_on = ["spec:paper-trading"]
+
+[[claim]]
+id = "AO-4"
+statement = "execution.fill_price stays close until the owner decides; a backtest filling at the open would need a slippage allowance of at least the observed p90 gap to the bar open plus half-spread."
+kind = "principle"
+grade = "n/a"
+scope = "Pending paper probe (#182) and an owner decision on a live test"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Owner probe protocols"
+bears_on = ["spec:backtest", "spec:paper-trading"]
+
+[[claim]]
+id = "AO-5"
+statement = "Alpaca corporate actions are complete back to 2016 for the probed names: every ground-truth split, reverse split and spin-off matched, and AAPL and KO returned 4 cash dividends per year 2016-2025."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "7 large-cap symbols; smaller and delisted names not checked; some ground truth from memory or search summaries"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Probe 1 results"
+bears_on = ["adr:0003", "adr:0009"]
+note = "Report's verdict: ADR 0003's 2016 adjustment backfill horizon stands."
+
+[[claim]]
+id = "AO-6"
+statement = "The corporate-actions start/end window filters on process_date, not ex_date, so a window chosen by ex-date misses events processed after it ends."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed in Probe 1"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Probe 1 results"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "AO-7"
+statement = "Alpaca corporate-action payloads carry no declaration or announcement date in any year (and only ex and process dates before 2020), so an announced_at column cannot be filled from Alpaca."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Probe 1 sample, 2016-2025"
+source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
+section = "Probe 1 results"
+bears_on = ["adr:0009"]
+
+# ===== 2026-09-25-cover-page-facts-at-scale.md =====
+[[claim]]
+id = "CF-1"
+statement = "The SEC Financial Statement and Notes (FSN) data sets carry cover-page facts (title, ticker, exchange, per-class shares) and a per-filing SIC, making them the cheapest point-in-time source: a backfill from 2019 is 40 files, about 14.8 GB, versus about 150,000 documents."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed by Probe P1 on one month (2026-01); coverage before 2019 not tested; sizes are SEC figures, runtimes estimates"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Answer"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "CF-2"
+statement = "FSN sub.accepted is Eastern local time at minute precision and must never be used for known_at; each accession is stamped from the submissions acceptance time instead."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed by Probe P1"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Probe P1 results"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "CF-3"
+statement = "FSN is published monthly with an undocumented lag (one observation: about 4 days after month end), so it cannot serve the nightly run; newer filings still need per-filing downloads, about 80 per average day."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Per-day counts are estimates"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Answer"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "CF-4"
+statement = "The companyfacts and frames APIs cannot replace FSN: they carry no text facts (title, ticker, exchange), drop dimensioned facts so dual-class issuers lack a shares fact, and frames drops non-calendar cover dates."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 SEC docs and local fixtures"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Answer"
+
+[[claim]]
+id = "CF-5"
+statement = "Submissions JSON holds only the current SIC per CIK, so using it for a past date leaks a later SIC backward; per-filing FSN sub.sic is the point-in-time source."
+kind = "fact"
+grade = "UNGRADED"
+scope = "XBRL filings since 2009; gap between registration and first XBRL filing needs SGML headers"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "SIC without SGML headers"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "CF-6"
+statement = "The smaller FS (non-notes) data sets were narrowed in December 2024 to primary-statement numbers and no longer carry the cover page, so they are usable for SIC only."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 SEC documentation"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Candidates, field by field"
+
+[[claim]]
+id = "CF-7"
+statement = "ClassOfStock members are often filer-custom, so per-class shares must be mapped to classes through the same filing's listing triples, not by member name; FSN also drops non-breaking spaces in titles."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed in Probe P1 and the 2026_02 fixture"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Probe P1 results"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "CF-8"
+statement = "FSN files are re-issued after publication and filer tagging errors (for example scaling errors in cover shares) affect every source equally, so extracted rows should be keyed by zip content hash and parser version."
+kind = "fact"
+grade = "UNGRADED"
+scope = "SEC update notes and 2022 data-quality notice"
+source = "docs/research/2026-09-25-cover-page-facts-at-scale.md"
+section = "Caveats & gaps"
+
+# ===== 2026-09-25-free-data-terms.md =====
+[[claim]]
+id = "FT-1"
+statement = "Alpaca's terms limit use to personal, non-commercial purposes and forbid redistribution for publication or commercial use, but do not forbid private local storage or algorithmic trading of one's own account."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Terms PDF dated 2021-08-31, currency unverified; Customer Agreement not read"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Answer"
+bears_on = ["adr:0003"]
+
+[[claim]]
+id = "FT-2"
+statement = "The free plan returns SIP historical daily bars when end is at least 15 minutes old (confirmed by an owner recording); real-time data is IEX only (about 2.5% of US volume)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Owner recording: one symbol, four days; two Tier 1 Alpaca pages conflicted before the recording"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Owner recording, 2026-09-25"
+bears_on = ["adr:0003", "adr:0009"]
+
+[[claim]]
+id = "FT-3"
+statement = "Alpaca's daily open is the first eligible trade, not the official opening-auction price (one example gap 0.29%), and the close is the last valid trade, on every feed."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 bar-aggregation table plus a Tier 2 staff example"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Answer"
+bears_on = ["spec:backtest"]
+note = "Reason execution.fill_price stays close."
+
+[[claim]]
+id = "FT-4"
+statement = "Alpaca Basic rate limit is 200 requests per minute and history is documented as since 2016."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 subscription table"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Evidence"
+
+[[claim]]
+id = "FT-5"
+statement = "EDGAR allows at most 10 requests per second per user, requires a declared User-Agent of the form Company Name contact@domain, and publishes nightly companyfacts.zip and submissions.zip bulk files."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 SEC pages"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Answer"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "FT-6"
+statement = "The Alpaca assets endpoint is current-only with no listing history; ticker reuse must be detected from EDGAR filings, never from assets."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Tier 1 docs and owner recording"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Owner recording, 2026-09-25"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "FT-7"
+statement = "Acceptance times must never be stamped from companyfacts filed dates; submissions acceptanceDateTime is UTC while the SGML acceptance time is Eastern with no zone."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Owner recording of EDGAR fixtures"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Owner recording, 2026-09-25"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "FT-8"
+statement = "A full survivorship-free backfill (about 8,000 symbols since 2016 plus EDGAR bulk files) is estimated to fit inside one overnight run, so a --since cap is not needed."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Estimate from documented limits and stated assumptions, not measured"
+source = "docs/research/2026-09-25-free-data-terms.md"
+section = "Owner recording, 2026-09-25"
+
+# ===== 2026-09-25-price-vendors.md =====
+[[claim]]
+id = "PV-1"
+statement = "Four vendors state that an individual can buy US daily prices including delisted names: Norgate (Platinum $630/yr from 1990, Windows-only), Sharadar SEP ($39/mo full history from 1998), EODHD ($199/yr, pre-2018 delistings EOD only) and Massive ($199/mo for 20+ years)."
+kind = "fact"
+grade = "MIXED"
+scope = "Prices retrieved 2026-09-25; delisted coverage is vendor-claimed, never independently verified"
+source = "docs/research/2026-09-25-price-vendors.md"
+section = "Answer"
+bears_on = ["adr:0009"]
+note = "MIXED is the report's overall verdict; Tier 3 reports contradict Massive's delisted claim."
+
+[[claim]]
+id = "PV-2"
+statement = "Tiingo ($300/yr) covers delisted tickers only if not yet recycled, and CRSP is licensed only to institutions."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Vendor docs"
+source = "docs/research/2026-09-25-price-vendors.md"
+section = "Answer"
+bears_on = ["adr:0009"]
+
+[[claim]]
+id = "PV-3"
+statement = "No vendor records when a corporate action became known, and every adjusted series examined is restated backwards, so adjusted vendor prices are not point-in-time."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Sharadar, EODHD, Massive explicit; Norgate not documented"
+source = "docs/research/2026-09-25-price-vendors.md"
+section = "Caveats & gaps"
+bears_on = ["adr:0009"]
+
+[[claim]]
+id = "PV-4"
+statement = "Every licence read is personal-use only and forbids redistribution, and Norgate, Tiingo, Sharadar and Massive require deleting local data when the subscription ends; only Sharadar's direct licence explicitly allows keeping derived outputs that cannot reproduce the data."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Licence pages read 2026-09-25; EODHD post-termination clause unresolved"
+source = "docs/research/2026-09-25-price-vendors.md"
+section = "Caveats & gaps"
+bears_on = ["adr:0003", "adr:0009"]
+
+[[claim]]
+id = "PV-5"
+statement = "A vendor's delisted coverage can only be graded verified by a data test, for example checking bars to the final session for N Form 25 delistings from the local EDGAR store."
+kind = "principle"
+grade = "n/a"
+scope = "Applies to every shortlisted vendor"
+source = "docs/research/2026-09-25-price-vendors.md"
+section = "Follow-up questions"
+bears_on = ["adr:0009"]
+
+# ===== 2026-10-02-edgar-data-pitfalls.md =====
+[[claim]]
+id = "EP-P1"
+statement = "Transient SEC failures (503, connection drops, truncated downloads) occur in backfills, and our client retries only once on status and never on transport errors or a corrupt zip; the policy is capped exponential backoff honouring Retry-After and one re-download on BadZipFile."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed: 1x503 and 1 network drop in one backfill (#554); covers P1 and P10"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Summary table"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-P2"
+statement = "An SEC rate-limit block lasts until the request rate has stayed under the threshold for 10 minutes, so a 1-second retry of a 403 cannot succeed; policy is one wait of at least 10 minutes, then fail."
+kind = "fact"
+grade = "MIXED"
+scope = "Duration agreed across sources; a 24 h upper figure is unsourced; block text not read on sec.gov"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E2)"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-P3"
+statement = "Never cache a degraded result after an HTTP error: a silent fallback made an SEC outage look like missing data, and edgartools replaced it with raising on any HTTP status."
+kind = "principle"
+grade = "n/a"
+scope = "Our _guarded already skips only 404/410; keep"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Pitfalls in detail"
+note = "Underlying library evidence (E8) graded SUPPORTED as a library decision."
+
+[[claim]]
+id = "EP-P4"
+statement = "Bulk zips contain empty or keyless members (about 70 empty objects among 20,425 companyfacts.zip members; 5,387 keyless submissions pages by design), repaired from the per-CIK API."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "One dated zip observed; frequency in other nights UNVERIFIED; handled by #567"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E11)"
+
+[[claim]]
+id = "EP-P5"
+statement = "A malformed or non-JSON per-CIK submissions or companyfacts payload currently fails the whole source; recommended policy is retry once, then quarantine per CIK with an allowance, never read as no facts."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "Not observed by us; grade is for it being a property of SEC's API; owner decides allowance and universe eligibility"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Top 5 recommendations"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-P6"
+statement = "A form.idx row that does not parse fails the source today; recommended policy is to quarantine the row with an allowance and repair form and acceptance from the CIK's submissions, never from the index filed date."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "1 bad row observed in the 2016+ backfill (#358); library evidence from one library each"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Top 5 recommendations"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-P7"
+statement = "FSN files documented as UTF-8 and tab-delimited have contained a non-UTF-8 byte and unquoted tabs; repair is allowed only in free-text columns, and an accession whose kept value carries U+FFFD fails."
+kind = "fact"
+grade = "MIXED"
+scope = "One instance each (#455, #498); covers P7 and P8"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E12)"
+
+[[claim]]
+id = "EP-P9"
+statement = "SEC data-set schemas and listing pages change (FSN/FS layouts changed in 2024), so a missing column or no periods must fail loudly rather than shift fields."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "FSN/FS data sets and index page"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E13)"
+
+[[claim]]
+id = "EP-P11"
+statement = "A filing's SGML .txt can be empty (0 bytes) repeatably; it is handled as a counted per-document quarantine."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "One filing, one library report"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E9)"
+
+[[claim]]
+id = "EP-P12"
+statement = "Acceptance times must come only from submissions (true UTC); SGML and FSN times are Eastern with no zone, libraries get this wrong, and a time field is never repaired."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "3 of 3 fixtures matched; library bug is one report"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E15)"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-P13"
+statement = "Conflicting or duplicate fact values are withheld and recorded, never picked; libraries have repeatedly shipped silent-drop or wrong-pick bugs here."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "Library-bug class (4 edgartools issues)"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E17)"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-P14"
+statement = "The SEC ticker map is current-only and not guaranteed accurate; it is used only as a snapshot stamped at fetch time, with malformed rows skipped and counted."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "SEC FAQ plus prior reports"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E19)"
+
+[[claim]]
+id = "EP-P15"
+statement = "Form 25/25-NSE quirks (filed by the exchange, no effective date, amendments) are handled: the exchange copy is dropped, effective date defaults to filing plus 10 days, and an unmatched class is never guessed."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "Grade is for library evidence (none found); our handling is from code"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Pitfalls in detail"
+
+[[claim]]
+id = "EP-P16"
+statement = "FSN re-issues are detected and counted but never re-extracted (first extracted wins), and bulk zips trailing the day fall back to the per-CIK API."
+kind = "principle"
+grade = "n/a"
+scope = "Already decided (#174 Q5)"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Pitfalls in detail"
+
+[[claim]]
+id = "EP-1"
+statement = "Mature EDGAR libraries handle transport failures far better than record failures; none offers record-level quarantine, an allowance or a pre-flight sweep, and our adapter already beats them on in-filing record failures."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Code read at one point in time; 8 SUPPORTED, 2 MIXED, 6 INSUFFICIENT across pitfalls for library handling"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Answer"
+
+[[claim]]
+id = "EP-2"
+statement = "Add a pre-flight validate-inputs sweep that runs every bulk and index parser in count-only mode and lists every bad record in one pass before ingest, since each past failure cost a full rerun of about 24 minutes or more."
+kind = "principle"
+grade = "n/a"
+scope = "Owner decides scope (separate command or first phase of backfill)"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Top 5 recommendations"
+bears_on = ["spec:data-foundation"]
+
+[[claim]]
+id = "EP-3"
+statement = "A 429 was reported at 9.7-9.9 requests per second, so the default edgar.requests_per_second = 10 sits at the ceiling; edgartools defaults to 9."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "One user report"
+source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
+section = "Evidence (E3)"
+note = "Follow-up only: consider defaulting to 9."
+
+# ===== 2026-09-26-g5-search-volume.md =====
+[[claim]]
+id = "G5-A"
+statement = "Ticker or company-name search volume predicts returns out of sample, post-publication, net of costs, in non-microcap US stocks."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "US non-microcaps; near the MIXED boundary (one direct replication read at abstract level)"
+source = "docs/research/2026-09-26-g5-search-volume.md"
+section = "Answer"
+note = "S&P 500 replication reverses the sign and fails net of costs; S&P 100 backtest shows no value beyond past prices (p = 0.72)."
+
+[[claim]]
+id = "G5-B"
+statement = "Product-level search volume nowcasts revenue surprises and yields a tradable net-of-cost return."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "Return part: one in-sample gross result (about 20 bps per s.d. over 3 days); revenue nowcasting itself is consistent across two Tier 1 sources"
+source = "docs/research/2026-09-26-g5-search-volume.md"
+section = "Answer"
+
+[[claim]]
+id = "G5-1"
+statement = "Google Trends data are sampled, noisy, revised and rescaled to each series' own maximum, so a series downloaded today embeds the window's future maximum and the series observable on a past date cannot be recovered."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Worst for low-volume terms such as single-firm product names"
+source = "docs/research/2026-09-26-g5-search-volume.md"
+section = "Google Trends data stability and terms"
+
+[[claim]]
+id = "G5-2"
+statement = "The official Google Trends API is an application-gated alpha with only a rolling 5-year window, and Google's terms bar automated access against robots.txt, which disallows the /explore? pages."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Retrieved 2026-09-26; robots.txt completeness unverified; not legal advice"
+source = "docs/research/2026-09-26-g5-search-volume.md"
+section = "Google Trends data stability and terms"
+
+[[claim]]
+id = "G5-3"
+statement = "An honest point-in-time backtest of either search-volume variant is not possible with data available today; only a forward, timestamped collector could build history."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Also keyword choice made with later knowledge is a look-ahead risk"
+source = "docs/research/2026-09-26-g5-search-volume.md"
+section = "Answer"
+
+[[claim]]
+id = "G5-4"
+statement = "Retire the ticker-search return variant; keep only the revenue-nowcast variant as a deferred candidate that cannot be backtested until point-in-time product-search history exists."
+kind = "principle"
+grade = "n/a"
+scope = "Report's one-line recommendation"
+source = "docs/research/2026-09-26-g5-search-volume.md"
+section = "Answer"
+
+# ===== 2026-09-26-g6-alpha-arena.md =====
+[[claim]]
+id = "G6-1"
+statement = "Alpha Arena results cannot support any claim that frontier-model capability translates into trading P&L, in either direction."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "Nof1 publishes no capability measure, no significance test and no benchmark, and disclaims single-run rankings"
+source = "docs/research/2026-09-26-g6-alpha-arena.md"
+section = "Answer"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "G6-2"
+statement = "In Season 1.5 only 6 of 32 accounts had a positive return (about -35% in aggregate), and the Season 1 winner Qwen3 Max lost money in all four of its Season 1.5 competitions (-6.79% to -82.06%)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Nof1 leaderboard, untimestamped; four competitions share one two-week window; leveraged instruments"
+source = "docs/research/2026-09-26-g6-alpha-arena.md"
+section = "Per-model results: Season 1.5"
+note = "Grok 4.20 positive in 4 of 4 is a single observation, not evidence of skill."
+
+[[claim]]
+id = "G6-3"
+statement = "Nof1 reports run-to-run variation in rankings, says early successes may be luck, and that P&L in early runs was dominated by trading costs from over-trading."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Nof1 TechPost1 (Tier 1, single publisher)"
+source = "docs/research/2026-09-26-g6-alpha-arena.md"
+section = "Run count and significance"
+bears_on = ["adr:0008"]
+
+# ===== 2026-10-03-quantitative-investing-research-brief.md =====
+
+[[claim]]
+id = "QI-1"
+statement = "Detecting a true annual Sharpe of 0.3 from one portfolio with 80% power takes about 69 years (a worked calculation, not a historical claim)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "single portfolio, independent returns, one-sided 5% test"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q4. How to know whether an edge is real"
+note = "Worked calculation that ignores costs, selection and regime change; bears on how much paper trading can prove (QI-9)."
+
+[[claim]]
+id = "QI-2"
+statement = "Published anomalies lose about 26% of their return out of sample and 58% after publication (E1, McLean & Pontiff, T1)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "characteristic long-short portfolios, gross, relative decline"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q2. What survives in practice?"
+note = "Relative decline in average returns, not a percentage-point haircut; the brief warns against applying one universal haircut."
+
+[[claim]]
+id = "QI-3"
+statement = "Cross-sectional momentum: strong historical evidence, MIXED under a modern net standard."
+kind = "empirical"
+grade = "MIXED"
+scope = "modern, net of costs; rebound-crash and turnover sensitive"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "Differs from the handoff's SUPPORTED grade that H1's rationale cites (pilot tension X4)."
+
+[[claim]]
+id = "QI-4"
+statement = "Pure size is unreliable; microcap spreads, impact and delistings can dominate."
+kind = "empirical"
+grade = "MIXED"
+scope = "pure market-cap sorting; net of costs"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+bears_on = ["adr:0006"]
+note = "\"Size without junk\" is a materially different construction."
+
+[[claim]]
+id = "QI-5"
+statement = "Lottery, attention and overreaction effects: behaviour plausibly persists, but \"avoid overpriced stocks\" is easier than shorting them."
+kind = "empirical"
+grade = "MIXED"
+scope = "tradable premium; borrow and cost sensitive"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Decision table: themes and practical accessibility"
+note = "Accessible version is a long-only avoidance filter, not automatic shorts."
+
+[[claim]]
+id = "QI-6"
+statement = "Slow, liquid, profitability-aware stock selection has an unusually substantial foundation."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "slow, liquid, diversified profitability tilts only; not every quality bundle or short book"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+bears_on = ["backlog:B3", "hyp:b3-gross-profitability"]
+note = "Graded SUPPORTED narrowly; pure modern all-cost magnitude unknown."
+
+[[claim]]
+id = "QI-7"
+statement = "ML prediction gains shrink under economic restrictions (removing microcaps and distressed or high-volatility stocks, adding frictions), and more predictors can worsen out-of-sample results."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "cross-sectional US equity ML"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q7. Where machine learning fits"
+note = "T1 sources [83, 84]; the brief gives no single grade, and notes ML profit is not necessarily all tiny-stock shorts."
+
+[[claim]]
+id = "QI-8"
+statement = "Generic LLM signals have unknown net portfolio alpha, and pretraining on later news creates look-ahead even with old documents."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "deep price networks, reinforcement learning and general LLM signals"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q7. Where machine learning fits"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "QI-9"
+statement = "Paper trading verifies operations but has little power to establish a low-Sharpe edge."
+kind = "principle"
+grade = "n/a"
+scope = "short paper-trading intervals"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q4 §6. Validation design"
+
+[[claim]]
+id = "QI-10"
+statement = "Analyst-estimate, news and attention data (I/B/E/S, FactSet, LSEG) have unknown price; EDGAR is free."
+kind = "fact"
+grade = "UNGRADED"
+scope = "data access for attention/text/ML themes"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q6. Data: what is needed and what it costs"
+
+[[claim]]
+id = "QI-11"
+statement = "Budget trials before seeing results: a dozen prespecified variants per hypothesis, every variant counted, failed trials kept."
+kind = "principle"
+grade = "n/a"
+scope = "research governance"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q4 §2. Trial budgeting"
+note = "The brief calls these governance choices, not empirically optimal numbers."
+
+[[claim]]
+id = "QI-12"
+statement = "Diversified equity ownership is an implementable compensated exposure, though its forward magnitude is unknown."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "broad, low-cost, long-only diversified ownership"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+note = "Ranked first for an individual with a modest account; it is the passive comparison to beat."
+
+[[claim]]
+id = "QI-13"
+statement = "Diversified liquid time-series trend can be implemented net of costs, with direct live net evidence (E8)."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "diversified liquid futures or a transparent fund wrapper; not every trend rule"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+note = "Graded SUPPORTED narrowly; needs futures permissions or a fund, outside a US-equity stock-selection system."
+
+[[claim]]
+id = "QI-14"
+statement = "Value has historically documented returns but its standalone modern all-cost alpha is unknown, with long dry periods and definition sensitivity."
+kind = "empirical"
+grade = "MIXED"
+scope = "standalone modern all-cost alpha"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+note = "Brief's preferred structure is a slow tilt integrated with profitability."
+
+[[claim]]
+id = "QI-15"
+statement = "Investment, issuance and accruals signals face replication conflict and substantial redundancy, so they should not be assumed separately paid."
+kind = "empirical"
+grade = "MIXED"
+scope = "slow liquid designs; post-2010 all-cost result unknown"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+note = "Best initial structure is a small incremental tilt after spanning."
+
+[[claim]]
+id = "QI-16"
+statement = "Broader \"quality\" bundles are MIXED as distinct independent premia, overlapping defensive and value exposures."
+kind = "empirical"
+grade = "MIXED"
+scope = "multi-ingredient quality packages, as opposed to slow profitability"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q1. Economic mechanisms and the other side"
+bears_on = ["backlog:B3", "hyp:b3-gross-profitability"]
+
+[[claim]]
+id = "QI-17"
+statement = "Short-horizon reversal, residual stat arb and pairs have no verified generic modern net edge; old favorable examples (E6) are pre-2010 and deteriorated within sample."
+kind = "empirical"
+grade = "MIXED"
+scope = "short-horizon, high-turnover implementations"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+note = "Execution access is the main handicap for individuals; market-neutral books can share liquidation risk."
+
+[[claim]]
+id = "QI-18"
+statement = "Betting-against-beta's canonical construction and independent alpha are challenged; a defensive portfolio may just repackage profitability and investment exposure."
+kind = "empirical"
+grade = "MIXED"
+scope = "BAB / low-beta; long-only minimum volatility is not BAB"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Evidence against: findings that should change decisions"
+
+[[claim]]
+id = "QI-19"
+statement = "The old index-addition trade does not transfer to a modern strategy: S&P addition abnormal returns fell from 7.4% in the 1990s to less than 1% in the recent decade (E7)."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "mechanical index-inclusion trading; gross event returns"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+note = "Other forced-flow alpha is INSUFFICIENT without event-specific evidence."
+
+[[claim]]
+id = "QI-20"
+statement = "A generic market-making investment premium has no qualifying evidence."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "generic market making; venue and latency specific"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "End-of-Q2 survival table"
+
+[[claim]]
+id = "QI-21"
+statement = "Liquid, cost-aware anomaly averages are small (about 8 bp/month on average, 10–20 bp for the strongest, E4), and fast turnover often eliminates profitability."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US anomaly long-short, partial net of modeled frictions"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Evidence against: findings that should change decisions"
+note = "E4 is partial net (impact, borrow and tax not fully covered); E5 marks about 50% monthly turnover as the level above which few anomalies survive costs."
+
+[[claim]]
+id = "QI-22"
+statement = "Deep learning on raw prices, trading reinforcement learning and unconstrained hyperparameter search lack the general evidence to recommend as standalone alpha programs."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "standalone alpha programs; not a claim no specialist can succeed"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q7. Where machine learning fits"
+
+[[claim]]
+id = "QI-23"
+statement = "Gu–Kelly–Xiu's nonlinear ML ranking earned a gross value-weighted decile long-short Sharpe of 1.35 on a held-out 1987–2016 US period (E12), which is not a net implementable result."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "gross, before trading, borrow, funding and tax"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Numerical evidence ledger"
+note = "Net incremental value over a fair regularized linear comparator in a common liquid universe is unknown."
+
+[[claim]]
+id = "QI-24"
+statement = "Test any ML signal combination against equal-weight ranks, ridge and elastic net on the same universe, labels and costs with a locked out-of-sample period."
+kind = "principle"
+grade = "n/a"
+scope = "ML for signal combination"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q7. Where machine learning fits"
+
+[[claim]]
+id = "QI-25"
+statement = "Volatility-managed in-sample alpha need not deliver a feasible out-of-sample improvement; risk targeting and timing alpha are different claims."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "volatility scaling of individual factors"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Evidence against: findings that should change decisions"
+note = "A conditional multifactor construction with cost-aware netting found favorable OOS results, supporting construction-specific testing only."
+
+[[claim]]
+id = "QI-26"
+statement = "The live momentum ETF returned 15.69% a year over ten years versus 15.06% for its parent index, with 104% turnover, so its return is mostly equity exposure, not momentum alpha (E10)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "live long-only ETF NAV, 2016–2026, before shareholder taxes"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Numerical evidence ledger"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "The difference is not risk-adjusted alpha; the underlying index changed in 2020."
+
+[[claim]]
+id = "QI-27"
+statement = "For a modest account, the first stock-selection test is an annual, as-filed gross-profits/total-assets tilt in an investable large/mid-cap universe, overweighting the top third and underweighting the bottom third within sector and position bounds."
+kind = "principle"
+grade = "n/a"
+scope = "design choice; forward net magnitude unknown for this construction"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Ranked shortlists by resources: (a) Individual with a modest account"
+note = "Main failure modes: restated accounting, sector bets, and mistaking market return for tilt alpha; compare against a cheaper available fund."
+
+[[claim]]
+id = "QI-28"
+statement = "A naive \"latest company facts\" XBRL download is not a point-in-time accounting panel; preserve accession, filed date, period, unit and taxonomy and keep original and restated values separate."
+kind = "principle"
+grade = "n/a"
+scope = "fundamental-factor research data"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q6. Data: what is needed and what it costs"
+
+[[claim]]
+id = "QI-29"
+statement = "Escalate evidence before capital: point-in-time backtest, independent verification, locked walk-forward or holdout, paper operational audit, small live, then controlled scaling."
+kind = "principle"
+grade = "n/a"
+scope = "program-level gating"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Program-level guidance"
+note = "Paired with four gates: mechanism, independent replication, exposure beyond known factors, survival after executable costs."
+
+[[claim]]
+id = "QI-30"
+statement = "With a hundred independent zero-edge trials of ten years each, the expected best Sharpe is about 0.80, so a selected winner at 0.80 has only about one-half deflated confidence (worked calculation)."
+kind = "fact"
+grade = "UNGRADED"
+scope = "independent Gaussian trials; illustrative"
+source = "docs/research/2026-10-03-quantitative-investing-research-brief.md"
+section = "Q4 §2. Multiple testing, deflation and backtest length"
+note = "Worked calculation; correlated trials or a misspecified null break it."
+
+# ===== 2026-10-03-disclosure-change-evidence-review.md =====
+
+[[claim]]
+id = "ER-1"
+statement = "Firms whose 10-K/10-Q text changes versus the prior filing (\"changers\") underperform, up to 188 bp/month in-sample (Lazy Prices), but no Tier 1/2 post-publication or net-of-cost test exists."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "return claim; post-publication, net of costs"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 1. 10-Q vs prior 10-Q; 10-K vs prior 10-K"
+note = "In-sample direction is consistent across S1 and S4; costs, size splits and value weighting are UNVERIFIED (full text unreachable)."
+
+[[claim]]
+id = "ER-2"
+statement = "The only post-publication Lazy Prices test found, a Tier 3 GitHub replication on the S&P 100 for 2009–2026, finds no effect, with similarity \"essentially 1 for every firm\"."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "large caps (S&P 100), post-publication"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Disconfirmation"
+note = "A pointer, not evidence: as consistent with a measurement problem as with decay."
+
+[[claim]]
+id = "ER-3"
+statement = "For positive-word change the sign is opposite: low positive-word similarity stocks outperform high-similarity stocks (0.41% monthly decile spread), so \"any change is bad\" does not hold per component."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "return claim; category-specific change measure"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 1. 10-Q vs prior 10-Q; 10-K vs prior 10-K"
+note = "The 0.41% figure and its sample are UNVERIFIED (Tier 3 relay)."
+
+[[claim]]
+id = "ER-4"
+statement = "Filing change predicts future earnings, profitability, news and bankruptcies."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement claim (predicts fundamentals)"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 1. 10-Q vs prior 10-Q; 10-K vs prior 10-K"
+note = "Only one predictive Tier 1 source (S1); no independent replication."
+
+[[claim]]
+id = "ER-5"
+statement = "Filing change tracks economic change (larger economic changes come with larger MD&A modifications), though MD&A modification usefulness declined within sample."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement claim (contemporaneous)"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 1. 10-Q vs prior 10-Q; 10-K vs prior 10-K"
+note = "Two sources (S1, S2), short of the three required."
+
+[[claim]]
+id = "ER-6"
+statement = "Whether a 10-Q filed after the earnings release adds information to prices is contested: little or no reaction in Li & Ramesh 2009, larger returns around filing days in Griffin 2003."
+kind = "empirical"
+grade = "MIXED"
+scope = "market reaction to filing after release"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 2. Filing vs earnings release"
+note = "No study measures release-vs-filing disagreement as a predictor (novelty gap d)."
+
+[[claim]]
+id = "ER-7"
+statement = "Earnings-call Q&A carries incremental information beyond the press release and the prepared presentation."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "measurement claim; three Tier 1 sources"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 3. Prepared remarks vs Q&A"
+
+[[claim]]
+id = "ER-8"
+statement = "Call Q&A carries more information than prepared remarks."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement claim; direct comparison"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 3. Prepared remarks vs Q&A"
+note = "Only one source (S11) compares the two directly; no source measures remarks-vs-Q&A divergence as a feature."
+
+[[claim]]
+id = "ER-9"
+statement = "Abnormal positive tone (tone not explained by fundamentals) predicts lower future earnings and cash flows and a delayed negative price reaction."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement and return claims both INSUFFICIENT"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 4. Narrative vs fundamentals"
+note = "Measurement has two Tier 1 sources, one measuring tone rather than a gap; the return claim rests on one in-sample source with no costs."
+
+[[claim]]
+id = "ER-10"
+statement = "Semantic (embedding) change measures beat bag-of-words change measures for prediction."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "prediction from filing change; head-to-head"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 5. Semantic change measures"
+note = "S4 figures UNVERIFIED and not independent of S5; robustness to similarity-metric choice is also INSUFFICIENT (Topic 7)."
+
+[[claim]]
+id = "ER-11"
+statement = "Current models do not reliably label financial entailment and contradiction: best FinNLI macro-F1 is 74.57% for fine-tuned encoders and 78.62% for LLMs, and domain shift degrades general NLI models."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement claim; 3-way financial NLI benchmark"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 6. Contradiction / incompatibility detection; financial NLI"
+note = "Benchmark numbers describe task difficulty, not TradePartner performance; no published financial dataset uses the 5-way relation set."
+
+[[claim]]
+id = "ER-12"
+statement = "Finance-specific word lists beat general dictionaries on finance text; about three-fourths of Harvard-dictionary negative words are not negative in financial contexts."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "measurement claim; three Tier 1 sources"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 7. Document similarity methods in finance"
+
+[[claim]]
+id = "ER-13"
+statement = "Domain encoders (FinBERT) beat dictionaries at classifying sentence sentiment, but no source shows the advantage carries over to predicting returns or fundamentals from filing change."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement claim; sentence sentiment and transfer to prediction"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 8. Domain-specific encoders and embeddings"
+note = "Direction is consistent but accuracy figures are UNVERIFIED."
+
+[[claim]]
+id = "ER-14"
+statement = "Typed decision models (Jev) classify financial disclosure change accurately and in a calibrated way."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "measurement claim; no evaluation on paired disclosure change"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 9b. Typed decision models (\"Jev\") and LLM disclosure classification"
+note = "S48's PhraseBank 73.0% and ECE 0.138 are not page-verified, and a Tier 3 evaluation reports 85.3% on a subset."
+
+[[claim]]
+id = "ER-15"
+statement = "A constrained decision head follows the option name, not the rubric bound to it: permuting name-to-rubric binding flipped 32.5% of decisions against a 1.33% test-retest floor."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "typed LLM classification; one unreplicated preprint"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 9b. Typed decision models (\"Jev\") and LLM disclosure classification"
+note = "Abstract-level only; motivates a label-name permutation control for taxonomy v0."
+
+[[claim]]
+id = "ER-16"
+statement = "LLMs extract economically meaningful measures from disclosures (e.g. non-answer detection at 96% accuracy, call-based investment scores predicting capex up to nine quarters)."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "measurement claim, in-sample only"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 9. LLM-based disclosure analysis"
+bears_on = ["adr:0008"]
+note = "Every study's model training window overlaps its sample, so results are subject to look-ahead and distraction bias (ER-18)."
+
+[[claim]]
+id = "ER-17"
+statement = "LLM-derived text signals predict returns after costs in a post-cutoff period."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "return claim; post-cutoff, net of costs"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Topic 9. LLM-based disclosure analysis"
+bears_on = ["adr:0008"]
+note = "No qualifying test found; e.g. the GPT-4 \">12% per year\" alpha is UNVERIFIED and only 2023 is post-cutoff."
+
+[[claim]]
+id = "ER-18"
+statement = "Pretrained language models leak future information and are distorted by company knowledge, inflating in-sample disclosure results; anonymizing helps."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "LLM measurement on historical text"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Replication ledger"
+bears_on = ["adr:0008"]
+note = "Ledger status \"replicated as a phenomenon\"; Sarkar & Vafa's \"over 25% vs 6.8%\" figure is UNVERIFIED."
+
+[[claim]]
+id = "ER-19"
+statement = "Deterministic filing change predicting returns is well studied in-sample; the missing evidence class is a post-publication, net-of-cost test inside a top-1,000 universe."
+kind = "fact"
+grade = "UNGRADED"
+scope = "novelty map hypothesis (a); return claim"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Novelty map (TradePartner hypotheses)"
+bears_on = ["adr:0006"]
+note = "Proposed test (a) uses deterministic features only, with a prior at or below the McLean-Pontiff haircut."
+
+[[claim]]
+id = "ER-20"
+statement = "Typed semantic direction labels, cross-document incompatibility and semantic change × insider purchase are apparently novel (no study found in 68 searches), while deterministic change predicting next-quarter fundamentals is partly studied."
+kind = "fact"
+grade = "UNGRADED"
+scope = "novelty map hypotheses (b), (c), (d), (f)"
+source = "docs/research/2026-10-03-disclosure-change-evidence-review.md"
+section = "Novelty map (TradePartner hypotheses)"
+note = "Novelty means untested, not promising: priors for (c), (d) and (f) stay centered near zero, and the review proposes prioritizing (c) and (b) over (d) and (f)."
+
+# Claims register fragment C. Extracted 2026-10-03 from docs/research reports; no new evidence.
+# Grades are the source report's own, or UNGRADED where it asserts without grading.
+
+# ===== 2026-10-03-claims-pilot.md =====
+[[claim]]
+id = "CP-X1"
+statement = "The neglected-equities thesis targets small, low-coverage firms that the ADR 0006 universe (top 1,000 by market cap, $5M median dollar-volume floor) excludes, and G2 and QI find those effects live mostly in small, illiquid, equal-weighted portfolios."
+kind = "principle"
+grade = "n/a"
+scope = "tension: NE-2, NE-3, NE-5 vs ADR 0006, G2-A, G2-S10"
+source = "docs/research/2026-10-03-claims-pilot.md"
+section = "1. Tensions found"
+bears_on = ["adr:0006"]
+note = "Decided by owner 2026-10-03: test NE ideas inside the ADR 0006 universe, with neglected meaning underfollowed among the top 1,000; no new ADR."
+
+[[claim]]
+id = "CP-X2"
+statement = "INT understates the ADR 0008 conflict: option 4 explicitly rejects an LLM as an extractor into the store, so INT Stage 5 needs a charter amendment plus an ADR, not a reinterpretation."
+kind = "principle"
+grade = "n/a"
+scope = "tension: INT-6, INT-9, NE-7 vs ADR 0008 option 4, charter principle 3"
+source = "docs/research/2026-10-03-claims-pilot.md"
+section = "1. Tensions found"
+bears_on = ["adr:0008"]
+note = "Open: owner decision on a charter change, which can wait until Stages 2-4 show whether deterministic text features carry anything."
+
+[[claim]]
+id = "CP-X3"
+statement = "NE's insider evidence (Lakonishok & Lee, pre-2000 sample) is superseded for the tradable case by G2, which grades the post-2010 filing-timed liquid version NOT SUPPORTED and the monthly version MIXED."
+kind = "principle"
+grade = "n/a"
+scope = "tension: NE-3 vs G2-A, G2-B"
+source = "docs/research/2026-10-03-claims-pilot.md"
+section = "1. Tensions found"
+note = "Resolved by evidence: NE-3 holds historically, G2 governs what can be traded; any test uses G2-B's design."
+
+[[claim]]
+id = "CP-X4"
+statement = "Momentum's grade differs between sources: H1's rationale rests on a handoff grade of SUPPORTED, while QI grades cross-sectional momentum MIXED under a modern net standard."
+kind = "principle"
+grade = "n/a"
+scope = "tension: H1 rationale vs QI-3"
+source = "docs/research/2026-10-03-claims-pilot.md"
+section = "1. Tensions found"
+bears_on = ["hyp:h1-momentum-12-1"]
+note = "No action: H1's prior is already centred on zero and it runs as an engine test; the disagreement should stay visible."
+
+[[claim]]
+id = "CP-X5"
+statement = "NE's conditional PEAD features need analyst count, dispersion and revisions, but analyst data (I/B/E/S, FactSet, LSEG) is of unknown price and not held."
+kind = "principle"
+grade = "n/a"
+scope = "tension: NE-1, NE-2 vs QI-10"
+source = "docs/research/2026-10-03-claims-pilot.md"
+section = "1. Tensions found"
+note = "Open: a no-analyst version (XBRL surprise, price/volume attention) is testable on free data; the analyst version needs a vendor ADR."
+
+# ===== 2026-10-03-ml-llm-neglected-equities-research.md =====
+[[claim]]
+id = "NE-1"
+statement = "Unconditional PEAD has weakened materially, or disappears with better risk and microstructure treatment."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "US equities, post-earnings drift"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "1. Small-cap and low-attention post-earnings behavior"
+note = "NE cites no source; no repo report covers PEAD, so a brief is needed before any hypothesis."
+
+[[claim]]
+id = "NE-2"
+statement = "PEAD (underreaction to earnings) is stronger in smaller, low-coverage firms."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "small, low-analyst-coverage firms; older literature"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "1. Small-cap and low-attention post-earnings behavior"
+bears_on = ["adr:0006"]
+note = "Conflicts with the ADR 0006 universe (CP-X1) and needs analyst data (CP-X5)."
+
+[[claim]]
+id = "NE-3"
+statement = "Open-market insider purchases are informative, more than sales, and mostly in smaller firms."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Lakonishok & Lee (NBER w6656), pre-2000 sample"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "2. Insider purchases"
+note = "Refined by G2-A and G2-B for the tradable post-2010 case (CP-X3)."
+
+[[claim]]
+id = "NE-4"
+statement = "Abnormal purchase intensity and context (role, history, clusters) carry more information than a binary insider-buy flag."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "insider purchases; support in G2 is 1986-2007 gross (opportunistic VW five-factor 0.72%/month vs routine 0.09%)"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "2. Insider purchases"
+note = "Untested post-2010 with filing-safe timing, the same gap as G2-B."
+
+[[claim]]
+id = "NE-5"
+statement = "Information in filings is incorporated less efficiently for firms with limited coverage."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "low-coverage firms; no citation"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "3. Neglected-company textual information"
+bears_on = ["adr:0006"]
+note = "Conflicts with the ADR 0006 universe if limited coverage means small caps (CP-X1)."
+
+[[claim]]
+id = "NE-6"
+statement = "Changes in a firm's filings from one period to the next predict returns (Lazy Prices, Cohen, Malloy & Nguyen JF 2020)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "10-K/10-Q period-over-period text change"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "4. Cross-document inconsistencies and changes"
+note = "Ungraded in NE; needs a brief on post-publication evidence, costs and a large-cap subsample before HS-1 is registered."
+
+[[claim]]
+id = "NE-7"
+statement = "An LLM should act as a measurement instrument, not the final predictor."
+kind = "principle"
+grade = "n/a"
+scope = "LLM role in research"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "3. Neglected-company textual information / Preferred architecture"
+bears_on = ["adr:0008"]
+note = "Contradicts ADR 0008 option 4, which rejects an LLM extractor (CP-X2)."
+
+[[claim]]
+id = "NE-8"
+statement = "Every extracted feature keeps full provenance: text, source, section, model and prompt versions."
+kind = "principle"
+grade = "n/a"
+scope = "any extracted text feature"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "3. Neglected-company textual information / Provenance requirement"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "NE-9"
+statement = "Build the falsification machine before the prediction machine."
+kind = "principle"
+grade = "n/a"
+scope = "research program ordering"
+source = "docs/research/2026-10-03-ml-llm-neglected-equities-research.md"
+section = "Core principle"
+
+# ===== 2026-10-03-tradepartner-ml-research-integration.md =====
+[[claim]]
+id = "INT-1"
+statement = "TradePartner already has most of the hard infrastructure: PIT discipline, security master, calendar, EDGAR ingest, trial registry, holdout, cost model."
+kind = "fact"
+grade = "UNGRADED"
+scope = "repo as of 2026-10-03"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Summary"
+note = "Repo fact, not re-verified in the claims pilot."
+
+[[claim]]
+id = "INT-2"
+statement = "The missing piece is a research layer between PIT facts and portfolio construction: events, features, labels, datasets, model runs."
+kind = "principle"
+grade = "n/a"
+scope = "architecture"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Recommended new conceptual layer"
+
+[[claim]]
+id = "INT-3"
+statement = "ML needs walk-forward validation inside the unspent research region, with the existing holdout kept as the final gate."
+kind = "principle"
+grade = "n/a"
+scope = "any learned model"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Validation change required for ML"
+
+[[claim]]
+id = "INT-4"
+statement = "Deterministic filing-change features (TF-IDF similarity, changed-sentence fractions) should be tested before any LLM features."
+kind = "principle"
+grade = "n/a"
+scope = "disclosure-change family, Stage 2"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Stage 2 - deterministic filing-change research"
+note = "Depends on NE-6's grade and on 10-Q document bodies and sections, which the EDGAR ingest does not appear to hold today."
+
+[[claim]]
+id = "INT-5"
+statement = "Form 4 ingest should take open-market purchases (code P, acquired), with transaction date stored separately from filing time."
+kind = "principle"
+grade = "n/a"
+scope = "Stage 3 insider events"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Stage 3 - Form 4 insider events"
+bears_on = ["spec:event-data"]
+note = "Refined by G2-1, G2-3 and G2-4 (acceptance timestamp, deemed execution dates, 3-year classifier history) and EP-P12."
+
+[[claim]]
+id = "INT-6"
+statement = "Stage 5 (LLM semantic extraction) conflicts with the current interpretation of ADR 0008."
+kind = "fact"
+grade = "UNGRADED"
+scope = "governance"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Stage 5 - LLM semantic extraction"
+bears_on = ["adr:0008"]
+note = "Contradicted by ADR 0008 option 4 wording, an explicit rejection rather than an interpretation (CP-X2)."
+
+[[claim]]
+id = "INT-7"
+statement = "A frontier model reading a historical filing may encode later information, so historical extraction research must be kept apart from prospective validation."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "modern pretrained models on historical documents"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Historical-model contamination"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "INT-8"
+statement = "Learned models (Elastic Net, gradient boosting) come only after baseline feature families show value, and they output a ranking score, never an order."
+kind = "principle"
+grade = "n/a"
+scope = "Stage 4 tabular ML"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Stage 4 - tabular ML"
+
+[[claim]]
+id = "INT-9"
+statement = "Reword 'code computes numbers' so learned components may produce versioned research measurements, while portfolio, sizing, risk and execution stay deterministic."
+kind = "principle"
+grade = "n/a"
+scope = "charter principle 3, CLAUDE.md non-negotiable 5"
+source = "docs/research/2026-10-03-tradepartner-ml-research-integration.md"
+section = "Architectural principle to revisit"
+bears_on = ["adr:0008"]
+note = "Contradicts charter principle 3 and non-negotiable 5 as written (CP-X2)."
+
+# ===== 2026-09-26-g2-insider-purchases.md =====
+[[claim]]
+id = "G2-A"
+statement = "Buying liquid US stocks at or after Form 4 acceptance and holding for days earns a positive excess return since 2010."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "post-2010, acceptance-timed, liquid stocks, days horizon; most liquid quartile +0.03% (t 0.37) to next close, gross (S1, 2018-2023)"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Claim A: short holding periods (days)"
+note = "Refines NE-3 (CP-X3)."
+
+[[claim]]
+id = "G2-B"
+statement = "A monthly-rebalanced, filing-timed portfolio of opportunistic or clustered insider purchases in non-microcap stocks earns a positive net excess return since 2010."
+kind = "empirical"
+grade = "MIXED"
+scope = "post-2010, filing-timed, non-microcap, monthly; support only pre-2008 and gross (CMP VW 0.72%/month, top-half 0.55%/month)"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Claim B: monthly holding periods, the CMP and cluster style"
+note = "No post-2010 filing-timed monthly test exists in the literature found; only the system's own backtest (HS-2) can close it."
+
+[[claim]]
+id = "G2-S10"
+statement = "Post-2005, non-microcap anomaly returns are near zero: a median of 7 bp/month (Chen & Welch 2026, abstract)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "~200 anomalies, top 3,000 stocks, post-2005; insider signals not named"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Evidence"
+note = "G2 uses it as a prior only, not graded; contradicts NE's small-cap framing (CP-X1)."
+
+[[claim]]
+id = "G2-1"
+statement = "Form 4 event time must be the EDGAR acceptance timestamp, not the filing date, because Section 16 forms submitted up to 10 p.m. ET count as filed that business day (17 CFR 232.13(a)(4))."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Forms 3, 4, 5; primary rule"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Point-in-time notes for the Form 4 ingest scope"
+bears_on = ["spec:event-data"]
+note = "S1's '5:30 pm' statement conflicts with the rule; the primary rule governs."
+
+[[claim]]
+id = "G2-2"
+statement = "More than 70% of open-market purchase Form 4 filings are published after the market close, so a backtest buying at the filing-date close uses information not yet public for most filings."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S1 sample, director/officer code-P purchases, Nov 2018 - Nov 2023"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Point-in-time notes for the Form 4 ingest scope"
+bears_on = ["spec:event-data"]
+
+[[claim]]
+id = "G2-3"
+statement = "For 10b5-1 and discretionary trades the deemed execution date can be up to three business days after the trade, so the filing lag can exceed two days (17 CFR 240.16a-3(g))."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Form 4 deadline rule; two-day rule since 2002"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Point-in-time notes for the Form 4 ingest scope"
+bears_on = ["spec:event-data"]
+
+[[claim]]
+id = "G2-4"
+statement = "A point-in-time CMP opportunistic classifier needs at least three prior calendar years of each insider's trades, assessed at the start of each year, and about two-thirds of transactions fall out of the classified sample, so a 2010-start backtest needs Form 4 history from 2007."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Cohen, Malloy & Pomorski (2012) method, pp. 11-13"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Point-in-time notes for the Form 4 ingest scope"
+bears_on = ["spec:event-data"]
+note = "CMP is ex ante (no look-ahead found); the Biggerstaff et al. trade-sequence classifier is not point-in-time."
+
+[[claim]]
+id = "G2-5"
+statement = "The filing-timed insider reaction is front-loaded and largely intraday, so close-to-close event studies overstate what a daily system entering at the first close after acceptance can capture."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S1 (whole-sample t1 +0.33%, t10 -0.05%), S3 ($30M-$500M: skipping day 1 leaves no significant alpha)"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Disconfirmation"
+
+[[claim]]
+id = "G2-6"
+statement = "70-80% of insider-trade alpha dissipates between the transaction date and the following trading day, before any public disclosure."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S4 working paper, Russell 2000, 2025 (sample months UNVERIFIED), abstract only"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Evidence"
+
+[[claim]]
+id = "G2-7"
+statement = "Filings published after hours carry lower subsequent returns: S1's overnight dummy is negative from t1 to t10 (t1 -0.0029, t -2.40)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "S1, 2018-2023, gross"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Point-in-time notes for the Form 4 ingest scope"
+note = "S12's claim that opportunistic insiders report after hours is from a search extract only (UNVERIFIED)."
+
+[[claim]]
+id = "G2-8"
+statement = "A CMP implementation must be checked against the original paper's text, because a secondary source (MDPI JRFM 2025) inverts the routine/opportunistic definition."
+kind = "principle"
+grade = "n/a"
+scope = "Form 4 classifier build"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Disconfirmation"
+
+[[claim]]
+id = "G2-9"
+statement = "If H2 enters the queue, it should be an exploratory slot after H1 with a pre-registered prior centred near 0, monthly rebalancing, an acceptance-timestamp event clock and a point-in-time CMP classifier."
+kind = "principle"
+grade = "n/a"
+scope = "recommendation; owner decides"
+source = "docs/research/2026-09-26-g2-insider-purchases.md"
+section = "Recommendation on whether H2 enters the Phase 3 queue"
+bears_on = ["spec:event-data"]
+
+# ===== 2026-10-03-typed-classifiers-financial-disclosures-research.md =====
+[[claim]]
+id = "TC-1"
+statement = "Keep semantic extraction provider-neutral and authorize only a bounded pilot: benchmark Jev as a candidate, but do not adopt it as the default extractor, assume its probabilities are calibrated for finance, or treat its classifications as investable signals."
+kind = "principle"
+grade = "n/a"
+scope = "recommended decision as of 2026-10-03"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "1. Decision and executive findings; 24. Final research judgment"
+bears_on = ["adr:0008"]
+note = "Running any pretrained model even offline needs a new research-measurement-boundary ADR under today's rules (MB-2)."
+
+[[claim]]
+id = "TC-2"
+statement = "On Financial PhraseBank (n=970), pinned jev-1.13.0 scored 0.730 accuracy with expected calibration error 0.138, above the brief's 0.05 target."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "sentence sentiment, not paired disclosure change; Deusser, Sparrenberg & Sifa preprint, Sept 2026"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "3. Verified Jev evidence"
+note = "Audit: paper exists but the PhraseBank figures appear only in search extracts, and a Tier 3 evaluation reports 85.3% on a 999-sample subset."
+
+[[claim]]
+id = "TC-3"
+statement = "An early evidence audit (Tang & Zheng) finds no independent accuracy advantage from typed readout itself; the clearer early advantages are cost and latency."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "review of 28 preprints posted Sept 2026"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "3. Verified Jev evidence"
+note = "Audit: exists, abstract matches."
+
+[[claim]]
+id = "TC-4"
+statement = "Jev's API confidence is not the selected-class probability (documented as (p_max - 1/K)/(1 - 1/K)), so routing thresholds must name which statistic they use and calibration must use the probability vector."
+kind = "fact"
+grade = "UNGRADED"
+scope = "vendor specification"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "5. Confidence: a critical correction"
+note = "Audit: confidence != probability corroborated, but the formula was not found; do not reuse it until read at page level."
+
+[[claim]]
+id = "TC-5"
+statement = "Vendor documentation lists jev-1.13.0 at $0.042 per million input tokens with free output, 100k tokens/s and 80 requests/s limits, 64k/32k token budgets and no customer fine-tuning."
+kind = "fact"
+grade = "UNGRADED"
+scope = "vendor specification, not independently tested"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "4. Official interface and operational facts"
+note = "Audit: price, free output and pinning corroborated by Tier 3 snippets; rate limits contradicted (250k tok/s, 1,200 req/min); 64k/32k budgets and no fine-tuning not found."
+
+[[claim]]
+id = "TC-6"
+statement = "The vendor documents Jev sensitivity to choice order and irrelevant context plus weaknesses with numbers, dates, indirection and adversarial content, so prespecified perturbation tests are essential."
+kind = "fact"
+grade = "UNGRADED"
+scope = "vendor jaggedness page"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "18. Robustness and negative controls"
+note = "Audit: broadly corroborated, but the choice-order sensitivity claim was not found."
+
+[[claim]]
+id = "TC-7"
+statement = "A vendor cookbook classifying 60 selected SEC business sections into SIC groups reports 39/60 correct and 27/30 in its confident subset (jev-1.12)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "vendor demo, filtered sample; not change detection"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "6. Vendor claims and demos"
+note = "Audit: not found; do not reuse."
+
+[[claim]]
+id = "TC-8"
+statement = "Finance Agent Benchmark's 46.8% for o3 is class-balanced accuracy, against 51.4% naive accuracy, so 'every agent scored below 50%' is misleading."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "2025 benchmark of retrieval, tools and reasoning; not a classification error rate"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "7. Financial NLP and benchmark evidence"
+note = "Audit: 46.8% confirmed, 51.4% not found."
+
+[[claim]]
+id = "TC-9"
+statement = "LLM reasoning on SEC filings degrades as tasks move from single-document to cross-period and cross-entity work (Fin-RATE), so period/entity alignment must be tested separately from classification."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Fin-RATE benchmark; not a disclosure-change estimate"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "7. Financial NLP and benchmark evidence"
+note = "Audit: confirmed at abstract level (-18.60% longitudinal, -14.35% cross-entity)."
+
+[[claim]]
+id = "TC-10"
+statement = "Typed output restricts possible labels but does not prevent wrong labels, periods or segments: schema correctness and semantic correctness are separate outcomes."
+kind = "principle"
+grade = "n/a"
+scope = "any constrained-output model"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "4. Official interface and operational facts"
+
+[[claim]]
+id = "TC-11"
+statement = "The strongest near-term architecture hypothesis is a cascade: deterministic document processing, a cheap semantic classifier, selective generative fallback, and an explicit unresolved outcome, with the cheap component's identity earned by evaluation."
+kind = "principle"
+grade = "n/a"
+scope = "extraction architecture"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "1. Decision and executive findings; 17. Cascades"
+note = "Fallback must be evaluated on the rejected tail; the two models' errors must not be assumed independent."
+
+[[claim]]
+id = "TC-12"
+statement = "Measure first three targets (demand, inventory pressure, liquidity pressure) with two outputs, evidence status and economic direction, assigning direction only when evidence supports comparison."
+kind = "principle"
+grade = "n/a"
+scope = "taxonomy design"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "10. Redefine the measurement before choosing a model"
+note = "Adopted in TX-1."
+
+[[claim]]
+id = "TC-13"
+statement = "At advertised prices, label taxonomy, evidence alignment and independent human annotation are likely to cost far more than Jev's token bill (illustrative: 100,000 pairs x 6,000 tokens = $25.20 vs ~400 annotator-hours, ~$16,000, for 2,000 pairs)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "illustrative arithmetic, not observed billing"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "12. Annotation and sample design; 17. Cascades"
+note = "Rests on the advertised $0.042/M price in TC-5 (price corroborated by Tier 3 snippets only)."
+
+[[claim]]
+id = "TC-14"
+statement = "Freeze an issuer-level split with deduplication across splits, and evaluate both out-of-time on continuing issuers and on unseen issuers, keeping all tuning outside the sealed test set."
+kind = "principle"
+grade = "n/a"
+scope = "semantic benchmark splits"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "13. Splits, leakage and prospective collection"
+
+[[claim]]
+id = "TC-15"
+statement = "Proposed planning gates (core macro-F1 >= 0.85, accepted adverse-label precision >= 0.95 with lower bound >= 0.90, directional coverage >= 0.50) are operating proposals, not thresholds validated by literature."
+kind = "principle"
+grade = "n/a"
+scope = "adoption gates, to be frozen after pilot"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "15. Metrics, statistical tests and adoption gates"
+
+[[claim]]
+id = "TC-16"
+statement = "Historical return findings from modern pretrained models should be exploratory; prospective frozen outputs are stronger, and prospective capture should start once taxonomy and inference configuration are frozen, without waiting for historical return tests."
+kind = "principle"
+grade = "n/a"
+scope = "evidentiary weight of model-derived features"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "13. Splits, leakage and prospective collection; 20. Return validation"
+bears_on = ["adr:0008"]
+note = "Same position as MB-3 and PS-3."
+
+[[claim]]
+id = "TC-17"
+statement = "Extraction adoption and investment adoption are separate decisions: a technically good extractor with no incremental economic information is not promoted into the ranking model."
+kind = "principle"
+grade = "n/a"
+scope = "research assistance vs measurement vs forecasting vs portfolio use"
+source = "docs/research/2026-10-03-typed-classifiers-financial-disclosures-research.md"
+section = "22. Decision framework and falsification"
+
+# ===== 2026-10-03-semantic-taxonomy-v0.md =====
+[[claim]]
+id = "TX-1"
+statement = "Every label splits into an evidence status (sufficient, not_discussed, mixed, incomparable, extraction_failure) and a direction, and a direction is assigned only when the status is sufficient; absence is never 'unchanged'."
+kind = "principle"
+grade = "n/a"
+scope = "taxonomy v0, D1-D3"
+source = "docs/research/2026-10-03-semantic-taxonomy-v0.md"
+section = "3. Evidence, inference, recommendation, unknown; 4.4 Evidence status"
+
+[[claim]]
+id = "TX-2"
+statement = "cross_document and narrated measurement modes, and the four comparison bases, measure different quantities and are never pooled or silently mixed; the v1 primary mode is chosen by the annotation pilot, never by economic or return results."
+kind = "principle"
+grade = "n/a"
+scope = "taxonomy v0"
+source = "docs/research/2026-10-03-semantic-taxonomy-v0.md"
+section = "4.2 Measurement modes; 4.3 Comparison basis"
+
+[[claim]]
+id = "TX-3"
+statement = "v0 covers only D1 demand, D2 inventory pressure and D3 liquidity pressure in 10-Q/10-K MD&A, for ADR 0006 issuers excluding financials (SIC 6000-6799), and is not expanded until D1-D3 pass the pilot agreement gate."
+kind = "principle"
+grade = "n/a"
+scope = "taxonomy v0 scope"
+source = "docs/research/2026-10-03-semantic-taxonomy-v0.md"
+section = "2. Scope"
+bears_on = ["adr:0006"]
+note = "Applies the owner's CP-X1 decision; the store holds no 10-Q/10-K bodies or sections today."
+
+[[claim]]
+id = "TX-4"
+statement = "A definition revision is tested only on fresh pairs, for at most two rounds with only the final round deciding, and any narrowing is written down before its fresh round."
+kind = "principle"
+grade = "n/a"
+scope = "v0 to v1 acceptance"
+source = "docs/research/2026-10-03-semantic-taxonomy-v0.md"
+section = "11. Proposed tests and acceptance criteria"
+
+# ===== 2026-10-03-disclosure-annotation-protocol.md =====
+[[claim]]
+id = "AP-1"
+statement = "No LLM or other model is an annotator, adjudicator or tie-breaker; gold labels are human decisions, and raw independent labels are never edited."
+kind = "principle"
+grade = "n/a"
+scope = "annotation pilot and benchmark"
+source = "docs/research/2026-10-03-disclosure-annotation-protocol.md"
+section = "3. Roles and independence"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "AP-2"
+statement = "The owner should not be annotator A, B or C, and labels feeding a confirmatory economic test come from a non-owner adjudicator or from observations where A and B agree."
+kind = "principle"
+grade = "n/a"
+scope = "annotation roles; owner decision pending"
+source = "docs/research/2026-10-03-disclosure-annotation-protocol.md"
+section = "3. Roles and independence"
+
+[[claim]]
+id = "AP-3"
+statement = "Each dimension x mode must pass prespecified gates (alpha(J) >= 0.667 to continue, >= 0.800 reliable; sufficiency alpha >= 0.667; adverse specific agreement >= 0.70 on R+C and >= 0.60 on R with >= 20 adverse-vote observations), and aggregate alpha is never the only gate."
+kind = "principle"
+grade = "n/a"
+scope = "about 200-pair pilot, Q1-vs-10-K stratum excluded from G1-G3"
+source = "docs/research/2026-10-03-disclosure-annotation-protocol.md"
+section = "8. Agreement analysis plan (prespecified)"
+
+[[claim]]
+id = "AP-4"
+statement = "The protocol's numbers and rules are frozen with the file's git blob hash before the first pilot label, and any later change is a new version with old labels kept under the old one."
+kind = "principle"
+grade = "n/a"
+scope = "protocol versioning"
+source = "docs/research/2026-10-03-disclosure-annotation-protocol.md"
+section = "Header status"
+
+# ===== 2026-10-03-ml-validation-methodology-brief.md =====
+[[claim]]
+id = "MB-1"
+statement = "The program runs as gated stages (define, label, measure, validate semantics, economics, prediction, portfolio use); stage 6 cannot start for a feature that failed stage 5, and classifier accuracy alone never promotes a feature."
+kind = "principle"
+grade = "n/a"
+scope = "semantic feature program"
+source = "docs/research/2026-10-03-ml-validation-methodology-brief.md"
+section = "2. Scope and stage gates"
+
+[[claim]]
+id = "MB-2"
+statement = "Under today's rules, any pretrained language model in an experiment, even offline, needs a new research-measurement-boundary ADR and a spend ceiling above $0, and any model-derived feature in a ranking, portfolio or paper run needs a charter amendment plus an ADR."
+kind = "principle"
+grade = "n/a"
+scope = "governance gates; whether a local encoder counts as an LLM is an owner decision"
+source = "docs/research/2026-10-03-ml-validation-methodology-brief.md"
+section = "Governance gates"
+bears_on = ["adr:0008"]
+note = "Extends CP-X2 to the TC Jev pilot (TC-1)."
+
+[[claim]]
+id = "MB-3"
+statement = "Historical economic or return tests using modern model labels are exploratory only; human-label tests are useful with a hindsight caveat, and prospective frozen outputs are the strongest evidence."
+kind = "principle"
+grade = "n/a"
+scope = "evidentiary weights"
+source = "docs/research/2026-10-03-ml-validation-methodology-brief.md"
+section = "7. Pretrained-model contamination: evidentiary weights"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "MB-4"
+statement = "Deterministic text baselines (TF-IDF and raw cosine, changed-sentence ratios, Loughran-McDonald features, length change and others) are permanent controls, and a semantic model is interesting only if it adds incremental value beyond them."
+kind = "principle"
+grade = "n/a"
+scope = "stages 3, 5 and 6"
+source = "docs/research/2026-10-03-ml-validation-methodology-brief.md"
+section = "6. Deterministic baselines (permanent controls)"
+
+# ===== 2026-10-03-prospective-semantic-feature-spec.md =====
+[[claim]]
+id = "PS-1"
+statement = "A semantic feature's known_at is max(source availability, inference completion), never back-stamped, and investability starts at the first trading session strictly after known_at."
+kind = "principle"
+grade = "n/a"
+scope = "prospective semantic records"
+source = "docs/research/2026-10-03-prospective-semantic-feature-spec.md"
+section = "4.3 known_at"
+
+[[claim]]
+id = "PS-2"
+statement = "Records are append-only: corrections are new records, the as-captured view alone is prospective evidence, and a new prompt, model, taxonomy or calibration version is a new feature stream."
+kind = "principle"
+grade = "n/a"
+scope = "prospective semantic records"
+source = "docs/research/2026-10-03-prospective-semantic-feature-spec.md"
+section = "7. Immutability and corrections"
+
+[[claim]]
+id = "PS-3"
+statement = "Model-arm capture runs only after a research-measurement-boundary ADR, a spend ceiling above $0, a frozen taxonomy v1 and a frozen inference configuration, and then starts without waiting for economic or return results."
+kind = "principle"
+grade = "n/a"
+scope = "model arms 5-9; deterministic features need only a corpus spec and research store"
+source = "docs/research/2026-10-03-prospective-semantic-feature-spec.md"
+section = "2. Scope and governance preconditions"
+bears_on = ["adr:0008"]
+
+[[claim]]
+id = "PS-4"
+statement = "Unresolved or failed observations stay in the dataset as missing-value indicators, and model abstention is a routing outcome, never an evidence status."
+kind = "principle"
+grade = "n/a"
+scope = "routing and fallback"
+source = "docs/research/2026-10-03-prospective-semantic-feature-spec.md"
+section = "5. Routing and fallback"

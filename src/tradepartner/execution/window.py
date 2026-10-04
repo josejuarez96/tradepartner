@@ -22,21 +22,29 @@ req 14 "Entry gate, start and stop", req 5, req 9 and open question 13; ADR
 5. **The account is not flat**: `open_orders()` is non-empty, or a
    position exists that is not explained by the previous window's listed
    residues (see "Flatness" below).
+6. **The live costs differ from the hypothesis's registered costs**
+   (`costs_drift`, #534): every `FROZEN_COSTS_KEYS` value must equal the
+   registration's, which planning sizes with, so the frozen costs the wrapper
+   reads are the plan's.
+7. **The live fill price differs from the hypothesis's registered one**
+   (`execution_drift`, #526): every `FROZEN_EXECUTION_KEYS` value must equal
+   the registration's, which the tracking trial fills at, so `paper report`
+   prices paper fills against the trial's own convention.
 
 Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
 rebalance session strictly after both `holdout_end` and today, per the spec
 Definitions' "Paper window"; `starting_cash` and `starting_equity` from
 `account()`; `code_version`; `frozen_json`/`frozen_sha256`, the canonicalised
-and hashed `risk.*` section plus `FROZEN_PAPER_KEYS`, exactly as
-`registry.canonical_params_json`/`params_sha256` do for hypothesis
-parameters), the `carried_residue` adjustments copied from the previous
-window's listed residues (quantity and origin unchanged, dated at the stop
-row's own session: the ledger itself split-adjusts an adjustment from its
-`session` through any later one, `execution.ledger`'s documented
-convention), and any `spinoff_receipt` adjustments a spin-off explained (see
-below). It takes the run lock (T59) for its writes, and migrates a store
-version 4 has left behind (`init_schema` on the write connection) before
-writing.
+and hashed `risk.*` section plus `FROZEN_PAPER_KEYS`, `FROZEN_COSTS_KEYS` and
+`FROZEN_EXECUTION_KEYS`, exactly as `registry.canonical_params_json`/
+`params_sha256` do for hypothesis parameters), the `carried_residue`
+adjustments copied from the previous window's listed residues (quantity and
+origin unchanged, dated at the stop row's own session: the ledger itself
+split-adjusts an adjustment from its `session` through any later one,
+`execution.ledger`'s documented convention), and any `spinoff_receipt`
+adjustments a spin-off explained (see below). It takes the run lock (T59) for
+its writes, and migrates a store version 4 has left behind (`init_schema` on
+the write connection) before writing.
 
 **Flatness.** With no previous window, or the latest one `abandoned`, the
 account must hold no position at all: an `abandoned` window carries no
@@ -143,7 +151,11 @@ reason is the trimmed text.
   the clock it is stamped with), raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
-  share. It reads the clock, then opens one short-lived `open_for_write`
+  share. It first refuses `override` for kind `settle_order` (#571, spec req
+  17: that kind is `paper settle`'s alone, whose gate needs a fresh broker
+  read the page and `paper override` do not make), before the clock, the
+  store or any other check. It then reads the clock, opens one short-lived
+  `open_for_write`
   (`StoreLockedError` propagates: "store busy"), refuses `no_window`, refuses
   `override` for a kind outside the schema's set or fields the kind does not
   take (`engage_kill_switch` takes neither a session nor a name;
@@ -157,7 +169,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -170,7 +182,13 @@ from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.broker import Broker
 from tradepartner.calendar import last_session_of_month, previous_session, session_close
-from tradepartner.config import FROZEN_PAPER_KEYS, RiskConfig, Settings
+from tradepartner.config import (
+    FROZEN_COSTS_KEYS,
+    FROZEN_EXECUTION_KEYS,
+    FROZEN_PAPER_KEYS,
+    RiskConfig,
+    Settings,
+)
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import plan as plan_rules
 from tradepartner.execution import switch
@@ -209,7 +227,12 @@ from tradepartner.store.journal import (
     unconsumed_kill_switch_overrides,
     window_stops_for,
 )
-from tradepartner.store.schema import JOURNAL_ENUMS, init_schema
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_ENUMS,
+    SETTLE_ORDER_KIND,
+    init_schema,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -217,6 +240,8 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 _NEW_YORK = ZoneInfo("America/New_York")
 _RISK_PREFIX = "risk."
 _PAPER_PREFIX = "paper."
+_COSTS_PREFIX = "costs."
+_EXECUTION_PREFIX = "execution."
 _ABANDONED = "abandoned"
 _DUST = "dust"
 _UNTRADABLE = "untradable"
@@ -282,13 +307,63 @@ def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
     return session_close(holdout_end) <= now
 
 
-def _frozen_params(settings: Settings) -> dict[str, Any]:
+def _cost_drifted(registered_value: Any, live_value: float) -> bool:
+    """Whether a registered cost value differs from the live one, true also
+    for a registered value `float()` cannot parse (a string or null): that is
+    drift too, refused the same way as a numeric mismatch (`costs_drift`,
+    #580 item 1), never a plain `ValueError`/`TypeError` escaping to the
+    caller."""
+    try:
+        return float(registered_value) != float(live_value)
+    except (TypeError, ValueError):
+        return True
+
+
+def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
-    `FROZEN_PAPER_KEYS` under `paper.*` (spec req 14)."""
+    `FROZEN_PAPER_KEYS` under `paper.*`, `FROZEN_COSTS_KEYS` under `costs.*` and
+    `FROZEN_EXECUTION_KEYS` under `execution.*` (spec req 14; the costs #534; the
+    fill price #366 Q20, #526, which `paper report` reads back).
+
+    The frozen costs must equal the hypothesis's `registered` parameters,
+    which planning sizes the decisions with, so the plan and the wrapper share
+    one cost model: a live `costs.*` value that differs from it, or a key the
+    registration lacks, refuses the start (`costs_drift`). Likewise the frozen
+    `execution.*` keys must equal the registered ones, which the tracking trial
+    fills at, so `paper report` compares paper fills against the trial's own
+    convention (`execution_drift`)."""
     risk = settings.risk.model_dump()
     paper = settings.paper.model_dump()
+    costs = settings.costs.model_dump()
+    execution = settings.execution.model_dump()
+    drift = [
+        f"{_COSTS_PREFIX}{k} live {costs[k]!r} vs registered "
+        f"{registered.get(f'{_COSTS_PREFIX}{k}')!r}"
+        for k in FROZEN_COSTS_KEYS
+        if f"{_COSTS_PREFIX}{k}" not in registered
+        or _cost_drifted(registered[f"{_COSTS_PREFIX}{k}"], costs[k])
+    ]
+    if drift:
+        raise StartRefusedError(
+            "costs_drift",
+            "the live costs differ from the hypothesis's registered costs: " + "; ".join(drift),
+        )
+    execution_drift = [
+        f"{_EXECUTION_PREFIX}{k} live {execution[k]!r} vs registered "
+        f"{registered.get(f'{_EXECUTION_PREFIX}{k}')!r}"
+        for k in FROZEN_EXECUTION_KEYS
+        if registered.get(f"{_EXECUTION_PREFIX}{k}") != execution[k]
+    ]
+    if execution_drift:
+        raise StartRefusedError(
+            "execution_drift",
+            "the live execution keys differ from the hypothesis's registered ones: "
+            + "; ".join(execution_drift),
+        )
     params: dict[str, Any] = {f"{_RISK_PREFIX}{k}": v for k, v in risk.items()}
     params.update({f"{_PAPER_PREFIX}{k}": paper[k] for k in FROZEN_PAPER_KEYS})
+    params.update({f"{_COSTS_PREFIX}{k}": costs[k] for k in FROZEN_COSTS_KEYS})
+    params.update({f"{_EXECUTION_PREFIX}{k}": execution[k] for k in FROZEN_EXECUTION_KEYS})
     return params
 
 
@@ -551,7 +626,7 @@ def start(
 
         t_0 = _first_rebalance_session(hyp.holdout_end, today)
         commit, _dirty = registry.code_version()
-        params = _frozen_params(settings)
+        params = _frozen_params(settings, hyp.params)
         frozen_json = registry.canonical_params_json(params)
         frozen_sha256 = registry.params_sha256(params)
 
@@ -634,7 +709,7 @@ OPEN_ORDERS = "open_orders"
 REQUESTED = "requested"
 CLOSED = "closed"
 ABANDONED = _ABANDONED
-_ENGAGE_KILL_SWITCH = "engage_kill_switch"
+_ENGAGE_KILL_SWITCH = ENGAGE_KILL_SWITCH_KIND
 _OWNER = "owner"
 _FAULT = "fault"
 _FILLED = "filled"
@@ -756,25 +831,38 @@ def _open_orders(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
 
 
 def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
-    """Every order of the window that is not terminal, and every outcome kind a
-    terminal one earns (`execution.outcomes`) with no row yet."""
+    """Every order of the window that is not terminal, every outcome kind a
+    terminal one earns (`execution.outcomes`) with no row yet, and (#571, spec
+    req 17 and req 15 (3)) every order with a live fill (`superseded_by` null,
+    what `fills_for` returns) journaled after its first terminal event: a fill
+    journaled with that event shares its stamp, and a feed fill after req 8's
+    synthetic fill is superseded, so neither is listed."""
     orders = orders_for(conn, window_id=window_id)
     open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=window_id)}
     terminal: dict[str, str] = {}
+    terminal_at: dict[str, datetime] = {}
     for event in sorted(
         order_events_for(conn, window_id=window_id), key=lambda e: (e.known_at, e.ingested_at)
     ):
         if event.status in TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
+            terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
+    late: set[str] = set()
     for item in fills_for(conn, window_id=window_id):
         coid = item.fill.client_order_id
         filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
+        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+            late.add(coid)
     written = {(o.client_order_id, o.kind) for o in outcomes_for(conn, window_id)}
 
     missing: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
         coid = order.client_order_id
+        if coid in late:
+            missing.append(
+                f"order {coid} ({order.symbol}) has a live fill journaled after its terminal event"
+            )
         if coid in open_ids or coid not in terminal:
             missing.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
@@ -1218,7 +1306,14 @@ def override(
     """Append one `overrides` row to the open window and return its
     `override_id` (module docstring; spec req 9). Raises
     `WindowCommandRefused` for every refusal, nothing written, and
-    `StoreLockedError` when the store stays locked ("store busy")."""
+    `StoreLockedError` when the store stays locked ("store busy"). Kind
+    `settle_order` is refused first (spec req 17, #571)."""
+    if kind == SETTLE_ORDER_KIND:
+        raise WindowCommandRefused(
+            OVERRIDE,
+            f"override kind {kind!r} is written only by `paper settle --order --reason`, "
+            "whose gate reads the broker first",
+        )
     now = _command_clock(clock)
     note = reason.strip()
     with open_for_write(settings) as conn:

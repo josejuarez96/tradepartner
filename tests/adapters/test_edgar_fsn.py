@@ -27,6 +27,7 @@ import zipfile
 from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import httpx
@@ -135,6 +136,14 @@ def _num(
 
 def _dim(dimhash: str, segments: str) -> dict[str, str]:
     return {"dimhash": dimhash, "segments": segments}
+
+
+SHARES_TAG = "EntityCommonStockSharesOutstanding"
+
+
+def _null_num(adsh: str, ddate: str, value: str | None, **kwargs: str) -> dict[str, Any]:
+    """A share row whose `value` DuckDB read as NULL (`None`) or blank (#609 F3)."""
+    return {**_num(adsh, SHARES_TAG, "", ddate, **kwargs), "value": value}
 
 
 class TestParseFsn:
@@ -341,6 +350,219 @@ class TestParseFsn:
         parsed = parse_fsn(sub, num, [], [])
         assert [(r.accession, len(r.shares)) for r in parsed.records] == [(good, 1)]
         assert [f.accession for f in parsed.failures] == [bad]
+
+    # --- #609: the 2026-10-02 backfill's FSN failures, from their exact row shapes
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_shares_at_several_ddates_keep_the_latest_per_member(self, reverse: bool) -> None:
+        """#609 F1 (0001193125-26-029314): one undimensioned share fact per
+        year-end, four ddates. The latest is kept, whatever the row order."""
+        accession = "0001193125-26-029314"
+        num = [
+            _num(accession, SHARES_TAG, "39347991.0000", "20211231", dimh="0x00000000"),
+            _num(accession, SHARES_TAG, "40547379.0000", "20221231", dimh="0x00000000"),
+            _num(accession, SHARES_TAG, "58334115.0000", "20231231", dimh="0x00000000"),
+            _num(accession, SHARES_TAG, "60203214.0000", "20241231", dimh="0x00000000"),
+        ]
+        parsed = parse_fsn([_sub(accession, "1", "10-K")], num[::-1] if reverse else num, [], [])
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert record.shares == (FsnShare("", 60_203_214.0, date(2024, 12, 31)),)
+
+    def test_equal_shares_at_two_ddates_keep_the_latest(self) -> None:
+        """#609 F1 (0001104659-26-008700): the same value at two ddates."""
+        accession = "0001104659-26-008700"
+        num = [
+            _num(accession, SHARES_TAG, "11924349.0000", "20250930", dimh="0x00000000"),
+            _num(accession, SHARES_TAG, "11924349.0000", "20260131", dimh="0x00000000"),
+        ]
+        [record] = parse_fsn([_sub(accession, "1", "10-Q")], num, [], []).records
+        assert record.shares == (FsnShare("", 11_924_349.0, date(2026, 1, 31)),)
+
+    def test_the_latest_ddate_is_kept_per_class_member(self) -> None:
+        accession = "0000000020-25-000001"
+        dim = [_dim("hA", "ClassOfStock=CommonClassA;"), _dim("hB", "ClassOfStock=CommonClassB;")]
+        num = [
+            _num(accession, SHARES_TAG, "10", "20250131", dimh="hA", dimn="1"),
+            _num(accession, SHARES_TAG, "11", "20241231", dimh="hA", dimn="1"),
+            _num(accession, SHARES_TAG, "20", "20241130", dimh="hB", dimn="1"),
+            _num(accession, SHARES_TAG, "21", "20241231", dimh="hB", dimn="1"),
+        ]
+        [record] = parse_fsn([_sub(accession, "20", "10-K")], num, [], dim).records
+        assert set(record.shares) == {
+            FsnShare("CommonClassA", 10.0, date(2025, 1, 31)),
+            FsnShare("CommonClassB", 21.0, date(2024, 12, 31)),
+        }
+
+    def test_two_values_on_one_ddate_still_fail_that_accession(self) -> None:
+        """#609 F2 (0001156039-15-000006): two values for one member on the
+        same ddate. The rows carry nothing that picks one, so it fails."""
+        good, bad = "0000000021-25-000001", "0001156039-15-000006"
+        num = [
+            _num(good, SHARES_TAG, "5", "20150331", dimh="0x00000000"),
+            _num(bad, SHARES_TAG, "264905598.0000", "20150331", dimh="0x00000000"),
+            _num(bad, SHARES_TAG, "264536271.0000", "20150331", dimh="0x00000000"),
+        ]
+        parsed = parse_fsn([_sub(good, "21", "10-Q"), _sub(bad, "1156039", "10-Q")], num, [], [])
+        assert [r.accession for r in parsed.records] == [good]
+        [failure] = parsed.failures
+        assert failure.accession == bad
+        assert "two share values for no class on 2015-03-31" in failure.error
+
+    def test_a_same_ddate_conflict_on_an_older_ddate_still_fails(self) -> None:
+        """Keeping the latest ddate never hides a same-ddate conflict on another."""
+        accession = "0000000022-25-000001"
+        num = [
+            _num(accession, SHARES_TAG, "1", "20241231"),
+            _num(accession, SHARES_TAG, "2", "20241231"),
+            _num(accession, SHARES_TAG, "3", "20250131"),
+        ]
+        parsed = parse_fsn([_sub(accession, "22", "10-K")], num, [], [])
+        assert parsed.records == ()
+        assert [f.accession for f in parsed.failures] == [accession]
+
+    def test_null_share_values_are_skipped(self) -> None:
+        """#609 F3 (0001398344-26-005654): FSN's NULL (an xsi:nil fact) for two
+        of four classes; DuckDB reads it as `None`."""
+        accession = "0001398344-26-005654"
+        hashes = {
+            "0x2b31592a40793786882dc7aad7a31ed4": ("ClassAUnits", None),
+            "0x31e4f22fb0955ced7f582087aae3e9b0": ("ClassMUnits", "48421.0000"),
+            "0x5a55c399179290be6e7ef30689e0c3da": ("ClassSUnits", None),
+            "0x84da7b0964c06bc1415d4381ab5eca6b": ("ClassIUnits", "181682064.0000"),
+        }
+        dim = [_dim(h, f"ClassOfStock={member};") for h, (member, _) in hashes.items()]
+        num = [
+            _null_num(accession, "20260228", v, dimh=h, dimn="1") for h, (_, v) in hashes.items()
+        ]
+        parsed = parse_fsn([_sub(accession, "1938649", "10-Q")], num, [], dim)
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert set(record.shares) == {
+            FsnShare("ClassMUnits", 48_421.0, date(2026, 2, 28)),
+            FsnShare("ClassIUnits", 181_682_064.0, date(2026, 2, 28)),
+        }
+
+    @pytest.mark.parametrize("blank", [None, "", "  "])
+    def test_a_null_older_row_beside_a_later_value_keeps_the_value(self, blank: str | None) -> None:
+        """#609 F3 (0000833444-15-000032): NULL at 2015-03-31, a value at 2015-04-30."""
+        accession = "0000833444-15-000032"
+        num = [
+            _null_num(accession, "20150331", blank, dimh="0x00000000"),
+            _null_num(accession, "20150430", "421032334.0000", dimh="0x00000000"),
+        ]
+        [record] = parse_fsn([_sub(accession, "833444", "10-Q")], num, [], []).records
+        assert record.shares == (FsnShare("", 421_032_334.0, date(2015, 4, 30)),)
+
+    def test_only_null_share_values_give_no_shares(self) -> None:
+        """#609 F3 (0001572910-15-000033): every share row NULL; the listing stays."""
+        accession = "0001572910-15-000033"
+        common = "0x171fa7700d0367d34c779c2b2e5f381e"
+        subordinated = "0x93a3d34f885a6316c43698c0db6b2984"
+        dim = [
+            _dim(common, "ClassOfStock=CommonUnits;"),
+            _dim(subordinated, "ClassOfStock=SubordinatedUnits;"),
+        ]
+        num = [
+            _null_num(accession, "20150331", None, dimh=h, dimn="1") for h in (common, subordinated)
+        ]
+        txt = [
+            _txt(accession, "Security12bTitle", "Common Units"),
+            _txt(accession, "TradingSymbol", "PSXP"),
+            _txt(accession, "SecurityExchangeName", "NYSE"),
+        ]
+        parsed = parse_fsn([_sub(accession, "1572910", "10-Q")], num, txt, dim)
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert record.shares == ()
+        assert [item.ticker for item in record.listings] == ["PSXP"]
+
+    def test_titles_differing_only_by_a_lost_class_letter_space_are_one_title(self) -> None:
+        """#609 F4 (0001193125-26-126955): FSN keeps two copies of a title, one
+        with the NBSP dropped ("ClassA"). The spaced variant is kept."""
+        accession = "0001193125-26-126955"
+        units, common = "0x177ad7e2c2df26ff9e10a1111859f872", "0x64aab115e615b3ad72099cbe43ef2567"
+        warrants = "0x8b4fd6841da661431963d15ddbf7a643"
+        dim = [
+            _dim(units, "ClassOfStock=CapitalUnits;"),
+            _dim(common, "ClassOfStock=CommonClassA;"),
+            _dim(warrants, "ClassOfStock=Warrant;"),
+        ]
+        unit_title = (
+            "Units, each consisting of one share of Class A common stock and one-half of one "
+            "redeemable warrant"
+        )
+        warrant_title = (
+            "Warrants, each whole warrant exercisable for one share of Class A common stock, "
+            "each at an exercise price of $11.50 per share"
+        )
+
+        def row(tag: str, value: str, dimh: str) -> dict[str, str]:
+            return _txt(accession, tag, value, dimh=dimh, dimn="1")
+
+        txt = [
+            row("Security12bTitle", unit_title, units),
+            row("Security12bTitle", "ClassA common stock, par value $0.0001 per share", common),
+            row("Security12bTitle", warrant_title, warrants),
+            row("Security12bTitle", unit_title.replace("Class A", "ClassA"), units),
+            row("Security12bTitle", warrant_title.replace("Class A", "ClassA"), warrants),
+            row("SecurityExchangeName", "NONE", units),
+            row("SecurityExchangeName", "NONE", common),
+            row("SecurityExchangeName", "NONE", warrants),
+            row("TradingSymbol", "AEAEU", units),
+            row("TradingSymbol", "AEAE", common),
+            row("TradingSymbol", "AEAEW", warrants),
+        ]
+        parsed = parse_fsn([_sub(accession, "1", "10-K")], [], txt, dim)
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert {item.ticker: item.title for item in record.listings} == {
+            "AEAEU": unit_title,
+            "AEAE": "Class A common stock, par value $0.0001 per share",
+            "AEAEW": warrant_title,
+        }
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_titles_differing_only_by_whitespace_keep_the_spaced_variant(
+        self, reverse: bool
+    ) -> None:
+        """#609 F4 (0001688757-21-000028): "No ParValue" vs "No Par Value"."""
+        accession = "0001688757-21-000028"
+        titles = [
+            _txt(accession, "Security12bTitle", "Common Shares, No ParValue"),
+            _txt(accession, "Security12bTitle", "Common Shares, No Par Value"),
+        ]
+        txt = [
+            _txt(accession, "SecurityExchangeName", "NASDAQ"),
+            _txt(accession, "SecurityExchangeName", "NASDAQ"),
+            _txt(accession, "TradingSymbol", "ESTA"),
+            *(titles[::-1] if reverse else titles),
+        ]
+        num = [_num(accession, SHARES_TAG, "23547075.0000", "20210228", dimh="0x00000000")]
+        parsed = parse_fsn([_sub(accession, "1688757", "10-K")], num, txt, [])
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert record.listings == (CoverListing("Common Shares, No Par Value", "ESTA", "NASDAQ"),)
+
+    def test_two_different_titles_still_fail_that_accession(self) -> None:
+        accession = "0000000023-25-000001"
+        txt = [
+            _txt(accession, "Security12bTitle", "Common Stock"),
+            _txt(accession, "Security12bTitle", "Preferred Stock"),
+            _txt(accession, "TradingSymbol", "ABC"),
+            _txt(accession, "SecurityExchangeName", "NYSE"),
+        ]
+        parsed = parse_fsn([_sub(accession, "23", "10-K")], [], txt, [])
+        assert parsed.records == ()
+        [failure] = parsed.failures
+        assert "two values for Security12bTitle" in failure.error
+
+    def test_symbols_are_still_compared_exactly(self) -> None:
+        """Only titles are compared without whitespace: "BRK A" is not "BRKA"."""
+        accession = "0000000024-25-000001"
+        txt = [_txt(accession, "TradingSymbol", "BRK A"), _txt(accession, "TradingSymbol", "BRKA")]
+        parsed = parse_fsn([_sub(accession, "24", "10-K")], [], txt, [])
+        assert [f.accession for f in parsed.failures] == [accession]
 
     def test_title_with_no_symbol_is_not_a_listing(self) -> None:
         accession = "0000000007-25-000001"

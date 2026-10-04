@@ -32,6 +32,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -131,6 +132,13 @@ class IngestConfig(BaseModel):
     # failure message is server-supplied text, capped so a large error page cannot fill
     # `ingestion_runs.message` and the page that shows it.
     max_message_chars: int = Field(default=2000, gt=0)
+    # Added for #573: a failed run's message gets ` | at: <frames>` appended (file:line
+    # in function, innermost first, across the `raise ... from` chain). `max_where_frames`
+    # bounds how many frames are kept; `max_where_chars` bounds the whole message
+    # (error text plus frames) before `max_message_chars`'s own cut, so a long frame
+    # trail is itself truncated rather than crowding out the error text.
+    max_where_frames: int = Field(default=8, gt=0)
+    max_where_chars: int = Field(default=1500, gt=0)
 
 
 class EdgarConfig(BaseModel):
@@ -155,10 +163,14 @@ class EdgarConfig(BaseModel):
     before `403` (SEC's rate-limit block) is retried once, then failed.
     Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
     is nonsensical and would either hang or hot-loop `edgar_raw`.
+
+    `requests_per_second` defaults to 9, not 10 (#656, research #572 E3):
+    SEC's 10 req/s is a ceiling, not a target; secedgar users saw 429s at
+    9.7 req/s and edgartools defaults to 9.
     """
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = Field(default=10.0, gt=0)
+    requests_per_second: float = Field(default=9.0, gt=0)
     retry_backoff_seconds: float = Field(default=1.0, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
@@ -482,9 +494,20 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
 # Q20, owner): the tracking trial's fill-price convention must be read from the
 # window's `frozen_json`, never live `Settings`, since a config edit mid-window must
 # not silently change what `paper report`'s fill-timing and residue terms compare
-# paper fills against. One key today; `execution/window.py`'s `_frozen_params` is the
-# writer this freezes into (not changed here: out of this task's file list).
+# paper fills against. One key today; `execution/window.py`'s `_frozen_params` writes
+# it (#526).
 FROZEN_EXECUTION_KEYS: tuple[str, ...] = ("fill_price",)
+
+# The `costs.*` keys req 14 also freezes into the window at `paper start` (#534,
+# owner): the wrapper sizes buys and checks the cash rule with the window's frozen
+# costs, never live `Settings`, as #366 Q20 does for `execution.fill_price`. Exactly
+# the keys `BuyCosts` is built from (`per_side_bps` and the two commissions
+# `Commissions.from_config` reads); `sensitivity_per_side_bps` is a backtest key.
+FROZEN_COSTS_KEYS: tuple[str, ...] = (
+    "per_side_bps",
+    "commission_per_share",
+    "commission_per_order",
+)
 
 AlertChannel = Literal["store", "macos", "email"]
 _DEFAULT_ALERT_CHANNELS: tuple[AlertChannel, ...] = ("store", "macos")
@@ -730,6 +753,19 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Load `Settings` fresh from the environment (no process-wide caching)."""
     return Settings()
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def clean_message(message: str, settings: Settings) -> str:
+    """`message` with every configured secret redacted, control characters
+    replaced by a space, and cut to `ingest.max_message_chars`: the one
+    cleaning for server- or filing-supplied text that is stored (the run row
+    and the EDGAR adapter's `failed_filings.json` and FSN manifests, #629)."""
+    for value in secret_values(settings):
+        message = message.replace(value, "[redacted]")
+    return _CONTROL_CHARS.sub(" ", message)[: settings.ingest.max_message_chars]
 
 
 def secret_values(settings: Settings) -> list[str]:

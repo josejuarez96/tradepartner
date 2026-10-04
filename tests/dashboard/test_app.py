@@ -22,6 +22,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
+from tradepartner.dashboard import override_page
 from tradepartner.dashboard.app import (
     StoreState,
     StoreUnavailable,
@@ -210,7 +211,49 @@ def test_render_ok_state_shows_navigation_and_placeholder_page(
     assert not at.info
     assert not at.error
     [nav] = at.sidebar.radio
-    assert nav.options == ["Data health", "Backtest", "Trial registry", "Operations"]
+    assert nav.options == [
+        "Data health",
+        "Backtest",
+        "Trial registry",
+        "Operations",
+        "Override",
+    ]
+
+
+def test_a_stray_outcome_shows_only_once_the_override_page_is_selected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`show_outcome` is only called when the Override page is selected
+    (module docstring): an `Outcome` left in `session_state` while another
+    page is showing (nothing in the current click flow produces this —
+    `on_click` cannot change the sidebar's own page selection — but nothing
+    should rely on that) does not bleed onto that other page, and is still
+    shown, once, the next time Override is selected, since `show_outcome`
+    pops rather than peeks."""
+    store_path = tmp_path / "outcome-scoped.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+
+    at = _run_app(monkeypatch, store_path)
+    at.sidebar.radio[0].set_value("Data health").run()
+    assert not at.exception
+
+    at.session_state[override_page.OUTCOME_KEY] = override_page.Outcome(
+        override_page.OutcomeStatus.WRITTEN, "Override 1 written: exclude_name."
+    )
+    at.run()
+
+    assert not at.exception
+    assert not any("written" in s.value.lower() for s in at.success)
+
+    at.sidebar.radio[0].set_value("Override").run()
+    assert not at.exception
+    assert any("written" in s.value.lower() for s in at.success)
+
+    at.sidebar.radio[0].set_value("Data health").run()
+    assert not at.exception
+    assert not any("written" in s.value.lower() for s in at.success)
 
 
 # --- server options (ADR 0011, #273) ---------------------------------------

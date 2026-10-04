@@ -17,8 +17,8 @@ from conftest import version_4_store
 
 from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker
-from tradepartner.config import Settings
-from tradepartner.execution import window
+from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
+from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.store import registry
@@ -61,7 +61,14 @@ def _connect(
 
 
 def _params(**extra: Any) -> dict[str, Any]:
-    return {"costs.per_side_bps": 15.0, "strategy.top_fraction": 0.1, **extra}
+    return {
+        "costs.per_side_bps": 15.0,
+        "costs.commission_per_share": 0.0,
+        "costs.commission_per_order": 0.0,
+        "execution.fill_price": "close",
+        "strategy.top_fraction": 0.1,
+        **extra,
+    }
 
 
 def _register(
@@ -69,6 +76,7 @@ def _register(
     settings: Settings,
     slug: str,
     holdout_end: date,
+    params: dict[str, Any] | None = None,
 ) -> registry.HypothesisRecord:
     return registry.register_hypothesis(
         conn,
@@ -77,7 +85,7 @@ def _register(
         title=f"{slug} title",
         doc_path=f"docs/hypotheses/{slug}.md",
         doc_sha256="d" * 64,
-        params=_params(),
+        params=_params() if params is None else params,
         in_sample_start=date(2016, 1, 29),
         holdout_start=date(2023, 1, 3),
         holdout_end=holdout_end,
@@ -564,6 +572,188 @@ def test_frozen_hash_stable_across_an_environment_override(
         stored = latest_window(conn)
     assert stored is not None
     assert stored.frozen_sha256 == frozen_sha_before
+
+
+def test_frozen_json_carries_the_registered_cost_keys_the_wrapper_reads(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`paper start` freezes `FROZEN_COSTS_KEYS` under `costs.` (#534), equal to
+    the hypothesis's registered costs, and no other `costs.*` key."""
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+
+    frozen = json.loads(result.window.frozen_json)
+    costs = {k: v for k, v in frozen.items() if k.startswith("costs.")}
+    assert costs == {k: v for k, v in ready_hypothesis.params.items() if k.startswith("costs.")}
+    assert {k.removeprefix("costs.") for k in costs} == set(FROZEN_COSTS_KEYS)
+
+
+@pytest.mark.parametrize("fill_price", ["close", "open"])
+def test_frozen_json_carries_the_live_execution_fill_price(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    fill_price: str,
+) -> None:
+    """`paper start` freezes `FROZEN_EXECUTION_KEYS` under `execution.` with the
+    live values, equal to the registered ones (#526, #366 Q20), and no other
+    `execution.*` key."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        execution={"fill_price": fill_price},
+    )
+    with open_for_write(settings) as conn:
+        params = _params(**{"execution.fill_price": fill_price})
+        hyp = _register(conn, settings, "h1", HOLDOUT_END_PAST, params)
+        _sign_off(conn, settings, hyp, tmp_path)
+
+    result = window.start(settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1")
+
+    frozen = json.loads(result.window.frozen_json)
+    execution = {k: v for k, v in frozen.items() if k.startswith("execution.")}
+    assert execution == {"execution.fill_price": fill_price}
+    assert {k.removeprefix("execution.") for k in execution} == set(FROZEN_EXECUTION_KEYS)
+
+
+def test_report_reads_the_fill_price_a_started_window_froze(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`paper report`'s `_frozen_fill_price` reads the value `paper start` wrote,
+    from the stored row, so a real window no longer raises `ValueError` (#526)."""
+    window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    with open_read_only(journal_settings) as conn:
+        stored = latest_window(conn)
+    assert stored is not None
+
+    assert report._frozen_fill_price(stored) == journal_settings.execution.fill_price
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"per_side_bps": 7.5},
+        {"commission_per_share": 0.01},
+        {"commission_per_order": 1.0},
+    ],
+)
+def test_refuses_when_live_costs_differ_from_the_registered_costs(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    live: dict[str, float],
+) -> None:
+    """Planning sizes with the registered costs and the wrapper with the
+    frozen ones, so a live `costs.*` edit before `paper start` refuses the
+    start (`costs_drift`) and writes no window (#534)."""
+    settings = Settings(_env_file=None, store={"path": journal_settings.store.path}, costs=live)
+    fake = _fake(fixed_clock)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+
+    assert refused.value.reason == "costs_drift"
+    assert f"costs.{next(iter(live))}" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_refuses_a_registration_without_the_cost_keys(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A registration that names only `costs.per_side_bps` cannot vouch for
+    the commissions the wrapper reads: refused, never filled from live."""
+    with open_for_write(journal_settings) as conn:
+        params = {"costs.per_side_bps": 15.0, "strategy.top_fraction": 0.1}
+        hyp = _register(conn, journal_settings, "h2", HOLDOUT_END_PAST, params)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h2"
+        )
+
+    assert refused.value.reason == "costs_drift"
+    assert "costs.commission_per_share" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", None], ids=["string", "null"])
+def test_refuses_when_a_registered_cost_value_is_not_a_number(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    bad: object,
+) -> None:
+    """A registered cost value `float()` cannot parse (a string or null)
+    refuses the start the same way a numeric drift does (`costs_drift`),
+    never a plain `ValueError`/`TypeError` escaping from `_frozen_params`,
+    and writes no window either way (#580 item 1)."""
+    with open_for_write(journal_settings) as conn:
+        params = _params(**{"costs.commission_per_share": bad})
+        hyp = _register(conn, journal_settings, "h3", HOLDOUT_END_PAST, params)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h3"
+        )
+
+    assert refused.value.reason == "costs_drift"
+    assert "costs.commission_per_share" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_refuses_when_live_fill_price_differs_from_the_registered_one(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """The tracking trial fills at the registered `execution.fill_price` and
+    `paper report` prices the fill-timing term off the frozen one, so a live
+    edit before `paper start` refuses the start (`execution_drift`) and writes
+    no window (#526)."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        execution={"fill_price": "open"},
+    )
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1")
+
+    assert refused.value.reason == "execution_drift"
+    assert "execution.fill_price live 'open' vs registered 'close'" in str(refused.value)
+    with open_read_only(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_refuses_a_registration_without_the_fill_price(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A registration that lacks `execution.fill_price` cannot vouch for the
+    convention `paper report` compares against: refused, never filled from live."""
+    with open_for_write(journal_settings) as conn:
+        params = {k: v for k, v in _params().items() if k != "execution.fill_price"}
+        hyp = _register(conn, journal_settings, "h2", HOLDOUT_END_PAST, params)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h2"
+        )
+
+    assert refused.value.reason == "execution_drift"
+    assert "execution.fill_price" in str(refused.value)
 
 
 def test_succeeds_on_a_version_4_store(tmp_path: Path, fixed_clock: FixedClock) -> None:

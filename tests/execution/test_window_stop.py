@@ -5,8 +5,10 @@ override writer, open question 13's `paper abandon`)."""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 import pytest
@@ -15,6 +17,7 @@ from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import switch
+from tradepartner.execution import window as window_module
 from tradepartner.execution.collect import collect
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile_run import reconcile_now
@@ -32,12 +35,14 @@ from tradepartner.execution.window import (
     KillWriteFailed,
     WindowCommandRefused,
     _check_flat,
+    _not_ready,
     _parse_residues,
     abandon,
     kill,
     override,
     stop,
 )
+from tradepartner.store import schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.delistings import listing_ends_as_of
@@ -45,6 +50,7 @@ from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
     DecisionRow,
+    FillRow,
     OrderEventRow,
     OrderRow,
     OutcomeRow,
@@ -56,6 +62,7 @@ from tradepartner.store.journal import (
     append,
     kill_switch_events_for,
     open_window,
+    order_events_for,
     overrides_for,
     reconciliations_for,
     runs_for,
@@ -500,6 +507,100 @@ def test_the_closing_stop_names_every_open_order_and_missing_outcome(
     assert _count(journal_settings, "reconciliations") == 0  # refused before reconciling
 
 
+def _settled(settings: Settings, fake: FakeBroker, clock: FixedClock, run_id: int) -> OrderRow:
+    """A buy `paper settle` closed: `cancelled` / `owner_settled_unknown`, no fill,
+    and its `not_executed` outcome."""
+    order = _buy(settings, fake, clock, run_id, "tp-settled", 1.0, fill=False)
+    at = DAY1 - timedelta(minutes=40)
+    _append(
+        settings,
+        OrderEventRow(
+            client_order_id="tp-settled",
+            status="cancelled",
+            reason="owner_settled_unknown",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _outcome(settings, "tp-settled", "not_executed")
+    return order
+
+
+def _fill_row(
+    coid: str,
+    broker_fill_id: str,
+    at: datetime,
+    *,
+    source: str = "broker_feed",
+    superseded_by: int | None = None,
+) -> FillRow:
+    return FillRow(
+        client_order_id=coid,
+        filled_at=at,
+        quantity=1.0,
+        price=PRICE,
+        price_implied=source == "broker_status",
+        broker_fill_id=broker_fill_id,
+        source=source,
+        superseded_by=superseded_by,
+        known_at=at,
+        ingested_at=at,
+    )
+
+
+def _not_ready_now(settings: Settings, window: PaperWindowRow) -> list[str]:
+    with open_read_only(settings) as conn:
+        return _not_ready(conn, window.window_id)  # type: ignore[arg-type]
+
+
+def test_the_closing_stop_names_a_live_fill_journaled_after_the_terminal_event(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Spec req 17 / req 15 (3): a fill the feed delivers for a settled order is
+    journaled like any fill, and `paper stop`'s readiness read then refuses
+    `not_ready`, whatever the order's outcome rows."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    _settled(journal_settings, fake, fixed_clock, run_id)
+    assert _not_ready_now(journal_settings, window) == []  # the chain is complete
+
+    late = DAY1 - timedelta(minutes=30)
+    _append(journal_settings, _fill_row("tp-settled", "late-1", late))
+    _outcome(journal_settings, "tp-settled", "position_return")
+    _requested(journal_settings, window, DAY1 - timedelta(minutes=20))
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        _stop(journal_settings, fake, fixed_clock)
+
+    reason, message = _refusal(excinfo)
+    assert reason == NOT_READY
+    assert "tp-settled" in message
+    assert "live fill journaled after its terminal event" in message
+    assert _count(journal_settings, "reconciliations") == 0
+
+
+def test_a_superseded_feed_fill_after_a_synthetic_one_is_not_named_by_stop(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """Req 8's synthetic fill completes the order; the later feed fill is journaled
+    `superseded_by` it, is no live fill, and leaves the chain complete."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    _buy(journal_settings, fake, fixed_clock, run_id, "tp-synthetic", 1.0, fill=False)
+    at = DAY1 - timedelta(minutes=40)
+    (synthetic,) = _append(
+        journal_settings, _fill_row("tp-synthetic", "synthetic-1", at, source="broker_status")
+    )
+    _append(
+        journal_settings,
+        OrderEventRow(client_order_id="tp-synthetic", status="filled", known_at=at, ingested_at=at),
+    )
+    _outcome(journal_settings, "tp-synthetic", "position_return")
+    _append(
+        journal_settings,
+        _fill_row("tp-synthetic", "feed-1", DAY1 - timedelta(minutes=30), superseded_by=synthetic),
+    )
+    assert _not_ready_now(journal_settings, window) == []
+
+
 def test_the_closing_stop_is_refused_when_a_holding_exceeds_its_residue(
     journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
@@ -776,6 +877,10 @@ def test_abandon_is_refused_while_an_order_the_broker_never_received_is_pending(
         False,
         accept_rejections=False,
     )
+    with open_read_only(journal_settings) as conn:
+        events = order_events_for(conn, window_id=None, client_order_ids=["tp-unsent"])
+    latest = events[-1]  # #571 item 3: the reader's (known_at, ingested_at, rowid) order
+    assert (latest.status, latest.reason) == ("cancelled", "not_received")
     fixed_clock.advance(minutes=1)
     abandon(journal_settings, _connect(journal_settings), fake, fixed_clock, NOTE)
     assert [s.state for s in _stops(journal_settings, window)] == ["abandoned"]
@@ -926,6 +1031,41 @@ def test_the_override_writer_refuses_fields_its_kind_does_not_take(
 
     assert excinfo.value.reason == OVERRIDE
     assert _count(journal_settings, "overrides") == 0
+
+
+@pytest.mark.parametrize(
+    ("session", "security_id"), [(None, None), (date(2026, 10, 30), SPY), (None, SPY)]
+)
+def test_the_override_writer_refuses_settle_order_first(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    session: date | None,
+    security_id: str | None,
+) -> None:
+    """Spec req 17 (#571): `settle_order` is `paper settle`'s alone (it needs a broker
+    read); the writer the page and `paper override` share refuses it as its first
+    branch, before the clock or the store is read."""
+
+    def no_clock() -> datetime:
+        raise AssertionError("the clock is read before the settle_order refusal")
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        override(journal_settings, no_clock, "settle_order", session, security_id, OVERRIDE_REASON)
+
+    reason, message = _refusal(excinfo)
+    assert reason == OVERRIDE
+    assert "settle_order" in message and "paper settle" in message
+    assert _count(journal_settings, "overrides") == 0
+
+
+def test_the_override_writer_refuses_settle_order_with_no_window(
+    journal_settings: Settings, fixed_clock: FixedClock
+) -> None:
+    """The refusal is the kind's, not `no_window`: the kind is never the writer's."""
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        override(journal_settings, fixed_clock, "settle_order", None, None, OVERRIDE_REASON)
+    assert excinfo.value.reason == OVERRIDE
 
 
 def test_override_refuses_more_than_one_open_window(
@@ -1359,3 +1499,12 @@ def test_abandon_says_the_switch_is_not_engaged_when_its_fault_row_fails(
         for note in getattr(excinfo.value, "__notes__", [])
     )
     assert _stops(journal_settings, window) == []
+
+
+def test_the_engage_kind_is_the_shared_schema_constant() -> None:
+    """#691: the window's `engage_kill_switch` checks read `schema.ENGAGE_KILL_SWITCH_KIND`,
+    never a quoted copy of it, so a renamed kind cannot leave the window matching a
+    stale string."""
+    assert window_module._ENGAGE_KILL_SWITCH is schema.ENGAGE_KILL_SWITCH_KIND
+    code = re.sub(r'"""[\s\S]*?"""', "", Path(window_module.__file__).read_text())
+    assert f'"{schema.ENGAGE_KILL_SWITCH_KIND}"' not in code

@@ -190,6 +190,15 @@ def test_every_order_path_module_requires_the_safety_review() -> None:
     )
 
 
+def test_merge_train_paths_require_the_safety_review() -> None:
+    for path in (
+        "scripts/merge_train.py",
+        "tests/test_merge_train.py",
+        ".github/rulesets/protect-main.json",
+    ):
+        assert "safety-reviewer" in ready_pr.required_reviews([path]), path
+
+
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
     # a rename must not silently disable the gate (#357: exec/ vs execution/)
     for prefix in (*ready_pr.QUANT_PREFIXES, *ready_pr.SAFETY_PREFIXES):
@@ -749,3 +758,14 @@ def test_a_moved_module_counts_as_deleted_at_its_old_path() -> None:
         "--diff-filter=D",
         "origin/main...HEAD",
     ) in moved.calls
+
+
+def test_full_suite_runs_in_parallel_only_with_xdist() -> None:
+    """#581: `-n auto` is added to the bare full-suite command, never to a targeted run."""
+    full = ready_pr.PYTEST_CHECK
+    assert ready_pr.parallel_if_full_suite(full, xdist=True) == (*full, "-n", "auto")
+    assert ready_pr.parallel_if_full_suite(full, xdist=False) == full
+    targeted = (*full, "tests/test_cli.py")
+    assert ready_pr.parallel_if_full_suite(targeted, xdist=True) == targeted
+    other = ("uv", "run", "mypy")
+    assert ready_pr.parallel_if_full_suite(other, xdist=True) == other

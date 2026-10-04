@@ -87,7 +87,7 @@ def test_edgar_defaults() -> None:
     # path: must be absolute and end with data/edgar_cache regardless of CWD.
     assert Path(s.edgar.cache_dir).is_absolute()
     assert Path(s.edgar.cache_dir) == Path(__file__).resolve().parents[1] / "data" / "edgar_cache"
-    assert s.edgar.requests_per_second == pytest.approx(10.0)
+    assert s.edgar.requests_per_second == pytest.approx(9.0)
     assert s.edgar.retry_backoff_seconds == pytest.approx(1.0)
     assert s.edgar.request_timeout_seconds == pytest.approx(30.0)
     assert s.edgar.header_bytes == 4096

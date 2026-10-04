@@ -346,6 +346,22 @@ def test_a_decision_event_closes_the_decision(status: str, reason: str) -> None:
     assert not state.written_off
 
 
+def test_a_closing_event_carries_its_reason_as_event_reason() -> None:
+    d = _decision(side="sell", planned_quantity=0.4, decision="forced_exit", reason="delisted")
+    state = _state(d, decision_events=[_decision_event(d, "skipped", "dust")])
+    assert (state.state, state.event_reason) == (State.CLOSED, "dust")
+
+
+def test_event_reason_is_none_when_no_closing_event_closed_the_state() -> None:
+    # Closed by the decision's own kind (a skip/dust decision), not by an event.
+    state = _state(_decision(side=None, decision="dust"))
+    assert state.event_reason is None
+    # Open: no closing event at all.
+    d = _decision(side="buy", planned_notional=100.0, target=100.0)
+    open_state = _state(d)
+    assert open_state.event_reason is None
+
+
 def test_a_deferred_buy_is_open_with_no_row() -> None:
     d = _decision(side="buy", planned_notional=100.0, target=100.0)
     state = _state(d)
@@ -504,8 +520,15 @@ def test_a_buy_with_a_sell_in_flight_at_submit_stays_open() -> None:
         (("cancel_requested", "halt"), ("cancel_failed", "halt"), ("expired", None)),
         (("cancel_failed", "halt"), ("cancelled", None)),
         (("cancelled", "not_received"),),
+        (("cancelled", "owner_settled_unknown"),),
     ],
-    ids=["halt-cancel", "halt-cancel-failed", "cancel-failed-only", "not-received"],
+    ids=[
+        "halt-cancel",
+        "halt-cancel-failed",
+        "cancel-failed-only",
+        "not-received",
+        "owner-settled",
+    ],
 )
 def test_a_halt_or_a_crash_is_not_a_funding_shortfall(
     extra: tuple[tuple[str, str | None], ...],
@@ -513,6 +536,16 @@ def test_a_halt_or_a_crash_is_not_a_funding_shortfall(
     d, o, events = _terminal_buy(extra=extra)
     state = _state(d, [o], events)
     assert (state.state, state.written_off) == (State.OPEN, False)
+
+
+def test_an_owner_settled_buy_stays_open_for_its_remainder() -> None:
+    """Spec req 17 (#571): `paper settle` journals the order `cancelled` with reason
+    `owner_settled_unknown` and no fill; the decision stays open for its remainder,
+    protected from the funding write-off as a `not_received` cancel is."""
+    d, o, events = _terminal_buy(extra=(("cancelled", "owner_settled_unknown"),))
+    state = _state(d, [o], events, [_fill(o, 4, 50.0)])
+    assert (state.state, state.written_off) == (State.OPEN, False)
+    assert state.remainder == Remainder(quantity=6.0, notional=300.0)
 
 
 def test_a_cancel_without_the_halt_reason_does_not_protect_the_buy() -> None:

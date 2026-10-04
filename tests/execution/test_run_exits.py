@@ -11,7 +11,7 @@ corporate actions of its own.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -27,13 +27,21 @@ from execution.test_run_trade import (
     split,
     window,
 )
-from tradepartner.adapters.broker import Asset
+from tradepartner.adapters.broker import Asset, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution import run as run_module
+from tradepartner.execution import switch
 from tradepartner.execution.planning import PlanOutcome
-from tradepartner.store.journal import AdjustmentRow, PaperRunRow, PaperWindowRow
+from tradepartner.store.journal import (
+    AdjustmentRow,
+    DecisionRow,
+    OrderEventRow,
+    OrderRow,
+    PaperRunRow,
+    PaperWindowRow,
+)
 
 __all__ = ["env", "window"]  # the fixtures, re-exported for this module's tests
 
@@ -316,6 +324,332 @@ def test_a_second_run_on_the_session_leaves_an_accepted_exit_sell_alone(
     assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
 
 
+def test_a_second_run_with_a_reused_ticker_leaves_an_accepted_exit_sell_alone(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Same shape as `test_a_second_run_on_the_session_leaves_an_accepted_exit_sell_alone`,
+    but a later issuer picks up TRNS between the two runs. The second run's
+    sell phase has no attempt left for SEC_TRANSFER (its exit sell is
+    already `accepted`), so the reused-ticker check (#568 item 2), now
+    scoped in `_phase_assets` to the phase's own attempt scope, never looks
+    at it: the run still ends `ok` with the open order untouched, not the
+    halt the check would have raised had it still run in `_read_book` for
+    every name of the batch's rows regardless of whether this phase
+    attempts it (the regression this PR's review caught)."""
+    bought(env)
+    ended_before(env, MAY_3)
+    env.fill_on_sleep = False
+    first = env.run(at(MAY_3))
+    assert first.status == "ok", env.result(env.latest_run())
+    ((decision_id, _reason, _side, _run),) = exits(env, "SEC_TRANSFER")
+    ((coid, _decision, _phase, _quantity, _session),) = exit_orders(env, "SEC_TRANSFER")
+    assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+    submitted = len(env.submits())
+
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    second = env.run(at(MAY_3, 12, 45))
+
+    assert second.status == "ok", env.result(env.latest_run())
+    assert not any("outside the submit window" in n for n in second.notes)
+    assert [e[0] for e in exits(env, "SEC_TRANSFER")] == [decision_id]
+    assert [o[0] for o in exit_orders(env, "SEC_TRANSFER")] == [coid]
+    assert len(env.submits()) == submitted
+    assert [o.client_order_id for o in env.fake.open_orders()] == [coid]
+
+
+def test_a_reused_ticker_under_a_kill_engaged_after_the_run_level_check_skips(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reused-ticker check (#568 item 2) must not run before the
+    wrapper's own kill-switch read (`_engaged`, inside `execute`): a kill
+    written after step 6's run-level check (e.g. during step 4's
+    `positions` read, mirroring
+    `test_a_kill_written_during_step_4_is_caught_before_any_submit` in
+    test_run_trade.py) but before the sells phase still ends
+    `skipped_kill_switch`, not a halt, even with a reused ticker present
+    (the regression this PR's review caught: the check used to run in
+    `_read_book`, before `_engaged` was ever read)."""
+    assert window.window_id is not None
+    window_id = window.window_id
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    original = env.fake.positions
+    killed: list[int | switch.WriteFailed] = []
+
+    def kill_at_step_4() -> object:
+        if not killed:
+            killed.append(
+                switch.engage(
+                    env.settings,
+                    env.clock,
+                    window_id=window_id,
+                    source="owner",
+                    reason="the owner kills the run before the sells phase",
+                )
+            )
+        return original()
+
+    monkeypatch.setattr(env.fake, "positions", kill_at_step_4)
+
+    outcome = env.run(at(MAY_3))
+
+    assert [isinstance(k, int) for k in killed] == [True]
+    assert outcome.status == "skipped_kill_switch", env.result(env.latest_run())
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+
+
+def test_an_unanswered_delisted_name_halts_the_whole_sells_phase(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's decision on #410 (2026-10-01) keeps this fail-closed until
+    T48c: a forced-exit name the broker's `assets` read does not answer for
+    (`wrapper._phase_assets`) halts the whole sells phase, the rebalance's
+    sells included, before anything is submitted (#568 item 1)."""
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    original_assets = env.fake.assets
+
+    def unanswering(symbols: list[str]) -> dict[str, Asset]:
+        # The run's own pre-read (`run._Run.assets_read`, for every held
+        # position) must still answer, so only the wrapper's own sells-phase
+        # read (`wrapper._phase_assets`, asked for just the forced-exit
+        # name) goes unanswered.
+        answer = original_assets(symbols)
+        if list(symbols) == ["TRNS"]:
+            answer.pop("TRNS", None)
+        return answer
+
+    monkeypatch.setattr(env.fake, "assets", unanswering)
+
+    with pytest.raises(ValueError, match=r"the assets read did not answer for \['TRNS'\]"):
+        env.run(at(MAY_3))
+
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+    ((_decision_id, reason, side, _run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side) == ("delisted", "sell")
+    status, fault_type, _message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "ValueError")
+
+
+def test_a_reused_ticker_never_resolves_to_the_new_issuers_asset(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """SEC_TRANSFER's ticker (TRNS) is picked up by a new issuer, a listing
+    known at close(S-1): the forced exit for the delisted SEC_TRANSFER must
+    never resolve its `assets` read against that reused symbol, since the
+    broker would answer for the new issuer, not the one this run means. It
+    fails closed instead of submitting anything (#568 item 2)."""
+    bought(env)
+    held = env.held()["TRNS"]
+    submitted_before = len(env.submits())
+    ended_before(env, MAY_3)
+    reused_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    with pytest.raises(ValueError, match="TRNS"):
+        env.run(at(MAY_3))
+
+    assert len(env.submits()) == submitted_before
+    assert exit_orders(env, "SEC_TRANSFER") == []
+    assert env.held()["TRNS"] == pytest.approx(held)
+    status, fault_type, _message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "ValueError")
+
+
+def test_a_reusing_listing_known_after_close_s_minus_1_is_ignored(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) is itself point-in-time: a new
+    issuer's listing known only after close(S-1) (`cut`) is not in the
+    universe this run reads (`listings_as_of`'s own `known_at` filter), so
+    it is no collision and the forced exit still submits normally."""
+    bought(env)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    cut = session_close(previous_session(MAY_3))
+    reused_known_at = cut + timedelta(minutes=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": reused_known_at,
+            "ingested_at": reused_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    ((_coid, ordered, phase, quantity, session),) = exit_orders(env, "SEC_TRANSFER")
+    assert (ordered, phase, session) == (decision_id, "exit", MAY_3)
+    assert quantity == pytest.approx(held)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_reusing_listings_valid_from_after_s_is_ignored(env: Env, window: PaperWindowRow) -> None:
+    """Same shape, but the reusing listing is known well before close(S-1)
+    while its own `valid_from` does not take effect until after S:
+    `current_listings` (as of day=S) excludes it on that filter alone, so
+    it is no collision either, and the exit still submits."""
+    bought(env)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    future_valid_from = MAY_3 + timedelta(days=1)
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_TRANSFER_NEW_ISSUER",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": future_valid_from,
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    ((_coid, ordered, phase, quantity, session),) = exit_orders(env, "SEC_TRANSFER")
+    assert (ordered, phase, session) == (decision_id, "exit", MAY_3)
+    assert quantity == pytest.approx(held)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_an_older_owner_of_a_now_delisted_names_ticker_never_blocks_its_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) fires only for a *later* issuer:
+    a now-dead security that held SEC_TRANSFER's ticker before SEC_TRANSFER
+    itself did (SEC_TRANSFER took the ticker over, not the other way round)
+    never blocks SEC_TRANSFER's own forced exit."""
+    bought(env)
+    ended_before(env, MAY_3)
+    ((own_valid_from,),) = env.query(
+        "SELECT valid_from FROM listings WHERE security_id = 'SEC_TRANSFER' "
+        "ORDER BY valid_from DESC LIMIT 1"
+    )
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=2)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_GHOST_HELD_TRNS_FIRST",
+            "ticker": "TRNS",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": own_valid_from - timedelta(days=1),
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((_decision_id, reason, side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, side, run_id) == ("delisted", "sell", outcome.run_id)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_stale_delisted_securitys_shared_ticker_never_blocks_a_live_name(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The reused-ticker check (#568 item 2) only ever looks at a name whose
+    own listing has ended: a dormant, unrelated security that happens to
+    share a currently-held, still-listed name's ticker (SPFT, never
+    delisted in this test) never blocks that name's own run, even though its
+    `valid_from` has the same shape a real reuse would."""
+    bought(env)
+    held = env.held()["SPFT"]
+    ghost_known_at = session_close(previous_session(MAY_3)) - timedelta(hours=1)
+    env.insert(
+        "listings",
+        {
+            "security_id": "SEC_GHOST_SHARES_SPFT",
+            "ticker": "SPFT",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": F_0_PLUS_1,
+            "known_at": ghost_known_at,
+            "ingested_at": ghost_known_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+    outcome = env.run(at(MAY_3))
+
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert env.held()["SPFT"] == pytest.approx(held)
+
+
 class _NoBroker:
     """A gate or broker that fails the test on any use."""
 
@@ -379,3 +713,183 @@ def test_nothing_traded_while_fills_lag_on_a_fill_session(
     assert context.notes == [
         "fills_lagging: nothing planned or traded; the rebalance stays pending"
     ]
+
+
+# --- an open order's name with no bar (#685, #569 owner option (b)) ---------------------
+
+NO_BAR = "SEC_NO_BAR"  # no `prices_daily` row at all: no reference price on any S
+NO_BAR_SYMBOL = "NOBR"
+
+
+def stale_order(
+    env: Env,
+    made: datetime,
+    *,
+    side: str = "buy",
+    quantity: float | None = 2.0,
+    notional: float | None = None,
+) -> str:
+    """An earlier run's non-terminal order of `NO_BAR` (a quantity buy unless
+    told otherwise), accepted by the broker and never filled: the stale order
+    #569 says must not stop the run. Its name is neither held nor in a
+    pending rebalance."""
+    run_id = env.latest_run()
+    (decision_id,) = env.append(
+        DecisionRow(
+            run_id=run_id,
+            rebalance_session=None,
+            security_id=NO_BAR,
+            side=side,
+            planned_quantity=quantity,
+            planned_notional=notional,
+            whole_share=False,
+            decision="forced_exit",
+            reason="delisted",
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+    coid = f"tp-stale-no-bar-{side}"
+    env.prices[NO_BAR_SYMBOL] = 10.0
+    placed = env.fake.submit(
+        OrderRequest(
+            coid,
+            NO_BAR_SYMBOL,
+            Side.BUY if side == "buy" else Side.SELL,
+            quantity=quantity,
+            notional=notional,
+        )
+    )
+    env.append(
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,  # type: ignore[arg-type]
+            run_id=run_id,
+            session=made.date(),
+            attempt=1,
+            phase="exit",
+            security_id=NO_BAR,
+            symbol=NO_BAR_SYMBOL,
+            side=side,
+            quantity=quantity,
+            notional=notional,
+            sells_in_flight_at_submit=False,
+            known_at=made,
+            ingested_at=made,
+        ),
+        OrderEventRow(client_order_id=coid, status="pending", known_at=made, ingested_at=made),
+        OrderEventRow(
+            client_order_id=coid,
+            status="accepted",
+            broker_order_id=placed.broker_order_id,
+            known_at=made,
+            ingested_at=made,
+        ),
+    )
+    return coid
+
+
+def fill_all_but(env: Env, coid: str) -> None:
+    """Fill every open order but `coid` when the run sleeps."""
+    env.fill_on_sleep = False
+
+    def fill(_now: datetime) -> None:
+        for order in env.fake.open_orders():
+            if order.client_order_id != coid:
+                env.fake.simulate_fill(order.client_order_id)
+
+    env.on_sleep.append(fill)
+
+
+@pytest.mark.parametrize(
+    ("side", "quantity", "notional"),
+    [
+        pytest.param("buy", 2.0, None, id="quantity-buy"),
+        # `unfilled_sells` would price a notional sell; step 7's open sells
+        # are the held names' only, so this one is never priced (#685).
+        pytest.param("sell", None, 30.0, id="notional-sell"),
+    ],
+)
+def test_an_unrelated_stale_order_with_no_bar_does_not_stop_a_mark_run(
+    env: Env,
+    window: PaperWindowRow,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+) -> None:
+    """Step 7's read prices the held names strictly; a name only a stale open
+    order (and its in-flight decision) brings in, with no bar at close(S-1),
+    is priced only if a number reads it, and none does here (#685)."""
+    bought(env)
+    stale_order(env, at(F_0_PLUS_1, 15, 0), side=side, quantity=quantity, notional=notional)
+    outcome = env.run(at(MAY_3))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert outcome.kind == "mark"
+
+
+def test_an_unrelated_stale_order_with_no_bar_does_not_block_a_forced_exit(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """End to end (#685, #569 (b)): the stale order neither halts step 7 nor the
+    wrapper's sells-only exit batch; the delisted name is sold whole."""
+    bought(env)
+    coid = stale_order(env, at(F_0_PLUS_1, 15, 0))
+    fill_all_but(env, coid)
+    held = env.held()["TRNS"]
+    ended_before(env, MAY_3)
+    outcome = env.run(at(MAY_3))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((decision_id, reason, _side, run_id),) = exits(env, "SEC_TRANSFER")
+    assert (reason, run_id) == ("delisted", outcome.run_id)
+    ((_coid, ordered, _phase, quantity, _session),) = exit_orders(env, "SEC_TRANSFER")
+    assert ordered == decision_id
+    assert quantity == pytest.approx(held)
+    assert env.held().get("TRNS", 0.0) < 1e-6
+
+
+def test_a_held_name_with_no_bar_still_halts_step_7(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The held names stay strict: a held name whose reference price cannot be
+    read still stops the run at step 7's read, before any exit is journaled."""
+    bought(env)
+    ended_before(env, MAY_3)
+    real = run_module.planning.reference_prices
+
+    def no_trns(conn: object, session: date, names: object, actions: object) -> object:
+        if "SEC_TRANSFER" in set(names):  # type: ignore[call-overload]
+            raise ValueError("no reference price for SEC_TRANSFER")
+        return real(conn, session, names, actions)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(run_module.planning, "reference_prices", no_trns)
+    with pytest.raises(ValueError, match="SEC_TRANSFER"):
+        env.run(at(MAY_3))
+    assert exits(env, "SEC_TRANSFER") == []
+
+
+def test_an_open_decision_of_a_name_with_no_bar_raises_its_reason_when_read(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Deferred, not dropped (#685): an open decision of a name with no bar,
+    whose remainder step 7 must price, still stops the run, with the reason
+    the price read failed, before any exit is journaled."""
+    bought(env)
+    made = at(F_0_PLUS_1, 15, 0)
+    env.append(
+        DecisionRow(
+            run_id=env.latest_run(),
+            rebalance_session=None,
+            security_id=NO_BAR,
+            side="sell",
+            planned_notional=30.0,
+            whole_share=False,
+            decision="forced_exit",
+            reason="delisted",
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+    ended_before(env, MAY_3)
+    with pytest.raises(ValueError, match=r"no reference price for SEC_NO_BAR: no bar on or before"):
+        env.run(at(MAY_3))
+    assert exits(env, "SEC_TRANSFER") == []

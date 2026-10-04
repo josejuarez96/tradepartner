@@ -48,6 +48,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
@@ -128,7 +129,10 @@ SAFETY_PREFIXES = (
     "tests/test_ready_pr.py",
     "scripts/fragments.py",
     "scripts/no_push_to_main.sh",
+    "scripts/merge_train.py",
+    "tests/test_merge_train.py",
     ".github/workflows/",
+    ".github/rulesets/",
     ".claude/agents/",
     ".claude/skills/",
     "tests/fixtures/alpaca/",
@@ -147,6 +151,9 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "pytest", "-q", "tests/test_docs_budget.py"),
 )
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
+# The full suite runs in parallel when pytest-xdist is installed (#581), as CI does. xdist
+# workers each get their own subdirectory of any --basetemp, so that flag still works.
+XDIST_ARGS: tuple[str, ...] = ("-n", "auto")
 # Targeted local pytest (#456): the tests a diff maps to, or the full suite when the mapping
 # is unclear. CI always runs the full suite, so a miss here is caught there, later.
 FULL_SUITE_FILES = ("pyproject.toml", "uv.lock", ".python-version")
@@ -211,6 +218,16 @@ class Runner(Protocol):
 
 
 # ── pure logic ──────────────────────────────────────────────────────────────────
+
+
+def parallel_if_full_suite(cmd: Sequence[str], *, xdist: bool) -> tuple[str, ...]:
+    """The full-suite pytest command with ``-n auto`` added when xdist is installed (#581).
+
+    Targeted runs (pytest plus file paths) and every other command pass through unchanged.
+    """
+    if xdist and tuple(cmd) == PYTEST_CHECK:
+        return (*cmd, *XDIST_ARGS)
+    return tuple(cmd)
 
 
 def resolve_append_conflicts(text: str) -> str | None:
@@ -666,6 +683,7 @@ class ShellRunner:
         return self._git(*args, check=False).returncode == 0
 
     def run_check(self, cmd: Sequence[str]) -> bool:
+        cmd = parallel_if_full_suite(cmd, xdist=importlib.util.find_spec("xdist") is not None)
         return subprocess.run(list(cmd), cwd=self.root, check=False).returncode == 0
 
     def read(self, path: str) -> str:

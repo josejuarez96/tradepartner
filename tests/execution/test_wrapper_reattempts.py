@@ -9,9 +9,10 @@ import pytest
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES
 from tradepartner.adapters.fake_broker import Accept, Expire, FillAt, PartialFill
-from tradepartner.execution import switch, wrapper
+from tradepartner.execution import phases, switch, wrapper
 from tradepartner.execution.collect import WriteOffContext
 from tradepartner.execution.plan import RebalanceState, State, rebalance_state
+from tradepartner.execution.reattempts import attempt_scope
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
     ReconciliationRow,
@@ -21,7 +22,9 @@ from tradepartner.store.journal import (
 )
 
 from .test_wrapper_phases import (
+    FROZEN,
     PRICE,
+    SYMBOLS,
     T_I,
     A,
     B,
@@ -393,17 +396,47 @@ def test_expired_buy_is_written_off_once_not_twice(
     assert _write_off_amounts(env) == [(buy.decision_id, 3000.0)]
 
 
+@pytest.mark.parametrize("engaged", [True, False])
 def test_engaged_switch_before_buys_first_submit_writes_off_no_deferred_buy(
-    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, engaged: bool
 ) -> None:
     """The T60b pin (#487): a switch read engaged before the buys phase's
-    first submit never collects, so it writes off no deferred buy, even with
-    the collection-time write-off path (#538) now wired in."""
+    first submit never sizes or collects, so it writes off no deferred buy,
+    even with the collection-time write-off path (#538) wired in. Not
+    trivially (#534 item 5): the phase is the rebalance's last and its sizing
+    defers the buy (the reserve takes all the cash), and the same batch with
+    the switch released writes that buy off."""
     env.new_fake(cash=2000.0)
     _open_buy(env, C, 2000.0)
     buy = _decision(env, A, "buy", notional=3000.0)
-    _override(env)
-    outcome = _execute(_gate(env, alerter_conn), env, [buy])
-    assert outcome.status == "skipped_kill_switch"
-    assert outcome.written_off == ()
-    assert _decision_events(env.settings) == []
+    gate = _gate(env, alerter_conn)
+    book = gate._read_book(env.run, [buy])
+    assert attempt_scope([buy], book.states, phase="buy").last
+    cash = gate._buys_cash(env.fake.account(), book, S)
+    assets = {A: env.fake.assets([SYMBOLS[A]])[SYMBOLS[A]]}
+    built = phases.buy_orders(
+        [buy],
+        book.states,
+        cash,
+        phases.PhaseOrders((), ()),
+        book.price_of,
+        book.costs,
+        assets,
+        FROZEN,
+        session=S,
+    )
+    assert (cash, built.orders, built.deferred) == (0.0, (), (buy.decision_id,))
+    if engaged:
+        _override(env)
+
+    outcome = _execute(gate, env, [buy])
+
+    if engaged:
+        assert outcome.status == "skipped_kill_switch"
+        assert outcome.written_off == ()
+        assert _decision_events(env.settings) == []
+    else:
+        assert outcome.status == "ok"
+        assert outcome.deferred == outcome.written_off == (buy.decision_id,)
+        assert _decision_events(env.settings) == [(buy.decision_id, "written_off", "unfunded")]
+    assert _submits(env.fake) == []

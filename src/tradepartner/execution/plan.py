@@ -114,6 +114,7 @@ from tradepartner.store.schema import (
     LEFT_TARGETS_REASON,
     LEFT_UNIVERSE_REASON,
     NOT_RECEIVED_REASON,
+    OWNER_SETTLED_UNKNOWN_REASON,
     UNTARGETED_RECEIPT_REASON,
     WINDOW_STOP_REASON,
 )
@@ -137,6 +138,11 @@ _PLAN_TRADE_KINDS = frozenset({_TRADE, _OVERRIDE})
 _HALT = HALT_REASON
 _HALT_CANCEL_STATUSES = frozenset({"cancel_requested", "cancel_failed"})
 _NOT_RECEIVED = NOT_RECEIVED_REASON
+_OWNER_SETTLED_UNKNOWN = OWNER_SETTLED_UNKNOWN_REASON
+#: Reasons of a terminal `cancelled` event that is not a funding shortfall: the
+#: broker never received the order (req 4), or the owner settled it without a
+#: fill (`paper settle`, req 17, #571).
+_PROTECTED_CANCEL_REASONS = frozenset({_NOT_RECEIVED, _OWNER_SETTLED_UNKNOWN})
 _CANCELLED = "cancelled"
 _SKIPPED = "skipped"
 _CARRIED_RESIDUE = "carried_residue"
@@ -196,12 +202,19 @@ class DecisionState:
     `closed`, reason `written_off`) although no `written_off` decision event
     exists yet: the run step that sees it appends that row with the remainder's
     notional as `unfunded_notional`.
+
+    `event_reason` is the reason of the `decision_events` row that closed the
+    state, when a closing event is what closed it (e.g. `dust` or
+    `untradable`); it is `None` when the state is closed for any other
+    reason (a `skip_*`/`dust` decision kind, a no-side `override`, a buy
+    write-off, or a state that is not closed at all).
     """
 
     state: State
     reason: str | None = None
     remainder: Remainder | None = None
     written_off: bool = False
+    event_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -465,11 +478,12 @@ def _is_terminal(events: Iterable[OrderEventRow]) -> bool:
 
 
 def _protected_from_write_off(events: Sequence[OrderEventRow]) -> bool:
-    """A halt cancel or a `not_received` cancel: not a funding shortfall."""
+    """A halt cancel, a `not_received` cancel or an `owner_settled_unknown` cancel
+    (req 17, #571): not a funding shortfall."""
     for event in events:
         if event.status in _HALT_CANCEL_STATUSES and event.reason == _HALT:
             return True
-        if event.status == _CANCELLED and event.reason == _NOT_RECEIVED:
+        if event.status == _CANCELLED and event.reason in _PROTECTED_CANCEL_REASONS:
             return True
     return False
 
@@ -497,8 +511,8 @@ def decision_state(
     whose latest order is terminal with a remainder at or above the minimum
     is written off when that order was submitted with no sell of its
     rebalance in flight, has no `cancel_requested`/`cancel_failed` event with
-    reason `halt`, and did not end `cancelled` with reason `not_received`;
-    otherwise it stays open.
+    reason `halt`, and did not end `cancelled` with reason `not_received` or
+    `owner_settled_unknown` (`paper settle`, req 17); otherwise it stays open.
     """
     _check_session(session)
     decision_id = _decision_id(decision)
@@ -510,7 +524,9 @@ def decision_state(
     if mine_events:
         latest_event = max(enumerate(mine_events), key=lambda p: (p[1].known_at, p[0]))[1]
         if latest_event.status in _CLOSING_EVENTS:
-            return DecisionState(State.CLOSED, latest_event.status)
+            return DecisionState(
+                State.CLOSED, latest_event.status, event_reason=latest_event.reason
+            )
 
     mine = _orders_of(decision, orders)
     events_by_order: dict[str, list[OrderEventRow]] = {o.client_order_id: [] for o in mine}
