@@ -121,6 +121,49 @@ def _merge_batches(payloads: list[Any]) -> dict[str, Any]:
     return merged
 
 
+def _drop_actions_seen_in_earlier_batches(payloads: list[Any]) -> list[Any]:
+    """`payloads` without the action rows an earlier batch already returned (#816).
+
+    Alpaca returns an action that names two symbols (e.g. a reverse split with
+    a `new_symbol`) to the batch holding either symbol, so the same `id` can
+    come back once per batch. A row is dropped only when an earlier batch held
+    a row of the same category and `id` that is identical in every field; a
+    differing row with that `id` raises `ValueError` (fail closed). Rows
+    without an `id`, and repeats inside one response, are left alone for the
+    parser to judge.
+    """
+    seen: dict[tuple[str, str], Any] = {}
+    kept: list[Any] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):  # raw_data=True always returns a dict
+            raise TypeError(f"expected a raw dict payload, got {type(payload).__name__}")
+        batch_seen: dict[tuple[str, str], Any] = {}
+        filtered: dict[str, Any] = {}
+        for category, rows in payload.items():
+            if not isinstance(rows, list):
+                filtered[category] = rows
+                continue
+            filtered[category] = []
+            for row in rows:
+                action_id = row.get("id") if isinstance(row, dict) else None
+                if action_id is None:
+                    filtered[category].append(row)
+                    continue
+                key = (category, action_id)
+                if key in seen:
+                    if row != seen[key]:
+                        raise ValueError(
+                            f"batches disagree on the {category} action {action_id!r}: "
+                            f"{seen[key]!r} != {row!r}"
+                        )
+                    continue
+                batch_seen.setdefault(key, row)
+                filtered[category].append(row)
+        seen.update(batch_seen)
+        kept.append(filtered)
+    return kept
+
+
 def _session_bounds_utc(start: date, end: date) -> tuple[datetime, datetime]:
     """`[start, end]` session dates as an inclusive tz-aware UTC instant range.
 
@@ -198,17 +241,20 @@ def corporate_actions(
     fetches everything. Symbols go out in batches of at most
     `alpaca.symbols_per_request` (#789), each paged to completion, and the
     per-type lists are concatenated in batch order; any failing batch fails
-    the whole call.
+    the whole call. An action an earlier batch already returned identically is
+    dropped, and one returned differently fails the call (#816).
     """
     settings = settings or get_settings()
     client = _corporate_actions_client(settings)
     return _merge_batches(
-        [
-            client.get_corporate_actions(
-                CorporateActionsRequest(symbols=batch, start=start, end=end, limit=None)
-            )
-            for batch in _symbol_batches(symbols, settings)
-        ]
+        _drop_actions_seen_in_earlier_batches(
+            [
+                client.get_corporate_actions(
+                    CorporateActionsRequest(symbols=batch, start=start, end=end, limit=None)
+                )
+                for batch in _symbol_batches(symbols, settings)
+            ]
+        )
     )
 
 
