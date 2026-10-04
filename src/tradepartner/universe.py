@@ -24,7 +24,14 @@ reported once, under the first rule it fails:
    `universe.min_median_dollar_volume`. Skipped, and recorded as disabled,
    when `universe.liquidity_rule_enabled` is false.
 6. `history`: every XNYS session in the `universe.min_history_months`
-   calendar months up to and including the session has a bar.
+   calendar months up to and including the session has a bar
+   (`missing_bars`), and no session in them carries a price jump
+   (`price_jump`, #787): `store.asof.price_jumps_as_of` at `t`, not in
+   `universe.accepted_price_jumps`. `price_jump` is not missing data.
+
+Every rule reads bars with `traded_only=True` (#787): a zero-volume bar is
+missing, not a price, so it fails rule 6 and is no close for rules 4 and 8
+and no dollar volume for rule 5.
 7. `shares`: the latest `shares_outstanding` fact known at `t` is at most
    `universe.max_shares_age_days` old at the session. Rows sharing that
    `as_of_date` are never summed: the one row with a class member wins
@@ -69,6 +76,7 @@ from tradepartner.store.asof import (
     _validate_t,
     facts_as_of,
     live_actions_as_of,
+    price_jumps_as_of,
     prices_as_of,
 )
 from tradepartner.store.classify import classifications_as_of
@@ -279,7 +287,7 @@ def universe_as_of(
     apply("sector", {sid: utility(sid) for sid in alive})
 
     bars: dict[str, dict[date, tuple[float, int]]] = defaultdict(dict)
-    for row in prices_as_of(conn, t, alive).iter_rows(named=True):
+    for row in prices_as_of(conn, t, alive, traded_only=True).iter_rows(named=True):
         if row["session"] <= session:
             bars[row["security_id"]][row["session"]] = (row["close"], row["volume"])
     sized = list(alive)  # passed rules 1-3: the classes a company's cap may sum
@@ -307,6 +315,10 @@ def universe_as_of(
         "history",
         {sid: "" if all(s in bars[sid] for s in history) else "missing_bars" for sid in alive},
     )
+    jumps = price_jumps_as_of(conn, t, alive, settings=settings).filter(
+        ~pl.col("accepted") & pl.col("session").is_in(list(history))
+    )
+    apply("history", dict.fromkeys(jumps["security_id"].to_list(), "price_jump"))
 
     latest_shares, ambiguous = latest_shares_as_of(conn, t, sized)
 

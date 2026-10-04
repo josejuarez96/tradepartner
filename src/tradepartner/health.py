@@ -47,6 +47,12 @@ here is this module's and is stated once:
   delisted at `t` (Forms 25 and 25-NSE; a transfer counts as delisted until its
   new listing is known, spec req 4), with ticker, exchange, class, form, filing
   time, end session and effective date.
+- **Price jumps** (`price_jumps`): the owner's review list (#787),
+  `store.asof.price_jumps_as_of` at `t` over every security: each one-day
+  close move between traded bars outside the `universe` jump bounds that no
+  split or dividend known at `t` explains, with `accepted` from
+  `universe.accepted_price_jumps`. An unaccepted jump fails universe rule 6
+  while it is in the history window; accepting one is a config change.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
@@ -101,7 +107,7 @@ from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
-from tradepartner.store.asof import _validate_t
+from tradepartner.store.asof import _validate_t, price_jumps_as_of
 from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
 from tradepartner.store.delistings import (
     DELISTED,
@@ -272,6 +278,18 @@ class DelistedNames:
 
 
 @dataclass(frozen=True, eq=False)
+class PriceJumps:
+    """The price-jump review list at `t` (#787), one row per jump."""
+
+    frame: pl.DataFrame
+
+    @property
+    def pending(self) -> pl.DataFrame:
+        """The jumps the owner has not accepted."""
+        return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
 
@@ -297,6 +315,7 @@ class HealthReport:
     unclassifiable: Unclassifiable
     static_reliance: StaticReliance
     delisted: DelistedNames
+    price_jumps: PriceJumps
     settings: dict[str, Any]
     integrity: tuple[IntegrityCheck, ...]
 
@@ -334,6 +353,7 @@ def health_report(
         unclassifiable=_unclassifiable(securities, classes),
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
+        price_jumps=PriceJumps(price_jumps_as_of(conn, t, settings=settings)),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,

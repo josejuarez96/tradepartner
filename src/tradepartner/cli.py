@@ -243,6 +243,13 @@ def _print_report(report: HealthReport) -> None:
     echo(f"delisted names: {report.delisted.count}")
     for row in report.delisted.frame.iter_rows(named=True):
         echo(f"  {row['security_id']} {row['ticker']} {row['exchange']} ended {row['end_session']}")
+    jumps = report.price_jumps
+    echo(f"price jumps: {jumps.pending.height} to review, {jumps.frame.height} in all")
+    for row in jumps.pending.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']}@{row['session']} {row['prev_close']} -> {row['close']} "
+            f"(x{row['ratio']:.2f} since {row['prev_session']})"
+        )
     echo(f"settings: {report.settings}")
     echo("integrity:")
     for check in report.integrity:
