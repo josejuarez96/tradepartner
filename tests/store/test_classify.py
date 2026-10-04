@@ -32,9 +32,11 @@ from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.config import Settings
 from tradepartner.store import schema
 from tradepartner.store.classify import (
+    EQUITY,
     ClassificationBuild,
     build_classifications,
     classifications_as_of,
+    listing_kind,
     write_classifications,
 )
 from tradepartner.store.db import configure_connection
@@ -488,3 +490,71 @@ class TestNoLookAhead:
             full = classifications_as_of(store, t)
             assert full.equals(classifications_as_of(partial, t)), f"T={t!r}"
             partial.close()
+
+
+# --- listing_kind: the price resolver's equity rule (#735) --------------------
+
+
+@pytest.mark.parametrize(
+    ("title", "kind"),
+    [
+        ("Common Stock, par value $0.01 per share", EQUITY),
+        ("Class A ordinary shares included as part of the units", EQUITY),
+        ("American Depositary Shares, each representing one ordinary share", EQUITY),
+        ("Global Depositary Shares, each representing ten shares of Common Stock", EQUITY),
+        ("Common Units Representing Limited Partner Interests", EQUITY),
+        (
+            "Depositary Units of Icahn Enterprises L.P. Representing Limited Partner Interests",
+            EQUITY,
+        ),
+        ("Shares of beneficial interest without par value", EQUITY),
+        ("N/A", EQUITY),
+        ("0.650% Notes due May 2024", "coupon"),
+        ("6.375% Series A Cumulative Redeemable", "coupon"),
+        ("Floating Rate Notes due 2020", "debt"),
+        ("Medium-Term Notes", "debt"),
+        ("Preferred Stock Purchase Rights", "preferred"),
+        ("Series A Preferred Units", "preferred"),
+        ("Depositary Shares, each representing a 1/1,000th interest in a share", "preferred"),
+        ("Warrants, each whole warrant exercisable for one Class A ordinary share", "warrant"),
+        ("Redeemable warrants included as part of the units", "warrant"),
+        ("Common Stock Purchase Warrants", "warrant"),
+        ("Rights, each right entitling the holder to one-tenth of one share", "right"),
+        ("Common Stock Purchase Rights", "right"),
+        ("Units, each consisting of one Class A ordinary share and one right", "unit"),
+        ("Units", "unit"),
+        ("Common Shares (including Rights under Shareholder Rights Plan), no par value", EQUITY),
+        ("Common Stock, $0.01 par value, Preferred Stock Purchase Rights, 8.875% Series B", EQUITY),
+        ("Common Stock $0.0001 par value per share Preferred Share Purchase Rights", EQUITY),
+        ("Common shares (including common share purchase rights)", EQUITY),
+        ("Common Stock and associated Preferred Stock Purchase Rights", EQUITY),
+        ("Class A Common Stock and one Redeemable Warrant", "warrant"),
+        ("Depository Shares", "preferred"),
+        ("6.75% Series C Cumulative Redeemable PreferredShares of Beneficial Interest", "coupon"),
+        ("Preferred Stock, Par Value $25 Per Share, 4%, Noncumulative", "coupon"),
+        ("Dep Shr, 1/1000th int. per shr of 5.85% Fix-to-Float Non-Cum. Perpetual", "coupon"),
+        ("Guarantee of Aon plc, 3.500% Senior Notes due 2024", "coupon"),
+        ("Class A Common Stock and one Right", "right"),
+        ("Ordinary Shares and one Right to receive one-tenth of a share", "right"),
+        ("Common Stock and Warrants to purchase Common Stock and Rights", "warrant"),
+        ("Common stock and contingent value rights", "right"),
+    ],
+)
+def test_listing_kind_reads_the_class_title(title: str, kind: str) -> None:
+    assert listing_kind("ANY", title) == kind
+
+
+@pytest.mark.parametrize(
+    ("ticker", "kind"),
+    [
+        ("ACME", EQUITY),
+        ("ACME.WS", "warrant"),
+        ("ACMEU", "unit"),
+        ("ACME-P", "preferred"),
+        ("ACMEY", EQUITY),
+        ("BRK.B", EQUITY),
+    ],
+)
+def test_an_untitled_listing_takes_its_ticker_suffix(ticker: str, kind: str) -> None:
+    assert listing_kind(ticker, None) == kind
+    assert listing_kind(ticker, " ") == kind

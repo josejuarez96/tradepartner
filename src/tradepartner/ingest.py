@@ -733,6 +733,8 @@ def _fetch_prices(
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
         f"{len(missing)} of {len(listed)} listed names missing"
     )
+    if resolution := prices.resolution_summary():
+        message += f"; {resolution}"
     return _PriceFetch(
         session, tuple(bars), tuple(actions), action_window, covered, ingested_at, message
     )

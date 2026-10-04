@@ -233,6 +233,8 @@ def _price_chunk(
                 f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
                 f"{len(missing)} of {len(listed)} listed names without a bar"
             )
+            if resolution := prices.resolution_summary():
+                message += f"; {resolution}"
             run = outcome(OK, added, message)
             _write_run(conn, run_id, started, clock(), run, BACKFILL)
         return run
