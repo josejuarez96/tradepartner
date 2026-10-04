@@ -72,10 +72,14 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.execution import window
 from tradepartner.store.db import StoreLockedError, utc_now
 from tradepartner.store.journal import JournalIntegrityError, JournalNotInitialised, open_window
-from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS
+from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS, SETTLE_ORDER_KIND
 
-#: The kinds the schema allows, in its order (spec req 9).
-KINDS: tuple[str, ...] = JOURNAL_ENUMS[("overrides", "kind")]
+#: The kinds the schema allows, in its order (spec req 9), except `settle_order`:
+#: `paper settle` alone writes it, after a broker read this page cannot make
+#: (spec req 17, issue 571; `window.override` refuses it too).
+KINDS: tuple[str, ...] = tuple(
+    kind for kind in JOURNAL_ENUMS[("overrides", "kind")] if kind != SETTLE_ORDER_KIND
+)
 
 FORM_KEY = "override_form"
 KIND_KEY = "override_kind"

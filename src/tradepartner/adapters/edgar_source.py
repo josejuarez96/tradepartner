@@ -53,7 +53,10 @@ inside the lag window also gets one, so a de-SPAC's new SIC still
 arrives with its 8-K. Each per-document result is cached by accession,
 its stamp stripped, under its own version constant (`COVER_VERSION`,
 `HEADER_VERSION`): a cached entry always wins over FSN for its accession,
-until the version bumps or the cache is cleared.
+until the version bumps or the cache is cleared. A cover parse's skipped
+listings (no title or exchange, #609) are written to its cache entry and
+counted on `.cover_incomplete_listings` when it is parsed, never on a cache
+hit (#612), as FSN's are on `.fsn_incomplete_listings` when extracted.
 
 **Facts (T11e).** `facts` joins two sources, both stamped at read time from
 `_load_stamps(cik)`: company facts (`companyfacts.zip` above the stamping
@@ -112,7 +115,10 @@ quarantined: no further request until its entry is deleted or
 recorded, with its message, in its period's manifest instead
 (`fsn/v{FSN_VERSION}/manifests/<period>.json`, `accessions_failed`), counted
 on `.failed_filings`, never quarantined, and retried only when
-`FSN_VERSION` changes.
+`FSN_VERSION` changes. Messages are stored from #616 on: an entry recorded
+before it carries none until the accession fails again (a quarantined one
+never does until un-quarantined), and an FSN manifest extracted before it
+none until `FSN_VERSION` changes; nothing backfills them (#629).
 
 `check_failures()` (called by `ingest.py`'s `_prefetch`, before the lock)
 raises `FilingFailuresError` when (1) the uncommitted FSN periods' failure
@@ -154,6 +160,7 @@ import gzip
 import hashlib
 import itertools
 import json
+import math
 import re
 import shutil
 import zipfile
@@ -196,7 +203,7 @@ from tradepartner.adapters.filings import (
     FilingIndexEntry,
     FilingSource,
 )
-from tradepartner.config import Settings, secret_values
+from tradepartner.config import Settings, clean_message
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Bumped when a parser change must re-stamp every cached accession.
@@ -234,9 +241,6 @@ _FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
 #: property of the data format, not a tunable threshold.
 _FSN_DECIMALS = 4
 _FSN_HALF_UNIT = Decimal(1).scaleb(-_FSN_DECIMALS) / 2
-#: Control characters replaced in a stored failure message (as `ingest`'s
-#: run messages): the text comes from a server or a filing.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
@@ -333,6 +337,9 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
+        # #612: listings skipped (no title or exchange, #609) by this run's
+        # per-document cover parses; as FSN's count, cache hits add nothing.
+        self.cover_incomplete_listings = 0
         self.fsn_missing = 0
         self._filing_index_ran = False
         self._fsn_ready = False
@@ -990,6 +997,7 @@ class EdgarFilingSource(FilingSource):
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing
         self._save_cover_cache(accession, cik, parsed)
+        self.cover_incomplete_listings += parsed.incomplete_listings
         return parsed
 
     def _cover_cache_path(self, accession: str) -> Path:
@@ -1022,6 +1030,10 @@ class EdgarFilingSource(FilingSource):
                 [item.title, item.ticker, item.exchange] for item in parsed.cover.listings
             ],
             "facts": [_fact_to_json(f) for f in parsed.facts],
+            # #612: the listings the parse skipped, so they are diagnosable
+            # from disk as an FSN manifest's are. Not read back: an entry
+            # written before #612 lacks it and still loads (no version bump).
+            "incomplete_listings": parsed.incomplete_listings,
         }
         edgar_raw.write_atomic(self._cover_cache_path(accession), json.dumps(data).encode("utf-8"))
 
@@ -1437,10 +1449,9 @@ class EdgarFilingSource(FilingSource):
     def _stored_message(self, message: str) -> str:
         """A failure message as written to disk (P4, #610): every configured
         secret redacted, control characters replaced, cut to
-        `ingest.max_message_chars` (it is server- or filing-supplied text)."""
-        for value in secret_values(self._settings):
-            message = message.replace(value, "[redacted]")
-        return _CONTROL.sub(" ", message)[: self._settings.ingest.max_message_chars]
+        `ingest.max_message_chars` (it is server- or filing-supplied text):
+        `config.clean_message`, the run row's own cleaning (#629)."""
+        return clean_message(message, self._settings)
 
     def _accepted(self, accession: str, error_class: str, message: str) -> bool:
         """Whether this run's failure of `accession` is `accepted`: only when
@@ -1535,7 +1546,8 @@ class EdgarFilingSource(FilingSource):
 
     def _check_per_document_group(self, reasons: list[str]) -> None:
         """Per-document's denominator is the accessions fetched or read from
-        the per-document cache this run (#610 policy 1), plus the quarantined
+        the per-document cache this run (#610 policy 1; a co-registrant's
+        cached copy, `entity_cik != cik`, counts too), plus the quarantined
         accessions it skipped; a quarantined accession counts as a failure
         unless its entry is `accepted` (a failed check can quarantine, #610
         policy 2, and quarantine never excuses on its own). A `facts()`
@@ -1852,7 +1864,12 @@ def _message_hash(message: str) -> str:
 def _same_value(a_source: str, a: float, b_source: str, b: float) -> bool:
     """Two sources' values for one key and date agree: exactly, or, when one
     side is FSN, within half a unit of FSN's 4th decimal place (#610 X1:
-    105.1597 from FSN agrees with company facts' 105.159666)."""
+    105.1597 from FSN agrees with company facts' 105.159666). A NaN or an
+    infinity never agrees (#629)."""
+    if not (math.isfinite(a) and math.isfinite(b)):
+        # #629: a NaN or an infinity never agrees, so the key is withheld;
+        # `Decimal` would raise `InvalidOperation` and fail the whole source.
+        return False
     if "fsn" not in (a_source, b_source):
         return a == b
     return abs(Decimal(repr(a)) - Decimal(repr(b))) <= _FSN_HALF_UNIT
