@@ -76,7 +76,11 @@ import httpx
 import typer
 
 from tradepartner.adapters import alpaca_raw
-from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, ListingResolver
+from tradepartner.adapters.alpaca_prices import (
+    AlpacaPriceSource,
+    ListingResolver,
+    registrant_evidence,
+)
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.backfill import backfill
@@ -89,8 +93,9 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import listings_as_of
+from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
+from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -105,7 +110,8 @@ Launcher = Callable[[list[str]], int]
 
 class StorePriceSource(PriceSource):
     """An `AlpacaPriceSource` whose `ListingResolver` is built from the
-    store's listings known at the first fetch, not when the run starts.
+    store's listings known at the first fetch, not when the run starts,
+    with the `registrant_evidence` of the facts and listing ends known then.
 
     `ingest` fetches prices only after the EDGAR chunk has committed, so on a
     first run the listings the resolver needs do not exist until then. The
@@ -140,8 +146,14 @@ class StorePriceSource(PriceSource):
             at = ensure_tz_aware_utc(self._clock(), field_name="clock()")
             with _read(self._settings) as conn:  # waits out a writer like ingest's reads
                 listings = listings_as_of(conn, at)
+                evidence = registrant_evidence(  # #793: who still trades under a ticker
+                    facts_as_of(conn, at).iter_rows(named=True),
+                    listing_ends_as_of(conn, at, self._settings).iter_rows(named=True),
+                    as_of=at.date(),
+                    quiet_after_days=self._settings.alpaca.registrant_quiet_days,
+                )
             self._inner = AlpacaPriceSource(
-                ListingResolver(listings.iter_rows(named=True)),
+                ListingResolver(listings.iter_rows(named=True), evidence),
                 fetch_bars=self._fetch_bars,
                 fetch_actions=self._fetch_actions,
                 settings=self._settings,
