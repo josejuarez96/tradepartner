@@ -513,6 +513,44 @@ class TestExchangeTagFlip:
         assert _status(df, "S", "NYSE_AMERICAN")["status"] == "delisted"
         assert _status(df, "S", "NYSE")["status"] == "listed"
 
+    def test_dual_listing_still_trading_after_effective_on_is_not_a_retag(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # BKFL shape (test_health): a NASDAQ line seven months before a NYSE
+        # Form 25. Bars after `effective_on` show the security still trades,
+        # so the filing withdrew the NYSE line, not the NASDAQ one. Before
+        # such a bar is known, the conservative re-tag holds.
+        insert_row(synthetic, "listings", _row("S", "BKFL", "NYSE", date(2018, 1, 2)))
+        insert_row(synthetic, "listings", _row("S", "BKFL", "NASDAQ", date(2018, 6, 1)))
+        filed = _at(2019, 1, 10)  # effective_on 2019-01-20
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", filed, "Common Stock"))
+        for day in (date(2019, 1, 10), date(2019, 1, 18), date(2019, 1, 22), date(2019, 1, 23)):
+            insert_row(synthetic, "prices_daily", _bar("S", day))
+        before = listing_ends_as_of(synthetic, session_close(date(2019, 1, 18)), _settings())
+        assert _status(before, "S", "NASDAQ")["status"] == "delisted"
+        assert _status(before, "S", "NYSE")["status"] == "listed"
+        after = listing_ends_as_of(synthetic, session_close(date(2019, 1, 22)), _settings())
+        assert _status(after, "S", "NYSE")["status"] == "delisted"
+        assert _status(after, "S", "NASDAQ")["status"] == "listed"
+
+    def test_late_amendment_never_ends_the_transfer_destination(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        insert_row(synthetic, "listings", _row("S", "A", "NASDAQ", date(2019, 1, 2)))
+        insert_row(synthetic, "listings", _row("S", "A", "NYSE", date(2019, 3, 4)))
+        insert_row(
+            synthetic, "delistings", _form_25("S", "NASDAQ", _at(2019, 3, 6), "Common Stock")
+        )
+        insert_row(
+            synthetic,
+            "delistings",
+            {**_form_25("S", "NASDAQ", _at(2019, 4, 15), "Common Stock"), "form": "25-NSE/A"},
+        )
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        nasdaq = _status(df, "S", "NASDAQ")
+        assert (nasdaq["status"], nasdaq["delisting_form"]) == ("transferred", "25-NSE")
+        assert _status(df, "S", "NYSE")["status"] == "listed"
+
 
 class TestOtherClassOnSnapshotListing:
     """#818 part 2: a Form 25 for a differently titled class (Class B,
@@ -628,6 +666,23 @@ class TestOtherClassOnSnapshotListing:
         insert_row(synthetic, "delistings", _form_25("S", "NYSE", filed_at, title))
         row = _status(listing_ends_as_of(synthetic, _at(2016, 1, 5), _settings()), "S", "NYSE")
         assert row["status"] == "delisted"
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Non-Voting Common Stock",
+            "Redeemable Common Stock",
+            "Exchangeable Common Shares",
+            "Common Stock When Issued",
+        ],
+    )
+    def test_qualified_common_title_leaves_snapshot_listing_listed(
+        self, synthetic: duckdb.DuckDBPyConnection, title: str
+    ) -> None:
+        insert_row(synthetic, "listings", _row("S", "X", "NYSE", date(2010, 1, 4), None))
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _at(2012, 6, 1), title))
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
+        assert row["status"] == "listed"
 
     def test_other_class_filing_still_ends_its_titled_listing(
         self, synthetic: duckdb.DuckDBPyConnection

@@ -6,9 +6,9 @@
 
 **Rows.** Forms 25 and 25-NSE are both stored as `delistings` rows,
 `known_at` = `filed_at` = the acceptance, `provenance = filing`, keeping
-the filing's class title and exchange. `effective_on` is reference only:
-the filing's stated date, else the acceptance's New York date plus 10
-days (Rule 12d2-2).
+the filing's class title and exchange. `effective_on` is the filing's
+stated date, else the acceptance's New York date plus 10 days (Rule
+12d2-2); it never sets an end, and only the re-tag rule below reads it.
 
 **One class per filing.** A filing names a class, not a company, so it is
 resolved to the `security_id` of its CIK whose listing on the filing's
@@ -36,10 +36,15 @@ a filing ends only a listing already known at T.
   the same ticker carries another exchange tag (the filer's own cover page
   flipping NYSE_AMERICAN to NYSE) and started before the transfer window,
   the filing ends the latest such listing instead: where the tags
-  disagree, the Form 25's exchange is the fact. A listing that starts
-  inside the window is a transfer's destination (below), and a tag that
-  names no exchange (`NONE`, `OTC`, empty) is a move off the exchange,
-  so neither is ever the one ended.
+  disagree, the Form 25's exchange is the fact. Never re-tagged: a
+  listing that starts inside the window (a transfer's destination,
+  below); a tag that names no exchange (`NONE`, `OTC`, empty: a move off
+  the exchange); a security with a bar known at T after the filing's
+  `effective_on` (it still trades, so the filing withdrew one line of a
+  dual listing; until such a bar is known the conservative re-tag
+  holds); and a filing whose own-exchange listing an earlier filing
+  already ended (a 25/A, or the issuer's Form 25 after the exchange's,
+  never moves an end).
 - **Other class on an untitled listing** (#818). A filing whose title is
   not plain common (a class or series letter, Special, (Old), T-DECS, or
   any title `_is_plain_title` refuses) never ends an untitled
@@ -134,9 +139,23 @@ _CLASS_DESIGNATION = re.compile(r"\b(?:class|series) [a-z0-9]\b")
 
 #: Words that make a common title name one class of several: "Special
 #: Common Shares", "Common Stock (Old)", "T-DECS", "Common Equivalent
-#: Securities", "Non-Voting Common Stock", a tracking or restricted stock.
+#: Securities", "Non-Voting Common Stock", a tracking, restricted,
+#: redeemable, exchangeable or when-issued stock.
 _QUALIFIER_WORDS = frozenset(
-    {"special", "old", "new", "tracking", "tangible", "decs", "equivalent", "voting", "restricted"}
+    {
+        "special",
+        "old",
+        "new",
+        "tracking",
+        "tangible",
+        "decs",
+        "equivalent",
+        "voting",
+        "restricted",
+        "redeemable",
+        "exchangeable",
+        "issued",
+    }
 )
 
 
@@ -260,27 +279,37 @@ def _window(filing_session: date, sessions: int) -> tuple[date, date]:
     return low, high
 
 
-def _ended_listing(siblings: list[Row], delisting: Row, window_sessions: int) -> Row | None:
-    """The listing among `siblings` (one security's) that `delisting` ends,
-    or `None` (module docstring: latest on its exchange, a re-tag, an
-    other-class filing on an untitled listing)."""
+def _ended_listing(
+    siblings: list[Row],
+    delisting: Row,
+    window_sessions: int,
+    last_bar: date | None,
+    ended: dict[int, Row],
+) -> Row | None:
+    """The listing among `siblings` (one security's, whose last bar known at
+    T is `last_bar`) that `delisting` ends, or `None`. `ended` holds the
+    listings earlier filings ended. Module docstring: latest on its
+    exchange, a re-tag, an other-class filing on an untitled listing."""
     session = _filing_session(delisting["filed_at"])
     exchange = delisting["exchange"]
     on_exchange = [r for r in siblings if r["exchange"] == exchange and r["valid_from"] <= session]
     if not on_exchange:
         return None
     target = max(on_exchange, key=lambda r: r["valid_from"])
-    low, _ = _window(session, window_sessions)
-    retagged = [
-        r
-        for r in siblings
-        if r["ticker"] == target["ticker"]
-        and r["exchange"] != exchange
-        and r["exchange"] not in _OFF_EXCHANGE
-        and target["valid_from"] < r["valid_from"] < low
-    ]
-    if retagged:
-        target = max(retagged, key=lambda r: r["valid_from"])
+    if target["_index"] in ended:
+        return None
+    if last_bar is None or last_bar <= delisting["effective_on"]:
+        low, _ = _window(session, window_sessions)
+        retagged = [
+            r
+            for r in siblings
+            if r["ticker"] == target["ticker"]
+            and r["exchange"] != exchange
+            and r["exchange"] not in _OFF_EXCHANGE
+            and target["valid_from"] < r["valid_from"] < low
+        ]
+        if retagged:
+            target = max(retagged, key=lambda r: r["valid_from"])
     if target["class_title"] is None and not _is_plain_title(delisting["class_title"]):
         return None
     return target
@@ -306,17 +335,22 @@ def derive_listing_ends(
     for index, row in enumerate(listing_rows):
         by_security[row["security_id"]].append({**row, "_index": index})
 
-    ended: dict[int, Row] = {}  # listing index -> the filing that ends it
-    for delisting in sorted(delistings.to_dicts(), key=lambda r: (r["filed_at"], r["form"])):
-        target = _ended_listing(
-            by_security.get(delisting["security_id"], []), delisting, transfer_window_sessions
-        )
-        if target is not None:
-            ended.setdefault(target["_index"], delisting)
-
     bars: dict[str, list[date]] = defaultdict(list)
     for security_id, session in bar_sessions.select("security_id", "session").iter_rows():
         bars[security_id].append(session)
+
+    ended: dict[int, Row] = {}  # listing index -> the filing that ends it
+    for delisting in sorted(delistings.to_dicts(), key=lambda r: (r["filed_at"], r["form"])):
+        security_id = delisting["security_id"]
+        target = _ended_listing(
+            by_security.get(security_id, []),
+            delisting,
+            transfer_window_sessions,
+            max(bars.get(security_id, []), default=None),
+            ended,
+        )
+        if target is not None:
+            ended.setdefault(target["_index"], delisting)
 
     out: list[Row] = []
     for index, row in enumerate(listing_rows):
