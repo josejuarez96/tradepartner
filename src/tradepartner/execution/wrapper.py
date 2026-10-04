@@ -106,8 +106,10 @@ or not a buy is still open) runs it once on the first book, before any sell is
 submitted, and halts there on a missing price. That pre-check runs only after
 one read of the derived switch (`_engaged`) finds it clear: an engaged switch
 skips the pre-check, and the phases' own reads (step 2) end the batch
-`skipped_kill_switch`, never a fault from a price the skipped batch would not
-read (#692, owner Q1 = B; keyed on any buy decision, owner Q2). The costs that
+`skipped_kill_switch` (or `ok`, nothing submitted, when no phase has an
+attempt), never a fault from a price a skipped batch would not read (#692,
+owner Q1 = B; keyed on any buy decision, owner Q2). Only a run-lock holder
+releases the switch, so it cannot clear between those reads. The costs that
 size the buys and the cash rule are the window's frozen `costs.*` keys
 (`config.FROZEN_COSTS_KEYS`, #534), read with each phase's book; a window whose
 `frozen_json` lacks them raises `ValueError` before any broker call, never
