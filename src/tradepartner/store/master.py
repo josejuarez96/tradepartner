@@ -75,7 +75,9 @@ a return across a bankruptcy.
 relist a class a Form 25 left pending, for its last pairs on that
 exchange, from the session after the Form 25 took effect: an 8-K12B (a
 successor issuer's 12(b) registration under Rule 12g-3) accepted after
-the class's last cover page, known at the later of it and the Form 25
+the class's last cover page, with no 8-A12B near the Form 25 (that
+registers another exchange or new equity, which a cover page settles:
+CTO's transfer), known at the later of it and the Form 25
 (FRT, whose later cover pages parse with no listing; OKE before its next
 cover page); else the earliest companies snapshot fetched after the Form
 25 that still names the ticker on that exchange, `provenance =
@@ -192,19 +194,22 @@ class _Stop:
 _Marks = Mapping[str, Sequence[datetime]]
 
 
+def _near(stop: _Stop, until: datetime, marks: _Marks, forms: frozenset[str]) -> bool:
+    """True when one of `forms` was accepted from `stop.window_start` to `until`."""
+    return any(
+        stop.window_start <= _session_of(at) and at <= until
+        for form in forms
+        for at in marks.get(form, ())
+    )
+
+
 def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     """True when the shares listed again after `stop` (evidence accepted at
     `until`) are new equity: an 8-A12B from `stop.window_start` to `until`
     and no Form 15 in that span (#820, #834)."""
-
-    def near(form_set: frozenset[str]) -> bool:
-        return any(
-            stop.window_start <= _session_of(at) and at <= until
-            for form in form_set
-            for at in marks.get(form, ())
-        )
-
-    return near(_NEW_REGISTRATION_FORMS) and not near(_DEREGISTRATION_FORMS)
+    return _near(stop, until, marks, _NEW_REGISTRATION_FORMS) and not _near(
+        stop, until, marks, _DEREGISTRATION_FORMS
+    )
 
 
 _Pairs = frozenset[tuple[str, str]]
@@ -465,7 +470,9 @@ class _Builder:
     ) -> None:
         """A Form 25 (recorded, and relisted at once if an 8-K12B since the
         class's last cover page precedes it) or an 8-K12B (relists every
-        class a Form 25 left pending)."""
+        class a Form 25 left pending). Not with an 8-A12B near the Form 25:
+        that registers another exchange (a transfer) or new equity, which
+        only a cover page settles (CTO, #834)."""
         at, _, _, filing = event
         if filing is not None:
             stopped = self._delisting(classes, filing)
@@ -477,12 +484,13 @@ class _Builder:
                 for form in _SUCCESSOR_ISSUER_FORMS
                 for a in marks.get(form, ())
             )
-            if successor_issuer:
+            if successor_issuer and not _near(stop, at, marks, _NEW_REGISTRATION_FORMS):
                 self._relist(first, classes, cls, filing.exchange, at, "filing", marks)
             return
         for cls in [c for c in classes if not c.retired]:
-            for exchange in [e for e, stop in cls.ended.items() if stop.filed_at < at]:
-                self._relist(first, classes, cls, exchange, at, "filing", marks)
+            for exchange, stop in list(cls.ended.items()):
+                if stop.filed_at < at and not _near(stop, at, marks, _NEW_REGISTRATION_FORMS):
+                    self._relist(first, classes, cls, exchange, at, "filing", marks)
 
     def _relist(
         self,

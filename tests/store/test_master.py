@@ -1274,3 +1274,39 @@ class TestListingEvidenceAfterForm25:
             assert listings_as_of(full, t).equals(listings_as_of(partial, t)), f"T={t!r}"
             partial.close()
         full.close()
+
+    def test_an_8k12b_with_a_transfer_waits_for_a_cover_page(self) -> None:
+        # CTO (REIT conversion and NYSE American -> NYSE, 2021): 8-A12B
+        # 2021-01-28 (the NYSE registration), 25-NSE and 8-K12B 2021-02-01,
+        # 15-12B 2021-02-12, a 10-K cover page on NYSE 2021-03-05. The 8-K12B
+        # must not relist the old exchange (nor make new equity): a transfer.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(
+                    cik, _at(2020, 11, 5), ("COMMON STOCK, $1 PAR VALUE", "CTO", "NYSE_AMERICAN")
+                ),
+                _cover(
+                    cik, _at(2021, 3, 5), ("Common Stock, $0.01 par value per share", "CTO", "NYSE")
+                ),
+            ],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Stock",
+                "NYSE_AMERICAN",
+                "25-cto",
+                _at(2021, 2, 1, 18, 10),
+                date(2021, 2, 11),
+            ),
+            forms=(
+                ("8-A12B", _at(2021, 1, 28)),
+                ("8-K12B", _at(2021, 2, 1, 21, 0)),
+                ("15-12B", _at(2021, 2, 12)),
+            ),
+        )
+        assert build.successions == ()
+        assert self._rows(build) == [
+            (cik, "CTO", date(2020, 11, 5), _at(2020, 11, 5), "filing"),
+            (cik, "CTO", date(2021, 3, 5), _at(2021, 3, 5), "filing"),
+        ]
