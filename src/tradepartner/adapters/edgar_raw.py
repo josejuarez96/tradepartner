@@ -14,10 +14,10 @@ module's shared client (a simple token/timestamp limiter, `threading.Lock`
 -guarded: it remembers the last request time and sleeps off the remainder
 of the interval).
 
-Retry policy (#554, research #572 pitfalls P1/P2/P10), all through
-`_execute_with_retry`, which every request (`_get`, `fsn_validators`'s
-`HEAD`, `_stream_to_with_headers`'s `GET`) goes through, each retry still
-behind `_RateLimiter`:
+Retry policy (#554, research #572 pitfalls P1/P2/P10), decided in one
+place, `_RetryPolicy`, which every request consults: `_execute_with_retry`
+(`_get`, `fsn_validators`'s `HEAD`) and `_stream_to_with_headers`'s
+streamed `GET`, each attempt and retry still behind `_RateLimiter`:
 - **`429`/`503`, and a transport error** (a dropped connection, a timeout,
   or any other `httpx.TransportError`): capped exponential backoff,
   `edgar.retry_backoff_seconds * 2 ** attempt` up to
@@ -32,10 +32,10 @@ behind `_RateLimiter`:
   stayed under the threshold for a while): one wait of
   `edgar.rate_limit_wait_seconds` (default 10 minutes), then one retry;
   a second `403` fails outright rather than waiting again.
-- **A corrupt or truncated bulk zip** (`BadZipFile`, or `testzip()` naming
-  a bad member): `_stream_to_with_headers` re-downloads it once more; a
-  zip still corrupt after that is returned as-is and fails later, when
-  its caller opens it.
+- **A corrupt or truncated bulk zip** (one that won't open, a member whose
+  deflate data won't inflate or ends early, or `testzip()` naming a CRC
+  mismatch): `_stream_to_with_headers` re-downloads it once more; a zip
+  still corrupt after that raises `zipfile.BadZipFile`.
 
 Every public function takes an optional `client: httpx.Client` so tests
 can inject an `httpx.MockTransport`-backed client without any real
@@ -52,6 +52,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import zlib
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,56 @@ def _backoff_seconds(
     )
 
 
+class _RetryPolicy:
+    """One request's retry state and decisions (see the module docstring),
+    shared by `_execute_with_retry` and the streamed `GET` in
+    `_stream_to_with_headers`, so both follow the same policy.
+
+    `429`/`503` responses and transport errors share one attempt counter,
+    capped at `edgar.retry_max_attempts`; a `403` is waited out once and
+    never advances that counter.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._attempt = 0
+        self._rate_limit_waited = False
+
+    def retry_after_transport_error(self) -> bool:
+        """After an `httpx.TransportError`: sleep the backoff and return
+        `True` to retry, or `False` (no sleep) when the attempts are used up,
+        and the caller re-raises the error."""
+        if self._attempt + 1 >= self._settings.edgar.retry_max_attempts:
+            return False
+        time.sleep(_backoff_seconds(self._attempt, self._settings, None))
+        self._attempt += 1
+        return True
+
+    def retry_after_response(self, response: httpx.Response) -> bool:
+        """After a response: sleep and return `True` to retry a `403` (once)
+        or a `429`/`503` (until the attempts are used up); return `False`
+        for a success; otherwise raise `httpx.HTTPStatusError`
+        (`response.raise_for_status()`: a second `403`, a last `429`/`503`,
+        or any status this policy doesn't retry). Reads only the status and
+        headers, never the body, so a streamed response is not consumed."""
+        status = response.status_code
+        edgar = self._settings.edgar
+        if status == _RATE_LIMIT_STATUS_CODE:
+            if self._rate_limit_waited:
+                response.raise_for_status()
+            self._rate_limit_waited = True
+            time.sleep(edgar.rate_limit_wait_seconds)
+            return True
+        if status in _TRANSIENT_STATUS_CODES:
+            if self._attempt + 1 >= edgar.retry_max_attempts:
+                response.raise_for_status()
+            time.sleep(_backoff_seconds(self._attempt, self._settings, response))
+            self._attempt += 1
+            return True
+        response.raise_for_status()
+        return False
+
+
 def _execute_with_retry(
     make_request: Callable[[], httpx.Response],
     *,
@@ -224,40 +275,22 @@ def _execute_with_retry(
     min_interval_seconds: float,
 ) -> httpx.Response:
     """Call `make_request()` (behind `_LIMITER`, which also spaces out every
-    retry) until it succeeds or the retry policy gives up; see the module
-    docstring for the policy. Raises `httpx.TransportError` (a transport
-    error on the last allowed attempt) or `httpx.HTTPStatusError`
-    (`response.raise_for_status()`, including a second `403`, or any status
-    this function doesn't retry) on final failure.
+    retry) until it succeeds or `_RetryPolicy` gives up. Raises
+    `httpx.TransportError` (a transport error on the last allowed attempt)
+    or `httpx.HTTPStatusError` (a second `403`, a last `429`/`503`, or any
+    status the policy doesn't retry) on final failure.
     """
-    attempt = 0
-    rate_limit_waited = False
+    policy = _RetryPolicy(settings)
     while True:
         _LIMITER.wait(min_interval_seconds)
         try:
             response = make_request()
         except httpx.TransportError:
-            if attempt + 1 >= settings.edgar.retry_max_attempts:
-                raise
-            time.sleep(_backoff_seconds(attempt, settings, None))
-            attempt += 1
+            if policy.retry_after_transport_error():
+                continue
+            raise
+        if policy.retry_after_response(response):
             continue
-
-        if response.status_code == _RATE_LIMIT_STATUS_CODE:
-            if rate_limit_waited:
-                response.raise_for_status()
-            rate_limit_waited = True
-            time.sleep(settings.edgar.rate_limit_wait_seconds)
-            continue
-
-        if response.status_code in _TRANSIENT_STATUS_CODES:
-            if attempt + 1 >= settings.edgar.retry_max_attempts:
-                response.raise_for_status()
-            time.sleep(_backoff_seconds(attempt, settings, response))
-            attempt += 1
-            continue
-
-        response.raise_for_status()
         return response
 
 
@@ -528,12 +561,16 @@ def _write_stream_atomic(dest: Path, chunks: Iterable[bytes]) -> None:
 
 
 def _zip_is_corrupt(path: Path) -> bool:
-    """Whether `path` fails to open as a zip, or its own CRC check names a
-    bad member: a truncated or corrupted download (research #572 P10)."""
+    """Whether `path` is a truncated or corrupted download (research #572
+    P10): it fails to open as a zip (`BadZipFile`), a member's deflate data
+    won't inflate (`zlib.error`) or ends early (`EOFError`), or its own CRC
+    check (`testzip()`) names a bad member. `testzip()` itself catches only
+    `BadZipFile`, so the other two would otherwise escape as raw errors
+    instead of triggering the re-download (#554 quant-auditor pass 1)."""
     try:
         with zipfile.ZipFile(path) as archive:
             return archive.testzip() is not None
-    except zipfile.BadZipFile:
+    except (zipfile.BadZipFile, zlib.error, EOFError):
         return True
 
 
@@ -545,9 +582,11 @@ def _stream_to_with_headers(
 
     Every destination streamed through this function is a zip
     (`bulk_submissions`, `bulk_company_facts`, `fsn_zip`): once a response
-    streams cleanly to `dest`, `dest` is opened and CRC-checked, and a
-    corrupt or truncated result is re-downloaded once more (a second corrupt
-    result is returned as-is, and fails later when its caller opens it).
+    streams cleanly to `dest`, `dest` is opened and CRC-checked
+    (`_zip_is_corrupt`), and a corrupt or truncated result is re-downloaded
+    once more; a second corrupt result raises `zipfile.BadZipFile`. The
+    status and transport-error decisions are `_RetryPolicy`'s, the same as
+    every other request here.
     """
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
@@ -557,36 +596,24 @@ def _stream_to_with_headers(
     min_interval_seconds = 1.0 / settings.edgar.requests_per_second
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    attempt = 0
-    rate_limit_waited = False
+    policy = _RetryPolicy(settings)
     zip_redownloaded = False
     while True:
         _LIMITER.wait(min_interval_seconds)
         try:
             with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
-                if response.status_code == _RATE_LIMIT_STATUS_CODE:
-                    if rate_limit_waited:
-                        response.raise_for_status()
-                    rate_limit_waited = True
-                    time.sleep(settings.edgar.rate_limit_wait_seconds)
+                if policy.retry_after_response(response):
                     continue
-                if response.status_code in _TRANSIENT_STATUS_CODES:
-                    if attempt + 1 >= settings.edgar.retry_max_attempts:
-                        response.raise_for_status()
-                    time.sleep(_backoff_seconds(attempt, settings, response))
-                    attempt += 1
-                    continue
-                response.raise_for_status()
                 response_headers = response.headers
                 _write_stream_atomic(dest, response.iter_bytes())
         except httpx.TransportError:
-            if attempt + 1 >= settings.edgar.retry_max_attempts:
-                raise
-            time.sleep(_backoff_seconds(attempt, settings, None))
-            attempt += 1
-            continue
+            if policy.retry_after_transport_error():
+                continue
+            raise
 
-        if not zip_redownloaded and _zip_is_corrupt(dest):
+        if _zip_is_corrupt(dest):
+            if zip_redownloaded:
+                raise zipfile.BadZipFile(f"{dest} still corrupt after one re-download")
             zip_redownloaded = True
             continue
         return dest, response_headers

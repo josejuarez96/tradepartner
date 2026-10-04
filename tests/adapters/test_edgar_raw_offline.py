@@ -12,7 +12,9 @@ safety-reviewer MUST FIX).
 from __future__ import annotations
 
 import io
+import random
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -687,13 +689,14 @@ def test_a_corrupt_zip_is_redownloaded_once_then_used(
     assert path.read_bytes() == good_zip
 
 
-def test_a_zip_still_corrupt_after_one_redownload_is_returned_as_is(
+def test_a_zip_still_corrupt_after_one_redownload_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A second corrupt download is not retried again: it is returned as
-    the cached file, to fail later when its caller opens it (`backfill`'s
-    pre-flight / `edgar_source`'s `zipfile.ZipFile`), rather than this
-    client looping forever against a source that keeps failing."""
+    """A second corrupt download is not retried again, and is not handed
+    back to the caller either: it raises `BadZipFile` naming the file
+    (research #572 P10, "re-download once, then fail"), rather than this
+    client looping forever against a source that keeps failing or a later
+    caller consuming a damaged file (#554 quant-auditor NIT)."""
     monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
     served: list[bytes] = []
 
@@ -702,12 +705,151 @@ def test_a_zip_still_corrupt_after_one_redownload_is_returned_as_is(
         served.append(body)
         return httpx.Response(200, content=body)
 
+    with pytest.raises(zipfile.BadZipFile, match="still corrupt after one re-download"):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+        )
+
+    assert len(served) == 2
+
+
+_MEMBER = "a.txt"
+# `ZipFile.writestr` writes a 30-byte local header plus the member's name
+# before its data (no extra field), so the member's data starts here.
+_MEMBER_DATA_OFFSET = 30 + len(_MEMBER)
+
+
+def _deflated_zip_with_damaged_compressed_data() -> bytes:
+    """A real `ZIP_DEFLATED` zip (as SEC's bulk and FSN zips are) with an
+    intact central directory but 40 flipped bytes in the middle of its
+    member's compressed data: opening succeeds, and reading the member
+    raises `zlib.error` (not `BadZipFile`), which `testzip()` does not
+    catch (#554 quant-auditor pass 1, SHOULD FIX)."""
+    rng = random.Random(0)
+    content = " ".join(f"w{rng.randint(0, 500)}" for _ in range(4000)).encode()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(_MEMBER, content)
+    damaged = bytearray(buffer.getvalue())
+    compress_size = zipfile.ZipFile(io.BytesIO(bytes(damaged))).getinfo(_MEMBER).compress_size
+    middle = _MEMBER_DATA_OFFSET + compress_size // 2
+    for i in range(middle, middle + 40):
+        damaged[i] ^= 0xFF
+    return bytes(damaged)
+
+
+def _stored_zip_failing_its_crc() -> bytes:
+    """A `ZIP_STORED` zip whose member's bytes were changed after writing
+    (same length, central directory intact): it opens and reads, and only
+    the CRC check (`testzip()` naming the member) catches it."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(_MEMBER, b"hello world" * 10)
+    damaged = bytearray(buffer.getvalue())
+    damaged[_MEMBER_DATA_OFFSET + 3] ^= 0xFF
+    return bytes(damaged)
+
+
+def test_damaged_deflate_data_raises_zlib_error_not_bad_zip_file() -> None:
+    """Guards the fixture: the deflate case must reach the `zlib.error`
+    branch, not the `BadZipFile` one the other corrupt-zip tests cover."""
+    archive = zipfile.ZipFile(io.BytesIO(_deflated_zip_with_damaged_compressed_data()))
+    with pytest.raises(zlib.error):
+        archive.testzip()
+    stored = zipfile.ZipFile(io.BytesIO(_stored_zip_failing_its_crc()))
+    assert stored.testzip() == _MEMBER
+
+
+@pytest.mark.parametrize(
+    "corrupt_body",
+    [_deflated_zip_with_damaged_compressed_data(), _stored_zip_failing_its_crc()],
+    ids=["deflate-stream-damaged", "stored-member-crc-mismatch"],
+)
+def test_a_zip_damaged_mid_body_is_redownloaded_once_then_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corrupt_body: bytes
+) -> None:
+    """A zip that opens but whose member data is damaged (a deflate error
+    or a CRC mismatch) is re-downloaded once, like one that fails to open."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    served: list[bytes] = []
+    good_zip = _valid_zip_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = corrupt_body if len(served) == 0 else good_zip
+        served.append(body)
+        return httpx.Response(200, content=body)
+
     path = edgar_raw.bulk_submissions(
         settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
     )
 
     assert len(served) == 2
-    assert path.read_bytes() == b"not a zip, attempt 2"
+    assert path.read_bytes() == good_zip
+
+
+# --- the stream path's retry policy (#554 quant-auditor pass 1) ----------
+
+
+def test_a_bulk_download_403_then_403_waits_once_then_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 200])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(
+                cache_dir=tmp_path, rate_limit_wait_seconds=600.0, retry_max_attempts=10
+            ),
+            client=_mock_client(handler),
+        )
+
+    assert served == [403, 403]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0)]
+    assert list((tmp_path / "bulk").iterdir()) == []
+
+
+def test_a_bulk_download_503_raises_after_retry_max_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    handler, served = _status_sequence_handler([503])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path, retry_max_attempts=3),
+            client=_mock_client(handler),
+        )
+
+    assert served == [503, 503, 503]
+
+
+def test_a_bulk_download_dropped_mid_stream_is_retried_and_replaces_the_previous_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `ReadError` mid-body is retried; the previous zip is replaced only
+    by the complete download, and no temp file is left behind."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    previous = tmp_path / "bulk" / "submissions.zip"
+    previous.parent.mkdir()
+    previous.write_bytes(b"yesterday's zip")
+    good_zip = _valid_zip_bytes()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, stream=_BrokenStream())
+        return httpx.Response(200, content=good_zip)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert calls["n"] == 2
+    assert path == previous and path.read_bytes() == good_zip
+    assert list(previous.parent.iterdir()) == [previous]
 
 
 # --- FSN data sets (T11c) -----------------------------------------------
