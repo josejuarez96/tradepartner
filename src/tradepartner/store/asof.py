@@ -155,11 +155,11 @@ corrupt data of another kind and still raises below.
 `ValueError`.** A split `ratio_or_amount` of `0` divides by zero (DuckDB
 returns `inf`, not an error, for `1.0 / 0.0`), and so does a NaN or
 infinite dividend amount or a zero or NaN prior close. That is bad store
-data, not
-"no factor" (`NULL`, which a dropped dividend produces and which this
-function treats as "no adjustment from this event", not an error).
-Before ever computing `LN()`, a dedicated query checks every non-`NULL` event factor for
-`factor > 0 AND isfinite(factor)`, **and separately** rejects any
+data, not "no factor" (`NULL`, which a dropped dividend produces and which
+this function treats as "no adjustment from this event", not an error).
+Before ever computing `LN()`, a dedicated query checks every non-`NULL`
+event factor for `factor > 0 AND isfinite(factor)`, **and separately**
+rejects any
 dividend with a negative `ratio_or_amount` even though `1 - (negative) /
 prior_close` is itself a perfectly positive, finite number greater than
 `1` (a dividend that *raises* the price is not a validation failure the
