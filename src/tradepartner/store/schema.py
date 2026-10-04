@@ -115,10 +115,17 @@ registry; #83 took version 2 first, so the registry is version 3):
   row kept in insertion order, each `overrides` row given `client_order_id =
   NULL` (no earlier row could be a `settle_order`). A store at version 4 or
   earlier gets the version-9 journal directly. A read-only connection accepts
-  a version-8 store, so every other read keeps working; an `overrides` read
-  there (`store.journal.overrides_for`) fails on the missing column until any
-  writing command migrates the store, as a `resume_invocations` read does on a
-  version-7 store.
+  a version-8 store, so every other read keeps working. Only a command that
+  calls `init_schema` on its write connection migrates (`ingest`, `backfill`,
+  `paper start`, a backtest run, `hypothesis register`, `decision gap-signoff`); `store.db
+  .open_for_write` alone does not. Until one has run, every `overrides` read
+  (`store.journal.overrides_for`: `paper check`, `paper run`'s planning and
+  kill-switch read, `paper stop`, `paper override`, the override
+  page) and write fails loudly on the missing column, never silently: the
+  nightly ingest, which `paper run`'s freshness check requires anyway,
+  migrates the store, and after pulling this version the owner runs one
+  ingest (copying the store file first, as for version 5) before any `paper`
+  command.
 - **A later DDL change goes to version 10**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
