@@ -62,7 +62,7 @@ Measured in [flow-audit-2026-10-04.md](../retros/flow-audit-2026-10-04.md); the 
 | Ready → merged, last 60 merged PRs | median 22 min, p75 55 min, max 71 h | issue timelines |
 | Created → merged, all merged PRs | median 1.2 h, p75 2.5 h | `gh pr list` |
 | CI `checks` on code PRs | median 36 min, p90 45 min; 118 of 300 runs cancelled | `gh run list` |
-| First-pass verdicts, last 60 PRs | 29 PASS, 21 PASS WITH FIXES, 4 FAIL | verdict comments |
+| First-pass verdicts, last 60 PRs (58 carry one) | 29 PASS, 21 PASS WITH FIXES, 4 FAIL, 2 spec-critic APPROVE, 2 other wording | verdict comments |
 | Classifier denials | 44 in 86 sessions; ~1 in 5 on read-only commands | transcripts |
 | Owner decisions open | 11 decision-shaped issues; #366 digest open since 09-30 | `gh issue list` |
 | Unsized open issues | 10 of 57 | `gh issue list` |

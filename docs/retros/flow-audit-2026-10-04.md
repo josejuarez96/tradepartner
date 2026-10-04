@@ -95,7 +95,7 @@ Verdicts: **keep** (load-bearing: removing it lets one mistake reach money, orde
 ## Changes to ways of working (made in this PR)
 
 1. `flow-auditor` added to the roster and the stage diagram ([agents.md](../ways-of-working/agents.md)).
-2. The stale "a subagent cannot spawn subagents" line replaced by the verified rule: depth is two (window → team agent → its reviewers and helpers), and a team runs reviewers in the foreground because a background helper's hand-back goes to the window ([agents.md](../ways-of-working/agents.md), Parallelism inside a team).
+2. The stale "a subagent cannot spawn subagents" line replaced by the verified rule: depth is two (the window → a team run as a background subagent → its reviewers and helpers), and a team runs reviewers in the foreground because a background helper's hand-back goes to the window ([agents.md](../ways-of-working/agents.md), Parallelism inside a team).
 3. [continuous-improvement.md](../ways-of-working/continuous-improvement.md): cadence, inputs, scoring, how findings become inbox entries or issues, and the baseline table this audit starts.
 
 Nothing in this PR changes a script, CI, a hook or a permission rule; every such change above is a proposal with an owner.
