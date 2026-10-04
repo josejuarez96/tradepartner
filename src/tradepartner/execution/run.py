@@ -174,7 +174,6 @@ from __future__ import annotations
 
 import bisect
 import json
-import math
 import os
 import sys
 import time
@@ -201,7 +200,7 @@ from tradepartner.errors import (
     StaleDataError,
     SystemFaultError,
 )
-from tradepartner.execution import exits, marks, planning, switch
+from tradepartner.execution import drawdown, exits, marks, planning, switch
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import (
     Collected,
@@ -1544,11 +1543,11 @@ class _Run:
             self._alert("missed_run", f"no paper run on {boundary.isoformat()}")
 
     def _drawdown(self, marked: set[date]) -> None:
-        """The drawdown check, in session order, on: every marked session whose
-        mark row's `known_at` is after the window's last `released` kill-switch
-        event (all marked sessions when there is none), plus the sessions this
-        run `marked` and the window's last marked session. The first crossing
-        engages, once.
+        """The drawdown check (`execution.drawdown.check`), in session order,
+        on: every marked session whose mark row's `known_at` is after the
+        window's last `released` kill-switch event (all marked sessions when
+        there is none), plus the sessions this run `marked` and the window's
+        last marked session. The first crossing engages, once.
 
         `switch.drawdown_peak` is constant between releases (the last
         `released` row's `peak_equity`, else `starting_equity`) and
@@ -1561,81 +1560,30 @@ class _Run:
         in the wider set this method checks until a release narrows that set
         again.
 
-        Known gap, pending an owner decision: a run that marks sessions and
-        then crashes, followed by `paper resume`, can still drop those
-        sessions from the check. `resume` writes the `released` row itself,
-        and this method only widens past a release's `known_at`, never
-        before it; it does not ask whether every session the crashed run
-        marked was itself checked before that release. Whether `resume`
-        should check the window's unchecked marked sessions before it
-        releases is open (no `resume.py` change is made here).
-
-        A crossing is labeled back-filled, and names the release's time, only
-        when its session is strictly before this run's S-1 (so an ordinary
-        S-1 mark, read the morning after a release, is never mislabeled) and
-        that session's own close (`calendar.session_close`) is at or before
-        the last release's time (so a session the release itself would have
-        seen, or one later than it, is not labeled either). It is still
-        checked and still engages either way (erring toward safety: a release
-        elsewhere in the window does not excuse a drawdown the owner has not
-        seen) — the label only says whether it predates the release.
+        `paper resume` runs the same check over the window's marks before it
+        releases, so a crashed run's marks are not dropped from the check
+        (#648).
         """
         with open_read_only(self.settings) as conn:
             marks_rows = positions_daily_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
-        if not marks_rows:
-            return
-        peak = switch.drawdown_peak(self.window, rows)
-        armed = switch.drawdown_armed(self.window_id, rows)
-        # The last release in write order (`event_id`), not by `at`: a halt row
-        # after a `ClockError` carries a real-time stamp (switch.py), so `at`
-        # does not always agree with write order.
-        released = sorted(
-            (r for r in rows if r.state == switch.RELEASED), key=lambda r: r.event_id or 0
+        crossing = drawdown.check(
+            self.window, marks_rows, rows, self.frozen.max_drawdown, marked, self.session
         )
-        last_release = released[-1].at if released else None
-        known_at_of: dict[date, datetime] = {}
-        for row in marks_rows:
-            known_at_of[row.session] = min(row.known_at, known_at_of.get(row.session, row.known_at))
-        to_check = {
-            day
-            for day, known_at in known_at_of.items()
-            if last_release is None or known_at > last_release
-        }
-        to_check |= marked | {max(r.session for r in marks_rows)}
-        crossed: tuple[date, float] | None = None
-        for day in sorted(to_check):
-            equity = _mark_equity(marks_rows, day)
-            if equity is not None and switch.drawdown_check(
-                equity, peak, self.frozen.max_drawdown, armed=armed
-            ):
-                crossed = day, equity
-                break
-        if crossed is None:
+        if crossing is None:
             return
-        day, equity = crossed
-        reason = (
-            f"ledger equity {equity:.2f} at {day.isoformat()} is below the peak {peak:.2f} "
-            f"by more than risk.max_drawdown {self.frozen.max_drawdown}"
-        )
-        if (
-            last_release is not None
-            and day < previous_session(self.session)
-            and calendar.session_close(day) <= last_release
-        ):
-            reason += f" (back-filled session, before the release at {last_release.isoformat()})"
         engaged = switch.engage(
             self.settings,
             self.gate.read_clock,
             window_id=self.window_id,
             source=_DRAWDOWN,
-            reason=reason,
+            reason=crossing.reason,
             run_id=self.run_id,
         )
         if isinstance(engaged, switch.WriteFailed):
             raise SystemFaultError(f"the drawdown engagement could not be written: {engaged.error}")
         self.engaged = True
-        self._alert(_DRAWDOWN, reason)
+        self._alert(_DRAWDOWN, crossing.reason)
 
     def _lapses(self) -> None:
         """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert."""
@@ -1838,13 +1786,6 @@ def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
     return sorted(sid for sid, row in _current(listings, day).items() if row["ticker"] == ticker)
 
 
-def _mark_equity(rows: Sequence[PositionDailyRow], day: date) -> float | None:
-    """Ledger equity at the marked session `day`: its cash row plus every name's
-    value, or None when that session's rows cannot give it."""
-    today = [r for r in rows if r.session == day]
-    cash = {r.cash for r in today if r.cash is not None}
-    values = [r.value for r in today if r.security_id is not None]
-    if len(cash) != 1 or any(v is None for v in values):
-        return None
-    equity = cash.pop() + math.fsum(v for v in values if v is not None)
-    return equity if math.isfinite(equity) else None
+#: Kept importable: `execution.drawdown.mark_equity` is the one definition
+#: (moved there for #648, shared with `resume`).
+_mark_equity = drawdown.mark_equity

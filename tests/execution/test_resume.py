@@ -26,6 +26,7 @@ from tradepartner.execution.resume import NO_WINDOW, REFUSED, RELEASED, resume
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
+    KillSwitchRow,
     OrderEventRow,
     OrderRow,
     PaperRunResultRow,
@@ -1023,6 +1024,10 @@ def test_a_last_mark_with_no_positive_equity_refuses(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
+    # Not -50.0: a finite negative equity is itself a drawdown crossing now
+    # (#648) and would be refused for that reason instead. NaN gives no
+    # usable equity (`mark_equity` returns None), so it reaches neither
+    # check's crossing and still exercises the peak's own validation below.
     run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
     at = DAY1 - timedelta(days=1)
     _append(
@@ -1031,7 +1036,7 @@ def test_a_last_mark_with_no_positive_equity_refuses(
             run_id=run_id,
             session=date(2026, 9, 30),
             quantity=0.0,
-            cash=-50.0,
+            cash=float("nan"),
             known_at=at,
             ingested_at=at,
         ),
@@ -1119,6 +1124,186 @@ def test_a_held_position_row_with_no_value_refuses(
     assert outcome.status == REFUSED
     assert any("positive equity" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
+
+
+# --- the drawdown check over the window's marks before resume releases (#648) -------------------
+
+
+def test_a_crashed_runs_marks_crossing_the_drawdown_refuse_with_no_prior_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A run that marks a session below the frozen `risk.max_drawdown` and
+    then crashes (no result row) leaves the switch engaged on its own (an
+    unfinished run engages); `resume`'s release path checks that mark before
+    computing the peak or releasing, so the refusal names the drawdown and
+    nothing is released (#648 owner decision)."""
+    at = DAY1 - timedelta(days=1)
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=50_000.0,  # well below starting_equity * (1 - max_drawdown) = 70,000
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("drawdown" in r for r in outcome.reasons)
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    drawdown_rows = [e for e in events if e.source == "drawdown"]
+    assert len(drawdown_rows) == 1 and drawdown_rows[0].state == "engaged"
+    assert not any(e.state == "released" for e in events)
+    assert _engaged(journal_settings, window)
+
+
+def test_a_crashed_runs_marks_crossing_the_drawdown_refuse_after_a_prior_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Same as above, but the window has already released once: the crashed
+    run's marks are known after that release, so the gap `_drawdown`'s old
+    docstring named (#648) would have let the next release widen straight
+    past them. A second `resume` -- after the drawdown refusal disarms the
+    trigger -- releases, resetting the peak to the crashed run's own last
+    mark."""
+    _engage(journal_settings, window, fixed_clock)
+    first = _resume(journal_settings, fake, fixed_clock)
+    assert first.status == RELEASED, first.reasons
+
+    at = fixed_clock.now  # after the release above
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=50_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    second = _resume(journal_settings, fake, fixed_clock)
+
+    assert second.status == REFUSED
+    assert any("drawdown" in r for r in second.reasons)
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert sum(e.state == "released" for e in events) == 1  # no new release row
+    assert sum(e.source == "drawdown" for e in events) == 1
+    assert _engaged(journal_settings, window)
+
+    third = _resume(journal_settings, fake, fixed_clock)
+
+    assert third.status == RELEASED, third.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    released = sorted((e for e in events if e.state == "released"), key=lambda e: e.event_id or 0)
+    assert len(released) == 2
+    assert released[-1].peak_equity == 50_000.0  # reset to the crashed run's last mark
+
+
+def test_marks_that_do_not_cross_the_drawdown_release_with_no_drawdown_row(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A crashed run's marks that stay within `risk.max_drawdown` do not
+    refuse: the release proceeds and writes no `drawdown` kill-switch row."""
+    at = DAY1 - timedelta(days=1)
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=93_000.0,  # above starting_equity * (1 - max_drawdown) = 70,000
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert not any(e.source == "drawdown" for e in events)
+
+
+def test_a_pre_release_crossing_mark_is_not_re_checked_by_resume(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A mark known *before* the window's last release, even one below the
+    reset peak by more than `risk.max_drawdown`, is not re-checked unless it
+    is the window's last marked session -- mirroring `run.py`'s own release
+    boundary (module docstring of `execution.drawdown`). Here the last
+    marked session is a later, in-bound one, so the earlier crossing never
+    stops the release."""
+    reset_peak = 80_000.0
+    below_bound = 30_000.0  # well below reset_peak * (1 - max_drawdown) = 56,000
+    in_bound = 90_000.0  # above reset_peak * (1 - max_drawdown)
+    released_at = DAY1 - timedelta(days=2)
+    _append(
+        journal_settings,
+        KillSwitchRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=released_at,
+            state="released",
+            source="owner",
+            peak_equity=reset_peak,
+            known_at=released_at,
+            ingested_at=released_at,
+        ),
+    )
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 29),  # before the release above
+            quantity=0.0,
+            cash=below_bound,
+            known_at=released_at - timedelta(hours=1),
+            ingested_at=released_at - timedelta(hours=1),
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),  # the window's last marked session
+            quantity=0.0,
+            cash=in_bound,
+            known_at=DAY1 - timedelta(days=1),
+            ingested_at=DAY1 - timedelta(days=1),
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert not any(e.source == "drawdown" for e in events)
+    released = sorted((e for e in events if e.state == "released"), key=lambda e: e.event_id or 0)
+    assert released[-1].peak_equity == in_bound
 
 
 def test_a_failed_fault_engagement_is_named_in_the_refusal(
