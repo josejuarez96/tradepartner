@@ -19,10 +19,20 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   older span from its own start (the ticker resolves to nothing rather than
   back to the older company), but never its own company's, so a company's
   notes listed under its common ticker never take or hide it;
-- a security listing two different tickers on equity rows of one day
-  (FutureFuel's cover page naming Ford's `F` beside its own `FF`) holds
-  neither ticker, nor any later one, from that day: its rows are not
-  assigned, and the tickers resolve as if it had never listed them;
+- a security listing two different tickers on equity rows of one day,
+  one of them the ticker of its row just before that day (FutureFuel's
+  cover page naming Ford's `F` beside its own `FF`), keeps that ticker:
+  the other rows of that day are a typo and are dropped (#819). With no
+  such ticker it holds neither, nor any later one, from that day: its rows
+  are not assigned, and the tickers resolve as if it had never listed them;
+- a span ends at its own delisting (#819): the effective day of a
+  delisted (not transferred) equity listing that is the span's last row
+  (`RegistrantEvidence.delisted_listings`). A later row of the same
+  ticker (a late cover page, a relisting, a reorganized security's new
+  row) means the security went on trading, and the span runs on. From
+  that day the ticker resolves to nothing until another span starts: it
+  never falls back to an older company's span, and a reused ticker never
+  prices the delisted security;
 - a ticker reused by another company belongs to whichever span started
   most recently on or before the session, so an old company's bars stop
   resolving once the new company's listing starts;
@@ -166,6 +176,10 @@ _FEEDS = frozenset({"sip", "iex"})
 _ACTIONS_SOURCE = "alpaca"
 _SPLIT_CATEGORIES = frozenset({"forward_splits", "reverse_splits"})
 _DIVIDEND_CATEGORIES = frozenset({"cash_dividends"})
+#: The `source` of every bar and action this module returns (#819: the
+#: rows a resolution repair may judge).
+BAR_SOURCES = frozenset(f"alpaca_{feed}" for feed in _FEEDS)
+ACTIONS_SOURCE = _ACTIONS_SOURCE
 
 Resolve = Callable[[str, date], str | None]
 
@@ -256,7 +270,8 @@ class ResolverReport:
     one day (from that day), and spans that are later-class (another class
     of the company already held the ticker), co-registrant or disputed (a
     claim on a live holder's ticker, #793), ambiguous (another security's
-    span of the ticker starts the same day) or contested."""
+    span of the ticker starts the same day) or contested; and (#819) the
+    spans ended at their own delisting and the same-day typo rows dropped."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -267,6 +282,8 @@ class ResolverReport:
     contested_spans: int = 0
     co_registrant_spans: int = 0
     disputed_spans: int = 0
+    ended_spans: int = 0
+    same_day_typos: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -279,7 +296,8 @@ class ResolverReport:
             f"{self.ambiguous_spans} ambiguous and "
             f"{self.contested_spans} contested spans unassigned; "
             f"{self.co_registrant_spans} co-registrant and {self.disputed_spans} disputed "
-            f"claims on another company's ticker"
+            f"claims on another company's ticker; {self.ended_spans} spans ended at their "
+            f"own delisting; {self.same_day_typos} same-day typo listings dropped"
         )
 
 
@@ -289,15 +307,17 @@ class RegistrantEvidence:
     still trades under it (#793): per company (the CIK of `<cik>` and
     `<cik>:<class>` ids), the day it last filed a cover-page share count
     and every `(as_of_date, value)` share count it reported; per security,
-    the effective days of its delisted (not transferred) equity listings;
-    the run's day, and how many days without a share count make a company
-    quiet."""
+    the effective days of its delisted (not transferred) equity listings,
+    and each such listing as `(valid_from, effective day)` (#819: which
+    span it ends); the run's day, and how many days without a share count
+    make a company quiet."""
 
     last_filed: Mapping[str, date]
     share_counts: Mapping[str, frozenset[tuple[date, float]]]
     delisted_on: Mapping[str, tuple[date, ...]]
     as_of: date
     quiet_after_days: int
+    delisted_listings: Mapping[str, tuple[tuple[date, date], ...]] = field(default_factory=dict)
 
     def left_on(self, security_id: str, since: date) -> date | None:
         """The first day `security_id` no longer trades, as far as the
@@ -337,8 +357,8 @@ def registrant_evidence(
     the UTC day of `known_at` is the filing day) and `listing_ends` rows
     (`store.delistings.listing_ends_as_of`: only `status == "delisted"` of
     an equity listing by `store.classify.listing_kind`, on its
-    `effective_on`, else the day after its `end_session`; a transfer is not
-    leaving)."""
+    `effective_on`, else the day after its `end_session`, with the
+    listing's `valid_from`; a transfer is not leaving)."""
     last: dict[str, date] = {}
     counts: dict[str, set[tuple[date, float]]] = defaultdict(set)
     for row in facts:
@@ -349,6 +369,7 @@ def registrant_evidence(
         last[company] = max(last.get(company, filed), filed)
         counts[company].add((row["as_of_date"], float(row["value"])))
     delisted: dict[str, set[date]] = defaultdict(set)
+    ended: dict[str, set[tuple[date, date]]] = defaultdict(set)
     for row in listing_ends:
         if (
             row["status"] != DELISTED
@@ -360,12 +381,14 @@ def registrant_evidence(
         )
         if day is not None:
             delisted[str(row["security_id"])].add(day)
+            ended[str(row["security_id"])].add((row["valid_from"], day))
     return RegistrantEvidence(
         last_filed=last,
         share_counts={company: frozenset(rows) for company, rows in counts.items()},
         delisted_on={sid: tuple(sorted(days)) for sid, days in delisted.items()},
         as_of=as_of,
         quiet_after_days=quiet_after_days,
+        delisted_listings={sid: tuple(sorted(rows)) for sid, rows in ended.items()},
     )
 
 
@@ -408,14 +431,19 @@ class ListingResolver:
         self._history: dict[str, list[TickerSpan]] = defaultdict(list)  # no placeholders
         # Spans that hold no ticker but shadow other companies' older spans.
         self._blockers: dict[str, list[TickerSpan]] = defaultdict(list)
-        placeholder = same_day_listings = 0
+        # A span ended at its own delisting (#819), whole, with the day it
+        # ended: from that day it still shadows the other companies' spans
+        # it had superseded (started before it), never a later one.
+        self._vacated: dict[str, list[tuple[TickerSpan, date]]] = defaultdict(list)
+        placeholder = same_day_listings = same_day_typos = ended_spans = 0
         same_day_securities: set[str] = set()
         non_equity: dict[str, int] = defaultdict(int)
-        for security_id, rows in by_security.items():
+        for security_id, listed in by_security.items():
             # A placeholder or non-equity row sorts first on its day, so it
             # never ends the span of an equity ticker listed that same day.
-            rows.sort(key=lambda r: (r.day, r.kind == EQUITY, r.ticker))
-            pair_day = _same_day_pair(rows)
+            listed.sort(key=lambda r: (r.day, r.kind == EQUITY, r.ticker))
+            rows, pair_day = _drop_same_day_typos(listed)
+            same_day_typos += len(listed) - len(rows)
             index = 0
             while index < len(rows):
                 first = index
@@ -424,9 +452,12 @@ class ListingResolver:
                 while index < len(rows) and rows[index].ticker == ticker:
                     index += 1  # the same ticker again (a second exchange): one span
                 end = rows[index].day if index < len(rows) else None
-                span = TickerSpan(security_id, ticker, start, end)
-                self._by_security[security_id].append(span)
                 kinds = {r.kind for r in rows[first:index]}
+                left = None
+                if kinds == {EQUITY}:
+                    left = self._own_delisting(security_id, rows[index - 1].day, start, end)
+                span = TickerSpan(security_id, ticker, start, end if left is None else left)
+                self._by_security[security_id].append(span)
                 if _PLACEHOLDER in kinds:
                     placeholder += index - first
                     continue
@@ -440,6 +471,10 @@ class ListingResolver:
                     same_day_listings += index - first
                 else:
                     self._by_ticker[ticker].append(span)
+                    if left is not None:
+                        ended_spans += 1
+                        whole = TickerSpan(security_id, ticker, start, end)
+                        self._vacated[ticker].append((whole, left))
         later_class = {
             span
             for spans in self._by_ticker.values()
@@ -501,7 +536,31 @@ class ListingResolver:
             contested_spans=len(self._contested),
             co_registrant_spans=sum(v == _CO_REGISTRANT for v, _ in claims.values()),
             disputed_spans=sum(v == _DISPUTED for v, _ in claims.values()),
+            ended_spans=ended_spans,
+            same_day_typos=same_day_typos,
         )
+
+    def _own_delisting(
+        self, security_id: str, last_row: date, start: date, end: date | None
+    ) -> date | None:
+        """The day an equity span of `security_id` (rows from `start`, the
+        last on `last_row`, until `end`) stops holding its ticker because
+        its own listing was delisted (#819), or `None`.
+
+        That is the earliest effective day, inside the span, of a delisted
+        equity listing that is the span's last row. A delisted listing
+        followed by another row of the same ticker (a late cover page, a
+        relisting, a transfer outside the transfer window, a reorganized
+        security's new row) never ends the span: the security went on
+        trading under it."""
+        if self._evidence is None:
+            return None
+        days = [
+            day
+            for valid_from, day in self._evidence.delisted_listings.get(security_id, ())
+            if valid_from == last_row and start < day and (end is None or day < end)
+        ]
+        return min(days, default=None)
 
     def _claim(
         self, span: TickerSpan, spans: Sequence[TickerSpan]
@@ -578,9 +637,25 @@ class ListingResolver:
             and block.covers(session)
             and _company(block.security_id) != _company(owner)
             for block in self._blockers.get(ticker, [])
+        ) or any(
+            latest < gone.start
+            and left <= session
+            and gone.covers(session)
+            and _company(gone.security_id) != _company(owner)
+            for gone, left in self._vacated.get(ticker, [])
         ):
             return None
         return owner
+
+    def holds(self, security_id: str, session: date) -> bool:
+        """True when some ticker resolves to `security_id` on `session`: a
+        row of it on that session is one this resolver would assign."""
+        return any(
+            span.covers(session)
+            and self._assigned(span)
+            and self.resolve(span.ticker, session) == security_id
+            for span in self._by_security.get(security_id, [])
+        )
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
         """Every ticker `security_id` traded under at some day in
@@ -625,6 +700,26 @@ def _same_day_pair(rows: Sequence[_Row]) -> date | None:
         if row.day == following.day and row.ticker != following.ticker:
             return row.day
     return None
+
+
+def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]:
+    """A security's sorted rows less each same-day typo (#819), and the
+    first same-day pair day left, or `None`.
+
+    On a day whose equity rows list two tickers, one of them the ticker of
+    the security's row just before that day (an equity row), the others
+    are a cover page's slip (FutureFuel naming Ford's `F` beside its own
+    `FF`): their rows are dropped and the security keeps its ticker. A pair
+    with no such ticker stays a pair."""
+    kept = list(rows)
+    while (day := _same_day_pair(kept)) is not None:
+        before = [r for r in kept if r.day < day]
+        held = before[-1].ticker if before and before[-1].kind == EQUITY else None
+        tickers = {r.ticker for r in kept if r.day == day and r.kind == EQUITY}
+        if held not in tickers:
+            return kept, day
+        kept = [r for r in kept if not (r.day == day and r.kind == EQUITY and r.ticker != held)]
+    return kept, None
 
 
 # --- bars ------------------------------------------------------------------

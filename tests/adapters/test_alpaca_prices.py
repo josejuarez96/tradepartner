@@ -115,10 +115,11 @@ class TestResolver:
         assert resolver.resolve("XX", date(2020, 1, 2)) == "SEC_X"
         assert resolver.symbols("SEC_X", START, date(2020, 1, 2)) == ["XX"]
 
-    def test_one_security_two_tickers_on_one_day_is_unassigned_from_that_day(self) -> None:
-        # Owner rule 2 (#735): FutureFuel's cover page of 2024-05-10 lists
-        # both FF and F, Ford's ticker. Its rows from that day are not
-        # assigned, and Ford keeps F.
+    def test_a_same_day_typo_keeps_the_ticker_the_security_held(self) -> None:
+        # #819 (was owner rule 2, #735): FutureFuel's cover page of
+        # 2024-05-10 lists Ford's F beside its own FF. FutureFuel held FF
+        # the day before, so F is a typo: FutureFuel keeps FF from that day
+        # on (it lost about 600 sessions before), and Ford keeps F.
         day = date(2024, 5, 10)
         resolver = ListingResolver(
             [
@@ -131,13 +132,56 @@ class TestResolver:
             ]
         )
         assert resolver.resolve("FF", date(2024, 5, 9)) == "0001337298"
-        assert resolver.resolve("FF", day) is None
+        assert resolver.resolve("FF", day) == "0001337298"
+        assert resolver.resolve("FF", date(2026, 9, 30)) == "0001337298"
         assert resolver.resolve("F", day) == "0000037996"
         assert resolver.resolve("F", date(2026, 9, 30)) == "0000037996"
-        assert resolver.knows("0001337298")
-        assert resolver.symbols("0001337298", date(2024, 5, 1), date(2024, 5, 31)) == ["FF"]
+        assert resolver.symbols("0001337298", day, date(2026, 9, 30)) == ["FF"]
+        assert resolver.report.same_day_typos == 1
+        assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (0, 0)
+        assert "1 same-day typo listings dropped" in resolver.report.summary()
+
+    def test_a_same_day_typo_after_a_second_exchange_keeps_the_ticker(self) -> None:
+        # TMPM (2022-03-17) names its warrants' TMPMW on the common's row;
+        # CLRC (2024-03-14) names CLCR, its ticker of 2022, again.
+        tmpm, clrc = "0001823524", "0001903392"
+        resolver = ListingResolver(
+            [
+                _listing(tmpm, "TMPM", date(2020, 11, 30), "Class A Ordinary Shares"),
+                _listing(tmpm, "TMPM", date(2022, 3, 17), "Class A Ordinary Shares"),
+                _listing(tmpm, "TMPMW", date(2022, 3, 17), "Class A Ordinary Shares"),
+                _listing(clrc, "CLCR", date(2022, 6, 10), "Class A Ordinary Share"),
+                _listing(clrc, "CLRC", date(2022, 11, 9), "Class A Ordinary Share"),
+                _listing(clrc, "CLCR", date(2024, 3, 14), "Class A Ordinary Share"),
+                _listing(clrc, "CLRC", date(2024, 3, 14), "Class A Ordinary Share"),
+            ]
+        )
+        assert resolver.resolve("TMPM", date(2022, 3, 17)) == tmpm
+        assert resolver.resolve("TMPM", date(2023, 1, 3)) == tmpm
+        assert resolver.resolve("TMPMW", date(2022, 3, 17)) is None
+        assert resolver.resolve("CLRC", date(2024, 3, 14)) == clrc
+        assert resolver.resolve("CLCR", date(2024, 3, 14)) is None
+        assert resolver.resolve("CLCR", date(2022, 7, 1)) == clrc
+        assert resolver.report.same_day_typos == 2
+
+    def test_two_new_tickers_on_one_day_are_unassigned_from_that_day(self) -> None:
+        # Owner rule 2 (#735) where neither ticker is the one held before:
+        # nothing shows which is right, so neither is assigned.
+        day = date(2024, 5, 10)
+        resolver = ListingResolver(
+            [
+                _listing("0000037996", "F", date(1994, 2, 10)),
+                _listing("0001337298", "FF", date(2020, 8, 7), "Common Stock"),
+                _listing("0001337298", "F", day, "Common Stock"),
+                _listing("0001337298", "FFX", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2024, 5, 9)) == "0001337298"
+        assert resolver.resolve("FFX", day) is None
+        assert resolver.resolve("F", day) == "0000037996"
         assert resolver.symbols("0001337298", day, date(2024, 5, 31)) == []
         assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (1, 2)
+        assert resolver.report.same_day_typos == 0
 
     def test_notes_and_preferred_under_the_common_ticker_are_left_out(self) -> None:
         # Owner rule 1 (#735): JNJ's notes and KSU's preferred list under
@@ -412,12 +456,14 @@ def _ended(
     class_title: str,
     effective_on: date,
     status: str = "delisted",
+    valid_from: date = date(1994, 1, 3),
 ) -> dict[str, object]:
-    """A `listing_ends_as_of` row: the listing's end by a Form 25."""
+    """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a Form 25."""
     return {
         "security_id": security_id,
         "ticker": ticker,
         "class_title": class_title,
+        "valid_from": valid_from,
         "status": status,
         "effective_on": effective_on,
         "end_session": None,
@@ -585,7 +631,7 @@ class TestRegistrantCheck:
     def test_a_holder_leaving_later_never_hands_its_earlier_bars_to_the_claimant(self) -> None:
         # Were AEP delisted in 2027, AEP Texas would take AEP only from then;
         # the sessions before are unassigned, no longer AEP's on proof.
-        ends = [_ended(AEP, "AEP", "Common Stock", date(2027, 3, 1))]
+        ends = [_ended(AEP, "AEP", "Common Stock", date(2027, 3, 1), valid_from=date(2025, 2, 13))]
         facts = [*AEP_FACTS, _shares(AEP, date(2027, 2, 15), 545000000, date(2027, 2, 20))]
         resolver = ListingResolver(AEP_LISTINGS, _evidence(facts, ends, date(2027, 6, 1)))
         assert resolver.resolve("AEP", date(2026, 7, 29)) == AEP
@@ -611,10 +657,18 @@ class TestRegistrantCheck:
                     _shares(group, date(2023, 10, 20), 61242238, date(2023, 10, 26)),
                     _shares(group, date(2026, 7, 24), 61517850, date(2026, 7, 29)),
                 ],
-                [_ended(nwe, "NWE", "Common stock", date(2023, 10, 9))],
+                [
+                    _ended(
+                        nwe, "NWE", "Common stock", date(2023, 10, 9), valid_from=date(2020, 10, 21)
+                    )
+                ],
             ),
         )
-        assert resolver.resolve("NWE", date(2023, 10, 25)) == nwe
+        assert resolver.resolve("NWE", date(2023, 10, 6)) == nwe
+        # #819: the old common ends at its delisting; the group's bars
+        # before its first listing (2023-10-26) are unassigned, never the
+        # old company's.
+        assert resolver.resolve("NWE", date(2023, 10, 25)) is None
         assert resolver.resolve("NWE", date(2024, 1, 16)) == group
         assert resolver.report.co_registrant_spans == 0
         assert resolver.report.disputed_spans == 0
@@ -676,7 +730,11 @@ class TestRegistrantCheck:
                     _shares(old, date(2026, 7, 31), 57561304, date(2026, 8, 5)),
                     _shares(new, date(2026, 7, 29), 57800356, date(2026, 7, 31)),
                 ],
-                [_ended(old, "CR", "Common Stock", date(2022, 5, 27))],
+                [
+                    _ended(
+                        old, "CR", "Common Stock", date(2022, 5, 27), valid_from=date(2019, 7, 30)
+                    )
+                ],
             ),
         )
         assert resolver.resolve("CR", date(2024, 1, 16)) == new
@@ -708,10 +766,211 @@ class TestRegistrantCheck:
         assert not evidence.same_count(AEP, AEP_TEXAS, date(2027, 2, 1))
         assert evidence.left_on(AEP, date(1994, 5, 16)) is None
         assert evidence.delisted_on == {"0000000001:class-a": (date(2021, 1, 4),)}
+        assert evidence.delisted_listings == {
+            "0000000001:class-a": ((date(1994, 1, 3), date(2021, 1, 4)),)
+        }
         # quiet: no share count for more than 180 days before the run
         assert evidence.left_on("0000000001:class-b", date(2019, 1, 2)) == date(2020, 1, 4)
         assert evidence.left_on("0000000001:class-a", date(2019, 1, 2)) == date(2020, 1, 4)
         assert evidence.left_on("0000000001:class-a", date(2020, 6, 1)) == date(2020, 1, 4)
+
+
+class TestOwnDelisting:
+    """#819: a span ends at its own delisting, so a reused ticker never
+    prices a delisted security; a later row of the ticker keeps it."""
+
+    def test_a_reused_ticker_never_prices_a_delisted_security(self) -> None:
+        # Eagle Bulk (EGLE) merged into Star Bulk; its NYSE listing (from
+        # 2023-03-10, after a move from NASDAQ) was delisted from
+        # 2024-04-19. Alpaca served another equity's EGLE bars from 2025.
+        egle = "0001322439"
+        resolver = ListingResolver(
+            [
+                _listing(egle, "EGLE", date(2020, 3, 12), "Common Stock"),
+                _listing(egle, "EGLE", date(2023, 3, 10), "Common Stock"),
+            ],
+            _evidence(
+                [_shares(egle, date(2024, 2, 23), 10000000, date(2024, 3, 1))],
+                [
+                    _ended(
+                        egle,
+                        "EGLE",
+                        "Common Stock",
+                        date(2024, 4, 19),
+                        valid_from=date(2023, 3, 10),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("EGLE", date(2024, 4, 18)) == egle
+        for session in (date(2024, 4, 19), date(2025, 4, 16), date(2026, 10, 2)):
+            assert resolver.resolve("EGLE", session) is None
+            assert not resolver.holds(egle, session)
+        assert resolver.holds(egle, date(2024, 4, 18))
+        assert resolver.symbols(egle, date(2024, 5, 1), date(2026, 10, 2)) == []
+        assert resolver.symbols(egle, date(2024, 4, 1), date(2026, 10, 2)) == ["EGLE"]
+        assert resolver.report.ended_spans == 1
+        assert "1 spans ended at their own delisting" in resolver.report.summary()
+
+    def test_a_delisted_holder_never_hands_its_ticker_back_to_an_older_company(self) -> None:
+        older, dead = "0000000001", "0000000002"
+        resolver = ListingResolver(
+            [
+                _listing(older, "REUSE", date(2005, 1, 3), "Common Stock"),
+                _listing(dead, "REUSE", date(2018, 3, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        dead, "REUSE", "Common Stock", date(2021, 6, 1), valid_from=date(2018, 3, 1)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("REUSE", date(2017, 1, 3)) == older
+        assert resolver.resolve("REUSE", date(2020, 1, 2)) == dead
+        assert resolver.resolve("REUSE", date(2022, 1, 3)) is None
+
+    def test_a_successor_listed_before_the_delisting_keeps_the_ticker(self) -> None:
+        # DraftKings' 2022 reorganization: the new company lists DKNG from
+        # 2022-05-06, the old one's Form 25 takes effect 2022-05-15. The
+        # newer span holds DKNG; the old one's end never shadows it.
+        old, new = "0001772757", "0001883685"
+        resolver = ListingResolver(
+            [
+                _listing(old, "DKNG", date(2020, 11, 13), "Class A common stock"),
+                _listing(new, "DKNG", date(2022, 5, 6), "Class A Common Stock"),
+            ],
+            _evidence(
+                [_shares(new, date(2026, 7, 31), 490000000, date(2026, 8, 5))],
+                [
+                    _ended(
+                        old,
+                        "DKNG",
+                        "Class A Common Stock",
+                        date(2022, 5, 15),
+                        valid_from=date(2020, 11, 13),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("DKNG", date(2022, 5, 5)) == old
+        assert resolver.resolve("DKNG", date(2022, 5, 16)) == new
+        assert resolver.resolve("DKNG", date(2026, 9, 30)) == new
+
+    def test_a_new_company_takes_a_dead_ticker_only_from_its_own_listing(self) -> None:
+        # MRLN: Marlin delisted 2022; Bleichroeder lists MRLN from
+        # 2026-05-15. The flat 2024 bars belong to neither.
+        marlin, bleichroeder = "0001260968", "0002028707:common-stock"
+        resolver = ListingResolver(
+            [
+                _listing(marlin, "MRLN", date(2020, 3, 13), "Common Stock"),
+                _listing(bleichroeder, "MRLN", date(2026, 5, 15), "Common Stock"),
+            ],
+            _evidence(
+                [_shares(marlin, date(2021, 10, 22), 12026394, date(2021, 10, 29))],
+                [
+                    _ended(
+                        marlin,
+                        "MRLN",
+                        "Common Stock",
+                        date(2022, 1, 30),
+                        valid_from=date(2020, 3, 13),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("MRLN", date(2022, 1, 28)) == marlin
+        assert resolver.resolve("MRLN", date(2024, 12, 2)) is None
+        assert resolver.resolve("MRLN", date(2026, 5, 15)) == bleichroeder
+
+    def test_a_renamed_security_loses_its_old_ticker_at_the_delisting(self) -> None:
+        # Old IAC (now Match Group): its IAC common was delisted from
+        # 2020-07-10 and its MTCH row starts 2020-08-10; the new IAC lists
+        # IAC from 2020-08-10. The new IAC's July bars are nobody's.
+        old, new = "0000891103", "0001800227"
+        resolver = ListingResolver(
+            [
+                _listing(old, "IAC", date(2019, 8, 8), "Common Stock"),
+                _listing(old, "MTCH", date(2020, 8, 10), "Common Stock"),
+                _listing(new, "IAC", date(2020, 8, 10), "Common stock"),
+            ],
+            _evidence(
+                [_shares(old, date(2026, 7, 31), 229550985, date(2026, 8, 5))],
+                [
+                    _ended(
+                        old, "IAC", "Common Stock", date(2020, 7, 10), valid_from=date(2019, 8, 8)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("IAC", date(2020, 7, 9)) == old
+        assert resolver.resolve("IAC", date(2020, 7, 13)) is None
+        assert resolver.resolve("IAC", date(2020, 8, 10)) == new
+        assert resolver.resolve("MTCH", date(2020, 8, 10)) == old
+
+    def test_a_later_row_of_the_ticker_keeps_the_span_through_an_old_form_25(self) -> None:
+        # Citigroup (causes 3): an undated snapshot listing of C, a 2012
+        # Form 25 against it, and the first cover page in 2019. C traded
+        # throughout; its 2016-2019 bars stay.
+        citi = "0000831001"
+        resolver = ListingResolver(
+            [
+                _listing(citi, "C", date(1994, 1, 13)),
+                _listing(citi, "C", date(2019, 8, 1), "Common Stock, par value $.01 per share"),
+            ],
+            _evidence(
+                [_shares(citi, date(2026, 7, 31), 1800000000, date(2026, 8, 5))],
+                [
+                    _ended(
+                        citi, "C", "Common Stock", date(2012, 12, 28), valid_from=date(1994, 1, 13)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("C", date(2016, 1, 4)) == citi
+        assert resolver.resolve("C", date(2026, 9, 30)) == citi
+        assert resolver.report.ended_spans == 0
+
+    def test_a_reorganized_security_with_a_new_row_keeps_its_ticker(self) -> None:
+        # CMPR (#820): a reorganization's Form 25 ends the old shares'
+        # listing from 2019-12-13; the same ticker's new row starts later.
+        # The span runs on, through the sessions before the new row.
+        cimpress = "0001262976"
+        listings = [
+            _listing(cimpress, "CMPR", date(2019, 8, 7), "Ordinary Shares"),
+            _listing(cimpress, "CMPR", date(2020, 2, 5), "Ordinary Shares"),
+        ]
+        ends = [
+            _ended(
+                cimpress, "CMPR", "Ordinary Shares", date(2019, 12, 13), valid_from=date(2019, 8, 7)
+            )
+        ]
+        facts = [_shares(cimpress, date(2026, 7, 31), 25000000, date(2026, 8, 5))]
+        resolver = ListingResolver(listings, _evidence(facts, ends))
+        assert resolver.resolve("CMPR", date(2019, 12, 20)) == cimpress
+        assert resolver.resolve("CMPR", date(2026, 9, 30)) == cimpress
+        # Without the new row (before #820), the span ends at the delisting.
+        alone = ListingResolver(listings[:1], _evidence(facts, ends))
+        assert alone.resolve("CMPR", date(2019, 12, 20)) is None
+
+    def test_the_cut_acts_only_from_the_effective_day(self) -> None:
+        # No look-ahead: the Form 25 is accepted before its effective day,
+        # and every session before that day keeps its mapping.
+        dead = "0000000002"
+        listings = [_listing(dead, "GONE", date(2018, 3, 1), "Common Stock")]
+        ends = [_ended(dead, "GONE", "Common Stock", date(2021, 6, 1), valid_from=date(2018, 3, 1))]
+        with_end = ListingResolver(listings, _evidence([], ends))
+        without = ListingResolver(listings, _evidence([]))
+        sessions = [date(y, m, 1) for y in range(2018, 2022) for m in range(1, 13)]
+        for session in (s for s in sessions if s < date(2021, 6, 1)):
+            assert with_end.resolve("GONE", session) == without.resolve("GONE", session)
+
+    def test_without_evidence_nothing_is_cut(self) -> None:
+        resolver = ListingResolver([_listing("0000000002", "GONE", date(2018, 3, 1))])
+        assert resolver.resolve("GONE", date(2026, 9, 30)) == "0000000002"
+        assert resolver.report.ended_spans == 0
 
 
 class TestBars:

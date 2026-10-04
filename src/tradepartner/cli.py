@@ -76,11 +76,7 @@ import httpx
 import typer
 
 from tradepartner.adapters import alpaca_raw
-from tradepartner.adapters.alpaca_prices import (
-    AlpacaPriceSource,
-    ListingResolver,
-    registrant_evidence,
-)
+from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.backfill import backfill
@@ -92,10 +88,9 @@ from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
+from tradepartner.repair import repair_resolution, store_resolver
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
-from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -145,15 +140,9 @@ class StorePriceSource(PriceSource):
         if self._inner is None:
             at = ensure_tz_aware_utc(self._clock(), field_name="clock()")
             with _read(self._settings) as conn:  # waits out a writer like ingest's reads
-                listings = listings_as_of(conn, at)
-                evidence = registrant_evidence(  # #793: who still trades under a ticker
-                    facts_as_of(conn, at).iter_rows(named=True),
-                    listing_ends_as_of(conn, at, self._settings).iter_rows(named=True),
-                    as_of=at.date(),
-                    quiet_after_days=self._settings.alpaca.registrant_quiet_days,
-                )
+                resolver = store_resolver(conn, at, self._settings)  # #793 evidence included
             self._inner = AlpacaPriceSource(
-                ListingResolver(listings.iter_rows(named=True), evidence),
+                resolver,
                 fetch_bars=self._fetch_bars,
                 fetch_actions=self._fetch_actions,
                 settings=self._settings,
@@ -462,6 +451,22 @@ def make_app(
             )
         _print_result(result)
         raise typer.Exit(result.exit_code)
+
+    @app.command("repair-resolution")
+    def repair_resolution_(
+        dry_run: Annotated[
+            bool, typer.Option(help="count what would be deleted and change nothing")
+        ] = False,
+    ) -> None:
+        """Delete Alpaca bars and actions the resolver no longer assigns to their security."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = repair_resolution(s, clock=clock, dry_run=dry_run)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        typer.echo(result.summary())
 
     @app.command()
     def health(
