@@ -12,7 +12,7 @@ days (Rule 12d2-2).
 
 **One class per filing.** A filing names a class, not a company, so it is
 resolved to the `security_id` of its CIK (known by the filing's acceptance,
-so never new equity listed after it, #820) whose listing on the filing's
+and not yet succeeded by new equity, #820) whose listing on the filing's
 exchange has the same title up to the first comma (master's
 `_norm_title`). Failing that, a filing whose title is plain common equity
 (master's `_is_common`, and no warrant, right, unit, preferred or
@@ -118,12 +118,15 @@ def _is_plain_common(title: str) -> bool:
 
 def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
     """The `security_id` `filing` delists, or `None` if it is not certain."""
+    succeeded = {s.predecessor_id for s in master.successions if s.known_at <= filing.accepted_at}
     candidates: set[str] = {
         row["security_id"]
         for row in master.securities
         if row["cik"] == filing.cik
         and not row.get("benchmark", False)
-        and row["known_at"] <= filing.accepted_at  # never a successor known later (#820)
+        # #820: never a successor known later, nor a class already succeeded.
+        and row["known_at"] <= filing.accepted_at
+        and row["security_id"] not in succeeded
     }
     on_exchange = [
         row

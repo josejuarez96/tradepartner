@@ -45,7 +45,9 @@ domicile, an LP or REIT conversion: CMPR, CG, WELL, FCFS, KIM), with
 the session after the filing session (a Form 25 ends the latest listing
 starting on or before that session). An amendment (`/A`) does not re-arm
 a class and exchange that already had one, so a late 25-NSE/A never
-splits the listing it amends.
+splits the listing it amends. A cover page that shows the class only on
+another exchange settles the Form 25 as a transfer: a later move back is
+an ordinary new row, never a relisting.
 
 **New equity after a Form 25 is a new security** (owner decision on
 #820): when the CIK filed an 8-A12B (a new 12(b) registration) between
@@ -384,8 +386,9 @@ class _Builder:
                 if cls.security_id in shown:
                     cls.pairs = frozenset(shown[cls.security_id])
                     cls.history.append((known_at, cls.pairs))
-                    for _, exchange in cls.pairs:
-                        cls.ended.pop(exchange, None)
+                    # Shown again: a Form 25 on an exchange it no longer lists
+                    # was a move (a transfer), not a pause before a relisting.
+                    cls.ended.clear()
         if not classes:
             classes.append(_Class(primary_security_id(cik), first.accepted_at))
         return classes

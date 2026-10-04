@@ -958,3 +958,53 @@ class TestNewEquityAfterForm25:
         before = securities_as_of(full, _at(2020, 11, 5) - PROBE_EPSILON)
         assert f"{self.CIK}@2020-11-05" not in _ids(before)
         full.close()
+
+    def test_a_delisted_successor_is_ended_by_its_own_form_25(self) -> None:
+        # quant-auditor on #826: the successor's later Form 25 names the same
+        # title as the old class; it must resolve to the successor.
+        cik = self.CIK
+        first = self._form25()
+        second = DelistingFiling(
+            cik, "25-NSE", "Common Stock", "NYSE", "25-crc-2", _at(2023, 6, 1), date(2023, 6, 12)
+        )
+        source = self._source(registered=_at(2020, 10, 27))
+        source = FixtureFilingSource(
+            index=source.filing_index(),
+            cover_pages=source.cover_pages(cik),
+            delistings=[first, second],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        delistings = build_delistings([first, second], build, ingested_at=INGESTED_AT)
+        assert [r["security_id"] for r in delistings.delistings] == [cik, f"{cik}@2020-11-05"]
+        assert delistings.unmatched == ()
+
+    @pytest.mark.parametrize("registered_back", [True, False])
+    def test_a_transfer_and_a_move_back_make_no_successor(self, registered_back: bool) -> None:
+        # quant-auditor on #826: NYSE -> NASDAQ (Form 25 on NYSE, 8-A12B for
+        # NASDAQ), later NASDAQ -> NYSE. A move, never new equity.
+        cik = self.CIK
+        index = [
+            _filing(cik, "Move Co", "10-K", _at(2018, 3, 1)),
+            _filing(cik, "Move Co", "8-A12B", _at(2020, 2, 27)),
+        ]
+        if registered_back:
+            index.append(_filing(cik, "Move Co", "8-A12B", _at(2023, 2, 27)))
+        source = FixtureFilingSource(
+            index=index,
+            cover_pages=[
+                _cover(cik, _at(2019, 8, 1), ("Common Stock", "XYZ", "NYSE")),
+                _cover(cik, _at(2020, 5, 1), ("Common Stock", "XYZ", "NASDAQ")),
+                _cover(cik, _at(2023, 5, 1), ("Common Stock", "XYZ", "NYSE")),
+            ],
+            delistings=[
+                _form25(cik, "Common Stock", "NYSE", _at(2020, 3, 2)),
+                _form25(cik, "Common Stock", "NASDAQ", _at(2023, 3, 1)),
+            ],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        assert build.successions == ()
+        assert [(r["security_id"], r["exchange"], r["valid_from"]) for r in build.listings] == [
+            (cik, "NYSE", date(2019, 8, 1)),
+            (cik, "NASDAQ", date(2020, 5, 1)),
+            (cik, "NYSE", date(2023, 5, 1)),
+        ]
