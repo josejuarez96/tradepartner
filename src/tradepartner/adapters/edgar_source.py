@@ -206,6 +206,9 @@ from tradepartner.adapters.filings import (
 from tradepartner.config import Settings, clean_message
 from tradepartner.timeutil import ensure_tz_aware_utc
 
+#: The cache versions below each name a directory under `edgar.cache_dir`;
+#: a bump never deletes the superseded tree (the runbook's "After an EDGAR
+#: cache version bump" says how to remove it, #615).
 #: Bumped when a parser change must re-stamp every cached accession.
 PARSER_VERSION = 1
 #: Bumped when a parser change must re-extract every cached FSN period.
@@ -215,6 +218,8 @@ FSN_VERSION = 2  # 2: #609 (latest ddate per member, NULL shares, title whitespa
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
+#: #615's nil-with-text refusal is no bump: a cached parse that skipped such
+#: a fact keeps it until the next bump re-parses it.
 COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and counted)
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
