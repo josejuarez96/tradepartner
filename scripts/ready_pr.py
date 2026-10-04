@@ -360,6 +360,18 @@ def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
     return [f"changelog.d/{issue}-<slug>.md"]
 
 
+def own_changelog_fragments(
+    branch: str, diff_names: Sequence[str], deleted: Collection[str]
+) -> list[str]:
+    """The ``changelog.d/<issue>-*`` fragments of the branch's issue that the diff adds or
+    edits (not deletes): the texts ``lacks_changelog_bullets`` reads. Shared with
+    ``merge_train`` (#764) so both read the same files."""
+    issue = issue_of_branch(branch)
+    if issue is None:
+        return []
+    return [p for p in diff_names if p.startswith(f"changelog.d/{issue}-") and p not in deleted]
+
+
 def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
     """On a ``feat/`` or ``fix/`` branch, whether none of the issue's added
     ``changelog.d`` fragments holds a CHANGELOG heading with a bullet (a STATUS-only
@@ -517,11 +529,7 @@ def ready(
                 + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
             )
         issue = issue_of_branch(pr.branch)
-        own = [
-            p
-            for p in touched
-            if issue is not None and p.startswith(f"changelog.d/{issue}-") and p not in deleted
-        ]
+        own = own_changelog_fragments(pr.branch, touched, deleted)
         if lacks_changelog_bullets(pr.branch, [r.read(p) for p in own]):
             raise ReadyError(
                 "a feat/fix PR records its change in CHANGELOG: add a bullet to "

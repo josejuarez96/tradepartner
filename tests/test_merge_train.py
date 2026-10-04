@@ -1952,3 +1952,68 @@ def test_shell_runner_pr_data_fails_closed_when_its_ref_vanishes_after_fetch(
     monkeypatch.setattr(runner, "_git", fake_git)
     with pytest.raises(mt.StoppedError, match="vanished"):
         runner.pr_data(7)
+
+
+def test_shell_runner_pr_data_reads_the_fragment_at_the_head_so_h_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#764: the real data path must fill `fragment_texts` from the branch's own added
+    `changelog.d` fragment, read at the PR's head SHA (never the branch tip), so a valid
+    feat/fix PR is not ineligible under (h). A deleted fragment is never read."""
+    head = "c" * 40
+    runner = mt.ShellRunner(tmp_path)
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"nameWithOwner": REPO})
+        if args[:3] == ("pr", "view", "7") and "statusCheckRollup" in args[-1]:
+            rollup = [
+                {"name": n, "status": "COMPLETED", "conclusion": "SUCCESS"}
+                for n in ("checks", "claims")
+            ]
+            return json.dumps({"headRefOid": head, "statusCheckRollup": rollup})
+        if args[:3] == ("pr", "view", "7"):
+            return json.dumps(
+                {
+                    "number": 7,
+                    "author": {"login": OWNER},
+                    "isCrossRepository": False,
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "headRefName": "fix/7-x",
+                    "headRefOid": head,
+                    "body": "Closes #7\n",
+                    "labels": [],
+                    "comments": [],
+                    "title": "x",
+                }
+            )
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    shown: list[str] = []
+
+    def fake_git(cwd: Path, *args: str, check: bool = True) -> _Proc:
+        if args[:2] == ("fetch", "-q"):
+            return _Proc(0, "")
+        if args[:1] == ("rev-parse",):
+            return _Proc(0, head + "\n")
+        if "diff" in args and "--diff-filter=D" in args:
+            assert args[-1] == f"origin/main...{head}"
+            return _Proc(0, "changelog.d/7-old.md\n")
+        if "diff" in args:
+            assert args[-1] == f"origin/main...{head}"
+            return _Proc(
+                0, "docs/x.md\nchangelog.d/7-x.md\nchangelog.d/7-old.md\nchangelog.d/9-y.md\n"
+            )
+        if args[:1] == ("show",):
+            shown.append(args[1])
+            return _Proc(0, FRAGMENT)
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    monkeypatch.setattr(runner, "_git", fake_git)
+    data = runner.pr_data(7)
+    assert shown == [f"{head}:changelog.d/7-x.md"]
+    assert data.pr.fragment_texts == (FRAGMENT.strip(),)
+    assert mt.eligibility(data.pr, data.head_checks, data.diff_paths, data.comments) is None
