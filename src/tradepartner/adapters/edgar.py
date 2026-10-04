@@ -544,10 +544,11 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
     title with no symbol (notes with `NoTradingSymbolFlag`) is not a
     listing; a symbol with no title or no exchange is skipped and counted
     in `incomplete_listings` (owner decision #224, as the FSN path); a fact
-    with no context raises. A nil fact (`xsi:nil="true"`) is skipped. A
-    context dimensioned by any axis other than the class axis (a
-    co-registrant in a combined filing) is skipped and returned in
-    `other_contexts`: its shares and listings are not the filer's.
+    with no context raises. A nil fact (`xsi:nil="true"`) is skipped, and
+    one that also has text raises (#615). A context dimensioned by any axis
+    other than the class axis (a co-registrant in a combined filing) is
+    skipped and returned in `other_contexts`: its shares and listings are
+    not the filer's.
 
     A cover with no listing, shares or title fact at all (a registrant
     with no listed class that reports no share count) is an empty parse for
