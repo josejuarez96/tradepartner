@@ -25,6 +25,7 @@ from tradepartner.store.journal import (
     AlertRow,
     DecisionRow,
     FillRow,
+    KillSwitchRow,
     OrderEventRow,
     OrderRow,
     OutcomeRow,
@@ -954,3 +955,607 @@ def test_under_the_limit_the_bounded_reads_show_every_row(
         + [o.known_at for o in outcomes]
         + [_at(12)]  # the seeded alert
     )
+
+
+# --- bounded reads, the remaining whole-window ones (#613) -----------------------
+
+
+def _rows(settings: Settings, pattern: str) -> list[tuple[str, int]]:
+    """`page_data`'s row counts for every query whose SQL matches `pattern`."""
+    with open_read_only(settings) as conn:
+        counting = _CountingConnection(conn)
+        ops.page_data(counting, settings)  # type: ignore[arg-type]
+    return [(sql, rows) for sql, rows in counting.reads if re.search(pattern, sql)]
+
+
+def test_marks_read_only_the_latest_marked_session(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """A window with marks on several sessions: the positions KPI matches a
+    full read of the latest session's rows, and the `positions_daily` query
+    never hands back more than that session's own rows, however many older
+    sessions the window has."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    sessions = [previous_session(_S_MINUS_1), _S_MINUS_1, _S]
+    with open_for_write(journal_settings) as conn:
+        for i, session in enumerate(sessions):
+            for security_id, quantity, value in (("BBB", 5.0, 100.0 + i), ("CCC", 2.0, 40.0 + i)):
+                append(
+                    conn,
+                    PositionDailyRow(
+                        run_id=seeded["run_id"],
+                        session=session,
+                        security_id=security_id,
+                        quantity=quantity,
+                        mark_price=20.0,
+                        value=value,
+                        **_stamp(60 + i),
+                    ),
+                )
+    with open_read_only(journal_settings) as conn:
+        full_marks = [
+            m
+            for m in ops.journal.positions_daily_for(conn, window_id)
+            if m.session == _S and m.security_id is not None
+        ]
+    expected_count = sum(1 for m in full_marks if m.quantity != 0)
+    expected_value = sum(m.value or 0.0 for m in full_marks if m.quantity != 0)
+
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.positions_count == expected_count
+    assert data.positions_value == expected_value
+
+    reads = _rows(journal_settings, r"\bFROM\s+positions_daily\b")
+    assert reads
+    assert max(rows for _, rows in reads) == len(full_marks)
+
+
+def test_kill_switch_read_is_at_most_two_rows_and_matches_derive(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """Many `kill_switch` rows, but `_kill_switch_rows_for` reads at most two
+    (the last by `event_id` and the greatest-`at` `released` row), and
+    `switch.derive` over that pair alone equals `derive` over the whole
+    window's rows."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        for i in range(10):
+            append(
+                conn,
+                KillSwitchRow(
+                    window_id=window_id,
+                    at=_at(100 + i),
+                    state="engaged" if i % 2 == 0 else "released",
+                    source="owner",
+                    **_stamp(100 + i),
+                ),
+            )
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+        full_rows = ops.journal.kill_switch_events_for(conn, window_id)
+        runs_with_results = ops.journal.runs_for(conn, window_id)
+        runs = [rw.run for rw in runs_with_results]
+        results = [rw.result for rw in runs_with_results if rw.result is not None]
+        expected = ops.derive(window, full_rows, runs, results, reading_run=None, lock_free=True)
+
+        bounded_rows = ops._kill_switch_rows_for(conn, window_id)
+        assert len(bounded_rows) <= 2
+        actual = ops.derive(window, bounded_rows, runs, results, reading_run=None, lock_free=True)
+    assert actual == expected
+
+
+@pytest.mark.parametrize("lock_free", [True, False])
+def test_bounded_run_reads_match_derive_across_fault_scenarios(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    seeded: dict[str, int],
+    lock_free: bool,
+) -> None:
+    """One fixture covering every scenario `switch.derive` branches on: a
+    faulted run a release clears (its own stamps are both before the
+    release), a faulted run the SAME release does not clear (stamped after
+    it), an old unfinished run, the window's latest run left unfinished (the
+    in-progress rule differs by `lock_free`), and an `engaged` row with no
+    run_id (the "latest kill-switch row" cause). `_kill_switch_rows_for` and
+    `_runs_for_switch`'s bounded reads must derive the identical
+    `SwitchState` a full, unbounded read of every row gives."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        cleared_run_id = append(conn, _run(window_id, _S, minutes=200))
+        append(conn, _result(cleared_run_id, "crashed", minutes=205))
+
+        uncleared_run_id = append(conn, _run(window_id, _S, minutes=300))
+        append(conn, _result(uncleared_run_id, "failed", minutes=305))
+
+        # The one release in the fixture: after both of the first run's
+        # stamps (clears it), but before the second run's finished_at (does
+        # not clear it) -- the exact release-between-stamps case.
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(302),
+                state="released",
+                source="owner",
+                **_stamp(302),
+            ),
+        )
+
+        old_unfinished_id = append(conn, _run(window_id, _S, minutes=400))
+        assert old_unfinished_id is not None
+        latest_unfinished_id = append(conn, _run(window_id, _S, minutes=500))
+        assert latest_unfinished_id is not None
+
+        # The window's last kill_switch row by event_id: an owner engagement
+        # tied to no run, so it is only ever found through "the last row".
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(310),
+                state="engaged",
+                source="owner",
+                **_stamp(310),
+            ),
+        )
+
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+        full_rows = ops.journal.kill_switch_events_for(conn, window_id)
+        full_runs_with_results = ops.journal.runs_for(conn, window_id)
+        full_runs = [rw.run for rw in full_runs_with_results]
+        full_results = [rw.result for rw in full_runs_with_results if rw.result is not None]
+        expected = ops.derive(
+            window, full_rows, full_runs, full_results, reading_run=None, lock_free=lock_free
+        )
+
+        bounded_rows = ops._kill_switch_rows_for(conn, window_id)
+        assert len(bounded_rows) <= 2
+        released_at = max((r.at for r in bounded_rows if r.state == "released"), default=None)
+        bounded_runs_with_results = ops._runs_for_switch(conn, window_id, released_at=released_at)
+        bounded_runs = [rw.run for rw in bounded_runs_with_results]
+        bounded_results = [rw.result for rw in bounded_runs_with_results if rw.result is not None]
+        actual = ops.derive(
+            window,
+            bounded_rows,
+            bounded_runs,
+            bounded_results,
+            reading_run=None,
+            lock_free=lock_free,
+        )
+
+    assert actual == expected
+    assert expected.engaged is True
+    assert any(f"run {uncleared_run_id} failed" in c for c in expected.causes)
+    assert not any(f"run {cleared_run_id} " in c for c in expected.causes)  # cleared
+    assert any(f"run {old_unfinished_id} unfinished" in c for c in expected.causes)
+    if lock_free:
+        assert expected.run_in_progress is False
+        assert any(f"run {latest_unfinished_id} unfinished" in c for c in expected.causes)
+    else:
+        assert expected.run_in_progress is True
+        assert not any(f"run {latest_unfinished_id} " in c for c in expected.causes)
+
+
+def test_reconciliation_tie_on_at_picks_the_same_row_as_max(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """Two reconciliations sharing the same (latest) `at`: `_latest_reconciliation`
+    must pick the one Python's `max(reconciliations, key=lambda r: r.at)`
+    would, which keeps the *first* maximal element it scans in
+    `reconciliations_for`'s order (known_at, ingested_at, rowid) -- the
+    earlier-known one, not an arbitrary tied row."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    tied_at = _at(500)
+    with open_for_write(journal_settings) as conn:
+        earlier_id = append(
+            conn,
+            ReconciliationRow(
+                window_id=window_id,
+                run_id=seeded["run_id"],
+                at=tied_at,
+                status="ok",
+                broker_cash=1234.0,
+                **_stamp(50),
+            ),
+        )
+        later_id = append(
+            conn,
+            ReconciliationRow(
+                window_id=window_id,
+                run_id=seeded["run_id"],
+                at=tied_at,
+                status="mismatch",
+                broker_cash=9999.0,
+                **_stamp(51),
+            ),
+        )
+    with open_read_only(journal_settings) as conn:
+        full = ops.journal.reconciliations_for(conn, window_id)
+        expected = max(full, key=lambda r: r.at)
+        actual = ops._latest_reconciliation(conn, window_id)
+    assert actual is not None
+    assert actual.reconciliation_id == expected.reconciliation_id == earlier_id
+    assert actual.reconciliation_id != later_id
+
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.reconciliation is not None
+    assert data.reconciliation.reconciliation_id == earlier_id
+
+
+def test_open_orders_count_matches_non_terminal_orders_with_many_terminal_orders(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """Many terminal (filled) orders plus a few open ones: the bounded
+    `COUNT(*)` matches `len(journal.non_terminal_orders(...))` and reads one
+    row, whatever the window's order count."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    _bulk_orders(journal_settings, seeded, 25)  # all terminal (filled)
+    with open_read_only(journal_settings) as conn:
+        expected = len(ops.journal.non_terminal_orders(conn, window_id=window_id))
+        actual = ops._open_orders_count(conn, window_id)
+    assert actual == expected
+
+    reads = _rows(journal_settings, r"SELECT\s+COUNT\(\*\)\s+FROM\s+orders\b")
+    assert reads
+    assert all(rows == 1 for _, rows in reads)
+
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.open_orders_count == expected
+
+
+def test_as_of_covers_rows_the_bounded_reads_no_longer_fetch(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """A late `known_at` on an old-session mark, an old (superseded)
+    kill-switch row and an old reconciliation -- none of them read by the
+    bounded reads above -- must still be picked up by `_bounded_known_at`'s
+    aggregate, so "as of" never predates a row the page no longer reads row
+    by row."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    late = _at(999)
+    with open_for_write(journal_settings) as conn:
+        # an old-session mark, journaled late (known_at far after its session)
+        append(
+            conn,
+            PositionDailyRow(
+                run_id=seeded["run_id"],
+                session=previous_session(_S_MINUS_1),
+                security_id="BBB",
+                quantity=1.0,
+                mark_price=1.0,
+                value=1.0,
+                known_at=late,
+                ingested_at=late,
+            ),
+        )
+        # the latest mark, on a later session, known well before `late`
+        append(
+            conn,
+            PositionDailyRow(
+                run_id=seeded["run_id"],
+                session=_S,
+                security_id="BBB",
+                quantity=1.0,
+                mark_price=1.0,
+                value=1.0,
+                **_stamp(13),
+            ),
+        )
+        # an old kill_switch row, superseded by nothing newer by event_id,
+        # but not the last row and not the max release either
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(14),
+                state="engaged",
+                source="owner",
+                known_at=late,
+                ingested_at=late,
+            ),
+        )
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(15),
+                state="released",
+                source="owner",
+                **_stamp(15),
+            ),
+        )
+        # an old reconciliation, not the one `_latest_reconciliation` returns
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=window_id,
+                run_id=seeded["run_id"],
+                at=_at(16),
+                status="ok",
+                known_at=late,
+                ingested_at=late,
+            ),
+        )
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings)
+    assert data.as_of == late
+
+
+def test_a_long_window_reads_at_most_the_bound_of_every_remaining_section(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """An oversized fixture across every section this task bounds -- many
+    sessions of marks, many kill-switch cycles, many finished runs, many
+    reconciliations and many terminal orders -- so a window that has run for
+    a long time never makes any of those queries hand back more than its
+    bound, and `page_data`'s output still matches a full, unbounded read."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    # Build 20 extra sessions of marks, 20 kill-switch engage/release cycles,
+    # 20 extra finished (non-faulted) runs, and 20 reconciliations: none of
+    # them a cause `switch.derive` can draw on, so the bounded reads must
+    # leave every one of them out.
+    with open_for_write(journal_settings) as conn:
+        session = _S_MINUS_1
+        for i in range(20):
+            session = next_session(session)
+            append(
+                conn,
+                PositionDailyRow(
+                    run_id=seeded["run_id"],
+                    session=session,
+                    security_id="BBB",
+                    quantity=1.0,
+                    mark_price=1.0,
+                    value=float(i),
+                    **_stamp(600 + i),
+                ),
+            )
+            append(
+                conn,
+                KillSwitchRow(
+                    window_id=window_id,
+                    at=_at(600 + i),
+                    state="engaged" if i % 2 == 0 else "released",
+                    source="owner",
+                    **_stamp(600 + i),
+                ),
+            )
+            extra_run_id = append(conn, _run(window_id, _S_MINUS_1, minutes=700 + i))
+            append(conn, _result(extra_run_id, "ok", minutes=701 + i))
+            append(
+                conn,
+                ReconciliationRow(
+                    window_id=window_id,
+                    run_id=seeded["run_id"],
+                    at=_at(600 + i),
+                    status="ok",
+                    **_stamp(600 + i),
+                ),
+            )
+        last_session = session
+    _bulk_orders(journal_settings, seeded, 20, start=800)  # all terminal (filled)
+
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+
+        # the reference: a full, unbounded read of every table
+        full_marks = [
+            m
+            for m in ops.journal.positions_daily_for(conn, window_id)
+            if m.session == last_session and m.security_id is not None
+        ]
+        expected_positions_count = sum(1 for m in full_marks if m.quantity != 0)
+        expected_positions_value = sum(m.value or 0.0 for m in full_marks if m.quantity != 0)
+        full_kill_switch_rows = ops.journal.kill_switch_events_for(conn, window_id)
+        full_runs_with_results = ops.journal.runs_for(conn, window_id)
+        full_runs = [rw.run for rw in full_runs_with_results]
+        full_results = [rw.result for rw in full_runs_with_results if rw.result is not None]
+        expected_switch_state = ops.derive(
+            window, full_kill_switch_rows, full_runs, full_results, reading_run=None, lock_free=True
+        )
+        expected_reconciliation = max(
+            ops.journal.reconciliations_for(conn, window_id), key=lambda r: r.at
+        )
+        expected_open_orders_count = len(ops.journal.non_terminal_orders(conn, window_id=window_id))
+
+        settings = journal_settings
+        counting = _CountingConnection(conn)
+        data = ops.page_data(counting, settings)  # type: ignore[arg-type]
+
+    assert data.positions_count == expected_positions_count
+    assert data.positions_value == expected_positions_value
+    assert data.switch_state == expected_switch_state
+    assert data.reconciliation is not None
+    assert data.reconciliation.reconciliation_id == expected_reconciliation.reconciliation_id
+    assert data.open_orders_count == expected_open_orders_count
+
+    marks_reads = [
+        rows for sql, rows in counting.reads if re.search(r"\bFROM\s+positions_daily\b", sql)
+    ]
+    assert marks_reads and max(marks_reads) == len(full_marks)
+
+    kill_switch_reads = [
+        rows for sql, rows in counting.reads if re.search(r"\bFROM\s+kill_switch\b", sql)
+    ]
+    # the "as of" aggregate also reads from kill_switch (one row); the
+    # bounded-rows query is the other two (at most one row each).
+    assert kill_switch_reads
+    assert max(kill_switch_reads) <= 2
+
+    reconciliation_reads = [
+        rows for sql, rows in counting.reads if re.search(r"\bFROM\s+reconciliations\b", sql)
+    ]
+    assert reconciliation_reads
+    assert max(reconciliation_reads) == 1
+
+    orders_count_reads = [
+        rows
+        for sql, rows in counting.reads
+        if re.search(r"SELECT\s+COUNT\(\*\)\s+FROM\s+orders\b", sql)
+    ]
+    assert orders_count_reads == [1]
+
+
+def _derive_bounded_and_full(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, *, lock_free: bool = True
+) -> tuple[ops.SwitchState, ops.SwitchState]:
+    """`switch.derive` over `_kill_switch_rows_for`/`_runs_for_switch`'s bounded
+    reads, and over a full, unbounded read of every row of the window --
+    paired, so a test can assert they are the same `SwitchState` and inspect
+    either one."""
+    window_id = window.window_id
+    assert window_id is not None
+    full_rows = ops.journal.kill_switch_events_for(conn, window_id)
+    full_runs_with_results = ops.journal.runs_for(conn, window_id)
+    full_runs = [rw.run for rw in full_runs_with_results]
+    full_results = [rw.result for rw in full_runs_with_results if rw.result is not None]
+    expected = ops.derive(
+        window, full_rows, full_runs, full_results, reading_run=None, lock_free=lock_free
+    )
+
+    bounded_rows = ops._kill_switch_rows_for(conn, window_id)
+    released_at = max((r.at for r in bounded_rows if r.state == "released"), default=None)
+    bounded_runs_with_results = ops._runs_for_switch(conn, window_id, released_at=released_at)
+    bounded_runs = [rw.run for rw in bounded_runs_with_results]
+    bounded_results = [rw.result for rw in bounded_runs_with_results if rw.result is not None]
+    actual = ops.derive(
+        window, bounded_rows, bounded_runs, bounded_results, reading_run=None, lock_free=lock_free
+    )
+    return actual, expected
+
+
+@pytest.mark.parametrize(
+    ("started_minutes", "finished_minutes", "release_minutes"),
+    [
+        (200, 205, 205),  # a release stamped exactly at finished_at
+        # a release stamped exactly at started_at, with finished_at BEFORE
+        # started_at (a clock-skewed run, nothing in the schema rules it
+        # out) so the finished_at clause alone could not already keep the
+        # run: only the started_at clause does, isolating it from the first
+        # case (safety-reviewer's verification pass on #651 found the
+        # original (200, 205, 200) case vacuous, since finished_at=205 >
+        # release=200 kept the run through the finished_at clause alone).
+        (205, 200, 205),
+    ],
+)
+def test_release_exactly_at_a_runs_stamp_does_not_clear_it(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    seeded: dict[str, int],
+    started_minutes: int,
+    finished_minutes: int,
+    release_minutes: int,
+) -> None:
+    """`switch._faulted_uncleared` clears a run only on a *strict* `at >
+    started_at and at > finished_at`; a release stamped at exactly one of
+    those two instants must not clear it. `_runs_for_switch`'s SQL expresses
+    "not cleared" as `released_at <= started_at OR released_at <= finished_at`
+    -- the equality case is the one a `<=` -> `<` slip would silently drop
+    from the bounded read while `derive` still calls the run engaged
+    (reviewed in #651: this is the fail-open direction, so it needs its own
+    boundary test rather than relying on the release-strictly-between-stamps
+    case already covered elsewhere in this file)."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        run_id = append(conn, _run(window_id, _S, minutes=started_minutes))
+        append(conn, _result(run_id, "crashed", minutes=finished_minutes))
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(release_minutes),
+                state="released",
+                source="owner",
+                **_stamp(release_minutes + 1),
+            ),
+        )
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+        actual, expected = _derive_bounded_and_full(conn, window)
+    assert actual == expected
+    assert expected.engaged is True
+    assert any(f"run {run_id} crashed" in c for c in expected.causes)
+
+
+def test_the_greatest_release_at_may_not_be_the_latest_by_event_id(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """Two `released` rows written out of `at` order (the halt path's
+    `utc_now()` stamp can run behind an earlier write's clock reading): the
+    first-written row carries the *later* `at` and clears a faulted run the
+    second-written (later `event_id`, earlier `at`) row would not. Neither
+    row is `engaged`, so if this case comes out `engaged=False`, that is only
+    because the switch correctly picked the greatest `at` to clear the run --
+    not because some row's state happened to be `engaged` (every other
+    scenario in this file ends on one)."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        run_id = append(conn, _run(window_id, _S, minutes=500))
+        append(conn, _result(run_id, "failed", minutes=550))
+        # written first, carries the later `at` -- the one that clears the run
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(600),
+                state="released",
+                source="owner",
+                **_stamp(600),
+            ),
+        )
+        # written second (higher event_id), carries the earlier `at` -- does
+        # not clear the run on its own, and is the "last row by event_id"
+        append(
+            conn,
+            KillSwitchRow(
+                window_id=window_id,
+                at=_at(510),
+                state="released",
+                source="owner",
+                **_stamp(601),
+            ),
+        )
+    with open_read_only(journal_settings) as conn:
+        window = ops.journal.latest_window(conn)
+        assert window is not None
+        actual, expected = _derive_bounded_and_full(conn, window)
+    assert actual == expected
+    assert expected.engaged is False  # the greatest `at` (600) clears the run
+    assert expected.causes == ()
+
+
+def test_switch_engages_from_an_unfinished_run_alone(
+    journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
+) -> None:
+    """No `kill_switch` row exists at all for this window: `engaged` must
+    still be True from the unfinished run alone (every other scenario in
+    this file has at least one kill-switch row; this is the one where
+    `_kill_switch_rows_for` legitimately returns zero rows)."""
+    window_id = open_window.window_id
+    assert window_id is not None
+    with open_for_write(journal_settings) as conn:
+        run_id = append(conn, _run(window_id, _S, minutes=900))  # no result: unfinished
+    with open_read_only(journal_settings) as conn:
+        bounded_rows = ops._kill_switch_rows_for(conn, window_id)
+        assert bounded_rows == ()
+        data = ops.page_data(conn, journal_settings)
+    assert data.switch_state is not None
+    assert data.switch_state.engaged is True
+    assert data.switch_state.causes == (f"run {run_id} unfinished",)

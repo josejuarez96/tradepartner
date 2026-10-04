@@ -36,6 +36,7 @@ from tradepartner.errors import LimitBreachError
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
+from tradepartner.execution.wrapper import BatchOutcome
 from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
@@ -742,6 +743,73 @@ def test_no_unspent_cash_alert_when_a_later_run_executes_within_the_fraction(
     later = env.run(at(F_0_PLUS_1))
     assert env.rebalance_events() == [(T_0, "executed", None, later.run_id)]
     assert env.alerts("unspent_cash") == []
+
+
+def test_two_rebalances_executed_at_step_3_in_one_run_write_one_alert(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alerter dedupes on (kind, run): step 3's loop may find more than
+    one rebalance reaching `executed` in the same run, so `_unspent_cash`
+    must write one alert naming every one of them over the bound, not one
+    per rebalance (the second of which the dedupe would silently drop)
+    (#563). A window with nothing ever due (`first_rebalance_session` far in
+    the future) is flat, so every call to `exits_step` makes no batch and
+    step 7b's own `_unspent_cash` call never happens; `_Run._executed` is
+    stubbed so step 3 finds two labels, real or not (`_unspent_cash` is pure
+    cash arithmetic over whatever it is given)."""
+    window = env.open_window(first=date(2099, 12, 31), tmp_path=tmp_path)
+    assert window.window_id is not None
+    monkeypatch.setattr(run_module._Run, "_executed", lambda self, actions, prices: [T_0, F_0])
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert T_0.isoformat() in message
+    assert F_0.isoformat() in message
+
+
+def test_step_7b_falls_back_to_broker_cash_when_cash_left_is_none(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BatchOutcome.cash_left` is None when no buys phase read the cash
+    (module docstring): step 7b's own `_unspent_cash` call must then fall
+    back to the broker's cash, not treat the batch's None as the cash itself
+    (#563). `trade_step` is stubbed to a no-op batch so nothing is really
+    submitted; `_Run._executed` is stubbed to find nothing at step 3 (so only
+    step 7b's call fires) and T_0 at step 7b."""
+    account = env.fake.account()
+    monkeypatch.setattr(run_module, "trade_step", lambda context: BatchOutcome(status="ok"))
+    calls = iter([[], [T_0]])
+    monkeypatch.setattr(run_module._Run, "_executed", lambda self, actions, prices: next(calls))
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert f"{account.cash:.2f} cash" in message
+
+
+def test_the_frozen_max_unspent_cash_fraction_is_used_not_settings(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The bound is the window's frozen `risk.max_unspent_cash_fraction`
+    (captured at `paper start`), not a later change to `settings`: raised
+    high enough in `settings` alone to silence the alert, the frozen 0.05
+    still alerts on SPFT's unspent third (#563)."""
+    env.fake.set_asset(
+        "SPFT", Asset(tradable=False, fractionable=True, status="active", cusip=None)
+    )
+    env.settings = Settings(
+        _env_file=None,
+        store={"path": env.settings.store.path},
+        alpaca={"quantity_decimals": 6, "client_order_id_max_length": 48},
+        risk={"max_unspent_cash_fraction": 0.9},
+    )
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert env.settings.risk.max_unspent_cash_fraction == 0.9
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert "max_unspent_cash_fraction 0.05" in message
 
 
 # --- overrides halt like any order ------------------------------------------------------
