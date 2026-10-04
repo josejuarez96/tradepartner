@@ -42,8 +42,10 @@ orders left to submit). In order:
    - `sell_within_holding`: each sell at most the reconciled holding rounded
      down to `quantity_decimals` (no short, ever);
    - `sell_sum_within_holding`: a name's sells plus the unfilled quantity of its
-     non-terminal own sells from any session at most the holding, rounded down
-     as above;
+     non-terminal own sells from any session (`open_sold`: each put on the
+     `quantity_decimals` grid, the nearest step only within `float` noise of
+     it and otherwise **up**, summed exactly in `Decimal`) at most the
+     holding, rounded down as above;
    - `buys_within_cash`: the buys with their modelled cost, a whole-share buy
      at the reference price x (1 + `risk.whole_share_price_buffer`), within
      `account().cash` (never `buying_power`), strictly and in `Decimal`
@@ -76,11 +78,12 @@ cash left, else deferred.
 from __future__ import annotations
 
 import math
+import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal
 
 import polars as pl
 
@@ -88,6 +91,7 @@ from tradepartner.adapters.broker import Account, Asset
 from tradepartner.backtest.costs import BPS_PER_UNIT
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.plan import _SPLIT as _SPLIT_ACTION
 from tradepartner.execution.plan import BuyCosts, Remainder, _split_factor
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
@@ -107,6 +111,7 @@ __all__ = [
     "Violation",
     "Violations",
     "check_phase",
+    "open_sold",
     "round_down",
     "size_buys",
     "unfilled_sells",
@@ -165,10 +170,14 @@ class PhaseOrder:
 
 @dataclass(frozen=True)
 class OpenSell:
-    """The unfilled quantity of one non-terminal own sell, any session."""
+    """The unfilled quantity of one non-terminal own sell, any session.
+    `split_ratios` is how many `float` split ratios `unfilled_sells`
+    multiplied into it: each one widens the `float` noise `open_sold` snaps
+    away (#719 item 1 /code-review: chained splits)."""
 
     security_id: str
     unfilled_quantity: float
+    split_ratios: int = 0
 
 
 @dataclass(frozen=True)
@@ -251,6 +260,49 @@ def _finite(value: float, what: str, *, positive: bool = False) -> float:
     return value
 
 
+def open_sold(open_sells: Iterable[OpenSell], quantity_decimals: int) -> dict[str, Decimal]:
+    """Each name's open sells (`unfilled_sells`), summed exactly in `Decimal`
+    by `security_id`, every unfilled quantity first put on the
+    `quantity_decimals` grid (`_on_grid`): the nearest step when it is within
+    `float` noise of one (a fully filled sell with no terminal event yet can
+    leave about 1e-16, which must not count), otherwise the step **above**,
+    so an off-grid estimate (a split factor such as 1/3, a notional sell's
+    unfilled value over the reference price) is never under-counted (#719
+    item 1: the nearest step could miss up to half a step, letting a trim
+    plus its open sells exceed the holding by that much). `check_phase`'s
+    `sell_sum_within_holding` and `phases.sell_orders`' sell cap both read
+    this one sum (#605)."""
+    if quantity_decimals < 0:
+        raise ValueError(f"decimals must be non-negative, got {quantity_decimals}")
+    step = Decimal(1).scaleb(-quantity_decimals)
+    totals: dict[str, Decimal] = defaultdict(Decimal)
+    for sell in open_sells:
+        left = _dec(_finite(sell.unfilled_quantity, f"open sell of {sell.security_id}"))
+        if sell.split_ratios < 0:
+            raise ValueError(f"open sell of {sell.security_id} has {sell.split_ratios} splits")
+        totals[sell.security_id] += _on_grid(left, step, sell.split_ratios)
+    return totals
+
+
+#: The relative rounding error of one `float` operation (machine epsilon).
+_FLOAT_EPSILON = Decimal(sys.float_info.epsilon)
+
+
+def _on_grid(left: Decimal, step: Decimal, split_ratios: int) -> Decimal:
+    """`left` (non-negative) on the grid of `step`: the nearest step when the
+    distance to it is at most `float` noise, else rounded **up**. The noise
+    bound is machine epsilon times the larger of `left` and one share, times
+    `split_ratios` + 2: `unfilled_sells` subtracts exactly, so what is left
+    is each split ratio's own rounding and their `float` product (under one
+    epsilon each), plus storing the result as a `float` and reading it back
+    through `repr` (under two together)."""
+    nearest = left.quantize(step, rounding=ROUND_HALF_EVEN)
+    noise = _FLOAT_EPSILON * max(left, Decimal(1)) * (split_ratios + 2)
+    if abs(left - nearest) <= noise:
+        return nearest
+    return left.quantize(step, rounding=ROUND_UP)
+
+
 def round_down(quantity: float, decimals: int) -> float:
     """`quantity` rounded toward zero to `decimals` places, from its shortest
     decimal form (so 0.57 stays 0.57): never up."""
@@ -327,30 +379,50 @@ def unfilled_sells(
     sell's submitted minus filled quantity, adjusted by the splits in
     `actions_as_of` with ex-date in (the order's session, S]; a notional sell's
     submitted notional minus its filled value, at the reference price. Never
-    below zero. An order with no event counts as open."""
+    below zero. An order with no event counts as open. The subtraction is
+    exact in `Decimal` (#719 item 1), so a fully filled sell with no terminal
+    event yet leaves nothing and a partly filled one leaves its grid quantity;
+    only a split factor or a notional over the price can leave it off-grid."""
     terminal = {e.client_order_id for e in order_events if e.status in TERMINAL_ORDER_STATUSES}
-    filled_quantity: dict[str, float] = defaultdict(float)
-    filled_value: dict[str, float] = defaultdict(float)
+    filled_quantity: dict[str, Decimal] = defaultdict(Decimal)
+    filled_value: dict[str, Decimal] = defaultdict(Decimal)
     for fill in fills:
         row = fill.fill
-        filled_quantity[row.client_order_id] += row.quantity
-        filled_value[row.client_order_id] += row.quantity * row.price
+        filled_quantity[row.client_order_id] += _dec(row.quantity)
+        filled_value[row.client_order_id] += _dec(row.quantity) * _dec(row.price)
     result = []
     for order in orders:
         if order.side != _SELL or order.client_order_id in terminal:
             continue
         coid = order.client_order_id
+        ratios = 0
         if order.quantity is not None:
             factor = _split_factor(actions_as_of, order.security_id, order.session, session)
-            left = (order.quantity - filled_quantity[coid]) * factor
+            ratios = _split_count(actions_as_of, order.security_id, order.session, session)
+            left = (_dec(order.quantity) - filled_quantity[coid]) * _dec(factor)
         elif order.notional is not None:
             price = _finite(price_of(order.security_id), "price", positive=True)
-            left = (order.notional - filled_value[coid]) / price
+            left = (_dec(order.notional) - filled_value[coid]) / _dec(price)
         else:
             raise ValueError(f"order {coid!r} has neither quantity nor notional")
         if left > 0:
-            result.append(OpenSell(order.security_id, left))
+            result.append(OpenSell(order.security_id, float(left), ratios))
     return result
+
+
+def _split_count(
+    actions_as_of: pl.DataFrame, security_id: str, stated_on: date, session: date
+) -> int:
+    """How many split ratios `plan._split_factor` multiplies for the same
+    arguments: the name's `split` rows with ex-date in (`stated_on`,
+    `session`]."""
+    return sum(
+        1
+        for row in actions_as_of.iter_rows(named=True)
+        if row["security_id"] == security_id
+        and row["action_type"] == _SPLIT_ACTION
+        and stated_on < row["ex_date"] <= session
+    )
 
 
 def _skip_reason(
@@ -513,15 +585,17 @@ def check_phase(
     for detail in over_weight.values():
         breach("max_position_weight", detail)
 
-    for sell in open_sells:
-        if sell.security_id in sold:
-            sold[sell.security_id] += sell.unfilled_quantity
+    # Exact in `Decimal`, never `float`, with the open sells summed by the one
+    # helper `phases.sell_orders` caps a trim with (`open_sold`), so a trim
+    # capped there never breaches here on float drift alone (#605).
+    open_by_name = open_sold(open_sells, quantity_decimals)
     for name, total in sold.items():
         holding = round_down(max(ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
-        if total > holding:
+        total_exact = _dec(total) + open_by_name.get(name, Decimal(0))
+        if total_exact > _dec(holding):
             breach(
                 "sell_sum_within_holding",
-                f"{name} sells and open sells of {total} over the holding {holding}",
+                f"{name} sells and open sells of {total_exact} over the holding {holding}",
             )
 
     exposure = (

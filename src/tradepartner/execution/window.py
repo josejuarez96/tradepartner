@@ -1,6 +1,7 @@
-"""Window start, stop, abandon, kill and the override writer (Phase 4 spec
-req 14 "Entry gate, start and stop", req 5, req 9 and open question 13; ADR
-0009 point 3; plans T64 and T64b).
+"""Window start, stop, abandon, kill, the override writer and the owner
+settlement writer (Phase 4 spec req 14 "Entry gate, start and stop", req 5,
+req 9, req 17 and open question 13; ADR 0009 point 3; plans T64, T64b and
+T84b).
 
 `start(settings, connect, broker, clock, slug)` is `paper start --hypothesis
 <slug>`. In order it refuses, before any write:
@@ -151,7 +152,11 @@ reason is the trimmed text.
   the clock it is stamped with), raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
-  share. It reads the clock, then opens one short-lived `open_for_write`
+  share. It first refuses `override` for kind `settle_order` (#571, spec req
+  17: that kind is `paper settle`'s alone, whose gate needs a fresh broker
+  read the page and `paper override` do not make), before the clock, the
+  store or any other check. It then reads the clock, opens one short-lived
+  `open_for_write`
   (`StoreLockedError` propagates: "store busy"), refuses `no_window`, refuses
   `override` for a kind outside the schema's set or fields the kind does not
   take (`engage_kill_switch` takes neither a session nor a name;
@@ -159,6 +164,15 @@ reason is the trimmed text.
   no earlier than the window's T_0), refuses `reason` when the trimmed reason
   is shorter than the window's frozen `paper.min_override_reason_chars`, and
   returns the new `override_id`.
+- **`settle_order(settings, connect, broker, clock, client_order_id,
+  reason)`** is the owner-only `paper settle --order --reason` (T84b, spec
+  req 17, #571), its one writer: under the run lock, the journal refusals in
+  req 17's order before any broker call, one read-only broker read (`account`,
+  `get_order`, `open_orders`, `fills`, `positions`, and a `get_order` per other
+  open order on the name), the three-part gate with the reset exception, then
+  the `overrides` row (`settle_order`) and the `cancelled` /
+  `owner_settled_unknown` event in one transaction, stamped after the reads.
+  It never calls `submit` or `cancel`. Its own docstring has the details.
 """
 
 from __future__ import annotations
@@ -168,7 +182,7 @@ import math
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -176,7 +190,7 @@ import duckdb
 import polars as pl
 from dateutil.relativedelta import relativedelta
 
-from tradepartner.adapters.broker import Broker
+from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
 from tradepartner.calendar import last_session_of_month, previous_session, session_close
 from tradepartner.config import (
     FROZEN_COSTS_KEYS,
@@ -191,8 +205,14 @@ from tradepartner.execution import switch
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
+from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import OK
-from tradepartner.execution.reconcile_run import command_session, frozen_risk, reconcile_now
+from tradepartner.execution.reconcile_run import (
+    command_session,
+    explanations_as_of,
+    frozen_risk,
+    reconcile_now,
+)
 from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write
@@ -203,10 +223,13 @@ from tradepartner.store.journal import (
     AdjustmentRow,
     JournalIntegrityError,
     JournalNotInitialised,
+    OrderEventRow,
+    OrderRow,
     OverrideRow,
     PaperWindowRow,
     PaperWindowStopRow,
     adjustments_for,
+    all_fill_ids,
     append,
     decisions_for,
     fills_for,
@@ -217,13 +240,19 @@ from tradepartner.store.journal import (
     order_events_for,
     orders_for,
     outcomes_for,
+    pending_orders,
     positions_daily_for,
     reconciliations_for,
     runs_for,
     unconsumed_kill_switch_overrides,
     window_stops_for,
 )
-from tradepartner.store.schema import JOURNAL_ENUMS, init_schema
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_ENUMS,
+    SETTLE_ORDER_KIND,
+    init_schema,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -298,6 +327,18 @@ def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
     return session_close(holdout_end) <= now
 
 
+def _cost_drifted(registered_value: Any, live_value: float) -> bool:
+    """Whether a registered cost value differs from the live one, true also
+    for a registered value `float()` cannot parse (a string or null): that is
+    drift too, refused the same way as a numeric mismatch (`costs_drift`,
+    #580 item 1), never a plain `ValueError`/`TypeError` escaping to the
+    caller."""
+    try:
+        return float(registered_value) != float(live_value)
+    except (TypeError, ValueError):
+        return True
+
+
 def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
     `FROZEN_PAPER_KEYS` under `paper.*`, `FROZEN_COSTS_KEYS` under `costs.*` and
@@ -320,7 +361,7 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
         f"{registered.get(f'{_COSTS_PREFIX}{k}')!r}"
         for k in FROZEN_COSTS_KEYS
         if f"{_COSTS_PREFIX}{k}" not in registered
-        or float(registered[f"{_COSTS_PREFIX}{k}"]) != float(costs[k])
+        or _cost_drifted(registered[f"{_COSTS_PREFIX}{k}"], costs[k])
     ]
     if drift:
         raise StartRefusedError(
@@ -411,18 +452,6 @@ def _parse_residues(residues_json: str | None) -> dict[str, _Residue]:
     return residues
 
 
-def _current_tickers(listings: pl.DataFrame, as_of: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from <= as_of`."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        if row["valid_from"] > as_of:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or row["valid_from"] > held["valid_from"]:
-            current[row["security_id"]] = row
-    return current
-
-
 def _split_factor(actions: pl.DataFrame, security_id: str, after: date, through: date) -> float:
     """The product of the ratios of `split` actions on `security_id` with
     `after < ex_date <= through`."""
@@ -480,7 +509,7 @@ def _check_flat(
     strictly_flat = previous_stop is None or previous_stop.state == _ABANDONED
     residues = {} if strictly_flat else _parse_residues(previous_stop.residues_json)
     stated_on = None if previous_stop is None else _ny_date(previous_stop.at)
-    current = _current_tickers(listings, now)
+    current = current_listings(listings, now)
 
     unmatched_symbols = {s: p.quantity for s, p in positions.items() if p.quantity != 0}
     carried: list[_Residue] = []
@@ -688,7 +717,7 @@ OPEN_ORDERS = "open_orders"
 REQUESTED = "requested"
 CLOSED = "closed"
 ABANDONED = _ABANDONED
-_ENGAGE_KILL_SWITCH = "engage_kill_switch"
+_ENGAGE_KILL_SWITCH = ENGAGE_KILL_SWITCH_KIND
 _OWNER = "owner"
 _FAULT = "fault"
 _FILLED = "filled"
@@ -810,25 +839,38 @@ def _open_orders(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
 
 
 def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
-    """Every order of the window that is not terminal, and every outcome kind a
-    terminal one earns (`execution.outcomes`) with no row yet."""
+    """Every order of the window that is not terminal, every outcome kind a
+    terminal one earns (`execution.outcomes`) with no row yet, and (#571, spec
+    req 17 and req 15 (3)) every order with a live fill (`superseded_by` null,
+    what `fills_for` returns) journaled after its first terminal event: a fill
+    journaled with that event shares its stamp, and a feed fill after req 8's
+    synthetic fill is superseded, so neither is listed."""
     orders = orders_for(conn, window_id=window_id)
     open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=window_id)}
     terminal: dict[str, str] = {}
+    terminal_at: dict[str, datetime] = {}
     for event in sorted(
         order_events_for(conn, window_id=window_id), key=lambda e: (e.known_at, e.ingested_at)
     ):
         if event.status in TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
+            terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
+    late: set[str] = set()
     for item in fills_for(conn, window_id=window_id):
         coid = item.fill.client_order_id
         filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
+        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+            late.add(coid)
     written = {(o.client_order_id, o.kind) for o in outcomes_for(conn, window_id)}
 
     missing: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
         coid = order.client_order_id
+        if coid in late:
+            missing.append(
+                f"order {coid} ({order.symbol}) has a live fill journaled after its terminal event"
+            )
         if coid in open_ids or coid not in terminal:
             missing.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
@@ -1272,7 +1314,14 @@ def override(
     """Append one `overrides` row to the open window and return its
     `override_id` (module docstring; spec req 9). Raises
     `WindowCommandRefused` for every refusal, nothing written, and
-    `StoreLockedError` when the store stays locked ("store busy")."""
+    `StoreLockedError` when the store stays locked ("store busy"). Kind
+    `settle_order` is refused first (spec req 17, #571)."""
+    if kind == SETTLE_ORDER_KIND:
+        raise WindowCommandRefused(
+            OVERRIDE,
+            f"override kind {kind!r} is written only by `paper settle --order --reason`, "
+            "whose gate reads the broker first",
+        )
     now = _command_clock(clock)
     note = reason.strip()
     with open_for_write(settings) as conn:
@@ -1300,3 +1349,393 @@ def override(
         )
     assert override_id is not None
     return override_id
+
+
+# --- `paper settle` (T84b, spec req 17, #571) -----------------------------------------
+
+UNKNOWN_ORDER = "unknown_order"
+ALREADY_TERMINAL = "already_terminal"
+PENDING_ORDER = "pending_order"
+NOT_ENGAGED = "not_engaged"
+ACCOUNT_MISMATCH = "account_mismatch"
+BROKER_OPEN = "broker_open"
+UNJOURNALED_FILL = "unjournaled_fill"
+UNEXPLAINED_POSITION = "unexplained_position"
+OTHER_OPEN_ORDER = "other_open_order"
+OWNER_SETTLED_UNKNOWN = "owner_settled_unknown"
+_CANCELLED = "cancelled"
+_PENDING = "pending"
+_ACKNOWLEDGING = ("accepted", "replay")
+_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SettleResult:
+    """What `settle_order` wrote: the `overrides` row's id, the settled order,
+    the one `known_at` both rows carry, and whether the reset exception of
+    gate (3) applied."""
+
+    override_id: int
+    client_order_id: str
+    known_at: datetime
+    reset: bool
+
+
+@dataclass(frozen=True)
+class _SettleTarget:
+    """The journal facts the gate read for the named order."""
+
+    window: PaperWindowRow
+    window_id: int
+    order: OrderRow
+    note: str
+    pending_at: datetime
+    broker_order_id: str | None
+    rebalance_session: date | None
+    others: tuple[OrderRow, ...]
+
+
+def _settle_journal_gate(
+    conn: duckdb.DuckDBPyConnection, client_order_id: str, reason: str
+) -> _SettleTarget:
+    """Req 17's journal refusals, in its order: `no_window`, `unknown_order`,
+    `already_terminal`, `pending_order`, `reason`, `not_engaged`."""
+    window, window_id = _window_of(conn)
+    order = next(
+        (o for o in orders_for(conn, window_id=window_id) if o.client_order_id == client_order_id),
+        None,
+    )
+    if order is None:
+        raise WindowCommandRefused(
+            UNKNOWN_ORDER, f"{client_order_id!r} is not an order of the open window {window_id}"
+        )
+    events = sorted(
+        order_events_for(conn, window_id=window_id, client_order_ids=[client_order_id]),
+        key=lambda e: (e.known_at, e.ingested_at),
+    )
+    if any(e.status in TERMINAL_ORDER_STATUSES for e in events):
+        raise WindowCommandRefused(
+            ALREADY_TERMINAL, f"order {client_order_id} already has a terminal event"
+        )
+    if any(o.client_order_id == client_order_id for o in pending_orders(conn, window_id=window_id)):
+        raise WindowCommandRefused(
+            PENDING_ORDER,
+            f"order {client_order_id} is pending (never acknowledged): paper resume settles it",
+        )
+    note = reason.strip()
+    minimum = _min_override_reason_chars(window)
+    if len(note) < minimum:
+        raise WindowCommandRefused(
+            REASON,
+            f"the settle reason is {len(note)} characters once trimmed; "
+            f"the window's frozen minimum is {minimum}",
+        )
+    runs = runs_for(conn, window_id)
+    state = switch.derive(
+        window,
+        kill_switch_events_for(conn, window_id),
+        [r.run for r in runs],
+        [r.result for r in runs if r.result is not None],
+        reading_run=None,
+        lock_free=True,
+    )
+    if not state.engaged:
+        raise WindowCommandRefused(
+            NOT_ENGAGED,
+            "the kill switch is not engaged: engage it with paper kill --reason first, "
+            "so no settlement runs beside a trading run",
+        )
+    pending_at = [e.known_at for e in events if e.status == _PENDING]
+    if not pending_at:
+        raise JournalIntegrityError(f"order {client_order_id} has no pending event")
+    acknowledged = [e for e in events if e.status in _ACKNOWLEDGING and e.broker_order_id]
+    accepted = [e for e in acknowledged if e.status == _ACKNOWLEDGING[0]]
+    ack = (accepted or acknowledged)[0] if acknowledged else None
+    decision = next(
+        (
+            d.decision
+            for d in decisions_for(conn, window_id)
+            if d.decision.decision_id == order.decision_id
+        ),
+        None,
+    )
+    if decision is None:
+        raise JournalIntegrityError(f"order {client_order_id} cites no decision of the window")
+    others = tuple(
+        sorted(
+            (
+                o
+                for o in non_terminal_orders(conn, window_id=window_id)
+                if o.security_id == order.security_id and o.client_order_id != client_order_id
+            ),
+            key=lambda o: o.client_order_id,
+        )
+    )
+    return _SettleTarget(
+        window=window,
+        window_id=window_id,
+        order=order,
+        note=note,
+        pending_at=min(pending_at),
+        broker_order_id=None if ack is None else ack.broker_order_id,
+        rebalance_session=decision.rebalance_session,
+        others=others,
+    )
+
+
+def _ledger_view(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    target: _SettleTarget,
+    as_of: datetime,
+    broker_symbols: list[str],
+    tolerance: float,
+) -> tuple[float, str | None]:
+    """The ledger's quantity in the order's name (the window's live fills and
+    adjustments known at `as_of`, split-adjusted through the clock's session S
+    by the actions known at close(S-1), the view `reconcile.compare` takes)
+    and the broker symbol reconciliation maps the name to (None: unmapped).
+    A journal row stamped after `as_of` means the clock went back since it
+    was written: `ClockError`, never a cut that silently drops it."""
+    window, window_id = target.window, target.window_id
+    session = command_session(as_of)
+    fills = fills_for(conn, window_id=window_id)
+    orders = orders_for(conn, window_id=window_id)
+    adjustments = adjustments_for(conn, window_id)
+    reconciliations = reconciliations_for(conn, window_id)
+    stamps = (
+        [f.fill.known_at for f in fills]
+        + [o.known_at for o in orders]
+        + [a.known_at for a in adjustments]
+        + [r.known_at for r in reconciliations]
+    )
+    if stamps and max(stamps) > as_of:
+        raise ClockError(
+            f"the clock reading {as_of.isoformat()} is before journal row stamped "
+            f"{max(stamps).isoformat()}"
+        )
+    stated = [r for r in reconciliations if r.status == OK and _ny_date(r.at) <= session]
+    ledger = from_journal(
+        fills,
+        orders,
+        adjustments,
+        live_actions_as_of(conn, session_close(previous_session(session))),
+        stated[-1] if stated else None,
+        window.starting_cash,
+        session,
+        window_id=window_id,
+        quantity_tolerance=tolerance,
+    )
+    symbols = explanations_as_of(
+        conn,
+        window,
+        session,
+        as_of=as_of,
+        settings=settings,
+        broker_symbols=broker_symbols,
+        quantity_tolerance=tolerance,
+    ).symbols
+    return ledger.positions.get(target.order.security_id, 0.0), symbols.get(
+        target.order.security_id
+    )
+
+
+def _reading_json(reading: Order | None) -> Any:
+    if reading is None:
+        return _UNKNOWN
+    return {
+        "status": reading.status.value,
+        "filled_quantity": reading.filled_quantity,
+        "filled_avg_price": reading.filled_avg_price,
+        "filled_at": None if reading.filled_at is None else reading.filled_at.isoformat(),
+    }
+
+
+def settle_order(
+    settings: Settings,
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    client_order_id: str,
+    reason: str,
+) -> SettleResult:
+    """`paper settle --order <client_order_id> --reason` (spec req 17, #571):
+    journal one acknowledged order of the open window terminal (`cancelled`,
+    reason `owner_settled_unknown`, no fill) beside an `overrides` row of kind
+    `settle_order`, on the evidence of one fresh read-only broker read.
+
+    In req 17's order: the run lock (`LockHeld` propagates: `locked`); the
+    journal refusals `no_window`, `unknown_order`, `already_terminal`,
+    `pending_order`, `reason` (the trimmed note under the window's frozen
+    `paper.min_override_reason_chars`) and `not_engaged` (the derived switch),
+    each before any broker call or write; one clock reading; then `account`
+    (`account_mismatch` when its id is not the window's), `get_order`,
+    `open_orders`, `fills(since)` (`since` = the order's `pending` event's
+    `known_at` minus `paper.fill_read_overlap_seconds`) and `positions`, and a
+    `get_order` per other non-terminal order of the window on the same
+    `security_id`. It refuses `broker_open` (a non-terminal reading, or the id
+    listed open), `unjournaled_fill` (a fill of the order in the stream whose
+    `broker_fill_id` the journal lacks), `unexplained_position` (the broker's
+    quantity in the name beyond the ledger's by more than the frozen
+    `risk.reconcile_quantity_tolerance` in the direction the order's fill
+    would move it: above for a buy, below for a sell; a name reconciliation
+    cannot map refuses too) and `other_open_order` (another non-terminal order
+    on the name the broker still knows). Neither of the last two applies under
+    the reset exception: `get_order` raised `UnknownOrderError` and
+    `positions()` holds nothing. Any broker error but that one
+    `UnknownOrderError` propagates, nothing written.
+
+    Then one clock reading, which must be later than the gate's reading and
+    than every journal row of the order (else `ClockError`), stamps both rows
+    (`known_at = ingested_at`) in one `connect()` transaction, which re-reads
+    the order's events and refuses `already_terminal` if one appeared. No other
+    row is written and no `submit` or `cancel` is ever called. The only caller
+    is the owner's CLI (#542 item 5)."""
+    with run_lock(settings):
+        with connect() as conn:
+            target = _settle_journal_gate(conn, client_order_id, reason)
+        window = target.window
+        tolerance = frozen_risk(window).reconcile_quantity_tolerance
+        now = _command_clock(clock)
+
+        account = broker.account()
+        if account.account_id != window.account_id:
+            raise WindowCommandRefused(
+                ACCOUNT_MISMATCH,
+                f"the broker's account {account.account_id!r} is not window "
+                f"{target.window_id}'s {window.account_id!r}",
+            )
+        try:
+            reading: Order | None = broker.get_order(client_order_id)
+        except UnknownOrderError:
+            reading = None
+        open_ids = sorted(o.client_order_id for o in broker.open_orders())
+        since = target.pending_at - timedelta(seconds=settings.paper.fill_read_overlap_seconds)
+        stream = broker.fills(since)
+        positions = broker.positions()
+        others: list[tuple[str, Order | None]] = []
+        for other in target.others:
+            try:
+                others.append((other.client_order_id, broker.get_order(other.client_order_id)))
+            except UnknownOrderError:
+                others.append((other.client_order_id, None))
+
+        with connect() as conn:
+            journaled = all_fill_ids(conn)
+            ledger_quantity, symbol = _ledger_view(
+                conn, settings, target, now, sorted(positions), tolerance
+            )
+        held = positions.get(symbol) if symbol is not None else None
+        broker_quantity = 0.0 if held is None else held.quantity
+        reset = reading is None and not any(p.quantity != 0 for p in positions.values())
+
+        if reading is not None and reading.status not in TERMINAL_STATUSES:
+            raise WindowCommandRefused(
+                BROKER_OPEN,
+                f"the broker reports order {client_order_id} {reading.status.value}: "
+                "it may yet fill; cancel it or wait",
+            )
+        if client_order_id in open_ids:
+            raise WindowCommandRefused(
+                BROKER_OPEN, f"the broker lists order {client_order_id} among its open orders"
+            )
+        missing = sorted(
+            f.broker_fill_id
+            for f in stream
+            if f.client_order_id == client_order_id and f.broker_fill_id not in journaled
+        )
+        if missing:
+            raise WindowCommandRefused(
+                UNJOURNALED_FILL,
+                f"the fill stream holds fills of {client_order_id} the journal lacks: "
+                + ", ".join(missing),
+            )
+        if not reset:
+            if symbol is None:
+                raise WindowCommandRefused(
+                    UNEXPLAINED_POSITION,
+                    f"{target.order.security_id} maps to no broker symbol, so its "
+                    "position cannot be read",
+                )
+            excess = broker_quantity - ledger_quantity
+            if target.order.side == _SELL:
+                excess = -excess
+            if excess > tolerance:
+                raise WindowCommandRefused(
+                    UNEXPLAINED_POSITION,
+                    f"the broker holds {broker_quantity:g} {symbol} against the ledger's "
+                    f"{ledger_quantity:g}: the {target.order.side}'s fill may exist",
+                )
+            known = [coid for coid, other in others if other is not None]
+            if known:
+                raise WindowCommandRefused(
+                    OTHER_OPEN_ORDER,
+                    f"other open orders of the window on {target.order.security_id} the "
+                    "broker still knows could net its quantity: " + ", ".join(known),
+                )
+
+        stamp = _command_clock(clock)
+        if stamp <= now:
+            raise ClockError(
+                f"the settle stamp {stamp.isoformat()} is not after the gate's reading "
+                f"{now.isoformat()}"
+            )
+        evidence: dict[str, Any] = {
+            "account_id": account.account_id,
+            "get_order": _reading_json(reading),
+            "open_order_ids": open_ids,
+            "symbol": symbol,
+            "broker_quantity": broker_quantity,
+            "ledger_quantity": ledger_quantity,
+            "fill_ids": [f.broker_fill_id for f in stream],
+            "other_orders": [
+                {"client_order_id": coid, "get_order": _reading_json(other)}
+                for coid, other in others
+            ],
+            "reset": reset,
+        }
+        with connect() as conn:
+            events = order_events_for(conn, window_id=None, client_order_ids=[client_order_id])
+            if any(e.status in TERMINAL_ORDER_STATUSES for e in events):
+                raise WindowCommandRefused(
+                    ALREADY_TERMINAL,
+                    f"order {client_order_id} got a terminal event after the gate",
+                )
+            rows = [e.known_at for e in events] + [
+                f.fill.known_at for f in fills_for(conn, client_order_ids=[client_order_id])
+            ]
+            if rows and stamp <= max(rows):
+                raise ClockError(
+                    f"the settle stamp {stamp.isoformat()} is not after the order's latest "
+                    f"journal row {max(rows).isoformat()}"
+                )
+            override_id = append(
+                conn,
+                OverrideRow(
+                    window_id=target.window_id,
+                    made_at=stamp,
+                    rebalance_session=target.rebalance_session,
+                    security_id=target.order.security_id,
+                    client_order_id=client_order_id,
+                    kind=SETTLE_ORDER_KIND,
+                    reason=target.note,
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+            assert override_id is not None
+            append(
+                conn,
+                OrderEventRow(
+                    client_order_id=client_order_id,
+                    status=_CANCELLED,
+                    reason=OWNER_SETTLED_UNKNOWN,
+                    broker_order_id=target.broker_order_id,
+                    raw_json=json.dumps(
+                        {"override_id": override_id, **evidence}, sort_keys=True, allow_nan=False
+                    ),
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+    return SettleResult(override_id, client_order_id, stamp, reset)

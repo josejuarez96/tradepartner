@@ -47,6 +47,14 @@ here is this module's and is stated once:
   delisted at `t` (Forms 25 and 25-NSE; a transfer counts as delisted until its
   new listing is known, spec req 4), with ticker, exchange, class, form, filing
   time, end session and effective date.
+- **Price jumps** (`price_jumps`): the owner's review list (#787),
+  `store.asof.price_jumps_as_of` at `t` over every security: each one-day
+  close move between traded bars outside the `universe` jump bounds that no
+  split or dividend known at `t` explains, with `accepted` from
+  `universe.accepted_price_jumps`. An unaccepted jump fails universe rule 6
+  while it is in the history window; accepting one is a config change.
+  `jumps_before`, when given, keeps only jumps on sessions before it (a
+  hypothesis's `holdout.start`), so the list never shows the holdout period.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
@@ -66,19 +74,34 @@ derived at `t`, as the data is read.
 - `non_overlapping_listings`: per security, ordered by `valid_from`, no two
   listings start on the same session, and no listing ended by a Form 25 was
   filed on more than `master.transfer_window_sessions` sessions after the next
-  listing started (both lines live at once: a dual listing, or a filing or
-  listing resolved to the wrong security). The filing session is the raw fact
-  to test: the derived end of a delisted or transferred listing is clipped
-  before the next listing's start by construction (spec req 4). A listing with
-  no Form 25 is superseded by the next one (a ticker change), as the as-of
-  reads treat it.
+  exchange line started (both lines live at once: a dual listing, or a filing
+  or listing resolved to the wrong security). The filing session is the raw
+  fact to test: the derived end of a delisted or transferred listing is
+  clipped before the next listing's start by construction (spec req 4). A
+  listing with no Form 25 is superseded by the next one (a ticker change), as
+  the as-of reads treat it. Two cases are not a second line (#822): rows of
+  the same ticker starting the same day, which differ only in the exchange
+  their filers tagged (or the class title's wording), are one line; and a
+  row on `OFF_EXCHANGE` (NONE or OTC) is no exchange line at all (the normal
+  suspension, OTC quote, late Form 25 sequence), so a late filing is tested
+  against the next row that is neither.
 - `no_bars_after_delisting`: no bar known at `t` for a delisted listing's
-  security dated after the delisting's `effective_on` and before the
-  security's next listing, if any. The derived end of a delisted listing is its
-  last bar (spec req 4), so the bound that can be broken is the date the
-  delisting takes effect; trading between the filing and that date is normal.
-  A bar past it means a wrong delisting or a bar resolved to the wrong security
-  (a reused ticker).
+  security that *resumes* after the delisting's `effective_on` and before the
+  security's next listing on an exchange, if any (a NONE or OTC row, often
+  started before `effective_on` in the suspension sequence, does not end the
+  check: the feed has no OTC bars, spec req 10). A listing's end is its last bar (spec req
+  4), so a line that keeps trading past `effective_on` without a break (a
+  holding-company or redomicile Form 25 on the same line, CMPR) is its own
+  tail and passes. A bar that comes after more than
+  `master.transfer_window_sessions` missing sessions fails, with every bar
+  after it up to that listing. Missing sessions are XNYS sessions strictly
+  between two bars; the first gap is counted from the last bar on or before
+  `effective_on`, or from `effective_on` when there is none, so a delisting
+  that took effect long before the store's first bar fails its line's bars:
+  the store cannot show the line kept trading.
+  Such a bar is another equity's resolved to this one (a reused ticker,
+  EGLE), a relisting with no listing row, or bars on both sides of a hole in
+  the store.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
@@ -88,10 +111,10 @@ This module holds no threshold; the only numbers in it are 0 and 1.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
-from itertools import pairwise
 from typing import Any
 
 import duckdb
@@ -101,7 +124,7 @@ from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
-from tradepartner.store.asof import _validate_t
+from tradepartner.store.asof import _validate_t, price_jumps_as_of
 from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
 from tradepartner.store.delistings import (
     DELISTED,
@@ -117,6 +140,10 @@ from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 STATIC = "snapshot_static"
 #: The classification ingest's staleness check counts, with benchmarks.
 _COMMON = "common"
+#: The exchange codes `adapters.edgar.normalize_exchange` gives a class
+#: registered with no exchange ("None") or quoted over the counter: a row on
+#: one of them is never a second exchange line (#822).
+OFF_EXCHANGE: frozenset[str] = frozenset({"NONE", "OTC"})
 
 KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
@@ -272,6 +299,20 @@ class DelistedNames:
 
 
 @dataclass(frozen=True, eq=False)
+class PriceJumps:
+    """The price-jump review list at `t` (#787), one row per jump, only sessions
+    before `before` when it is set."""
+
+    frame: pl.DataFrame
+    before: date | None = None
+
+    @property
+    def pending(self) -> pl.DataFrame:
+        """The jumps the owner has not accepted."""
+        return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
 
@@ -297,6 +338,7 @@ class HealthReport:
     unclassifiable: Unclassifiable
     static_reliance: StaticReliance
     delisted: DelistedNames
+    price_jumps: PriceJumps
     settings: dict[str, Any]
     integrity: tuple[IntegrityCheck, ...]
 
@@ -312,11 +354,16 @@ class HealthReport:
 
 
 def health_report(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings | None = None,
+    *,
+    jumps_before: date | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
-    ends, securities and classifications are read once and shared."""
+    ends, securities and classifications are read once and shared.
+    `jumps_before` limits the price-jump list to sessions before it."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -334,12 +381,22 @@ def health_report(
         unclassifiable=_unclassifiable(securities, classes),
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
+        price_jumps=_price_jumps(conn, t, settings, jumps_before),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
         },
         integrity=_integrity_checks(conn, t, settings, listings),
     )
+
+
+def _price_jumps(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> PriceJumps:
+    frame = price_jumps_as_of(conn, t, settings=settings)
+    if before is not None:
+        frame = frame.filter(pl.col("session") < before)
+    return PriceJumps(frame, before)
 
 
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
@@ -602,15 +659,30 @@ def _integrity_checks(
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
-        NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings),
+        NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
 
+def _present_tables(conn: duckdb.DuckDBPyConnection) -> set[str]:
+    """Table names `conn` actually has, per `dashboard.header.store_freshness`'s
+    pattern: a read-only connection never migrates (`store.schema.init_schema`),
+    so a store opened before a later `_FACT_TABLES` addition (e.g.
+    `statement_facts`, version 9, #660) is missing it until the next writable
+    open -- querying it directly would raise `duckdb.CatalogException` instead
+    of the loud-but-graceful "run `tradepartner ingest`" health already gives
+    for an uninitialised store."""
+    rows = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    return {name for (name,) in rows}
+
+
 def _count_per_table(conn: duckdb.DuckDBPyConnection, condition: str) -> pl.DataFrame:
+    present = _present_tables(conn)
     rows: list[dict[str, Any]] = []
     for table in _FACT_TABLES:
+        if table not in present:
+            continue
         row = conn.execute(f"SELECT count(*) FROM {table} WHERE {condition}").fetchone()
         count = int(row[0]) if row is not None else 0
         if count:
@@ -619,8 +691,11 @@ def _count_per_table(conn: duckdb.DuckDBPyConnection, condition: str) -> pl.Data
 
 
 def _bad_provenance(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    present = _present_tables(conn)
     rows: list[dict[str, Any]] = []
     for table in _FACT_TABLES:
+        if table not in present:
+            continue
         allowed = TABLE_PROVENANCE_VALUES[table]
         marks = ", ".join("?" for _ in allowed)
         found = conn.execute(
@@ -667,18 +742,36 @@ def _by_security(listings: pl.DataFrame) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+def _same_line(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Two rows of one ticker from one day: one line tagged with two
+    exchanges by its filers (#822), never two lines."""
+    return bool(a["valid_from"] == b["valid_from"] and a["ticker"] == b["ticker"])
+
+
 def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for sid, ordered in sorted(_by_security(listings).items()):
-        for current, following in pairwise(ordered):
+        for i, current in enumerate(ordered[:-1]):
+            following = ordered[i + 1]
+            same_start = current["valid_from"] == following["valid_from"]
+            flagged = following if same_start and not _same_line(current, following) else None
             filed = current["delisting_filed_at"]
             filing_session = None if filed is None else _filing_session(filed)
-            same_start = current["valid_from"] == following["valid_from"]
-            filed_late = (
-                filing_session is not None
-                and following["valid_from"] < _window(filing_session, window_sessions)[0]
-            )
-            if same_start or filed_late:
+            if flagged is None and filing_session is not None:
+                exchange_line = next(
+                    (
+                        r
+                        for r in ordered[i + 1 :]
+                        if r["exchange"] not in OFF_EXCHANGE and not _same_line(current, r)
+                    ),
+                    None,
+                )
+                if (
+                    exchange_line is not None
+                    and exchange_line["valid_from"] < _window(filing_session, window_sessions)[0]
+                ):
+                    flagged = exchange_line
+            if flagged is not None:
                 rows.append(
                     {
                         "security_id": sid,
@@ -687,29 +780,62 @@ def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.Da
                         "valid_from": current["valid_from"],
                         "status": current["status"],
                         "filing_session": filing_session,
-                        "next_ticker": following["ticker"],
-                        "next_exchange": following["exchange"],
-                        "next_valid_from": following["valid_from"],
+                        "next_ticker": flagged["ticker"],
+                        "next_exchange": flagged["exchange"],
+                        "next_valid_from": flagged["valid_from"],
                     }
                 )
     return pl.DataFrame(rows, schema=_OVERLAP_SCHEMA)
 
 
+def _missing_sessions(sessions: tuple[date, ...], after: date, before: date) -> int:
+    """XNYS sessions strictly between `after` and `before`."""
+    return max(0, bisect_left(sessions, before) - bisect_right(sessions, after))
+
+
+def _resumed_bars(
+    bars: list[date],
+    effective_on: date,
+    next_start: date | None,
+    window_sessions: int,
+    sessions: tuple[date, ...],
+) -> list[date]:
+    """The bars of `bars` (sorted) after `effective_on` and before
+    `next_start` that come back after more than `window_sessions` missing
+    sessions, and every bar after the first of them; the bars before it are
+    the listing's own tail. The first gap is counted from the last bar on or
+    before `effective_on`, or from `effective_on` when there is none."""
+    start = bisect_right(bars, effective_on)
+    previous = bars[start - 1] if start else effective_on
+    resumed: list[date] = []
+    for session in bars[start:]:
+        if next_start is not None and session >= next_start:
+            break
+        if resumed or _missing_sessions(sessions, previous, session) > window_sessions:
+            resumed.append(session)
+        previous = session
+    return resumed
+
+
 def _bars_after_delisting(
-    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame, window_sessions: int
 ) -> pl.DataFrame:
     bounds: list[dict[str, Any]] = []
     for ordered in _by_security(listings).values():
         for row in ordered:
             if row["status"] != DELISTED:
                 continue
-            later = [o["valid_from"] for o in ordered if o["valid_from"] > row["valid_from"]]
+            later = [
+                o["valid_from"]
+                for o in ordered
+                if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
+            ]
             bounds.append({**row, "_next": min(later, default=None)})
     if not bounds:
         return pl.DataFrame([], schema=_AFTER_DELISTING_SCHEMA)
     ids = sorted({b["security_id"] for b in bounds})
     marks = ", ".join("?" for _ in ids)
-    sessions: dict[str, list[date]] = defaultdict(list)
+    bars: dict[str, list[date]] = defaultdict(list)
     for sid, session in conn.execute(
         f"""
         SELECT DISTINCT security_id, session FROM prices_daily
@@ -718,7 +844,8 @@ def _bars_after_delisting(
         """,
         [t, *ids],
     ).fetchall():
-        sessions[sid].append(session)
+        bars[sid].append(session)
+    sessions = all_sessions()
     rows = [
         {
             "security_id": b["security_id"],
@@ -728,8 +855,9 @@ def _bars_after_delisting(
             "effective_on": b["effective_on"],
         }
         for b in bounds
-        for s in sessions[b["security_id"]]
-        if s > b["effective_on"] and (b["_next"] is None or s < b["_next"])
+        for s in _resumed_bars(
+            bars[b["security_id"]], b["effective_on"], b["_next"], window_sessions, sessions
+        )
     ]
     return pl.DataFrame(rows, schema=_AFTER_DELISTING_SCHEMA).sort("security_id", "session")
 

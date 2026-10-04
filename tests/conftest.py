@@ -11,7 +11,9 @@
   library may use either.
 - `load_universe_fixtures` (used by `fixture_store`, also called directly
   by `tests/test_fixture_loader.py`) loads every `<table>.csv` under a
-  fixtures directory into the store table of the same name.
+  fixtures directory into the store table of the same name — generic over
+  `schema.TABLE_NAMES`, so `statement_facts.csv` (#660, T76) loads the
+  same way as every other fixture CSV, with no code change here.
 - `fixture_store` builds a fresh in-memory DuckDB store, initializes the
   schema, and loads `tests/fixtures/universe/` this way — a no-op until T5
   populates that directory.
@@ -258,11 +260,20 @@ def version_4_store(path: Path) -> Path:
     unchanged (pinned by hash in `tests/store/test_journal_schema.py`), and
     never through `init_schema`, which would migrate it. For journal code
     that must refuse, and fact or registry reads that must still work, on a
-    store no write has touched since T49."""
+    store no write has touched since T49.
+
+    Also includes `schema._STATEMENT_FACTS_TABLE_DDL` (version 9, #660):
+    anachronistic for a true version-4 store, but `load_universe_fixtures`
+    below loads every fixture CSV generically, `statement_facts.csv`
+    included, so the table must exist for that call to succeed — the same
+    simplification this function already makes for every other fact
+    table's shape."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
-        for ddl in schema._TABLE_DDL + schema._REGISTRY_TABLE_DDL:
+        for ddl in (
+            schema._TABLE_DDL + schema._REGISTRY_TABLE_DDL + schema._STATEMENT_FACTS_TABLE_DDL
+        ):
             conn.execute(ddl)
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (4, TIMESTAMPTZ "

@@ -16,8 +16,11 @@ Everything a build window types, in order of use. The rules behind each line fol
 | `uv run python scripts/team.py release <Tn\|issue#> [--park]` | When you stop for good on an item: `--park` for a green PR, plain for a red or empty one. Write a handoff comment. |
 | `uv run python scripts/fragments.py add <issue> --slug <slug> --status "…" --added "…"` | Once per PR, before ready: the STATUS line and CHANGELOG bullets as one new file. |
 | `uv run python scripts/ready_pr.py <pr> --timeout-min 45` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
+| `uv run python scripts/merge_train.py build [PR ...] [--order N [N ...]]` | Only when the owner asks for a train, by any window or the orchestrator: tests the ready PRs together on `train/<batch id>`, posts a `merge-train:` comment on each. Merges nothing. `--resume <batch id>` re-attaches to an unfinished batch (after an inconclusive run). Flags in full: [git-workflow.md](git-workflow.md#the-merge-train). |
+| `uv run python scripts/merge_train.py merge <batch id>` | Only on the owner's "merge train `<batch id>`", by him or the one window he says it to, on the machine that holds the record: lands the batch's longest green prefix, nothing else. This exact spelling is the one `.claude/settings.json` prompts on (#529). `--resume` continues a stopped merge. |
+| `uv run python scripts/merge_train.py status [<batch id>]` | A batch's record, or the list of records. `uv run python scripts/merge_train.py prune` (no flags) deletes finished batches' `train/*` branches and worktrees; run it from the clone that built them. |
 
-Owner only: `release --force`, `claim --owner-task`, `prune --yes`.
+Owner only: `team.py release --force`, `team.py claim --owner-task`, `team.py prune --yes`, and the word "merge train `<batch id>`".
 
 ## Rules and history
 
@@ -31,13 +34,14 @@ This document adds the missing layer so that **any number of Claude Code windows
 
 | Term | Meaning |
 |---|---|
-| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human who merges. The session he types in is a team like any other. |
+| **Team** | One orchestrator session in **its own working directory**: a git worktree of this repo (the default in VS Code) or its own clone. Registered once with `scripts/team.py register <name>`. Jose is not a team; he is the human whose word lands every class-B PR ([git-workflow rule 7](git-workflow.md): "merge" on one specific PR, or his "merge train `<batch id>`"); class-A PRs are landed by the orchestrator ([Orchestrator](#orchestrator), the single session above the teams, never a team's own lead session) under that rule. The session he types in is a team like any other. |
 | **Claim** | A comment `claim: team:<name>` on a GitHub issue, mirrored by a `team:<name>` label. The claim, not the label, is authoritative. |
 | **Plan task** | A checkbox line in `docs/plans/*.md` (`T5`, `T8b`). Its issue carries the label `task:Tn`. |
 | **Canonical issue** | The lowest-numbered **open** issue carrying a given `task:Tn` label. |
 | **Ready frontier** | Unclaimed plan tasks whose dependencies are all ticked in the plan **as merged on `origin/main`**. The tool fetches and reads the plan from there, never from your working tree, so a checkbox ticked inside an unmerged PR does not open the next task. |
 | **Chain** | Consecutive dependent tasks that one team should keep (listed per plan). |
 | **Parked** | Label on a green PR whose team stopped. Re-claim its issue and continue the branch. |
+| **Orchestrator** | The one session Jose names as orchestrator. It spawns the teams and hands over through the "Orchestrator log" issue ([Orchestrator](#orchestrator)). |
 
 ### Set up a team (once per session)
 
@@ -52,7 +56,7 @@ cd <the path it prints>            # ~/Projects/tradepartner-teams/<name>, a wor
 
 Team directories live **outside the repo** on purpose: a session that lists files in its own directory never sees another team's work. A **separate clone** (`git clone … ~/Projects/tradepartner-<name>`, then `uv sync && uv run pre-commit install && register <name>`) works the same and is only needed for a second VS Code window.
 
-- **Your directory is the only directory you touch.** Never `cd` into, read from, or run git in another team's directory or in the main checkout, not even "to check". Everything you need is in your worktree, on GitHub, or in `status`.
+- **Your directory is the only directory you touch.** Never `cd` into, read from, or run git in another team's directory or in the main checkout, not even "to check". Everything you need is in your worktree, on GitHub, or in `status`. The one exception is the merge train's record directory, `~/.tradepartner/merge_train/` (`TRADEPARTNER_MERGE_TRAIN_DIR`), which sits outside every team directory on purpose so that a `build` in one window and the `merge` in another, or in the owner's shell, read the same records; only `scripts/merge_train.py` writes there, never your hands.
 - **One session per working directory, always.** Two sessions in one directory switch branches under each other. `.team` marks whose directory it is.
 - Names are short and lowercase (`atlas`, `team-b`). A session that is closed for good keeps its name; the next session may reuse it or pick a new one.
 - Implementer subagents get their own worktrees and are told the team name by the orchestrator; they verify the issue's `team:` label and never claim themselves.
@@ -70,7 +74,7 @@ Team directories live **outside the repo** on purpose: a session that lists file
 **During**
 - One `implementer` per claimed task, one writer per branch. Run several in parallel only on tasks with disjoint files. Read-only helpers and the reviewers may run alongside; the table in [agents.md](agents.md#parallelism-inside-a-team) says what goes in parallel and what does not.
 - Reviewers (`spec-critic`, `quant-auditor`, `safety-reviewer`) post their full report as the PR's verdict comment and return a ten-line summary; a window never pastes a report into its own context or its messages (#352).
-- **Two review passes per reviewer per PR** (#489): the review, then one verification pass after the fixes, told to check those fixes only. It reads everything pushed since the first pass. An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices goes into one follow-up `size:S` issue, not a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
+- **Two review passes per reviewer per PR** (#489): pass 1 is the review; pass 2 verifies the fixes and reads everything pushed to the PR's own files since pass 1 (commits a merge of `main` brought in are skipped). An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices goes into one follow-up `size:S` issue, not a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
 - An implementer never claims or releases; it checks that its issue carries the team label and stops if not.
 - Anything you notice outside your task becomes an issue (`gh issue create`), unclaimed, for any team to pick up.
 
@@ -88,6 +92,14 @@ Every message wakes the session that receives it, and that session re-reads its 
 1. Push; update the draft PR description with the current state.
 1. Done with the task: `/ready-pr` (runs `uv run python scripts/ready_pr.py <pr>`): merges `main` in, runs the checks, verifies the template and the specialist reviews, waits for CI on that commit and marks the PR ready. It never merges. Do not mark a PR ready by hand.
 2. If you are stopping for good on an item: `uv run python scripts/team.py release <Tn | issue#> --park` when the PR is green (the tool labels it `parked`; the next claimant continues the branch after bringing `main` in with `/ready-pr`), or plain `release` when it is red or empty (handoff comment only, the next team may start over). Write the handoff comment on the issue: done, remaining, gotchas. If the window is done for good, say so there; the owner prunes its directory when convenient.
+
+### Orchestrator
+
+Added 2026-10-04 (#780, [orchestration layer audit](../retros/2026-10-04-orchestration-layer-audit.md) item 1). Between 2026-10-01 and 10-04 eight sessions acted as orchestrator and three were live at once. Each handover was a private memory note that no other agent, and not Jose on his phone, could read; the teams of a retired session kept reporting to it, so their `ready` and `blocked` lines reached nobody.
+
+- **The orchestrator is the session Jose names as the orchestrator.** It spawns the teams, sends each one its assignment, triages their `ready` and `blocked` lines, and reports to him. It claims and builds like any team when it does so (the vocabulary row above), and it is the only session that spawns teams. **Exactly one orchestrator session at a time:** any other session Jose opens takes work as a team and spawns no teams of its own. In the Team row above and in agents.md ("the window itself is the orchestrator") the word still means a team's own lead session, the one that spawns that team's implementer and reviewers; this section is about the single session above the teams.
+- **It retires only after the handover is complete**, in this order: (a) list every live team with its issue, its PR (or its issue alone, when no PR exists yet) and its state (building, in review, ready, blocked), and the model it runs on; (b) stop its live teams, which keep their claims for the successor to re-spawn, and release or park what the teams that died earlier still hold. `team.py release` refuses a claim held by another team (claim protocol rule 7), so the orchestrator spawns a short session in the dead team's own directory, which releases or parks as that team, with the handoff comment on the issue; the orchestrator does not enter the directory. A claim that cannot be reached that way (the directory is gone) is listed in the handover for Jose's `release --force`; retirement waits on the listing, not on him acting. (c) Write the handover as a comment on the one standing issue titled exactly **`Orchestrator log`** (`gh issue list --search "Orchestrator log in:title"`; the first orchestrator to hand over opens it, once, and it stays open), never as a memory note. The comment carries the list from (a), the claims left for Jose from (b), the owner decisions pending and the ones he made in chat that no issue records yet, and the merge queue in order; it says that the retiring session's teams have stopped. A memory note may point at the comment; it never replaces it.
+- **The successor starts from that comment.** Its first act is a one-line "taking over" comment on `Orchestrator log`, so a session that finds a takeover newer than the last handover knows an orchestrator is live. Between steps 1 and 2 of Start it reads the latest handover comment, then re-spawns each live team of the retired orchestrator from that team's own directory with "continue PR #N" (or "continue issue #N" where no PR exists yet) and the team's assignment; the spawned session works there, the orchestrator does not enter it. A team's final report reaches only the session that spawned it, so a team left under a retired orchestrator is a team nobody hears from. Nothing else changes for the teams: the same claim, the same branch, the same PR.
 
 ### The claim protocol, exactly
 
@@ -110,9 +122,17 @@ In this order:
    - `type:research` issues whose body is a brief following the [research brief template](../templates/research-brief.md), filed or approved on the issue by Jose (no approved brief, not claimable): claim one, run the `researcher` agent on it (Opus), one issue per run, report PR to `docs/research/`;
    - `type:decision` and `type:docs` issues (ADR, spec or plan drafts): Fable-tier per agents.md, `spec-critic` before ready, owner accepts by merging.
    An issue with no size label is not ready to claim; ask the owner to size it.
-4. Nothing left: **do not invent work.** Report to the owner. Parallelism is bounded by the plan's dependency graph, not by the number of windows; another window only helps once the frontier widens.
+4. Nothing left: **do not invent work.** Report to the owner; the orchestrator may then spawn the planning team (below). Parallelism is bounded by the plan's dependency graph, not by the number of windows; another window only helps once the frontier widens.
 
 Chains are a preference, not a lock. Every task is still claimed individually.
+
+**The planning team.** Added 2026-10-04 (#782, [orchestration layer audit](../retros/2026-10-04-orchestration-layer-audit.md) item 6). Once a plan is consumed the frontier has no owner: on 2026-10-04 the agent-claimable frontier was zero, 36 unclaimed `size:S` follow-ups filled the gap, and none of the roadmap's idle-capacity items had an issue. The planning team is that duty on a trigger: a team like any other, spawned by the orchestrator, not a standing architect agent and not a new agent file.
+- **Trigger.** The orchestrator spawns it when the agent-claimable frontier is below two tasks, or when three or more unclaimed issues name one shared module (`run.py`, `window.py`, `wrapper.py`, `resume.py`) in the title or the body (`gh issue list --search "run.py in:title,body"`). Agent-claimable means the `agent` tasks on the ready frontier of `status` whose plan line carries no owner gate; `status` marks only `owner` against `agent`, so the gate is read from each frontier task's line (`team.py show Tn`).
+- **Model.** Fable, by the tier table's spec, plan and ADR drafting row ([agents.md](agents.md#orchestrator-windows-and-model-tiers)).
+- **Inputs.** [roadmap.md](../roadmap.md), the plans, `uv run python scripts/team.py graph`, the open issues, STATUS "Decisions needed from owner".
+- **Outputs, one PR at a time.** (a) The next item of roadmap.md "Calendar-bound phases" (the Phase 5 spec and plan, Phase 6 preparation, the `data-validator` and `journal-analyst` agents), as a spec or plan PR; or a plan amendment that chains the shared-module issues: each issue becomes a plan task line (`Files:` and `Depends on:` on the line, the issue titled or labelled as that task), at most three to a chain per module, declared in the plan's lanes paragraph (plan-shape rules 1 and 3), with the rest folded into one `size:S` issue per module (rule 6), so that `graph` shows the contention and `claim` refuses the next until the one before is merged. (b) A decision memo per open owner question, as one comment on that question's issue, lettered options and a recommendation; a "Decisions needed" line that has no issue gets one `type:decision` issue first. Its PRs go through `spec-critic` before ready, as item 3 above says; the owner accepts by merging.
+- **Claim.** A roadmap item has no issue until the planning team files one `type:docs` issue for it and claims it with `team.py claim` before branching, like any team; the chaining amendment and a decision issue are claimed the same way.
+- **Caps.** It never messages a team; teams read its output at claim time, from the plan line and the issue. One PR in flight. Never more than one phase beyond the highest phase in build on STATUS's phase line (Phase 5 while Phase 4 is in build), except that Phase 6 preparation, the owner's own docs tasks, may get the decision issues and memos it needs, never a spec or plan. It stops when three spec, plan, ADR or process PRs are waiting for the owner's word, its own or anyone's. It files no code issues.
 
 ### Shared files: how N PRs avoid conflicts
 
@@ -142,7 +162,7 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Labels of retired teams are harmless; delete them when convenient.
 - **Directories of retired teams are pruned ad hoc, never automatically.** A team may take another claim later, so its directory stays while it is touched. When the disk or the board looks cluttered: `uv run python scripts/team.py prune` prints which directories have no open claim and have been idle for six hours or more (`--hours` to change); `--yes` removes them with `git worktree remove` and prunes the worktree list. Directories with uncommitted changes are listed and skipped, never removed (#167). Agents never run it.
 - Two windows on the same task is always a process failure, never a judgment call. When it happens anyway, the lower issue number wins and the other PR is closed with a pointer, as on 2026-09-24 (#34 → #31, #26 → #27).
-- You are not a role in the tool. You merge, you decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
+- You are not a role in the tool. You approve every class-B merge (your word on that PR, or your "merge train `<batch id>`", which lets the window you say it to run `merge_train.py merge`; git-workflow rule 7); class-A PRs are landed by the orchestrator ([Orchestrator](#orchestrator), the single session above the teams, never a team's own lead session) under that rule. You decide which window claims T3, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
 ### Never
 
@@ -151,8 +171,8 @@ A label or comment change on an issue does not re-run a PR's checks. After claim
 - Enter another team's directory or the main checkout for any reason.
 - Touch a branch, PR or issue that another team currently **holds** (a released or parked one is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
-- Merge. The owner merges, or explicitly tells one main session to (git-workflow rule 7).
+- Merge, except the orchestrator ([Orchestrator](#orchestrator)) landing a class-A PR under git-workflow rule 7's class-A conditions, every one of them. A class-B PR lands only on the owner's word for that specific PR, by him or the window he tells; a train only on his "merge train `<batch id>`", run by him or the window he says it to (building a train is not merging and happens only when he asks); the ruleset bypass (`--admin`) is never a window's.
 
 ### Model tiers
 
-Which model a window or agent runs on is set in [agents.md](agents.md#orchestrator-windows-and-model-tiers): Opus 5.5 for the orchestrator window and for windows on order-path driver and integration tasks, Sonnet 5 for windows on `size:S` issues, docs-only tasks and pure-module plan tasks (#489), Fable only where a wrong judgment propagates (specs, plans, ADRs, retros, conflict resolution, these docs), roster models unchanged.
+Which model a window or agent runs on is set by the table in [agents.md](agents.md#orchestrator-windows-and-model-tiers) (#489); the orchestrator names it in the assignment. This page does not restate the rows, so the table is the only place to read or change them.

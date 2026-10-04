@@ -32,7 +32,15 @@ The four `CheckLine`s, in order:
    terminal event -> outcome, ADR 0005) is incomplete once its outcome is
    due: at the first run after close(T_{i+1}) for an order of rebalance i,
    or after the order's own session for a forced exit with no rebalance
-   (spec req 8's last sentence).
+   (spec req 8's last sentence); and (#571, req 17) no order with a **live**
+   fill (`superseded_by` null: the rows `store.journal.fills_for` returns)
+   whose `known_at` is after its first terminal event's, whatever its outcome
+   rows and whether or not its outcome is due yet, so an owner settlement
+   (`paper settle`) can never silently absorb a real fill. A fill journaled
+   with its terminal event shares its stamp and is not after it; a feed fill
+   that arrives after req 8's synthetic fill is journaled superseded and is not
+   live. `paper stop`'s readiness read (`window._not_ready`) applies the same
+   rule.
 4. **`override_reason`**: no `overrides` row whose trimmed `reason` is
    shorter than `paper.min_override_reason_chars`.
 
@@ -55,7 +63,12 @@ import polars as pl
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import is_session, last_session_of_month, next_session, session_close
 from tradepartner.config import Settings
-from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
+from tradepartner.execution.outcomes import (
+    NOT_EXECUTED,
+    POSITION_RETURN,
+    REALISED_PNL,
+    outcome_horizon,
+)
 from tradepartner.execution.report import Journal, PriceOf, TrialMonths, compare_months
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
@@ -72,7 +85,6 @@ _BUY = "buy"
 _SELL = "sell"
 _REBALANCE = "rebalance"
 _CATCH_UP = "catch_up"
-_EXIT_PHASE = "exit"
 _PAPER_MIN_REBALANCES = "paper.min_rebalances"
 _PAPER_MIN_OVERRIDE_REASON_CHARS = "paper.min_override_reason_chars"
 _EXECUTION_FILL_PRICE = "execution.fill_price"
@@ -143,14 +155,6 @@ def _rebalance_session_before(session: date) -> date:
         candidate = last_session_of_month(year, month)
         if candidate < session:
             return candidate
-
-
-def _next_rebalance_session(session: date) -> date:
-    """The first rebalance session strictly after `session`: T_{i+1} for T_i
-    (Definitions)."""
-    year, month = session.year, session.month
-    year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    return last_session_of_month(year, month)
 
 
 def _stop_session(at: datetime) -> date:
@@ -325,41 +329,21 @@ def _tracking_line(
     return CheckLine(name="tracking", passed=passed, query=query, detail=detail)
 
 
-def _rebalance_before(session: date) -> date:
-    """The last rebalance session (last session of a month) strictly before
-    `session` (`outcomes._rebalance_before`, duplicated locally)."""
-    candidate = last_session_of_month(session.year, session.month)
-    if candidate < session:
-        return candidate
-    year, month = (session.year, session.month - 1) if session.month > 1 else (session.year - 1, 12)
-    return last_session_of_month(year, month)
-
-
 def _order_due_threshold(
     order: store_journal.OrderRow, decision: store_journal.DecisionRow | None
 ) -> date:
-    """The session an order's outcome becomes due strictly after
-    (`outcomes._horizon`'s non-stop `base`, duplicated locally): for a `phase
-    = exit` order (a forced exit's own phase, spec req 8's "exit session"),
-    its own session; otherwise T_{i+1} of its rebalance (the decision's
-    `rebalance_session` when it has one, else the rebalance strictly before
-    the order's own session - `outcomes.py` falls back the same way for an order
-    whose decision carries none, a forced exit traded inside a rebalance
-    batch with phase `sell`, ADR 0010 amendment 2026-10-01)."""
-    if order.phase == _EXIT_PHASE:
-        return order.session
-    rebalance = (
-        decision.rebalance_session
-        if decision is not None and decision.rebalance_session is not None
-        else _rebalance_before(order.session)
-    )
-    return _next_rebalance_session(rebalance)
+    """The session an order's outcome becomes due strictly after: `outcomes.
+    outcome_horizon`'s rule, read from the one place it is written (#597) so
+    this and `outcomes._horizon`'s non-stop `base` cannot drift."""
+    decision_rebalance = decision.rebalance_session if decision is not None else None
+    return outcome_horizon(order, decision_rebalance)
 
 
 def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
     query = (
         "every order's chain (order -> terminal event -> outcome) once its "
-        "outcome is due (spec req 8)"
+        "outcome is due (spec req 8), and no live fill journaled after its "
+        "order's terminal event (req 17)"
     )
     orders = store_journal.orders_for(conn, window_id=window_id)
     decisions = {
@@ -372,20 +356,30 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
         o.client_order_id for o in store_journal.non_terminal_orders(conn, window_id=window_id)
     }
     terminal: dict[str, str] = {}
+    terminal_at: dict[str, datetime] = {}
     for event in sorted(
         store_journal.order_events_for(conn, window_id=window_id),
         key=lambda e: (e.known_at, e.ingested_at),
     ):
         if event.status in store_journal.TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
+            terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
+    late: set[str] = set()
     for item in store_journal.fills_for(conn, window_id=window_id):
         coid = item.fill.client_order_id
         filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
+        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+            late.add(coid)
     written = {(o.client_order_id, o.kind) for o in store_journal.outcomes_for(conn, window_id)}
 
     incomplete: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
+        if order.client_order_id in late:
+            incomplete.append(
+                f"order {order.client_order_id} ({order.symbol}) has a live fill "
+                "journaled after its terminal event"
+            )
         decision = decisions.get(order.decision_id)
         threshold = _order_due_threshold(order, decision)
         due = any(session > threshold for session in run_sessions)

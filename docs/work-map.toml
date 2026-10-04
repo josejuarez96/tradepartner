@@ -256,7 +256,7 @@ why = "One toolchain every agent uses."
 unblocks = ["phase:0"]
 
 [adr.0002]
-what = "Trunk-based git: a PR for every change, the owner approves every merge."
+what = "Trunk-based git: a PR for every change; the owner's word lands class-B PRs, the orchestrator lands class-A PRs under rule 7 (amended 2026-10-04)."
 why = "Keeps main always releasable with many agents pushing."
 unblocks = ["phase:0"]
 
@@ -671,3 +671,13 @@ unblocks = ["issue:618"]
 what = "A research program page, a graded claims register over every research report, and a ranked hypothesis backlog."
 why = "Answers what the tool should test next and how results flow back into what we believe."
 unblocks = ["phase:3"]
+
+[spec.research-registry]
+what = "What the research-experiment registry records and refuses: pre-registered agreement runs, classifier benchmarks, regressions and feature studies as append-only rows with known_at, beside the backtest trial registry, with protected windows, run budgets and the family's N raised by any run on return data."
+why = "The charter halts a phase on any untracked run; without this the annotation pilot, B5 and E1 have nowhere to register and cannot start honestly."
+unblocks = ["issue:618"]
+
+[issue.661]
+what = "Draft the research-experiment registry spec (runs that are not backtests), with its plan task lines, as a spec only."
+why = "Answers the ML validation brief's registry proposal and the annotation protocol's interim log before any such run happens."
+unblocks = ["spec:research-registry"]

@@ -4,10 +4,11 @@ Spec: docs/specs/merge-train.md. This is the **pure half** (plan T72): the recor
 types and every rule the commands apply, with no I/O, so each is a tested function.
 The commands (`build`, `merge`, `status`, `prune`) and their runner are T73/T74.
 
-- `eligibility` is req 1: checks (0) to (i) in order, the first failure the one
+- `eligibility` is req 1: checks (0) to (j) in order, the first failure the one
   reason. Comments are filtered to the repository owner's login first, so a pasted
   verdict or a forged `merge-train:` line from another account is invisible; checks
-  (e) to (i) reuse `ready_pr`'s pure functions by import, never a copy.
+  (e) to (i) reuse `ready_pr`'s pure functions by import, never a copy; (j) counts
+  unresolved review threads of any author, which can only make a PR ineligible.
 - `order_batch` is req 2; `classify_run` req 4; `next_probe`, `probe_branch` and
   `bisect_result` req 5; `mergeable_prefix` req 6; `record_matches_comments` req 7;
   `comment` req 8.
@@ -27,7 +28,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -40,7 +41,16 @@ RED_STEPS = ("Hygiene", "Fragments", "Lint", "Format", "Types", "Tests")
 INCONCLUSIVE_SECONDS = 60
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
-OUTCOMES = ("TESTED", "MERGED", "DROPPED", "CULPRIT", "HELD", "INCONCLUSIVE", "INELIGIBLE")
+OUTCOMES = (
+    "TESTED",
+    "MERGED",
+    "UNCONFIRMED",
+    "DROPPED",
+    "CULPRIT",
+    "HELD",
+    "INCONCLUSIVE",
+    "INELIGIBLE",
+)
 PR_STATES = ("accepted", "dropped", "already_merged", "ineligible")
 
 _TRAIN_LINE = re.compile(r"^merge-train: (?P<outcome>[A-Z]+) batch (?P<batch>\S+)\s*$")
@@ -150,6 +160,9 @@ class PullRequest:
     body: str
     fragment_texts: tuple[str, ...] = ()
     title: str = ""
+    # #731, req 1 (j): how many of the PR's review threads are unresolved, read from GitHub
+    # at build time. None means they were never read, which is ineligible (fail closed).
+    unresolved_threads: int | None = None
 
     @property
     def owner(self) -> str:
@@ -215,6 +228,11 @@ def eligibility(
         return "(h) fragment missing, or no CHANGELOG bullet"
     if reviews := ready_pr.missing_reviews(ready_pr.required_reviews(diff_paths), bodies):
         return f"(i) review without a latest PASS: {', '.join(reviews)}"
+    if pr.unresolved_threads is None:
+        return "(j) review threads not read"
+    if pr.unresolved_threads:
+        plural = "" if pr.unresolved_threads == 1 else "s"
+        return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
     return None
 
 
@@ -325,7 +343,14 @@ def _parse_tested(body: str) -> tuple[str, int, str, frozenset[int]] | None:
 
 def record_matches_comments(record: Record, owner_comments: Mapping[int, Sequence[str]]) -> bool:
     """Whether the frozen record is the one `build` reported (req 7). `owner_comments`
-    maps each PR number to the bodies its owner-authored comments carry."""
+    maps each PR number to the bodies its owner-authored comments carry. `run_merge`
+    (#642, follow-up 2) only passes bodies for the *accepted* PRs - a dropped, already-
+    merged or ineligible PR carries no `TESTED` comment to check in the first place, so its
+    missing entry here can never make the "a PR outside the accepted list was listed as
+    tested" branch below fire from `merge`. That branch still does its job against a
+    hand-edited record: the prefix-set and position-range checks below still catch a
+    *tested* PR removed from the middle of the accepted list, and dropping only the last
+    tested PR still lands a valid (shorter) tested prefix."""
     accepted = record.accepted()
     numbers = [pr.number for pr in record.prs]
     if len(set(numbers)) != len(numbers):
@@ -474,6 +499,7 @@ class Runner(Protocol):
     def tree_of_ref(self, ref: str) -> str: ...
     def parent_of(self, sha: str) -> str: ...
     def merge_pr(self, number: int, head: str) -> MergeAttempt: ...
+    def delete_merge_train_refs(self) -> int: ...
 
 
 # -- the record directory and worktree (spec Data / interfaces) -------------------------
@@ -922,6 +948,7 @@ def run_build_resume(
 
 MERGE_RETRY_ATTEMPTS = 5
 MERGE_RETRY_DELAY_S = 30  # five attempts over about two minutes (four 30s waits)
+MERGE_PR_TIMEOUT_S = 120  # #642, follow-up 3: `gh pr merge` must never hang indefinitely
 
 
 def _merge_with_retries(
@@ -1013,10 +1040,15 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         record.merge = MergeLog(started_at=r.now().isoformat())
     _save(record)
 
-    # req 7: the frozen record must still match the owner's TESTED comments.
+    # req 7: the frozen record must still match the owner's TESTED comments. Only the
+    # accepted PRs are read live (#642, follow-up 2): a dropped/already-merged/ineligible
+    # PR is not part of what `merge` lands, so a push to it mid-merge must never abort the
+    # whole batch, and its live state (including the fetch-race check in `pr_data`) is
+    # never needed here. `record_matches_comments`'s docstring explains why leaving its
+    # `owner_comments` entry out is still safe.
     owner_comments: dict[int, list[str]] = {}
     pr_data_by_number: dict[int, PrData] = {}
-    for pr_entry in record.prs:
+    for pr_entry in accepted:
         data = r.pr_data(pr_entry.number)
         pr_data_by_number[pr_entry.number] = data
         owner_comments[pr_entry.number] = owner_bodies(data.comments, data.pr.owner)
@@ -1045,13 +1077,20 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         verified, never from `pos`, so a PR that never landed (or whose landing could not
         be verified) is never skipped on `--resume`. Whenever something is known to have
         merged - including, on the exception path, a best-effort re-read of `main_sha()`
-        that moved but was never verified - the reason names that SHA as untested."""
+        that moved but was never verified - the reason names that SHA as untested.
+        #642, follow-up 10: a second call in the same run (e.g. persisting the first stop
+        itself raises, and the exception handler calls `_stop` again) never replaces the
+        first reason - it is the one that explains what actually went wrong first; a later
+        one is only logged."""
         nonlocal held_start, broke
         held_start, broke = len(merged_so_far) + 1, True
         sha = extra_sha or (merged_so_far[-1]["main_sha"] if merged_so_far else None)
         if sha:
             reason = f"{reason}; {sha} is untested at main's head"
-        record.merge.reason = reason
+        if record.merge.reason is None:
+            record.merge.reason = reason
+        else:
+            say(f"also: {reason}")
         record.merge.stopped_at_position = held_start
         _save(record)
 
@@ -1064,6 +1103,8 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         # `try`, so anything raising after an earlier PR landed still records the stop
         # position and reason before it propagates - a stopped merge must always leave a
         # trail, never just an exception.
+        attempted_merge = False  # #642, follow-up 9: what the exception reason may claim
+        verified = False  # #694: the landing passed the parent and tree checks
         try:
             fresh = r.pr_data(entry.number)
             if fresh.pr.head != entry.head or (
@@ -1073,6 +1114,7 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                 _stop(f"#{entry.number}'s head or eligibility changed since build")
                 break
 
+            attempted_merge = True
             attempt = _merge_with_retries(r, entry.number, entry.head, say)
             new_main = r.main_sha()
             if attempt.outcome != "merged" and new_main == previous_tip:
@@ -1098,12 +1140,30 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                 }
             )
             record.merge.merged = list(merged_so_far)
-            _save(record)  # record the landing before posting it (SHOULD FIX 2)
-            _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
+            _save(record)  # record the landing before posting anything about it (SHOULD FIX 2)
             if not parent_ok or landed_tree != expected_tree:
+                # #642, follow-up 7: an unconfirmed landing (parent or tree mismatch, e.g. a
+                # concurrent hand merge) must never be reported to the PR as `MERGED` - the
+                # comment is posted only once the landing is confirmed, below.
                 check = "parent" if not parent_ok else "tree"  # SHOULD FIX 11: name which
-                _stop(f"the landed {check} for #{entry.number} does not match tree_{pos}")
+                mismatch = f"the landed {check} for #{entry.number} does not match tree_{pos}"
+                _stop(mismatch)
+                # #694: the PR's code did land, so its thread must not go silent either -
+                # `UNCONFIRMED` (never `MERGED`) says the landing happened but failed the
+                # check. Posted after the stop is saved; a failed post is only reported, so
+                # the stop still ends cleanly and posts `HELD` on the rest.
+                try:
+                    _post(
+                        r,
+                        say,
+                        entry.number,
+                        comment("UNCONFIRMED", bid, main_sha=new_main, reason=mismatch),
+                    )
+                except Exception as exc:
+                    say(f"could not post UNCONFIRMED on #{entry.number}: {exc}")
                 break
+            verified = True
+            _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
         except Exception:
             # pass-2 review, SHOULD FIX 1: re-read `main_sha()` one more time, best-effort,
             # to name the freshest known head even if the earlier read inside the `try` is
@@ -1114,11 +1174,24 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
             with contextlib.suppress(Exception):
                 current_sha = r.main_sha()
             extra = current_sha if current_sha != previous_tip else None
-            _stop(
-                f"could not verify #{entry.number}'s landing after gh pr merge; "
-                "reconcile main by hand and rerun build",
-                extra_sha=extra,
-            )
+            # #642, follow-up 9: the reason must say what actually happened - `pr_data` or
+            # the eligibility re-read can raise before any merge was even attempted for this
+            # PR, and that must never be reported as an unverified merge.
+            if verified:
+                # #694: the landing was verified and recorded; only posting `MERGED` failed,
+                # so the reason must not claim the landing is unverified. `--resume` goes on
+                # from the next PR (the position derives from `merged_so_far`).
+                reason = (
+                    f"#{entry.number} landed and was verified, but posting its MERGED "
+                    "comment failed; post it by hand, then run merge --resume"
+                )
+            else:
+                when = "after gh pr merge" if attempted_merge else "before attempting to merge it"
+                reason = (
+                    f"could not verify #{entry.number}'s landing {when}; "
+                    "reconcile main by hand and rerun build"
+                )
+            _stop(reason, extra_sha=extra)
             raise
 
     # SHOULD FIX 3/5: "stopped" means either an in-loop failure (`broke`, however far along -
@@ -1139,7 +1212,16 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
     )
 
     for branch in (record.train_branch, *(p.branch for p in record.probes)):
-        if not r.delete_branch(branch):
+        # #642, follow-up 1: a record hand-edited to name a branch outside `train/*` makes
+        # `delete_branch` refuse it (same rule as `push`); the merges above already
+        # succeeded, so that refusal is reported and the loop moves on, never turning a
+        # completed merge into an exit code of 1.
+        try:
+            deleted = r.delete_branch(branch)
+        except StoppedError as exc:
+            say(f"could not delete branch {branch}: {exc}")
+            continue
+        if not deleted:
             say(f"could not delete branch {branch}; remove it by hand")
     return record
 
@@ -1178,21 +1260,45 @@ def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
     """`prune`: remove leftover worktrees and delete `train/*` branches of finished batches.
     A build still in flight (`outcome` `None` or `inconclusive`, or a `red` run whose bisect
     hasn't concluded) is left alone - `build --resume` or another window may still need its
-    worktree and branches. A batch already pruned is not retried."""
+    worktree and branches. A batch already pruned is not retried. The local
+    `refs/merge-train/pr-*` refs `pr_data` fetches into are deleted too (#694), but only
+    when no build is in flight. Takes the same lock
+    `merge` uses (#642, follow-up 8): saving `record.pruned` must never interleave with a
+    concurrent `merge` reading or writing that same record."""
+    with _merge_lock():
+        _run_prune_locked(r, say)
+
+
+def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
     report = say
     say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
+    # #694: `_merge_lock` has already created `record_dir()`, so there is no "no directory"
+    # case; "nothing to prune" is decided at the end, from what was actually found.
     rdir = record_dir()
-    if not rdir.exists():
-        say("nothing to prune")
-        return
     records: dict[str, Record] = {}
     for path in sorted(rdir.glob("*.json")):
         record = Record.from_json(path.read_text())
         records[record.batch_id] = record
-    for wpath in sorted(rdir.glob("worktree-*")):
+    worktrees = sorted(rdir.glob("worktree-*"))
+    # a build with no record yet, or one not finished, may still be reading PRs (and so
+    # fetching into `refs/merge-train/pr-*`): the refs are then left alone (#694).
+    in_flight = any(not _build_finished(rec) for rec in records.values())
+    for wpath in worktrees:
         bid = wpath.name.removeprefix("worktree-")
         record = records.get(bid)
-        if record is not None and not _build_finished(record):
+        # #642, follow-up 6: `build` creates the worktree before it can save the batch's
+        # first record (it has nothing to save until the PRs are known), so a worktree with
+        # no record yet may belong to a build still in flight. Fail closed: skip it, exactly
+        # as an unfinished build's own record would be skipped, rather than guess it is
+        # orphaned.
+        if record is None:
+            in_flight = True
+            say(
+                f"skipping worktree {wpath}: no batch record (a build may be in flight; "
+                "remove by hand if not)"
+            )
+            continue
+        if not _build_finished(record):
             continue  # a live build (or one that crashed before finishing) owns this
         say(f"removing leftover worktree {wpath}")
         r.remove_worktree(wpath)
@@ -1201,14 +1307,41 @@ def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
             continue
         ok = True
         for branch in (record.train_branch, *(p.branch for p in record.probes)):
-            if not r.delete_branch(branch):
+            # code-review follow-up on #693, item 2: a branch outside `train/*` in a
+            # hand-edited record must be reported, not fatal, the same as follow-up 1 in
+            # `merge` - a refused deletion here must never stop `prune` from moving on to
+            # the next branch or the next record.
+            try:
+                deleted = r.delete_branch(branch)
+            except StoppedError as exc:
+                ok = False
+                say(f"could not delete branch {branch}: {exc}")
+                continue
+            if not deleted:
                 ok = False
                 say(f"could not delete branch {branch}; remove it by hand")
         record.pruned = ok
         _save(record)
+    removed = 0
+    if in_flight:
+        say("keeping refs/merge-train/* refs: a build may still be in flight")
+    else:
+        removed = r.delete_merge_train_refs()
+        if removed:
+            say(f"deleted {removed} refs/merge-train/* ref(s)")
+    if not records and not worktrees and not removed:
+        say("nothing to prune")
 
 
 # -- the real runner ------------------------------------------------------------------------
+
+# #731, req 1 (j): one page of a PR's review threads; no `cursor` reads the first page.
+_THREADS_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!, $cursor: String) {"
+    " repository(owner: $owner, name: $name) { pullRequest(number: $number) {"
+    " reviewThreads(first: 100, after: $cursor) {"
+    " nodes { isResolved } pageInfo { hasNextPage endCursor } } } } }"
+)
 
 
 class ShellRunner:
@@ -1305,11 +1438,23 @@ class ShellRunner:
             return PrData(pr, comments, ready_pr.HeadChecks(pr.head, ()), ())
         # the owner's own head may never have been fetched into this clone (a push from
         # another clone, or a GitHub "Update branch"); `refs/pull/<n>/head` always exists.
-        self._git(self.root, "fetch", "-q", "origin", f"refs/pull/{number}/head", check=False)
+        # #642, follow-up 5: fetched into a private ref, never the shared `FETCH_HEAD` - a
+        # concurrent `merge_train` run in this same clone (e.g. `merge` fetching a different
+        # PR) would otherwise overwrite it between this fetch and the read below.
+        private_ref = f"refs/merge-train/pr-{number}"
+        refspec = f"+refs/pull/{number}/head:{private_ref}"
+        fetch = self._git(self.root, "fetch", "-q", "origin", refspec, check=False)
         # #524, follow-up 3: a push to the PR between reading its metadata and this fetch
         # would otherwise compute the diff against a stale head; fail closed instead.
-        fetched = self._git(self.root, "rev-parse", "FETCH_HEAD", check=False)
+        fetched = self._git(self.root, "rev-parse", private_ref, check=False)
         fetched_sha = fetched.stdout.strip() if fetched.returncode == 0 else ""
+        if fetch.returncode == 0 and not fetched_sha:
+            # #694: `prune` deletes these refs; one gone right after a successful fetch must
+            # never silently skip the stale-head check below. Fail closed.
+            raise StoppedError(
+                f"PR #{number}: {private_ref} vanished right after fetching it "
+                "(a concurrent prune?); retry"
+            )
         if fetched_sha and fetched_sha != pr.head:
             raise StoppedError(
                 f"PR #{number}'s head changed between reading it ({pr.head[:7]}) and "
@@ -1324,7 +1469,56 @@ class ShellRunner:
             "--name-only",
             f"origin/main...{pr.head}",
         )
-        return PrData(pr, comments, self._head_checks(number), tuple(diff.splitlines()))
+        paths = tuple(diff.splitlines())
+        # #764: (h) reads the branch's own fragments, at the recorded head SHA (never the
+        # branch tip, so a push after this read cannot change what was checked).
+        deleted = self._git_out(
+            self.root,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=D",
+            f"origin/main...{pr.head}",
+        ).splitlines()
+        texts = tuple(
+            self._git_out(self.root, "show", f"{pr.head}:{path}")
+            for path in ready_pr.own_changelog_fragments(pr.branch, paths, deleted)
+        )
+        pr = replace(pr, fragment_texts=texts, unresolved_threads=self._unresolved_threads(number))
+        return PrData(pr, comments, self._head_checks(number), paths)
+
+    def _unresolved_threads(self, number: int) -> int:
+        """How many of PR `number`'s review threads are unresolved, every page (#731).
+
+        Counts every thread whoever opened it, as the ruleset's
+        `required_review_thread_resolution` does: a thread can only make the PR
+        ineligible, never eligible.
+        """
+        owner, name = self._repo_name().split("/", 1)
+        unresolved = 0
+        cursor: str | None = None
+        while True:
+            args = ["-f", f"query={_THREADS_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"]
+            args += ["-F", f"number={number}"]
+            if cursor is not None:
+                args += ["-f", f"cursor={cursor}"]
+            try:
+                raw = json.loads(self._gh("api", "graphql", *args))
+                threads = raw["data"]["repository"]["pullRequest"]["reviewThreads"]
+                states = [t["isResolved"] for t in threads["nodes"]]
+                if not all(isinstance(state, bool) for state in states):
+                    raise TypeError("isResolved is not a boolean")
+                unresolved += states.count(False)
+                more = bool(threads["pageInfo"]["hasNextPage"])
+                cursor = threads["pageInfo"]["endCursor"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoppedError(f"PR #{number}: unreadable review threads ({exc!r})") from None
+            if not more:
+                return unresolved
+            if not cursor:
+                raise StoppedError(f"PR #{number}: review threads page has no end cursor")
 
     def add_worktree(self, path: Path, base: str) -> None:
         self._git_out(self.root, "worktree", "add", "--detach", str(path), base)
@@ -1382,23 +1576,71 @@ class ShellRunner:
     def tree_of_ref(self, ref: str) -> str:
         return self._git_out(self.root, "rev-parse", f"{ref}^{{tree}}")
 
+    def delete_merge_train_refs(self) -> int:
+        """Delete this clone's local `refs/merge-train/*` refs (`pr_data`'s private fetch
+        targets, #694); never any other ref. Returns how many were deleted."""
+        out = self._git_out(self.root, "for-each-ref", "--format=%(refname)", "refs/merge-train/")
+        refs = [ref for ref in out.splitlines() if ref.startswith("refs/merge-train/")]
+        for ref in refs:
+            self._git_out(self.root, "update-ref", "-d", ref)
+        return len(refs)
+
     def parent_of(self, sha: str) -> str:
         result = self._git(self.root, "rev-parse", f"{sha}^", check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
 
     def merge_pr(self, number: int, head: str) -> MergeAttempt:
-        result = subprocess.run(
-            ["gh", "pr", "merge", str(number), "--squash", "--match-head-commit", head],
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-        )
+        # #642, follow-up 3: a hung `gh pr merge` must never hang `merge` itself, and
+        # whether it actually landed is then unknown - an ambiguous, fail-closed outcome
+        # (never `merged`), so the caller's own post-attempt `main_sha()` check decides.
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "merge", str(number), "--squash", "--match-head-commit", head],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=MERGE_PR_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            # code-review follow-up on #693, item 5: GitHub may still apply the squash after
+            # the CLI gives up waiting, so the owner must check before assuming it didn't.
+            return MergeAttempt(
+                "failed",
+                f"gh pr merge timed out after {MERGE_PR_TIMEOUT_S}s; outcome unknown - check "
+                "the PR and main before rerunning build",
+            )
         if result.returncode == 0:
             return MergeAttempt("merged")
         text = _redact(((result.stderr or "") + (result.stdout or "")).strip())
         low = text.lower()
-        phrases = ("not mergeable", "mergeable state is unknown", "try again")
-        retryable = any(phrase in low for phrase in phrases)
+        # #642, follow-up 4: a permanent refusal (a real conflict, a branch-protection or
+        # review-policy block) must stop at once, never retry for ~2 minutes as if it were
+        # the transient "GitHub hasn't finished computing mergeability yet" case. Checked
+        # first, since GitHub's own wording for a real conflict still says "not mergeable".
+        permanent_phrases = (
+            "cannot be cleanly created",  # a real conflict
+            "required status check",
+            "review is required",
+            "changes requested",
+            "protected branch",
+            "approving review",
+            "still a draft",  # #694: a draft PR never becomes mergeable by waiting
+            "merge queue",  # #694: a merge-queue requirement neither
+        )
+        if any(phrase in low for phrase in permanent_phrases):
+            return MergeAttempt("failed", text)
+        # code-review follow-up on #693, item 1: a plain "not mergeable" with none of the
+        # permanent phrases above is GitHub still computing mergeability - exactly what the
+        # train hits by design right after the previous PR lands - so it belongs back on the
+        # retryable list, checked only after the permanent phrases have already ruled out a
+        # real conflict or policy block.
+        retryable_phrases = (
+            "mergeable state is unknown",
+            "try again",
+            "is in unstable status",
+            "not mergeable",
+        )
+        retryable = any(phrase in low for phrase in retryable_phrases)
         return MergeAttempt("retryable" if retryable else "failed", text)
 
     def find_run(self, sha: str, branch: str) -> RunInfo:

@@ -20,7 +20,7 @@ import pytest
 
 from tradepartner import calendar
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
-from tradepartner.adapters.fake_broker import FakeBroker, FillAt, Reject, Vanish
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, Reject, Vanish
 from tradepartner.calendar import session_close, session_open
 from tradepartner.config import FROZEN_PAPER_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import (
@@ -403,10 +403,11 @@ def test_every_book_fact_comes_from_one_close_s_minus_1_actions_read(
 def test_cash_left_excludes_a_buy_check_phase_drops_as_skip_delisted(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
-    """#518 item 8: `buy_orders` sizes a buy of a name whose listing ended
-    (only `check_phase` knows), so it shrinks the kept buy; `cash_left` is
-    recomputed over the verdict's orders, so it counts the delisted buy's
-    share as unspent."""
+    """#604: `buy_orders` skips a buy of a name whose listing ended
+    (`book.ended`) as `skip_delisted` before sizing, so it takes no share of
+    the kept buy's sizing (the pre-#604 behavior sized it in and had
+    `check_phase` drop it afterward, shrinking the kept buy); `cash_left` is
+    recomputed over the verdict's orders either way."""
     cash = Decimal("600.00")
     env.new_fake(cash=float(cash), round_cash_to_cent=True)
     kept = _decision(env, A, "buy", notional=300.0)
@@ -422,6 +423,32 @@ def test_cash_left_excludes_a_buy_check_phase_drops_as_skip_delisted(
     spent = Decimal(str(request.notional)) * rate
     assert outcome.cash_left == pytest.approx(float(cash - spent))
     assert outcome.cash_left is not None and outcome.cash_left > float(cash) / 2 - 1
+
+
+def test_an_ended_buy_is_skipped_before_sizing_so_the_kept_buys_are_not_shrunk(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#604 wrapper-level: cash (610) comfortably covers the two kept buys'
+    combined target (600, scale 1, full notional) but not that total plus
+    the ended name's (900, which would force scale well under 1). Only
+    excluding the ended buy from sizing, not merely dropping it from
+    `check_phase`'s verdict afterward, leaves the kept buys unshrunk; the
+    ended buy is still journaled `skip_delisted` and counted once toward the
+    skip cap."""
+    env.new_fake(cash=610.0, round_cash_to_cent=True)
+    kept1 = _decision(env, A, "buy", notional=300.0)
+    kept2 = _decision(env, B, "buy", notional=300.0)
+    delisted = _decision(env, GONE, "buy", notional=300.0)
+
+    outcome = _execute(_gate(env, alerter_conn), env, [kept1, kept2, delisted])
+
+    submits = {r.symbol: r for r in _submits(env.fake)}
+    assert set(submits) == {"DUALA", "DUALB"}
+    assert submits["DUALA"].notional == pytest.approx(300.0)
+    assert submits["DUALB"].notional == pytest.approx(300.0)
+    assert [s.reason for s in outcome.skips] == ["skip_delisted"]
+    assert sum(s.counts_toward_cap for s in outcome.skips) == 1
+    assert _decision_events(env.settings) == [(delisted.decision_id, "skipped", "skip_delisted")]
 
 
 # --- the batch limits and the skip cap ---------------------------------------------------
@@ -454,19 +481,134 @@ def test_each_batch_limit_halts_with_zero_submits_and_the_missed_row(
     assert _missed(env.settings) == [("missed", "limit_breach")]
 
 
-def test_a_sell_above_the_reconciled_holding_halts_with_zero_submits(
+@pytest.mark.parametrize(
+    ("held_qty", "open_qty", "notional", "capped"),
+    [
+        (10.0, 8.0, 500.0, 2.0),
+        # Fractional (#605 pass 1's SHOULD FIX): the old `float` cap could
+        # trip `sell_sum_within_holding` by a rounding ulp on exactly this
+        # shape of input; it is now exact in `Decimal` on both sides.
+        (6.21089, 0.859, 540.0, 5.35189),
+    ],
+)
+def test_a_trim_is_capped_by_the_names_open_sell_instead_of_halting_the_batch(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    held_qty: float,
+    open_qty: float,
+    notional: float,
+    capped: float,
+) -> None:
+    """#605 owner decision: an earlier session's sell still open, and a trim
+    that would otherwise sell more than what is left of the holding, sum to
+    over the holding. Instead of halting on `sell_sum_within_holding` (the
+    pre-#605 behaviour), the trim's cap subtracts the open sell and the batch
+    submits the smaller sell."""
+    _hold(env, A, held_qty)
+    _open_sell(env, A, open_qty)
+    trim = _decision(env, A, "sell", notional=notional)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim])
+    assert outcome.status == "ok"
+    submits = _submits(env.fake)
+    assert len(submits) == 1
+    assert (submits[0].quantity, submits[0].notional) == (capped, None)
+    assert _missed(env.settings) == []
+
+
+def test_a_trim_wiped_out_by_an_open_sell_is_held_not_skipped(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#605 pass 1's second SHOULD FIX, end to end: without the open sell the
+    trim's cap is the full 10 held, so its 5-share remainder would be a valid
+    whole-share order; the open sell (9.5 of 10) cuts the cap to 0.5, which
+    floors to 0 and would be `skip_below_one_share`. A skip here would close
+    the decision for good; held instead, the run neither halts nor journals
+    `skipped`, so the trim can be re-attempted once the open sell
+    terminates."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 9.5)
+    trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
+    gate = _gate(env, alerter_conn)
+    with caplog.at_level("WARNING", logger=wrapper.__name__):
+        outcome = _execute(gate, env, [trim])
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    assert outcome.skips == ()
+    assert _decision_events(env.settings) == []
+    assert _missed(env.settings) == []
+    # #719 item 3: the decision is still open after the run.
+    book = gate._read_book(env.run, [trim])
+    assert book.states[trim.decision_id].state is State.OPEN  # type: ignore[index]
+    # #719 item 2: one structured line per held sell, with both quantities.
+    (record,) = [r for r in caplog.records if r.name == wrapper.__name__]
+    assert record.levelname == "WARNING"
+    assert record.getMessage() == (
+        f"sell held: run_id={env.run.run_id} session={S.isoformat()} "
+        f"decision_id={trim.decision_id} security_id={A} "
+        "uncapped_quantity=5.0 capped_quantity=0.0 capped_skip=skip_below_one_share"
+    )
+
+
+def test_a_trim_after_a_gap_down_sells_the_holding_with_no_limit_breach(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
-    """An earlier session's sell of 8 still open, and a trim of 5 of the 10 held:
-    the sum is over the holding."""
+    """#719 item 6 acceptance, end to end: a $950 trim planned at $100 is 19
+    shares at the $50 reference price after a gap-down, above the 10 held. It
+    sells the holding less the residue (none here; the residue case is
+    `test_phases`' `test_a_trim_after_a_price_drop_is_capped_at_the_holding_less_residue`)
+    and the batch never halts on `limit_breach`."""
     _hold(env, A, 10.0)
-    _open_sell(env, A, 8.0)
-    trim = _decision(env, A, "sell", notional=500.0)
-    submitted = len(_submits(env.fake))
-    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
-        _execute(_gate(env, alerter_conn), env, [trim])
-    assert len(_submits(env.fake)) == submitted
-    assert _missed(env.settings) == [("missed", "limit_breach")]
+    _query(env.settings, "UPDATE prices_daily SET close = ? WHERE security_id = ?", [50.0, A])
+    trim = _decision(env, A, "sell", notional=950.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim])
+    assert outcome.status == "ok"
+    (request,) = _submits(env.fake)
+    assert (request.quantity, request.notional) == (10.0, None)
+    assert _missed(env.settings) == []
+    assert _decision_events(env.settings) == []
+
+
+def test_a_held_trim_sells_the_rest_once_the_open_sell_expires(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#719 item 6 acceptance, end to end: a trim beside an earlier session's
+    open own sell is held (no order, no `decision_events` row, no skip count,
+    decision open); once that sell expires, the next run trims the rest."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 9.5)
+    trim = _decision(env, A, "sell", notional=500.0, whole_share=True)
+    gate = _gate(env, alerter_conn)
+    held = _execute(gate, env, [trim])
+    assert (held.status, held.skips, _submits(env.fake)) == ("ok", (), [])
+    assert _decision_events(env.settings) == []
+    assert gate._read_book(env.run, [trim]).states[trim.decision_id].state is State.OPEN  # type: ignore[index]
+
+    env.fake.apply(f"fx-open-{A}", Expire())
+    at = env.clock.now
+    _append(
+        env.settings,
+        OrderEventRow(
+            client_order_id=f"fx-open-{A}", status="expired", known_at=at, ingested_at=at
+        ),
+    )
+    _append(
+        env.settings,
+        PaperRunResultRow(
+            run_id=env.run.run_id,  # type: ignore[arg-type]
+            finished_at=at,
+            status="ok",
+            clock_fault=False,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    env.clock.advance(seconds=1)
+    env.run = _run(env.settings, env.window, S, env.clock.now)
+    rest = _execute(_gate(env, alerter_conn), env, [trim])
+    assert rest.status == "ok"
+    (request,) = _submits(env.fake)
+    assert (request.quantity, request.notional) == (5.0, None)  # the whole $500 remainder
+    assert _missed(env.settings) == []
 
 
 def _open_sell(env: Env, security_id: str, quantity: float) -> None:
@@ -593,12 +735,18 @@ def test_phase_time_skips_are_journaled_while_the_rest_submits(
 def test_a_forced_exits_only_batch_that_halts_leaves_the_rebalance_pending(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
+    """A full exit's own open sell no longer trips `sell_sum_within_holding`
+    (#647 item 5; see
+    `test_a_full_exit_nets_out_its_own_open_sell_instead_of_halting_the_batch`
+    below), so an unrelated batch limit exercises the same claim here: a
+    halt in a forced-exits-only phase still leaves the rebalance pending."""
     _hold(env, A, 10.0)
-    _open_sell(env, A, 8.0)
-    _decision(env, B, "buy", notional=3000.0)  # the pending rebalance, not in this batch
+    _hold(env, B, 5.0)  # untouched this batch; breaches the tightened cap below
+    _decision(env, C, "buy", notional=3000.0)  # the pending rebalance, not in this batch
     forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
-    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
-        _execute(_gate(env, alerter_conn), env, [], [forced])
+    gate = _gate(env, alerter_conn, FROZEN.model_copy(update={"max_gross_exposure": 0.0}))
+    with pytest.raises(LimitBreachError, match="max_gross_exposure"):
+        _execute(gate, env, [], [forced])
     assert _missed(env.settings) == []
 
 
@@ -609,13 +757,53 @@ def test_a_sells_phase_breach_marks_a_held_buys_only_rebalance_missed(
     phase holds only the exit, and its breach still marks the rebalance
     `missed` (ADR 0010 point 2: per batch, not per phase)."""
     _hold(env, A, 10.0)
-    _open_sell(env, A, 8.0)
-    buy = _decision(env, B, "buy", notional=3000.0)
+    _hold(env, B, 5.0)  # untouched this batch; breaches the tightened cap below
+    buy = _decision(env, C, "buy", notional=3000.0)
     forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
-    with pytest.raises(LimitBreachError, match="sell_sum_within_holding"):
-        _execute(_gate(env, alerter_conn), env, [buy], (forced,))
+    gate = _gate(env, alerter_conn, FROZEN.model_copy(update={"max_gross_exposure": 0.0}))
+    with pytest.raises(LimitBreachError, match="max_gross_exposure"):
+        _execute(gate, env, [buy], (forced,))
     assert _missed(env.settings) == [("missed", "limit_breach")]
     assert _submits(env.fake) == []
+
+
+def test_a_full_exit_nets_out_its_own_open_sell_instead_of_halting_the_batch(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#647 item 5 owner decision, end to end: this is the exact shape the
+    two tests above used to exercise pre-#647 (10 held, 8 open-sold: the old
+    full exit sold the whole 10 and tripped `sell_sum_within_holding` at 18
+    over the 10 held). Now the full exit nets the open sell out and submits
+    the smaller sell, so the batch neither halts nor skips."""
+    _hold(env, A, 10.0)
+    _open_sell(env, A, 8.0)
+    forced = _decision(env, A, "sell", quantity=10.0, decision="forced_exit", reason="delisted")
+    outcome = _execute(_gate(env, alerter_conn), env, [], [forced])
+    assert outcome.status == "ok"
+    submits = _submits(env.fake)
+    assert len(submits) == 1
+    assert (submits[0].quantity, submits[0].notional) == (2.0, None)  # 10 - 0 - 8
+    assert _missed(env.settings) == []
+
+
+def test_several_holding_capped_trims_already_at_residue_do_not_trip_the_skip_cap(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#647 item 7 owner decision, end to end: a broad price drop can leave
+    several trims already sold down to their residue (here, simply never
+    held at all, which caps each one's quantity at 0 just the same). Before
+    #647 each one's holding-capped quantity closed as a real skip and
+    counted toward the cap (the #602-era bug); now each is held instead, so
+    more of them than `max_skips_per_run` never trips `SkipCapError`, writes
+    no skip `decision_events` row, and leaves every decision open."""
+    trims = [_decision(env, sid, "sell", notional=300.0) for sid in (A, B, C)]
+    gate = _gate(env, alerter_conn, FROZEN.model_copy(update={"max_skips_per_run": 0}))
+    outcome = _execute(gate, env, trims)
+    assert outcome.status == "ok"
+    assert _submits(env.fake) == []
+    assert outcome.skips == ()
+    assert _decision_events(env.settings) == []
+    assert _missed(env.settings) == []
 
 
 # --- the journal before the broker ---------------------------------------------------------
@@ -988,6 +1176,186 @@ def test_a_reserve_error_halts_the_buys_with_zero_buy_submits(
     with pytest.raises(ValueError, match="after close"):
         _execute(_gate(env, alerter_conn), env, [_decision(env, A, "buy", notional=3000.0)])
     assert _submits(env.fake) == []
+
+
+# --- a name with no bar at close(S-1) (#569, owner option (b)) ----------------------------------
+
+NO_BAR = "SEC_NO_BAR"  # no `prices_daily` row at all, so no reference price on S
+
+
+def _stale_order(
+    env: Env, side: str, *, quantity: float | None = None, notional: float | None = None
+) -> None:
+    """A non-terminal order of the earlier run on S-1 for `NO_BAR`, journaled
+    only (accepted, never filled): the stale order #569 says must not halt
+    every batch."""
+    at = CUT - timedelta(hours=2)
+    decision = _decision(
+        env,
+        NO_BAR,
+        side,
+        notional=notional,
+        quantity=quantity,
+        reason="left_targets" if side == "sell" else None,
+    )
+    coid = f"fx-stale-{side}"
+    _append(
+        env.settings,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision.decision_id,  # type: ignore[arg-type]
+            run_id=env.earlier.run_id,
+            session=PREV,
+            attempt=1,
+            phase=side,
+            security_id=NO_BAR,
+            symbol="NOBR",
+            side=side,
+            notional=notional,
+            quantity=quantity,
+            sells_in_flight_at_submit=side == "sell",
+            known_at=at,
+            ingested_at=at,
+        ),
+        OrderEventRow(client_order_id=coid, status="pending", known_at=at, ingested_at=at),
+        OrderEventRow(
+            client_order_id=coid,
+            status="accepted",
+            broker_order_id=f"broker-{coid}",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "quantity", "notional"),
+    [
+        # The reserve takes a notional buy's unfilled notional as it stands.
+        ("buy", None, 500.0),
+        # The open-sell check counts a quantity sell's shares, unpriced.
+        ("sell", 3.0, None),
+        # A notional sell would be priced, but the check reads only the names
+        # the batch sells (`_open_sells`).
+        ("sell", None, 300.0),
+    ],
+)
+def test_an_unpriced_open_order_no_number_reads_does_not_halt_the_batch(
+    env: Env,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+) -> None:
+    """#569 (b): a non-terminal order whose name has no bar at close(S-1), and
+    whose price neither the open-buy reserve nor the open-sell check reads,
+    leaves both phases of the batch to proceed."""
+    env.new_fake(cash=10_000.0)
+    _hold(env, A, 10.0)
+    _stale_order(env, side, quantity=quantity, notional=notional)
+    trim = _decision(env, A, "sell", notional=300.0)
+    buy = _decision(env, B, "buy", notional=1000.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim, buy])
+    assert outcome.status == "ok"
+    assert sorted(r.symbol for r in _submits(env.fake)) == ["DUALA", "DUALB"]
+    assert _missed(env.settings) == []
+
+
+@pytest.mark.parametrize("with_sell", [False, True])
+def test_an_unpriced_open_quantity_buy_halts_at_the_reserve_before_any_submit(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, with_sell: bool
+) -> None:
+    """The reserve prices an open quantity buy's unfilled shares at the
+    reference price, so a missing bar there still halts. A batch with buys
+    runs the reserve on its first book, so even a sell-and-buy batch halts
+    before its sells are submitted, not after (#569)."""
+    env.new_fake(cash=10_000.0)
+    _stale_order(env, "buy", quantity=3.0)
+    batch = [_decision(env, B, "buy", notional=1000.0)]
+    if with_sell:
+        _hold(env, A, 10.0)
+        batch.insert(0, _decision(env, A, "sell", notional=300.0))
+    calls = len(env.fake.calls)
+    with pytest.raises(ValueError, match=NO_BAR):
+        _execute(_gate(env, alerter_conn), env, batch)
+    assert not env.fake.calls[calls:]
+
+
+@pytest.mark.parametrize("with_sell", [False, True])
+def test_an_engaged_switch_skips_before_the_reserve_reads_an_unpriced_open_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, with_sell: bool
+) -> None:
+    """#692 (owner Q1 = B): the switch is read before the reserve pre-check, so
+    an engaged switch ends the batch `skipped_kill_switch`, never a fault, even
+    when an open quantity buy has no price; nothing written, nothing sent."""
+    env.new_fake(cash=10_000.0)
+    _stale_order(env, "buy", quantity=3.0)
+    batch = [_decision(env, B, "buy", notional=1000.0)]
+    if with_sell:
+        _hold(env, A, 10.0)
+        batch.insert(0, _decision(env, A, "sell", notional=300.0))
+    _override(env)
+    calls = len(env.fake.calls)
+    outcome = _execute(_gate(env, alerter_conn), env, batch)
+    assert outcome.status == "skipped_kill_switch"
+    assert not env.fake.calls[calls:]
+    assert _query(
+        env.settings, "SELECT count(*) FROM orders WHERE run_id = ?", [env.run.run_id]
+    ) == [(0,)]
+
+
+def test_the_reserve_pre_check_runs_after_the_switch_read_and_before_any_sell(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#692: on a sell-and-buy batch the order is switch read, then the
+    reserve pre-check, then the sells phase's own switch read and submits."""
+    env.new_fake(cash=10_000.0)
+    _hold(env, A, 10.0)
+    trim = _decision(env, A, "sell", notional=300.0)
+    buy = _decision(env, B, "buy", notional=1000.0)
+    gate = _gate(env, alerter_conn)
+    seen: list[str] = []
+    engaged, reserve = gate._engaged, wrapper.open_buy_reserve
+
+    def spy_engaged(*args: Any, **kwargs: Any) -> bool:
+        seen.append("switch")
+        return engaged(*args, **kwargs)
+
+    def spy_reserve(*args: Any, **kwargs: Any) -> Any:
+        seen.append("reserve")
+        return reserve(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "_engaged", spy_engaged)
+    monkeypatch.setattr(wrapper, "open_buy_reserve", spy_reserve)
+    env.fake.on_submit = lambda _request: seen.append("submit")
+    _execute(gate, env, [trim, buy])
+    assert seen[:4] == ["switch", "reserve", "switch", "submit"]
+
+
+def test_a_sells_only_batch_never_reads_the_reserve(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """No buy, no reserve: an unpriced open quantity buy does not halt it."""
+    _hold(env, A, 10.0)
+    _stale_order(env, "buy", quantity=3.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [_decision(env, A, "sell", notional=300.0)])
+    assert outcome.status == "ok"
+    assert [r.symbol for r in _submits(env.fake)] == ["DUALA"]
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_a_batch_name_with_no_bar_halts_before_any_broker_call(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, stale: bool
+) -> None:
+    """A name inside the batch is priced at the book read, with or without a
+    stale open order of its own: no bar halts before any broker call."""
+    if stale:
+        _stale_order(env, "buy", notional=500.0)
+    buy = _decision(env, NO_BAR, "buy", notional=1000.0)
+    calls = len(env.fake.calls)
+    with pytest.raises(ValueError, match="no bar on or before"):
+        _execute(_gate(env, alerter_conn), env, [buy])
+    assert not env.fake.calls[calls:]
 
 
 # --- frozen versus settings -------------------------------------------------------------------

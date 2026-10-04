@@ -5,8 +5,9 @@ resume acceptance cases; #374's rejection-cap handoff from T58)."""
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Protocol
 
 import pytest
@@ -15,6 +16,7 @@ from tradepartner.adapters.broker import Order, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, Reject
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
+from tradepartner.errors import ClockError
 from tradepartner.execution import resume as resume_module
 from tradepartner.execution import switch
 from tradepartner.execution.collect import collect
@@ -24,6 +26,7 @@ from tradepartner.execution.resume import NO_WINDOW, REFUSED, RELEASED, resume
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
+    KillSwitchRow,
     OrderEventRow,
     OrderRow,
     PaperRunResultRow,
@@ -210,6 +213,18 @@ def _order(
     return order
 
 
+class _ScriptedClock:
+    """A clock whose calls follow an exact, scripted sequence of readings —
+    one popped per call — used to pin a backward step to one specific
+    internal reading of `resume` (monotonic-stamps tests, #551 item 4)."""
+
+    def __init__(self, *readings: datetime) -> None:
+        self._readings = list(readings)
+
+    def __call__(self) -> datetime:
+        return self._readings.pop(0)
+
+
 def _engage(settings: Settings, window: PaperWindowRow, clock: FixedClock) -> None:
     switch.engage(settings, clock, window_id=window.window_id, source="owner", reason="test")  # type: ignore[arg-type]
 
@@ -380,12 +395,16 @@ def test_resume_closes_an_unfinished_run_crashed_and_releases_with_its_ids(
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
 
-    outcome = _resume(journal_settings, fake, fixed_clock)
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == RELEASED, outcome.reasons
+    # The clock only ever moves forward here: nothing is clamped, nothing logged.
+    assert "clamped" not in caplog.text
     assert outcome.crashed_runs == (crashed,)
     with open_read_only(journal_settings) as conn:
         (run,) = runs_for(conn, window.window_id)  # type: ignore[arg-type]
@@ -437,6 +456,112 @@ def test_the_release_resets_the_peak_to_the_equity_at_the_last_mark(
                 ingested_at=at,
             ),
         )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        released = [
+            e
+            for e in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            if e.state == "released"
+        ]
+    assert released[0].peak_equity == 93_500.0
+
+
+def test_the_release_resets_the_peak_from_marks_fors_real_row_shape(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Regression for #653: `marks.marks_for`'s own docstring says a session
+    with nothing held gets a `security_id=None` cash row, but once anything
+    is held every row is a per-security row carrying the ledger's `cash`
+    redundantly -- there is never a dedicated null-security row. Build the
+    last marked session in exactly that shape (no cash-only row; every
+    position row carries the same `cash`) and require `resume` to still read
+    the peak from it, rather than refusing because no null-security row
+    exists."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    session = date(2026, 9, 30)
+    cash = 93_000.0
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=50.0,
+            value=500.0,
+            cash=cash,
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id="SEC_OTHER",
+            quantity=4.0,
+            mark_price=25.0,
+            value=100.0,
+            cash=cash,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        released = [
+            e
+            for e in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+            if e.state == "released"
+        ]
+    assert released[0].peak_equity == cash + 500.0 + 100.0
+
+
+def test_only_the_max_marked_session_counts(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A broken earlier session (a position row with no value) must not sink
+    the read: only the rows of the highest `session` count."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 29),
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=None,
+            value=None,
+            cash=100_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=50.0,
+            value=500.0,
+            cash=93_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
     _engage(journal_settings, window, fixed_clock)
 
     outcome = _resume(journal_settings, fake, fixed_clock)
@@ -643,7 +768,7 @@ def test_a_real_fill_after_the_synthetic_one_is_superseded_and_kept_once(
 ) -> None:
     order = _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
     assert _resume(journal_settings, fake, fixed_clock, accept=True).status == RELEASED
-    fake._fill_hidden_reads = [0 for _ in fake._fill_hidden_reads]  # the feed catches up
+    fake.reveal_hidden_fills()  # the feed catches up
 
     for _ in range(3):
         fixed_clock.advance(minutes=1)
@@ -899,6 +1024,344 @@ def test_a_last_mark_with_no_positive_equity_refuses(
     window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
+    # Not -50.0: a finite negative equity is itself a drawdown crossing now
+    # (#648) and would be refused for that reason instead. NaN gives no
+    # usable equity (`mark_equity` returns None), so it reaches neither
+    # check's crossing and still exercises the peak's own validation below.
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=float("nan"),
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_two_distinct_cash_values_at_the_last_mark_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Two rows of the same session disagreeing on `cash` cannot be a
+    single ledger reading: refuse rather than pick either one."""
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    session = date(2026, 9, 30)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=50.0,
+            value=500.0,
+            cash=93_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=session,
+            security_id="SEC_OTHER",
+            quantity=4.0,
+            mark_price=25.0,
+            value=100.0,
+            cash=92_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+def test_a_held_position_row_with_no_value_refuses(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    at = DAY1 - timedelta(days=1)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),
+            security_id=SPY,
+            quantity=10.0,
+            mark_price=None,
+            value=None,
+            cash=93_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("positive equity" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
+
+
+# --- the drawdown check over the window's marks before resume releases (#648) -------------------
+
+
+def test_a_crashed_runs_marks_crossing_the_drawdown_refuse_with_no_prior_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A run that marks a session below the frozen `risk.max_drawdown` and
+    then crashes (no result row) leaves the switch engaged on its own (an
+    unfinished run engages); `resume`'s release path checks that mark before
+    computing the peak or releasing, so the refusal names the drawdown and
+    nothing is released (#648 owner decision)."""
+    at = DAY1 - timedelta(days=1)
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=50_000.0,  # well below starting_equity * (1 - max_drawdown) = 70,000
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("drawdown" in r for r in outcome.reasons)
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    drawdown_rows = [e for e in events if e.source == "drawdown"]
+    assert len(drawdown_rows) == 1 and drawdown_rows[0].state == "engaged"
+    assert not any(e.state == "released" for e in events)
+    assert _engaged(journal_settings, window)
+
+
+def test_a_crashed_runs_marks_crossing_the_drawdown_refuse_after_a_prior_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Same as above, but the window has already released once: the crashed
+    run's marks are known after that release, so the gap `_drawdown`'s old
+    docstring named (#648) would have let the next release widen straight
+    past them. A second `resume` -- after the drawdown refusal disarms the
+    trigger -- releases, resetting the peak to the crashed run's own last
+    mark."""
+    _engage(journal_settings, window, fixed_clock)
+    first = _resume(journal_settings, fake, fixed_clock)
+    assert first.status == RELEASED, first.reasons
+
+    at = fixed_clock.now  # after the release above
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=50_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    second = _resume(journal_settings, fake, fixed_clock)
+
+    assert second.status == REFUSED
+    assert any("drawdown" in r for r in second.reasons)
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert sum(e.state == "released" for e in events) == 1  # no new release row
+    assert sum(e.source == "drawdown" for e in events) == 1
+    assert _engaged(journal_settings, window)
+
+    third = _resume(journal_settings, fake, fixed_clock)
+
+    assert third.status == RELEASED, third.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    released = sorted((e for e in events if e.state == "released"), key=lambda e: e.event_id or 0)
+    assert len(released) == 2
+    assert released[-1].peak_equity == 50_000.0  # reset to the crashed run's last mark
+
+
+def test_marks_that_do_not_cross_the_drawdown_release_with_no_drawdown_row(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A crashed run's marks that stay within `risk.max_drawdown` do not
+    refuse: the release proceeds and writes no `drawdown` kill-switch row."""
+    at = DAY1 - timedelta(days=1)
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=93_000.0,  # above starting_equity * (1 - max_drawdown) = 70,000
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert not any(e.source == "drawdown" for e in events)
+
+
+def test_a_pre_release_crossing_mark_is_not_re_checked_by_resume(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A mark known *before* the window's last release, even one below the
+    reset peak by more than `risk.max_drawdown`, is not re-checked unless it
+    is the window's last marked session -- mirroring `run.py`'s own release
+    boundary (module docstring of `execution.drawdown`). Here the last
+    marked session is a later, in-bound one, so the earlier crossing never
+    stops the release."""
+    reset_peak = 80_000.0
+    below_bound = 30_000.0  # well below reset_peak * (1 - max_drawdown) = 56,000
+    in_bound = 90_000.0  # above reset_peak * (1 - max_drawdown)
+    released_at = DAY1 - timedelta(days=2)
+    _append(
+        journal_settings,
+        KillSwitchRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=released_at,
+            state="released",
+            source="owner",
+            peak_equity=reset_peak,
+            known_at=released_at,
+            ingested_at=released_at,
+        ),
+    )
+    run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 29),  # before the release above
+            quantity=0.0,
+            cash=below_bound,
+            known_at=released_at - timedelta(hours=1),
+            ingested_at=released_at - timedelta(hours=1),
+        ),
+        PositionDailyRow(
+            run_id=run_id,
+            session=date(2026, 9, 30),  # the window's last marked session
+            quantity=0.0,
+            cash=in_bound,
+            known_at=DAY1 - timedelta(days=1),
+            ingested_at=DAY1 - timedelta(days=1),
+        ),
+    )
+    _engage(journal_settings, window, fixed_clock)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == RELEASED, outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert not any(e.source == "drawdown" for e in events)
+    released = sorted((e for e in events if e.state == "released"), key=lambda e: e.event_id or 0)
+    assert released[-1].peak_equity == in_bound
+
+
+def test_an_earlier_crossing_of_the_crashed_run_refuses_though_its_last_mark_is_in_bound(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The crashed run marks two sessions after the window's last release: the
+    earlier one crosses the drawdown, the last one is back in bound. Checking
+    only the last mark would release; `resume` checks every mark known after
+    the release, so it refuses and names the earlier session (#648)."""
+    _engage(journal_settings, window, fixed_clock)
+    first = _resume(journal_settings, fake, fixed_clock)
+    assert first.status == RELEASED, first.reasons
+
+    at = fixed_clock.now + timedelta(seconds=1)  # strictly after the release above
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 29),
+            quantity=0.0,
+            cash=50_000.0,  # below starting_equity * (1 - max_drawdown) = 70,000
+            known_at=at,
+            ingested_at=at,
+        ),
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),  # the window's last marked session
+            quantity=0.0,
+            cash=93_000.0,  # in bound
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("drawdown" in r and "2026-09-29" in r for r in outcome.reasons), outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert sum(e.state == "released" for e in events) == 1
+    drawdown_rows = [e for e in events if e.source == "drawdown"]
+    assert len(drawdown_rows) == 1 and "2026-09-29" in (drawdown_rows[0].reason or "")
+    assert _engaged(journal_settings, window)
+
+
+def test_a_finite_non_positive_last_mark_refuses_once_the_drawdown_is_disarmed(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """After a `drawdown` engagement the trigger is disarmed, so a last mark of
+    -50 cash reaches the peak's own validation: no positive equity refuses."""
     run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
     at = DAY1 - timedelta(days=1)
     _append(
@@ -912,12 +1375,63 @@ def test_a_last_mark_with_no_positive_equity_refuses(
             ingested_at=at,
         ),
     )
-    _engage(journal_settings, window, fixed_clock)
+    switch.engage(
+        journal_settings,
+        fixed_clock,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        source="drawdown",
+        reason="test",
+    )
 
     outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == REFUSED
-    assert any("positive equity" in r for r in outcome.reasons)
+    assert any("positive equity" in r for r in outcome.reasons), outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert sum(e.source == "drawdown" for e in events) == 1  # no second engagement
+    assert _engaged(journal_settings, window)
+
+
+def test_a_drawdown_row_that_cannot_be_written_still_refuses_and_names_it(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crossing whose `drawdown` engagement fails to write still refuses the
+    release (fail closed) and names the failed write."""
+    at = DAY1 - timedelta(days=1)
+    crashed = _run(journal_settings, window, at, finished=False)
+    _append(
+        journal_settings,
+        PositionDailyRow(
+            run_id=crashed,
+            session=date(2026, 9, 30),
+            quantity=0.0,
+            cash=50_000.0,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    real_engage = switch.engage
+
+    def engage(*args: Any, **kwargs: Any) -> int | switch.WriteFailed:
+        if kwargs.get("source") == "drawdown":
+            return switch.WriteFailed("IOException: disk full")
+        return real_engage(*args, **kwargs)
+
+    monkeypatch.setattr(switch, "engage", engage)
+
+    outcome = _resume(journal_settings, fake, fixed_clock)
+
+    assert outcome.status == REFUSED
+    assert any("drawdown" in r for r in outcome.reasons)
+    assert any("could not be written" in r for r in outcome.reasons), outcome.reasons
+    with open_read_only(journal_settings) as conn:
+        events = kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert not any(e.state == "released" for e in events)
     assert _engaged(journal_settings, window)
 
 
@@ -1345,3 +1859,303 @@ def test_the_flag_without_a_verdict_refuses_what_a_plain_resume_refuses(
     assert plain.status == flagged.status == REFUSED
     assert plain.reasons == flagged.reasons
     assert _engaged(journal_settings, window)
+
+
+# --- monotonic stamps (#551 item 4) --------------------------------------------
+
+
+def test_a_skewed_clock_clamps_the_resume_acceptances_stamp_to_the_floor(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejection-cap verdict `--accept-rejections` clears, with a lagging
+    order still refusing afterwards (reusing the existing
+    `test_with_the_flag_the_lag_bound_still_refuses` setup): the clock steps
+    back right before the `resume_acceptances` row, so its `known_at` is
+    clamped to the invocation's own first reading instead of preceding it."""
+    fixed_clock.now = DAY1
+    run_id = _halted_with_rejections(journal_settings, fake, fixed_clock, window)
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+
+    floor = DAY2
+    backward = DAY2 - timedelta(minutes=5)
+    clock = _ScriptedClock(floor, floor, floor, backward)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=True,
+        )
+
+    assert outcome.status == REFUSED
+    assert any("tp-lag" in r and "lag bound" in r for r in outcome.reasons)
+    assert not any(f"run {run_id}" in r for r in outcome.reasons)
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+        (resume_id, _, known_at) = _acceptances(journal_settings)[0]
+    assert resume_id == invocation.resume_id
+    assert known_at == invocation.known_at == floor
+    assert "resume_acceptances" in caplog.text
+    assert backward.isoformat() in caplog.text
+    assert floor.isoformat() in caplog.text
+
+
+def test_a_skewed_clock_clamps_a_settled_orders_stamp_to_the_floor(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pending order from a crashed run is settled while a separate lagging
+    order (past the bound, without `--accept-broker-fills`) refuses the resume
+    afterwards, so the invocation never reaches the reconciliation step where
+    an unscripted clock read could run out. The settle read itself steps
+    back, and is clamped to the invocation's own first reading."""
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+    crashed = _run(journal_settings, window, DAY2 - timedelta(hours=1), finished=False)
+    _order(
+        journal_settings,
+        fake,
+        crashed,
+        "tp-p1",
+        1.0,
+        DAY2 - timedelta(hours=1),
+        acknowledge=False,
+    )
+
+    floor = DAY2
+    backward = DAY2 - timedelta(minutes=5)
+    clock = _ScriptedClock(floor, backward, floor, floor)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=False,
+        )
+
+    assert outcome.status == REFUSED
+    assert any("tp-lag" in r and "lag bound" in r for r in outcome.reasons)
+    with open_read_only(journal_settings) as conn:
+        (invocation,) = resume_invocations(conn)
+    settle_events = [e for e in _events(journal_settings, "tp-p1") if e.status != "pending"]
+    assert settle_events and all(e.known_at == invocation.known_at == floor for e in settle_events)
+    assert "settle order_events" in caplog.text
+    assert backward.isoformat() in caplog.text
+    assert floor.isoformat() in caplog.text
+
+
+def test_a_backward_step_before_the_journal_cut_does_not_release(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The journal-cut `as_of` is clamped like every other stamp this
+    invocation writes for itself, but `reconcile_now` keeps its own, unclamped
+    backward-clock guard: once the clamped `as_of` is later than its own fresh
+    reading, it raises `ClockError` and the switch stays engaged (module
+    docstring, "Monotonic stamps")."""
+    _engage(journal_settings, window, fixed_clock)
+
+    floor = DAY1
+    backward = DAY1 - timedelta(minutes=5)
+    clock = _ScriptedClock(floor, floor, floor, backward, backward)
+
+    with pytest.raises(ClockError):
+        resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=False,
+        )
+
+    assert _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        states = [e.state for e in kill_switch_events_for(conn, window.window_id)]  # type: ignore[arg-type]
+    assert "released" not in states
+
+
+def test_a_backward_step_before_the_cut_is_clamped_to_what_collect_wrote(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Settle stamps T1, collect journals a fill and its terminal event at T3,
+    then the clock steps back to T2 (T1 < T2 < T3) before the journal cut.
+    Without raising the floor from collect's own readings, the raw `as_of`
+    (T2) would exclude the fill collect just journaled from its own
+    reconciliation — a spurious mismatch. `collect`'s readings instead raise
+    the floor (`_MonotonicStamps.observe`), so the cut is clamped to T3 and
+    the reconciliation sees the fill it was stamped to see."""
+    crashed = _run(journal_settings, window, DAY1 - timedelta(hours=1), finished=False)
+    _order(
+        journal_settings,
+        fake,
+        crashed,
+        "tp-p1",
+        2.0,
+        DAY1 - timedelta(hours=1),
+        acknowledge=False,
+    )
+    fake.simulate_fill("tp-p1")
+
+    t1 = DAY1
+    t2 = DAY1 + timedelta(minutes=5)
+    t3 = DAY1 + timedelta(minutes=10)
+    t4 = DAY1 + timedelta(minutes=20)
+    t5 = DAY1 + timedelta(minutes=25)
+    # [resume's now, settle, collect's now, collect's stamp, as_of (backward),
+    #  reconcile_now's now, its stamp, switch.release's own reading]
+    clock = _ScriptedClock(t1, t1, t3, t3, t2, t4, t4, t5)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            False,
+            accept_rejections=False,
+        )
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert "journal cut as_of" in caplog.text
+    assert t2.isoformat() in caplog.text
+    assert t3.isoformat() in caplog.text
+    with open_read_only(journal_settings) as conn:
+        (reconciliation,) = reconciliations_for(conn, window.window_id)  # type: ignore[arg-type]
+    assert reconciliation.status == "ok"
+
+
+def test_a_skewed_clock_clamps_the_synthetic_fill_stamp_on_a_release_that_proceeds(
+    journal_settings: Settings,
+    fake: SkewedFake,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`--accept-broker-fills` completes a lagging order with a synthetic
+    residual fill (reusing the `_lagging_third_fill` setup): the clock steps
+    back right before that fill is written, so its stamp is clamped to the
+    floor `collect` already raised, and the resume still reconciles and
+    releases — the clamp on a quiet path, not only on a refusal."""
+    fixed_clock.now = DAY1
+    _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
+
+    t1 = DAY2
+    t2 = DAY2 + timedelta(minutes=5)
+    t3 = DAY2 + timedelta(minutes=10)
+    t4 = DAY2 + timedelta(minutes=20)
+    t5 = DAY2 + timedelta(minutes=25)
+    t6 = DAY2 + timedelta(minutes=30)
+    # [resume's now, collect's now, collect's stamp, synthetic fill (backward),
+    #  as_of, reconcile_now's now, its stamp, switch.release's own reading]
+    clock = _ScriptedClock(t1, t3, t3, t2, t4, t5, t5, t6)
+
+    with caplog.at_level(logging.WARNING, logger=resume_module.__name__):
+        outcome = resume(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            clock,
+            "owner checked",
+            True,
+            accept_rejections=False,
+        )
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert outcome.synthetic_fills == ("tp-lag",)
+    assert "synthetic fills" in caplog.text
+    assert t2.isoformat() in caplog.text
+    assert t3.isoformat() in caplog.text
+    fill = _synthetic_row(journal_settings, "tp-lag")
+    assert fill.known_at == t3
+
+
+def test_observe_wraps_collects_clock_without_weakening_its_own_guard(
+    journal_settings: Settings,
+    fake: SkewedFake,
+) -> None:
+    """`_MonotonicStamps.observe` must hand `collect` the raw reading
+    completely unchanged: a backward step between collect's own two readings
+    still raises collect's own "clock went back" `ClockError`, exactly as it
+    would unwrapped."""
+    stamps = resume_module._MonotonicStamps(DAY1)
+    backward = _ScriptedClock(DAY1, DAY1 - timedelta(minutes=1))
+
+    with pytest.raises(ClockError, match="clock went back"):
+        collect(
+            fake,
+            lambda: open_for_write(journal_settings),
+            [],
+            stamps.observe(backward),
+            "run",
+            1,
+            FROZEN,
+            journal_settings,
+        )
+
+    # Neither reading raised the floor: the first tied it, the second was
+    # behind it, and `observe` never lowers the floor either.
+    assert stamps._floor == DAY1
+
+
+def test_observe_normalises_a_non_utc_reading_before_raising_the_floor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #682: a tz-aware reading in another zone raises the floor as its
+    UTC instant, so the floor, every stamp clamped to it and the clamp
+    warning are UTC, while `collect` still gets the raw reading unchanged."""
+    eastern = timezone(timedelta(hours=-4))
+    ahead = (DAY1 + timedelta(minutes=5)).astimezone(eastern)
+    stamps = resume_module._MonotonicStamps(DAY1)
+
+    assert stamps.observe(lambda: ahead)() is ahead
+    assert stamps._floor == ahead
+    assert stamps._floor.tzinfo is UTC
+
+    caplog.set_level(logging.WARNING, logger=resume_module.__name__)
+    stamp = stamps.next(lambda: DAY1, "the journal cut")
+
+    assert stamp == ahead
+    assert stamp.tzinfo is UTC
+    assert ahead.astimezone(UTC).isoformat() in caplog.text
+    assert "-04:00" not in caplog.text
+
+
+def test_observe_leaves_the_floor_alone_on_a_reading_without_a_utc_offset() -> None:
+    """A reading whose tzinfo gives no offset is not a usable instant: it
+    passes through to `collect` (whose own guard rejects it) and never
+    raises the floor."""
+
+    class _NoOffset(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta | None:
+            return None
+
+    odd = datetime(2026, 10, 1, 15, 0, tzinfo=_NoOffset())
+    stamps = resume_module._MonotonicStamps(DAY1)
+
+    assert stamps.observe(lambda: odd)() is odd
+    assert stamps._floor == DAY1

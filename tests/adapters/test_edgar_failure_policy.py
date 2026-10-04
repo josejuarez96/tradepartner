@@ -155,12 +155,13 @@ X1_ACCESSION = "0000320193-26-000300"
 X1_ACCEPTED = datetime(2026, 3, 21, 0, 30, tzinfo=UTC)  # 2026-03-20 in New York
 
 
-def _x1_zip(fsn_value: str) -> bytes:
+def _x1_zip(fsn_value: str | None) -> bytes:
     """The synthetic newest period with an FSN 10-Q for Apple whose share
-    count FSN rounded to 4 decimal places (0000916457-18-000149's shape)."""
+    count FSN rounded to 4 decimal places (0000916457-18-000149's shape);
+    `None` lists the 10-Q with no share row (#749)."""
     return _fsn_zip_bytes(
         [_sub(BLANK_SIC_ACCESSION, "320193", "8-K", sic=""), _sub(X1_ACCESSION, "320193", "10-Q")],
-        [_num(X1_ACCESSION, SHARES, fsn_value, "20260331")],
+        [] if fsn_value is None else [_num(X1_ACCESSION, SHARES, fsn_value, "20260331")],
         [
             _txt(BLANK_SIC_ACCESSION, "Security12bTitle", "Common Stock"),
             _txt(BLANK_SIC_ACCESSION, "TradingSymbol", "AAPL"),
@@ -637,3 +638,91 @@ def test_p4_stored_messages_are_redacted_cleaned_and_capped(tmp_path: Path) -> N
     assert len(message) <= settings.ingest.max_message_chars
     # the hash is still of the raw message, so acceptance matches the next run
     assert entry["message_hash"] == hashlib.sha256(long.encode("utf-8")).hexdigest()
+
+
+def test_p4_stored_messages_and_run_rows_share_one_redaction(tmp_path: Path) -> None:
+    """#629: `failed_filings.json` and the run row clean a message with one
+    helper, so the two paths cannot drift."""
+    from tradepartner import ingest
+    from tradepartner.config import clean_message
+
+    settings = _settings(tmp_path)
+    source = _garbage_source(settings, 0)
+    message = f"bad {USER_AGENT}\x00\x1b[31m " + "x" * 10_000
+    assert ingest._clean is clean_message
+    assert source._stored_message(message) == clean_message(message, settings)
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        (float("nan"), 1.0, False),
+        (1.0, float("nan"), False),
+        (float("nan"), float("nan"), False),
+        (float("inf"), float("inf"), False),
+        (float("inf"), float("-inf"), False),
+        (float("inf"), 1.0, False),
+    ],
+)
+def test_a_non_finite_value_compares_without_raising(a: float, b: float, same: bool) -> None:
+    """#629: a NaN or infinite value against FSN raised
+    `decimal.InvalidOperation`, failing the whole source; a non-finite value
+    now never agrees, from any source, so the key is withheld."""
+    from tradepartner.adapters.edgar_source import _same_value
+
+    assert _same_value("fsn", a, "company", b) is same
+    assert _same_value("company", a, "fsn", b) is same
+    assert _same_value("company", a, "document", b) is same
+
+
+# --- #749: a non-finite value from a single source is never served ------------
+
+NON_FINITE = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("value", NON_FINITE, ids=["nan", "inf", "-inf"])
+def test_a_non_finite_company_value_from_one_source_is_withheld(
+    tmp_path: Path, value: float
+) -> None:
+    """#749: a key only company facts supply is never compared, so a NaN or
+    infinity was served as a fact. It is withheld and recorded like a
+    collision; the CIK's other keys are still served."""
+    payload = _apple_entries(
+        _entry(APPLE_ACCESSION, "2025-10-31", 14_776_353_000),
+        _entry(X1_ACCESSION, "2026-03-13", value),
+    )
+    # raw bytes: `json.loads` accepts the `NaN`/`Infinity` tokens httpx won't encode
+    router = _facts_router(**{APPLE: json.dumps(payload).encode("utf-8")})
+    router.add(_fsn_zip_url("2026_03"), _x1_zip(None))  # FSN covers it, no share row
+    source = _source(_settings(tmp_path), router)
+    _seed_apple(source, _record(X1_ACCESSION, "10-Q", X1_ACCEPTED))
+    records = _shares(source, APPLE)
+    assert [f for f in records if f.accession == X1_ACCESSION] == []
+    assert [(f.accession, f.value) for f in records if f.accession == APPLE_ACCESSION] == [
+        (APPLE_ACCESSION, 14_776_353_000.0)
+    ]
+    assert source.failed_filings == 1
+    [(error_class, base_form, message)] = source._pending_failures.values()
+    assert (error_class, base_form) == ("ValueError", "10-Q")
+    assert "not finite" in message
+    assert source._collision_failures == {X1_ACCESSION}
+
+
+@pytest.mark.parametrize("raw", ["Infinity", "-Infinity"])
+def test_a_non_finite_fsn_value_from_one_source_is_withheld(tmp_path: Path, raw: str) -> None:
+    """#749: the same for a key only FSN supplies (no company-facts entry
+    for the accession): withheld and recorded like a collision. (An FSN
+    `NaN` already fails its accession's extraction: `parse_fsn`'s two-values
+    check sees `NaN != NaN`.)"""
+    payload = _apple_entries(_entry(APPLE_ACCESSION, "2025-10-31", 14_776_353_000))
+    router = _facts_router(**{APPLE: payload})
+    router.add(_fsn_zip_url("2026_03"), _x1_zip(raw))
+    source = _source(_settings(tmp_path), router)
+    _seed_apple(source, _record(X1_ACCESSION, "10-Q", X1_ACCEPTED))
+    records = _shares(source, APPLE)
+    assert [f for f in records if f.accession == X1_ACCESSION] == []
+    assert [f.value for f in records if f.accession == APPLE_ACCESSION] == [14_776_353_000.0]
+    [(error_class, base_form, message)] = source._pending_failures.values()
+    assert (error_class, base_form) == ("ValueError", "10-Q")
+    assert "not finite" in message
+    assert source._collision_failures == {X1_ACCESSION}

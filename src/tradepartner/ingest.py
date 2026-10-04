@@ -20,10 +20,15 @@ row at all (there is no way to write one) and status `locked`.
 **Staleness** (price side): stale if the bar for `ingest.reference_symbol`
 is missing at the expected session, or if more than
 `ingest.max_missing_share` of listed names lack one. Listed names are the
-securities whose current listing at the session is `listed`, or
-`transferred` and not yet ended. Delisted names whose `effective_on` is
-not past are still fetched (their bars fix the listing's end) but not
-counted.
+benchmarks and the common names on one of `universe.exchanges` whose
+current listing at the session is `listed`, or `transferred` and not yet
+ended. Delisted names whose `effective_on` is not past are still fetched
+(their bars fix the listing's end) but not counted. A common name whose
+current listing is `snapshot_static` and that has no bar is named in the
+run message with its own count, not counted (#784); so is any other name
+with no bar now or at the previous session in the store, unless it is a
+benchmark or first listed this session, or the store has no bar at all at
+the previous session.
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -96,10 +101,12 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.calendar import last_completed_session
-from tradepartner.config import Settings, secret_values
+from tradepartner.calendar import last_completed_session, previous_session
+from tradepartner.config import Settings, clean_message
+from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
     build_classifications,
@@ -322,7 +329,6 @@ def _record_only(
     return run
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 
 
@@ -380,12 +386,9 @@ def _with_frames(message: str, exc: BaseException, settings: Settings) -> str:
     return f"{message} | at: {frames[:budget]}"
 
 
-def _clean(message: str, settings: Settings) -> str:
-    """`message` with every configured secret redacted, control characters
-    replaced by a space, and cut to `ingest.max_message_chars`."""
-    for value in secret_values(settings):
-        message = message.replace(value, "[redacted]")
-    return _CONTROL.sub(" ", message)[: settings.ingest.max_message_chars]
+#: The run row's message cleaning, shared with the EDGAR adapter's stored
+#: failure messages so the two cannot drift (#629).
+_clean = clean_message
 
 
 def _write_run(
@@ -456,6 +459,20 @@ class _Recorded(FilingSource):
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
 
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        """Memoized like every other question above, but not yet asked
+        anywhere: `#660`'s switch defaults off, and no caller reaches this
+        until T77b wires a per-CIK call into `_build_filings`'s fetch
+        pass. That wiring is not free of this class's own rules, despite
+        the shared `_ask` cache: the proxy's memo would otherwise hold
+        every record in memory (the spec's "Ingest" section says the
+        fetch pass must record only *which* CIKs were filled, never the
+        records themselves, for a payload the shares path already reads
+        once per CIK). T77b's wiring therefore cannot simply call this
+        method and keep the answer; it needs a dedicated memo keyed on
+        "CIK filled: yes/no", not the generic `_ask` cache used here."""
+        return list(self._ask("statement_facts", cik))
+
 
 def _unwrap(filings: FilingSource) -> FilingSource:
     """The adapter under any number of `_Recorded` wrappers (T17's fetch
@@ -465,7 +482,7 @@ def _unwrap(filings: FilingSource) -> FilingSource:
     return filings
 
 
-def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False) -> None:
+def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
     """The fetch pass: every filing question, with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
     before the lock; then `recorded` answers only from what it holds.
@@ -474,9 +491,22 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False)
     `record_failed_check()` (if it has one) records the run's failures
     first, so they can be quarantined and `accepted` although the chunk
     never commits (#610 policy 2); the check's error is re-raised either
-    way, and a dry run records nothing."""
+    way, and a dry run records nothing. `dry_run` has no default (#629), so
+    a caller cannot record failures by leaving it out.
+
+    Before `check_failures()`, the input-validation gate (#578): if the
+    source exposes `validation_failures` (`edgar_validation`) and the pass
+    recorded any parse failure, the run fails here with one bounded message
+    naming the full list's file, before any store write, on a dry run too.
+    `check_failures()` and `record_failed_check()` are then not called: a
+    pass with absent inputs must not advance the per-document failure
+    counts."""
     _build_filings(recorded, settings, _FETCH_PASS)
     source = _unwrap(recorded)
+    validation = getattr(source, "validation_failures", None)
+    if validation is not None:
+        counted = {label: getattr(source, attribute, 0) for attribute, label in _EMPTY_COUNTS}
+        validation.raise_if_any(settings, counted)
     check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
         try:
@@ -493,6 +523,16 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False)
                     ) from record_error
             raise
     recorded.frozen = True
+
+
+#: The source's counts of empty `{}` payloads (#566, #576): counted, never
+#: failed, and shown next to a failed validation's list (#578).
+_EMPTY_COUNTS: tuple[tuple[str, str], ...] = (
+    ("facts_bulk_empty", "empty bulk facts"),
+    ("submissions_bulk_empty", "empty bulk submissions"),
+    ("facts_api_empty", "empty API facts"),
+    ("submissions_api_empty", "empty API submissions"),
+)
 
 
 def _ingest_filings(
@@ -564,6 +604,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_duplicates", "FSN duplicates"),
         ("fsn_reissue_undetected", "FSN re-issues unchecked"),
         ("fsn_incomplete_listings", "FSN incomplete listings"),
+        ("cover_incomplete_listings", "cover incomplete listings"),  # #612: per-document
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
         ("unstamped_delistings", "unstamped delistings"),  # T11f
@@ -609,7 +650,8 @@ def fact_rows(
     """`facts` rows for `records`, and the records no security could take.
 
     Candidates are the CIK's **common** classes, by the classification in
-    force at the fact's acceptance (no later knowledge picks the class);
+    force at the fact's acceptance (no later knowledge picks the class),
+    without a class whose successor is known by then (`MasterBuild.successions`);
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
@@ -626,11 +668,15 @@ def fact_rows(
     for row in master.securities:
         if not row["benchmark"]:
             by_cik[row["cik"]].append(row["security_id"])
+    succeeded = {s.predecessor_id: s.known_at for s in master.successions}
 
     def common_at(cik: str, t: datetime) -> list[str]:
-        """The CIK's classes classified `common` by the latest row known at `t`."""
+        """The CIK's classes classified `common` by the latest row known at
+        `t`, less any whose successor (new equity, #820) is known at `t`."""
         out = []
         for sid in by_cik.get(cik, []):
+            if sid in succeeded and succeeded[sid] <= t:
+                continue
             known = [kind for at, kind in kinds[sid] if at <= t]
             if known and known[-1] == "common":
                 out.append(sid)
@@ -705,12 +751,16 @@ def _fetch_prices(
     reference: str | None = None
     fetch: set[str] = set()
     listed: set[str] = set()
+    static_only: set[str] = set()
+    may_count: set[str] | None = None
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
             # rows are stamped at their fetch time, which can be after the run began).
             read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
-            fetch, listed, reference = _price_names(conn, read_at, session, settings)
+            fetch, listed, static_only, may_count, reference = _price_names(
+                conn, read_at, session, settings
+            )
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
@@ -724,17 +774,19 @@ def _fetch_prices(
     have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
-    missing = sorted(listed - have)
-    share, limit = len(missing) / len(listed), settings.ingest.max_missing_share
+    counted, missing, reported = _staleness(listed, have, static_only, may_count)
+    share, limit = len(missing) / len(counted), settings.ingest.max_missing_share
     if share > limit:
         raise _Stale(
-            f"{len(missing)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
-            f"have no bar for {session}: {', '.join(missing[:10])}"
+            f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
+            f"have no bar for {session}: {', '.join(missing[:10])}{_reported_note(reported)}"
         )
     message = (
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
-        f"{len(missing)} of {len(listed)} listed names missing"
+        f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}"
     )
+    if resolution := prices.resolution_summary():
+        message += f"; {resolution}"
     return _PriceFetch(
         session, tuple(bars), tuple(actions), action_window, covered, ingested_at, message
     )
@@ -800,19 +852,146 @@ def _read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
         return
 
 
+STATIC = "snapshot_static"
+
+
+def _counted(
+    sid: str, row: Row, benchmarks: set[str], kinds: dict[str, str], settings: Settings
+) -> bool:
+    """Whether a live listing `row` puts `sid` in the staleness denominator:
+    a benchmark, or a common name on one of `universe.exchanges` (OTC is not
+    one, and the SIP feed has no OTC bars; #784)."""
+    return sid in benchmarks or (
+        kinds.get(sid) == "common" and row["exchange"] in settings.universe.exchanges
+    )
+
+
+def _types_known(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, set[str]]:
+    """Every `security_type` of each security in a `classifications` row
+    known at `t`: every revision, not only the latest, so a window before a
+    later reclassification still fetches the name (#794). A bare date
+    raises `TypeError`, a naive datetime `ValueError`."""
+    t = _validate_t(t)
+    types: dict[str, set[str]] = defaultdict(set)
+    for sid, kind in conn.execute(
+        "SELECT DISTINCT security_id, security_type FROM classifications WHERE known_at <= ?",
+        [t],
+    ).fetchall():
+        types[sid].add(kind)
+    return types
+
+
+#: Classifier labels never fetched unless `universe.security_types` admits
+#: them: debt (notes, debentures), preferreds, warrants, units and rights.
+#: Everything else on `universe.exchanges` is fetched (owner, #802).
+NOT_EQUITY = frozenset({"debt", "preferred", "warrant", "unit", "right"})
+
+
+def _fetched(
+    sid: str,
+    row: Row,
+    benchmarks: set[str],
+    types: Mapping[str, set[str]],
+    settings: Settings,
+) -> bool:
+    """Whether a listing `row` puts `sid` in the price fetch (#794): a
+    benchmark, or a listing on one of `universe.exchanges` whose security
+    has no classification yet or a `types` entry outside `NOT_EQUITY` (or
+    in `universe.security_types`). Common, unclassifiable, spac, foreign,
+    fund and depositary names are fetched; no OTC listing. Wider than
+    `_counted`, so every counted name is fetched."""
+    if sid in benchmarks:
+        return True
+    if row["exchange"] not in settings.universe.exchanges:
+        return False
+    known = types.get(sid)
+    skipped = NOT_EQUITY - set(settings.universe.security_types)
+    return not known or not known <= skipped
+
+
+def _may_count(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    previous: tuple[date, date],
+    earliest: Mapping[str, date],
+    benchmarks: set[str],
+) -> set[str] | None:
+    """The names whose miss may count (#784, dark names): those with a bar
+    in the `previous` chunk window already in the store at `t` (nothing this
+    chunk fetched), those first listed after it, and the benchmarks. `None`
+    when the store holds no bar at all in `previous` (no previous chunk):
+    then every miss counts."""
+    first, last = previous
+    had = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT security_id FROM prices_daily "
+            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+            [first, last, t],
+        ).fetchall()
+    }
+    if not had:
+        return None
+    return had | benchmarks | {sid for sid, start in earliest.items() if start > last}
+
+
+SNAPSHOT_ONLY = "snapshot-only names with no rows"
+DARK = "names with no bar in the previous chunk"
+
+
+def _staleness(
+    listed: Iterable[str], have: set[str], static_only: set[str], may_count: set[str] | None
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """`(counted, missing, reported)`. A listed name with no bar is reported
+    by cause, and left out of both sides of the share, if it is in
+    `static_only` (listed only by `snapshot_static` spans, never a
+    benchmark: its back-dated ticker may not be the one it traded under
+    then; #784, owner option a), or else if `may_count` is not `None` and
+    lacks it (dark since before this chunk: it counted once, in the chunk
+    it went dark). Every other listed name counts and is missing if it has
+    no bar."""
+    absent = sorted(sid for sid in set(listed) if sid not in have)
+    static = [sid for sid in absent if sid in static_only]
+    dark = [
+        sid
+        for sid in absent
+        if sid not in static_only and may_count is not None and sid not in may_count
+    ]
+    out = {*static, *dark}
+    counted = sorted(set(listed) - out)
+    missing = [sid for sid in absent if sid not in out]
+    return counted, missing, {SNAPSHOT_ONLY: static, DARK: dark}
+
+
+def _reported_note(reported: Mapping[str, list[str]]) -> str:
+    """The run-message clauses naming `_staleness`'s reported names by
+    cause (count and up to 10 names each), or `""`."""
+    return "".join(
+        f"; {len(names)} {cause} (not counted): {', '.join(names[:10])}"
+        for cause, names in reported.items()
+        if names
+    )
+
+
 def _price_names(
     conn: duckdb.DuckDBPyConnection, now: datetime, session: date, settings: Settings
-) -> tuple[set[str], set[str], str | None]:
-    """Names to fetch, listed common and benchmark names (the staleness
-    denominator) and the reference symbol's `security_id`, from each
+) -> tuple[set[str], set[str], set[str], set[str] | None, str | None]:
+    """Names to fetch (`_fetched` listings live or delisted from `session`
+    on, and the reference), listed common and benchmark names (the staleness
+    denominator), the listed names whose current listing is
+    `snapshot_static` (benchmarks never), `_may_count` over the previous
+    session, and the reference symbol's `security_id`, from each
     security's current listing."""
     current: dict[str, Row] = {}
+    earliest: dict[str, date] = {}
     for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
-        held = current.get(row["security_id"])
+        sid = row["security_id"]
+        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
+        held = current.get(sid)
         if row["valid_from"] <= session and (
             held is None or row["valid_from"] > held["valid_from"]
         ):
-            current[row["security_id"]] = row
+            current[sid] = row
     kinds = {
         row["security_id"]: row["security_type"]
         for row in classifications_as_of(conn, now).iter_rows(named=True)
@@ -822,20 +1001,29 @@ def _price_names(
         for row in securities_as_of(conn, now).iter_rows(named=True)
         if row["benchmark"]
     }
+    types = _types_known(conn, now)
     fetch: set[str] = set()
     listed: set[str] = set()
+    static_only: set[str] = set()
     reference = None
     for sid, row in current.items():
         status, end = row["status"], row["end_session"]
         live = status == LISTED or (status == TRANSFERRED and (end is None or end >= session))
-        if live and (sid in benchmarks or kinds.get(sid) == "common"):
+        if live and _counted(sid, row, benchmarks, kinds, settings):
             listed.add(sid)
+            if row["provenance"] == STATIC and sid not in benchmarks:
+                static_only.add(sid)
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
         effective = row["effective_on"]
-        if live or (status == DELISTED and effective is not None and effective >= session):
+        ending = status == DELISTED and effective is not None and effective >= session
+        if (live or ending) and _fetched(sid, row, benchmarks, types, settings):
             fetch.add(sid)
-    return fetch, listed, reference
+    if reference is not None:
+        fetch.add(reference)
+    before = previous_session(session)
+    may_count = _may_count(conn, now, (before, before), earliest, benchmarks)
+    return fetch, listed, static_only, may_count, reference
 
 
 def _bar_row(bar: Bar, ingested_at: datetime) -> Row:

@@ -13,9 +13,18 @@ import pytest
 from tradepartner.calendar import next_session, session_close
 from tradepartner.config import Settings
 from tradepartner.execution import check as check_module
+from tradepartner.execution import outcomes as outcomes_module
 from tradepartner.execution.check import check
 from tradepartner.store.db import open_for_write, open_read_only
-from tradepartner.store.journal import FillRow, OverrideRow, PaperReportRow, PaperWindowRow, append
+from tradepartner.store.journal import (
+    DecisionRow,
+    FillRow,
+    OrderRow,
+    OverrideRow,
+    PaperReportRow,
+    PaperWindowRow,
+    append,
+)
 
 T0 = date(2026, 9, 30)  # a rebalance session, month 0 start
 T1 = date(2026, 10, 30)  # month 0 end / month 1 start
@@ -418,7 +427,7 @@ def test_chain_becomes_due_once_a_run_exists_after_its_threshold(settings: Setti
     run after T_{i+1} = T2: now its missing terminal event and outcome are due,
     and the check must flag it (pins the `session > threshold` boundary from
     both sides, not just the "not yet due" one)."""
-    t3 = check_module._next_rebalance_session(T2)
+    t3 = outcomes_module._rebalance_after(T2)
     with open_for_write(settings) as conn:
         _build_passing_fixture(conn)
         _insert_decision(conn, 2, 2, T1)
@@ -436,6 +445,151 @@ def test_chain_becomes_due_once_a_run_exists_after_its_threshold(settings: Setti
     assert not line.passed
     assert "o2" in line.detail
     assert "is not terminal" in line.detail
+
+
+# --- req 15 (3)'s rule from req 17 (#571): a live fill after the terminal event --------
+
+
+def _insert_order(
+    conn: duckdb.DuckDBPyConnection,
+    coid: str,
+    *,
+    status: str,
+    reason: str | None = None,
+    at: datetime = _T0_UTC,
+    decision_id: int = 1,
+    run_id: int = 1,
+    session: date = T0,
+) -> None:
+    """An order of decision 1 at T0 with one terminal event stamped `at`."""
+    conn.execute(
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, notional, sells_in_flight_at_submit, known_at, "
+        "ingested_at) VALUES (?, ?, ?, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', 1000.0, FALSE, "
+        "?, ?)",
+        [coid, decision_id, run_id, session, _utc(session), _utc(session)],
+    )
+    conn.execute(
+        "INSERT INTO order_events (client_order_id, status, reason, known_at, ingested_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [coid, status, reason, at, at],
+    )
+
+
+def _insert_fill(
+    conn: duckdb.DuckDBPyConnection,
+    coid: str,
+    broker_fill_id: str,
+    at: datetime,
+    *,
+    source: str = "broker_feed",
+    superseded_by: int | None = None,
+) -> int:
+    fill_id = append(
+        conn,
+        FillRow(
+            client_order_id=coid,
+            filled_at=at,
+            quantity=1.0,
+            price=100.0,
+            price_implied=source == "broker_status",
+            broker_fill_id=broker_fill_id,
+            source=source,
+            superseded_by=superseded_by,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert fill_id is not None
+    return fill_id
+
+
+def _insert_outcome(conn: duckdb.DuckDBPyConnection, coid: str, kind: str) -> None:
+    conn.execute(
+        "INSERT INTO outcomes (client_order_id, through_session, kind, value, "
+        "known_at, ingested_at) VALUES (?, ?, ?, 0.0, ?, ?)",
+        [coid, T1, kind, _utc(T1), _utc(T1)],
+    )
+
+
+def _chain(settings: Settings) -> check_module.CheckLine:
+    """The chain line alone: these fixtures' extra fills have no bars for the
+    tracking line to price."""
+    with open_read_only(settings) as conn:
+        return check_module._chain_line(conn, WINDOW_ID)
+
+
+def test_chain_counts_an_owner_settled_order_complete_once_not_executed_is_written(
+    settings: Settings,
+) -> None:
+    """Spec req 17: a `cancelled` / `owner_settled_unknown` order owes `not_executed`
+    like any `cancelled` one; once written, its chain is complete."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "tp-settled", status="cancelled", reason="owner_settled_unknown")
+    line = _chain(settings)
+    assert not line.passed
+    assert "tp-settled" in line.detail and "not_executed" in line.detail
+
+    with open_for_write(settings) as conn:
+        _insert_outcome(conn, "tp-settled", "not_executed")
+    assert _chain(settings).passed
+
+
+def test_chain_lists_a_live_fill_journaled_after_the_terminal_event(settings: Settings) -> None:
+    """Spec req 15 (3) as amended by req 17: a live fill whose `known_at` is after its
+    order's terminal event is an incomplete chain whatever its outcome rows, so a
+    settlement can never silently absorb a real fill."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "tp-settled", status="cancelled", reason="owner_settled_unknown")
+        _insert_outcome(conn, "tp-settled", "not_executed")
+        _insert_fill(conn, "tp-settled", "late-1", _T0_UTC + timedelta(days=1))
+        _insert_outcome(conn, "tp-settled", "position_return")
+    line = _chain(settings)
+    assert not line.passed
+    assert "tp-settled" in line.detail
+    assert "live fill journaled after its terminal event" in line.detail
+
+
+def test_chain_lists_a_late_live_fill_even_before_the_outcome_is_due(settings: Settings) -> None:
+    """The rule reads the journal as it stands: an order of T1, whose outcome is not
+    due yet, is still listed once a live fill lands after its terminal event."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_decision(conn, 2, 2, T1)
+        _insert_order(
+            conn, "o2", status="expired", at=_utc(T1), decision_id=2, run_id=2, session=T1
+        )
+        _insert_fill(conn, "o2", "late-2", _utc(T1) + timedelta(hours=1))
+    line = _chain(settings)
+    assert not line.passed
+    assert "o2" in line.detail and "after its terminal event" in line.detail
+
+
+def test_chain_ignores_a_fill_journaled_with_its_terminal_event(settings: Settings) -> None:
+    """A collection journals the fill and the terminal event under one stamp: not
+    after."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+    line = _chain(settings)
+    assert line.passed
+
+
+def test_chain_ignores_a_superseded_feed_fill_after_a_synthetic_one(settings: Settings) -> None:
+    """Req 8's synthetic fill completes the order; the feed fill that arrives later is
+    journaled `superseded_by` it, and is no live fill, so the chain stays complete."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _insert_order(conn, "tp-synthetic", status="filled")
+        synthetic = _insert_fill(
+            conn, "tp-synthetic", "synthetic-1", _T0_UTC, source="broker_status"
+        )
+        _insert_outcome(conn, "tp-synthetic", "position_return")
+        _insert_fill(
+            conn, "tp-synthetic", "feed-1", _T0_UTC + timedelta(days=1), superseded_by=synthetic
+        )
+    assert _chain(settings).passed
 
 
 def test_chain_due_threshold_follows_order_phase_for_a_forced_exit_in_a_rebalance_batch(
@@ -500,6 +654,51 @@ def test_chain_due_threshold_follows_order_phase_for_a_forced_exit_in_a_rebalanc
         lines = check(conn, settings)
     line = next(line for line in lines if line.name == "chain")
     assert line.passed, line.detail
+
+
+def _order(session: date, phase: str) -> OrderRow:
+    return OrderRow(
+        client_order_id="tp-threshold",
+        decision_id=1,
+        run_id=1,
+        session=session,
+        attempt=1,
+        phase=phase,
+        security_id="SEC_A",
+        symbol="SEC_A",
+        side="buy",
+        sells_in_flight_at_submit=False,
+        known_at=_utc(session),
+        ingested_at=_utc(session),
+    )
+
+
+def test_order_due_threshold_is_the_orders_own_session_for_a_forced_exit() -> None:
+    """Pins `_order_due_threshold`'s call-through to the shared
+    `outcomes.outcome_horizon` (#597): a forced exit is due at its own
+    session, whatever decision it carries."""
+    order = _order(T1, phase="exit")
+    assert check_module._order_due_threshold(order, None) == T1
+
+
+def test_order_due_threshold_uses_the_decisions_rebalance_session() -> None:
+    decision = DecisionRow(
+        decision_id=1,
+        run_id=1,
+        rebalance_session=T0,
+        security_id="SEC_A",
+        whole_share=False,
+        decision="trade",
+        known_at=_T0_UTC,
+        ingested_at=_T0_UTC,
+    )
+    order = _order(next_session(T0), phase="buy")
+    assert check_module._order_due_threshold(order, decision) == T1
+
+
+def test_order_due_threshold_falls_back_to_the_rebalance_before_the_order() -> None:
+    order = _order(next_session(T1), phase="buy")
+    assert check_module._order_due_threshold(order, None) == T2
 
 
 def test_override_reason_fails_on_a_whitespace_padded_reason_under_the_minimum(

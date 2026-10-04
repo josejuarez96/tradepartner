@@ -48,6 +48,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
@@ -93,6 +94,7 @@ QUANT_PREFIXES = (
     "src/tradepartner/adapters/fixture_",
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
+    "src/tradepartner/adapters/edgar_source.py",
     "src/tradepartner/calendar.py",
     "src/tradepartner/config.py",
     "src/tradepartner/timeutil.py",
@@ -101,8 +103,8 @@ QUANT_PREFIXES = (
     "src/tradepartner/ingest.py",
     "src/tradepartner/backfill.py",
     "src/tradepartner/health.py",
-    "src/tradepartner/signals/",
     "src/tradepartner/backtest/",
+    "src/tradepartner/execution/",
     "scripts/make_fixture_universe.py",
     "tests/lookahead/",
     "tests/fixtures/universe/",
@@ -122,7 +124,6 @@ SAFETY_PREFIXES = (
     "src/tradepartner/ingest.py",
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
-    "src/tradepartner/risk/",
     "src/tradepartner/llm/",
     "scripts/ready_pr.py",
     "tests/test_ready_pr.py",
@@ -141,6 +142,7 @@ SAFETY_PREFIXES = (
     ".claude/settings.json",
     ".pre-commit-config.yaml",
     "pyproject.toml",
+    "uv.lock",
 )
 LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "check", "."),
@@ -150,6 +152,9 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "pytest", "-q", "tests/test_docs_budget.py"),
 )
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
+# The full suite runs in parallel when pytest-xdist is installed (#581), as CI does. xdist
+# workers each get their own subdirectory of any --basetemp, so that flag still works.
+XDIST_ARGS: tuple[str, ...] = ("-n", "auto")
 # Targeted local pytest (#456): the tests a diff maps to, or the full suite when the mapping
 # is unclear. CI always runs the full suite, so a miss here is caught there, later.
 FULL_SUITE_FILES = ("pyproject.toml", "uv.lock", ".python-version")
@@ -214,6 +219,16 @@ class Runner(Protocol):
 
 
 # ── pure logic ──────────────────────────────────────────────────────────────────
+
+
+def parallel_if_full_suite(cmd: Sequence[str], *, xdist: bool) -> tuple[str, ...]:
+    """The full-suite pytest command with ``-n auto`` added when xdist is installed (#581).
+
+    Targeted runs (pytest plus file paths) and every other command pass through unchanged.
+    """
+    if xdist and tuple(cmd) == PYTEST_CHECK:
+        return (*cmd, *XDIST_ARGS)
+    return tuple(cmd)
 
 
 def resolve_append_conflicts(text: str) -> str | None:
@@ -345,6 +360,18 @@ def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
     if any(d.startswith(have) for d in diff_names):
         return []
     return [f"changelog.d/{issue}-<slug>.md"]
+
+
+def own_changelog_fragments(
+    branch: str, diff_names: Sequence[str], deleted: Collection[str]
+) -> list[str]:
+    """The ``changelog.d/<issue>-*`` fragments of the branch's issue that the diff adds or
+    edits (not deletes): the texts ``lacks_changelog_bullets`` reads. Shared with
+    ``merge_train`` (#764) so both read the same files."""
+    issue = issue_of_branch(branch)
+    if issue is None:
+        return []
+    return [p for p in diff_names if p.startswith(f"changelog.d/{issue}-") and p not in deleted]
 
 
 def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
@@ -504,11 +531,7 @@ def ready(
                 + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
             )
         issue = issue_of_branch(pr.branch)
-        own = [
-            p
-            for p in touched
-            if issue is not None and p.startswith(f"changelog.d/{issue}-") and p not in deleted
-        ]
+        own = own_changelog_fragments(pr.branch, touched, deleted)
         if lacks_changelog_bullets(pr.branch, [r.read(p) for p in own]):
             raise ReadyError(
                 "a feat/fix PR records its change in CHANGELOG: add a bullet to "
@@ -669,6 +692,7 @@ class ShellRunner:
         return self._git(*args, check=False).returncode == 0
 
     def run_check(self, cmd: Sequence[str]) -> bool:
+        cmd = parallel_if_full_suite(cmd, xdist=importlib.util.find_spec("xdist") is not None)
         return subprocess.run(list(cmd), cwd=self.root, check=False).returncode == 0
 
     def read(self, path: str) -> str:

@@ -570,6 +570,28 @@ class TestCoverPageFailClosed:
             "ClassMUnits": 377_418.0,
         }
 
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            _shares("s1", "1,000", ' xsi:nil="true"'),
+            _nn("TradingSymbol", "c1", "SO", ' xsi:nil="true"'),
+            _nn("Security12bTitle", "c1", "<span>Common Stock</span>", ' xsi:nil="true"'),
+        ],
+    )
+    def test_a_nil_fact_that_also_has_text_raises(self, fact: str) -> None:
+        """#615: `xsi:nil="true"` on an element with text is an XBRL
+        inconsistency; fail closed rather than skip a fact that may be real."""
+        document = _ixbrl(_context("c1") + _context("s1", instant=True), fact)
+        with pytest.raises(ValueError, match="nil but has text"):
+            _cover(document)
+
+    def test_a_nil_fact_with_only_whitespace_is_still_skipped(self) -> None:
+        document = _ixbrl(
+            _context("s1", instant=True),
+            _shares("s1", " \n ", ' xsi:nil="true"') + _shares("s1", "1000"),
+        )
+        assert [f.value for f in _cover(document).facts] == [1000]
+
     def test_a_blank_share_fact_that_is_not_nil_still_raises(self) -> None:
         with pytest.raises(ValueError, match="malformed"):
             _cover(_ixbrl(_context("s1", instant=True), _shares("s1", "")))

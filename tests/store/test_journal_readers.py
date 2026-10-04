@@ -365,6 +365,14 @@ def test_the_module_still_never_updates_or_deletes() -> None:
     assert not re.search(r"\b(UPDATE|DELETE|TRUNCATE|DROP|ALTER)\b", code)
 
 
+def test_the_kill_switch_override_kind_is_the_shared_schema_constant() -> None:
+    """#691: `OverrideWithConsumption.consumed` and `unconsumed_kill_switch_overrides` compare
+    against `schema.ENGAGE_KILL_SWITCH_KIND`, never a quoted copy of it, so a renamed
+    kind cannot leave the journal readers matching a stale string."""
+    code = re.sub(r'"""[\s\S]*?"""', "", Path(journal.__file__).read_text())
+    assert f'"{schema.ENGAGE_KILL_SWITCH_KIND}"' not in code
+
+
 # --- windows ------------------------------------------------------------------------------
 
 
@@ -798,6 +806,35 @@ def test_an_override_is_consumed_only_by_what_its_kind_consumes(
     assert [o.override_id for o in journal.unconsumed_kill_switch_overrides(conn, window_id)] == [
         kill
     ]
+
+
+def test_a_settle_order_override_reads_back_with_its_order(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Schema version 9 (#571, spec req 17): `overrides.client_order_id` is on the
+    row and its reader; every other kind reads it as None, and a settlement is never
+    an unconsumed kill-switch engagement."""
+    window_id = _window(conn)
+    settle = append(
+        conn,
+        OverrideRow(
+            window_id=window_id,
+            made_at=_at(0),
+            security_id="SEC_A",
+            client_order_id="tp-a",
+            kind="settle_order",
+            reason="r",
+            **_stamp(),
+        ),
+    )
+    keep = append(
+        conn,
+        OverrideRow(window_id=window_id, made_at=_at(0), kind="keep_name", reason="r", **_stamp()),
+    )
+    found = {o.override.override_id: o.override for o in journal.overrides_for(conn, window_id)}
+    assert (found[settle].kind, found[settle].client_order_id) == ("settle_order", "tp-a")
+    assert found[keep].client_order_id is None
+    assert journal.unconsumed_kill_switch_overrides(conn, window_id) == []
 
 
 # --- bounded page reads (#435) ------------------------------------------------------------------

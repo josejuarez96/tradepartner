@@ -38,6 +38,11 @@ Conventions this module fixes for the writers (T61 reconcile, T64 window start):
 - A reconciliation is `ok` only when every fill the broker has booked is
   collected (the `fills_lagging` status exists for the other case), so a fill
   known after an `ok` reconciliation was not in its `broker_cash`.
+- A fill journaled after a reconciliation is stamped strictly after that
+  reconciliation's `known_at`: `store.journal.append` refuses a fill at or
+  before the latest one (#650). So a fill whose `known_at` ties the base was
+  journaled before it and is in its `broker_cash`, and the strict comparison
+  in `from_journal` never drops a later fill.
 
 A row's own date for the split test is its `session` (an adjustment) or the
 New York date of `filled_at` (a fill): a fill on the ex-date is already in

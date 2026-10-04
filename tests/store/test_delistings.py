@@ -380,6 +380,320 @@ class TestSynthetic:
         assert _status(late, "S", "NYSE")["end_session"] == date(2019, 3, 5)
 
 
+# ------------------------------------------- #818: real cases from the 10-04 store
+
+
+def _ny(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
+    """A New York wall-clock acceptance (EDGAR's stamps), as UTC."""
+    offset = 4 if 3 < month < 11 else 5  # EDT / EST, close enough for these dates
+    return datetime(year, month, day, hour + offset, minute, tzinfo=UTC)
+
+
+def _row(
+    sid: str,
+    ticker: str,
+    exchange: str,
+    valid_from: date,
+    class_title: str | None = "Common Stock",
+) -> dict[str, Any]:
+    return {
+        **_listing(
+            sid,
+            ticker,
+            exchange,
+            valid_from,
+            _ny(valid_from.year, valid_from.month, valid_from.day, 8, 0),
+        ),
+        "class_title": class_title,
+        "provenance": "filing" if class_title is not None else "snapshot_static",
+    }
+
+
+def _form_25(sid: str, exchange: str, filed_at: datetime, class_title: str) -> dict[str, Any]:
+    return {**_delisting(sid, exchange, filed_at), "form": "25-NSE", "class_title": class_title}
+
+
+class TestExchangeTagFlip:
+    """#818 part 1: the filer re-tags its exchange on a later cover page
+    (NYSE_AMERICAN <-> NYSE) and the Form 25 names the old tag. The filing
+    ends the security's latest listing with the same ticker."""
+
+    def test_asxc_form_25_on_the_old_tag_ends_the_retagged_listing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Store 2026-10-04, security 0000876378: ASXC flipped five times; the
+        # 25-NSE (NYSE_AMERICAN) came five months after the last NYSE cover page.
+        sid = "0000876378"
+        for exchange, start in (
+            ("NYSE", date(2022, 5, 4)),
+            ("NYSE_AMERICAN", date(2023, 5, 11)),
+            ("NYSE", date(2024, 3, 21)),
+        ):
+            insert_row(synthetic, "listings", _row(sid, "ASXC", exchange, start))
+        for day in (date(2024, 3, 20), date(2024, 3, 21), date(2024, 8, 21)):
+            insert_row(synthetic, "prices_daily", _bar(sid, day))
+        insert_row(
+            synthetic,
+            "delistings",
+            _form_25(sid, "NYSE_AMERICAN", _ny(2024, 8, 22, 7, 17), "Common Stock"),
+        )
+        df = listing_ends_as_of(synthetic, _at(2024, 9, 30), _settings()).sort("valid_from")
+        assert df["status"].to_list() == ["listed", "listed", "delisted"]
+        latest = df.row(2, named=True)
+        assert (latest["exchange"], latest["end_session"]) == ("NYSE", date(2024, 8, 21))
+        assert latest["delisting_form"] == "25-NSE"
+
+    def test_sccb_note_with_no_bars_is_delisted_on_its_retagged_listing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "0001682220:7-125pct-notes-due-2024"
+        title = "7.125% Notes due 2024"
+        insert_row(
+            synthetic, "listings", _row(sid, "SCCB", "NYSE_AMERICAN", date(2022, 5, 27), title)
+        )
+        insert_row(synthetic, "listings", _row(sid, "SCCB", "NYSE", date(2022, 11, 10), title))
+        insert_row(
+            synthetic, "delistings", _form_25(sid, "NYSE_AMERICAN", _ny(2024, 7, 1, 10, 27), title)
+        )
+        df = listing_ends_as_of(synthetic, _at(2024, 9, 30), _settings())
+        nyse = _status(df, sid, "NYSE")
+        assert (nyse["status"], nyse["end_session"]) == ("delisted", None)
+        assert _status(df, sid, "NYSE_AMERICAN")["status"] == "listed"
+
+    def test_aone_units_flip_back_to_nasdaq_is_the_one_ended(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        sid = "0001816613:units"
+        title = "Units, each consisting of one Class A ordinary share"
+        insert_row(synthetic, "listings", _row(sid, "AONE.U", "NASDAQ", date(2021, 3, 29), title))
+        insert_row(synthetic, "listings", _row(sid, "AONE.U", "NYSE", date(2021, 5, 14), title))
+        insert_row(synthetic, "listings", _row(sid, "AONE.U", "NASDAQ", date(2021, 5, 24), title))
+        insert_row(synthetic, "delistings", _form_25(sid, "NYSE", _ny(2021, 7, 15, 4, 40), title))
+        df = listing_ends_as_of(synthetic, _at(2021, 9, 30), _settings()).sort("valid_from")
+        assert df["status"].to_list() == ["listed", "listed", "delisted"]
+
+    def test_same_ticker_listing_inside_the_window_stays_a_transfer(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Spec req 4: a new listing on another exchange within the window is
+        # the transfer's destination, never the listing the filing ends.
+        insert_row(synthetic, "listings", _row("S", "A", "NASDAQ", date(2019, 1, 2)))
+        insert_row(synthetic, "listings", _row("S", "A", "NYSE", date(2019, 3, 4)))
+        insert_row(
+            synthetic, "delistings", _form_25("S", "NASDAQ", _at(2019, 3, 6), "Common Stock")
+        )
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        assert _status(df, "S", "NASDAQ")["status"] == "transferred"
+        assert _status(df, "S", "NYSE")["status"] == "listed"
+
+    def test_a_move_off_exchange_is_not_a_retag(self, synthetic: duckdb.DuckDBPyConnection) -> None:
+        # SCON (0000895665): the cover page said NONE before the NASDAQ 25-NSE.
+        # NONE is no exchange, so the filing still ends the NASDAQ listing.
+        sid = "0000895665"
+        insert_row(synthetic, "listings", _row(sid, "SCON", "NASDAQ", date(2019, 8, 13)))
+        insert_row(synthetic, "listings", _row(sid, "SCON", "NONE", date(2020, 11, 10)))
+        insert_row(synthetic, "prices_daily", _bar(sid, date(2020, 9, 29)))
+        insert_row(
+            synthetic, "delistings", _form_25(sid, "NASDAQ", _ny(2021, 2, 2, 4, 55), "Common Stock")
+        )
+        df = listing_ends_as_of(synthetic, _at(2021, 3, 31), _settings())
+        nasdaq = _status(df, sid, "NASDAQ")
+        assert (nasdaq["status"], nasdaq["end_session"]) == ("delisted", date(2020, 9, 29))
+        assert _status(df, sid, "NONE")["status"] == "listed"
+
+    def test_another_ticker_on_another_exchange_is_not_a_retag(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        insert_row(synthetic, "listings", _row("S", "AAA", "NYSE_AMERICAN", date(2019, 1, 2)))
+        insert_row(synthetic, "listings", _row("S", "BBB", "NYSE", date(2019, 2, 1)))
+        insert_row(
+            synthetic, "delistings", _form_25("S", "NYSE_AMERICAN", _at(2019, 6, 3), "Common Stock")
+        )
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        assert _status(df, "S", "NYSE_AMERICAN")["status"] == "delisted"
+        assert _status(df, "S", "NYSE")["status"] == "listed"
+
+    def test_dual_listing_still_trading_after_effective_on_is_not_a_retag(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # BKFL shape (test_health): a NASDAQ line seven months before a NYSE
+        # Form 25. Bars after `effective_on` show the security still trades,
+        # so the filing withdrew the NYSE line, not the NASDAQ one. Before
+        # such a bar is known, the conservative re-tag holds.
+        insert_row(synthetic, "listings", _row("S", "BKFL", "NYSE", date(2018, 1, 2)))
+        insert_row(synthetic, "listings", _row("S", "BKFL", "NASDAQ", date(2018, 6, 1)))
+        filed = _at(2019, 1, 10)  # effective_on 2019-01-20
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", filed, "Common Stock"))
+        for day in (date(2019, 1, 10), date(2019, 1, 18), date(2019, 1, 22), date(2019, 1, 23)):
+            insert_row(synthetic, "prices_daily", _bar("S", day))
+        before = listing_ends_as_of(synthetic, session_close(date(2019, 1, 18)), _settings())
+        assert _status(before, "S", "NASDAQ")["status"] == "delisted"
+        assert _status(before, "S", "NYSE")["status"] == "listed"
+        after = listing_ends_as_of(synthetic, session_close(date(2019, 1, 22)), _settings())
+        assert _status(after, "S", "NYSE")["status"] == "delisted"
+        assert _status(after, "S", "NASDAQ")["status"] == "listed"
+
+    def test_late_amendment_never_ends_the_transfer_destination(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        insert_row(synthetic, "listings", _row("S", "A", "NASDAQ", date(2019, 1, 2)))
+        insert_row(synthetic, "listings", _row("S", "A", "NYSE", date(2019, 3, 4)))
+        insert_row(
+            synthetic, "delistings", _form_25("S", "NASDAQ", _at(2019, 3, 6), "Common Stock")
+        )
+        insert_row(
+            synthetic,
+            "delistings",
+            {**_form_25("S", "NASDAQ", _at(2019, 4, 15), "Common Stock"), "form": "25-NSE/A"},
+        )
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        nasdaq = _status(df, "S", "NASDAQ")
+        assert (nasdaq["status"], nasdaq["delisting_form"]) == ("transferred", "25-NSE")
+        assert _status(df, "S", "NYSE")["status"] == "listed"
+
+
+class TestOtherClassOnSnapshotListing:
+    """#818 part 2: a Form 25 for a differently titled class (Class B,
+    Special, (Old), T-DECS, any non-plain title) never ends an untitled
+    `snapshot_static` listing. Titles and dates are the store's."""
+
+    @pytest.mark.parametrize(
+        ("sid", "ticker", "exchange", "valid_from", "filed_at", "title"),
+        [
+            (
+                "0001058090",
+                "CMG",
+                "NYSE",
+                date(2005, 10, 24),
+                _ny(2009, 12, 22, 13, 51),
+                "Class B Common tock",
+            ),
+            (
+                "0000831001",
+                "C",
+                "NYSE",
+                date(1994, 1, 13),
+                _ny(2012, 12, 18, 15, 17),
+                "Tangible Dividend Enhanced Common Stock (T-DECS)",
+            ),
+            (
+                "0001051512",
+                "TDS",
+                "NYSE",
+                date(1998, 5, 22),
+                _ny(2012, 1, 26, 15, 2),
+                "Special Common Shares",
+            ),
+            (
+                "0001166691",
+                "CMCSA",
+                "NASDAQ",
+                date(2002, 10, 30),
+                _ny(2015, 12, 11, 16, 23),
+                "Class A Special Common Stock",
+            ),
+            (
+                "0001020569",
+                "IRM",
+                "NYSE",
+                date(1996, 11, 13),
+                _ny(2015, 1, 23, 10, 47),
+                "Common Stock (Old)",
+            ),
+            (
+                "0001051470",
+                "CCI",
+                "NYSE",
+                date(1998, 5, 6),
+                _ny(2014, 12, 16, 16, 50),
+                "Common Stock (OLD)",
+            ),
+            (
+                "0001350593",
+                "MWA",
+                "NYSE",
+                date(2006, 2, 3),
+                _ny(2009, 4, 13, 11, 5),
+                "Series B Common Stock",
+            ),
+            (
+                "0001053507",
+                "AMT",
+                "NYSE",
+                date(1998, 3, 20),
+                _ny(2012, 1, 4, 11, 33),
+                "Class A Common Stock",
+            ),
+            (
+                "0000070858",
+                "BAC",
+                "NYSE",
+                date(1994, 3, 30),
+                _ny(2010, 2, 25, 14, 46),
+                "Common Equivalent Securities, Consisting of Depositary Shares",
+            ),
+        ],
+    )
+    def test_other_class_filing_leaves_snapshot_listing_listed(
+        self,
+        synthetic: duckdb.DuckDBPyConnection,
+        sid: str,
+        ticker: str,
+        exchange: str,
+        valid_from: date,
+        filed_at: datetime,
+        title: str,
+    ) -> None:
+        insert_row(synthetic, "listings", _row(sid, ticker, exchange, valid_from, None))
+        insert_row(synthetic, "prices_daily", _bar(sid, date(2016, 1, 4)))
+        insert_row(synthetic, "delistings", _form_25(sid, exchange, filed_at, title))
+        row = _status(listing_ends_as_of(synthetic, _at(2016, 1, 5), _settings()), sid, exchange)
+        assert (row["status"], row["end_session"]) == ("listed", None)
+
+    @pytest.mark.parametrize(
+        ("title", "filed_at"),
+        [
+            ("Common Stock", _ny(2006, 11, 20, 16, 2)),  # HCA, taken private
+            ("Common Stock of Pentair, Inc.", _ny(2012, 12, 19, 14, 36)),  # PNR
+            ("Common stock, par value $0.01 per share (United States)", _ny(2015, 7, 20, 14, 13)),
+            ("Ordinary Shares", _ny(2009, 12, 3, 10, 41)),
+        ],
+    )
+    def test_plain_common_filing_still_ends_snapshot_listing(
+        self, synthetic: duckdb.DuckDBPyConnection, title: str, filed_at: datetime
+    ) -> None:
+        insert_row(synthetic, "listings", _row("S", "HCA", "NYSE", date(1994, 2, 10), None))
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", filed_at, title))
+        row = _status(listing_ends_as_of(synthetic, _at(2016, 1, 5), _settings()), "S", "NYSE")
+        assert row["status"] == "delisted"
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Non-Voting Common Stock",
+            "Redeemable Common Stock",
+            "Exchangeable Common Shares",
+            "Common Stock When Issued",
+        ],
+    )
+    def test_qualified_common_title_leaves_snapshot_listing_listed(
+        self, synthetic: duckdb.DuckDBPyConnection, title: str
+    ) -> None:
+        insert_row(synthetic, "listings", _row("S", "X", "NYSE", date(2010, 1, 4), None))
+        insert_row(synthetic, "delistings", _form_25("S", "NYSE", _at(2012, 6, 1), title))
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S", "NYSE")
+        assert row["status"] == "listed"
+
+    def test_other_class_filing_still_ends_its_titled_listing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        title = "Class B Common Stock"
+        insert_row(synthetic, "listings", _row("S:class-b", "XB", "NYSE", date(2019, 1, 2), title))
+        insert_row(synthetic, "delistings", _form_25("S:class-b", "NYSE", _at(2019, 6, 3), title))
+        row = _status(listing_ends_as_of(synthetic, LATE, _settings()), "S:class-b", "NYSE")
+        assert row["status"] == "delisted"
+
+
 # ---------------------------------------------------------------- build / write
 
 CIK_DUAL = "0000000007"

@@ -159,8 +159,6 @@ REPO = Path(__file__).resolve().parents[1]
 PLANNED_PREFIXES = {
     "src/tradepartner/adapters/alpaca_broker",  # T48c
     "src/tradepartner/llm/",  # Phase 5, ADR 0008
-    "src/tradepartner/signals/",  # no plan names it; signals live in backtest/signals.py
-    "src/tradepartner/risk/",  # no plan names it; the checks live in execution/risk.py
 }
 
 
@@ -190,6 +188,15 @@ def test_every_order_path_module_requires_the_safety_review() -> None:
     )
 
 
+def test_execution_modules_also_require_the_quant_audit() -> None:
+    # plan.py, outcomes.py and lots.py compute quantities from store data (#381)
+    modules = list((REPO / "src" / "tradepartner" / "execution").glob("*.py"))
+    assert len(modules) > 10
+    for m in modules:
+        path = m.relative_to(REPO).as_posix()
+        assert ready_pr.required_reviews([path]) == {"quant-auditor", "safety-reviewer"}, path
+
+
 def test_merge_train_paths_require_the_safety_review() -> None:
     for path in (
         "scripts/merge_train.py",
@@ -206,6 +213,23 @@ def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
             assert _on_tree(prefix), prefix
     for prefix in PLANNED_PREFIXES:
         assert not _on_tree(prefix), f"{prefix} exists now; drop it from PLANNED_PREFIXES"
+
+
+def test_edgar_source_requires_the_quant_audit() -> None:
+    # it fetches the filing text the store keeps (#382, owner decision 2026-10-04)
+    assert ready_pr.required_reviews(["src/tradepartner/adapters/edgar_source.py"]) == {
+        "quant-auditor"
+    }
+
+
+def test_uv_lock_requires_the_safety_review() -> None:
+    # dependency pins, like pyproject.toml (#382)
+    assert ready_pr.required_reviews(["uv.lock"]) == {"safety-reviewer"}
+
+
+def test_gitignore_requires_no_review() -> None:
+    # owner decision on #382: .gitignore gets no required reviewer
+    assert ready_pr.required_reviews([".gitignore"]) == set()
 
 
 def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> None:
@@ -728,6 +752,7 @@ def test_the_flow_runs_only_the_mapped_tests_unless_full_tests(
     assert "--full-tests" in capsys.readouterr().out
 
     unclear = FakeRunner(test_sources=SOURCES, touched=["uv.lock", "changelog.d/69-x.md"])
+    unclear._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
     assert ready_pr.ready(unclear, 69, dry_run=True) == 0
     assert unclear.checks_run[-1] == ready_pr.PYTEST_CHECK
 
@@ -758,3 +783,14 @@ def test_a_moved_module_counts_as_deleted_at_its_old_path() -> None:
         "--diff-filter=D",
         "origin/main...HEAD",
     ) in moved.calls
+
+
+def test_full_suite_runs_in_parallel_only_with_xdist() -> None:
+    """#581: `-n auto` is added to the bare full-suite command, never to a targeted run."""
+    full = ready_pr.PYTEST_CHECK
+    assert ready_pr.parallel_if_full_suite(full, xdist=True) == (*full, "-n", "auto")
+    assert ready_pr.parallel_if_full_suite(full, xdist=False) == full
+    targeted = (*full, "tests/test_cli.py")
+    assert ready_pr.parallel_if_full_suite(targeted, xdist=True) == targeted
+    other = ("uv", "run", "mypy")
+    assert ready_pr.parallel_if_full_suite(other, xdist=True) == other

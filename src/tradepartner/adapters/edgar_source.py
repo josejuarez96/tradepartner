@@ -53,7 +53,10 @@ inside the lag window also gets one, so a de-SPAC's new SIC still
 arrives with its 8-K. Each per-document result is cached by accession,
 its stamp stripped, under its own version constant (`COVER_VERSION`,
 `HEADER_VERSION`): a cached entry always wins over FSN for its accession,
-until the version bumps or the cache is cleared.
+until the version bumps or the cache is cleared. A cover parse's skipped
+listings (no title or exchange, #609) are written to its cache entry and
+counted on `.cover_incomplete_listings` when it is parsed, never on a cache
+hit (#612), as FSN's are on `.fsn_incomplete_listings` when extracted.
 
 **Facts (T11e).** `facts` joins two sources, both stamped at read time from
 `_load_stamps(cik)`: company facts (`companyfacts.zip` above the stamping
@@ -66,7 +69,8 @@ one, else `min(ddate, acceptance date in New York)`, because FSN's `ddate`
 is a rounded month end (owner decision 2026-09-26, #242); a per-document
 record keeps its cover date. Records are de-duplicated across sources on
 (accession, fact name, class member), the winner keeping its own dates; two
-sources disagreeing on a value is a collision (T11h's policy, below). FSN
+sources disagreeing on a value, or a NaN or infinite value from any source
+(#749), is a collision (T11h's policy, below). FSN
 holds 4 decimal places, so a value agrees with FSN's when it is within half
 a unit of the 4th place (#610 X1). A company-facts date after acceptance is
 capped at the Eastern acceptance date; when that cap makes it collide with a
@@ -112,7 +116,10 @@ quarantined: no further request until its entry is deleted or
 recorded, with its message, in its period's manifest instead
 (`fsn/v{FSN_VERSION}/manifests/<period>.json`, `accessions_failed`), counted
 on `.failed_filings`, never quarantined, and retried only when
-`FSN_VERSION` changes.
+`FSN_VERSION` changes. Messages are stored from #616 on: an entry recorded
+before it carries none until the accession fails again (a quarantined one
+never does until un-quarantined), and an FSN manifest extracted before it
+none until `FSN_VERSION` changes; nothing backfills them (#629).
 
 `check_failures()` (called by `ingest.py`'s `_prefetch`, before the lock)
 raises `FilingFailuresError` when (1) the uncommitted FSN periods' failure
@@ -144,6 +151,11 @@ entry and leave every other field as it is:
 
 The file must stay valid JSON: one that does not load fails the run loudly,
 never silently lifting an acceptance (#275).
+
+**Input validation (#578).** `.validation_failures` collects the fetch pass's
+parse failures (`edgar_validation`) for `ingest._prefetch`'s gate, which
+fails the run before any store write and lists them all in
+`edgar.cache_dir/validation/`.
 """
 
 from __future__ import annotations
@@ -154,6 +166,7 @@ import gzip
 import hashlib
 import itertools
 import json
+import math
 import re
 import shutil
 import zipfile
@@ -186,6 +199,7 @@ from tradepartner.adapters.edgar import (
     parse_fsn,
     parse_sgml_header,
 )
+from tradepartner.adapters.edgar_validation import ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -195,10 +209,14 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
-from tradepartner.config import Settings, secret_values
+from tradepartner.config import Settings, clean_message
 from tradepartner.timeutil import ensure_tz_aware_utc
 
+#: The cache versions below each name a directory under `edgar.cache_dir`;
+#: a bump never deletes the superseded tree (the runbook's "After an EDGAR
+#: cache version bump" says how to remove it, #615).
 #: Bumped when a parser change must re-stamp every cached accession.
 PARSER_VERSION = 1
 #: Bumped when a parser change must re-extract every cached FSN period.
@@ -208,6 +226,8 @@ FSN_VERSION = 2  # 2: #609 (latest ddate per member, NULL shares, title whitespa
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
+#: #615's nil-with-text refusal is no bump: a cached parse that skipped such
+#: a fact keeps it until the next bump re-parses it.
 COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and counted)
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
@@ -234,9 +254,6 @@ _FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
 #: property of the data format, not a tunable threshold.
 _FSN_DECIMALS = 4
 _FSN_HALF_UNIT = Decimal(1).scaleb(-_FSN_DECIMALS) / 2
-#: Control characters replaced in a stored failure message (as `ingest`'s
-#: run messages): the text comes from a server or a filing.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
@@ -324,6 +341,8 @@ class EdgarFilingSource(FilingSource):
         self._client.event_hooks = hooks
         self._clock = clock or (lambda: datetime.now(UTC))
         self._cache = Path(settings.edgar.cache_dir)
+        # #578: the fetch pass's parse failures, for `ingest._prefetch`'s gate.
+        self.validation_failures = ValidationFailures(self._cache / "validation", self._clock)
         self._submissions: dict[str, _Submissions] = {}
         self._open_quarters: dict[Quarter, str] = {}
         self.requests = 0
@@ -333,6 +352,9 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
+        # #612: listings skipped (no title or exchange, #609) by this run's
+        # per-document cover parses; as FSN's count, cache hits add nothing.
+        self.cover_incomplete_listings = 0
         self.fsn_missing = 0
         self._filing_index_ran = False
         self._fsn_ready = False
@@ -990,6 +1012,7 @@ class EdgarFilingSource(FilingSource):
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing
         self._save_cover_cache(accession, cik, parsed)
+        self.cover_incomplete_listings += parsed.incomplete_listings
         return parsed
 
     def _cover_cache_path(self, accession: str) -> Path:
@@ -1022,6 +1045,10 @@ class EdgarFilingSource(FilingSource):
                 [item.title, item.ticker, item.exchange] for item in parsed.cover.listings
             ],
             "facts": [_fact_to_json(f) for f in parsed.facts],
+            # #612: the listings the parse skipped, so they are diagnosable
+            # from disk as an FSN manifest's are. Not read back: an entry
+            # written before #612 lacks it and still loads (no version bump).
+            "incomplete_listings": parsed.incomplete_listings,
         }
         edgar_raw.write_atomic(self._cover_cache_path(accession), json.dumps(data).encode("utf-8"))
 
@@ -1437,10 +1464,9 @@ class EdgarFilingSource(FilingSource):
     def _stored_message(self, message: str) -> str:
         """A failure message as written to disk (P4, #610): every configured
         secret redacted, control characters replaced, cut to
-        `ingest.max_message_chars` (it is server- or filing-supplied text)."""
-        for value in secret_values(self._settings):
-            message = message.replace(value, "[redacted]")
-        return _CONTROL.sub(" ", message)[: self._settings.ingest.max_message_chars]
+        `ingest.max_message_chars` (it is server- or filing-supplied text):
+        `config.clean_message`, the run row's own cleaning (#629)."""
+        return clean_message(message, self._settings)
 
     def _accepted(self, accession: str, error_class: str, message: str) -> bool:
         """Whether this run's failure of `accession` is `accepted`: only when
@@ -1535,7 +1561,8 @@ class EdgarFilingSource(FilingSource):
 
     def _check_per_document_group(self, reasons: list[str]) -> None:
         """Per-document's denominator is the accessions fetched or read from
-        the per-document cache this run (#610 policy 1), plus the quarantined
+        the per-document cache this run (#610 policy 1; a co-registrant's
+        cached copy, `entity_cik != cik`, counts too), plus the quarantined
         accessions it skipped; a quarantined accession counts as a failure
         unless its entry is `accepted` (a failed check can quarantine, #610
         policy 2, and quarantine never excuses on its own). A `facts()`
@@ -1606,7 +1633,8 @@ class EdgarFilingSource(FilingSource):
         member): a per-document parse wins over company facts, which win over
         FSN; every source's records keep their own `as_of_date` keys within
         the winner; the same key with different values in two sources (FSN
-        compared at its 4 decimal places, #610 X1) is a collision (T11h):
+        compared at its 4 decimal places, #610 X1), or a NaN or infinite
+        value in any source, even the only one (#749), is a collision (T11h):
         only that (accession, fact name, class member) key
         is withheld, recorded under the accession's base form, and it counts
         toward `check_failures`'s cross-day (error class, base form) rule
@@ -1656,6 +1684,12 @@ class EdgarFilingSource(FilingSource):
                 dated: dict[str, dict[date, float]] = {}
                 for source, facts in sources.items():
                     for fact in facts:
+                        if not math.isfinite(fact.value):
+                            # #749: a key only one source supplies is never
+                            # compared by `_same_value`, so check it here.
+                            raise ValueError(
+                                f"{label} {source} value on {fact.as_of_date} is not finite"
+                            )
                         held = dated.setdefault(source, {}).setdefault(fact.as_of_date, fact.value)
                         if held != fact.value:  # one source, one date, two values
                             raise ValueError(
@@ -1694,6 +1728,19 @@ class EdgarFilingSource(FilingSource):
             key=lambda f: (f.accepted_at, f.accession, f.fact_name, f.class_member, f.as_of_date)
         )
         return out
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        """As-filed statement facts (amendment 2026-10-03, #660).
+
+        Placeholder for T76 (schema/records/fixture adapter only): always
+        empty. `edgar.statement_facts_enabled` defaults to `false`, so no
+        caller reaches this yet; the real companyfacts parse, cache and
+        stamping (reading `companyfacts.zip`/the per-CIK API, the
+        `statement_facts/v<N>/<cik>.json` cache, `statement_conflicts` and
+        the other plain-attribute counts) is T77a's.
+        """
+        _validate_cik(cik)
+        return []
 
     def _facts_cache_key(
         self, stamps: Mapping[str, SubmissionRecord], cover_forms: set[str]
@@ -1852,7 +1899,12 @@ def _message_hash(message: str) -> str:
 def _same_value(a_source: str, a: float, b_source: str, b: float) -> bool:
     """Two sources' values for one key and date agree: exactly, or, when one
     side is FSN, within half a unit of FSN's 4th decimal place (#610 X1:
-    105.1597 from FSN agrees with company facts' 105.159666)."""
+    105.1597 from FSN agrees with company facts' 105.159666). A NaN or an
+    infinity never agrees (#629)."""
+    if not (math.isfinite(a) and math.isfinite(b)):
+        # #629: a NaN or an infinity never agrees, so the key is withheld;
+        # `Decimal` would raise `InvalidOperation` and fail the whole source.
+        return False
     if "fsn" not in (a_source, b_source):
         return a == b
     return abs(Decimal(repr(a)) - Decimal(repr(b))) <= _FSN_HALF_UNIT

@@ -38,6 +38,9 @@ from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import (
     ClockError,
     LimitBreachError,
+    ReconciliationError,
+    RejectionCapError,
+    SkipCapError,
     StaleDataError,
     SystemFaultError,
 )
@@ -513,6 +516,42 @@ def test_the_alert_row_exists_before_the_fault_propagates(
     assert results == [("halted",)]
 
 
+@pytest.mark.parametrize(
+    "fault, kind",
+    [
+        (ReconciliationError("local and broker state disagree"), "reconciliation"),
+        (RejectionCapError("too many rejections"), "rejection_cap"),
+        (SkipCapError("too many skips"), "skip_cap"),
+        (StaleDataError("prices end at S-2"), "stale_data"),
+        (LimitBreachError("per-order notional"), "halted"),
+        (ValueError("bad request"), "halted"),
+    ],
+    ids=["reconciliation", "rejection_cap", "skip_cap", "stale_data", "limit_breach", "value"],
+)
+def test_halt_writes_one_alert_with_the_fault_specific_kind(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+    fault: Exception,
+    kind: str,
+) -> None:
+    """Owner decision 2026-10-03, #644, Option A: `halt` writes exactly one
+    alert per halt, with the fault-specific kind where `_FAULT_ALERT_KINDS`
+    maps one, and `fault_type` still named in its message. `StaleDataError`
+    and any other fault keep their existing, unmapped kinds."""
+    run = _run(journal_settings, open_window, fixed_clock())
+    gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn)
+    with pytest.raises(type(fault)):
+        _halt(gate, fault, run)
+    seen = _query(
+        journal_settings, "SELECT kind, message FROM alerts WHERE run_id = ?", [run.run_id]
+    )
+    assert [row[0] for row in seen] == [kind]
+    assert type(fault).__name__ in seen[0][1]
+
+
 def test_the_halt_cancels_only_acknowledged_orders_and_never_a_pending_one(
     journal_settings: Settings,
     scripted_fake: FakeBroker,
@@ -573,7 +612,7 @@ def test_a_failed_cancel_and_a_failed_read_each_journal_cancel_failed(
         journal_settings, "SELECT message FROM paper_run_results WHERE run_id = ?", [run.run_id]
     )
     assert "cancel of tp-a failed" in message
-    assert "halt read of tp-a failed" in message
+    assert "halt read of tp-a failed (FakeTransportError: read lost)" in message  # #730
 
 
 def test_a_rejection_verdict_the_halt_read_finds_is_named_in_the_alert(

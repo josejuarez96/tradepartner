@@ -30,7 +30,9 @@ must be in that store and have no result row yet. T40
 passes a truncated data store as `connect` and the untruncated fixture
 store as `registry_connect`.
 
-**Frames** are the as-of functions' own frames, unchanged. Two reads have no
+**Frames** are the as-of functions' own frames, read with `traded_only=True`
+(#787): a zero-volume bar is missing, not a price, so it can be neither a
+fill, a mark nor a signal anchor. Two reads have no
 single as-of function and are built from `store.asof` reads:
 
 - `late_dividends(t_prev, t, ids)`: dividend keys known at `t` but not at
@@ -181,12 +183,17 @@ class StoreProvider:
     ) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
         return adjusted_prices_as_of(
-            self._at(t), t, wanted, include_dividends=include_dividends, settings=self.settings
+            self._at(t),
+            t,
+            wanted,
+            include_dividends=include_dividends,
+            settings=self.settings,
+            traded_only=True,
         )
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
-        return prices_as_of(self._at(t), t, wanted)
+        return prices_as_of(self._at(t), t, wanted, traded_only=True)
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)

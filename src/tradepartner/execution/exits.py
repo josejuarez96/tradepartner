@@ -33,7 +33,17 @@ to `missed`) blocks nothing. A `window_stop` exit is blocked by an open or
 in-flight `forced_exit` decision, a non-terminal own sell, or a same-run
 `untradable` exit (`untradable_this_run`); a plan decision does not block it
 (a `stop` run plans nothing). A settled or closed decision, however recent,
-blocks nothing.
+blocks nothing, except for `forced_exits` alone: no new forced exit is made
+for a name whose latest `forced_exit` decision (any reason, by `known_at`
+then decision id) is closed by a `decision_events` `skipped` row with reason
+`dust` while the holding is not above that decision's `planned_quantity`, or
+settled while the holding is not above its state's remainder quantity (`None`
+counts as 0). The remainder below the trading minimum is a dust residue, held
+and reported, never re-decided each session (owner decision 2026-10-01,
+#505). A holding that grew past that quantity (a split, a new receipt) gets a
+new decision, as any other case does. `stop_exits` is unaffected: a dust- or
+settled-closed name still gets its `window_stop` exit, so the residue is
+counted (quantity floored to 0 when `whole_share`).
 
 **Inputs.** `held` is the ledger's quantity per `security_id` on S (names at
 zero are ignored, a negative or non-finite one raises). `decisions` are every
@@ -86,6 +96,7 @@ _SKIPPED = "skipped"
 _UNTRADABLE = "untradable"
 _SPINOFF_RECEIPT = "spinoff_receipt"
 _ACTIVE = frozenset({State.OPEN, State.IN_FLIGHT})
+_DUST = "dust"
 
 
 class ExitAsset(Protocol):
@@ -187,9 +198,16 @@ def _state(decision: DecisionRow, states: Mapping[int, DecisionState]) -> Decisi
     return states[decision.decision_id]
 
 
+class MissingAssetRefused(ValueError):
+    """A held name that would be decided is missing from this run's `assets`
+    read: the exit is refused and nothing is journaled or submitted for it. A
+    `ValueError`, so callers that catch that keep working; the run still ends
+    `failed` (fail closed), not the `SystemFaultError` halt path."""
+
+
 def _asset(security_id: str, assets: Mapping[str, ExitAsset]) -> ExitAsset:
     if security_id not in assets:
-        raise ValueError(f"{security_id} is missing from the assets read")
+        raise MissingAssetRefused(f"{security_id} is missing from the assets read")
     return assets[security_id]
 
 
@@ -261,6 +279,39 @@ def _unspent_receipts(
     return names
 
 
+def _latest_forced_exit(security_id: str, decisions: Sequence[DecisionRow]) -> DecisionRow | None:
+    """The held name's own latest `forced_exit` decision (any reason), by
+    `known_at` then decision id, or `None` if it has none."""
+    mine = [d for d in decisions if d.decision == _FORCED_EXIT and d.security_id == security_id]
+    if not mine:
+        return None
+    return max(mine, key=lambda d: (d.known_at, d.decision_id or 0))
+
+
+def _dust_blocked(
+    security_id: str,
+    quantity: float,
+    decisions: Sequence[DecisionRow],
+    states: Mapping[int, DecisionState],
+) -> bool:
+    """Whether `security_id`'s holding `quantity` is a dust residue of its
+    latest `forced_exit` decision: that decision is closed by a
+    `decision_events` `skipped` row with reason `dust` and the holding is not
+    above its `planned_quantity`, or it is settled and the holding is not
+    above its state's remainder quantity (`None` counts as 0). A holding that
+    grew past that quantity is not blocked."""
+    latest = _latest_forced_exit(security_id, decisions)
+    if latest is None:
+        return False
+    state = _state(latest, states)
+    if state.state is State.CLOSED and state.event_reason == _DUST:
+        return quantity <= (latest.planned_quantity or 0.0)
+    if state.state is State.SETTLED:
+        remainder_quantity = state.remainder.quantity if state.remainder else 0.0
+        return quantity <= remainder_quantity
+    return False
+
+
 def forced_exits(
     held: Mapping[str, float],
     listings_at: Mapping[str, date | None],
@@ -278,9 +329,11 @@ def forced_exits(
     whose listing ended at close(S-1), `untargeted_receipt` for a held,
     unspent spin-off receipt, each for the whole holding, `whole_share` from
     `assets`; one not tradable now is returned closed (`skipped_reason`
-    `untradable`). None for a name with an open or in-flight decision or a
-    non-terminal own sell. `pending_rebalance` is the window's pending
-    rebalance session T_i, or `None` when none is pending.
+    `untradable`). None for a name with an open or in-flight decision, a
+    non-terminal own sell, or a dust residue of its own latest `forced_exit`
+    decision (module docstring **Blocking**; owner decision 2026-10-01,
+    #505). `pending_rebalance` is the window's pending rebalance session T_i,
+    or `None` when none is pending.
     """
     _check_session(session)
     holding = _held(held)
@@ -292,6 +345,8 @@ def forced_exits(
     exits: list[ExitDecision] = []
     for security_id in sorted(holding):
         if security_id in blocked:
+            continue
+        if _dust_blocked(security_id, holding[security_id], decisions, states):
             continue
         if _ended(security_id, listings_at, previous):
             reason = DELISTED_REASON

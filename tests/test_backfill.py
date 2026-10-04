@@ -19,7 +19,22 @@ from typing import Any
 
 import duckdb
 import pytest
-from test_ingest import ACME, DUAL, DUAL_B, NOW, SPY, _at, _filings
+from test_ingest import (
+    ACME,
+    DUAL,
+    DUAL_B,
+    NEWCO,
+    NOT_COMMON,
+    NOW,
+    OTC_B,
+    SPY,
+    STAT,
+    _at,
+    _filings,
+    _loose,
+    _with_newco,
+    _with_stat,
+)
 
 from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling
 from tradepartner.adapters.prices import (
@@ -203,6 +218,20 @@ def test_backfill_check_failures_raising_fails_the_edgar_chunk(settings: Setting
     result = _backfill(settings, _History(), filings=_filings(cls=Unhealthy), source="edgar")
     assert result.runs[0].status == FAILED
     assert "too many failures" in result.runs[0].message
+
+
+def test_backfill_input_validation_fails_the_edgar_chunk(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578: the backfill runs the same `_prefetch` gate (the crashes it
+    exists for were backfills: #599, #609)."""
+    from test_ingest import _CRASHES, _validating
+
+    filings = _validating(tmp_path, _CRASHES)
+    result = _backfill(settings, _History(), filings=filings, source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "3 input(s) failed to parse" in result.runs[0].message
+    assert _read(settings, "SELECT count(*) FROM securities") == [(0,)]
 
 
 def test_actions_are_fetched_per_month_window(settings: Settings) -> None:
@@ -543,6 +572,106 @@ def test_a_name_delisted_after_the_month_still_counts_toward_its_staleness(
     assert ACME in result.runs[-1].message
 
 
+MAY = _sessions(date(2019, 5, 1), date(2019, 5, 31))
+
+
+@pytest.mark.parametrize(("missing", "status"), [(DUAL_B, OK), (ACME, STALE)])
+def test_an_otc_common_name_is_not_counted_in_a_months_staleness(
+    settings: Settings, missing: str, status: str
+) -> None:
+    # #784: OTC is not one of `universe.exchanges`; a NYSE name still counts.
+    prices = _History(gaps={(missing, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_filings(dual_listings=OTC_B))
+    assert result.runs[-1].status == status, result.runs[-1].message
+
+
+def test_a_month_fetches_no_notes_preferreds_or_otc_listings(
+    settings: Settings,
+) -> None:
+    # #794: a note, a preferred and an OTC listing are never fetched; a
+    # common NYSE name and a benchmark are.
+    prices = _History()
+    filings = _filings(acme_extra=NOT_COMMON, dual_listings=OTC_B)
+    result = _backfill(settings, prices, filings=filings)
+    assert result.runs[-1].status == OK, result.runs[-1].message
+    for fetched in prices.fetched.values():
+        assert {ACME, SPY} <= fetched
+        assert DUAL_B not in fetched
+        assert not any(sid.startswith(f"{ACME}:") for sid in fetched)  # preferred, note
+
+
+def test_a_snapshot_static_only_name_with_no_rows_in_a_month_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    prices = _History(gaps={(STAT, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 4 listed names without a bar" in may.message
+    assert f"1 snapshot-only names with no rows (not counted): {STAT}" in may.message
+
+
+def test_a_name_with_a_filing_based_span_in_the_month_still_counts(settings: Settings) -> None:
+    prices = _History(gaps={(STAT, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_with_stat(cover=True))
+    assert result.runs[-1].status == STALE and STAT in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+def test_a_snapshot_static_only_name_with_some_rows_follows_the_existing_rule(
+    settings: Settings,
+) -> None:
+    # Bars on some May sessions: not missing, so neither counted nor reported.
+    prices = _History(gaps={(STAT, s) for s in MAY[1:]})
+    result = _backfill(settings, prices, filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 5 listed names without a bar" in may.message
+    assert "snapshot-only" not in may.message
+
+
+def test_a_benchmark_with_no_rows_in_a_month_still_counts(settings: Settings) -> None:
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"reference_symbol": "ACME"})}
+    )
+    result = _backfill(tuned, _History(gaps={(SPY, s) for s in MAY}))
+    assert result.runs[-1].status == STALE and SPY in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+APRIL_END = datetime(2019, 5, 1, 2, 0, tzinfo=UTC)  # expected session 2019-04-30
+APRIL = _sessions(SINCE, date(2019, 4, 30))
+
+
+def test_a_name_dark_since_before_the_month_is_reported_not_counted(settings: Settings) -> None:
+    # #784 (dark names): ACME has no bar in April (committed under a looser
+    # share), so its May and June misses are reported, not counted.
+    early = _filings(fetched_at=_at(2019, 4, 1))
+    dark = {(ACME, s) for s in _sessions(SINCE, date(2019, 6, 30))}
+    first = _backfill(_loose(settings), _History(gaps=dark), filings=early, now=APRIL_END)
+    assert first.ok, first.runs[-1].message
+    result = _backfill(settings, _History(gaps=dark), filings=early)
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 3 listed names without a bar" in may.message
+    assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in may.message
+
+
+def test_a_name_with_a_bar_last_month_and_none_now_counts(settings: Settings) -> None:
+    result = _backfill(settings, _History(gaps={(ACME, s) for s in MAY}))
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    assert ACME in result.runs[-1].message
+
+
+def test_a_name_first_listed_in_the_month_with_no_bar_counts(settings: Settings) -> None:
+    filings = _with_newco(_at(2019, 5, 1))
+    result = _backfill(settings, _History(gaps={(NEWCO, s) for s in MAY}), filings=filings)
+    assert result.runs[-1].status == STALE and NEWCO in result.runs[-1].message
+
+
 def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
     secret = "sk-sentinel-backfill"
     settings = Settings(
@@ -660,6 +789,27 @@ def test_the_edgar_commit_never_reaches_the_source() -> None:
     from tradepartner.ingest import _prefetch, _Recorded
 
     recorded = _Recorded(_filings())
-    _prefetch(recorded, Settings(_env_file=None))
+    _prefetch(recorded, Settings(_env_file=None), dry_run=False)
     with pytest.raises(RuntimeError, match="after the fetch pass"):
         recorded.facts(ACME, ["SomethingNew"])
+
+
+# --- #735: the resolver's exclusions are counted on the run row ---------------
+
+
+@dataclass
+class _Resolving(_History):
+    def resolution_summary(self) -> str:
+        return "resolver left out 3 placeholder-ticker listings"
+
+
+def test_the_resolution_summary_is_on_every_backfill_price_run(settings: Settings) -> None:
+    result = _backfill(settings, _Resolving())
+    alpaca = [run for run in result.runs if run.source == "alpaca"]
+    assert alpaca and all("resolver left out 3" in run.message for run in alpaca)
+
+
+def test_the_resolution_summary_is_on_the_daily_price_run(settings: Settings) -> None:
+    result = ingest_session(settings, prices=_Resolving(), filings=_filings(), clock=lambda: NOW)
+    assert result.ok, result.runs[-1].message
+    assert "resolver left out 3" in result.runs[-1].message

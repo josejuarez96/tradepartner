@@ -46,6 +46,22 @@ the next-submit queue's head, like any unscripted id. Scripting calls are
 not `Broker` methods: they are not logged and read no clock unless they
 fill.
 
+**Account scripts (#753, spec req 17).** `apply_account(instruction)` changes
+the whole book rather than one order; like the other scripting calls it is not
+a `Broker` method, is not logged in `calls` and reads no clock. `Reset()` is a
+paper-account reset as Alpaca does it: it forgets **every** order, filled or
+not, and empties the positions and the fill stream (lagging fills included)
+together, so a forgotten order never holds a position or a fill the real
+broker could not show. It is the one exception to the rule above that an order
+with fills cannot be forgotten. Cash is left as it was (a test that needs a
+reset's cash sets it through the constructor of a new fake), every id is free
+again, the broker order ids stay unique, and scripts queued for future
+submits are kept. `SetPosition(symbol, quantity)` sets one name's net
+quantity (`None` or `0` drops it), touching no order, fill or cash: a
+`FILLED` order whose fill lags with the name held at the ledger's quantity,
+or a `Vanish` with the name still held, since the fake otherwise books a
+position on every fill.
+
 **Account.** `cash` starts at the constructor's value and moves by
 `quantity * price` per fill (a buy debits, a sell credits), exact in
 `Decimal`, or rounded half-up to the cent per fill with
@@ -59,10 +75,15 @@ from_session=)`), or a tradable, fractionable, `active` asset with no CUSIP.
 **Lagging fills, hook and log.** After `lag_fills(n)`, each fill recorded is
 missing from the next `n` calls of `fills()` and delivered from the one
 after (`None`: never delivered), while `get_order` already shows it.
+`reveal_hidden_fills()` delivers every fill recorded so far on the next
+`fills()` (the feed catches up); it is not logged in `calls`.
 `on_submit(request)` runs at the start of every `submit`, before anything is
 checked or recorded, so a test can assert the store state at submit time.
-`calls` is every `Broker` method called, in order, with its arguments as
-passed.
+`apply_split(symbol, ratio)` books a broker-side forward/reverse split (the
+fake has no corporate actions) by multiplying the symbol's net quantity by
+`ratio`, leaving cash untouched; it is not a `Broker` call and is not
+logged in `calls`. `calls` is every `Broker` method called, in order, with
+its arguments as passed.
 
 **Clock.** All timestamps come from an injectable `clock: Callable[[],
 datetime]` supplied at construction and exposed as `.clock` (the wrapper's
@@ -190,11 +211,36 @@ class HoldCancel:
     fill: PartialFill | None = None
 
 
+@dataclass(frozen=True)
+class Reset:
+    """A paper-account reset: every order, position and fill is forgotten
+    (module docstring, "Account scripts")."""
+
+
+@dataclass(frozen=True)
+class SetPosition:
+    """Set `symbol`'s net quantity to `quantity`, or drop it when `None` or
+    zero (module docstring, "Account scripts")."""
+
+    symbol: str
+    quantity: float | None
+
+    def __post_init__(self) -> None:
+        quantity = self.quantity
+        if quantity is not None and (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int | float)
+            or not math.isfinite(quantity)
+        ):
+            raise ValueError(f"quantity must be a finite number or None, got {quantity!r}")
+
+
 SubmitOutcome = Accept | FillAt | PartialFill | Expire | Reject | Vanish | TransportFault
 BookInstruction = FillAt | PartialFill | Expire | Reject | Vanish | HoldCancel
 Instruction = SubmitOutcome | HoldCancel
 _SUBMIT_OUTCOMES = (Accept, FillAt, PartialFill, Expire, Reject, Vanish, TransportFault)
 _BOOK_INSTRUCTIONS = (FillAt, PartialFill, Expire, Reject, Vanish, HoldCancel)
+AccountInstruction = Reset | SetPosition
 
 
 @dataclass(frozen=True)
@@ -297,6 +343,27 @@ class FakeBroker(Broker):
         else:
             self._fill(order, instruction, self._now())
 
+    def apply_account(self, instruction: AccountInstruction) -> None:
+        """Apply `Reset` or `SetPosition` to the whole book (module
+        docstring, "Account scripts"). Raises `ValueError` for anything else."""
+        if isinstance(instruction, Reset):
+            self._orders.clear()
+            self._filled.clear()
+            self._fills.clear()
+            self._fill_hidden_reads.clear()
+            self._net_quantity.clear()
+            self._cancel_holds.clear()
+            self._cancel_pending.clear()
+            return
+        if isinstance(instruction, SetPosition):
+            key = canonical_symbol(instruction.symbol)
+            if instruction.quantity is None or instruction.quantity == 0:
+                self._net_quantity.pop(key, None)
+            else:
+                self._net_quantity[key] = Decimal(repr(float(instruction.quantity)))
+            return
+        raise ValueError(f"not an account instruction: {instruction!r}")
+
     def complete_cancel(self, client_order_id: str) -> None:
         """Complete a held cancel: the order becomes `CANCELLED`, keeping
         its fills. Raises `ValueError` when no cancel is pending."""
@@ -325,6 +392,13 @@ class FakeBroker(Broker):
             raise ValueError(f"reads must be a non-negative int or None, got {reads!r}")
         self._fill_lag = reads
 
+    def reveal_hidden_fills(self) -> None:
+        """Deliver every fill recorded so far on the next `fills()` call,
+        whatever lag it was recorded under (`None` included): the feed
+        catches up. Fills recorded afterwards still follow `lag_fills`.
+        Not a `Broker` call: not logged in `calls`."""
+        self._fill_hidden_reads = [0] * len(self._fill_hidden_reads)
+
     def set_asset(self, symbol: str, asset: Asset, *, from_session: date | None = None) -> None:
         """Answer `asset` for `symbol` from `from_session` on (a New York
         date), or for every session when `None`."""
@@ -339,6 +413,20 @@ class FakeBroker(Broker):
         current = self._assets.get(key, [(date.min, _DEFAULT_ASSET)])
         schedule = [e for e in current if e[0] != from_session] + [(from_session, asset)]
         self._assets[key] = sorted(schedule, key=lambda entry: entry[0])
+
+    def apply_split(self, symbol: str, ratio: float) -> None:
+        """Book a broker-side forward/reverse split (the fake has no
+        corporate actions): multiplies `symbol`'s net quantity by `ratio`,
+        leaving cash untouched. Not a `Broker` call: not logged in `calls`.
+        Raises `ValueError` for a non-finite or non-positive `ratio`, and
+        for a symbol with no position (or one netted to zero): a split of
+        nothing is a test bug."""
+        validate_positive_finite(ratio, field_name="ratio")
+        key = canonical_symbol(symbol)
+        current = self._net_quantity.get(key, Decimal(0))
+        if current == 0:
+            raise ValueError(f"no position to split for {key!r}")
+        self._net_quantity[key] = current * Decimal(repr(float(ratio)))
 
     @property
     def calls(self) -> tuple[BrokerCall, ...]:

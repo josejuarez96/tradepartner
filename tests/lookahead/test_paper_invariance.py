@@ -35,7 +35,12 @@ two must be equal:
   that cut itself; on the cut store it applies none, so the check is that the `as_of`
   rule and the harness's truncation give the same state. Until #507 routes it through
   T63's loaders, that equality holds by construction; its liveness half is the
-  evidence that the loaders must cut.
+  evidence that the loaders must cut;
+- a `stop` run's own two pure pieces, `outcomes.due_outcomes` and `exits.stop_exits`,
+  given this window by hand as if S were a stop requested at T_PREV (`#598`: this
+  window's own run on S is a rebalance, so no `stop` run of its own has read them).
+  Each is built the same way as the derived state above, from the same readers cut at
+  `as_of`.
 
 Every equality has a liveness half, so an equal result is the pieces ignoring the late
 rows, not the rows missing: `test_every_injected_fact_is_live` sees each injected row
@@ -53,6 +58,15 @@ The cut connection is read-only and carries no registry, so the plan's provider 
 its trial handle on the full store (as `test_backtest_plan_timing.py` does).
 `store.journal.require_journal` counts base tables only, and the cut journal is views,
 so the journal readers run with a stand-in that also accepts views (`_views_count`).
+
+`test_a_stop_run_s_outcomes_and_exits_are_unchanged_on_the_cut` (#598) gives
+`due_outcomes` and `stop_exits` the fixture's own rows, read at `as_of` the same way
+as `_derived`, with `OutcomeWindow(stop_requested=T_PREV)` by hand. Both pieces always
+read store facts (actions, prices) at close(S-1), never later, as a run does; its
+liveness half reads the held[1] split action past the cut (changing the F_PREV buy's
+`position_return`, as `test_a_late_corporate_action_...` does for the remainder) and
+the held[1] trim's own terminal state past the cut (an open sell blocks `stop_exits`
+for it at the cut; filled past it, the name gets an exit).
 """
 
 from __future__ import annotations
@@ -75,10 +89,13 @@ from tradepartner.backtest.schedule import fill_session, read_time, rebalance_se
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.execution import plan, reconcile_run, switch
+from tradepartner.execution import exits, outcomes, plan, reconcile_run, switch
+from tradepartner.execution.exits import ExitAsset, ExitDecision
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.marks import Mark, marks_for
+from tradepartner.execution.outcomes import OutcomeWindow
 from tradepartner.execution.reconcile import Explanations
+from tradepartner.execution.risk import unfilled_sells
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -717,6 +734,119 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
     )
 
 
+@dataclass(frozen=True)
+class _StopAsset:
+    """A stand-in `ExitAsset` (module docstring): not journal data, so it is
+    the same whichever store is read."""
+
+    tradable: bool = True
+    fractionable: bool = True
+
+
+def _closes_at(
+    conn: duckdb.DuckDBPyConnection, names: Sequence[str], session: date
+) -> dict[str, float]:
+    return {
+        row["security_id"]: float(row["close"])
+        for row in prices_as_of(conn, CUT, list(names))
+        .filter(pl.col("session") == session)
+        .iter_rows(named=True)
+    }
+
+
+def _outcomes_for(
+    fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime | None
+) -> list[outcomes.Outcome]:
+    """`due_outcomes` for `fixture`'s window as if S were a `stop` run with the
+    stop requested at T_PREV (module docstring: #598, no `stop` run of its own
+    exists in this window, so `OutcomeWindow` is given by hand). Store facts
+    (`actions`, the reference closes) are read at close(S-1) regardless of
+    `as_of`, as a run always reads them; the journal rows are cut at `as_of`
+    (`_known`), or not cut again when `conn` already is (`cut`, `as_of=None`)."""
+    window_id = fixture.window_id
+    decisions = _known([d.decision for d in journal.decisions_for(conn, window_id)], as_of)
+    order_events = _known(journal.order_events_for(conn, window_id=window_id), as_of)
+    orders = _known(journal.orders_for(conn, window_id=window_id), as_of)
+    fills = [
+        f
+        for f in journal.fills_for(conn, window_id=window_id)
+        if as_of is None or f.fill.known_at <= as_of
+    ]
+    marks = _known(journal.positions_daily_for(conn, window_id), as_of)
+    actions = live_actions_as_of(conn, CUT)
+    return outcomes.due_outcomes(
+        OutcomeWindow(window_id=window_id, stop_requested=T_PREV),
+        orders,
+        order_events,
+        fills,
+        marks,
+        None,
+        lambda sid, day: _closes_at(conn, [sid], day).get(sid),
+        S,
+        decisions=decisions,
+        actions=actions,
+    )
+
+
+def _stop_exits_for(
+    fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime | None
+) -> list[ExitDecision]:
+    """`exits.stop_exits` for `fixture`'s two held names, the same rows and cut
+    rule as `_outcomes_for` and `_derived`."""
+    window_id = fixture.window_id
+    with_events = journal.decisions_for(conn, window_id)
+    decisions = _known([d.decision for d in with_events], as_of)
+    events = _known([e for d in with_events for e in d.events], as_of)
+    orders = _known(journal.orders_for(conn, window_id=window_id), as_of)
+    order_events = _known(journal.order_events_for(conn, window_id=window_id), as_of)
+    fills = [
+        f
+        for f in journal.fills_for(conn, window_id=window_id)
+        if as_of is None or f.fill.known_at <= as_of
+    ]
+    actions = live_actions_as_of(conn, CUT)
+    closes = _closes_at(conn, [d.security_id for d in decisions], S_PREV)
+    states = {
+        d.decision_id: plan.decision_state(
+            d, events, orders, order_events, fills, actions, closes.__getitem__, FROZEN, session=S
+        )
+        for d in decisions
+        if d.decision_id is not None
+    }
+    runs = _known([r.run for r in journal.runs_for(conn, window_id)], as_of)
+    ledger = _ledger_for(fixture, conn, as_of or LATER)(S)
+    held = {sid: ledger.positions.get(sid, 0.0) for sid in fixture.held}
+    adjustments = _known(journal.adjustments_for(conn, window_id), as_of)
+    marks = _known(journal.positions_daily_for(conn, window_id), as_of)
+    residues = {
+        sid: plan.residue(
+            sid,
+            adjustments,
+            decisions,
+            events,
+            marks,
+            ledger,
+            actions,
+            window_id=window_id,
+            runs=runs,
+        )
+        for sid in fixture.held
+    }
+    open_sells = unfilled_sells(orders, order_events, fills, closes.__getitem__, actions, session=S)
+    assets: dict[str, ExitAsset] = dict.fromkeys(fixture.held, _StopAsset())
+    return exits.stop_exits(
+        held,
+        residues,
+        assets,
+        decisions,
+        states,
+        open_sells,
+        (),
+        session=S,
+        quantity_decimals=6,
+    )
+
+
 # --- the checks --------------------------------------------------------------------
 
 
@@ -861,3 +991,114 @@ def test_a_late_bar_revision_changes_the_next_run_only(
     on_next = _explain(fixture, fixture.full, session_close(S), session=S_NEXT)
     assert on_s.reference_prices[fixture.held[0]] == fixture.original_close
     assert on_next.reference_prices[fixture.held[0]] == fixture.revised_close
+
+
+def test_a_stop_run_s_outcomes_and_exits_are_unchanged_on_the_cut(
+    fixture: Fixture, cut: duckdb.DuckDBPyConnection
+) -> None:
+    """A `stop` run's own two pure pieces (module docstring; #598), given this
+    window by hand as if S were a stop requested at T_PREV: `due_outcomes` for
+    the F_PREV buys of both held names (due at T_I, before S), and
+    `stop_exits` over the ledger held through S. Both are pure over the rows
+    they are given, cut the same way as `_derived`, so reading them at `CUT`
+    on the full store agrees with the cut store."""
+    security_of = {
+        o.client_order_id: o.security_id
+        for o in journal.orders_for(fixture.full, window_id=fixture.window_id)
+    }
+    full_outcomes = _outcomes_for(fixture, fixture.full, CUT)
+    assert full_outcomes == _outcomes_for(fixture, cut, None)
+    by_security = {
+        security_of[o.client_order_id]: o
+        for o in full_outcomes
+        if o.kind == outcomes.POSITION_RETURN
+    }
+    assert set(by_security) == set(fixture.held)
+    assert all(o.value is not None for o in by_security.values())
+
+    full_exits = _stop_exits_for(fixture, fixture.full, CUT)
+    assert full_exits == _stop_exits_for(fixture, cut, None)
+    # held[1]'s trim is still open at the cut (its fill is known only after it):
+    # `stop_exits` makes no exit for a name with a non-terminal own sell.
+    assert {e.security_id for e in full_exits} == {fixture.held[0]}
+
+    # Read past the cut, both pieces change: held[1]'s split (ex-date S-1, known
+    # only after the cut) is applied to its F_PREV buy's position_return ...
+    late_outcomes = outcomes.due_outcomes(
+        OutcomeWindow(window_id=fixture.window_id, stop_requested=T_PREV),
+        journal.orders_for(fixture.full, window_id=fixture.window_id),
+        journal.order_events_for(fixture.full, window_id=fixture.window_id),
+        journal.fills_for(fixture.full, window_id=fixture.window_id),
+        journal.positions_daily_for(fixture.full, fixture.window_id),
+        None,
+        lambda sid, day: _closes_at(fixture.full, [sid], day).get(sid),
+        S,
+        decisions=[d.decision for d in journal.decisions_for(fixture.full, fixture.window_id)],
+        actions=live_actions_as_of(fixture.full, LATER),
+    )
+    late_by_security = {
+        security_of[o.client_order_id]: o
+        for o in late_outcomes
+        if o.kind == outcomes.POSITION_RETURN
+    }
+    assert late_by_security[fixture.held[1]].value != by_security[fixture.held[1]].value
+    # ... and held[1]'s trim, filled and collected past the cut, is no longer an open
+    # sell, so the stop gets an exit for it too.
+    late_exits = _stop_exits_for(fixture, fixture.full, None)
+    assert {e.security_id for e in late_exits} == set(fixture.held)
+
+
+# --- `paper settle` (T84b, spec req 17, #571) --------------------------------------------
+
+
+class _SettleClock:
+    """A settable clock (the base `Ticking` moves)."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def test_a_cut_at_the_settle_gates_reading_does_not_see_its_rows(
+    fixture_store_path: Path,
+) -> None:
+    """Both rows `paper settle` writes are stamped after the gate's clock
+    reading, so the journal cut at that reading shows the order still
+    non-terminal and no `settle_order` override; past the stamp it shows both."""
+    from execution.test_window_settle import DAY1, NOTE, Settle, Ticking, new_window
+
+    from tradepartner.adapters.fake_broker import FakeBroker, Vanish
+    from tradepartner.execution.window import settle_order
+    from tradepartner.store.db import open_read_only
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    base = _SettleClock(DAY1)
+    fake = FakeBroker(clock=base, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1")
+    s = Settle(settings, base, fake, new_window(settings))
+    s.place("tp-settle")
+    fake.apply("tp-settle", Vanish())
+    s.engage()
+    clock = Ticking(base)
+    result = settle_order(settings, s.connect, fake, clock, "tp-settle", NOTE)
+    gate = clock.readings[0]
+    assert result.known_at > gate
+
+    def seen(conn: duckdb.DuckDBPyConnection) -> tuple[int, int, list[str]]:
+        (overrides,) = conn.execute(  # type: ignore[misc]
+            "SELECT count(*) FROM overrides WHERE kind = 'settle_order'"
+        ).fetchone()
+        (events,) = conn.execute(  # type: ignore[misc]
+            "SELECT count(*) FROM order_events WHERE reason = 'owner_settled_unknown'"
+        ).fetchone()
+        open_ids = [o.client_order_id for o in journal.non_terminal_orders(conn, window_id=None)]
+        return int(overrides), int(events), open_ids
+
+    with open_read_only(settings) as full:
+        store = TruncatedStore(full, tables=CUT_TABLES)
+        try:
+            assert seen(store.at(gate)) == (0, 0, ["tp-settle"])
+            assert seen(store.at(result.known_at)) == (1, 1, [])
+        finally:
+            store.close()

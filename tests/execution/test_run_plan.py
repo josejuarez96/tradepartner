@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from tradepartner.adapters.broker import OrderRequest, Side
-from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
+from tradepartner.adapters.fake_broker import FakeBroker, FillAt, PartialFill
 from tradepartner.backtest import engine
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import previous_session
@@ -34,6 +34,7 @@ from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
+    FillRow,
     OrderEventRow,
     OrderRow,
     PaperRunResultRow,
@@ -433,9 +434,106 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
     """An earlier run's order half filled at the broker, the fill never
     delivered by the feed: the F_0 run finds it `fills_lagging` (inside the
     bound, so no halt), makes no plan (no trial, signal, decision or plan row),
-    submits nothing and leaves T_0 pending; the run still ends `ok`."""
+    submits nothing and leaves T_0 pending; the run still ends `ok`. The
+    seeded `forced_exit` is a sell of a position actually held -- a real
+    buy-side fill, journaled and booked at the broker before the forced exit
+    -- not an exit of a name never bought (`phases.py`'s own `forced_exits
+    holds a decision that is not a forced-exit sell` check rules out a
+    buy-side forced exit, but a sell with nothing behind it is just as
+    unreal)."""
     window = env.window
     assert window is not None and window.window_id is not None
+    bought_at = at(T_0, 10, 0)
+    (bought_run,) = env.append(
+        PaperRunRow(
+            window_id=window.window_id,
+            session=T_0,
+            kind="mark",
+            started_at=bought_at,
+            invoked_by="scheduler",
+            code_version="test",
+            known_at=bought_at,
+            ingested_at=bought_at,
+        )
+    )
+    assert bought_run is not None
+    bought_done = bought_at + timedelta(minutes=1)
+    env.append(
+        PaperRunResultRow(
+            run_id=bought_run,
+            finished_at=bought_done,
+            status="ok",
+            clock_fault=False,
+            known_at=bought_done,
+            ingested_at=bought_done,
+        )
+    )
+    (buy_decision_id,) = env.append(
+        DecisionRow(
+            run_id=bought_run,
+            rebalance_session=None,  # pre-existing position, not T_0's own rebalance decision
+            security_id="SEC_SPY",
+            side="buy",
+            planned_quantity=2.0,
+            target_notional=200.0,
+            whole_share=False,
+            decision="trade",
+            known_at=bought_at,
+            ingested_at=bought_at,
+        )
+    )
+    assert buy_decision_id is not None
+    buy_coid = "tp-spy-buy"
+    env.prices["SPY"] = 100.0
+    env.clock.now = bought_at
+    buy_placed = env.fake.submit(OrderRequest(buy_coid, "SPY", Side.BUY, quantity=2.0))
+    env.fake.apply(buy_coid, FillAt(100.0))  # fully filled: SPY 2 shares actually held
+    env.append(
+        OrderRow(
+            client_order_id=buy_coid,
+            decision_id=buy_decision_id,
+            run_id=bought_run,
+            session=T_0,
+            attempt=1,
+            phase="buy",
+            security_id="SEC_SPY",
+            symbol="SPY",
+            side="buy",
+            quantity=2.0,
+            sells_in_flight_at_submit=False,
+            known_at=bought_at,
+            ingested_at=bought_at,
+        ),
+        OrderEventRow(
+            client_order_id=buy_coid, status="pending", known_at=bought_at, ingested_at=bought_at
+        ),
+        OrderEventRow(
+            client_order_id=buy_coid,
+            status="accepted",
+            broker_order_id=buy_placed.broker_order_id,
+            known_at=bought_at,
+            ingested_at=bought_at,
+        ),
+        OrderEventRow(
+            client_order_id=buy_coid,
+            status="filled",
+            filled_quantity=2.0,
+            filled_avg_price=100.0,
+            known_at=bought_at,
+            ingested_at=bought_at,
+        ),
+        FillRow(
+            client_order_id=buy_coid,
+            filled_at=bought_at,
+            quantity=2.0,
+            price=100.0,
+            price_implied=False,
+            broker_fill_id="fake-fill-seed-spy",
+            source="broker_feed",
+            known_at=bought_at,
+            ingested_at=bought_at,
+        ),
+    )
     earlier_at = at(T_0, 13, 0)
     (earlier,) = env.append(
         PaperRunRow(
@@ -466,7 +564,7 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
             run_id=earlier,
             rebalance_session=None,
             security_id="SEC_SPY",
-            side="buy",
+            side="sell",
             planned_quantity=2.0,
             whole_share=False,
             decision="forced_exit",
@@ -477,10 +575,9 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
     )
     assert decision_id is not None
     coid = "tp-lag"
-    env.prices["SPY"] = 100.0
     env.clock.now = earlier_at
     env.fake.lag_fills(None)
-    placed = env.fake.submit(OrderRequest(coid, "SPY", Side.BUY, quantity=2.0))
+    placed = env.fake.submit(OrderRequest(coid, "SPY", Side.SELL, quantity=2.0))
     env.append(
         OrderRow(
             client_order_id=coid,
@@ -491,7 +588,7 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
             phase="exit",
             security_id="SEC_SPY",
             symbol="SPY",
-            side="buy",
+            side="sell",
             quantity=2.0,
             sells_in_flight_at_submit=False,
             known_at=earlier_at,
@@ -519,8 +616,8 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
     assert plan is not None and plan.status == "lagging"
     assert plan.decisions == ()
     assert env.counts() == before
-    assert env.submits() == 1  # the earlier run's order only
-    assert env.count("fills") == 0  # never delivered
+    assert env.submits() == 2  # the seeded SPY buy, and the earlier run's lagging sell
+    assert env.count("fills") == 1  # the seeded buy only: the sell's fill is never delivered
     assert env.rebalance_events() == []  # T_0 stays pending
     assert env.engaged() == []
     statuses = env.query(

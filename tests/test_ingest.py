@@ -7,6 +7,7 @@ with a `FixtureFilingSource` of synthetic filings and `_Prices`, a stub
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
@@ -19,6 +20,7 @@ from typing import Any
 import duckdb
 import pytest
 
+from tradepartner.adapters.edgar_validation import ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -46,9 +48,11 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     _add_rows,
+    _fetched,
     _ingest_filings,
     _prefetch,
     _Recorded,
+    _types_known,
     expected_session,
     fact_rows,
     ingest_session,
@@ -83,6 +87,10 @@ def _filings(
     dual_listings: tuple[CoverListing, ...] | None = None,
     delistings: Sequence[DelistingFiling] = (),
     extra_facts: Sequence[FactRecord] = (),
+    extra_index: Sequence[FilingIndexEntry] = (),
+    extra_headers: Sequence[FilingHeader] = (),
+    extra_snapshot: Sequence[CompanySnapshotEntry] = (),
+    extra_covers: Sequence[CoverPage] = (),
 ) -> FixtureFilingSource:
     dual = dual_listings or (
         CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
@@ -93,6 +101,7 @@ def _filings(
         index=[
             FilingIndexEntry(ACME, "Acme Corp", "10-K", f"{ACME}-18-000001", _at(2018, 3, 1)),
             FilingIndexEntry(DUAL, "Dual Corp", "10-K", f"{DUAL}-18-000001", _at(2018, 3, 2)),
+            *extra_index,
         ],
         cover_pages=[
             CoverPage(
@@ -107,10 +116,12 @@ def _filings(
                 _at(2019, 3, 4),
                 dual,
             ),
+            *extra_covers,
         ],
         headers=[
             FilingHeader(ACME, f"{ACME}-19-000001", "10-K", 3571, _at(2019, 3, 1)),
             FilingHeader(DUAL, f"{DUAL}-19-000001", "10-K", 7372, _at(2019, 3, 4)),
+            *extra_headers,
         ],
         facts=[
             _fact(ACME, "", 5_000_000, f"{ACME}-19-000001", _at(2019, 3, 1)),
@@ -118,7 +129,10 @@ def _filings(
             _fact(DUAL, "us-gaap:CommonClassBMember", 1_000_000, f"{DUAL}-19-1", _at(2019, 3, 4)),
             *extra_facts,
         ],
-        snapshot=[CompanySnapshotEntry(SPY_TRUST, "SPDR S&P 500", "SPY", "NYSE_ARCA", fetched_at)],
+        snapshot=[
+            CompanySnapshotEntry(SPY_TRUST, "SPDR S&P 500", "SPY", "NYSE_ARCA", fetched_at),
+            *extra_snapshot,
+        ],
     )
 
 
@@ -473,12 +487,13 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
         fsn_duplicates = 1
         fsn_reissue_undetected = 3
         fsn_incomplete_listings = 4
+        cover_incomplete_listings = 6  # #612: per-document cover parses
         fsn_missing = 5
 
     message = _run(settings, filings=_filings(cls=Fsn), source="edgar").runs[0].message
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
-        "FSN incomplete listings: 4; FSN missing: 5; missing"
+        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; missing"
     )
     assert counts in message
 
@@ -641,6 +656,93 @@ def test_a_failing_record_keeps_the_check_message(settings: Settings) -> None:
     run = _run(settings, filings=_filings(cls=RecordBoom), source="edgar").runs[0]
     assert run.status == FAILED
     assert "too many failures" in run.message and "disk full" in run.message
+
+
+class _Validating(_RecordsFailedCheck):
+    """A source that records `bad` parse failures on its validation
+    collector during the fetch pass (#578), as the EDGAR adapter does. Its
+    `check_failures` raises, so a test sees whether the gate ran first."""
+
+    bad: tuple[tuple[str, str, Exception], ...] = ()
+    facts_bulk_empty = 62  # #566: counted, never failed
+    validation_failures: ValidationFailures
+
+    def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+        for input, key, error in self.bad:
+            self.validation_failures.record(input, key, error)
+        self.bad = ()  # once per pass, like a cached payload
+        return super().facts(cik, names)
+
+
+#: Parse failures that crashed past backfills (#599, #609 C3 and F3).
+_CRASHES = (
+    ("companyfacts.zip member", "0001786835", KeyError("cik")),
+    ("cover page", "0002124122-26-000017", ValueError("cover page names 0 entities")),
+    ("FSN period", "2026q1", TypeError("conversion from NoneType to Decimal")),
+)
+
+
+def _validating(
+    tmp_path: Path, bad: Sequence[tuple[str, str, Exception]], *, fails: bool = True
+) -> FixtureFilingSource:
+    def make(**kwargs: Any) -> _Validating:
+        source = _Validating(**kwargs)
+        source.validation_failures = ValidationFailures(tmp_path / "validation", lambda: NOW)
+        source.bad, source.fails = tuple(bad), fails
+        return source
+
+    return _filings(cls=make)
+
+
+def test_input_validation_fails_the_run_before_any_store_write(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#578: three different bad inputs fail the run once, listing all three,
+    with no data row written and the failure policy's check never reached."""
+    _RecordsFailedCheck.recorded = 0
+    run = _run(settings, filings=_validating(tmp_path, _CRASHES), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "InputValidationError: EDGAR input validation: 3 input(s)" in run.message
+    assert "counted, not failed: empty bulk facts 62" in run.message
+    (listed,) = (tmp_path / "validation").glob("failures-*.json")
+    assert f"full list: {listed.resolve()}" in run.message
+    assert len(json.loads(listed.read_text())["failures"]) == 3
+    assert _RecordsFailedCheck.recorded == 0  # check_failures/record_failed_check not called
+    assert set(_counts(read).values()) == {0}
+    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
+def test_input_validation_runs_on_a_dry_run_and_writes_the_list(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    _run(settings, source="edgar")  # a real run first, so the store exists
+    before = (_counts(read), read("SELECT count(*) FROM ingestion_runs"))
+    filings = _validating(tmp_path, _CRASHES[:1])
+    run = _run(settings, filings=filings, source="edgar", dry_run=True).runs[0]
+    assert run.status == FAILED and "1 input(s) failed to parse" in run.message
+    assert len(list((tmp_path / "validation").glob("failures-*.json"))) == 1
+    assert (_counts(read), read("SELECT count(*) FROM ingestion_runs")) == before
+
+
+def test_a_clean_validation_passes_straight_through(settings: Settings, tmp_path: Path) -> None:
+    run = _run(settings, filings=_validating(tmp_path, (), fails=False), source="edgar").runs[0]
+    assert run.status == OK  # 62 empty bulk facts are counted, never failed
+    assert not (tmp_path / "validation").exists()
+
+
+def test_input_validation_fails_before_a_write_time_collision(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#687 failed at the write (a listings PRIMARY KEY collision); with
+    parse failures recorded, the gate fails the run before that write runs."""
+
+    def collide(*args: Any) -> tuple[int, str]:
+        raise duckdb.ConstraintException('duplicate key "0000864270:0-750pct-medium-term-notes"')
+
+    monkeypatch.setattr("tradepartner.ingest._ingest_filings", collide)
+    run = _run(settings, filings=_validating(tmp_path, _CRASHES), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "InputValidationError" in run.message and "ConstraintException" not in run.message
 
 
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:
@@ -855,6 +957,50 @@ def test_a_class_member_needs_a_matching_title_even_for_one_class(settings: Sett
     assert (ACME, 7) in {(r["security_id"], r["value"]) for r in matched[0]}
 
 
+def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:
+    # #820: post-bankruptcy equity is a new security; the old common no
+    # longer takes the company's share count once the successor is known.
+    cik = "0000000099"
+    ingested_at = datetime(2021, 6, 1, tzinfo=UTC)
+
+    def shares(value: float, accession: str, at: datetime) -> FactRecord:
+        return FactRecord(
+            cik, "EntityCommonStockSharesOutstanding", at.date(), "", value, accession, at
+        )
+
+    before = shares(49_000_000, "a1", datetime(2020, 8, 6, 21, tzinfo=UTC))
+    after = shares(83_000_000, "a2", datetime(2020, 11, 5, 22, tzinfo=UTC))
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(cik, "Crc Co", "10-K", "k1", datetime(2018, 3, 1, tzinfo=UTC)),
+            FilingIndexEntry(cik, "Crc Co", "8-A12B", "r1", datetime(2020, 10, 27, tzinfo=UTC)),
+        ],
+        cover_pages=[
+            CoverPage(cik, "c1", datetime(2019, 8, 1, 21, tzinfo=UTC), (_common("CRC"),)),
+            CoverPage(cik, "a1", before.accepted_at, ()),
+            CoverPage(cik, "a2", after.accepted_at, (_common("CRC"),)),
+        ],
+        delistings=[
+            DelistingFiling(
+                cik, "25-NSE", "Common Stock", "NYSE", "d1", datetime(2020, 7, 31, 18, tzinfo=UTC)
+            )
+        ],
+        facts=[before, after],
+    )
+    master = build_master(source, settings, ingested_at=ingested_at)
+    classes = build_classifications(source, master, settings, ingested_at=ingested_at)
+    rows, unmatched = fact_rows([before, after], master, classes, ingested_at=ingested_at)
+    assert [(r["security_id"], r["value"]) for r in rows] == [
+        (cik, 49_000_000),
+        (f"{cik}@2020-11-05", 83_000_000),
+    ]
+    assert unmatched == ()
+
+
+def _common(ticker: str) -> CoverListing:
+    return CoverListing("Common Stock", ticker, "NYSE")
+
+
 def test_shares_reach_the_as_of_read(settings: Settings) -> None:
     _run(settings)
     with duckdb.connect(settings.store.path, read_only=True) as conn:
@@ -889,6 +1035,13 @@ def _filing_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any,
     return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall(), key=repr) for t in tables}
 
 
+def test_prefetch_requires_dry_run_by_keyword(settings: Settings) -> None:
+    """#629: `dry_run` has no default, so a future dry caller cannot record
+    failures by leaving it out."""
+    with pytest.raises(TypeError, match="dry_run"):
+        _prefetch(_Recorded(_filings()), settings)  # type: ignore[call-arg]
+
+
 def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -910,7 +1063,7 @@ def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
         source: FixtureFilingSource | _Recorded = _filings()
         if prefetch:
             source = _Recorded(source)
-            _prefetch(source, settings)
+            _prefetch(source, settings, dry_run=False)
         conn = duckdb.connect(":memory:")
         conn.execute("SET TimeZone='UTC'")
         init_schema(conn)
@@ -995,6 +1148,211 @@ def test_a_listed_preferred_is_not_in_the_staleness_denominator(settings: Settin
     prices = _Prices(missing={f"{ACME}:6-00pct-series-a-preferred-stock"})
     result = _run(settings, prices, filings=_filings(acme_extra=(pref,)))
     assert result.ok, result.runs[-1].message
+
+
+OTC_B = (
+    CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
+    CoverListing("Class B Common Stock", "DUB", "OTC"),
+)
+STAT = "0000000003"  # no cover page: its only listing is snapshot_static
+
+
+def _with_stat(*, cover: bool = False, **kwargs: Any) -> FixtureFilingSource:
+    """`_filings` plus STAT, a common name listed only by a `snapshot_static`
+    span, or also by a cover page (a filing-based span) if `cover`."""
+    accession = f"{STAT}-18-000001"
+    page = CoverPage(
+        STAT, f"{STAT}-19-000001", _at(2019, 3, 6), (CoverListing("Common Stock", "STAT", "NYSE"),)
+    )
+    return _filings(
+        extra_index=[FilingIndexEntry(STAT, "Stat Corp", "10-K", accession, _at(2018, 3, 5))],
+        extra_headers=[FilingHeader(STAT, accession, "10-K", 3571, _at(2018, 3, 5))],
+        extra_facts=[_fact(STAT, "", 3_000_000, accession, _at(2018, 3, 5))],
+        extra_snapshot=[CompanySnapshotEntry(STAT, "Stat Corp", "STAT", "NYSE", FETCHED_AT)],
+        extra_covers=[page] if cover else [],
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(("missing", "ok"), [(DUAL_B, True), (ACME, False)])
+def test_an_otc_common_name_is_not_in_the_staleness_denominator(
+    settings: Settings, missing: str, ok: bool
+) -> None:
+    # #784: OTC is not one of `universe.exchanges` and the SIP feed has no
+    # OTC bars; a NYSE name with no bar still counts (1 of 3 is stale).
+    result = _run(settings, _Prices(missing={missing}), filings=_filings(dual_listings=OTC_B))
+    assert result.ok is ok, result.runs[-1].message
+    if ok:
+        assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+NOT_COMMON = (
+    CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE"),
+    CoverListing("5.25% Notes due 2030", "ACME30", "NYSE"),
+)
+
+
+def test_notes_preferreds_and_otc_listings_are_not_fetched(
+    settings: Settings,
+) -> None:
+    # #794: a note, a preferred and an OTC listing are not fetched; a
+    # common NYSE name and a benchmark are, and every counted name is.
+    prices = _Prices()
+    result = _run(settings, prices, filings=_filings(acme_extra=NOT_COMMON, dual_listings=OTC_B))
+    assert result.ok, result.runs[-1].message
+    fetched = set(next(c for c in prices.calls if c[0] == "bars")[1])
+    assert {ACME, SPY} <= fetched
+    assert DUAL_B not in fetched
+    assert not any(sid.startswith(f"{ACME}:") for sid in fetched)  # preferred, note
+    assert "0 of 3 listed names missing" in result.runs[-1].message
+
+
+def test_the_fetched_security_types_come_from_config(settings: Settings) -> None:
+    # #794: a type the universe admits is fetched; a note still is not.
+    types = [*settings.universe.security_types, "preferred"]
+    tuned = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"security_types": types})}
+    )
+    prices = _Prices()
+    _run(tuned, prices, filings=_filings(acme_extra=NOT_COMMON))
+    fetched = set(next(c for c in prices.calls if c[0] == "bars")[1])
+    assert f"{ACME}:6-00pct-series-a-preferred-stock" in fetched
+    assert f"{ACME}:5-25pct-notes-due-2030" not in fetched
+
+
+@pytest.mark.parametrize(
+    ("sid", "exchange", "types", "fetched"),
+    [
+        ("X", "NYSE", {}, True),  # no classification row yet
+        ("X", "NYSE", {"X": {"unclassifiable"}}, True),  # e.g. before a spin-off's first 10-Q
+        ("X", "NYSE", {"X": {"debt", "common"}}, True),  # common in one revision
+        ("X", "NYSE", {"X": {"spac"}}, True),  # #802 owner: blocklist, not allowlist
+        ("X", "NYSE", {"X": {"foreign"}}, True),
+        ("X", "NYSE", {"X": {"fund"}}, True),
+        ("X", "NYSE", {"X": {"depositary"}}, True),
+        ("X", "NYSE", {"X": {"debt"}}, False),
+        ("X", "NYSE", {"X": {"preferred"}}, False),
+        ("X", "NYSE", {"X": {"warrant"}}, False),
+        ("X", "NYSE", {"X": {"unit"}}, False),
+        ("X", "NYSE", {"X": {"right"}}, False),
+        ("X", "OTC", {"X": {"common"}}, False),
+        (SPY, "OTC", {}, True),  # a benchmark whatever its listing
+    ],
+)
+def test_the_fetch_predicate(
+    settings: Settings, sid: str, exchange: str, types: dict[str, set[str]], fetched: bool
+) -> None:
+    assert _fetched(sid, {"exchange": exchange}, {SPY}, types, settings) is fetched
+
+
+def test_types_known_has_every_revision_known_at_t_and_none_after(settings: Settings) -> None:
+    _run(settings, source="edgar")
+    later = NOW + timedelta(days=1)
+    with open_for_write(settings) as conn:
+        cursor = conn.execute("SELECT * FROM classifications WHERE security_id = ?", [ACME])
+        names = [d[0] for d in cursor.description]
+        row = dict(zip(names, cursor.fetchone() or (), strict=True))
+        insert_row(
+            conn,
+            "classifications",
+            {**row, "security_type": "foreign", "known_at": later, "ingested_at": later},
+        )
+        assert _types_known(conn, NOW)[ACME] == {"common"}  # no look-ahead
+        assert _types_known(conn, later)[ACME] == {"common", "foreign"}
+
+
+def test_the_staleness_exchange_filter_comes_from_config(settings: Settings) -> None:
+    exchanges = [*settings.universe.exchanges, "OTC"]
+    tuned = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"exchanges": exchanges})}
+    )
+    result = _run(tuned, _Prices(missing={DUAL_B}), filings=_filings(dual_listings=OTC_B))
+    assert result.runs[-1].status == STALE
+
+
+def test_a_snapshot_static_only_name_with_no_bar_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    # #784 (owner option a): its back-dated ticker may not be the one it traded under.
+    result = _run(settings, _Prices(missing={STAT}), filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    message = result.runs[-1].message
+    assert "0 of 4 listed names missing" in message
+    assert f"1 snapshot-only names with no rows (not counted): {STAT}" in message
+
+
+def test_a_name_with_a_filing_based_span_and_no_bar_still_counts(settings: Settings) -> None:
+    result = _run(settings, _Prices(missing={STAT}), filings=_with_stat(cover=True))
+    assert result.runs[-1].status == STALE and STAT in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+def test_a_missing_benchmark_still_counts_though_snapshot_static(settings: Settings) -> None:
+    # SPY's listing is snapshot_static on NYSE_ARCA (not a universe exchange);
+    # with ACME as the reference, only the benchmark rule keeps SPY counted.
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"reference_symbol": "ACME"})}
+    )
+    result = _run(tuned, _Prices(missing={SPY}))
+    assert result.runs[-1].status == STALE and SPY in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+NEWCO = "0000000004"  # first listed by a cover page accepted on `accepted`
+
+
+def _with_newco(accepted: datetime, **kwargs: Any) -> FixtureFilingSource:
+    """`_filings` plus NEWCO, a NYSE common name first listed at `accepted`."""
+    accession = f"{NEWCO}-19-000001"
+    page = CoverPage(NEWCO, accession, accepted, (CoverListing("Common Stock", "NEWC", "NYSE"),))
+    return _filings(
+        extra_index=[FilingIndexEntry(NEWCO, "Newco Inc", "10-K", accession, accepted)],
+        extra_headers=[FilingHeader(NEWCO, accession, "10-K", 3571, accepted)],
+        extra_facts=[_fact(NEWCO, "", 2_000_000, accession, accepted)],
+        extra_covers=[page],
+        **kwargs,
+    )
+
+
+def _loose(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_missing_share": 0.3})}
+    )
+
+
+def _early() -> FixtureFilingSource:
+    """`_filings` with SPY's snapshot known before the previous session."""
+    return _filings(fetched_at=_at(2019, 6, 3))
+
+
+PREVIOUS = NOW - timedelta(days=1)  # expected session 2019-06-27
+
+
+def test_a_name_dark_since_before_the_previous_session_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    # #784 (dark names): no bar at 06-27 either, so 06-28's miss is not counted.
+    assert _run(_loose(settings), _Prices(missing={ACME}), now=PREVIOUS, filings=_early()).ok
+    result = _run(settings, _Prices(missing={ACME}), filings=_early())
+    assert result.ok, result.runs[-1].message
+    message = result.runs[-1].message
+    assert "0 of 3 listed names missing" in message
+    assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in message
+
+
+def test_a_name_with_a_bar_at_the_previous_session_and_none_now_counts(
+    settings: Settings,
+) -> None:
+    assert _run(settings, now=PREVIOUS, filings=_early()).ok
+    result = _run(settings, _Prices(missing={ACME}), filings=_early())
+    assert result.runs[-1].status == STALE and ACME in result.runs[-1].message
+
+
+def test_a_name_first_listed_this_session_with_no_bar_counts(settings: Settings) -> None:
+    assert _run(settings, now=PREVIOUS, filings=_early()).ok
+    filings = _with_newco(_at(2019, 6, 28), fetched_at=_at(2019, 6, 3))
+    result = _run(settings, _Prices(missing={NEWCO}), filings=filings)
+    assert result.runs[-1].status == STALE and NEWCO in result.runs[-1].message
 
 
 def test_run_messages_are_redacted_cleaned_and_capped(
@@ -1179,6 +1537,89 @@ def test_a_late_filing_behind_a_stored_revision_is_one_row_at_ingested_at() -> N
     )
     rows = conn.execute("SELECT name, known_at FROM securities ORDER BY known_at").fetchall()
     assert rows == [("A", T1), ("B", one), ("C", two)]
+
+
+def test_cover_page_duplicate_pair_does_not_abort_the_listings_write() -> None:
+    """#687: `build_master` must never hand `_add_rows` two `listings` rows
+    with the same (security_id, ticker, exchange, valid_from, known_at)
+    key, or the store's UNIQUE constraint aborts the whole EDGAR write
+    (the failing path of the 2026-10-03 backfill rerun). Real shapes:
+    Honda (CIK 0000864270) 10-Q accepted 2021-11-09, two 0.750%
+    medium-term notes both tagged HMC/26A on one cover page; Moatable
+    (CIK 0001509223) 10-Q accepted 2023-08-14, Class A ordinary shares and
+    their ADS both retickered to MTBL on one cover page."""
+    notes_cik = "0000900001"
+    ads_cik = "0000900002"
+    ads_title = "American depositary shares, each representing 45 Class A ordinary shares"
+    class_a_title = "Class A ordinary shares, par value $0.001 per share*"
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(notes_cik, "Honda-like Co", "10-K", f"{notes_cik}-1", _at(2015, 3, 1)),
+            FilingIndexEntry(ads_cik, "Moatable-like Inc", "10-K", f"{ads_cik}-1", _at(2015, 3, 1)),
+        ],
+        cover_pages=[
+            CoverPage(
+                notes_cik,
+                f"{notes_cik}-2",
+                _at(2021, 3, 1),
+                (CoverListing("Common Stock, par value $0.50 per share", "HMC", "NYSE"),),
+            ),
+            CoverPage(
+                notes_cik,
+                f"{notes_cik}-3",
+                datetime(2021, 11, 9, 17, 59, 52, tzinfo=UTC),
+                (
+                    CoverListing("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                    CoverListing(
+                        "0.750% Medium-Term Notes, Series ADue November 25, 2026",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    CoverListing(
+                        "0.750% Medium-Term Notes, Series ADue January 17, 2024",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    CoverListing(
+                        "1.100% Medium-Term Notes, Series BDue October 1, 2025",
+                        "HMC/25B",
+                        "NYSE",
+                    ),
+                ),
+            ),
+            CoverPage(
+                ads_cik, f"{ads_cik}-2", _at(2020, 3, 1), (CoverListing(ads_title, "RENN", "NYSE"),)
+            ),
+            CoverPage(
+                ads_cik,
+                f"{ads_cik}-3",
+                _at(2023, 3, 31),
+                (
+                    CoverListing(class_a_title, "RENN", "NYSE"),
+                    CoverListing(ads_title, "RENN", "NYSE"),
+                ),
+            ),
+            CoverPage(
+                ads_cik,
+                f"{ads_cik}-4",
+                datetime(2023, 8, 14, 20, 56, 14, tzinfo=UTC),
+                (
+                    CoverListing(class_a_title, "MTBL", "NYSE"),
+                    CoverListing(ads_title, "MTBL", "NYSE"),
+                ),
+            ),
+        ],
+    )
+    ingested_at = datetime(2023, 8, 15, tzinfo=UTC)
+    master = build_master(source, Settings(_env_file=None), ingested_at=ingested_at)
+    conn = _store()
+    added = _add_rows(conn, "listings", master.listings, ingested_at=ingested_at, current=False)
+    assert added == len(master.listings)
+    rows = conn.execute(
+        "SELECT security_id, ticker, exchange, valid_from, known_at, COUNT(*) AS n "
+        "FROM listings GROUP BY 1, 2, 3, 4, 5 HAVING COUNT(*) > 1"
+    ).fetchall()
+    assert rows == []
 
 
 def test_fact_class_uses_the_classification_known_at_acceptance(settings: Settings) -> None:

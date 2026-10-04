@@ -22,7 +22,11 @@ pointer).
   moment the system learned or decided the fact (spec "Definitions"): this module
   never derives it from a broker field such as `filled_at` or `event_at`.
   `ingested_at` must come from the same clock or later, or the check refuses the
-  row.
+  row. A `fills` row must also be stamped strictly after every `reconciliations`
+  row's `known_at` (any window): `execution.ledger` treats a fill tied with its
+  base reconciliation as inside that reconciliation's `broker_cash`, so a later
+  fill on the same clock reading would silently drop out of the ledger's cash
+  (#650). A tie needs a frozen or coarse clock; the writer refuses it.
 - **`fills_for(conn, ...)`**: the **single** reader of `fills`. It hides every
   superseded row (`superseded_by IS NULL`) and joins each fill to its `orders` row
   for `side` and `security_id` (`fills.quantity` is unsigned). A live fill with no
@@ -48,7 +52,11 @@ from typing import Any, ClassVar, Protocol
 import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
-from tradepartner.store.schema import JOURNAL_TABLE_NAMES, LATER_JOURNAL_TABLE_NAMES
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_TABLE_NAMES,
+    LATER_JOURNAL_TABLE_NAMES,
+)
 
 
 class JournalNotInitialised(RuntimeError):
@@ -461,7 +469,8 @@ class KillSwitchRow:
 
 @dataclass(frozen=True, kw_only=True)
 class OverrideRow:
-    """One `overrides` row."""
+    """One `overrides` row. `client_order_id` is set exactly for a `settle_order`
+    row, the order `paper settle` settled (schema version 9, spec req 17, #571)."""
 
     TABLE: ClassVar[str] = "overrides"
     ID_COLUMN: ClassVar[str | None] = "override_id"
@@ -471,6 +480,7 @@ class OverrideRow:
     made_at: datetime
     rebalance_session: date | None = None
     security_id: str | None = None
+    client_order_id: str | None = None
     kind: str
     reason: str
     known_at: datetime
@@ -648,12 +658,27 @@ def _next_id(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> int:
     return int(row[0])
 
 
+def _require_after_reconciliations(conn: duckdb.DuckDBPyConnection, known_at: datetime) -> None:
+    """Refuse a fill stamped at or before the latest reconciliation (#650): a
+    ledger counts a fill's cash only when its `known_at` is strictly after its
+    base reconciliation's, so a tied stamp would drop the fill from every later
+    ledger's cash."""
+    row = conn.execute("SELECT MAX(known_at) FROM reconciliations").fetchone()
+    floor = None if row is None else row[0]
+    if floor is not None and known_at <= floor:
+        raise ValueError(
+            f"fills: known_at {known_at.isoformat()} is not after the latest reconciliation's "
+            f"{floor.isoformat()}; the clock did not advance past it"
+        )
+
+
 def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
     """Insert `row` into its table and return its own id (assigned when None), or
-    None for a table without one. Raises `ValueError` for a naive timestamp or
-    `known_at` after `ingested_at`, `JournalNotInitialised` on a store without the
-    journal, and DuckDB's constraint errors for anything the schema refuses. Runs in
-    the caller's transaction."""
+    None for a table without one. Raises `ValueError` for a naive timestamp,
+    `known_at` after `ingested_at`, or a fill not stamped after every
+    reconciliation; `JournalNotInitialised` on a store without the journal; and
+    DuckDB's constraint errors for anything the schema refuses. Runs in the
+    caller's transaction."""
     if type(row) not in ROW_TYPES.values():
         raise TypeError(f"not a journal row type: {type(row).__name__}")
     table, id_column = type(row).TABLE, type(row).ID_COLUMN
@@ -665,6 +690,8 @@ def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
             f"{ingested_at.isoformat()}"
         )
     require_journal(conn)
+    if isinstance(row, FillRow):
+        _require_after_reconciliations(conn, known_at)
     values = {f.name: getattr(row, f.name) for f in fields(row)}  # type: ignore[arg-type]
     row_id = None
     if id_column is not None:
@@ -851,7 +878,7 @@ class OverrideWithConsumption:
     def consumed(self) -> bool:
         """True once what its kind consumes cites it: an `engaged` `kill_switch` row
         for `engage_kill_switch`, a decision for the name kinds."""
-        if self.override.kind == "engage_kill_switch":
+        if self.override.kind == ENGAGE_KILL_SWITCH_KIND:
             return bool(self.kill_switch_event_ids)
         return bool(self.decision_ids)
 
@@ -1188,7 +1215,7 @@ def unconsumed_kill_switch_overrides(
     return [
         o.override
         for o in overrides_for(conn, window_id)
-        if o.override.kind == "engage_kill_switch" and not o.kill_switch_event_ids
+        if o.override.kind == ENGAGE_KILL_SWITCH_KIND and not o.kill_switch_event_ids
     ]
 
 

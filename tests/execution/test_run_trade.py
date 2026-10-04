@@ -36,6 +36,7 @@ from tradepartner.errors import LimitBreachError
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.run import RunOutcome, submit_window, tracking_run
+from tradepartner.execution.wrapper import BatchOutcome
 from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
@@ -531,7 +532,7 @@ def test_a_catch_up_uses_its_own_session_ids_and_applies_its_split_once(
     held = env.held()["TRNS"]
     split(env, "SEC_TRANSFER", catch_up, 2.0, at(f_1, 19, 0))
     # The broker applies the split before the catch-up session's open.
-    env.fake._net_quantity["TRNS"] *= 2  # the fake has no corporate actions
+    env.fake.apply_split("TRNS", 2.0)  # the fake has no corporate actions
     close = env.query(
         "SELECT close FROM prices_daily WHERE security_id = 'SEC_TRANSFER' AND session = ?",
         [f_1],
@@ -654,6 +655,33 @@ def test_same_session_collection_explains_a_partial_fill_and_an_open_order(
     assert any(still in note for note in outcome.notes)
 
 
+def test_a_fill_collected_under_a_clock_tied_with_a_reconciliation_halts_the_run(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#650/#730: a clock frozen since step 4's reconciliation stamps the next
+    collection's fill with that reconciliation's `known_at`. `append` refuses
+    the fill, the collection's write chunk rolls back (no fill journaled), and
+    the run takes the halt path: the switch engaged and a `halted` result
+    naming the refusal. The halt path's own reads meet the same refusal, and
+    each note keeps its message, not only the exception type."""
+    frozen = at(F_0)
+    env.on_sleep.append(lambda _now: setattr(env.clock, "now", frozen))
+    with pytest.raises(ValueError, match="not after the latest reconciliation"):
+        env.run(frozen)
+    halted = env.latest_run()
+    status, fault, message = env.result(halted)
+    assert (status, fault) == ("halted", "ValueError")
+    assert message is not None and message.startswith("ValueError: fills: known_at")
+    reads = [part for part in message.split("; ") if part.startswith("halt read of ")]
+    assert reads, message
+    assert all("failed (ValueError: fills: known_at" in part for part in reads)
+    assert env.query("SELECT max(known_at) FROM reconciliations") == [(frozen,)]
+    assert env.count("fills") == 0
+    assert env.query("SELECT source, fault_type, run_id FROM kill_switch") == [
+        ("fault", "ValueError", halted)
+    ]
+
+
 def test_step_7b_stops_at_its_absolute_deadline(env: Env, window: PaperWindowRow) -> None:
     env.fill_on_sleep = False
     outcome = env.run(at(F_0))
@@ -744,6 +772,73 @@ def test_no_unspent_cash_alert_when_a_later_run_executes_within_the_fraction(
     assert env.alerts("unspent_cash") == []
 
 
+def test_two_rebalances_executed_at_step_3_in_one_run_write_one_alert(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alerter dedupes on (kind, run): step 3's loop may find more than
+    one rebalance reaching `executed` in the same run, so `_unspent_cash`
+    must write one alert naming every one of them over the bound, not one
+    per rebalance (the second of which the dedupe would silently drop)
+    (#563). A window with nothing ever due (`first_rebalance_session` far in
+    the future) is flat, so every call to `exits_step` makes no batch and
+    step 7b's own `_unspent_cash` call never happens; `_Run._executed` is
+    stubbed so step 3 finds two labels, real or not (`_unspent_cash` is pure
+    cash arithmetic over whatever it is given)."""
+    window = env.open_window(first=date(2099, 12, 31), tmp_path=tmp_path)
+    assert window.window_id is not None
+    monkeypatch.setattr(run_module._Run, "_executed", lambda self, actions, prices: [T_0, F_0])
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert T_0.isoformat() in message
+    assert F_0.isoformat() in message
+
+
+def test_step_7b_falls_back_to_broker_cash_when_cash_left_is_none(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BatchOutcome.cash_left` is None when no buys phase read the cash
+    (module docstring): step 7b's own `_unspent_cash` call must then fall
+    back to the broker's cash, not treat the batch's None as the cash itself
+    (#563). `trade_step` is stubbed to a no-op batch so nothing is really
+    submitted; `_Run._executed` is stubbed to find nothing at step 3 (so only
+    step 7b's call fires) and T_0 at step 7b."""
+    account = env.fake.account()
+    monkeypatch.setattr(run_module, "trade_step", lambda context: BatchOutcome(status="ok"))
+    calls = iter([[], [T_0]])
+    monkeypatch.setattr(run_module._Run, "_executed", lambda self, actions, prices: next(calls))
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert f"{account.cash:.2f} cash" in message
+
+
+def test_the_frozen_max_unspent_cash_fraction_is_used_not_settings(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The bound is the window's frozen `risk.max_unspent_cash_fraction`
+    (captured at `paper start`), not a later change to `settings`: raised
+    high enough in `settings` alone to silence the alert, the frozen 0.05
+    still alerts on SPFT's unspent third (#563)."""
+    env.fake.set_asset(
+        "SPFT", Asset(tradable=False, fractionable=True, status="active", cusip=None)
+    )
+    env.settings = Settings(
+        _env_file=None,
+        store={"path": env.settings.store.path},
+        alpaca={"quantity_decimals": 6, "client_order_id_max_length": 48},
+        risk={"max_unspent_cash_fraction": 0.9},
+    )
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert env.settings.risk.max_unspent_cash_fraction == 0.9
+    ((run_id, session, message),) = env.alerts("unspent_cash")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert "max_unspent_cash_fraction 0.05" in message
+
+
 # --- overrides halt like any order ------------------------------------------------------
 
 
@@ -823,6 +918,11 @@ def test_a_kill_written_during_step_4_is_caught_before_any_submit(
     assert "submit" not in [c.method for c in env.fake.calls]
     assert env.count("orders") == 0
     assert env.rebalance_events() == []
+    # The wrapper's skip is the run's: one `kill_switch` alert for it (#677).
+    ((run_id, session, message),) = env.alerts("kill_switch")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert "source owner" in message
+    assert "the owner kills the run at step 4" in message
 
 
 @pytest.mark.parametrize(

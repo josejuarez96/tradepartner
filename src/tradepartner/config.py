@@ -32,6 +32,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -151,16 +152,32 @@ class EdgarConfig(BaseModel):
     added in round 3 (safety-reviewer MUST FIX): an SEC response naming an
     unreasonably large (or non-finite) `Retry-After` must not make
     `edgar_raw` sleep for that long, or at all, on a NaN/infinite value.
+    `retry_max_attempts`/`retry_backoff_cap_seconds`/`rate_limit_wait_seconds`
+    were added in #554 (research #572 pitfalls P1/P2/P10): a single 1-second
+    retry couldn't outlast a real outage or SEC's rate-limit block, and a
+    truncated zip just failed the whole run. `retry_max_attempts` caps the
+    capped-exponential-backoff loop on `429`/`503`/a transport error;
+    `retry_backoff_cap_seconds` caps that backoff's own growth (separately
+    from `max_retry_after_seconds`, which caps how far an SEC-sent
+    `Retry-After` is trusted); `rate_limit_wait_seconds` is the one wait
+    before `403` (SEC's rate-limit block) is retried once, then failed.
     Every field here is `gt=0`: a zero or negative throttle/timeout/backoff
     is nonsensical and would either hang or hot-loop `edgar_raw`.
+
+    `requests_per_second` defaults to 9, not 10 (#656, research #572 E3):
+    SEC's 10 req/s is a ceiling, not a target; secedgar users saw 429s at
+    9.7 req/s and edgartools defaults to 9.
     """
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = Field(default=10.0, gt=0)
+    requests_per_second: float = Field(default=9.0, gt=0)
     retry_backoff_seconds: float = Field(default=1.0, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
     max_retry_after_seconds: float = Field(default=120.0, gt=0)
+    retry_max_attempts: int = Field(default=5, gt=0)
+    retry_backoff_cap_seconds: float = Field(default=60.0, gt=0)
+    rate_limit_wait_seconds: float = Field(default=600.0, gt=0)
     # T11b (#163): the EDGAR `FilingSource`. The full index starts in 1993; a
     # quarter's raw index is cached only once fetched this many days after its
     # Eastern-time end; above this many CIKs to stamp, stamping reads the nightly
@@ -194,6 +211,10 @@ class EdgarConfig(BaseModel):
     # trips it.
     min_failed_filings: int = Field(default=5, gt=0)
     max_failed_filing_share: float = Field(default=0.01, gt=0, le=1)
+    # #578: how many of the fetch pass's parse failures the run message names
+    # (the full list goes to a file under `cache_dir/validation/` whose path
+    # the message gives), so a run with thousands stays readable.
+    max_validation_listed: int = Field(default=20, gt=0)
 
     @property
     def header_start_year(self) -> int:
@@ -235,6 +256,12 @@ class AlpacaConfig(BaseModel):
     processed 2021-01-25; #101 probe 1). `AlpacaPriceSource` asks for actions processed up
     to this many calendar days after the end of an ex-date window, then filters on ex-date.
 
+    `registrant_quiet_days`: `ListingResolver` rule 6 (#793) takes a ticker's holder to
+    have left it the day after its company's last cover-page share count once more than
+    this many calendar days have passed by the run with none. Since 2022 the store's
+    gaps between one company's share-count filings are 91 days at the median, 124 at the
+    90th and 168 at the 99th percentile, so 180 marks a missed filing.
+
     Frozen and closed (T47, safety-reviewer): the `paper` guard below runs at
     construction, so an attribute assignment after the fact must be impossible too, and a
     misspelt broker fact (`quantity_decimals`) must fail rather than stay unset silently.
@@ -246,6 +273,11 @@ class AlpacaConfig(BaseModel):
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
+    registrant_quiet_days: int = Field(default=180, ge=1)
+    # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
+    # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
+    # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
+    symbols_per_request: int = Field(default=1000, gt=0)
     # --- Phase 4 trading keys (docs/specs/paper-trading.md req 2, T47) ---
     # Guarded: the trading client is constructed with `paper=True` on every path
     # and a `false` here is refused, even from the environment (validator below).
@@ -281,6 +313,15 @@ class ExecutionConfig(BaseModel):
     fill_price: Literal["close", "open"] = "close"
 
 
+def parse_accepted_jump(entry: str) -> tuple[str, date]:
+    """`"<security_id>@<YYYY-MM-DD>"` (an `universe.accepted_price_jumps` entry) as
+    `(security_id, session)`. Raises `ValueError` on any other shape."""
+    security_id, sep, session = entry.rpartition("@")
+    if not sep or not security_id:
+        raise ValueError(f"accepted price jump {entry!r} is not '<security_id>@<YYYY-MM-DD>'")
+    return security_id, date.fromisoformat(session)
+
+
 class UniverseConfig(BaseModel):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
@@ -299,6 +340,21 @@ class UniverseConfig(BaseModel):
     min_history_months: int = 12
     max_shares_age_days: int = 400
     top_n_by_cap: int = 1000
+    # Price-quality gate (#787), part of rule 6: a close-to-close ratio between two
+    # consecutive traded bars above `max_jump_ratio` or below `min_jump_ratio`, that no
+    # split or dividend known at T explains, fails rule 6 while its session is in the
+    # `min_history_months` window, unless the owner lists it in `accepted_price_jumps`
+    # as "<security_id>@<YYYY-MM-DD>" (the jump's session). `health` lists every jump.
+    max_jump_ratio: float = Field(default=2.5, gt=1, allow_inf_nan=False)
+    min_jump_ratio: float = Field(default=0.4, gt=0, lt=1)
+    accepted_price_jumps: list[str] = Field(default_factory=list)
+
+    @field_validator("accepted_price_jumps")
+    @classmethod
+    def _check_accepted_price_jumps(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_accepted_jump(entry)
+        return value
 
     @field_validator("exclude_sic_ranges")
     @classmethod
@@ -736,6 +792,19 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Load `Settings` fresh from the environment (no process-wide caching)."""
     return Settings()
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def clean_message(message: str, settings: Settings) -> str:
+    """`message` with every configured secret redacted, control characters
+    replaced by a space, and cut to `ingest.max_message_chars`: the one
+    cleaning for server- or filing-supplied text that is stored (the run row
+    and the EDGAR adapter's `failed_filings.json` and FSN manifests, #629)."""
+    for value in secret_values(settings):
+        message = message.replace(value, "[redacted]")
+    return _CONTROL_CHARS.sub(" ", message)[: settings.ingest.max_message_chars]
 
 
 def secret_values(settings: Settings) -> list[str]:

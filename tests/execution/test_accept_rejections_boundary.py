@@ -10,21 +10,61 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
 2. Nothing gives it a default: no parameter or dataclass field named
    `accept_rejections` has one, so a caller that forgets it fails rather than
    quietly passing a value.
-3. Every `accept_rejections=` keyword passes the caller's own
-   `accept_rejections` name on, never a literal or another expression. The name
-   is never bound except as a parameter or a dataclass field (no
+3. The check fails closed: every `Load` of the bare name must sit in one of
+   four safe contexts, or it is reported. The safe contexts are the value of
+   an `accept_rejections=` keyword to a reviewed callee in
+   `_KEYWORD_CALLEES` (`resume`'s own `_start` and the journal's
+   `ResumeInvocationRow`, passing the caller's own flag on; any other
+   callee, such as `dict`, an alias of it, `OrderedDict`, `SimpleNamespace`,
+   a local `def f(**kw)` or a class keyword, could collect it into a
+   mapping and feed it on positionally), the sole, unkeyworded,
+   by-identity first argument of a 1-arg `type` call or the sole,
+   unkeyworded, by-identity first-of-2 argument of a 2-arg
+   `isinstance(x, bool)` call, its second argument the bare name `bool`
+   (`resume`'s own type check), the whole `test` of an `if`, or (for a
+   `Store`) the target of a bare annotated field. The exemptions hold only
+   while the names they trust are what they say, so the fence refuses
+   outright: any rebinding of `isinstance`, `type` or `bool`, a star import
+   (which could rebind them unseen), any attribute store to one of those
+   names, or to any attribute or item reached from one of them or from a
+   reviewed callee, however deep (`builtins.isinstance = f`,
+   `ResumeInvocationRow.__init__.__code__ = g`), any use or import of
+   `builtins`, any use of `__builtins__`, `__import__`, `globals`,
+   `locals` or a bare `vars()`, any `__builtins__` or `__globals__`
+   attribute, a `__dict__` attribute other than as a `**` unpacking source,
+   and, in a module that passes the keyword, any binding of a reviewed
+   callee but its own undecorated `def _start(..., *, accept_rejections)`
+   with no `**kwargs` or
+   `from tradepartner.store.journal import ResumeInvocationRow`. Any
+   attribute named for the flag (`row.accept_rejections`) is refused in any
+   position. Everything else - a literal or other expression under the
+   `accept_rejections=` keyword, the name under any other keyword, a
+   positional pass, smuggling through a starred list/tuple/set/dict
+   display, a multiplied or generator expression, an `IfExp`, an alias
+   bound first and starred later, `del`, or a PEP 695 type parameter named
+   for it - is refused. The name is never otherwise bound (no
    `accept_rejections = True`, no match, except, import, global or nonlocal
-   capture, and no `def`, `async def` or `class` named for it), every such
-   parameter is keyword-only (so no positional argument can feed it), the name
-   is never passed positionally, including unwrapped through a starred list,
-   tuple or set display (`*[accept_rejections]`, `*(accept_rejections,)`) but
-   to `isinstance` or `type`, for `resume`'s own type check, and it is never
-   spelt as a whole string (no `**{"accept_rejections": True}`).
+   capture, and no `def`, `async def` or `class` named for it), and every
+   such parameter is keyword-only (so no positional argument can feed it).
 4. No module imports `execution.resume` except those in `RESUME_CALLERS`. There
    are none yet: the `paper resume` CLI is T67. T67 adds `cli.py` here and to
    `ALLOWED`, with the flag as an explicit `argparse` `store_true` option and one
-   reviewed exception to rule 3 for `accept_rejections=args.accept_rejections`.
+   reviewed exception to rule 3 for `accept_rejections=args.accept_rejections`
+   (an attribute, which rule 3 otherwise refuses), and adds `resume` to
+   `_KEYWORD_CALLEES`.
 5. No config field anywhere in `Settings` is named for it.
+
+Known limits, not checked here (#696 closed what a name-based scan can):
+a value laundered through control flow into a new name (`if
+accept_rejections: f = True`) breaks the name-based premise entirely, and
+`resume`'s own `if accept_rejections:` body is exactly such a laundering,
+by design; a reviewed callee is trusted to do what its review says with the
+flag; and the interpreter's machinery can still be reached in ways no static
+scan sees: `sys.modules[...]`, `importlib`, `vars(module)`, `setattr` or
+`delattr` on a module or callee obtained some other way, frame objects
+(`sys._getframe().f_globals`), `exec`/`eval` of a built string, or
+`getattr` with a computed name (the journal's own row writer reads every
+field this way, including the flag, to store it).
 
 `test_each_rule_refuses_a_sample_that_breaks_it` runs each rule on a sample
 source that breaks it, so a rule that silently stops matching fails too.
@@ -57,8 +97,24 @@ ALLOWED = frozenset(
     }
 )
 RESUME_CALLERS: frozenset[str] = frozenset()
-#: Builtins the flag may be passed to positionally: `resume`'s own type check.
-_TYPE_CHECKS = frozenset({"isinstance", "type"})
+#: Names the fence refuses to see rebound anywhere: `resume`'s own type
+#: check (`isinstance`, `type`) and the type `isinstance` is always checked
+#: against here (`bool`), so a custom `__instancecheck__` can't see the flag.
+_TYPE_CHECKS = frozenset({"isinstance", "type", "bool"})
+#: Names that reach the builtins or a module's own namespace, through which
+#: `isinstance`, `type` or `bool` could be patched without a binding the
+#: fence sees (`builtins.isinstance = f`, `globals()["bool"] = Spy`).
+_REACH = frozenset({"builtins", "__builtins__", "__import__", "globals", "locals"})
+#: Attributes that reach a module's namespace or the builtins' from any
+#: object (`os.__builtins__`, `_start.__globals__`); `__dict__` is allowed
+#: only as the source of a `**` unpacking (`{**row.__dict__}`), a read.
+_REACH_ATTRIBUTES = frozenset({"__builtins__", "__globals__", "__dict__"})
+#: The only callees the flag may be passed on to under `accept_rejections=`:
+#: `resume`'s own `_start` and the journal row. Any other callee (`dict`, an
+#: alias of it, `OrderedDict`, `SimpleNamespace`, a local `def f(**kw)`) could
+#: collect it into a mapping and feed it on positionally. T67 adds `resume`.
+_KEYWORD_CALLEES = frozenset({"_start", "ResumeInvocationRow"})
+JOURNAL_MODULE = "tradepartner.store.journal"
 
 
 def _modules() -> dict[str, ast.Module]:
@@ -88,6 +144,10 @@ def mentions(tree: ast.Module) -> list[int]:
             or (isinstance(node, ast.arg) and node.arg == FLAG)
             or (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name == FLAG
+            )
+            or (
+                isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple))
                 and node.name == FLAG
             )
             or (
@@ -124,33 +184,173 @@ def defaults(tree: ast.Module) -> list[int]:
     return lines
 
 
-def _unwrap_display(expr: ast.expr) -> list[ast.expr]:
-    """The bare expressions reachable through nested list/tuple/set displays
-    and the `Starred` elements inside them (`*[accept_rejections]`,
-    `*(accept_rejections,)`), so a positional check can see the name without
-    flagging an arbitrary expression that merely contains it."""
-    if not isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
-        return [expr]
-    found: list[ast.expr] = []
-    for elt in expr.elts:
-        inner = elt.value if isinstance(elt, ast.Starred) else elt
-        found.extend(_unwrap_display(inner))
-    return found
+def _parent_map(tree: ast.Module) -> dict[int, ast.AST]:
+    """Maps each node's `id()` to its parent, so a `Load` of the flag can be
+    classified by where it sits without re-deriving an unwrapper for every
+    new smuggling shape (a display, a generator, an `IfExp`, ...)."""
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    return parents
+
+
+def _is_type_check(call: ast.Call, node: ast.expr) -> bool:
+    """Whether `call` is exactly `resume`'s own type check with `node` as the
+    argument being checked: `type(x)` (1 positional arg, no keywords, `node`
+    is it) or `isinstance(x, bool)` (2 positional args, no keywords, `node`
+    is the first by identity, never by position alone, and the second is the
+    bare name `bool` - never a variable, so a custom `__instancecheck__`
+    cannot see the value)."""
+    if call.keywords or not isinstance(call.func, ast.Name):
+        return False
+    if call.func.id == "type":
+        return len(call.args) == 1 and call.args[0] is node
+    if call.func.id == "isinstance":
+        return (
+            len(call.args) == 2
+            and call.args[0] is node
+            and isinstance(call.args[1], ast.Name)
+            and call.args[1].id == "bool"
+        )
+    return False
+
+
+def _bound(node: ast.AST) -> list[tuple[str, str]]:
+    """Every name `node` binds, with how: the one list each rebinding check
+    reads, so a new binding form is added once rather than per pinned name."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [(node.name, "a def/class")]
+    if isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+        return [(node.name, "a type parameter")]
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+        return [(node.name, "a match")]
+    if isinstance(node, ast.MatchMapping) and node.rest is not None:
+        return [(node.rest, "a match")]
+    if isinstance(node, ast.ExceptHandler) and node.name is not None:
+        return [(node.name, "an except")]
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [((a.asname or a.name).split(".")[0], "an import") for a in node.names]
+    if isinstance(node, ast.arg):
+        return [(node.arg, "a parameter")]
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return [(n, f"a {type(node).__name__.lower()} declaration") for n in node.names]
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [(node.id, "an assignment or del")]
+    return []
+
+
+def _is_reviewed_callee_binding(node: ast.AST, name: str) -> bool:
+    """Whether `node` is the one reviewed way to bind a `_KEYWORD_CALLEES`
+    name: an undecorated `def _start(..., *, accept_rejections, ...)` with
+    no `**kwargs`
+    (`resume`'s own), or `ResumeInvocationRow` imported under its own name
+    from the journal."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (
+            name == "_start"
+            and not node.decorator_list
+            and node.args.kwarg is None
+            and any(a.arg == FLAG for a in node.args.kwonlyargs)
+        )
+    if isinstance(node, ast.ImportFrom):
+        alias = next(a for a in node.names if (a.asname or a.name) == name)
+        return (
+            name == "ResumeInvocationRow"
+            and alias.asname is None
+            and node.level == 0
+            and node.module == JOURNAL_MODULE
+        )
+    return False
+
+
+def _root_name(node: ast.expr) -> str | None:
+    """The `Name` an attribute or subscript chain starts from
+    (`ResumeInvocationRow` for `ResumeInvocationRow.__init__.__code__`), or
+    `None` when it starts from anything else."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _is_unpacked(node: ast.expr, parents: dict[int, ast.AST]) -> bool:
+    """Whether `node` is the source of a `**` unpacking, in a dict display
+    (`{**x}`) or a call (`f(**x)`): a read of its items, never a write."""
+    parent = parents.get(id(node))
+    if isinstance(parent, ast.Dict):
+        return any(k is None and v is node for k, v in zip(parent.keys, parent.values, strict=True))
+    return isinstance(parent, ast.keyword) and parent.arg is None and parent.value is node
 
 
 def misuses(tree: ast.Module) -> list[str]:
-    """Rule 3: a keyword passing anything but the caller's own flag, a parameter
-    that is not keyword-only (so no positional argument can feed it), a binding
-    other than such a parameter or a field, a positional pass, or a whole-string
-    key."""
+    """Rule 3, fail closed: a parameter that is not keyword-only (so no
+    positional argument can feed it), a binding other than a keyword-only
+    parameter or a bare annotated field, a PEP 695 type parameter named for
+    it, a whole-string spelling, any attribute named for it, a keyword
+    passing anything but the caller's own flag under `accept_rejections=`,
+    or passing it to a callee outside `_KEYWORD_CALLEES` (or to a class
+    keyword), any rebinding of `isinstance`, `type` or `bool` (the
+    type-check exemption below only holds if those names are still the
+    builtins) or any way of reaching the builtins or the module namespace
+    to patch them, a rebinding of a reviewed callee in a module that passes
+    the keyword, or (the catch-all) any `Load` of the bare name that is not
+    the value of such a keyword, the checked argument of `resume`'s own
+    `isinstance`/`type` call, or the whole `test` of an `if`. Anything else
+    - smuggled through a display, a multiplied or generator expression, an
+    `IfExp`, an alias bound first, another keyword, `del`, or laundered
+    through any `**kwargs` collector - is reported rather than
+    special-cased."""
     fields = {
         id(node.target)
         for node in ast.walk(tree)
         if isinstance(node, ast.AnnAssign) and node.value is None
     }
+    passes_keyword = any(
+        isinstance(node, ast.keyword) and node.arg == FLAG for node in ast.walk(tree)
+    )
+    pinned = _TYPE_CHECKS | _REACH | (_KEYWORD_CALLEES if passes_keyword else frozenset())
+    parents = _parent_map(tree)
     found = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.arguments):
+        for name, how in _bound(node):
+            if name in pinned and not (
+                name in _KEYWORD_CALLEES and _is_reviewed_callee_binding(node, name)
+            ):
+                found.append(f"{getattr(node, 'lineno', 0)}: rebinds {name} in {how}")
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            found.append(f"{node.lineno}: a star import can rebind {', '.join(sorted(pinned))}")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (node.module if isinstance(node, ast.ImportFrom) else alias.name) == "builtins"
+            for alias in node.names
+        ):
+            found.append(f"{node.lineno}: imports from builtins")
+        elif (
+            isinstance(node, (ast.Attribute, ast.Subscript))
+            and not isinstance(node.ctx, ast.Load)
+            and (
+                (isinstance(node, ast.Attribute) and node.attr in _TYPE_CHECKS | _KEYWORD_CALLEES)
+                or _root_name(node) in _TYPE_CHECKS | _KEYWORD_CALLEES
+            )
+        ):
+            found.append(f"{node.lineno}: patches {ast.unparse(node)}")
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr in _REACH_ATTRIBUTES
+            and not (node.attr == "__dict__" and _is_unpacked(node, parents))
+        ):
+            found.append(f"{node.lineno}: reaches a namespace through {ast.unparse(node)}")
+        elif isinstance(node, ast.Name) and node.id in _REACH:
+            found.append(f"{node.lineno}: reaches the namespace through {node.id}")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "vars"
+            and not node.args
+        ):
+            found.append(f"{node.lineno}: reaches the namespace through vars()")
+        elif isinstance(node, ast.Attribute) and node.attr == FLAG:
+            found.append(f"{node.lineno}: names the flag as an attribute: {ast.unparse(node)}")
+        elif isinstance(node, ast.arguments):
             loose = [*node.posonlyargs, *node.args, node.vararg, node.kwarg]
             found += [
                 f"{a.lineno}: not keyword-only" for a in loose if a is not None and a.arg == FLAG
@@ -160,6 +360,8 @@ def misuses(tree: ast.Module) -> list[str]:
             and node.name == FLAG
         ):
             found.append(f"{node.lineno}: binds the name in a def/class")
+        elif isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) and node.name == FLAG:
+            found.append(f"{node.lineno}: binds the name in a type parameter")
         elif (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == FLAG) or (
             isinstance(node, ast.MatchMapping) and node.rest == FLAG
         ):
@@ -179,26 +381,37 @@ def misuses(tree: ast.Module) -> list[str]:
         ):
             found.append(f"{node.value.lineno}: passes {ast.unparse(node.value)}")
         elif (
-            isinstance(node, ast.Name)
-            and node.id == FLAG
-            and isinstance(node.ctx, ast.Store)
-            and id(node) not in fields
-        ):
-            found.append(f"{node.lineno}: binds the name")
-        elif isinstance(node, ast.Call) and not (
-            isinstance(node.func, ast.Name) and node.func.id in _TYPE_CHECKS
-        ):
-            for arg in node.args:
-                inner = arg.value if isinstance(arg, ast.Starred) else arg
-                for candidate in _unwrap_display(inner):
-                    if isinstance(candidate, ast.Name) and candidate.id == FLAG:
-                        found.append(f"{candidate.lineno}: passed positionally")
-        elif (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
             and node.value.strip() in SPELLINGS
         ):
             found.append(f"{node.lineno}: spelt as a whole string")
+        elif isinstance(node, ast.Name) and node.id == FLAG:
+            if isinstance(node.ctx, ast.Store):
+                if id(node) not in fields:
+                    found.append(f"{node.lineno}: binds the name")
+            elif isinstance(node.ctx, ast.Load):
+                parent = parents.get(id(node))
+                keyword_callee = (
+                    parents.get(id(parent)) if isinstance(parent, ast.keyword) else None
+                )
+                safe = (
+                    (
+                        isinstance(parent, ast.keyword)
+                        and parent.arg == FLAG
+                        and parent.value is node
+                        and isinstance(keyword_callee, ast.Call)
+                        and isinstance(keyword_callee.func, ast.Name)
+                        and keyword_callee.func.id in _KEYWORD_CALLEES
+                    )
+                    or (isinstance(parent, ast.Call) and _is_type_check(parent, node))
+                    or (isinstance(parent, ast.If) and parent.test is node)
+                )
+                if not safe:
+                    where = ast.unparse(parent) if parent is not None else ast.unparse(node)
+                    found.append(f"{node.lineno}: unclassified use: {where}")
+            else:
+                found.append(f"{node.lineno}: deletes the name")
     return found
 
 
@@ -280,6 +493,76 @@ Rule = Callable[[ast.Module], object]
         ("class accept_rejections: ...", misuses),
         ("_start(c, *[accept_rejections])", misuses),
         ("_start(c, *(accept_rejections,))", misuses),
+        ("_start(c, *{accept_rejections: 0})", misuses),
+        ("_start(c, **{accept_rejections: 0})", misuses),
+        ("_start(c, *{accept_rejections})", misuses),
+        ("_start(c, *([accept_rejections] * 1))", misuses),
+        ('_start(c, *(accept_rejections for _ in "x"))', misuses),
+        ("_start(c, accept_rejections if x else y)", misuses),
+        ("_start(c, *([accept_rejections] if x else []))", misuses),
+        ("x = [accept_rejections]\n_start(*x)", misuses),
+        ("_start(c, other=accept_rejections)", misuses),
+        ("del accept_rejections", misuses),
+        ("def f[accept_rejections](): ...", misuses),
+        ("def f[accept_rejections](): ...", mentions),
+        ("class C[**accept_rejections]: ...", misuses),
+        ("class C[**accept_rejections]: ...", mentions),
+        ("type A[*accept_rejections] = int", misuses),
+        ("type A[*accept_rejections] = int", mentions),
+        ("isinstance(x, accept_rejections)", misuses),
+        ("type('X', (), accept_rejections)", misuses),
+        ("isinstance(accept_rejections, bool, extra=1)", misuses),
+        ("from x import _start as isinstance\nisinstance(accept_rejections, c)", misuses),
+        ("_start(c, *dict(accept_rejections=accept_rejections).values())", misuses),
+        ("from m import *\nisinstance(accept_rejections, bool)", misuses),
+        ("isinstance(accept_rejections, Spy)", misuses),
+        ("bool = Spy\nisinstance(accept_rejections, bool)", misuses),
+        ("from m import Spy as bool\nisinstance(accept_rejections, bool)", misuses),
+        # #696: any `**kwargs` collector other than a reviewed callee.
+        ("d = dict\n_start(c, *d(accept_rejections=accept_rejections).values())", misuses),
+        ("_start(c, *OrderedDict(accept_rejections=accept_rejections).values())", misuses),
+        (
+            "_start(c, *vars(SimpleNamespace(accept_rejections=accept_rejections)).values())",
+            misuses,
+        ),
+        (
+            "def kw(**k):\n    return k\n_start(c, *kw(accept_rejections=accept_rejections))",
+            misuses,
+        ),
+        ("class C(accept_rejections=accept_rejections): ...", misuses),
+        ("_start = dict\n_start(accept_rejections=accept_rejections)", misuses),
+        ("from m import dict as _start\n_start(accept_rejections=accept_rejections)", misuses),
+        ("def _start(**kw): ...\n_start(accept_rejections=accept_rejections)", misuses),
+        (
+            "from m import ResumeInvocationRow\n"
+            "ResumeInvocationRow(accept_rejections=accept_rejections)",
+            misuses,
+        ),
+        ("resume._start = dict", misuses),
+        # #696: the flag as an attribute, in any position.
+        ("_start(c, row.accept_rejections)", misuses),
+        ("row.accept_rejections = True", misuses),
+        # #696: patching the builtins or the module namespace.
+        ("import builtins\nbuiltins.isinstance = _start", misuses),
+        ("__builtins__['bool'] = Spy", misuses),
+        ("globals()['isinstance'] = _start", misuses),
+        ("locals()", misuses),
+        ("vars()['bool'] = Spy", misuses),
+        ("b = __import__('builtins')", misuses),
+        ("import builtins as b\nsetattr(b, 'bool', Spy)", misuses),
+        ("from builtins import isinstance as i", misuses),
+        ("import os\nos.__builtins__['isinstance'] = _start", misuses),
+        ("_start.__globals__['bool'] = Spy", misuses),
+        ("resume.__dict__['isinstance'] = _start", misuses),
+        ("_start.__code__ = f.__code__", misuses),
+        ("ResumeInvocationRow.__init__ = spy", misuses),
+        ("ResumeInvocationRow.__init__.__code__ = g", misuses),
+        ("_start.__kwdefaults__['x'] = 1", misuses),
+        (
+            "@spy\ndef _start(c, *, accept_rejections): ...\n"
+            "_start(c, accept_rejections=accept_rejections)",
+            misuses,
+        ),
         ("def accept_rejections(): ...", mentions),
         ("async def accept_rejections(): ...", mentions),
         ("class accept_rejections: ...", mentions),
@@ -297,8 +580,15 @@ def test_each_rule_refuses_a_sample_that_breaks_it(source: str, rule: Rule) -> N
 
 def test_the_rules_let_the_callers_own_flag_through() -> None:
     allowed = ast.parse(
+        "from tradepartner.store.journal import ResumeInvocationRow\n"
+        "def _start(c, *, accept_rejections: bool): ...\n"
         "def resume(*, accept_rejections: bool):\n"
+        "    if not isinstance(accept_rejections, bool):\n"
+        "        raise TypeError(f'{type(accept_rejections).__name__}')\n"
         "    _start(c, accept_rejections=accept_rejections)\n"
+        "    ResumeInvocationRow(accept_rejections=accept_rejections)\n"
+        "    if accept_rejections:\n"
+        "        pass\n"
         "class Row:\n"
         "    accept_rejections: bool\n"
     )
