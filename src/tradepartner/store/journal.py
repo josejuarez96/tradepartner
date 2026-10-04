@@ -52,7 +52,11 @@ from typing import Any, ClassVar, Protocol
 import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
-from tradepartner.store.schema import JOURNAL_TABLE_NAMES, LATER_JOURNAL_TABLE_NAMES
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_TABLE_NAMES,
+    LATER_JOURNAL_TABLE_NAMES,
+)
 
 
 class JournalNotInitialised(RuntimeError):
@@ -872,7 +876,7 @@ class OverrideWithConsumption:
     def consumed(self) -> bool:
         """True once what its kind consumes cites it: an `engaged` `kill_switch` row
         for `engage_kill_switch`, a decision for the name kinds."""
-        if self.override.kind == "engage_kill_switch":
+        if self.override.kind == ENGAGE_KILL_SWITCH_KIND:
             return bool(self.kill_switch_event_ids)
         return bool(self.decision_ids)
 
@@ -1209,7 +1213,7 @@ def unconsumed_kill_switch_overrides(
     return [
         o.override
         for o in overrides_for(conn, window_id)
-        if o.override.kind == "engage_kill_switch" and not o.kill_switch_event_ids
+        if o.override.kind == ENGAGE_KILL_SWITCH_KIND and not o.kill_switch_event_ids
     ]
 
 

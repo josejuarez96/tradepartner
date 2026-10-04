@@ -40,7 +40,16 @@ RED_STEPS = ("Hygiene", "Fragments", "Lint", "Format", "Types", "Tests")
 INCONCLUSIVE_SECONDS = 60
 #: Every train comment's first line starts with this.
 COMMENT_PREFIX = "merge-train:"
-OUTCOMES = ("TESTED", "MERGED", "DROPPED", "CULPRIT", "HELD", "INCONCLUSIVE", "INELIGIBLE")
+OUTCOMES = (
+    "TESTED",
+    "MERGED",
+    "UNCONFIRMED",
+    "DROPPED",
+    "CULPRIT",
+    "HELD",
+    "INCONCLUSIVE",
+    "INELIGIBLE",
+)
 PR_STATES = ("accepted", "dropped", "already_merged", "ineligible")
 
 _TRAIN_LINE = re.compile(r"^merge-train: (?P<outcome>[A-Z]+) batch (?P<batch>\S+)\s*$")
@@ -481,6 +490,7 @@ class Runner(Protocol):
     def tree_of_ref(self, ref: str) -> str: ...
     def parent_of(self, sha: str) -> str: ...
     def merge_pr(self, number: int, head: str) -> MergeAttempt: ...
+    def delete_merge_train_refs(self) -> int: ...
 
 
 # -- the record directory and worktree (spec Data / interfaces) -------------------------
@@ -1085,6 +1095,7 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
         # position and reason before it propagates - a stopped merge must always leave a
         # trail, never just an exception.
         attempted_merge = False  # #642, follow-up 9: what the exception reason may claim
+        verified = False  # #694: the landing passed the parent and tree checks
         try:
             fresh = r.pr_data(entry.number)
             if fresh.pr.head != entry.head or (
@@ -1126,8 +1137,23 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
                 # concurrent hand merge) must never be reported to the PR as `MERGED` - the
                 # comment is posted only once the landing is confirmed, below.
                 check = "parent" if not parent_ok else "tree"  # SHOULD FIX 11: name which
-                _stop(f"the landed {check} for #{entry.number} does not match tree_{pos}")
+                mismatch = f"the landed {check} for #{entry.number} does not match tree_{pos}"
+                _stop(mismatch)
+                # #694: the PR's code did land, so its thread must not go silent either -
+                # `UNCONFIRMED` (never `MERGED`) says the landing happened but failed the
+                # check. Posted after the stop is saved; a failed post is only reported, so
+                # the stop still ends cleanly and posts `HELD` on the rest.
+                try:
+                    _post(
+                        r,
+                        say,
+                        entry.number,
+                        comment("UNCONFIRMED", bid, main_sha=new_main, reason=mismatch),
+                    )
+                except Exception as exc:
+                    say(f"could not post UNCONFIRMED on #{entry.number}: {exc}")
                 break
+            verified = True
             _post(r, say, entry.number, comment("MERGED", bid, main_sha=new_main))
         except Exception:
             # pass-2 review, SHOULD FIX 1: re-read `main_sha()` one more time, best-effort,
@@ -1142,12 +1168,21 @@ def _run_merge_locked(r: Runner, bid: str, *, resume: bool, say: Callable[[str],
             # #642, follow-up 9: the reason must say what actually happened - `pr_data` or
             # the eligibility re-read can raise before any merge was even attempted for this
             # PR, and that must never be reported as an unverified merge.
-            when = "after gh pr merge" if attempted_merge else "before attempting to merge it"
-            _stop(
-                f"could not verify #{entry.number}'s landing {when}; "
-                "reconcile main by hand and rerun build",
-                extra_sha=extra,
-            )
+            if verified:
+                # #694: the landing was verified and recorded; only posting `MERGED` failed,
+                # so the reason must not claim the landing is unverified. `--resume` goes on
+                # from the next PR (the position derives from `merged_so_far`).
+                reason = (
+                    f"#{entry.number} landed and was verified, but posting its MERGED "
+                    "comment failed; post it by hand, then run merge --resume"
+                )
+            else:
+                when = "after gh pr merge" if attempted_merge else "before attempting to merge it"
+                reason = (
+                    f"could not verify #{entry.number}'s landing {when}; "
+                    "reconcile main by hand and rerun build"
+                )
+            _stop(reason, extra_sha=extra)
             raise
 
     # SHOULD FIX 3/5: "stopped" means either an in-loop failure (`broke`, however far along -
@@ -1216,7 +1251,9 @@ def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
     """`prune`: remove leftover worktrees and delete `train/*` branches of finished batches.
     A build still in flight (`outcome` `None` or `inconclusive`, or a `red` run whose bisect
     hasn't concluded) is left alone - `build --resume` or another window may still need its
-    worktree and branches. A batch already pruned is not retried. Takes the same lock
+    worktree and branches. A batch already pruned is not retried. The local
+    `refs/merge-train/pr-*` refs `pr_data` fetches into are deleted too (#694), but only
+    when no build is in flight. Takes the same lock
     `merge` uses (#642, follow-up 8): saving `record.pruned` must never interleave with a
     concurrent `merge` reading or writing that same record."""
     with _merge_lock():
@@ -1226,15 +1263,18 @@ def run_prune(r: Runner, say: Callable[[str], None] = print) -> None:
 def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
     report = say
     say = lambda msg: report(_redact(msg))  # noqa: E731 - redact before anything is shown
+    # #694: `_merge_lock` has already created `record_dir()`, so there is no "no directory"
+    # case; "nothing to prune" is decided at the end, from what was actually found.
     rdir = record_dir()
-    if not rdir.exists():
-        say("nothing to prune")
-        return
     records: dict[str, Record] = {}
     for path in sorted(rdir.glob("*.json")):
         record = Record.from_json(path.read_text())
         records[record.batch_id] = record
-    for wpath in sorted(rdir.glob("worktree-*")):
+    worktrees = sorted(rdir.glob("worktree-*"))
+    # a build with no record yet, or one not finished, may still be reading PRs (and so
+    # fetching into `refs/merge-train/pr-*`): the refs are then left alone (#694).
+    in_flight = any(not _build_finished(rec) for rec in records.values())
+    for wpath in worktrees:
         bid = wpath.name.removeprefix("worktree-")
         record = records.get(bid)
         # #642, follow-up 6: `build` creates the worktree before it can save the batch's
@@ -1243,6 +1283,7 @@ def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
         # as an unfinished build's own record would be skipped, rather than guess it is
         # orphaned.
         if record is None:
+            in_flight = True
             say(
                 f"skipping worktree {wpath}: no batch record (a build may be in flight; "
                 "remove by hand if not)"
@@ -1272,6 +1313,15 @@ def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
                 say(f"could not delete branch {branch}; remove it by hand")
         record.pruned = ok
         _save(record)
+    removed = 0
+    if in_flight:
+        say("keeping refs/merge-train/* refs: a build may still be in flight")
+    else:
+        removed = r.delete_merge_train_refs()
+        if removed:
+            say(f"deleted {removed} refs/merge-train/* ref(s)")
+    if not records and not worktrees and not removed:
+        say("nothing to prune")
 
 
 # -- the real runner ------------------------------------------------------------------------
@@ -1376,11 +1426,18 @@ class ShellRunner:
         # PR) would otherwise overwrite it between this fetch and the read below.
         private_ref = f"refs/merge-train/pr-{number}"
         refspec = f"+refs/pull/{number}/head:{private_ref}"
-        self._git(self.root, "fetch", "-q", "origin", refspec, check=False)
+        fetch = self._git(self.root, "fetch", "-q", "origin", refspec, check=False)
         # #524, follow-up 3: a push to the PR between reading its metadata and this fetch
         # would otherwise compute the diff against a stale head; fail closed instead.
         fetched = self._git(self.root, "rev-parse", private_ref, check=False)
         fetched_sha = fetched.stdout.strip() if fetched.returncode == 0 else ""
+        if fetch.returncode == 0 and not fetched_sha:
+            # #694: `prune` deletes these refs; one gone right after a successful fetch must
+            # never silently skip the stale-head check below. Fail closed.
+            raise StoppedError(
+                f"PR #{number}: {private_ref} vanished right after fetching it "
+                "(a concurrent prune?); retry"
+            )
         if fetched_sha and fetched_sha != pr.head:
             raise StoppedError(
                 f"PR #{number}'s head changed between reading it ({pr.head[:7]}) and "
@@ -1453,6 +1510,15 @@ class ShellRunner:
     def tree_of_ref(self, ref: str) -> str:
         return self._git_out(self.root, "rev-parse", f"{ref}^{{tree}}")
 
+    def delete_merge_train_refs(self) -> int:
+        """Delete this clone's local `refs/merge-train/*` refs (`pr_data`'s private fetch
+        targets, #694); never any other ref. Returns how many were deleted."""
+        out = self._git_out(self.root, "for-each-ref", "--format=%(refname)", "refs/merge-train/")
+        refs = [ref for ref in out.splitlines() if ref.startswith("refs/merge-train/")]
+        for ref in refs:
+            self._git_out(self.root, "update-ref", "-d", ref)
+        return len(refs)
+
     def parent_of(self, sha: str) -> str:
         result = self._git(self.root, "rev-parse", f"{sha}^", check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
@@ -1492,6 +1558,8 @@ class ShellRunner:
             "changes requested",
             "protected branch",
             "approving review",
+            "still a draft",  # #694: a draft PR never becomes mergeable by waiting
+            "merge queue",  # #694: a merge-queue requirement neither
         )
         if any(phrase in low for phrase in permanent_phrases):
             return MergeAttempt("failed", text)

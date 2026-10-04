@@ -529,7 +529,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
         prices = planning.reference_prices(conn, session, names, actions)
         held = sorted(name for name, quantity in ledger.positions.items() if quantity > 0)
         ends = (
-            _current(
+            planning.current_listings(
                 listing_ends_as_of(conn, cut, context.settings, held), previous_session(session)
             )
             if held
@@ -1854,29 +1854,17 @@ def _rebalance_kind(
     )
 
 
-def _current(listings: pl.DataFrame, day: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from` on or before `day`."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        valid_from = row["valid_from"]
-        if valid_from is not None and valid_from > day:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or (
-            valid_from is not None
-            and (held["valid_from"] is None or valid_from > held["valid_from"])
-        ):
-            current[row["security_id"]] = row
-    return current
-
-
 def _current_tickers(listings: pl.DataFrame, day: date) -> dict[str, str]:
-    return {sid: row["ticker"] for sid, row in _current(listings, day).items()}
+    return {sid: row["ticker"] for sid, row in planning.current_listings(listings, day).items()}
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
     """The securities whose listing current on `day` has `ticker`."""
-    return sorted(sid for sid, row in _current(listings, day).items() if row["ticker"] == ticker)
+    return sorted(
+        sid
+        for sid, row in planning.current_listings(listings, day).items()
+        if row["ticker"] == ticker
+    )
 
 
 def _mark_equity(rows: Sequence[PositionDailyRow], day: date) -> float | None:

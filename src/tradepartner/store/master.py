@@ -28,7 +28,10 @@ page is read as a new class: a documented limit, not a guess.
 (ticker, exchange) pair it did not show on its previous cover page, so a
 ticker change or an exchange transfer adds a row and a repeated cover page
 does not. `valid_from` is the XNYS session on or after the acceptance's
-New York date; `known_at` is the acceptance.
+New York date; `known_at` is the acceptance. A class shows a pair once per
+page: when a page lists one class's pair under two titles (a filer's
+duplicate, e.g. an ADS and its underlying shares, or two notes given one
+ticker), the row takes the first item's title.
 
 **Snapshot listings** (pre-~2019 names have no cover page). A companies
 snapshot entry attaches to the class trading under its ticker on the cover
@@ -248,8 +251,9 @@ class _Builder:
                 claimed[cls.security_id] = item.ticker
                 cls.titles.add(_norm_title(item.title))
                 pair = (item.ticker, item.exchange)
+                shown_already = pair in shown[cls.security_id]
                 shown[cls.security_id].add(pair)
-                if pair not in cls.pairs:
+                if pair not in cls.pairs and not shown_already:
                     self.listing(cls.security_id, *pair, item.title, valid_from, known_at)
                     if cls.first_listing is None:
                         cls.first_listing = (item.ticker, item.exchange, valid_from, known_at)
