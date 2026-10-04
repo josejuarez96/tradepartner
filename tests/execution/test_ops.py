@@ -1015,19 +1015,23 @@ def test_marks_read_only_the_latest_marked_session(
 def test_marks_filter_does_not_depend_on_the_trading_calendar(
     journal_settings: Settings, open_window: PaperWindowRow, seeded: dict[str, int]
 ) -> None:
-    """The latest marked session is a Monday (2026-10-05); a stray mark row
-    sits on the Saturday before it (2026-10-03), between
-    `previous_session(last_session)` (the preceding Friday, 2026-10-02) and
-    `last_session` itself. The old filter, `after=previous_session(
-    last_session)`, reads every row with `session > Friday`, which catches
-    the Saturday row too, since the calendar has no session that weekend to
-    keep the two apart (#652); the fix must still read only the Monday row,
-    whatever mark the calendar never scheduled sits in between."""
+    """The latest marked session is the first session after the seeded
+    marks' `_S_MINUS_1` that follows a non-session date (a weekend or a
+    holiday); a stray mark row sits on the calendar day before it, between
+    `previous_session(last_session)` and `last_session` itself. The old
+    filter, `after=previous_session(last_session)`, reads every row with
+    `session > previous_session(last_session)`, which catches the stray row
+    too, since the calendar has no session that day to keep the two apart
+    (#652); the fix must still read only the last session's row, whatever
+    mark the calendar never scheduled sits in between. Dates derive from
+    `_S_MINUS_1` so the test does not depend on the day it runs."""
     window_id = open_window.window_id
     assert window_id is not None
-    last_session = date(2026, 10, 5)  # a Monday
-    stray_session = date(2026, 10, 3)  # the Saturday before it, not a session
-    assert previous_session(last_session) == date(2026, 10, 2)  # the Friday before
+    last_session = next_session(_S_MINUS_1)
+    while last_session - previous_session(last_session) <= timedelta(days=1):
+        last_session = next_session(last_session)
+    stray_session = last_session - timedelta(days=1)  # not a session
+    assert previous_session(last_session) < stray_session < last_session
 
     with open_for_write(journal_settings) as conn:
         append(
