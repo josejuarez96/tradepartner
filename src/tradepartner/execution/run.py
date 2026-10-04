@@ -704,10 +704,19 @@ def _optional_prices(
     names: Collection[str],
     actions: pl.DataFrame,
 ) -> tuple[dict[str, float], dict[str, str]]:
-    """The reference prices of `names`, each read on its own so one name with
-    no bar at close(S-1) does not stop the rest; a name that fails lands in
-    the second map with its `ValueError` message, which `_lookup` raises only
-    if something reads that name's price (#685, as `wrapper._optional_prices`)."""
+    """The reference prices of `names`: one batched `reference_prices` read
+    (#712), and only when that raises, each name read on its own so one name
+    with no bar at close(S-1) does not stop the rest; a name that fails lands
+    in the second map with its `ValueError` message, which `_lookup` raises
+    only if something reads that name's price (#685, as
+    `wrapper._optional_prices`). `reference_prices` prices each name from its
+    own bars and actions, so both paths give the same rows."""
+    if not names:
+        return {}, {}
+    try:
+        return planning.reference_prices(conn, session, names, actions), {}
+    except ValueError:
+        pass
     priced: dict[str, float] = {}
     unpriced: dict[str, str] = {}
     for security_id in sorted(names):
