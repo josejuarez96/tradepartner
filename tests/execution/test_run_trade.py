@@ -532,7 +532,7 @@ def test_a_catch_up_uses_its_own_session_ids_and_applies_its_split_once(
     held = env.held()["TRNS"]
     split(env, "SEC_TRANSFER", catch_up, 2.0, at(f_1, 19, 0))
     # The broker applies the split before the catch-up session's open.
-    env.fake._net_quantity["TRNS"] *= 2  # the fake has no corporate actions
+    env.fake.apply_split("TRNS", 2.0)  # the fake has no corporate actions
     close = env.query(
         "SELECT close FROM prices_daily WHERE security_id = 'SEC_TRANSFER' AND session = ?",
         [f_1],
