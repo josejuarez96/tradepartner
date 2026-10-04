@@ -222,6 +222,16 @@ class Env:
         )
         return {r[0]: float(r[1]) for r in rows}
 
+    def expected_equity(self, cash: float, quantities: dict[str, float], session: date) -> float:
+        """`cash` plus each name's `quantities[name]` times its own raw close
+        on `session`, independent of any value the run itself wrote."""
+        equity = cash
+        for name, quantity in quantities.items():
+            close = self.close(name, session)
+            assert close is not None
+            equity += quantity * close
+        return equity
+
     def rebalance_events(self) -> list[tuple[date, str, str | None, int]]:
         return [
             (r[0], r[1], r[2], r[3])
@@ -410,12 +420,7 @@ def test_a_split_on_the_session_marks_pre_split_and_reconciles_doubled(
     assert len(cash_values) == 1
     cash = cash_values.pop()
     equity = cash + sum(r[4] for r in rows if r[1] is not None)
-    expected_equity = cash
-    for name, quantity in held.items():
-        close = env.close(name, F_0)
-        assert close is not None
-        expected_equity += quantity * close
-    assert equity == pytest.approx(expected_equity)
+    assert equity == pytest.approx(env.expected_equity(cash, held, F_0))
     assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True)
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
     assert env.alerts("missed_run") == []  # F_0 had its run
@@ -462,13 +467,8 @@ def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
     cash = cash_values.pop()
     for day, quantity in expected.items():
         equity = cash + sum(r[4] for r in rows if r[0] == day and r[1] is not None)
-        expected_equity = cash
-        for name, other_quantity in held_all.items():
-            close = env.close(name, day)
-            assert close is not None
-            held_quantity = quantity if name == "SEC_TRANSFER" else other_quantity
-            expected_equity += held_quantity * close
-        assert equity == pytest.approx(expected_equity), day
+        day_quantities = {**held_all, "SEC_TRANSFER": quantity}
+        assert equity == pytest.approx(env.expected_equity(cash, day_quantities, day)), day
         assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True), day
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
 
