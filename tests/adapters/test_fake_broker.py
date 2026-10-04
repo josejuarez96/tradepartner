@@ -903,3 +903,55 @@ def test_non_utc_clock_is_normalized_to_utc() -> None:
     assert order.submitted_at == T0
     assert order.submitted_at.tzinfo is UTC
     assert broker.fills()[0].filled_at.tzinfo is UTC
+
+
+# --- apply_split (#632) -----------------------------------------------------
+
+
+def test_apply_split_doubles_the_position_and_marked_value() -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", quantity=10))
+    before = broker.account()
+
+    broker.apply_split("AAPL", 2.0)
+
+    assert broker.positions()["AAPL"].quantity == 20
+    after = broker.account()
+    assert after.cash == before.cash
+    assert after.equity == pytest.approx(before.equity + 10 * PRICES["AAPL"])
+
+
+def test_apply_split_leaves_cash_unchanged_and_logs_no_call() -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", quantity=10))
+    calls_before = broker.calls
+
+    broker.apply_split("AAPL", 2.0)
+
+    assert broker.calls == calls_before  # apply_split is not a `Broker` call
+    assert broker.account().cash == 100_000.0 - 10 * PRICES["AAPL"]
+
+
+@pytest.mark.parametrize("bad_ratio", [0, -2.0, float("nan"), float("inf")])
+def test_apply_split_rejects_a_non_positive_or_non_finite_ratio(bad_ratio: float) -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", quantity=10))
+
+    with pytest.raises(ValueError, match="ratio"):
+        broker.apply_split("AAPL", bad_ratio)
+
+
+def test_apply_split_of_an_unheld_symbol_raises() -> None:
+    broker, _ = make_broker()
+
+    with pytest.raises(ValueError, match="AAPL"):
+        broker.apply_split("AAPL", 2.0)
+
+
+def test_apply_split_of_a_netted_to_zero_symbol_raises() -> None:
+    broker, _ = make_broker()
+    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", quantity=10))
+    broker.submit(make_request(client_order_id="co-2", symbol="AAPL", side=Side.SELL, quantity=10))
+
+    with pytest.raises(ValueError, match="AAPL"):
+        broker.apply_split("AAPL", 2.0)
