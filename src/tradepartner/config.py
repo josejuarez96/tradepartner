@@ -240,6 +240,12 @@ class AlpacaConfig(BaseModel):
     processed 2021-01-25; #101 probe 1). `AlpacaPriceSource` asks for actions processed up
     to this many calendar days after the end of an ex-date window, then filters on ex-date.
 
+    `registrant_quiet_days`: `ListingResolver` rule 6 (#793) takes a ticker's holder to
+    have left it the day after its company's last cover-page share count once more than
+    this many calendar days have passed by the run with none. Since 2022 the store's
+    gaps between one company's share-count filings are 91 days at the median, 124 at the
+    90th and 168 at the 99th percentile, so 180 marks a missed filing.
+
     Frozen and closed (T47, safety-reviewer): the `paper` guard below runs at
     construction, so an attribute assignment after the fact must be impossible too, and a
     misspelt broker fact (`quantity_decimals`) must fail rather than stay unset silently.
@@ -251,6 +257,7 @@ class AlpacaConfig(BaseModel):
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
+    registrant_quiet_days: int = Field(default=180, ge=1)
     # --- Phase 4 trading keys (docs/specs/paper-trading.md req 2, T47) ---
     # Guarded: the trading client is constructed with `paper=True` on every path
     # and a `false` here is refused, even from the environment (validator below).

@@ -92,7 +92,7 @@ from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
-from tradepartner.store.delistings import delistings_as_of
+from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -108,7 +108,7 @@ Launcher = Callable[[list[str]], int]
 class StorePriceSource(PriceSource):
     """An `AlpacaPriceSource` whose `ListingResolver` is built from the
     store's listings known at the first fetch, not when the run starts,
-    with the `registrant_evidence` of the facts and delistings known then.
+    with the `registrant_evidence` of the facts and listing ends known then.
 
     `ingest` fetches prices only after the EDGAR chunk has committed, so on a
     first run the listings the resolver needs do not exist until then. The
@@ -145,7 +145,9 @@ class StorePriceSource(PriceSource):
                 listings = listings_as_of(conn, at)
                 evidence = registrant_evidence(  # #793: who still trades under a ticker
                     facts_as_of(conn, at).iter_rows(named=True),
-                    delistings_as_of(conn, at).iter_rows(named=True),
+                    listing_ends_as_of(conn, at, self._settings).iter_rows(named=True),
+                    as_of=at.date(),
+                    quiet_after_days=self._settings.alpaca.registrant_quiet_days,
                 )
             self._inner = AlpacaPriceSource(
                 ListingResolver(listings.iter_rows(named=True), evidence),
