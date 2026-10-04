@@ -9,9 +9,10 @@ phases" criterion's resume half, the fill-lag bound, the chain criterion, the
 cent-rounding tolerance, and the alert-kind suite (spec req 11): eleven of
 the plan line's fifteen kinds with a real trigger (`lot_ledger` through the
 run's own lot-ledger error path); `reconciliation`, `rejection_cap` and
-`skip_cap` became real once #667 fixed #644, and `kill_switch` stays `xfail`
-until #741 (#677/#698 covered only the skipped_kill_switch path, not a
-halt's own engagement). `paper resume` releasing while the window holds a marked position
+`skip_cap` became real once #667 fixed #644, and a halt's own engagement
+writes one `halted` alert and no `kill_switch` alert (#741, owner decision
+(a): `kill_switch` alerts belong to skipped_kill_switch runs, #677/#698).
+`paper resume` releasing while the window holds a marked position
 (#653, found while building the chain criterion) is fixed by #664 and tested
 here. (#650, found the same way,
 was regraded to low-priority hardening reproducible only with a frozen test
