@@ -18,7 +18,7 @@ Everything a build window types, in order of use. The rules behind each line fol
 | `uv run python scripts/ready_pr.py <pr> --timeout-min 45` (`/ready-pr`) | When the task is done: merges `main` in, runs the checks, waits for CI, marks the PR ready. Never merges. |
 | `uv run python scripts/merge_train.py build [PR ...] [--order N [N ...]]` | Only when the owner asks for a train, by any window or the orchestrator: tests the ready PRs together on `train/<batch id>`, posts a `merge-train:` comment on each. Merges nothing. `--resume <batch id>` re-attaches to an unfinished batch (after an inconclusive run). Flags in full: [git-workflow.md](git-workflow.md#the-merge-train). |
 | `uv run python scripts/merge_train.py merge <batch id>` | Only on the owner's "merge train `<batch id>`", by him or the one window he says it to, on the machine that holds the record: lands the batch's longest green prefix, nothing else. This exact spelling is the one `.claude/settings.json` prompts on (#529). `--resume` continues a stopped merge. |
-| `uv run python scripts/merge_train.py status [<batch id>]` | A batch's record, or the list of records. `uv run python scripts/merge_train.py prune` (no flags) deletes finished batches' `train/*` branches and worktrees; run it from the clone that built them (git-workflow.md has the one caveat, #642). |
+| `uv run python scripts/merge_train.py status [<batch id>]` | A batch's record, or the list of records. `uv run python scripts/merge_train.py prune` (no flags) deletes finished batches' `train/*` branches and worktrees; run it from the clone that built them. |
 
 Owner only: `team.py release --force`, `team.py claim --owner-task`, `team.py prune --yes`, and the word "merge train `<batch id>`".
 
