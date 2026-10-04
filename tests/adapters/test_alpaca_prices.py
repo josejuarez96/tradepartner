@@ -39,8 +39,15 @@ def _json(name: str) -> Any:
     return json.loads((FIXTURES / name).read_text())
 
 
-def _listing(security_id: str, ticker: str, valid_from: date) -> dict[str, object]:
-    return {"security_id": security_id, "ticker": ticker, "valid_from": valid_from}
+def _listing(
+    security_id: str, ticker: str, valid_from: date, class_title: str | None = None
+) -> dict[str, object]:
+    return {
+        "security_id": security_id,
+        "ticker": ticker,
+        "valid_from": valid_from,
+        "class_title": class_title,
+    }
 
 
 START = date(2016, 1, 4)
@@ -85,10 +92,18 @@ class TestResolver:
         assert resolver.resolve("AAPL", date(2015, 12, 31)) is None
         assert resolver.resolve("NOPE", date(2020, 1, 2)) is None
 
-    def test_same_ticker_same_start_is_ambiguous(self) -> None:
-        resolver = ListingResolver([_listing("A", "DUP", START), _listing("B", "DUP", START)])
-        with pytest.raises(ValueError, match="ambiguous"):
-            resolver.resolve("DUP", date(2020, 1, 2))
+    def test_two_equities_starting_on_one_day_are_unassigned_not_raised(self) -> None:
+        # Owner rule 3 (#735): Revlon and its parent both listed REV from
+        # 2020-03-12; neither gets the rows, the run does not abort.
+        resolver = ListingResolver(
+            [
+                _listing("0000887921", "REV", date(2020, 3, 12), "Class A Common Stock"),
+                _listing("0000890547", "REV", date(2020, 3, 12), "Class A Common Stock"),
+            ]
+        )
+        assert resolver.resolve("REV", date(2020, 6, 1)) is None
+        assert resolver.report.ambiguous_spans == 2
+        assert "2 ambiguous" in resolver.report.summary()
 
     def test_second_exchange_listing_same_ticker_is_one_span(self) -> None:
         resolver = ListingResolver(
@@ -97,9 +112,129 @@ class TestResolver:
         assert resolver.resolve("XX", date(2020, 1, 2)) == "SEC_X"
         assert resolver.symbols("SEC_X", START, date(2020, 1, 2)) == ["XX"]
 
-    def test_one_security_two_tickers_same_day_raises(self) -> None:
-        with pytest.raises(ValueError, match="same day"):
-            ListingResolver([_listing("SEC_X", "AA", START), _listing("SEC_X", "BB", START)])
+    def test_one_security_two_tickers_on_one_day_is_unassigned_from_that_day(self) -> None:
+        # Owner rule 2 (#735): FutureFuel's cover page of 2024-05-10 lists
+        # both FF and F, Ford's ticker. Its rows from that day are not
+        # assigned, and Ford keeps F.
+        day = date(2024, 5, 10)
+        resolver = ListingResolver(
+            [
+                _listing("0000037996", "F", date(1994, 2, 10)),
+                _listing("0000037996", "F", date(2019, 7, 24), "Common Stock"),
+                _listing("0001337298", "FF", date(2005, 9, 2)),
+                _listing("0001337298", "FF", date(2020, 8, 7), "Common Stock"),
+                _listing("0001337298", "F", day, "Common Stock"),
+                _listing("0001337298", "FF", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2024, 5, 9)) == "0001337298"
+        assert resolver.resolve("FF", day) is None
+        assert resolver.resolve("F", day) == "0000037996"
+        assert resolver.resolve("F", date(2026, 9, 30)) == "0000037996"
+        assert resolver.knows("0001337298")
+        assert resolver.symbols("0001337298", date(2024, 5, 1), date(2024, 5, 31)) == ["FF"]
+        assert resolver.symbols("0001337298", day, date(2024, 5, 31)) == []
+        assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (1, 2)
+
+    def test_notes_and_preferred_under_the_common_ticker_are_left_out(self) -> None:
+        # Owner rule 1 (#735): JNJ's notes and KSU's preferred list under
+        # the common's ticker; the common resolves, the others are counted.
+        jnj, ksu = "0000200406", "0000054480"
+        resolver = ListingResolver(
+            [
+                _listing(jnj, "JNJ", START),
+                _listing(
+                    f"{jnj}:0-650pct-notes-due-may-2024",
+                    "JNJ",
+                    date(2019, 7, 29),
+                    "0.650% Notes due May 2024",
+                ),
+                _listing(
+                    f"{jnj}:floating-rate-notes",
+                    "JNJ",
+                    date(2019, 7, 29),
+                    "Floating Rate Notes due 2020",
+                ),
+                _listing(ksu, "KSU", date(2019, 7, 19), "Common Stock, $.01 Par Value"),
+                _listing(
+                    f"{ksu}:preferred-stock",
+                    "KSU",
+                    date(2019, 7, 19),
+                    "Preferred Stock, Par Value $25 Per Share",
+                ),
+                _listing(
+                    f"{ksu}:rights", "KSU", date(2019, 7, 19), "Preferred Stock Purchase Rights"
+                ),
+            ]
+        )
+        assert resolver.resolve("JNJ", date(2020, 1, 2)) == jnj
+        assert resolver.resolve("KSU", date(2020, 1, 2)) == ksu
+        assert resolver.report.non_equity == {"debt": 1, "coupon": 1, "preferred": 2}
+        notes = f"{jnj}:0-650pct-notes-due-may-2024"
+        assert resolver.knows(notes)
+        assert resolver.symbols(notes, START, date(2020, 1, 2)) == []
+
+    def test_a_note_starting_after_the_common_does_not_take_its_ticker(self) -> None:
+        # The silent case: the latest span wins a ticker, so a note listed
+        # under MSFT years after the common would otherwise price as MSFT.
+        resolver = ListingResolver(
+            [
+                _listing("0000789019", "MSFT", START),
+                _listing(
+                    "0000789019:2-125pct-notes-due-2021",
+                    "MSFT",
+                    date(2019, 10, 23),
+                    "2.125% Notes due 2021",
+                ),
+            ]
+        )
+        assert resolver.resolve("MSFT", date(2020, 1, 2)) == "0000789019"
+
+    def test_a_later_class_of_the_company_never_takes_its_ticker(self) -> None:
+        # AIN: the cover page of 2019 lists the unlisted Class B under the
+        # Class A's ticker. The Class A keeps it; the Class B never holds
+        # it, not even after the Class A moves to another ticker.
+        resolver = ListingResolver(
+            [
+                _listing("0000819793", "AIN", START),
+                _listing(
+                    "0000819793:class-b-common-stock",
+                    "AIN",
+                    date(2019, 7, 31),
+                    "Class B Common Stock",
+                ),
+                _listing("0000819793", "AINX", date(2023, 1, 3), "Class A Common Stock"),
+            ]
+        )
+        assert resolver.resolve("AIN", date(2020, 1, 2)) == "0000819793"
+        assert resolver.resolve("AIN", date(2023, 6, 1)) is None
+        assert resolver.report.later_class_spans == 1
+
+    def test_another_company_taking_the_ticker_later_still_wins(self) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "REUSE", START, "Common Stock"),
+                _listing("0000000002", "REUSE", date(2022, 3, 1), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("REUSE", date(2022, 3, 1)) == "0000000002"
+        assert resolver.report.later_class_spans == 0
+
+    @pytest.mark.parametrize("ticker", ["", "N/A", "n/a", "None", "NONE", "NA", "-", " 0 "])
+    def test_placeholder_tickers_are_left_out(self, ticker: str) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", ticker, START, "Common Stock"),
+                _listing("0000000002", ticker, START, "Common Stock"),
+                _listing("0000000003", "ABC", START, "Common Stock"),
+                _listing("0000000003", ticker, START, "Common Stock"),  # no second ticker
+            ]
+        )
+        assert resolver.resolve(ticker, date(2020, 1, 2)) is None
+        assert resolver.resolve("ABC", date(2020, 1, 2)) == "0000000003"
+        assert resolver.report.placeholder == 3
+        assert resolver.report.same_day_securities == 0
+        assert resolver.symbols("0000000001", START, date(2020, 1, 2)) == []
 
     def test_ticker_taken_through_a_rename_is_contested(self) -> None:
         # Roundhill's ETF traded as META before Facebook renamed FB -> META;

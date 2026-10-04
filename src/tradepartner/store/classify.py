@@ -163,6 +163,57 @@ def ticker_suffix_type(ticker: str) -> str | None:
     return None
 
 
+EQUITY = "equity"
+
+#: Non-equity words in a listing's title head, checked in this order.
+_LISTING_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bprefer(red|ence)"), "preferred"),
+    (re.compile(r"\b(notes?|debentures?|bonds?)\b"), "debt"),
+    (re.compile(r"\bwarrants?\b"), "warrant"),
+    (re.compile(r"\brights?\b"), "right"),
+)
+_INCLUDED_IN_UNITS = re.compile(r"\s+included\b.*\bunits?\b.*$")
+_DEPOSITARY_SHARE = re.compile(r"\bdepositary shares?\b")
+_ADS = re.compile(r"\b(american|global)\b")
+_UNIT = re.compile(r"\bunits?\b")
+_EQUITY_UNIT = re.compile(r"\b(common|depositary) units?\b|\bpartner")
+_NON_EQUITY_SUFFIXES = frozenset({"warrant", "unit", "right", "preferred"})
+
+
+def listing_kind(ticker: str, class_title: str | None) -> str:
+    """`EQUITY`, or why one `listings` row is not an equity class, for the
+    price resolver (spec, amendment #735). Read from the row alone:
+
+    - a title with a `%` is a coupon instrument (`coupon`: notes, preferred);
+    - else the title head (the master's `_norm_title`, up to the first comma,
+      less a trailing "included as part of the units" clause, which names
+      the shares or warrants inside a unit, not the unit) naming preferred,
+      debt (note, debenture, bond), a warrant or a right is that kind;
+    - else a depositary *share* that is not American or Global is a bank's
+      preferred depositary share (`preferred`);
+    - else a head naming a unit is a `unit`, unless it names common or
+      depositary units or partner interests (an MLP's "Common Units");
+    - an untitled (snapshot) row takes its ticker suffix
+      (`ticker_suffix_type`): warrant, unit, right or preferred.
+
+    Everything else is `EQUITY`: common and ordinary shares, ADSs, and
+    titles no rule recognises ("Shares", "Class A")."""
+    if class_title is None:
+        suffix = ticker_suffix_type(ticker)
+        return suffix if suffix in _NON_EQUITY_SUFFIXES else EQUITY
+    if "%" in class_title:
+        return "coupon"
+    head = _INCLUDED_IN_UNITS.sub("", _norm_title(class_title))
+    for pattern, kind in _LISTING_WORDS:
+        if pattern.search(head):
+            return kind
+    if _DEPOSITARY_SHARE.search(head) and not _ADS.search(head):
+        return "preferred"
+    if _UNIT.search(head) and not _EQUITY_UNIT.search(head):
+        return "unit"
+    return EQUITY
+
+
 @dataclass(frozen=True)
 class _State:
     """What a CIK's filings say at one instant: the inputs rules 2-5 and 8 read."""

@@ -663,3 +663,24 @@ def test_the_edgar_commit_never_reaches_the_source() -> None:
     _prefetch(recorded, Settings(_env_file=None))
     with pytest.raises(RuntimeError, match="after the fetch pass"):
         recorded.facts(ACME, ["SomethingNew"])
+
+
+# --- #735: the resolver's exclusions are counted on the run row ---------------
+
+
+@dataclass
+class _Resolving(_History):
+    def resolution_summary(self) -> str:
+        return "resolver left out 3 placeholder-ticker listings"
+
+
+def test_the_resolution_summary_is_on_every_backfill_price_run(settings: Settings) -> None:
+    result = _backfill(settings, _Resolving())
+    alpaca = [run for run in result.runs if run.source == "alpaca"]
+    assert alpaca and all("resolver left out 3" in run.message for run in alpaca)
+
+
+def test_the_resolution_summary_is_on_the_daily_price_run(settings: Settings) -> None:
+    result = ingest_session(settings, prices=_Resolving(), filings=_filings(), clock=lambda: NOW)
+    assert result.ok, result.runs[-1].message
+    assert "resolver left out 3" in result.runs[-1].message
