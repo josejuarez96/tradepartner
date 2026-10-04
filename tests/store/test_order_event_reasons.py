@@ -136,7 +136,9 @@ def test_fresh_init_records_the_current_version(journal: duckdb.DuckDBPyConnecti
     assert _versions(journal) == [schema.CURRENT_SCHEMA_VERSION]
 
 
-#: The tables the migration from version 5 rebuilds or creates (versions 6 to 8).
+#: The tables the migration from version 5 rebuilds or creates (versions 6 to
+#: 8; version 9, #660, adds `statement_facts` but rebuilds nothing, so the
+#: set stops growing here).
 _REBUILT = {"order_events", "decisions", "resume_invocations", "resume_acceptances"}
 
 

@@ -527,6 +527,61 @@ def test_statement_facts_ddl_is_pinned_at_version_9() -> None:
     )
 
 
+def test_migrating_a_genuine_pre_version_9_store_creates_statement_facts() -> None:
+    """Unlike `conftest.version_4_store` and
+    `test_registry_schema._make_old_store` (which both pre-create
+    `statement_facts` so `load_universe_fixtures` can load
+    `statement_facts.csv` into them -- code-review of PR #729: that makes
+    their own before/after snapshots of this table vacuously equal), this
+    builds a store with none of version 9's DDL at all, so migrating it is
+    the only way the table can appear."""
+    conn = duckdb.connect(":memory:")
+    try:
+        configure_connection(conn)
+        for ddl in schema._TABLE_DDL + schema._REGISTRY_TABLE_DDL + schema._JOURNAL_TABLE_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (8, TIMESTAMPTZ "
+            "'2026-09-26 12:00:00+00')"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = 'statement_facts'"
+            ).fetchone()[0]  # type: ignore[index]
+            == 0
+        )
+        schema.init_schema(conn)
+        info = conn.execute("PRAGMA table_info('statement_facts')").fetchall()
+        columns = {row[1] for row in info}
+        assert columns == {
+            "cik",
+            "fact_name",
+            "xbrl_tag",
+            "period_start",
+            "period_end",
+            "period_days",
+            "value",
+            "unit",
+            "form",
+            "filing_accession",
+            "basis",
+            "comparative",
+            "known_at",
+            "ingested_at",
+            "source",
+            "provenance",
+        }
+        constraints = conn.execute(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'statement_facts' AND constraint_type = 'UNIQUE'"
+        ).fetchall()
+        assert len(constraints) == 1
+        assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (9,)
+    finally:
+        conn.close()
+
+
 # --- lock-error detection -----------------------------------------------
 
 

@@ -99,6 +99,29 @@ def test_known_by_keeps_only_records_knowable_at_t() -> None:
     assert _source().known_ats() == [T1, T2]
 
 
+def test_known_by_raises_rather_than_silently_dropping_statement_facts() -> None:
+    """`known_by` has no as-of filter for statement facts yet (T76b's job);
+    a source carrying any must raise there rather than return a copy whose
+    `statement_facts(cik)` silently answers `[]` for every `t`."""
+    record = StatementFactRecord(
+        CIK,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        T1,
+        date(2019, 2, 14),
+        False,
+    )
+    source = FixtureFilingSource(statement_facts=[record])
+    with pytest.raises(NotImplementedError, match="statement_facts"):
+        source.known_by(T2)
+
+
 # --- StatementFactRecord and FixtureFilingSource.statement_facts (#660, T76) ---
 
 

@@ -68,7 +68,27 @@ class FixtureFilingSource(FilingSource):
         )
 
     def known_by(self, t: datetime) -> FixtureFilingSource:
-        """A copy with only the records knowable at `t`."""
+        """A copy with only the records knowable at `t`.
+
+        Raises if this source carries any `statement_facts` rather than
+        silently dropping them: this method exists for the master's
+        write-path look-ahead tests (class docstring), and statement
+        facts have their own, not-yet-defined as-of filter (T76b's
+        `statement_facts_as_of`, including the hold rule on an unstamped
+        `accepted_at=None` record) rather than a plain `accepted_at <= t`
+        -- so a caller that combines the two here would otherwise get a
+        copy that silently answers `statement_facts(cik)` with `[]`
+        regardless of `t`, letting a look-ahead test pass vacuously
+        instead of exercising anything (code-review of PR #729).
+        """
+        if self._statement_facts:
+            raise NotImplementedError(
+                "FixtureFilingSource.known_by does not support statement_facts yet "
+                "(T76b defines statement_facts_as_of's own look-ahead filter, "
+                "including the hold rule on an unstamped accepted_at=None record); "
+                "build a source with no statement_facts for known_by, or filter "
+                "them separately until T76b adds support here"
+            )
         t = ensure_tz_aware_utc(t, field_name="t")
         return FixtureFilingSource(
             index=[e for e in self._index if e.accepted_at <= t],

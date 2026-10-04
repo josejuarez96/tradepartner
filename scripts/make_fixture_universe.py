@@ -1622,7 +1622,7 @@ def _statement_facts_plain_issuer(rows: Rows) -> None:
     )
 
     q2_accession = _statement_accession(cik, 2020, 3)
-    q2_known_at = _filing_acceptance(date(2020, 8, 10))
+    q2_known_at = _filing_acceptance(_session_on_or_after(date(2020, 8, 10)))
     rows.statement_fact(
         cik,
         "revenue",
@@ -1647,7 +1647,7 @@ def _statement_facts_plain_issuer(rows: Rows) -> None:
     )
 
     q3_accession = _statement_accession(cik, 2020, 4)
-    q3_known_at = _filing_acceptance(date(2020, 11, 10))
+    q3_known_at = _filing_acceptance(_session_on_or_after(date(2020, 11, 10)))
     rows.statement_fact(
         cik,
         "revenue",
@@ -1688,7 +1688,7 @@ def _statement_facts_derived_gross_profit(rows: Rows) -> None:
     profit"). Reuses `SEC_CLEAN_MERGER`'s cik (`CIK0001000003`)."""
     cik = "CIK0001000003"
     accession = _statement_accession(cik, 2020, 1)
-    known_at = _filing_acceptance(date(2020, 2, 20))
+    known_at = _filing_acceptance(_session_on_or_after(date(2020, 2, 20)))
     period_end = date(2019, 12, 31)
     period_start = date(2019, 1, 1)
     rows.statement_fact(
@@ -1830,7 +1830,7 @@ def _statement_facts_no_securities_row_yet(rows: Rows) -> None:
     join it through, and should return nothing."""
     cik = "CIK0001000001"
     accession = _statement_accession(cik, 2017, 1)
-    known_at = _filing_acceptance(date(2017, 6, 15))
+    known_at = _filing_acceptance(_session_on_or_after(date(2017, 6, 15)))
     rows.statement_fact(
         cik,
         "revenue",

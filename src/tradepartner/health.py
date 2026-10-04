@@ -608,9 +608,24 @@ def _integrity_checks(
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
 
+def _present_tables(conn: duckdb.DuckDBPyConnection) -> set[str]:
+    """Table names `conn` actually has, per `dashboard.header.store_freshness`'s
+    pattern: a read-only connection never migrates (`store.schema.init_schema`),
+    so a store opened before a later `_FACT_TABLES` addition (e.g.
+    `statement_facts`, version 9, #660) is missing it until the next writable
+    open -- querying it directly would raise `duckdb.CatalogException` instead
+    of the loud-but-graceful "run `tradepartner ingest`" health already gives
+    for an uninitialised store."""
+    rows = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    return {name for (name,) in rows}
+
+
 def _count_per_table(conn: duckdb.DuckDBPyConnection, condition: str) -> pl.DataFrame:
+    present = _present_tables(conn)
     rows: list[dict[str, Any]] = []
     for table in _FACT_TABLES:
+        if table not in present:
+            continue
         row = conn.execute(f"SELECT count(*) FROM {table} WHERE {condition}").fetchone()
         count = int(row[0]) if row is not None else 0
         if count:
@@ -619,8 +634,11 @@ def _count_per_table(conn: duckdb.DuckDBPyConnection, condition: str) -> pl.Data
 
 
 def _bad_provenance(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    present = _present_tables(conn)
     rows: list[dict[str, Any]] = []
     for table in _FACT_TABLES:
+        if table not in present:
+            continue
         allowed = TABLE_PROVENANCE_VALUES[table]
         marks = ", ".join("?" for _ in allowed)
         found = conn.execute(

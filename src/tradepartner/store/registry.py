@@ -325,10 +325,23 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def store_max_ingested_at(conn: duckdb.DuckDBPyConnection) -> datetime | None:
-    """The latest `ingested_at` over every fact table; None on an empty store."""
-    union = " UNION ALL ".join(
-        f"SELECT MAX(ingested_at) AS m FROM {table}" for table in TABLE_PROVENANCE_VALUES
-    )
+    """The latest `ingested_at` over every fact table; None on an empty store.
+
+    Every caller here opens a writable connection first (a trial needs one
+    to record itself), which migrates the store, so every
+    `TABLE_PROVENANCE_VALUES` table always exists by the time this runs
+    today. Still guarded against a table absent from `conn` (the same
+    defensive check `health._count_per_table`/`_bad_provenance` added for
+    #660's `statement_facts`), rather than relying on every future caller
+    continuing to migrate first.
+    """
+    present = {
+        name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    }
+    tables = [table for table in TABLE_PROVENANCE_VALUES if table in present]
+    if not tables:
+        return None
+    union = " UNION ALL ".join(f"SELECT MAX(ingested_at) AS m FROM {table}" for table in tables)
     row = conn.execute(f"SELECT MAX(m) FROM ({union})").fetchone()
     return row[0] if row is not None else None
 
