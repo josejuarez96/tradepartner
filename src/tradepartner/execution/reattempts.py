@@ -45,7 +45,8 @@ amount. Only a funding shortfall is written off: a phase that did not complete
 (the halt path, a kill switch read before a submit, a clock or limit stop, any
 exception) writes off only the derived ones, its unreached buys staying open
 for the run after, and `decision_state` never writes off a buy whose order
-carries a halt cancel or ended `cancelled` with reason `not_received`, so such
+carries a halt cancel or ended `cancelled` with reason `not_received` or
+`owner_settled_unknown` (`paper settle`, spec req 17), so such
 a buy stays open and the next in-window run retries it, sized from cash like
 any other; if a completed last phase defers that retry, it is written off.
 """
