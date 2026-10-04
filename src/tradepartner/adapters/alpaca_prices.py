@@ -61,6 +61,19 @@ no-op under `prices.revision_of`.
 raises, so ingest can never mix feeds for a security unnoticed
 (`tests/fixtures/README.md`). Actions are `alpaca`.
 
+**Symbols sent (#737).** alpaca-py comma-joins every symbol into the one
+`symbols=` parameter of one request and raises `APIError` for the whole
+call on any error status, so one invalid symbol is taken to fail the whole
+chunk (whether Alpaca's server rejects it or drops it is not established).
+A master ticker is therefore sent only in Alpaca's form (`alpaca_symbol`):
+trimmed of spaces and quotes, upper-cased, and a one-letter class suffix
+after `-` or `/` written with `.` (`CRD-A` -> `CRD.A`). Anything else
+(`BAX (NYSE)`, `C/28`, `F&G`) is not sent, so its security gets no rows
+under it, never a guessed mapping's; `last_excluded_symbols` and
+`symbol_summary` name those tickers. A row served under a symbol resolves
+through every master spelling of it, and to nothing when two spellings
+name two securities on that session.
+
 **Not returned as data, reported instead:**
 
 - a zero-volume placeholder bar (`v == 0` and `n == 0`) that Alpaca can
@@ -80,6 +93,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -394,6 +408,25 @@ def _default_fetch_actions(symbols: list[str], start: date, end: date) -> Mappin
     return payload
 
 
+#: Alpaca's US-equity symbol grammar: letters and digits from a letter, with
+#: at most one `.`-separated suffix (`BRK.B`).
+_ALPACA_SYMBOL = re.compile(r"[A-Z][A-Z0-9]*(\.[A-Z0-9]+)?")
+#: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
+_CLASS_SUFFIX = re.compile(r"([A-Z][A-Z0-9]*)[-/]([A-Z])")
+
+
+def alpaca_symbol(ticker: str) -> str | None:
+    """`ticker` in Alpaca's symbol form, or `None` when it has none.
+
+    Spaces and quotes at both ends are trimmed, letters upper-cased and a
+    one-letter class suffix after `-` or `/` written with `.`; whatever then
+    falls outside `_ALPACA_SYMBOL` is `None`, never a guessed symbol."""
+    norm = ticker.strip().strip("\"'").strip().upper()
+    if match := _CLASS_SUFFIX.fullmatch(norm):
+        norm = f"{match[1]}.{match[2]}"
+    return norm if _ALPACA_SYMBOL.fullmatch(norm) else None
+
+
 class AlpacaPriceSource(PriceSource):
     """`PriceSource` over Alpaca: asks for every symbol the requested
     securities traded under in the range, parses, and keeps only the
@@ -423,25 +456,56 @@ class AlpacaPriceSource(PriceSource):
         self._lag = timedelta(days=(settings or get_settings()).alpaca.actions_process_lag_days)
         self.last_bars_report: BarsParse | None = None
         self.last_actions_report: ActionsParse | None = None
+        self.last_excluded_symbols: tuple[str, ...] = ()
+        # Every master spelling of each Alpaca symbol, over all securities.
+        spellings: dict[str, set[str]] = defaultdict(set)
+        for spans in resolver._by_security.values():
+            for span in spans:
+                if (symbol := alpaca_symbol(span.ticker)) is not None:
+                    spellings[symbol].add(span.ticker)
+        self._spellings = {symbol: sorted(names) for symbol, names in spellings.items()}
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
     ) -> tuple[set[str], list[str]]:
+        self.last_excluded_symbols = ()
         ids = set(check_request(security_ids, start, end))
         unknown = sorted(i for i in ids if not self._resolver.knows(i))
         if unknown:
             raise UnknownSecurityIdError(
                 f"unknown security_id(s) {unknown}; resolve tickers through the security master"
             )
-        symbols = sorted({s for i in ids for s in self._resolver.symbols(i, symbols_from, end)})
-        return ids, symbols
+        tickers = {t for i in ids for t in self._resolver.symbols(i, symbols_from, end)}
+        symbols = {t: alpaca_symbol(t) for t in tickers}
+        self.last_excluded_symbols = tuple(sorted(t for t, s in symbols.items() if s is None))
+        return ids, sorted({s for s in symbols.values() if s is not None})
+
+    def _resolve(self, symbol: str, session: date) -> str | None:
+        """`ListingResolver.resolve` over every master spelling of the
+        Alpaca `symbol`; `None` when they name two securities."""
+        spellings = self._spellings.get(symbol, [symbol])
+        if len(spellings) == 1:
+            return self._resolver.resolve(spellings[0], session)
+        owners = {self._resolver.resolve(t, session) for t in spellings} - {None}
+        return owners.pop() if len(owners) == 1 else None
+
+    def symbol_summary(self) -> str:
+        """The latest call's master tickers not sent to Alpaca, as one line
+        for the run row's message; `""` when there are none."""
+        if not self.last_excluded_symbols:
+            return ""
+        named = ", ".join(repr(t) for t in self.last_excluded_symbols)
+        return (
+            f"{len(self.last_excluded_symbols)} master ticker(s) not sent to Alpaca, "
+            f"not Alpaca symbols: {named}"
+        )
 
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
         self.last_bars_report = None
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
             return []
-        parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolver.resolve)
+        parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolve)
         self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
 
@@ -456,6 +520,6 @@ class AlpacaPriceSource(PriceSource):
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
         payload = self._fetch_actions(symbols, start - self._lag, end + self._lag)
-        parsed = parse_corporate_actions(payload, self._resolver.resolve)
+        parsed = parse_corporate_actions(payload, self._resolve)
         self.last_actions_report = parsed
         return [a for a in parsed.actions if a.security_id in ids and start <= a.ex_date <= end]

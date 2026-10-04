@@ -20,6 +20,7 @@ import pytest
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
     ListingResolver,
+    alpaca_symbol,
     feed_source,
     parse_bars,
     parse_corporate_actions,
@@ -565,3 +566,160 @@ class TestAlpacaPriceSource:
             assert bar.known_at == bar_known_at(bar.session)
         for action in source.corporate_actions(ids, date(2020, 8, 3), date(2020, 9, 30)):
             assert action.known_at == action_first_seen_known_at(action.ex_date)
+
+
+class TestAlpacaSymbols:
+    """#737: a master ticker goes to Alpaca only in Alpaca's symbol form.
+
+    alpaca-py comma-joins every symbol into one `symbols=` parameter of one
+    request and raises `APIError` for the whole call on any error status, so
+    one invalid symbol is taken to fail the whole chunk: such a ticker is
+    never sent. Its security gets no bars under it, never another's."""
+
+    @pytest.mark.parametrize(
+        ("ticker", "symbol"),
+        [
+            ("AAPL", "AAPL"),
+            ("BRK.B", "BRK.B"),
+            ("NKTX ", "NKTX"),
+            ('"""CDTX"""', "CDTX"),
+            ("'XOM'", "XOM"),
+            ("Caap", "CAAP"),
+            ("LEDs", "LEDS"),
+            ("CRD-A", "CRD.A"),
+            ("GEF-B", "GEF.B"),
+            ("BRK/B", "BRK.B"),
+        ],
+    )
+    def test_safe_spellings_become_the_alpaca_symbol(self, ticker: str, symbol: str) -> None:
+        assert alpaca_symbol(ticker) == symbol
+
+    @pytest.mark.parametrize(
+        "ticker",
+        [
+            "BAX (NYSE)",
+            "New York Stock Exchange",
+            "F&G",
+            "C/28",
+            "CUBI/PC",
+            "AAPL,MSFT",
+            "",
+            "  ",
+            "-",
+            "1234",
+            "BRK..B",
+            "BRK.",
+            ".B",
+            "CRD-A-B",
+        ],
+    )
+    def test_anything_else_is_not_an_alpaca_symbol(self, ticker: str) -> None:
+        assert alpaca_symbol(ticker) is None
+
+    @staticmethod
+    def _bars_under(symbols: dict[str, str]) -> dict[str, Any]:
+        """The recorded payload with each `{new: recorded}` symbol's rows
+        served under `new` as well."""
+        payload = _json("daily_bars.json")
+        for new, recorded in symbols.items():
+            payload["bars"][new] = copy.deepcopy(payload["bars"][recorded])
+        return payload
+
+    def test_an_invalid_ticker_is_never_sent_and_is_named(self) -> None:
+        listings = [
+            _listing("SEC_AAPL", "AAPL", START),
+            _listing("SEC_CRD", "CRD-A", START),
+            _listing("SEC_BAX", "BAX (NYSE)", START),
+        ]
+        calls: list[list[str]] = []
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._bars_under({"CRD.A": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(["SEC_AAPL", "SEC_CRD", "SEC_BAX"], date(2020, 8, 3), date(2020, 8, 7))
+        assert calls == [["AAPL", "CRD.A"]]
+        assert {b.security_id for b in bars} == {"SEC_AAPL", "SEC_CRD"}
+        crd = [b for b in bars if b.security_id == "SEC_CRD"]
+        assert len(crd) == 5 and crd[0].close == _json("daily_bars.json")["bars"]["KO"][0]["c"]
+        assert source.last_excluded_symbols == ("BAX (NYSE)",)
+        assert "1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'BAX (NYSE)'" in (
+            source.symbol_summary()
+        )
+
+    def test_only_invalid_tickers_fetch_nothing(self) -> None:
+        recorded = _Recorded()
+        source = AlpacaPriceSource(
+            ListingResolver([_listing("SEC_X", "New York Stock Exchange", START)]),
+            fetch_bars=recorded.bars,
+            fetch_actions=recorded.actions,
+            settings=_settings(),
+        )
+        assert source.bars(["SEC_X"], date(2020, 8, 3), date(2020, 8, 7)) == []
+        assert source.corporate_actions(["SEC_X"], date(2020, 8, 3), date(2020, 8, 7)) == []
+        assert recorded.calls == []
+        assert source.last_excluded_symbols == ("New York Stock Exchange",)
+
+    def test_actions_are_asked_and_resolved_under_the_alpaca_symbol(self) -> None:
+        listings = [_listing("SEC_CRD", "CRD-A", START)]
+        calls: list[list[str]] = []
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(symbols)
+            row = {**_json("corporate_actions.json")["cash_dividends"][0], "symbol": "CRD.A"}
+            return {"cash_dividends": [row]}
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_CRD"], date(2020, 8, 3), date(2020, 8, 31))
+        assert calls == [["CRD.A"]]
+        assert [(a.security_id, a.ex_date) for a in actions] == [("SEC_CRD", date(2020, 8, 7))]
+
+    def test_two_spellings_held_by_two_securities_resolve_to_nothing(self) -> None:
+        # 'CRD-A' and 'CRD.A' are one Alpaca symbol; when both are live for
+        # two securities, its rows are nobody's rather than a guess.
+        listings = [
+            _listing("SEC_OLD", "CRD-A", START),
+            _listing("SEC_NEW", "CRD.A", date(2020, 1, 2)),
+        ]
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            return self._bars_under({"CRD.A": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        assert source.bars(["SEC_OLD", "SEC_NEW"], date(2020, 8, 3), date(2020, 8, 7)) == []
+        assert source.last_bars_report is not None
+        assert ("CRD.A", date(2020, 8, 3)) in source.last_bars_report.unresolved
+
+    def test_two_spellings_of_one_security_resolve_to_it(self) -> None:
+        listings = [
+            _listing("SEC_CAAP", "Caap", START),
+            _listing("SEC_CAAP", "CAAP", date(2020, 8, 5)),
+        ]
+        calls: list[list[str]] = []
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._bars_under({"CAAP": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(["SEC_CAAP"], date(2020, 8, 3), date(2020, 8, 7))
+        assert calls == [["CAAP"]]
+        assert [b.session.day for b in bars] == [3, 4, 5, 6, 7]
+        assert {b.security_id for b in bars} == {"SEC_CAAP"}
+
+    def test_a_valid_ticker_alone_names_no_exclusion(self) -> None:
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_bars=_Recorded().bars, settings=_settings()
+        )
+        source.bars(["SEC_AAPL"], date(2020, 8, 3), date(2020, 8, 7))
+        assert source.last_excluded_symbols == ()
+        assert source.symbol_summary() == ""
