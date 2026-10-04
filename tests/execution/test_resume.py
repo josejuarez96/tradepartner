@@ -768,7 +768,7 @@ def test_a_real_fill_after_the_synthetic_one_is_superseded_and_kept_once(
 ) -> None:
     order = _lagging_third_fill(journal_settings, fake, window, fixed_clock, "tp-lag")
     assert _resume(journal_settings, fake, fixed_clock, accept=True).status == RELEASED
-    fake._fill_hidden_reads = [0 for _ in fake._fill_hidden_reads]  # the feed catches up
+    fake.reveal_hidden_fills()  # the feed catches up
 
     for _ in range(3):
         fixed_clock.advance(minutes=1)

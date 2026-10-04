@@ -75,6 +75,8 @@ from_session=)`), or a tradable, fractionable, `active` asset with no CUSIP.
 **Lagging fills, hook and log.** After `lag_fills(n)`, each fill recorded is
 missing from the next `n` calls of `fills()` and delivered from the one
 after (`None`: never delivered), while `get_order` already shows it.
+`reveal_hidden_fills()` delivers every fill recorded so far on the next
+`fills()` (the feed catches up); it is not logged in `calls`.
 `on_submit(request)` runs at the start of every `submit`, before anything is
 checked or recorded, so a test can assert the store state at submit time.
 `apply_split(symbol, ratio)` books a broker-side forward/reverse split (the
@@ -389,6 +391,13 @@ class FakeBroker(Broker):
         ):
             raise ValueError(f"reads must be a non-negative int or None, got {reads!r}")
         self._fill_lag = reads
+
+    def reveal_hidden_fills(self) -> None:
+        """Deliver every fill recorded so far on the next `fills()` call,
+        whatever lag it was recorded under (`None` included): the feed
+        catches up. Fills recorded afterwards still follow `lag_fills`.
+        Not a `Broker` call: not logged in `calls`."""
+        self._fill_hidden_reads = [0] * len(self._fill_hidden_reads)
 
     def set_asset(self, symbol: str, asset: Asset, *, from_session: date | None = None) -> None:
         """Answer `asset` for `symbol` from `from_session` on (a New York
