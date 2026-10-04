@@ -169,3 +169,23 @@ def test_corporate_actions_one_failing_batch_fails_the_call(
         alpaca_raw.corporate_actions(
             ["A", "B", "C"], date(2026, 1, 1), date(2026, 3, 31), settings=_batched_settings(2)
         )
+
+
+def test_daily_bars_sends_a_repeated_symbol_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[list[str]] = []
+
+    def fake_get_stock_bars(
+        self: StockHistoricalDataClient, request_params: StockBarsRequest
+    ) -> dict[str, Any]:
+        symbols = list(request_params.symbol_or_symbols)
+        sent.append(symbols)
+        return {s: [{"c": 1.0}] for s in symbols}
+
+    monkeypatch.setattr(StockHistoricalDataClient, "get_stock_bars", fake_get_stock_bars)
+
+    out = alpaca_raw.daily_bars(
+        ["A", "B", "A"], date(2026, 9, 30), date(2026, 9, 30), settings=_batched_settings(2)
+    )
+
+    assert sent == [["A", "B"]]
+    assert sum(len(v) for v in out["bars"].values()) == 2

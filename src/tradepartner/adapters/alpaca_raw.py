@@ -94,11 +94,13 @@ def _symbol_batches(symbols: list[str], settings: Settings) -> list[list[str]]:
     """`symbols` in order, in batches of at most `alpaca.symbols_per_request` (#789).
 
     alpaca-py sends the whole list comma-joined in one GET, which Alpaca refuses
-    with HTTP 414 once the URL grows too long. An empty list stays one request,
-    unchanged from the unbatched behaviour.
+    with HTTP 414 once the URL grows too long. Repeats are dropped (first one
+    kept) so a symbol split across two batches cannot return its bars twice. An
+    empty list stays one request, unchanged from the unbatched behaviour.
     """
+    unique = list(dict.fromkeys(symbols))
     size = settings.alpaca.symbols_per_request
-    return [symbols[i : i + size] for i in range(0, len(symbols), size)] or [symbols]
+    return [unique[i : i + size] for i in range(0, len(unique), size)] or [unique]
 
 
 def _merge_batches(payloads: list[Any]) -> dict[str, Any]:
