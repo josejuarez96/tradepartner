@@ -63,13 +63,20 @@ is fetching is stored, not refused as look-ahead.
 control characters replaced and the length capped at
 `ingest.max_message_chars`: an exception's text comes from a server. The
 EDGAR message carries the adapter's unstamped-filing, unstamped-fact and
-skipped-filer counts when the source exposes them (#172).
+skipped-filer counts when the source exposes them (#172). A `failed` run's
+message also names where the error was raised: `_with_frames` appends
+` | at: <frames>` (file:line in function, innermost first, across the
+`raise ... from` chain, paths relative to the package -- never a source
+line or a local/argument value), itself bounded by `ingest.max_where_frames`
+and `ingest.max_where_chars` so a long trail is cut, never the error text,
+before the redaction and `max_message_chars` cut above (#573).
 """
 
 from __future__ import annotations
 
 import re
 import time
+import traceback
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -213,7 +220,7 @@ def ingest_session(
     }
     fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
-        "edgar": lambda: _prefetch(recorded, settings),
+        "edgar": lambda: _prefetch(recorded, settings, dry_run=dry_run),
         "alpaca": lambda: fetched.update(alpaca=_fetch_prices(settings, prices, now, clock)),
     }
     # T11h: `record_failures` (the failure policy's after-commit hook), edgar
@@ -282,7 +289,8 @@ def _run_source(
         run = outcome(STALE, 0, str(exc))
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     except Exception as exc:  # any source or parse failure halts with a run row
-        run = outcome(FAILED, 0, f"{type(exc).__name__}: {exc}")
+        message = _with_frames(f"{type(exc).__name__}: {exc}", exc, settings)
+        run = outcome(FAILED, 0, message)
         # A dry run writes no run row, failed or not.
         return run if dry_run else _record_only(settings, run_id, now, clock, run, mode)
     if after_commit is not None:
@@ -315,6 +323,61 @@ def _record_only(
 
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+def _relative_path(filename: str) -> str:
+    """`filename` relative to the `tradepartner` package root, or just its
+    name when it falls outside the package (stdlib, a dependency, a test)."""
+    try:
+        return str(Path(filename).resolve().relative_to(_PACKAGE_ROOT))
+    except ValueError:
+        return Path(filename).name
+
+
+def _next_in_chain(exc: BaseException) -> BaseException | None:
+    """The next exception in `exc`'s chain for `_where`: the explicit
+    `raise ... from cause`, else the implicit `__context__` unless a bare
+    `raise ... from None` suppressed it."""
+    if exc.__cause__ is not None:
+        return exc.__cause__
+    if exc.__suppress_context__:
+        return None
+    return exc.__context__
+
+
+def _where(exc: BaseException, settings: Settings) -> str:
+    """`file:line in function` for the innermost `ingest.max_where_frames`
+    frames of `exc`'s traceback, continuing into its `__cause__`/
+    `__context__` chain so a `raise ... from` keeps the original error's
+    frames, joined by ` < `. Reads only a frame's filename, line number and
+    function name -- never a source line, a local or an argument value."""
+    limit = settings.ingest.max_where_frames
+    frames: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(frames) < limit:
+        seen.add(id(current))
+        for summary in reversed(traceback.extract_tb(current.__traceback__)):
+            frames.append(f"{_relative_path(summary.filename)}:{summary.lineno} in {summary.name}")
+            if len(frames) >= limit:
+                break
+        current = _next_in_chain(current)
+    return " < ".join(frames)
+
+
+def _with_frames(message: str, exc: BaseException, settings: Settings) -> str:
+    """`message` with ` | at: <frames>` appended for where `exc` was raised,
+    the combined text bounded to `ingest.max_where_chars` by shortening the
+    frame list -- never `message`, the error text -- before `_clean` applies
+    its own, separate `max_message_chars` cut."""
+    frames = _where(exc, settings)
+    if not frames:
+        return message
+    budget = settings.ingest.max_where_chars - len(message) - len(" | at: ")
+    if budget <= 0:
+        return message
+    return f"{message} | at: {frames[:budget]}"
 
 
 def _clean(message: str, settings: Settings) -> str:
@@ -402,14 +465,33 @@ def _unwrap(filings: FilingSource) -> FilingSource:
     return filings
 
 
-def _prefetch(recorded: _Recorded, settings: Settings) -> None:
+def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool = False) -> None:
     """The fetch pass: every filing question, with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
-    before the lock; then `recorded` answers only from what it holds."""
+    before the lock; then `recorded` answers only from what it holds.
+
+    When `check_failures()` raises on a non-dry run, the source's
+    `record_failed_check()` (if it has one) records the run's failures
+    first, so they can be quarantined and `accepted` although the chunk
+    never commits (#610 policy 2); the check's error is re-raised either
+    way, and a dry run records nothing."""
     _build_filings(recorded, settings, _FETCH_PASS)
-    check_failures = getattr(_unwrap(recorded), "check_failures", None)
+    source = _unwrap(recorded)
+    check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
-        check_failures()
+        try:
+            check_failures()
+        except Exception as check_error:
+            record = getattr(source, "record_failed_check", None)
+            if record is not None and not dry_run:
+                try:
+                    record()
+                except Exception as record_error:
+                    raise RuntimeError(
+                        f"{check_error}; recording the failures also failed: "
+                        f"{type(record_error).__name__}: {record_error}"
+                    ) from record_error
+            raise
     recorded.frozen = True
 
 
@@ -420,7 +502,12 @@ def _ingest_filings(
     clock: Callable[[], datetime],
 ) -> tuple[int, str]:
     recorded = _Recorded(filings)
-    _build_filings(recorded, settings, _FETCH_PASS)
+    # The fetch pass, so `now` is read only after every source answer. When
+    # `filings` is already a frozen fetch pass (`_prefetch`, as both callers
+    # do) nothing is left to fetch and repeating its build would only
+    # recompute it (#564).
+    if not (isinstance(filings, _Recorded) and filings.frozen):
+        _build_filings(recorded, settings, _FETCH_PASS)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
     added = 0
@@ -483,6 +570,13 @@ def _source_counts(filings: FilingSource) -> str:
         ("failed_filings", "failed filings"),  # T11h: the failure policy
         ("quarantined", "quarantined"),
         ("facts_missing", "facts missing"),  # T11h: T11e's company-facts-404 leftover
+        ("facts_bulk_empty", "empty bulk facts"),  # #566: `{}` companyfacts.zip members
+        ("submissions_bulk_empty", "empty bulk submissions"),
+        ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
+        ("submissions_api_empty", "empty API submissions"),
+        ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`
+        ("facts_api_keyless", "keyless API facts"),
+        ("facts_capped_dropped", "capped facts dropped"),  # #610 X2
     ):
         if (n := count(attribute)) is not None:
             parts.append(f"{label}: {n}")

@@ -19,12 +19,14 @@ Steps, in order (each one stops the run with a reason on failure):
    "[Unreleased]" in ``CHANGELOG.md``) unless
    it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
-4. Local checks: ruff check, ruff format --check, mypy and the fragment check always;
-   pytest only when the diff touches code, tests, scripts, dependencies or CI (``src/``,
-   ``tests/``, ``scripts/``, ``.github/``, ``pyproject.toml``, ``uv.lock``,
-   ``.python-version``).
-   CI applies the same rule on PRs (``--tests-needed``) and runs the full suite on every
-   push to main. ``--tests`` forces the local run, ``--no-tests`` skips it.
+4. Local checks: ruff check, ruff format --check, mypy, the fragment check and
+   ``tests/test_docs_budget.py`` always; pytest only when the diff touches code, tests,
+   scripts, dependencies or CI (``src/``, ``tests/``, ``scripts/``, ``.github/``,
+   ``pyproject.toml``, ``uv.lock``, ``.python-version``), and then only the test files the
+   diff maps to (``targeted_tests``), or the full suite when the mapping is unclear (#456).
+   CI runs the full suite on such PRs (``--tests-needed``) and on every push to main.
+   ``--full-tests`` runs the full suite locally, ``--tests`` forces the local run,
+   ``--no-tests`` skips it.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
@@ -38,6 +40,7 @@ Usage::
     uv run python scripts/ready_pr.py 69 --dry-run            # stop before pushing
     uv run python scripts/ready_pr.py 70 --allow-shared-files # process PRs only
     uv run python scripts/ready_pr.py 69 --tests              # force local pytest
+    uv run python scripts/ready_pr.py 69 --full-tests         # full suite, not targeted
     git diff --name-only origin/main...HEAD | python3 scripts/ready_pr.py --tests-needed
                                                    # prints yes/no; CI gates its Tests step on it
 """
@@ -50,7 +53,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -124,7 +127,10 @@ SAFETY_PREFIXES = (
     "tests/test_ready_pr.py",
     "scripts/fragments.py",
     "scripts/no_push_to_main.sh",
+    "scripts/merge_train.py",
+    "tests/test_merge_train.py",
     ".github/workflows/",
+    ".github/rulesets/",
     ".claude/agents/",
     ".claude/skills/",
     "tests/fixtures/alpaca/",
@@ -140,8 +146,23 @@ LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "format", "--check", "."),
     ("uv", "run", "mypy"),
     ("uv", "run", "python", "scripts/fragments.py", "check"),
+    ("uv", "run", "pytest", "-q", "tests/test_docs_budget.py"),
 )
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
+# Targeted local pytest (#456): the tests a diff maps to, or the full suite when the mapping
+# is unclear. CI always runs the full suite, so a miss here is caught there, later.
+FULL_SUITE_FILES = ("pyproject.toml", "uv.lock", ".python-version")
+DOCS_BUDGET_TEST = "tests/test_docs_budget.py"
+# Static checks that scan a whole subtree: any change under the prefix can fail them.
+TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
+    "src/": (
+        "tests/execution/test_boundaries.py",
+        "tests/execution/test_sdk_boundary.py",
+        "tests/test_no_forbidden_imports.py",
+        "tests/test_no_literals.py",
+    ),
+    "src/tradepartner/backtest/": ("tests/backtest/test_store_provider.py",),
+}
 # A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
 # (pushes to main always run the full suite).
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
@@ -346,6 +367,67 @@ def tests_needed(paths: Sequence[str]) -> bool:
     return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
 
 
+def _module_tests(path: str, test_sources: Mapping[str, str]) -> set[str]:
+    """Test files that import the module at ``src/<dotted>.py``, by name."""
+    dotted = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+    parent, _, stem = dotted.rpartition(".")
+    direct = re.compile(rf"\b{re.escape(dotted)}\b")
+    from_parent = re.compile(
+        rf"\bfrom\s+{re.escape(parent)}\s+import\s+(?:\([^)]*|[^\n]*)\b{re.escape(stem)}\b"
+    )
+    return {
+        test
+        for test, text in test_sources.items()
+        if direct.search(text) or from_parent.search(text)
+    }
+
+
+def targeted_tests(
+    paths: Sequence[str], test_sources: Mapping[str, str], deleted: Collection[str] = ()
+) -> tuple[str, ...] | None:
+    """The test files a diff maps to, or ``None`` for the full suite (#456).
+
+    ``test_sources`` maps every tracked ``tests/**/test_*.py`` path to its text. A changed
+    test file runs itself; a ``src/`` module runs every test file that imports it by name plus
+    the static checks over its subtree (``TREE_SCAN_TESTS``); a file under ``scripts/`` or
+    ``.github/`` runs the tests that name it. Anything whose effect cannot be told falls back
+    to the full suite: a ``conftest.py``, a dependency or Python-version file, a non-test file
+    under ``tests/`` (fixtures, helpers), a package ``__init__``, a non-Python file under
+    ``src/``, a deleted module, and a module or script no test names. A ``.github/`` file no
+    test names, and docs, map to nothing. A test file not in ``test_sources`` (deleted or
+    renamed away) is not run. ``tests/test_docs_budget.py`` is left out: it always runs on
+    its own. Pass ``deleted`` from a ``--no-renames`` diff, so a moved module counts as gone.
+    """
+    selected: set[str] = set()
+    for p in paths:
+        name = p.rpartition("/")[2]
+        if p in FULL_SUITE_FILES or name == "conftest.py":
+            return None
+        if p.startswith("tests/"):
+            if not (name.startswith("test_") and name.endswith(".py")):
+                return None
+            selected.add(p)
+        elif p.startswith("src/"):
+            if p in deleted or not p.endswith(".py") or name == "__init__.py":
+                return None
+            found = _module_tests(p, test_sources)
+            if not found:
+                return None
+            selected |= found
+            for prefix, scans in TREE_SCAN_TESTS.items():
+                if p.startswith(prefix):
+                    selected.update(scans)
+        elif p.startswith(("scripts/", ".github/")):
+            mention = re.compile(rf"\b{re.escape(name)}\b")
+            found = {t for t, text in test_sources.items() if mention.search(text)}
+            if not found and p.startswith("scripts/"):
+                return None
+            selected |= found
+    selected &= set(test_sources)
+    selected.discard(DOCS_BUDGET_TEST)
+    return tuple(sorted(selected))
+
+
 # ── the flow ────────────────────────────────────────────────────────────────────
 
 
@@ -356,6 +438,7 @@ def ready(
     dry_run: bool = False,
     allow_shared_files: bool = False,
     run_tests: bool | None = None,
+    full_tests: bool = False,
     wait: bool = True,
     timeout_s: int = CI_TIMEOUT_S,
     poll_s: int = CI_POLL_S,
@@ -431,16 +514,35 @@ def ready(
                 f"changelog.d/{issue}-<slug>.md (`fragments.py add ... --added/--fixed ...`)"
             )
 
-    # 4. local checks; pytest only when the diff can fail it (None = decide from the paths)
+    # 4. local checks; pytest only when the diff can fail it (None = decide from the paths),
+    # and then only the tests it maps to unless --full-tests (CI runs the full suite)
     checks = list(LOCAL_CHECKS)
-    if run_tests is None:
-        run_tests = tests_needed(touched)
-        if not run_tests:
-            say("skipping local pytest: no code, test, script, dependency or CI changes")
-    elif not run_tests:
-        say("skipping local pytest (--no-tests); CI still runs it if the diff touches code")
-    if run_tests:
+    if full_tests:
+        say("local pytest: the full suite (--full-tests)")
         checks.append(PYTEST_CHECK)
+    elif run_tests is False:
+        say("skipping local pytest (--no-tests); CI still runs it if the diff touches code")
+    elif run_tests or tests_needed(touched):
+        sources = {
+            p: r.read(p)
+            for p in r.git("ls-files", "tests").splitlines()
+            if p.rpartition("/")[2].startswith("test_") and p.endswith(".py")
+        }
+        # --no-renames: a module moved within src/ must count as deleted at its old path
+        gone = r.git(
+            "diff", "--no-renames", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD"
+        ).splitlines()
+        selected = targeted_tests(touched, sources, gone)
+        if selected is None or (run_tests and not selected):
+            say("local pytest: the full suite (the diff's tests cannot be told from its paths)")
+            checks.append(PYTEST_CHECK)
+        elif selected:
+            say(f"local pytest: {len(selected)} targeted file(s); CI runs the full suite")
+            checks.append((*PYTEST_CHECK, *selected))
+        else:
+            say("skipping local pytest: no test maps to the diff; CI runs the full suite")
+    else:
+        say("skipping local pytest: no code, test, script, dependency or CI changes")
     for cmd in checks:
         say(f"$ {' '.join(cmd)}")
         if not r.run_check(cmd):
@@ -663,6 +765,11 @@ def build_parser() -> argparse.ArgumentParser:
         const=False,
         help="skip local pytest (CI still runs it when the diff touches code)",
     )
+    tests.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="run the full pytest suite locally instead of the tests the diff maps to",
+    )
     parser.add_argument("--no-wait", action="store_true", help="push but do not wait for CI")
     parser.add_argument("--timeout-min", type=int, default=CI_TIMEOUT_S // 60)
     return parser
@@ -689,6 +796,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             allow_shared_files=args.allow_shared_files,
             run_tests=args.tests,
+            full_tests=args.full_tests,
             wait=not args.no_wait,
             timeout_s=args.timeout_min * 60,
         )

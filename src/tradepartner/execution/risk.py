@@ -1,5 +1,5 @@
 """Risk checks and buy sizing for one wrapper phase (Phase 4 spec req 3 (c);
-ADR 0010 point 1; plan T54).
+ADR 0010 point 1 and its amendment of 2026-09-30; plans T54 and T54c).
 
 Pure functions. Every limit is read from `frozen`, the window's frozen `risk.*`
 section, never from live `Settings`; the only run-time input is
@@ -8,16 +8,19 @@ explicitly. No numeric literal other than 0, 1, 2 and -1 appears here
 (`tests/test_no_literals.py`).
 
 `check_phase` takes the phase's candidate orders, already built by the wrapper
-(a sell as a quantity or a notional, a whole-share order by whole-share
-quantity), and returns either `Violations` (the batch halts before any submit)
-or `Skips` (the per-name skips and the orders left to submit). In order:
+(every sell by quantity, a whole-share order by whole-share quantity, and
+`full_exit` set from `plan.is_full_exit`), and returns either `Violations`
+(the batch halts before any submit) or `Skips` (the per-name skips and the
+orders left to submit). In order:
 
-1. **Phase-time skips**, per name, each with its journal reason (a zero-size
+1. **Phase-time skips**, per name (a sell carrying a notional is refused first,
+   `sell_by_quantity`, before any skip), each with its journal reason (a zero-size
    order is always below the minimum):
    `skip_delisted` (the listing ended at close(S-1); a `forced_exit` is never
    skipped for it), `skip_untradable` (not `tradable`; `untradable` instead for
    a `forced_exit`, exempt from the cap like `dust`), `skip_below_one_share` (a
-   whole-share order that rounds to zero; `dust` for a whole-share full exit),
+   whole-share order that rounds to zero; `dust` for a whole-share full exit,
+   so a full exit of one share is still sold),
    `skip_below_minimum` (notional below `risk.min_order_notional`; `dust` for a
    full exit). A deferred buy is not a skip: `size_buys` leaves it out.
 2. **The skip cap**: skips other than `dust` and `untradable`, plus the run's
@@ -26,38 +29,49 @@ or `Skips` (the per-name skips and the orders left to submit). In order:
 3. **The batch limits** on the orders left, each a violation of kind
    `limit_breach` (`LimitBreachError`) naming its rule:
    - `max_position_weight`: a buy's decision target weight (a buy without one,
-     or with a non-finite or negative one, fails closed);
-   - `max_order_notional_fraction`: each order's notional against equity;
+     or with a non-finite or negative one, fails closed), and every bought
+     name's held value after the phase (its ledger quantity at the reference
+     price plus the buy, a whole-share buy at the buffered price) over equity;
+     names the phase does not buy are not checked, so drift alone never halts;
+   - `one_order_per_name_side`: at most one order per (name, side);
+   - `max_order_notional_fraction`: each buy's and trim's notional against
+     equity; a full exit (every forced exit included) is exempt;
    - `max_gross_exposure`: held value after the batch over equity (a
      non-finite price for any name fails closed);
    - `max_orders_per_run`: this phase's orders plus the run's earlier ones;
    - `sell_within_holding`: each sell at most the reconciled holding rounded
      down to `quantity_decimals` (no short, ever);
    - `sell_sum_within_holding`: a name's sells plus the unfilled quantity of its
-     non-terminal own sells from any session at most the holding, rounded down
-     as above;
+     non-terminal own sells from any session (`open_sold`: each snapped to the
+     `quantity_decimals` grid, summed exactly in `Decimal`) at most the
+     holding, rounded down as above;
    - `buys_within_cash`: the buys with their modelled cost, a whole-share buy
      at the reference price x (1 + `risk.whole_share_price_buffer`), within
-     `account().cash` (never `buying_power`), checked here independently of the
-     sizing; within `risk.reconcile_cash_tolerance`, float noise, the check
-     passes;
+     `account().cash` (never `buying_power`), strictly and in `Decimal`
+     (`_buy_cash`, which `size_buys` uses too); a buy notional not in whole
+     cents is refused (`ValueError`: the wrapper floors to the cent first);
    - `asset_missing` and `whole_shares`: an order whose name the broker's
-     `assets` read lacks, or a fractional order on a name that is not
-     `fractionable` (the wrapper builds it by whole shares), fail closed.
+     `assets` read lacks, or a fractional order by whole shares, fail closed. A
+     buy or trim of a name no longer `fractionable` goes by whole shares (the
+     wrapper floors it); a full exit goes by its decision's `whole_share` flag
+     alone, so a name that lost `fractionable` is still sold whole (#395).
 
-Equity is the ledger's at `price_of` (the reference price, close(S-1)); a
-notional sell is converted to shares at its order's reference price.
+Equity is the ledger's at `price_of` (the reference price, close(S-1)).
 
-`size_buys` sizes the buys phase from cash after the sells (spec req 3):
-spendable = `costs.buy_notional_after_costs(cash, ...)`; scale = min(1,
-spendable / the buys' remainders), so the cost reserve a first attempt's target
-already carries is not deducted twice; a notional buy whose scaled attempt falls
-below `risk.min_order_notional`, or a whole-share buy that floors to no share
-(or to less than the minimum), is deferred and the others rescaled without it;
-each active buy's per-order commission is reserved before scaling; whole-share
-buys come last, by floor at the buffered price, while that fits the cash left,
-else deferred. Notionals are not rounded to cents here: the wrapper rounds them
-down (`round_down`), which only spends less.
+`size_buys` sizes the buys phase from cash after the sells (spec req 3), in
+`Decimal`: spendable is the cash less one per-order commission per active buy,
+over 1 + the per-side rate + the per-share commission at the lowest price;
+scale = min(1, spendable / the buys' remainders), so the cost reserve a first
+attempt's target already carries is not deducted twice; notionals are floored
+to the cent and, should `Decimal` rounding leave the floored batch needing more
+than the cash under `_buy_cash`, the overshoot rounded up to the cent comes off
+the largest notional once (a `ValueError` if that takes it below the minimum),
+so every sized batch passes `check_phase`'s cash rule. A notional buy whose
+scaled attempt falls below `risk.min_order_notional`, or a whole-share buy that
+floors to no share (or to less than the minimum), is deferred and the others
+rescaled without it;
+whole-share buys come last, by floor at the buffered price, while that fits the
+cash left, else deferred.
 """
 
 from __future__ import annotations
@@ -67,12 +81,12 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal
 
 import polars as pl
 
 from tradepartner.adapters.broker import Account, Asset
-from tradepartner.backtest.costs import buy_notional_after_costs, trade_cost
+from tradepartner.backtest.costs import BPS_PER_UNIT
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import BuyCosts, Remainder, _split_factor
@@ -94,6 +108,7 @@ __all__ = [
     "Violation",
     "Violations",
     "check_phase",
+    "open_sold",
     "round_down",
     "size_buys",
     "unfilled_sells",
@@ -104,6 +119,8 @@ _SELL = "sell"
 _FORCED_EXIT = "forced_exit"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
+#: Cash is compared in cents (spec req 3 (c)).
+_CENT = Decimal(1).scaleb(-2)
 #: Skips exempt from `risk.max_skips_per_run` (spec req 3).
 _CAP_EXEMPT = frozenset({"dust", "untradable"})
 
@@ -115,8 +132,8 @@ class PhaseOrder:
     """One candidate order of a phase, as the wrapper built it: exactly one of
     `notional` and `quantity`. `decision` is the decision's kind (`trade`,
     `override`, `forced_exit`); `full_exit` marks a sell of the whole remaining
-    holding; `whole_share` is the order's basis (the decision's flag, or the
-    name's lost `fractionable`); `price` is the reference price at close(S-1);
+    holding; `whole_share` is the order's basis (the decision's flag, or, for
+    a buy or trim, the name's lost `fractionable`); `price` is the reference price at close(S-1);
     `target_weight` is a buy decision's; `listing_ended` is true when the
     name's listing ended at close(S-1)."""
 
@@ -134,7 +151,7 @@ class PhaseOrder:
     listing_ended: bool = False
 
     def shares(self) -> float:
-        """The order in shares (a notional at its reference price)."""
+        """The order in shares (a notional buy at its reference price)."""
         if self.quantity is not None:
             return self.quantity
         assert self.notional is not None
@@ -190,7 +207,8 @@ class Violations:
 @dataclass(frozen=True)
 class Skips:
     """The batch passes: its skips and the orders left to submit, in input order,
-    each with `whole_share` set when its name is not `fractionable`."""
+    each buy and trim with `whole_share` set when its name is not
+    `fractionable`."""
 
     skips: tuple[Skip, ...]
     orders: tuple[PhaseOrder, ...]
@@ -235,6 +253,24 @@ def _finite(value: float, what: str, *, positive: bool = False) -> float:
     return value
 
 
+def open_sold(open_sells: Iterable[OpenSell], quantity_decimals: int) -> dict[str, Decimal]:
+    """Each name's open sells (`unfilled_sells`), summed exactly in `Decimal`
+    by `security_id`, every unfilled quantity first snapped to the nearest
+    step of the `quantity_decimals` grid. A broker quantity and its fills sit on
+    that grid, so the snap removes only the `float` noise of `unfilled_sells`'
+    subtraction (a fully filled sell with no terminal event yet leaves about
+    1e-16, which must not count). `check_phase`'s `sell_sum_within_holding`
+    and `phases.sell_orders`' trim cap both read this one sum (#605)."""
+    if quantity_decimals < 0:
+        raise ValueError(f"decimals must be non-negative, got {quantity_decimals}")
+    step = Decimal(1).scaleb(-quantity_decimals)
+    totals: dict[str, Decimal] = defaultdict(Decimal)
+    for sell in open_sells:
+        left = _dec(_finite(sell.unfilled_quantity, f"open sell of {sell.security_id}"))
+        totals[sell.security_id] += left.quantize(step, rounding=ROUND_HALF_EVEN)
+    return totals
+
+
 def round_down(quantity: float, decimals: int) -> float:
     """`quantity` rounded toward zero to `decimals` places, from its shortest
     decimal form (so 0.57 stays 0.57): never up."""
@@ -243,6 +279,58 @@ def round_down(quantity: float, decimals: int) -> float:
     _finite(quantity, "quantity")
     step = Decimal(1).scaleb(-decimals)
     return float(Decimal(repr(quantity)).quantize(step, rounding=ROUND_DOWN))
+
+
+def _dec(value: float) -> Decimal:
+    return Decimal(repr(value))
+
+
+def _buy_cash(
+    notional: float | None,
+    quantity: float | None,
+    price: float,
+    whole_share: bool,
+    frozen: RiskConfig,
+    costs: BuyCosts,
+) -> Decimal:
+    """What one buy takes from cash, in `Decimal`: a notional (floored to the
+    cent; `check_phase` refuses any other), or a whole-share quantity at the
+    buffered reference price, plus its modelled cost (`backtest.costs.
+    trade_cost`'s formula; nothing for a buy of nothing). `check_phase` and
+    `size_buys` both use it."""
+    if whole_share:
+        assert quantity is not None
+        shares = _dec(quantity)
+        amount = shares * _dec(price) * (1 + _dec(frozen.whole_share_price_buffer))
+    else:
+        assert notional is not None
+        amount = _dec(notional).quantize(_CENT, rounding=ROUND_DOWN)
+        shares = amount / _dec(price)
+    if amount == 0 and shares == 0:
+        return Decimal(0)
+    return (
+        amount
+        + amount * _dec(costs.per_side_bps) / BPS_PER_UNIT
+        + shares * _dec(costs.commissions.per_share)
+        + _dec(costs.commissions.per_order)
+    )
+
+
+def _spendable(cash: Decimal, buys: int, low_price: float, costs: BuyCosts) -> Decimal:
+    """The largest notional `buys` buys can share out of `cash`: cash less one
+    per-order commission per buy, over 1 + the per-side rate + the per-share
+    commission at the lowest price (the most shares per dollar).
+    `costs.buy_notional_after_costs`'s formula in `Decimal` (a test pins the
+    two equal); never below zero."""
+    available = cash - buys * _dec(costs.commissions.per_order)
+    if available <= 0:
+        return Decimal(0)
+    rate = (
+        1
+        + _dec(costs.per_side_bps) / BPS_PER_UNIT
+        + _dec(costs.commissions.per_share) / _dec(low_price)
+    )
+    return available / rate
 
 
 def unfilled_sells(
@@ -325,6 +413,14 @@ def check_phase(
         _finite(order.value(), f"size of decision {order.decision_id}")
         if order.side == _BUY and (order.full_exit or order.decision == _FORCED_EXIT):
             raise ValueError(f"buy of decision {order.decision_id} marked as an exit")
+        if order.side == _BUY and order.quantity is not None and not order.whole_share:
+            raise ValueError(f"buy of decision {order.decision_id} by quantity is not whole-share")
+        if (
+            order.side == _BUY
+            and order.notional is not None
+            and _dec(order.notional) != _dec(order.notional).quantize(_CENT)
+        ):
+            raise ValueError(f"buy of decision {order.decision_id} is not in whole cents")
 
     violations: list[Violation] = []
 
@@ -334,6 +430,9 @@ def check_phase(
     skips: list[Skip] = []
     left: list[PhaseOrder] = []
     for order in orders:
+        if order.side == _SELL and order.quantity is None:
+            breach("sell_by_quantity", f"{order.security_id} sell carries a notional")
+            continue
         if order.listing_ended and order.decision != _FORCED_EXIT:
             skips.append(Skip(order.decision_id, order.security_id, "skip_delisted"))
             continue
@@ -341,7 +440,8 @@ def check_phase(
         if asset is None:
             breach("asset_missing", f"no asset read for {order.security_id}")
             continue
-        whole = order.whole_share or not asset.fractionable
+        # A full exit keeps its decision's basis and sells the whole holding (#395).
+        whole = order.whole_share or (not asset.fractionable and not order.full_exit)
         reason = _skip_reason(order, asset, frozen, whole)
         if reason is not None:
             skips.append(Skip(order.decision_id, order.security_id, reason))
@@ -373,11 +473,20 @@ def check_phase(
             f"{prior_orders + len(left)} orders against the cap of {frozen.max_orders_per_run}",
         )
 
+    per_side: dict[tuple[str, str], int] = defaultdict(int)
+    for order in left:
+        per_side[order.security_id, order.side] += 1
+    for (name, side), count in per_side.items():
+        if count > 1:
+            breach("one_order_per_name_side", f"{count} {side} orders for {name}")
+
     after: dict[str, float] = defaultdict(float, ledger.positions)
     sold: dict[str, float] = defaultdict(float)
-    buy_cash = 0.0
+    bought: dict[str, tuple[float, float]] = {}
+    over_weight: dict[str, str] = {}
+    buy_cash = Decimal(0)
     for order in left:
-        if order.value() > frozen.max_order_notional_fraction * equity:
+        if not order.full_exit and order.value() > frozen.max_order_notional_fraction * equity:
             breach(
                 "max_order_notional_fraction",
                 f"{order.security_id} order of {order.value():.2f} over "
@@ -391,19 +500,16 @@ def check_phase(
                 or weight < 0
                 or weight > frozen.max_position_weight
             ):
-                breach(
-                    "max_position_weight",
+                over_weight.setdefault(
+                    order.security_id,
                     f"{order.security_id} target weight {weight} over {frozen.max_position_weight}",
                 )
             after[order.security_id] += order.shares()
-            if order.whole_share:
-                assert order.quantity is not None
-                price = order.price * (1 + frozen.whole_share_price_buffer)
-                notional, shares = order.quantity * price, order.quantity
-            else:
-                notional, shares = order.value(), order.shares()
-            buy_cash += notional + trade_cost(
-                notional, shares, costs.per_side_bps, costs.commissions
+            buffer = 1 + frozen.whole_share_price_buffer if order.whole_share else 1
+            _, value = bought.get(order.security_id, (order.price, 0.0))
+            bought[order.security_id] = (order.price, value + order.value() * buffer)
+            buy_cash += _buy_cash(
+                order.notional, order.quantity, order.price, order.whole_share, frozen, costs
             )
         else:
             holding = ledger.positions.get(order.security_id, 0.0)
@@ -416,15 +522,28 @@ def check_phase(
             sold[order.security_id] += order.shares()
             after[order.security_id] -= order.shares()
 
-    for sell in open_sells:
-        if sell.security_id in sold:
-            sold[sell.security_id] += sell.unfilled_quantity
+    for name, (price, value) in bought.items():
+        held = max(ledger.positions.get(name, 0.0), 0.0) * price + value
+        if held > frozen.max_position_weight * equity:
+            over_weight.setdefault(
+                name,
+                f"{name} held {held:.2f} after the phase over "
+                f"{frozen.max_position_weight} of equity {equity:.2f}",
+            )
+    for detail in over_weight.values():
+        breach("max_position_weight", detail)
+
+    # Exact in `Decimal`, never `float`, with the open sells summed by the one
+    # helper `phases.sell_orders` caps a trim with (`open_sold`), so a trim
+    # capped there never breaches here on float drift alone (#605).
+    open_by_name = open_sold(open_sells, quantity_decimals)
     for name, total in sold.items():
         holding = round_down(max(ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
-        if total > holding:
+        total_exact = _dec(total) + open_by_name.get(name, Decimal(0))
+        if total_exact > _dec(holding):
             breach(
                 "sell_sum_within_holding",
-                f"{name} sells and open sells of {total} over the holding {holding}",
+                f"{name} sells and open sells of {total_exact} over the holding {holding}",
             )
 
     exposure = (
@@ -440,8 +559,8 @@ def check_phase(
             f"gross exposure after the batch {exposure:.4f} over {frozen.max_gross_exposure}",
         )
 
-    if buy_cash > account.cash + frozen.reconcile_cash_tolerance:
-        breach("buys_within_cash", f"buys need {buy_cash:.2f}, cash is {account.cash:.2f}")
+    if buy_cash > _dec(account.cash):
+        breach("buys_within_cash", f"buys need {buy_cash:.4f}, cash is {account.cash:.2f}")
 
     if violations:
         return Violations(tuple(violations))
@@ -469,16 +588,38 @@ def size_buys(
         b.decision.security_id: _finite(price_of(b.decision.security_id), "price", positive=True)
         for b in decisions
     }
-    buffer = 1 + frozen.whole_share_price_buffer
+    buffer = 1 + _dec(frozen.whole_share_price_buffer)
+    cash_d = _dec(cash)
 
-    def whole_shares(buy: BuyToSize, scale: float) -> float:
-        buffered = prices[buy.decision.security_id] * buffer
-        return float(math.floor(buy.remainder.notional * scale / buffered))
+    def whole_shares(buy: BuyToSize, scale: Decimal) -> float:
+        buffered = _dec(prices[buy.decision.security_id]) * buffer
+        return float(
+            (_dec(buy.remainder.notional) * scale / buffered).to_integral_value(ROUND_DOWN)
+        )
 
-    def below_minimum(buy: BuyToSize, scale: float) -> bool:
+    def attempt(buy: BuyToSize, scale: Decimal) -> float:
+        return float((_dec(buy.remainder.notional) * scale).quantize(_CENT, rounding=ROUND_DOWN))
+
+    def need(buy: BuyToSize, scale: Decimal) -> Decimal:
+        price = prices[buy.decision.security_id]
+        if buy.by_whole_shares:
+            return _buy_cash(None, whole_shares(buy, scale), price, True, frozen, costs)
+        return _buy_cash(attempt(buy, scale), None, price, False, frozen, costs)
+
+    def scale_for(active: list[BuyToSize]) -> Decimal:
+        total = sum((_dec(b.remainder.notional) for b in active), Decimal(0))
+        if not active or total <= 0:
+            return Decimal(0)
+        # Each buy pays its own per-order commission, and the lowest price buys
+        # the most shares (the worst case for a per-share one); Alpaca charges
+        # neither.
+        low_price = min(prices[b.decision.security_id] for b in active)
+        return min(Decimal(1), _spendable(cash_d, len(active), low_price, costs) / total)
+
+    def below_minimum(buy: BuyToSize, scale: Decimal) -> bool:
         if not buy.by_whole_shares:
-            attempt = buy.remainder.notional * scale
-            return attempt <= 0 or attempt < frozen.min_order_notional
+            notional = attempt(buy, scale)
+            return notional <= 0 or notional < frozen.min_order_notional
         quantity = whole_shares(buy, scale)
         value = quantity * prices[buy.decision.security_id]
         return quantity < 1 or value < frozen.min_order_notional
@@ -486,46 +627,57 @@ def size_buys(
     active = [b for b in decisions if b.remainder.notional > 0]
     deferred: set[int] = {id(b) for b in decisions if b.remainder.notional <= 0}
     while True:
-        # Each buy pays its own per-order commission, and the lowest price buys
-        # the most shares (the worst case for a per-share one); Alpaca charges
-        # neither.
-        reserved = max(len(active) - 1, 0) * costs.commissions.per_order
-        spendable = buy_notional_after_costs(
-            max(cash - reserved, 0.0),
-            costs.per_side_bps,
-            costs.commissions,
-            price=min((prices[b.decision.security_id] for b in active), default=1.0),
-        )
-        total = sum(b.remainder.notional for b in active)
-        scale = min(1.0, spendable / total) if total > 0 else 0.0
+        scale = scale_for(active)
         low = [b for b in active if below_minimum(b, scale)]
         if not low:
             break
         deferred.update(id(b) for b in low)
         active = [b for b in active if id(b) not in deferred]
 
+    notionals = {
+        id(b): _dec(attempt(b, scale))
+        for b in decisions
+        if not b.by_whole_shares and id(b) not in deferred
+    }
+    by_id = {id(b): b for b in decisions}
+
+    def notional_need(key: int) -> Decimal:
+        buy = by_id[key]
+        price = prices[buy.decision.security_id]
+        return _buy_cash(float(notionals[key]), None, price, False, frozen, costs)
+
+    # Exact arithmetic keeps the floored batch within cash; `Decimal` rounding
+    # can overshoot by a few units in its last place. One cut, the overshoot
+    # rounded up to the cent, off the largest notional removes at least the
+    # overshoot (a dollar less needs at least a dollar less), so no loop; an
+    # overshoot above a cent is not rounding, and raises.
+    over = sum((notional_need(k) for k in notionals), Decimal(0)) - cash_d
+    if over > 0:
+        largest = max(notionals, key=lambda k: notionals[k])
+        cut = over.quantize(_CENT, rounding=ROUND_UP)
+        if cut > _CENT or notionals[largest] - cut < _dec(frozen.min_order_notional):
+            raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")
+        notionals[largest] -= cut
+
     notional_sizings: list[Sizing] = []
-    cash_left = cash
+    cash_left = cash_d
     for buy in decisions:
         if buy.by_whole_shares:
             continue
         if id(buy) in deferred:
             notional_sizings.append(_sizing(buy))
             continue
-        notional = buy.remainder.notional * scale
-        shares = notional / prices[buy.decision.security_id]
-        cash_left -= notional + trade_cost(notional, shares, costs.per_side_bps, costs.commissions)
-        notional_sizings.append(_sizing(buy, notional=notional))
+        cash_left -= notional_need(id(buy))
+        notional_sizings.append(_sizing(buy, notional=float(notionals[id(buy)])))
 
     whole_sizings: list[Sizing] = []
     for buy in decisions:
         if not buy.by_whole_shares:
             continue
-        price = prices[buy.decision.security_id] * buffer
         quantity = 0.0 if id(buy) in deferred else whole_shares(buy, scale)
-        cost = trade_cost(quantity * price, quantity, costs.per_side_bps, costs.commissions)
-        if quantity >= 1 and quantity * price + cost <= cash_left:
-            cash_left -= quantity * price + cost
+        cost = need(buy, scale) if quantity else Decimal(0)
+        if quantity >= 1 and cost <= cash_left:
+            cash_left -= cost
             whole_sizings.append(_sizing(buy, quantity=quantity))
         else:
             whole_sizings.append(_sizing(buy))

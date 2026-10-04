@@ -51,10 +51,15 @@ calling a writer; an open one in the same process makes the write fail at once.
   checks, in one transaction, that: the window is open; the reconciliation is
   this window's latest and `ok`, and not older than the resume; the resume is
   the latest `resume_invocations` row and no `released` row cites it yet; no
-  run of the window is unfinished; the switch is engaged (a release with
-  nothing engaged would only reset the drawdown peak); and the peak is a
-  positive finite number. Only `paper resume` calls it (T60e), after its own
-  checks.
+  run of the window is unfinished; no `engaged` row of the window was
+  written after the resume (its `event_id` above the caller's
+  `seen_event_id`: an engagement the owner did not see when resuming needs a
+  new resume); the switch is engaged (a release with
+  nothing engaged would only reset the drawdown peak) and the new row would
+  clear it (a release stamped at or before a faulted run's `finished_at`
+  would not); and the peak is a positive finite number. "No `released` row
+  cites the resume" spans every window, because resumes carry none. Only
+  `paper resume` calls it (T60e), after its own checks.
 
 **Drawdown** (ADR 0010 point 1): at the mark step, ledger equity below the
 window's peak by more than the frozen `risk.max_drawdown`, strictly, engages
@@ -71,7 +76,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import duckdb
@@ -117,6 +122,12 @@ class SwitchState:
     causes: tuple[str, ...]
 
 
+class ReleaseRefused(ValueError):
+    """`release` refused: one of its checks failed and nothing was written, so
+    the switch stays engaged. A `ValueError`, so callers that catch that keep
+    working; `paper resume` catches this type alone and reports a refusal."""
+
+
 @dataclass(frozen=True)
 class WriteFailed:
     """A writer could not reach the store; `error` names the exception."""
@@ -158,13 +169,43 @@ def derive(
         result = finished.get(run_id)
         if result is None:
             causes.append(f"run {run_id} unfinished")
-        elif result.status in FAULTED_RUN_STATUSES and not any(
-            at > run.started_at and at > result.finished_at for at in releases
-        ):
+        elif _faulted_uncleared(run, result, releases):
             causes.append(f"run {run_id} {result.status}")
 
     return SwitchState(
         engaged=bool(causes), run_in_progress=in_progress is not None, causes=tuple(causes)
+    )
+
+
+def _faulted_uncleared(
+    run: PaperRunRow, result: PaperRunResultRow, releases: Sequence[datetime]
+) -> bool:
+    """A run that ended faulted with no `released` row after both its
+    `started_at` and its `finished_at` (the rule `derive` engages on)."""
+    return result.status in FAULTED_RUN_STATUSES and not any(
+        at > run.started_at and at > result.finished_at for at in releases
+    )
+
+
+def faulted_runs(
+    window: PaperWindowRow,
+    kill_switch_rows: Sequence[KillSwitchRow],
+    runs: Sequence[PaperRunRow],
+    results: Sequence[PaperRunResultRow],
+) -> tuple[int, ...]:
+    """The window's runs that ended `halted`, `crashed` or `failed` and that no
+    release has cleared, by `derive`'s own rule: the runs a release would clear.
+    For a lock holder (resume): it applies none of `derive`'s `reading_run` or
+    run-in-progress exclusions, and leaves out unfinished runs, which resume
+    closes `crashed` first."""
+    window_id = window.window_id
+    releases = [r.at for r in kill_switch_rows if r.window_id == window_id and r.state == RELEASED]
+    finished = {r.run_id: r for r in results}
+    return tuple(
+        _run_order(run)
+        for run in sorted((r for r in runs if r.window_id == window_id), key=_run_order)
+        if (result := finished.get(_run_order(run))) is not None
+        and _faulted_uncleared(run, result, releases)
     )
 
 
@@ -231,9 +272,9 @@ def engage_from_overrides(
     """Append one `engaged` row per unconsumed `engage_kill_switch` override of
     the window, citing it, and return their `event_id`s (empty when there is
     none), or `WriteFailed` when the store cannot be written."""
+    now = clock()
     try:
         with open_for_write(settings) as conn:
-            now = clock()
             event_ids = []
             for override in unconsumed_kill_switch_overrides(conn, window_id):
                 event_ids.append(
@@ -265,74 +306,106 @@ def release(
     resume_id: int,
     reconciliation_id: int,
     peak_equity: float,
+    seen_event_id: int,
 ) -> int:
     """Append the `released` row (source `owner`) and return its `event_id`.
-    Raises `ValueError`, writing nothing, when any check in the module docstring
-    fails. Store errors propagate: the owner's `paper resume` reports them."""
+    `seen_event_id` is the highest `kill_switch` `event_id` of the window when
+    the resume row was written, in the same transaction (0 when there was none).
+    Raises `ReleaseRefused` (a `ValueError`), writing nothing, when any check in
+    the module docstring fails. Store errors propagate: the owner's `paper resume` reports them."""
     if not (math.isfinite(peak_equity) and peak_equity > 0):
-        raise ValueError(f"peak_equity must be positive and finite, got {peak_equity!r}")
+        raise ReleaseRefused(f"peak_equity must be positive and finite, got {peak_equity!r}")
+    if seen_event_id < 0:
+        raise ReleaseRefused(f"seen_event_id must not be negative, got {seen_event_id!r}")
+    seen = seen_event_id
+    now = clock()
     with open_for_write(settings) as conn:
         window = open_window(conn)
         if window is None or window.window_id != window_id:
-            raise ValueError(f"window {window_id} is not the open window")
+            raise ReleaseRefused(f"window {window_id} is not the open window")
         reconciliations = reconciliations_for(conn, window_id)
         reconciliation = next(
             (r for r in reconciliations if r.reconciliation_id == reconciliation_id),
             None,
         )
         if reconciliation is None:
-            raise ValueError(f"reconciliation {reconciliation_id} is not in window {window_id}")
+            raise ReleaseRefused(f"reconciliation {reconciliation_id} is not in window {window_id}")
         if reconciliation.status != _RECONCILIATION_OK:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"reconciliation {reconciliation_id} is {reconciliation.status!r}, not ok"
             )
         latest = max(r.reconciliation_id or 0 for r in reconciliations)
         if reconciliation_id != latest:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"reconciliation {reconciliation_id} is not the window's latest ({latest})"
             )
         resumes = resume_invocations(conn)
         resume = next((r for r in resumes if r.resume_id == resume_id), None)
         if resume is None:
-            raise ValueError(f"no resume_invocations row {resume_id}")
+            raise ReleaseRefused(f"no resume_invocations row {resume_id}")
         if resume_id != max(r.resume_id or 0 for r in resumes):
-            raise ValueError(f"resume {resume_id} is not the latest resume")
+            raise ReleaseRefused(f"resume {resume_id} is not the latest resume")
+        # Resumes carry no window, so a release in any window consumes one.
+        cited = conn.execute(
+            "SELECT window_id FROM kill_switch WHERE state = ? AND resume_id = ? LIMIT 1",
+            [RELEASED, resume_id],
+        ).fetchone()
+        if cited is not None:
+            raise ReleaseRefused(
+                f"resume {resume_id} has already released the switch (window {cited[0]})"
+            )
         rows = kill_switch_events_for(conn, window_id)
-        if any(r.state == RELEASED and r.resume_id == resume_id for r in rows):
-            raise ValueError(f"resume {resume_id} has already released the switch")
         if reconciliation.at < resume.at:
-            raise ValueError(f"reconciliation {reconciliation_id} is older than resume {resume_id}")
+            raise ReleaseRefused(
+                f"reconciliation {reconciliation_id} is older than resume {resume_id}"
+            )
+        # An engagement written after the resume row is one the owner did not
+        # see when resuming: only a new resume may release it. Write order
+        # (`event_id`), not stamps: a halt row after a `ClockError` carries
+        # `utc_now`, and two clocks can disagree.
+        later = [str(r.event_id) for r in rows if r.state == ENGAGED and _event_order(r) > seen]
+        if later:
+            raise ReleaseRefused(
+                f"kill_switch event(s) {', '.join(later)} engaged after resume "
+                f"{resume_id}: resume again to release them"
+            )
         runs = runs_for(conn, window_id)
         unfinished = [str(r.run.run_id) for r in runs if r.result is None]
         if unfinished:
-            raise ValueError(
+            raise ReleaseRefused(
                 f"run(s) {', '.join(unfinished)} unfinished: close them as crashed first"
             )
-        state = derive(
+        run_rows = [r.run for r in runs]
+        results = [r.result for r in runs if r.result is not None]
+        state = derive(window, rows, run_rows, results, reading_run=None, lock_free=True)
+        if not state.engaged:
+            raise ReleaseRefused(f"the kill switch of window {window_id} is not engaged")
+        row = KillSwitchRow(
+            window_id=window_id,
+            at=now,
+            state=RELEASED,
+            source=_OWNER,
+            resume_id=resume_id,
+            reconciliation_id=reconciliation_id,
+            peak_equity=peak_equity,
+            known_at=now,
+            ingested_at=now,
+        )
+        last = max((_event_order(r) for r in rows), default=0)
+        after = derive(
             window,
-            rows,
-            [r.run for r in runs],
-            [r.result for r in runs if r.result is not None],
+            [*rows, replace(row, event_id=last + 1)],
+            run_rows,
+            results,
             reading_run=None,
             lock_free=True,
         )
-        if not state.engaged:
-            raise ValueError(f"the kill switch of window {window_id} is not engaged")
-        now = clock()
-        return _append(
-            conn,
-            KillSwitchRow(
-                window_id=window_id,
-                at=now,
-                state=RELEASED,
-                source=_OWNER,
-                resume_id=resume_id,
-                reconciliation_id=reconciliation_id,
-                peak_equity=peak_equity,
-                known_at=now,
-                ingested_at=now,
-            ),
-        )
+        if after.engaged:
+            raise ReleaseRefused(
+                f"a release at {now.isoformat()} would not clear the switch: "
+                f"{'; '.join(after.causes)}"
+            )
+        return _append(conn, row)
 
 
 def drawdown_peak(window: PaperWindowRow, kill_switch_rows: Sequence[KillSwitchRow]) -> float:

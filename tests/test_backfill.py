@@ -563,6 +563,99 @@ def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
     assert all(secret not in m for (m,) in stored) and "[redacted]" in stored[0][0]
 
 
+# --- #573: a failed run row names where the error was raised --------------
+
+
+def test_backfill_failed_run_message_names_the_raising_file_line_and_function(
+    settings: Settings,
+) -> None:
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            raise RuntimeError("actions endpoint down")
+
+    result = _backfill(settings, Boom())
+    assert result.runs[-1].status == FAILED
+    message = result.runs[-1].message
+    assert "RuntimeError: actions endpoint down" in message
+    assert " | at: " in message
+    where = message.split(" | at: ", 1)[1]
+    assert "test_backfill.py" in where
+    assert " in corporate_actions" in where
+
+
+def test_backfill_failed_run_message_has_no_local_or_argument_values(
+    settings: Settings,
+) -> None:
+    def _inner(argument: str) -> None:
+        local_secret = "sk-local-backfill-5c1a"
+        assert local_secret  # kept "in scope" for the frame, never read back
+        raise ValueError("boom")
+
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            _inner("sk-argument-backfill-9d4e")
+
+    result = _backfill(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "ValueError: boom" in message
+    assert "sk-local-backfill-5c1a" not in message
+    assert "sk-argument-backfill-9d4e" not in message
+    assert "_inner" in message
+
+
+def test_backfill_failed_run_message_includes_the_chained_causes_frame(
+    settings: Settings,
+) -> None:
+    def _root_cause() -> None:
+        raise KeyError("cik")
+
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            try:
+                _root_cause()
+            except KeyError as exc:
+                raise RuntimeError("wrapped") from exc
+
+    result = _backfill(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    where = message.split(" | at: ", 1)[1]
+    assert "_root_cause" in where
+    assert "corporate_actions" in where
+
+
+def test_backfill_failed_run_message_where_is_length_bounded(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        ingest={"max_where_chars": 60},
+    )
+
+    def _deep(n: int) -> None:
+        if n == 0:
+            raise RuntimeError("deep failure")
+        _deep(n - 1)
+
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            _deep(20)
+
+    result = _backfill(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "RuntimeError: deep failure" in message
+    assert len(message) <= 60
+
+
 def test_the_edgar_commit_never_reaches_the_source() -> None:
     from tradepartner.ingest import _prefetch, _Recorded
 

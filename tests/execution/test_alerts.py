@@ -10,6 +10,7 @@ the spec's list is accepted and any other refused.
 from __future__ import annotations
 
 import re
+import smtplib
 import ssl
 import subprocess
 from collections.abc import Iterator, Sequence
@@ -19,6 +20,7 @@ from typing import Any, ClassVar
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from tradepartner.config import Settings
 from tradepartner.execution import alerts
@@ -50,6 +52,7 @@ SPEC_KINDS = (
     "unspent_cash",
     "locked",
     "no_window",
+    "lot_ledger",  # #366 Q5 (a), 2026-10-01
 )
 
 
@@ -66,7 +69,7 @@ def conn() -> Iterator[duckdb.DuckDBPyConnection]:
 _TIMEOUT = 7.5
 
 
-def _settings(channels: Sequence[str] = ("store",), **secrets: str) -> Settings:
+def _settings(channels: Sequence[str] = ("store", "macos"), **secrets: str) -> Settings:
     alerts_config = {"channels": list(channels), "delivery_timeout_seconds": _TIMEOUT}
     return Settings(_env_file=None, alerts=alerts_config, **secrets)  # type: ignore[call-arg]
 
@@ -92,23 +95,29 @@ class FakeRunner:
 
 
 class FakeSMTP:
-    """Stands in for `smtplib.SMTP`; records what was sent."""
+    """Stands in for `smtplib.SMTP`; records what was sent. Like the real client,
+    the host it is built with is the one STARTTLS verifies the certificate
+    against, so it must carry no port (#394)."""
 
     instances: ClassVar[list[FakeSMTP]] = []
     fail_login_with: ClassVar[Exception | None] = None
+    fail_quit_with: ClassVar[Exception | None] = None
 
-    def __init__(self, host: str, timeout: float) -> None:
-        self.host, self.timeout = host, timeout
+    def __init__(self, host: str, port: int = 0, *, timeout: float) -> None:
+        self.host, self.port, self.timeout = host, port, timeout
         self.tls = False
+        self.closed = False
         self.logins: list[tuple[str, str]] = []
         self.sent: list[EmailMessage] = []
         FakeSMTP.instances.append(self)
 
-    def __enter__(self) -> FakeSMTP:
-        return self
+    def quit(self) -> None:
+        self.closed = True
+        if FakeSMTP.fail_quit_with is not None:
+            raise FakeSMTP.fail_quit_with
 
-    def __exit__(self, *exc: object) -> None:
-        return None
+    def close(self) -> None:
+        self.closed = True
 
     def starttls(self, *, context: ssl.SSLContext | None = None) -> None:
         assert context is not None, "STARTTLS must use a verifying context"
@@ -130,6 +139,7 @@ class FakeSMTP:
 def _reset_smtp() -> Iterator[None]:
     FakeSMTP.instances = []
     FakeSMTP.fail_login_with = None
+    FakeSMTP.fail_quit_with = None
     yield
 
 
@@ -239,6 +249,24 @@ def test_a_raising_channel_leaves_a_failed_row_and_never_raises(
     assert store_row == (alert_id, "store", True, None)
 
 
+def test_a_failed_osascript_records_its_stderr_scrubbed(conn: duckdb.DuckDBPyConnection) -> None:
+    """`CalledProcessError`'s text omits stderr, which carries the cause (#402);
+    a secret in it is still masked."""
+
+    class Refusing(FakeRunner):
+        def __call__(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+            raise subprocess.CalledProcessError(
+                1, args, stderr=b"Not authorized to send Apple events to hunter2-very-secret\n"
+            )
+
+    alerter = _alerter(conn, _settings(["store", "macos"], **_SECRETS), runner=Refusing())
+    alerter.write("halted", 7, _SESSION, "m")
+    ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "macos"]
+    assert not ok and error is not None
+    assert "CalledProcessError" in error and "Not authorized to send Apple events to ***" in error
+    assert "hunter2" not in error
+
+
 def test_osascript_receives_the_message_escaped(conn: duckdb.DuckDBPyConnection) -> None:
     runner = FakeRunner()
     alerter = _alerter(conn, _settings(["store", "macos"]), runner=runner)
@@ -255,7 +283,8 @@ def test_email_is_sent_over_starttls_to_the_configured_address(
     alerter = _alerter(conn, _settings(["store", "email"], **_SECRETS))
     alert_id = alerter.write("drawdown", 7, _SESSION, "equity below the peak")
     (smtp,) = FakeSMTP.instances
-    assert smtp.host == "smtp.example.test:587" and smtp.tls and smtp.timeout == _TIMEOUT
+    assert (smtp.host, smtp.port) == ("smtp.example.test", 587)
+    assert smtp.tls and smtp.timeout == _TIMEOUT and smtp.closed
     assert smtp.logins == [("owner-login@example.test", "hunter2-very-secret")]
     (message,) = smtp.sent
     assert message["To"] == "owner-inbox@example.test"
@@ -264,9 +293,96 @@ def test_email_is_sent_over_starttls_to_the_configured_address(
     assert (alert_id, "email", True, None) in _deliveries(conn)
 
 
+@pytest.mark.parametrize(
+    ("setting", "host", "port"),
+    [
+        ("smtp.example.test:587", "smtp.example.test", 587),
+        ("smtp.example.test:2525", "smtp.example.test", 2525),
+        ("smtp.example.test", "smtp.example.test", 587),
+        (" smtp.example.test : 465 ", "smtp.example.test", 465),
+    ],
+)
+def test_the_port_is_split_off_the_host_starttls_verifies(
+    conn: duckdb.DuckDBPyConnection, setting: str, host: str, port: int
+) -> None:
+    """`smtplib.SMTP(host)` keeps `host` whole as the STARTTLS `server_hostname`,
+    so `host:587` could never match a certificate (#394): the client gets the bare
+    host and the port separately; no port means 587 (submission)."""
+    alerter = _alerter(
+        conn, _settings(["store", "email"], **{**_SECRETS, "alert_smtp_host": setting})
+    )
+    alert_id = alerter.write("drawdown", 7, _SESSION, "m")
+    (smtp,) = FakeSMTP.instances
+    assert (smtp.host, smtp.port) == (host, port)
+    assert (alert_id, "email", True, None) in _deliveries(conn)
+
+
+def test_the_real_client_verifies_the_bare_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Against `smtplib.SMTP` itself: the hostname STARTTLS would verify is the
+    host without its port. `connect` is stubbed, so no socket is opened."""
+    monkeypatch.setattr(smtplib.SMTP, "connect", lambda self, host, port: (220, b"ok"))
+    client = smtplib.SMTP(*alerts._smtp_address("smtp.example.test:587"), timeout=_TIMEOUT)
+    assert client._host == "smtp.example.test"  # what starttls() passes as server_hostname
+
+
+@pytest.mark.parametrize(
+    "setting", ["smtp.example.test:", "smtp.example.test:abc", "h:0", "h:70000", ":587"]
+)
+def test_a_malformed_host_is_a_failed_delivery(
+    conn: duckdb.DuckDBPyConnection, setting: str
+) -> None:
+    alerter = _alerter(
+        conn, _settings(["store", "email"], **{**_SECRETS, "alert_smtp_host": setting})
+    )
+    alerter.write("drawdown", 7, _SESSION, "m")
+    assert FakeSMTP.instances == []
+    ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
+    assert not ok and error is not None and "ALERT_SMTP_HOST" in error
+
+
+def test_a_failed_quit_after_the_send_is_still_delivered(conn: duckdb.DuckDBPyConnection) -> None:
+    """The server accepted the message; a non-221 reply to QUIT (#403) must not
+    turn it into a failed delivery. The connection is closed either way."""
+    FakeSMTP.fail_quit_with = smtplib.SMTPResponseException(421, b"closing")
+    alerter = _alerter(conn, _settings(["store", "email"], **_SECRETS))
+    alert_id = alerter.write("drawdown", 7, _SESSION, "m")
+    (smtp,) = FakeSMTP.instances
+    assert len(smtp.sent) == 1 and smtp.closed
+    assert (alert_id, "email", True, None) in _deliveries(conn)
+
+
+def test_a_failed_send_still_closes_and_records_the_send_error(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    FakeSMTP.fail_login_with = smtplib.SMTPAuthenticationError(535, b"bad credentials")
+    FakeSMTP.fail_quit_with = smtplib.SMTPServerDisconnected("gone")
+    alerter = _alerter(conn, _settings(["store", "email"], **_SECRETS))
+    alerter.write("drawdown", 7, _SESSION, "m")
+    (smtp,) = FakeSMTP.instances
+    assert smtp.closed
+    ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
+    assert not ok and error is not None and "SMTPAuthenticationError" in error
+
+
+def test_from_defaults_to_the_login_and_follows_alert_email_from(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Relays whose login is not a mailbox (`apikey`) need a separate sender (#404)."""
+    _alerter(conn, _settings(["store", "email"], **_SECRETS)).write("drawdown", 7, _SESSION, "m")
+    relay = {**_SECRETS, "alert_smtp_user": "apikey", "alert_email_from": "alerts@example.test"}
+    _alerter(conn, _settings(["store", "email"], **relay)).write("drawdown", 8, _SESSION, "m")
+    first, second = FakeSMTP.instances
+    assert first.sent[0]["From"] == "owner-login@example.test"
+    assert second.sent[0]["From"] == "alerts@example.test"
+    assert second.logins == [("apikey", "hunter2-very-secret")]
+
+
 def test_email_is_skipped_when_unset(conn: duckdb.DuckDBPyConnection) -> None:
+    # `macos` is also listed so `Settings` loads (#544: `email` alone with a
+    # partial config now refuses at config load, tested in test_config.py);
+    # `_email_configured` is still exercised here as the delivery-time defense.
     partial = {k: v for k, v in _SECRETS.items() if k != "alert_smtp_password"}
-    alerter = _alerter(conn, _settings(["store", "email"], **partial))
+    alerter = _alerter(conn, _settings(["store", "macos", "email"], **partial))
     alert_id = alerter.write("drawdown", 7, _SESSION, "m")
     assert FakeSMTP.instances == []
     ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
@@ -299,6 +415,19 @@ def test_deliver_without_store_writes_nothing_to_the_store(conn: duckdb.DuckDBPy
     assert conn.execute("SELECT COUNT(*) FROM alert_deliveries").fetchone() == (0,)
     assert len(runner.calls) == 1 and len(FakeSMTP.instances) == 1
     assert [(o.channel, o.ok) for o in outcomes] == [("macos", True), ("email", True)]
+
+
+def test_deliver_without_store_never_returns_empty_for_a_valid_config(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#416/#515: `AlertsConfig` now requires a non-store channel, so a `store`-only
+    config is rejected at load, and a valid `Settings` always gives
+    `deliver_without_store` at least one channel to try."""
+    with pytest.raises(ValidationError, match="non-store"):
+        _settings(["store"])
+    alerter = _alerter(conn, _settings(["store", "macos"]))
+    outcomes = alerter.deliver_without_store("kill_switch_write_failed", "the switch row failed")
+    assert outcomes != []
 
 
 def test_deliver_without_store_never_raises_and_works_on_a_closed_store() -> None:
@@ -440,3 +569,25 @@ def test_a_secret_is_masked_in_errors_in_any_case_or_repr_form(
     ((_, _, ok, error),) = [d for d in _deliveries(conn) if d[1] == "email"]
     assert not ok and error is not None and "refused" in error
     assert "OWNER-INBOX" not in error and "word" not in error
+
+
+@pytest.mark.parametrize("blank", [" ", "  \t", "\n"])
+def test_a_blank_secret_masks_nothing(conn: duckdb.DuckDBPyConnection, blank: str) -> None:
+    """A whitespace-only secret (an `.env` line like `ALERT_SMTP_USER=' '`) must not
+    turn every space of the message into the mask (#417); `config.secret_values`
+    drops it, as the other scrubbers do."""
+    alerter = _alerter(
+        conn, _settings(alert_smtp_user=blank, alert_email_to="owner-inbox@example.test")
+    )
+    alerter.write(
+        "halted", 7, _SESSION, "kill switch write failed at run 7 for owner-inbox@example.test"
+    )
+    ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
+    assert message == "kill switch write failed at run 7 for ***"
+
+
+def test_a_padded_secret_is_masked_by_its_stripped_value(conn: duckdb.DuckDBPyConnection) -> None:
+    alerter = _alerter(conn, _settings(alert_smtp_password="  hunter2-very-secret  "))
+    alerter.write("halted", 7, _SESSION, "auth hunter2-very-secret refused")
+    ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
+    assert message == "auth *** refused"

@@ -46,6 +46,9 @@ from tradepartner.ingest import (
     STALE,
     IngestResult,
     _add_rows,
+    _ingest_filings,
+    _prefetch,
+    _Recorded,
     expected_session,
     fact_rows,
     ingest_session,
@@ -492,15 +495,29 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
 
 
 def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
-    """T11h: failed filings, quarantined accessions and facts missing."""
+    """T11h: failed filings, quarantined accessions and facts missing; #566:
+    empty bulk zip members; #576: empty per-CIK API answers; #599: payloads
+    with `facts` but no `cik`; #610: company values dropped after capping."""
 
     class Failing(FixtureFilingSource):
         failed_filings = 2
         quarantined = 1
         facts_missing = 4
+        facts_bulk_empty = 3  # #566
+        submissions_bulk_empty = 5
+        facts_api_empty = 6  # #576
+        submissions_api_empty = 7
+        facts_bulk_keyless = 8  # #599
+        facts_api_keyless = 9
+        facts_capped_dropped = frozenset({("acc", "name", "day")})  # #610 X2: dropped keys
 
     message = _run(settings, filings=_filings(cls=Failing), source="edgar").runs[0].message
-    counts = "; failed filings: 2; quarantined: 1; facts missing: 4; missing"
+    counts = (
+        "; failed filings: 2; quarantined: 1; facts missing: 4"
+        "; empty bulk facts: 3; empty bulk submissions: 5"
+        "; empty API facts: 6; empty API submissions: 7"
+        "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; missing"
+    )
     assert counts in message
 
 
@@ -572,6 +589,58 @@ def test_check_failures_raising_fails_the_chunk_with_one_failed_run_row(
     assert result.runs[0].status == FAILED
     assert "too many failures" in result.runs[0].message
     assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
+class _RecordsFailedCheck(FixtureFilingSource):
+    """A source whose `check_failures` raises and that counts the
+    `record_failed_check` calls (#610 policy 2)."""
+
+    recorded = 0
+    fails = True
+
+    def check_failures(self) -> None:
+        if self.fails:
+            raise RuntimeError("too many failures")
+
+    def record_failed_check(self) -> None:
+        type(self).recorded += 1
+
+
+def test_a_failed_check_records_the_failures_before_the_chunk_fails(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#610 policy 2: the failures reach disk although nothing commits, so the
+    owner can accept them; the check's own message is the run's message."""
+    _RecordsFailedCheck.recorded = 0
+    result = _run(settings, filings=_filings(cls=_RecordsFailedCheck), source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "too many failures" in result.runs[0].message
+    assert _RecordsFailedCheck.recorded == 1
+    assert read("SELECT source, status FROM ingestion_runs") == [("edgar", FAILED)]
+
+
+def test_a_dry_run_or_a_passing_check_records_no_failed_check(settings: Settings) -> None:
+    _RecordsFailedCheck.recorded = 0
+    _run(settings, source="edgar")  # a real run first, so the store exists
+    result = _run(settings, filings=_filings(cls=_RecordsFailedCheck), source="edgar", dry_run=True)
+    assert result.runs[0].status == FAILED
+    assert _RecordsFailedCheck.recorded == 0
+
+    class Passing(_RecordsFailedCheck):
+        fails = False
+
+    assert _run(settings, filings=_filings(cls=Passing), source="edgar").runs[0].status == OK
+    assert _RecordsFailedCheck.recorded == 0
+
+
+def test_a_failing_record_keeps_the_check_message(settings: Settings) -> None:
+    class RecordBoom(_RecordsFailedCheck):
+        def record_failed_check(self) -> None:
+            raise OSError("disk full")
+
+    run = _run(settings, filings=_filings(cls=RecordBoom), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "too many failures" in run.message and "disk full" in run.message
 
 
 def test_a_fixture_source_leaves_the_edgar_message_unchanged(settings: Settings) -> None:
@@ -815,6 +884,45 @@ def test_a_filing_accepted_while_the_run_fetches_is_stored(settings: Settings) -
     assert result.ok
 
 
+def _filing_tables(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
+    tables = ("securities", "listings", "delistings", "classifications", "facts")
+    return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall(), key=repr) for t in tables}
+
+
+def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#564: after `_prefetch`, `_ingest_filings` skips its own fetch pass (a
+    frozen source has nothing left to fetch) and writes exactly the rows the
+    unprefetched path writes, stamped at the same clock."""
+    import tradepartner.ingest as ingest
+
+    builds: list[datetime] = []
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        builds.append(kwargs["ingested_at"])
+        return build_classifications(*args, **kwargs)
+
+    monkeypatch.setattr(ingest, "build_classifications", counting)
+    written = []
+    for prefetch in (False, True):
+        builds.clear()
+        source: FixtureFilingSource | _Recorded = _filings()
+        if prefetch:
+            source = _Recorded(source)
+            _prefetch(source, settings)
+        conn = duckdb.connect(":memory:")
+        conn.execute("SET TimeZone='UTC'")
+        init_schema(conn)
+        added, _ = _ingest_filings(conn, settings, source, lambda: NOW)
+        assert added > 0
+        written.append(_filing_tables(conn))
+        conn.close()
+        assert builds[-1] == NOW
+        assert len(builds) == 2  # one fetch pass, then the build at the clock
+    assert written[0] == written[1]
+
+
 def test_a_filed_value_that_reverts_is_a_third_row(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
@@ -915,6 +1023,88 @@ def test_run_messages_are_redacted_cleaned_and_capped(
         assert len(message) == 200
 
 
+# --- #573: a failed run row names where the error was raised --------------
+
+
+def test_failed_run_message_names_the_raising_file_line_and_function(
+    settings: Settings,
+) -> None:
+    result = _run(settings, _Prices(fail="bars"))
+    assert result.runs[-1].status == FAILED
+    message = result.runs[-1].message
+    assert "RuntimeError: bars endpoint down" in message
+    assert " | at: " in message
+    where = message.split(" | at: ", 1)[1]
+    assert "test_ingest.py" in where
+    assert " in bars" in where
+
+
+def test_failed_run_message_has_no_local_or_argument_values(settings: Settings) -> None:
+    # The traceback is read for file/line/function only; `_where` never reads
+    # a frame's locals or arguments, so a secret-looking one of each must not
+    # leak even though neither is a configured secret `_clean` would catch.
+    def _inner(argument: str) -> None:
+        local_secret = "sk-local-9f3c21"
+        assert local_secret  # kept "in scope" for the frame, never read back
+        raise ValueError("boom")
+
+    class Boom(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            _inner("sk-argument-7e21aa")
+
+    result = _run(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "ValueError: boom" in message
+    assert "sk-local-9f3c21" not in message
+    assert "sk-argument-7e21aa" not in message
+    assert "_inner" in message
+
+
+def test_failed_run_message_includes_the_chained_causes_frame(settings: Settings) -> None:
+    def _root_cause() -> None:
+        raise KeyError("cik")
+
+    class Boom(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            try:
+                _root_cause()
+            except KeyError as exc:
+                raise RuntimeError("wrapped") from exc
+
+    result = _run(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "RuntimeError: wrapped" in message
+    where = message.split(" | at: ", 1)[1]
+    assert "_root_cause" in where
+    assert "bars" in where
+
+
+def test_failed_run_message_where_is_length_bounded(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        ingest={"max_where_chars": 60},
+    )
+
+    def _deep(n: int) -> None:
+        if n == 0:
+            raise RuntimeError("deep failure")
+        _deep(n - 1)
+
+    class Boom(_Prices):
+        def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+            _deep(20)
+
+    result = _run(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    # The error text is never cut to make room for frames.
+    assert "RuntimeError: deep failure" in message
+    assert len(message) <= 60
+
+
 # --- filed-row revisions, decided per key (quant-auditor re-audit on #164) --
 
 
@@ -989,6 +1179,89 @@ def test_a_late_filing_behind_a_stored_revision_is_one_row_at_ingested_at() -> N
     )
     rows = conn.execute("SELECT name, known_at FROM securities ORDER BY known_at").fetchall()
     assert rows == [("A", T1), ("B", one), ("C", two)]
+
+
+def test_cover_page_duplicate_pair_does_not_abort_the_listings_write() -> None:
+    """#687: `build_master` must never hand `_add_rows` two `listings` rows
+    with the same (security_id, ticker, exchange, valid_from, known_at)
+    key, or the store's UNIQUE constraint aborts the whole EDGAR write
+    (the failing path of the 2026-10-03 backfill rerun). Real shapes:
+    Honda (CIK 0000864270) 10-Q accepted 2021-11-09, two 0.750%
+    medium-term notes both tagged HMC/26A on one cover page; Moatable
+    (CIK 0001509223) 10-Q accepted 2023-08-14, Class A ordinary shares and
+    their ADS both retickered to MTBL on one cover page."""
+    notes_cik = "0000900001"
+    ads_cik = "0000900002"
+    ads_title = "American depositary shares, each representing 45 Class A ordinary shares"
+    class_a_title = "Class A ordinary shares, par value $0.001 per share*"
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(notes_cik, "Honda-like Co", "10-K", f"{notes_cik}-1", _at(2015, 3, 1)),
+            FilingIndexEntry(ads_cik, "Moatable-like Inc", "10-K", f"{ads_cik}-1", _at(2015, 3, 1)),
+        ],
+        cover_pages=[
+            CoverPage(
+                notes_cik,
+                f"{notes_cik}-2",
+                _at(2021, 3, 1),
+                (CoverListing("Common Stock, par value $0.50 per share", "HMC", "NYSE"),),
+            ),
+            CoverPage(
+                notes_cik,
+                f"{notes_cik}-3",
+                datetime(2021, 11, 9, 17, 59, 52, tzinfo=UTC),
+                (
+                    CoverListing("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                    CoverListing(
+                        "0.750% Medium-Term Notes, Series ADue November 25, 2026",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    CoverListing(
+                        "0.750% Medium-Term Notes, Series ADue January 17, 2024",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    CoverListing(
+                        "1.100% Medium-Term Notes, Series BDue October 1, 2025",
+                        "HMC/25B",
+                        "NYSE",
+                    ),
+                ),
+            ),
+            CoverPage(
+                ads_cik, f"{ads_cik}-2", _at(2020, 3, 1), (CoverListing(ads_title, "RENN", "NYSE"),)
+            ),
+            CoverPage(
+                ads_cik,
+                f"{ads_cik}-3",
+                _at(2023, 3, 31),
+                (
+                    CoverListing(class_a_title, "RENN", "NYSE"),
+                    CoverListing(ads_title, "RENN", "NYSE"),
+                ),
+            ),
+            CoverPage(
+                ads_cik,
+                f"{ads_cik}-4",
+                datetime(2023, 8, 14, 20, 56, 14, tzinfo=UTC),
+                (
+                    CoverListing(class_a_title, "MTBL", "NYSE"),
+                    CoverListing(ads_title, "MTBL", "NYSE"),
+                ),
+            ),
+        ],
+    )
+    ingested_at = datetime(2023, 8, 15, tzinfo=UTC)
+    master = build_master(source, Settings(_env_file=None), ingested_at=ingested_at)
+    conn = _store()
+    added = _add_rows(conn, "listings", master.listings, ingested_at=ingested_at, current=False)
+    assert added == len(master.listings)
+    rows = conn.execute(
+        "SELECT security_id, ticker, exchange, valid_from, known_at, COUNT(*) AS n "
+        "FROM listings GROUP BY 1, 2, 3, 4, 5 HAVING COUNT(*) > 1"
+    ).fetchall()
+    assert rows == []
 
 
 def test_fact_class_uses_the_classification_known_at_acceptance(settings: Settings) -> None:

@@ -281,7 +281,13 @@ def test_page_is_in_the_shell_navigation(
 ) -> None:
     at = _app(monkeypatch, seeded_store[0])
     assert not at.exception
-    assert at.sidebar.radio[0].options == ["Data health", "Backtest", _PAGE]
+    assert at.sidebar.radio[0].options == [
+        "Data health",
+        "Backtest",
+        _PAGE,
+        "Operations",
+        "Override",
+    ]
 
 
 def test_render_lists_trials_and_decisions(

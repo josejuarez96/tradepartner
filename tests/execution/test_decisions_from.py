@@ -34,6 +34,7 @@ from tradepartner.execution.plan import (
     Decisions,
     Signal,
     decisions_from,
+    is_full_exit,
     remainder,
 )
 from tradepartner.store.journal import DecisionRow, OverrideRow, SignalRow
@@ -314,6 +315,38 @@ def test_overrides_of_another_rebalance_or_the_kill_switch_are_ignored() -> None
     assert _by_name(result) == _by_name(_run())
 
 
+def _settle_order(security_id: str, *, override_id: int) -> OverrideRow:
+    """A `settle_order` row (spec req 17, #571) on rebalance T's order of a name."""
+    return replace(
+        _override("settle_order", security_id, override_id=override_id),
+        client_order_id=f"tp-{security_id}",
+    )
+
+
+def test_a_settle_order_override_makes_no_decision() -> None:
+    """Spec req 17: `plan.decisions_from` ignores `settle_order` rows; no
+    `override` decision exists for them, held or target, on their own session."""
+    settlements = (_settle_order("A", override_id=22), _settle_order("B", override_id=23))
+    result = _run(overrides=settlements)
+    assert _by_name(result) == _by_name(_run())
+    assert all(d.decision != "override" for d in _by_name(result).values())
+
+
+def test_a_settle_order_row_does_not_clash_with_a_name_override() -> None:
+    """A settlement on a name the owner also excludes is not a second override of
+    the name (only `exclude_name` and `keep_name` are)."""
+    alone = _by_name(_run(overrides=(_override("exclude_name", "A", override_id=24),)))
+    both = _by_name(
+        _run(
+            overrides=(
+                _override("exclude_name", "A", override_id=24),
+                _settle_order("A", override_id=25),
+            )
+        )
+    )
+    assert both == alone
+
+
 def test_an_override_naming_no_decided_name_makes_no_decision() -> None:
     got = _by_name(_run(overrides=(_override("keep_name", "D", override_id=17),)))
     assert "D" not in got
@@ -590,3 +623,25 @@ def test_plan_py_imports_no_adapter() -> None:
 
 def test_signal_value_type_is_exported() -> None:
     assert Signal.__name__ == "Signal"
+
+
+def test_is_full_exit_reads_every_sell_decisions_from_writes() -> None:
+    """T54c: `plan.is_full_exit` accepts every decision `decisions_from` writes,
+    true exactly for the whole-holding sells (spec Definitions > Full exit)."""
+    stamp = datetime(2026, 10, 1, 21, tzinfo=UTC)
+    runs = [
+        _run(),  # C left_targets, X left_universe, A and B buys
+        _run(_plan(targets={"A": 0.5, "B": 0.5}), _ledger({"A": 30.0})),  # A a trim
+        _run(overrides=(_override("exclude_name", "A", override_id=11),)),
+    ]
+    seen = set()
+    for result in runs:
+        for d in result.decisions:
+            row = d.row(run_id=1, known_at=stamp, ingested_at=stamp)
+            full = is_full_exit(row)
+            assert full == (d.side == "sell" and d.reason is not None), d
+            seen.add((d.decision, d.side, d.reason, full))
+    assert ("trade", "sell", None, False) in seen
+    assert ("trade", "sell", "left_targets", True) in seen
+    assert ("trade", "sell", "left_universe", True) in seen
+    assert ("override", "sell", "exclude_name", True) in seen

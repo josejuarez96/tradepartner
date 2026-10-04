@@ -42,6 +42,7 @@ from tradepartner.store.journal import (
     PositionDailyRow,
     RebalanceEventRow,
     ReconciliationRow,
+    ResumeAcceptanceRow,
     ResumeInvocationRow,
     SignalRow,
     append,
@@ -362,6 +363,14 @@ def test_the_module_still_never_updates_or_deletes() -> None:
     text = Path(journal.__file__).read_text()
     code = re.sub(r'"""[\s\S]*?"""', "", text)
     assert not re.search(r"\b(UPDATE|DELETE|TRUNCATE|DROP|ALTER)\b", code)
+
+
+def test_the_kill_switch_override_kind_is_the_shared_schema_constant() -> None:
+    """#691: `OverrideWithConsumption.consumed` and `unconsumed_kill_switch_overrides` compare
+    against `schema.ENGAGE_KILL_SWITCH_KIND`, never a quoted copy of it, so a renamed
+    kind cannot leave the journal readers matching a stale string."""
+    code = re.sub(r'"""[\s\S]*?"""', "", Path(journal.__file__).read_text())
+    assert f'"{schema.ENGAGE_KILL_SWITCH_KIND}"' not in code
 
 
 # --- windows ------------------------------------------------------------------------------
@@ -714,9 +723,19 @@ def test_reports_resumes_alerts_and_outcomes(conn: duckdb.DuckDBPyConnection) ->
     assert journal.resume_invocations(conn) == []
     append(
         conn,
-        ResumeInvocationRow(at=_at(1), reason="checked", accept_broker_fills=False, **_stamp(1)),
+        ResumeInvocationRow(
+            at=_at(1),
+            reason="checked",
+            accept_broker_fills=False,
+            accept_rejections=False,
+            **_stamp(1),
+        ),
     )
     assert [r.reason for r in journal.resume_invocations(conn)] == ["checked"]
+
+    assert journal.resume_acceptances(conn) == []
+    append(conn, ResumeAcceptanceRow(resume_id=1, accepted_json="[]", **_stamp(2)))
+    assert [(r.resume_id, r.accepted_json) for r in journal.resume_acceptances(conn)] == [(1, "[]")]
 
     assert journal.alerts_for(conn, kind="no_window", session=_NEXT) == []
     append(conn, AlertRow(session=_NEXT, kind="no_window", message="m", at=_at(1), **_stamp(1)))
@@ -787,3 +806,120 @@ def test_an_override_is_consumed_only_by_what_its_kind_consumes(
     assert [o.override_id for o in journal.unconsumed_kill_switch_overrides(conn, window_id)] == [
         kill
     ]
+
+
+def test_a_settle_order_override_reads_back_with_its_order(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Schema version 9 (#571, spec req 17): `overrides.client_order_id` is on the
+    row and its reader; every other kind reads it as None, and a settlement is never
+    an unconsumed kill-switch engagement."""
+    window_id = _window(conn)
+    settle = append(
+        conn,
+        OverrideRow(
+            window_id=window_id,
+            made_at=_at(0),
+            security_id="SEC_A",
+            client_order_id="tp-a",
+            kind="settle_order",
+            reason="r",
+            **_stamp(),
+        ),
+    )
+    keep = append(
+        conn,
+        OverrideRow(window_id=window_id, made_at=_at(0), kind="keep_name", reason="r", **_stamp()),
+    )
+    found = {o.override.override_id: o.override for o in journal.overrides_for(conn, window_id)}
+    assert (found[settle].kind, found[settle].client_order_id) == ("settle_order", "tp-a")
+    assert found[keep].client_order_id is None
+    assert journal.unconsumed_kill_switch_overrides(conn, window_id) == []
+
+
+# --- bounded page reads (#435) ------------------------------------------------------------------
+
+
+def _timed_order(conn: duckdb.DuckDBPyConnection, run_id: int, coid: str, minutes: int) -> str:
+    """An order of its own decision, stamped `minutes` after `_NOW`."""
+    decision_id = _decision(conn, run_id, security_id=f"SEC_{coid}")
+    append(
+        conn,
+        OrderRow(
+            client_order_id=coid,
+            decision_id=decision_id,
+            run_id=run_id,
+            session=_SESSION,
+            attempt=1,
+            phase="buy",
+            security_id=f"SEC_{coid}",
+            symbol=f"SEC_{coid}",
+            side="buy",
+            notional=100.0,
+            sells_in_flight_at_submit=False,
+            **_stamp(minutes),
+        ),
+    )
+    return coid
+
+
+def test_orders_for_a_limit_reads_the_newest_orders_newest_first(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    window_id = _window(conn)
+    run_id = _run(conn, window_id)
+    other = _run(conn, _window(conn))
+    # inserted out of known_at order; "b" and "c" tie on known_at
+    for coid, minutes in (("d", 4), ("a", 1), ("c", 3), ("b", 3), ("e", 2)):
+        _timed_order(conn, run_id, coid, minutes)
+    _timed_order(conn, other, "z", 9)  # another window's newest order
+
+    every = journal.orders_for(conn, window_id=window_id)
+    assert [o.client_order_id for o in every] == ["a", "e", "c", "b", "d"]  # unchanged
+    newest = journal.orders_for(conn, window_id=window_id, limit=3)
+    assert [o.client_order_id for o in newest] == ["d", "c", "b"]  # ties by id, descending
+    assert journal.orders_for(conn, window_id=window_id, limit=10) == sorted(
+        every, key=lambda o: (o.known_at, o.client_order_id), reverse=True
+    )
+    with pytest.raises(ValueError, match="limit"):
+        journal.orders_for(conn, window_id=window_id, limit=0)
+
+
+def test_events_and_outcomes_filter_by_client_order_ids_within_the_window(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    window_id = _window(conn)
+    run_id = _run(conn, window_id)
+    other = _run(conn, _window(conn))
+    for coid, minutes in (("a", 1), ("b", 2), ("c", 3)):
+        _timed_order(conn, run_id, coid, minutes)
+        _event(conn, coid, "accepted", minutes + 10)
+        append(
+            conn,
+            OutcomeRow(
+                client_order_id=coid,
+                through_session=_SESSION,
+                kind="not_executed",
+                **_stamp(minutes + 20),
+            ),
+        )
+    _timed_order(conn, other, "z", 9)
+    _event(conn, "z", "accepted", 19)
+
+    def events(**kw: Any) -> list[str]:
+        return [e.client_order_id for e in journal.order_events_for(conn, **kw)]
+
+    assert events(window_id=window_id) == ["a", "b", "c"]  # unchanged
+    assert events(window_id=window_id, client_order_ids=["c", "a"]) == ["a", "c"]
+    assert events(window_id=window_id, client_order_ids=["z"]) == []  # still the window's
+    assert events(window_id=None, client_order_ids=["z", "b"]) == ["b", "z"]
+    assert events(window_id=window_id, client_order_ids=[]) == []
+    with pytest.raises(TypeError):
+        journal.order_events_for(conn, window_id=window_id, client_order_ids="a")
+
+    def outcomes(**kw: Any) -> list[str]:
+        return [o.client_order_id for o in journal.outcomes_for(conn, window_id, **kw)]
+
+    assert outcomes() == ["a", "b", "c"]  # unchanged
+    assert outcomes(client_order_ids=["b"]) == ["b"]
+    assert outcomes(client_order_ids=[]) == []

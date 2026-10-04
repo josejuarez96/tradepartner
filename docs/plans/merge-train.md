@@ -1,0 +1,48 @@
+# Plan: Merge train
+
+**Spec:** [specs/merge-train.md](../specs/merge-train.md)  ·  **Status:** Draft
+
+## Approach (short)
+
+One script, `scripts/merge_train.py`, in the shape of `scripts/ready_pr.py`: pure functions over data first (records, eligibility, order, run classification, bisect arithmetic, the mergeable prefix, comment text), then a `Runner` protocol with a `ShellRunner` over `git` and `gh` and the `build` command, then the `merge` command (the only code that lands anything, reviewed on its own) with `status` and `prune`, so every rule in the spec is unit-tested on a fake runner and the one real run is the owner's. The CI change is one line in the workflow (`push.branches` gains `train/**`), independent of the script. The process wiring (review prefixes, the `ask` rule) and the docs (git-workflow, teams, development-process, CLAUDE.md rule 1, the ADR 0002 amendment, the ruleset file) are their own tasks because they touch files no other task here names. The owner's task, activating the ruleset and running the first real train, gates nothing: it is the edge.
+
+No LLM anywhere in the path, no new dependency (`git`, `gh`, the standard library), no config key (constants with flags, as `ready_pr.py`), nothing under `src/`.
+
+**Plan shape numbers** (development-process.md, "Plan shape"; from `uv run python scripts/team.py graph --ref <this branch>` on 2026-10-01, this plan's tasks only): longest open chain **5** PRs (T72 → T72b → T72c → T75 → T75b, the last the owner's); depth 1: T72, T73; depth 2: T72b, T74; depth 3: T72c; depth 4: T75; depth 5: T75b (owner). Files named by more than one open task: `scripts/merge_train.py` and `tests/test_merge_train.py`, by T72, T72b and T72c only, the declared chain of three below. No file here is named by an open task of another plan (checked against `docs/plans/{data-foundation,backtest,paper-trading}.md` on `main` 1327d96: none names `ci.yml`, `ready_pr.py`, `settings.json`, ADR 0002 or the ways-of-working docs).
+
+**Lanes.** `scripts/merge_train.py` (with `tests/test_merge_train.py`) is edited by exactly three tasks in sequence, T72, T72b, T72c: the pure core, the runner with `build`, and `merge` with the small commands (plan-shape rule 1, a declared chain of three, the driver and its wiring). Every other task has its own files. T73 may run beside T72, and T74 beside T72b. T75 waits for T72c and T73 because it describes the real commands. The owner's seven decisions of 2026-10-01 are folded into the spec (Owner decisions), so T75 waits on nothing but its dependencies.
+
+**Owner items, ordered by what they unblock:** none pending before the build: the spec's seven questions were answered on 2026-10-01 (PR #465) and folded in. The one owner task is T75b: the `gh api` POST of the ruleset, the `train/smoke` push (AC14), the first real batch (AC15, AC16).
+
+## Tasks
+
+Each task = one branch = one PR (~≤400 lines). Tasks with no shared files may run in parallel.
+Shape (development-process.md, "Plan shape"): slice by file, not by step; no open chain over six PRs without a reason; no file named by more than two unticked tasks unless they are one chain; owner tasks gate only the edge, with the stub declared on the waiting line; the numbers above come from `uv run python scripts/team.py graph`. Task ids are global across plans (T71b is the last Phase 4 id). Every PR touching `scripts/merge_train.py`, `scripts/ready_pr.py`, `.github/workflows/`, `.claude/settings.json` or the ruleset file runs `safety-reviewer` (the merge path is the process analogue of the order path; spec, Risks).
+
+- [x] **T72: Merge train, pure core.** (#475, PR #479) · Files: `scripts/merge_train.py` · Depends on: n/a
+- [x] **T72b: Merge train, runner and `build`.** (#510, PR #521) · Files: `scripts/merge_train.py`, `tests/test_merge_train.py` · Depends on: T72
+- [x] **T72c: Merge train, `merge`, `status` and `prune`.** (#622, PR #640) · Files: `scripts/merge_train.py`, `tests/test_merge_train.py` · Depends on: T72b
+- [x] **T73: CI runs the full suite on train branches.** (#476, PR #478) · Files: `.github/workflows/ci.yml` · Depends on: n/a
+- [x] **T74: Review prefixes and the ask rule for the train.** (#527, PR #528) · Files: `scripts/ready_pr.py`, `tests/test_ready_pr.py`, `.claude/settings.json` · Depends on: T72
+- [x] **T75: The train in the ways of working, ADR 0002 and the ruleset file.** (#673, PR #676) · Files: `docs/ways-of-working/git-workflow.md`, `docs/decisions/0002-git-workflow.md`, `docs/ways-of-working/teams.md`, `docs/ways-of-working/development-process.md`, `CLAUDE.md`, `.github/rulesets/protect-main.json` · Depends on: T72c, T73
+- [ ] **T75b (owner): Activate the ruleset and run the first real train.** Files: none in the repo. The owner: `gh api -X POST repos/josejuarez96/tradepartner/rulesets --input .github/rulesets/protect-main.json`; pushes `train/smoke` and confirms one run with the `Tests` step run and no `claims` job (AC14), then deletes the branch; runs `build` on three or more real ready PRs and `merge` on the batch (AC15); runs every check in AC16: the direct push, a force-push and a deletion refused with his own token, plain `gh pr merge` refused on a throwaway red PR that he then closes, a green PR merged by hand. The outputs go in a comment on #460 and the spec's status moves to Shipped in a size-S docs PR that also ticks this line · Tests: AC14 to AC16 · Depends on: T73, T74, T75 · Review: n/a. Gates nothing.
+
+## Chains (for team claims)
+
+| Chain | Tasks | Starts when |
+|---|---|---|
+| train | T72 → T72b → T72c | this plan merges |
+| ci | T73 | this plan merges; beside T72 |
+| wiring | T74 | T72 merged; beside T72b |
+| docs | T75 | T72c and T73 merged |
+| owner | T75b | T73, T74 and T75 merged |
+
+## Verification
+
+1. Any checkout: `uv run pytest tests/test_merge_train.py tests/test_ready_pr.py tests/test_docs_budget.py` green with no network (the fake runner covers AC1 to AC13 and AC17, `merge --resume` included).
+2. Owner (T75b): AC14, the `train/smoke` run; AC15, a real batch of three or more PRs built and merged with the PR set, heads, run id, outcome and `main` SHAs matching across the PR comments, `~/.tradepartner/merge_train/<id>.json` and `gh run list --branch train/<id>`, and `main`'s run on the head commit green; AC16, every check listed on T75b.
+3. Over the following week: no `main`-red incident of the #430 or #444 × #429 shape, and `gh run list --branch main` showing the per-merge runs as before.
+
+## Rollback
+
+Everything is additive to the process and nothing touches `src/` or the store. To undo: revert T73 (the `train/**` trigger) and T75 (docs, ruleset file; the ADR amendment is superseded by a further dated note, never deleted) in one PR; delete any `train/*` branches (`merge_train.py prune`, or by hand); deactivate the ruleset (`gh api -X DELETE repos/josejuarez96/tradepartner/rulesets/<id>`, owner only: agents may not run `gh api -X DELETE`); the records under `~/.tradepartner/merge_train/` are outside the repo and can be deleted. `ready_pr.py` keeps working as before throughout, so PRs can be merged by hand at any point.

@@ -108,6 +108,41 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Phase 4 risk checks and buy sizing for the wrapper's phases (#336)
 - Paper trading: order outcomes (`execution.outcomes.due_outcomes`, `write_outcomes_and_lots`) and the lot-ledger write (T62, #344)
 - Process: `tests/test_docs_budget.py` fails CI when `docs/STATUS.md` exceeds 2,000 tokens or `CLAUDE.md` 3,000 (#351)
+- Schema version 6: CHECK on order_events.reason ({halt, not_received} or null) with shared constants, and a migration from version 5 that rebuilds order_events (#332)
+- Backtest: public `engine.plan`/`Plan` and `kind=tracking` windows in `holdout.decide` (T53, #343)
+- Schema version 7: CHECK on decisions.reason (left_targets, left_universe, exclude_name, keep_name, delisted, untargeted_receipt, window_stop or null) with shared constants, a migration from version 6 or 5 that rebuilds decisions, and the spec list closed to match (#377)
+- Execution: `reconcile_now`, `explanations_as_of` and `reconcile_command` (`paper reconcile`), reconciliation with store explanations (T61, #378)
+- `execution.plan.decisions_from`: one decision per held-or-target name (`left_targets`/`left_universe` full exits by quantity, notional trades, `exclude_name`/`keep_name` overrides, `skip_delisted`, `skip_below_minimum`, plan-time `dust`), buy `target_notional`, `signals` rows and `n_orders_below_min_at_live_capital` (T53b, #386)
+- Docs: Phase 4 plan amendment for a parallel build (slice by file, owner gates at the edge, T63g and T70b off the chain); the plan-shape checklist in development-process.md, the plan template and spec-critic check 5; roadmap section on what fills Phase 4's paper months (#388)
+- Add team.py graph: critical path, depth levels, file contention and owner gates for open plan tasks (#389).
+- execution/wrapper.py: the risk-gated wrapper's core (allowlist, clock pre-check, halt path, replay) (T60, #390, #375)
+- Execution: `resume` (`paper resume`): settles pending orders, collects, refuses on a rejection-cap verdict, the lag bound or a failing reconciliation, journals synthetic residual fills with `--accept-broker-fills`, and releases the kill switch (T61b, #423, #374)
+- execution.ops.page_data: pure read-only summary of a paper window (header dates/stale chip, KPIs, kill-switch state, ranking, fills, per-order chains, alerts, reconciliation status), row-limited by new dashboard.page_row_limit config (ADR 0011).
+- Execution: `window.start` opens a paper window — gap_signoff, holdout.end and flatness gates, carried_residue/spinoff_receipt adjustments, frozen risk/paper config (T64, #426)
+- Scheduling runbook now covers `paper run` (plist, submit-window timing, alert-kind table, kill/resume procedure, abandon and the strictly-flat rule)
+- execution.marks: marks_for, lapses, missed_run (T63b), pure read-only helpers for the tracking run's mark step.
+- Cockpit: open-work graph in phase bands with click-to-trace, the critical path from `team.critical_path`, drag to pan and `#node=`/`#all` deep links; "What matters now" strip; Plan by chain grouped by phase with finished chains folded and titles on open tasks; inactive teams with no claim folded (#438)
+- Docs: merge-train spec and plan (#460): eligibility, batch order, the combined branch, one full run, bisect, tree-equal squash merges, owner authority, the public-repo ruleset; tasks T72 to T75b
+- `execution/reserve.py`: `open_buy_reserve`, the cash reserve for our own open buys that T60b subtracts before buy sizing and the cash rule (ADR 0010 amendment 2026-10-01; T54d, #481)
+- Optional ALERT_EMAIL_FROM sender for the email alert channel, defaulting to the SMTP login (#404)
+- `execution.planning`: `rebalance_kind`/`due_rebalance`, `plan_rebalance` (one write transaction for the plan trial, `signals`, `decisions` and `paper_plans`; re-use, lagging, `PlanTrialError`, faults and `assets` errors re-raised unchanged) and `reference_prices` (T63c, #422)
+- Phase 4 T65: `execution.report.compare_months(window, trial, journal, actions, prices, stop_session)` computes the req 10 tracking-comparison terms per month and the frozen-rule check (#424)
+- Execution: order-path fences now resolve renamed getattr/attrgetter imports, flag a stored bound `__getattribute__`, flag `__dict__`/`vars()` order-name subscripts, and catch `DELETE ... USING fills` (#471)
+- resume(..., accept_rejections=) for the owner's paper resume --accept-rejections: accepts only rejection-cap verdicts on runs the release would clear, records them (or []) on a new resume_acceptances row before reconciliation, and lifts no other refusal; schema version 8 adds resume_invocations.accept_rejections (#472)
+- scripts/merge_train.py: the merge train's pure core (eligibility, order, classification, bisect, merge prefix, record check, comments) (T72, #475)
+- execution.window: stop (requested, then closed, refused under the switch, open orders, missing outcomes, a failed reconciliation or a holding above its residue), owner-only abandon, kill and the override writer shared by the page and the CLI; spec req 14/16 and the Data section amended (T64b, #484).
+- Operations dashboard page (positions, open orders, today's signals, kill-switch chip, ranking hero, fills, chain detail view, alerts, reconciliation status); render_app refuses to render off-localhost or with telemetry on (ADR 0011).
+- No-look-ahead suite for the tracking run: plan, ledger, reconciliation explanations, marks and journal-derived state unchanged by rows known after close(S-1) (T63g, #486).
+- execution.reattempts: attempt_scope (open decisions for their remainder, in-flight ones left to collection, the last-phase rule) and write_offs (derived write-offs plus the buys a completed last phase deferred), pure over decisions and their plan.decision_state (T60d, #487).
+- Forced and stop exits, pure (T63e): `execution.exits` decides delisted and spin-off receipt exits, re-attempts open forced exits, and sizes `window_stop` exits to the holding minus its residue with the whole-share floor
+- Pure phase-order building for the paper wrapper (execution/phases.py, T60c): quantity sells for full exits and trims with the per-name skips, buys sized through risk.size_buys with deferrals and the cash left, and validated OrderRequests with attempt-counted ids.
+- Tracking run core (`execution.run.tracking_run`, T63), and the `lot_ledger` alert kind (#366 Q5) (#519)
+- Target comparison (`execution.report.compare_targets`, spec req 10) and `paper report` (`execution.report.report`); `backtest.run.run_hypothesis` gains `kind="tracking"`; `execution.fill_price` joins the req 14 freeze list (#366 Q20) (#512)
+- RiskGatedBroker.execute(run, decisions, forced_exits) -> BatchOutcome: the two-phase driver over phases, reattempts, reserve and risk.check_phase, journaling every order before its submit (T60b, #530).
+- Wrapper integration tests for re-attempted sells and buys, last-phase write-offs, fake-clock sell wait, whole-share buy order and cash safety (T60e).
+- `paper run` trades: the submit window, the forced exits (delisted, untradable, spin-off receipts, re-attempts) through the wrapper's two phases, and step 7b's same-session collection with the `executed` event and the `unspent_cash` alert (T63d, #545)
+- Research report docs/research/2026-10-02-edgar-data-pitfalls.md: EDGAR data-quality pitfalls mined from open-source EDGAR libraries, mapped to our handling with recommended fail/quarantine/repair/retry policies (#572)
+- EDGAR: a per-CIK companyfacts API answer of 200 {} is treated like a 404 (no XBRL facts, cached) and counted as empty API facts; a submissions API 200 {} leaves its rows unstamped for the run instead of failing the source (#576)
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -140,6 +175,18 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Docs: STATUS and CHANGELOG fold of the 2026-09-26/27 fragments and board refresh (#293)
 - Process: one bookkeeping fragment per PR (`changelog.d/<issue>-<slug>.md` holds the STATUS line and the CHANGELOG bullets); `fragments.py fold` keeps the last 10 STATUS "Recently done" lines; STATUS is a board (about 1.4k tokens, from 10k); the old `docs/status.d/` layout is still read during the transition (#351)
 - Process: `scripts/team.py show` and the claim printout of the task and dependency lines; implementer and reviewer agent definitions, ready-pr, development-process and teams updated so windows load task lines and reviewer summaries instead of whole plans and reports (#352)
+- Docs: every finished plan task is one line (title, issue, PR, Files paths, Depends on), capped at 400 characters by `tests/test_docs_budget.py`; teams.md starts with a one-screen command card (#353)
+- Docs: CLAUDE.md fragment wording per #351; STATUS fold and board refresh for the 2026-09-30 restart (#361)
+- Docs: ADR 0010 amendment 2026-09-30 and paper-trading spec req 3 (c), Definitions and acceptance per the owner's #366 Q1–Q3 answers (#367)
+- Execution: risk checks and decision state per the ADR 0010 amendment of 2026-09-30; every sell order by quantity; buy sizing and the cash rule in `Decimal` at the cent through one cost function (#384)
+- ready_pr: local pytest runs only the tests the diff maps to (importers of changed modules, changed tests, tree-wide static checks), falling back to the full suite for conftest, dependency, fixture or unmapped changes; `--full-tests` runs everything; CI is unchanged (#456)
+- CLAUDE.md pre-push rule matches #456's targeted local pytest (#458)
+- Docs: ADR 0010 amendment 2026-10-01 reserves the unfilled notional of our own open buys in buy sizing and the cash rule; plan task T54d (`execution/reserve.py`) with T60b and T71 depending on it; spec req 6 records the owner's spin-off decisions (#366 Q16–Q18, #469)
+- Process: "Messages between windows" in teams.md; model tiers by work and "Review passes" in agents.md; a verification-pass section in the implementer, safety-reviewer, quant-auditor and spec-critic prompts; ready_pr's PASS gate unchanged (#489)
+- CI: runs on pushes to `train/**` branches with a per-commit, never-cancelled concurrency group; the `checks` job token is read-only (T73, #476)
+- reattempts.py imports plan.FORCED_EXIT (now public) instead of defining a duplicate _FORCED_EXIT literal; no behaviour change
+- The run's StepContext no longer carries the raw broker; later steps reach it only through the gate and assets_read (#523).
+- `window.abandon` refuses with `WindowCommandRefused(open_orders)` before any broker call or write while an order of the window has no terminal event in the journal; it never cancels (#542)
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -155,6 +202,43 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Secrets: ingestion run messages redact every configured secret (the paper keys and alert secrets were missed), the paper recorder scrubs its stderr error, and the SMTP login base64 forms are scrubbed (#334)
 - mypy on main: unused type-ignore in `execution/switch.py` (#347)
 - Data: `parse_filing_index` accepts an index row whose company-name column is blank; the owner's first `ingest --backfill` no longer fails the EDGAR source on it (#358)
+- Secrets: CLI output and fixtures scrub every `SecretStr` setting found by type; the paper recorder's construction errors and a failed backtest's registry message are scrubbed (#342)
+- ready_pr: a `PASS WITH FIXES` verdict no longer passes the review gate while its findings may be open; the re-review after the fixes must post `PASS` (#356)
+- ready_pr: order-path PRs (`execution/`, `adapters/alpaca_trading_raw.py`) now require safety-reviewer; a test catches review prefixes that no longer exist (#357)
+- Tests: `test_config.py` no longer reads the project `.env` or a leaked `STORE__PATH`-style variable, which failed ready_pr's local pytest on checkouts with a real `.env` (#360)
+- Outcomes refuse non-finite or non-positive marks, start prices and equity instead of journaling them (#369)
+- Outcomes/lot write is one transaction; realised_pnl waits for a saved ledger; lots refuse non-finite or naive-time fills (#370, #371, #372, #373)
+- Execution: a failed write-off back-fill no longer loses the collection's rejection-cap verdict (#396)
+- Execution: `paper resume` refuses on a rejection-cap breach of a halted run whose halt read journaled the rejections (#397)
+- Execution: reconciliation bounds a notional order's lag, allows a dividend credit during a lag or pending order, and keeps a dividend out of ended-listing proceeds (#398, #399, #400)
+- Docs: the paper-trading spec's `plan.*` signatures match the code; `collect`'s docstring names `store.db.open_for_write` instead of the nonexistent `open_forappend` (#401, #408)
+- Kill switch: release re-derives and refuses a row that would not clear; the resume check spans every window; engage_from_overrides and release read the clock outside the write (#413, #414, #415)
+- A whitespace-only secret made the alert scrubber mask ordinary text; a failed osascript's delivery error omitted its stderr (#417, #402)
+- Main green again: the ticked T70b plan line collapsed to the one-line form, under the 400-character cap (#442)
+- plan.decision_state labels a sideless exclude_name override exclude_name, not keep_name; the spec lists it as closed and never a full exit (#450)
+- Execution: `paper resume` reports a refused release (`switch.ReleaseRefused`) as a refusal instead of raising, after #429 and #444 met on main (#453)
+- Ingest: one non-UTF-8 byte in an SEC FSN member no longer fails the EDGAR source; invalid bytes are replaced, valid UTF-8 kept (#455)
+- test_wrapper_core's halt-read skew test no longer depends on the real date: utc_now() pinned (#462)
+- Email alerts could never pass STARTTLS hostname verification when ALERT_SMTP_HOST carried a port; a non-221 QUIT reply after a sent message was recorded as a failed delivery (#394, #403)
+- Execution: `check_phase` no longer halts a full exit with `whole_shares` when the name lost `fractionable`; spec req 3's whole-share wording matches the owner's rule (#395)
+- Tests: `fills_for`'s chained and self-pointing superseded checks are now exercised; a mutation dropping the clause fails two cases (#405)
+- Tests: the T50 boundary fences catch aliased-import chains into store.journal/execution (#406), parenthesised `FROM (fills)` without flagging comma prose (#407), and order calls via attrgetter, __getattribute__ or a non-literal name (#418)
+- Kill switch: release refuses an engagement written at or after its resume (#447)
+- Reconciliation's ledger and explanations read only journal rows known at an explicit `as_of`, so `explanations_as_of` no longer depends on when it runs (#488).
+- Ingest: unquoted tabs inside an SEC FSN free-text column (txt.tsv value, dim.tsv segments) no longer fail the EDGAR source; a kept listing value or class member that had one fails only its accession (#498)
+- `paper abandon` now says the kill switch is NOT engaged when it fails after a reconciliation mismatch and the fault engagement cannot be written (#500).
+- a lapsed rebalance missed because the kill switch engaged mid-catch-up but was released before the lapse was detected used to report catch_up_lapsed; it now reports kill_switch, naming the real cause
+- The halt path's engaged-row write failure now exits a distinct code (WRITE_FAILED_EXIT_CODE=2) from an ordinary crash (CRASH_EXIT_CODE=1), and `alerts.channels` must include a non-store channel so `deliver_without_store` can never deliver nowhere (#515, #416).
+- execution/window: kill refuses more than one open paper window (multiple_open_windows); _parse_residues refuses a null residue origin.
+- The tracking run's drawdown check now covers every session the run marks, so a crossing on a back-filled session engages the switch (#523).
+- Paper wrapper's buys phase writes off a terminal buy (expired or rejected) during collection, not only at the end of the phase, matching the spec's "Two phases" criterion (#538).
+- execution/window: stop, abandon and the override writer refuse more than one open paper window (multiple_open_windows), moved into the shared _window_of path.
+- config: Settings refuses a channels=[store, email] (or email-only non-store) config when the ALERT_* email settings are not fully set, naming the missing variable names; macos alone still satisfies the #366 Q22 (iii) usable-channel rule (#544).
+- `paper run`: a rebalance that reaches `executed` on a later run (a fill collected late by step 3) now gets the `unspent_cash` test, on the broker's cash and equity read just after `executed` is written (#553).
+- Planning no longer journals `skip_delisted` for a Form 25 transfer to another exchange; it now matches the exits' DELISTED-only rule (#555).
+- Backtester no longer force-exits a name on a Form 25 transfer to another exchange; only a genuine delisting ends a listing (#557).
+- build_classifications was quadratic in filings per company and stalled the backfill for 8+ hours; it now folds each CIK's evidence once and evaluates each class only where its inputs change, with rows identical to before; _ingest_filings no longer rebuilds a prefetched source's fetch pass (#564).
+- EDGAR: an empty `{}` member in SEC's companyfacts.zip or submissions.zip no longer fails the whole source with KeyError 'cik'; it falls back to the per-CIK API and is counted in the run message (#566).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.

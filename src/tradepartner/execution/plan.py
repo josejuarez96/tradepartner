@@ -20,20 +20,26 @@ ex-date is after the date the quantity was stated for and on or before S.
 How decisions are read (T53 writes them this way):
 
 - every `skip_*` kind and `dust` are closed with that reason; an `override`
-  decision with no side is a `keep_name` and closed; an `override` with a side
-  (`exclude_name`) trades like any other decision.
-- A sell with `planned_quantity` is a quantity sell, one with
-  `planned_notional` a notional sell; once ordered, the latest order's own
-  field decides. A buy's remainder is measured against its `target_notional`.
+  decision with no side is closed with its own kind as the reason (every
+  `keep_name`, and an `exclude_name` of a name not held, #450); an `override`
+  with a side (always `exclude_name`) trades like any other decision.
+- A sell with `planned_notional` is a **trim**, measured against that planned
+  notional over all its orders, whatever field they carry (every sell order is
+  by quantity, ADR 0010 amendment 2026-09-30); a sell with `planned_quantity`
+  is measured by its latest order's own field. A buy's remainder is measured
+  against its `target_notional`.
+- A **full exit** (`is_full_exit`, the spec's Definitions > Full exit) is a
+  sell that is a `forced_exit`, an `override` (with a side, always
+  `exclude_name`), or a `trade` with reason `left_targets` or `left_universe`;
+  a `trade` sell with no reason is a trim. A sideless override is never one.
 - A decision's quantity before any order is stated for its
   `rebalance_session`, or, for a forced exit (no rebalance session), for the
   New York date of its `known_at`.
 
 `price_of(security_id)` is the reference price on the same split basis as the
-quantities: the close read at close(S-1), divided by the splits with ex-date
-after that close's session and on or before S (so on an ex-date the price is
-in post-split shares). The spec does not say this; T53 and T54 build
-`price_of` and follow it.
+quantities (spec Definitions > Reference price): the close read at close(S-1),
+divided by the splits with ex-date after that close's session and on or before
+S (so on an ex-date the price is in post-split shares).
 
 Every amount read is checked finite, and amounts that cannot be negative are
 checked too; a remainder is clamped to [0, the amount it is measured against]
@@ -100,15 +106,28 @@ from tradepartner.store.journal import (
     RebalanceEventRow,
     SignalRow,
 )
-from tradepartner.store.schema import HALT_REASON, NOT_RECEIVED_REASON
+from tradepartner.store.schema import (
+    DELISTED_REASON,
+    EXCLUDE_NAME_REASON,
+    HALT_REASON,
+    KEEP_NAME_REASON,
+    LEFT_TARGETS_REASON,
+    LEFT_UNIVERSE_REASON,
+    NOT_RECEIVED_REASON,
+    OWNER_SETTLED_UNKNOWN_REASON,
+    UNTARGETED_RECEIPT_REASON,
+    WINDOW_STOP_REASON,
+)
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SPLIT = "split"
 _BUY = "buy"
 _SELL = "sell"
 _OVERRIDE = "override"
-_FORCED_EXIT = "forced_exit"
-_KEEP_NAME = "keep_name"
+#: The `decisions.decision` kind for a forced exit; public so other
+#: execution modules (e.g. `reattempts.py`) share one name (#497).
+FORCED_EXIT = "forced_exit"
+_KEEP_NAME = KEEP_NAME_REASON
 _WRITTEN_OFF = "written_off"
 _CLOSING_EVENTS = frozenset({"skipped", _WRITTEN_OFF})
 _SKIP_PREFIX = "skip_"
@@ -119,19 +138,26 @@ _PLAN_TRADE_KINDS = frozenset({_TRADE, _OVERRIDE})
 _HALT = HALT_REASON
 _HALT_CANCEL_STATUSES = frozenset({"cancel_requested", "cancel_failed"})
 _NOT_RECEIVED = NOT_RECEIVED_REASON
+_OWNER_SETTLED_UNKNOWN = OWNER_SETTLED_UNKNOWN_REASON
+#: Reasons of a terminal `cancelled` event that is not a funding shortfall: the
+#: broker never received the order (req 4), or the owner settled it without a
+#: fill (`paper settle`, req 17, #571).
+_PROTECTED_CANCEL_REASONS = frozenset({_NOT_RECEIVED, _OWNER_SETTLED_UNKNOWN})
 _CANCELLED = "cancelled"
 _SKIPPED = "skipped"
 _CARRIED_RESIDUE = "carried_residue"
 _UNTRADABLE = "untradable"
-_WINDOW_STOP = "window_stop"
+_WINDOW_STOP = WINDOW_STOP_REASON
 #: Forced-exit reasons whose `untradable` skip leaves an untradable residue.
-_UNTRADABLE_EXIT_REASONS = frozenset({_WINDOW_STOP, "delisted", "untargeted_receipt"})
+_UNTRADABLE_EXIT_REASONS = frozenset({_WINDOW_STOP, DELISTED_REASON, UNTARGETED_RECEIPT_REASON})
 #: A carried residue's origin (spec req 14: `paper start` copies it from the stop row).
 _RESIDUE_ORIGINS = frozenset({_DUST, _UNTRADABLE})
 #: Full-exit reasons `decisions_from` writes (spec req 3; Definitions > Full exit).
-_LEFT_TARGETS = "left_targets"
-_LEFT_UNIVERSE = "left_universe"
-_EXCLUDE_NAME = "exclude_name"
+_LEFT_TARGETS = LEFT_TARGETS_REASON
+_LEFT_UNIVERSE = LEFT_UNIVERSE_REASON
+_EXCLUDE_NAME = EXCLUDE_NAME_REASON
+#: `trade` sell reasons that sell the whole holding (spec Definitions > Full exit).
+_FULL_EXIT_TRADE_REASONS = frozenset({_LEFT_TARGETS, _LEFT_UNIVERSE})
 _NAME_OVERRIDES = frozenset({_EXCLUDE_NAME, _KEEP_NAME})
 _SKIP_DELISTED = "skip_delisted"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
@@ -176,12 +202,19 @@ class DecisionState:
     `closed`, reason `written_off`) although no `written_off` decision event
     exists yet: the run step that sees it appends that row with the remainder's
     notional as `unfunded_notional`.
+
+    `event_reason` is the reason of the `decision_events` row that closed the
+    state, when a closing event is what closed it (e.g. `dust` or
+    `untradable`); it is `None` when the state is closed for any other
+    reason (a `skip_*`/`dust` decision kind, a no-side `override`, a buy
+    write-off, or a state that is not closed at all).
     """
 
     state: State
     reason: str | None = None
     remainder: Remainder | None = None
     written_off: bool = False
+    event_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +226,27 @@ class BuyCosts:
 
 
 PriceOf = Callable[[str], float]
+
+
+def is_full_exit(decision: DecisionRow) -> bool:
+    """Whether `decision` sells the name's whole remaining holding (spec
+    Definitions > Full exit): a sell that is a `forced_exit` (any reason), an
+    `override`, or a `trade` with reason `left_targets` or `left_universe`. A
+    `trade` sell with no reason is a trim; any other sell raises `ValueError`.
+    """
+    if decision.side != _SELL:
+        return False
+    if decision.decision in (FORCED_EXIT, _OVERRIDE):
+        return True
+    if decision.decision == _TRADE:
+        if decision.reason in _FULL_EXIT_TRADE_REASONS:
+            return True
+        if decision.reason is None:
+            return False
+    raise ValueError(
+        f"sell decision {decision.decision_id} ({decision.decision!r}, reason "
+        f"{decision.reason!r}) is neither a full exit nor a trim"
+    )
 
 
 def _decision_id(decision: DecisionRow) -> int:
@@ -292,10 +346,11 @@ def remainder(
 ) -> Remainder:
     """What is left of `decision` on session `session` (spec Definitions):
 
-    - a quantity sell: the latest order's submitted quantity minus its filled
-      quantity, adjusted by the splits with ex-date in (the order's session, S];
-    - a notional sell: the latest order's submitted notional minus its filled
-      value, converted to shares at the reference price;
+    - a trim (`planned_notional`): the planned notional minus the filled value
+      over all its orders, converted to shares at the reference price;
+    - any other sell: the latest order's submitted quantity minus its filled
+      quantity, adjusted by the splits with ex-date in (the order's session, S]
+      (a notional order: its notional minus its filled value);
     - a buy: its `target_notional` minus the filled value over all its orders.
 
     Before any order it is the plan: the buy's target, or the sell's planned
@@ -318,6 +373,12 @@ def remainder(
         return Remainder(quantity=notional / price, notional=notional)
     if decision.side != _SELL:
         raise ValueError(f"decision {decision.decision_id} has side {decision.side!r}")
+    what = f"decision {decision.decision_id}"
+    if decision.planned_notional is not None:
+        planned = _finite(decision.planned_notional, f"{what} notional", non_negative=True)
+        sold = sum(_filled(order, fills)[1] for order in mine)
+        notional = _clamp(planned - sold, planned)
+        return Remainder(quantity=notional / price, notional=notional)
     if mine:
         latest = mine[-1]
         filled_quantity, filled_value = _filled(latest, fills)
@@ -331,15 +392,11 @@ def remainder(
             raise ValueError(f"order {latest.client_order_id!r} has neither quantity nor notional")
         notional = _clamp(latest.notional - filled_value, latest.notional)
         return Remainder(quantity=notional / price, notional=notional)
-    what = f"decision {decision.decision_id}"
     if decision.planned_quantity is not None:
         planned = _finite(decision.planned_quantity, f"{what} quantity", non_negative=True)
         factor = _split_factor(actions_as_of, decision.security_id, _stated_on(decision), session)
         quantity = planned * factor
         return Remainder(quantity=quantity, notional=quantity * price)
-    if decision.planned_notional is not None:
-        notional = _finite(decision.planned_notional, f"{what} notional", non_negative=True)
-        return Remainder(quantity=notional / price, notional=notional)
     raise ValueError(f"sell decision {decision.decision_id} has no planned quantity or notional")
 
 
@@ -374,7 +431,7 @@ def target_notional(
         raise ValueError("planned_sells and planned_buys hold a missing or repeated decision_id")
     for row in (*planned_sells, *planned_buys):
         if (row.rebalance_session, row.run_id) != (rebalance, decision.run_id) and (
-            row.decision != _FORCED_EXIT
+            row.decision != FORCED_EXIT
         ):
             raise ValueError(
                 f"decision {row.decision_id} is not of rebalance {rebalance} run {decision.run_id}"
@@ -421,11 +478,12 @@ def _is_terminal(events: Iterable[OrderEventRow]) -> bool:
 
 
 def _protected_from_write_off(events: Sequence[OrderEventRow]) -> bool:
-    """A halt cancel or a `not_received` cancel: not a funding shortfall."""
+    """A halt cancel, a `not_received` cancel or an `owner_settled_unknown` cancel
+    (req 17, #571): not a funding shortfall."""
     for event in events:
         if event.status in _HALT_CANCEL_STATUSES and event.reason == _HALT:
             return True
-        if event.status == _CANCELLED and event.reason == _NOT_RECEIVED:
+        if event.status == _CANCELLED and event.reason in _PROTECTED_CANCEL_REASONS:
             return True
     return False
 
@@ -447,23 +505,28 @@ def decision_state(
     `frozen` is the window's frozen `risk.*` section: the trading minimum is
     `risk.min_order_notional`, or for a `whole_share` decision (read from the
     row, never the live asset) one share at the reference price x
-    (1 + `risk.whole_share_price_buffer`). A buy whose latest order is terminal
-    with a remainder at or above the minimum is written off when that order
-    was submitted with no sell of its rebalance in flight, has no
-    `cancel_requested`/`cancel_failed` event with reason `halt`, and did not end
-    `cancelled` with reason `not_received`; otherwise it stays open.
+    (1 + `risk.whole_share_price_buffer`), except that a `whole_share` full
+    exit (`is_full_exit`) settles only below one share or below
+    `risk.min_order_notional`, so its last share is sold (#366 Q3). A buy
+    whose latest order is terminal with a remainder at or above the minimum
+    is written off when that order was submitted with no sell of its
+    rebalance in flight, has no `cancel_requested`/`cancel_failed` event with
+    reason `halt`, and did not end `cancelled` with reason `not_received` or
+    `owner_settled_unknown` (`paper settle`, req 17); otherwise it stays open.
     """
     _check_session(session)
     decision_id = _decision_id(decision)
     if decision.decision.startswith(_SKIP_PREFIX) or decision.decision == _DUST:
         return DecisionState(State.CLOSED, decision.decision)
     if decision.decision == _OVERRIDE and decision.side is None:
-        return DecisionState(State.CLOSED, _KEEP_NAME)
+        return DecisionState(State.CLOSED, decision.reason or _OVERRIDE)
     mine_events = [e for e in decision_events if e.decision_id == decision_id]
     if mine_events:
         latest_event = max(enumerate(mine_events), key=lambda p: (p[1].known_at, p[0]))[1]
         if latest_event.status in _CLOSING_EVENTS:
-            return DecisionState(State.CLOSED, latest_event.status)
+            return DecisionState(
+                State.CLOSED, latest_event.status, event_reason=latest_event.reason
+            )
 
     mine = _orders_of(decision, orders)
     events_by_order: dict[str, list[OrderEventRow]] = {o.client_order_id: [] for o in mine}
@@ -479,13 +542,14 @@ def decision_state(
     if not mine:
         return DecisionState(State.OPEN, remainder=left)
 
-    price = _price(price_of, decision.security_id)
-    minimum = (
-        price * (1 + frozen.whole_share_price_buffer)
-        if decision.whole_share
-        else frozen.min_order_notional
-    )
-    if left.quantity <= 0 or left.notional < minimum:
+    if decision.whole_share and is_full_exit(decision):
+        below = left.quantity < 1 or left.notional < frozen.min_order_notional
+    elif decision.whole_share:
+        price = _price(price_of, decision.security_id)
+        below = left.notional < price * (1 + frozen.whole_share_price_buffer)
+    else:
+        below = left.notional < frozen.min_order_notional
+    if left.quantity <= 0 or below:
         return DecisionState(State.SETTLED, remainder=left)
 
     latest = mine[-1]
@@ -637,7 +701,7 @@ def residue(
     carried = min(_carried(security_id, carried_rows, actions_as_of, through, flag_false), held)
     dust = untradable = 0.0
     latest = _latest_decision(security_id, decisions)
-    if latest is not None and latest.decision == _FORCED_EXIT:
+    if latest is not None and latest.decision == FORCED_EXIT:
         event = _latest_event(latest, decision_events)
         if event is not None and event.status == _SKIPPED:
             if event.reason == _DUST and latest.reason == _WINDOW_STOP:
@@ -701,7 +765,7 @@ def rebalance_state(
         what = f"decision {decision.decision_id}"
         if not _in_window(decision.run_id, windows, window.window_id, what):
             continue
-        if decision.decision == _FORCED_EXIT:
+        if decision.decision == FORCED_EXIT:
             continue
         if decision.rebalance_session is None:
             raise ValueError(f"{what} is not a forced exit and has no rebalance session")
@@ -922,7 +986,7 @@ def decisions_from(
       close(S-1) (its end session on or before S-1, or unknown);
     - an `exclude_name` override (`overrides` naming T_i) sells a held name
       whole (`override`, side `sell`, reason `exclude_name`) and buys nothing
-      for an unheld target (`override`, no side), its weight left in cash; a
+      for an unheld target (`override`, no side, reason `exclude_name`), its weight left in cash; a
       `keep_name` override trades nothing (`override`, no side, reason
       `keep_name`); either carries its `override_id`;
     - a held name outside the universe is sold whole by quantity (`trade`,

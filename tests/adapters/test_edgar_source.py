@@ -287,6 +287,53 @@ def test_the_bulk_zip_stamps_and_the_per_cik_top_up_follows(tmp_path: Path) -> N
     assert [u.accession for u in source.unstamped_filings] == [MISSING]
 
 
+def test_an_empty_submissions_api_payload_leaves_rows_unstamped_not_failed(
+    tmp_path: Path,
+) -> None:
+    """#576: the per-CIK submissions API answering 200 `{}` (a CIK payload or
+    an older page) lists nothing: the run goes on, the rows it would have
+    stamped are excluded and reported as unstamped, and nothing is cached as
+    unstampable, so a later run that gets the real payload stamps them."""
+    settings = edgar_settings(tmp_path / "cache")
+    router = _router()
+    router.add(f"{SUBMISSIONS_URL}CIK{ALPHABET}.json", {})
+    router.add(f"{SUBMISSIONS_URL}CIK{APPLE}-submissions-001.json", {})
+    source = _source(settings, router)
+    entries = source.filing_index()
+    full = _source(edgar_settings(tmp_path / "per-cik"), _router()).filing_index()
+    assert source.submissions_api_empty == 2
+    assert entries == [e for e in entries if e in full]
+    assert not any(e.cik == ALPHABET for e in entries)
+    unstamped = {u.accession for u in source.unstamped_filings}
+    assert {e.accession for e in full if e.cik == ALPHABET} <= unstamped
+    assert {e.accession for e in full} - {e.accession for e in entries} <= unstamped
+    later = _source(settings, _router())
+    assert later.filing_index() == full
+    assert later.submissions_api_empty == 0
+
+
+def test_an_empty_bulk_submissions_member_falls_back_to_the_api(tmp_path: Path) -> None:
+    """#566 sweep: an empty `{}` CIK member or older page in `submissions.zip`
+    is treated as absent, so the CIK is stamped per CIK, never left
+    unstamped or failing the source."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        bulk.write(FIXTURES / SUBMISSIONS[APPLE][0], f"CIK{APPLE}.json")
+        bulk.writestr(f"CIK{APPLE}-submissions-001.json", "{}")
+        bulk.writestr(f"CIK{ALPHABET}.json", "{}")
+    router = _router()
+    router.add(BULK_URL, buffer.getvalue())
+    settings = edgar_settings(tmp_path / "cache", bulk_stamp_threshold_ciks=2)
+    source = _source(settings, router)
+    entries = source.filing_index()
+    assert entries == _source(edgar_settings(tmp_path / "per-cik"), _router()).filing_index()
+    assert source.submissions_bulk_empty == 2
+    assert {"CIK0001652044.json", "CIK0000320193-submissions-001.json"} <= set(
+        _submission_urls(router)
+    )
+    assert [u.accession for u in source.unstamped_filings] == [MISSING]
+
+
 # --- the companies snapshot and provenance ---------------------------------------
 
 

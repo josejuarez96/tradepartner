@@ -24,6 +24,7 @@ from tradepartner.execution.plan import (
     Remainder,
     State,
     decision_state,
+    is_full_exit,
     remainder,
     target_notional,
 )
@@ -70,6 +71,7 @@ def _decision(
     security_id: str = A,
     rebalance_session: date | None = T0,
     decision_id: int = 1,
+    reason: str | None = None,
 ) -> DecisionRow:
     stamp = _utc(T0, 21)
     return DecisionRow(
@@ -83,6 +85,7 @@ def _decision(
         target_notional=target,
         whole_share=whole_share,
         decision=decision,
+        reason=reason,
         known_at=stamp,
         ingested_at=stamp,
     )
@@ -252,13 +255,18 @@ def test_quantity_sell_remainder_reads_only_the_latest_order() -> None:
     assert _remainder(d, [second, first], fills).quantity == 3.0
 
 
-def test_notional_sell_remainder_is_submitted_notional_minus_filled_value() -> None:
+def test_a_trim_remainder_is_planned_notional_minus_filled_value_over_every_order() -> None:
+    """A trim is notional and its orders are quantity sells (ADR 0010
+    amendment 2026-09-30): what is left is measured against the plan, not
+    against the latest order's quantity."""
     d = _decision(planned_notional=500.0)
-    o = _order(d, S1, notional=500.0)
-    r = _remainder(d, [o], [_fill(o, 3, 100.0), _fill(o, 1, 90.0)])
-    # 500 - (300 + 90) = 110 notional; 110 / 50 = 2.2 shares at the reference price.
-    assert r.notional == pytest.approx(110.0)
-    assert r.quantity == pytest.approx(2.2)
+    first = _order(d, S1, quantity=6.0)
+    second = _order(d, S2, attempt=2, quantity=4.0)
+    fills = [_fill(first, 3, 100.0), _fill(first, 1, 90.0), _fill(second, 1, 60.0)]
+    r = _remainder(d, [first, second], fills)
+    # 500 - (300 + 90 + 60) = 50 notional; 50 / 50 = 1 share at the reference price.
+    assert r.notional == pytest.approx(50.0)
+    assert r.quantity == pytest.approx(1.0)
 
 
 def test_buy_remainder_is_target_minus_filled_value_over_every_order() -> None:
@@ -319,10 +327,13 @@ def test_skip_and_dust_decisions_are_closed(kind: str) -> None:
     assert (state.state, state.reason) == (State.CLOSED, kind)
 
 
-def test_a_keep_name_override_is_closed() -> None:
-    # `keep_name` is an `override` decision with nothing to trade (no side).
-    state = _state(_decision(side=None, decision="override"))
-    assert (state.state, state.reason) == (State.CLOSED, "keep_name")
+@pytest.mark.parametrize("kind", ["keep_name", "exclude_name"])
+def test_a_sideless_override_is_closed_with_its_own_kind(kind: str) -> None:
+    # An `override` decision with nothing to trade (no side): every `keep_name`, and
+    # an `exclude_name` of a name not held (#450). The state names the override's
+    # kind, never `keep_name` for an `exclude_name`.
+    state = _state(_decision(side=None, decision="override", reason=kind))
+    assert (state.state, state.reason) == (State.CLOSED, kind)
 
 
 @pytest.mark.parametrize(
@@ -333,6 +344,22 @@ def test_a_decision_event_closes_the_decision(status: str, reason: str) -> None:
     state = _state(d, decision_events=[_decision_event(d, status, reason)])
     assert (state.state, state.reason) == (State.CLOSED, status)
     assert not state.written_off
+
+
+def test_a_closing_event_carries_its_reason_as_event_reason() -> None:
+    d = _decision(side="sell", planned_quantity=0.4, decision="forced_exit", reason="delisted")
+    state = _state(d, decision_events=[_decision_event(d, "skipped", "dust")])
+    assert (state.state, state.event_reason) == (State.CLOSED, "dust")
+
+
+def test_event_reason_is_none_when_no_closing_event_closed_the_state() -> None:
+    # Closed by the decision's own kind (a skip/dust decision), not by an event.
+    state = _state(_decision(side=None, decision="dust"))
+    assert state.event_reason is None
+    # Open: no closing event at all.
+    d = _decision(side="buy", planned_notional=100.0, target=100.0)
+    open_state = _state(d)
+    assert open_state.event_reason is None
 
 
 def test_a_deferred_buy_is_open_with_no_row() -> None:
@@ -391,6 +418,56 @@ def test_a_whole_share_residue_of_one_share_or_more_stays_open() -> None:
     assert state.state == State.OPEN
 
 
+@pytest.mark.parametrize("kind", ["trade", "forced_exit", "override"])
+def test_a_whole_share_full_exit_with_one_share_left_stays_open(kind: str) -> None:
+    """#366 Q3: the buffered-share minimum is for trims; a full exit sells its
+    last share and settles only below one share or below the minimum."""
+    reason = {"trade": "left_targets", "forced_exit": "window_stop", "override": None}[kind]
+    d = _decision(planned_quantity=10, whole_share=True, decision=kind, reason=reason)
+    o = _order(d, S1, quantity=10)
+    one_left = _state(d, [o], [_event(o, "expired")], [_fill(o, 9, 50.0)])
+    assert one_left.state == State.OPEN  # 1 x 50 = 50, below one buffered share (51)
+    sub_share = _state(d, [o], [_event(o, "expired")], [_fill(o, 9.5, 50.0)])
+    assert sub_share.state == State.SETTLED
+    cheap = _state(
+        d,
+        [o],
+        [_event(o, "expired")],
+        [_fill(o, 9, 50.0)],
+        frozen=RiskConfig(min_order_notional=60.0),
+    )
+    assert cheap.state == State.SETTLED  # one share worth 50, below a $60 minimum
+
+
+@pytest.mark.parametrize(
+    ("side", "kind", "reason", "expected"),
+    [
+        ("sell", "forced_exit", "delisted", True),
+        ("sell", "forced_exit", "untargeted_receipt", True),
+        ("sell", "forced_exit", "window_stop", True),
+        ("sell", "trade", "left_targets", True),
+        ("sell", "trade", "left_universe", True),
+        ("sell", "override", "exclude_name", True),
+        ("sell", "trade", None, False),
+        ("buy", "trade", None, False),
+        (None, "override", "keep_name", False),
+        (None, "override", "exclude_name", False),  # an unheld exclude_name (#450)
+    ],
+)
+def test_is_full_exit_follows_the_spec_table(
+    side: str | None, kind: str, reason: str | None, expected: bool
+) -> None:
+    assert is_full_exit(_decision(side=side, decision=kind, reason=reason)) is expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason"), [("trade", "drifted"), ("skip_below_minimum", None), ("dust", None)]
+)
+def test_is_full_exit_refuses_a_sell_outside_the_table(kind: str, reason: str | None) -> None:
+    with pytest.raises(ValueError, match="full exit"):
+        is_full_exit(_decision(decision=kind, reason=reason))
+
+
 def test_a_fractionable_remainder_below_the_minimum_settles() -> None:
     d = _decision(side="buy", planned_notional=100.0, target=100.0)
     o = _order(d, S1, notional=100.0)
@@ -443,8 +520,15 @@ def test_a_buy_with_a_sell_in_flight_at_submit_stays_open() -> None:
         (("cancel_requested", "halt"), ("cancel_failed", "halt"), ("expired", None)),
         (("cancel_failed", "halt"), ("cancelled", None)),
         (("cancelled", "not_received"),),
+        (("cancelled", "owner_settled_unknown"),),
     ],
-    ids=["halt-cancel", "halt-cancel-failed", "cancel-failed-only", "not-received"],
+    ids=[
+        "halt-cancel",
+        "halt-cancel-failed",
+        "cancel-failed-only",
+        "not-received",
+        "owner-settled",
+    ],
 )
 def test_a_halt_or_a_crash_is_not_a_funding_shortfall(
     extra: tuple[tuple[str, str | None], ...],
@@ -452,6 +536,16 @@ def test_a_halt_or_a_crash_is_not_a_funding_shortfall(
     d, o, events = _terminal_buy(extra=extra)
     state = _state(d, [o], events)
     assert (state.state, state.written_off) == (State.OPEN, False)
+
+
+def test_an_owner_settled_buy_stays_open_for_its_remainder() -> None:
+    """Spec req 17 (#571): `paper settle` journals the order `cancelled` with reason
+    `owner_settled_unknown` and no fill; the decision stays open for its remainder,
+    protected from the funding write-off as a `not_received` cancel is."""
+    d, o, events = _terminal_buy(extra=(("cancelled", "owner_settled_unknown"),))
+    state = _state(d, [o], events, [_fill(o, 4, 50.0)])
+    assert (state.state, state.written_off) == (State.OPEN, False)
+    assert state.remainder == Remainder(quantity=6.0, notional=300.0)
 
 
 def test_a_cancel_without_the_halt_reason_does_not_protect_the_buy() -> None:
@@ -764,3 +858,25 @@ def test_the_target_refuses_a_negative_cost_rate() -> None:
     bad = BuyCosts(per_side_bps=-20_000.0, commissions=COSTS.commissions)
     with pytest.raises(ValueError, match="per_side_bps"):
         target_notional(buy, 100.0, [], [buy], price_of, bad)
+
+
+def test_a_floored_trim_of_a_name_that_lost_fractionable_stays_open_on_its_remainder() -> None:
+    """#395: a $475 trim (9.5 shares at $50) journaled `whole_share = false`
+    sells 9 whole shares once the name lost `fractionable`; the 0.5-share
+    remainder ($25) is above `risk.min_order_notional`, so the trim stays open
+    (the next attempt floors it to zero and skips it `skip_below_one_share`)."""
+    d = _decision(planned_notional=475.0)
+    o = _order(d, S1, quantity=9.0)
+    state = _state(d, [o], [_event(o, "filled")], [_fill(o, 9, 50.0)])
+    assert state.state == State.OPEN
+    assert state.remainder is not None
+    assert state.remainder.quantity == pytest.approx(0.5)
+    # Worth less than the minimum, the same remainder settles instead.
+    cheap = _state(
+        d,
+        [o],
+        [_event(o, "filled")],
+        [_fill(o, 9, 50.0)],
+        frozen=RiskConfig(min_order_notional=30.0),
+    )
+    assert cheap.state == State.SETTLED

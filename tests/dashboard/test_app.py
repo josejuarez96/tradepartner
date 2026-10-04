@@ -13,20 +13,29 @@ fixture and `tests/test_config.py` for the same env-var pattern).
 from __future__ import annotations
 
 import runpy
+import tomllib
 from pathlib import Path
 
 import duckdb
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from tradepartner.config import Settings
-from tradepartner.dashboard.app import StoreState, StoreUnavailable, open_store_connection
+from tradepartner.dashboard import override_page
+from tradepartner.dashboard.app import (
+    StoreState,
+    StoreUnavailable,
+    _server_options_ok,
+    open_store_connection,
+)
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write
 
 _APP_PATH = str(
     Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "dashboard" / "app.py"
 )
+_CONFIG_TOML = Path(__file__).resolve().parents[2] / ".streamlit" / "config.toml"
 
 
 def _run_app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
@@ -202,4 +211,117 @@ def test_render_ok_state_shows_navigation_and_placeholder_page(
     assert not at.info
     assert not at.error
     [nav] = at.sidebar.radio
-    assert nav.options == ["Data health", "Backtest", "Trial registry"]
+    assert nav.options == [
+        "Data health",
+        "Backtest",
+        "Trial registry",
+        "Operations",
+        "Override",
+    ]
+
+
+def test_a_stray_outcome_shows_only_once_the_override_page_is_selected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`show_outcome` is only called when the Override page is selected
+    (module docstring): an `Outcome` left in `session_state` while another
+    page is showing (nothing in the current click flow produces this —
+    `on_click` cannot change the sidebar's own page selection — but nothing
+    should rely on that) does not bleed onto that other page, and is still
+    shown, once, the next time Override is selected, since `show_outcome`
+    pops rather than peeks."""
+    store_path = tmp_path / "outcome-scoped.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+
+    at = _run_app(monkeypatch, store_path)
+    at.sidebar.radio[0].set_value("Data health").run()
+    assert not at.exception
+
+    at.session_state[override_page.OUTCOME_KEY] = override_page.Outcome(
+        override_page.OutcomeStatus.WRITTEN, "Override 1 written: exclude_name."
+    )
+    at.run()
+
+    assert not at.exception
+    assert not any("written" in s.value.lower() for s in at.success)
+
+    at.sidebar.radio[0].set_value("Override").run()
+    assert not at.exception
+    assert any("written" in s.value.lower() for s in at.success)
+
+    at.sidebar.radio[0].set_value("Data health").run()
+    assert not at.exception
+    assert not any("written" in s.value.lower() for s in at.success)
+
+
+# --- server options (ADR 0011, #273) ---------------------------------------
+
+
+def test_config_toml_pins_localhost_and_no_telemetry() -> None:
+    config = tomllib.loads(_CONFIG_TOML.read_text(encoding="utf-8"))
+    assert config["server"]["address"] == "localhost"
+    assert config["browser"]["gatherUsageStats"] is False
+
+
+@pytest.mark.parametrize(
+    ("address", "gather_usage_stats", "expected"),
+    [
+        ("localhost", False, True),
+        ("127.0.0.1", False, True),
+        ("0.0.0.0", False, False),
+        (None, False, False),
+        ("localhost", True, False),
+        ("localhost", None, False),
+    ],
+)
+def test_server_options_ok(
+    address: str | None, gather_usage_stats: bool | None, expected: bool
+) -> None:
+    ok, message = _server_options_ok(address, gather_usage_stats)
+    assert ok is expected
+    assert bool(message) is not expected
+
+
+def test_render_app_refuses_when_server_options_differ(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A running override (`STREAMLIT_SERVER_ADDRESS`, a CLI flag) that opens
+    `server.address` to another interface must stop the render, not just the
+    file on disk (ADR 0011 point 3)."""
+    store_path = tmp_path / "ok.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+
+    real_get_option = st.get_option
+
+    def _fake_get_option(key: str) -> object:
+        if key == "server.address":
+            return "0.0.0.0"
+        return real_get_option(key)
+
+    monkeypatch.setattr(st, "get_option", _fake_get_option)
+    at = _run_app(monkeypatch, store_path)
+
+    assert not at.exception
+    assert any("refusing to render" in e.value.lower() for e in at.error)
+    assert not at.sidebar.radio
+
+
+def test_render_app_renders_when_server_options_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The default (unpatched) options come from the real `.streamlit/config.toml`,
+    which this test pins matches ADR 0011, so the shell renders as normal."""
+    store_path = tmp_path / "ok.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+
+    at = _run_app(monkeypatch, store_path)
+
+    assert not at.exception
+    assert not at.error
+    assert at.sidebar.radio

@@ -66,34 +66,84 @@ one, else `min(ddate, acceptance date in New York)`, because FSN's `ddate`
 is a rounded month end (owner decision 2026-09-26, #242); a per-document
 record keeps its cover date. Records are de-duplicated across sources on
 (accession, fact name, class member), the winner keeping its own dates; two
-sources disagreeing on a value is a collision (T11h's policy, below). The
+sources disagreeing on a value is a collision (T11h's policy, below). FSN
+holds 4 decimal places, so a value agrees with FSN's when it is within half
+a unit of the 4th place (#610 X1). A company-facts date after acceptance is
+capped at the Eastern acceptance date; when that cap makes it collide with a
+different value the filing reports for that date, the after-acceptance value
+is dropped and counted on `.facts_capped_dropped` (#610 X2, owner
+2026-10-02); with no value dated on or before acceptance it stays a
+collision. The
 store's `facts_as_of` serves one row per (security, fact name, class,
 accession), the latest ingested, so a re-dated share never appears twice.
 A company-facts 404, or a CIK the bulk zip has no file for, is not a filing
 failure (many issuers have no XBRL facts): counted on `.facts_missing`, its
-empty result cached the same way as a real payload.
+empty result cached the same way as a real payload. A bulk member that is an
+empty object (SEC ships `{}` members, #566) is treated as absent from the
+zip, counted on `.facts_bulk_empty` (`.submissions_bulk_empty` for
+`submissions.zip`, where an empty older page is likewise absent). A
+per-CIK companyfacts API answer of 200 `{}` (SEC's answer for those same
+CIKs, #576) is SEC's "no facts", handled exactly like a 404 and also counted
+on `.facts_api_empty`. A payload that carries `facts` but no `cik` (#599:
+SEC serves this shape for a handful of CIKs, identically from the zip and
+the API) is identified by the CIK it was requested under (the zip member
+name, or the API URL), counted on `.facts_bulk_keyless`/`.facts_api_keyless`,
+and its facts carry that CIK; a `cik` that is present but differs still
+raises. A per-CIK submissions API answer of 200 `{}` (a CIK payload or an
+older page) lists nothing: the rows it would stamp stay unstamped this run
+and are never cached as unstampable for it, counted on
+`.submissions_api_empty`. Any other malformed payload still fails the source.
 
-**Failure policy (T11h, owner decision (2)).** A per-document fetch/parse
-that raises `ValueError` (a malformed document, a fact collision) or meets a
-404/410 for the document or header itself is skipped, not raised: `_guarded`
-records it in `failed_filings.json` (keyed by `FAILURES_VERSION`) with a
-count of consecutive Eastern days it has failed identically, advanced only
-by `record_failures()` (the `after_commit` hook `ingest.py`/`backfill.py`
-call after a committed `ok`, non-dry-run EDGAR chunk). An accession failing
-identically `edgar.max_filing_failures` days running is quarantined: no
-further request until its entry is deleted or `FAILURES_VERSION` changes.
-An FSN accession whose rows failed extraction is recorded in its period's
-manifest instead, counted on `.failed_filings`, never quarantined, and
-retried only when `FSN_VERSION` changes. `check_failures()` (called by
-`ingest.py`'s `_prefetch`, before the lock) raises `FilingFailuresError`
-when an uncommitted FSN period's failure share, or the run's per-document
-failure share, clears both `edgar.min_failed_filings` and
-`edgar.max_failed_filing_share`, or when one (error class, base form) pair
-has at least `edgar.min_failed_filings` distinct non-`accepted` accessions
-across `failed_filings.json` and every FSN manifest together. A fact
-collision withholds only the collided (accession, fact name, class member)
-key, recorded under the accession's base form, counting toward the
-cross-day pair rule only, never the per-document share.
+**Failure policy (T11h, owner decision (2); #610).** A per-document
+fetch/parse that raises `ValueError` (a malformed document, a fact
+collision) or meets a 404/410 for the document or header itself is skipped,
+not raised: `_guarded` records it in `failed_filings.json` (keyed by
+`FAILURES_VERSION`) with a count of consecutive Eastern days it has failed
+identically and its message (redacted, capped at `ingest.max_message_chars`;
+#610 P4). The count advances at most once per Eastern day, by
+`record_failures()` (the `after_commit` hook `ingest.py`/`backfill.py` call
+after a committed `ok`, non-dry-run EDGAR chunk) or by
+`record_failed_check()` (which `ingest._prefetch` calls when
+`check_failures()` raised on a non-dry run; #610 policy 2), so failures are
+recorded, quarantined and accepted even when no run can commit. An
+accession failing identically `edgar.max_filing_failures` days running is
+quarantined: no further request until its entry is deleted or
+`FAILURES_VERSION` changes. An FSN accession whose rows failed extraction is
+recorded, with its message, in its period's manifest instead
+(`fsn/v{FSN_VERSION}/manifests/<period>.json`, `accessions_failed`), counted
+on `.failed_filings`, never quarantined, and retried only when
+`FSN_VERSION` changes.
+
+`check_failures()` (called by `ingest.py`'s `_prefetch`, before the lock)
+raises `FilingFailuresError` when (1) the uncommitted FSN periods' failure
+share, or (2) the run's per-document failure share, clears both
+`edgar.min_failed_filings` and `edgar.max_failed_filing_share`, or (3) one
+(error class, base form) pair has at least `edgar.min_failed_filings`
+distinct non-`accepted` accessions across `failed_filings.json` and this
+run's failures. The per-document denominator is every per-document
+accession the run fetched or read from its per-document cache (#610 policy
+1; a co-registrant's cached copy included) plus the quarantined accessions
+it skipped, each of which counts as a failure unless `accepted`: quarantine
+alone never excuses a failure. FSN failures are judged by rule (1)
+only, never pooled into rule (3) (#610 policy 3). A fact collision withholds
+only the collided (accession, fact name, class member) key, recorded under
+the accession's base form, counting toward rule (3) only, never rule (2).
+
+**Accepting a failure (the owner, by hand).** Set `"accepted": true` on its
+entry and leave every other field as it is:
+
+- a per-document failure: the accession's entry under `"entries"` in
+  `edgar.cache_dir/failed_filings.json`. `accepted` holds only while the
+  accession keeps failing with the same `error_class` and `message_hash`; a
+  different failure resets it to `false` and is judged again. An accepted
+  entry leaves the numerators of rules (2) and (3); it still counts toward
+  quarantine, and a quarantined accession is excused only by `accepted`.
+- an FSN failure: the accession's object in `accessions_failed` of its
+  period's manifest. It leaves rule (1); it is re-judged only when
+  `FSN_VERSION` changes (the period is re-extracted).
+
+The file must stay valid JSON: one that does not load fails the run loudly,
+never silently lifting an acceptance (#275).
 """
 
 from __future__ import annotations
@@ -112,6 +162,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
@@ -145,7 +196,7 @@ from tradepartner.adapters.filings import (
     FilingIndexEntry,
     FilingSource,
 )
-from tradepartner.config import Settings
+from tradepartner.config import Settings, secret_values
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Bumped when a parser change must re-stamp every cached accession.
@@ -153,11 +204,11 @@ PARSER_VERSION = 1
 #: Bumped when a parser change must re-extract every cached FSN period.
 #: Separate from `PARSER_VERSION`, which stays the per-CIK stamps' key: a
 #: bump here re-downloads every period's zip (the PR states that cost).
-FSN_VERSION = 1
+FSN_VERSION = 2  # 2: #609 (latest ddate per member, NULL shares, title whitespace)
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
-COVER_VERSION = 1
+COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and counted)
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
@@ -177,6 +228,15 @@ _REGISTRATION_FORMS = frozenset({"S-1", "F-1", "10-12B"})
 _FSN_SHARES_TAG = "EntityCommonStockSharesOutstanding"
 _FSN_LISTING_TAGS = ("Security12bTitle", "TradingSymbol", "SecurityExchangeName")
 _FSN_MEMBERS = ("sub.tsv", "num.tsv", "txt.tsv", "dim.tsv")
+#: FSN's `num.tsv` `value` column is DECIMAL(28,4) (SEC's FSN data-set
+#: readme): a share count FSN holds agrees with another source's value when
+#: that value is within half a unit of the 4th decimal place (#610 X1). A
+#: property of the data format, not a tunable threshold.
+_FSN_DECIMALS = 4
+_FSN_HALF_UNIT = Decimal(1).scaleb(-_FSN_DECIMALS) / 2
+#: Control characters replaced in a stored failure message (as `ingest`'s
+#: run messages): the text comes from a server or a filing.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25/A", "25-NSE", "25-NSE/A"})
@@ -212,6 +272,9 @@ class _Submissions:
     records: dict[str, SubmissionRecord]
     pages: list[str]
     fetched_at: datetime
+    # #576: the API answered 200 `{}` for the payload or a page, so a missing
+    # accession is not evidence the filing is unstampable.
+    empty: bool = False
 
 
 def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, SubmissionRecord], list[str]]:
@@ -289,6 +352,23 @@ class EdgarFilingSource(FilingSource):
         self.failed_filings = 0
         self.quarantined = 0
         self.facts_missing = 0
+        # #566: bulk zip members that are an empty object or carry no `cik`
+        # (SEC ships `{}` members), treated as absent from the zip and asked
+        # of the per-CIK API instead; counted for the run's summary.
+        self.facts_bulk_empty = 0
+        self.submissions_bulk_empty = 0
+        # #576: per-CIK API answers of 200 `{}` (SEC's "nothing here").
+        self.facts_api_empty = 0
+        self.submissions_api_empty = 0
+        # #599: a payload with `facts` but no `cik` (SEC ships this shape for
+        # a few CIKs, identically from the zip and the API): identified by
+        # the CIK it was requested under, not treated as absent.
+        self.facts_bulk_keyless = 0
+        self.facts_api_keyless = 0
+        # #610 X2: (accession, fact name, capped date) keys where a company
+        # value dated after acceptance was dropped because capping its date
+        # made it collide with the value the filing reports for that date.
+        self.facts_capped_dropped: set[tuple[str, str, date]] = set()
         # accession -> (error_class, base_form, message), skipped this run,
         # never yet written to failed_filings.json (that is `record_failures`'s
         # job, after an `ok` commit).
@@ -300,9 +380,15 @@ class EdgarFilingSource(FilingSource):
         # Accessions whose guarded fetch succeeded this run: their stale
         # failed_filings.json entries are pruned by `record_failures()`.
         self._succeeded_this_run: set[str] = set()
-        # Per-document accessions actually fetched this run (cache hits and
-        # quarantined accessions excluded): `check_failures`'s denominator.
+        # Per-document accessions this run fetched or read from their
+        # per-document cache (#610 policy 1: cache hits count; quarantined
+        # accessions do not): `check_failures`'s per-document denominator.
         self._per_document_attempted: set[str] = set()
+        # Quarantined per-document accessions this run skipped: they stay in
+        # the per-document share (numerator unless `accepted`, denominator
+        # always), since a failed check can now quarantine (#610 policy 2)
+        # and quarantine must never excuse a failure nobody accepted.
+        self._quarantined_this_run: set[str] = set()
         self._failed_filings_cache: dict[str, dict[str, Any]] | None = None
         # FSN accessions newly recorded as failed by this run's own
         # `_extract_fsn_period` calls, folded into `.failed_filings`.
@@ -421,6 +507,8 @@ class EdgarFilingSource(FilingSource):
             submissions = self._fetch_submissions(cik, wanted)
             new = {a: submissions.records[a] for a in wanted if a in submissions.records}
             for accession in wanted - new.keys():
+                if submissions.empty:
+                    break  # #576: an empty answer proves nothing unstampable
                 row, quarter = kept[cik][accession]
                 if self._settled(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
@@ -435,12 +523,21 @@ class EdgarFilingSource(FilingSource):
         memo = self._submissions.get(cik)
         if memo is None:
             payload = edgar_raw.submissions(cik, settings=self._settings, client=self._client)
-            records, pages = reduce_submissions(payload)
-            memo = self._submissions[cik] = _Submissions(records, pages, self._now())
+            if _empty_object(payload):  # #576: SEC's "nothing here"; lists nothing
+                self.submissions_api_empty += 1
+                memo = self._submissions[cik] = _Submissions({}, [], self._now(), empty=True)
+            else:
+                records, pages = reduce_submissions(payload)
+                memo = self._submissions[cik] = _Submissions(records, pages, self._now())
         while memo.pages and not wanted <= memo.records.keys():
             page = edgar_raw.submissions_page(
                 memo.pages.pop(0), settings=self._settings, client=self._client
             )
+            if _empty_object(page):  # #576: lists nothing; stop paging
+                self.submissions_api_empty += 1
+                memo.pages.clear()
+                memo.empty = True
+                break
             memo.records.update(reduce_submissions(page)[0])
         return memo
 
@@ -455,11 +552,21 @@ class EdgarFilingSource(FilingSource):
             for cik, wanted in pending.items():
                 if f"CIK{cik}.json" not in names:
                     continue
-                records, pages = reduce_submissions(json.loads(bulk.read(f"CIK{cik}.json")))
+                payload = json.loads(bulk.read(f"CIK{cik}.json"))
+                if _keyless_member(payload):  # #566: as if absent; stamped per CIK
+                    self.submissions_bulk_empty += 1
+                    continue
+                records, pages = reduce_submissions(payload)
                 for page in pages:
                     if wanted <= records.keys() or page not in names:
                         break
-                    records.update(reduce_submissions(json.loads(bulk.read(page)))[0])
+                    page_payload = json.loads(bulk.read(page))
+                    if isinstance(page_payload, dict) and not page_payload:
+                        # #566: an empty page is absent; the per-CIK top-up
+                        # in `_stamp` fetches it for what is still wanted.
+                        self.submissions_bulk_empty += 1
+                        break
+                    records.update(reduce_submissions(page_payload)[0])
                 new = {a: records[a] for a in wanted if a in records}
                 if new:
                     stamps[cik].update(new)
@@ -640,6 +747,7 @@ class EdgarFilingSource(FilingSource):
                 members["txt.tsv"],
                 ("adsh", "tag", "dimh", "dimn", "coreg", "value"),
                 where=f"tag IN ({listing_tags})",
+                free_text="value",
             )
             # Only the dimensions a kept row uses: a quarterly dim.tsv is
             # millions of rows, the largest part of peak memory otherwise.
@@ -652,6 +760,7 @@ class EdgarFilingSource(FilingSource):
                     ("dimhash", "segments"),
                     where="list_contains(?, dimhash)",
                     params=[dimhashes],
+                    free_text="segments",
                 )
                 if dimhashes
                 else []
@@ -685,6 +794,8 @@ class EdgarFilingSource(FilingSource):
                 "accession": f.accession,
                 "error_class": f.error_class,
                 "base_form": form_by_accession.get(f.accession, "").removesuffix("/A"),
+                # P4 (#610): the message, so a failed run is diagnosed from disk
+                "message": self._stored_message(f.error),
                 "accepted": False,
             }
             for f in parsed.failures
@@ -831,6 +942,7 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_cover_cache(accession)
             if cached is not None:
+                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
                 if cached.entity_cik == cik:  # else a co-registrant's copy: not its page
                     yield record, cached
                 continue
@@ -846,6 +958,7 @@ class EdgarFilingSource(FilingSource):
                 if accession in self._pending_failures:
                     continue  # failed earlier this run (cover_pages, then facts): never twice
                 if self._is_quarantined(accession):
+                    self._quarantined_this_run.add(accession)
                     if count_missing:  # count once per run, on the cover_pages pass
                         self.quarantined += 1
                     continue
@@ -934,6 +1047,7 @@ class EdgarFilingSource(FilingSource):
                 continue
             cached = self._load_header_cache(cik, accession)
             if cached is not None:
+                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
                 headers.append(
                     FilingHeader(cik, accession, record.form, cached.sic, record.accepted_at)
                 )
@@ -977,6 +1091,7 @@ class EdgarFilingSource(FilingSource):
         """`_ranged_header`, gated by the quarantine check and wrapped in
         `_guarded` (T11h): a mismatched accession, or a 404/410, is skipped."""
         if self._is_quarantined(accession):
+            self._quarantined_this_run.add(accession)
             self.quarantined += 1
             return None
         return self._guarded(
@@ -1085,6 +1200,7 @@ class EdgarFilingSource(FilingSource):
             cik, record, accepted_at = stamped[0]
             cached = self._load_delisting_cache(accession)
             if cached is not None:
+                self._per_document_attempted.add(accession)  # #610 policy 1: a cache hit
                 results.append(
                     DelistingFiling(
                         cik=cached.cik,
@@ -1101,6 +1217,7 @@ class EdgarFilingSource(FilingSource):
                 self.pre_xml_delistings += 1
                 continue
             if self._is_quarantined(accession):
+                self._quarantined_this_run.add(accession)
                 self.quarantined += 1
                 continue
             delisting_fetch: Callable[[], DelistingFiling] = partial(
@@ -1268,8 +1385,8 @@ class EdgarFilingSource(FilingSource):
     def record_failures(self) -> None:
         """The `after_commit` hook (T11h): advances `failed_filings.json`'s
         consecutive-counted-day counts for this run's per-document failures
-        (`_pending_failures`), and marks every still-uncommitted FSN
-        manifest `committed: true`.
+        (`_pending_failures`, messages included), and marks every
+        still-uncommitted FSN manifest `committed: true`.
 
         Counts advance at most once per Eastern calendar day, the day read
         from the clock now (commit time). A second writer the same day is
@@ -1278,6 +1395,34 @@ class EdgarFilingSource(FilingSource):
         count to 1 instead of incrementing it; `accepted` (set by hand) is
         preserved across an advance.
         """
+        self._write_failure_store()
+        for period in self._cached_fsn_periods():
+            manifest = self._load_fsn_manifest(period)
+            if manifest is not None and not manifest.get("committed", False):
+                manifest["committed"] = True
+                self._save_fsn_manifest(period, manifest)
+        # The run is recorded: its in-memory failures and attempts end with it.
+        self._pending_failures.clear()
+        self._collision_failures.clear()
+        self._per_document_attempted.clear()
+        self._quarantined_this_run.clear()
+        self._succeeded_this_run.clear()
+
+    def record_failed_check(self) -> None:
+        """Called by `ingest._prefetch` when `check_failures()` raised, on a
+        non-dry run (#610 policy 2): writes this run's failures to
+        `failed_filings.json` by the same counted-day rule as
+        `record_failures()` (messages included, P4), so they can be
+        quarantined and `accepted` although the run never commits. FSN
+        manifests stay uncommitted (they keep being judged), and the
+        in-memory state is kept: the run is not recorded as a success."""
+        if self._pending_failures or self._succeeded_this_run:
+            self._write_failure_store()
+
+    def _write_failure_store(self) -> None:
+        """Merge this run's failures into `failed_filings.json` under the
+        lock, pruning accessions that parse now; counts advance at most once
+        per Eastern day read from the clock now."""
         today = self._now().astimezone(_EASTERN).date().isoformat()
         with self._failed_filings_lock():
             # Re-read under the lock, never the copy loaded at the fetch pass:
@@ -1288,16 +1433,26 @@ class EdgarFilingSource(FilingSource):
             self._merge_pending_failures(store, today)
             self._save_failed_filings(store)
         self._failed_filings_cache = store
-        for period in self._cached_fsn_periods():
-            manifest = self._load_fsn_manifest(period)
-            if manifest is not None and not manifest.get("committed", False):
-                manifest["committed"] = True
-                self._save_fsn_manifest(period, manifest)
-        # The run is recorded: its in-memory failures and attempts end with it.
-        self._pending_failures.clear()
-        self._collision_failures.clear()
-        self._per_document_attempted.clear()
-        self._succeeded_this_run.clear()
+
+    def _stored_message(self, message: str) -> str:
+        """A failure message as written to disk (P4, #610): every configured
+        secret redacted, control characters replaced, cut to
+        `ingest.max_message_chars` (it is server- or filing-supplied text)."""
+        for value in secret_values(self._settings):
+            message = message.replace(value, "[redacted]")
+        return _CONTROL.sub(" ", message)[: self._settings.ingest.max_message_chars]
+
+    def _accepted(self, accession: str, error_class: str, message: str) -> bool:
+        """Whether this run's failure of `accession` is `accepted`: only when
+        its stored entry is accepted for this same error class and message
+        hash (fail closed: a different failure is judged again)."""
+        entry = self._failure_store().get(accession)
+        return (
+            entry is not None
+            and bool(entry.get("accepted", False))
+            and entry.get("error_class") == error_class
+            and entry.get("message_hash") == _message_hash(message)
+        )
 
     @contextlib.contextmanager
     def _failed_filings_lock(self) -> Iterator[None]:
@@ -1314,7 +1469,7 @@ class EdgarFilingSource(FilingSource):
     def _merge_pending_failures(self, store: dict[str, dict[str, Any]], today: str) -> None:
         """This run's failures into `store`, by the counted-day rule."""
         for accession, (error_class, base_form, message) in self._pending_failures.items():
-            message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            message_hash = _message_hash(message)
             entry = store.get(accession)
             if entry is not None and entry.get("last_counted_day") == today:
                 continue  # already advanced today
@@ -1327,6 +1482,7 @@ class EdgarFilingSource(FilingSource):
                 "error_class": error_class,
                 "base_form": base_form,
                 "message_hash": message_hash,
+                "message": self._stored_message(message),  # P4 (#610)
                 "count": (entry["count"] + 1) if same and entry is not None else 1,
                 "last_counted_day": today,
                 # `accepted` was given for one error: a different one is reviewed again.
@@ -1343,7 +1499,11 @@ class EdgarFilingSource(FilingSource):
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
         if reasons:
-            raise FilingFailuresError("; ".join(reasons))
+            raise FilingFailuresError(
+                "; ".join(reasons)
+                + f"; failure messages in {self._failed_filings_path()} (not on a dry run)"
+                + f" and the FSN manifests under {self._fsn_root() / 'manifests'}"
+            )
 
     def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
         min_n = self._settings.edgar.min_failed_filings
@@ -1374,17 +1534,31 @@ class EdgarFilingSource(FilingSource):
             reasons.append(reason)
 
     def _check_per_document_group(self, reasons: list[str]) -> None:
-        """Per-document's denominator is the accessions attempted this run
-        (cache hits and quarantined accessions excluded); a `facts()`
-        collision counts toward `_check_cross_day_pairs` only, never here."""
-        store = self._failure_store()
+        """Per-document's denominator is the accessions fetched or read from
+        the per-document cache this run (#610 policy 1), plus the quarantined
+        accessions it skipped; a quarantined accession counts as a failure
+        unless its entry is `accepted` (a failed check can quarantine, #610
+        policy 2, and quarantine never excuses on its own). A `facts()`
+        collision counts toward `_check_cross_day_pairs` only, never here. A
+        pending failure is excused only by an entry accepted for its same
+        error class and message."""
         failures = sum(
             1
-            for accession in self._pending_failures
+            for accession, (error_class, _form, message) in self._pending_failures.items()
             if accession not in self._collision_failures
-            and not store.get(accession, {}).get("accepted", False)
+            and not self._accepted(accession, error_class, message)
         )
-        denominator = len(self._per_document_attempted)
+        # A quarantined accession is a failure no request re-checked this run:
+        # it counts unless its stored entry is accepted (#610 review), even when
+        # another of its documents (a cached header) put it in the attempted
+        # set; one this run already failed is counted above, never twice.
+        store = self._failure_store()
+        failures += sum(
+            1
+            for accession in self._quarantined_this_run - self._pending_failures.keys()
+            if not store.get(accession, {}).get("accepted", False)
+        )
+        denominator = len(self._per_document_attempted | self._quarantined_this_run)
         reason = self._threshold_reason("per-document", failures, denominator)
         if reason:
             reasons.append(reason)
@@ -1392,23 +1566,19 @@ class EdgarFilingSource(FilingSource):
     def _check_cross_day_pairs(self, reasons: list[str]) -> None:
         """One (error class, base form) pair with at least
         `edgar.min_failed_filings` distinct accessions, `accepted: true`
-        entries excluded, across `failed_filings.json`, this run's not-yet-
-        recorded failures and every FSN manifest's `accessions_failed`."""
+        entries excluded, across `failed_filings.json` and this run's
+        not-yet-recorded failures. FSN manifest failures are not pooled here
+        (#610 policy 3): `_check_fsn_group`'s share rule alone judges them."""
         pairs: dict[tuple[str, str], set[str]] = defaultdict(set)
         store = self._failure_store()
         for accession, entry in store.items():
+            if accession in self._pending_failures:
+                continue  # judged below, by this run's own error
             if not entry.get("accepted", False):
                 pairs[(entry["error_class"], entry["base_form"])].add(accession)
-        for accession, (error_class, base_form, _message) in self._pending_failures.items():
-            if not store.get(accession, {}).get("accepted", False):
+        for accession, (error_class, base_form, message) in self._pending_failures.items():
+            if not self._accepted(accession, error_class, message):
                 pairs[(error_class, base_form)].add(accession)
-        for period in self._cached_fsn_periods():
-            manifest = self._load_fsn_manifest(period)
-            if manifest is None:
-                continue
-            for failure in manifest.get("accessions_failed", []):
-                if not failure.get("accepted", False):
-                    pairs[(failure["error_class"], failure["base_form"])].add(failure["accession"])
         min_n = self._settings.edgar.min_failed_filings
         for (error_class, base_form), accessions in pairs.items():
             if len(accessions) >= min_n:
@@ -1435,8 +1605,9 @@ class EdgarFilingSource(FilingSource):
         **De-duplication across sources** on (accession, fact name, class
         member): a per-document parse wins over company facts, which win over
         FSN; every source's records keep their own `as_of_date` keys within
-        the winner; the same key with different values in two sources is a
-        collision (T11h): only that (accession, fact name, class member) key
+        the winner; the same key with different values in two sources (FSN
+        compared at its 4 decimal places, #610 X1) is a collision (T11h):
+        only that (accession, fact name, class member) key
         is withheld, recorded under the accession's base form, and it counts
         toward `check_failures`'s cross-day (error class, base form) rule
         only; the accession's other facts are still served.
@@ -1493,11 +1664,17 @@ class EdgarFilingSource(FilingSource):
                 for a, b in itertools.combinations(sorted(dated), 2):
                     common = dated[a].keys() & dated[b].keys()
                     if common:  # comparable dates must agree, value for value
-                        clash = [d for d in common if dated[a][d] != dated[b][d]]
+                        clash = [
+                            d for d in common if not _same_value(a, dated[a][d], b, dated[b][d])
+                        ]
                         if clash:
                             days = ", ".join(d.isoformat() for d in sorted(clash))
                             raise ValueError(f"{label} differs between {a} and {b} on {days}")
-                    elif set(dated[a].values()).isdisjoint(dated[b].values()):
+                    elif not any(
+                        _same_value(a, x, b, y)
+                        for x in dated[a].values()
+                        for y in dated[b].values()
+                    ):
                         raise ValueError(f"{label} differs between {a} and {b}: no value in common")
             except ValueError as error:
                 # T11h: a collision withholds only this key, never the whole
@@ -1562,7 +1739,8 @@ class EdgarFilingSource(FilingSource):
                 data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
                 edgar_raw.write_atomic(path, json.dumps(data).encode("utf-8"))
         fsn_cache = self._load_fsn_cache(cik)
-        out: dict[str, list[_CachedFact]] = {}
+        # (accession, name, capped date) -> [(value, dated after acceptance)]
+        kept: dict[tuple[str, str, date], list[tuple[float, bool]]] = {}
         for name, accession, as_of, value in cached:
             record = stamps.get(accession)
             if record is None or record.accepted_at is None or name not in wanted:
@@ -1574,7 +1752,18 @@ class EdgarFilingSource(FilingSource):
                 continue  # the per-document parse names another entity
             eastern = record.accepted_at.astimezone(_EASTERN).date()
             capped = min(as_of, eastern)  # an XBRL date typo never dates a fact after its stamp
-            out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
+            kept.setdefault((accession, name, capped), []).append((value, as_of > eastern))
+        out: dict[str, list[_CachedFact]] = {}
+        for (accession, name, capped), values in kept.items():
+            reported = {value for value, after in values if not after}
+            if reported and any(after and v not in reported for v, after in values):
+                # #610 X2 (owner, 2026-10-02): capping made a value dated after
+                # acceptance collide with one the filing reports on that date;
+                # drop the later-dated one, keep what the filing reports.
+                self.facts_capped_dropped.add((accession, name, capped))
+                values = [(v, after) for v, after in values if not after or v in reported]
+            for value, _after in values:
+                out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
     def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool]:
@@ -1586,7 +1775,16 @@ class EdgarFilingSource(FilingSource):
         rebuilt nightly), falls back to the API. A payload for another CIK
         raises. A 404 from the per-CIK API (T11h, T11e's leftover: many
         issuers have no XBRL facts at all) is **not** a filing failure: the
-        payload is `None`, complete `True` (an empty result is cached)."""
+        payload is `None`, complete `True` (an empty result is cached). An
+        API 200 whose payload is an empty object (#576: SEC's answer for the
+        CIKs whose zip member is `{}`) is handled exactly like that 404 and
+        counted on `facts_api_empty`; any other payload without `cik` or
+        `facts` still raises. A payload that has `facts` but no `cik` (#599:
+        SEC ships this shape for a few CIKs, identically from the zip and the
+        API) is identified by the CIK it was requested under (the zip member
+        name, or the API URL) rather than treated as absent, and counted on
+        `facts_bulk_keyless`/`facts_api_keyless`; a `cik` that is present but
+        differs still raises."""
         if self._facts_bulk is None:
             stale = 0
             for stamps_path in self._stamps_path("0").parent.glob("*.json"):
@@ -1608,13 +1806,34 @@ class EdgarFilingSource(FilingSource):
         if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
             with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
                 bulk_payload = json.loads(bulk.read(f"CIK{cik}.json"))
-            if _holds_accession(bulk_payload, cik, latest):
+            if _keyless_member(bulk_payload):
+                if "facts" in bulk_payload:
+                    # #599: has facts despite missing `cik`; identified by the
+                    # zip member name it was read under.
+                    self.facts_bulk_keyless += 1
+                    bulk_payload = _identified(bulk_payload, cik)
+                else:
+                    # #566: SEC's zip has `{}` members. As if absent from the
+                    # zip: the API is asked, never "no facts" assumed.
+                    self.facts_bulk_empty += 1
+                    bulk_payload = None
+            if bulk_payload is not None and _holds_accession(bulk_payload, cik, latest):
                 return bulk_payload, True
         try:
             payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
         except httpx.HTTPStatusError as error:
             if error.response.status_code != 404:
                 raise
+            absent = True
+        else:
+            absent = _empty_object(payload)
+            if absent:
+                self.facts_api_empty += 1  # #576: SEC's 200 `{}` is its 404
+            elif _keyless_member(payload) and "facts" in payload:
+                # #599: as above, identified by the API URL it was requested under.
+                self.facts_api_keyless += 1
+                payload = _identified(payload, cik)
+        if absent:
             if bulk_payload is not None:
                 # The zip has this CIK's facts, only trailing `latest`: serve
                 # them, marked incomplete so the next run asks again (#275).
@@ -1622,6 +1841,45 @@ class EdgarFilingSource(FilingSource):
             self.facts_missing += 1
             return None, True  # no XBRL facts at all: an empty result is cached
         return payload, _holds_accession(payload, cik, latest)
+
+
+def _message_hash(message: str) -> str:
+    """The `failed_filings.json` key `accepted` is bound to (with the error
+    class): the SHA-256 of the raw, unredacted message."""
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+def _same_value(a_source: str, a: float, b_source: str, b: float) -> bool:
+    """Two sources' values for one key and date agree: exactly, or, when one
+    side is FSN, within half a unit of FSN's 4th decimal place (#610 X1:
+    105.1597 from FSN agrees with company facts' 105.159666)."""
+    if "fsn" not in (a_source, b_source):
+        return a == b
+    return abs(Decimal(repr(a)) - Decimal(repr(b))) <= _FSN_HALF_UNIT
+
+
+def _empty_object(payload: Any) -> bool:
+    """Whether a per-CIK API payload is an empty JSON object (#576: SEC
+    answers 200 `{}` for some CIKs)."""
+    return isinstance(payload, dict) and not payload
+
+
+def _keyless_member(payload: Any) -> bool:
+    """Whether a bulk zip's `CIK##########.json` member, or a per-CIK API
+    payload, is an object with no `cik` (SEC ships empty `{}` members, #566,
+    and a handful of non-empty payloads that carry `facts` but no `cik`,
+    #599). Anything that is not an object is left to fail downstream; the
+    caller tells the two keyless shapes apart by `"facts" in payload`."""
+    return isinstance(payload, dict) and "cik" not in payload
+
+
+def _identified(payload: Mapping[str, Any], cik: str) -> dict[str, Any]:
+    """`payload` with its requested CIK substituted for `cik` (#599): when SEC
+    omits `cik` from a payload that otherwise carries `facts`, the zip member
+    name or API URL it was requested under is its only identity. Downstream
+    readers (`_holds_accession`, `parse_company_facts`) then index
+    `payload["cik"]` as usual, so the facts parsed from it carry `cik`."""
+    return {**payload, "cik": cik}
 
 
 def _holds_accession(payload: Any, cik: str, accession: str) -> bool:
@@ -1799,6 +2057,7 @@ def _fsn_rows(
     *,
     where: str | None = None,
     params: Sequence[object] = (),
+    free_text: str | None = None,
 ) -> list[dict[str, str]]:
     """`columns` of `path` (a tab-separated FSN member) as plain string
     dicts, via DuckDB `read_csv` with every column read as `varchar` (FSN's
@@ -1807,9 +2066,16 @@ def _fsn_rows(
     quoted, and a bare `"` inside a `txt.tsv` value must not start one).
     A zero-byte member (no header row at all -- a real FSN file never is
     one, but a test fixture may be) has no columns to select and yields no
-    rows rather than a DuckDB binder error."""
+    rows rather than a DuckDB binder error.
+
+    DuckDB fails the whole read on one malformed line, so the member is
+    first rewritten in place by `_fsn_normalize_member` (#455, #498);
+    `free_text` names the member's free-text column whose literal tabs may
+    be folded (`txt.tsv`'s `value`, `dim.tsv`'s `segments`), and is `None`
+    for every other member, whose surplus tabs still fail the read."""
     if path.stat().st_size == 0:
         return []
+    _fsn_normalize_member(path, free_text=free_text)
     column_list = ", ".join(columns)
     sql = (
         f"SELECT {column_list} FROM read_csv(?, delim='\t', header=true, "
@@ -1824,6 +2090,46 @@ def _fsn_rows(
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
     finally:
         connection.close()
+
+
+def _fsn_normalize_member(path: Path, *, free_text: str | None = None) -> None:
+    """Rewrite `path`, streamed (an FSN member reaches hundreds of MB), so
+    DuckDB can read it; anything else is kept byte for byte.
+
+    - An invalid UTF-8 byte becomes U+FFFD (FSN members are not always valid
+      UTF-8; #455).
+    - With `free_text` (which must name a header column), a line with more
+      fields than the header keeps its surplus in that column, each surplus
+      tab replaced by U+FFFD: a 2015 `txt.tsv` note carries unquoted tabs in
+      `value`, its last column, and a 2025 `dim.tsv` InvestmentIdentifier
+      in `segments`, its middle one (#498). The U+FFFD makes `parse_fsn`
+      fail an accession whose kept listing value or class member had one.
+      A line with fewer fields, or any surplus without `free_text`, is left
+      for DuckDB to fail loudly: folding a column that is not free text
+      would shift fields silently.
+    """
+    cleaned = path.with_name(path.name + ".normalized")
+    with (
+        path.open(encoding="utf-8", errors="replace", newline="") as source,
+        cleaned.open("w", encoding="utf-8", newline="") as target,
+    ):
+        header = source.readline()
+        target.write(header)
+        names = header.rstrip("\r\n").split("\t")
+        if free_text is not None and free_text not in names:
+            raise ValueError(f"{path.name}: no {free_text!r} column to fold tabs into")
+        column = names.index(free_text) if free_text is not None else -1
+        tabs = len(names) - 1
+        for line in source:
+            if column >= 0 and line.count("\t") > tabs:
+                body = line.rstrip("\r\n")
+                fields = body.split("\t")
+                surplus = len(fields) - len(names)
+                folded = "\ufffd".join(fields[column : column + surplus + 1])
+                fields[column : column + surplus + 1] = [folded]
+                line = "\t".join(fields) + line[len(body) :]
+            target.write(line)
+    cleaned.replace(path)
 
 
 def _fsn_validators_dict(headers: httpx.Headers) -> dict[str, str | None]:

@@ -51,7 +51,11 @@ path's read, `paper resume`'s settlement). In order:
    `unfunded_notional`) for every buy of a **pending** rebalance (one with no
    `rebalance_events` row) that `plan.decision_state` reports written off and
    that lacks one, such as a buy that went terminal inside a resume. Settled
-   rebalances are never re-judged at today's prices.
+   rebalances are never re-judged at today's prices. If the back-fill raises
+   after this collection found a rejection verdict, `collect` raises
+   `RejectionCapError` with the verdict, chained from the back-fill's error,
+   since the committed cursor means no later collection judges those
+   rejections again; without a verdict the back-fill's error propagates as is.
 
 Every clock reading is checked (ADR 0007 point 4): an exception, a
 non-`datetime` or a naive value becomes `ClockError`, and so does a write
@@ -76,10 +80,14 @@ when every one of its orders is `rejected`, even below the cap. The caller
 raises `RejectionCapError` with the verdict's message. `collect` judges each
 submitting run with a `rejected` event written by this collection or since
 the latest **run** collection's cursor row. A rejection journaled by a resume
-or a halt read is therefore judged again by the next run, while a run's own
-rejections are not judged again by every later read of its other orders. A
-resume or halt-path caller that gets a verdict must not drop it: resume
-refuses to release, and the halt path names it in its alert.
+is therefore judged again by the next run, while a run's own rejections are
+not judged again by every later read of its other orders. The halt path's
+read collects as its run, so the rejections it journals are **not** judged
+again by the next run: the halt alert names its verdict, and `paper resume`
+judges every run its release would clear directly with `rejection_breaches`
+before it can release (#397, owner answer (a)). A resume or halt-path caller
+that gets a verdict must not drop it: resume refuses to release, and the halt
+path names it in its alert.
 """
 
 from __future__ import annotations
@@ -99,7 +107,7 @@ import polars as pl
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Fill, Order
 from tradepartner.calendar import all_sessions, is_session
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.errors import ClockError
+from tradepartner.errors import ClockError, RejectionCapError
 from tradepartner.execution.plan import decision_state
 from tradepartner.store.journal import (
     DecisionEventRow,
@@ -230,13 +238,14 @@ def collect(
 ) -> Collected:
     """Collect fills and the terminal events of `orders` (module docstring).
 
-    `connect` opens a write chunk (`lambda: store.db.open_forappend(settings)`),
+    `connect` opens a write chunk (`lambda: store.db.open_for_write(settings)`),
     `frozen` is the window's frozen `risk.*` section, and `settings` gives the
     run-time `paper.fill_read_overlap_seconds`. `writer_kind` is `run` or
     `resume` and `writer_id` its run or resume id. Raises `ValueError` for a
     `pending` order, an unknown writer kind or `write_offs` outside a run, and
     `ClockError` for a fill beyond the broker-clock skew, all before any
-    write."""
+    write, and `RejectionCapError` when the write-off back-fill fails after
+    this collection found a rejection verdict."""
     if writer_kind not in WRITER_KINDS:
         raise ValueError(f"writer_kind must be one of {WRITER_KINDS}, got {writer_kind!r}")
     if write_offs is not None and writer_kind != _RUN:
@@ -297,8 +306,15 @@ def collect(
 
     written_off: tuple[int, ...] = ()
     if write_offs is not None:
-        with connect() as conn:
-            written_off = _back_fill_write_offs(conn, write_offs, frozen, writer_id, stamp)
+        try:
+            with connect() as conn:
+                written_off = _back_fill_write_offs(conn, write_offs, frozen, writer_id, stamp)
+        except Exception as exc:
+            if not rejections:
+                raise
+            # The cursor above has committed, so no later collection judges these
+            # rejections again: the verdict leaves with the failure (#396).
+            raise RejectionCapError("; ".join(b.message for b in rejections)) from exc
 
     return Collected(
         since=since,

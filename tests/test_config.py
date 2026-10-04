@@ -8,35 +8,36 @@ spec; T1 picked conservative ones under the gitignored `data/` directory.
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from tradepartner.config import FROZEN_PAPER_KEYS, PaperConfig, Settings
+from tradepartner.config import (
+    FROZEN_EXECUTION_KEYS,
+    FROZEN_PAPER_KEYS,
+    ExecutionConfig,
+    PaperConfig,
+    Settings,
+    _default_env_file,
+)
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate every test from the real shell environment."""
-    for key in (
-        "ALPACA_API_KEY",
-        "ALPACA_API_SECRET",
-        "SEC_EDGAR_USER_AGENT",
-        "TRADEPARTNER_ENV_FILE",
-        "UNIVERSE__EXCLUDE_SIC_RANGES",
-        "HOLDOUT__START",
-        "HOLDOUT__END",
-        "ALPACA__PAPER",
-        "ALPACA_PAPER_API_KEY",
-        "ALPACA_PAPER_API_SECRET",
-        "ALERT_SMTP_HOST",
-        "ALERT_SMTP_USER",
-        "ALERT_SMTP_PASSWORD",
-        "ALERT_EMAIL_TO",
-    ):
-        monkeypatch.delenv(key, raising=False)
+    """Isolate every test from the real shell environment.
+
+    Every variable `Settings` reads is cleared, found from its fields, so a new
+    key or a nested one such as `STORE__PATH` is covered without a list edit (#360).
+    """
+    fields = {name.upper() for name in Settings.model_fields}
+    nested = tuple(f"{name}__" for name in fields)
+    for key in list(os.environ):
+        upper = key.upper()
+        if upper in fields or upper.startswith(nested) or upper == "TRADEPARTNER_ENV_FILE":
+            monkeypatch.delenv(key)
 
 
 def _settings() -> Settings:
@@ -48,8 +49,14 @@ def _settings() -> Settings:
 def test_settings_construct_with_no_env_file_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Import and load succeed with no `.env` present (acceptance criterion)."""
+    """Import and load succeed with no `.env` present (acceptance criterion).
+
+    The loader reads `.env` from the project root, not the CWD, so a checkout
+    with a real `.env` needs the documented override to have none (#360).
+    """
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "absent.env"))
     monkeypatch.chdir(tmp_path)
+    assert not _default_env_file().exists()
     settings = Settings()
     assert settings is not None
     assert settings.store.path == "data/tradepartner.duckdb"
@@ -80,7 +87,7 @@ def test_edgar_defaults() -> None:
     # path: must be absolute and end with data/edgar_cache regardless of CWD.
     assert Path(s.edgar.cache_dir).is_absolute()
     assert Path(s.edgar.cache_dir) == Path(__file__).resolve().parents[1] / "data" / "edgar_cache"
-    assert s.edgar.requests_per_second == pytest.approx(10.0)
+    assert s.edgar.requests_per_second == pytest.approx(9.0)
     assert s.edgar.retry_backoff_seconds == pytest.approx(1.0)
     assert s.edgar.request_timeout_seconds == pytest.approx(30.0)
     assert s.edgar.header_bytes == 4096
@@ -696,6 +703,21 @@ def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
 
 
+def test_frozen_execution_keys_cover_fill_price() -> None:
+    """#366 Q20 (owner): `execution.fill_price` freezes into the paper window
+    beside the `paper.*` keys, read from `frozen_json`, never live `Settings`."""
+    assert FROZEN_EXECUTION_KEYS == ("fill_price",)
+    assert set(FROZEN_EXECUTION_KEYS) <= set(ExecutionConfig.model_fields)
+
+
+def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None:
+    """ADR 0011, #273: bounds every per-row read a page makes over the journal."""
+    assert _settings().dashboard.page_row_limit == 500
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, dashboard={"page_row_limit": bad})
+
+
 def test_alerts_channels_default_store_and_macos() -> None:
     """#247 Q2: `[store, macos]`; `email` only when the owner sets the `ALERT_*` variables."""
     assert _settings().alerts.channels == ["store", "macos"]
@@ -721,6 +743,62 @@ def test_alerts_channels_require_store_once_and_known_names(channels: list[str])
         Settings(_env_file=None, alerts={"channels": channels})
 
 
+def test_alerts_channels_require_a_non_store_channel() -> None:
+    """#366 Q22 (iii), #515/#416: `store`-only would make `deliver_without_store`
+    (the halt path's `kill_switch_write_failed` alert, which never touches the
+    store) deliver through nothing at all."""
+    with pytest.raises(ValidationError, match="non-store"):
+        Settings(_env_file=None, alerts={"channels": ["store"]})
+
+
+_ALL_EMAIL_SETTINGS: dict[str, str] = {
+    "alert_smtp_host": "smtp.example.com",
+    "alert_smtp_user": "alerts-user",
+    "alert_smtp_password": "hunter2",
+    "alert_email_to": "owner@example.com",
+}
+
+
+def test_alerts_email_channel_with_nothing_set_refuses() -> None:
+    """#544: `channels=[store, email]` with every `ALERT_*` variable unset passed
+    #543's "at least one non-store channel is listed" check but left
+    `kill_switch_write_failed` reaching nobody, since `email` can never actually
+    deliver. The owner's #366 Q22 (iii) answer requires a *usable* channel.
+
+    This refuses with a plain `ValueError`, not a `ValidationError`: a whole-model
+    pydantic validator's `ValidationError` embeds the raw constructor input (every
+    field, including any other secret passed alongside `alerts=...`) in its
+    `input_value`, which `_validate_alert_channel_is_usable` is deliberately
+    structured to avoid (see its docstring in `config.py`)."""
+    with pytest.raises(ValueError, match="ALERT_SMTP_HOST"):
+        Settings(_env_file=None, alerts={"channels": ["store", "email"]})
+
+
+def test_alerts_email_channel_with_every_setting_loads() -> None:
+    s = Settings(_env_file=None, alerts={"channels": ["store", "email"]}, **_ALL_EMAIL_SETTINGS)
+    assert s.alerts.channels == ["store", "email"]
+
+
+def test_alerts_email_channel_names_the_single_missing_variable() -> None:
+    """Only the actually-missing variable is named; nothing else, and never a value."""
+    partial = {k: v for k, v in _ALL_EMAIL_SETTINGS.items() if k != "alert_smtp_password"}
+    with pytest.raises(ValueError) as exc_info:
+        Settings(_env_file=None, alerts={"channels": ["store", "email"]}, **partial)
+    message = str(exc_info.value)
+    assert "ALERT_SMTP_PASSWORD" in message
+    for other in ("ALERT_SMTP_HOST", "ALERT_SMTP_USER", "ALERT_EMAIL_TO"):
+        assert other not in message
+    for secret in _ALL_EMAIL_SETTINGS.values():
+        assert secret not in message
+
+
+def test_alerts_email_alongside_macos_needs_no_email_config() -> None:
+    """`macos` alone is a usable non-store channel, so a config that also lists
+    `email` (e.g. belt-and-suspenders) is not forced to configure it too."""
+    s = Settings(_env_file=None, alerts={"channels": ["store", "macos", "email"]})
+    assert s.alerts.channels == ["store", "macos", "email"]
+
+
 def test_paper_and_alert_secrets_default_to_none() -> None:
     s = _settings()
     assert s.alpaca_paper_api_key is None
@@ -729,6 +807,7 @@ def test_paper_and_alert_secrets_default_to_none() -> None:
     assert s.alert_smtp_user is None
     assert s.alert_smtp_password is None
     assert s.alert_email_to is None
+    assert s.alert_email_from is None
 
 
 def test_paper_and_alert_secrets_absent_from_repr_and_str(
@@ -740,6 +819,7 @@ def test_paper_and_alert_secrets_absent_from_repr_and_str(
     monkeypatch.setenv("ALERT_SMTP_USER", "alerts-user")
     monkeypatch.setenv("ALERT_SMTP_PASSWORD", "smtp-pass-789")
     monkeypatch.setenv("ALERT_EMAIL_TO", "jose@example.com")
+    monkeypatch.setenv("ALERT_EMAIL_FROM", "alerts-sender@example.com")
     s = _settings()
     assert s.alpaca_paper_api_key is not None
     assert s.alpaca_paper_api_key.get_secret_value() == "pk-paper-abc123"
@@ -748,6 +828,7 @@ def test_paper_and_alert_secrets_absent_from_repr_and_str(
         for secret in ("pk-paper-abc123", "ps-paper-secret456", "alerts-user", "smtp-pass-789"):
             assert secret not in blob
         assert "jose@example.com" not in blob
+        assert "alerts-sender@example.com" not in blob
 
 
 def test_paper_keys_are_separate_from_data_keys(monkeypatch: pytest.MonkeyPatch) -> None:
