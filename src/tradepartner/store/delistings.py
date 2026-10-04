@@ -75,6 +75,9 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 # Amendments too (owner decision 2026-09-26, #262): EDGAR's history has them,
 # and `derive_listing_ends`' earliest-filing rule means an amendment never
 # moves a listing's end, while a 25/A whose original is missing still ends it.
+# An amendment after a filing already counted for that security and exchange
+# is ignored at read time, so it never ends a relisting row opened after the
+# original (#820). Limit: a later delisting known only by its /A is missed.
 DELISTING_FORMS = frozenset({"25", "25-NSE", "25/A", "25-NSE/A"})
 
 #: Days from filing to effect when the filing states none (Rule 12d2-2).
@@ -118,15 +121,20 @@ def _is_plain_common(title: str) -> bool:
 
 def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
     """The `security_id` `filing` delists, or `None` if it is not certain."""
-    succeeded = {s.predecessor_id for s in master.successions if s.known_at <= filing.accepted_at}
+    # #820: never a successor known later. An original Form 25 after a
+    # succession names the successor; an amendment amends the old class's.
+    known = [s for s in master.successions if s.known_at <= filing.accepted_at]
+    if filing.form.endswith("/A"):
+        excluded = {s.security_id for s in known}
+    else:
+        excluded = {s.predecessor_id for s in known}
     candidates: set[str] = {
         row["security_id"]
         for row in master.securities
         if row["cik"] == filing.cik
         and not row.get("benchmark", False)
-        # #820: never a successor known later, nor a class already succeeded.
         and row["known_at"] <= filing.accepted_at
-        and row["security_id"] not in succeeded
+        and row["security_id"] not in excluded
     }
     on_exchange = [
         row
@@ -245,7 +253,12 @@ def derive_listing_ends(
         by_security[row["security_id"]].append({**row, "_index": index})
 
     ended: dict[int, Row] = {}  # listing index -> the filing that ends it
+    counted: set[tuple[str, str]] = set()  # (security_id, exchange) with a filing
     for delisting in sorted(delistings.to_dicts(), key=lambda r: (r["filed_at"], r["form"])):
+        key = (delisting["security_id"], delisting["exchange"])
+        if delisting["form"].endswith("/A") and key in counted:
+            continue  # amends a filing already counted: never ends a later relisting (#820)
+        counted.add(key)
         session = _filing_session(delisting["filed_at"])
         targets = [
             row

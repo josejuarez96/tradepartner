@@ -684,24 +684,40 @@ class TestRelistingAfterForm25:
         )
         assert len(build.listings) == 1
 
-    def test_same_session_cover_page_starts_the_next_session(self) -> None:
-        # The Form 25 ends the latest listing with `valid_from` on or before
-        # its filing session, so the new row must start after it.
+    def test_a_cover_page_before_the_delisting_takes_effect_relists_nothing(self) -> None:
+        # code-review on #826: an acquisition target's 10-K filed between its
+        # Form 25 and the effective day still names the pair; the shares are
+        # still trading, so it opens no row, and the Form 25 ends the listing.
+        cik = self.CIK
+        filing = _form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 6), (self.ORD, "RLC", "NASDAQ")),
+            ],
+            [filing],
+        )
+        assert [row["valid_from"] for row in build.listings] == [date(2019, 8, 9)]
+        delistings = build_delistings([filing], build, ingested_at=INGESTED_AT)
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik], "session": [date(2019, 12, 12)]}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("status", "end_session").rows() == [(DELISTED, date(2019, 12, 12))]
+
+    def test_the_first_cover_page_after_the_effective_day_relists(self) -> None:
         cik = self.CIK
         build = self._build(
             [
                 _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
-                _cover(cik, _at(2019, 12, 3, 20, 0), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 6), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2020, 1, 29), (self.ORD, "RLC", "NASDAQ")),
             ],
-            [_form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3, 15, 0))],
+            [_form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))],
         )
-        assert self._rows(build)[-1] == (
-            cik,
-            "RLC",
-            "NASDAQ",
-            date(2019, 12, 4),
-            _at(2019, 12, 3, 20, 0),
-        )
+        assert self._rows(build)[-1] == (cik, "RLC", "NASDAQ", date(2020, 1, 29), _at(2020, 1, 29))
 
     def test_form_25_on_the_preferred_leaves_the_common_alone(self) -> None:
         cik = self.CIK
@@ -726,7 +742,7 @@ class TestRelistingAfterForm25:
         build = self._build(
             [
                 _cover(cik, _at(2019, 7, 26), common, pref),
-                _cover(cik, _at(2023, 1, 4), common, pref),
+                _cover(cik, _at(2023, 2, 2), common, pref),
             ],
             [
                 _form25(
@@ -737,7 +753,7 @@ class TestRelistingAfterForm25:
                 )
             ],
         )
-        relisted = [row for row in build.listings if row["known_at"] == _at(2023, 1, 4)]
+        relisted = [row for row in build.listings if row["known_at"] == _at(2023, 2, 2)]
         assert [(row["security_id"], row["ticker"]) for row in relisted] == [(cik, "RLC")]
 
     def test_an_amendment_after_the_relisting_opens_no_second_row(self) -> None:
@@ -756,6 +772,23 @@ class TestRelistingAfterForm25:
         assert [row["valid_from"] for row in build.listings] == [
             date(2019, 8, 9),
             date(2019, 12, 16),
+        ]
+        # Read side (code-review on #826): the late amendment never ends the
+        # relisting row it postdates.
+        filings = [
+            _form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3)),
+            _form25(cik, "Ordinary Shares", "NASDAQ", _at(2020, 1, 6), form="25-NSE/A"),
+        ]
+        delistings = build_delistings(filings, build, ingested_at=INGESTED_AT)
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik], "session": [date(2019, 12, 13)]}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("valid_from", "status").rows() == [
+            (date(2019, 8, 9), DELISTED),
+            (date(2019, 12, 16), LISTED),
         ]
 
     def test_an_amendment_alone_still_counts(self) -> None:
@@ -1007,4 +1040,27 @@ class TestNewEquityAfterForm25:
             (cik, "NYSE", date(2019, 8, 1)),
             (cik, "NASDAQ", date(2020, 5, 1)),
             (cik, "NYSE", date(2023, 5, 1)),
+        ]
+
+    def test_a_late_amendment_never_delists_the_successor(self) -> None:
+        # quant-auditor pass 2 on #826: a 25-NSE/A amending the old class's
+        # Form 25, filed after the successor is known, amends the old class.
+        cik = self.CIK
+        amendment = DelistingFiling(
+            cik, "25-NSE/A", "Common Stock", "NYSE", "25-crc-a", _at(2020, 12, 1), date(2020, 8, 10)
+        )
+        build = build_master(
+            self._source(registered=_at(2020, 10, 27)), _settings(), ingested_at=INGESTED_AT
+        )
+        delistings = build_delistings([self._form25(), amendment], build, ingested_at=INGESTED_AT)
+        assert [r["security_id"] for r in delistings.delistings] == [cik, cik]
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik], "session": [date(2020, 7, 30)]}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("security_id", "status").rows() == [
+            (cik, DELISTED),
+            (f"{cik}@2020-11-05", LISTED),
         ]

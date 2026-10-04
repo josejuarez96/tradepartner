@@ -42,11 +42,13 @@ accepted after it that lists that class on that exchange opens a new row
 even for an unchanged pair (a holding-company reorganisation, a change of
 domicile, an LP or REIT conversion: CMPR, CG, WELL, FCFS, KIM), with
 `known_at` that cover page's acceptance and `valid_from` no earlier than
-the session after the filing session (a Form 25 ends the latest listing
+the session after the filing session. A cover page before the delisting
+takes effect (the effective day: the filing's, else filing day + 10) only
+shows shares still trading and relists nothing (a Form 25 ends the latest listing
 starting on or before that session). An amendment (`/A`) does not re-arm
 a class and exchange that already had one, so a late 25-NSE/A never
 splits the listing it amends. A cover page that shows the class only on
-another exchange settles the Form 25 as a transfer: a later move back is
+another exchange (and not on the Form 25's) settles it as a transfer: a later move back is
 an ordinary new row, never a relisting.
 
 **New equity after a Form 25 is a new security** (owner decision on
@@ -57,7 +59,7 @@ post-bankruptcy equity (CRC, OAS, DBD, GPOR, MNK, WW, WOLF all filed one,
 none of the five reorganisations above did). The successor gets the id
 `<cik>@<valid_from>`, its own `securities` row known at the cover page,
 the old class's titles, and a row starting no earlier than the session
-after the Form 25's effective day (the filing's, else filing day + 10).
+after the Form 25's effective day (that cover page may precede it).
 The old class takes no later cover-page item, so no listing joins the two
 and no return spans the gap. `MasterBuild.successions` records each pair.
 The id has no `<cik>:` prefix on purpose: the price resolver treats it as
@@ -361,16 +363,21 @@ class _Builder:
                 relisted = False
                 stop = cls.ended.get(item.exchange)
                 if stop is not None and (cls.security_id, item.exchange) not in starts:
-                    relisted = True
-                    start = max(valid_from, stop.after)
                     new_equity = any(
                         stop.window_start <= _session_of(at) and at <= page.accepted_at
                         for at in registrations
                     )
-                    if new_equity:
-                        start = max(start, stop.effective_after)
-                        cls = self._successor(first, cls, start, classes, known_at)
-                    starts[(cls.security_id, item.exchange)] = start
+                    # Before the delisting takes effect the old shares still
+                    # trade, so the page relists only new equity (whose row
+                    # starts after the effective day anyway).
+                    if new_equity or valid_from >= stop.effective_after:
+                        relisted = True
+                        del cls.ended[item.exchange]
+                        start = max(valid_from, stop.after)
+                        if new_equity:
+                            start = max(start, stop.effective_after)
+                            cls = self._successor(first, cls, start, classes, known_at)
+                        starts[(cls.security_id, item.exchange)] = start
                 start = starts.get((cls.security_id, item.exchange), valid_from)
                 claimed[cls.security_id] = item.ticker
                 cls.titles.add(_norm_title(item.title))
@@ -386,9 +393,11 @@ class _Builder:
                 if cls.security_id in shown:
                     cls.pairs = frozenset(shown[cls.security_id])
                     cls.history.append((known_at, cls.pairs))
-                    # Shown again: a Form 25 on an exchange it no longer lists
-                    # was a move (a transfer), not a pause before a relisting.
-                    cls.ended.clear()
+                    # A Form 25 on an exchange the page no longer lists for the
+                    # class was a move (a transfer), not a pause before a relisting.
+                    listed_on = {exchange for _, exchange in cls.pairs}
+                    for exchange in [e for e in cls.ended if e not in listed_on]:
+                        del cls.ended[exchange]
         if not classes:
             classes.append(_Class(primary_security_id(cik), first.accepted_at))
         return classes
