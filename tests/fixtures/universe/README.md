@@ -41,3 +41,21 @@ Shared conventions: securities needing a universe-rule-passing history run bars 
 - Every `security_id`, listing and classification not called out in a case row above still exists to carry that case's bars/actions/facts; this table lists only the rows that make each req 13 case identifiable.
 - SPY and MTUM are both seeded on exchange `NYSE` for simplicity; the real listings are NYSE Arca, which is not in `universe.exchanges`.
 - Most 2018-dated listings here use `provenance=filing` for ticker/exchange even though the spec's master column-sources table calls pre-~2019 ticker/exchange `snapshot_static`; this is a deliberate simplification (only `SEC_STATIC_PRE2019` exercises the `snapshot_static` case on purpose). Per the owner's decision on [issue #35](https://github.com/josejuarez96/tradepartner/issues/35), a `snapshot_static` row is invisible to as-of reads before its own `known_at`, so PRE9 is unlisted at any T before 2020-01-15.
+
+## Statement facts (#660)
+
+Maps every statement-facts fixture case (`statement_facts.csv`) to its cik, the facts/periods it carries, the filing dates and any case-specific note, for T76b-T78 authors. Rows are DB-table-level, authored directly rather than parsed or derived (this generator owns no EDGAR parsing or derivation logic) — see `make_fixture_universe.py`'s module docstring.
+
+| Case | cik | Fact(s) | Dates | Notes |
+|---|---|---|---|---|
+| 10-K/A first carrier: an amendment is the first (and only) filing to carry this key; form stays '10-K/A', never normalized to '10-K' | CIK0001000005 | total_assets (FY2019, instant: period_start=NULL, period_days=0) | 10-K/A known_at 2020-03-01T20:30:00+00:00 (0001000005-20-000002) | n/a |
+| Derived gross profit: no filed GrossProfit; revenue - cost_of_revenue from one accession stored as a basis='derived' row | CIK0001000003 | revenue, cost_of_revenue, gross_profit (derived) — all FY2019 | 10-K known_at 2020-02-20T20:30:00+00:00 (0001000003-20-000001) | gross_profit.value (400,000.0) equals revenue - cost_of_revenue exactly, the health --check rule T77c adds |
+| Dual-class cik: one row set, not duplicated per security_id/class | CIK0001000006 | revenue (FY2019) | 10-K known_at 2020-02-01T20:30:00+00:00 (0001000006-20-000001) | the join through securities_as_of (T76b) is expected to surface this one row once per class (SEC_DUAL_A, SEC_DUAL_B, SEC_DUAL_PFD) |
+| No securities row yet: this fact's known_at precedes CIK0001000001's own securities.known_at (2017-12-01T20:30:00+00:00) | CIK0001000001 | revenue (FY2016) | 10-K known_at 2017-06-15T20:30:00+00:00 (0001000001-17-000001) | a T76b as-of read at a T between the two known_ats is expected to return nothing for this cik (no securities row to join through yet) |
+| Plain issuer: one 10-K (FY plus two flagged comparatives) and three 10-Qs (quarter revenue; two also carry a year-to-date operating_cash_flow row) | CIK0001000002 | revenue (FY2019/18/17, Q1-Q3 2020), operating_cash_flow (H1 and 9mo 2020 YTD) | 10-K known_at 2020-02-15T20:30:00+00:00 (0001000002-20-000001); 10-Qs known_at 2020-05-10T20:30:00+00:00, 2020-08-10T20:30:00+00:00, 2020-11-10T20:30:00+00:00 | n/a |
+| Restated revenue: FY2018's original 10-K value is the only row; the FY2019 10-K's differing comparative (520,000.0) is never stored | CIK0001000005 | revenue (FY2018) | 10-K known_at 2019-02-10T20:30:00+00:00 (0001000005-19-000001) | no second row for this key exists anywhere in this fixture -- the absence itself is the case |
+
+### Notes for readers
+
+- `statement_facts` is keyed by **cik**, not `security_id` (spec decision (c)): most cases above reuse an existing req 13 case's cik from `securities.csv` rather than inventing a bare one, so a later as-of/join test (T76b) has a security to join against.
+- `basis='derived'` and a restated key's single surviving row are authored directly as the (future) ingest's expected output, not computed by this generator or verified against a parser here (T77/T77b's job).

@@ -200,12 +200,12 @@ def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason
 # --- version 7 and the migrations from versions 6 and 5 ----------------------------------
 
 
-def test_current_schema_version_is_8() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 8
+def test_current_schema_version_is_9() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 9
 
 
-def test_fresh_init_records_version_8(journal: duckdb.DuckDBPyConnection) -> None:
-    assert _versions(journal) == [8]
+def test_fresh_init_records_version_9(journal: duckdb.DuckDBPyConnection) -> None:
+    assert _versions(journal) == [9]
 
 
 @pytest.mark.parametrize("version", [5, 6])

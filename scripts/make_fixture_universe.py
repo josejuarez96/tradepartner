@@ -1,11 +1,22 @@
-"""Deterministic generator for the fixture universe (T5).
+"""Deterministic generator for the fixture universe (T5; #660/T76).
 
 Writes one CSV per store fact table into `tests/fixtures/universe/` (or an
 override directory given as the first CLI argument, so tests can regenerate
 into a tmp dir): `securities.csv`, `listings.csv`, `classifications.csv`,
 `delistings.csv`, `prices_daily.csv`, `corporate_actions.csv`, `facts.csv`,
-plus `README.md` mapping every spec req 13 case to the rows that exercise
-it.
+`statement_facts.csv`, plus `README.md` mapping every spec req 13 case,
+and every statement-facts case (#660), to the rows that exercise it.
+
+`statement_facts.csv` rows are **DB-table-level** rows, like every other
+CSV here (as if the as-yet-unbuilt T77/T77a/T77b parser and ingest had
+already run on these scenarios) — this generator owns no EDGAR parsing or
+derivation logic, so a "derived" gross-profit row or a restated fact's
+one surviving vintage is authored directly, not computed from inputs.
+Unlike every other table, it is keyed by **cik**, not `security_id` (the
+spec's decision (c)); most of its cases reuse a `securities.csv` cik from
+an existing req 13 case (so later as-of/join tests have one to join
+against) rather than inventing a bare one, since this task's file list
+does not include `securities.csv` itself.
 
 Determinism (spec req 13, acceptance criterion "content-equal
 regeneration"): every timestamp is built from a fixed calendar date plus a
@@ -166,6 +177,24 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "source",
         "provenance",
     ),
+    "statement_facts": (
+        "cik",
+        "fact_name",
+        "xbrl_tag",
+        "period_start",
+        "period_end",
+        "period_days",
+        "value",
+        "unit",
+        "form",
+        "filing_accession",
+        "basis",
+        "comparative",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
 }
 
 
@@ -275,7 +304,9 @@ class Rows:
     prices_daily: list[dict[str, object]] = field(default_factory=list)
     corporate_actions: list[dict[str, object]] = field(default_factory=list)
     facts: list[dict[str, object]] = field(default_factory=list)
+    statement_facts: list[dict[str, object]] = field(default_factory=list)
     readme_cases: list[dict[str, str]] = field(default_factory=list)
+    statement_readme_cases: list[dict[str, str]] = field(default_factory=list)
 
     def security(
         self,
@@ -546,6 +577,56 @@ class Rows:
                 "dates": dates,
                 "probe": probe,
             }
+        )
+
+    def statement_fact(
+        self,
+        cik: str,
+        fact_name: str,
+        xbrl_tag: str,
+        period_end: date,
+        value: float,
+        known_at: datetime,
+        filing_accession: str,
+        *,
+        period_start: date | None = None,
+        unit: str = "USD",
+        form: str = "10-K",
+        basis: str = "reported",
+        comparative: bool = False,
+        source: str = _SOURCE_EDGAR,
+        ingested_delay: timedelta = timedelta(minutes=10),
+    ) -> None:
+        """One `statement_facts` row (#660): `period_days` is derived from
+        `period_start`/`period_end` here (never a caller-supplied number),
+        matching `StatementFactRecord.period_days` (`adapters/filings.py`)
+        — `0` for an instant fact (`period_start=None`), else the
+        duration in days."""
+        period_days = 0 if period_start is None else (period_end - period_start).days
+        self.statement_facts.append(
+            {
+                "cik": cik,
+                "fact_name": fact_name,
+                "xbrl_tag": xbrl_tag,
+                "period_start": period_start,
+                "period_end": period_end,
+                "period_days": period_days,
+                "value": value,
+                "unit": unit,
+                "form": form,
+                "filing_accession": filing_accession,
+                "basis": basis,
+                "comparative": comparative,
+                "known_at": known_at,
+                "ingested_at": known_at + ingested_delay,
+                "source": source,
+                "provenance": "filing",
+            }
+        )
+
+    def statement_case(self, case: str, cik: str, facts: str, dates: str, notes: str) -> None:
+        self.statement_readme_cases.append(
+            {"case": case, "cik": cik, "facts": facts, "dates": dates, "notes": notes}
         )
 
 
@@ -1474,6 +1555,303 @@ def _benchmarks(rows: Rows) -> None:
         )
 
 
+def _statement_accession(cik: str, year: int, seq: int) -> str:
+    """A plausible EDGAR accession number: the filer's 10-digit cik (the
+    `CIK` prefix of this generator's `securities.cik` convention stripped),
+    the 2-digit acceptance year, and a 6-digit sequence — matching the
+    convention `facts.csv`'s own `filing_accession` cells already use."""
+    digits = cik.removeprefix("CIK")
+    return f"{digits}-{year % 100:02d}-{seq:06d}"
+
+
+def _statement_facts_plain_issuer(rows: Rows) -> None:
+    """A plain issuer with one 10-K (FY plus two comparative years, the
+    comparatives flagged) and three 10-Qs (quarter durations, two of them
+    also carrying a `operating_cash_flow` year-to-date duration row —
+    spec "Statement facts" > Periods: a 10-Q's cash-flow statement is
+    year-to-date, never calendarised here). Reuses `SEC_WINDOW_DELIST`'s
+    cik (`CIK0001000002`) rather than inventing a bare one."""
+    cik = "CIK0001000002"
+    accession = _statement_accession(cik, 2020, 1)
+    known_at = _filing_acceptance(date(2020, 2, 15))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 12, 31),
+        900_000.0,
+        known_at,
+        accession,
+        period_start=date(2019, 1, 1),
+    )
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2018, 12, 31),
+        850_000.0,
+        known_at,
+        accession,
+        period_start=date(2018, 1, 1),
+        comparative=True,
+    )
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2017, 12, 31),
+        800_000.0,
+        known_at,
+        accession,
+        period_start=date(2017, 1, 1),
+        comparative=True,
+    )
+
+    q1_accession = _statement_accession(cik, 2020, 2)
+    q1_known_at = _filing_acceptance(date(2020, 5, 10))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2020, 3, 31),
+        230_000.0,
+        q1_known_at,
+        q1_accession,
+        period_start=date(2020, 1, 1),
+        form="10-Q",
+    )
+
+    q2_accession = _statement_accession(cik, 2020, 3)
+    q2_known_at = _filing_acceptance(date(2020, 8, 10))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2020, 6, 30),
+        245_000.0,
+        q2_known_at,
+        q2_accession,
+        period_start=date(2020, 4, 1),
+        form="10-Q",
+    )
+    rows.statement_fact(
+        cik,
+        "operating_cash_flow",
+        "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+        date(2020, 6, 30),
+        300_000.0,
+        q2_known_at,
+        q2_accession,
+        period_start=date(2020, 1, 1),
+        form="10-Q",
+    )
+
+    q3_accession = _statement_accession(cik, 2020, 4)
+    q3_known_at = _filing_acceptance(date(2020, 11, 10))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2020, 9, 30),
+        260_000.0,
+        q3_known_at,
+        q3_accession,
+        period_start=date(2020, 7, 1),
+        form="10-Q",
+    )
+    rows.statement_fact(
+        cik,
+        "operating_cash_flow",
+        "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+        date(2020, 9, 30),
+        480_000.0,
+        q3_known_at,
+        q3_accession,
+        period_start=date(2020, 1, 1),
+        form="10-Q",
+    )
+    rows.statement_case(
+        "Plain issuer: one 10-K (FY plus two flagged comparatives) and three 10-Qs "
+        "(quarter revenue; two also carry a year-to-date operating_cash_flow row)",
+        cik,
+        "revenue (FY2019/18/17, Q1-Q3 2020), operating_cash_flow (H1 and 9mo 2020 YTD)",
+        f"10-K known_at {known_at.isoformat()} ({accession}); 10-Qs known_at "
+        f"{q1_known_at.isoformat()}, {q2_known_at.isoformat()}, {q3_known_at.isoformat()}",
+        "n/a",
+    )
+
+
+def _statement_facts_derived_gross_profit(rows: Rows) -> None:
+    """An issuer with no filed `GrossProfit` whose stored `revenue` and
+    `cost_of_revenue` rows from one accession carry a `derived`
+    `gross_profit` row equal to their difference (spec "Derived gross
+    profit"). Reuses `SEC_CLEAN_MERGER`'s cik (`CIK0001000003`)."""
+    cik = "CIK0001000003"
+    accession = _statement_accession(cik, 2020, 1)
+    known_at = _filing_acceptance(date(2020, 2, 20))
+    period_end = date(2019, 12, 31)
+    period_start = date(2019, 1, 1)
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        period_end,
+        1_000_000.0,
+        known_at,
+        accession,
+        period_start=period_start,
+    )
+    rows.statement_fact(
+        cik,
+        "cost_of_revenue",
+        "us-gaap:CostOfRevenue",
+        period_end,
+        600_000.0,
+        known_at,
+        accession,
+        period_start=period_start,
+    )
+    rows.statement_fact(
+        cik,
+        "gross_profit",
+        "us-gaap:Revenues-us-gaap:CostOfRevenue",
+        period_end,
+        400_000.0,
+        known_at,
+        accession,
+        period_start=period_start,
+        basis="derived",
+    )
+    rows.statement_case(
+        "Derived gross profit: no filed GrossProfit; revenue - cost_of_revenue "
+        "from one accession stored as a basis='derived' row",
+        cik,
+        "revenue, cost_of_revenue, gross_profit (derived) — all FY2019",
+        f"10-K known_at {known_at.isoformat()} ({accession})",
+        "gross_profit.value (400,000.0) equals revenue - cost_of_revenue exactly, "
+        "the health --check rule T77c adds",
+    )
+
+
+def _statement_facts_restated_revenue(rows: Rows) -> None:
+    """An issuer whose FY2018 revenue is restated in its FY2019 10-K: the
+    first-accepted (FY2018 10-K) row is the only one stored, per the
+    first-vintage rule — the FY2019 10-K's differing FY2018 comparative
+    column (520,000.0, vs. the original 500,000.0) is never written, so it
+    is deliberately absent from this fixture rather than represented as a
+    row. Reuses `SEC_BOUNDARY_DELIST`'s cik (`CIK0001000005`)."""
+    cik = "CIK0001000005"
+    accession = _statement_accession(cik, 2019, 1)
+    known_at = _filing_acceptance(date(2019, 2, 10))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2018, 12, 31),
+        500_000.0,
+        known_at,
+        accession,
+        period_start=date(2018, 1, 1),
+    )
+    rows.statement_case(
+        "Restated revenue: FY2018's original 10-K value is the only row; the FY2019 "
+        "10-K's differing comparative (520,000.0) is never stored",
+        cik,
+        "revenue (FY2018)",
+        f"10-K known_at {known_at.isoformat()} ({accession})",
+        "no second row for this key exists anywhere in this fixture -- the absence "
+        "itself is the case",
+    )
+
+
+def _statement_facts_10ka_first_carrier(rows: Rows) -> None:
+    """A 10-K/A that is the first carrier of a key (`total_assets`, an
+    instant fact: `period_start=None`, `period_days=0`); the vintage's
+    `form` is kept verbatim. Reuses `SEC_BOUNDARY_DELIST`'s cik
+    (`CIK0001000005`), a second accession distinct from the restated-
+    revenue case above."""
+    cik = "CIK0001000005"
+    accession = _statement_accession(cik, 2020, 2)
+    known_at = _filing_acceptance(date(2020, 3, 1))
+    rows.statement_fact(
+        cik,
+        "total_assets",
+        "us-gaap:Assets",
+        date(2019, 12, 31),
+        2_000_000.0,
+        known_at,
+        accession,
+        form="10-K/A",
+    )
+    rows.statement_case(
+        "10-K/A first carrier: an amendment is the first (and only) filing to carry "
+        "this key; form stays '10-K/A', never normalized to '10-K'",
+        cik,
+        "total_assets (FY2019, instant: period_start=NULL, period_days=0)",
+        f"10-K/A known_at {known_at.isoformat()} ({accession})",
+        "n/a",
+    )
+
+
+def _statement_facts_dual_class(rows: Rows) -> None:
+    """A dual-class CIK: one row set, never duplicated per class, since
+    `statement_facts` is keyed by cik, not security_id (spec decision
+    (c)). Reuses the dual-class case's cik (`CIK0001000006`,
+    `SEC_DUAL_A`/`SEC_DUAL_B`/`SEC_DUAL_PFD`)."""
+    cik = "CIK0001000006"
+    accession = _statement_accession(cik, 2020, 1)
+    known_at = _filing_acceptance(date(2020, 2, 1))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 12, 31),
+        1_200_000.0,
+        known_at,
+        accession,
+        period_start=date(2019, 1, 1),
+    )
+    rows.statement_case(
+        "Dual-class cik: one row set, not duplicated per security_id/class",
+        cik,
+        "revenue (FY2019)",
+        f"10-K known_at {known_at.isoformat()} ({accession})",
+        "the join through securities_as_of (T76b) is expected to surface this one "
+        "row once per class (SEC_DUAL_A, SEC_DUAL_B, SEC_DUAL_PFD)",
+    )
+
+
+def _statement_facts_no_securities_row_yet(rows: Rows) -> None:
+    """A CIK with no securities row until after its first filing: this
+    statement filing's known_at (2017-06-15) is strictly before
+    `SEC_TRUNC_DELIST`'s `securities.known_at` (2017-12-01T20:30:00+00:00,
+    `securities.csv`) for the same cik (`CIK0001000001`) -- so a T76b
+    as-of read between the two sees the fact but no securities row to
+    join it through, and should return nothing."""
+    cik = "CIK0001000001"
+    accession = _statement_accession(cik, 2017, 1)
+    known_at = _filing_acceptance(date(2017, 6, 15))
+    rows.statement_fact(
+        cik,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2016, 12, 31),
+        300_000.0,
+        known_at,
+        accession,
+        period_start=date(2016, 1, 1),
+    )
+    rows.statement_case(
+        "No securities row yet: this fact's known_at precedes CIK0001000001's own "
+        "securities.known_at (2017-12-01T20:30:00+00:00)",
+        cik,
+        "revenue (FY2016)",
+        f"10-K known_at {known_at.isoformat()} ({accession})",
+        "a T76b as-of read at a T between the two known_ats is expected to return "
+        "nothing for this cik (no securities row to join through yet)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # CSV / README writing.
 # ---------------------------------------------------------------------------
@@ -1503,8 +1881,11 @@ def _write_csv(
             writer.writerow(_format_cell(record[c]) for c in columns)
 
 
-def _write_readme(path: Path, cases: list[dict[str, str]]) -> None:
+def _write_readme(
+    path: Path, cases: list[dict[str, str]], statement_cases: list[dict[str, str]]
+) -> None:
     ordered = sorted(cases, key=lambda c: c["case"])
+    statement_ordered = sorted(statement_cases, key=lambda c: c["case"])
     lines = [
         "# Fixture universe (T5)",
         "",
@@ -1543,6 +1924,33 @@ def _write_readme(path: Path, cases: list[dict[str, str]]) -> None:
             "[issue #35](https://github.com/josejuarez96/tradepartner/issues/35), a "
             "`snapshot_static` row is invisible to as-of reads before its own `known_at`, "
             "so PRE9 is unlisted at any T before 2020-01-15.",
+            "",
+            "## Statement facts (#660)",
+            "",
+            "Maps every statement-facts fixture case (`statement_facts.csv`) to its cik, "
+            "the facts/periods it carries, the filing dates and any case-specific note, "
+            "for T76b-T78 authors. Rows are DB-table-level, authored directly rather than "
+            "parsed or derived (this generator owns no EDGAR parsing or derivation logic) "
+            "— see `make_fixture_universe.py`'s module docstring.",
+            "",
+            "| Case | cik | Fact(s) | Dates | Notes |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    for c in statement_ordered:
+        lines.append(f"| {c['case']} | {c['cik']} | {c['facts']} | {c['dates']} | {c['notes']} |")
+    lines.extend(
+        [
+            "",
+            "### Notes for readers",
+            "",
+            "- `statement_facts` is keyed by **cik**, not `security_id` (spec decision "
+            "(c)): most cases above reuse an existing req 13 case's cik from "
+            "`securities.csv` rather than inventing a bare one, so a later as-of/join "
+            "test (T76b) has a security to join against.",
+            "- `basis='derived'` and a restated key's single surviving row are authored "
+            "directly as the (future) ingest's expected output, not computed by this "
+            "generator or verified against a parser here (T77/T77b's job).",
         ]
     )
     path.write_text("\n".join(lines) + "\n")
@@ -1572,6 +1980,12 @@ def build_rows() -> Rows:
     _unclassifiable_name(rows)
     _static_pre_2019_listing(rows)
     _benchmarks(rows)
+    _statement_facts_plain_issuer(rows)
+    _statement_facts_derived_gross_profit(rows)
+    _statement_facts_restated_revenue(rows)
+    _statement_facts_10ka_first_carrier(rows)
+    _statement_facts_dual_class(rows)
+    _statement_facts_no_securities_row_yet(rows)
     return rows
 
 
@@ -1617,7 +2031,13 @@ def write_fixtures(output_dir: Path) -> None:
         rows.facts,
         ("security_id", "fact_name", "as_of_date", "class_member", "known_at"),
     )
-    _write_readme(output_dir / "README.md", rows.readme_cases)
+    _write_csv(
+        output_dir / "statement_facts.csv",
+        "statement_facts",
+        rows.statement_facts,
+        ("cik", "fact_name", "period_end", "period_days"),
+    )
+    _write_readme(output_dir / "README.md", rows.readme_cases, rows.statement_readme_cases)
 
 
 def main(argv: list[str]) -> int:

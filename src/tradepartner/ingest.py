@@ -96,6 +96,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session
@@ -455,6 +456,13 @@ class _Recorded(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        """Memoized like every other question above. Not yet asked in the
+        fetch pass (#660's switch defaults off, and T77b wires the
+        per-CIK call into `_build_filings`); the generic `_ask` cache
+        means that wiring needs no change here."""
+        return list(self._ask("statement_facts", cik))
 
 
 def _unwrap(filings: FilingSource) -> FilingSource:

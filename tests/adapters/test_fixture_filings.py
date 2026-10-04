@@ -15,6 +15,7 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 
@@ -96,3 +97,199 @@ def test_known_by_keeps_only_records_knowable_at_t() -> None:
     assert early.delistings() == []
     assert [h.accession for h in early.filing_headers(CIK, ["10-K", "8-K"])] == ["a1"]
     assert _source().known_ats() == [T1, T2]
+
+
+# --- StatementFactRecord and FixtureFilingSource.statement_facts (#660, T76) ---
+
+
+def test_statement_fact_period_days_is_computed_not_stored() -> None:
+    """`period_days` is a property (`(period_end - period_start).days`, or
+    `0` for an instant), never a constructor argument -- the spec's
+    `StatementFactRecord` field list has no such field (interfaces)."""
+    duration = StatementFactRecord(
+        CIK,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        T1,
+        date(2019, 2, 14),
+        False,
+    )
+    assert duration.period_days == 364
+    instant = StatementFactRecord(
+        CIK,
+        "total_assets",
+        "us-gaap:Assets",
+        None,
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        T1,
+        date(2019, 2, 14),
+        False,
+    )
+    assert instant.period_days == 0
+
+
+def test_statement_fact_period_end_must_be_after_period_start() -> None:
+    with pytest.raises(ValueError, match="period_end"):
+        StatementFactRecord(
+            CIK,
+            "revenue",
+            "us-gaap:Revenues",
+            date(2019, 1, 1),
+            date(2019, 1, 1),
+            1.0,
+            "USD",
+            "10-K",
+            "a1",
+            T1,
+            date(2019, 2, 14),
+            False,
+        )
+
+
+def test_statement_fact_accepted_at_none_for_an_unstamped_accession() -> None:
+    """An accession with no stamp record yet: `accepted_at=None` is valid
+    (unlike every other record's `accepted_at`/`fetched_at`, which must be
+    tz-aware), and `filed` -- the companyfacts date the ingest's hold rule
+    reads -- is required regardless."""
+    record = StatementFactRecord(
+        CIK,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        None,
+        date(2019, 2, 14),
+        False,
+    )
+    assert record.accepted_at is None
+    assert record.filed == date(2019, 2, 14)
+
+
+def test_statement_fact_accepted_at_naive_still_raises() -> None:
+    """`accepted_at` is tz-checked only when it is *not* None -- a naive
+    value is still refused, never silently accepted like the None case."""
+    with pytest.raises(ValueError, match="tz-aware"):
+        StatementFactRecord(
+            CIK,
+            "revenue",
+            "us-gaap:Revenues",
+            date(2019, 1, 1),
+            date(2019, 12, 31),
+            1.0,
+            "USD",
+            "10-K",
+            "a1",
+            datetime(2019, 2, 14),  # noqa: DTZ001
+            date(2019, 2, 14),
+            False,
+        )
+
+
+def test_statement_fact_filed_the_day_after_acceptance_carries_no_trace_of_filed() -> None:
+    """A fixture entry whose companyfacts `filed` date differs from its
+    acceptance date (an after-hours filing): the record is visible from
+    `accepted_at`, and `filed` plays no role beyond the ingest's hold rule
+    -- `statement_facts` has no `filed` column at all (spec "Statement
+    facts" > Interfaces), so nothing downstream of this record could read
+    it even if it wanted to."""
+    accepted_at = datetime(2019, 2, 13, 23, 55, tzinfo=UTC)
+    filed_the_next_day = date(2019, 2, 14)
+    record = StatementFactRecord(
+        CIK,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        accepted_at,
+        filed_the_next_day,
+        False,
+    )
+    assert record.accepted_at == accepted_at
+    assert record.filed == filed_the_next_day
+
+
+def test_statement_facts_served_per_cik() -> None:
+    other_cik = StatementFactRecord(
+        OTHER,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        2.0,
+        "USD",
+        "10-K",
+        "b1",
+        T1,
+        date(2019, 2, 14),
+        False,
+    )
+    this_cik = StatementFactRecord(
+        CIK,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        T2,
+        date(2019, 2, 14),
+        False,
+    )
+    source = FixtureFilingSource(statement_facts=[other_cik, this_cik])
+    assert source.statement_facts(CIK) == [this_cik]
+    assert source.statement_facts(OTHER) == [other_cik]
+
+
+def test_statement_facts_sorted_with_unstamped_entries_first() -> None:
+    """An unstamped entry (`accepted_at=None`) sorts deterministically
+    rather than raising on a `None`/`datetime` comparison."""
+    unstamped = StatementFactRecord(
+        CIK,
+        "revenue",
+        "us-gaap:Revenues",
+        date(2019, 1, 1),
+        date(2019, 12, 31),
+        1.0,
+        "USD",
+        "10-K",
+        "a1",
+        None,
+        date(2019, 2, 14),
+        False,
+    )
+    stamped = StatementFactRecord(
+        CIK,
+        "total_assets",
+        "us-gaap:Assets",
+        None,
+        date(2019, 12, 31),
+        2.0,
+        "USD",
+        "10-K",
+        "a2",
+        T1,
+        date(2019, 2, 14),
+        False,
+    )
+    source = FixtureFilingSource(statement_facts=[stamped, unstamped])
+    assert source.statement_facts(CIK) == [unstamped, stamped]

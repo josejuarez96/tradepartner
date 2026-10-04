@@ -83,13 +83,32 @@ _CSV_TABLES = (
     "prices_daily",
     "corporate_actions",
     "facts",
+    "statement_facts",
 )
+
+#: Every statement-facts fixture case (#660, T76) as a keyword that must
+#: appear in the README's "Statement facts" section, mirroring
+#: `_REQ13_CASE_KEYWORDS` above.
+_STATEMENT_FACTS_CASE_KEYWORDS = [
+    "Plain issuer",
+    "Derived gross profit",
+    "Restated revenue",
+    "10-K/A first carrier",
+    "Dual-class cik",
+    "No securities row yet",
+]
 
 
 def test_readme_documents_every_req13_case() -> None:
     readme = (_FIXTURES_DIR / "README.md").read_text()
     missing = [kw for kw in _REQ13_CASE_KEYWORDS if kw not in readme]
     assert not missing, f"README missing case(s): {missing}"
+
+
+def test_readme_documents_every_statement_facts_case() -> None:
+    readme = (_FIXTURES_DIR / "README.md").read_text()
+    missing = [kw for kw in _STATEMENT_FACTS_CASE_KEYWORDS if kw not in readme]
+    assert not missing, f"README missing statement-facts case(s): {missing}"
 
 
 def test_regeneration_is_byte_identical(tmp_path: Path) -> None:
@@ -150,11 +169,16 @@ _DATE_COLUMNS = {
     "prices_daily": {"session"},
     "corporate_actions": {"ex_date"},
     "facts": {"as_of_date"},
+    "statement_facts": {"period_end"},
 }
 _TZ_COLUMNS_COMMON = {"known_at", "ingested_at"}
 _EXTRA_TZ_COLUMNS = {"delistings": {"filed_at"}}
 #: Nullable timestamp columns: an empty cell is NULL, a set one needs an offset.
 _NULLABLE_TZ_COLUMNS = {"corporate_actions": {"announced_at"}}
+#: Nullable date columns: an empty cell is NULL (statement_facts.period_start,
+#: NULL exactly for an instant fact -- spec "Statement facts" > Schema), a
+#: set one still needs a bare YYYY-MM-DD.
+_NULLABLE_DATE_COLUMNS = {"statement_facts": {"period_start"}}
 
 
 def test_timestamp_and_date_cell_formats() -> None:
@@ -181,6 +205,11 @@ def test_timestamp_and_date_cell_formats() -> None:
                 assert _BARE_DATE_PATTERN.fullmatch(value), (
                     f"{table}.csv:{i} column {column} = {value!r} is not a bare date"
                 )
+            for column in _NULLABLE_DATE_COLUMNS.get(table, set()):
+                value = row[column]
+                assert not value or _BARE_DATE_PATTERN.fullmatch(value), (
+                    f"{table}.csv:{i} column {column} = {value!r} is not a bare date"
+                )
 
 
 @pytest.mark.parametrize(
@@ -196,6 +225,10 @@ def test_timestamp_and_date_cell_formats() -> None:
             ("security_id", "action_type", "ex_date", "source_action_id", "known_at"),
         ),
         ("facts", ("security_id", "fact_name", "as_of_date", "class_member", "known_at")),
+        # No known_at: statement_facts holds one vintage per key for ever
+        # (spec "Statement facts" > Schema), the deliberate exception to
+        # every other table's known_at-keyed uniqueness above.
+        ("statement_facts", ("cik", "fact_name", "period_end", "period_days")),
     ],
 )
 def test_no_unique_key_violations(table: str, unique_cols: tuple[str, ...]) -> None:

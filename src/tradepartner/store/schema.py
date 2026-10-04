@@ -25,7 +25,7 @@ by column type, before any row reaches these tables.
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
 EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
 If a store records a version this code has no path from (anything other
-than 2, 3, 4, 5, 6, 7 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+than 2, 3, 4, 5, 6, 7, 8 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
 `SchemaVersionError` rather than silently operating against a shape it
 does not know about.
 
@@ -103,7 +103,22 @@ registry; #83 took version 2 first, so the registry is version 3):
   ask for `LATER_JOURNAL_TABLE_NAMES`); a `resume_invocations` or
   `resume_acceptances` read there fails on the missing column or table
   (only `paper resume`'s write path reads them).
-- **A later DDL change goes to version 9**, with its own migration and a
+- **Version 9** (#660, T76): adds `statement_facts` (as-filed revenue,
+  cost of revenue, gross profit, total assets and operating cash flow;
+  the 2026-10-03 amendment, "Amendment 2026-10-03 (#660)" in the spec).
+  Purely additive, like version 3 and version 5: the migration from
+  version 5, 6, 7 or 8 just creates the table and appends a version-9
+  row; no existing table changes. A store at version 4 or earlier gets
+  it directly alongside the journal tables. Unlike every other fact
+  table here, its UNIQUE key (`cik, fact_name, period_end, period_days`)
+  excludes `known_at`: the table is the one deliberate exception to the
+  "Definitions" revision rule — it holds the first-accepted vintage of
+  each key for ever, and a later filing carrying the same key (an
+  identical comparative or a differing restatement) is never stored, so
+  there is no revision to key on. A read-only connection accepts a
+  version-8 store (every other read keeps working; `statement_facts`
+  there fails on the missing table).
+- **A later DDL change goes to version 10**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -188,7 +203,16 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "prices_daily": ("bar",),
     "corporate_actions": ("action",),
     "facts": ("filing",),
+    "statement_facts": ("filing",),
 }
+
+#: `statement_facts.basis` (#660): `reported` for an as-filed value,
+#: `derived` for a `gross_profit` row the ingest computed from the stored
+#: `revenue` and `cost_of_revenue` rows because the filing carried no
+#: `GrossProfit` tag. A closed set, like `ORDER_EVENT_REASONS` and
+#: `DECISION_REASONS` below, enforced by this table's own `CHECK` rather
+#: than deferred to `health --check` (T77c).
+STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 
 #: The schema version `init_schema` records on a fresh store and migrates
 #: a version-2, 3, 4, 5, 6 or 7 store to. Bump and add a migration note (not
@@ -227,7 +251,18 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 #:   the `resume_acceptances` table. Migration from version 7 (or 5 or 6,
 #:   after their steps): `resume_invocations` is rebuilt in one transaction
 #:   with every row kept and given `accept_rejections = FALSE`.
-CURRENT_SCHEMA_VERSION = 8
+#: - 9 (#660, T76): the `statement_facts` table (as-filed revenue, cost of
+#:   revenue, gross profit, total assets and operating cash flow; the
+#:   2026-10-03 amendment). Purely additive: the table is new, so the
+#:   migration from version 5, 6, 7 or 8 is just creating it and appending a
+#:   version-9 row; no existing table changes. Unlike every other fact
+#:   table, its UNIQUE key (`cik, fact_name, period_end, period_days`)
+#:   excludes `known_at`: the table holds one vintage per period for ever,
+#:   never a revision (module docstring's "Schema versions" exception to
+#:   the "Definitions" revision rule). T84 (#714) also takes "the next free
+#:   schema version" in a separate PR; whichever of the two PRs lands
+#:   second renumbers to stay additive on top of the other.
+CURRENT_SCHEMA_VERSION = 9
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -251,6 +286,11 @@ _PRE_DECISION_REASON_VERSION = 6
 #: The last version without `resume_invocations.accept_rejections` and
 #: `resume_acceptances` (#472): read-only connections serve every other read.
 _PRE_ACCEPT_REJECTIONS_VERSION = 7
+
+#: The last version without `statement_facts` (#660, T76): read-only
+#: connections serve every other read; a `statement_facts` read there fails
+#: on the missing table, same as a journal table on a pre-journal store.
+_PRE_STATEMENT_FACTS_VERSION = 8
 
 
 class SchemaVersionError(RuntimeError):
@@ -410,6 +450,46 @@ CREATE TABLE IF NOT EXISTS facts (
 )
 """
 
+# As-filed statement facts (amendment 2026-10-03, #660; spec "Data /
+# interfaces" > Amendment 2026-10-03). Keyed by **cik**, never
+# security_id: a statement is the issuer's, not a share class's (ADR 0003
+# rule 3 is kept -- the key is the master's own cik column, never a
+# ticker). The UNIQUE constraint deliberately excludes known_at (unlike
+# every other fact table above): the table holds the first-accepted
+# vintage of each (cik, fact_name, period_end, period_days) key for
+# ever, and a later filing carrying the same key -- an identical
+# comparative column or a differing restatement -- is never stored, so
+# there is no revision to key on. period_start is NULL exactly when
+# period_days = 0 (an instant fact, e.g. total_assets); the CHECK below
+# enforces that at the schema level rather than deferring it to `health
+# --check` (T77c also restates it there for a store's own confidence).
+# basis is restricted to STATEMENT_FACT_BASIS_VALUES. filing_accession is
+# NOT NULL (unlike facts.filing_accession above): a statement fact always
+# comes from a filing, never a snapshot.
+_CREATE_STATEMENT_FACTS = f"""
+CREATE TABLE IF NOT EXISTS statement_facts (
+    cik VARCHAR NOT NULL,
+    fact_name VARCHAR NOT NULL,
+    xbrl_tag VARCHAR NOT NULL,
+    period_start DATE,
+    period_end DATE NOT NULL,
+    period_days INTEGER NOT NULL,
+    value DOUBLE NOT NULL,
+    unit VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    filing_accession VARCHAR NOT NULL,
+    basis VARCHAR NOT NULL,
+    comparative BOOLEAN NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["statement_facts"])},
+    CHECK (basis IN ({", ".join(f"'{value}'" for value in STATEMENT_FACT_BASIS_VALUES)})),
+    CHECK (
+        (period_days = 0 AND period_start IS NULL)
+        OR (period_days != 0 AND period_start IS NOT NULL)
+    ),
+    UNIQUE (cik, fact_name, period_end, period_days)
+)
+"""
+
 # Not a fact table (spec "Data / interfaces" > Tables): no known_at,
 # ingested_at, source or provenance columns, and no per-fact provenance
 # concept applies to an ingest job's own status row.
@@ -445,6 +525,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "prices_daily",
     "corporate_actions",
     "facts",
+    "statement_facts",
     "ingestion_runs",
     "schema_version",
 )
@@ -458,6 +539,7 @@ _TABLE_DDL: tuple[str, ...] = (
     _CREATE_CORPORATE_ACTIONS,
     _CREATE_CORPORATE_ACTIONS_IDENTITY_INDEX,
     _CREATE_FACTS,
+    _CREATE_STATEMENT_FACTS,
     _CREATE_INGESTION_RUNS,
     _CREATE_SCHEMA_VERSION,
 )
@@ -1326,10 +1408,12 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_ORDER_EVENT_REASON_VERSION,
         _PRE_DECISION_REASON_VERSION,
         _PRE_ACCEPT_REJECTIONS_VERSION,
+        _PRE_STATEMENT_FACTS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 and 6 every read;
-        # version 7 every read but `resume_invocations` and `resume_acceptances`.
+        # version 7 every read but `resume_invocations` and `resume_acceptances`;
+        # version 8 every read but `statement_facts`.
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
         raise SchemaVersionError(
@@ -1521,7 +1605,7 @@ def _migrate_resume_flags(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2, 3, 4, 5, 6 or 7 store to version 8.
+    version-2 to 8 store to version 9.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -1533,20 +1617,24 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; a version-7 store gets `resume_invocations`
-    rebuilt with `accept_rejections` (every row kept, `FALSE`), the
-    `resume_acceptances` table and a version-8 row; a version-6 store gets
-    `decisions` rebuilt with the reason `CHECK` (every row kept) first, and
-    version-7 and version-8 rows; a version-5 store gets `order_events` rebuilt
-    likewise before that, and version-6 to version-8 rows; a version-4 store
-    gets the journal tables and version-5 to version-8 rows; a version-3 store gets that plus
+    `CURRENT_SCHEMA_VERSION`; a version-8 store gets `statement_facts`
+    created and a version-9 row (purely additive, #660); a version-7 store
+    gets `resume_invocations` rebuilt with `accept_rejections` (every row
+    kept, `FALSE`), the `resume_acceptances` table and version-8 and
+    version-9 rows; a version-6 store gets `decisions` rebuilt with the
+    reason `CHECK` (every row kept) first, and version-7 to version-9 rows;
+    a version-5 store gets `order_events` rebuilt likewise before that, and
+    version-6 to version-9 rows; a version-4 store gets the journal tables
+    and version-5 to version-9 rows; a version-3 store gets that plus
     `corporate_actions` rebuilt with the version-4 columns (every row kept)
     and a version-4 row; a version-2 store gets all of that plus the
     registry tables and a version-3 row. Nothing else changes (module
     docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-8, 7, 6 or 5 store
-    passes, and so does a version-4 store (fact and registry reads work; the journal
+    On a read-only connection no DDL runs: a version-9, 8, 7, 6 or 5 store
+    passes (a version-8 store serves every read but `statement_facts`,
+    missing there as a pre-journal store's journal tables are), and so does
+    a version-4 store (fact and registry reads work; the journal
     tables are absent, which `store.journal` reports); a version-2 or
     uninitialised store raises `RegistryNotInitialised`, and a version-3
     store raises `SchemaVersionError`.
@@ -1568,6 +1656,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_ORDER_EVENT_REASON_VERSION,
         _PRE_DECISION_REASON_VERSION,
         _PRE_ACCEPT_REJECTIONS_VERSION,
+        _PRE_STATEMENT_FACTS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(

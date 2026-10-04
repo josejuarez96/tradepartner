@@ -11,7 +11,9 @@
   library may use either.
 - `load_universe_fixtures` (used by `fixture_store`, also called directly
   by `tests/test_fixture_loader.py`) loads every `<table>.csv` under a
-  fixtures directory into the store table of the same name.
+  fixtures directory into the store table of the same name — generic over
+  `schema.TABLE_NAMES`, so `statement_facts.csv` (#660, T76) loads the
+  same way as every other fixture CSV, with no code change here.
 - `fixture_store` builds a fresh in-memory DuckDB store, initializes the
   schema, and loads `tests/fixtures/universe/` this way — a no-op until T5
   populates that directory.

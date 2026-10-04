@@ -11,7 +11,7 @@ tested for look-ahead.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -21,8 +21,15 @@ from tradepartner.adapters.filings import (
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
+
+#: Sort key floor for a `StatementFactRecord.accepted_at` of `None` (an
+#: accession with no stamp record yet), so it sorts deterministically
+#: before every stamped record instead of raising on a `None`/`datetime`
+#: comparison.
+_UNSTAMPED_SORT_FLOOR = datetime.min.replace(tzinfo=UTC)
 
 
 class FixtureFilingSource(FilingSource):
@@ -37,6 +44,7 @@ class FixtureFilingSource(FilingSource):
         headers: Iterable[FilingHeader] = (),
         cover_pages: Iterable[CoverPage] = (),
         delistings: Iterable[DelistingFiling] = (),
+        statement_facts: Iterable[StatementFactRecord] = (),
     ) -> None:
         self._index = sorted(index, key=lambda e: (e.accepted_at, e.accession, e.cik))
         self._snapshot = sorted(snapshot, key=lambda e: (e.fetched_at, e.cik, e.ticker))
@@ -44,6 +52,20 @@ class FixtureFilingSource(FilingSource):
         self._headers = sorted(headers, key=lambda e: (e.accepted_at, e.accession))
         self._cover_pages = sorted(cover_pages, key=lambda e: (e.accepted_at, e.accession))
         self._delistings = sorted(delistings, key=lambda e: (e.accepted_at, e.accession))
+        # Not filtered by `known_by`/`known_ats` below: those two methods
+        # exist for the master's write-path look-ahead tests (module
+        # docstring), which never touch statement facts — their own
+        # look-ahead harness is `statement_facts_as_of` (T76b), driven
+        # straight off the store, not this adapter.
+        self._statement_facts = sorted(
+            statement_facts,
+            key=lambda e: (
+                e.accepted_at or _UNSTAMPED_SORT_FLOOR,
+                e.accession,
+                e.fact_name,
+                e.period_end,
+            ),
+        )
 
     def known_by(self, t: datetime) -> FixtureFilingSource:
         """A copy with only the records knowable at `t`."""
@@ -84,3 +106,6 @@ class FixtureFilingSource(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return [e for e in self._delistings if since is None or e.accepted_at >= since]
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        return [e for e in self._statement_facts if e.cik == cik]
