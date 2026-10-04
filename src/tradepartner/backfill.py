@@ -22,7 +22,10 @@ source, `edgar` then `alpaca`, halting at the first chunk that is not `ok`:
   common names on one of `universe.exchanges` live through the month have
   no bar in it. A common name whose every listing live in the month is
   `snapshot_static` and that has no bar in it is named in the run message
-  with its own count, not counted (#784).
+  with its own count, not counted (#784); so is any other name with no bar
+  in this month or the previous one (bars already committed), unless it is
+  a benchmark or first listed this month, or the store has no bar at all in
+  the previous month.
 
 The EDGAR chunk is fetched with no store connection open (a recording
 pass) and committed in one short write transaction.
@@ -66,6 +69,7 @@ from tradepartner.ingest import (
     _clean,
     _counted,
     _ingest_filings,
+    _may_count,
     _prefetch,
     _read,
     _record_only,
@@ -198,7 +202,9 @@ def _price_chunk(
 
     try:
         with _read(settings) as conn:
-            ids, listed, static_only, reference = _window_names(conn, started, window, settings)
+            ids, listed, static_only, may_count, reference = _window_names(
+                conn, started, window, settings
+            )
         symbol = settings.ingest.reference_symbol
         if reference is None:
             raise LookupError(f"reference symbol {symbol} has no listing in {first}..{last}")
@@ -216,7 +222,7 @@ def _price_chunk(
             shown = ", ".join(day.isoformat() for day in gaps[:10])
             raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {shown}")
         with_bars = {bar.security_id for bar in bars}
-        counted, missing, reported = _staleness(listed, with_bars, static_only)
+        counted, missing, reported = _staleness(listed, with_bars, static_only, may_count)
         share = len(missing) / len(counted) if counted else 0.0
         limit = settings.ingest.max_missing_share
         if share > limit:
@@ -261,13 +267,14 @@ def _window_names(
     t: datetime,
     window: tuple[date, date],
     settings: Settings,
-) -> tuple[list[str], list[str], set[str], str | None]:
+) -> tuple[list[str], list[str], set[str], set[str] | None, str | None]:
     """From listings known at `t`: securities with a listing live at some
     point in `window` (to fetch), the benchmark names and the common names
     on one of `universe.exchanges` listed through the whole window,
     including any delisted only later (the staleness denominator), those
     of them (benchmarks never) whose every listing live in the window is
-    `snapshot_static`, and the reference symbol's `security_id`.
+    `snapshot_static`, `_may_count` over the previous calendar month, and
+    the reference symbol's `security_id`.
 
     A listing counts from its `valid_from`; a delisted or transferred one
     still counts while its end session (last bar known) or `effective_on`
@@ -287,10 +294,12 @@ def _window_names(
     listed: set[str] = set()
     filed: set[str] = set()  # with a filing-based listing live in the window
     reference = None
+    earliest: dict[str, date] = {}
     for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
+        sid, status = row["security_id"], row["status"]
+        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
         if row["valid_from"] > last:
             continue
-        sid, status = row["security_id"], row["status"]
         end, effective = row["end_session"], row["effective_on"]
         ended = status in (DELISTED, TRANSFERRED) and (
             end is not None and end < first and (effective is None or effective < first)
@@ -311,4 +320,6 @@ def _window_names(
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
     static_only = listed - filed - benchmarks
-    return sorted(ids), sorted(listed), static_only, reference
+    before = first - timedelta(days=1)
+    may_count = _may_count(conn, t, (before.replace(day=1), before), earliest, benchmarks)
+    return sorted(ids), sorted(listed), static_only, may_count, reference

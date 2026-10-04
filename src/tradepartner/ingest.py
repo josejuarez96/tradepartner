@@ -25,7 +25,10 @@ current listing at the session is `listed`, or `transferred` and not yet
 ended. Delisted names whose `effective_on` is not past are still fetched
 (their bars fix the listing's end) but not counted. A common name whose
 current listing is `snapshot_static` and that has no bar is named in the
-run message with its own count, not counted (#784).
+run message with its own count, not counted (#784); so is any other name
+with no bar now or at the previous session in the store, unless it is a
+benchmark or first listed this session, or the store has no bar at all at
+the previous session.
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -100,7 +103,7 @@ from tradepartner.adapters.filings import (
     FilingSource,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.calendar import last_completed_session
+from tradepartner.calendar import last_completed_session, previous_session
 from tradepartner.config import Settings, clean_message
 from tradepartner.store.classify import (
     ClassificationBuild,
@@ -706,12 +709,15 @@ def _fetch_prices(
     fetch: set[str] = set()
     listed: set[str] = set()
     static_only: set[str] = set()
+    may_count: set[str] | None = None
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
             # rows are stamped at their fetch time, which can be after the run began).
             read_at = ensure_tz_aware_utc(clock(), field_name="clock()")
-            fetch, listed, static_only, reference = _price_names(conn, read_at, session, settings)
+            fetch, listed, static_only, may_count, reference = _price_names(
+                conn, read_at, session, settings
+            )
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
@@ -725,7 +731,7 @@ def _fetch_prices(
     have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
-    counted, missing, reported = _staleness(listed, have, static_only)
+    counted, missing, reported = _staleness(listed, have, static_only, may_count)
     share, limit = len(missing) / len(counted), settings.ingest.max_missing_share
     if share > limit:
         raise _Stale(
@@ -817,43 +823,88 @@ def _counted(
     )
 
 
+def _may_count(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    previous: tuple[date, date],
+    earliest: Mapping[str, date],
+    benchmarks: set[str],
+) -> set[str] | None:
+    """The names whose miss may count (#784, dark names): those with a bar
+    in the `previous` chunk window already in the store at `t` (nothing this
+    chunk fetched), those first listed after it, and the benchmarks. `None`
+    when the store holds no bar at all in `previous` (no previous chunk):
+    then every miss counts."""
+    first, last = previous
+    had = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT security_id FROM prices_daily "
+            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+            [first, last, t],
+        ).fetchall()
+    }
+    if not had:
+        return None
+    return had | benchmarks | {sid for sid, start in earliest.items() if start > last}
+
+
+SNAPSHOT_ONLY = "snapshot-only names with no rows"
+DARK = "names with no bar in the previous chunk"
+
+
 def _staleness(
-    listed: Iterable[str], have: set[str], static_only: set[str]
-) -> tuple[list[str], list[str], list[str]]:
-    """`(counted, missing, reported)`: a listed name in `static_only` (listed
-    only by `snapshot_static` spans, never a benchmark) with no bar at all is
-    reported, not counted, since its back-dated ticker may not be the one it
-    traded under then (#784, owner option a); every other listed name counts
-    and is missing if it has no bar."""
-    reported = sorted(sid for sid in listed if sid in static_only and sid not in have)
-    counted = sorted(set(listed) - set(reported))
-    return counted, [sid for sid in counted if sid not in have], reported
+    listed: Iterable[str], have: set[str], static_only: set[str], may_count: set[str] | None
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """`(counted, missing, reported)`. A listed name with no bar is reported
+    by cause, and left out of both sides of the share, if it is in
+    `static_only` (listed only by `snapshot_static` spans, never a
+    benchmark: its back-dated ticker may not be the one it traded under
+    then; #784, owner option a), or else if `may_count` is not `None` and
+    lacks it (dark since before this chunk: it counted once, in the chunk
+    it went dark). Every other listed name counts and is missing if it has
+    no bar."""
+    absent = sorted(sid for sid in set(listed) if sid not in have)
+    static = [sid for sid in absent if sid in static_only]
+    dark = [
+        sid
+        for sid in absent
+        if sid not in static_only and may_count is not None and sid not in may_count
+    ]
+    out = {*static, *dark}
+    counted = sorted(set(listed) - out)
+    missing = [sid for sid in absent if sid not in out]
+    return counted, missing, {SNAPSHOT_ONLY: static, DARK: dark}
 
 
-def _reported_note(reported: list[str]) -> str:
-    """The run-message clause naming `_staleness`'s reported names, or `""`."""
-    if not reported:
-        return ""
-    return (
-        f"; {len(reported)} snapshot-only names with no rows (not counted): "
-        f"{', '.join(reported[:10])}"
+def _reported_note(reported: Mapping[str, list[str]]) -> str:
+    """The run-message clauses naming `_staleness`'s reported names by
+    cause (count and up to 10 names each), or `""`."""
+    return "".join(
+        f"; {len(names)} {cause} (not counted): {', '.join(names[:10])}"
+        for cause, names in reported.items()
+        if names
     )
 
 
 def _price_names(
     conn: duckdb.DuckDBPyConnection, now: datetime, session: date, settings: Settings
-) -> tuple[set[str], set[str], set[str], str | None]:
+) -> tuple[set[str], set[str], set[str], set[str] | None, str | None]:
     """Names to fetch, listed common and benchmark names (the staleness
     denominator), the listed names whose current listing is
-    `snapshot_static` (benchmarks never), and the reference symbol's
-    `security_id`, from each security's current listing."""
+    `snapshot_static` (benchmarks never), `_may_count` over the previous
+    session, and the reference symbol's `security_id`, from each
+    security's current listing."""
     current: dict[str, Row] = {}
+    earliest: dict[str, date] = {}
     for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
-        held = current.get(row["security_id"])
+        sid = row["security_id"]
+        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
+        held = current.get(sid)
         if row["valid_from"] <= session and (
             held is None or row["valid_from"] > held["valid_from"]
         ):
-            current[row["security_id"]] = row
+            current[sid] = row
     kinds = {
         row["security_id"]: row["security_type"]
         for row in classifications_as_of(conn, now).iter_rows(named=True)
@@ -879,7 +930,9 @@ def _price_names(
         effective = row["effective_on"]
         if live or (status == DELISTED and effective is not None and effective >= session):
             fetch.add(sid)
-    return fetch, listed, static_only, reference
+    before = previous_session(session)
+    may_count = _may_count(conn, now, (before, before), earliest, benchmarks)
+    return fetch, listed, static_only, may_count, reference
 
 
 def _bar_row(bar: Bar, ingested_at: datetime) -> Row:

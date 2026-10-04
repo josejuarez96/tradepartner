@@ -1077,6 +1077,74 @@ def test_a_name_with_a_filing_based_span_and_no_bar_still_counts(settings: Setti
     assert "snapshot-only" not in result.runs[-1].message
 
 
+def test_a_missing_benchmark_still_counts_though_snapshot_static(settings: Settings) -> None:
+    # SPY's listing is snapshot_static on NYSE_ARCA (not a universe exchange);
+    # with ACME as the reference, only the benchmark rule keeps SPY counted.
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"reference_symbol": "ACME"})}
+    )
+    result = _run(tuned, _Prices(missing={SPY}))
+    assert result.runs[-1].status == STALE and SPY in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+NEWCO = "0000000004"  # first listed by a cover page accepted on `accepted`
+
+
+def _with_newco(accepted: datetime, **kwargs: Any) -> FixtureFilingSource:
+    """`_filings` plus NEWCO, a NYSE common name first listed at `accepted`."""
+    accession = f"{NEWCO}-19-000001"
+    page = CoverPage(NEWCO, accession, accepted, (CoverListing("Common Stock", "NEWC", "NYSE"),))
+    return _filings(
+        extra_index=[FilingIndexEntry(NEWCO, "Newco Inc", "10-K", accession, accepted)],
+        extra_headers=[FilingHeader(NEWCO, accession, "10-K", 3571, accepted)],
+        extra_facts=[_fact(NEWCO, "", 2_000_000, accession, accepted)],
+        extra_covers=[page],
+        **kwargs,
+    )
+
+
+def _loose(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_missing_share": 0.3})}
+    )
+
+
+def _early() -> FixtureFilingSource:
+    """`_filings` with SPY's snapshot known before the previous session."""
+    return _filings(fetched_at=_at(2019, 6, 3))
+
+
+PREVIOUS = NOW - timedelta(days=1)  # expected session 2019-06-27
+
+
+def test_a_name_dark_since_before_the_previous_session_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    # #784 (dark names): no bar at 06-27 either, so 06-28's miss is not counted.
+    assert _run(_loose(settings), _Prices(missing={ACME}), now=PREVIOUS, filings=_early()).ok
+    result = _run(settings, _Prices(missing={ACME}), filings=_early())
+    assert result.ok, result.runs[-1].message
+    message = result.runs[-1].message
+    assert "0 of 3 listed names missing" in message
+    assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in message
+
+
+def test_a_name_with_a_bar_at_the_previous_session_and_none_now_counts(
+    settings: Settings,
+) -> None:
+    assert _run(settings, now=PREVIOUS, filings=_early()).ok
+    result = _run(settings, _Prices(missing={ACME}), filings=_early())
+    assert result.runs[-1].status == STALE and ACME in result.runs[-1].message
+
+
+def test_a_name_first_listed_this_session_with_no_bar_counts(settings: Settings) -> None:
+    assert _run(settings, now=PREVIOUS, filings=_early()).ok
+    filings = _with_newco(_at(2019, 6, 28), fetched_at=_at(2019, 6, 3))
+    result = _run(settings, _Prices(missing={NEWCO}), filings=filings)
+    assert result.runs[-1].status == STALE and NEWCO in result.runs[-1].message
+
+
 def test_run_messages_are_redacted_cleaned_and_capped(
     tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:

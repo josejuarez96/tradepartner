@@ -19,7 +19,21 @@ from typing import Any
 
 import duckdb
 import pytest
-from test_ingest import ACME, DUAL, DUAL_B, NOW, OTC_B, SPY, STAT, _at, _filings, _with_stat
+from test_ingest import (
+    ACME,
+    DUAL,
+    DUAL_B,
+    NEWCO,
+    NOW,
+    OTC_B,
+    SPY,
+    STAT,
+    _at,
+    _filings,
+    _loose,
+    _with_newco,
+    _with_stat,
+)
 
 from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling
 from tradepartner.adapters.prices import (
@@ -584,6 +598,48 @@ def test_a_snapshot_static_only_name_with_some_rows_follows_the_existing_rule(
     may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
     assert "0 of 5 listed names without a bar" in may.message
     assert "snapshot-only" not in may.message
+
+
+def test_a_benchmark_with_no_rows_in_a_month_still_counts(settings: Settings) -> None:
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"reference_symbol": "ACME"})}
+    )
+    result = _backfill(tuned, _History(gaps={(SPY, s) for s in MAY}))
+    assert result.runs[-1].status == STALE and SPY in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+APRIL_END = datetime(2019, 5, 1, 2, 0, tzinfo=UTC)  # expected session 2019-04-30
+APRIL = _sessions(SINCE, date(2019, 4, 30))
+
+
+def test_a_name_dark_since_before_the_month_is_reported_not_counted(settings: Settings) -> None:
+    # #784 (dark names): ACME has no bar in April (committed under a looser
+    # share), so its May and June misses are reported, not counted.
+    early = _filings(fetched_at=_at(2019, 4, 1))
+    dark = {(ACME, s) for s in _sessions(SINCE, date(2019, 6, 30))}
+    first = _backfill(_loose(settings), _History(gaps=dark), filings=early, now=APRIL_END)
+    assert first.ok, first.runs[-1].message
+    result = _backfill(settings, _History(gaps=dark), filings=early)
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 3 listed names without a bar" in may.message
+    assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in may.message
+
+
+def test_a_name_with_a_bar_last_month_and_none_now_counts(settings: Settings) -> None:
+    result = _backfill(settings, _History(gaps={(ACME, s) for s in MAY}))
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    assert ACME in result.runs[-1].message
+
+
+def test_a_name_first_listed_in_the_month_with_no_bar_counts(settings: Settings) -> None:
+    filings = _with_newco(_at(2019, 5, 1))
+    result = _backfill(settings, _History(gaps={(NEWCO, s) for s in MAY}), filings=filings)
+    assert result.runs[-1].status == STALE and NEWCO in result.runs[-1].message
 
 
 def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
