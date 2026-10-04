@@ -4,10 +4,11 @@ Spec: docs/specs/merge-train.md. This is the **pure half** (plan T72): the recor
 types and every rule the commands apply, with no I/O, so each is a tested function.
 The commands (`build`, `merge`, `status`, `prune`) and their runner are T73/T74.
 
-- `eligibility` is req 1: checks (0) to (i) in order, the first failure the one
+- `eligibility` is req 1: checks (0) to (j) in order, the first failure the one
   reason. Comments are filtered to the repository owner's login first, so a pasted
   verdict or a forged `merge-train:` line from another account is invisible; checks
-  (e) to (i) reuse `ready_pr`'s pure functions by import, never a copy.
+  (e) to (i) reuse `ready_pr`'s pure functions by import, never a copy; (j) counts
+  unresolved review threads of any author, which can only make a PR ineligible.
 - `order_batch` is req 2; `classify_run` req 4; `next_probe`, `probe_branch` and
   `bisect_result` req 5; `mergeable_prefix` req 6; `record_matches_comments` req 7;
   `comment` req 8.
@@ -27,7 +28,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -159,6 +160,9 @@ class PullRequest:
     body: str
     fragment_texts: tuple[str, ...] = ()
     title: str = ""
+    # #731, req 1 (j): how many of the PR's review threads are unresolved, read from GitHub
+    # at build time. None means they were never read, which is ineligible (fail closed).
+    unresolved_threads: int | None = None
 
     @property
     def owner(self) -> str:
@@ -224,6 +228,11 @@ def eligibility(
         return "(h) fragment missing, or no CHANGELOG bullet"
     if reviews := ready_pr.missing_reviews(ready_pr.required_reviews(diff_paths), bodies):
         return f"(i) review without a latest PASS: {', '.join(reviews)}"
+    if pr.unresolved_threads is None:
+        return "(j) review threads not read"
+    if pr.unresolved_threads:
+        plural = "" if pr.unresolved_threads == 1 else "s"
+        return f"(j) {pr.unresolved_threads} unresolved review thread{plural}"
     return None
 
 
@@ -1326,6 +1335,14 @@ def _run_prune_locked(r: Runner, say: Callable[[str], None]) -> None:
 
 # -- the real runner ------------------------------------------------------------------------
 
+# #731, req 1 (j): one page of a PR's review threads; no `cursor` reads the first page.
+_THREADS_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!, $cursor: String) {"
+    " repository(owner: $owner, name: $name) { pullRequest(number: $number) {"
+    " reviewThreads(first: 100, after: $cursor) {"
+    " nodes { isResolved } pageInfo { hasNextPage endCursor } } } } }"
+)
+
 
 class ShellRunner:
     """Real git, gh and the filesystem. Thin: every rule lives in the functions above."""
@@ -1452,7 +1469,56 @@ class ShellRunner:
             "--name-only",
             f"origin/main...{pr.head}",
         )
-        return PrData(pr, comments, self._head_checks(number), tuple(diff.splitlines()))
+        paths = tuple(diff.splitlines())
+        # #764: (h) reads the branch's own fragments, at the recorded head SHA (never the
+        # branch tip, so a push after this read cannot change what was checked).
+        deleted = self._git_out(
+            self.root,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=D",
+            f"origin/main...{pr.head}",
+        ).splitlines()
+        texts = tuple(
+            self._git_out(self.root, "show", f"{pr.head}:{path}")
+            for path in ready_pr.own_changelog_fragments(pr.branch, paths, deleted)
+        )
+        pr = replace(pr, fragment_texts=texts, unresolved_threads=self._unresolved_threads(number))
+        return PrData(pr, comments, self._head_checks(number), paths)
+
+    def _unresolved_threads(self, number: int) -> int:
+        """How many of PR `number`'s review threads are unresolved, every page (#731).
+
+        Counts every thread whoever opened it, as the ruleset's
+        `required_review_thread_resolution` does: a thread can only make the PR
+        ineligible, never eligible.
+        """
+        owner, name = self._repo_name().split("/", 1)
+        unresolved = 0
+        cursor: str | None = None
+        while True:
+            args = ["-f", f"query={_THREADS_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"]
+            args += ["-F", f"number={number}"]
+            if cursor is not None:
+                args += ["-f", f"cursor={cursor}"]
+            try:
+                raw = json.loads(self._gh("api", "graphql", *args))
+                threads = raw["data"]["repository"]["pullRequest"]["reviewThreads"]
+                states = [t["isResolved"] for t in threads["nodes"]]
+                if not all(isinstance(state, bool) for state in states):
+                    raise TypeError("isResolved is not a boolean")
+                unresolved += states.count(False)
+                more = bool(threads["pageInfo"]["hasNextPage"])
+                cursor = threads["pageInfo"]["endCursor"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoppedError(f"PR #{number}: unreadable review threads ({exc!r})") from None
+            if not more:
+                return unresolved
+            if not cursor:
+                raise StoppedError(f"PR #{number}: review threads page has no end cursor")
 
     def add_worktree(self, path: Path, base: str) -> None:
         self._git_out(self.root, "worktree", "add", "--detach", str(path), base)

@@ -9,9 +9,10 @@ phases" criterion's resume half, the fill-lag bound, the chain criterion, the
 cent-rounding tolerance, and the alert-kind suite (spec req 11): eleven of
 the plan line's fifteen kinds with a real trigger (`lot_ledger` through the
 run's own lot-ledger error path); `reconciliation`, `rejection_cap` and
-`skip_cap` became real once #667 fixed #644, and `kill_switch` stays `xfail`
-until #741 (#677/#698 covered only the skipped_kill_switch path, not a
-halt's own engagement). `paper resume` releasing while the window holds a marked position
+`skip_cap` became real once #667 fixed #644, and a halt's own engagement
+writes one `halted` alert and no `kill_switch` alert (#741, owner decision
+(a): `kill_switch` alerts belong to skipped_kill_switch runs, #677/#698).
+`paper resume` releasing while the window holds a marked position
 (#653, found while building the chain criterion) is fixed by #664 and tested
 here. (#650, found the same way,
 was regraded to low-priority hardening reproducible only with a frozen test
@@ -588,10 +589,7 @@ def test_the_fill_lag_bound_halts_and_accept_broker_fills_completes_it(
 
     # The real fills the fake was holding back now surface: each must be
     # superseded by its synthetic one, counted once, not twice.
-    # FakeBroker has no public hook to reveal already-recorded hidden-lag
-    # fills (`lag_fills` only affects fills recorded after the call), so
-    # this reaches into the private counter directly; tracked as #742.
-    env.fake._fill_hidden_reads = [0 for _ in env.fake._fill_hidden_reads]
+    env.fake.reveal_hidden_fills()
     nxt = env.run(at(date(2019, 5, 6)))
     assert nxt.status == "ok", env.result(env.latest_run())
     for security_id, c in coids.items():
@@ -1158,22 +1156,16 @@ def test_paper_stop_is_refused_while_a_run_holds_the_lock(fixture_store_path: Pa
         )
 
 
-# --- the four fault-specific halt kinds (#644: fixed by #667; kill_switch is #741) -----------
+# --- the fault-specific halt kinds (#644: fixed by #667; a halt's own engagement, #741) -------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#741: #677/#698 fixed only the skipped_kill_switch path (a later run finding "
-    "the switch already engaged); the halt's OWN engagement here writes no distinct "
-    "'kill_switch' alert row yet (#644's other kinds were fixed by #667)",
-)
-def test_kill_switch_alert_kind_is_not_yet_written(
+def test_halt_writes_exactly_one_halted_alert_and_no_kill_switch_alert(
     alert_fakes: FakeRunner, fixture_store_path: Path, tmp_path: Path
 ) -> None:
-    """The trigger picked (#644): the halt path's own `engage()` call, the
-    only kill-switch engagement every halt makes (spec req 4: 'appends the
-    kill_switch engaged row ... writes the alert (req 11)')."""
+    """A halt's own `engage()` writes no `kill_switch` alert (#741, owner
+    decision (a)): spec req 4 says a halt writes **one** alert, `halted` for
+    a transport fault (#644 Option A), and req 11 scopes `kill_switch` alerts
+    to runs that end `skipped_kill_switch` (#644 option 2, #677)."""
     alerting_env = _alerting_env(fixture_store_path)
     alerting_env.open_window(tmp_path=tmp_path)
     alerting_env.fake.script(
@@ -1181,7 +1173,14 @@ def test_kill_switch_alert_kind_is_not_yet_written(
     )
     with pytest.raises(Exception, match="transport error"):
         alerting_env.run(at(F_0))
-    assert alerting_env.alerts("kill_switch") != []
+    run_id = alerting_env.latest_run()
+    assert alerting_env.query("SELECT source, run_id FROM kill_switch WHERE state = 'engaged'") == [
+        ("fault", run_id)
+    ]  # the halt did engage the switch
+    assert alerting_env.query("SELECT kind, run_id FROM alerts ORDER BY alert_id") == [
+        ("halted", run_id)
+    ]
+    assert alerting_env.alerts("kill_switch") == []
 
 
 def test_reconciliation_alert_row_exists_before_the_exception_propagates(

@@ -32,7 +32,8 @@ from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
-from tradepartner.execution import planning, wrapper
+from tradepartner.execution import planning, reconcile_run, wrapper
+from tradepartner.execution import window as window_module
 from tradepartner.execution.planning import (
     PlanTrialError,
     due_rebalance,
@@ -962,3 +963,8 @@ def test_current_listings_keeps_the_first_row_on_a_valid_from_tie() -> None:
     assert flipped["X"]["ticker"] == "SECOND"
     assert wrapper.current_listings is planning.current_listings
     assert not hasattr(wrapper, "_current")
+    # reconcile_run and the window's flatness check read the same rule (#705).
+    assert reconcile_run.current_listings is planning.current_listings
+    assert window_module.current_listings is planning.current_listings
+    assert not hasattr(reconcile_run, "_current_listings")
+    assert not hasattr(window_module, "_current_tickers")

@@ -42,6 +42,8 @@ Filters apply **in this order**; the top-N cut is last, so the result has exactl
 | 7 | Shares data: a shares-outstanding fact with `known_at ≤ T` and age ≤ 400 days | `universe.max_shares_age_days=400` | EDGAR XBRL |
 | 8 | Size: top N companies by market cap; cap = shares outstanding **adjusted by corporate actions with `known_at ≤ T`** × close at T, summed over all classes; every listed class of a qualifying company is admitted | `universe.top_n_by_cap=1000` | EDGAR XBRL × `PriceSource` × `corporate_actions` |
 
+*Amendment 2026-10-04 (#787):* in rule 6 "a bar" means a traded bar (volume above zero). Rule 6 also fails a name with an unexplained one-day price jump in the window that the owner has not accepted (reason `price_jump`, not missing data). See the [data-foundation spec](../specs/data-foundation.md), "price-quality gate".
+
 Names dropped by rules 1, 6 or 7 for **missing data** (unclassifiable type, truncated price history, no or stale shares fact) are counted in the survivorship-gap report (ADR 0003 rule 5) as separate categories, so every exclusion is visible.
 
 The owner confirmed on 2026-09-24 that the exclusion covers the **entire** SIC 4900–4999 division (electric, gas, water, sanitary services and related), with no carve-outs: nothing utilities-adjacent is in scope.

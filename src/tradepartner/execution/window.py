@@ -205,6 +205,7 @@ from tradepartner.execution import switch
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
+from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import OK
 from tradepartner.execution.reconcile_run import (
     command_session,
@@ -451,18 +452,6 @@ def _parse_residues(residues_json: str | None) -> dict[str, _Residue]:
     return residues
 
 
-def _current_tickers(listings: pl.DataFrame, as_of: date) -> dict[str, dict[str, Any]]:
-    """Per security, its listing row with the latest `valid_from <= as_of`."""
-    current: dict[str, dict[str, Any]] = {}
-    for row in listings.iter_rows(named=True):
-        if row["valid_from"] > as_of:
-            continue
-        held = current.get(row["security_id"])
-        if held is None or row["valid_from"] > held["valid_from"]:
-            current[row["security_id"]] = row
-    return current
-
-
 def _split_factor(actions: pl.DataFrame, security_id: str, after: date, through: date) -> float:
     """The product of the ratios of `split` actions on `security_id` with
     `after < ex_date <= through`."""
@@ -520,7 +509,7 @@ def _check_flat(
     strictly_flat = previous_stop is None or previous_stop.state == _ABANDONED
     residues = {} if strictly_flat else _parse_residues(previous_stop.residues_json)
     stated_on = None if previous_stop is None else _ny_date(previous_stop.at)
-    current = _current_tickers(listings, now)
+    current = current_listings(listings, now)
 
     unmatched_symbols = {s: p.quantity for s, p in positions.items() if p.quantity != 0}
     carried: list[_Residue] = []

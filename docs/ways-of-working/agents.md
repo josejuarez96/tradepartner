@@ -28,7 +28,7 @@ Seven agents. That is deliberately few: each one owns a job the main session doe
 
 **General code review** uses the built-in `/code-review` command. We don't need our own generic reviewer.
 
-**Architecture and planning** use the main session, or the built-in `Plan` agent, driven by the owner. That's where the owner's judgment matters most, so it isn't delegated to a custom agent.
+**Architecture and planning** use the main session, or the built-in `Plan` agent, driven by the owner. That's where the owner's judgment matters most, so it isn't delegated to a custom agent. When the plan is consumed, the **planning team** ([teams.md, Picking work](teams.md#picking-work), #782) takes the same duty on a trigger, with caps: a Fable-tier team the orchestrator spawns, not a new agent file.
 
 ## Who runs what, by stage
 
@@ -36,6 +36,8 @@ Seven agents. That is deliberately few: each one owns a job the main session doe
 Research:  owner writes brief (issue) ──► researcher ──► report PR ──► owner reads, decides
 Decide:    main session drafts ADR ──► spec-critic ──► owner merges
 Spec/Plan: main session drafts ──► spec-critic ──► owner merges
+Frontier:  orchestrator spawns the planning team on its trigger (teams.md, Picking work) ──► next roadmap spec or plan PR, or a chaining plan amendment ──► spec-critic ──► owner merges
+           ... or a decision memo ──► comment on the question's issue ──► owner decides
 Build:     team claims task (scripts/team.py) ──► implementer × N (parallel worktrees, non-overlapping tasks) ──► draft PRs
 Review:    /code-review + quant-auditor and/or safety-reviewer (by paths touched) ──► owner merges
 Record:    doc-keeper

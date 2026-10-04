@@ -90,6 +90,37 @@ def _trading_client(settings: Settings) -> TradingClient:
     return TradingClient(api_key=api_key, secret_key=secret_key, raw_data=True, paper=True)
 
 
+def _symbol_batches(symbols: list[str], settings: Settings) -> list[list[str]]:
+    """`symbols` in order, in batches of at most `alpaca.symbols_per_request` (#789).
+
+    alpaca-py sends the whole list comma-joined in one GET, which Alpaca refuses
+    with HTTP 414 once the URL grows too long. Repeats are dropped (first one
+    kept) so a symbol split across two batches cannot return its bars twice. An
+    empty list stays one request, unchanged from the unbatched behaviour.
+    """
+    unique = list(dict.fromkeys(symbols))
+    size = settings.alpaca.symbols_per_request
+    return [unique[i : i + size] for i in range(0, len(unique), size)] or [unique]
+
+
+def _merge_batches(payloads: list[Any]) -> dict[str, Any]:
+    """Merge per-batch raw payloads key by key, list values concatenated in batch order.
+
+    The same rule alpaca-py's own paging loop applies across pages; any exception
+    from a batch has already propagated, so a partial merge is never returned.
+    """
+    merged: dict[str, Any] = {}
+    for payload in payloads:
+        if not isinstance(payload, dict):  # raw_data=True always returns a dict
+            raise TypeError(f"expected a raw dict payload, got {type(payload).__name__}")
+        for key, value in payload.items():
+            if isinstance(value, list):
+                merged.setdefault(key, []).extend(value)
+            else:
+                merged[key] = value
+    return merged
+
+
 def _session_bounds_utc(start: date, end: date) -> tuple[datetime, datetime]:
     """`[start, end]` session dates as an inclusive tz-aware UTC instant range.
 
@@ -117,21 +148,29 @@ def daily_bars(
     produced the bars travels with them (spec: "expose the feed used").
     `feed=None` means the configured `alpaca.historical_feed`. Always
     `adjustment=raw` per ADR 0003 rule 1 (adjustment happens at read time
-    in the store, never at the source).
+    in the store, never at the source). Symbols go out in batches of at most
+    `alpaca.symbols_per_request` (#789), each paged by the SDK, merged in order;
+    any failing batch fails the whole call.
     """
     settings = settings or get_settings()
     feed = feed or default_feed(settings)
     client = _stock_data_client(settings)
     start_utc, end_utc = _session_bounds_utc(start, end)
-    request = StockBarsRequest(
-        symbol_or_symbols=symbols,
-        start=start_utc,
-        end=end_utc,
-        timeframe=TimeFrame.Day,
-        adjustment=Adjustment.RAW,
-        feed=feed,
+    raw_bars = _merge_batches(
+        [
+            client.get_stock_bars(
+                StockBarsRequest(
+                    symbol_or_symbols=batch,
+                    start=start_utc,
+                    end=end_utc,
+                    timeframe=TimeFrame.Day,
+                    adjustment=Adjustment.RAW,
+                    feed=feed,
+                )
+            )
+            for batch in _symbol_batches(symbols, settings)
+        ]
     )
-    raw_bars = client.get_stock_bars(request)
     return {"feed": feed.value, "bars": raw_bars}
 
 
@@ -156,12 +195,21 @@ def corporate_actions(
     paging is governed only by `get_corporate_actions`'s own fixed
     `page_size=1000`/`page_limit=1000` per-page arguments and continues
     until the API stops returning a `next_page_token` — i.e. it always
-    fetches everything.
+    fetches everything. Symbols go out in batches of at most
+    `alpaca.symbols_per_request` (#789), each paged to completion, and the
+    per-type lists are concatenated in batch order; any failing batch fails
+    the whole call.
     """
     settings = settings or get_settings()
     client = _corporate_actions_client(settings)
-    request = CorporateActionsRequest(symbols=symbols, start=start, end=end, limit=None)
-    return client.get_corporate_actions(request)
+    return _merge_batches(
+        [
+            client.get_corporate_actions(
+                CorporateActionsRequest(symbols=batch, start=start, end=end, limit=None)
+            )
+            for batch in _symbol_batches(symbols, settings)
+        ]
+    )
 
 
 def assets_snapshot(

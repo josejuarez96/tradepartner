@@ -13,7 +13,8 @@ from typing import Any
 
 import pytest
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
-from alpaca.data.requests import CorporateActionsRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
 
 from tradepartner.adapters import alpaca_raw
 from tradepartner.config import Settings
@@ -58,3 +59,133 @@ def test_alpaca_credentials_error_when_api_key_missing() -> None:
 def test_alpaca_credentials_error_when_api_secret_blank() -> None:
     with pytest.raises(alpaca_raw.AlpacaCredentialsError):
         alpaca_raw.assets_snapshot(["SPY"], settings=_settings(api_secret="   "))
+
+
+# --- #789: symbol batching (an unbatched 9,500-symbol GET returned HTTP 414) ---
+
+
+def _batched_settings(per_request: int) -> Settings:
+    return Settings(
+        _env_file=None,
+        alpaca_api_key="PKFAKE1234567890ABCD",
+        alpaca_api_secret="SKFAKE1234567890ABCD",
+        alpaca={"symbols_per_request": per_request},
+    )
+
+
+def test_symbols_per_request_defaults_to_1000() -> None:
+    assert Settings(_env_file=None).alpaca.symbols_per_request == 1000
+
+
+def test_daily_bars_batches_symbols_and_merges_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[list[str]] = []
+
+    def fake_get_stock_bars(
+        self: StockHistoricalDataClient, request_params: StockBarsRequest
+    ) -> dict[str, Any]:
+        symbols = list(request_params.symbol_or_symbols)
+        sent.append(symbols)
+        # Two bars per symbol, as the SDK's paging loop would merge them.
+        return {s: [{"t": "2026-09-30", "c": 1.0}, {"t": "2026-10-01", "c": 2.0}] for s in symbols}
+
+    monkeypatch.setattr(StockHistoricalDataClient, "get_stock_bars", fake_get_stock_bars)
+    symbols = ["A", "B", "C", "D", "E"]
+
+    out = alpaca_raw.daily_bars(
+        symbols, date(2026, 9, 30), date(2026, 10, 1), settings=_batched_settings(2)
+    )
+
+    assert sent == [["A", "B"], ["C", "D"], ["E"]]
+    assert list(out["bars"]) == symbols
+    assert sum(len(v) for v in out["bars"].values()) == 10
+    assert out["feed"] == "sip"
+
+
+def test_daily_bars_one_failing_batch_fails_the_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def fake_get_stock_bars(
+        self: StockHistoricalDataClient, request_params: StockBarsRequest
+    ) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("HTTP 414 Request-URI Too Large")
+        return {s: [{"c": 1.0}] for s in request_params.symbol_or_symbols}
+
+    monkeypatch.setattr(StockHistoricalDataClient, "get_stock_bars", fake_get_stock_bars)
+
+    with pytest.raises(RuntimeError, match="414"):
+        alpaca_raw.daily_bars(
+            ["A", "B", "C", "D", "E"],
+            date(2026, 9, 30),
+            date(2026, 9, 30),
+            settings=_batched_settings(2),
+        )
+
+
+def test_corporate_actions_batches_symbols_and_merges_per_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[list[str]] = []
+
+    def fake_get_corporate_actions(
+        self: CorporateActionsClient, request_params: CorporateActionsRequest
+    ) -> dict[str, Any]:
+        symbols = list(request_params.symbols or [])
+        sent.append(symbols)
+        assert request_params.limit is None
+        return {
+            "cash_dividends": [{"symbol": s} for s in symbols],
+            "forward_splits": [{"symbol": s} for s in symbols if s == "C"],
+        }
+
+    monkeypatch.setattr(CorporateActionsClient, "get_corporate_actions", fake_get_corporate_actions)
+
+    out = alpaca_raw.corporate_actions(
+        ["A", "B", "C"], date(2026, 1, 1), date(2026, 3, 31), settings=_batched_settings(2)
+    )
+
+    assert sent == [["A", "B"], ["C"]]
+    assert out == {
+        "cash_dividends": [{"symbol": "A"}, {"symbol": "B"}, {"symbol": "C"}],
+        "forward_splits": [{"symbol": "C"}],
+    }
+
+
+def test_corporate_actions_one_failing_batch_fails_the_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get_corporate_actions(
+        self: CorporateActionsClient, request_params: CorporateActionsRequest
+    ) -> dict[str, Any]:
+        if "C" in (request_params.symbols or []):
+            raise RuntimeError("HTTP 500")
+        return {"cash_dividends": [{"symbol": s} for s in request_params.symbols or []]}
+
+    monkeypatch.setattr(CorporateActionsClient, "get_corporate_actions", fake_get_corporate_actions)
+
+    with pytest.raises(RuntimeError, match="500"):
+        alpaca_raw.corporate_actions(
+            ["A", "B", "C"], date(2026, 1, 1), date(2026, 3, 31), settings=_batched_settings(2)
+        )
+
+
+def test_daily_bars_sends_a_repeated_symbol_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[list[str]] = []
+
+    def fake_get_stock_bars(
+        self: StockHistoricalDataClient, request_params: StockBarsRequest
+    ) -> dict[str, Any]:
+        symbols = list(request_params.symbol_or_symbols)
+        sent.append(symbols)
+        return {s: [{"c": 1.0}] for s in symbols}
+
+    monkeypatch.setattr(StockHistoricalDataClient, "get_stock_bars", fake_get_stock_bars)
+
+    out = alpaca_raw.daily_bars(
+        ["A", "B", "A"], date(2026, 9, 30), date(2026, 9, 30), settings=_batched_settings(2)
+    )
+
+    assert sent == [["A", "B"]]
+    assert sum(len(v) for v in out["bars"].values()) == 2

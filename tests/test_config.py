@@ -92,6 +92,9 @@ def test_edgar_defaults() -> None:
     assert s.edgar.request_timeout_seconds == pytest.approx(30.0)
     assert s.edgar.header_bytes == 4096
     assert s.edgar.max_retry_after_seconds == pytest.approx(120.0)
+    assert s.edgar.retry_max_attempts == 5
+    assert s.edgar.retry_backoff_cap_seconds == pytest.approx(60.0)
+    assert s.edgar.rate_limit_wait_seconds == pytest.approx(600.0)
 
 
 def test_edgar_filing_source_defaults() -> None:
@@ -171,6 +174,9 @@ def test_edgar_cache_dir_independent_of_cwd(
         "request_timeout_seconds",
         "header_bytes",
         "max_retry_after_seconds",
+        "retry_max_attempts",
+        "retry_backoff_cap_seconds",
+        "rate_limit_wait_seconds",
     ],
 )
 def test_edgar_thresholds_reject_zero(field: str) -> None:

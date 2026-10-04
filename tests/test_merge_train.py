@@ -54,6 +54,7 @@ def _pr(**overrides: object) -> object:
         "branch": "feat/12-thing",
         "body": BODY,
         "fragment_texts": (FRAGMENT,),
+        "unresolved_threads": 0,
     }
     fields.update(overrides)
     return mt.PullRequest(**fields)
@@ -539,6 +540,7 @@ class FakeRunner:
             "branch": branch,
             "body": f"Closes #{number}\n\n- [x] done\n",
             "fragment_texts": (FRAGMENT,),
+            "unresolved_threads": 0,
             "title": f"PR {number}",
         }
         fields.update(pr_overrides)
@@ -1956,3 +1958,232 @@ def test_shell_runner_pr_data_fails_closed_when_its_ref_vanishes_after_fetch(
     monkeypatch.setattr(runner, "_git", fake_git)
     with pytest.raises(mt.StoppedError, match="vanished"):
         runner.pr_data(7)
+
+
+def test_shell_runner_pr_data_reads_the_fragment_at_the_head_so_h_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#764: the real data path must fill `fragment_texts` from the branch's own added
+    `changelog.d` fragment, read at the PR's head SHA (never the branch tip), so a valid
+    feat/fix PR is not ineligible under (h). A deleted fragment is never read."""
+    head = "c" * 40
+    runner = mt.ShellRunner(tmp_path)
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"nameWithOwner": REPO})
+        if args[:2] == ("api", "graphql"):
+            return _threads_page([], None)
+        if args[:3] == ("pr", "view", "7") and "statusCheckRollup" in args[-1]:
+            rollup = [
+                {"name": n, "status": "COMPLETED", "conclusion": "SUCCESS"}
+                for n in ("checks", "claims")
+            ]
+            return json.dumps({"headRefOid": head, "statusCheckRollup": rollup})
+        if args[:3] == ("pr", "view", "7"):
+            return json.dumps(
+                {
+                    "number": 7,
+                    "author": {"login": OWNER},
+                    "isCrossRepository": False,
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "headRefName": "fix/7-x",
+                    "headRefOid": head,
+                    "body": "Closes #7\n",
+                    "labels": [],
+                    "comments": [],
+                    "title": "x",
+                }
+            )
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    shown: list[str] = []
+
+    def fake_git(cwd: Path, *args: str, check: bool = True) -> _Proc:
+        if args[:2] == ("fetch", "-q"):
+            return _Proc(0, "")
+        if args[:1] == ("rev-parse",):
+            return _Proc(0, head + "\n")
+        if "diff" in args and "--diff-filter=D" in args:
+            assert args[-1] == f"origin/main...{head}"
+            return _Proc(0, "changelog.d/7-old.md\n")
+        if "diff" in args:
+            assert args[-1] == f"origin/main...{head}"
+            return _Proc(
+                0, "docs/x.md\nchangelog.d/7-x.md\nchangelog.d/7-old.md\nchangelog.d/9-y.md\n"
+            )
+        if args[:1] == ("show",):
+            shown.append(args[1])
+            return _Proc(0, FRAGMENT)
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    monkeypatch.setattr(runner, "_git", fake_git)
+    data = runner.pr_data(7)
+    assert shown == [f"{head}:changelog.d/7-x.md"]
+    assert data.pr.fragment_texts == (FRAGMENT.strip(),)
+    assert mt.eligibility(data.pr, data.head_checks, data.diff_paths, data.comments) is None
+
+
+def _threads_page(resolved: Sequence[bool], cursor: str | None) -> str:
+    """One `gh api graphql` page of a PR's `reviewThreads`; `cursor` set means more pages."""
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [{"isResolved": r} for r in resolved],
+                            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+
+def _real_pr_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pages: Sequence[str],
+    graphql: list[tuple[str, ...]],
+) -> object:
+    """`ShellRunner.pr_data(7)` through its real code with fake `_gh`/`_git`: a valid fix/
+    PR in every respect but its review threads, which come from `pages` in order."""
+    head = "c" * 40
+    runner = mt.ShellRunner(tmp_path)
+    remaining = list(pages)
+
+    def fake_gh(*args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"nameWithOwner": REPO})
+        if args[:2] == ("api", "graphql"):
+            graphql.append(args)
+            return remaining.pop(0)
+        if args[:3] == ("pr", "view", "7") and "statusCheckRollup" in args[-1]:
+            rollup = [
+                {"name": n, "status": "COMPLETED", "conclusion": "SUCCESS"}
+                for n in ("checks", "claims")
+            ]
+            return json.dumps({"headRefOid": head, "statusCheckRollup": rollup})
+        if args[:3] == ("pr", "view", "7"):
+            return json.dumps(
+                {
+                    "number": 7,
+                    "author": {"login": OWNER},
+                    "isCrossRepository": False,
+                    "baseRefName": "main",
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "headRefName": "fix/7-x",
+                    "headRefOid": head,
+                    "body": "Closes #7\n",
+                    "labels": [],
+                    "comments": [],
+                    "title": "x",
+                }
+            )
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    def fake_git(cwd: Path, *args: str, check: bool = True) -> _Proc:
+        if args[:2] == ("fetch", "-q"):
+            return _Proc(0, "")
+        if args[:1] == ("rev-parse",):
+            return _Proc(0, head + "\n")
+        if "diff" in args and "--diff-filter=D" in args:
+            return _Proc(0, "")
+        if "diff" in args:
+            return _Proc(0, "docs/x.md\nchangelog.d/7-x.md\n")
+        if args[:1] == ("show",):
+            return _Proc(0, FRAGMENT)
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(runner, "_gh", fake_gh)
+    monkeypatch.setattr(runner, "_git", fake_git)
+    data = runner.pr_data(7)
+    assert not remaining, "every page was read"
+    return data
+
+
+@pytest.mark.parametrize(
+    ("pages", "reason"),
+    [
+        # one unresolved thread among resolved ones (#731: the ruleset's
+        # required_review_thread_resolution would refuse the merge mid-train)
+        ([_threads_page([True, False, True], None)], "(j) 1 unresolved review thread"),
+        # the unresolved one is on the second page: pagination must reach it
+        (
+            [_threads_page([True] * 100, "cur1"), _threads_page([False, False], None)],
+            "(j) 2 unresolved review threads",
+        ),
+        ([_threads_page([True, True], None)], None),
+        ([_threads_page([], None)], None),
+    ],
+)
+def test_shell_runner_pr_data_reads_review_threads_so_j_refuses_an_unresolved_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pages: list[str], reason: str | None
+) -> None:
+    """#731 (spec req 1 (j)): the real data path reads every page of the PR's review
+    threads from GitHub, and an unresolved one makes the PR ineligible at build time."""
+    graphql: list[tuple[str, ...]] = []
+    data = _real_pr_data(tmp_path, monkeypatch, pages, graphql)
+    assert mt.eligibility(data.pr, data.head_checks, data.diff_paths, data.comments) == reason
+    assert len(graphql) == len(pages)
+    assert all("number=7" in call for call in graphql)
+    if len(pages) > 1:
+        assert "cursor=cur1" in graphql[1]
+
+
+def test_eligibility_fails_closed_when_review_threads_were_never_read() -> None:
+    """#731: `unresolved_threads=None` means nobody read them (the #764 trap: a field only
+    tests fill); that is ineligible, never eligible."""
+    assert _eligible(_pr(unresolved_threads=None)) == "(j) review threads not read"
+
+
+@pytest.mark.parametrize(
+    ("pages", "match"),
+    [
+        # the PR is missing from the answer (`pullRequest: null`)
+        (
+            [json.dumps({"data": {"repository": {"pullRequest": None}}})],
+            "unreadable review threads",
+        ),
+        # a thread without `isResolved`, and one with a non-boolean value
+        (
+            [
+                json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequest": {
+                                    "reviewThreads": {
+                                        "nodes": [{}],
+                                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+            ],
+            "unreadable review threads",
+        ),
+        (
+            [_threads_page([True], None).replace("true", "null")],
+            "unreadable review threads",
+        ),
+        (["not json"], "unreadable review threads"),
+        # says more pages follow but gives no cursor to read them with
+        ([_threads_page([True], "")], "no end cursor"),
+    ],
+)
+def test_shell_runner_pr_data_stops_on_an_unreadable_or_incomplete_thread_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pages: list[str], match: str
+) -> None:
+    """#731 (spec req 1 (j)): a failed or incomplete review-thread read stops the run with
+    `STOPPED:` (fail closed), never counts as zero unresolved threads."""
+    with pytest.raises(mt.StoppedError, match=match):
+        _real_pr_data(tmp_path, monkeypatch, pages, [])

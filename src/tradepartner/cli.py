@@ -8,8 +8,11 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   the price side first fetches (`StorePriceSource`), so it sees the listings the
   EDGAR chunk has just committed. It prints one line per source and exits with
   the result's code: 0 when every source is `ok`, 1 otherwise.
-- `tradepartner health [--check]` prints `health.health_report` at the current
-  time. `--check` exits 1 when any integrity rule fails and names the rules. It
+- `tradepartner health [--check] [--jumps-before DATE]` prints
+  `health.health_report` at the current time; `--jumps-before` limits the
+  price-jump review list (#787) to sessions before DATE, so the owner can
+  review a hypothesis's in-sample jumps without reading its holdout period.
+  `--check` exits 1 when any integrity rule fails and names the rules. It
   also warns, without failing, when the latest EDGAR run row reports
   quarantined accessions (the T11h failure policy): those filings get no
   further request until the owner clears them.
@@ -73,7 +76,11 @@ import httpx
 import typer
 
 from tradepartner.adapters import alpaca_raw
-from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, ListingResolver
+from tradepartner.adapters.alpaca_prices import (
+    AlpacaPriceSource,
+    ListingResolver,
+    registrant_evidence,
+)
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.backfill import backfill
@@ -86,8 +93,9 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import listings_as_of
+from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
+from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -102,7 +110,8 @@ Launcher = Callable[[list[str]], int]
 
 class StorePriceSource(PriceSource):
     """An `AlpacaPriceSource` whose `ListingResolver` is built from the
-    store's listings known at the first fetch, not when the run starts.
+    store's listings known at the first fetch, not when the run starts,
+    with the `registrant_evidence` of the facts and listing ends known then.
 
     `ingest` fetches prices only after the EDGAR chunk has committed, so on a
     first run the listings the resolver needs do not exist until then. The
@@ -137,8 +146,14 @@ class StorePriceSource(PriceSource):
             at = ensure_tz_aware_utc(self._clock(), field_name="clock()")
             with _read(self._settings) as conn:  # waits out a writer like ingest's reads
                 listings = listings_as_of(conn, at)
+                evidence = registrant_evidence(  # #793: who still trades under a ticker
+                    facts_as_of(conn, at).iter_rows(named=True),
+                    listing_ends_as_of(conn, at, self._settings).iter_rows(named=True),
+                    as_of=at.date(),
+                    quiet_after_days=self._settings.alpaca.registrant_quiet_days,
+                )
             self._inner = AlpacaPriceSource(
-                ListingResolver(listings.iter_rows(named=True)),
+                ListingResolver(listings.iter_rows(named=True), evidence),
                 fetch_bars=self._fetch_bars,
                 fetch_actions=self._fetch_actions,
                 settings=self._settings,
@@ -243,6 +258,14 @@ def _print_report(report: HealthReport) -> None:
     echo(f"delisted names: {report.delisted.count}")
     for row in report.delisted.frame.iter_rows(named=True):
         echo(f"  {row['security_id']} {row['ticker']} {row['exchange']} ended {row['end_session']}")
+    jumps = report.price_jumps
+    shown = "" if jumps.before is None else f" before {jumps.before.isoformat()}"
+    echo(f"price jumps{shown}: {jumps.pending.height} to review, {jumps.frame.height} in all")
+    for row in jumps.pending.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']}@{row['session']} {row['prev_close']} -> {row['close']} "
+            f"(x{row['ratio']:.2f} since {row['prev_session']})"
+        )
     echo(f"settings: {report.settings}")
     echo("integrity:")
     for check in report.integrity:
@@ -445,15 +468,22 @@ def make_app(
         check: Annotated[
             bool, typer.Option(help="exit non-zero if any integrity rule fails")
         ] = False,
+        jumps_before: Annotated[
+            str | None,
+            typer.Option(
+                help="list only price jumps before this day (a holdout start), YYYY-MM-DD"
+            ),
+        ] = None,
     ) -> None:
         """Print the data-health report."""
+        cutoff = _parse_day("--jumps-before", jumps_before)
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
         t = ensure_tz_aware_utc(clock(), field_name="clock()")
         try:
             with open_read_only(s) as conn:
-                report = health_report(conn, t, s)
+                report = health_report(conn, t, s, jumps_before=cutoff)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         except (duckdb.CatalogException, duckdb.BinderException) as exc:
