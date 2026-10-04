@@ -655,6 +655,33 @@ def test_same_session_collection_explains_a_partial_fill_and_an_open_order(
     assert any(still in note for note in outcome.notes)
 
 
+def test_a_fill_collected_under_a_clock_tied_with_a_reconciliation_halts_the_run(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#650/#730: a clock frozen since step 4's reconciliation stamps the next
+    collection's fill with that reconciliation's `known_at`. `append` refuses
+    the fill, the collection's write chunk rolls back (no fill journaled), and
+    the run takes the halt path: the switch engaged and a `halted` result
+    naming the refusal. The halt path's own reads meet the same refusal, and
+    each note keeps its message, not only the exception type."""
+    frozen = at(F_0)
+    env.on_sleep.append(lambda _now: setattr(env.clock, "now", frozen))
+    with pytest.raises(ValueError, match="not after the latest reconciliation"):
+        env.run(frozen)
+    halted = env.latest_run()
+    status, fault, message = env.result(halted)
+    assert (status, fault) == ("halted", "ValueError")
+    assert message is not None and message.startswith("ValueError: fills: known_at")
+    reads = [part for part in message.split("; ") if part.startswith("halt read of ")]
+    assert reads, message
+    assert all("failed (ValueError: fills: known_at" in part for part in reads)
+    assert env.query("SELECT max(known_at) FROM reconciliations") == [(frozen,)]
+    assert env.count("fills") == 0
+    assert env.query("SELECT source, fault_type, run_id FROM kill_switch") == [
+        ("fault", "ValueError", halted)
+    ]
+
+
 def test_step_7b_stops_at_its_absolute_deadline(env: Env, window: PaperWindowRow) -> None:
     env.fill_on_sleep = False
     outcome = env.run(at(F_0))
