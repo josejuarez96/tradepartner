@@ -4,7 +4,7 @@ req 17, #571; plan T84b). The fixtures are `test_window_settle.py`'s."""
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -14,8 +14,10 @@ import pytest
 from execution.test_run_stop import buy_id
 from execution.test_run_trade import F_0, FROZEN, Env, at, env
 from execution.test_window_settle import (
+    DAY1,
     NOTE,
     READS,
+    SPY,
     Settle,
     _no_env_file,
     s,
@@ -31,6 +33,7 @@ from tradepartner.adapters.fake_broker import (
     SetPosition,
     Vanish,
 )
+from tradepartner.errors import ClockError
 from tradepartner.execution.resume import RELEASED, resume
 from tradepartner.execution.window import (
     ACCOUNT_MISMATCH,
@@ -39,9 +42,10 @@ from tradepartner.execution.window import (
     OTHER_OPEN_ORDER,
     UNEXPLAINED_POSITION,
     UNJOURNALED_FILL,
+    WindowCommandRefused,
     settle_order,
 )
-from tradepartner.store.db import open_for_write
+from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.journal import OrderEventRow, append
 
 __all__ = ["_no_env_file", "env", "s"]  # the fixtures, re-exported
@@ -235,9 +239,9 @@ def test_a_terminal_event_written_after_the_gate_aborts_the_write(s: Settle) -> 
 
     late = LateTerminal(clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1")
     overrides = s.count("overrides")
-    with pytest.raises(Exception) as raised:
+    with pytest.raises(WindowCommandRefused) as raised:
         s.settle("tp-a", broker=late)
-    assert getattr(raised.value, "reason", None) == ALREADY_TERMINAL
+    assert raised.value.reason == ALREADY_TERMINAL
     assert s.count("overrides") == overrides
     assert s.query(
         "SELECT count(*) FROM order_events WHERE client_order_id = 'tp-a' AND status = 'cancelled'"
@@ -352,12 +356,105 @@ def test_case_ii_with_the_book_holding_the_fill_is_refused_and_resume_completes_
     env: Env, tmp_path: Path
 ) -> None:
     spft, _trns = lagging_window(env, tmp_path, hold=True)
-    with pytest.raises(Exception) as raised:
+    with pytest.raises(WindowCommandRefused) as raised:
         settle_order(env.settings, env.connect, env.fake, ticking(env), spft, NOTE)
-    assert getattr(raised.value, "reason", None) == UNEXPLAINED_POSITION
+    assert raised.value.reason == UNEXPLAINED_POSITION
 
     with pytest.raises(Exception, match=r"RejectionCap|rejection"):
         env.run(at(MAY_6))
     released = resumed(env, accept_broker_fills=True, accept_rejections=True)
     assert released.status == RELEASED, released.reasons
     assert synthetic(env, spft) == 1
+
+
+# --- the ledger view: splits and the clock ---------------------------------------------------
+
+SPLIT_DAY = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)  # S = 2026-10-02, after the fill's session
+
+
+def split_spy(s: Settle, known_at: datetime) -> None:
+    """A 2:1 split of SPY with ex-date 2026-10-02, after the held fill."""
+    with open_for_write(s.settings) as conn:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": SPY,
+                "action_type": "split",
+                "ex_date": date(2026, 10, 2),
+                "ratio_or_amount": 2.0,
+                "announced_at": None,
+                "source_action_id": "test-split-settle",
+                "cancelled": False,
+                "known_at": known_at,
+                "ingested_at": known_at,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+
+
+def split_sell(s: Settle, book: float, split_known_at: datetime) -> None:
+    """10 shares held, then split 2:1; a sell of 6 the broker reports
+    expired, with the book holding `book`."""
+    s.held("tp-held", 10.0)
+    s.place("tp-sell", side="sell", quantity=6.0)
+    s.fake.apply("tp-sell", Expire())
+    s.fake.apply_account(SetPosition("SPY", book))
+    split_spy(s, split_known_at)
+    s.clock.now = SPLIT_DAY
+    s.engage()
+
+
+def test_a_sell_whose_fill_the_split_book_shows_is_refused(s: Settle) -> None:
+    """The ledger is 20 split-adjusted; the broker's 14 is the sell's 6 gone:
+    an unadjusted ledger (10) would wrongly settle it."""
+    split_sell(s, 14.0, datetime(2026, 10, 1, 15, 0, tzinfo=UTC))
+    s.refused(UNEXPLAINED_POSITION, "tp-sell")
+
+
+def test_a_sell_with_the_book_at_the_split_ledger_is_accepted(s: Settle) -> None:
+    split_sell(s, 20.0, datetime(2026, 10, 1, 15, 0, tzinfo=UTC))
+    s.settle("tp-sell")
+    _, event = s.settled_rows("tp-sell")
+    evidence = json.loads(event[5])
+    assert (evidence["broker_quantity"], evidence["ledger_quantity"]) == (20.0, 20.0)
+
+
+def test_a_split_known_after_close_s_minus_1_is_not_applied(s: Settle) -> None:
+    """Known only after close(2026-10-01): the ledger stays 10, so a book
+    of 14 is above it and does not refuse the sell."""
+    split_sell(s, 14.0, datetime(2026, 10, 2, 13, 0, tzinfo=UTC))
+    s.settle("tp-sell")
+    _, event = s.settled_rows("tp-sell")
+    assert json.loads(event[5])["ledger_quantity"] == 10.0
+
+
+def test_a_clock_behind_the_journal_raises_and_writes_nothing(s: Settle) -> None:
+    s.place("tp-a")
+    s.fake.apply("tp-a", Vanish())
+    s.engage()
+    s.clock.now = DAY1 - timedelta(hours=3)  # before the order's rows
+    before = s.counts()
+    with pytest.raises(ClockError):
+        s.settle("tp-a")
+    assert s.counts() == before
+
+
+def test_another_orders_get_order_error_propagates_with_nothing_written(s: Settle) -> None:
+    s.place("tp-a")
+    s.place("tp-b")
+    s.fake.apply("tp-a", Vanish())
+    s.engage()
+
+    class FailsOnB(FakeBroker):
+        def get_order(self, client_order_id: str) -> Order:
+            if client_order_id == "tp-b":
+                raise ConnectionError("transport timeout")
+            return super().get_order(client_order_id)
+
+    broken = FailsOnB(clock=s.clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1")
+    before = s.counts()
+    with pytest.raises(ConnectionError):
+        s.settle("tp-a", broker=broken)
+    assert s.counts() == before

@@ -1505,18 +1505,31 @@ def _ledger_view(
     """The ledger's quantity in the order's name (the window's live fills and
     adjustments known at `as_of`, split-adjusted through the clock's session S
     by the actions known at close(S-1), the view `reconcile.compare` takes)
-    and the broker symbol reconciliation maps the name to (None: unmapped)."""
+    and the broker symbol reconciliation maps the name to (None: unmapped).
+    A journal row stamped after `as_of` means the clock went back since it
+    was written: `ClockError`, never a cut that silently drops it."""
     window, window_id = target.window, target.window_id
     session = command_session(as_of)
-    stated = [
-        r
-        for r in reconciliations_for(conn, window_id)
-        if r.status == OK and r.known_at <= as_of and _ny_date(r.at) <= session
-    ]
+    fills = fills_for(conn, window_id=window_id)
+    orders = orders_for(conn, window_id=window_id)
+    adjustments = adjustments_for(conn, window_id)
+    reconciliations = reconciliations_for(conn, window_id)
+    stamps = (
+        [f.fill.known_at for f in fills]
+        + [o.known_at for o in orders]
+        + [a.known_at for a in adjustments]
+        + [r.known_at for r in reconciliations]
+    )
+    if stamps and max(stamps) > as_of:
+        raise ClockError(
+            f"the clock reading {as_of.isoformat()} is before journal row stamped "
+            f"{max(stamps).isoformat()}"
+        )
+    stated = [r for r in reconciliations if r.status == OK and _ny_date(r.at) <= session]
     ledger = from_journal(
-        [f for f in fills_for(conn, window_id=window_id) if f.fill.known_at <= as_of],
-        [o for o in orders_for(conn, window_id=window_id) if o.known_at <= as_of],
-        [a for a in adjustments_for(conn, window_id) if a.known_at <= as_of],
+        fills,
+        orders,
+        adjustments,
         live_actions_as_of(conn, session_close(previous_session(session))),
         stated[-1] if stated else None,
         window.starting_cash,
