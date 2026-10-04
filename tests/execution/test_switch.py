@@ -141,6 +141,39 @@ def test_the_latest_row_is_the_last_written_not_the_latest_stamped() -> None:
     assert derive(_window(), rows, [], [], reading_run=None, lock_free=True).engaged
 
 
+def test_engaged_row_is_the_latest_row_by_write_order_when_it_is_engaged() -> None:
+    """`engaged_row` is the row `causes` names first (#699): the run's
+    `kill_switch` alert reads it, so the alert and the derivation share one
+    definition of "latest engaged row"."""
+    other_window = _row(9, "engaged", 1, window_id=_WINDOW + 1)
+    rows = [other_window, _row(1, "released", 9), _row(2, "engaged", 5, source="drawdown")]
+    state = derive(_window(), rows, [], [], reading_run=None, lock_free=True)
+    assert state.engaged_row == rows[2]
+    assert state.causes == ("kill_switch event 2 engaged (drawdown)",)
+
+
+@pytest.mark.parametrize(
+    ("rows", "runs", "results"),
+    [
+        ([], [], []),
+        ([_row(1, "engaged", 5), _row(2, "released", 9)], [], []),
+        # engaged by derivation alone: a faulted run after the release
+        (
+            [_row(1, "engaged", 5), _row(2, "released", 9)],
+            [_run(1, 10)],
+            [_result(1, "failed", 12)],
+        ),
+        # only another window's row is engaged
+        ([_row(1, "engaged", 5, window_id=_WINDOW + 1)], [], []),
+    ],
+)
+def test_engaged_row_is_none_unless_the_latest_row_is_engaged(
+    rows: list[KillSwitchRow], runs: list[PaperRunRow], results: list[PaperRunResultRow]
+) -> None:
+    state = derive(_window(), rows, runs, results, reading_run=None, lock_free=True)
+    assert state.engaged_row is None
+
+
 @pytest.mark.parametrize("status", ["halted", "crashed", "failed"])
 def test_an_earlier_faulted_run_engages_with_no_engaged_row(status: str) -> None:
     runs = [_run(1, 0), _run(2, 60)]

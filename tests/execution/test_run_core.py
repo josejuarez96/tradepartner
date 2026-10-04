@@ -46,6 +46,7 @@ from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
+    KillSwitchRow,
     OrderEventRow,
     OrderRow,
     OverrideRow,
@@ -502,6 +503,94 @@ def test_an_ok_run_writes_no_kill_switch_alert(env: Env, exits_done: list[object
     _marked(env)
     assert env.run(_at(TUE)).status == "ok"
     assert _kill_switch_alerts(env) == []
+
+
+def _engage_override(env: Env, window: PaperWindowRow, reason: str) -> None:
+    made = _at(MON, 23)
+    env.append(
+        OverrideRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            made_at=made,
+            kind="engage_kill_switch",
+            reason=reason,
+            known_at=made,
+            ingested_at=made,
+        )
+    )
+
+
+def test_the_kill_switch_alert_names_the_row_switch_derive_reports(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alert's "latest engaged row" is `switch.derive`'s `engaged_row`, not
+    a second reading of the rows, so the two cannot drift (#699)."""
+    window = _marked(env)
+    _engage_override(env, window, "the real reason")
+    real = switch.derive
+    stand_in = KillSwitchRow(
+        event_id=4242,
+        window_id=window.window_id,  # type: ignore[arg-type]
+        at=_at(MON),
+        state="engaged",
+        source="drawdown",
+        reason="the row derive names",
+        known_at=_at(MON),
+        ingested_at=_at(MON),
+    )
+
+    def derive(*args: Any, **kwargs: Any) -> switch.SwitchState:
+        state = real(*args, **kwargs)
+        return replace(state, engaged_row=stand_in) if state.engaged_row is not None else state
+
+    monkeypatch.setattr(switch, "derive", derive)
+    assert env.run(_at(TUE)).status == "skipped_kill_switch"
+    ((_, _, message),) = _kill_switch_alerts(env)
+    assert "kill_switch event 4242: source drawdown" in message
+    assert "the row derive names" in message
+    assert "the real reason" not in message
+
+
+def test_a_secret_in_an_override_reason_is_masked_in_the_kill_switch_alert(env: Env) -> None:
+    """The override's free-text reason reaches the `kill_switch` alert; a
+    configured secret in it is masked in every form (#699)."""
+    secret = "Ab\\cDef-9876xyz"  # a backslash, so its repr-escaped form differs
+    env.settings = Settings(
+        _env_file=None, store={"path": env.settings.store.path}, alpaca_paper_api_secret=secret
+    )
+    window = _marked(env)
+    escaped = repr(secret)[1:-1]
+    _engage_override(env, window, f"pasted {secret} / {secret.upper()} / {escaped}")
+    assert env.run(_at(TUE)).status == "skipped_kill_switch"
+    ((_, _, message),) = _kill_switch_alerts(env)
+    assert "source owner" in message
+    assert "***" in message
+    for form in (secret, secret.upper(), escaped, escaped.upper()):
+        assert form not in message
+
+
+def test_a_kill_switch_alert_write_error_fails_the_skipped_run(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins today's behaviour (#699, an open owner question): a store error
+    writing the `kill_switch` alert leaves `_skipped` before the
+    `skipped_kill_switch` row, so the run is recorded `failed` (fail closed:
+    a `failed` run itself engages the switch) and nothing is submitted."""
+    window = _marked(env)
+    _engage_override(env, window, "owner pauses trading for the test")
+    original = run_module._ChunkAlerter.write
+
+    def failing(self: run_module._ChunkAlerter, kind: str, *args: Any, **kwargs: Any) -> int:
+        if kind == "kill_switch":
+            raise duckdb.IOException("Could not set lock on file")
+        return original(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(run_module._ChunkAlerter, "write", failing)
+    with pytest.raises(duckdb.IOException):
+        env.run(_at(TUE))
+    run_id = env.latest_run()
+    assert env.results()[run_id][0] == "failed"
+    assert _kill_switch_alerts(env) == []
+    assert "submit" not in env.broker_methods()
 
 
 def test_invoked_by_is_scheduler_only_with_the_variable_and_no_tty() -> None:
@@ -1046,6 +1135,61 @@ def test_a_crash_between_marks_and_the_drawdown_check_is_caught_by_the_next_run(
     assert outcome.status == "skipped_kill_switch", env.results()
     assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
     assert ("drawdown", outcome.run_id, WED) in env.alerts()
+    assert exits_done == []
+
+
+def test_a_drawdown_engaging_in_the_run_writes_that_runs_kill_switch_alert(
+    env: Env, exits_done: list[object]
+) -> None:
+    """The switch is open when the run starts; its own drawdown check engages
+    it. The run writes the `drawdown` alert, then one `kill_switch` alert for
+    itself naming the `drawdown` row it just wrote and its reason (#699,
+    quant-auditor on #698)."""
+    shares = 1000.0
+    cash = FAKE_CASH
+    (close_mon,) = (
+        r[0]
+        for r in env.query(
+            "SELECT close FROM prices_daily WHERE security_id = ? AND session = ?", [SPY, MON]
+        )
+    )
+    peak = 10.0 * (cash + shares * close_mon)  # far below the line on every session
+    window = env.window(started=_at(MON, 22), starting_equity=peak)
+    env.ingest(_at(TUE, 21))
+    from tradepartner.store.journal import PositionDailyRow
+
+    earlier = env.past_run(window, _at(MON), status="ok")
+    env.append(
+        PositionDailyRow(
+            run_id=earlier,
+            session=MON,
+            security_id=SPY,
+            quantity=shares,
+            mark_price=close_mon,
+            value=shares * close_mon,
+            cash=cash,
+            tradable=True,
+            known_at=_at(MON, 21),
+            ingested_at=_at(MON, 21),
+        )
+    )
+    assert env.engaged() == []  # open when the run starts
+    outcome = env.run(_at(WED))
+    assert outcome.status == "skipped_kill_switch", env.results()
+    assert env.engaged() == [("drawdown", None, outcome.run_id, None)]
+    ((event_id,),) = env.query("SELECT event_id FROM kill_switch")
+    kinds = [
+        kind
+        for kind, run_id, _ in env.alerts()
+        if run_id == outcome.run_id and kind in ("drawdown", "kill_switch")
+    ]
+    assert kinds == ["drawdown", "kill_switch"]
+    (reason,) = [r[0] for r in env.query("SELECT message FROM alerts WHERE kind = 'drawdown'")]
+    ((run_id, session, message),) = _kill_switch_alerts(env)
+    assert (run_id, session) == (outcome.run_id, WED)
+    assert f"kill_switch event {event_id}: source drawdown" in message
+    assert reason in message
+    assert f"kill_switch event {event_id} engaged (drawdown)" in message
     assert exits_done == []
 
 
