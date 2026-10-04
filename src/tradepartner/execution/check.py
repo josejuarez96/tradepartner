@@ -313,7 +313,11 @@ def _tracking_line(
     journal = _journal_for(conn, window_id)
     actions = conn.execute("SELECT * FROM corporate_actions").pl()
     prices = _price_of(conn, fill_price_key)
-    comparison = compare_months(window, trial, journal, actions, prices, stop_session)
+    #: Residues always price at the close, like the marks, never through the
+    #: frozen `execution.fill_price` bar (#606): bound separately from
+    #: `prices`, same as `report.report`'s own binding.
+    closes = _price_of(conn, "close")
+    comparison = compare_months(window, trial, journal, actions, prices, closes, stop_session)
     compared = [m for m in comparison.months if not m.excluded]
     enough = len(compared) >= min_rebalances
     passed = comparison.passed and enough
