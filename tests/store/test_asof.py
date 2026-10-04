@@ -907,6 +907,50 @@ class TestImplausibleDividendAmount:
         )
         assert row["reason"] == "stale_prior_bar"
 
+    def test_a_prior_bar_revision_known_after_t_does_not_change_the_drop_at_t(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # The 09-12 close is revised to 30.00 after T: at T the $25 row is
+        # still sized against 22.35 and dropped; once the revision is known
+        # it is under the close and applies.
+        self._carlyle(synthetic_store)
+        _bar(
+            synthetic_store,
+            "SEC_CG",
+            date(2017, 9, 12),
+            30.0,
+            known_at=datetime(2017, 11, 15, 21, tzinfo=UTC),
+        )
+        assert dropped_dividends_as_of(synthetic_store, self.T).height == 1
+        later = datetime(2017, 11, 30, 21, tzinfo=UTC)
+        assert dropped_dividends_as_of(synthetic_store, later).height == 0
+        adjusted = adjusted_prices_as_of(synthetic_store, later, include_dividends=True)
+        assert _one(adjusted, session=date(2017, 9, 12))["close"] == pytest.approx(5.0)
+
+    @pytest.mark.parametrize("amount", [float("nan"), float("inf")])
+    def test_non_finite_amount_still_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection, amount: float
+    ) -> None:
+        self._carlyle(synthetic_store, amount=amount)
+        with pytest.raises(ValueError, match="SEC_CG"):
+            adjusted_prices_as_of(synthetic_store, self.T, include_dividends=True)
+        with pytest.raises(ValueError, match="SEC_CG"):
+            dropped_dividends_as_of(synthetic_store, self.T)
+
+    def test_zero_prior_close_still_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._carlyle(synthetic_store)
+        _bar(
+            synthetic_store,
+            "SEC_CG",
+            date(2017, 9, 12),
+            0.0,
+            known_at=datetime(2017, 9, 12, 22, tzinfo=UTC),
+        )
+        with pytest.raises(ValueError, match="SEC_CG"):
+            adjusted_prices_as_of(synthetic_store, self.T, include_dividends=True)
+
     def test_negative_amount_still_raises(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
         self._carlyle(synthetic_store, amount=-1.0)
         with pytest.raises(ValueError, match="SEC_CG"):

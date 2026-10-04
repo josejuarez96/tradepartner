@@ -147,12 +147,15 @@ factor) like a stale-prior-bar dividend and `dropped_dividends_as_of`
 reports it as `implausible_amount`: an amount at or above
 `adjust.max_dividend_to_prior_close` (default `1.0`, at most `1.0`)
 times the prior close. The bound is checked only on a usable prior close
-(the gap reasons come first), so the factor that reaches `LN()` is always
-positive.
+(the gap reasons come first), and only for a finite amount on a positive,
+finite close: a NaN or infinite amount, or a zero or NaN prior close, is
+corrupt data of another kind and still raises below.
 
 **Every other event's factor must be positive and finite, or this raises
 `ValueError`.** A split `ratio_or_amount` of `0` divides by zero (DuckDB
-returns `inf`, not an error, for `1.0 / 0.0`). That is bad store data, not
+returns `inf`, not an error, for `1.0 / 0.0`), and so does a NaN or
+infinite dividend amount or a zero or NaN prior close. That is bad store
+data, not
 "no factor" (`NULL`, which a dropped dividend produces and which this
 function treats as "no adjustment from this event", not an error).
 Before ever computing `LN()`, a dedicated query checks every non-`NULL` event factor for
@@ -613,7 +616,13 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
                         WHEN prior_session IS NULL THEN 'no_prior_bar'
                         WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
                         WHEN gap_sessions > ? THEN 'stale_prior_bar'
-                        WHEN ratio_or_amount >= ? * prior_close THEN 'implausible_amount'
+                        -- Only a finite amount on a positive, finite close: a
+                        -- NaN or infinite amount, or a zero or NaN close, is
+                        -- corrupt data `_raise_on_invalid_factor` names.
+                        WHEN isfinite(ratio_or_amount) AND isfinite(prior_close)
+                            AND prior_close > 0
+                            AND ratio_or_amount >= ? * prior_close
+                            THEN 'implausible_amount'
                     END
                 END AS drop_reason
             FROM event_gap
