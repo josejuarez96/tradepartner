@@ -87,13 +87,18 @@ derived at `t`, as the data is read.
   against the next row that is neither.
 - `no_bars_after_delisting`: no bar known at `t` for a delisted listing's
   security that *resumes* after the delisting's `effective_on` and before the
-  security's next listing, if any. A listing's end is its last bar (spec req
+  security's next listing on an exchange, if any (a NONE or OTC row, often
+  started before `effective_on` in the suspension sequence, does not end the
+  check: the feed has no OTC bars, spec req 10). A listing's end is its last bar (spec req
   4), so a line that keeps trading past `effective_on` without a break (a
   holding-company or redomicile Form 25 on the same line, CMPR) is its own
   tail and passes. A bar that comes after more than
   `master.transfer_window_sessions` missing sessions fails, with every bar
-  after it up to the next listing: the first gap is counted from the last
-  bar on or before `effective_on`, or from `effective_on` when there is none.
+  after it up to that listing. Missing sessions are XNYS sessions strictly
+  between two bars; the first gap is counted from the last bar on or before
+  `effective_on`, or from `effective_on` when there is none, so a delisting
+  that took effect long before the store's first bar fails its line's bars:
+  the store cannot show the line kept trading.
   Such a bar is another equity's resolved to this one (a reused ticker,
   EGLE), a relisting with no listing row, or bars on both sides of a hole in
   the store.
@@ -820,7 +825,11 @@ def _bars_after_delisting(
         for row in ordered:
             if row["status"] != DELISTED:
                 continue
-            later = [o["valid_from"] for o in ordered if o["valid_from"] > row["valid_from"]]
+            later = [
+                o["valid_from"]
+                for o in ordered
+                if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
+            ]
             bounds.append({**row, "_next": min(later, default=None)})
     if not bounds:
         return pl.DataFrame([], schema=_AFTER_DELISTING_SCHEMA)

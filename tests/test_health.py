@@ -701,16 +701,18 @@ def test_late_form25_is_checked_against_the_next_exchange_line_past_an_otc_row(
 
 
 @pytest.mark.parametrize("late_form25", [False, True])
+@pytest.mark.parametrize("class_title", ["Class A Common Stock", "CLASS A COMMON STOCK, $0.01 PAR"])
 def test_same_day_rows_differing_only_in_exchange_tag_are_tolerated(
-    fixture_store: duckdb.DuckDBPyConnection, late_form25: bool
+    fixture_store: duckdb.DuckDBPyConnection, late_form25: bool, class_title: str
 ) -> None:
-    # INTT/PLAG/PRPB.U (#822): the same ticker filed on the same day under
-    # two exchange tags is one line tagged twice, also when a Form 25 later
-    # ends one of the two rows.
+    # INTT/PLAG/PRPB.U/CEI (#822): the same ticker filed on the same day
+    # under two exchange tags (and in CEI's case two wordings of the class
+    # title) is one line tagged twice, also when a Form 25 later ends one of
+    # the two rows.
     insert_row(
         fixture_store,
         "listings",
-        _listing_row("SEC_DUAL_A", "DUALA", "NASDAQ", date(2017, 1, 3), "Class A Common Stock"),
+        _listing_row("SEC_DUAL_A", "DUALA", "NASDAQ", date(2017, 1, 3), class_title),
     )
     if late_form25:
         insert_row(
@@ -804,6 +806,21 @@ def test_bars_resuming_after_a_gap_past_the_effective_date_fail(
     # back months later: every resumed bar fails, the tail before does not.
     for session in _sessions(date(2018, 5, 29), date(2018, 6, 29)):
         insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    resumed = _sessions(date(2018, 10, 1), date(2018, 10, 5))
+    for session in resumed:
+        insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
+    assert _violating_sessions(fixture_store, _settings()) == resumed
+
+
+@pytest.mark.parametrize("off_exchange", ["NONE", "OTC"])
+def test_an_otc_row_before_the_effective_date_does_not_end_the_check(
+    fixture_store: duckdb.DuckDBPyConnection, off_exchange: str
+) -> None:
+    # Suspension sequence: TRHX quoted OTC from 2018-06-01, before its Form
+    # 25 takes effect. Bars resuming months later still fail.
+    insert_row(
+        fixture_store, "listings", _listing_row(_TRHX, "TRHX", off_exchange, date(2018, 6, 1))
+    )
     resumed = _sessions(date(2018, 10, 1), date(2018, 10, 5))
     for session in resumed:
         insert_row(fixture_store, "prices_daily", _bar(_TRHX, session))
