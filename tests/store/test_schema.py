@@ -811,8 +811,64 @@ def test_corporate_actions_carry_source_action_id_and_cancelled(
 def test_schema_version_is_bumped_past_action_identity() -> None:
     """#108 took version 4; the Phase 4 journal (T49) is version 5; #332's
     `order_events.reason` CHECK is version 6; #377's `decisions.reason` CHECK
-    is version 7; #472's `resume_invocations.accept_rejections` is version 8."""
-    assert schema.CURRENT_SCHEMA_VERSION == 8
+    is version 7; #472's `resume_invocations.accept_rejections` is version 8;
+    #571's owner settlement (`settle_order`, `owner_settled_unknown`,
+    `overrides.client_order_id`) is version 9."""
+    assert schema.CURRENT_SCHEMA_VERSION == 9
+
+
+# --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
+
+_OVERRIDE_AT = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
+
+
+def _override(
+    conn: duckdb.DuckDBPyConnection, override_id: int, kind: str, client_order_id: str | None
+) -> None:
+    conn.execute(
+        "INSERT INTO overrides (override_id, window_id, made_at, security_id, "
+        "client_order_id, kind, reason, known_at, ingested_at) "
+        "VALUES (?, 1, ?, 'S1', ?, ?, 'a reason long enough', ?, ?)",
+        [override_id, _OVERRIDE_AT, client_order_id, kind, _OVERRIDE_AT, _OVERRIDE_AT],
+    )
+
+
+def test_settle_order_is_an_override_kind_spelt_as_the_spec_names_it() -> None:
+    """Spec "Data / interfaces" > Tables: `kind ∈ {exclude_name, keep_name,
+    engage_kill_switch, settle_order}`."""
+    assert schema.SETTLE_ORDER_KIND == "settle_order"
+    assert schema.JOURNAL_ENUMS["overrides", "kind"] == (
+        "exclude_name",
+        "keep_name",
+        "engage_kill_switch",
+        schema.SETTLE_ORDER_KIND,
+    )
+
+
+def test_a_settle_order_override_with_its_order_is_accepted() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    _override(conn, 1, schema.SETTLE_ORDER_KIND, "tp-1")
+    assert conn.execute("SELECT kind, client_order_id FROM overrides").fetchall() == [
+        ("settle_order", "tp-1")
+    ]
+
+
+def test_a_settle_order_override_without_an_order_is_refused() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    with pytest.raises(duckdb.ConstraintException):
+        _override(conn, 1, schema.SETTLE_ORDER_KIND, None)
+
+
+@pytest.mark.parametrize("kind", ["exclude_name", "keep_name", "engage_kill_switch"])
+def test_only_a_settle_order_override_may_carry_an_order(kind: str) -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    with pytest.raises(duckdb.ConstraintException):
+        _override(conn, 1, kind, "tp-1")
+    _override(conn, 2, kind, None)
+    assert conn.execute("SELECT client_order_id FROM overrides").fetchall() == [(None,)]
 
 
 def test_two_source_ids_may_share_an_ex_date_and_known_at(
