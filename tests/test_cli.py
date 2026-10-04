@@ -305,7 +305,7 @@ def test_store_price_source_reports_what_its_resolver_left_out(
     source.bars(["SEC_SPY"], date(2020, 6, 30), date(2020, 6, 30))
     summary = source.resolution_summary()
     assert summary.startswith("resolver left out ")
-    assert "; 0 co-registrant and 0 disputed claims held" in summary  # #793: evidence read
+    assert "; 0 co-registrant and 0 disputed claims on another" in summary  # #793: evidence read
     assert summary.endswith("; 0 bar rows unresolved")
 
 

@@ -494,6 +494,41 @@ class TestRegistrantCheck:
         )
         assert resolver.resolve("MAA", date(2026, 9, 15)) == maa
 
+    def test_a_co_registrant_never_inherits_the_parents_old_ticker(self) -> None:
+        # MPT's operating partnership cites MPW; the REIT moves to MPT. The
+        # partnership never traded MPW and does not take it then.
+        listings = [*AEP_LISTINGS, _listing(AEP, "AEPX", date(2026, 9, 1), "Common Stock")]
+        resolver = ListingResolver(listings, _evidence(AEP_FACTS))
+        assert resolver.resolve("AEP", date(2026, 8, 31)) == AEP
+        assert resolver.resolve("AEP", date(2026, 9, 15)) is None
+        assert resolver.symbols(AEP_TEXAS, date(2026, 1, 2), date(2026, 12, 31)) == []
+
+    def test_an_old_shared_count_is_no_proof_of_a_combined_filing(self) -> None:
+        # Two counts that match years before the claim are a coincidence,
+        # not the combined filing that produced the claimant's listing.
+        facts = [
+            _shares(MGE, date(2019, 3, 31), 5000000, date(2019, 4, 30)),
+            _shares(MGEE, date(2019, 3, 31), 5000000, date(2019, 4, 30)),
+            *MGEE_FACTS,
+        ]
+        resolver = ListingResolver(MGEE_LISTINGS, _evidence(facts))
+        assert resolver.resolve("MGEE", date(2026, 9, 15)) is None
+        assert resolver.report.disputed_spans == 1
+
+    def test_a_waiting_claim_never_ties_with_a_new_listing_on_its_first_day(self) -> None:
+        holdings, spinco, newco = "0001808834", "0001821393", "0009999999"
+        resolver = ListingResolver(
+            [
+                _listing(holdings, "AAN", date(2020, 10, 29), "Common Stock"),
+                _listing(holdings, "PRG", date(2021, 2, 25), "Common Stock"),
+                _listing(spinco, "AAN", date(2021, 2, 23), "Common Stock"),
+                _listing(newco, "AAN", date(2021, 2, 25), "Common Stock"),
+            ],
+            _evidence([_shares(holdings, date(2026, 7, 24), 39000000, date(2026, 7, 29))]),
+        )
+        assert resolver.resolve("AAN", date(2021, 3, 1)) == newco
+        assert resolver.report.ambiguous_spans == 0
+
     def test_an_exchange_transfer_is_not_the_holder_leaving(self) -> None:
         ends = [_ended(AEP, "AEP", "Common Stock", date(2019, 3, 1), status="transferred")]
         resolver = ListingResolver(AEP_LISTINGS, _evidence(AEP_FACTS, ends))
@@ -669,7 +704,8 @@ class TestRegistrantCheck:
             quiet_after_days=180,
         )
         assert evidence.last_filed[AEP] == date(2026, 7, 30)
-        assert evidence.same_count(AEP, AEP_TEXAS)
+        assert evidence.same_count(AEP, AEP_TEXAS, date(2026, 7, 30))
+        assert not evidence.same_count(AEP, AEP_TEXAS, date(2027, 2, 1))
         assert evidence.left_on(AEP, date(1994, 5, 16)) is None
         assert evidence.delisted_on == {"0000000001:class-a": (date(2021, 1, 4),)}
         # quiet: no share count for more than 180 days before the run

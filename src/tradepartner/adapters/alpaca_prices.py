@@ -46,14 +46,16 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   store at the run) says when a holder left: the effective day of a
   delisted, not transferred, equity listing of its security, or the day
   after its company's last cover-page share count once it has filed none
-  for `alpaca.registrant_quiet_days` by the run. A claim waits: it holds the ticker
-  only from the earlier of the holder's span end and its leaving. Until
-  then it is a **co-registrant** when the holder has not left and the
-  claimant reported the holder's share count for one date (a combined
-  filing: AEP Texas listing AEP's stock), and the holder keeps the ticker;
-  otherwise it is **disputed** and shadows the holder (MG&E listing MGE
-  Energy's `MGEE`). With no evidence on the holder the newer span wins as
-  above, and a holding-company successor (Xerox Holdings, NorthWestern
+  for `alpaca.registrant_quiet_days` by the run. A claim is a
+  **co-registrant** when the holder has not left and the claimant
+  reported the holder's share count for one date at most that many days
+  before its start (a combined filing: AEP Texas listing AEP's stock): the
+  holder keeps the ticker and the claimant never holds it. Any other claim
+  is **disputed**: it shadows the holder until the earlier of the holder's
+  span end and its leaving, then holds the ticker from that day (unless
+  another span starts that same day) (MG&E listing MGE Energy's `MGEE`).
+  With no evidence on the holder the newer span wins as above, and a
+  holding-company successor (Xerox Holdings, NorthWestern
   Energy Group) takes the ticker from its start, its predecessor having
   left before.
 
@@ -275,7 +277,7 @@ class ResolverReport:
             f"{self.ambiguous_spans} ambiguous and "
             f"{self.contested_spans} contested spans unassigned; "
             f"{self.co_registrant_spans} co-registrant and {self.disputed_spans} disputed "
-            f"claims held until the holder leaves"
+            f"claims on another company's ticker"
         )
 
 
@@ -311,12 +313,15 @@ class RegistrantEvidence:
         """True when the evidence has a share count or a delisting for it."""
         return _company(security_id) in self.last_filed or security_id in self.delisted_on
 
-    def same_count(self, one: str, other: str) -> bool:
+    def same_count(self, one: str, other: str, around: date) -> bool:
         """True when the two companies reported one share count for one
-        date (a combined filing)."""
+        date no more than `quiet_after_days` before `around` or later (the
+        combined filing behind a claimant's listing, not a coincidence)."""
         empty: frozenset[tuple[date, float]] = frozenset()
         mine = self.share_counts.get(_company(one), empty)
-        return bool(mine & self.share_counts.get(_company(other), empty))
+        shared = mine & self.share_counts.get(_company(other), empty)
+        since = around - timedelta(days=self.quiet_after_days)
+        return any(day >= since for day, _ in shared)
 
 
 def registrant_evidence(
@@ -455,9 +460,15 @@ class ListingResolver:
             if verdict == _DISPUTED:  # shadows the holder until the claim may hold
                 stop = until if span.end is None or (until and until < span.end) else span.end
                 self._blockers[span.ticker].append(replace(span, end=stop))
-            if until is not None and (span.end is None or until < span.end):
+            rivals = self._by_ticker[span.ticker]
+            if (
+                verdict == _DISPUTED  # a co-registrant never traded the ticker
+                and until is not None
+                and (span.end is None or until < span.end)
+                and not any(other.start == until for other in rivals)  # no rule-4 tie
+            ):
                 held = replace(span, start=until)  # the claim waits for the holder
-                self._by_ticker[span.ticker].append(held)
+                rivals.append(held)
                 own = self._by_security[span.security_id]
                 own[own.index(span)] = held
         self._contested = frozenset(
@@ -526,7 +537,9 @@ class ListingResolver:
             return None  # a successor or a reuse
         ends = [day for day in (holder.end, left) if day is not None]
         until = min(ends, default=None)
-        if left is None and evidence.same_count(holder.security_id, claimant.security_id):
+        if left is None and evidence.same_count(
+            holder.security_id, claimant.security_id, claimant.start
+        ):
             return _CO_REGISTRANT, until
         return _DISPUTED, until
 
