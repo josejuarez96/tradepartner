@@ -126,7 +126,7 @@ def backfill(
             f"since={since.isoformat()}",
             dry_run=False,
             mode=BACKFILL,
-            prepare=lambda: _prefetch(recorded, settings),
+            prepare=lambda: _prefetch(recorded, settings, dry_run=False),
             after_commit=getattr(_unwrap(filings), "record_failures", None),
         )
         runs.append(run)
