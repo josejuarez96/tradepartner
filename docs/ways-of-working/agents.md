@@ -36,7 +36,8 @@ Seven agents. That is deliberately few: each one owns a job the main session doe
 Research:  owner writes brief (issue) ──► researcher ──► report PR ──► owner reads, decides
 Decide:    main session drafts ADR ──► spec-critic ──► owner merges
 Spec/Plan: main session drafts ──► spec-critic ──► owner merges
-Frontier:  orchestrator spawns the planning team on its trigger (teams.md, Picking work) ──► next roadmap spec or plan PR, a chaining plan amendment, or a decision memo ──► spec-critic ──► owner merges
+Frontier:  orchestrator spawns the planning team on its trigger (teams.md, Picking work) ──► next roadmap spec or plan PR, or a chaining plan amendment ──► spec-critic ──► owner merges
+           ... or a decision memo ──► comment on the question's issue ──► owner decides
 Build:     team claims task (scripts/team.py) ──► implementer × N (parallel worktrees, non-overlapping tasks) ──► draft PRs
 Review:    /code-review + quant-auditor and/or safety-reviewer (by paths touched) ──► owner merges
 Record:    doc-keeper
