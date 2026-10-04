@@ -1313,8 +1313,8 @@ class TestListingEvidenceAfterForm25:
 
     @pytest.mark.parametrize(
         "fetched_at",
-        [_at(2026, 6, 10), _at(2026, 6, 16), _at(2026, 7, 14)],
-        ids=["before-effective", "day-after-effective", "inside-lag"],
+        [_at(2026, 6, 10), _at(2026, 6, 15), _at(2026, 6, 16), _at(2026, 7, 14)],
+        ids=["before-effective", "effective-day", "day-after-effective", "inside-lag"],
     )
     def test_a_snapshot_inside_the_lag_relists_nothing(self, fetched_at: datetime) -> None:
         # safety-reviewer and quant-auditor on #835: a daily fetch before SEC
@@ -1335,6 +1335,21 @@ class TestListingEvidenceAfterForm25:
                 cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
             ),
             forms=(("15-12G", _at(2026, 7, 30, 20, 1)),),
+            snapshot=(_snap(cik, "GOLD RESOURCE", "GORO", "NYSE_AMERICAN", _at(2026, 10, 4)),),
+        )
+        assert [r[2] for r in self._rows(build)] == [date(2026, 5, 7)]
+
+    def test_a_snapshot_after_a_late_form_15_relists_nothing(self) -> None:
+        # Pass-2 fix on #835: a Form 15 filed after the reorganisation window
+        # but before the fetch still vetoes the snapshot (the company left
+        # the registry; a stale ticker file is no listing evidence).
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2026, 5, 7), ("Common Stock", "GORO", "NYSE_AMERICAN"))],
+            DelistingFiling(
+                cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
+            ),
+            forms=(("15-12G", _at(2026, 8, 31, 20, 1)),),
             snapshot=(_snap(cik, "GOLD RESOURCE", "GORO", "NYSE_AMERICAN", _at(2026, 10, 4)),),
         )
         assert [r[2] for r in self._rows(build)] == [date(2026, 5, 7)]

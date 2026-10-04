@@ -86,8 +86,8 @@ snapshot`, known at the fetch (SA). The 8-K12B must fall inside
 `master.reorganisation_window_sessions` sessions of the Form 25's filing
 session (so an old Form 25 is never revived years later), and the fetch
 must come `master.snapshot_relisting_lag_days` after the effective day
-with no Form 15 in that window (so a fetch before SEC drops a delisted or
-acquired name's ticker never relists it). Fetches are judged in time
+with no Form 15 from that window's start to the fetch (so a fetch before
+SEC drops a delisted or acquired name's ticker never relists it). Fetches are judged in time
 order with the cover pages, against what was known at the fetch. The same new-equity test applies. A
 company acquired into another CIK (GORO, STRR) has neither, and stays
 delisted: its ticker's later bars belong to the other CIK.
@@ -213,10 +213,13 @@ def _registered(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     )
 
 
-def _deregistered(stop: _Stop, until: datetime, marks: _Marks) -> bool:
-    """A Form 15 accepted by `until` inside the stop's reorganisation window."""
+def _deregistered(stop: _Stop, until: datetime, marks: _Marks, *, windowed: bool = True) -> bool:
+    """A Form 15 accepted by `until` inside the stop's reorganisation window
+    (or, with `windowed=False`, any time from the window's start)."""
     return any(
-        stop.reorg_start <= _session_of(at) <= stop.reorg_end and at <= until
+        stop.reorg_start <= _session_of(at)
+        and (not windowed or _session_of(at) <= stop.reorg_end)
+        and at <= until
         for form in _DEREGISTRATION_FORMS
         for at in marks.get(form, ())
     )
@@ -538,7 +541,7 @@ class _Builder:
                     record.exchange == exchange
                     and record.ticker in tickers
                     and at.astimezone(_EXCHANGE_TZ).date() >= stop.effective_on + lag
-                    and not _deregistered(stop, at, marks)
+                    and not _deregistered(stop, at, marks, windowed=False)
                 ):
                     self._relist(first, classes, cls, exchange, at, "snapshot", marks)
 
