@@ -660,7 +660,7 @@ def test_the_edgar_commit_never_reaches_the_source() -> None:
     from tradepartner.ingest import _prefetch, _Recorded
 
     recorded = _Recorded(_filings())
-    _prefetch(recorded, Settings(_env_file=None))
+    _prefetch(recorded, Settings(_env_file=None), dry_run=False)
     with pytest.raises(RuntimeError, match="after the fetch pass"):
         recorded.facts(ACME, ["SomethingNew"])
 

@@ -136,6 +136,28 @@ def test_the_form_offers_exactly_the_schemas_kinds(
     ]
 
 
+def test_the_page_never_offers_settle_order(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
+    """Spec req 17 (#571): the page has no broker and the settlement gate needs one,
+    so its kinds stay req 9's three although the schema allows `settle_order`."""
+    assert schema.SETTLE_ORDER_KIND in schema.JOURNAL_ENUMS["overrides", "kind"]
+    assert schema.SETTLE_ORDER_KIND not in override_page.KINDS
+    at = _app(monkeypatch, store)
+    assert not at.exception
+    assert schema.SETTLE_ORDER_KIND not in at.selectbox(key=override_page.KIND_KEY).options
+
+
+def test_a_settle_order_submit_is_refused_and_writes_nothing(store: Path) -> None:
+    """Even a submit that bypasses the form's options is refused by the writer the
+    page shares with `paper override`."""
+    outcome = override_page.submit(
+        _settings(store), schema.SETTLE_ORDER_KIND, _REBALANCE, _NAME, _REASON
+    )
+    assert outcome.status is override_page.OutcomeStatus.REFUSED
+    assert outcome.refusal == "override"
+    assert schema.SETTLE_ORDER_KIND in outcome.message
+    assert _rows(store) == []
+
+
 def test_the_page_renders_with_no_memo_table(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
     """ADR 0008 point 4: the form is never blocked by the memo layer. Phase 4
     has no memo table at all, and the page renders its form without one."""

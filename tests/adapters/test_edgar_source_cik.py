@@ -20,6 +20,7 @@ and `parse_sgml_header` run for real rather than being stubbed.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import gzip
 import io
 import json
@@ -35,7 +36,8 @@ from test_edgar_fsn import FSN_PAGE_URL, _fsn_zip_bytes, _fsn_zip_url, _num, _su
 from test_edgar_source import EXCHANGE_LINE, KLX, KLX_25NSE, KLX_LINE, MISSING_LINE, SUBMISSIONS_URL
 from test_edgar_source import _payload as _index_payload
 
-from tradepartner.adapters import edgar_raw
+from tradepartner.adapters import edgar_raw, edgar_source
+from tradepartner.adapters.edgar import CoverPageParse
 from tradepartner.adapters.edgar_source import (
     COVER_VERSION,
     DELISTING_VERSION,
@@ -233,6 +235,68 @@ def test_a_lag_window_filing_absent_from_fsn_is_fetched_once_and_cached(tmp_path
     [again] = source.cover_pages(APPLE)
     assert again == page
     assert router.urls[before:] == []
+
+
+def test_a_lag_window_parse_carries_its_incomplete_listings_into_cache_and_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#612: a per-document parse's skipped listings (no title or exchange,
+    #609) are written to its cover cache entry and counted once on
+    `.cover_incomplete_listings`, as FSN's are on `.fsn_incomplete_listings`;
+    a cache hit (the `facts` pass, a later run) re-counts nothing."""
+    real_parse = edgar_source.parse_cover_page
+
+    def parse_with_two_skipped(
+        document: bytes, *, accession: str, accepted_at: datetime
+    ) -> CoverPageParse:
+        parsed = real_parse(document, accession=accession, accepted_at=accepted_at)
+        return dataclasses.replace(parsed, incomplete_listings=2)
+
+    monkeypatch.setattr(edgar_source, "parse_cover_page", parse_with_two_skipped)
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000050"
+    router.add(_download_url(APPLE, accession, "lagwin.htm"), _COVER_DOCUMENT)
+    source = _source(settings, router)
+    stamps = {accession: _record(accession, "10-K", INSIDE_LAG, primary_document="lagwin.htm")}
+    _seed_stamps(source, APPLE, stamps)
+    assert source.cover_incomplete_listings == 0
+    source.cover_pages(APPLE)
+    source.cover_pages(APPLE)  # served from the cache: not counted again
+    assert source.cover_incomplete_listings == 2
+    cache_path = (
+        Path(settings.edgar.cache_dir) / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
+    )
+    assert json.loads(cache_path.read_text())["incomplete_listings"] == 2
+
+    later = _source(settings, router)  # a later run over the same cache
+    _seed_stamps(later, APPLE, stamps)
+    later.cover_pages(APPLE)
+    assert later.cover_incomplete_listings == 0
+
+
+def test_a_cover_cache_entry_written_before_612_still_loads(tmp_path: Path) -> None:
+    """#612 adds `incomplete_listings` to the cover cache entry without a
+    `COVER_VERSION` bump: an entry with no such key is still a cache hit."""
+    settings = _settings(tmp_path)
+    source = _source(settings, _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    entry = {
+        "version": COVER_VERSION,
+        "accession": APPLE_ACCESSION,
+        "cik": APPLE,
+        "entity_cik": APPLE,
+        "listings": [["Old Title", "OLD", "NYSE"]],
+        "facts": [],
+    }
+    cache_path = (
+        Path(settings.edgar.cache_dir) / "cover" / f"v{COVER_VERSION}" / f"{APPLE_ACCESSION}.json"
+    )
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps(entry))
+    [page] = source.cover_pages(APPLE)
+    assert [item.ticker for item in page.listings] == ["OLD"]
+    assert source.cover_incomplete_listings == 0
 
 
 def test_an_older_accession_absent_from_fsn_is_not_fetched_and_is_counted(tmp_path: Path) -> None:

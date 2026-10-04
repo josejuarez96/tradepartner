@@ -1206,6 +1206,57 @@ def test_an_unpriced_open_quantity_buy_halts_at_the_reserve_before_any_submit(
     assert not env.fake.calls[calls:]
 
 
+@pytest.mark.parametrize("with_sell", [False, True])
+def test_an_engaged_switch_skips_before_the_reserve_reads_an_unpriced_open_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, with_sell: bool
+) -> None:
+    """#692 (owner Q1 = B): the switch is read before the reserve pre-check, so
+    an engaged switch ends the batch `skipped_kill_switch`, never a fault, even
+    when an open quantity buy has no price; nothing written, nothing sent."""
+    env.new_fake(cash=10_000.0)
+    _stale_order(env, "buy", quantity=3.0)
+    batch = [_decision(env, B, "buy", notional=1000.0)]
+    if with_sell:
+        _hold(env, A, 10.0)
+        batch.insert(0, _decision(env, A, "sell", notional=300.0))
+    _override(env)
+    calls = len(env.fake.calls)
+    outcome = _execute(_gate(env, alerter_conn), env, batch)
+    assert outcome.status == "skipped_kill_switch"
+    assert not env.fake.calls[calls:]
+    assert _query(
+        env.settings, "SELECT count(*) FROM orders WHERE run_id = ?", [env.run.run_id]
+    ) == [(0,)]
+
+
+def test_the_reserve_pre_check_runs_after_the_switch_read_and_before_any_sell(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#692: on a sell-and-buy batch the order is switch read, then the
+    reserve pre-check, then the sells phase's own switch read and submits."""
+    env.new_fake(cash=10_000.0)
+    _hold(env, A, 10.0)
+    trim = _decision(env, A, "sell", notional=300.0)
+    buy = _decision(env, B, "buy", notional=1000.0)
+    gate = _gate(env, alerter_conn)
+    seen: list[str] = []
+    engaged, reserve = gate._engaged, wrapper.open_buy_reserve
+
+    def spy_engaged(*args: Any, **kwargs: Any) -> bool:
+        seen.append("switch")
+        return engaged(*args, **kwargs)
+
+    def spy_reserve(*args: Any, **kwargs: Any) -> Any:
+        seen.append("reserve")
+        return reserve(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "_engaged", spy_engaged)
+    monkeypatch.setattr(wrapper, "open_buy_reserve", spy_reserve)
+    env.fake.on_submit = lambda _request: seen.append("submit")
+    _execute(gate, env, [trim, buy])
+    assert seen[:4] == ["switch", "reserve", "switch", "submit"]
+
+
 def test_a_sells_only_batch_never_reads_the_reserve(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:

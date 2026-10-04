@@ -151,7 +151,11 @@ reason is the trimmed text.
   the clock it is stamped with), raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
-  share. It reads the clock, then opens one short-lived `open_for_write`
+  share. It first refuses `override` for kind `settle_order` (#571, spec req
+  17: that kind is `paper settle`'s alone, whose gate needs a fresh broker
+  read the page and `paper override` do not make), before the clock, the
+  store or any other check. It then reads the clock, opens one short-lived
+  `open_for_write`
   (`StoreLockedError` propagates: "store busy"), refuses `no_window`, refuses
   `override` for a kind outside the schema's set or fields the kind does not
   take (`engage_kill_switch` takes neither a session nor a name;
@@ -223,7 +227,12 @@ from tradepartner.store.journal import (
     unconsumed_kill_switch_overrides,
     window_stops_for,
 )
-from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS, init_schema
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_ENUMS,
+    SETTLE_ORDER_KIND,
+    init_schema,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -822,25 +831,38 @@ def _open_orders(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
 
 
 def _not_ready(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[str]:
-    """Every order of the window that is not terminal, and every outcome kind a
-    terminal one earns (`execution.outcomes`) with no row yet."""
+    """Every order of the window that is not terminal, every outcome kind a
+    terminal one earns (`execution.outcomes`) with no row yet, and (#571, spec
+    req 17 and req 15 (3)) every order with a live fill (`superseded_by` null,
+    what `fills_for` returns) journaled after its first terminal event: a fill
+    journaled with that event shares its stamp, and a feed fill after req 8's
+    synthetic fill is superseded, so neither is listed."""
     orders = orders_for(conn, window_id=window_id)
     open_ids = {o.client_order_id for o in non_terminal_orders(conn, window_id=window_id)}
     terminal: dict[str, str] = {}
+    terminal_at: dict[str, datetime] = {}
     for event in sorted(
         order_events_for(conn, window_id=window_id), key=lambda e: (e.known_at, e.ingested_at)
     ):
         if event.status in TERMINAL_ORDER_STATUSES:
             terminal.setdefault(event.client_order_id, event.status)
+            terminal_at.setdefault(event.client_order_id, event.known_at)
     filled: dict[str, float] = {}
+    late: set[str] = set()
     for item in fills_for(conn, window_id=window_id):
         coid = item.fill.client_order_id
         filled[coid] = filled.get(coid, 0.0) + item.fill.quantity
+        if coid in terminal_at and item.fill.known_at > terminal_at[coid]:
+            late.add(coid)
     written = {(o.client_order_id, o.kind) for o in outcomes_for(conn, window_id)}
 
     missing: list[str] = []
     for order in sorted(orders, key=lambda o: o.client_order_id):
         coid = order.client_order_id
+        if coid in late:
+            missing.append(
+                f"order {coid} ({order.symbol}) has a live fill journaled after its terminal event"
+            )
         if coid in open_ids or coid not in terminal:
             missing.append(f"order {coid} ({order.symbol}) is not terminal")
             continue
@@ -1284,7 +1306,14 @@ def override(
     """Append one `overrides` row to the open window and return its
     `override_id` (module docstring; spec req 9). Raises
     `WindowCommandRefused` for every refusal, nothing written, and
-    `StoreLockedError` when the store stays locked ("store busy")."""
+    `StoreLockedError` when the store stays locked ("store busy"). Kind
+    `settle_order` is refused first (spec req 17, #571)."""
+    if kind == SETTLE_ORDER_KIND:
+        raise WindowCommandRefused(
+            OVERRIDE,
+            f"override kind {kind!r} is written only by `paper settle --order --reason`, "
+            "whose gate reads the broker first",
+        )
     now = _command_clock(clock)
     note = reason.strip()
     with open_for_write(settings) as conn:
