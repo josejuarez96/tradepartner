@@ -33,6 +33,7 @@ from tradepartner.store.journal import (
     JournalNotInitialised,
     OrderRow,
     PaperRunRow,
+    ReconciliationRow,
     all_fill_ids,
     append,
     fills_for,
@@ -237,6 +238,37 @@ def test_known_at_is_stored_as_given_whatever_the_broker_says(
         _NOW - timedelta(hours=1),
         learned,
     )
+
+
+@pytest.mark.parametrize("status", schema.JOURNAL_ENUMS[("reconciliations", "status")])
+@pytest.mark.parametrize(
+    "offset", [timedelta(0), -timedelta(microseconds=1)], ids=["tie", "before"]
+)
+def test_a_fill_not_stamped_after_every_reconciliation_is_refused(
+    conn: duckdb.DuckDBPyConnection, status: str, offset: timedelta
+) -> None:
+    """#650: a ledger counts a fill's cash only when its `known_at` is strictly
+    after its base reconciliation's, so a fill journaled after a reconciliation
+    with a stamp that ties it (a frozen clock) or precedes it would vanish from
+    every later ledger's cash. The writer refuses it instead."""
+    append(conn, _sample(ReconciliationRow, status=status, known_at=_NOW, ingested_at=_NOW))
+    stamp = _NOW + offset
+    with pytest.raises(ValueError, match="not after the latest reconciliation"):
+        append(conn, _sample(FillRow, known_at=stamp, ingested_at=_NOW))
+    assert conn.execute("SELECT COUNT(*) FROM fills").fetchone() == (0,)
+
+
+def test_a_fill_stamped_after_every_reconciliation_appends(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """The floor is the latest reconciliation in any window; one microsecond
+    later is enough, and a fill with no reconciliation yet has no floor."""
+    append(conn, _sample(FillRow, broker_fill_id="before", known_at=_NOW, ingested_at=_NOW))
+    for window_id, at in ((1, _NOW - timedelta(hours=1)), (2, _NOW)):
+        append(conn, _sample(ReconciliationRow, window_id=window_id, known_at=at, ingested_at=at))
+    later = _NOW + timedelta(microseconds=1)
+    append(conn, _sample(FillRow, broker_fill_id="after", known_at=later, ingested_at=later))
+    assert conn.execute("SELECT COUNT(*) FROM fills").fetchone() == (2,)
 
 
 def test_append_refuses_what_is_not_a_row_type(conn: duckdb.DuckDBPyConnection) -> None:
