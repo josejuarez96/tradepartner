@@ -42,6 +42,7 @@ from tradepartner.execution.risk import (
     Violations,
     _spendable,
     check_phase,
+    open_sold,
     round_down,
     size_buys,
     unfilled_sells,
@@ -65,13 +66,13 @@ _NO_ACTIONS = pl.DataFrame(
 )
 
 
-def _split(ex_date: date) -> pl.DataFrame:
+def _split(ex_date: date, ratio: float = 2.0) -> pl.DataFrame:
     return pl.DataFrame(
         {
             "security_id": ["A"],
             "action_type": ["split"],
             "ex_date": [ex_date],
-            "ratio_or_amount": [2.0],
+            "ratio_or_amount": [ratio],
         }
     )
 
@@ -315,6 +316,104 @@ def test_open_sells_count_only_their_unfilled_part() -> None:
         [order], [accepted], [fill], _price_of, _split(date(2026, 9, 30)), session=_S
     )
     assert before == [OpenSell("A", 2.0)]  # ex-date on the order's own session: already in
+
+
+def _open_sell_row(quantity: float | None = None, notional: float | None = None) -> OrderRow:
+    return OrderRow(
+        client_order_id="tp-A-1",
+        decision_id=9,
+        run_id=1,
+        session=date(2026, 9, 30),
+        attempt=1,
+        phase="sell",
+        security_id="A",
+        symbol="A",
+        side="sell",
+        quantity=quantity,
+        notional=notional,
+        sells_in_flight_at_submit=False,
+        known_at=_NOW,
+        ingested_at=_NOW,
+    )
+
+
+def _sell_fills(*quantities: float, price: float = 10.0) -> list[OrderedFill]:
+    return [
+        OrderedFill(
+            fill=replace(_fill("tp-A-1", q), price=price),
+            side="sell",
+            security_id="A",
+            symbol="A",
+            run_id=1,
+            window_id=1,
+        )
+        for q in quantities
+    ]
+
+
+_ACCEPTED = OrderEventRow(
+    client_order_id="tp-A-1", status="accepted", known_at=_NOW, ingested_at=_NOW
+)
+
+
+def test_an_open_sells_unfilled_part_is_exact_not_float_noise() -> None:
+    """#719 item 1: the unfilled part is submitted minus filled in `Decimal`,
+    so a large partly filled sell leaves its exact grid quantity (`float`
+    leaves 0.30000000000001137 for 500 - 499.7) and a fully filled one with no
+    terminal event yet leaves nothing (`float` leaves about 1e-16)."""
+    order = _open_sell_row(quantity=500.0)
+    (partly,) = unfilled_sells(
+        [order], [_ACCEPTED], _sell_fills(499.7), _price_of, _NO_ACTIONS, session=_S
+    )
+    assert partly == OpenSell("A", 0.3)
+    whole = _open_sell_row(quantity=1.0)
+    fills = _sell_fills(0.7, 0.2, 0.1)
+    assert unfilled_sells([whole], [_ACCEPTED], fills, _price_of, _NO_ACTIONS, session=_S) == []
+
+
+def test_an_off_grid_open_sell_after_a_one_third_split_counts_up_to_the_grid() -> None:
+    """#719 item 1: a 1-for-3 split leaves 10 unfilled shares at 3.333...; the
+    nearest 9-dp step (3.333333333) would under-count it by a third of a step,
+    so an off-grid estimate rounds **up** (3.333333334). 9 shares land on 3
+    up to `float` noise, which still snaps to the nearest step."""
+    split = _split(_S, 1 / 3)
+    ten = unfilled_sells(
+        [_open_sell_row(quantity=10.0)], [_ACCEPTED], [], _price_of, split, session=_S
+    )
+    assert open_sold(ten, 9) == {"A": Decimal("3.333333334")}
+    nine = unfilled_sells(
+        [_open_sell_row(quantity=9.0)], [_ACCEPTED], [], _price_of, split, session=_S
+    )
+    assert open_sold(nine, 9) == {"A": Decimal(3)}
+
+
+def test_an_open_notional_sell_estimate_counts_up_to_the_grid() -> None:
+    """#719 item 1: a notional sell's unfilled value over the reference price
+    is an estimate, never on the grid by construction: it rounds up."""
+    order = _open_sell_row(notional=100.0)  # $100 at $10: fills 3 shares, $70 left
+    (left,) = unfilled_sells(
+        [order], [_ACCEPTED], _sell_fills(3.0), lambda _s: 30.0, _NO_ACTIONS, session=_S
+    )
+    assert open_sold([left], 9) == {"A": Decimal("2.333333334")}
+    assert open_sold([left], 2) == {"A": Decimal("2.34")}
+
+
+@pytest.mark.parametrize(
+    ("unfilled", "decimals", "expected"),
+    [
+        (1.0 - (0.7 + 0.2 + 0.1), 9, "0"),  # float noise of a filled sell
+        (1.0 - 0.7, 9, "0.3"),  # 0.30000000000000004
+        (9 * (1 / 3), 9, "3"),  # 2.9999999999999996 or so
+        (0.615, 2, "0.62"),  # off the 2-dp grid by half a step: up
+        (0.611, 2, "0.62"),  # off the grid below the midpoint: still up
+        (0.62, 2, "0.62"),
+    ],
+)
+def test_open_sold_snaps_only_float_noise_and_rounds_any_other_off_grid_part_up(
+    unfilled: float, decimals: int, expected: str
+) -> None:
+    """#719 item 1: nearest step only within `float` noise of it, else up."""
+    assert open_sold([OpenSell("A", unfilled)], decimals) == {"A": Decimal(expected)}
 
 
 def _fill(client_order_id: str, quantity: float) -> Any:

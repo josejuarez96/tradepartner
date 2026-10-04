@@ -21,6 +21,7 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution.ids import client_order_id
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.phases import (
+    HeldSell,
     PhaseOrder,
     PhaseOrders,
     buy_orders,
@@ -383,6 +384,8 @@ def test_a_trim_cut_to_zero_by_open_sells_alone_is_held_not_skipped() -> None:
     trim = _d(1, "sell", notional=950.0)
     result = _sells([trim], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 50.0)])
     assert result.orders == () and result.skips == ()
+    # #719 items 2 and 4: the hold is reported, with both quantities.
+    assert result.held == (HeldSell(1, "SEC_1", 9.5, 0.0, "skip_below_minimum"),)
 
 
 def test_a_trim_below_the_minimum_even_without_open_sells_still_skips() -> None:
@@ -419,6 +422,7 @@ def test_a_trim_whose_cap_leaves_it_below_the_minimum_is_held_not_skipped() -> N
     # cap: 10 - 9.999 = 0.001 shares, $0.10 of notional, below the $1 minimum.
     result = _sells([trim], {"SEC_1": 10.0}, residues={"SEC_1": 9.999})
     assert result.orders == () and result.skips == ()
+    assert result.held == (HeldSell(1, "SEC_1", 9.5, 0.001, "skip_below_minimum"),)
 
 
 def test_a_full_exit_nets_out_its_own_open_sells() -> None:
@@ -489,6 +493,7 @@ def test_a_full_exit_whose_open_sells_cover_the_whole_holding_is_held() -> None:
     plan = _d(1, "sell", reason="left_targets", quantity=10.0)
     result = _sells([plan], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 10.0)])
     assert result.orders == () and result.skips == ()
+    assert result.held == (HeldSell(1, "SEC_1", 10.0, 0.0, "dust"),)
 
 
 def test_a_full_exit_that_is_dust_even_without_open_sells_still_skips() -> None:
@@ -498,6 +503,30 @@ def test_a_full_exit_that_is_dust_even_without_open_sells_still_skips() -> None:
     result = _sells([plan], {"SEC_1": 0.4}, open_sells=[OpenSell("SEC_1", 5.0)])
     assert result.orders == ()
     assert _reasons(result) == {"SEC_1": "dust"}
+    assert result.held == ()
+
+
+def test_a_trim_beside_an_off_grid_open_sell_after_a_split_passes_check_phase() -> None:
+    """#719 item 1: 10 unfilled shares through a 1-for-3 split are 3.333...;
+    the open-sells sum counts them up to 3.333333334, so the trim's cap is
+    10 - 3.333333334 and `check_phase`, reading the same sum, passes it."""
+    trim = _d(1, "sell", notional=10_000_000.0)
+    held = {"SEC_1": 10.0}
+    opens = [OpenSell("SEC_1", 10.0 * (1 / 3))]
+    order = _one(_sells([trim], held, open_sells=opens))
+    assert order.quantity == 6.666666666
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=opens,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
 
 
 #: What `unfilled_sells` leaves for a sell of 1.0 filled 0.7 + 0.2 + 0.1 with
@@ -783,6 +812,23 @@ def test_a_buy_of_a_name_the_sells_phase_skipped_is_refused() -> None:
     assert sells.orders == () and _reasons(sells) == {"SEC_2": "skip_untradable"}
     with pytest.raises(ValueError, match="both sells and buys \\['SEC_2'\\]"):
         _buys(THREE[:2], 1000.0, sells=sells)
+
+
+def test_a_buy_of_a_name_whose_sell_the_phase_held_is_refused() -> None:
+    """#719 item 4: a held sell is neither an order nor a skip, but it still
+    sells the name in this phase, so the "both sells and buys" guard sees it."""
+    trim = _d(9, "sell", sid="SEC_2", notional=300.0)
+    sells = _sells([trim], {"SEC_2": 10.0}, open_sells=[OpenSell("SEC_2", 10.0)])
+    assert sells.orders == () and sells.skips == () and len(sells.held) == 1
+    with pytest.raises(ValueError, match="both sells and buys \\['SEC_2'\\]"):
+        _buys(THREE[:2], 1000.0, sells=sells)
+
+
+def test_buys_refuse_a_held_only_sells_phase_of_another_session() -> None:
+    trim = _d(9, "sell", sid="SEC_5", notional=300.0)
+    sells = _sells([trim], {"SEC_5": 10.0}, open_sells=[OpenSell("SEC_5", 10.0)])
+    with pytest.raises(ValueError, match="sells phase of"):
+        _buys(THREE[:1], 1000.0, sells=PhaseOrders((), (), held=sells.held, session=T0))
 
 
 def test_a_buy_of_a_name_with_a_sell_in_flight_is_refused() -> None:
