@@ -365,6 +365,15 @@ def test_the_module_still_never_updates_or_deletes() -> None:
     assert not re.search(r"\b(UPDATE|DELETE|TRUNCATE|DROP|ALTER)\b", code)
 
 
+def test_the_kill_switch_override_kind_is_the_shared_schema_constant() -> None:
+    """#691: `OverrideWithUse.consumed` and `unconsumed_kill_switch_overrides` compare
+    against `schema.ENGAGE_KILL_SWITCH_KIND`, never a quoted copy of it, so a renamed
+    kind cannot leave the journal readers matching a stale string."""
+    code = re.sub(r'"""[\s\S]*?"""', "", Path(journal.__file__).read_text())
+    assert f'"{schema.ENGAGE_KILL_SWITCH_KIND}"' not in code
+    assert code.count("== ENGAGE_KILL_SWITCH_KIND") == 2
+
+
 # --- windows ------------------------------------------------------------------------------
 
 
