@@ -1090,7 +1090,8 @@ def test_the_fetched_security_types_come_from_config(settings: Settings) -> None
 @pytest.mark.parametrize(
     ("sid", "exchange", "types", "fetched"),
     [
-        ("X", "NYSE", {}, True),  # not classified yet (e.g. a Form 10 spin-off)
+        ("X", "NYSE", {}, True),  # no classification row yet
+        ("X", "NYSE", {"X": {"unclassifiable"}}, True),  # e.g. before a spin-off's first 10-Q
         ("X", "NYSE", {"X": {"foreign", "common"}}, True),  # common in an earlier revision
         ("X", "NYSE", {"X": {"debt"}}, False),
         ("X", "OTC", {"X": {"common"}}, False),

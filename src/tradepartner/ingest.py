@@ -105,7 +105,10 @@ from tradepartner.adapters.filings import (
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session, previous_session
 from tradepartner.config import Settings, clean_message
+from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import (
+    COMMON,
+    UNCLASSIFIABLE,
     ClassificationBuild,
     build_classifications,
     classifications_as_of,
@@ -826,7 +829,9 @@ def _counted(
 def _types_known(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, set[str]]:
     """Every `security_type` of each security in a `classifications` row
     known at `t`: every revision, not only the latest, so a window before a
-    later reclassification still fetches the name (#794)."""
+    later reclassification still fetches the name (#794). A bare date
+    raises `TypeError`, a naive datetime `ValueError`."""
+    t = _validate_t(t)
     types: dict[str, set[str]] = defaultdict(set)
     for sid, kind in conn.execute(
         "SELECT DISTINCT security_id, security_type FROM classifications WHERE known_at <= ?",
@@ -845,15 +850,17 @@ def _fetched(
 ) -> bool:
     """Whether a listing `row` puts `sid` in the price fetch (#794): a
     benchmark, or a listing on one of `universe.exchanges` whose security
-    has no classification yet or a `types` entry that is common or one of
-    `universe.security_types`. No note, preferred (unless configured) or
-    OTC listing; wider than `_counted`, so every counted name is fetched."""
+    is not classified yet (no row, or `unclassifiable`) or has a `types`
+    entry that is common or one of `universe.security_types`. No note,
+    preferred (unless configured) or OTC listing; wider than `_counted`, so
+    every counted name is fetched."""
     if sid in benchmarks:
         return True
     if row["exchange"] not in settings.universe.exchanges:
         return False
     known = types.get(sid)
-    return not known or not known.isdisjoint({"common", *settings.universe.security_types})
+    wanted = {COMMON, UNCLASSIFIABLE, *settings.universe.security_types}
+    return not known or not known.isdisjoint(wanted)
 
 
 def _may_count(
