@@ -12,7 +12,7 @@ What TradePartner should test next, and why, in proposed order. An entry here is
 |---|---|---|---|---|---|---|
 | B1 | 12-1 momentum, long-only, monthly (H1) | HO-1 SUPPORTED vs G1-1, QI-3 MIXED | have | have | — | hypothesis file on `main`; `hypothesis register` and the run are the owner's T45b |
 | B2 | Trend filter on H1 (hold cash when the market is below its 10-month average) | TT-1, HO-5 MIXED | have | small | S | **parked** (#659) |
-| B3 | Profitability tilt (gross profit / assets), slow, long-only | QI-6 SUPPORTED (narrow); QI-16 MIXED | **add 4 XBRL facts** | new family | M | proposed |
+| B3 | Profitability tilt (gross profit / assets), slow, long-only | QI-6 SUPPORTED (narrow); QI-16 MIXED | **5 XBRL facts** (#660 spec merged; in the store with T78) | new family (spec amendment #720, draft) | M | hypothesis file drafted (#720), not registrable |
 | B4 | Momentum + profitability combined | G4-2 MIXED; G4-1 SUPPORTED (long-short only) | after B1, B3 | small | S | after B1 and B3 |
 | B5 | Filing change (deterministic text) → next-quarter fundamentals | ER-4, ER-5 INSUFFICIENT; INT-4 | **filing text ingest** | research regression, not the backtester | L | proposed |
 | B6 | Filing change → returns (Lazy Prices, post-publication, net) | ER-1 INSUFFICIENT; NE-6 | after B5 | new family | M | after B5 |
@@ -39,14 +39,15 @@ Parked ideas are listed at the end with the reason.
 - **Information value:** the cheapest test of whether a risk overlay belongs in the system at all. It needs no new data.
 - **Cost:** S. It counts as trials in the `momentum` family, so it raises H1's deflated-Sharpe bar.
 
-### B3. Profitability tilt
+### B3. Profitability tilt: file drafted, waits on the family and T78
 - **Tests:** QI-6, the only SUPPORTED stock-selection claim in the register, narrowly: slow, liquid, diversified profitability. QI-16: broader quality bundles are MIXED, so stay with plain gross profitability.
-- **Data:** add as-filed `GrossProfit` (or `Revenues` minus `CostOfRevenue`) and `Assets` to the company-facts ingest. The pipeline exists, stamps acceptance times, and withholds conflicting values (EP-P12, EP-P13). Today it keeps only shares outstanding. Annual values, as first filed, never restated.
-- **Engine:** a new `profitability` family: an annual signal with a monthly rebalance, inside the ADR 0006 universe.
-- **Prior:** small positive excess, well below published magnitudes. Expect long flat stretches.
-- **Kill:** in-sample deflated Sharpe below the family bar, or an excess return explained away by momentum and market exposure.
+- **Data:** the five as-filed statement facts of the data-foundation amendment #660 (`revenue`, `cost_of_revenue`, `gross_profit` with a derived fallback, `total_assets`, `operating_cash_flow`): first vintage only, `known_at` = the filing's acceptance, conflicts withheld (EP-P12, EP-P13). The spec is merged; the store holds the rows once the owner runs T78. B3 reads `gross_profit` and `total_assets`; the cash-based variant reads `operating_cash_flow`.
+- **Engine:** a new `profitability` family: an annual signal with a monthly rebalance, inside the ADR 0006 universe. Specified as a draft amendment of the [backtest spec](../specs/backtest.md#amendment-2026-10-03-720-the-profitability-family-draft) (#720): what the engine reads, the point-in-time rule for annual facts, the `profitability.*` keys, the counts and the proposed tasks T85 to T85f.
+- **Hypothesis file:** [b3-gross-profitability](../hypotheses/b3-gross-profitability.md) (draft, #720): prior, kill, power arithmetic, prior-evidence disclosure and the family's trial budget, with B3-1 and B3-2 decided by the owner (2026-10-03) and B3-3 to B3-8 open. Not registrable until the family exists and T78 lands.
+- **Prior:** small positive excess, well below published magnitudes (0 to +0.5 pp/yr over SPY; range −2 to +2). Expect long flat stretches and a sector-shaped book.
+- **Kill:** the file's retirement rule (first audited in-sample trial with net excess over SPY below −1 pp/yr and `dsr_excess` below 0.5); the momentum-and-market spanning check is a pre-declared diagnostic, a registered research run, not part of the rule (B3-8).
 - **Information value:** high. It is the best-evidenced idea, it is the first non-price signal, and it proves the fundamentals pipeline that B5 and the E1 economic test also need (revenue).
-- **Cost:** M (one data extension, one family).
+- **Cost:** M (one data extension, merged as a spec; one family, five agent tasks and one owner run).
 
 ### B4. Momentum + profitability combined
 - **Tests:** G4-2 (MIXED for long-only, liquid portfolios); G4-1 (SUPPORTED for long-short or unconstrained only).
