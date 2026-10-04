@@ -16,15 +16,17 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    caller's own flag on; `dict(accept_rejections=accept_rejections)` would
    launder it into an iterable), the sole, unkeyworded, by-identity first
    argument of a 1-arg `type` call or the sole, unkeyworded, by-identity
-   first-of-2 argument of a 2-arg `isinstance` call (`resume`'s own type
-   check; a module that rebinds either name is refused outright, so the
-   calls can only be the builtins), the whole `test` of an `if`, or (for a
-   `Store`) the target of a bare annotated field. Everything else - a
-   literal or other expression under the `accept_rejections=` keyword, the
-   name under any other keyword, a positional pass, smuggling through a
-   starred list/tuple/set/dict display, a multiplied or generator
-   expression, an `IfExp`, an alias bound first and starred later, `del`, or
-   a PEP 695 type parameter named for it - is refused. The name is never
+   first-of-2 argument of a 2-arg `isinstance(x, bool)` call, its second
+   argument the bare name `bool` (`resume`'s own type check; a module that
+   rebinds either name, or uses a star import that could, is refused
+   outright - this makes the calls the builtins in every module this fence
+   can see, not in every module there is), the whole `test` of an `if`, or
+   (for a `Store`) the target of a bare annotated field. Everything else -
+   a literal or other expression under the `accept_rejections=` keyword,
+   the name under any other keyword, a positional pass, smuggling through
+   a starred list/tuple/set/dict display, a multiplied or generator
+   expression, an `IfExp`, an alias bound first and starred later, `del`,
+   or a PEP 695 type parameter named for it - is refused. The name is never
    otherwise bound (no `accept_rejections = True`, no match, except, import,
    global or nonlocal capture, and no `def`, `async def` or `class` named
    for it), and every such parameter is keyword-only (so no positional
@@ -37,8 +39,15 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
 
 Known limits (#696), not checked here: a value laundered through control
 flow into a new name (`if accept_rejections: f = True`) breaks the name-based
-premise entirely, and a positional `ast.Attribute` load (`row.accept_rejections`)
-inside an `ALLOWED` module is not checked the way a bare `Name` is.
+premise entirely; a positional `ast.Attribute` load (`row.accept_rejections`)
+inside an `ALLOWED` module is not checked the way a bare `Name` is; and the
+`isinstance`/`type` exemption still trusts the interpreter's own builtins and
+import machinery - a `**kwargs` collector other than `dict` by name (an alias
+of `dict`, `builtins.dict`, `collections.OrderedDict`, `SimpleNamespace`, or
+any plain function taking `**kwargs`), a class keyword (`accept_rejections`
+passed as `metaclass=...` or similar), patching `builtins.isinstance` itself,
+or reaching either name through `globals()[...]` all sit outside what a
+static AST scan can see.
 
 `test_each_rule_refuses_a_sample_that_breaks_it` runs each rule on a sample
 source that breaks it, so a rule that silently stops matching fails too.
@@ -156,14 +165,21 @@ def _parent_map(tree: ast.Module) -> dict[int, ast.AST]:
 def _is_type_check(call: ast.Call, node: ast.expr) -> bool:
     """Whether `call` is exactly `resume`'s own type check with `node` as the
     argument being checked: `type(x)` (1 positional arg, no keywords, `node`
-    is it) or `isinstance(x, T)` (2 positional args, no keywords, `node` is
-    the first, by identity, never by position alone)."""
+    is it) or `isinstance(x, bool)` (2 positional args, no keywords, `node`
+    is the first by identity, never by position alone, and the second is the
+    bare name `bool` - never a variable, so a custom `__instancecheck__`
+    cannot see the value)."""
     if call.keywords or not isinstance(call.func, ast.Name):
         return False
     if call.func.id == "type":
         return len(call.args) == 1 and call.args[0] is node
     if call.func.id == "isinstance":
-        return len(call.args) == 2 and call.args[0] is node
+        return (
+            len(call.args) == 2
+            and call.args[0] is node
+            and isinstance(call.args[1], ast.Name)
+            and call.args[1].id == "bool"
+        )
     return False
 
 
@@ -231,6 +247,8 @@ def misuses(tree: ast.Module) -> list[str]:
             (alias.asname or alias.name) in _TYPE_CHECKS for alias in node.names
         ):
             found.append(f"{node.lineno}: rebinds isinstance/type in an import")
+        elif isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            found.append(f"{node.lineno}: a star import can rebind isinstance/type unseen")
         elif isinstance(node, ast.arg) and node.arg in _TYPE_CHECKS:
             found.append(f"{node.lineno}: rebinds {node.arg} as a parameter")
         elif isinstance(node, (ast.Global, ast.Nonlocal)) and FLAG in node.names:
@@ -387,6 +405,8 @@ Rule = Callable[[ast.Module], object]
         ("isinstance(accept_rejections, bool, extra=1)", misuses),
         ("from x import _start as isinstance\nisinstance(accept_rejections, c)", misuses),
         ("_start(c, *dict(accept_rejections=accept_rejections).values())", misuses),
+        ("from m import *\nisinstance(accept_rejections, bool)", misuses),
+        ("isinstance(accept_rejections, Spy)", misuses),
         ("def accept_rejections(): ...", mentions),
         ("async def accept_rejections(): ...", mentions),
         ("class accept_rejections: ...", mentions),
