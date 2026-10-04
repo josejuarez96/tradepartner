@@ -215,6 +215,23 @@ def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
         assert not _on_tree(prefix), f"{prefix} exists now; drop it from PLANNED_PREFIXES"
 
 
+def test_edgar_source_requires_the_quant_audit() -> None:
+    # it fetches the filing text the store keeps (#382, owner decision 2026-10-04)
+    assert ready_pr.required_reviews(["src/tradepartner/adapters/edgar_source.py"]) == {
+        "quant-auditor"
+    }
+
+
+def test_uv_lock_requires_the_safety_review() -> None:
+    # dependency pins, like pyproject.toml (#382)
+    assert ready_pr.required_reviews(["uv.lock"]) == {"safety-reviewer"}
+
+
+def test_gitignore_requires_no_review() -> None:
+    # owner decision on #382: .gitignore gets no required reviewer
+    assert ready_pr.required_reviews([".gitignore"]) == set()
+
+
 def test_shared_list_guard_sees_only_added_bullets_under_the_list_heading() -> None:
     main = "## Done\n- a\n\n## Blocked\n- none\n"
     assert ready_pr.added_list_bullets(main, "## Done\n- a\n- b\n\n## Blocked\n", "## Done") == [
@@ -735,6 +752,7 @@ def test_the_flow_runs_only_the_mapped_tests_unless_full_tests(
     assert "--full-tests" in capsys.readouterr().out
 
     unclear = FakeRunner(test_sources=SOURCES, touched=["uv.lock", "changelog.d/69-x.md"])
+    unclear._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
     assert ready_pr.ready(unclear, 69, dry_run=True) == 0
     assert unclear.checks_run[-1] == ready_pr.PYTEST_CHECK
 
