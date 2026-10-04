@@ -523,6 +523,15 @@ class TestNoLookAhead:
         ("Common Stock Purchase Rights", "right"),
         ("Units, each consisting of one Class A ordinary share and one right", "unit"),
         ("Units", "unit"),
+        ("Common Shares (including Rights under Shareholder Rights Plan), no par value", EQUITY),
+        ("Common Stock, $0.01 par value, Preferred Stock Purchase Rights, 8.875% Series B", EQUITY),
+        ("Common Stock $0.0001 par value per share Preferred Share Purchase Rights", EQUITY),
+        ("Common shares (including common share purchase rights)", EQUITY),
+        ("Common Stock and associated Preferred Stock Purchase Rights", EQUITY),
+        ("Class A Common Stock and one Redeemable Warrant", "warrant"),
+        ("Depository Shares", "preferred"),
+        ("6.75% Series C Cumulative Redeemable PreferredShares of Beneficial Interest", "coupon"),
+        ("Preferred Stock, Par Value $25 Per Share, 4%, Noncumulative", "preferred"),
     ],
 )
 def test_listing_kind_reads_the_class_title(title: str, kind: str) -> None:
@@ -542,3 +551,4 @@ def test_listing_kind_reads_the_class_title(title: str, kind: str) -> None:
 )
 def test_an_untitled_listing_takes_its_ticker_suffix(ticker: str, kind: str) -> None:
     assert listing_kind(ticker, None) == kind
+    assert listing_kind(ticker, " ") == kind

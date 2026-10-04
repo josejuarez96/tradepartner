@@ -167,43 +167,75 @@ EQUITY = "equity"
 
 #: Non-equity words in a listing's title head, checked in this order.
 _LISTING_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bprefer(red|ence)"), "preferred"),
+    (re.compile(r"prefer(red|ence)"), "preferred"),  # also "CumulativePreferred"
     (re.compile(r"\b(notes?|debentures?|bonds?)\b"), "debt"),
     (re.compile(r"\bwarrants?\b"), "warrant"),
     (re.compile(r"\brights?\b"), "right"),
 )
 _INCLUDED_IN_UNITS = re.compile(r"\s+included\b.*\bunits?\b.*$")
-_DEPOSITARY_SHARE = re.compile(r"\bdepositary shares?\b")
+#: A common or ordinary class at the start of a head, and a shareholder
+#: rights plan attached to it after that ("Common Shares (including Rights
+#: under Shareholder Rights Plan)", "Common Stock ... Preferred Share
+#: Purchase Rights"): the rights trade with the shares, so the row is the
+#: common's. A head going on with "purchase", "rights" or "warrants" right
+#: after the class ("Common Stock Purchase Rights") is the instrument itself.
+_COMMON_HEAD = re.compile(
+    r"^((class|series) [a-z0-9] )?(common|ordinary|capital) (stock|shares?)\b"
+)
+_INSTRUMENT = re.compile(r"^\s*(purchase|rights?|warrants?)\b")
+_RIGHTS_PLAN = re.compile(
+    r"\b(including|associated|together with|with|and)\b.*\brights?\b.*$"
+    r"|\b(preferred|preference|common) (stock|shares?) purchase rights?\b.*$"
+)
+_DEPOSITARY_SHARE = re.compile(r"\bdepos[a-z]*ry ?shares?\b")
 _ADS = re.compile(r"\b(american|global)\b")
 _UNIT = re.compile(r"\bunits?\b")
 _EQUITY_UNIT = re.compile(r"\b(common|depositary) units?\b|\bpartner")
 _NON_EQUITY_SUFFIXES = frozenset({"warrant", "unit", "right", "preferred"})
+#: The kinds `listing_kind` returns for a non-equity row.
+NON_EQUITY_KINDS = ("coupon", "preferred", "debt", "warrant", "right", "unit")
+
+
+def _listing_head(class_title: str) -> str:
+    """The master's `_norm_title` head, less a trailing "included as part of
+    the units" clause (it names the shares or warrants inside a unit, not
+    the unit) and a rights plan attached to a common class."""
+    head = _INCLUDED_IN_UNITS.sub("", _norm_title(class_title))
+    common = _COMMON_HEAD.match(head)
+    if common is None:
+        return head
+    rest = head[common.end() :]
+    if _INSTRUMENT.match(rest):
+        return head
+    return head[: common.end()] + _RIGHTS_PLAN.sub("", rest)
 
 
 def listing_kind(ticker: str, class_title: str | None) -> str:
-    """`EQUITY`, or why one `listings` row is not an equity class, for the
-    price resolver (spec, amendment #735). Read from the row alone:
+    """`EQUITY`, or why one `listings` row is not an equity class (one of
+    `NON_EQUITY_KINDS`), for the price resolver (spec, amendment #735).
+    Read from the row alone, on its title head (`_listing_head`: up to the
+    first comma, less an "included as part of the units" clause and a
+    rights plan attached to a common class):
 
-    - a title with a `%` is a coupon instrument (`coupon`: notes, preferred);
-    - else the title head (the master's `_norm_title`, up to the first comma,
-      less a trailing "included as part of the units" clause, which names
-      the shares or warrants inside a unit, not the unit) naming preferred,
-      debt (note, debenture, bond), a warrant or a right is that kind;
-    - else a depositary *share* that is not American or Global is a bank's
-      preferred depositary share (`preferred`);
+    - a `%` in the head is a coupon instrument (`coupon`: notes, preferred);
+    - else a head naming preferred, debt (note, debenture, bond), a warrant
+      or a right is that kind;
+    - else a depositary *share* that is not American or Global is read as a
+      bank's preferred depositary share (`preferred`), so a foreign issuer's
+      ADS titled only "Depositary Shares" is left out too;
     - else a head naming a unit is a `unit`, unless it names common or
       depositary units or partner interests (an MLP's "Common Units");
-    - an untitled (snapshot) row takes its ticker suffix
+    - an untitled row (`None` or blank: a snapshot) takes its ticker suffix
       (`ticker_suffix_type`): warrant, unit, right or preferred.
 
     Everything else is `EQUITY`: common and ordinary shares, ADSs, and
     titles no rule recognises ("Shares", "Class A")."""
-    if class_title is None:
+    if class_title is None or not class_title.strip():
         suffix = ticker_suffix_type(ticker)
         return suffix if suffix in _NON_EQUITY_SUFFIXES else EQUITY
-    if "%" in class_title:
+    head = _listing_head(class_title)
+    if "%" in head:
         return "coupon"
-    head = _INCLUDED_IN_UNITS.sub("", _norm_title(class_title))
     for pattern, kind in _LISTING_WORDS:
         if pattern.search(head):
             return kind

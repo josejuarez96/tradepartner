@@ -220,7 +220,9 @@ class TestResolver:
         assert resolver.resolve("REUSE", date(2022, 3, 1)) == "0000000002"
         assert resolver.report.later_class_spans == 0
 
-    @pytest.mark.parametrize("ticker", ["", "N/A", "n/a", "None", "NONE", "NA", "-", " 0 "])
+    @pytest.mark.parametrize(
+        "ticker", ["", "N/A", "n/a", "None", "NONE", "Not applicable", "-", " 0 "]
+    )
     def test_placeholder_tickers_are_left_out(self, ticker: str) -> None:
         resolver = ListingResolver(
             [
@@ -277,6 +279,81 @@ class TestResolver:
             [_listing("SEC_OLD", "REUSE", START), _listing("SEC_NEW", "REUSE", date(2022, 3, 1))]
         )
         assert resolver.contested_spans == ()
+
+    @pytest.mark.parametrize("ticker", ["TRUE", "NA", "NO"])
+    def test_a_real_ticker_that_reads_as_a_word_resolves(self, ticker: str) -> None:
+        resolver = ListingResolver([_listing("0000000001", ticker, START, "Common Stock")])
+        assert resolver.resolve(ticker, date(2020, 1, 2)) == "0000000001"
+
+    def test_a_left_out_listing_still_shadows_an_older_company(self) -> None:
+        # Company 3's units take T in 2015: company 1's span (2005, never
+        # ended by a later listing) must not get 2016's bars back.
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "T", date(2005, 1, 3), "Common Stock"),
+                _listing("0000000003:units", "T", date(2015, 1, 2), "Units"),
+            ]
+        )
+        assert resolver.resolve("T", date(2014, 12, 31)) == "0000000001"
+        assert resolver.resolve("T", date(2016, 1, 4)) is None
+
+    def test_a_later_class_still_shadows_an_older_company(self) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "T", date(2005, 1, 3), "Common Stock"),
+                _listing("0000000002", "T", date(2010, 1, 4), "Class A Common Stock"),
+                _listing("0000000002:class-b", "T", date(2012, 1, 3), "Class B Common Stock"),
+                _listing("0000000002", "U", date(2014, 1, 2), "Class A Common Stock"),
+            ]
+        )
+        assert resolver.resolve("T", date(2011, 1, 3)) == "0000000002"
+        assert resolver.resolve("T", date(2013, 1, 2)) == "0000000002"
+        assert resolver.resolve("T", date(2015, 1, 2)) is None
+
+    def test_a_warrant_row_on_the_commons_day_does_not_cost_the_common(self) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "ABC", START, "Class A Common Stock"),
+                _listing("0000000001", "ABCW", START, "Redeemable Warrants"),
+            ]
+        )
+        assert resolver.resolve("ABC", date(2020, 1, 2)) == "0000000001"
+        assert resolver.report.same_day_securities == 0
+
+    def test_listings_from_a_later_day_never_change_an_earlier_mapping(self) -> None:
+        # No look-ahead: dropping every row from `cut` on leaves each
+        # earlier session's mapping as it was (renames aside: contested
+        # spans are the documented exception).
+        cut = date(2019, 7, 1)
+        rows = [
+            _listing("0000000001", "AAA", START),
+            _listing(
+                "0000000001",
+                "AAA",
+                date(2020, 2, 3),
+                "Common Shares (including Rights under Shareholder Rights Plan)",
+            ),
+            _listing("0000000001:notes", "AAA", date(2019, 10, 1), "1.5% Notes due 2029"),
+            _listing("0000000002", "BBB", START),
+            _listing("0000000002", "BB", date(2021, 3, 1), "Common Stock"),
+            _listing("0000000002", "BBB", date(2021, 3, 1), "Common Stock"),
+            _listing("0000000003", "CCC", START),
+            _listing("0000000003:class-b", "CCC", date(2019, 8, 1), "Class B Common Stock"),
+            _listing("0000000004", "DDD", START),
+            _listing("0000000005:warrants", "DDD", date(2020, 6, 1), "Warrants"),
+            _listing("0000000006", "EEE", date(2017, 5, 1), "Common Stock"),
+            _listing("0000000007", "EEE", date(2019, 9, 3), "Common Stock"),
+        ]
+        full = ListingResolver(rows)
+        early = ListingResolver([r for r in rows if r["valid_from"] < cut])  # type: ignore[operator]
+        sessions = [date(y, m, 1) for y in range(2016, 2020) for m in range(1, 13)]
+        for ticker in ("AAA", "BBB", "BB", "CCC", "DDD", "EEE"):
+            for session in (s for s in sessions if s < cut):
+                assert full.resolve(ticker, session) == early.resolve(ticker, session), (
+                    ticker,
+                    session,
+                )
+        assert full.resolve("AAA", date(2019, 3, 1)) == "0000000001"
 
     def test_symbols_over_a_range(self) -> None:
         resolver = ListingResolver(

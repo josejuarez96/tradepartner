@@ -10,16 +10,19 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
 - a security holds a ticker from a listing's `valid_from` until its next
   listing with a different ticker (a ticker change), so one security has
   one span per ticker it traded under;
-- only equity classes hold tickers (#735). A listing under a placeholder
-  ticker (`is_placeholder_ticker`: '', 'N/A', 'None', '-', ...) or of a
-  non-equity class (`store.classify.listing_kind`: notes, preferred,
-  warrants, rights, units, from the row's own class title, else its ticker
-  suffix) still ends the security's previous span but holds nothing, so a
-  company's notes listed under its common ticker never take it;
-- a security listing two different tickers from one day (FutureFuel's
-  cover page naming Ford's `F` beside its own `FF`) holds neither ticker,
-  nor any later one, from that day: its rows are not assigned, and the
-  tickers resolve as if it had never listed them;
+- only equity classes hold tickers (#735). A span with a listing under a
+  placeholder ticker (`is_placeholder_ticker`: '', 'N/A', 'None', '-',
+  ...) or of a non-equity class (`store.classify.listing_kind`: notes,
+  preferred, warrants, rights, units, from the row's own class title, else
+  its ticker suffix) holds nothing; its first row still ends the security's
+  previous span. A non-equity span still **shadows** another company's
+  older span from its own start (the ticker resolves to nothing rather than
+  back to the older company), but never its own company's, so a company's
+  notes listed under its common ticker never take or hide it;
+- a security listing two different tickers on equity rows of one day
+  (FutureFuel's cover page naming Ford's `F` beside its own `FF`) holds
+  neither ticker, nor any later one, from that day: its rows are not
+  assigned, and the tickers resolve as if it had never listed them;
 - a ticker reused by another company belongs to whichever span started
   most recently on or before the session, so an old company's bars stop
   resolving once the new company's listing starts;
@@ -27,16 +30,16 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   class that held a ticker first keeps it: a span starting while another
   class of the company already holds the ticker never holds it, not even
   after that class moves on (a Class B listed under the Class A's ticker);
+  it shadows other companies like a non-equity span;
 - two spans of one ticker starting on the same day, of two securities,
   are **ambiguous**: the ticker resolves to nothing while they are the
   latest, and the run goes on;
 - a span is **contested** when its ticker is later taken by another
-  security that arrived at it through a rename (Roundhill's
-  `META` ETF, then Facebook's `FB` -> `META`). Alpaca serves a renamed
-  company's history under its new symbol as well (#104), so rows under that
-  ticker on the old holder's dates may be the renamed company's. They
-  resolve to nothing and are reported, never assigned; `contested_spans`
-  lists them.
+  security that arrived at it through a rename (Roundhill's `META` ETF,
+  then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
+  history under its new symbol as well (#104), so rows under that ticker
+  on the old holder's dates may be the renamed company's. They resolve to
+  nothing and are reported, never assigned; `contested_spans` lists them.
 
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
@@ -161,11 +164,11 @@ class TickerSpan:
         return self.start <= session and (self.end is None or session < self.end)
 
 
-#: Ticker fields that name no ticker (compared stripped of spaces and
-#: quotes, upper-cased); a field with no letter is one too ('-', '0').
-PLACEHOLDER_TICKERS = frozenset(
-    {"", "N/A", "NA", "NONE", "NO", "NOT APPLICABLE", "TRUE", "FALSE", "TRADING SYMBOL"}
-)
+#: Ticker fields that name no ticker (compared stripped of spaces, quotes
+#: and brackets, upper-cased); a field with no letter is one too ('-',
+#: '0'). Only words no exchange uses as a symbol: `NA`, `NO` and `TRUE`
+#: are real tickers.
+PLACEHOLDER_TICKERS = frozenset({"", "N/A", "NONE", "NOT APPLICABLE", "TRADING SYMBOL"})
 
 
 def is_placeholder_ticker(ticker: str) -> bool:
@@ -232,13 +235,15 @@ class ListingResolver:
         self._by_ticker: dict[str, list[TickerSpan]] = defaultdict(list)
         self._by_security: dict[str, list[TickerSpan]] = defaultdict(list)
         self._history: dict[str, list[TickerSpan]] = defaultdict(list)  # no placeholders
+        # Spans that hold no ticker but shadow other companies' older spans.
+        self._blockers: dict[str, list[TickerSpan]] = defaultdict(list)
         placeholder = same_day_listings = 0
         same_day_securities: set[str] = set()
         non_equity: dict[str, int] = defaultdict(int)
         for security_id, rows in by_security.items():
-            # A placeholder sorts first on its day, so it never ends the span
-            # of a real ticker listed that same day.
-            rows.sort(key=lambda r: (r.day, r.kind != _PLACEHOLDER, r.ticker))
+            # A placeholder or non-equity row sorts first on its day, so it
+            # never ends the span of an equity ticker listed that same day.
+            rows.sort(key=lambda r: (r.day, r.kind == EQUITY, r.ticker))
             pair_day = _same_day_pair(rows)
             index = 0
             while index < len(rows):
@@ -258,6 +263,7 @@ class ListingResolver:
                 if kinds != {EQUITY}:
                     kind = min(kinds - {EQUITY})
                     non_equity[kind] += index - first
+                    self._blockers[ticker].append(span)
                 elif pair_day is not None and start >= pair_day:
                     same_day_securities.add(security_id)
                     same_day_listings += index - first
@@ -271,6 +277,8 @@ class ListingResolver:
         }
         for spans in self._by_ticker.values():
             spans[:] = [span for span in spans if span not in later_class]
+        for span in later_class:
+            self._blockers[span.ticker].append(span)
         self._contested = frozenset(
             span
             for spans in self._by_ticker.values()
@@ -313,8 +321,11 @@ class ListingResolver:
 
     def resolve(self, ticker: str, session: date) -> str | None:
         """The security trading under `ticker` on `session`, or `None` when
-        none does, or when the span holding it is contested or shares its
-        start with another security's span (ambiguous)."""
+        none does; when the span holding it is contested or shares its start
+        with another security's span (ambiguous); or when another company's
+        span that holds no ticker (non-equity or later-class) started on or
+        after it and is live: an older company never gets the bars of a
+        newer listing just because that listing is left out."""
         live = [span for span in self._by_ticker.get(ticker, []) if span.covers(session)]
         if not live:
             return None
@@ -323,7 +334,15 @@ class ListingResolver:
         owners = {span.security_id for span in winners}
         if len(owners) > 1 or any(span in self._contested for span in winners):
             return None
-        return owners.pop()
+        owner = owners.pop()
+        if any(
+            block.start >= latest
+            and block.covers(session)
+            and _company(block.security_id) != _company(owner)
+            for block in self._blockers.get(ticker, [])
+        ):
+            return None
+        return owner
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
         """Every ticker `security_id` traded under at some day in
@@ -362,9 +381,9 @@ def _holds_before(holder: TickerSpan, span: TickerSpan) -> bool:
 
 
 def _same_day_pair(rows: Sequence[_Row]) -> date | None:
-    """The first day a security's sorted rows list two different tickers
-    (placeholders aside), or `None`."""
-    for row, following in itertools.pairwise(r for r in rows if r.kind != _PLACEHOLDER):
+    """The first day a security's sorted rows list two different tickers on
+    equity rows (placeholder and non-equity rows aside), or `None`."""
+    for row, following in itertools.pairwise(r for r in rows if r.kind == EQUITY):
         if row.day == following.day and row.ticker != following.ticker:
             return row.day
     return None
@@ -596,11 +615,13 @@ class AlpacaPriceSource(PriceSource):
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
 
     def resolution_summary(self) -> str:
-        """The resolver's `ResolverReport` line, plus the bar rows of the
-        latest `bars` call that resolved to no security."""
+        """The resolver's `ResolverReport` line, plus the rows of the latest
+        `bars` and `corporate_actions` calls that resolved to no security."""
         line = self._resolver.report.summary()
         if self.last_bars_report is not None:
             line += f"; {len(self.last_bars_report.unresolved)} bar rows unresolved"
+        if self.last_actions_report is not None:
+            line += f"; {len(self.last_actions_report.unresolved)} action rows unresolved"
         return line
 
     def corporate_actions(
