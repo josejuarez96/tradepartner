@@ -10,7 +10,8 @@ cent-rounding tolerance, and the alert-kind suite (spec req 11): eleven of
 the plan line's fifteen kinds with a real trigger (`lot_ledger` through the
 run's own lot-ledger error path); `reconciliation`, `rejection_cap` and
 `skip_cap` became real once #667 fixed #644, and `kill_switch` stays `xfail`
-until #677. `paper resume` releasing while the window holds a marked position
+until #741 (#677/#698 covered only the skipped_kill_switch path, not a
+halt's own engagement). `paper resume` releasing while the window holds a marked position
 (#653, found while building the chain criterion) is fixed by #664 and tested
 here. (#650, found the same way,
 was regraded to low-priority hardening reproducible only with a frozen test
@@ -63,7 +64,7 @@ from tradepartner.adapters.fake_broker import (
     TransportFault,
 )
 from tradepartner.calendar import last_session_of_month, next_session, previous_session
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import PaperConfig, RiskConfig, Settings
 from tradepartner.errors import ReconciliationError, RejectionCapError, SkipCapError, StaleDataError
 from tradepartner.execution import alerts as alerts_module
 from tradepartner.execution import check as check_module
@@ -339,9 +340,11 @@ def test_resume_settles_the_pending_order_and_the_next_run_reattempts_only_it(
     )[0][0]
     # the fake fills the two accepted orders while the test is not looking,
     # so `resume` finds the crashed run's third order still open or pending.
-    for coid in list(env.fake._orders):
-        if env.fake.get_order(coid).status.value == "accepted":
-            env.fake.simulate_fill(coid)
+    # `open_orders()` is every order not in a terminal status, which (per
+    # `broker.py`'s `TERMINAL_STATUSES`) is exactly `accepted`, so this is
+    # the public equivalent of the private `_orders` reach it replaces.
+    for order in list(env.fake.open_orders()):
+        env.fake.simulate_fill(order.client_order_id)
 
     outcome = _resume(env, accept_broker_fills=True)
     assert outcome.status == RELEASED, outcome.reasons
@@ -585,6 +588,9 @@ def test_the_fill_lag_bound_halts_and_accept_broker_fills_completes_it(
 
     # The real fills the fake was holding back now surface: each must be
     # superseded by its synthetic one, counted once, not twice.
+    # FakeBroker has no public hook to reveal already-recorded hidden-lag
+    # fills (`lag_fills` only affects fills recorded after the call), so
+    # this reaches into the private counter directly; tracked as #742.
     env.fake._fill_hidden_reads = [0 for _ in env.fake._fill_hidden_reads]
     nxt = env.run(at(date(2019, 5, 6)))
     assert nxt.status == "ok", env.result(env.latest_run())
@@ -789,15 +795,27 @@ def test_the_chain_query_is_zero_once_every_outcome_is_due_then_a_deleted_event_
 def _price_every_symbol(env: Env, session: date) -> None:
     """`Env.price_at`'s job, but for every ticker with a price that session,
     not just the fixed `SYMBOLS` set: the real momentum universe can pick a
-    name outside that set over several real months."""
+    name outside that set over several real months. Filtered to the one
+    `known_at` vintage the run's own ingest would have seen (`Env.run`
+    ingests through 21:00 UTC on S-1, the same cutoff used here): a bare
+    `session = ?` with no `known_at` bound would pick an arbitrary row once
+    a restatement gives `(security_id, session)` more than one `known_at`
+    (schema.py's `UNIQUE (security_id, session, known_at)`), which could
+    read a later-known price into the fake's fill and silently violate
+    point-in-time."""
+    as_of = at(previous_session(session), 21, 0)
     rows = env.query(
         "SELECT l.ticker, p.close FROM prices_daily p "
         "JOIN listings l ON l.security_id = p.security_id "
         "WHERE p.session = ? AND l.valid_from = ("
         "  SELECT max(l2.valid_from) FROM listings l2 "
         "  WHERE l2.security_id = l.security_id AND l2.valid_from <= p.session"
+        ") AND p.known_at = ("
+        "  SELECT max(p2.known_at) FROM prices_daily p2 "
+        "  WHERE p2.security_id = p.security_id AND p2.session = p.session "
+        "  AND p2.known_at <= ?"
         ")",
-        [previous_session(session)],
+        [previous_session(session), as_of],
     )
     for ticker, close in rows:
         env.prices[ticker] = float(close)
@@ -807,15 +825,17 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fake that rounds each fill to the cent (`round_cash_to_cent=True`)
-    stays within `risk.reconcile_cash_tolerance` over `paper.min_rebalances`
-    (6, the config default) months of fills, with the rounding actually
-    exercised (at least one fill not an exact cent itself). Position limits
-    are loosened to 1.0 (the other tests' `FROZEN` is tuned for a fixed
+    stays within `risk.reconcile_cash_tolerance` over the window's frozen
+    `paper.min_rebalances` months of fills, with the rounding actually
+    exercised (at least one fill not an exact cent itself) and the
+    cumulative drift across the whole window, not just each month's own
+    reconciliation, kept under the same tolerance. Position limits are
+    loosened to 1.0 (the other tests' `FROZEN` is tuned for a fixed
     3-name, one-third-each portfolio, not whatever the real momentum
     universe picks each month), and `price_at` is widened to every ticker
     with a price that session, not just the fixed `SYMBOLS` set, so a later
     month's pick is never missing a price."""
-    env.open_window(
+    window = env.open_window(
         frozen=FROZEN.model_copy(
             update={"max_position_weight": 1.0, "max_order_notional_fraction": 1.0}
         ),
@@ -830,7 +850,22 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
         "WNDX", Asset(tradable=False, fractionable=True, status="active", cusip=None)
     )
 
-    min_rebalances = Settings(_env_file=None).paper.min_rebalances
+    # The fixture's `frozen_json` (test_run_trade.py) leaves `paper.*` keys
+    # out; req 14 freezes `min_rebalances` at `paper start` (config.py's
+    # `FROZEN_PAPER_KEYS`), so give this window's frozen value the same key
+    # production would, and read the loop bound back from it rather than
+    # from `Settings()` (which the owner's environment, not the window,
+    # controls).
+    assert window.window_id is not None
+    frozen_values = json.loads(window.frozen_json)
+    frozen_values["paper.min_rebalances"] = PaperConfig().min_rebalances
+    with env.connect() as conn:
+        conn.execute(
+            "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",
+            [json.dumps(frozen_values), window.window_id],
+        )
+    min_rebalances = frozen_values["paper.min_rebalances"]
+
     sessions = [F_0]
     year, month = F_0.year, F_0.month
     for _ in range(min_rebalances - 1):
@@ -845,23 +880,43 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
         (2019, 10),
     ]  # six consecutive months' first sessions, none skipped
 
+    cash_tolerance = Decimal(repr(FROZEN.reconcile_cash_tolerance))
+    cumulative_drift = Decimal("0")
+    any_fill_needed_rounding = False
+    sessions_with_fills = 0
     for session in sessions:
         outcome = env.run(at(session))
         assert outcome.status == "ok", env.result(env.latest_run())
+        session_fills = env.query(
+            "SELECT f.price, f.quantity FROM fills f "
+            "JOIN orders o ON o.client_order_id = f.client_order_id "
+            "WHERE o.run_id = ?",
+            [outcome.run_id],
+        )
+        # a rebalance that already matches its target makes no order, so
+        # not every one of the six sessions need fill; the window as a
+        # whole does (checked below).
+        if session_fills:
+            sessions_with_fills += 1
+        for price, quantity in session_fills:
+            exact = Decimal(repr(price)) * Decimal(repr(quantity))
+            rounded = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if exact != rounded:
+                any_fill_needed_rounding = True
+            cumulative_drift += exact - rounded
+        # the drift accumulated over every month so far, not just this
+        # month's own reconciliation, stays inside the tolerance the
+        # reconciliation itself enforces per run
+        assert abs(cumulative_drift) <= cash_tolerance, (
+            f"cumulative rounding drift {cumulative_drift} through {session.isoformat()} "
+            f"exceeded risk.reconcile_cash_tolerance ({cash_tolerance})"
+        )
 
     rows = env.query("SELECT status FROM reconciliations ORDER BY reconciliation_id")
     assert len(rows) >= min_rebalances  # not a vacuous pass on an empty table
     assert all(status == "ok" for (status,) in rows)
-
-    fills = env.query("SELECT price, quantity FROM fills")
-    assert fills  # fills were actually made
-    assert any(
-        Decimal(repr(price)) * Decimal(repr(quantity))
-        != (Decimal(repr(price)) * Decimal(repr(quantity))).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-        for price, quantity in fills
-    )  # at least one fill's exact notional needed rounding to the cent
+    assert sessions_with_fills > 0  # fills were actually made somewhere in the window
+    assert any_fill_needed_rounding  # at least one fill's exact notional needed cent rounding
 
 
 # =============================================================================================
@@ -1087,14 +1142,15 @@ def test_paper_stop_is_refused_while_a_run_holds_the_lock(fixture_store_path: Pa
         )
 
 
-# --- the four fault-specific halt kinds (#644: fixed by #667; kill_switch is #677) -----------
+# --- the four fault-specific halt kinds (#644: fixed by #667; kill_switch is #741) -----------
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="#677: the halt's own kill-switch engagement writes no distinct 'kill_switch' "
-    "alert row yet (#644's other kinds were fixed by #667)",
+    reason="#741: #677/#698 fixed only the skipped_kill_switch path (a later run finding "
+    "the switch already engaged); the halt's OWN engagement here writes no distinct "
+    "'kill_switch' alert row yet (#644's other kinds were fixed by #667)",
 )
 def test_kill_switch_alert_kind_is_not_yet_written(
     alert_fakes: FakeRunner, fixture_store_path: Path, tmp_path: Path
