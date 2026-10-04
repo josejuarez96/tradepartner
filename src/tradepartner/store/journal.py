@@ -461,7 +461,8 @@ class KillSwitchRow:
 
 @dataclass(frozen=True, kw_only=True)
 class OverrideRow:
-    """One `overrides` row."""
+    """One `overrides` row. `client_order_id` is set exactly for a `settle_order`
+    row, the order `paper settle` settled (schema version 9, spec req 17, #571)."""
 
     TABLE: ClassVar[str] = "overrides"
     ID_COLUMN: ClassVar[str | None] = "override_id"
@@ -471,6 +472,7 @@ class OverrideRow:
     made_at: datetime
     rebalance_session: date | None = None
     security_id: str | None = None
+    client_order_id: str | None = None
     kind: str
     reason: str
     known_at: datetime
