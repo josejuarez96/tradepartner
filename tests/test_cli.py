@@ -22,6 +22,7 @@ from tradepartner import cli
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import PriceSource
+from tradepartner.backfill import FILLED, Hole, HoleFill
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, SourceRun
@@ -211,6 +212,113 @@ def test_inconsistent_backfill_flags_are_refused_before_any_work(
     result = _invoke(secrets_set, args)
     assert result.exit_code == 2
     assert filled.calls == [] and session.calls == []
+
+
+# --- ingest --backfill --fill-holes (#831) -------------------------------------
+
+HOLE = Hole("0001404912", "KKR", (date(2018, 8, 1), date(2018, 8, 31)), True)
+
+
+class _FillRecorder:
+    """Stands in for `fill_holes`, recording its arguments."""
+
+    def __init__(self, runs: tuple[SourceRun, ...] = ()) -> None:
+        self.runs = runs
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, settings: Settings, **kwargs: Any) -> HoleFill:
+        self.calls.append(kwargs)
+        dry = bool(kwargs.get("dry_run", False))
+        return HoleFill((HOLE,) if dry else (), () if dry else self.runs, dry)
+
+
+def _with_store(settings: Settings) -> Settings:
+    Path(settings.store.path).touch()
+    return settings
+
+
+def test_a_fill_holes_dry_run_lists_the_holes_and_needs_no_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fill = _FillRecorder()
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    filled = _patched(monkeypatch, "backfill", _ok("alpaca"))
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca"]
+    result = _invoke(_with_store(_settings(tmp_path)), [*args, "--fill-holes", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    (call,) = fill.calls
+    assert call["since"] == date(2016, 1, 1) and call["dry_run"] is True
+    assert filled.calls == []
+    assert "1 holes (security, month) over 1 securities" in result.output
+    assert "0001404912 KKR: 2018-08 (1 months, 1 between its stored bars)" in result.output
+
+
+def test_a_fill_holes_run_prints_each_month_and_exits_on_its_status(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    cursor = "holes;since=2016-01-01;through=2018-08-31"
+    fill = _FillRecorder((SourceRun("alpaca", STALE, 0, cursor, "reference gap"),))
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca", "--fill-holes"]
+    result = _invoke(_with_store(secrets_set), args)
+    assert result.exit_code == 1
+    (call,) = fill.calls
+    assert isinstance(call["prices"], PriceSource) and "dry_run" not in call
+    assert f"alpaca: stale, 0 rows, cursor {cursor}: reference gap" in result.output
+    fill.runs = (SourceRun("alpaca", FILLED, 40, cursor, "holes of 1 names"),)
+    assert _invoke(secrets_set, args).exit_code == 0
+
+
+def test_a_fill_holes_dry_run_on_a_locked_store_says_so_and_lists_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    locked = SourceRun("alpaca", "locked", 0, "holes;since=2016-01-01", "store is locked")
+    monkeypatch.setattr(cli, "fill_holes", lambda *_, **__: HoleFill((), (locked,), True))
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca"]
+    result = _invoke(_with_store(_settings(tmp_path)), [*args, "--fill-holes", "--dry-run"])
+    assert result.exit_code == 1
+    assert "alpaca: locked" in result.output and "store is locked" in result.output
+    assert "holes as of now" not in result.output
+
+
+def test_a_real_fill_holes_run_needs_the_alpaca_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fill = _FillRecorder()
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca", "--fill-holes"]
+    result = _invoke(_with_store(_settings(tmp_path)), args)
+    assert result.exit_code == 2 and "ALPACA_API_KEY" in result.output
+    assert fill.calls == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["ingest", "--fill-holes", "--source", "alpaca"],
+        ["ingest", "--backfill", "--since", "2016-01-01", "--fill-holes"],
+        ["ingest", "--backfill", "--since", "2016-01-01", "--fill-holes", "--source", "edgar"],
+    ],
+)
+def test_inconsistent_fill_holes_flags_are_refused_before_any_work(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, args: list[str]
+) -> None:
+    fill = _FillRecorder()
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    result = _invoke(_with_store(secrets_set), args)
+    assert result.exit_code == 2
+    assert fill.calls == []
+
+
+def test_a_fill_holes_run_without_a_store_fails(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    fill = _FillRecorder()
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    args = ["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca", "--fill-holes"]
+    result = _invoke(secrets_set, [*args, "--dry-run"])
+    assert result.exit_code == 1 and "no store" in result.output
+    assert fill.calls == []
 
 
 def test_missing_edgar_user_agent_exits_non_zero_with_no_secret_in_the_output(
