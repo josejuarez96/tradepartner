@@ -891,6 +891,11 @@ def test_a_kill_written_during_step_4_is_caught_before_any_submit(
     assert "submit" not in [c.method for c in env.fake.calls]
     assert env.count("orders") == 0
     assert env.rebalance_events() == []
+    # The wrapper's skip is the run's: one `kill_switch` alert for it (#677).
+    ((run_id, session, message),) = env.alerts("kill_switch")
+    assert (run_id, session) == (outcome.run_id, F_0)
+    assert "source owner" in message
+    assert "the owner kills the run at step 4" in message
 
 
 @pytest.mark.parametrize(
