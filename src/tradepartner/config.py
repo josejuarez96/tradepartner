@@ -251,6 +251,10 @@ class AlpacaConfig(BaseModel):
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
+    # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
+    # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
+    # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
+    symbols_per_request: int = Field(default=1000, gt=0)
     # --- Phase 4 trading keys (docs/specs/paper-trading.md req 2, T47) ---
     # Guarded: the trading client is constructed with `paper=True` on every path
     # and a `false` here is refused, even from the environment (validator below).
