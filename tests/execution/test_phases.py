@@ -400,12 +400,104 @@ def test_a_trim_below_the_minimum_even_without_open_sells_still_skips() -> None:
     assert result.skips[0].counts_toward_cap
 
 
-def test_a_full_exit_is_unaffected_by_the_names_open_sells() -> None:
-    """The #605 owner decision is about trims; a full exit still sells the
-    whole holding less residue regardless of open sells."""
+def test_a_trim_wiped_out_by_the_holding_cap_alone_is_held_not_skipped() -> None:
+    """#647 item 7 owner decision: the holding cap itself (no open sells at
+    all) can wipe out a trim after it has already been sold down to its
+    residue (e.g. by an earlier attempt's fill); the uncapped remainder is
+    not a skip, so this is held, not journaled, the same way an open-sells-
+    only wipe-out already was (#605)."""
+    trim = _d(1, "sell", notional=300.0)  # a 3-share remainder
+    result = _sells([trim], {"SEC_1": 5.0}, residues={"SEC_1": 5.0})  # cap: 5 - 5 = 0
+    assert result.orders == () and result.skips == ()
+
+
+def test_a_trim_whose_cap_leaves_it_below_the_minimum_is_held_not_skipped() -> None:
+    """#647 item 7: the holding cap need not be exactly 0 to trigger the
+    hold -- any capped quantity that is itself a skip, while the uncapped
+    remainder was not, is held."""
+    trim = _d(1, "sell", notional=950.0)  # a 9.5-share remainder
+    # cap: 10 - 9.999 = 0.001 shares, $0.10 of notional, below the $1 minimum.
+    result = _sells([trim], {"SEC_1": 10.0}, residues={"SEC_1": 9.999})
+    assert result.orders == () and result.skips == ()
+
+
+def test_a_full_exit_nets_out_its_own_open_sells() -> None:
+    """#647 item 5 owner decision (replaces the pre-#647 behavior the old
+    test_a_full_exit_is_unaffected_by_the_names_open_sells encoded): a full
+    exit sells the holding less residue less its own open sells, computed
+    exactly like a trim's cap (`_trim_cap`)."""
     plan = _d(1, "sell", reason="left_targets", quantity=10.0)
-    order = _one(_sells([plan], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 4.0)]))
-    assert (order.quantity, order.full_exit) == (10.0, True)
+    order = _one(
+        _sells(
+            [plan],
+            {"SEC_1": 10.0},
+            residues={"SEC_1": 0.5},
+            open_sells=[OpenSell("SEC_1", 4.0)],
+        )
+    )
+    assert (order.quantity, order.full_exit) == (5.5, True)  # 10 - 0.5 - 4
+
+
+def test_a_whole_share_full_exit_nets_out_its_open_sells_and_floors() -> None:
+    plan = _d(1, "sell", reason="left_universe", quantity=10.0, whole_share=True)
+    order = _one(_sells([plan], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 2.7)]))
+    assert (order.quantity, order.whole_share) == (7.0, True)  # floor(10 - 2.7) = 7
+
+
+def test_a_forced_exit_of_a_whole_holding_reason_nets_out_its_open_sells() -> None:
+    """A `delisted`/`untargeted_receipt` forced exit's residue is 0 regardless
+    of `plan.residue`, but its open sells are still netted out."""
+    delisted = _d(1, "sell", decision="forced_exit", reason="delisted", quantity=7.0)
+    order = _one(
+        _sells(
+            [],
+            {"SEC_1": 7.0},
+            forced=[delisted],
+            residues={"SEC_1": 2.0},
+            open_sells=[OpenSell("SEC_1", 3.0)],
+        )
+    )
+    assert (order.quantity, order.full_exit) == (4.0, True)  # 7 - 0 - 3
+
+
+def test_a_full_exit_capped_by_off_grid_open_sells_passes_check_phase() -> None:
+    """#647 item 5, exact the same way the trim cap is (#605): the full
+    exit's own open sells must never trip `check_phase`'s
+    `sell_sum_within_holding` on a rounding ulp."""
+    plan = _d(1, "sell", reason="left_universe", quantity=437.78)
+    held = {"SEC_1": 437.78}
+    opens = [OpenSell("SEC_1", 54.62566982250126), OpenSell("SEC_1", 120.92920606749875)]
+    order = _one(_sells([plan], held, open_sells=opens))
+    checked = check_phase(
+        [order.to_risk("AAA", listing_ended=False)],
+        _ledger(held, 10_000_000.0),
+        Account("PA1", 0.0, 0.0, 0.0, STAMP),
+        {"SEC_1": TRADABLE},
+        FROZEN,
+        DECIMALS,
+        price_of=_price,
+        costs=NO_COSTS,
+        open_sells=opens,
+    )
+    assert isinstance(checked, Skips) and len(checked.orders) == 1
+
+
+def test_a_full_exit_whose_open_sells_cover_the_whole_holding_is_held() -> None:
+    """#647 item 5: when the open-sells subtraction alone turns the full
+    exit into a skip, it is held like a trim -- no order, no skip, so the
+    decision stays open and the next run re-attempts it."""
+    plan = _d(1, "sell", reason="left_targets", quantity=10.0)
+    result = _sells([plan], {"SEC_1": 10.0}, open_sells=[OpenSell("SEC_1", 10.0)])
+    assert result.orders == () and result.skips == ()
+
+
+def test_a_full_exit_that_is_dust_even_without_open_sells_still_skips() -> None:
+    """A full exit the holding-and-residue cap alone already makes dust is a
+    real skip, not held, even beside an (irrelevant) open sell."""
+    plan = _d(1, "sell", reason="left_universe", quantity=0.4, whole_share=True)
+    result = _sells([plan], {"SEC_1": 0.4}, open_sells=[OpenSell("SEC_1", 5.0)])
+    assert result.orders == ()
+    assert _reasons(result) == {"SEC_1": "dust"}
 
 
 #: What `unfilled_sells` leaves for a sell of 1.0 filled 0.7 + 0.2 + 0.1 with
