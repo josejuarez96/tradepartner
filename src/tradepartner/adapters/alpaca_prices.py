@@ -163,11 +163,13 @@ def _fail_closed[**P, R](parse: Callable[P, R]) -> Callable[P, R]:
     return wrapper
 
 
-#: Alpaca's US-equity symbol grammar: letters and digits from a letter, with
-#: at most one `.`-separated suffix (`BRK.B`).
-_ALPACA_SYMBOL = re.compile(r"[A-Z][A-Z0-9]*(\.[A-Z0-9]+)?")
+#: The US-equity symbols sent to Alpaca: letters only, with at most one
+#: `.`-separated suffix (`BRK.B`). A ticker with a digit is a note or other
+#: non-equity line (Citi's `C27C`, P&G's `PG25`); Alpaca rejected all 510
+#: such tickers seen from 2019-08, one by one, and had bars for none (#792).
+_ALPACA_SYMBOL = re.compile(r"[A-Z]+(\.[A-Z]+)?")
 #: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
-_CLASS_SUFFIX = re.compile(r"([A-Z][A-Z0-9]*)[-/]([A-Z])")
+_CLASS_SUFFIX = re.compile(r"([A-Z]+)[-/]([A-Z])")
 
 
 def alpaca_symbol(ticker: str) -> str | None:
