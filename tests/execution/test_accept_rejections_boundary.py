@@ -26,8 +26,9 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    while the names they trust are what they say, so the fence refuses
    outright: any rebinding of `isinstance`, `type` or `bool`, a star import
    (which could rebind them unseen), any attribute store to one of those
-   names or to any attribute of one of them or of a reviewed callee
-   (`builtins.isinstance = f`, `_start.__code__ = g`), any use or import of
+   names, or to any attribute or item reached from one of them or from a
+   reviewed callee, however deep (`builtins.isinstance = f`,
+   `ResumeInvocationRow.__init__.__code__ = g`), any use or import of
    `builtins`, any use of `__builtins__`, `__import__`, `globals`,
    `locals` or a bare `vars()`, any `__builtins__` or `__globals__`
    attribute, a `__dict__` attribute other than as a `**` unpacking source,
@@ -263,6 +264,15 @@ def _is_reviewed_callee_binding(node: ast.AST, name: str) -> bool:
     return False
 
 
+def _root_name(node: ast.expr) -> str | None:
+    """The `Name` an attribute or subscript chain starts from
+    (`ResumeInvocationRow` for `ResumeInvocationRow.__init__.__code__`), or
+    `None` when it starts from anything else."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
 def _is_unpacked(node: ast.expr, parents: dict[int, ast.AST]) -> bool:
     """Whether `node` is the source of a `**` unpacking, in a dict display
     (`{**x}`) or a call (`f(**x)`): a read of its items, never a write."""
@@ -315,14 +325,11 @@ def misuses(tree: ast.Module) -> list[str]:
         ):
             found.append(f"{node.lineno}: imports from builtins")
         elif (
-            isinstance(node, ast.Attribute)
+            isinstance(node, (ast.Attribute, ast.Subscript))
             and not isinstance(node.ctx, ast.Load)
             and (
-                node.attr in _TYPE_CHECKS | _KEYWORD_CALLEES
-                or (
-                    isinstance(node.value, ast.Name)
-                    and node.value.id in _TYPE_CHECKS | _KEYWORD_CALLEES
-                )
+                (isinstance(node, ast.Attribute) and node.attr in _TYPE_CHECKS | _KEYWORD_CALLEES)
+                or _root_name(node) in _TYPE_CHECKS | _KEYWORD_CALLEES
             )
         ):
             found.append(f"{node.lineno}: patches {ast.unparse(node)}")
@@ -549,6 +556,8 @@ Rule = Callable[[ast.Module], object]
         ("resume.__dict__['isinstance'] = _start", misuses),
         ("_start.__code__ = f.__code__", misuses),
         ("ResumeInvocationRow.__init__ = spy", misuses),
+        ("ResumeInvocationRow.__init__.__code__ = g", misuses),
+        ("_start.__kwdefaults__['x'] = 1", misuses),
         (
             "@spy\ndef _start(c, *, accept_rejections): ...\n"
             "_start(c, accept_rejections=accept_rejections)",
