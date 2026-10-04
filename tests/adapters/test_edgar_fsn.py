@@ -919,8 +919,10 @@ class TestEnsureFsn:
         """No usable validator (a failed `HEAD` at the HTTP or network level,
         or neither `ETag` nor `Last-Modified`) is counted on
         `.fsn_reissue_undetected` so the run message says re-issues went
-        unchecked; it never aborts the run and is never a re-issue."""
-        settings = _settings(tmp_path)
+        unchecked; it never aborts the run and is never a re-issue. A tiny
+        `retry_backoff_seconds` keeps the transport-error case's retries
+        (#554) from sleeping for real."""
+        settings = _settings(tmp_path, retry_backoff_seconds=0.001)
         zip_bytes = _one_period_zip("0000000011-15-000001", "11")
 
         def zip_route(request: httpx.Request) -> httpx.Response:
