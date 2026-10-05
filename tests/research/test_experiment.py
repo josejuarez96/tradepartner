@@ -218,8 +218,20 @@ def test_splits_given_in_both_places_is_refused(tmp_path: Path, settings: Settin
 
 def test_event_dates_are_normalised_to_utc_regardless_of_source_timezone(tmp_path: Path) -> None:
     """quant-auditor, PR #935 SHOULD FIX 1: the same instant must read as the same
-    date whether the export stores it naive, in UTC, or in another zone, or a row
-    near a sealed-period edge could land on either side depending on the writer."""
+    date whether the export's own column is stamped naive, in UTC, or in another
+    zone, or a row near a sealed-period edge could land on either side depending
+    on the writer.
+
+    `polars` normalises a tz-aware input to UTC the moment a `DataFrame` is built
+    from Python objects (verified: constructing from an `America/New_York`
+    `datetime` already yields a `time_zone="UTC"` column), so the ET case is built
+    by writing a UTC column and then explicitly converting its *stored* time zone
+    to `America/New_York` with `dt.convert_time_zone` before writing the parquet
+    file. That is what actually reproduces the originally-reported bug: the old
+    `_as_date` (`value.date()` with no conversion) read the ET-zoned column's wall
+    time, 2025-12-31, one day off the correct UTC date, 2026-01-01 (quant-auditor
+    verification pass 1 on #935, which caught the first version of this test for
+    not reproducing the bug it claimed to)."""
     import polars as pl
 
     instant_et = datetime(
@@ -228,11 +240,21 @@ def test_event_dates_are_normalised_to_utc_regardless_of_source_timezone(tmp_pat
     instant_utc = instant_et.astimezone(UTC)
     naive = datetime(2026, 1, 1, 1, 0)  # noqa: DTZ001 -- deliberately naive; treated as UTC
 
-    for name, value in (("et", instant_et), ("utc", instant_utc), ("naive", naive)):
+    et_path = tmp_path / "et.parquet"
+    et_frame = pl.DataFrame({"event_date": [instant_et]}).with_columns(
+        pl.col("event_date").dt.convert_time_zone("America/New_York")
+    )
+    assert et_frame.schema["event_date"].time_zone == "America/New_York"
+    et_frame.write_parquet(et_path)
+    assert pl.read_parquet(et_path).schema["event_date"].time_zone == "America/New_York"
+
+    for name, value in (("utc", instant_utc), ("naive", naive)):
         path = tmp_path / f"{name}.parquet"
         pl.DataFrame({"event_date": [value]}).write_parquet(path)
         values = read_event_column(path, "event_date")
         assert values == [date(2026, 1, 1)], name
+
+    assert read_event_column(et_path, "event_date") == [date(2026, 1, 1)]
 
 
 def test_hash_file_is_deterministic(tmp_path: Path) -> None:
