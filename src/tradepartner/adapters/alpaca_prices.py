@@ -19,6 +19,16 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   older span from its own start (the ticker resolves to nothing rather than
   back to the older company), but never its own company's, so a company's
   notes listed under its common ticker never take or hide it;
+- an equity row whose ticker is no symbol even in Alpaca's form
+  (`alpaca_symbol`: `New York Stock Exchange`, `F&G`, `PTN1`) never ends
+  its security's span (#844): it is dropped on a day that also lists a
+  readable equity ticker of the security, else read as the ticker of the
+  security's last row before it when that is a readable equity row
+  (Vulcan's 10-Qs naming the exchange for `VMC`), and a delisting of its
+  listing ends that span under the rule below. As its first row, or after
+  a placeholder or non-equity row, it stays as written. A footnote marker
+  or bracketed exchange after a symbol (`VAL*`, `BAX (NYSE)`) is that
+  symbol (`alpaca_symbol`), never a bracketed class (`HEI (A)`);
 - a security listing two different tickers on equity rows of one day,
   one of them the ticker of its row just before that day (FutureFuel's
   cover page naming Ford's `F` beside its own `FF`), keeps that ticker:
@@ -137,9 +147,10 @@ raises, so ingest can never mix feeds for a security unnoticed
 call on any error status, so one invalid symbol is taken to fail the whole
 chunk (whether Alpaca's server rejects it or drops it is not established).
 A master ticker is therefore sent only in Alpaca's form (`alpaca_symbol`):
-trimmed of spaces and quotes, upper-cased, and a one-letter class suffix
-after `-` or `/` written with `.` (`CRD-A` -> `CRD.A`). Anything else
-(`BAX (NYSE)`, `C/28`, `F&G`) is not sent, so its security gets no rows
+trimmed of spaces and quotes, less one trailing footnote marker or
+bracketed exchange (`VAL*`, `BAX (NYSE)` -> `BAX`, #844), upper-cased, and
+a one-letter class suffix after `-` or `/` written with `.` (`CRD-A` ->
+`CRD.A`). Anything else (`C/28`, `F&G`) is not sent, so its security gets no rows
 under it, never a guessed mapping's; `last_excluded_symbols` and
 `symbol_summary` name those tickers, last on `resolution_summary`'s line.
 `ListingResolver` keys every listing by that form (an invalid ticker or a
@@ -225,16 +236,37 @@ def _fail_closed[**P, R](parse: Callable[P, R]) -> Callable[P, R]:
 _ALPACA_SYMBOL = re.compile(r"[A-Z]+(\.[A-Z]+)?")
 #: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
 _CLASS_SUFFIX = re.compile(r"([A-Z]+)[-/]([A-Z])")
+#: A filer's footnote marker or bracketed exchange after the symbol (#844):
+#: trailing asterisks (`VAL*`), or one trailing bracketed footnote number
+#: of one or two digits (`UPH(1)`, `LCINQ (1)`; never a year) or exchange
+#: name (`BAX (NYSE)`), with the spaces before it. Any other bracketed
+#: group (`HEI (A)`, `GOOG (Class C)`, `BAC (Series L)`) names a class or
+#: series and is left alone, so it stays no symbol rather than another
+#: class's.
+_FOOTNOTE = re.compile(
+    r"(.*?[^\s*(])\s*(?:\*+|\(\s*(?:\d{1,2}|NYSE(?:\s+(?:AMERICAN|MKT|ARCA))?|NASDAQ(?:\s*[GC][SM])?"
+    r"|AMEX|CBOE|BATS)\s*\))",
+    re.IGNORECASE,
+)
+
+
+def _strip_footnote(ticker: str) -> str:
+    """`ticker` less one trailing footnote marker (`_FOOTNOTE`), trimmed of
+    spaces and quotes at both ends; a field that is only a marker stays."""
+    trimmed = ticker.strip().strip("\"'").strip()
+    match = _FOOTNOTE.fullmatch(trimmed)
+    return match[1] if match else trimmed
 
 
 def alpaca_symbol(ticker: str) -> str | None:
     """`ticker` in Alpaca's symbol form, or `None` when it has none.
 
-    Spaces and quotes at both ends are trimmed, letters upper-cased and a
-    one-letter class suffix after `-` or `/` written with `.`; a non-ASCII
-    ticker, or whatever then falls outside `_ALPACA_SYMBOL`, is `None`,
-    never a guessed symbol."""
-    trimmed = ticker.strip().strip("\"'").strip()
+    Spaces and quotes at both ends are trimmed, one trailing footnote
+    marker or bracketed exchange dropped (`VAL*`, `BAX (NYSE)`: #844),
+    letters upper-cased and a one-letter class suffix after `-` or `/`
+    written with `.`; a non-ASCII ticker, or whatever then falls outside
+    `_ALPACA_SYMBOL`, is `None`, never a guessed symbol."""
+    trimmed = _strip_footnote(ticker)
     if not trimmed.isascii():  # upper() folds some letters into ASCII ('\ufb01' -> 'FI')
         return None
     norm = trimmed.upper()
@@ -292,7 +324,8 @@ class ResolverReport:
     claim on a live holder's ticker, #793), ambiguous (another security's
     span of the ticker starts the same day) or contested; and (#819) the
     spans ended at their own delisting, those kept through a delisting by a
-    later row of their ticker, and the same-day typo rows dropped."""
+    later row of their ticker, and the same-day typo rows dropped; and (#844)
+    the equity rows whose ticker is no symbol that were ignored."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -306,6 +339,7 @@ class ResolverReport:
     ended_spans: int = 0
     same_day_typos: int = 0
     kept_spans: int = 0
+    unreadable: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -320,7 +354,8 @@ class ResolverReport:
             f"{self.co_registrant_spans} co-registrant and {self.disputed_spans} disputed "
             f"claims on another company's ticker; {self.ended_spans} spans ended at their "
             f"own delisting, {self.kept_spans} kept through one by a later row of the "
-            f"ticker; {self.same_day_typos} same-day typo listings dropped"
+            f"ticker; {self.same_day_typos} same-day typo listings dropped; "
+            f"{self.unreadable} unreadable-ticker listings ignored"
         )
 
 
@@ -444,6 +479,7 @@ class _Row:
     day: date
     ticker: str
     kind: str  # EQUITY or the non-equity kind; "placeholder" for no ticker
+    written: str | None = None  # an unreadable ticker read as `ticker` (#844)
 
 
 _PLACEHOLDER = "placeholder"
@@ -485,15 +521,14 @@ class ListingResolver:
         # superseded (started before it), never a later one.
         self._vacated: dict[str, list[TickerSpan]] = defaultdict(list)
         cut: set[TickerSpan] = set()  # spans ended at their own delisting
-        placeholder = same_day_listings = same_day_typos = kept_spans = 0
+        placeholder = same_day_listings = same_day_typos = kept_spans = unreadable = 0
         same_day_securities: set[str] = set()
         non_equity: dict[str, int] = defaultdict(int)
         for security_id, listed in by_security.items():
-            # A placeholder or non-equity row sorts first on its day, so it
-            # never ends the span of an equity ticker listed that same day.
-            listed.sort(key=lambda r: (r.day, r.kind == EQUITY, r.ticker))
-            rows, pair_day = _drop_same_day_typos(listed)
-            same_day_typos += len(listed) - len(rows)
+            listed.sort(key=_row_order)
+            rows, pair_day, typos, ignored = _clean_rows(listed)
+            same_day_typos += typos
+            unreadable += ignored
             index = 0
             while index < len(rows):
                 first = index
@@ -506,7 +541,8 @@ class ListingResolver:
                 left, kept = None, False
                 if kinds == {EQUITY}:
                     days = [r.day for r in rows[first:index]]
-                    left, kept = self._own_delisting(security_id, ticker, days, end)
+                    aliases = {(r.day, r.written) for r in rows[first:index] if r.written}
+                    left, kept = self._own_delisting(security_id, ticker, days, end, aliases)
                 span = TickerSpan(security_id, ticker, start, end if left is None else left)
                 if left is not None:
                     cut.add(span)
@@ -616,13 +652,22 @@ class ListingResolver:
             ended_spans=len(ended),
             same_day_typos=same_day_typos,
             kept_spans=kept_spans,
+            unreadable=unreadable,
         )
 
     def _own_delisting(
-        self, security_id: str, ticker: str, days: Sequence[date], end: date | None
+        self,
+        security_id: str,
+        ticker: str,
+        days: Sequence[date],
+        end: date | None,
+        aliases: Collection[tuple[date, str]] = (),
     ) -> tuple[date | None, bool]:
         """`(left, kept)` for an equity span of `security_id` under `ticker`
-        whose rows are on `days` (sorted), until `end` (#819).
+        whose rows are on `days` (sorted), until `end` (#819). `aliases`
+        are `(day, ticker)` of the span's unreadable rows read as `ticker`
+        (#844): a delisted listing under one of them is a listing of the
+        span too.
 
         `left` is the day the span stops holding its ticker because its own
         listing was delisted: the earliest effective day, inside the span,
@@ -638,7 +683,7 @@ class ListingResolver:
         inside = [
             (valid_from, day)
             for valid_from, listed, day in self._evidence.delisted_listings.get(security_id, ())
-            if listed == ticker
+            if (listed == ticker or (valid_from, listed) in aliases)
             and start <= valid_from
             and start < day
             and (end is None or day < end)
@@ -838,10 +883,53 @@ def same_alpaca_symbol(one: str, other: str) -> bool:
     itself, and what it sends Alpaca, is unchanged."""
 
     def folded(ticker: str) -> str | None:
-        return alpaca_symbol(_INTERNAL_WHITESPACE.sub("-", ticker.strip()))
+        return alpaca_symbol(_INTERNAL_WHITESPACE.sub("-", _strip_footnote(ticker)))
 
     left, right = folded(one), folded(other)
     return left is not None and left == right
+
+
+def _unreadable(row: _Row) -> bool:
+    """An equity row whose ticker is no symbol even after `alpaca_symbol`'s
+    folds (an exchange name, `F&G`, a digit): a cover page's slip (#844)."""
+    return row.kind == EQUITY and alpaca_symbol(row.ticker) is None
+
+
+def _row_order(row: _Row) -> tuple[date, bool, str]:
+    """A placeholder or non-equity row sorts first on its day, so it never
+    ends the span of an equity ticker listed that same day."""
+    return row.day, row.kind == EQUITY, row.ticker
+
+
+def _clean_rows(rows: Sequence[_Row]) -> tuple[list[_Row], date | None, int, int]:
+    """A security's sorted rows less each same-day typo (#819) and with
+    each unreadable equity row (#844) ignored; the first same-day pair day
+    left, or `None`; and how many typo and unreadable rows there were.
+
+    An unreadable row never ends the security's span: on a day that also
+    lists a readable equity ticker it is dropped, and otherwise it is read
+    as the ticker of the security's last row before that day, once that
+    day's typos are dropped, when that row is a readable equity row
+    (Vulcan's 10-Qs naming `New York Stock Exchange` for `VMC`). With no
+    such row (its first row, or after a placeholder or non-equity row) it
+    is kept as written, a span that holds a ticker Alpaca is never sent,
+    as before. The typo rule runs on the readable rows first, so a typo's
+    ticker is never carried on."""
+    readable = [r for r in rows if not _unreadable(r)]
+    out, pair_day = _drop_same_day_typos(readable)
+    typos = len(readable) - len(out)
+    ignored = 0
+    for row in (r for r in rows if _unreadable(r)):
+        if any(r.day == row.day and r.kind == EQUITY for r in readable):
+            ignored += 1
+            continue
+        before = [r for r in out if r.day < row.day]
+        if before and before[-1].kind == EQUITY and not _unreadable(before[-1]):
+            row = replace(row, ticker=before[-1].ticker, written=row.ticker)
+            ignored += 1
+        out.append(row)
+        out.sort(key=_row_order)
+    return out, pair_day, typos, ignored
 
 
 def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]:
