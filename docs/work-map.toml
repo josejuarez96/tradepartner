@@ -681,3 +681,8 @@ unblocks = ["issue:618"]
 what = "Draft the research-experiment registry spec (runs that are not backtests), with its plan task lines, as a spec only."
 why = "Answers the ML validation brief's registry proposal and the annotation protocol's interim log before any such run happens."
 unblocks = ["spec:research-registry"]
+
+[issue.931]
+what = "Flip the Status fields of the strategy-lab spec and the research-registry spec and plan to Accepted, recording the owner's decision of 2026-10-05."
+why = "A plan is written only from an accepted spec; the flip is the record in git that the owner approved these three documents."
+unblocks = ["plan:research-registry", "spec:strategy-lab"]

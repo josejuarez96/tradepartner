@@ -1,6 +1,6 @@
 # Plan: Research-experiment registry
 
-**Spec:** [specs/research-registry.md](../specs/research-registry.md) (every open question decided on #810, PR #877)  ·  **Status:** Draft  ·  **Issue:** #901
+**Spec:** [specs/research-registry.md](../specs/research-registry.md) (every open question decided on #810, PR #877)  ·  **Status:** Accepted (owner, 2026-10-05, #931)  ·  **Issue:** #901
 
 ## Approach (short)
 
