@@ -108,12 +108,14 @@ derived at `t`, as the data is read.
   the store cannot show the line kept trading.
   Such a bar is another equity's resolved to this one (a reused ticker,
   EGLE), a relisting with no listing row, or bars on both sides of a hole in
-  the store. A delisting whose next listing of the security carries the
-  same ticker (compared as `alpaca_symbol` keys it) raises no violation at
-  all (#829): `ListingResolver`'s own rule 7 (module docstring of
-  `adapters.alpaca_prices`) keeps the span running under that ticker
-  through the delisting, so the bars between are the security's own, never
-  a resumption to flag, however long the gap.
+  the store. A delisting whose next *equity* listing of the security
+  carries the same ticker (compared as `alpaca_symbol` keys it) raises no
+  violation at all (#829): the resolver's own rule 7 (`docs/specs/data-foundation.md`,
+  "Resolver rules"; #819) keeps the span running under that ticker through
+  the delisting, so the bars between are the security's own, never a
+  resumption to flag, however long the gap. A later row that shares the
+  ticker but is not EQUITY (a note, a right, a unit) does not count: the
+  resolver's rule only runs a span on when both rows are EQUITY.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
@@ -952,16 +954,23 @@ def _bars_after_delisting(
                 ),
                 key=lambda o: o["valid_from"],
             )
-            next_row = later[0] if later else None
-            if next_row is not None and _resolver_ticker(
-                str(next_row["ticker"])
-            ) == _resolver_ticker(str(row["ticker"])):
-                # Resolver rule 7 (#819, module docstring of
-                # `adapters.alpaca_prices`): a later row of the same ticker
-                # means the span ran on through this delisting, so no bar
-                # before that row is a resumption to flag (#829).
-                continue
-            bounds.append({**row, "_next": None if next_row is None else next_row["valid_from"]})
+            next_valid_from = later[0]["valid_from"] if later else None
+            if next_valid_from is not None and _row_kind(row) == EQUITY:
+                # The resolver's own rule 7 (spec data-foundation.md,
+                # "Resolver rules"; #819) only keeps a span running under a
+                # later row of the same ticker when both rows are EQUITY,
+                # and only from the day that row actually holds the ticker:
+                # a same-day filer-typo pair (#846) is tied on `valid_from`,
+                # so every row of that day, not just the one `later` sorts
+                # first, is checked (#829).
+                own_ticker = _resolver_ticker(str(row["ticker"]))
+                same_day = [o for o in later if o["valid_from"] == next_valid_from]
+                if any(
+                    _row_kind(o) == EQUITY and _resolver_ticker(str(o["ticker"])) == own_ticker
+                    for o in same_day
+                ):
+                    continue
+            bounds.append({**row, "_next": next_valid_from})
     if not bounds:
         return pl.DataFrame([], schema=_AFTER_DELISTING_SCHEMA)
     ids = sorted({b["security_id"] for b in bounds})
