@@ -10,6 +10,7 @@ unaccepted ones in its pre-write message. The companyfacts API cases are in
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,9 @@ def test_the_check_lists_the_unaccepted_per_document_failures(tmp_path: Path) ->
     with pytest.raises(FilingFailuresError) as raised:
         source.check_failures()
     message = str(raised.value)
-    assert "unaccepted filing failures (per-document and fact collisions): 6, first 6: " in message
+    assert (
+        "unaccepted filing failures (per-document and fact collisions): 6, full list: " in message
+    )
     assert f"{accessions[1]} ValueError/10-K: bad {accessions[1]}" in message
     assert f"{accepted} ValueError" not in message
     assert message.index("failed_filings.json") < message.index("unaccepted filing failures")
@@ -141,9 +144,60 @@ def test_the_listing_is_bounded_and_redacted(tmp_path: Path) -> None:
     with pytest.raises(FilingFailuresError) as raised:
         source.check_failures()
     message = str(raised.value)
-    assert "fact collisions): 5, first 2: " in message
+    assert "fact collisions): 5, full list: " in message and ", first 2: " in message
     assert accessions[1] in message and accessions[2] not in message
     assert secret not in message
+
+
+def test_the_full_listing_is_written_to_disk_and_named_first(tmp_path: Path) -> None:
+    """#884: past `edgar.max_validation_listed`, the message names a JSON file
+    under `edgar.cache_dir/validation/` holding every unaccepted failure
+    (cleaned and redacted, like the message); the path comes before the
+    entries, so the run row's `ingest.max_message_chars` cut keeps it. A dry
+    run writes no `failed_filings.json`, so this file is its only full list."""
+    secret = "sk-sentinel-884"
+    base = edgar_settings(tmp_path / "cache", max_validation_listed=2)
+    settings = Settings(
+        _env_file=None,
+        edgar=base.edgar.model_dump(),
+        sec_edgar_user_agent=base.sec_edgar_user_agent,
+        alpaca_api_secret=secret,
+    )
+    source = EdgarFilingSource(settings, client=_router().client())
+    accessions = [f"0000320193-26-000{k:03d}" for k in range(5)]
+    source._pending_failures = {a: ("ValueError", "10-K", f"bad {a} {secret}") for a in accessions}
+    source._per_document_attempted = set(accessions)
+    with pytest.raises(FilingFailuresError) as raised:
+        source.check_failures()
+    message = str(raised.value)
+
+    [written] = (Path(settings.edgar.cache_dir) / "validation").glob("filing-failures-*.json")
+    assert f"5, full list: {written.resolve()}, first 2: " in message
+    assert not (Path(settings.edgar.cache_dir) / "failed_filings.json").exists()
+    data = json.loads(written.read_text())
+    assert [entry["accession"] for entry in data["failures"]] == accessions
+    assert data["failures"][4]["error_class"] == "ValueError"
+    assert data["failures"][4]["base_form"] == "10-K"
+    assert data["failures"][4]["message"].startswith(f"bad {accessions[4]} ")
+    assert secret not in written.read_text()
+
+
+def test_a_listing_file_that_cannot_be_written_still_fails_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def full_disk(path: Path, data: bytes) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("tradepartner.adapters.edgar_source.edgar_raw.write_atomic", full_disk)
+    source = _bare_source(tmp_path)
+    accessions = [f"0000320193-26-000{k:03d}" for k in range(6)]
+    source._pending_failures = {a: ("ValueError", "10-K", "x") for a in accessions}
+    source._per_document_attempted = set(accessions)
+    with pytest.raises(FilingFailuresError) as raised:
+        source.check_failures()
+    assert "6, full list: not written (OSError: No space left on device), first 6: " in str(
+        raised.value
+    )
 
 
 def test_a_run_under_the_allowance_does_not_fail(tmp_path: Path) -> None:
