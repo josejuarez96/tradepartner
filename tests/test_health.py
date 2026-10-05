@@ -1390,3 +1390,27 @@ def test_accepted_same_day_pair_entries_are_validated(bad: str) -> None:
 
 def test_accepted_same_day_pairs_default_empty() -> None:
     assert _settings().universe.accepted_same_day_pairs == []
+
+
+def test_an_accepted_day_is_one_line_for_every_row_of_that_day(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Code-review on #917: HACAR tagged on two exchanges that day (one line,
+    # #822) sorts HACAR@NASDAQ, HACAR@NYSE, HCACR@NYSE. HACAR@NASDAQ's own
+    # Form 25, filed later, must not find the accepted partner HCACR as its
+    # "next exchange line": the accepted day is one line for all its rows.
+    for ticker, exchange in (("HACAR", "NASDAQ"), ("HACAR", "NYSE"), ("HCACR", "NYSE")):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row(FIRST_PAIR_SID, ticker, exchange, FIRST_PAIR_DAY, "Rights"),
+        )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row(FIRST_PAIR_SID, "NASDAQ", date(2020, 1, 10), date(2020, 1, 20)),
+    )
+    assert health_report(fixture_store, T_END, _settings()).failures == (NON_OVERLAPPING_LISTINGS,)
+    report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
+    assert report.ok, report.integrity
+    assert report.accepted_same_day_pairs.frame["next_ticker"].to_list() == ["HCACR"]

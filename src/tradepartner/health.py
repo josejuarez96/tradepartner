@@ -961,12 +961,14 @@ def _overlapping_listings(
             )
             filed = current["delisting_filed_at"]
             filing_session = None if filed is None else _filing_session(filed)
-            # An accepted pair is one line, as the owner reviewed it: its
-            # same-day partner is no second line for the late-Form-25 test.
-            one_line_day: date | None = None
-            if flagged is not None and (sid, current["valid_from"]) in accepted_days:
+            # An accepted day is one line, as the owner reviewed it: for every
+            # row of that day (also a ticker's second exchange tag, #822), no
+            # same-day row is a second line for the late-Form-25 test.
+            accepted_day = (sid, current["valid_from"]) in accepted_days
+            one_line_day = current["valid_from"] if accepted_day else None
+            if flagged is not None and accepted_day:
                 accepted.append(_overlap_row(current, flagged, filing_session))
-                flagged, one_line_day = None, current["valid_from"]
+                flagged = None
             if flagged is None and filing_session is not None:
                 exchange_line = next(
                     (
