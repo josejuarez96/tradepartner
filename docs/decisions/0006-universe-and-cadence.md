@@ -1,6 +1,6 @@
 # 0006. Universe and cadence
 
-**Status:** Accepted  ·  **Date:** 2026-09-24  ·  **Issue:** #7
+**Status:** Accepted; Cadence section superseded by [ADR 0012](0012-cadence-as-a-hypothesis-parameter.md) (2026-10-05); the universe section, guards (a) and (b) and Verify stay in force  ·  **Date:** 2026-09-24  ·  **Issue:** #7
 
 ## Context
 
