@@ -193,3 +193,16 @@ def test_an_unwritable_list_still_fails_with_the_validation_message(
         failures.raise_if_any(_settings(tmp_path))
     assert "full list: not written (OSError: disk full)" in str(raised.value)
     assert f"cover page {EMPTY_COVER}" in str(raised.value)
+
+
+def test_the_error_that_stopped_the_pass_is_named_cleaned_and_chained(tmp_path: Path) -> None:
+    failures = _collector(tmp_path)
+    failures.record("form.idx", "2019-QTR1", ValueError("bad row"))
+    stopped = RuntimeError(f"no FSN period; key {SECRET}")
+    with pytest.raises(InputValidationError) as raised:
+        failures.raise_if_any(_settings(tmp_path), stopped_by=stopped)
+    message = str(raised.value)
+    assert "the pass then stopped: RuntimeError: no FSN period" in message
+    assert SECRET not in message
+    assert raised.value.__cause__ is stopped
+    assert message.index("by input:") < message.index("the pass then stopped")

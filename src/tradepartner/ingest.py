@@ -500,13 +500,24 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
     naming the full list's file, before any store write, on a dry run too.
     `check_failures()` and `record_failed_check()` are then not called: a
     pass with absent inputs must not advance the per-document failure
-    counts."""
-    _build_filings(recorded, settings, _FETCH_PASS)
+    counts. If the pass itself raises after recording a parse failure (a
+    later step can fail because an input was treated as absent), the gate
+    still fails the run with the full list and names that error, so the
+    error never hides the list."""
     source = _unwrap(recorded)
     validation = getattr(source, "validation_failures", None)
-    if validation is not None:
-        counted = {label: getattr(source, attribute, 0) for attribute, label in _EMPTY_COUNTS}
-        validation.raise_if_any(settings, counted)
+
+    def gate(stopped_by: BaseException | None = None) -> None:
+        if validation is not None:
+            counted = {label: getattr(source, attribute, 0) for attribute, label in _EMPTY_COUNTS}
+            validation.raise_if_any(settings, counted, stopped_by=stopped_by)
+
+    try:
+        _build_filings(recorded, settings, _FETCH_PASS)
+    except Exception as error:
+        gate(stopped_by=error)  # raises when anything was recorded
+        raise
+    gate()
     check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
         try:

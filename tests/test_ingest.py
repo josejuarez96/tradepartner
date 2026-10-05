@@ -724,6 +724,49 @@ def test_input_validation_runs_on_a_dry_run_and_writes_the_list(
     assert (_counts(read), read("SELECT count(*) FROM ingestion_runs")) == before
 
 
+def test_a_pass_that_stops_after_a_recorded_failure_still_lists_it(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578: an input treated as absent can make a later step of the pass
+    raise; the gate still fails the run with the full list, naming that
+    error, so the error never hides the list."""
+
+    class Stops(_Validating):
+        def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+            super().facts(cik, names)
+            raise RuntimeError("no cached FSN period at or after edgar.fsn_first_year")
+
+    def make(**kwargs: Any) -> Stops:
+        source = Stops(**kwargs)
+        source.validation_failures = ValidationFailures(tmp_path / "validation", lambda: NOW)
+        source.bad = _CRASHES[2:]
+        return source
+
+    run = _run(settings, filings=_filings(cls=make), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "InputValidationError: EDGAR input validation: 1 input(s)" in run.message
+    assert "the pass then stopped: RuntimeError: no cached FSN period" in run.message
+    assert "FSN period 2026q1" in run.message
+
+
+def test_a_pass_that_stops_with_nothing_recorded_raises_its_own_error(
+    settings: Settings, tmp_path: Path
+) -> None:
+    class Stops(_Validating):
+        def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+            raise RuntimeError("unrelated")
+
+    def make(**kwargs: Any) -> Stops:
+        source = Stops(**kwargs)
+        source.validation_failures = ValidationFailures(tmp_path / "validation", lambda: NOW)
+        return source
+
+    run = _run(settings, filings=_filings(cls=make), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "RuntimeError: unrelated" in run.message and "InputValidationError" not in run.message
+    assert not (tmp_path / "validation").exists()
+
+
 def test_a_clean_validation_passes_straight_through(settings: Settings, tmp_path: Path) -> None:
     run = _run(settings, filings=_validating(tmp_path, (), fails=False), source="edgar").runs[0]
     assert run.status == OK  # 62 empty bulk facts are counted, never failed

@@ -155,7 +155,13 @@ never silently lifting an acceptance (#275).
 **Input validation (#578).** `.validation_failures` collects the fetch pass's
 parse failures (`edgar_validation`) for `ingest._prefetch`'s gate, which
 fails the run before any store write and lists them all in
-`edgar.cache_dir/validation/`.
+`edgar.cache_dir/validation/`. Recorded so far (part 2), each then absent
+for the rest of the pass: a quarter's `form.idx` (its rows skipped), a
+`submissions.zip` member or older page (the CIK left unstamped, no per-CIK
+top-up), a `companyfacts.zip` member (no company facts for the CIK, nothing
+cached, no API call) and an FSN period whose extraction or parse fails
+whole (no manifest, so the next run extracts it again). A per-accession FSN
+failure stays with the failure policy above.
 """
 
 from __future__ import annotations
@@ -199,7 +205,7 @@ from tradepartner.adapters.edgar import (
     parse_fsn,
     parse_sgml_header,
 )
-from tradepartner.adapters.edgar_validation import ValidationFailures
+from tradepartner.adapters.edgar_validation import PARSE_ERRORS, ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -345,6 +351,8 @@ class EdgarFilingSource(FilingSource):
         self.validation_failures = ValidationFailures(self._cache / "validation", self._clock)
         self._submissions: dict[str, _Submissions] = {}
         self._open_quarters: dict[Quarter, str] = {}
+        # #578: quarters whose form.idx did not parse, recorded once per instance.
+        self._unparsed_quarters: set[Quarter] = set()
         self.requests = 0
         self.skipped_filers = 0
         self.unstamped_filings: list[UnstampedFiling] = []
@@ -479,9 +487,24 @@ class EdgarFilingSource(FilingSource):
         self, quarters: Sequence[Quarter], open_quarter: Quarter
     ) -> Iterator[tuple[Quarter, UnstampedFiling]]:
         """Every row of every quarter's index, undated (the parser is given no
-        acceptance times, so it returns each row with its filing date only)."""
+        acceptance times, so it returns each row with its filing date only).
+
+        A quarter whose `form.idx` does not parse is recorded on
+        `.validation_failures` (#578) and skipped whole, as if absent, by
+        this walk and every later one on this instance (`filing_index` walks
+        twice, `delistings` twice more), so it is recorded once. The cached
+        file is kept as it is."""
         for quarter in quarters:
-            for row in parse_filing_index(self._index_text(quarter, open_quarter), {}).unstamped:
+            if quarter in self._unparsed_quarters:
+                continue
+            text = self._index_text(quarter, open_quarter)
+            parsed = self.validation_failures.collect(
+                "form.idx", f"{quarter[0]}-QTR{quarter[1]}", partial(parse_filing_index, text, {})
+            )
+            if parsed is None:
+                self._unparsed_quarters.add(quarter)
+                continue
+            for row in parsed.unstamped:
                 yield quarter, row
 
     def _index_text(self, quarter: Quarter, open_quarter: Quarter) -> str:
@@ -520,12 +543,13 @@ class EdgarFilingSource(FilingSource):
         stamps = {cik: self._load_stamps(cik) for cik in kept}
         pending = {cik: {a for a in rows if a not in stamps[cik]} for cik, rows in kept.items()}
         pending = {cik: wanted for cik, wanted in pending.items() if wanted}
+        unparsed: set[str] = set()
         if len(pending) > self._settings.edgar.bulk_stamp_threshold_ciks:
-            self._stamp_bulk(pending, stamps)
+            unparsed = self._stamp_bulk(pending, stamps)
         for cik, wanted in pending.items():
             wanted -= stamps[cik].keys()
-            if not wanted:
-                continue
+            if not wanted or cik in unparsed:
+                continue  # #578: a recorded bad zip member is never topped up per CIK
             submissions = self._fetch_submissions(cik, wanted)
             new = {a: submissions.records[a] for a in wanted if a in submissions.records}
             for accession in wanted - new.keys():
@@ -565,34 +589,64 @@ class EdgarFilingSource(FilingSource):
 
     def _stamp_bulk(
         self, pending: Mapping[str, set[str]], stamps: dict[str, dict[str, SubmissionRecord]]
-    ) -> None:
+    ) -> set[str]:
         """Stamp from `submissions.zip`; never marks anything unstampable (the
-        zip trails the day's filings)."""
+        zip trails the day's filings).
+
+        A member (CIK payload or older page) that does not parse is recorded
+        on `.validation_failures` (#578) and its CIK is returned: the CIK
+        keeps no stamp from this zip and `_stamp` asks nothing of the per-CIK
+        API for it, whose answer would likely share the shape (#599), so its
+        rows stay unstamped this run and nothing is cached for it."""
         path = edgar_raw.bulk_submissions(settings=self._settings, client=self._client)
+        unparsed: set[str] = set()
         with zipfile.ZipFile(path) as bulk:
             names = set(bulk.namelist())
+
+            def member(
+                name: str, absent: Callable[[Any], bool]
+            ) -> tuple[dict[str, SubmissionRecord], list[str]] | bool:
+                """`name`'s records and pages; `True` when `absent(payload)`
+                (#566), `False` once recorded as unparsed."""
+
+                def parse() -> tuple[dict[str, SubmissionRecord], list[str]] | bool:
+                    payload = json.loads(bulk.read(name))
+                    return True if absent(payload) else reduce_submissions(payload)
+
+                parsed = self.validation_failures.collect("submissions.zip member", name, parse)
+                return False if parsed is None else parsed
+
             for cik, wanted in pending.items():
                 if f"CIK{cik}.json" not in names:
                     continue
-                payload = json.loads(bulk.read(f"CIK{cik}.json"))
-                if _keyless_member(payload):  # #566: as if absent; stamped per CIK
+                main = member(f"CIK{cik}.json", _keyless_member)
+                if main is False:
+                    unparsed.add(cik)
+                    continue
+                if main is True:  # #566: as if absent; stamped per CIK
                     self.submissions_bulk_empty += 1
                     continue
-                records, pages = reduce_submissions(payload)
+                records, pages = main
                 for page in pages:
                     if wanted <= records.keys() or page not in names:
                         break
-                    page_payload = json.loads(bulk.read(page))
-                    if isinstance(page_payload, dict) and not page_payload:
+                    older = member(page, _empty_object)
+                    if older is False:
+                        unparsed.add(cik)
+                        break
+                    if older is True:
                         # #566: an empty page is absent; the per-CIK top-up
                         # in `_stamp` fetches it for what is still wanted.
                         self.submissions_bulk_empty += 1
                         break
-                    records.update(reduce_submissions(page_payload)[0])
+                    records.update(older[0])
+                if cik in unparsed:
+                    continue
                 new = {a: records[a] for a in wanted if a in records}
                 if new:
                     stamps[cik].update(new)
                     self._save_stamps(cik, stamps[cik])
+        return unparsed
 
     def _stamps_path(self, cik: str) -> Path:
         return self._cache / "stamps" / f"v{PARSER_VERSION}" / f"{cik}.json"
@@ -788,6 +842,12 @@ class EdgarFilingSource(FilingSource):
                 else []
             )
             parsed = parse_fsn(sub_rows, num_rows, txt_rows, dim_rows)
+        except _FSN_PARSE_ERRORS as error:
+            # #578: the period is absent for this run (no manifest, so the
+            # next run downloads and extracts it again); `record` re-raises
+            # a tripped path-safety guard.
+            self.validation_failures.record("FSN period", period, error)
+            return
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
             zip_path.unlink(missing_ok=True)  # the zip is deleted after extraction
@@ -1769,17 +1829,25 @@ class EdgarFilingSource(FilingSource):
             return {}
         key = _facts_key(latest, wanted)
         path = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{cik}.json"
-        cached = self._facts_memo.get((cik, key)) or _load_facts_cache(path, cik, key)
+        cached = self._facts_memo.get((cik, key))
+        if cached is None:  # an empty memo is an answer too: asked once per run (#578)
+            cached = _load_facts_cache(path, cik, key)
         if cached is None:
-            payload, complete = self._company_facts_payload(cik, latest)
-            cached = (
-                []
-                if payload is None  # T11h/T11e: no XBRL facts at all; not a filing failure
-                else [
+            payload, complete, from_zip = self._company_facts_payload(cik, latest)
+
+            def parse() -> _FactsCache:
+                if payload is None:  # T11h/T11e: no XBRL facts at all; not a filing failure
+                    return []
+                return [
                     (f.fact_name, f.accession, f.as_of_date, f.value)
                     for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
                 ]
-            )
+
+            if from_zip:  # #578: a zip member that does not parse is recorded, absent
+                parsed = self.validation_failures.collect(_FACTS_MEMBER, f"CIK{cik}.json", parse)
+                cached, complete = ([], False) if parsed is None else (parsed, complete)
+            else:
+                cached = parse()
             self._facts_memo[cik, key] = cached  # one fetch per CIK per run, cached or not
             if complete:  # else the payload trails the latest filing: fetch again next run
                 rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
@@ -1813,9 +1881,10 @@ class EdgarFilingSource(FilingSource):
                 out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
-    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool]:
-        """The raw company-facts payload and whether it already holds
-        `latest` (the filing the cache is keyed by): from one
+    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool, bool]:
+        """The raw company-facts payload, whether it already holds
+        `latest` (the filing the cache is keyed by) and whether it came from
+        the zip: from one
         `companyfacts.zip` when more than `edgar.bulk_stamp_threshold_ciks`
         stamped CIKs need a fetch (the stamping rule), else the per-CIK API;
         a CIK the zip lacks, or whose zip payload trails `latest` (the zip is
@@ -1831,7 +1900,15 @@ class EdgarFilingSource(FilingSource):
         API) is identified by the CIK it was requested under (the zip member
         name, or the API URL) rather than treated as absent, and counted on
         `facts_bulk_keyless`/`facts_api_keyless`; a `cik` that is present but
-        differs still raises."""
+        differs still raises.
+
+        A zip member that does not parse (not JSON, or another CIK's facts,
+        or missing the fields `_holds_accession` reads) is recorded on
+        `.validation_failures` (#578) and is absent for this run: no facts
+        from company facts, nothing cached, and the per-CIK API is not
+        asked, since its answer would likely share the shape (#599). The
+        caller records a zip payload that `parse_company_facts` refuses the
+        same way."""
         if self._facts_bulk is None:
             stale = 0
             for stamps_path in self._stamps_path("0").parent.glob("*.json"):
@@ -1851,21 +1928,34 @@ class EdgarFilingSource(FilingSource):
                 self._facts_bulk = False
         bulk_payload: Any | None = None
         if isinstance(self._facts_bulk, tuple) and f"CIK{cik}.json" in self._facts_bulk[1]:
-            with zipfile.ZipFile(self._facts_bulk[0]) as bulk:
-                bulk_payload = json.loads(bulk.read(f"CIK{cik}.json"))
-            if _keyless_member(bulk_payload):
-                if "facts" in bulk_payload:
-                    # #599: has facts despite missing `cik`; identified by the
-                    # zip member name it was read under.
-                    self.facts_bulk_keyless += 1
-                    bulk_payload = _identified(bulk_payload, cik)
-                else:
-                    # #566: SEC's zip has `{}` members. As if absent from the
-                    # zip: the API is asked, never "no facts" assumed.
-                    self.facts_bulk_empty += 1
-                    bulk_payload = None
-            if bulk_payload is not None and _holds_accession(bulk_payload, cik, latest):
-                return bulk_payload, True
+            bulk_path = self._facts_bulk[0]
+
+            def member() -> tuple[Any | None, str, bool]:
+                """The member's payload (`None` when `{}`), its shape
+                ("empty", "keyless" or "keyed") and whether it holds `latest`."""
+                with zipfile.ZipFile(bulk_path) as bulk:
+                    payload = json.loads(bulk.read(f"CIK{cik}.json"))
+                if not _keyless_member(payload):
+                    return payload, "keyed", _holds_accession(payload, cik, latest)
+                if "facts" not in payload:
+                    return None, "empty", False
+                payload = _identified(payload, cik)
+                return payload, "keyless", _holds_accession(payload, cik, latest)
+
+            read = self.validation_failures.collect(_FACTS_MEMBER, f"CIK{cik}.json", member)
+            if read is None:
+                return None, False, False
+            bulk_payload, shape, holds = read
+            if shape == "keyless":
+                # #599: has facts despite missing `cik`; identified by the
+                # zip member name it was read under.
+                self.facts_bulk_keyless += 1
+            elif shape == "empty":
+                # #566: SEC's zip has `{}` members. As if absent from the
+                # zip: the API is asked, never "no facts" assumed.
+                self.facts_bulk_empty += 1
+            if holds:
+                return bulk_payload, True, True
         try:
             payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
         except httpx.HTTPStatusError as error:
@@ -1884,10 +1974,19 @@ class EdgarFilingSource(FilingSource):
             if bulk_payload is not None:
                 # The zip has this CIK's facts, only trailing `latest`: serve
                 # them, marked incomplete so the next run asks again (#275).
-                return bulk_payload, False
+                return bulk_payload, False, True
             self.facts_missing += 1
-            return None, True  # no XBRL facts at all: an empty result is cached
-        return payload, _holds_accession(payload, cik, latest)
+            return None, True, False  # no XBRL facts at all: an empty result is cached
+        return payload, _holds_accession(payload, cik, latest), False
+
+
+#: What fails an FSN period whole (#578): a parser refusal, or DuckDB failing
+#: a member's read on a malformed line (#455, #498). DuckDB's I/O errors
+#: still propagate.
+_FSN_PARSE_ERRORS: tuple[type[Exception], ...] = (*PARSE_ERRORS, duckdb.InvalidInputException)
+
+#: The validation collector's input name for a `companyfacts.zip` member (#578).
+_FACTS_MEMBER = "companyfacts.zip member"
 
 
 def _message_hash(message: str) -> str:
