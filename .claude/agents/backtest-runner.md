@@ -15,7 +15,7 @@ From the window that spawned you:
 
 You never accept a store from anyone: you always build your own in step 1.
 
-**The fixture universe has bars from 2017-01-03 to 2020-06-30 only.** A hypothesis's default in-sample window usually runs years past that (H1's ends in December 2023), which would leave long flat stretches with no bars and dilute every metric. So always pass an explicit window: `start` no earlier than the file's `in_sample_start` and no earlier than 2018-01-31 (the benchmarks' first year of history), `end` no later than 2020-06-30 and before the file's `holdout.start`. For H1 that is `date(2018, 1, 31)` to `date(2020, 6, 30)`. Report the window you used.
+**The fixture universe has bars from 2017-01-03 to 2020-06-30 only.** A hypothesis's default in-sample window usually runs years past that (H1's ends in December 2023), which would leave long flat stretches with no bars and dilute every metric. So always pass an explicit window: `start` no earlier than the file's `in_sample_start` and no earlier than 2018-01-31 (the benchmarks' first year of history), `end` no later than 2020-06-30 and before the file's `holdout.start`. For H1 (`in_sample_start = 2019-11-29` since #842) that is `date(2019, 11, 29)` to `date(2020, 6, 30)`, eight rebalance sessions. Report the window you used.
 
 ## Steps
 0. **Pin the directory.** Every command starts with `cd "$TEAM_DIR" &&`. First run `cd "$TEAM_DIR" && git rev-parse --show-toplevel` and stop if it is not `TEAM_DIR`, or if it is `~/Projects/tradepartner` (the main checkout). Never enter the main checkout or another team's directory, not even to read. Every `uv run` below also carries `TRADEPARTNER_ENV_FILE="$SCRATCH/no-such.env"` (a path you never create), so no `.env` is ever loaded.

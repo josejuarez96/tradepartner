@@ -1,8 +1,8 @@
 """The H1 hypothesis file parses through `backtest.hypothesis` (plan T35b, spec req 18).
 
 `docs/hypotheses/h1-momentum-12-1.md` must name every required key with `family=momentum`
-and the owner's answers to spec open questions 1, 2 and 8 (#156). Nothing here registers
-it: the owner does that on the real store after merge (T45b).
+and the owner's answers to spec open questions 1, 2 and 8 (#156; Q8 amended on #842).
+Nothing here registers it: the owner does that on the real store after merge (T45b).
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ def test_h1_file_parses_with_slug_family_and_dates() -> None:
     assert parsed.family == "momentum"
     assert parsed.family in Settings(_env_file=None).hypotheses.families
     assert parsed.title
-    # Owner answers to spec open questions 8 and 2 (#156).
-    assert parsed.in_sample_start == date(2017, 1, 31)
+    # Owner answers to spec open questions 8 and 2 (#156); Q8 amended on #842 (decision (b):
+    # the first month-end at which the real store's universe reaches top_n_by_cap).
+    assert parsed.in_sample_start == date(2019, 11, 29)
     assert parsed.holdout_start == date(2024, 1, 1)
     assert parsed.holdout_end == date(2026, 9, 30)
 
@@ -71,13 +72,15 @@ def test_h1_frozen_set_builds_over_default_settings() -> None:
 def test_h1_power_arithmetic_counts() -> None:
     """The session counts the file's power arithmetic states, on the XNYS calendar."""
     parsed = hypothesis.parse_file(H1_PATH)
-    assert parsed.in_sample_start == last_session_of_month(2017, 1)
+    assert parsed.in_sample_start == last_session_of_month(2019, 11)
     # Spec req 11: the in-sample default window ends at the last rebalance before holdout.start.
     before_holdout = schedule.rebalance_sessions(
         parsed.in_sample_start, parsed.holdout_start - timedelta(days=1)
     )
     assert before_holdout[-1] == LAST_IN_SAMPLE_REBALANCE
-    assert len(before_holdout) == 84
+    # 50 sessions, 49 monthly returns (#842; 84 and 83 before the amendment).
+    assert len(before_holdout) == 50
+    assert schedule.fill_session(before_holdout[0]) == date(2019, 12, 2)
     # The holdout window itself holds 33 month-ends; the pinned holdout run starts one
     # rebalance earlier so that January 2024 belongs to a window (34 sessions, 33 returns).
     assert len(schedule.rebalance_sessions(parsed.holdout_start, parsed.holdout_end)) == 33
