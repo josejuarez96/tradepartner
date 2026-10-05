@@ -25,7 +25,9 @@ source, `edgar` then `alpaca`, halting at the first chunk that is not `ok`:
   with its own count, not counted (#784); so is any other name with no bar
   in this month or the previous one (bars already committed), unless it is
   a benchmark or first listed this month, or the store has no bar at all in
-  the previous month.
+  the previous month. The names so reported (dark plus snapshot-only) make
+  the month stale when they are more than `ingest.max_dark_share` of the
+  listed names (#796).
 
 The EDGAR chunk is fetched with no store connection open (a recording
 pass) and committed in one short write transaction.
@@ -125,6 +127,7 @@ from tradepartner.ingest import (
     _bar_row,
     _clean,
     _counted,
+    _dark_stale,
     _fetched,
     _ingest_filings,
     _may_count,
@@ -634,6 +637,8 @@ def _price_chunk(
                 f"have no bar in {first}..{last}: {', '.join(missing[:10])}"
                 f"{_reported_note(reported)}"
             )
+        if stale := _dark_stale(listed, reported, settings, f"in {first}..{last}"):
+            raise _Stale(stale)
         with open_for_write(settings) as conn:
             init_schema(conn)
             added = _add_rows(
