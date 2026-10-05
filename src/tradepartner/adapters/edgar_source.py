@@ -379,6 +379,9 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
+        # #868: periods parsed cleanly after an earlier period failed whole,
+        # so not written; they still set where the lag window starts.
+        self._fsn_unwritten_periods: list[str] = []
         # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
@@ -779,6 +782,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_incomplete_listings = 0
         self.fsn_missing = 0
         self._fsn_extraction_failures_this_run = 0
+        self._fsn_unwritten_periods = []
 
         all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
         listed = set(all_periods)
@@ -858,7 +862,8 @@ class EdgarFilingSource(FilingSource):
         period of the pass failed whole, #868), the period is only downloaded
         and parsed, so a whole-period failure is still recorded, and nothing
         else happens: no accession is claimed, no counter moves, no cache row
-        or manifest is written. Returns `False` once a period has failed
+        or manifest is written (the period only counts toward where the lag
+        window starts, `_lag_window_start`). Returns `False` once a period has failed
         whole (this one, or an earlier one), else `True`."""
         zip_path, headers = edgar_raw.fsn_zip(period, settings=self._settings, client=self._client)
         with zip_path.open("rb") as zip_file:  # streamed: FSN zips reach hundreds of MB
@@ -907,7 +912,9 @@ class EdgarFilingSource(FilingSource):
             zip_path.unlink(missing_ok=True)  # the zip is deleted after extraction
 
         if not persist:
-            return False  # parsed only to record a whole-period failure (#868)
+            # parsed only to record a whole-period failure (#868)
+            self._fsn_unwritten_periods.append(period)
+            return False
         form_by_accession = {str(row["adsh"]): str(row["form"]) for row in sub_rows}
         per_cik_new: dict[str, dict[str, FsnFiling]] = {}
         served: list[str] = []
@@ -1029,10 +1036,14 @@ class EdgarFilingSource(FilingSource):
 
     def _lag_window_start(self) -> datetime:
         """The first day (Eastern midnight, as UTC) of the newest cached FSN
-        period at or after `edgar.fsn_first_year`. With no such period
-        (e.g. `fsn_first_year` past the newest listed period) it raises
-        rather than treating all history as the lag window."""
-        periods = self._fsn_loaded_periods  # in range, and the manifest loads
+        period at or after `edgar.fsn_first_year`, or of a newer one this
+        pass parsed but did not write after an earlier period failed whole
+        (#868: otherwise every filing since the last written period would be
+        fetched one by one on a run the gate fails anyway). With no such
+        period (e.g. `fsn_first_year` past the newest listed period) it
+        raises rather than treating all history as the lag window."""
+        # in range, and the manifest loads; or parsed but unwritten (#868)
+        periods = (*self._fsn_loaded_periods, *self._fsn_unwritten_periods)
         if not periods:
             # Fail closed: "everything is inside the lag window" would request
             # a header for every 8-K and 10-Q since 1993 (#249 safety review).

@@ -183,27 +183,40 @@ def test_an_fsn_period_that_fails_whole_is_recorded_and_absent(tmp_path: Path) -
 
 def test_after_a_period_fails_whole_later_periods_persist_nothing(tmp_path: Path) -> None:
     """#868: once an FSN period fails whole, the later periods of the same
-    pass are still extracted (every failure is seen in one pass) but write
-    no manifest and no per-CIK cache, so a shared accession is not claimed
-    by the later period. On the next run, with the earlier period repaired,
-    the earlier period extracts it first and the later one counts it as the
-    duplicate (the oldest-first rule holds)."""
+    pass are still parsed, so a second whole-period failure is recorded too
+    (every failure is seen in one pass), but write no manifest and no
+    per-CIK cache, so a shared accession is not claimed by a later period.
+    The lag window still starts at the newest period parsed, not at the
+    last one written (here none, which would raise). On the next run, with
+    the periods repaired, the oldest extracts the shared accession first
+    and the later one counts it as the duplicate."""
     shared, cik = "0000000011-15-000001", "11"
     settings = _fsn_settings(tmp_path)
-    broken = {"2015q1": _missing_member_zip(), "2015q2": _one_period_zip(shared, cik)}
+    broken = {
+        "2015q1": _missing_member_zip(),
+        "2015q2": _one_period_zip(shared, cik),
+        "2015q3": _malformed_num_zip(),
+        "2015q4": _one_period_zip("0000000013-15-000001", "13"),
+    }
     source = _source_ready(settings, _router_with_fsn(*broken, zips=broken))
     source._ensure_fsn()
-    assert _failures(source) == [("FSN period", "2015q1")]
+    assert _failures(source) == [("FSN period", "2015q1"), ("FSN period", "2015q3")]
     fsn_root = Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}"
     assert not list((fsn_root / "manifests").glob("*.json"))
     assert not list(fsn_root.glob("*.json"))
     assert source._fsn_loaded_periods == ()
+    assert source.fsn_duplicates == 0
 
-    repaired = {"2015q1": _one_period_zip(shared, cik), "2015q2": _one_period_zip(shared, cik)}
+    repaired = {
+        **broken,
+        "2015q1": _one_period_zip(shared, cik),
+        "2015q3": _one_period_zip("0000000012-15-000001", "12"),
+    }
     again = _source_ready(settings, _router_with_fsn(*repaired, zips=repaired))
     again._ensure_fsn()
     assert _failures(again) == []
     assert again.fsn_duplicates == 1
+    assert source._lag_window_start() == again._lag_window_start()
     first = json.loads((fsn_root / "manifests" / "2015q1.json").read_bytes())
     later = json.loads((fsn_root / "manifests" / "2015q2.json").read_bytes())
     assert first["accessions_served"] == [shared]
