@@ -2577,3 +2577,100 @@ grade = "n/a"
 scope = "routing and fallback"
 source = "docs/research/2026-10-03-prospective-semantic-feature-spec.md"
 section = "5. Routing and fallback"
+
+# ===== 2026-10-05-gdelt-news-metadata.md =====
+[[claim]]
+id = "GD-1"
+statement = "No documented GDELT time field (DATEADDED, MentionTimeDate, GKG DATE, record-id or file-name batch time, DOC API seendate) is shown to be never earlier than an article's public availability with a bounded lag."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "GDELT 2.0 Events, Mentions, GKG 2.1 and DOC 2.0 API, as documented; no latency measurement found"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Answer"
+bears_on = ["spec:event-data"]
+note = "Brief #882 graded claim. The batch window-label convention is undocumented, so a batch stamp may precede publication by up to one interval (inference, UNVERIFIED)."
+
+[[claim]]
+id = "GD-2"
+statement = "GDELT's Events DATEADDED, Mentions MentionTimeDate, GKG DATE and GKG record-id prefix are 15-minute processing-batch timestamps, one value per update file, not the article's stated publication time."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Event Codebook V2.0 p.6-7 and GKG Codebook V2.1 (Tier 1)"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Stamp semantics, per product (the critical question)"
+bears_on = ["spec:event-data"]
+note = "Conflicting Tier 1 prose: the GDELT 2.0 blog calls the Mentions stamp 'the timestamp the article was published', and the GKG codebook calls DATE the 'date of publication' while saying it is the same for all rows in a file."
+
+[[claim]]
+id = "GD-3"
+statement = "A forward collector that stamps known_at as its own fetch time cannot stamp a GDELT record earlier than public availability, whatever GDELT's stamp semantics, because GDELT publishes a record only after crawling the article."
+kind = "principle"
+grade = "n/a"
+scope = "Forward-only collection per event-data spec req 2 (d)"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Answer"
+bears_on = ["spec:event-data"]
+
+[[claim]]
+id = "GD-4"
+statement = "GDELT datasets are free for any academic, commercial or governmental use, and may be redistributed or mirrored provided every use cites the GDELT Project with a link."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GDELT about.html terms (page copyright 2013-2022); no terms change found; publishers' headlines are not licensed by GDELT"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Evidence"
+bears_on = ["spec:event-data"]
+
+[[claim]]
+id = "GD-5"
+statement = "GDELT has no source-provided issuer link that avoids a model: GKG organizations come from GDELT's own extraction engine, tuned to favour recall, and event actors are machine-coded, so both fall under the event-data spec's no-source-computed-field rule."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GKG Codebook V2.1; Events 2.0"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Answers to the brief, question by question"
+bears_on = ["spec:event-data", "adr:0008"]
+note = "A deterministic name or ticker match on titles or URLs is the only route without a model; its precision is unmeasured."
+
+[[claim]]
+id = "GD-6"
+statement = "GKG 2.1 does not deduplicate (20 articles with identical extractions appear as 20 rows), and machine-coded GDELT events often duplicate and misclassify (only 21% of valid protest URLs were true protest events in a 2016 Science study)."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "GKG Codebook V2.1; Wang et al., Science 353(6307), 2016, Latin American protest events to July 2014"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Disconfirmation"
+bears_on = ["spec:event-data"]
+note = "The Science finding concerns event coding, not URL or headline metadata."
+
+[[claim]]
+id = "GD-7"
+statement = "GDELT Events, Mentions and GKG files update every 15 minutes since 2015-02-19; the DOC 2.0 API covers a rolling 3-month window and returns at most 250 records per query."
+kind = "fact"
+grade = "UNGRADED"
+scope = "GDELT blog 2015-02-19 and 2017-06-20 (Tier 1); outages and late or replaced files undocumented; DOC API rate of about 1 request per 5 s is Tier 3 only"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Answers to the brief, question by question"
+bears_on = ["spec:event-data"]
+
+[[claim]]
+id = "GD-8"
+statement = "For a top-1000 US universe, GDELT GKG would yield roughly 3,500 to 21,000 matched rows per day before deduplication."
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "Estimate from an unverified ~700,000 articles a day and an assumed 0.5-3% match share; not measured"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Volume estimate (rows per day, top-1000 US universe)"
+bears_on = ["spec:event-data"]
+note = "Replace with the spec's one-week forward measurement."
+
+[[claim]]
+id = "GD-9"
+statement = "Alpaca's News API serves Benzinga news since 2015 with headline, url, source, symbols, created_at and updated_at, but its docs do not define the timestamps or how symbols are assigned, and it falls under Alpaca's personal, non-commercial terms."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Alpaca docs updated 2025-09-24; free rate of 200 per minute is Tier 3; Benzinga licence not read"
+source = "docs/research/2026-10-05-gdelt-news-metadata.md"
+section = "Alternative evaluated: Alpaca News API (Benzinga)"
+bears_on = ["spec:event-data", "adr:0008"]
+note = "See FT-1 for the Alpaca terms."
