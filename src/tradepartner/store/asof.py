@@ -825,6 +825,7 @@ def adjusted_prices_as_of(
     include_dividends: bool = False,
     settings: Settings | None = None,
     traded_only: bool = False,
+    sessions_from: date | None = None,
 ) -> pl.DataFrame:
     """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
     `close` adjusted for every split known by `t` with `ex_date <= t`
@@ -853,14 +854,27 @@ def adjusted_prices_as_of(
     `prices_as_of(traded_only=True)` (#787); the factors themselves are
     computed over every stored bar, so a dividend's prior close is the one
     the unfiltered read would use.
+
+    `sessions_from` (strategy-lab T99) leaves bars with `session <
+    sessions_from` out of the returned frame, **after** the as-of selection:
+    the `known_at` cut, the latest revision per bar and every factor are
+    computed exactly as the unbounded read computes them (a dividend whose
+    prior close falls before the bound still adjusts), so the result is the
+    unbounded frame's rows at or after the bound, row for row. `None` (the
+    default) bounds nothing. Raises `TypeError` for a `datetime`: the bound is
+    a session date, not a read time.
     """
     t = _validate_t(t)
+    if isinstance(sessions_from, datetime):
+        raise TypeError(f"sessions_from must be a session date, not a datetime: {sessions_from!r}")
     common_ctes, params = _adjusted_params(
         t, security_ids, settings, include_dividends=include_dividends
     )
     with _sessions_registered(conn, include_dividends=include_dividends):
         _raise_on_invalid_factor(conn, common_ctes, params)
         frame = conn.execute(_adjusted_select(common_ctes), params).pl()
+    if sessions_from is not None:
+        frame = frame.filter(pl.col("session") >= sessions_from)
     return _traded(frame) if traded_only else frame
 
 

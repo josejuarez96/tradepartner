@@ -45,6 +45,7 @@ class Call:
     ids: tuple[str, ...] | None = None
     include_dividends: bool | None = None
     t_prev: datetime | None = None
+    sessions_from: date | None = None
 
 
 def _known(frame: pl.DataFrame, t: datetime) -> pl.DataFrame:
@@ -122,15 +123,28 @@ class FakeProvider:
         )
 
     def adjusted_prices(
-        self, t: datetime, ids: Sequence[str], include_dividends: bool
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
     ) -> pl.DataFrame:
-        t = self._record("adjusted_prices", t, ids=ids, include_dividends=include_dividends)
+        t = self._record(
+            "adjusted_prices",
+            t,
+            ids=ids,
+            include_dividends=include_dividends,
+            sessions_from=sessions_from,
+        )
         source = (
             self.dividend_prices
             if include_dividends and self.dividend_prices is not None
             else self.prices
         )
-        return _latest(_for_ids(_known(source, t), ids), ["security_id", "session"])
+        frame = _latest(_for_ids(_known(source, t), ids), ["security_id", "session"])
+        # The bound applies after the as-of selection, as in the store (T99).
+        return frame if sessions_from is None else frame.filter(pl.col("session") >= sessions_from)
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t = self._record("raw_prices", t, ids=ids)
