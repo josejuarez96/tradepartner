@@ -83,7 +83,8 @@ def store_resolver(
     """The `ListingResolver` an ingest run at `at` builds: the listings
     known at `at`, with the `registrant_evidence` of the facts and listing
     ends known then (#793) and `at`'s day as the run's day, and
-    `alpaca.rename_lead_days` (#843)."""
+    `alpaca.rename_lead_days` (#843) and `alpaca.accepted_relistings`
+    (#943)."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
         facts_as_of(conn, at).iter_rows(named=True),
@@ -96,6 +97,7 @@ def store_resolver(
         listings_as_of(conn, at).iter_rows(named=True),
         evidence,
         rename_lead_days=settings.alpaca.rename_lead_days,
+        accepted_relistings=settings.alpaca.accepted_relistings,
     )
 
 

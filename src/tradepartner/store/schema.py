@@ -25,7 +25,7 @@ by column type, before any row reaches these tables.
 `init_schema(conn)` is idempotent: every statement is `CREATE ... IF NOT
 EXISTS`, and each `schema_version` bookkeeping row is inserted only once.
 If a store records a version this code has no path from (anything other
-than 2, 3, 4, 5, 6, 7, 8 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
+than 2 to 11 or `CURRENT_SCHEMA_VERSION`), `init_schema` raises
 `SchemaVersionError` rather than silently operating against a shape it
 does not know about.
 
@@ -161,7 +161,25 @@ registry; #83 took version 2 first, so the registry is version 3):
   a version-10 (or older) store: it has no retraction, so the master reads
   (`has_retracted`) take every row as live, as before; `paper start` reads
   the master before its write connection migrates.
-- **A later DDL change goes to version 12**, with its own migration and a
+- **Version 12** (#926, research-registry plan T80; spec req 1): the five
+  research-registry tables (`RESEARCH_TABLE_NAMES`: registrations, dataset
+  versions, runs, results, decisions) and `trial_results.n_research
+  INTEGER` (nullable, req 9). Purely additive, like version 3 and version
+  10: the migration from version 11 (or any earlier migratable version,
+  after its own steps) creates the tables, adds the column by `ALTER TABLE`
+  so the pinned `_REGISTRY_TABLE_DDL` never changes (NULL on every existing
+  row; a fresh store gets the column the same way), and appends a
+  version-12 row; no fact, journal or other registry table changes. The
+  research tables are neither fact nor registry nor journal tables (see
+  below) and stay out of `TABLE_NAMES`, so the look-ahead harness never
+  sees them. Any writing `init_schema` migrates, so the owner's store takes
+  version 12 at its first writing job after this version is pulled (the
+  research-registry plan, "Schema version"). A read-only connection accepts
+  a version-11 store without migrating it: every non-research read keeps
+  working, a research read raises `ResearchNotInitialised`
+  (`require_research`, which the research readers call first) and a
+  `trial_results.n_research` read fails on the missing column.
+- **A later DDL change goes to version 13**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -190,6 +208,20 @@ NOT NULL only where the spec's rules say it always has a value; anything
 conditional (a reason, a fault type, a broker id, a JSON detail) is
 nullable. No foreign keys, as for the other tables; ids come from
 `store.journal`.
+
+Research-registry tables (research-registry spec "Data / interfaces" >
+Tables; version 12) are not fact tables either: every row carries
+`known_at TIMESTAMPTZ NOT NULL` (the write's clock: the registration, the
+run's open, the result's close, the decision) and no `ingested_at`,
+`source` or `provenance`, and they stay out of `TABLE_NAMES`,
+`REGISTRY_TABLE_NAMES` and `JOURNAL_TABLE_NAMES`. Append-only by contract
+(`store.research` exposes inserts and reads only). Schema-level backstops:
+a primary key on each table's own id (on `research_results`, the run id,
+so a run has one result), a `CHECK` on every column the spec enumerates
+(`RESEARCH_ENUMS` and `RESEARCH_STAGES`), `verdict` and a positive
+`n_configurations` on exactly the `ok` results, a positive
+`n_configurations_declared`, and req 2's `return` implies `touches_returns`
+implies a `family`. No foreign keys; ids come from `store.research`.
 
 Design decisions (not pinned by the spec text, recorded here because
 they shape this DDL):
@@ -258,7 +290,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
 STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 
 #: The schema version `init_schema` records on a fresh store and migrates
-#: a version-2, 3, 4, 5, 6, 7 or 8 store to. Bump and add a migration note (not
+#: a version-2 to 11 store to. Bump and add a migration note (not
 #: silent DDL edits) if the shape of a table changes after data has been
 #: loaded.
 #:
@@ -315,7 +347,13 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   table. `_TABLE_DDL` keeps its version-4 pin, so every store, a fresh one
 #:   included, has the two tables rebuilt after the DDL pass with every row
 #:   kept and `retracted = FALSE`.
-CURRENT_SCHEMA_VERSION = 11
+#: - 12 (#926, research-registry plan T80): the five research-registry tables
+#:   (`RESEARCH_TABLE_NAMES`) and `trial_results.n_research INTEGER`
+#:   (nullable). Additive: the migration from version 11 (or any earlier
+#:   migratable version, after its steps) creates the tables, adds the column
+#:   by `ALTER TABLE` (NULL on every existing row) and appends a version-12
+#:   row; no fact, journal or other registry table changes.
+CURRENT_SCHEMA_VERSION = 12
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -356,6 +394,11 @@ _PRE_STATEMENT_FACTS_VERSION = 9
 #: `retracted` column (`has_retracted`) and take every row as live.
 _PRE_RETRACTION_VERSION = 10
 
+#: The last version without the research registry and `trial_results
+#: .n_research` (#926, T80): read-only connections serve every other read; a
+#: research read there raises `ResearchNotInitialised` (`require_research`).
+_PRE_RESEARCH_VERSION = 11
+
 
 class SchemaVersionError(RuntimeError):
     """The store's `schema_version` table records a version this code has
@@ -368,6 +411,15 @@ class RegistryNotInitialised(RuntimeError):
     (a version-2 store, or one never initialised). Read-only
     connections never migrate; any writing command's `init_schema` call
     does."""
+
+
+class ResearchNotInitialised(RuntimeError):
+    """The store has no research-registry tables: a store before version 12
+    that only a read-only connection has opened (read-only connections never
+    migrate).
+    Raised by the research readers (`require_research`), never by
+    `init_schema`, so every other read on such a store keeps working; any
+    writing command's `init_schema` migrates it."""
 
 
 def _common_fact_columns(provenance_values: tuple[str, ...]) -> str:
@@ -1534,6 +1586,303 @@ _JOURNAL_TABLE_DDL: tuple[str, ...] = (
 )
 
 
+# Research-experiment registry (schema version 12; research-registry spec req 1
+# and "Data / interfaces" > Tables, plan T80). Not fact tables: every row
+# carries `known_at` (`db.utc_now()` at the write, tz-aware UTC, NOT NULL) and
+# none of the other three common columns, and the tables stay out of
+# `TABLE_NAMES` so the look-ahead harness never sees them. Append-only by
+# contract (`store.research`, T81, exposes inserts and reads only); a run's
+# outcome is its one `research_results` row (the primary key), never an update
+# of `research_runs`. No foreign keys and no sequences, as for the trial
+# registry: ids are `MAX + 1` inside the write transaction. Every JSON payload
+# is VARCHAR (no json extension, `configure_connection`). The schema-level
+# backstops are the primary keys, a `CHECK` on every column the spec
+# enumerates (each set a code constant below, pinned by a test: a new value is
+# a spec amendment), `verdict` and a positive `n_configurations` set on an `ok`
+# result (req 8, req 9), and the two req 2 rules N depends on (`return` implies
+# `touches_returns` implies a `family`). The other req 2 and req 11 refusals
+# belong to the parser and `store.research`: a refused registration or dataset
+# never reaches these tables.
+
+#: `research_registrations.kind` (spec "Definitions", Kind).
+RESEARCH_KINDS: tuple[str, ...] = ("agreement", "benchmark", "robustness", "economic", "return")
+
+#: `research_registrations.stage`: the brief §2 gates 2 to 7 (stage 1 has no runs).
+RESEARCH_STAGES: tuple[int, ...] = (2, 3, 4, 5, 6, 7)
+
+#: `research_registrations.provenance` (spec "Definitions", Provenance).
+RESEARCH_PROVENANCES: tuple[str, ...] = (
+    "human",
+    "deterministic",
+    "classical",
+    "model_historical",
+    "model_prospective",
+    "pit_model",
+)
+
+#: `research_registrations.primary_direction`.
+RESEARCH_DIRECTIONS: tuple[str, ...] = ("greater", "less")
+
+#: `research_registrations.multiplicity_method`.
+RESEARCH_MULTIPLICITY_METHODS: tuple[str, ...] = ("holm", "fixed_sequence", "bh", "none")
+
+#: `research_runs.split` (spec "Definitions", Split).
+RESEARCH_SPLITS: tuple[str, ...] = ("dev", "cal", "test", "prospective", "pilot", "full", "none")
+
+#: `research_runs.confirmatory_basis` (req 7); `none` on an exploratory run.
+RESEARCH_CONFIRMATORY_BASES: tuple[str, ...] = ("predates_dataset", "sealed_split", "none")
+
+#: `research_results.outcome` (req 8).
+RESEARCH_OUTCOMES: tuple[str, ...] = (
+    "ok",
+    "failed",
+    "refused_window",
+    "refused_holdout",
+    "refused_split",
+    "refused_budget",
+    "abandoned",
+)
+
+#: `research_results.verdict` (req 8), set exactly on an `ok` result.
+RESEARCH_VERDICTS: tuple[str, ...] = ("pass", "fail", "underpowered", "n/a")
+
+#: `research_decisions.kind` (req 2's `budget_amend`, req 5's `holdout_spend`;
+#: the earlier draft's `import` was dropped with req 12, #810).
+RESEARCH_DECISION_KINDS: tuple[str, ...] = ("holdout_spend", "budget_amend")
+
+#: Every enumerated research column and its allowed values, one `CHECK` each
+#: (`stage`, an integer, has its own `CHECK` over `RESEARCH_STAGES`).
+RESEARCH_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("research_registrations", "kind"): RESEARCH_KINDS,
+    ("research_registrations", "provenance"): RESEARCH_PROVENANCES,
+    ("research_registrations", "primary_direction"): RESEARCH_DIRECTIONS,
+    ("research_registrations", "multiplicity_method"): RESEARCH_MULTIPLICITY_METHODS,
+    ("research_runs", "split"): RESEARCH_SPLITS,
+    ("research_runs", "confirmatory_basis"): RESEARCH_CONFIRMATORY_BASES,
+    ("research_results", "outcome"): RESEARCH_OUTCOMES,
+    ("research_results", "verdict"): RESEARCH_VERDICTS,
+    ("research_decisions", "kind"): RESEARCH_DECISION_KINDS,
+}
+
+
+def _research_check(table: str, column: str, *, nullable: bool = False) -> str:
+    """The `CHECK` restricting `table.column` to its `RESEARCH_ENUMS` values
+    (and NULL when `nullable`)."""
+    allowed = ", ".join(f"'{value}'" for value in RESEARCH_ENUMS[table, column])
+    check = f"{column} IN ({allowed})"
+    return f"CHECK ({column} IS NULL OR {check})" if nullable else f"CHECK ({check})"
+
+
+_RESEARCH_STAGE_CHECK = f"CHECK (stage IN ({', '.join(str(s) for s in RESEARCH_STAGES)}))"
+
+# One row per registration; an amendment is a new row pointing at the one it
+# supersedes (`amends_registration_id`, NULL on the first of a chain). Two of
+# req 2's refusals are backstopped here too, since N reads them: a `return`
+# registration touches returns, and one that touches returns names a family. `family`
+# is NULL unless the file names one (required when `touches_returns`, req 2);
+# `hypothesis_ref`, `dataset_sha256_pin`, `primary_threshold` and the
+# multiplicity family's id and size are optional in the file (req 2).
+_CREATE_RESEARCH_REGISTRATIONS = f"""
+CREATE TABLE IF NOT EXISTS research_registrations (
+    registration_id BIGINT NOT NULL PRIMARY KEY,
+    slug VARCHAR NOT NULL,
+    kind VARCHAR NOT NULL,
+    stage INTEGER NOT NULL,
+    title VARCHAR NOT NULL,
+    confirmatory BOOLEAN NOT NULL,
+    provenance VARCHAR NOT NULL,
+    touches_returns BOOLEAN NOT NULL,
+    family VARCHAR,
+    claims_json VARCHAR NOT NULL,
+    hypothesis_ref VARCHAR,
+    dataset_name VARCHAR NOT NULL,
+    dataset_sha256_pin VARCHAR,
+    window_start DATE NOT NULL,
+    window_end DATE NOT NULL,
+    splits_json VARCHAR NOT NULL,
+    primary_metric VARCHAR NOT NULL,
+    primary_direction VARCHAR NOT NULL,
+    primary_threshold DOUBLE,
+    primary_ci_level DOUBLE NOT NULL,
+    primary_min_clusters INTEGER NOT NULL,
+    primary_inference VARCHAR NOT NULL,
+    secondary_json VARCHAR NOT NULL,
+    comparison_set VARCHAR NOT NULL,
+    multiplicity_method VARCHAR NOT NULL,
+    multiplicity_family_id VARCHAR,
+    multiplicity_family_size INTEGER,
+    budget_runs INTEGER NOT NULL,
+    budget_configurations INTEGER NOT NULL,
+    stop_rule VARCHAR NOT NULL,
+    expected_effect VARCHAR NOT NULL,
+    seed BIGINT NOT NULL,
+    doc_path VARCHAR NOT NULL,
+    doc_sha256 VARCHAR NOT NULL,
+    params_json VARCHAR NOT NULL,
+    params_sha256 VARCHAR NOT NULL,
+    amends_registration_id BIGINT,
+    registered_by VARCHAR NOT NULL,
+    known_at TIMESTAMPTZ NOT NULL,
+    {_research_check("research_registrations", "kind")},
+    {_RESEARCH_STAGE_CHECK},
+    {_research_check("research_registrations", "provenance")},
+    {_research_check("research_registrations", "primary_direction")},
+    {_research_check("research_registrations", "multiplicity_method")},
+    CHECK (kind <> 'return' OR touches_returns),
+    CHECK (NOT touches_returns OR family IS NOT NULL)
+)
+"""
+
+# One row per dataset version (req 11). `n_rows` is NULL for a non-tabular
+# (directory) export; `event_column`, `split_path`, `split_sha256` and `seed`
+# are NULL when not given; `split_spans_json` always holds the per-split event
+# spans (`full` alone without a split file). `code_dirty` is NULL when
+# `code_version` is 'unknown', as in `trials`.
+_CREATE_RESEARCH_DATASETS = """
+CREATE TABLE IF NOT EXISTS research_datasets (
+    dataset_id BIGINT NOT NULL PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    version VARCHAR NOT NULL,
+    path VARCHAR NOT NULL,
+    sha256 VARCHAR NOT NULL,
+    n_rows BIGINT,
+    event_start DATE NOT NULL,
+    event_end DATE NOT NULL,
+    event_column VARCHAR,
+    split_path VARCHAR,
+    split_sha256 VARCHAR,
+    split_spans_json VARCHAR NOT NULL,
+    sealed_splits_json VARCHAR NOT NULL,
+    sealed_periods_json VARCHAR NOT NULL,
+    locked BOOLEAN NOT NULL,
+    seed BIGINT,
+    code_version VARCHAR NOT NULL,
+    code_dirty BOOLEAN,
+    note VARCHAR,
+    known_at TIMESTAMPTZ NOT NULL
+)
+"""
+
+# One row per run, written at open and never updated (req 3); a refusal at
+# open is a run row too, its outcome the result row. `store_max_ingested_at`
+# is NULL for a run that reads no runtime-store data (or an empty store);
+# `holdout_reason` is NULL unless `holdout_spent`. At least one configuration
+# is declared (req 6, `--configurations` default 1).
+_CREATE_RESEARCH_RUNS = f"""
+CREATE TABLE IF NOT EXISTS research_runs (
+    run_id BIGINT NOT NULL PRIMARY KEY,
+    registration_id BIGINT NOT NULL,
+    dataset_id BIGINT NOT NULL,
+    dataset_sha256 VARCHAR NOT NULL,
+    split VARCHAR NOT NULL,
+    config_json VARCHAR NOT NULL,
+    config_sha256 VARCHAR NOT NULL,
+    n_configurations_declared INTEGER NOT NULL,
+    confirmatory BOOLEAN NOT NULL,
+    confirmatory_basis VARCHAR NOT NULL,
+    code_version VARCHAR NOT NULL,
+    code_dirty BOOLEAN,
+    store_max_ingested_at TIMESTAMPTZ,
+    synthetic BOOLEAN NOT NULL,
+    holdout_spent BOOLEAN NOT NULL,
+    holdout_repeat BOOLEAN NOT NULL,
+    holdout_reason VARCHAR,
+    run_by VARCHAR NOT NULL,
+    note VARCHAR,
+    known_at TIMESTAMPTZ NOT NULL,
+    {_research_check("research_runs", "split")},
+    {_research_check("research_runs", "confirmatory_basis")},
+    CHECK (n_configurations_declared >= 1)
+)
+"""
+
+# One row per run, the primary key, so a second result for a run raises
+# (req 8). The statistics are NULL unless `ok`; `verdict` is set exactly on an
+# `ok` row, computed by code from the interval, and an `ok` row reports at least
+# one evaluated configuration (`family_run_count` sums them into N, req 9).
+_CREATE_RESEARCH_RESULTS = f"""
+CREATE TABLE IF NOT EXISTS research_results (
+    run_id BIGINT NOT NULL PRIMARY KEY,
+    outcome VARCHAR NOT NULL,
+    message VARCHAR,
+    primary_value DOUBLE,
+    primary_ci_low DOUBLE,
+    primary_ci_high DOUBLE,
+    n_observations BIGINT,
+    n_clusters BIGINT,
+    n_configurations INTEGER,
+    secondary_json VARCHAR,
+    exploratory_json VARCHAR,
+    verdict VARCHAR,
+    artifact_sha256 VARCHAR,
+    artifact_path VARCHAR,
+    known_at TIMESTAMPTZ NOT NULL,
+    {_research_check("research_results", "outcome")},
+    {_research_check("research_results", "verdict", nullable=True)},
+    CHECK ((outcome = 'ok') = (verdict IS NOT NULL)),
+    CHECK (outcome <> 'ok' OR (n_configurations IS NOT NULL AND n_configurations >= 1))
+)
+"""
+
+# `registration_id` and `run_id` are NULL where the decision has none (a
+# `budget_amend` names a registration, a `holdout_spend` a run).
+_CREATE_RESEARCH_DECISIONS = f"""
+CREATE TABLE IF NOT EXISTS research_decisions (
+    decision_id BIGINT NOT NULL PRIMARY KEY,
+    kind VARCHAR NOT NULL,
+    registration_id BIGINT,
+    run_id BIGINT,
+    values_json VARCHAR NOT NULL,
+    reason VARCHAR NOT NULL,
+    made_by VARCHAR NOT NULL,
+    known_at TIMESTAMPTZ NOT NULL,
+    {_research_check("research_decisions", "kind")}
+)
+"""
+
+#: The research-registry tables added at schema version 12, disjoint from
+#: `TABLE_NAMES` (the look-ahead harness never sees them), `REGISTRY_TABLE_NAMES`
+#: and `JOURNAL_TABLE_NAMES`.
+RESEARCH_TABLE_NAMES: tuple[str, ...] = (
+    "research_registrations",
+    "research_datasets",
+    "research_runs",
+    "research_results",
+    "research_decisions",
+)
+
+_RESEARCH_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_RESEARCH_REGISTRATIONS,
+    _CREATE_RESEARCH_DATASETS,
+    _CREATE_RESEARCH_RUNS,
+    _CREATE_RESEARCH_RESULTS,
+    _CREATE_RESEARCH_DECISIONS,
+)
+
+#: The column version 12 adds to `trial_results` (req 9): the research share of
+#: a backtest's N, NULL on every row written before the migration. Added by
+#: `ALTER TABLE` after the DDL pass (`_migrate_n_research`), so the pinned
+#: `_REGISTRY_TABLE_DDL` never changes.
+N_RESEARCH_COLUMN = "n_research"
+
+
+def require_research(conn: duckdb.DuckDBPyConnection) -> None:
+    """Raise `ResearchNotInitialised` unless every `RESEARCH_TABLE_NAMES` table
+    exists. The research readers (T81's `store.research`, T83c's page) call it
+    before their first query."""
+    (present,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND table_name IN "
+        f"({', '.join('?' for _ in RESEARCH_TABLE_NAMES)})",
+        list(RESEARCH_TABLE_NAMES),
+    ).fetchone()
+    if present != len(RESEARCH_TABLE_NAMES):
+        raise ResearchNotInitialised(
+            "research registry not initialised (a research table is missing); "
+            "any writing command migrates the store to the current version"
+        )
+
+
 def _is_read_only(conn: duckdb.DuckDBPyConnection) -> bool:
     """Whether `conn`'s current database is attached read-only."""
     result = conn.execute(
@@ -1567,13 +1916,16 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_SETTLE_ORDER_VERSION,
         _PRE_STATEMENT_FACTS_VERSION,
         _PRE_RETRACTION_VERSION,
+        _PRE_RESEARCH_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
         # read but `overrides` (no `client_order_id` before 9), and versions 5 to 7
         # none of `resume_invocations` and `resume_acceptances` either; version 9
         # every read but `statement_facts`; version 10 every read (no
-        # `retracted` column: no retraction, see `has_retracted`).
+        # `retracted` column: no retraction, see `has_retracted`); version 11
+        # every read but the research tables (`require_research` raises
+        # `ResearchNotInitialised`) and `trial_results.n_research`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -1845,9 +2197,20 @@ def _migrate_retracted(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
 
 
+def _migrate_n_research(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add `trial_results.n_research INTEGER` (nullable, NULL on every existing
+    row) where it is missing (module docstring, "Schema versions", version 12).
+    `_REGISTRY_TABLE_DDL` keeps its version-4 pin, so a fresh store gets the
+    column here too. Idempotent: a table that has the column is left alone.
+    Runs inside `init_schema`'s transaction, after its DDL pass."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_results')").fetchall()}
+    if N_RESEARCH_COLUMN not in columns:
+        conn.execute(f"ALTER TABLE trial_results ADD COLUMN {N_RESEARCH_COLUMN} INTEGER")
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 10 store to version 11.
+    version-2 to 11 store to version 12.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -1859,10 +2222,12 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; every store gets `securities` and `listings`
-    rebuilt with `retracted` (every row kept, `FALSE`) and
-    `master_underived` created, and a version-10 store a version-11 row
-    (#859); a version-9 store gets `statement_facts`
+    `CURRENT_SCHEMA_VERSION`; every store gets the research-registry tables
+    created and `trial_results.n_research` added (NULL on every existing row),
+    and a version-11 store a version-12 row (#926, T80); every store gets
+    `securities` and `listings` rebuilt with `retracted` (every row kept,
+    `FALSE`) and `master_underived` created, and a version-10 store a
+    version-11 row (#859); a version-9 store gets `statement_facts`
     created and a version-10 row (purely additive, #660); a version-8
     store gets that after `order_events` and `overrides` are rebuilt with
     the version-9 sets and column (every row kept) and a version-9 row; a
@@ -1879,8 +2244,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     registry tables and a version-3 row. Nothing else changes (module
     docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-11, 10, 9, 8, 7, 6 or 5
-    store passes (a version-9 store serves every read but
+    On a read-only connection no DDL runs: a version-12, 11, 10, 9, 8, 7, 6 or
+    5 store passes (a version-11 store serves every read but the research
+    tables, which `require_research` reports as `ResearchNotInitialised`, and
+    `trial_results.n_research`; a version-9 store serves every read but
     `statement_facts`, missing there as a pre-journal store's journal
     tables are; a version-8 store serves every read but `overrides`,
     which needs `client_order_id`), and so does a version-4 store (fact
@@ -1909,6 +2276,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_SETTLE_ORDER_VERSION,
         _PRE_STATEMENT_FACTS_VERSION,
         _PRE_RETRACTION_VERSION,
+        _PRE_RESEARCH_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -1940,9 +2308,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _JOURNAL_TABLE_DDL
             + _STATEMENT_FACTS_TABLE_DDL
             + _MASTER_UNDERIVED_TABLE_DDL
+            + _RESEARCH_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
+        _migrate_n_research(conn)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
