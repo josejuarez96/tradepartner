@@ -25,7 +25,7 @@ than hunting for a fixture case that happens to fit.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import duckdb
@@ -40,6 +40,7 @@ from tradepartner.store.asof import (
     facts_as_of,
     listings_as_of,
     prices_as_of,
+    statement_facts_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
 
@@ -1178,6 +1179,208 @@ class TestListingsAsOf:
     def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
         with pytest.raises(TypeError):
             listings_as_of(fixture_store, date(2020, 1, 15))  # type: ignore[arg-type]
+
+
+def _security(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    cik: str,
+    *,
+    known_at: datetime,
+) -> None:
+    """One `securities` row (T76b synthetic-store tests)."""
+    insert_row(
+        conn,
+        "securities",
+        {
+            "security_id": security_id,
+            "cik": cik,
+            "name": f"{security_id} Inc",
+            "benchmark": False,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+def _statement_fact(
+    conn: duckdb.DuckDBPyConnection,
+    cik: str,
+    fact_name: str,
+    period_end: date,
+    value: float,
+    *,
+    known_at: datetime,
+    period_start: date | None = None,
+    accession: str = "0000000001-21-000001",
+) -> None:
+    """One `statement_facts` row (T76b synthetic-store tests): an instant
+    fact (`period_start=None`, `period_days=0`) unless `period_start` is
+    given."""
+    insert_row(
+        conn,
+        "statement_facts",
+        {
+            "cik": cik,
+            "fact_name": fact_name,
+            "xbrl_tag": f"us-gaap:{fact_name}",
+            "period_start": period_start,
+            "period_end": period_end,
+            "period_days": 0 if period_start is None else (period_end - period_start).days,
+            "value": value,
+            "unit": "USD",
+            "form": "10-K",
+            "filing_accession": accession,
+            "basis": "reported",
+            "comparative": False,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+class TestStatementFactsAsOf:
+    """T76b (#660): `statement_facts_as_of` joins through
+    `store.master.securities_as_of(t)` on `cik`. The fixture's
+    CIK0001000006 ("Dual Class Holdings") carries SEC_DUAL_A, SEC_DUAL_B
+    and SEC_DUAL_PFD, all known at 2016-12-23, and a `revenue` statement
+    fact known at 2020-02-03T20:30:00+00:00 -- the multi-class case; the
+    other cases use a `synthetic_store` for exact control.
+    """
+
+    _DUAL_CIK = "CIK0001000006"
+    _DUAL_KNOWN_AT = datetime(2020, 2, 3, 20, 30, 0, tzinfo=UTC)
+
+    def test_invisible_before_known_at_visible_after(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        just_before = self._DUAL_KNOWN_AT - timedelta(microseconds=1)
+        just_after = self._DUAL_KNOWN_AT
+        before = statement_facts_as_of(fixture_store, just_before, security_ids=["SEC_DUAL_A"])
+        assert before.filter(pl.col("fact_name") == "revenue").height == 0
+        after = statement_facts_as_of(fixture_store, just_after, security_ids=["SEC_DUAL_A"])
+        assert after.filter(pl.col("fact_name") == "revenue").height == 1
+
+    def test_dual_class_cik_rows_appear_once_per_class(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = statement_facts_as_of(fixture_store, self._DUAL_KNOWN_AT)
+        revenue = rows.filter(
+            (pl.col("cik") == self._DUAL_CIK) & (pl.col("fact_name") == "revenue")
+        )
+        assert sorted(revenue["security_id"]) == ["SEC_DUAL_A", "SEC_DUAL_B", "SEC_DUAL_PFD"]
+        assert revenue["value"].n_unique() == 1  # same statement row, repeated per class
+
+    def test_security_ids_restricts_to_the_requested_class(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = statement_facts_as_of(
+            fixture_store, self._DUAL_KNOWN_AT, security_ids=["SEC_DUAL_B"]
+        )
+        assert rows["security_id"].unique().to_list() == ["SEC_DUAL_B"]
+
+    def test_cik_with_no_securities_row_returns_nothing(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        known_at = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+        _statement_fact(
+            synthetic_store, "CIK0009999999", "revenue", date(2020, 12, 31), 1.0, known_at=known_at
+        )
+        rows = statement_facts_as_of(synthetic_store, known_at + timedelta(days=1))
+        assert rows.height == 0
+
+    def test_cik_whose_security_is_not_yet_known_at_t_returns_nothing(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The statement fact is known at T, but the master's own
+        `securities` row for its CIK is not known until later -- the join
+        through `securities_as_of(t)` must still hide it (spec: a CIK with
+        no `securities` row at T is invisible at T)."""
+        fact_known = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+        security_known = datetime(2021, 6, 10, 20, 0, tzinfo=UTC)
+        _statement_fact(
+            synthetic_store,
+            "CIK0001234567",
+            "revenue",
+            date(2020, 12, 31),
+            1.0,
+            known_at=fact_known,
+        )
+        _security(synthetic_store, "SEC_LATE_MASTER", "CIK0001234567", known_at=security_known)
+
+        between = statement_facts_as_of(synthetic_store, fact_known + timedelta(hours=1))
+        assert between.height == 0
+        after_both = statement_facts_as_of(synthetic_store, security_known)
+        assert after_both.height == 1
+        assert after_both.row(0, named=True)["security_id"] == "SEC_LATE_MASTER"
+
+    def test_no_revision_first_vintage_only(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """`statement_facts` holds no revision (its `UNIQUE` excludes
+        `known_at`), so this is a plain `known_at <= t` filter: a second
+        row for a *different* period on the same CIK simply adds a row,
+        never replaces the first."""
+        security_known = datetime(2021, 1, 1, tzinfo=UTC)
+        _security(synthetic_store, "SEC_FIRST_VINTAGE", "CIK0001234568", known_at=security_known)
+        first_known = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+        _statement_fact(
+            synthetic_store,
+            "CIK0001234568",
+            "revenue",
+            date(2020, 12, 31),
+            100.0,
+            known_at=first_known,
+        )
+        rows = statement_facts_as_of(synthetic_store, first_known + timedelta(days=1))
+        assert rows.height == 1
+        assert rows.row(0, named=True)["value"] == pytest.approx(100.0)
+
+    def test_empty_security_ids_returns_empty_frame_with_schema(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = statement_facts_as_of(fixture_store, self._DUAL_KNOWN_AT, security_ids=[])
+        assert rows.height == 0
+        assert "security_id" in rows.columns
+        assert "fact_name" in rows.columns
+
+    def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(TypeError):
+            statement_facts_as_of(fixture_store, date(2020, 1, 1))  # type: ignore[arg-type]
+
+    def test_naive_datetime_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError):
+            statement_facts_as_of(fixture_store, datetime(2020, 1, 1, 21, 0, 0))  # noqa: DTZ001
+
+    def test_view_is_dropped_after_the_call_even_on_a_read_only_connection(
+        self, tmp_path: Path
+    ) -> None:
+        path = str(tmp_path / "statement_facts_ro.duckdb")
+        conn = duckdb.connect(path)
+        try:
+            configure_connection(conn)
+            schema.init_schema(conn)
+            known_at = datetime(2021, 1, 1, tzinfo=UTC)
+            _security(conn, "SEC_RO_STMT", "CIK0001234569", known_at=known_at)
+            _statement_fact(
+                conn, "CIK0001234569", "revenue", date(2020, 12, 31), 1.0, known_at=known_at
+            )
+        finally:
+            conn.close()
+
+        ro = duckdb.connect(path, read_only=True)
+        try:
+            configure_connection(ro)
+            rows = statement_facts_as_of(ro, known_at + timedelta(days=1))
+            assert rows.height == 1
+            with pytest.raises(duckdb.CatalogException):
+                ro.execute("SELECT * FROM _asof_statement_securities")
+        finally:
+            ro.close()
 
 
 def test_dividend_queries_work_on_a_read_only_connection_and_drop_their_view(
