@@ -1,6 +1,6 @@
 # Hypothesis: H1, long-only 12-1 momentum, monthly
 
-**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration)
+**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only)
 
 Merging this file does not register it. The owner runs
 `tradepartner hypothesis register docs/hypotheses/h1-momentum-12-1.md` after merge (spec req
@@ -10,10 +10,13 @@ Merging this file does not register it. The owner runs
 them to the disclosure below, and re-runs the Q8 amendment's coverage check on the store he
 registers on (`universe_as_of` at close of 2019-10-31 and of 2019-11-29: the top-1000 cut
 must not bind at the first and must bind at the second; the date was pinned on the
-pre-repair store, and the listing repairs since #818 can move either count). If the first
-binding month-end moved, he re-pins `in_sample_start` and the counts in this file first. An
-edit before registration is not a new hypothesis. The registry hashes the whole file, so any
-edit after registration makes a new hypothesis.
+pre-repair store, and the listing repairs since #818 and the rule 7 shares fallback (#849)
+can move either count). If the first binding month-end moved, he re-pins `in_sample_start`
+first, via a class-B PR that updates this file (the TOML value, the power-arithmetic session
+counts and the retirement window) and `tests/backtest/test_h1_file.py` (the date, the 50
+sessions and the first fill), and registers only after it merges. An edit before
+registration is not a new hypothesis. The registry hashes the whole file, so any edit after
+registration makes a new hypothesis.
 
 ## Economic rationale
 
@@ -182,15 +185,19 @@ Owner answers that set these values (spec open questions, answered on #156):
   than in later months (65 companies of headroom against about 100); that is noted, not
   corrected. **No trial result was seen before this choice:** every #839 backtest failed
   before `write_results` (the benchmark read, #840, or the CG dividend, #841), so no
-  in-sample return, turnover or metric exists for any window on any store, and the sweep
-  above counted universe members and exclusions only. The first rebalance's signal reads
+  in-sample return, turnover or metric exists on real data for any window (fixture-store
+  smoke runs produce synthetic figures only), and the sweep above counted universe members
+  and exclusions only. The first rebalance's signal reads
   closes from 2018-11-30 (`formation_months = 12`: close(month-end of T − 12) to close(month-end of
   T − 1), 2019-10-31) and rule 6 needs bars from December 2018; the store holds Alpaca
   bars from January 2016 (ADR 0009), so the lookback has about three years of slack and
-  the start is set by listings, not by prices. Two open data issues (#845, share-count
-  scale errors that put a few small names at the top of the cap ranking; #840, the
-  benchmark rows) were found on the same store and are not addressed here; neither changes
-  which month-end the cut first binds. H1 is not registered on the owner's store, so this
+  the start is set by listings, not by prices. Two data issues were found on the same
+  store and fixed after the sweep: #845, share-count scale errors that put a few small
+  names at the top of the cap ranking (rule 7 now falls back to the last in-line fact,
+  #849), and #840, the benchmark rows invisible under #35 (benchmarks are now read by
+  symbol, #857). Neither is expected to change which month-end the cut first binds; the
+  pre-registration check in the preamble is what confirms that on the store the owner
+  registers on. H1 is not registered on the owner's store, so this
   edit changes the file before its first registration and is not a new hypothesis. The
   registry hashes the whole file, so this edit changes H1's hash; that is harmless because
   no registration exists on the owner's store for the new hash to differ from. #839
@@ -217,7 +224,8 @@ Owner answers that set these values (spec open questions, answered on #156):
   count a company that delisted before 2021-12. After 2020-08 the pool grows by about 220
   more companies by 2020-12 (later accelerated-filer filings) and by about 150 more with
   the mid-2021 phase (non-accelerated filers); neither moves the top-1000 line in
-  substance (the ratio band holds and the ref-invisible count is already in the teens).
+  substance (the ratio band holds and the ref-invisible count is already 13–20 across
+  2020-08 to 2021-01).
   Full table: PR #852, "iXBRL phase-in check". **Why this is point-in-time and not look-ahead or survivorship:** every
   rebalance reads only listings and shares facts known at close(T), so the 2019-11 to
   2020-07 universes are what this data source could have shown an investor on those
@@ -229,8 +237,10 @@ Owner answers that set these values (spec open questions, answered on #156):
   bottom 6–12% of the book's eligible names is set by filer size, not by market cap, and
   the top decile the signal selects is drawn from a slightly smaller, larger-filer-tilted
   pool. **How to read 2019-11 to 2020-07 results:** as a top-1000-of-large-filers
-  momentum portfolio, not yet the ADR 0006 universe in substance; about one candidate in
-  eight to ten in those months could differ under a full pool. From 2020-08-31 the
+  momentum portfolio, not yet the ADR 0006 universe in substance; between about one
+  eligible name in sixteen and one in eight at 2019-11 (the two proxies above, 60 as a
+  floor and 116 of 1000), falling to about one in ten by 2020-06 (27 and 102), could
+  differ under a full pool. From 2020-08-31 the
   universe is the ADR 0006 top 1000 in substance. The first-trial metrics that the
   retirement condition reads cover all 50 rebalances; a reader comparing the first nine
   months with the rest should expect a universe-composition difference there before
