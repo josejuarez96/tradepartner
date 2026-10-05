@@ -109,8 +109,41 @@ only when the security has no row (bar or placeholder) that session from
 the rest of the payload: the hole closes at the old symbol's last bar,
 and no session is stored twice. The mapping is the master's at the run,
 as for every row; a bar's `known_at` stays its session's close.
-Corporate actions take no lead, nor does `holds(..., lead=False)`, the
-repair's action check.
+Corporate actions take no rename lead, nor does `holds(...,
+actions=True)`, the repair's action check.
+
+**First-span lead (#974).** A security's earliest ticker-bearing cover
+page comes with iXBRL cover tagging (periods ending after 2019-06-15),
+often years after it started trading, and the companies snapshot
+back-dates a ticker only for a survivor that still shows it; so a name
+renamed since, moved to another exchange or delisted before the snapshot
+has no listing, and no bar, before that cover page (META's `FB` from
+2019-07-24). With `first_sessions` (per security id, the session of its
+earliest `securities` row's `known_at`: `repair.store_resolver`, when
+`alpaca.first_span_lead` is on), a security's **first span** (its
+earliest span once placeholder spans are skipped) also *leads* to it,
+under the span's ticker, on sessions from that first session up to the
+span's start (`FirstSpanLead`), when the span is assigned (its rule-7 end
+does not matter: a delisted name is the case to fix), not contested and
+starts after the first session. A first span that is non-equity,
+same-day, later-class or a claim means the earliest ticker evidence is in
+doubt: no lead. Any other security's span of the ticker, of any kind but
+placeholder, covering a session of the window means a reuse the master
+knows of: the whole lead is refused and counted
+(`ResolverReport.first_span_refused`). On each session the lead answers
+only while `resolve` gives the ticker to no one, and two leads of either
+kind on one `(ticker, session)` answer nothing (`lead`); `parse_bars`
+assigns such a row only where the security has no row of its own, as for
+#843. Unlike the rename lead, corporate actions take it
+(`lead(..., actions=True)` answers first-span leads only, and
+`parse_corporate_actions` sends a row `resolve` leaves out to it on the
+session before the ex-date): there is no second symbol to serve the
+action twice, and a split inside the window must adjust the bars it
+belongs to. `holds(..., actions=True)` counts the first-span lead and
+never the rename lead. Bars keep their session-close `known_at`; the
+identity is the master's at the run, the same back-dating a
+`snapshot_static` row gives a survivor, and `universe_as_of` still
+excludes the name (rule 2, `not_listed`) until its listing is known.
 
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
@@ -340,7 +373,8 @@ class ResolverReport:
     later row of their ticker, and the same-day typo rows dropped; (#844)
     the equity rows whose ticker is no symbol that were ignored; (#847) the
     spans ended at a stopped line; and (#943) the spans of an owner-accepted
-    relisting kept through one."""
+    relisting kept through one; and (#974) the securities given a
+    first-span lead and those refused one for a reused ticker."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -358,6 +392,8 @@ class ResolverReport:
     unreadable: int = 0
     stopped_spans: int = 0
     accepted_relistings: int = 0
+    first_span_leads: int = 0
+    first_span_refused: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -377,7 +413,9 @@ class ResolverReport:
             f"{self.unreadable} unreadable-ticker listings ignored; "
             f"{self.stopped_spans} spans ended at a stopped line despite a later row, "
             f"{self.accepted_relistings} kept through a stopped line by "
-            "alpaca.accepted_relistings"
+            "alpaca.accepted_relistings; "
+            f"{self.first_span_leads} securities led by a first-span lead, "
+            f"{self.first_span_refused} refused one for a reused ticker"
         )
 
 
@@ -536,6 +574,19 @@ class RenameLead:
 
 
 @dataclass(frozen=True)
+class FirstSpanLead:
+    """A first span's lead window (#974): `security_id`'s first span holds
+    `ticker` from `end` (its start); on sessions in `[start, end)`, from the
+    security's first session, rows under `ticker` may be its own (see
+    `ListingResolver.lead`)."""
+
+    security_id: str
+    ticker: str
+    start: date
+    end: date
+
+
+@dataclass(frozen=True)
 class _Row:
     day: date
     ticker: str
@@ -553,7 +604,9 @@ class ListingResolver:
     the module docstring for the rules. A row's `class_title` is optional
     (an untitled row is judged by its ticker suffix). `accepted_relistings`
     (`alpaca.accepted_relistings`, #943) are security ids whose spans rule
-    7's stopped-line cut (#847) never ends."""
+    7's stopped-line cut (#847) never ends. `first_sessions` (#974) maps a
+    security id to its first session and turns on the first-span lead;
+    `None` leaves every mapping as without it."""
 
     def __init__(
         self,
@@ -562,6 +615,7 @@ class ListingResolver:
         *,
         rename_lead_days: int = 0,
         accepted_relistings: Collection[str] = (),
+        first_sessions: Mapping[str, date] | None = None,
     ) -> None:
         self._evidence = evidence
         self._accepted = frozenset(accepted_relistings)
@@ -586,6 +640,7 @@ class ListingResolver:
         # superseded (started before it), never a later one.
         self._vacated: dict[str, list[TickerSpan]] = defaultdict(list)
         cut: set[TickerSpan] = set()  # spans ended at their own delisting
+        placeholder_spans: set[TickerSpan] = set()
         placeholder = same_day_listings = same_day_typos = kept_spans = unreadable = 0
         stopped_spans = accepted_spans = 0
         same_day_securities: set[str] = set()
@@ -620,6 +675,7 @@ class ListingResolver:
                 self._by_security[security_id].append(span)
                 if _PLACEHOLDER in kinds:
                     placeholder += index - first
+                    placeholder_spans.add(span)
                     continue
                 self._history[security_id].append(span)
                 if kinds != {EQUITY}:
@@ -723,6 +779,11 @@ class ListingResolver:
                         lead = RenameLead(security_id, old.ticker, new.ticker, start, new.start)
                         self._leads[new.ticker].append(lead)
                         self._leads_of[security_id].append(lead)
+        self._first_leads: dict[str, list[FirstSpanLead]] = defaultdict(list)  # by ticker
+        self._first_lead_of: dict[str, FirstSpanLead] = {}  # by security
+        first_span_refused = (
+            self._first_span_leads(first_sessions, placeholder_spans) if first_sessions else 0
+        )
         self.report = ResolverReport(
             placeholder=placeholder,
             non_equity=dict(non_equity),
@@ -740,7 +801,41 @@ class ListingResolver:
             unreadable=unreadable,
             stopped_spans=stopped_spans,
             accepted_relistings=accepted_spans,
+            first_span_leads=len(self._first_lead_of),
+            first_span_refused=first_span_refused,
         )
+
+    def _first_span_leads(
+        self, first_sessions: Mapping[str, date], placeholder_spans: Collection[TickerSpan]
+    ) -> int:
+        """Record each security's `FirstSpanLead` (#974, module docstring)
+        and return how many were refused for a reused ticker."""
+        others: dict[str, list[TickerSpan]] = defaultdict(list)  # every non-placeholder span
+        for history in self._history.values():
+            for other in history:
+                others[other.ticker].append(other)
+        refused = 0
+        for security_id, own in self._by_security.items():
+            first_session = first_sessions.get(security_id)
+            first = next((s for s in own if s not in placeholder_spans), None)
+            if (
+                first_session is None
+                or first is None
+                or first not in self._assigned_spans
+                or first in self._contested
+                or first.start <= first_session
+            ):
+                continue
+            lead = FirstSpanLead(security_id, first.ticker, first_session, first.start)
+            if any(
+                other.security_id != security_id and _covers_a_session(other, lead.start, lead.end)
+                for other in others[first.ticker]
+            ):
+                refused += 1  # a reuse the master knows of: no lead at all
+                continue
+            self._first_leads[lead.ticker].append(lead)
+            self._first_lead_of[security_id] = lead
+        return refused
 
     def _own_delisting(
         self,
@@ -888,14 +983,21 @@ class ListingResolver:
             return None
         return owner
 
-    def lead(self, ticker: str, session: date) -> str | None:
-        """The renamed security whose rename lead (#843) covers `ticker` on
-        `session`, or `None`: only while `resolve` gives the ticker to no
-        one and the old ticker to no other security (a reuse the master
-        knows of is #869's), and only one security's lead. A caller assigns
-        such a row only where the security has no row under its own symbols
-        that session (`parse_bars`)."""
-        owners = {
+    def lead(self, ticker: str, session: date, *, actions: bool = False) -> str | None:
+        """The security whose rename lead (#843) or first-span lead (#974)
+        covers `ticker` on `session`, or `None`: only while `resolve` gives
+        the ticker to no one, a rename lead only while the old ticker
+        resolves to no other security (a reuse the master knows of is
+        #869's), and only one security's lead of either kind. With
+        `actions` (corporate actions) only a first-span lead answers. A
+        caller assigns a bar only where the security has no row under its
+        own symbols that session (`parse_bars`)."""
+        first = {
+            lead.security_id
+            for lead in self._first_leads.get(ticker, [])
+            if lead.start <= session < lead.end
+        }
+        owners = first | {
             lead.security_id
             for lead in self._leads.get(ticker, [])
             if lead.start <= session < lead.end
@@ -903,25 +1005,31 @@ class ListingResolver:
         }
         if len(owners) != 1 or self.resolve(ticker, session) is not None:
             return None
-        return owners.pop()
+        owner = owners.pop()
+        return owner if not actions or owner in first else None
 
-    def holds(self, security_id: str, session: date, *, lead: bool = True) -> bool:
+    def holds(self, security_id: str, session: date, *, actions: bool = False) -> bool:
         """True when some ticker resolves to `security_id` on `session`, or
-        (with `lead`, for bars only: actions take no lead) leads to it
-        (#843): a row of it on that session is one this resolver would
-        assign."""
-        return any(
+        leads to it: for bars a rename lead (#843) or a first-span lead
+        (#974), with `actions` the first-span lead only. A row of it on that
+        session is one this resolver would assign."""
+        if any(
             span.covers(session)
             and self._assigned(span)
             and self.resolve(span.ticker, session) == security_id
             for span in self._by_security.get(security_id, [])
-        ) or (
-            lead
-            and any(
-                rename.start <= session < rename.end
-                and self.lead(rename.new, session) == security_id
-                for rename in self._leads_of.get(security_id, [])
-            )
+        ):
+            return True
+        first = self._first_lead_of.get(security_id)
+        if (
+            first is not None
+            and first.start <= session < first.end
+            and self.lead(first.ticker, session, actions=actions) == security_id
+        ):
+            return True
+        return not actions and any(
+            rename.start <= session < rename.end and self.lead(rename.new, session) == security_id
+            for rename in self._leads_of.get(security_id, [])
         )
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
@@ -935,6 +1043,14 @@ class ListingResolver:
         for lead in self._leads_of.get(security_id, []):  # #843: the new symbol too
             if lead.start <= end and start < lead.end and lead.new not in out:
                 out.append(lead.new)
+        first = self._first_lead_of.get(security_id)  # #974: before every span
+        if (
+            first is not None
+            and first.start <= end
+            and start < first.end
+            and first.ticker not in out
+        ):
+            out.insert(0, first.ticker)
         return out
 
     def _assigned(self, span: TickerSpan) -> bool:
@@ -969,6 +1085,15 @@ def _succeeds(successor: str, security_id: str) -> bool:
         return _company(security_id) == match[1]
     mine = (match[2], int(match[3] or 1))
     return older[1] == match[1] and (older[2], int(older[3] or 1)) < mine
+
+
+def _covers_a_session(span: TickerSpan, start: date, end: date) -> bool:
+    """True when `span` covers an XNYS session in `[start, end)`."""
+    first = max(span.start, start)
+    last = end if span.end is None else min(span.end, end)
+    if first >= last:
+        return False
+    return (first if is_session(first) else next_session(first)) < last
 
 
 def _holds_before(holder: TickerSpan, span: TickerSpan) -> bool:
@@ -1218,12 +1343,19 @@ class ActionsParse:
 
 
 @_fail_closed
-def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> ActionsParse:
+def parse_corporate_actions(
+    payload: Mapping[str, Any], resolve: Resolve, lead: Resolve | None = None
+) -> ActionsParse:
     """Splits and cash dividends from an `alpaca_raw.corporate_actions`
     payload, on the first-seen proxy, resolved on the last session before
     each ex-date. Alpaca's stable `id` becomes `source_action_id`, so a
     re-dated action is a revision of one event (#108, #181); a row without
-    one has none."""
+    one has none.
+
+    With `lead` (`ListingResolver.lead` with `actions=True`, #974), a row
+    `resolve` leaves out goes to `lead(symbol, session)` on that same
+    session (a split under a first span's ticker before its first cover
+    page); otherwise it stays unresolved."""
     actions: list[CorporateAction] = []
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
@@ -1242,7 +1374,10 @@ def parse_corporate_actions(payload: Mapping[str, Any], resolve: Resolve) -> Act
             raise ValueError(f"category {category!r} is not a list")
         for row in rows:
             ex_date = date.fromisoformat(row["ex_date"])
-            security_id = resolve(row["symbol"], previous_session(ex_date))
+            session = previous_session(ex_date)
+            security_id = resolve(row["symbol"], session)
+            if security_id is None and lead is not None:
+                security_id = lead(row["symbol"], session)
             if security_id is None:
                 unresolved.append((row["symbol"], ex_date))
                 continue
@@ -1379,6 +1514,10 @@ class AlpacaPriceSource(PriceSource):
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
         payload = self._fetch_actions(symbols, start - self._lag, end + self._lag)
-        parsed = parse_corporate_actions(payload, self._resolver.resolve)
+        parsed = parse_corporate_actions(
+            payload,
+            self._resolver.resolve,
+            functools.partial(self._resolver.lead, actions=True),  # #974: no rename lead
+        )
         self.last_actions_report = parsed
         return [a for a in parsed.actions if a.security_id in ids and start <= a.ex_date <= end]

@@ -50,7 +50,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 
 import duckdb
 
@@ -66,6 +66,7 @@ from tradepartner.ingest import SourceRun, _read, _write_run
 from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.master import _session_of
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 REPAIR = "repair"
@@ -84,7 +85,8 @@ def store_resolver(
     known at `at`, with the `registrant_evidence` of the facts and listing
     ends known then (#793) and `at`'s day as the run's day, and
     `alpaca.rename_lead_days` (#843) and `alpaca.accepted_relistings`
-    (#943)."""
+    (#943); and, while `alpaca.first_span_lead` is on (#974), each
+    security's first session (`first_sessions`)."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
         facts_as_of(conn, at).iter_rows(named=True),
@@ -98,7 +100,33 @@ def store_resolver(
         evidence,
         rename_lead_days=settings.alpaca.rename_lead_days,
         accepted_relistings=settings.alpaca.accepted_relistings,
+        first_sessions=first_sessions(conn, at, settings)
+        if settings.alpaca.first_span_lead
+        else None,
     )
+
+
+def first_sessions(
+    conn: duckdb.DuckDBPyConnection, at: datetime, settings: Settings
+) -> dict[str, date]:
+    """Per security id, the session of the **earliest** `known_at` among
+    its `securities` rows known at `at` (#974): its first filing's
+    acceptance, mapped to a session as `store.master` maps one (the session
+    of its New York day, else the next). A direct read of the table, never
+    `securities_as_of`, whose latest revision is stamped at an ingest clock
+    (a renamed, or retracted and restored, row would move the floor past
+    the first span and take the lead away). A `known_at` before
+    `calendar.start` maps from that day, the calendar's first."""
+    at = ensure_tz_aware_utc(at, field_name="at")
+    floor = datetime.combine(settings.calendar.start, time(12), tzinfo=UTC)
+    rows = conn.execute(
+        "SELECT security_id, min(known_at) FROM securities WHERE known_at <= ? GROUP BY ALL",
+        [at],
+    ).fetchall()
+    return {
+        str(sid): _session_of(max(ensure_tz_aware_utc(known, field_name="known_at"), floor))
+        for sid, known in rows
+    }
 
 
 @dataclass(frozen=True)
@@ -128,7 +156,7 @@ def misattributed(
     actions = {
         (sid, day): rows
         for sid, day, rows in action_keys
-        if not resolver.holds(sid, previous_session(day), lead=False)  # #843: no lead
+        if not resolver.holds(sid, previous_session(day), actions=True)  # #843, #974
     }
     return Misattributed(bars, actions)
 

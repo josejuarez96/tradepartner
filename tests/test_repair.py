@@ -444,3 +444,83 @@ def test_a_live_name_with_a_bar_hole_keeps_every_bar(seagate: Settings) -> None:
     result = repair_resolution(seagate, clock=lambda: RUN, dry_run=True)
     assert (result.bar_rows, result.action_rows) == (0, 0)
     assert result.found.securities == ()
+
+
+META, REUSER = "0001326801", "0000000099"
+COVER = date(2019, 7, 24)
+
+
+def _security(sid: str, known: datetime, name: str) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "cik": sid,
+        "name": name,
+        "benchmark": False,
+        "known_at": known,
+        "ingested_at": RUN,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _split(sid: str, ex_date: date) -> dict[str, Any]:
+    return {**_dividend(sid, ex_date), "action_type": "split", "ratio_or_amount": 2.0}
+
+
+def _without_lead(settings: Settings) -> Settings:
+    alpaca = settings.alpaca.model_copy(update={"first_span_lead": False})
+    return settings.model_copy(update={"alpaca": alpaca})
+
+
+@pytest.fixture
+def led(settings: Settings) -> Settings:
+    """#974, META-shaped: Facebook's first filing is accepted 2012-02-01 and
+    its first cover page naming FB on 2019-07-24; a later securities
+    revision (a rename) is stamped at an ingest clock in 2024. Bars from
+    2017 and a split ex 2017-06-01 were stored under the first-span lead."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "securities", _security(META, datetime(2012, 2, 1, 21, tzinfo=UTC), "FB"))
+        insert_row(conn, "securities", _security(META, datetime(2024, 1, 5, tzinfo=UTC), "Meta"))
+        insert_row(conn, "listings", _listing(META, "FB", COVER))
+        for session in (date(2017, 5, 31), date(2018, 7, 2), COVER):
+            insert_row(conn, "prices_daily", _bar(META, session))
+        insert_row(conn, "corporate_actions", _split(META, date(2017, 6, 1)))
+    return settings
+
+
+def test_the_repair_keeps_lead_bars_and_a_lead_window_split(led: Settings) -> None:
+    # The floor is the earliest securities row's session (2012-02-01), not
+    # the 2024 revision's, which would leave no lead window at all.
+    result = repair_resolution(led, clock=lambda: RUN, dry_run=True)
+    assert (result.bar_rows, result.action_rows) == (0, 0)
+    with duckdb.connect(led.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, led)
+    assert resolver.lead("FB", date(2012, 2, 1)) == META
+    assert resolver.lead("FB", date(2012, 1, 31)) is None
+    assert resolver.report.first_span_leads == 1
+
+
+def test_the_floor_is_the_earliest_securities_row_known_at_the_run(led: Settings) -> None:
+    earlier = datetime(2011, 12, 29, 22, tzinfo=UTC)  # its New York day, as `store.master`
+    with open_for_write(led) as conn:
+        insert_row(conn, "securities", _security(META, earlier, "early") | {"ingested_at": RUN})
+    with duckdb.connect(led.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, led)
+    assert resolver.lead("FB", date(2011, 12, 29)) == META
+    assert resolver.lead("FB", date(2011, 12, 28)) is None
+
+
+def test_the_switch_off_lists_the_lead_bars_and_split(led: Settings) -> None:
+    result = repair_resolution(_without_lead(led), clock=lambda: RUN, dry_run=True)
+    assert sorted(result.found.bars) == [(META, date(2017, 5, 31)), (META, date(2018, 7, 2))]
+    assert sorted(result.found.actions) == [(META, date(2017, 6, 1))]
+
+
+def test_a_bar_under_a_refused_lead_is_listed(led: Settings) -> None:
+    with open_for_write(led) as conn:
+        insert_row(conn, "listings", _listing(REUSER, "FB", date(2016, 3, 1)))
+        insert_row(conn, "listings", _listing(REUSER, "OTHR", date(2018, 1, 2)))
+    result = repair_resolution(led, clock=lambda: RUN, dry_run=True)
+    assert sorted(result.found.bars) == [(META, date(2017, 5, 31)), (META, date(2018, 7, 2))]
+    assert sorted(result.found.actions) == [(META, date(2017, 6, 1))]
