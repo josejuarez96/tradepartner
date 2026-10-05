@@ -327,7 +327,7 @@ class HoleFill:
         return out
 
 
-HALTED = "not reached: the fill halted first"
+HALTED = "not filled: the fill halted first"
 
 
 def _dropped_note(dropped: dict[str, int]) -> str:
@@ -339,7 +339,8 @@ def _dropped_note(dropped: dict[str, int]) -> str:
 
 @dataclass
 class _Tally:
-    """What a real fill's months fetched and dropped, per security."""
+    """The securities whose holes a fill listed (dry run) or committed (a
+    `filled` month), and the holes it dropped per security and reason."""
 
     fetched: set[str] = field(default_factory=set)
     dropped: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
@@ -603,7 +604,7 @@ def _price_chunk(
                 holes, dropped = _assignable(store_resolver(conn, started, settings), holes, window)
         if fill:
             if tally is not None:
-                tally.add(holes, dropped)
+                tally.add((), dropped)
             if not holes:
                 return None
             ids = sorted({*holes, *([reference] if reference is not None else [])})
@@ -660,6 +661,8 @@ def _price_chunk(
                 message += f"; {resolution}"
             run = outcome(done, added, message)
             _write_run(conn, run_id, started, clock(), run, mode)
+        if fill and tally is not None:
+            tally.fetched.update(holes)  # committed: a halted month's names stay listed
         return run
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))

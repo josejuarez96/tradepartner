@@ -55,6 +55,7 @@ from tradepartner.adapters.prices import (
 from tradepartner.backfill import (
     BACKFILL,
     FILLED,
+    HALTED,
     HOLES,
     NO_HOLE,
     NOT_ALPACA,
@@ -1180,6 +1181,18 @@ def test_named_securities_limit_the_holes_and_each_unfetched_one_is_listed(
         securities=[ACME],
     )
     assert other.holes == () and other.named == (NamedSecurity(ACME, NO_HOLE),)
+
+
+def test_a_named_security_in_a_month_that_halts_is_listed_as_not_filled(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings, ())
+    prices = _History(gaps={(SPY, date(2019, 5, 15))})
+    result = fill_holes(
+        settings, prices=prices, since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [STALE]
+    assert result.named == (NamedSecurity(ACME, HALTED),)
 
 
 def test_named_securities_must_be_ids(settings: Settings) -> None:
