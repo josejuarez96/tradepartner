@@ -130,7 +130,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import MasterBuild, build_master, securities_as_of
-from tradepartner.store.retraction import record_underived, stored_underived
+from tradepartner.store.retraction import record_underived, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
@@ -609,7 +609,8 @@ def _ingest_filings(
     facts once more from the recorded answers, add what changes an as-of
     read, then record the stored master rows this build no longer derives
     under `run_id` (#859: `master_underived`, health's
-    `underived_master_rows`; `master-retract` withdraws them)."""
+    `underived_master_rows`; `master-retract` withdraws them), except the
+    rows of an owner-kept successor (`master.keep_successors`, #922)."""
     recorded = _Recorded(filings)
     # The fetch pass, so `now` is read only after every source answer. When
     # `filings` is already a frozen fetch pass (`_prefetch`, as both callers
@@ -630,7 +631,9 @@ def _ingest_filings(
     ):
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
     skip = _unjudged_ciks(recorded).ciks
-    record_underived(conn, run_id, now, stored_underived(conn, master, now, skip))
+    keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
+    found, _ = split_kept(stored_underived(conn, master, now, skip), keep)
+    record_underived(conn, run_id, now, found)
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"

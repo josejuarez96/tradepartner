@@ -30,6 +30,11 @@ revision instead.
   run (`ingest._unjudged_ciks`): their rows are not judged either. A key
   the build still derives with other values (a reworded class title) is a
   revision ingest writes, not an underived row.
+- **Kept (#922).** `split_kept(found, keep)` sets aside every row of a
+  security on the owner's `master.keep_successors` (a successor the owner
+  accepted, MTCH's `0000891103@2020-08-10` on #828, that the rules no longer
+  derive). An EDGAR ingest's check does not record them, and
+  `master-retract` reports them as kept and never proposes them.
 - **Retraction.** `retraction(row, at)` is the stored row with `retracted
   = TRUE`, `known_at = ingested_at = at`: a revision of its key stamped at
   the correcting run, never back-dated (a row known after `at` raises).
@@ -151,6 +156,16 @@ def underived(
         ]
         found.extend(sorted(rows, key=lambda u: tuple(str(part) for part in u.key)))
     return tuple(found)
+
+
+def split_kept(
+    found: tuple[Underived, ...], keep: frozenset[str]
+) -> tuple[tuple[Underived, ...], tuple[Underived, ...]]:
+    """`found` split into the rows not kept and the rows of a security in
+    `keep` (module docstring), each in `found`'s order. Pure."""
+    proposed = tuple(u for u in found if u.row["security_id"] not in keep)
+    kept = tuple(u for u in found if u.row["security_id"] in keep)
+    return proposed, kept
 
 
 def stored_underived(

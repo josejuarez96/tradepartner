@@ -118,6 +118,7 @@ Statement facts (amendment 2026-10-03, #660)
   - The dry run refuses on a version-10 store, on an empty build and on a failure naming no CIK.
   - An EDGAR ingest's set fails `underived_master_rows`, and the apply clears it.
   - The v10 → v11 migration keeps every row.
+  - A `master.keep_successors` id (#922) is never proposed, so the count and digest leave its rows out; the dry run lists them as kept; an ingest check records none of them, an earlier check reads as recorded, and a malformed id refuses the config.
 
 ## Out of scope
 
@@ -287,6 +288,8 @@ Only `filing` rows are judged, because they come from full-history inputs (the f
 - **`tradepartner master-retract`** is owner-run (option x; never automatic). It builds the master exactly as an EDGAR ingest would and lists every underived row, marking `[traded]` any security a journal order names. It prints the CIKs it did not judge and a 12-character digest of the set (table, key, stored `known_at`), and changes nothing by default.
 - **`--apply --expect-rows N --expect-digest D`** takes the dry run's count and digest, and refuses on any other set, writing nothing. It also refuses a `[traded]` row (a security any journal order, adjustment, daily position or lot names, in any window) unless the owner adds `--allow-traded`: a window holding the name could lose its price or fall back to an older ticker. Otherwise, in one transaction, it writes the retractions, a run row (source `edgar`, mode `retract`, status `retracted`, never `ok`; health's last-ingest view skips it) and the retracted rows in `master_underived`.
 - **It refuses, judging nothing,** when the fetch pass fails, when a failure names no CIK (an FSN extraction failure), when the build derives no security, and on a dry run against a store below version 11.
+
+*Owner-kept successors (amendment 2026-10-05, #922).* `master.keep_successors` (default empty) lists successor ids (`<cik>@<YYYY-MM-DD>`, with `-<n>` for a second one that day, #820) the owner accepted although the current rules no longer derive them. The first is MTCH's `0000891103@2020-08-10`: the July 2020 IAC/Match separation is a successor, since spin-offs are not stored (#473) and one series across it would book the spin-off as a ~60% fake loss (owner, #828; option (b) on #922). A row of a listed security, in either table, is never proposed: `master-retract` leaves it out of the row count, the digest and the `[traded]` check, and lists it as kept with the reason (`[kept: master.keep_successors]`, and a count in the summary). An EDGAR ingest's check does not record it, so `underived_master_rows` does not fail on it from the next check (an ingest or an apply) on. A check recorded before the id was listed is read as it was recorded, so health at a T before that check is unchanged. A listed id with no underived row (a typo, or a successor the rules derive again) is named in the dry run's summary. A malformed id (not a ten-digit CIK, `@`, and a valid day) refuses the config, so every command fails rather than keep nothing silently.
 
 *Afterwards.* Bars filed under a retracted id are not touched here. `repair-resolution` (#819) deletes them once its resolver no longer assigns them. `ingest --backfill --fill-holes` (#831) then fetches the corrected security's missing bars.
 
