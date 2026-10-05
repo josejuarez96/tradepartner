@@ -116,7 +116,15 @@ derived at `t`, as the data is read.
   the delisting, so the bars between are the security's own, never a
   resumption to flag, however long the gap. A later row that shares the
   ticker but is not EQUITY (a note, a right, a unit) does not count: the
-  resolver's rule only runs a span on when both rows are EQUITY.
+  resolver's rule only runs a span on when both rows are EQUITY. **Known
+  limit (#827):** when there is no bar at all on or before `effective_on`
+  (the line's own history is unknown, not merely absent), `effective_on`
+  itself stands in for "the last bar on or before it" when counting the
+  first gap; a bar that is some other security's reused ticker, not this
+  line's own, still passes if it starts within
+  `master.transfer_window_sessions` of `effective_on`, the same grace a
+  genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
+  store.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
