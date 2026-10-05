@@ -42,21 +42,37 @@ from datetime import date
 
 import duckdb
 
+from tradepartner.store.schema import has_retracted
+
 
 class BenchmarkIdentityError(ValueError):
     """A configured benchmark symbol does not name exactly one security."""
 
 
-#: Every `listings` key whose latest revision (any `known_at`) is not a
-#: retraction (#859), as one row: the latest.
-_LIVE_LISTINGS = """
+def _live_listings(conn: duckdb.DuckDBPyConnection) -> str:
+    """SQL for every `listings` key whose latest revision (any `known_at`) is
+    not a retraction (#859), as one row: the latest. Below schema version 11
+    there is no retraction, so every key."""
+    live = "AND NOT retracted" if has_retracted(conn, "listings") else ""
+    return f"""
     SELECT * EXCLUDE (n) FROM (
         SELECT *, row_number() OVER (
             PARTITION BY security_id, ticker, exchange, valid_from ORDER BY known_at DESC
         ) AS n
         FROM listings
     )
-    WHERE n = 1 AND NOT retracted
+    WHERE n = 1 {live}
+"""
+
+
+def _latest_securities(conn: duckdb.DuckDBPyConnection) -> str:
+    """SQL for each security's latest row with its `retracted` flag (FALSE
+    below schema version 11)."""
+    flag = "retracted" if has_retracted(conn, "securities") else "FALSE AS retracted"
+    return f"""
+            SELECT security_id, benchmark, {flag},
+                   row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) AS n
+            FROM securities
 """
 
 
@@ -69,11 +85,7 @@ def benchmark_candidates(conn: duckdb.DuckDBPyConnection, symbol: str) -> list[s
     a listing row (any `known_at`) under `symbol`, sorted."""
     rows = conn.execute(
         f"""
-        WITH latest AS (
-            SELECT security_id, benchmark, retracted,
-                   row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) AS n
-            FROM securities
-        ), live AS ({_LIVE_LISTINGS})
+        WITH latest AS ({_latest_securities(conn)}), live AS ({_live_listings(conn)})
         SELECT DISTINCT l.security_id
         FROM live l JOIN latest s ON s.security_id = l.security_id AND s.n = 1
         WHERE s.benchmark AND NOT s.retracted AND upper(trim(l.ticker)) = ?
@@ -96,7 +108,7 @@ def ticker_holders(
     holds `symbol` at some day in `[start, through]` (module docstring), sorted."""
     rows = conn.execute(
         f"""
-        WITH live AS ({_LIVE_LISTINGS})
+        WITH live AS ({_live_listings(conn)})
         SELECT DISTINCT security_id, upper(trim(ticker)), valid_from FROM live
         WHERE security_id IN (
             SELECT security_id FROM live WHERE upper(trim(ticker)) = ?

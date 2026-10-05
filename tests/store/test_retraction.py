@@ -209,10 +209,18 @@ def _ddl(c: duckdb.DuckDBPyConnection) -> list[tuple[Any, ...]]:
     ).fetchall()
 
 
-def test_a_read_only_version_10_store_fails_master_reads_loudly(tmp_path: Path) -> None:
+def test_a_read_only_version_10_store_reads_every_master_row_as_live(tmp_path: Path) -> None:
+    """A read-only connection never migrates (`paper start` reads the master
+    before its write connection does): no column, no retraction."""
     path = tmp_path / "v10.duckdb"
     _version_10_store(path)
     with duckdb.connect(str(path), read_only=True) as c:
         schema.init_schema(c)  # a version check only: passes, migrates nothing
-        with pytest.raises(duckdb.BinderException, match="retracted"):
-            listings_as_of(c, LATER)
+        assert not schema.has_retracted(c, "listings")
+        assert set(listings_as_of(c, LATER)["security_id"]) == {SID, "0001647088"}
+        assert set(securities_as_of(c, LATER)["security_id"]) == {SID, "0001647088"}
+        assert ticker_holders(c, "WSC", start=date(2020, 1, 2), through=None) == [
+            "0001647088",
+            SID,
+        ]
+        assert benchmark_candidates(c, "WSC") == []

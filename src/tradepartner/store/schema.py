@@ -158,8 +158,9 @@ registry; #83 took version 2 first, so the registry is version 3):
   two tables with the version-11 DDL (`_migrate_retracted`) on every
   store without the column, a fresh one included, every row kept in
   insertion order with `retracted = FALSE`. A read-only connection accepts
-  a version-10 store; its `securities` and `listings` reads fail loudly on
-  the missing column until a writing command (`ingest`) migrates it.
+  a version-10 (or older) store: it has no retraction, so the master reads
+  (`has_retracted`) take every row as live, as before; `paper start` reads
+  the master before its write connection migrates.
 - **A later DDL change goes to version 12**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
@@ -351,8 +352,8 @@ _PRE_SETTLE_ORDER_VERSION = 8
 _PRE_STATEMENT_FACTS_VERSION = 9
 
 #: The last version without `retracted` and `master_underived` (#859):
-#: read-only connections serve every read but `securities`, `listings` and
-#: `master_underived`, which fail loudly on the missing column or table.
+#: read-only connections serve every read; the master reads find no
+#: `retracted` column (`has_retracted`) and take every row as live.
 _PRE_RETRACTION_VERSION = 10
 
 
@@ -638,6 +639,19 @@ _RETRACTION_TABLE_DDL: dict[str, str] = {
     )
     for table, ddl in (("securities", _CREATE_SECURITIES), ("listings", _CREATE_LISTINGS))
 }
+
+
+def has_retracted(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
+    """Whether `table` has the version-11 `retracted` column. A store a
+    read-only connection opened below version 11 lacks it, and holds no
+    retraction, so its reads take every row as live (#859)."""
+    found = conn.execute(
+        "SELECT count(*) FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND table_name = ? AND column_name = 'retracted'",
+        [table],
+    ).fetchone()
+    return found is not None and found[0] > 0
+
 
 #: `master_underived` (#859, version 11): per master check (an EDGAR ingest
 #: chunk or a `master-retract` run), each stored `securities` or `listings`
@@ -1558,9 +1572,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
         # read but `overrides` (no `client_order_id` before 9), and versions 5 to 7
         # none of `resume_invocations` and `resume_acceptances` either; version 9
-        # every read but `statement_facts`; version 10 every read but
-        # `securities` and `listings` (no `retracted` before 11) and
-        # `master_underived`.
+        # every read but `statement_facts`; version 10 every read (no
+        # `retracted` column: no retraction, see `has_retracted`).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:

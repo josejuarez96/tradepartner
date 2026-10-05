@@ -204,7 +204,7 @@ import polars as pl
 
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, get_settings, parse_accepted_jump
-from tradepartner.store.schema import RETRACTABLE_TABLES
+from tradepartner.store.schema import RETRACTABLE_TABLES, has_retracted
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Natural key (excluding `known_at`) each table's rows are keyed by for
@@ -300,7 +300,9 @@ def _latest_as_of(
     # A retraction (#859) is the latest revision of its key, so the filter
     # applies after choosing it, as `cancelled` does for actions: the key is
     # withdrawn from the retraction's `known_at` on, never before.
-    retractable = table in RETRACTABLE_TABLES
+    # A store below version 11 (a read-only connection never migrates) has
+    # no `retracted` column and no retraction: every row is live there.
+    retractable = table in RETRACTABLE_TABLES and has_retracted(conn, table)
     excluded = "_rn, retracted" if retractable else "_rn"
     live = "AND NOT retracted" if retractable else ""
     sql = f"""
