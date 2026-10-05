@@ -11,7 +11,8 @@ whose key that build does not derive (`store.retraction.underived`).
 
 - **Dry run by default.** It reads on a read-only connection and changes
   nothing. The terminal lists every row found, marks a row of a security
-  the journal has an order for (`[traded]`), names the CIKs not judged, and
+  the journal names in an order, adjustment, daily position or lot, in any
+  window (`[traded]`), names the CIKs not judged, and
   ends with a digest of the set. A read-only connection never migrates, so
   on a store below schema version 11 it refuses and names the ingest that
   migrates it.
@@ -142,15 +143,25 @@ class RetractResult:
         )
 
 
+#: Every journal table that names a security a window traded or holds:
+#: orders, adjustments (a spin-off child arrives as a `spinoff_receipt` with
+#: no order), daily positions and lots (safety review of #872).
+_TRADED_SQL = """
+    SELECT security_id FROM orders WHERE list_contains(?, security_id)
+    UNION SELECT security_id FROM adjustments WHERE list_contains(?, security_id)
+    UNION SELECT security_id FROM positions_daily WHERE list_contains(?, security_id)
+    UNION SELECT security_id FROM lots WHERE list_contains(?, security_id)
+"""
+
+
 def _traded(conn: duckdb.DuckDBPyConnection, found: tuple[Underived, ...]) -> frozenset[str]:
-    """The securities among `found` that any journal order names (any window,
-    any state): a superset of the ones a window holds."""
+    """The securities among `found` that any journal order, adjustment, daily
+    position or lot names, in any window, open or closed: a superset of the
+    ones a window holds."""
     ids = sorted({u.row["security_id"] for u in found})
     if not ids:
         return frozenset()
-    rows = conn.execute(
-        "SELECT DISTINCT security_id FROM orders WHERE list_contains(?, security_id)", [ids]
-    ).fetchall()
+    rows = conn.execute(_TRADED_SQL, [ids, ids, ids, ids]).fetchall()
     return frozenset(sid for (sid,) in rows)
 
 

@@ -23,7 +23,10 @@ revision instead.
   delisted or renamed name's snapshot row is legitimately absent from
   today's build, and retracting it would erase delisted history (quant
   audit of #872). Such rows are never judged; a false one needs another
-  remedy. `skip_ciks` are CIKs whose filings failed or were skipped this
+  remedy. Nor is a successor id (`<cik>@<valid_from>`, #820) with a
+  stored non-`filing` listing, or any of its rows: one relisted on
+  snapshot evidence has a `filing` securities row, yet exists only while
+  the snapshot names it. `skip_ciks` are CIKs whose filings failed or were skipped this
   run (`ingest._unjudged_ciks`): their rows are not judged either. A key
   the build still derives with other values (a reworded class title) is a
   revision ingest writes, not an underived row.
@@ -124,19 +127,26 @@ def underived(
     """The stored live EDGAR `filing` rows whose key `build` does not derive,
     outside `skip_ciks` (module docstring), securities first, each table
     sorted by key. Pure."""
+    stored_rows = {"securities": list(securities), "listings": list(listings)}
+    # A successor (`<cik>@<valid_from>`, #820) relisted on snapshot evidence
+    # has a `filing` securities row but exists only while the snapshot names
+    # it (quant audit of #872): its own non-filing listing marks it.
+    snapshot_evidenced = {
+        row["security_id"]
+        for row in stored_rows["listings"]
+        if "@" in row["security_id"] and row["provenance"] != FILING
+    }
     found: list[Underived] = []
-    for table, stored, built in (
-        ("securities", securities, build.securities),
-        ("listings", listings, build.listings),
-    ):
+    for table, built in (("securities", build.securities), ("listings", build.listings)):
         columns = KEYS[table]
         derived = {tuple(row[c] for c in columns) for row in built}
         rows = [
             Underived(table, dict(row))
-            for row in stored
+            for row in stored_rows[table]
             if row["source"] == EDGAR
             and row["provenance"] == FILING
             and cik_of(row["security_id"]) not in skip_ciks
+            and row["security_id"] not in snapshot_evidenced
             and tuple(row[c] for c in columns) not in derived
         ]
         found.extend(sorted(rows, key=lambda u: tuple(str(part) for part in u.key)))

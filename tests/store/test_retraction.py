@@ -74,6 +74,21 @@ def test_underived_is_every_stored_edgar_key_the_build_does_not_derive() -> None
     ]
 
 
+def test_a_successor_relisted_on_snapshot_evidence_is_never_judged() -> None:
+    """Quant audit of #872, pass 2: a `<cik>@<date>` successor relisted from
+    a companies snapshot has a `filing` securities row, yet exists only while
+    the snapshot names it; its `snapshot` listing marks it."""
+    successor = "0000900005@2026-06-16"
+    snapshot_listing = _listing(successor, "NEWCO") | {"provenance": "snapshot"}
+    later_cover = _listing(successor, "NEWC2") | {"valid_from": date(2026, 9, 1)}
+    found = underived(
+        _build((), ()),
+        [_security(successor), _security()],
+        [snapshot_listing, later_cover, _listing()],
+    )
+    assert {u.row["security_id"] for u in found} == {SID}
+
+
 def test_a_retraction_is_stamped_at_the_run_and_never_back_dated() -> None:
     row = retraction(_listing(), FIXED)
     assert (row["retracted"], row["known_at"], row["ingested_at"]) == (True, FIXED, FIXED)

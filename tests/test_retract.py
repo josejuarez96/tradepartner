@@ -244,6 +244,22 @@ def test_a_traded_name_is_marked_and_refused_without_the_flag(store: Settings) -
     assert FALSE_ID not in _listed(store, AFTER)
 
 
+def test_a_spinoff_receipt_with_no_order_is_traded(store: Settings) -> None:
+    """Safety review of #872, pass 2: a spin-off child arrives as an
+    adjustment, never an order, yet a window holds it."""
+    with open_for_write(store) as conn:
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+            "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+            "(1, 1, NULL, DATE '2019-06-03', 'spinoff_receipt', NULL, ?, 10.0, NULL, NULL, ?, ?)",
+            [FALSE_ID, FALSE_KNOWN, FALSE_KNOWN],
+        )
+    dry = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    assert dry.traded == frozenset({FALSE_ID})
+    with pytest.raises(RetractRefused, match="traded securities"):
+        _apply(store, RETRACT_AT)
+
+
 def test_a_snapshot_row_of_a_name_gone_from_the_snapshot_is_never_judged(
     store: Settings,
 ) -> None:
