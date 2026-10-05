@@ -14,8 +14,9 @@ here is this module's and is stated once:
 
 - **Last ingest per source** (`last_ingests`): from `ingestion_runs` rows
   known at `t`, i.e. finished at or before `t` (ingest writes a run's row when
-  the run ends), per source (`ingest.SOURCES` first, then any other source in
-  the table, alphabetically): the finish time and cursor of the last `ok` run,
+  the run ends), other than `master-retract`'s (#859), per source
+  (`ingest.SOURCES` first, then any other source in the table,
+  alphabetically): the finish time and cursor of the last `ok` run,
   and the status, start and message of the latest run of any status. A source
   that never ran shows `None`s.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -119,6 +120,12 @@ derived at `t`, as the data is read.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
+- `underived_master_rows` (#859): the stored `securities` and `listings` rows
+  the latest master check finished by `t` (an EDGAR ingest chunk or a
+  `master-retract --apply`) found the current rules no longer derive, and
+  that are still live at `t` (`store.retraction.underived_as_of`): table,
+  key, stored `known_at` and the check's run id. `tradepartner
+  master-retract` lists the same set from a fresh build and retracts it.
 
 This module holds no threshold; the only numbers in it are 0 and 1.
 """
@@ -155,6 +162,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import securities_as_of
+from tradepartner.store.retraction import RETRACT, underived_as_of
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 from tradepartner.universe import shares_as_of
 
@@ -178,6 +186,7 @@ NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
 GUARDED_SIC_DEFAULT = "guarded_sic_default"
+UNDERIVED_MASTER_ROWS = "underived_master_rows"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -190,6 +199,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
     GUARDED_SIC_DEFAULT,
+    UNDERIVED_MASTER_ROWS,
 )
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
@@ -452,15 +462,17 @@ def _shares_outliers(
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
     """Per source, the last `ok` run and the latest run whose row is known at
     `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
-    source."""
+    source. A `master-retract` run row (mode `retract`, #859) is not an
+    ingest and is left out, so it never hides the latest EDGAR run's status
+    or quarantine count."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ?
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode <> ?
         ORDER BY started_at, run_id
         """,
-        [t],
+        [t, RETRACT],
     ).fetchall()
     by_source: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     for run in runs:
@@ -711,6 +723,7 @@ def _integrity_checks(
         NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
+        UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 

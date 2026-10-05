@@ -34,6 +34,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   also warns, without failing, when the latest EDGAR run row reports
   quarantined accessions (the T11h failure policy): those filings get no
   further request until the owner clears them.
+- `tradepartner master-retract [--apply --expect-rows N --expect-digest D
+  [--allow-traded]]` runs `retract.master_retract` (#859): the dry run (the
+  default) builds the master as an EDGAR ingest would and lists every stored
+  `securities` or `listings` filing row the current rules no longer derive,
+  with a digest, changing nothing; with `--apply` and the dry run's count and
+  digest it retracts them (refused, writing nothing, on another set, or on a
+  traded name without `--allow-traded`). Needs the EDGAR user agent.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -107,6 +114,7 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
+from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import registry, schema
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -640,6 +648,64 @@ def make_app(
             raise _fail(f"store busy: {exc}", 1) from None
         except RepairRefused as exc:
             raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
+
+    @app.command("master-retract")
+    def master_retract_(
+        apply: Annotated[
+            bool, typer.Option("--apply", help="retract the rows (default: dry run)")
+        ] = False,
+        expect_rows: Annotated[
+            int | None, typer.Option(help="the dry run's row count (required with --apply)")
+        ] = None,
+        expect_digest: Annotated[
+            str | None, typer.Option(help="the dry run's digest (required with --apply)")
+        ] = None,
+        allow_traded: Annotated[
+            bool,
+            typer.Option("--allow-traded", help="with --apply: retract rows of traded names"),
+        ] = False,
+    ) -> None:
+        """Retract stored master rows the current rules no longer derive (#859)."""
+        expect: tuple[int, str] | None = None
+        if apply:
+            if expect_rows is None or expect_digest is None:
+                raise _fail(
+                    "run without --apply first, then pass its count and digest as "
+                    "--expect-rows and --expect-digest",
+                    USAGE_ERROR,
+                )
+            expect = (expect_rows, expect_digest)
+        elif expect_rows is not None or expect_digest is not None or allow_traded:
+            raise _fail(
+                "--expect-rows, --expect-digest and --allow-traded go with --apply", USAGE_ERROR
+            )
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        missing = _missing_secrets(s, "edgar")
+        if missing:
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        filings = EdgarFilingSource(s, client=edgar_client, clock=clock)
+        try:
+            result = master_retract(
+                s,
+                filings=filings,
+                clock=clock,
+                dry_run=not apply,
+                expect=expect,
+                allow_traded=allow_traded,
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RetractRefused as exc:
+            raise _fail(f"retract refused: {_scrubbed(str(exc), s)}", 1) from None
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)

@@ -759,7 +759,7 @@ def test_an_unfrozen_source_handed_to_the_write_meets_the_gate(
     conn.execute("SET TimeZone='UTC'")
     init_schema(conn)
     with pytest.raises(InputValidationError, match="3 input"):
-        _ingest_filings(conn, settings, _validating(tmp_path, _CRASHES), lambda: NOW)
+        _ingest_filings(conn, settings, _validating(tmp_path, _CRASHES), lambda: NOW, "run-1")
     assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
     conn.close()
 
@@ -1125,7 +1125,7 @@ def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
         conn = duckdb.connect(":memory:")
         conn.execute("SET TimeZone='UTC'")
         init_schema(conn)
-        added, _ = _ingest_filings(conn, settings, source, lambda: NOW)
+        added, _ = _ingest_filings(conn, settings, source, lambda: NOW, "run-1")
         assert added > 0
         written.append(_filing_tables(conn))
         conn.close()
