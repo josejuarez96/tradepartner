@@ -1795,33 +1795,75 @@ def test_an_empty_api_payload_is_missing_like_a_404_and_cached(tmp_path: Path, b
     assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == 1
 
 
-def test_a_non_empty_api_payload_without_facts_still_fails(tmp_path: Path) -> None:
-    """Fail closed (#576, #599): only an empty object is "no facts", and only
-    a payload with `facts` is identified by its requested CIK; a non-empty
-    payload missing `facts` still fails the source."""
+def _assert_api_recorded_and_absent(
+    source: EdgarFilingSource, records: list[FactRecord], error: str
+) -> None:
+    """#578 part 3: Apple's API payload is recorded once and is absent for
+    the run: no company facts (FSN's share alone), nothing cached, and not
+    counted as empty, keyless or missing."""
+    [failure] = source.validation_failures
+    assert (failure.input, failure.key) == ("companyfacts API", f"CIK{APPLE}.json")
+    assert error in failure.error
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+    cache = Path(source._settings.edgar.cache_dir) / "facts" / f"v{PARSER_VERSION}"
+    assert not (cache / f"{APPLE}.json").exists()
+    counts = (source.facts_api_empty, source.facts_api_keyless, source.facts_missing)
+    assert counts == (0, 0, 0)
+    _shares(source, APPLE)  # memoised: asked and recorded once per run
+    assert len(source.validation_failures) == 1
+
+
+def test_a_non_empty_api_payload_without_facts_is_recorded(tmp_path: Path) -> None:
+    """Fail closed (#576, #599, #578): only an empty object is "no facts",
+    and only a payload with `facts` is identified by its requested CIK; a
+    non-empty payload missing `facts` is recorded for the gate."""
     payload = {"cik": 320193}
     source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: payload})
-    with pytest.raises(KeyError):
-        _shares(source, APPLE)
-    assert source.facts_api_empty == 0
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "KeyError")
 
 
-def test_an_api_payload_that_is_not_an_object_still_fails(tmp_path: Path) -> None:
-    """Fail closed (#576): an empty list is not an empty object."""
+def test_an_api_payload_that_is_not_an_object_is_recorded(tmp_path: Path) -> None:
+    """Fail closed (#576, #578): an empty list is not an empty object."""
     source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: b"[]"})
-    with pytest.raises(TypeError):
-        _shares(source, APPLE)
-    assert source.facts_api_empty == 0
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "TypeError")
 
 
-def test_an_api_payload_for_another_cik_still_raises(tmp_path: Path) -> None:
-    """#576 leaves the API's CIK check as it was: another CIK's facts raise."""
+def test_an_api_payload_for_another_cik_is_recorded(tmp_path: Path) -> None:
+    """#578 part 3: another CIK's facts are never served; recorded, not raised."""
     settings = _settings(tmp_path)
     router = _facts_router(**{APPLE: load("company_facts_dual_class.json")})
     source = _source(settings, router)
     _seed_apple(source)
-    with pytest.raises(ValueError, match="served for"):
-        _shares(source, APPLE)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "served for")
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        (b"<html>busy</html>", "JSONDecodeError"),
+        (b'{"cik": 320193, "facts": []}', "ValueError: company facts: malformed"),
+    ],
+    ids=["not-json", "facts-a-list"],
+)
+def test_an_api_body_that_is_not_json_or_has_the_wrong_shape_is_recorded(
+    tmp_path: Path, body: bytes, error: str
+) -> None:
+    """Reviewers on #881: a non-JSON body and a `facts` list (an
+    `AttributeError` in `_holds_accession`) are recorded, never a crash."""
+    settings = _settings(tmp_path)
+    source = _source(settings, _facts_router(**{APPLE: body}))
+    _seed_apple(source)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), error)
+
+
+def test_an_api_payload_whose_facts_do_not_parse_is_recorded(tmp_path: Path) -> None:
+    """#578 part 3: `parse_company_facts` refusing an API payload (an
+    impossible `end`) is recorded under the API, never cached."""
+    bad = _apple_entries(_entry(APPLE_ACCESSION, "2025-13-45", 5.0))
+    settings = _settings(tmp_path)
+    source = _source(settings, _facts_router(**{APPLE: bad}))
+    _seed_apple(source)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "ValueError")
 
 
 # --- a keyless companyfacts payload with facts (#599) --------------------------
