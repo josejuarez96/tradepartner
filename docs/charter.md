@@ -18,7 +18,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 - **Deferred beyond the MVP** (ADR required to enter scope): social and Google Trends data, news-text signals, and the LLM analyst layer. See [roadmap.md](roadmap.md), "MVP scope".
 - **Interface:** the owner interacts through a CLI and a local, read-only dashboard that reads the system's own database. The only write action is a logged override with a reason. See [roadmap.md](roadmap.md), "User experience".
 - **Universe** ([ADR 0006](decisions/0006-universe-and-cadence.md)): US common stocks on NYSE, Nasdaq and NYSE American; ranked by market cap with liquidity and price floors, rebuilt point-in-time at each rebalance. The numbers (proposed defaults: top 1000, $5M median dollar volume, $5 price) are config, frozen per hypothesis at pre-registration.
-- **Cadence** ([ADR 0006](decisions/0006-universe-and-cadence.md)): monthly rebalance at the last session of the month, orders at the next open, one-month hold.
+- **Cadence** ([ADR 0012](decisions/0012-cadence-as-a-hypothesis-parameter.md), superseding ADR 0006's cadence): a frozen hypothesis parameter, `month_end` by default (the last session of the month, orders for the next session at the frozen fill convention, one-period hold); the MVP's paper and live cadence is monthly.
 
 ## Constraints
 - Runs locally, for personal use only.
