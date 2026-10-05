@@ -70,10 +70,11 @@ is after the window's start date and has no `paper_runs` row; the lapse rows
 from `marks.lapses`, with one `missed_rebalance` alert; the due outcomes and the
 lot-ledger write (T62). A lot-ledger error never fails the run: it is a
 `lot_ledger` alert (#366 Q5) and a note on the result row. Once the window has
-a `requested` stop, the outcomes get its **stop session** (`stop_session`: the
-New York date of the row's `at`, or the next session when that date is not
-one), and a `stop` run also passes, as S, every name of the window's orders
-that is flat apart from its residue (`plan.residue`, within the frozen
+a `requested` stop, the outcomes get its **stop session** (`plan.stop_session`,
+re-exported here as `stop_session`: the New York date of the row's `at`, or the
+next session when that date is not one), and a `stop` run also passes, as S,
+every name of the window's orders that is flat apart from its residue
+(`plan.residue`, within the frozen
 `risk.reconcile_quantity_tolerance`) on the ledger after step 3; a name never
 held is flat. The flatness a run's own step 7b fills make is therefore the next
 run's to find, and an order's horizon ends at the earliest of the flattening
@@ -225,6 +226,7 @@ from tradepartner.execution.plan import (
     decision_state,
     rebalance_state,
     residue,
+    stop_session,
 )
 from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, Reconciliation
 from tradepartner.execution.reconcile import OK as RECONCILED
@@ -430,14 +432,6 @@ def stop_step(context: StepContext) -> BatchOutcome | None:
     if not handed or not _in_submit_window(context):
         return None
     return _execute(context, (), handed)
-
-
-def stop_session(requested_at: datetime) -> date:
-    """The stop session (spec req 14): the calendar session containing the
-    `requested` row's `at` (its New York date), or the next session when that
-    date is not a session."""
-    day = ensure_tz_aware_utc(requested_at, field_name="requested_at").astimezone(_NEW_YORK).date()
-    return day if is_session(day) else next_session(day)
 
 
 def submit_window(settings: Settings, session: date) -> tuple[datetime, datetime]:

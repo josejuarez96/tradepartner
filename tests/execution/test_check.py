@@ -15,6 +15,7 @@ from tradepartner.config import Settings
 from tradepartner.execution import check as check_module
 from tradepartner.execution import outcomes as outcomes_module
 from tradepartner.execution.check import check
+from tradepartner.execution.plan import stop_session
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
@@ -23,6 +24,7 @@ from tradepartner.store.journal import (
     OverrideRow,
     PaperReportRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     append,
 )
 
@@ -748,3 +750,31 @@ def test_last_completed_rebalance_session() -> None:
         == T2
     )
     assert check_module._last_completed_rebalance_session(session_close(T2)) == T2
+
+
+@pytest.mark.parametrize(
+    ("requested_at", "expected"),
+    [
+        pytest.param(datetime(2026, 10, 30, 22, tzinfo=UTC), T1, id="after-the-close"),
+        # Saturday 2026-10-31: the next session, Monday 2026-11-02.
+        pytest.param(datetime(2026, 10, 31, 15, tzinfo=UTC), date(2026, 11, 2), id="saturday"),
+    ],
+)
+def test_check_stop_session_is_plan_stop_session(requested_at: datetime, expected: date) -> None:
+    """check reads the stop session through `plan.stop_session` (#592), the one
+    rule `run` and `report` share, from the earliest `requested` row."""
+    stops = [
+        PaperWindowStopRow(
+            window_id=WINDOW_ID,
+            at=at,
+            state=state,
+            known_at=at,
+            ingested_at=at,
+        )
+        for at, state in (
+            (requested_at + timedelta(days=3), "closed"),
+            (requested_at + timedelta(days=1), "requested"),
+            (requested_at, "requested"),
+        )
+    ]
+    assert check_module._stop_session_of(stops) == stop_session(requested_at) == expected
