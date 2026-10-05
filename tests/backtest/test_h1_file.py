@@ -26,7 +26,8 @@ def test_h1_file_parses_with_slug_family_and_dates() -> None:
     assert parsed.family in Settings(_env_file=None).hypotheses.families
     assert parsed.title
     # Owner answers to spec open questions 8 and 2 (#156); Q8 amended on #842 (decision (b):
-    # the first month-end at which the real store's universe reaches top_n_by_cap).
+    # the first month-end at which the real store's size cut binds, that is, at least
+    # universe.top_n_by_cap companies pass ADR 0006 rules 1-7).
     assert parsed.in_sample_start == date(2019, 11, 29)
     assert parsed.holdout_start == date(2024, 1, 1)
     assert parsed.holdout_end == date(2026, 9, 30)
