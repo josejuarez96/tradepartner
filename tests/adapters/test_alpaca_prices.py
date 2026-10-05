@@ -1331,6 +1331,149 @@ class TestCorporateActions:
             parse_corporate_actions({"forward_splits": [{"symbol": "AAPL"}]}, resolver.resolve)
 
 
+class TestUnreadableTickers:
+    """#844: a cover page that puts junk in the trading-symbol field (an
+    exchange name, a footnote marker) never ends the company's span."""
+
+    VMC = "0001396009"
+
+    def _vmc(self) -> list[dict[str, object]]:
+        return [
+            _listing(self.VMC, "VMC", date(2019, 7, 29), "Common Stock"),
+            _listing(self.VMC, "New York Stock Exchange", date(2020, 11, 6), "Common Stock"),
+            _listing(self.VMC, "VMC", date(2021, 2, 25), "Common Stock"),
+            _listing(self.VMC, "New York Stock Exchange", date(2021, 5, 5), "Common Stock"),
+            _listing(self.VMC, "VMC", date(2022, 2, 25), "Common Stock"),
+        ]
+
+    def test_an_exchange_name_in_the_ticker_field_keeps_the_span(self) -> None:
+        resolver = ListingResolver(self._vmc())
+        for session in (date(2020, 11, 6), date(2020, 12, 1), date(2021, 6, 1), date(2022, 3, 1)):
+            assert resolver.resolve("VMC", session) == self.VMC, session
+            assert resolver.holds(self.VMC, session)
+        assert resolver.resolve("New York Stock Exchange", date(2020, 12, 1)) is None
+        assert resolver.symbols(self.VMC, date(2020, 1, 2), date(2022, 6, 1)) == ["VMC"]
+        assert resolver.report.unreadable == 2
+        assert "2 unreadable-ticker listings ignored" in resolver.report.summary()
+
+    @pytest.mark.parametrize("junk", ["VAL*", "BAX (NYSE)", "LCINQ (1)", "UPH(1)"])
+    def test_a_footnote_marker_is_the_same_ticker(self, junk: str) -> None:
+        held = alpaca_symbol(junk)
+        assert held is not None
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", held, date(2019, 7, 29), "Common Stock"),
+                _listing("0000000001", junk, date(2020, 10, 29), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve(held, date(2021, 1, 4)) == "0000000001"
+        assert resolver.symbols("0000000001", START, date(2021, 1, 4)) == [held]
+        assert resolver.report.unreadable == 0  # read as the symbol, not kept as junk
+
+    def test_a_junk_row_on_a_rename_day_never_costs_the_new_ticker(self) -> None:
+        day = date(2022, 6, 9)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "OLD", START, "Common Stock"),
+                _listing("0000000001", "NEWT", day, "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("NEWT", date(2022, 7, 1)) == "0000000001"
+        assert resolver.resolve("OLD", date(2022, 7, 1)) is None
+        assert resolver.report.same_day_securities == 0
+        assert resolver.report.unreadable == 1
+
+    def test_a_junk_row_after_a_placeholder_still_holds_nothing(self) -> None:
+        # Only a readable equity ticker just before is carried on: after a
+        # placeholder row (no ticker listed) the junk row is left as it was.
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "AAA", START, "Common Stock"),
+                _listing("0000000001", "N/A", date(2020, 1, 2), "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", date(2021, 1, 4), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("AAA", date(2021, 6, 1)) is None
+        assert resolver.report.unreadable == 0
+
+    def test_a_security_listing_only_junk_is_known_and_never_sent(self) -> None:
+        resolver = ListingResolver(
+            [_listing("0000000001", "New York Stock Exchange", START, "Common Stock")]
+        )
+        assert resolver.knows("0000000001")
+        assert resolver.report.unreadable == 0
+
+    def test_a_delisted_junk_last_row_still_ends_the_span(self) -> None:
+        # quant-auditor on #863: the Form 25 lands on the junk row's listing,
+        # keyed under the junk string; rule 7 must still cut the span.
+        junk_day = date(2021, 1, 4)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "XYZ", date(2019, 1, 2), "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", junk_day, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        "0000000001",
+                        "New York Stock Exchange",
+                        "Common Stock",
+                        date(2021, 3, 1),
+                        valid_from=junk_day,
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("XYZ", date(2021, 2, 1)) == "0000000001"
+        assert resolver.resolve("XYZ", date(2022, 6, 1)) is None
+        assert resolver.report.ended_spans == 1
+
+    def test_a_junk_row_never_carries_a_same_day_typo_on(self) -> None:
+        # code-review on #863: Ford's typo day lists F and FF; a later junk
+        # row must be read as F, never as FutureFuel's FF.
+        resolver = ListingResolver(
+            [
+                _listing("ff", "FF", date(2019, 1, 2), "Common Stock"),
+                _listing("ford", "F", date(2020, 1, 2), "Common Stock"),
+                _listing("ford", "F", date(2020, 4, 1), "Common Stock"),
+                _listing("ford", "FF", date(2020, 4, 1), "Common Stock"),
+                _listing("ford", "New York Stock Exchange", date(2020, 7, 1), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2020, 8, 3)) == "ff"
+        assert resolver.resolve("F", date(2020, 8, 3)) == "ford"
+        assert (resolver.report.unreadable, resolver.report.same_day_typos) == (1, 1)
+
+    def test_a_dropped_junk_row_is_counted_once(self) -> None:
+        day = date(2022, 6, 9)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "OLD", START, "Common Stock"),
+                _listing("0000000001", "NEWT", day, "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", day, "Common Stock"),
+            ]
+        )
+        assert (resolver.report.unreadable, resolver.report.same_day_typos) == (1, 0)
+
+    def test_a_junk_row_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: a junk row, and every row after it, change nothing
+        # before its day; nor does it hand the ticker to another company.
+        cut = date(2020, 11, 6)
+        rows = [
+            *self._vmc(),
+            _listing("0000000009", "VMC", date(2016, 3, 1), "Common Stock"),
+        ]
+        full = ListingResolver(rows)
+        early = ListingResolver([r for r in rows if r["valid_from"] < cut])  # type: ignore[operator]
+        sessions = [date(y, m, 1) for y in range(2016, 2023) for m in range(1, 13)]
+        for session in (s for s in sessions if s < cut):
+            assert full.resolve("VMC", session) == early.resolve("VMC", session), session
+        for session in (s for s in sessions if s >= date(2019, 7, 29)):
+            assert full.resolve("VMC", session) == self.VMC, session
+
+
 class _Recorded:
     """Fetchers returning the recorded payloads, and remembering the calls."""
 
@@ -1484,6 +1627,16 @@ class TestAlpacaSymbols:
             ("crd-a", "CRD.A"),
             ("BF.B", "BF.B"),
             ("bf-b", "BF.B"),
+            # #844: a footnote marker or an exchange in brackets after it.
+            ("VAL*", "VAL"),
+            ("DNR*", "DNR"),
+            ("CVIAQ*", "CVIAQ"),
+            ("BAX (NYSE)", "BAX"),
+            ("UPH(1)", "UPH"),
+            ("LCINQ (1)", "LCINQ"),
+            ("QTEKQ (1) ", "QTEKQ"),
+            ("ABC (Nasdaq GS)", "ABC"),
+            ("ABC (NYSE American)", "ABC"),
         ],
     )
     def test_safe_spellings_become_the_alpaca_symbol(self, ticker: str, symbol: str) -> None:
@@ -1492,8 +1645,17 @@ class TestAlpacaSymbols:
     @pytest.mark.parametrize(
         "ticker",
         [
-            "BAX (NYSE)",
             "New York Stock Exchange",
+            "Trading SymbolSLP",
+            "*",
+            "(NYSE)",
+            # quant-auditor on #863: a bracketed class or series is no footnote.
+            "HEI (A)",
+            "BRK (A)",
+            "GOOG (Class C)",
+            "BAC (Series L)",
+            "XYZ (Pfd)",
+            "F (2029)",  # code-review on #863: a year is no footnote
             "F&G",
             "C/28",
             "CUBI/PC",
@@ -1557,7 +1719,7 @@ class TestAlpacaSymbols:
         listings = [
             _listing("SEC_AAPL", "AAPL", START),
             _listing("SEC_CRD", "CRD-A", START),
-            _listing("SEC_BAX", "BAX (NYSE)", START),
+            _listing("SEC_FG", "F&G", START),
         ]
         calls: list[list[str]] = []
 
@@ -1568,13 +1730,13 @@ class TestAlpacaSymbols:
         source = AlpacaPriceSource(
             ListingResolver(listings), fetch_bars=fetch, settings=_settings()
         )
-        bars = source.bars(["SEC_AAPL", "SEC_CRD", "SEC_BAX"], date(2020, 8, 3), date(2020, 8, 7))
+        bars = source.bars(["SEC_AAPL", "SEC_CRD", "SEC_FG"], date(2020, 8, 3), date(2020, 8, 7))
         assert calls == [["AAPL", "CRD.A"]]
         assert {b.security_id for b in bars} == {"SEC_AAPL", "SEC_CRD"}
         crd = [b for b in bars if b.security_id == "SEC_CRD"]
         assert len(crd) == 5 and crd[0].close == _json("daily_bars.json")["bars"]["KO"][0]["c"]
-        assert source.last_excluded_symbols == ("BAX (NYSE)",)
-        assert "1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'BAX (NYSE)'" in (
+        assert source.last_excluded_symbols == ("F&G",)
+        assert "1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'F&G'" in (
             source.symbol_summary()
         )
 
@@ -1693,13 +1855,13 @@ class TestAlpacaSymbols:
         assert resolver.symbols("SEC_P", START, date(2020, 8, 7)) == []
 
     def test_the_run_line_names_the_tickers_not_sent_last(self) -> None:
-        listings = [_listing("SEC_AAPL", "AAPL", START), _listing("SEC_BAX", "BAX (NYSE)", START)]
+        listings = [_listing("SEC_AAPL", "AAPL", START), _listing("SEC_FG", "F&G", START)]
         source = AlpacaPriceSource(
             ListingResolver(listings), fetch_bars=_Recorded().bars, settings=_settings()
         )
-        source.bars(["SEC_AAPL", "SEC_BAX"], date(2020, 8, 3), date(2020, 8, 7))
+        source.bars(["SEC_AAPL", "SEC_FG"], date(2020, 8, 3), date(2020, 8, 7))
         assert source.resolution_summary().endswith(
-            "; 1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'BAX (NYSE)'"
+            "; 1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'F&G'"
         )
 
     def test_a_valid_ticker_alone_names_no_exclusion(self) -> None:
@@ -1733,14 +1895,20 @@ class TestSameAlpacaSymbolFold:
 
     @pytest.mark.parametrize(
         ("one", "other"),
-        [("MOTV U", "MOTV.U"), ("MOTV.U", "MOTV U"), ("BRK B", "BRK.B"), ("crd a", "CRD.A")],
+        [
+            ("MOTV U", "MOTV.U"),
+            ("MOTV.U", "MOTV U"),
+            ("BRK B", "BRK.B"),
+            ("crd a", "CRD.A"),
+            ("BAX (NYSE)", "BAX"),  # #844: a bracketed exchange after the symbol
+        ],
     )
     def test_a_space_class_suffix_is_the_dot_spelling(self, one: str, other: str) -> None:
         assert same_alpaca_symbol(one, other) is True
 
     @pytest.mark.parametrize(
         ("one", "other"),
-        [("HACAR", "HCACR"), ("CLCR", "CLRC"), ("F", "FF"), ("BAX (NYSE)", "BAX")],
+        [("HACAR", "HCACR"), ("CLCR", "CLRC"), ("F", "FF"), ("BAX (NYSE)", "BAXX")],
     )
     def test_different_tickers_are_not_one_symbol(self, one: str, other: str) -> None:
         assert same_alpaca_symbol(one, other) is False
