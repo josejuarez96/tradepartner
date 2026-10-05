@@ -218,19 +218,16 @@ def test_capped_exponential_backoff_across_several_attempts(
     ]
 
 
-@pytest.mark.parametrize("status", [429, 503])
-def test_transient_status_fails_after_retry_max_attempts(
-    monkeypatch: pytest.MonkeyPatch, status: int
-) -> None:
+def test_503_fails_after_retry_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
-    handler, served = _status_sequence_handler([status] * 10)
+    handler, served = _status_sequence_handler([503] * 10)
 
     with pytest.raises(httpx.HTTPStatusError):
         edgar_raw.company_tickers(
             settings=_settings(retry_max_attempts=3), client=_mock_client(handler)
         )
 
-    assert served == [status, status, status]
+    assert served == [503, 503, 503]
 
 
 def test_403_waits_the_configured_rate_limit_wait_then_retries_once(
@@ -962,3 +959,149 @@ def test_fsn_validators_retries_once_on_a_rate_limit_status() -> None:
     )
     assert len(served) == 2
     assert headers["ETag"] == '"x"'
+
+
+# --- #761: zip checked before it replaces the cache; per-run block; 429 block ---
+
+
+def test_a_zip_still_corrupt_after_one_redownload_keeps_the_previous_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each streamed zip is checked in its temp file, before `os.replace`:
+    two corrupt downloads raise `BadZipFile` and leave the previous good
+    zip in place, with no temp file behind (#761 item 1)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    previous = tmp_path / "bulk" / "submissions.zip"
+    previous.parent.mkdir()
+    yesterdays_zip = _valid_zip_bytes(content=b"yesterday")
+    previous.write_bytes(yesterdays_zip)
+
+    with pytest.raises(zipfile.BadZipFile, match="still corrupt after one re-download"):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(200, content=b"not a zip")),
+        )
+
+    assert previous.read_bytes() == yesterdays_zip
+    assert list(previous.parent.iterdir()) == [previous]
+
+
+def test_a_corrupt_zip_never_replaces_the_previous_zip_even_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the good second download is moved over `dest`: the corrupt first
+    one is never `os.replace`d onto it (#761 item 1)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    replaced_with: list[bytes] = []
+    real_replace = edgar_raw.os.replace
+
+    def recording_replace(src: str | Path, dst: str | Path) -> None:
+        replaced_with.append(Path(src).read_bytes())
+        real_replace(src, dst)
+
+    monkeypatch.setattr(edgar_raw.os, "replace", recording_replace)
+    good_zip = _valid_zip_bytes()
+    served: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(1)
+        return httpx.Response(200, content=b"not a zip" if len(served) == 1 else good_zip)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert replaced_with == [good_zip]
+    assert path.read_bytes() == good_zip
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_a_persistent_403_is_waited_out_once_per_run_not_once_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `403` that outlasts its one wait (e.g. a refused User-Agent) makes
+    every later `403` in the process fail at once, without another
+    `edgar.rate_limit_wait_seconds` wait: `fsn_validators` over many cached
+    periods would otherwise wait 10 minutes per period (#761 item 2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403])
+    settings = _settings(rate_limit_wait_seconds=600.0)
+    client = _mock_client(handler)
+
+    for period in ("2025_08", "2025_09", "2025_10"):
+        with pytest.raises(httpx.HTTPStatusError):
+            edgar_raw.fsn_validators(period, settings=settings, client=client)
+
+    assert served == [403, 403, 403, 403]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0)]
+
+
+def test_a_success_ends_the_block_so_a_later_403_is_waited_out_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-fast lasts only while the block does: once any request
+    succeeds, a later `403` gets its own wait again (#761 item 2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 200, 403, 200])
+    settings = _settings(rate_limit_wait_seconds=600.0)
+    client = _mock_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(settings=settings, client=client)
+    assert edgar_raw.company_tickers(settings=settings, client=client) == {"status": 200}
+    assert edgar_raw.company_tickers(settings=settings, client=client) == {"status": 200}
+
+    assert served == [403, 403, 200, 403, 200]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0), pytest.approx(600.0)]
+
+
+def test_a_429_past_its_backoff_is_waited_out_as_a_block_then_retried_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC may signal its block with a `429` (research #572 P2): once the
+    backoff attempts are used up, a `429` gets the same one
+    `edgar.rate_limit_wait_seconds` wait and one retry as a `403` (#761
+    item 3)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([429, 429, 429, 200])
+
+    payload = edgar_raw.company_tickers(
+        settings=_settings(
+            retry_max_attempts=3, retry_backoff_seconds=1.0, rate_limit_wait_seconds=600.0
+        ),
+        client=_mock_client(handler),
+    )
+
+    assert payload == {"status": 200}
+    assert served == [429, 429, 429, 200]
+    assert [s for s in slept if s > 0.5] == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(600.0),
+    ]
+
+
+def test_a_429_that_outlasts_the_block_wait_fails_without_a_second_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([429] * 10)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(
+            settings=_settings(
+                retry_max_attempts=3, retry_backoff_seconds=1.0, rate_limit_wait_seconds=600.0
+            ),
+            client=_mock_client(handler),
+        )
+
+    assert served == [429, 429, 429, 429]
+    assert [s for s in slept if s > 0.5] == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(600.0),
+    ]

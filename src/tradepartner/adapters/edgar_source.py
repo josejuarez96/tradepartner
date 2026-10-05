@@ -169,7 +169,9 @@ per-accession FSN failure and every per-document failure (cover page, SGML
 header, delisting notice) stay with the failure policy above, one policy
 (owner option (a) on #808): `check_failures` fails the run only where its
 rules fire, and its message lists the run's unaccepted per-document
-failures, bounded, with `failed_filings.json` as the full list.
+failures, bounded, naming a file under `edgar.cache_dir/validation/` that
+holds the full list whenever the check fails with them, dry run or not
+(#884).
 """
 
 from __future__ import annotations
@@ -247,6 +249,9 @@ COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: Bumped when the layout of `check_failures`'s full-list file changes (#884).
+FILING_FAILURES_LIST_VERSION = 1
+
 #: Bumped to retry every accession in `failed_filings.json` (T11h): deleting
 #: an entry by hand un-quarantines one accession; bumping this un-quarantines
 #: every one and resets every count.
@@ -379,6 +384,9 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
+        # #868: periods parsed cleanly after an earlier period failed whole,
+        # so not written; they still set where the lag window starts.
+        self._fsn_unwritten_periods: list[str] = []
         # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
@@ -754,7 +762,11 @@ class EdgarFilingSource(FilingSource):
         `accepted: False`), and `committed: False` until T11f's
         `record_failures()` sets it. An accession seen in two periods keeps
         the first extracted; the duplicate is counted on `.fsn_duplicates`.
-        A period is re-extracted only when `FSN_VERSION` changes.
+        A period is re-extracted only when `FSN_VERSION` changes. Once a
+        period fails whole (recorded on `.validation_failures`, #578), the
+        later periods of the pass are extracted but write no manifest or
+        cache (#868): otherwise a later period would claim an accession the
+        failed one shares, and keep it after the failed one is repaired.
 
         For periods already extracted (a manifest exists) and still listed
         on the data-set page, one `HEAD` compares their validators with the
@@ -775,6 +787,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_incomplete_listings = 0
         self.fsn_missing = 0
         self._fsn_extraction_failures_this_run = 0
+        self._fsn_unwritten_periods = []
 
         all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
         listed = set(all_periods)
@@ -794,8 +807,15 @@ class EdgarFilingSource(FilingSource):
                 known_accessions.update(manifest["accessions_extracted"])
 
         kept_forms = {*self._settings.edgar.cover_page_forms, *self._settings.edgar.header_forms}
+        persist = True
         for period in to_extract:
-            self._extract_fsn_period(period, kept_forms, known_accessions)
+            # #868: after a period fails whole, the later periods of this pass
+            # are still extracted (every failure shows in one pass, #578) but
+            # write nothing, so none claims an accession the failed period
+            # shares; the gate fails the run, and the next run extracts them.
+            persist = self._extract_fsn_period(
+                period, kept_forms, known_accessions, persist=persist
+            )
 
         for period in self._cached_fsn_periods():
             if edgar_raw.fsn_period_year(period) < self._settings.edgar.fsn_first_year:
@@ -841,8 +861,15 @@ class EdgarFilingSource(FilingSource):
         self._fsn_ready = True
 
     def _extract_fsn_period(
-        self, period: str, kept_forms: set[str], known_accessions: set[str]
-    ) -> None:
+        self, period: str, kept_forms: set[str], known_accessions: set[str], *, persist: bool
+    ) -> bool:
+        """Extract one FSN period. When `persist` is `False` (an earlier
+        period of the pass failed whole, #868), the period is only downloaded
+        and parsed, so a whole-period failure is still recorded, and nothing
+        else happens: no accession is claimed, no counter moves, no cache row
+        or manifest is written (the period only counts toward where the lag
+        window starts, `_lag_window_start`). Returns `False` once a period has failed
+        whole (this one, or an earlier one), else `True`."""
         zip_path, headers = edgar_raw.fsn_zip(period, settings=self._settings, client=self._client)
         with zip_path.open("rb") as zip_file:  # streamed: FSN zips reach hundreds of MB
             content_hash = hashlib.file_digest(zip_file, "sha256").hexdigest()
@@ -884,11 +911,15 @@ class EdgarFilingSource(FilingSource):
             # next run downloads and extracts it again); `record` re-raises
             # a tripped path-safety guard.
             self.validation_failures.record("FSN period", period, error)
-            return
+            return False
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
             zip_path.unlink(missing_ok=True)  # the zip is deleted after extraction
 
+        if not persist:
+            # parsed only to record a whole-period failure (#868)
+            self._fsn_unwritten_periods.append(period)
+            return False
         form_by_accession = {str(row["adsh"]): str(row["form"]) for row in sub_rows}
         per_cik_new: dict[str, dict[str, FsnFiling]] = {}
         served: list[str] = []
@@ -940,6 +971,7 @@ class EdgarFilingSource(FilingSource):
         # changes (the zip is gone).
         self._fsn_extraction_failures_this_run += len(accessions_failed)
         self._update_failed_filings_count()
+        return True
 
     def _fsn_root(self) -> Path:
         return self._cache / "fsn" / f"v{FSN_VERSION}"
@@ -1009,10 +1041,14 @@ class EdgarFilingSource(FilingSource):
 
     def _lag_window_start(self) -> datetime:
         """The first day (Eastern midnight, as UTC) of the newest cached FSN
-        period at or after `edgar.fsn_first_year`. With no such period
-        (e.g. `fsn_first_year` past the newest listed period) it raises
-        rather than treating all history as the lag window."""
-        periods = self._fsn_loaded_periods  # in range, and the manifest loads
+        period at or after `edgar.fsn_first_year`, or of a newer one this
+        pass parsed but did not write after an earlier period failed whole
+        (#868: otherwise every filing since the last written period would be
+        fetched one by one on a run the gate fails anyway). With no such
+        period (e.g. `fsn_first_year` past the newest listed period) it
+        raises rather than treating all history as the lag window."""
+        # in range, and the manifest loads; or parsed but unwritten (#868)
+        periods = (*self._fsn_loaded_periods, *self._fsn_unwritten_periods)
         if not periods:
             # Fail closed: "everything is inside the lag window" would request
             # a header for every 8-K and 10-Q since 1993 (#249 safety review).
@@ -1623,24 +1659,32 @@ class EdgarFilingSource(FilingSource):
         owner option (a) on #808):
         their count, then the first `edgar.max_validation_listed` as
         `accession error_class/base_form: message`, each message cleaned
-        (`_stored_message`). The full list is `failed_filings.json` (written
-        on a non-dry run by `record_failed_check`); accepting one stays the
-        hand edit there."""
+        (`_stored_message`). Whenever the check fails with such failures, dry
+        run or not, the full list is written to a JSON file under
+        `edgar.cache_dir/validation/`, named at the very start of the
+        message, so the run row's `ingest.max_message_chars` cut keeps it
+        whatever the reasons' length (#884); `failed_filings.json` (written
+        on a non-dry run by `record_failed_check`) holds them too, and
+        accepting one stays the hand edit there."""
         reasons: list[str] = []
         self._check_fsn_group(reasons)
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
         if reasons:
+            full_list, listing = self._unaccepted_listing()
             raise FilingFailuresError(
-                "; ".join(reasons)
+                full_list
+                + "; ".join(reasons)
                 + f"; failure messages in {self._failed_filings_path()} (not on a dry run)"
                 + f" and the FSN manifests under {self._fsn_root() / 'manifests'}"
-                + self._unaccepted_listing()
+                + listing
             )
 
-    def _unaccepted_listing(self) -> str:
-        """`check_failures`'s bounded list of this run's unaccepted
-        per-document failures, or "" when there are none."""
+    def _unaccepted_listing(self) -> tuple[str, str]:
+        """`check_failures`'s message parts for this run's unaccepted
+        per-document failures: where their full list was written (the
+        message's first part) and the bounded list (its last); both "" when
+        there are none."""
         unaccepted = [
             (accession, error_class, base_form, message)
             for accession, (error_class, base_form, message) in sorted(
@@ -1649,16 +1693,48 @@ class EdgarFilingSource(FilingSource):
             if not self._accepted(accession, error_class, message)
         ]
         if not unaccepted:
-            return ""
+            return "", ""
+        try:
+            where = str(self._write_unaccepted_listing(unaccepted))
+        except OSError as error:  # the check still fails, unlisted on disk
+            where = self._stored_message(f"not written ({type(error).__name__}: {error})")
         limit = self._settings.edgar.max_validation_listed
         listed = "; ".join(
             self._stored_message(f"{accession} {error_class}/{base_form}: {message}")
             for accession, error_class, base_form, message in unaccepted[:limit]
         )
         return (
+            f"full list of this run's {len(unaccepted)} unaccepted filing failures: {where}; ",
             f"; this run's unaccepted filing failures (per-document and fact collisions): "
-            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}"
+            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}",
         )
+
+    def _write_unaccepted_listing(self, unaccepted: Sequence[tuple[str, str, str, str]]) -> Path:
+        """Write every one of `check_failures`'s unaccepted failures to a new
+        JSON file under `edgar.cache_dir/validation/` (beside the input
+        validation gate's lists) and return its path (#884): a dry run
+        writes no `failed_filings.json`, and the message lists only the
+        first `edgar.max_validation_listed`. Messages are cleaned as on
+        disk elsewhere (`_stored_message`)."""
+        now = self._now()
+        path = (
+            self._cache / "validation" / f"filing-failures-{now.strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        )
+        payload = {
+            "version": FILING_FAILURES_LIST_VERSION,
+            "written_at": now.isoformat(),
+            "failures": [
+                {
+                    "accession": accession,
+                    "error_class": error_class,
+                    "base_form": base_form,
+                    "message": self._stored_message(message),
+                }
+                for accession, error_class, base_form, message in unaccepted
+            ],
+        }
+        edgar_raw.write_atomic(path, json.dumps(payload, indent=1).encode("utf-8"))
+        return path.resolve()
 
     def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
         min_n = self._settings.edgar.min_failed_filings
