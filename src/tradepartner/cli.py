@@ -12,7 +12,11 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   `backfill.fill_holes` instead (#831): the dry run lists the (security,
   month) holes in the backfill's committed months, needs no Alpaca secret
   and fetches nothing; the real run refetches them and exits 0 only when
-  every month it fetched is `filled`.
+  every month it fetched is `filled`. Only holes the store's resolver can
+  assign are listed or fetched; the rest are counted per reason (#876).
+  `--security ID` (repeatable, or comma-separated) limits both to the named
+  securities; a named id with no hole fetched is listed with why, not an
+  error.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -210,7 +214,9 @@ def _print_result(result: IngestResult) -> None:
 
 def _print_holes(result: HoleFill) -> None:
     """Any run rows (a real run's months, or a locked store), then a dry
-    run's holes: the summary and one line per security."""
+    run's holes: the summary and one line per security; or a real run's
+    holes not fetched per reason and its named securities with no hole
+    fetched."""
     for run in result.runs:
         typer.echo(
             f"{run.source}: {run.status}, {run.rows_added} rows, "
@@ -220,8 +226,13 @@ def _print_holes(result: HoleFill) -> None:
         typer.echo(f"alpaca: holes as of now: {result.summary()}")
         for line in result.lines():
             typer.echo(line)
-    elif not result.runs:
+        return
+    if not result.runs:
         typer.echo("alpaca: no holes to fill")
+    if result.dropped:
+        typer.echo(f"alpaca: {result.dropped_note().removeprefix('; ')}")
+    for named in result.named:
+        typer.echo(f"  {named.security_id}: not fetched, {named.reason}")
 
 
 class _NoPrices(PriceSource):
@@ -478,6 +489,13 @@ def make_app(
                 help="with --backfill: refetch committed months' missing bars (#831)",
             ),
         ] = False,
+        security: Annotated[
+            list[str] | None,
+            typer.Option(
+                "--security",
+                help="with --fill-holes: only this security_id's holes (repeatable, or ID,ID)",
+            ),
+        ] = None,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
@@ -492,6 +510,13 @@ def make_app(
             raise _fail("--fill-holes refetches prices only: pass --source alpaca", USAGE_ERROR)
         if backfill_ and dry_run and not fill_holes_:
             raise _fail("--dry-run is not available with --backfill", USAGE_ERROR)
+        named: list[str] | None = None
+        if security is not None:
+            if not fill_holes_:
+                raise _fail("--security needs --fill-holes", USAGE_ERROR)
+            named = [part.strip() for value in security for part in value.split(",")]
+            if not all(named):
+                raise _fail(f"--security takes non-blank ids, got {security!r}", USAGE_ERROR)
         start: date | None = None
         if since is not None:
             try:
@@ -503,7 +528,14 @@ def make_app(
             if (absent := _store_missing(s)) is not None:
                 raise absent
             if dry_run:  # fetches nothing: no secret needed
-                listed = fill_holes(s, prices=_NoPrices(), since=start, clock=clock, dry_run=True)
+                listed = fill_holes(
+                    s,
+                    prices=_NoPrices(),
+                    since=start,
+                    clock=clock,
+                    dry_run=True,
+                    securities=named,
+                )
                 _print_holes(listed)
                 raise typer.Exit(listed.exit_code)
         missing = _missing_secrets(s, source)
@@ -516,7 +548,7 @@ def make_app(
         filings = EdgarFilingSource(s, client=edgar_client, clock=clock)
         prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
         if fill_holes_ and start is not None:
-            filled = fill_holes(s, prices=prices, since=start, clock=clock)
+            filled = fill_holes(s, prices=prices, since=start, clock=clock, securities=named)
             _print_holes(filled)
             raise typer.Exit(filled.exit_code)
         if start is not None:
