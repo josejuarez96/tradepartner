@@ -76,6 +76,20 @@ rm -rf "$CACHE/fsn/v1"   # example: a tree whose number is below its constant
 
 Never delete a tree whose number matches its constant, `failed_filings.json` (it holds your accepted failures), or `bulk/` and `index/`, which are not versioned. If you might roll back to the old code, keep the old tree until you're sure you won't.
 
+## EDGAR input-validation list files
+
+When the EDGAR fetch pass finds inputs that do not parse (#578), the run fails before any store write. Its message names a JSON file under `edgar.cache_dir/validation/`, `failures-<UTC stamp>.json`, which holds the full list. Every failing run writes a new file, dry runs included. **Nothing prunes them** (#806): each is small, but they pile up across reruns. A run that passes the check writes nothing.
+
+Once you have read a file and acted on it (fixed the cause, or removed the bad cached input it names), you may delete it. The run never reads these files back, so deleting one changes nothing about the next run. To list the files, then delete the ones older than 30 days:
+
+```bash
+CACHE=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().edgar.cache_dir)")
+ls -lt "$CACHE/validation/"
+find "$CACHE/validation" -name 'failures-*.json' -mtime +30 -print -delete
+```
+
+Delete only `validation/failures-*.json` this way. Never delete `failed_filings.json` (your accepted failures) or the cache trees (see "After an EDGAR cache version bump" above).
+
 ## PATH, working directory and `.env`
 
 launchd starts jobs with a minimal environment: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, the working directory `/`, and none of your shell profile. Three things follow:
