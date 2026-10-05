@@ -45,7 +45,10 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   it shadows other companies like a non-equity span;
 - two spans of one ticker starting on the same day, of two securities,
   are **ambiguous**: the ticker resolves to nothing while they are the
-  latest, and the run goes on;
+  latest, and the run goes on. Not so a repair successor (`<cik>@<date>`)
+  and its own company's span (#874): that is the predecessor's copy of the
+  successor's row, so the predecessor's span is dropped (after the
+  contested rule) and the successor holds the ticker;
 - a span is **contested** when its ticker is later taken by another
   security that arrived at it through a rename (Roundhill's `META` ETF,
   then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
@@ -288,6 +291,7 @@ class ResolverReport:
     ended_spans: int = 0
     same_day_typos: int = 0
     kept_spans: int = 0
+    successor_duplicates: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -302,7 +306,8 @@ class ResolverReport:
             f"{self.co_registrant_spans} co-registrant and {self.disputed_spans} disputed "
             f"claims on another company's ticker; {self.ended_spans} spans ended at their "
             f"own delisting, {self.kept_spans} kept through one by a later row of the "
-            f"ticker; {self.same_day_typos} same-day typo listings dropped"
+            f"ticker; {self.same_day_typos} same-day typo listings dropped; "
+            f"{self.successor_duplicates} predecessor rows duplicated by a successor"
         )
 
 
@@ -536,6 +541,19 @@ class ListingResolver:
                 for other in spans
             )
         )
+        # A repair successor's row duplicating its predecessor's (#874) holds
+        # the ticker alone: the predecessor's span is dropped, never a tie.
+        # After the contested rule, so a rename into the ticker still counts.
+        duplicated = {
+            span
+            for spans in self._by_ticker.values()
+            for span in spans
+            if any(
+                o.start == span.start and _succeeds(o.security_id, span.security_id) for o in spans
+            )
+        }
+        for spans in self._by_ticker.values():
+            spans[:] = [span for span in spans if span not in duplicated]
         ambiguous = {
             span
             for spans in self._by_ticker.values()
@@ -566,6 +584,7 @@ class ListingResolver:
             ended_spans=len(ended),
             same_day_typos=same_day_typos,
             kept_spans=kept_spans,
+            successor_duplicates=len(duplicated),
         )
 
     def _own_delisting(
@@ -714,6 +733,18 @@ def _company(security_id: str) -> str:
     """The CIK of a `<cik>` or `<cik>:<class>` id; any other id is its own."""
     head, sep, _ = security_id.partition(":")
     return head if sep and head.isdigit() else security_id
+
+
+#: A repair successor's id (#820, `store.master`): `<cik>@<valid_from>`,
+#: with `-<n>` when that id was taken.
+_SUCCESSOR_ID = re.compile(r"(\d+)@\d{4}-\d{2}-\d{2}(?:-\d+)?")
+
+
+def _succeeds(successor: str, security_id: str) -> bool:
+    """True when `successor` is a repair successor id of `security_id`'s
+    company (`<cik>@<date>` for `<cik>` or `<cik>:<class>`; #874)."""
+    match = _SUCCESSOR_ID.fullmatch(successor)
+    return match is not None and successor != security_id and _company(security_id) == match[1]
 
 
 def _holds_before(holder: TickerSpan, span: TickerSpan) -> bool:
