@@ -491,6 +491,36 @@ def _unwrap(filings: FilingSource) -> FilingSource:
     return filings
 
 
+@dataclass(frozen=True)
+class Unjudged:
+    """What a master check must not judge after a fetch pass (#859): the
+    CIKs with a filing that failed or was quarantined this run, and how many
+    failures name no accession that maps to a CIK."""
+
+    ciks: frozenset[str]
+    unmapped: int
+
+
+def _unjudged_ciks(filings: FilingSource) -> Unjudged:
+    """The CIKs whose filings the adapter under `filings` failed (T11h's
+    pending failures) or skipped as quarantined this run, mapped to CIKs
+    through the recorded full-history filing index; plus the failures it
+    cannot map (FSN extraction failures, which name no accession, and any
+    accession absent from the index). A source without the failure policy
+    (the fixture) has none. `filings` must already have answered
+    `filing_index(None)` (the fetch pass), so nothing is fetched here."""
+    source = _unwrap(filings)
+    pending: Mapping[str, Any] = getattr(source, "_pending_failures", {})
+    accessions = set(pending) | set(getattr(source, "_quarantined_this_run", set()))
+    unmapped = int(getattr(source, "_fsn_extraction_failures_this_run", 0))
+    if not accessions:
+        return Unjudged(frozenset(), unmapped)
+    by_accession = {entry.accession: entry.cik for entry in filings.filing_index(None)}
+    ciks = {by_accession[a] for a in accessions if a in by_accession}
+    unmapped += sum(1 for a in accessions if a not in by_accession)
+    return Unjudged(frozenset(ciks), unmapped)
+
+
 def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
     """The fetch pass: every filing question, with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
@@ -574,7 +604,8 @@ def _ingest_filings(
         ("facts", facts),
     ):
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
-    record_underived(conn, run_id, now, stored_underived(conn, master, now))
+    skip = _unjudged_ciks(recorded).ciks
+    record_underived(conn, run_id, now, stored_underived(conn, master, now, skip))
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"

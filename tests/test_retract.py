@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, ClassVar
 
 import duckdb
 import pytest
@@ -28,13 +28,13 @@ from tradepartner.adapters.filings import (
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.config import Settings
-from tradepartner.health import UNDERIVED_MASTER_ROWS, integrity_checks
+from tradepartner.health import UNDERIVED_MASTER_ROWS, integrity_checks, last_ingests
 from tradepartner.ingest import ingest_session
-from tradepartner.retract import RetractRefused, master_retract
+from tradepartner.retract import RetractRefused, RetractResult, master_retract
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import securities_as_of
-from tradepartner.store.retraction import RETRACT, RETRACTED, underived_as_of
+from tradepartner.store.retraction import RETRACT, RETRACTED, Underived, underived_as_of
 from tradepartner.store.schema import init_schema
 
 ACME = "0000000001"
@@ -137,13 +137,29 @@ def _rule(settings: Settings, t: datetime) -> list[dict[str, Any]]:
         return check.violations.to_dicts()
 
 
+def _apply(settings: Settings, at: datetime, **kwargs: Any) -> RetractResult:
+    """A dry run, then an apply with its count and digest, both at `at`."""
+    dry = master_retract(settings, filings=_filings(), clock=lambda: at)
+    return master_retract(
+        settings,
+        filings=_filings(),
+        clock=lambda: at,
+        dry_run=False,
+        expect=(dry.rows, dry.digest),
+        **kwargs,
+    )
+
+
 def test_a_dry_run_lists_every_underived_row_and_changes_nothing(store: Settings) -> None:
     result = master_retract(store, filings=_filings(), clock=lambda: CHECK)
     assert [(u.table, u.key) for u in result.found] == [
         ("securities", (FALSE_ID,)),
         ("listings", (FALSE_ID, "ACME", "NYSE", date(2019, 5, 1))),
     ]
-    assert result.summary().startswith("would retract 2 rows (1 securities, 1 listings)")
+    assert result.summary().startswith(
+        f"would retract 2 rows (1 securities, 1 listings), digest {result.digest}, at "
+    )
+    assert len(result.digest) == 12
     assert result.lines()[0] == f"securities: {FALSE_ID} (known {FALSE_KNOWN.isoformat()})"
     assert FALSE_ID in _listed(store, AFTER)
     with _read(store) as conn:
@@ -154,7 +170,7 @@ def test_the_apply_retracts_at_its_clock_and_reads_before_it_are_unchanged(
     store: Settings,
 ) -> None:
     """No look-ahead: an as-of read before the correction still sees the row."""
-    master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=2)
+    _apply(store, RETRACT_AT)
     for t in (FALSE_KNOWN, CHECK):
         assert FALSE_ID in _listed(store, t)
         assert FALSE_ID in _known(store, t)
@@ -171,9 +187,7 @@ def test_the_apply_retracts_at_its_clock_and_reads_before_it_are_unchanged(
 
 
 def test_the_apply_is_recorded_and_never_reads_as_a_fresh_ingest(store: Settings) -> None:
-    result = master_retract(
-        store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=2
-    )
+    result = _apply(store, RETRACT_AT)
     with _read(store) as conn:
         [(run_id, source, status, mode, rows, message)] = conn.execute(
             "SELECT run_id, source, status, mode, rows_added, message FROM ingestion_runs "
@@ -191,16 +205,113 @@ def test_the_apply_is_recorded_and_never_reads_as_a_fresh_ingest(store: Settings
     assert recorded == [(run_id, RETRACT_AT, "listings"), (run_id, RETRACT_AT, "securities")]
 
 
-def test_the_apply_refuses_another_count_and_writes_nothing(store: Settings) -> None:
-    with pytest.raises(RetractRefused, match="found 2 rows, not the expected 1"):
-        master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=1)
+def test_the_apply_refuses_another_set_and_writes_nothing(store: Settings) -> None:
+    dry = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    for expect in ((1, dry.digest), (2, "000000000000")):
+        with pytest.raises(RetractRefused, match="found 2 rows"):
+            master_retract(
+                store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=expect
+            )
     assert FALSE_ID in _listed(store, AFTER)
     with pytest.raises(ValueError, match="dry run"):
         master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False)
 
 
+def test_the_digest_names_the_set_not_the_count() -> None:
+    def result(sid: str) -> RetractResult:
+        row = {"security_id": sid, "known_at": FALSE_KNOWN}
+        return RetractResult(found=(Underived("securities", row),), at=CHECK, dry_run=True)
+
+    assert result("A").rows == result("B").rows
+    assert result("A").digest != result("B").digest
+
+
+def test_a_traded_name_is_marked_and_refused_without_the_flag(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+            "security_id, symbol, side, notional, quantity, sells_in_flight_at_submit, "
+            "known_at, ingested_at) VALUES ('o1', 1, 1, DATE '2019-06-03', 1, 'buy', ?, "
+            "'ACME', 'buy', 100.0, NULL, FALSE, ?, ?)",
+            [FALSE_ID, FALSE_KNOWN, FALSE_KNOWN],
+        )
+    dry = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    assert all(line.endswith(" [traded]") for line in dry.lines())
+    with pytest.raises(RetractRefused, match="traded securities"):
+        _apply(store, RETRACT_AT)
+    assert FALSE_ID in _listed(store, AFTER)
+    _apply(store, RETRACT_AT, allow_traded=True)
+    assert FALSE_ID not in _listed(store, AFTER)
+
+
+def test_a_snapshot_row_of_a_name_gone_from_the_snapshot_is_never_judged(
+    store: Settings,
+) -> None:
+    """Quant audit of #872: today's companies snapshot lists only names
+    trading today, so a delisted name's snapshot listing is not underived."""
+    gone = {
+        "security_id": "0000000007",
+        "ticker": "GONE",
+        "exchange": "NYSE",
+        "class_title": None,
+        "valid_from": date(2010, 3, 1),
+        "known_at": FALSE_KNOWN,
+        "ingested_at": FALSE_KNOWN,
+        "source": "edgar",
+        "provenance": "snapshot_static",
+    }
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", gone)
+    found = master_retract(store, filings=_filings(), clock=lambda: CHECK).found
+    assert {u.row["security_id"] for u in found} == {FALSE_ID}
+
+
+def test_a_cik_with_a_failed_or_quarantined_filing_is_not_judged(store: Settings) -> None:
+    class Failing(FixtureFilingSource):
+        """As the EDGAR adapter: one of ACME's filings failed this run."""
+
+        _pending_failures: ClassVar[dict[str, tuple[str, str, str]]] = {
+            f"{ACME}-18-1": ("ParseError", "10-K", "bad cover")
+        }
+
+    result = master_retract(store, filings=_filings(Failing), clock=lambda: CHECK)
+    assert result.found == ()
+    assert result.unjudged == frozenset({ACME})
+    assert f"not judged (filings failed or quarantined): 1 CIKs: {ACME}" in result.summary()
+
+    class Unnamed(FixtureFilingSource):
+        _fsn_extraction_failures_this_run: ClassVar[int] = 1
+
+    with pytest.raises(RetractRefused, match="name no CIK"):
+        master_retract(store, filings=_filings(Unnamed), clock=lambda: CHECK)
+
+
+def test_the_retraction_is_stamped_after_the_lock(store: Settings) -> None:
+    """The clock is read again once the store is open: the stamp is never
+    earlier than a revision committed while the command waited."""
+    ticks = iter([CHECK, CHECK, RETRACT_AT, AFTER])
+    dry = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    result = master_retract(
+        store,
+        filings=_filings(),
+        clock=lambda: next(ticks),
+        dry_run=False,
+        expect=(dry.rows, dry.digest),
+    )
+    assert result.at == RETRACT_AT
+    assert FALSE_ID in _listed(store, RETRACT_AT.replace(minute=59, hour=1))
+    assert FALSE_ID not in _listed(store, RETRACT_AT)
+
+
+def test_a_retract_run_never_hides_the_latest_edgar_ingest(store: Settings) -> None:
+    _apply(store, RETRACT_AT)
+    with _read(store) as conn:
+        [edgar] = [s for s in last_ingests(conn, AFTER) if s.source == "edgar"]
+    assert edgar.latest_status == "ok"
+
+
 def test_a_second_run_finds_nothing(store: Settings) -> None:
-    master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=2)
+    _apply(store, RETRACT_AT)
     again = master_retract(store, filings=_filings(), clock=lambda: AFTER)
     assert again.found == ()
 
@@ -230,13 +341,13 @@ def test_an_edgar_ingest_records_the_underived_rows_for_health(store: Settings) 
     ]
     assert found[0]["known_at"] == FALSE_KNOWN
     assert _rule(store, INGEST) == []  # a check is visible only once finished
-    master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=2)
+    _apply(store, RETRACT_AT)
     assert _rule(store, AFTER) == []
     assert len(_rule(store, CHECK.replace(hour=3))) == 2  # health at T before the apply
 
 
 def test_a_later_ingest_keeps_a_retracted_row_retracted(store: Settings) -> None:
-    master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=2)
+    _apply(store, RETRACT_AT)
     _ingest(store, AFTER)
     assert FALSE_ID not in _listed(store, AFTER.replace(hour=5))
     assert _rule(store, AFTER.replace(hour=5)) == []
@@ -261,12 +372,17 @@ def test_the_command_dry_run_then_apply(store: Settings, monkeypatch: pytest.Mon
     assert refused.exit_code == cli.USAGE_ERROR
     blank = cli.make_app(settings=lambda: store, clock=lambda: RETRACT_AT)
     assert runner.invoke(blank, ["master-retract"]).exit_code == cli.USAGE_ERROR  # no agent
-    lonely = runner.invoke(app, ["master-retract", "--expect-rows", "2"])
-    assert lonely.exit_code == cli.USAGE_ERROR
-    wrong = runner.invoke(app, ["master-retract", "--apply", "--expect-rows", "3"])
+    for alone in (["--expect-rows", "2"], ["--allow-traded"]):
+        assert runner.invoke(app, ["master-retract", *alone]).exit_code == cli.USAGE_ERROR
+    digest = dry.output.split("digest ")[1].split(",")[0]
+    wrong = runner.invoke(
+        app, ["master-retract", "--apply", "--expect-rows", "3", "--expect-digest", digest]
+    )
     assert wrong.exit_code == 1
     assert "retract refused" in wrong.output
-    done = runner.invoke(app, ["master-retract", "--apply", "--expect-rows", "2"])
+    done = runner.invoke(
+        app, ["master-retract", "--apply", "--expect-rows", "2", "--expect-digest", digest]
+    )
     assert done.exit_code == 0, done.output
     assert done.output.startswith("retracted 2 rows")
     assert FALSE_ID not in _listed(store, AFTER)

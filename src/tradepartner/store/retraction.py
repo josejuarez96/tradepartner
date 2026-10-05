@@ -1,5 +1,5 @@
 """Stored master rows the current rules no longer derive, and their
-retraction (#859; spec req 3, amendment 2026-10-04).
+retraction (#859; spec req 3, amendment 2026-10-04 (#859)).
 
 `securities` and `listings` are append-only, and ingest writes only rows
 that change an as-of read (`ingest` module docstring): a key the builder
@@ -9,15 +9,24 @@ old rule wrote stays live for ever. Deleting it would rewrite what every
 as-of read before the correction returned; this module withdraws it as a
 revision instead.
 
-- **Underived.** `underived(build, securities, listings)` is pure: each
-  stored live row (the latest revision per key as of the check, not
-  retracted) with `source = 'edgar'` whose key (`security_id` for
-  `securities`; `security_id, ticker, exchange, valid_from` for `listings`)
-  is not among `build`'s rows. Only EDGAR rows: the master builder derives
-  nothing else, and a benchmark seeded from config (`backfill-benchmark`,
-  #840) is never its row to judge. A key the build still derives with
-  other values (a reworded class title) is a revision ingest writes, not
-  an underived row.
+- **Underived.** `underived(build, securities, listings, skip_ciks)` is
+  pure: each stored live row (the latest revision per key as of the check,
+  not retracted) with `source = 'edgar'` and `provenance = 'filing'` whose
+  key (`security_id` for `securities`; `security_id, ticker, exchange,
+  valid_from` for `listings`) is not among `build`'s rows, and whose CIK is
+  not in `skip_ciks`. Only EDGAR rows: the master builder derives nothing
+  else, and a benchmark seeded from config (`backfill-benchmark`, #840) is
+  never its row to judge. Only `filing` rows: they come from full-history
+  inputs (the filing index, cover pages, Forms 25), so a build that lacks
+  one has changed its rules. A `snapshot` or `snapshot_static` row comes
+  from the companies snapshot, which lists only names trading today: a
+  delisted or renamed name's snapshot row is legitimately absent from
+  today's build, and retracting it would erase delisted history (quant
+  audit of #872). Such rows are never judged; a false one needs another
+  remedy. `skip_ciks` are CIKs whose filings failed or were skipped this
+  run (`ingest._unjudged_ciks`): their rows are not judged either. A key
+  the build still derives with other values (a reworded class title) is a
+  revision ingest writes, not an underived row.
 - **Retraction.** `retraction(row, at)` is the stored row with `retracted
   = TRUE`, `known_at = ingested_at = at`: a revision of its key stamped at
   the correcting run, never back-dated (a row known after `at` raises).
@@ -52,6 +61,8 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: The source of every row the master builder derives.
 EDGAR = "edgar"
+#: The one provenance judged (module docstring).
+FILING = "filing"
 #: The status of a `master-retract --apply` run row: a master check, never a
 #: fresh ingest (health and execution read only `ok` runs as fresh).
 RETRACTED = "retracted"
@@ -98,13 +109,21 @@ class Underived:
         return f"{self.table}: {key} (known {self.row['known_at'].isoformat()})"
 
 
+def cik_of(security_id: str) -> str:
+    """The CIK an EDGAR `security_id` belongs to: its first ten characters
+    (`<cik>`, `<cik>:<class>`, `<cik>@<valid_from>`)."""
+    return security_id[:10]
+
+
 def underived(
     build: MasterBuild,
     securities: Iterable[Mapping[str, Any]],
     listings: Iterable[Mapping[str, Any]],
+    skip_ciks: frozenset[str] = frozenset(),
 ) -> tuple[Underived, ...]:
-    """The stored live EDGAR rows whose key `build` does not derive (module
-    docstring), securities first, each table sorted by key. Pure."""
+    """The stored live EDGAR `filing` rows whose key `build` does not derive,
+    outside `skip_ciks` (module docstring), securities first, each table
+    sorted by key. Pure."""
     found: list[Underived] = []
     for table, stored, built in (
         ("securities", securities, build.securities),
@@ -115,20 +134,27 @@ def underived(
         rows = [
             Underived(table, dict(row))
             for row in stored
-            if row["source"] == EDGAR and tuple(row[c] for c in columns) not in derived
+            if row["source"] == EDGAR
+            and row["provenance"] == FILING
+            and cik_of(row["security_id"]) not in skip_ciks
+            and tuple(row[c] for c in columns) not in derived
         ]
         found.extend(sorted(rows, key=lambda u: tuple(str(part) for part in u.key)))
     return tuple(found)
 
 
 def stored_underived(
-    conn: duckdb.DuckDBPyConnection, build: MasterBuild, at: datetime
+    conn: duckdb.DuckDBPyConnection,
+    build: MasterBuild,
+    at: datetime,
+    skip_ciks: frozenset[str] = frozenset(),
 ) -> tuple[Underived, ...]:
     """`underived` over the master rows live at `at`."""
     return underived(
         build,
         securities_as_of(conn, at).iter_rows(named=True),
         listings_as_of(conn, at).iter_rows(named=True),
+        skip_ciks,
     )
 
 
