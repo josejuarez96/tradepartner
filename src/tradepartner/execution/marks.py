@@ -108,6 +108,26 @@ def _frozen_int(frozen: Mapping[str, object], key: str) -> int:
     return value
 
 
+def _last_bars(
+    conn: duckdb.DuckDBPyConnection, books: Mapping[date, Ledger], sessions: Sequence[date]
+) -> dict[str, date]:
+    """Each name held on any of `sessions`: its latest bar's session on or
+    before the last of them, as known at that close (never after the run's
+    own cut, since `sessions` ends at S-1). One read over every such name, so
+    a name sold before the last session (which the run's `assets` read never
+    flags) still shows a bar after an ingest gap. It only decides whether a
+    missing bar raises; it never prices a mark."""
+    held = sorted({name for book in books.values() for name in book.positions})
+    if not held:
+        return {}
+    last: dict[str, date] = {}
+    for row in prices_as_of(conn, session_close(sessions[-1]), held).iter_rows(named=True):
+        name, bar_session = row["security_id"], row["session"]
+        if name not in last or bar_session > last[name]:
+            last[name] = bar_session
+    return last
+
+
 def marks_for(
     conn: duckdb.DuckDBPyConnection,
     window: PaperWindowRow,
@@ -133,9 +153,10 @@ def marks_for(
 
     A held name with no bar for a session is marked at its last close (spec
     req 7, #678) only when its flag is false or absent (untradable, no
-    current ticker, or not in the broker's assets read) and no later session
-    of `sessions` has a bar for it, so the gap runs from the session after
-    its last bar: that close is the latest bar on or before the session as
+    current ticker, or not in the broker's assets read) and it has no bar
+    after the session through the last of `sessions` (`_last_bars`, read
+    for every name held on any of them), so the gap runs from the session
+    after its last bar: that close is the latest bar on or before the session as
     known at close(session), never a bar after it, and each such mark logs a
     `marks` warning naming the stale close's date. Every other missing bar
     (a tradable name, a gap before the name's last bar, or a name with no
@@ -145,7 +166,6 @@ def marks_for(
     books = {session: ledger(session) for session in sessions}
     own: dict[date, dict[str, float]] = {}
     last_known: dict[date, dict[str, tuple[date, float]]] = {}
-    last_bar: dict[str, date] = {}
     for session in sessions:
         held = sorted(books[session].positions)
         if not held:
@@ -164,7 +184,7 @@ def marks_for(
             last_known[session][security_id] = (bar_session, close)
             if bar_session == session:
                 own[session][security_id] = close
-                last_bar[security_id] = session
+    last_bar = _last_bars(conn, books, sessions)
     marks: list[Mark] = []
     for session in sessions:
         book = books[session]

@@ -412,6 +412,21 @@ def test_a_gap_before_the_names_last_bar_still_raises(tmp_path) -> None:
     conn.close()
 
 
+def test_a_gap_on_a_name_sold_before_the_last_session_still_raises(tmp_path) -> None:
+    """A back-fill: the name is held on D1 only (sold before D2), so the run's
+    `assets` read gives it no flag, and its D1 bar is missing while D2's is
+    there. That is an ingest gap, not a delisting: it raises, though the name
+    is not held on the session that has the later bar."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    _bar(conn, A, D2, 12.0)
+    ledger = _ledger_for({D1: {A: 1.0}})  # flat on D2
+    with pytest.raises(ValueError, match="no price"):
+        marks_for(conn, _window(), ledger, [D1, D2], {})
+    conn.close()
+
+
 def test_a_name_with_no_bar_at_all_still_raises_when_untradable(tmp_path) -> None:
     """No last close to carry: the untradable rule never invents a price."""
     conn = duckdb.connect(str(tmp_path / "store.duckdb"))
