@@ -634,10 +634,16 @@ def _settings_has_key(dotted_key: str) -> bool:
     """`True` iff `dotted_key` (e.g. `"strategy.formation_months"`) names a real field on
     `Settings`, walked through its nested section models. Used only to validate
     `lab.sweepable_keys` entries against typos: a key `Settings` lacks must be refused,
-    never silently accepted as an axis that can never vary."""
-    section, _, rest = dotted_key.partition(".")
-    if not rest:
-        return section in Settings.model_fields
+    never silently accepted as an axis that can never vary.
+
+    Requires a `section.field` shape: a bare top-level name (no dot) is always
+    rejected, whether or not it happens to name a `Settings` field, since every real
+    sweepable key is one `strategy.*`/`schedule.*` field inside a section, never a
+    whole section (`"universe"`) or a top-level scalar such as a secret
+    (`"alpaca_api_key"`) (reviewer findings on #952, both reviewer passes)."""
+    section, sep, rest = dotted_key.partition(".")
+    if not sep or not rest:
+        return False
     field = Settings.model_fields.get(section)
     if field is None:
         return False

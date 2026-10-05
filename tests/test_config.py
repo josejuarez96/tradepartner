@@ -595,6 +595,28 @@ def test_sweepable_keys_entry_unknown_top_level_section_rejected() -> None:
         Settings(_env_file=None, lab={"sweepable_keys": ["not_a_section.key"], "axis_lattice": {}})
 
 
+@pytest.mark.parametrize(
+    "bare_key",
+    ["universe", "costs", "holdout", "alpaca_api_key"],
+)
+def test_sweepable_keys_entry_without_a_dot_rejected(bare_key: str) -> None:
+    """A bare top-level name is refused even when `Settings` has a field by that
+    name: `universe`/`costs`/`holdout` name a whole section and `alpaca_api_key` a
+    secret scalar, and none is one `strategy.*`/`schedule.*`-shaped field a grid can
+    vary. Closes the gap where a bare forbidden-section name (`"universe"`, no
+    trailing dot) slipped past the `FORBIDDEN_AXIS_PREFIXES` `startswith` check,
+    since a bare name never matches a dotted prefix (#952 reviewer findings)."""
+    with pytest.raises(ValidationError, match="names a key Settings lacks"):
+        Settings(_env_file=None, lab={"sweepable_keys": [bare_key], "axis_lattice": {}})
+
+
+def test_sweepable_keys_entry_bare_exact_forbidden_name_rejected() -> None:
+    """`benchmarks` (no trailing dot: the one `FORBIDDEN_AXIS_PREFIXES` entry that is
+    an exact field name, not a prefix) is still refused, by the prefix check itself."""
+    with pytest.raises(ValidationError, match="forbidden prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": ["benchmarks"], "axis_lattice": {}})
+
+
 def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
     """Every family in `HypothesisFamily` except `oracle` needs a lineage entry
     (strategy-lab spec open question 11)."""
