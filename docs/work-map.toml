@@ -677,6 +677,17 @@ what = "A research program page, a graded claims register over every research re
 why = "Answers what the tool should test next and how results flow back into what we believe."
 unblocks = ["phase:3"]
 
+[spec.research-labeling]
+what = "What the research-labeling job under ADR 0013 does for its first pilot (task A, the security-master departure reason) and how we know it is done: a corpus build of Form 25 and 8-K text, a pinned typed classifier answering one closed question per listing end, a crosswalk onto the resolver's conclusion, the owner's blind gold labels and shortlist review, the boundary tests (a) to (e), two spend ceilings against the $20 credit."
+why = "ADR 0013 builds nothing until this spec is Accepted; the master's rules are patched one hand-read filing at a time (#921, #943, #905, #922) and this turns that pile into a reviewed shortlist without a model ever writing a fact."
+unblocks = ["issue:963"]
+
+[issue.963]
+what = "Write the research-labeling spec (docs/specs/research-labeling.md, Draft) that ADR 0013 requires before any model client exists, scoped to pilot A."
+why = "The spec is the key ADR 0013's tests turn on and the owner's acceptance gate for the labeling plan (size L)."
+unblocks = ["spec:research-labeling"]
+
+
 [spec.research-registry]
 what = "What the research-experiment registry records and refuses: pre-registered agreement runs, classifier benchmarks, regressions and feature studies as append-only rows with known_at, beside the backtest trial registry, with protected windows, run budgets and the family's N raised by any run on return data."
 why = "The charter halts a phase on any untracked run; without this the annotation pilot, B5 and E1 have nowhere to register and cannot start honestly."
