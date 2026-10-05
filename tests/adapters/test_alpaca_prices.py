@@ -760,12 +760,19 @@ class TestRegistrantCheck:
                 {**_shares(AEP, date(2027, 1, 2), 9, date(2027, 1, 2)), "fact_name": "revenue"},
             ],
             [
-                _ended("0000000001:class-a", "XA", "Class A Common Stock", date(2021, 1, 4)),
+                _ended(
+                    "0000000001:class-a",
+                    "XA",
+                    "Class A Common Stock",
+                    date(2021, 1, 4),
+                    end_session=date(2020, 12, 31),
+                ),
                 _ended("0000000001", "XA", "5.25% Notes due 2030", date(2022, 1, 4)),
                 _ended("0000000001", "XA", "Common Stock", date(2023, 1, 4), "transferred"),
             ],
             as_of=RUN_DAY,
             quiet_after_days=180,
+            transfer_window_sessions=5,
         )
         assert evidence.last_filed[AEP] == date(2026, 7, 30)
         assert evidence.same_count(AEP, AEP_TEXAS, date(2026, 7, 30))
@@ -775,6 +782,11 @@ class TestRegistrantCheck:
         assert evidence.delisted_listings == {
             "0000000001:class-a": ((date(1994, 1, 3), "XA", date(2021, 1, 4)),)
         }
+        # #847: the last bar of each delisted listing, and the stop window.
+        assert evidence.last_bars == {
+            ("0000000001:class-a", date(1994, 1, 3), "XA"): date(2020, 12, 31)
+        }
+        assert evidence.stop_after_sessions == 5
         # quiet: no share count for more than 180 days before the run
         assert evidence.left_on("0000000001:class-b", date(2019, 1, 2)) == date(2020, 1, 4)
         assert evidence.left_on("0000000001:class-a", date(2019, 1, 2)) == date(2020, 1, 4)
@@ -787,7 +799,9 @@ class TestRegistrantCheck:
             **_ended("0000000001", "XA", "Common Stock", date(2021, 1, 4)),
             "delisting_filed_at": datetime(2021, 1, 8, 21, tzinfo=UTC),
         }
-        evidence = registrant_evidence([], [row], as_of=RUN_DAY, quiet_after_days=180)
+        evidence = registrant_evidence(
+            [], [row], as_of=RUN_DAY, quiet_after_days=180, transfer_window_sessions=5
+        )
         assert evidence.delisted_on == {"0000000001": (date(2021, 1, 9),)}
 
 
@@ -1080,6 +1094,17 @@ class TestOwnDelisting:
         assert resolver.resolve("BID", date(2026, 7, 20)) is None
         assert not resolver.holds(self.SOTHEBYS, date(2026, 7, 20))
         assert (resolver.report.ended_spans, resolver.report.kept_spans) == (1, 0)
+        assert resolver.report.stopped_spans == 1
+        assert "1 spans ended at a stopped line despite a later row" in (resolver.report.summary())
+
+    def test_a_relisting_after_a_long_gap_is_cut_too(self) -> None:
+        # Accepted cost (spec rule 7, #847): a bar gap cannot tell a real
+        # relisting after months off-exchange from a cover page filed after
+        # going private; the span is cut and counted, and the repair's dry
+        # run lists its later bars for the owner to review.
+        resolver = self._sothebys(date(2019, 10, 2), date(2021, 3, 1))
+        assert resolver.resolve("BID", date(2021, 6, 1)) is None
+        assert resolver.report.stopped_spans == 1
 
     def test_a_row_within_the_transfer_window_of_the_last_bar_still_keeps_it(self) -> None:
         # Five sessions strictly between the last bar and the next row: the

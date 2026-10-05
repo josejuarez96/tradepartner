@@ -326,6 +326,7 @@ class ResolverReport:
     same_day_typos: int = 0
     kept_spans: int = 0
     unreadable: int = 0
+    stopped_spans: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -341,7 +342,8 @@ class ResolverReport:
             f"claims on another company's ticker; {self.ended_spans} spans ended at their "
             f"own delisting, {self.kept_spans} kept through one by a later row of the "
             f"ticker; {self.same_day_typos} same-day typo listings dropped; "
-            f"{self.unreadable} unreadable-ticker listings ignored"
+            f"{self.unreadable} unreadable-ticker listings ignored; "
+            f"{self.stopped_spans} spans ended at a stopped line despite a later row"
         )
 
 
@@ -416,7 +418,7 @@ def registrant_evidence(
     *,
     as_of: date,
     quiet_after_days: int,
-    transfer_window_sessions: int | None = None,
+    transfer_window_sessions: int,
 ) -> RegistrantEvidence:
     """`RegistrantEvidence` from `facts` rows (`shares_outstanding` only;
     the UTC day of `known_at` is the filing day) and `listing_ends` rows
@@ -526,6 +528,7 @@ class ListingResolver:
         self._vacated: dict[str, list[TickerSpan]] = defaultdict(list)
         cut: set[TickerSpan] = set()  # spans ended at their own delisting
         placeholder = same_day_listings = same_day_typos = kept_spans = unreadable = 0
+        stopped_spans = 0
         same_day_securities: set[str] = set()
         non_equity: dict[str, int] = defaultdict(int)
         for security_id, listed in by_security.items():
@@ -542,15 +545,18 @@ class ListingResolver:
                     index += 1  # the same ticker again (a second exchange): one span
                 end = rows[index].day if index < len(rows) else None
                 kinds = {r.kind for r in rows[first:index]}
-                left, kept = None, False
+                left, kept, stopped = None, False, False
                 if kinds == {EQUITY}:
                     days = [r.day for r in rows[first:index]]
                     aliases = {(r.day, r.written) for r in rows[first:index] if r.written}
-                    left, kept = self._own_delisting(security_id, ticker, days, end, aliases)
+                    left, kept, stopped = self._own_delisting(
+                        security_id, ticker, days, end, aliases
+                    )
                 span = TickerSpan(security_id, ticker, start, end if left is None else left)
                 if left is not None:
                     cut.add(span)
                 kept_spans += kept
+                stopped_spans += stopped
                 self._by_security[security_id].append(span)
                 if _PLACEHOLDER in kinds:
                     placeholder += index - first
@@ -640,6 +646,7 @@ class ListingResolver:
             same_day_typos=same_day_typos,
             kept_spans=kept_spans,
             unreadable=unreadable,
+            stopped_spans=stopped_spans,
         )
 
     def _own_delisting(
@@ -649,8 +656,8 @@ class ListingResolver:
         days: Sequence[date],
         end: date | None,
         aliases: Collection[tuple[date, str]] = (),
-    ) -> tuple[date | None, bool]:
-        """`(left, kept)` for an equity span of `security_id` under `ticker`
+    ) -> tuple[date | None, bool, bool]:
+        """`(left, kept, stopped)` for an equity span of `security_id` under `ticker`
         whose rows are on `days` (sorted), until `end` (#819). `aliases`
         are `(day, ticker)` of the span's unreadable rows read as `ticker`
         (#844): a delisted listing under one of them is a listing of the
@@ -666,29 +673,33 @@ class ListingResolver:
         page, a relisting, a transfer outside the transfer window, a
         reorganized security's new row) never ends it: the security went on
         trading under the ticker. `kept` is true when such a listing is
-        what the span ran on through."""
+        what the span ran on through, `stopped` when a stopped line is
+        what ends it."""
         if self._evidence is None:
-            return None, False
+            return None, False, False
         start, last = days[0], days[-1]
         evidence = self._evidence
 
         def ends(valid_from: date, listed: str) -> bool:
             if valid_from == last:
                 return True
-            following = min(d for d in days if d > valid_from)
-            return evidence.stopped_before(security_id, valid_from, listed, following)
+            following = min((d for d in days if d > valid_from), default=None)
+            return following is None or evidence.stopped_before(
+                security_id, valid_from, listed, following
+            )
 
         inside = [
-            (day, ends(valid_from, listed))
+            (day, ends(valid_from, listed), valid_from < last)
             for valid_from, listed, day in evidence.delisted_listings.get(security_id, ())
             if (listed == ticker or (valid_from, listed) in aliases)
             and start <= valid_from
             and start < day
             and (end is None or day < end)
         ]
-        left = min((day for day, cut in inside if cut), default=None)
-        kept = any(not cut for _, cut in inside)
-        return left, kept
+        left = min((day for day, cut, _ in inside if cut), default=None)
+        kept = any(not cut for _, cut, _ in inside)
+        stopped = any(cut and day == left and later for day, cut, later in inside)
+        return left, kept, stopped
 
     def _claim(
         self, span: TickerSpan, spans: Sequence[TickerSpan]
