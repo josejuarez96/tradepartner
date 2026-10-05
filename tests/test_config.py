@@ -254,6 +254,48 @@ def test_master_keep_successors_accepts_a_numbered_successor() -> None:
     assert s.master.keep_successors == ["0000891103@2020-08-10-2"]
 
 
+def test_alpaca_accepted_relistings_defaults_empty() -> None:
+    """#943: every span stays under the #847 stopped-line cut unless the owner lists it."""
+    assert _settings().alpaca.accepted_relistings == []
+
+
+def test_alpaca_accepted_relistings_reads_the_owner_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `.env` line the PR body gives the owner (MiMedx, #943)."""
+    monkeypatch.setenv("ALPACA__ACCEPTED_RELISTINGS", '["0001376339"]')
+    assert _settings().alpaca.accepted_relistings == ["0001376339"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["0001376339", "0000314808:common-shares", "0000891103@2020-08-10", "0000891103@2020-08-10-2"],
+)
+def test_alpaca_accepted_relistings_takes_every_security_id_shape(entry: str) -> None:
+    """A primary, a class and a successor id (#820) are all security ids."""
+    s = Settings(_env_file=None, alpaca={"accepted_relistings": [entry]})
+    assert s.alpaca.accepted_relistings == [entry]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MDXG",  # a ticker, not a security id
+        "1376339",  # CIK not ten digits
+        " 0001376339",
+        "0001376339 ",
+        "0001376339:",
+        "0001376339:Common Stock",
+        "0001376339@2020-13-01",  # no such day
+        "0001376339@2020-11-4",
+        "BENCH:SPY",
+        "",
+    ],
+)
+def test_alpaca_accepted_relistings_fails_closed_on_a_malformed_id(entry: str) -> None:
+    """#943: a malformed id refuses the config, never keeps nothing silently."""
+    with pytest.raises(ValidationError, match="accepted_relistings"):
+        Settings(_env_file=None, alpaca={"accepted_relistings": [entry]})
+
+
 def test_benchmarks_default() -> None:
     assert _settings().benchmarks == ["SPY", "MTUM"]
 

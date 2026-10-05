@@ -295,6 +295,30 @@ def parse_successor_id(entry: str) -> tuple[str, date]:
     return match["cik"], day
 
 
+#: A master `security_id`: a ten-digit CIK, then nothing, a `:<class slug>`
+#: (`store.master._new_class`) or an `@<day>` successor (`-<n>`, #820).
+_SECURITY_ID = re.compile(
+    r"\d{10}(?::[a-z0-9]+(?:-[a-z0-9]+)*|@(?P<day>\d{4}-\d{2}-\d{2})(?:-(?:[2-9]|[1-9]\d+))?)?"
+)
+
+
+def check_security_id(entry: str, key: str) -> str:
+    """`entry` if it is a master security id (`_SECURITY_ID`, with a valid
+    day for a successor); else `ValueError` naming the config `key`."""
+    match = _SECURITY_ID.fullmatch(entry)
+    if match is None:
+        raise ValueError(
+            f"{key} entry {entry!r} is not a security id "
+            "'<10-digit cik>', '<cik>:<class>' or '<cik>@<YYYY-MM-DD>'"
+        )
+    if match["day"] is not None:
+        try:
+            date.fromisoformat(match["day"])
+        except ValueError:
+            raise ValueError(f"{key} entry {entry!r} names no valid day") from None
+    return entry
+
+
 class AlpacaConfig(BaseModel):
     """Alpaca market-data choices resolved by the owner in T3 (#84).
 
@@ -334,6 +358,13 @@ class AlpacaConfig(BaseModel):
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
     symbols_per_request: int = Field(default=1000, gt=0)
+    #: Security ids (`<cik>`, `<cik>:<class>` or a #820 successor `<cik>@<day>`)
+    #: the owner accepted as genuine long-gap relistings (#943: MiMedx, Nasdaq
+    #: 2019-03 to OTC to Nasdaq 2020-11): `ListingResolver` does not apply rule 7's
+    #: #847 stopped-line cut to their spans, which run on through a Form 25 to a
+    #: later row of their ticker as before #905. Default empty. A malformed id
+    #: refuses the config, so a typo never leaves a live name cut silently.
+    accepted_relistings: list[str] = Field(default_factory=list)
     # --- Phase 4 trading keys (docs/specs/paper-trading.md req 2, T47) ---
     # Guarded: the trading client is constructed with `paper=True` on every path
     # and a `false` here is refused, even from the environment (validator below).
@@ -348,6 +379,13 @@ class AlpacaConfig(BaseModel):
     # adapter (T48c) refuses to construct while either is `None`.
     quantity_decimals: int | None = Field(default=None, ge=0)
     client_order_id_max_length: int | None = Field(default=None, gt=0)
+
+    @field_validator("accepted_relistings")
+    @classmethod
+    def _check_accepted_relistings(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            check_security_id(entry, "alpaca.accepted_relistings")
+        return value
 
     @field_validator("paper")
     @classmethod
