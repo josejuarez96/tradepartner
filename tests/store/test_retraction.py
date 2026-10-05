@@ -17,7 +17,13 @@ from tradepartner.store.asof import listings_as_of
 from tradepartner.store.benchmarks import benchmark_candidates, ticker_holders
 from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.master import MasterBuild, securities_as_of
-from tradepartner.store.retraction import retraction, underived, write_retractions
+from tradepartner.store.retraction import (
+    Underived,
+    retraction,
+    split_kept,
+    underived,
+    write_retractions,
+)
 
 KNOWN = datetime(2020, 8, 10, 20, 30, tzinfo=UTC)
 FIXED = datetime(2026, 10, 5, 2, 0, tzinfo=UTC)
@@ -224,3 +230,20 @@ def test_a_read_only_version_10_store_reads_every_master_row_as_live(tmp_path: P
             SID,
         ]
         assert benchmark_candidates(c, "WSC") == []
+
+
+def test_split_kept_partitions_by_security_id_and_keeps_order() -> None:
+    """#922: rows of a keep-listed security, in either table, are kept."""
+    known = datetime(2020, 1, 2, tzinfo=UTC)
+    found = (
+        Underived("securities", {"security_id": "0000000001@2020-01-02", "known_at": known}),
+        Underived("securities", {"security_id": "0000000002@2020-01-02", "known_at": known}),
+        Underived("listings", {"security_id": "0000000001@2020-01-02", "known_at": known}),
+    )
+    keep = frozenset({"0000000001@2020-01-02"})
+    proposed, kept = split_kept(found, keep, frozenset())
+    assert proposed == (found[1],)
+    assert kept == (found[0], found[2])
+    assert split_kept(found, frozenset(), frozenset()) == (found, ())
+    # Derived again: the keep no longer applies (quant audit of #923).
+    assert split_kept(found, keep, keep) == (found, ())
