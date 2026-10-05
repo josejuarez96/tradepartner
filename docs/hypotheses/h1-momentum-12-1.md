@@ -1,6 +1,6 @@
 # Hypothesis: H1, long-only 12-1 momentum, monthly
 
-**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only)
+**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only); 2026-10-05 (#975, `in_sample_start` re-pinned to 2020-08-31 for the #974 bar gap; owner decision on #974, 2026-10-05, before registration)
 
 Merging this file does not register it. The owner runs
 `tradepartner hypothesis register docs/hypotheses/h1-momentum-12-1.md` after merge (spec req
@@ -8,15 +8,17 @@ Merging this file does not register it. The owner runs
 `holdout.end` is a completed month-end. Before registering, the owner re-checks
 `docs/research/` for holdout-period results published since this file was written and adds
 them to the disclosure below, and re-runs the Q8 amendment's coverage check on the store he
-registers on (`universe_as_of` at close of 2019-10-31 and of 2019-11-29: the top-1000 cut
-must not bind at the first and must bind at the second; the date was pinned on the
+registers on (`universe_as_of` at close of 2020-08-31: the top-1000 cut must bind, that is,
+at least `universe.top_n_by_cap` companies pass rules 1–7; the counts were taken on the
 pre-repair store, and the listing repairs since #818 and the rule 7 shares fallback (#849)
-can move either count). If the first binding month-end moved, he re-pins `in_sample_start`
+can move them). Since the #975 re-pin the start is no longer the first binding month-end,
+so a moved first binding month-end alone does not move it; if the cut does not bind at
+2020-08-31, he re-pins `in_sample_start`
 first, via a class-B PR that updates this file (the TOML value, the power-arithmetic session
 counts and the retirement window, and every passage and count that derives from them: the
-Q8 rationale and its iXBRL disclosure, the t-statistic table, the "nine of the 50") and
-`tests/backtest/test_h1_file.py` (the date, the 50 sessions and the first fill), and
-registers only after it merges. An edit before
+Q8 rationale and its iXBRL disclosure, the t-statistic table, the rebalance counts in the
+disclosure) and `tests/backtest/test_h1_file.py` (the date, the 41 sessions and the first
+fill), and registers only after it merges. An edit before
 registration is not a new hypothesis. The registry hashes the whole file, so any edit after
 registration makes a new hypothesis.
 
@@ -88,7 +90,7 @@ registration and is printed with the rest, so the full frozen set is on record e
 slug = "h1-momentum-12-1"
 family = "momentum"
 title = "H1: long-only 12-1 momentum, top 10% equal weight, monthly"
-in_sample_start = 2019-11-29
+in_sample_start = 2020-08-31
 
 [holdout]
 start = 2024-01-01
@@ -177,7 +179,9 @@ Owner answers that set these values (spec open questions, answered on #156):
   amendment. Non-zero is not enough: from 2019-07 to 2019-10 the cut never bound, so
   those universes are the coverage ramp, not a top-1000, and a run starting there would
   hold a book whose membership is set by filing arrival, not by size. That month-end is
-  **2019-11-29**, so `in_sample_start = 2019-11-29`. Coverage is still ramping after it:
+  **2019-11-29**, so the #842 amendment pinned `in_sample_start = 2019-11-29` (re-pinned to
+  2020-08-31 on #975, below; the rule and the table stand as the record of #842). Coverage
+  is still ramping after it:
   listing rows known grow from 3,438 to 3,941 and companies reaching rule 8 from 1065 to
   1122 by 2020-03, so a late filer that would outrank the 1000th company can still be
   missing at the first rebalances. That residual bias is accepted and reported, not
@@ -189,7 +193,7 @@ Owner answers that set these values (spec open questions, answered on #156):
   before `write_results` (the benchmark read, #840, or the CG dividend, #841), so no
   in-sample return, turnover or metric exists on real data for any window (fixture-store
   smoke runs produce synthetic figures only), and the sweep above counted universe members
-  and exclusions only. The first rebalance's signal reads
+  and exclusions only. The 2019-11-29 rebalance's signal reads
   closes from 2018-11-30 (`formation_months = 12`: close(month-end of T − 12) to close(month-end of
   T − 1), 2019-10-31) and rule 6 needs bars from December 2018; the store holds Alpaca
   bars from January 2016 (ADR 0009), so the lookback has about three years of slack and
@@ -207,11 +211,13 @@ Owner answers that set these values (spec open questions, answered on #156):
   those copies are gone.
 
   **The iXBRL phase-in bias, stated (owner decision on PR #852, 2026-10-04, option 2:
-  keep 2019-11-29 and disclose).** Inline-XBRL cover-page tagging, the only pre-snapshot
+  keep 2019-11-29 and disclose; the #975 re-pin to 2020-08-31 moves the bias window out of
+  the in-sample run, below).** Inline-XBRL cover-page tagging, the only pre-snapshot
   source of listings and of the `dei` shares fact rule 7 reads, phased in by filer size:
   large accelerated filers from fiscal periods ending 2019-06-15, accelerated filers from
   2020-06-15, all other filers from 2021-06-15. So the pool the top-1000 cut binds against
-  is short of full for the first nine rebalances. On the same store copy, the companies
+  is short of full for the nine month-end rebalances from 2019-11-29 to 2020-07-31. On the
+  same store copy, the companies
   passing rules 1–7 number **1065 at 2019-11-29**, 1177 at 2020-06-30, **1483 at
   2020-08-31** (the accelerated filers' first iXBRL 10-Qs), 1704 at 2020-12-31 and about
   1850 from 2021-06 on, flat after 2021-08. The rank-1000 cap cutoff divided by the median
@@ -222,7 +228,10 @@ Owner answers that set these values (spec open questions, answered on #156):
   trading but had no listing known at close(T), and **116 (12%)** members sat below
   0.30 × median cap, about the cutoff ratio the full pool imposes from 2020-08 (the names
   a full pool would push out); at 2020-06-30, 27 and 102; at 2020-08-31, 13 and 0; at
-  2021-06-30, 6 and 0, falling to 0 and 0 by 2021-11. The 60 is a floor: the proxy cannot
+  2021-06-30, 6 and 0, falling to 0 and 0 by 2021-11. None of these counts includes the
+  #974 names, which had a listing known at T but no bars before mid-2019 and failed rule 6;
+  the 2019-11 to 2020-07 bias was larger than the two proxies say. The 60 is a floor: the
+  proxy cannot
   count a company that delisted before 2021-12. After 2020-08 the pool grows by about 220
   more companies by 2020-12 (later accelerated-filer filings) and by about 150 more with
   the mid-2021 phase (non-accelerated filers); neither moves the top-1000 line in
@@ -235,19 +244,41 @@ Owner answers that set these values (spec open questions, answered on #156):
   because their filings did not yet carry the tag, not because they later failed or
   succeeded (the ref-invisible set is the one proxy that looks forward, and it is a
   measurement of the bias, not an input to any rebalance). The bias is in the universe's
-  composition: for nine of the 50 in-sample rebalances (2019-11-29 to 2020-07-31) up to
-  the bottom 6–12% of the book's eligible names is set by filer size, not by market cap, and
-  the top decile the signal selects is drawn from a slightly smaller, larger-filer-tilted
-  pool. **How to read 2019-11 to 2020-07 results:** as a top-1000-of-large-filers
-  momentum portfolio, not yet the ADR 0006 universe in substance; between about one
-  eligible name in sixteen and one in eight at 2019-11 (the two proxies above, 60 as a
-  floor and 116 of 1000), falling to between about one in thirty-seven and one in ten by
-  2020-06 (27 and 102), could differ under a full pool. From 2020-08-31 the
-  universe is the ADR 0006 top 1000 in substance. The first-trial metrics that the
-  retirement condition reads cover all 50 rebalances; a reader comparing the first nine
-  months with the rest should expect a universe-composition difference there before
-  looking for a signal difference. Starting at 2020-08-31 (41 sessions, 40 returns) or
-  2021-06-30 (31, 30) was considered and declined, as above.
+  composition: for the nine month-end rebalances from 2019-11-29 to 2020-07-31, which the
+  #842 window held and the #975 window does not, up to the bottom 6–12% of the book's
+  eligible names was set by filer size, not by market cap, and the top decile the signal
+  selects was drawn from a slightly smaller, larger-filer-tilted pool. From 2020-08-31 the
+  universe is the ADR 0006 top 1000 in substance, so **none of the 41 in-sample rebalances
+  (2020-08-31 to 2023-12-29) falls in that window**. The residual at the first rebalance,
+  2020-08-31, is the 13 ref-invisible companies (1.3% of 1000, a floor) and none below
+  0.30 × median cap; the later accelerated and non-accelerated filers that join the pool
+  by 2021 do not move the top-1000 line in substance (above). That residual is accepted
+  and reported, not removed. Starting at 2020-08-31 was considered and declined on PR
+  #852, and adopted on #975 for the #974 reason below; 2021-06-30 (31 sessions, 30 returns)
+  was considered and declined, as above.
+
+  **Amendment, 2026-10-05 (#975; owner decision on #974, 2026-10-05).** `in_sample_start`
+  moves from 2019-11-29 to **2020-08-31**. The 2026-10-05 read-only audit (#967) and its
+  root-cause pass (#974) found that for 192 established securities (META and Elevance among
+  them) the earliest listing is the first EDGAR cover page that carried a ticker (July or
+  August 2019), so the store holds no Alpaca bars for them before then although they traded
+  throughout. Universe rule 6 (`universe.min_history_months = 12` trailing months of bars)
+  then excluded them until the window cleared: 81 enter at 2020-07-31 and 111 at
+  2020-08-31. That is about 1,650 member-months, roughly 19% of each universe from 2019-11
+  to 2020-06, across the COVID crash, and a selection bias rather than the coverage ramp the
+  #842 amendment assumed: rule 8 ranks only the names that pass rules 1–7, so each wrongly
+  excluded large name handed its top-1000 slot to a smaller one. 2020-08-31 is the first
+  month-end rebalance at which all 192 have entered the universe on the store as it stands
+  (#974), and the same month-end from which the iXBRL disclosure above finds the universe the ADR 0006
+  top 1000 in substance. #974 fixes the data in parallel (size M); this re-pin does not
+  wait for it. The 2020-08-31 rebalance's signal reads closes from 2019-08-30 to 2020-07-31
+  (`formation_months = 12`, `skip_months = 1`) and rule 6 needs bars over the 12 months to
+  2020-08-31, inside the 192 names' bars (from July 2019) and the store's January 2016
+  start (ADR 0009). No other parameter changes. **No trial result was seen before this
+  choice either:** H1 has no trial on real data (the #842 statement above still holds; the
+  audit counted universe members and bar spans only). H1 is not registered on the owner's
+  store, so this edit before registration is not a new hypothesis; it changes the file's
+  hash, which is harmless for the same reason as #842's.
 - **Q10, statistical threshold:** option (a), no numeric cut-off. The retirement condition
   is stated in words at the end of this file. DSR is shown on both bases, never adjudicated
   (ADR 0005: beating a benchmark is never a phase-exit criterion).
@@ -293,9 +324,9 @@ back-tested). No Tier 1 source gives a post-2010 peak-to-trough; the run compute
 
 - Base-level `excess_cagr_spy` above `metrics.red_flag_excess_cagr_pp` (3.0): spec req 15
   marks the trial `red_flag`. G1 found no live or gross window above +1.1 pp/yr.
-- No loss of about −18% or worse in either of the two G1 worst-quarter episodes inside
-  the window (1Q20, AQR −17.97%; 2Q22, MTUM −18.70%; the third, 3Q11, is before it).
-  G1 reports no live momentum product escaping those quarters.
+- No loss of about −18% or worse in the one G1 worst-quarter episode inside the window
+  (2Q22, MTUM −18.70%; the other two, 3Q11 and 1Q20 (AQR −17.97%), are before it, 1Q20
+  since the #975 re-pin). G1 reports no live momentum product escaping those quarters.
 - Tracking error well below 8%/yr, or one-sided turnover far below 30%/month: the signal
   or the universe has collapsed (for example onto survivors or a handful of names).
 - A `cost_drag` at the 15 bp level far from ≈ 12 × `turnover_monthly` × 2 × 15 bp (an
@@ -310,13 +341,16 @@ back-tested). No Tier 1 source gives a post-2010 peak-to-trough; the run compute
   `n_universe` below `universe.top_n_by_cap` at any rebalance. Before the #842 amendment
   this bullet watched for "a large static-listing count in 2017–2018", the years the
   universe was expected to lean on `snapshot_static` rows (#35). That reading is moot: the
-  window now starts 2019-11-29, after the cover-page era began, and under #35 the owner's
+  window now starts 2020-08-31 (#975; 2019-11-29 under #842), after the cover-page era
+  began, and under #35 the owner's
   store's `snapshot_static` rows (known 2026-10-03, after `holdout.end`) are invisible at
   every in-sample T anyway, so the count is zero by construction. A non-zero count there
   would mean a `known_at` on a static row earlier than its fetch: a point-in-time bug, not
   a universe property. (The fixture store is different: its `snapshot_static` row for
-  PRE9 is known 2020-01-15, so a `backtest-runner` smoke run over 2019-11-29 to 2020-06-30
-  counts it legitimately.) `n_universe` counts securities and rule 8 cuts companies, so with
+  PRE9 is known 2020-01-15, so a fixture-store run reading a T after that date counts it
+  legitimately. The fixture's bars end 2020-06-30, before this window's 2020-08-31 start,
+  so since #975 the fixture has no H1 smoke window inside the file's frozen window; #976.)
+  `n_universe` counts securities and rule 8 cuts companies, so with
   multi-class companies admitted it runs 1000–1008; a value below 1000 is a sufficient,
   not a necessary, sign that fewer than 1000 companies reached rule 8, that is, that the
   size cut did not bind, the condition the start date was chosen to rule out (Q8
@@ -328,34 +362,37 @@ Rebalance sessions are counted with `backtest.schedule.rebalance_sessions` on th
 calendar; `tests/backtest/test_h1_file.py` checks the counts.
 
 - **In-sample run:** the spec's default window, `in_sample_start` to the last rebalance
-  session before `holdout.start`: 2019-11-29 to 2023-12-29 (since the #842 amendment;
-  2017-01-31 to 2023-12-29, 84 sessions and 83 returns, before it). That is **50 rebalance
-  sessions** and **49 monthly returns** (the first rebalance fills on 2019-12-02, so the
-  first holding month is December 2019; the 2023-12-29 rebalance fills on 2024-01-02,
-  inside the holdout, so its month is not in sample). The spec's "~84 months" was written
-  for the old start and counts sessions; the arithmetic below uses 49 returns.
+  session before `holdout.start`: 2020-08-31 to 2023-12-29 (since the #975 amendment;
+  2019-11-29 to 2023-12-29, 50 sessions and 49 returns, under #842; 2017-01-31 to
+  2023-12-29, 84 sessions and 83 returns, before it). That is **41 rebalance sessions**
+  and **40 monthly returns** (the first rebalance fills on 2020-09-01, so the first
+  holding month is September 2020; the 2023-12-29 rebalance fills on 2024-01-02, inside
+  the holdout, so its month is not in sample). The spec's "~84 months" was written for the
+  original start and counts sessions; the arithmetic below uses 40 returns.
 - **Holdout run**, pinned here so that January 2024 belongs to a window:
   `--start 2023-12-29 --end 2026-09-30`, from the last in-sample rebalance to
   `holdout.end`. The window overlaps the frozen holdout, so it needs `--spend-holdout` and
   runs as `kind=holdout` (spec req 11). That is **34 rebalance sessions** and **33 monthly
-  returns**, January 2024 to September 2026, unchanged by #842. In-sample and holdout
-  together cover December 2019 to September 2026, 82 monthly returns, with no gap and no
-  overlap.
+  returns**, January 2024 to September 2026, unchanged by #842 and #975. In-sample and
+  holdout together cover September 2020 to September 2026, 73 monthly returns, with no
+  gap and no overlap.
 
 **t-statistic** (handoff D1 and ADR 0005: t ≈ SR × √years, here the excess Sharpe, the
 excess return over its tracking error):
 
 | Window | Months | Years | t for +1 pp/yr at 8.4% tracking error | Excess needed for t ≈ 2 |
 |---|---|---|---|---|
-| In-sample | 49 | 4.1 | **0.24** | **8.3 pp/yr** |
+| In-sample | 40 | 3.3 | **0.22** | **9.2 pp/yr** |
 | Holdout | 33 | 2.75 | **0.20** | 10.1 pp/yr |
-| Both | 82 | 6.8 | 0.31 | 6.4 pp/yr |
+| Both | 73 | 6.1 | 0.29 | 6.8 pp/yr |
 
-(Before #842 the in-sample row read 83 months, 6.9 years, t 0.31, 6.4 pp/yr, and the
-Both row 116 months, 9.7 years, 0.37, 5.4 pp/yr. The shorter window weakens an already
-powerless test; it does not change the conclusion below.) A +1 pp/yr excess, the top of
+(Under #842 the in-sample row read 49 months, 4.1 years, t 0.24, 8.3 pp/yr, and the Both
+row 82 months, 6.8 years, 0.31, 6.4 pp/yr; before #842 the in-sample row read 83 months,
+6.9 years, t 0.31, 6.4 pp/yr, and the Both row 116 months, 9.7 years, 0.37, 5.4 pp/yr.
+Each shorter window weakens an already powerless test; neither changes the conclusion
+below.) A +1 pp/yr excess, the top of
 the prior range, would need about 280 years of data to reach t ≈ 2. Any in-sample excess
-large enough to be significant (about +8 pp/yr) is nearly three times the red-flag
+large enough to be significant (about +9 pp/yr) is about three times the red-flag
 threshold and above every live or gross window G1 found, so it would read as a bug before
 it read as an edge. **The test cannot reach significance for any
 result the prior allows.** That is why open question 10 takes option (a): a pass/fail
@@ -446,7 +483,8 @@ Stated before any run, per open question 10 (a).
 the base-level `excess_cagr_spy` and the run-time `dsr_excess` in `trial_results` (N and V
 at run time), not the page's recomputation with today's N and V. The trial is the **first**
 `ok`, non-synthetic, `in_sample` trial of this hypothesis over the full default window
-[2019-11-29, 2023-12-29] (the `in_sample_start` of the Q8 amendment, #842) that passed
+[2020-08-31, 2023-12-29] (the `in_sample_start` of the Q8 amendments, #842 and #975)
+that passed
 `quant-auditor` (plan T45b). A later trial replaces
 it only when an audit logged a bug in the earlier one. Shorter or later-start in-sample
 runs never count. The holdout run neither retires nor promotes H1; its result is reported
@@ -459,9 +497,10 @@ roadmap names the MVP strategy as the first paper strategy, and ADR 0005 makes P
 test of process, not of returns.
 
 **The −1 pp/yr line is a decision rule committed in advance, not a statistical finding.**
-Each pp/yr of excess is worth about t ≈ 0.24 over the in-sample window (0.31 before
-#842), so −1 pp/yr is inside one standard error of zero. The number is the bottom of G1's
-plausible ten-year range applied to a four-year window, which is not like for like; live
+Each pp/yr of excess is worth about t ≈ 0.22 over the in-sample window (0.24 under
+#842, 0.31 before it), so −1 pp/yr is inside one standard error of zero. The number is
+the bottom of G1's plausible ten-year range applied to a window of about three and a third
+years, which is not like for like; live
 five-year windows as low as −2.8 pp/yr count as normal above. The rule retires H1 anyway, because its job is
 to be a line drawn before the run, nothing more. The DSR half: `dsr_excess` below 0.5
 means the excess Sharpe is below SR*, the expected maximum Sharpe across the family's
