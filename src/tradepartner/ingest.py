@@ -27,8 +27,11 @@ ended. Delisted names whose `effective_on` is not past are still fetched
 current listing is `snapshot_static` and that has no bar is named in the
 run message with its own count, not counted (#784); so is any other name
 with no bar now or at the previous session in the store, unless it is a
-benchmark or first listed this session, or the store has no bar at all at
-the previous session.
+benchmark or first listed on one of `universe.exchanges` this session (an
+up-listing from OTC is a first listing), or the store has no bar at all at
+the previous session. The names so reported (dark plus snapshot-only) make
+the run stale when they are more than `ingest.max_dark_share` of the listed
+names (#796).
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -84,7 +87,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -850,6 +853,8 @@ def _fetch_prices(
             f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
             f"have no bar for {session}: {', '.join(missing[:10])}{_reported_note(reported)}"
         )
+    if stale := _dark_stale(listed, reported, settings, f"for {session}"):
+        raise _Stale(stale)
     message = (
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}"
@@ -986,8 +991,10 @@ def _may_count(
     benchmarks: set[str],
 ) -> set[str] | None:
     """The names whose miss may count (#784, dark names): those with a bar
-    in the `previous` chunk window already in the store at `t` (nothing this
-    chunk fetched), those first listed after it, and the benchmarks. `None`
+    in the `previous` chunk window already in the store at `t` (ingested by
+    `t`, so nothing this chunk fetched and nothing a later run stamped; #796),
+    those whose first listing in `earliest` (`_first_listed`) starts after
+    it, and the benchmarks. `None`
     when the store holds no bar at all in `previous` (no previous chunk):
     then every miss counts."""
     first, last = previous
@@ -995,13 +1002,23 @@ def _may_count(
         row[0]
         for row in conn.execute(
             "SELECT DISTINCT security_id FROM prices_daily "
-            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+            "WHERE session BETWEEN ? AND ? AND ingested_at <= ?",
             [first, last, t],
         ).fetchall()
     }
     if not had:
         return None
     return had | benchmarks | {sid for sid, start in earliest.items() if start > last}
+
+
+def _first_listed(earliest: dict[str, date], row: Row, settings: Settings) -> None:
+    """Fold listing `row` into `earliest`, each security's first `valid_from`
+    on one of `universe.exchanges` (`_may_count`'s new listings; #796, owner
+    option ii a): a move between those exchanges is a transfer, never a new
+    listing, while an up-listing from OTC starts the security's first one."""
+    if row["exchange"] in settings.universe.exchanges:
+        sid = row["security_id"]
+        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
 
 
 SNAPSHOT_ONLY = "snapshot-only names with no rows"
@@ -1032,6 +1049,24 @@ def _staleness(
     return counted, missing, {SNAPSHOT_ONLY: static, DARK: dark}
 
 
+def _dark_stale(
+    listed: Sized, reported: Mapping[str, list[str]], settings: Settings, where: str
+) -> str | None:
+    """The stale message when the names `_staleness` reported rather than
+    counted (dark and snapshot-only) are more than `ingest.max_dark_share`
+    of the `listed` names (#796), else None. A gradual dropout leaves the
+    missing share by going dark, so it is bounded here instead."""
+    out = sorted({sid for names in reported.values() for sid in names})
+    share = len(out) / len(listed) if len(listed) else 0.0
+    limit = settings.ingest.max_dark_share
+    if share <= limit:
+        return None
+    return (
+        f"{len(out)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
+        f"are dark or snapshot-only {where}{_reported_note(reported)}"
+    )
+
+
 def _reported_note(reported: Mapping[str, list[str]]) -> str:
     """The run-message clauses naming `_staleness`'s reported names by
     cause (count and up to 10 names each), or `""`."""
@@ -1055,7 +1090,7 @@ def _price_names(
     earliest: dict[str, date] = {}
     for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
         sid = row["security_id"]
-        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
+        _first_listed(earliest, row, settings)
         held = current.get(sid)
         if row["valid_from"] <= session and (
             held is None or row["valid_from"] > held["valid_from"]

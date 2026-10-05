@@ -50,6 +50,7 @@ from tradepartner.ingest import (
     _add_rows,
     _fetched,
     _ingest_filings,
+    _may_count,
     _prefetch,
     _Recorded,
     _types_known,
@@ -1411,6 +1412,93 @@ def test_a_name_first_listed_this_session_with_no_bar_counts(settings: Settings)
     filings = _with_newco(_at(2019, 6, 28), fetched_at=_at(2019, 6, 3))
     result = _run(settings, _Prices(missing={NEWCO}), filings=filings)
     assert result.runs[-1].status == STALE and NEWCO in result.runs[-1].message
+
+
+def _dark_limited(settings: Settings, share: float) -> Settings:
+    return settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_dark_share": share})}
+    )
+
+
+def test_too_many_dark_names_make_the_run_stale(settings: Settings) -> None:
+    # #796 (i a): dark names leave the missing share, so a gradual dropout is
+    # bounded by their own share of the listed set (here 1 of 4).
+    assert _run(_loose(settings), _Prices(missing={ACME}), now=PREVIOUS, filings=_early()).ok
+    result = _run(_dark_limited(settings, 0.2), _Prices(missing={ACME}), filings=_early())
+    assert result.runs[-1].status == STALE, result.runs[-1].message
+    assert "1 of 4 listed names (25.0%, over 20.0%) are dark or snapshot-only" in (
+        result.runs[-1].message
+    )
+    assert ACME in result.runs[-1].message
+
+
+def test_dark_names_within_the_limit_leave_the_run_ok(settings: Settings) -> None:
+    assert _run(_loose(settings), _Prices(missing={ACME}), now=PREVIOUS, filings=_early()).ok
+    result = _run(_dark_limited(settings, 0.25), _Prices(missing={ACME}), filings=_early())
+    assert result.ok, result.runs[-1].message
+
+
+def test_snapshot_only_names_count_toward_the_dark_share(settings: Settings) -> None:
+    # 1 of 5 listed names is snapshot-only with no bar.
+    tuned = _dark_limited(settings, 0.15)
+    result = _run(tuned, _Prices(missing={STAT}), filings=_with_stat())
+    assert result.runs[-1].status == STALE, result.runs[-1].message
+    assert "1 of 5 listed names (20.0%, over 15.0%) are dark or snapshot-only" in (
+        result.runs[-1].message
+    )
+
+
+def test_a_name_up_listed_from_otc_this_session_with_no_bar_counts(settings: Settings) -> None:
+    # #796: DUB moves from OTC to NASDAQ on 06-28. Its first listing on a
+    # universe exchange starts this session, so it is a new listing, not dark.
+    otc = _filings(fetched_at=_at(2019, 6, 3), dual_listings=OTC_B)
+    assert _run(settings, now=PREVIOUS, filings=otc).ok
+    up = CoverPage(
+        DUAL,
+        f"{DUAL}-19-000002",
+        _at(2019, 6, 28),
+        (
+            CoverListing("Class A Common Stock", "DUA", "NASDAQ"),
+            CoverListing("Class B Common Stock", "DUB", "NASDAQ"),
+        ),
+    )
+    filings = _filings(fetched_at=_at(2019, 6, 3), dual_listings=OTC_B, extra_covers=[up])
+    result = _run(settings, _Prices(missing={DUAL_B}), filings=filings)
+    assert result.runs[-1].status == STALE, result.runs[-1].message
+    assert DUAL_B in result.runs[-1].message
+
+
+def _bar(sid: str, session: date, ingested_at: datetime) -> dict[str, Any]:
+    known = datetime.combine(session, datetime.min.time(), UTC) + timedelta(hours=21)
+    return {
+        "security_id": sid,
+        "session": session,
+        "open": 10.0,
+        "high": 10.0,
+        "low": 10.0,
+        "close": 10.0,
+        "volume": 100,
+        "known_at": known,
+        "ingested_at": ingested_at,
+        "source": "alpaca",
+        "provenance": "bar",
+    }
+
+
+def test_may_count_reads_bars_ingested_by_t_and_always_the_benchmarks(
+    settings: Settings,
+) -> None:
+    # #796: "already in the store" means ingested by t, not known by t: a
+    # backfilled bar of the previous session stamped after t is not there yet.
+    # A benchmark may always count, with or without a bar.
+    t = NOW
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "prices_daily", _bar(ACME, date(2019, 6, 27), t - timedelta(hours=1)))
+        insert_row(conn, "prices_daily", _bar(DUAL_B, date(2019, 6, 27), t + timedelta(hours=1)))
+        window = (date(2019, 6, 27), date(2019, 6, 27))
+        may = _may_count(conn, t, window, {}, {SPY})
+    assert may == {ACME, SPY}
 
 
 def test_run_messages_are_redacted_cleaned_and_capped(

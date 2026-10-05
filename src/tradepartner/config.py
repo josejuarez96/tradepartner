@@ -128,6 +128,11 @@ class IngestConfig(BaseModel):
     # Spec default, unmeasured. On SIP history a listed name should lack a bar only on a
     # halt or suspension; measure over ~20 real sessions and tighten (T3, #86).
     max_missing_share: float = 0.05
+    # #796 (owner, option i a): a cap on the names a chunk reports instead of counting
+    # (dark plus snapshot-only, as a share of the chunk's listed names), so a gradual
+    # dropout that keeps `max_missing_share` under its limit still ends in a stale run.
+    # 1.0 is off: the default is set from the backfill's measured baseline after T45b.
+    max_dark_share: float = Field(default=1.0, ge=0.0, le=1.0)
     # Not in the spec's key list; added in T16 (safety-reviewer): an ingest run's stored
     # failure message is server-supplied text, capped so a large error page cannot fill
     # `ingestion_runs.message` and the page that shows it.
