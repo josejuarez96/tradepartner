@@ -16,11 +16,15 @@ The gates, in spec order:
 2. **Split** (`check_split`, req 5 / req 14). A split the registration does
    not list is `refused_split` at open.
 3. **Holdout** (`check_holdout`, req 5). A window overlapping a protected
-   window of its family, a bound split that is itself sealed, or a bound
-   split whose event span overlaps a sealed period of the dataset name, is
-   `refused_holdout` unless `--spend-holdout --holdout-reason` is given; a
-   spend over a window any prior run has already spent additionally needs
-   `--holdout-repeat`.
+   window of its family, a bound split that is itself sealed
+   (`is_split_sealed`), or a bound split whose event span overlaps a
+   sealed period of the dataset name, is `refused_holdout` unless
+   `--spend-holdout --holdout-reason` is given. A repeat of a dated window
+   (a family holdout or a sealed period) is decided by date overlap with a
+   prior spend; a repeat of the sealed split by name is decided by the
+   caller's own `sealed_split_already_spent` flag, since a dataset
+   version can redraw which dated rows carry a sealed split name. Either
+   kind of repeat additionally needs `--holdout-repeat`.
 4. **Budget** (`check_budget`, req 6). Opening a run once the chain's run
    count has reached `budget.runs`, or declaring configurations that would
    push the chain's sum past `budget.configurations`, is `refused_budget`.
@@ -44,6 +48,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
+from tradepartner.backtest.holdout import _has_text
 from tradepartner.calendar import is_session, previous_session, session_close
 
 WindowOutcome = Literal["ok", "refused_window"]
@@ -80,7 +85,12 @@ class Span:
 
 @dataclass(frozen=True)
 class Flags:
-    """The owner's CLI flags (spec req 14); mirrors `backtest/holdout.py`."""
+    """The owner's CLI flags (spec req 14). Named `Flags` to match the spec's
+    Data / interfaces section ("`Flags(spend_holdout, holdout_repeat)` ...
+    mirror `backtest/holdout.py`"), which deliberately reuses
+    `backtest.holdout.Flags`'s name and shape for the same CLI concept. A
+    caller that imports both (T83's `cli.py`) needs an alias, for example
+    `from tradepartner.research.gates import Flags as ResearchFlags`."""
 
     spend_holdout: bool = False
     holdout_repeat: bool = False
@@ -88,13 +98,11 @@ class Flags:
 
 @dataclass(frozen=True)
 class Reasons:
-    """The reason that must accompany `spend_holdout`; mirrors `backtest/holdout.py`."""
+    """The reason that must accompany `spend_holdout`. Named `Reasons` for
+    the same reason as `Flags` above; alias it the same way where both are
+    imported."""
 
     holdout_reason: str | None = None
-
-
-def _has_text(reason: str | None) -> bool:
-    return reason is not None and reason.strip() != ""
 
 
 @dataclass(frozen=True)
@@ -149,15 +157,55 @@ def check_split(split: str, allowed_splits: tuple[str, ...]) -> SplitDecision:
     return SplitDecision("ok", "split is among the registration's splits")
 
 
+def is_split_sealed(split: str, sealed_splits: tuple[str, ...]) -> bool:
+    """Whether `split` is sealed under the bound dataset name: `test` always
+    is (Definitions, Split — a dataset's own sealed-set column need not
+    list it, req 11's "`test` rows ... seal `test` whether or not `--sealed
+    test` is passed"); any other split only when `sealed_splits` (the
+    dataset name's own registered sealed set) lists it. `check_holdout`
+    uses this, and a caller builds `check_confirmatory`'s
+    `bound_split_sealed` with the same rule, so req 5 and req 7 never
+    disagree about which splits are sealed."""
+    return split == "test" or split in sealed_splits
+
+
+def _overlapping(spans: tuple[Span, ...], target: Span) -> tuple[Span, ...]:
+    """The members of `spans` that share at least one day with `target`,
+    order preserved."""
+    return tuple(span for span in spans if target.overlaps(span))
+
+
+def _deduplicated(spans: tuple[Span, ...]) -> tuple[Span, ...]:
+    """`spans` with exact duplicates removed, order preserved (a sealed
+    period can equal a sealed split's own span by coincidence)."""
+    seen: set[Span] = set()
+    result: list[Span] = []
+    for span in spans:
+        if span not in seen:
+            seen.add(span)
+            result.append(span)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class PriorSpend:
-    """A previously recorded spend of a protected window: `label` is
-    whatever the caller found it under (a run id, a slug, a backtest trial
-    id — for messages only) and `window` is the protected window it spent
-    (a family holdout, the bound split's own span when the spend sealed a
-    split by name, or a sealed period). The repeat decision below compares
-    `window` against what *this* run touches, by `Span.overlaps`, so the
-    caller never has to pre-filter by family or dataset name itself."""
+    """A previously recorded spend of one of the **dated** protected
+    windows (a family holdout or a sealed period): `label` is whatever the
+    caller found it under (a run id, a slug, a backtest trial id — for
+    messages only) and `window` is the protected window it spent, exactly
+    as registered (so the same hypothesis holdout or the same sealed
+    period compares equal across calls). The repeat decision in
+    `check_holdout` matches `window` against what *this* run touches by
+    `Span.overlaps`. This does **not** cover a sealed split's own spend
+    (`sealed_split_already_spent` below): a dataset version can redraw
+    which event-dated rows carry a sealed split name (req 11), so the
+    sealed split is protected by the dataset **name**, not by any one
+    version's dates, and `check_holdout` cannot infer "the same sealed
+    split" from span equality across redraws. The caller must still scope
+    `prior_spends` and `sealed_split_already_spent` to this run's own
+    family and dataset name (Definitions, Protected window): passing every
+    spend in the store, unscoped, would match an unrelated family's or
+    dataset's spend whose dates happen to overlap (#936)."""
 
     label: str
     window: Span
@@ -171,6 +219,7 @@ class HoldoutDecision:
     holdout_repeat: bool = False
     holdout_reason: str | None = None
     touched: tuple[Span, ...] = ()
+    touches_sealed_split: bool = False
 
 
 def check_holdout(
@@ -183,63 +232,76 @@ def check_holdout(
     flags: Flags,
     reasons: Reasons,
     prior_spends: tuple[PriorSpend, ...],
+    sealed_split_already_spent: bool = False,
 ) -> HoldoutDecision:
     """Req 5: a run whose window overlaps a protected window of its family
-    (`family_holdouts`), or that binds a sealed split (`bound_split` is
-    `"test"`, which is always sealed, Definitions, Split, or is otherwise in
-    `sealed_splits`) or whose bound split's event span overlaps a sealed
-    period of the dataset name (`sealed_periods`), is refused unless the
-    flags are given. A former `test` row relabelled into another split
-    still trips the check, because `bound_split_span` is checked against
+    (`family_holdouts`), or that binds a sealed split (`is_split_sealed`)
+    or whose bound split's event span overlaps a sealed period of the
+    dataset name (`sealed_periods`), is refused unless the flags are
+    given. A former `test` row relabelled into another split still trips
+    the sealed-period check, because `bound_split_span` is checked against
     `sealed_periods` whatever the split's current label.
 
-    `decision.touched` names exactly the protected windows this run
-    touched (the overlapped family holdouts, the bound split's own span
-    when sealed by name, the overlapped sealed periods), so the caller can
-    record "the window, split or period spent" (req 5) without redoing the
-    overlap arithmetic. The spend is a repeat when any `prior_spends` entry
-    overlaps one of `touched` (`prior_spends` is every prior spend the
-    caller found: any backtest `holdout` trial of the family, any research
-    run of the family, any research run on this dataset name, synthetic
-    excluded, this run's own id dropped); a repeat additionally needs
-    `--holdout-repeat`."""
-    touched_holdouts = tuple(holdout for holdout in family_holdouts if window.overlaps(holdout))
-    split_sealed_by_name = bound_split == "test" or bound_split in sealed_splits
-    touched_periods = tuple(
-        period for period in sealed_periods if bound_split_span.overlaps(period)
+    `decision.touched` names the dated protected windows this run touched
+    (the overlapped family holdouts and sealed periods, deduplicated), and
+    `decision.touches_sealed_split` says whether it also touched the
+    sealed split by name, so the caller can record "the window, split or
+    period spent" (req 5) without redoing the overlap arithmetic.
+
+    **The sealed test is scored once per dataset name** (req 5): because a
+    later dataset version can redraw which rows carry a sealed split name,
+    a spend of the sealed split is a repeat only when the caller says so
+    directly, via `sealed_split_already_spent` — never by matching this
+    run's `bound_split_span` against a `PriorSpend`'s dates, which a
+    redraw would defeat (see `PriorSpend`'s docstring). A spend of a dated
+    window (a family holdout or a sealed period) is a repeat when any
+    `prior_spends` entry overlaps one of `touched` (`prior_spends` is
+    every dated spend the caller found, already scoped to this run's
+    family and dataset name, this run's own id dropped). Either kind of
+    repeat additionally needs `--holdout-repeat`."""
+    touched = _deduplicated(
+        _overlapping(family_holdouts, window) + _overlapping(sealed_periods, bound_split_span)
     )
-    touched = (
-        touched_holdouts + ((bound_split_span,) if split_sealed_by_name else ()) + touched_periods
-    )
-    if not touched:
+    touches_sealed_split = is_split_sealed(bound_split, sealed_splits)
+    if not touched and not touches_sealed_split:
         return HoldoutDecision("ok", "no protected window touched")
     if not flags.spend_holdout:
         return HoldoutDecision(
             "refused_holdout",
             "touches a protected window; spending it needs --spend-holdout",
             touched=touched,
+            touches_sealed_split=touches_sealed_split,
         )
     if not _has_text(reasons.holdout_reason):
         return HoldoutDecision(
-            "refused_holdout", "--spend-holdout needs a --holdout-reason", touched=touched
+            "refused_holdout",
+            "--spend-holdout needs a --holdout-reason",
+            touched=touched,
+            touches_sealed_split=touches_sealed_split,
         )
-    repeats = tuple(
+    dated_repeats = tuple(
         spend for spend in prior_spends if any(spend.window.overlaps(t) for t in touched)
     )
-    if repeats and not flags.holdout_repeat:
-        spent_by = ", ".join(spend.label for spend in repeats)
+    is_repeat = bool(dated_repeats) or (touches_sealed_split and sealed_split_already_spent)
+    if is_repeat and not flags.holdout_repeat:
+        reasons_for_repeat = [spend.label for spend in dated_repeats]
+        if touches_sealed_split and sealed_split_already_spent:
+            reasons_for_repeat.append("the sealed split was already scored")
+        spent_by = ", ".join(reasons_for_repeat)
         return HoldoutDecision(
             "refused_holdout",
             f"already spent ({spent_by}); a repeat needs --holdout-repeat",
             touched=touched,
+            touches_sealed_split=touches_sealed_split,
         )
     return HoldoutDecision(
         "ok",
         "holdout spend recorded",
         holdout_spent=True,
-        holdout_repeat=bool(repeats),
+        holdout_repeat=is_repeat,
         holdout_reason=reasons.holdout_reason,
         touched=touched,
+        touches_sealed_split=touches_sealed_split,
     )
 
 
@@ -300,9 +362,10 @@ def check_confirmatory(
     `predates_dataset` when `registration_known_at` precedes the bound
     dataset name's first `known_at` (re-hashing an export makes a new
     version, never an earlier name), else `sealed_split` when the run binds
-    a sealed split or sealed period (`bound_split_sealed`, computed by the
-    caller from the dataset's sealed splits/periods and the registered
-    seed), else refused with "dataset precedes registration"."""
+    a sealed split or sealed period (`bound_split_sealed`, which a caller
+    builds with `is_split_sealed` plus its own sealed-period overlap check
+    and the registered seed, so req 5 and req 7 agree on what counts as
+    sealed), else refused with "dataset precedes registration"."""
     if not confirmatory:
         return ConfirmatoryDecision("ok", "exploratory run", basis="none")
     if kind == "agreement" and not dataset_locked:

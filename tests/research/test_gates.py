@@ -23,6 +23,7 @@ from tradepartner.research.gates import (
     check_split,
     check_window,
     compute_verdict,
+    is_split_sealed,
 )
 
 NO_FLAGS = Flags()
@@ -142,6 +143,7 @@ def _holdout(
     flags: Flags = NO_FLAGS,
     reasons: Reasons = NO_REASONS,
     prior_spends: tuple[PriorSpend, ...] = (),
+    sealed_split_already_spent: bool = False,
 ) -> HoldoutDecision:
     return check_holdout(
         window,
@@ -153,6 +155,7 @@ def _holdout(
         flags,
         reasons,
         prior_spends,
+        sealed_split_already_spent,
     )
 
 
@@ -191,11 +194,18 @@ def test_relabelled_test_row_inside_sealed_period_is_a_spend() -> None:
     assert spent.holdout_repeat is False
 
 
+def test_is_split_sealed_test_is_always_sealed() -> None:
+    assert is_split_sealed("test", ()) is True
+    assert is_split_sealed("dev", ()) is False
+    assert is_split_sealed("dev", ("dev",)) is True
+
+
 def test_test_split_is_sealed_even_when_sealed_splits_omits_it() -> None:
     # Definitions, Split: "`test` is always sealed" — the dataset row's own sealed-set
     # column need not list it for the gate to protect it.
     decision = _holdout(split="test", sealed_splits=())
     assert decision.outcome == "refused_holdout"
+    assert decision.touches_sealed_split is True
     spent = _holdout(split="test", sealed_splits=(), flags=SPEND, reasons=SPEND_REASON)
     assert spent.outcome == "ok"
     assert spent.holdout_spent is True
@@ -206,14 +216,14 @@ def test_first_test_scoring_is_the_spend_and_second_is_a_repeat() -> None:
     assert first.outcome == "ok"
     assert first.holdout_spent is True
     assert first.holdout_repeat is False
-    assert first.touched == (UNTOUCHED,)  # the bound split's own span, sealed by name
+    assert first.touches_sealed_split is True
 
     second_unflagged = _holdout(
         split="test",
         sealed_splits=("test",),
         flags=SPEND,
         reasons=SPEND_REASON,
-        prior_spends=(PriorSpend("run 1", UNTOUCHED),),
+        sealed_split_already_spent=True,
     )
     assert second_unflagged.outcome == "refused_holdout"
     assert "a repeat needs --holdout-repeat" in second_unflagged.message
@@ -223,11 +233,54 @@ def test_first_test_scoring_is_the_spend_and_second_is_a_repeat() -> None:
         sealed_splits=("test",),
         flags=SPEND_REPEAT,
         reasons=SPEND_REASON,
-        prior_spends=(PriorSpend("run 1", UNTOUCHED),),
+        sealed_split_already_spent=True,
     )
     assert second_flagged.outcome == "ok"
     assert second_flagged.holdout_spent is True
     assert second_flagged.holdout_repeat is True
+
+
+def test_test_redrawn_to_new_dates_in_a_later_version_is_still_a_repeat() -> None:
+    # Regression (code-review, post quant-auditor pass 2): the sealed split is
+    # protected by the dataset NAME (Definitions, Protected window (b): "sealing
+    # persists across versions"), not by any one version's dates. A dataset version
+    # that redraws which rows carry `test` must not look like a fresh, unspent split
+    # just because this run's bound_split_span differs from the version that was
+    # scored first. The caller signals this directly with `sealed_split_already_spent`
+    # rather than through `prior_spends` (which only matches by date overlap, and a
+    # redrawn split need not overlap the old one at all).
+    v1_test_span = Span(date(2020, 1, 1), date(2020, 6, 30))
+    v2_test_span = Span(date(2021, 1, 1), date(2021, 6, 30))
+    assert not v1_test_span.overlaps(v2_test_span)
+
+    repeat = check_holdout(
+        window=UNTOUCHED,
+        bound_split="test",
+        bound_split_span=v2_test_span,
+        family_holdouts=(),
+        sealed_splits=("test",),
+        sealed_periods=(),
+        flags=SPEND_REPEAT,
+        reasons=SPEND_REASON,
+        prior_spends=(PriorSpend("run 1 (v1 test)", v1_test_span),),
+        sealed_split_already_spent=True,
+    )
+    assert repeat.outcome == "ok"
+    assert repeat.holdout_repeat is True
+
+    refused_without_repeat_flag = check_holdout(
+        window=UNTOUCHED,
+        bound_split="test",
+        bound_split_span=v2_test_span,
+        family_holdouts=(),
+        sealed_splits=("test",),
+        sealed_periods=(),
+        flags=SPEND,
+        reasons=SPEND_REASON,
+        prior_spends=(PriorSpend("run 1 (v1 test)", v1_test_span),),
+        sealed_split_already_spent=True,
+    )
+    assert refused_without_repeat_flag.outcome == "refused_holdout"
 
 
 def test_repeat_across_slugs_and_dataset_names_is_still_a_repeat() -> None:
@@ -311,6 +364,25 @@ def test_window_not_touching_any_protected_window_ignores_flags() -> None:
     decision = _holdout(window=Span(date(2020, 1, 1), date(2020, 6, 30)), flags=SPEND)
     assert decision.outcome == "ok"
     assert decision.holdout_spent is False
+
+
+def test_touched_is_deduplicated_when_a_sealed_period_equals_a_family_holdout() -> None:
+    # A coincidence (the same dates registered as both a family holdout and a sealed
+    # period) must not double-record one window.
+    shared = Span(date(2024, 2, 1), date(2024, 2, 29))
+    decision = check_holdout(
+        window=shared,
+        bound_split="dev",
+        bound_split_span=shared,
+        family_holdouts=(shared,),
+        sealed_splits=(),
+        sealed_periods=(shared,),
+        flags=SPEND,
+        reasons=SPEND_REASON,
+        prior_spends=(),
+    )
+    assert decision.outcome == "ok"
+    assert decision.touched == (shared,)
 
 
 # --- check_budget (req 6) -------------------------------------------------
