@@ -220,12 +220,13 @@ _ALPACA_SYMBOL = re.compile(r"[A-Z]+(\.[A-Z]+)?")
 _CLASS_SUFFIX = re.compile(r"([A-Z]+)[-/]([A-Z])")
 #: A filer's footnote marker or bracketed exchange after the symbol (#844):
 #: trailing asterisks (`VAL*`), or one trailing bracketed footnote number
-#: (`UPH(1)`, `LCINQ (1)`) or exchange name (`BAX (NYSE)`), with the spaces
-#: before it. Any other bracketed group (`HEI (A)`, `GOOG (Class C)`,
-#: `BAC (Series L)`) names a class or series and is left alone, so it stays
-#: no symbol rather than another class's.
+#: of one or two digits (`UPH(1)`, `LCINQ (1)`; never a year) or exchange
+#: name (`BAX (NYSE)`), with the spaces before it. Any other bracketed
+#: group (`HEI (A)`, `GOOG (Class C)`, `BAC (Series L)`) names a class or
+#: series and is left alone, so it stays no symbol rather than another
+#: class's.
 _FOOTNOTE = re.compile(
-    r"(.*?[^\s*(])\s*(?:\*+|\(\s*(?:\d+|NYSE(?:\s+(?:AMERICAN|MKT|ARCA))?|NASDAQ(?:\s*[GC][SM])?"
+    r"(.*?[^\s*(])\s*(?:\*+|\(\s*(?:\d{1,2}|NYSE(?:\s+(?:AMERICAN|MKT|ARCA))?|NASDAQ(?:\s*[GC][SM])?"
     r"|AMEX|CBOE|BATS)\s*\))",
     re.IGNORECASE,
 )
@@ -491,13 +492,10 @@ class ListingResolver:
         same_day_securities: set[str] = set()
         non_equity: dict[str, int] = defaultdict(int)
         for security_id, listed in by_security.items():
-            # A placeholder or non-equity row sorts first on its day, so it
-            # never ends the span of an equity ticker listed that same day.
-            listed.sort(key=lambda r: (r.day, r.kind == EQUITY, r.ticker))
-            readable, ignored = _ignore_unreadable(listed)
+            listed.sort(key=_row_order)
+            rows, pair_day, typos, ignored = _clean_rows(listed)
+            same_day_typos += typos
             unreadable += ignored
-            rows, pair_day = _drop_same_day_typos(readable)
-            same_day_typos += len(readable) - len(rows)
             index = 0
             while index < len(rows):
                 first = index
@@ -818,33 +816,41 @@ def _unreadable(row: _Row) -> bool:
     return row.kind == EQUITY and alpaca_symbol(row.ticker) is None
 
 
-def _ignore_unreadable(rows: Sequence[_Row]) -> tuple[list[_Row], int]:
-    """A security's sorted rows with each unreadable equity row (#844)
-    ignored, and how many were.
+def _row_order(row: _Row) -> tuple[date, bool, str]:
+    """A placeholder or non-equity row sorts first on its day, so it never
+    ends the span of an equity ticker listed that same day."""
+    return row.day, row.kind == EQUITY, row.ticker
 
-    Such a row never ends the security's span: on a day that also lists a
-    readable equity ticker it is dropped, and otherwise it is read as the
-    ticker of the security's last row before that day when that row is a
-    readable equity row (Vulcan's 10-Qs naming `New York Stock Exchange`
-    for `VMC`). With no such row (its first row, or after a placeholder or
-    non-equity row) it is kept as written, a span that holds a ticker
-    Alpaca is never sent, as before."""
-    out: list[_Row] = []
+
+def _clean_rows(rows: Sequence[_Row]) -> tuple[list[_Row], date | None, int, int]:
+    """A security's sorted rows less each same-day typo (#819) and with
+    each unreadable equity row (#844) ignored; the first same-day pair day
+    left, or `None`; and how many typo and unreadable rows there were.
+
+    An unreadable row never ends the security's span: on a day that also
+    lists a readable equity ticker it is dropped, and otherwise it is read
+    as the ticker of the security's last row before that day, once that
+    day's typos are dropped, when that row is a readable equity row
+    (Vulcan's 10-Qs naming `New York Stock Exchange` for `VMC`). With no
+    such row (its first row, or after a placeholder or non-equity row) it
+    is kept as written, a span that holds a ticker Alpaca is never sent,
+    as before. The typo rule runs on the readable rows first, so a typo's
+    ticker is never carried on."""
+    readable = [r for r in rows if not _unreadable(r)]
+    out, pair_day = _drop_same_day_typos(readable)
+    typos = len(readable) - len(out)
     ignored = 0
-    for row in rows:
-        if not _unreadable(row):
-            out.append(row)
-            continue
-        if any(r.day == row.day and r.kind == EQUITY and not _unreadable(r) for r in rows):
+    for row in (r for r in rows if _unreadable(r)):
+        if any(r.day == row.day and r.kind == EQUITY for r in readable):
             ignored += 1
             continue
         before = [r for r in out if r.day < row.day]
         if before and before[-1].kind == EQUITY and not _unreadable(before[-1]):
-            out.append(replace(row, ticker=before[-1].ticker, written=row.ticker))
+            row = replace(row, ticker=before[-1].ticker, written=row.ticker)
             ignored += 1
-            continue
         out.append(row)
-    return out, ignored
+        out.sort(key=_row_order)
+    return out, pair_day, typos, ignored
 
 
 def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]:

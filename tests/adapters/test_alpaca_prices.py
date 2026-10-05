@@ -1430,6 +1430,22 @@ class TestUnreadableTickers:
         assert resolver.resolve("XYZ", date(2022, 6, 1)) is None
         assert resolver.report.ended_spans == 1
 
+    def test_a_junk_row_never_carries_a_same_day_typo_on(self) -> None:
+        # code-review on #863: Ford's typo day lists F and FF; a later junk
+        # row must be read as F, never as FutureFuel's FF.
+        resolver = ListingResolver(
+            [
+                _listing("ff", "FF", date(2019, 1, 2), "Common Stock"),
+                _listing("ford", "F", date(2020, 1, 2), "Common Stock"),
+                _listing("ford", "F", date(2020, 4, 1), "Common Stock"),
+                _listing("ford", "FF", date(2020, 4, 1), "Common Stock"),
+                _listing("ford", "New York Stock Exchange", date(2020, 7, 1), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2020, 8, 3)) == "ff"
+        assert resolver.resolve("F", date(2020, 8, 3)) == "ford"
+        assert (resolver.report.unreadable, resolver.report.same_day_typos) == (1, 1)
+
     def test_a_dropped_junk_row_is_counted_once(self) -> None:
         day = date(2022, 6, 9)
         resolver = ListingResolver(
@@ -1639,6 +1655,7 @@ class TestAlpacaSymbols:
             "GOOG (Class C)",
             "BAC (Series L)",
             "XYZ (Pfd)",
+            "F (2029)",  # code-review on #863: a year is no footnote
             "F&G",
             "C/28",
             "CUBI/PC",
