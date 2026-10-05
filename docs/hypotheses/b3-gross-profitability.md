@@ -1,6 +1,6 @@
 # Hypothesis: B3, long-only gross profitability (GP/A) tilt, monthly
 
-**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 pending  ·  **Date:** 2026-10-03  ·  **Status:** draft, not registrable
+**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 pending  ·  **Date:** 2026-10-03  ·  **Amended:** 2026-10-04 (#851, `in_sample_start` follows H1's #842 amendment)  ·  **Status:** draft, not registrable
 
 Merging this file does not register it, and today it **cannot** be registered: the
 `profitability` family, its frozen keys and its signal do not exist in the engine (the
@@ -121,8 +121,9 @@ tests have one source:
    accepted after that instant on the rebalance session T is **invisible** at that
    read and enters the next month's read; one accepted before it is visible, as it was
    to anyone reading EDGAR before the close. The close is the calendar's, not 16:00 New
-   York: two month-ends in the windows are half days (2019-11-29 in sample, 2024-11-29 in
-   the holdout, close 13:00 New York), where a 14:00 acceptance is invisible. The signal
+   York: two month-ends in the windows are half days (2019-11-29, the first in-sample
+   rebalance, and 2024-11-29 in the holdout, close 13:00 New York), where a 14:00
+   acceptance is invisible. The signal
    function takes `t` itself and filters `known_at ≤ t` again, so a frame that carries a
    later row (a fake provider in a test, a provider bug) cannot score it (amendment
    #720, "The signal"). No fact is ever pulled forward to its period end, and the engine
@@ -213,7 +214,7 @@ this registration, and its overlap and standalone-file rules do not apply to it.
 slug = "b3-gross-profitability"
 family = "profitability"
 title = "B3: long-only gross profitability (GP/A) tilt, top 10% equal weight, monthly"
-in_sample_start = 2017-01-31
+in_sample_start = 2019-11-29
 
 [holdout]
 start = 2024-01-01
@@ -253,11 +254,23 @@ H1's where the question is the same):
   names) fires as it did for H1; it is already recorded for the Phase 4 spec.
 - **Holdout window**: H1's, `[2024-01-01, 2026-09-30]`. Months after that are Phase 4
   tracking, never holdout. The holdout is named here and never read from live settings.
-- **`in_sample_start`**: `2017-01-31`, H1's. Statement facts exist in companyfacts from
-  2009, so the binding constraint is Alpaca price history (ADR 0009, from 2016-01-04)
-  and the pre-2019 `snapshot_static` listing reliance (#35), both reported per rebalance
-  as for H1. The first rebalance scores most December fiscal-year names on FY2015 (its
-  10-K accepted in early 2016).
+- **`in_sample_start`**: `2019-11-29`, H1's since its #842 amendment (this file followed
+  on #851; it read `2017-01-31`, H1's original value, before). The real-data dry run
+  (#839) found the ADR 0006 universe **empty at every month-end from 2017-01-31 to
+  2019-06-28** on the owner's store: under #35 the only pre-2019 listings are
+  `snapshot_static` rows known at their 2026-10-03 fetch, and cover-page listings arrive
+  only from mid-2019. H1's Q8 amendment pins the first month-end at which the size cut
+  binds (at least `universe.top_n_by_cap` companies pass ADR 0006 rules 1–7) at
+  2019-11-29, with the sweep table, the rule and the iXBRL phase-in disclosure. B3 reads
+  the same store through the same `universe_as_of`, so the same month-end binds here, and
+  the pre-registration coverage check in H1's preamble covers B3 too: if H1 re-pins, B3
+  follows, before either registers. Statement facts exist in companyfacts from 2009 and
+  Alpaca bars from 2016-01-04 (ADR 0009), so neither facts nor prices bind; listings do,
+  exactly as for H1, and B3 inherits the iXBRL phase-in bias H1 discloses (for nine of
+  the 50 in-sample rebalances, 2019-11-29 to 2020-07-31, the pool the top-1000 cut binds
+  against is tilted to larger filers; from 2020-08-31 the universe is the ADR 0006
+  top 1000 in substance). The first rebalance scores most December fiscal-year names on
+  FY2018 (its 10-K accepted in early 2019, well inside `max_fact_age_days`).
 - **Costs**: the spec's placeholders, `per_side_bps = 15` and the ladder
   `[0, 30, 60, 100]`, as for H1, until Phase 4 paper fills recalibrate them; the
   strategy-lab family rules allow a higher base later, never a lower one.
@@ -344,17 +357,24 @@ run computes it.
   teeth for this table.
 - A `cost_drag` at 15 bp far from ≈ 12 × `turnover_monthly` × 2 × 15 bp, or a net CAGR
   that rises with the cost level: a cost-model bug.
-- A survivorship gap above `gap.count_share_threshold` at any rebalance, or a large
-  static-listing count in 2017–2018: a biased universe, as for H1.
+- A survivorship gap above `gap.count_share_threshold` at any rebalance: a biased
+  universe, as for H1. On the owner's store, a non-zero `n_static_listings` or an
+  `n_universe` below `universe.top_n_by_cap` at any rebalance: as for H1, whose red-flag
+  bullet says why the static count is zero by construction after #842 and why a short
+  universe means the size cut did not bind (a coverage hole inside the window). Before
+  #851 this bullet watched for a large static-listing count in 2017–2018; that reading is
+  moot with the window starting 2019-11-29.
 
 ## Power arithmetic
 
 Rebalance sessions and monthly returns are H1's exactly, since the windows and the
-calendar are the same (`tests/backtest/test_h1_file.py` checks the counts): **84
-rebalance sessions and 83 monthly returns** in sample (2017-01-31 to 2023-12-29; the
-2023-12-29 rebalance fills inside the holdout), **34 sessions and 33 returns** in the
-holdout run (`--start 2023-12-29 --end 2026-09-30`, which needs `--spend-holdout` and runs
-as `kind=holdout`), 116 returns together with no gap and no overlap.
+calendar are the same (`tests/backtest/test_h1_file.py` checks the counts): **50
+rebalance sessions and 49 monthly returns** in sample (2019-11-29 to 2023-12-29 since
+#842 and #851; 84 and 83 over 2017-01-31 to 2023-12-29 before; the first rebalance fills
+on 2019-12-02 and the 2023-12-29 rebalance fills inside the holdout), **34 sessions and
+33 returns** in the holdout run (`--start 2023-12-29 --end 2026-09-30`, which needs
+`--spend-holdout` and runs as `kind=holdout`), 82 returns together with no gap and no
+overlap.
 
 **t-statistic** (ADR 0005: t ≈ SR × √years, the excess Sharpe being the excess return
 over its tracking error), at the assumed 6%/yr tracking error and, for comparison, at
@@ -362,14 +382,17 @@ H1's 8.4%:
 
 | Window | Months | Years | t for +1 pp/yr at 6% TE | Excess needed for t ≈ 2 at 6% | Same at 8.4% TE |
 |---|---|---|---|---|---|
-| In-sample | 83 | 6.9 | **0.44** | **4.6 pp/yr** | 6.4 pp/yr |
+| In-sample | 49 | 4.1 | **0.34** | **5.9 pp/yr** | 8.3 pp/yr |
 | Holdout | 33 | 2.75 | 0.28 | 7.2 pp/yr | 10.1 pp/yr |
-| Both | 116 | 9.7 | 0.52 | 3.9 pp/yr | 5.4 pp/yr |
+| Both | 82 | 6.8 | 0.44 | 4.6 pp/yr | 6.4 pp/yr |
 
-A +0.5 pp/yr excess, the centre of the prior, would need about 580 years at 6%
-tracking error to reach t ≈ 2. Any in-sample excess large enough to be significant
-(about +4.6 pp/yr) is above the red-flag threshold, so it would read as a bug before it
-read as an edge. **The test cannot reach significance for any result the prior
+(Before #851 the in-sample row read 83 months, 6.9 years, t 0.44, 4.6 and 6.4 pp/yr,
+and the Both row 116 months, 9.7 years, 0.52, 3.9 and 5.4 pp/yr. The shorter window
+weakens an already powerless test; it does not change the conclusion below.) A +0.5
+pp/yr excess, the centre of the prior, would need about 580 years at 6% tracking error
+to reach t ≈ 2. Any in-sample excess large enough to be significant (about +5.9 pp/yr)
+is nearly twice the red-flag threshold, so it would read as a bug before it read as an
+edge. **The test cannot reach significance for any result the prior
 allows.** What the in-sample run can show is whether the engine reads annual facts
 correctly point-in-time (the look-ahead suites extended to this table), whether the
 coverage and turnover sit inside the prior, and whether the result sits inside it.
@@ -451,7 +474,8 @@ Stated before any run, per spec open question 10 (a), and read the way H1's is.
 the base-level `excess_cagr_spy` and the run-time `dsr_excess` in `trial_results` (N and
 V at run time), not the page's recomputation with today's N and V. The trial is the
 **first** `ok`, non-synthetic, `in_sample` trial of this hypothesis over the full default
-window [2017-01-31, 2023-12-29] that passed `quant-auditor`. A later trial replaces it
+window [2019-11-29, 2023-12-29] (the `in_sample_start` of #842 and #851) that passed
+`quant-auditor`. A later trial replaces it
 only when an audit logged a bug in the earlier one (a look-ahead in the fact read, a
 period-band or staleness defect, a derivation defect). Shorter or later-start in-sample
 runs never count. The holdout run neither retires nor promotes B3; its result is
@@ -463,8 +487,9 @@ Unlike H1, B3 is not the Phase 4 paper vehicle, so retirement ends its line: a l
 revisit is a new hypothesis with its own registration and budget (research-program §6).
 
 **The −1 pp/yr line is a decision rule committed in advance, not a statistical
-finding.** Each pp/yr of excess is worth about t ≈ 0.44 over the in-sample window at the
-assumed tracking error, so −1 pp/yr is inside one standard error of zero and inside the
+finding.** Each pp/yr of excess is worth about t ≈ 0.34 over the in-sample window at the
+assumed tracking error (0.44 before #851), so −1 pp/yr is inside one standard error of
+zero and inside the
 prior's range. It is the same line H1 drew, chosen so the two families are read alike;
 its job is to be a line drawn before the run.
 
@@ -571,5 +596,5 @@ N. This file is never edited after registration to fit a result.
 - **B3-8. The spanning diagnostic.** Keep it a registered research run outside the
   retirement rule (above), or add a `metrics` key (`alpha_vs_mtum_monthly`, its t) by
   spec amendment so the rule can read it. Recommendation: keep it outside; a stored
-  regression on 83 months has no power either, and the rule stays readable from two
+  regression on 49 months has no power either, and the rule stays readable from two
   stored values.
