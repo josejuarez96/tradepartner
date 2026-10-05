@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -459,8 +459,10 @@ def _ended(
     effective_on: date,
     status: str = "delisted",
     valid_from: date = date(1994, 1, 3),
+    end_session: date | None = None,
 ) -> dict[str, object]:
-    """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a Form 25."""
+    """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a
+    Form 25, its last bar before the security's next row `end_session`."""
     return {
         "security_id": security_id,
         "ticker": ticker,
@@ -468,7 +470,7 @@ def _ended(
         "valid_from": valid_from,
         "status": status,
         "effective_on": effective_on,
-        "end_session": None,
+        "end_session": end_session,
     }
 
 
@@ -480,7 +482,9 @@ def _evidence(
     ends: list[dict[str, object]] | None = None,
     as_of: date = RUN_DAY,
 ) -> RegistrantEvidence:
-    return registrant_evidence(facts, ends or [], as_of=as_of, quiet_after_days=180)
+    return registrant_evidence(
+        facts, ends or [], as_of=as_of, quiet_after_days=180, transfer_window_sessions=5
+    )
 
 
 # Real cases from backfill pre-flight F (#793), store values as filed.
@@ -1041,6 +1045,92 @@ class TestOwnDelisting:
         sessions = [date(y, m, 1) for y in range(2018, 2022) for m in range(1, 13)]
         for session in (s for s in sessions if s < date(2021, 6, 1)):
             assert with_end.resolve("GONE", session) == without.resolve("GONE", session)
+
+    SOTHEBYS = "0000823094"
+
+    def _sothebys(self, last_bar: date | None, later: date) -> ListingResolver:
+        # #847: Sotheby's went private (25-NSE 2019-10-03, effective 10-13;
+        # last bar 10-02) but filed a cover page for its debt on 2019-11-12
+        # naming BID; another issuer lists BID in 2026.
+        sid, listed = self.SOTHEBYS, date(2019, 7, 30)
+        return ListingResolver(
+            [
+                _listing(sid, "BID", listed, "Common Stock"),
+                _listing(sid, "BID", later, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=listed,
+                        end_session=last_bar,
+                    )
+                ],
+            ),
+        )
+
+    def test_a_cover_page_after_the_line_stopped_never_keeps_the_span(self) -> None:
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 11, 12))
+        assert resolver.resolve("BID", date(2019, 10, 2)) == self.SOTHEBYS
+        assert resolver.resolve("BID", date(2019, 10, 14)) is None
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+        assert not resolver.holds(self.SOTHEBYS, date(2026, 7, 20))
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (1, 0)
+
+    def test_a_row_within_the_transfer_window_of_the_last_bar_still_keeps_it(self) -> None:
+        # Five sessions strictly between the last bar and the next row: the
+        # line may still have traded (a relisting the session after the
+        # Form 25 took effect, #835).
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 10, 10))
+        assert resolver.resolve("BID", date(2026, 7, 20)) == self.SOTHEBYS
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (0, 1)
+
+    def test_a_row_after_more_than_the_window_ends_the_span(self) -> None:
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 10, 11))  # six between
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+
+    def test_without_a_last_bar_the_later_row_still_keeps_it(self) -> None:
+        # No bar evidence (a listing before the store's first bar): as before.
+        resolver = self._sothebys(None, date(2019, 11, 12))
+        assert resolver.resolve("BID", date(2026, 7, 20)) == self.SOTHEBYS
+
+    def test_a_new_issuer_of_the_dead_ticker_takes_it(self) -> None:
+        sid, listed = self.SOTHEBYS, date(2019, 7, 30)
+        resolver = ListingResolver(
+            [
+                _listing(sid, "BID", listed, "Common Stock"),
+                _listing(sid, "BID", date(2019, 11, 12), "Common Stock"),
+                _listing("0002000001", "BID", date(2026, 7, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=listed,
+                        end_session=date(2019, 10, 2),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("BID", date(2026, 7, 20)) == "0002000001"
+
+    def test_the_stopped_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: every session before the effective day keeps its
+        # mapping, with or without the stop.
+        stopped = self._sothebys(date(2019, 10, 2), date(2019, 11, 12))
+        kept = self._sothebys(None, date(2019, 11, 12))
+        day = date(2019, 7, 30)
+        while day < date(2019, 10, 13):
+            assert stopped.resolve("BID", day) == kept.resolve("BID", day), day
+            day += timedelta(days=1)
 
     def test_without_evidence_nothing_is_cut(self) -> None:
         resolver = ListingResolver([_listing("0000000002", "GONE", date(2018, 3, 1))])

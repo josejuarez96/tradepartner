@@ -89,6 +89,7 @@ def store_resolver(
         listing_ends_as_of(conn, at, settings).iter_rows(named=True),
         as_of=at.date(),
         quiet_after_days=settings.alpaca.registrant_quiet_days,
+        transfer_window_sessions=settings.master.transfer_window_sessions,
     )
     return ListingResolver(listings_as_of(conn, at).iter_rows(named=True), evidence)
 

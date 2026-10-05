@@ -40,7 +40,11 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   span's last row (`RegistrantEvidence.delisted_listings`), never before
   the day after the Form 25's acceptance. A later row of the same
   ticker (a late cover page, a relisting, a reorganized security's new
-  row) means the security went on trading, and the span runs on. From
+  row) means the security went on trading, and the span runs on, unless
+  the line had stopped (#847): more than `master.transfer_window_sessions`
+  sessions without a bar between the listing's last bar and that row (a
+  cover page filed for debt after going private) ends the span as if the
+  listing were its last row. From
   that day the ticker resolves to nothing until another span starts: it
   never falls back to an older company's span, and a reused ticker never
   prices the delisted security. Only a span that still holds the ticker
@@ -177,7 +181,7 @@ from tradepartner.adapters.prices import (
     bar_known_at,
     check_request,
 )
-from tradepartner.calendar import is_session, previous_session
+from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
@@ -350,7 +354,11 @@ class RegistrantEvidence:
     the effective days of its delisted (not transferred) equity listings,
     and each such listing as `(valid_from, ticker, effective day)` (#819:
     which span it ends; the ticker as `ListingResolver` keys it); the run's
-    day, and how many days without a share count make a company quiet."""
+    day, and how many days without a share count make a company quiet.
+    (#847) Each such listing's last bar before its security's next row,
+    keyed `(security_id, valid_from, ticker)`, and how many sessions
+    without a bar before that next row mean the line had stopped trading
+    (`master.transfer_window_sessions`; `None`: never judged)."""
 
     last_filed: Mapping[str, date]
     share_counts: Mapping[str, frozenset[tuple[date, float]]]
@@ -360,6 +368,20 @@ class RegistrantEvidence:
     delisted_listings: Mapping[str, tuple[tuple[date, str, date], ...]] = field(
         default_factory=dict
     )
+    last_bars: Mapping[tuple[str, date, str], date] = field(default_factory=dict)
+    stop_after_sessions: int | None = None
+
+    def stopped_before(self, security_id: str, valid_from: date, ticker: str, row: date) -> bool:
+        """True when the delisted listing `(security_id, valid_from, ticker)`
+        had stopped trading before a later row of its span on `row` (#847):
+        more than `stop_after_sessions` sessions strictly between its last
+        bar and `row`. False without a last bar or a window."""
+        last_bar = self.last_bars.get((security_id, valid_from, ticker))
+        if last_bar is None or self.stop_after_sessions is None:
+            return False
+        return _sessions_between(last_bar, row, self.stop_after_sessions + 1) > (
+            self.stop_after_sessions
+        )
 
     def left_on(self, security_id: str, since: date) -> date | None:
         """The first day `security_id` no longer trades, as far as the
@@ -394,6 +416,7 @@ def registrant_evidence(
     *,
     as_of: date,
     quiet_after_days: int,
+    transfer_window_sessions: int | None = None,
 ) -> RegistrantEvidence:
     """`RegistrantEvidence` from `facts` rows (`shares_outstanding` only;
     the UTC day of `known_at` is the filing day) and `listing_ends` rows
@@ -402,7 +425,8 @@ def registrant_evidence(
     `effective_on`, else the day after its `end_session`, never before the
     day after the Form 25's acceptance (`delisting_filed_at`, when given),
     with the listing's `valid_from` and ticker; a transfer is not
-    leaving)."""
+    leaving), with each such listing's `end_session` as its last bar and
+    `transfer_window_sessions` as the stop window (#847)."""
     last: dict[str, date] = {}
     counts: dict[str, set[tuple[date, float]]] = defaultdict(set)
     for row in facts:
@@ -414,6 +438,7 @@ def registrant_evidence(
         counts[company].add((row["as_of_date"], float(row["value"])))
     delisted: dict[str, set[date]] = defaultdict(set)
     ended: dict[str, set[tuple[date, str, date]]] = defaultdict(set)
+    last_bars: dict[tuple[str, date, str], date] = {}
     for row in listing_ends:
         if (
             row["status"] != DELISTED
@@ -430,9 +455,10 @@ def registrant_evidence(
         if day is not None:
             ticker = str(row["ticker"])
             delisted[str(row["security_id"])].add(day)
-            ended[str(row["security_id"])].add(
-                (row["valid_from"], alpaca_symbol(ticker) or ticker, day)
-            )
+            keyed = alpaca_symbol(ticker) or ticker
+            ended[str(row["security_id"])].add((row["valid_from"], keyed, day))
+            if row["end_session"] is not None:
+                last_bars[(str(row["security_id"]), row["valid_from"], keyed)] = row["end_session"]
     return RegistrantEvidence(
         last_filed=last,
         share_counts={company: frozenset(rows) for company, rows in counts.items()},
@@ -440,7 +466,18 @@ def registrant_evidence(
         as_of=as_of,
         quiet_after_days=quiet_after_days,
         delisted_listings={sid: tuple(sorted(rows)) for sid, rows in ended.items()},
+        last_bars=last_bars,
+        stop_after_sessions=transfer_window_sessions,
     )
+
+
+def _sessions_between(first: date, last: date, cap: int) -> int:
+    """XNYS sessions strictly between `first` and `last`, counted up to
+    `cap` (enough to tell a gap above a window)."""
+    count, day = 0, next_session(first)
+    while day < last and count < cap:
+        count, day = count + 1, next_session(day)
+    return count
 
 
 @dataclass(frozen=True)
@@ -622,24 +659,35 @@ class ListingResolver:
         `left` is the day the span stops holding its ticker because its own
         listing was delisted: the earliest effective day, inside the span,
         of a delisted equity listing of that ticker that is the span's last
-        row; else `None`. A delisted listing followed by another row of the
-        span (a late cover page, a relisting, a transfer outside the
-        transfer window, a reorganized security's new row) never ends it:
-        the security went on trading under the ticker. `kept` is true when
-        such a listing is what the span ran on through."""
+        row, or (#847) whose line had stopped trading before the span's
+        next row (`RegistrantEvidence.stopped_before`: a cover page filed
+        after going private); else `None`. A delisted listing followed by
+        another row of the span while the line still traded (a late cover
+        page, a relisting, a transfer outside the transfer window, a
+        reorganized security's new row) never ends it: the security went on
+        trading under the ticker. `kept` is true when such a listing is
+        what the span ran on through."""
         if self._evidence is None:
             return None, False
         start, last = days[0], days[-1]
+        evidence = self._evidence
+
+        def ends(valid_from: date, listed: str) -> bool:
+            if valid_from == last:
+                return True
+            following = min(d for d in days if d > valid_from)
+            return evidence.stopped_before(security_id, valid_from, listed, following)
+
         inside = [
-            (valid_from, day)
-            for valid_from, listed, day in self._evidence.delisted_listings.get(security_id, ())
+            (day, ends(valid_from, listed))
+            for valid_from, listed, day in evidence.delisted_listings.get(security_id, ())
             if (listed == ticker or (valid_from, listed) in aliases)
             and start <= valid_from
             and start < day
             and (end is None or day < end)
         ]
-        left = min((day for valid_from, day in inside if valid_from == last), default=None)
-        kept = any(valid_from < last for valid_from, _ in inside)
+        left = min((day for day, cut in inside if cut), default=None)
+        kept = any(not cut for _, cut in inside)
         return left, kept
 
     def _claim(
