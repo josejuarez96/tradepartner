@@ -632,7 +632,8 @@ def _ingest_filings(
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
-    found, _ = split_kept(stored_underived(conn, master, now, skip), keep)
+    derived = frozenset(row["security_id"] for row in master.securities)
+    found, _ = split_kept(stored_underived(conn, master, now, skip), keep, derived)
     record_underived(conn, run_id, now, found)
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "

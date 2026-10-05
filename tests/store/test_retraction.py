@@ -240,7 +240,10 @@ def test_split_kept_partitions_by_security_id_and_keeps_order() -> None:
         Underived("securities", {"security_id": "0000000002@2020-01-02", "known_at": known}),
         Underived("listings", {"security_id": "0000000001@2020-01-02", "known_at": known}),
     )
-    proposed, kept = split_kept(found, frozenset({"0000000001@2020-01-02"}))
+    keep = frozenset({"0000000001@2020-01-02"})
+    proposed, kept = split_kept(found, keep, frozenset())
     assert proposed == (found[1],)
     assert kept == (found[0], found[2])
-    assert split_kept(found, frozenset()) == (found, ())
+    assert split_kept(found, frozenset(), frozenset()) == (found, ())
+    # Derived again: the keep no longer applies (quant audit of #923).
+    assert split_kept(found, keep, keep) == (found, ())

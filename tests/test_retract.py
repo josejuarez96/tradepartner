@@ -497,3 +497,41 @@ def test_a_keep_list_never_rewrites_an_earlier_check(two: Settings) -> None:
     _ingest(keep, AFTER)
     assert {r["security_id"] for r in _rule(keep, AFTER.replace(hour=5))} == {OTHER_ID}
     assert _rule(keep, CHECK.replace(hour=3)) == before
+
+
+def test_a_kept_id_the_build_derives_again_is_not_kept(store: Settings) -> None:
+    """Quant audit of #923: once the build derives the kept security again,
+    a stale listing of it is proposed like any other. ACME (derived) stands
+    in for a successor derived again: `model_copy` skips the id validator."""
+    stale = {
+        "security_id": ACME,
+        "ticker": "OLDA",
+        "exchange": "NYSE",
+        "class_title": "Common Stock",
+        "valid_from": date(2018, 3, 1),
+        "known_at": FALSE_KNOWN,
+        "ingested_at": FALSE_KNOWN,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", stale)
+    result = master_retract(_keep(store, ACME), filings=_filings(), clock=lambda: CHECK)
+    assert (ACME, "OLDA") in {(u.row["security_id"], u.row.get("ticker")) for u in result.found}
+    assert result.kept == ()
+    assert f"master.keep_successors derived again, not kept: {ACME}" in result.summary()
+
+
+def test_a_keep_id_of_a_cik_not_judged_is_not_called_a_typo(two: Settings) -> None:
+    """Code review of #923: a failed filing leaves the CIK unjudged, so its
+    kept id has no underived row for that reason alone."""
+
+    class Failing(FixtureFilingSource):
+        _pending_failures: ClassVar[dict[str, tuple[str, str, str]]] = {
+            f"{ACME}-18-1": ("ParseError", "10-K", "bad cover")
+        }
+
+    result = master_retract(_keep(two, FALSE_ID), filings=_filings(Failing), clock=lambda: CHECK)
+    assert result.kept == ()
+    assert f"master.keep_successors not judged this run: {FALSE_ID}" in result.summary()
+    assert "with no underived row" not in result.summary()

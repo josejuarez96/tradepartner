@@ -31,9 +31,10 @@ whose key that build does not derive (`store.retraction.underived`).
   `master.keep_successors` (an owner-accepted successor the rules no longer
   derive, MTCH's `0000891103@2020-08-10` on #828) is never proposed: it is
   outside the row count, the digest and the `[traded]` check, and the dry
-  run lists it as kept, with the reason (`store.retraction.split_kept`). A
-  keep-list id with no underived row is named in the summary (a typo, or a
-  successor the rules derive again).
+  run lists it as kept, with the reason (`store.retraction.split_kept`).
+  The summary names every other keep-list id: one the build derives again
+  (the keep no longer applies, so its stale rows are proposed), one whose
+  CIK is not judged this run, and one with no underived row (a typo).
 - **Stamped under the lock.** The retraction's `known_at = ingested_at` is
   the clock read after the write lock is held, and the set is found at that
   instant, so no stored revision (an ingest that committed while the
@@ -81,6 +82,7 @@ from tradepartner.store.retraction import (
     RETRACT,
     RETRACTED,
     Underived,
+    cik_of,
     record_underived,
     split_kept,
     stored_underived,
@@ -110,7 +112,11 @@ class RetractResult:
     unjudged: frozenset[str] = frozenset()
     #: Underived rows of a `master.keep_successors` security: never proposed.
     kept: tuple[Underived, ...] = ()
-    #: `master.keep_successors` ids with no underived row in this run.
+    #: `master.keep_successors` ids the build derives again (not kept).
+    keep_derived: tuple[str, ...] = ()
+    #: `master.keep_successors` ids whose CIK is not judged this run.
+    keep_unjudged: tuple[str, ...] = ()
+    #: Other `master.keep_successors` ids with no underived row this run.
     keep_unmatched: tuple[str, ...] = ()
 
     @property
@@ -141,12 +147,17 @@ class RetractResult:
             f"at {self.at.isoformat()}"
         )
         if self.kept:
-            ids = sorted({u.row["security_id"] for u in self.kept})
+            held = sorted({u.row["security_id"] for u in self.kept})
             line += f"; kept {len(self.kept)} rows on {_KEEP_KEY} (owner-accepted): " + ", ".join(
-                ids
+                held
             )
-        if self.keep_unmatched:
-            line += f"; {_KEEP_KEY} with no underived row: " + ", ".join(self.keep_unmatched)
+        for ids, what in (
+            (self.keep_derived, "derived again, not kept"),
+            (self.keep_unjudged, "not judged this run"),
+            (self.keep_unmatched, "with no underived row"),
+        ):
+            if ids:
+                line += f"; {_KEEP_KEY} {what}: " + ", ".join(ids)
         if self.unjudged:
             named = sorted(self.unjudged)
             more = len(named) - _NAMED_CIKS
@@ -240,8 +251,10 @@ def master_retract(
         if at < built_at:
             raise RetractRefused(f"the clock went back from {built_at} to {at}; nothing judged")
         keep = frozenset(settings.master.keep_successors)
-        found, kept = split_kept(stored_underived(conn, build, at, unjudged.ciks), keep)
-        matched = {u.row["security_id"] for u in kept}
+        derived = frozenset(row["security_id"] for row in build.securities)
+        found, kept = split_kept(stored_underived(conn, build, at, unjudged.ciks), keep, derived)
+        rest = keep - derived - {u.row["security_id"] for u in kept}
+        unjudged_ids = {sid for sid in rest if cik_of(sid) in unjudged.ciks}
         result = RetractResult(
             found=found,
             at=at,
@@ -249,7 +262,9 @@ def master_retract(
             traded=_traded(conn, found),
             unjudged=unjudged.ciks,
             kept=kept,
-            keep_unmatched=tuple(sorted(keep - matched)),
+            keep_derived=tuple(sorted(keep & derived)),
+            keep_unjudged=tuple(sorted(unjudged_ids)),
+            keep_unmatched=tuple(sorted(rest - unjudged_ids)),
         )
         if not dry_run:
             if (result.rows, result.digest) != expect:
