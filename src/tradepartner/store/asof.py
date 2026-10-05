@@ -135,17 +135,31 @@ of scope here -- no acceptance criterion in this task requires an
 adjusted-volume convention, and the spec's "Data / interfaces" table
 documents `prices_daily` volume as raw only).
 
-**Every event's factor must be positive and finite, or this raises
+**Implausible dividend amounts are dropped, not applied (#841).** A
+dividend `amount >= prior_close` would make `1 - amount / prior_close`
+zero or negative, and DuckDB's `LN()` (used by the cumulative-factor
+window function below) *raises* on a non-positive input rather than
+returning `-inf`/`NaN`. Such a row is bad source data on one name (Alpaca
+attached Carlyle's $25 preferred issue price to CG's common on
+2017-09-13, a $22 stock), and raising failed every read that included
+the name, so a whole backtest trial. It is left unapplied (`NULL`
+factor) like a stale-prior-bar dividend and `dropped_dividends_as_of`
+reports it as `implausible_amount`: an amount at or above
+`adjust.max_dividend_to_prior_close` (default `1.0`, at most `1.0`)
+times the prior close. The bound is checked only on a usable prior close
+(the gap reasons come first), and only for a finite amount on a positive,
+finite close: a NaN or infinite amount, or a zero or NaN prior close, is
+corrupt data of another kind and still raises below.
+
+**Every other event's factor must be positive and finite, or this raises
 `ValueError`.** A split `ratio_or_amount` of `0` divides by zero (DuckDB
-returns `inf`, not an error, for `1.0 / 0.0`); a dividend `amount >=
-prior_close` makes `1 - amount / prior_close` zero or negative, and
-DuckDB's `LN()` (used by the cumulative-factor window function below)
-*raises* on a non-positive input rather than returning `-inf`/`NaN`. Both
-are bad store data, not "no factor" (`NULL`, which a dividend with no
-known prior bar can legitimately produce and which this function treats
-as "no adjustment from this event", not an error). Before ever computing
-`LN()`, a dedicated query checks every non-`NULL` event factor for
-`factor > 0 AND isfinite(factor)`, **and separately** rejects any
+returns `inf`, not an error, for `1.0 / 0.0`), and so does a NaN or
+infinite dividend amount or a zero or NaN prior close. That is bad store
+data, not "no factor" (`NULL`, which a dropped dividend produces and which
+this function treats as "no adjustment from this event", not an error).
+Before ever computing `LN()`, a dedicated query checks every non-`NULL`
+event factor for `factor > 0 AND isfinite(factor)`, **and separately**
+rejects any
 dividend with a negative `ratio_or_amount` even though `1 - (negative) /
 prior_close` is itself a perfectly positive, finite number greater than
 `1` (a dividend that *raises* the price is not a validation failure the
@@ -591,17 +605,40 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
             ASOF LEFT JOIN {_SESSIONS_VIEW} xe ON xe.session < ep.ex_date
             ASOF LEFT JOIN {_SESSIONS_VIEW} xp ON xp.session < ep.prior_session
         ),
-        -- Each event's own factor; NULL for a dividend with no prior bar,
-        -- one more than `max_prior_close_gap_sessions` sessions back, or
-        -- one outside the calendar (gap NULL).
+        -- Why a dividend is left unapplied, in this order; NULL when it
+        -- applies, and always for a split. `dropped_dividends_as_of`
+        -- reports this column as `reason`.
+        event_drop AS (
+            SELECT
+                *,
+                CASE WHEN action_type = 'dividend' THEN
+                    CASE
+                        WHEN prior_session IS NULL THEN 'no_prior_bar'
+                        WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
+                        WHEN gap_sessions > ? THEN 'stale_prior_bar'
+                        -- Only a finite amount on a positive, finite close: a
+                        -- NaN or infinite amount, or a zero or NaN close, is
+                        -- corrupt data `_raise_on_invalid_factor` names.
+                        WHEN isfinite(ratio_or_amount) AND isfinite(prior_close)
+                            AND prior_close > 0
+                            AND ratio_or_amount >= ? * prior_close
+                            THEN 'implausible_amount'
+                    END
+                END AS drop_reason
+            FROM event_gap
+        ),
+        -- Each event's own factor; NULL for a dividend with a drop reason:
+        -- no prior bar, one more than `max_prior_close_gap_sessions`
+        -- sessions back, one outside the calendar (gap NULL), or an amount
+        -- at or above `max_dividend_to_prior_close` of the prior close.
         event_factor AS (
             SELECT
                 *,
                 CASE
                     WHEN action_type = 'split' THEN 1.0 / ratio_or_amount
-                    WHEN gap_sessions <= ? THEN 1.0 - ratio_or_amount / prior_close
+                    WHEN drop_reason IS NULL THEN 1.0 - ratio_or_amount / prior_close
                 END AS factor
-            FROM event_gap
+            FROM event_drop
         )
     """
 
@@ -615,25 +652,26 @@ def _adjusted_params(
 ) -> tuple[str, list[Any]]:
     """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
     `t` and the bars filter (`latest_bars`), `t`, the actions filter and
-    `t_session` (`latest_actions`), and `max_prior_close_gap_sessions`
-    (`event_factor`). `t` must already be validated.
+    `t_session` (`latest_actions`), then `max_prior_close_gap_sessions`
+    and `max_dividend_to_prior_close` (`event_drop`). `t` must already be
+    validated.
 
-    The gap limit only matters for a dividend, so a splits-only query
-    binds `0` and never loads settings (`get_settings()` rereads the
+    Both limits only matter for a dividend, so a splits-only query binds
+    `0` and `1.0` and never loads settings (`get_settings()` rereads the
     environment on every call).
     """
     t_session = t.astimezone(_EXCHANGE_TZ).date()
     action_types = "'split', 'dividend'" if include_dividends else "'split'"
-    max_gap = 0
+    max_gap, max_share = 0, 1.0
     if include_dividends:
-        max_gap = (settings or get_settings()).adjust.max_prior_close_gap_sessions
+        adjust = (settings or get_settings()).adjust
+        max_gap, max_share = adjust.max_prior_close_gap_sessions, adjust.max_dividend_to_prior_close
 
     params: list[Any] = [t]
     bars_filter = _security_filter(security_ids, params)
     params.append(t)
     actions_filter = _security_filter(security_ids, params)
-    params.append(t_session)
-    params.append(max_gap)
+    params += [t_session, max_gap, max_share]
     return _adjusted_ctes(action_types, bars_filter, actions_filter), params
 
 
@@ -702,9 +740,13 @@ def adjusted_prices_as_of(
     that has no prior bar at all) is left unapplied; `dropped_dividends_
     as_of` lists those. `settings` defaults to `get_settings()`.
 
+    A dividend whose amount is at or above `settings.adjust.
+    max_dividend_to_prior_close` times its prior close is left unapplied
+    too, and reported as `implausible_amount` (#841).
+
     Raises `ValueError` if any known, effective event's own factor is
-    non-positive or non-finite (a split `ratio_or_amount` of `0`, or a
-    dividend `amount >= prior_close`), or a dividend amount is negative.
+    non-positive or non-finite (a split `ratio_or_amount` of `0`), or a
+    dividend amount is negative.
 
     `traded_only=True` drops zero-volume bars after adjusting, as
     `prices_as_of(traded_only=True)` (#787); the factors themselves are
@@ -798,9 +840,9 @@ def dropped_dividends_as_of(
 ) -> pl.DataFrame:
     """Dividends known by `t` with `ex_date <= t` that `adjusted_prices_as_of(
     ..., include_dividends=True)` leaves unapplied because it has no usable
-    prior close (#72): one row per `(security_id, ex_date)`, sorted by
-    both, with `ratio_or_amount`, `prior_session`, `gap_sessions` and
-    `reason`, one of:
+    prior close (#72) or an implausible amount (#841): one row per
+    `(security_id, ex_date)`, sorted by both, with `ratio_or_amount`,
+    `prior_session`, `gap_sessions` and `reason`, one of:
 
     - `"no_prior_bar"`: no bar before the ex-date is known at `t`
       (`prior_session` and `gap_sessions` are `NULL`);
@@ -808,7 +850,10 @@ def dropped_dividends_as_of(
       outside `calendar.start`..`calendar.end`, so the gap cannot be
       counted (`gap_sessions` is `NULL`);
     - `"stale_prior_bar"`: more than `settings.adjust.
-      max_prior_close_gap_sessions` XNYS sessions before the ex-date.
+      max_prior_close_gap_sessions` XNYS sessions before the ex-date;
+    - `"implausible_amount"` (#841): the amount is at or above
+      `settings.adjust.max_dividend_to_prior_close` times the prior close
+      (bad source data, e.g. a preferred issue price on the common).
 
     For `health` to count; `settings` defaults to `get_settings()`.
     Raises `ValueError` on the same invalid data `adjusted_prices_as_of`
@@ -825,13 +870,9 @@ def dropped_dividends_as_of(
             ratio_or_amount,
             prior_session,
             gap_sessions,
-            CASE
-                WHEN prior_session IS NULL THEN 'no_prior_bar'
-                WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
-                ELSE 'stale_prior_bar'
-            END AS reason
+            drop_reason AS reason
         FROM event_factor
-        WHERE action_type = 'dividend' AND factor IS NULL
+        WHERE drop_reason IS NOT NULL
         ORDER BY security_id, ex_date
     """
     with _sessions_registered(conn, include_dividends=True):

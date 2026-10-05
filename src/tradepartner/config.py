@@ -377,9 +377,20 @@ class AdjustConfig(BaseModel):
     dividend is left unapplied and reported by `dropped_dividends_as_of`,
     rather than sized against a close from weeks or years earlier. Must be
     positive: zero would drop every dividend.
+
+    `max_dividend_to_prior_close` (#841, not in the spec's list either) is a
+    sanity bound on the amount: a dividend at or above this share of its
+    prior close is bad source data (Alpaca attached Carlyle's $25 preferred
+    issue price to CG's common on 2017-09-13, a $22 stock), so it is left
+    unapplied and `dropped_dividends_as_of` reports it as
+    `implausible_amount`. The default `1.0` drops exactly the amounts that
+    would make the factor zero or negative; a lower value also drops
+    implausibly large ones below the close. In `(0, 1]`: above `1` such an
+    amount would reach `LN()` again.
     """
 
     max_prior_close_gap_sessions: int = Field(default=5, gt=0)
+    max_dividend_to_prior_close: float = Field(default=1.0, gt=0, le=1.0)
 
 
 class GapConfig(BaseModel):
