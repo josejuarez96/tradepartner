@@ -38,7 +38,7 @@ from tradepartner.config import Settings
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.exits import MissingAssetRefused
-from tradepartner.execution.run import stop_session
+from tradepartner.execution.plan import stop_session
 from tradepartner.execution.window import stop
 from tradepartner.store.db import open_read_only
 from tradepartner.store.journal import (
@@ -135,6 +135,12 @@ def test_the_stop_session_contains_the_request_or_is_the_next_session(
     requested: datetime, expected: date
 ) -> None:
     assert stop_session(requested) == expected
+
+
+def test_run_stop_session_is_the_one_rule_in_plan() -> None:
+    """`run.stop_session` is a re-export of `plan.stop_session` (#592): one rule
+    for `run`, `report` and `check`, not a copy that can drift."""
+    assert run_module.stop_session is stop_session
 
 
 # --- the stop run -------------------------------------------------------------------------

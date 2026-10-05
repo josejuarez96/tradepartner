@@ -71,15 +71,14 @@ from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import (
-    is_session,
     last_session_of_month,
-    next_session,
     previous_session,
     session_close,
 )
 from tradepartner.config import Settings
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import residue as residue_of
+from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
@@ -732,19 +731,12 @@ def _last_completed_rebalance_session(now: datetime) -> date:
             month -= 1
 
 
-def _stop_session(at: datetime) -> date:
-    """spec req 9: the calendar session containing `at`, or the next session when
-    `at` falls on a non-session day."""
-    day = _local_date(at)
-    return day if is_session(day) else next_session(day)
-
-
 def _stop_session_of(stops: Sequence[PaperWindowStopRow]) -> date | None:
-    """The stop session (`_stop_session`) of the window's `requested` stop, or
+    """The stop session (`plan.stop_session`) of the window's `requested` stop, or
     None when the window was never asked to stop (still open, or abandoned with
     no `requested` row of its own kind read here)."""
     requested = [s for s in stops if s.state == "requested"]
-    return _stop_session(min(s.at for s in requested)) if requested else None
+    return stop_session_of_request(min(s.at for s in requested)) if requested else None
 
 
 def _frozen_fill_price(window: PaperWindowRow) -> Literal["close", "open"]:
