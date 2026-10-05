@@ -28,7 +28,7 @@ at raw `prices_daily` instead of the point-in-time `latest_bars` CTE.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import duckdb
@@ -44,6 +44,7 @@ from tradepartner.store.asof import (
     listings_as_of,
     live_actions_as_of,
     prices_as_of,
+    statement_facts_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
 
@@ -95,7 +96,9 @@ def test_snapshot_static_listing_invariant_under_truncation_without_exemption(
     assert visible == [0, 0, 1]
 
 
-@pytest.mark.parametrize("func", [prices_as_of, facts_as_of, listings_as_of, live_actions_as_of])
+@pytest.mark.parametrize(
+    "func", [prices_as_of, facts_as_of, listings_as_of, live_actions_as_of, statement_facts_as_of]
+)
 def test_as_of_function_invariant_under_truncation(
     fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, func: AsOfFunc
 ) -> None:
@@ -469,5 +472,91 @@ def test_re_dated_accession_rows_invariant_under_truncation() -> None:
             }
         finally:
             truncated_store.close()
+    finally:
+        conn.close()
+
+
+def _statement_fact_row(
+    conn: duckdb.DuckDBPyConnection,
+    cik: str,
+    period_end: date,
+    value: float,
+    *,
+    known_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "statement_facts",
+        {
+            "cik": cik,
+            "fact_name": "revenue",
+            "xbrl_tag": "us-gaap:Revenues",
+            "period_start": date(period_end.year - 1, 1, 1),
+            "period_end": period_end,
+            "period_days": (period_end - date(period_end.year - 1, 1, 1)).days,
+            "value": value,
+            "unit": "USD",
+            "form": "10-K",
+            "filing_accession": "0001234567-21-000001",
+            "basis": "reported",
+            "comparative": False,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_statement_fact_invariant_under_truncation_when_its_cik_is_known_later() -> None:
+    """T76b (#660): the fixture's one multi-class CIK (CIK0001000006) has
+    its `securities` rows known well *before* its statement fact, so the
+    main parametrized invariance test never exercises a `securities` row
+    becoming known *after* the statement fact it would otherwise join to
+    -- exactly the ordering that would expose a join that forgot
+    `securities_as_of`'s own `known_at <= t` filter (it would see the
+    fact and the not-yet-known security together at every probe, truncated
+    or not, same as a missing filter on a revised corporate action can't be
+    caught by a fixture with no revision, `test_revised_split_invariant_
+    under_truncation` above).
+
+    This builds its own synthetic store (not the shared `fixture_store`
+    the module's `truncated` fixture wraps) and its own `TruncatedStore`
+    over it, reusing only the harness's probe helpers.
+    """
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    try:
+        cik = "CIK0009988776"
+        fact_known = datetime(2021, 2, 1, 20, 30, tzinfo=UTC)
+        security_known = datetime(2021, 2, 10, 20, 30, tzinfo=UTC)
+        _statement_fact_row(conn, cik, date(2020, 12, 31), 500000.0, known_at=fact_known)
+        insert_row(
+            conn,
+            "securities",
+            {
+                "security_id": "SEC_LATE_MASTER_INVARIANCE",
+                "cik": cik,
+                "name": "Late Master Inc",
+                "benchmark": False,
+                "known_at": security_known,
+                "ingested_at": security_known,
+                "source": "test",
+                "provenance": "filing",
+            },
+        )
+        store = TruncatedStore(conn)
+        try:
+            for t in probe_timestamps(conn):
+                full = statement_facts_as_of(conn, t)
+                result = statement_facts_as_of(store.at(t), t)
+                assert full.equals(result), f"disagreed at T={t!r}"
+            # Direct check either side of the later boundary: invisible
+            # once the fact alone is known, visible once the security is too.
+            assert statement_facts_as_of(conn, security_known - timedelta(seconds=1)).height == 0
+            assert statement_facts_as_of(conn, security_known).height == 1
+        finally:
+            store.close()
     finally:
         conn.close()

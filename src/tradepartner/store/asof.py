@@ -7,12 +7,33 @@ Every function here takes a tz-aware UTC `t` ("T" in the spec's
 Rows are never updated in place, so "latest revision" is always a query,
 never a stored flag.
 
-Only four of the six as-of functions the spec lists live here:
-`prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`,
-plus `dropped_dividends_as_of`, which reports the dividends
-`adjusted_prices_as_of` leaves unapplied (#72).
-`securities_as_of`, `universe_as_of` and `survivorship_gap` are later plan
-tasks (T8, T13, T15) and are out of scope for this module.
+Five of the eight as-of functions the spec lists live here: `prices_as_of`,
+`adjusted_prices_as_of`, `facts_as_of`, `listings_as_of` and
+`statement_facts_as_of` (#660, T76b), plus `dropped_dividends_as_of`, which
+reports the dividends `adjusted_prices_as_of` leaves unapplied (#72) and is
+not itself one of the spec's eight. The other three live elsewhere, each
+owned by the module that writes its own table: `securities_as_of` in
+`store.master` (T8; the security master owns `securities`/`listings`
+writes, and `statement_facts_as_of` below calls it rather than duplicating
+its latest-revision query), `universe_as_of` in `universe.py` (T13) and
+`survivorship_gap` in `gap.py` (T15) -- all three shipped; out of scope
+for this module, not later tasks.
+
+**`statement_facts_as_of` has no revision to pick** (spec "Definitions" >
+Revision, exception): `statement_facts`'s `UNIQUE (cik, fact_name,
+period_end, period_days)` excludes `known_at`, so each key has at most one
+row ever -- "latest known at T" and "known at T" coincide, and the read is
+a plain `known_at <= t` filter, no `ROW_NUMBER()` needed. The join through
+`securities_as_of(t)` on `cik` is what makes this read point-in-time
+overall: a CIK with no `securities` row known at `t` contributes no rows
+(invisible at `t`, same as everywhere else in this module), and a
+multi-class CIK's one statement row is repeated once per `security_id`
+`securities_as_of(t)` lists for it at `t` -- so a class added after `t`
+does not yet pull the CIK's statement facts in under its own id. A class
+`securities_as_of` ever stops listing at some T (a delisted class stays
+listed today; #859's retraction is a later task) would drop out here too,
+the same way every other function in this module defers to whatever that
+one function decides a security's existence is.
 
 **Return type: `polars.DataFrame`.** ADR 0004 adopts polars for
 dataframes, and it is already a T1 runtime dependency. Every function
@@ -215,6 +236,16 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 _PRICE_KEY: tuple[str, ...] = ("security_id", "session")
 _FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "as_of_date", "class_member")
 _LISTING_KEY: tuple[str, ...] = ("security_id", "ticker", "exchange", "valid_from")
+#: `statement_facts_as_of`'s result key (after the `cik` -> `security_id`
+#: join, spec "Data / interfaces" > Amendment 2026-10-03): not
+#: `statement_facts`'s own natural key (`cik, fact_name, period_end,
+#: period_days`, its `UNIQUE` constraint) -- a multi-class CIK's one row
+#: becomes one row per `security_id`, so `security_id` replaces `cik` here.
+_STATEMENT_FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "period_end", "period_days")
+
+#: View name `statement_facts_as_of` registers the `securities_as_of(t)`
+#: frame under, to join `statement_facts` against it by `cik` in SQL.
+_STATEMENT_SECURITIES_VIEW = "_asof_statement_securities"
 
 #: `PARTITION BY` for an action's identity (#108): the source's id when it
 #: gave one, else `(action_type, ex_date)`. Every reader of
@@ -520,6 +551,61 @@ def listings_as_of(
     """
     t = _validate_t(t)
     return _latest_as_of(conn, "listings", _LISTING_KEY, t, security_ids)
+
+
+def statement_facts_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """`statement_facts` rows known by `t` (amendment 2026-10-03, #660; plan
+    T76b), joined through `securities_as_of(t)` on `cik`: one row per
+    `(security_id, fact_name, period_end, period_days)`, sorted by that key.
+    Columns: `security_id` then every `statement_facts` column in schema
+    order (`cik` included).
+
+    `statement_facts` holds only the first-accepted vintage of each key
+    (its `UNIQUE` excludes `known_at` -- see this module's docstring), so
+    this is a plain `known_at <= t` filter, not a latest-revision query.
+
+    The join is what makes this point-in-time: a CIK with no `securities`
+    row known at `t` contributes nothing, and a dual- (or multi-) class
+    CIK's one row is repeated once per `security_id` that
+    `tradepartner.store.master.securities_as_of` lists for it at `t` --
+    this function calls that one rather than re-deriving which `security_id`s
+    a `cik` maps to.
+
+    `security_ids`, when given, is passed straight to `securities_as_of`
+    (an empty sequence therefore joins against no securities, returning no
+    rows -- `_security_filter`'s usual meaning); every row this returns
+    already carries a `security_id` from that call, so no second filter is
+    needed here.
+
+    `t` must be tz-aware (a bare date raises `TypeError`, a naive
+    `datetime` raises `ValueError` -- same rules as every other function in
+    this module).
+    """
+    t = _validate_t(t)
+    # Imported here, not at module level: `store.master` imports
+    # `_latest_as_of` from this module, so a top-level import the other way
+    # would be circular. `securities_as_of` already applies every rule
+    # (including any retraction, #859) for "which securities exist at t" --
+    # this function must not re-implement that query.
+    from tradepartner.store.master import securities_as_of
+
+    securities = securities_as_of(conn, t, security_ids).select("security_id", "cik")
+    conn.register(_STATEMENT_SECURITIES_VIEW, securities)
+    try:
+        sql = f"""
+            SELECT s.security_id, f.*
+            FROM statement_facts f
+            JOIN {_STATEMENT_SECURITIES_VIEW} s ON s.cik = f.cik
+            WHERE f.known_at <= ?
+            ORDER BY {", ".join(_STATEMENT_FACT_KEY)}
+        """
+        return conn.execute(sql, [t]).pl()
+    finally:
+        conn.unregister(_STATEMENT_SECURITIES_VIEW)
 
 
 def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> str:
