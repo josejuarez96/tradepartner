@@ -216,6 +216,31 @@ def test_splits_given_in_both_places_is_refused(tmp_path: Path, settings: Settin
         parse_experiment_file(path, experiments_dir, settings=settings)
 
 
+def test_default_ci_level_hashes_the_same_as_writing_it_explicitly(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """code-review on #935: `primary.ci_level` defaults to 0.95 when the file omits
+    it (`_DEFAULT_CI_LEVEL`). The resolved value must be baked back into the hashed
+    keys, or a file that omits it and one that writes `ci_level = 0.95` explicitly
+    -- parameter-identical -- would hash differently, which breaks req 2's
+    amendment check (`amends_sha256` is compared against `params_sha256`)."""
+    original = (FIXTURES / "e1h-demand-deterioration-revenue.md").read_text(encoding="utf-8")
+    original = original.replace('["ER-4", "ER-5", "INT-4"]', '["FX-1"]')
+    assert "ci_level = 0.95\n" in original
+    without_ci_level = original.replace("ci_level = 0.95\n", "")
+
+    with_dir, with_path = _fixture_experiment_tree(tmp_path, "with_ci_level", original)
+    without_dir, without_path = _fixture_experiment_tree(
+        tmp_path, "without_ci_level", without_ci_level
+    )
+
+    with_default = parse_experiment_file(with_path, with_dir, settings=settings)
+    without_default = parse_experiment_file(without_path, without_dir, settings=settings)
+
+    assert with_default.primary_ci_level == without_default.primary_ci_level == 0.95
+    assert with_default.params_sha256 == without_default.params_sha256
+
+
 def test_event_dates_are_normalised_to_utc_regardless_of_source_timezone(tmp_path: Path) -> None:
     """quant-auditor, PR #935 SHOULD FIX 1: the same instant must read as the same
     date whether the export's own column is stamped naive, in UTC, or in another

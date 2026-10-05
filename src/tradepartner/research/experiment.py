@@ -233,6 +233,8 @@ def canonical_experiment_json(block: Mapping[str, Any]) -> str:
 
 
 def experiment_sha256(block: Mapping[str, Any]) -> str:
+    """SHA-256 of `block`'s canonical JSON (`params_sha256`): one parameter set has
+    one hash whoever computes it, mirroring `store.registry.params_sha256`."""
     return sha256(canonical_experiment_json(block).encode("utf-8")).hexdigest()
 
 
@@ -444,6 +446,11 @@ def parse_experiment_file(
             f"{path}: primary.ci_level must be in (0, 1), got {ci_level_raw!r}"
         )
     primary_ci_level = float(ci_level_raw)
+    # Bake the resolved value back into `flat` so the canonical hash is the same
+    # whether the file wrote `ci_level = 0.95` explicitly or left it to default
+    # (code-review on #935: a `.get(key, default)` fallback must not make two
+    # parameter-identical files hash differently).
+    flat["primary.ci_level"] = primary_ci_level
     primary_min_clusters = _require_int("primary.min_clusters", flat["primary.min_clusters"], path)
     if primary_min_clusters < 1:
         raise ExperimentFileError(
