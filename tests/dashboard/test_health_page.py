@@ -265,6 +265,33 @@ def test_render_marks_a_stale_store(monkeypatch: pytest.MonkeyPatch, store_path:
     assert "stale:" not in _text(_app(monkeypatch, store_path))
 
 
+@pytest.mark.parametrize("status", ["repaired", "filled"])
+def test_a_maintenance_run_is_a_caution_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path, status: str
+) -> None:
+    # #833: a successful repair-resolution or fill-holes run is deliberately
+    # never `ok` (module docstring), but it is not a failure either; the
+    # "Sources" card must not show it as critical. Started after the
+    # fixture's `ok` run (so it is the latest) but finished no later than
+    # `T` (so `last_ingests` still counts it as known).
+    _write(
+        store_path,
+        """
+        INSERT INTO ingestion_runs
+        (run_id, started_at, finished_at, status, source, mode, rows_added,
+         chunk_cursor, message)
+        VALUES (2, ?, ?, ?, ?, 'maintenance', 0, NULL, 'fixture run')
+        """,
+        [FINISHED - timedelta(minutes=2), FINISHED, status, SOURCES[0]],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert f"latest run: {status}" in text
+    assert ":red-badge[" not in text
+    assert ":orange-badge[" in text
+
+
 def test_render_empty_store_has_no_warning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "empty.duckdb"
     with duckdb.connect(str(path)) as conn:
