@@ -35,7 +35,8 @@ import os
 import re
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -490,6 +491,20 @@ class GapConfig(BaseModel):
 HypothesisFamily = Literal["momentum", "oracle"]
 _HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 
+# Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
+# ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
+# `HypothesisFamily` since both are the enumerations a hypothesis file pins.
+Cadence = Literal["month_end", "week_end", "daily"]
+SignalAnchor = Literal["month_end", "offset"]
+
+# A family's lineage (strategy-lab spec open question 11): every non-`oracle` family in
+# `HypothesisFamily` has an entry here, either a parent family or `None` for a **root**
+# family whose signal is unrelated to momentum's. Adding a family is one reviewed code
+# change to the literal and this table together, whose PR states why it is a child or a
+# root; a child's holdout may only start after its parent's `holdout.end` and only once
+# the parent has spent its holdout or reached its spend cap (`store/registry.py`).
+FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {"momentum": None}
+
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
 # silently to the default, and a NaN or infinite value must fail rather than turn a
@@ -599,15 +614,172 @@ class BacktestConfig(BaseModel):
 class MetricsConfig(BaseModel):
     """Metric settings (spec reqs 7 and 15).
 
-    No `periods_per_year`: `MONTHS_PER_YEAR = 12` is a constant derived from the ADR 0006
-    monthly cadence. `red_flag_excess_cagr_pp` marks a trial for a look-ahead and cost
-    audit; it is a reported flag, never a gate (spec open question 6).
+    No `periods_per_year`: `PERIODS_PER_YEAR` (12, 52, 252 by cadence; ADR 0012,
+    `backtest/schedule.py`, T94) is a derived constant table, not config, and
+    `MONTHS_PER_YEAR = 12` is its `month_end` entry. `red_flag_excess_cagr_pp` marks a
+    trial for a look-ahead and cost audit; it is a reported flag, never a gate (spec
+    open question 6).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     risk_free_rate: float = 0.0
     red_flag_excess_cagr_pp: float = Field(default=3.0, ge=0)
+
+
+# --- Strategy lab: schedule and lab sections (docs/specs/strategy-lab.md, T93) ---
+
+
+def _settings_has_key(dotted_key: str) -> bool:
+    """`True` iff `dotted_key` (e.g. `"strategy.formation_months"`) names a real field on
+    `Settings`, walked through its nested section models. Used only to validate
+    `lab.sweepable_keys` entries against typos: a key `Settings` lacks must be refused,
+    never silently accepted as an axis that can never vary."""
+    section, _, rest = dotted_key.partition(".")
+    if not rest:
+        return section in Settings.model_fields
+    field = Settings.model_fields.get(section)
+    if field is None:
+        return False
+    model = field.annotation
+    if not (isinstance(model, type) and issubclass(model, BaseModel)):
+        return False
+    return rest in model.model_fields
+
+
+class ScheduleConfig(BaseModel):
+    """Cadence and signal anchor (strategy-lab spec "Config keys"; ADR 0012, superseding
+    ADR 0006's Cadence section). Frozen per hypothesis like the universe
+    (`backtest/frozen.py`, T96): once a hypothesis registers, these never change for it.
+    `paper start` refuses anything but `rebalance_cadence = month_end` (paper-trading
+    spec req 14); only the backtest path exercises `week_end` and `daily`.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    rebalance_cadence: Cadence = "month_end"
+    signal_anchor: SignalAnchor = "month_end"
+
+
+# Forbidden `lab.sweepable_keys` prefixes (strategy-lab spec req 1, "Config keys"):
+# costs are sensitivities inside a trial (backtest spec req 6), the universe is not
+# tuned on P&L (ADR 0006 guard a), `execution.fill_price` is a convention (ADR 0006), and
+# the rest are data or accounting rules a hypothesis never varies. Pinned by value in
+# tests/test_config.py; the `Settings` validator below refuses any `lab.sweepable_keys`
+# entry under one of these.
+FORBIDDEN_AXIS_PREFIXES: tuple[str, ...] = (
+    "costs.",
+    "universe.",
+    "holdout.",
+    "gap.",
+    "adjust.",
+    "master.",
+    "metrics.",
+    "backtest.",
+    "benchmarks",
+    "alpaca.",
+    "execution.",
+)
+
+_DEFAULT_SWEEPABLE_KEYS: tuple[str, ...] = (
+    "strategy.formation_months",
+    "strategy.skip_months",
+    "strategy.top_fraction",
+    "strategy.weighting",
+    "strategy.signal_total_return",
+    "schedule.rebalance_cadence",
+    "schedule.signal_anchor",
+)
+
+# Placeholders (plan approach choice 4; open question 3 on #933, not yet answered): the
+# measured seconds a single backtest variant takes at each cadence. Until T114's
+# measurement run, these are scaled only by how many more rebalances a faster cadence
+# runs per year relative to `month_end` (about 4 ISO weeks and 21 XNYS sessions per
+# month), never measured; `backtest/quiet.py`'s `seconds_per_variant` (T106) falls back
+# to this table when no measured figure exists.
+_DEFAULT_SECONDS_PER_VARIANT: dict[Cadence, float] = {
+    "month_end": 1.0,
+    "week_end": 4.0,
+    "daily": 20.0,
+}
+
+
+class LabConfig(BaseModel):
+    """Strategy-lab sweep rules (strategy-lab spec "Config keys").
+
+    `sweepable_keys` names every `Settings` key a sweep file's `[grid]` may vary
+    (validated against `FORBIDDEN_AXIS_PREFIXES` and against `Settings` itself on the
+    `Settings` model, since that check needs the whole model); `axis_lattice` is a step
+    per continuous sweepable key (an integer axis needs none) and its keys must be a
+    subset of `sweepable_keys`. `promotion_min_dsr_excess` and `min_sharpe_variance_annual`
+    are the promotion floor and the V floor (spec open question 4); `max_variants_per_sweep`
+    bounds one sweep (open question 5); `max_family_holdout_spends` and
+    `max_family_promotions` are copied into `family_rules` at a family's first
+    registration (open question 10). `sweep_time_budget_minutes` and the
+    `registry_size_*` guards are placeholders the measurement task (T114) replaces.
+    `quiet_intervals`, `quiet_weekdays` and `quiet_timezone` describe the ingest plist's
+    window and days; `paper_run_lead_minutes` is how long before the submit window the
+    paper plist fires. `seconds_per_variant_default` is drafted here as config rather
+    than a code constant (code standards; approach choice 4); it is not in the spec's
+    "Config keys" list.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    sweepable_keys: list[str] = Field(default_factory=lambda: list(_DEFAULT_SWEEPABLE_KEYS))
+    max_variants_per_sweep: int = Field(default=100, gt=0)
+    max_promotions_per_sweep: int = Field(default=1, gt=0)
+    max_family_promotions: int = Field(default=2, gt=0)
+    promotion_min_dsr_excess: float = Field(default=0.5, ge=0)
+    min_sharpe_variance_annual: float = Field(default=0.04, ge=0)
+    max_failures_per_variant: int = Field(default=2, ge=0)
+    max_family_holdout_spends: int = Field(default=3, gt=0)
+    sweep_time_budget_minutes: float = Field(default=480.0, gt=0)
+    sweep_detail_level: Literal["full", "summary"] = "summary"
+    axis_lattice: dict[str, float] = Field(default_factory=lambda: {"strategy.top_fraction": 0.01})
+    quiet_intervals: list[tuple[str, str]] = Field(default_factory=lambda: [("16:00", "21:00")])
+    quiet_weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
+    quiet_timezone: str = "America/New_York"
+    paper_run_lead_minutes: int = Field(default=30, ge=0)
+    registry_size_warn_gb: float = Field(default=20.0, gt=0)
+    registry_size_refuse_gb: float = Field(default=50.0, gt=0)
+    seconds_per_variant_default: dict[Cadence, float] = Field(
+        default_factory=lambda: dict(_DEFAULT_SECONDS_PER_VARIANT)
+    )
+
+    @field_validator("quiet_timezone")
+    @classmethod
+    def _validate_quiet_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"lab.quiet_timezone {value!r} is not a valid IANA timezone") from exc
+        return value
+
+    @field_validator("quiet_weekdays")
+    @classmethod
+    def _validate_quiet_weekdays(cls, value: list[int]) -> list[int]:
+        bad = [day for day in value if day < 0 or day > 6]
+        if bad:
+            raise ValueError(f"lab.quiet_weekdays entries must be 0-6 (Monday-Sunday), got {bad}")
+        return value
+
+    @field_validator("seconds_per_variant_default")
+    @classmethod
+    def _validate_seconds_per_variant_default(
+        cls, value: dict[Cadence, float]
+    ) -> dict[Cadence, float]:
+        missing = sorted(set(get_args(Cadence)) - set(value))
+        if missing:
+            raise ValueError(f"lab.seconds_per_variant_default is missing an entry for {missing}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_axis_lattice_keys_are_sweepable(self) -> LabConfig:
+        unsweepable = sorted(set(self.axis_lattice) - set(self.sweepable_keys))
+        if unsweepable:
+            raise ValueError(f"lab.axis_lattice key(s) {unsweepable} are not in lab.sweepable_keys")
+        return self
 
 
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
@@ -817,6 +989,8 @@ class Settings(BaseSettings):
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    lab: LabConfig = Field(default_factory=LabConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     paper: PaperConfig = Field(default_factory=PaperConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
@@ -855,6 +1029,21 @@ class Settings(BaseSettings):
         # a plain `raise`, means nothing but the already-validated `self` is ever
         # touched, so only the env var *names* below can appear in the message.
         self._validate_alert_channel_is_usable()
+
+    @model_validator(mode="after")
+    def _validate_lab_sweepable_keys(self) -> Settings:
+        """`lab.sweepable_keys` (strategy-lab spec req 1) may name only a real
+        `Settings` key, outside `FORBIDDEN_AXIS_PREFIXES`; this needs the whole model
+        (to resolve a dotted key), so it lives here rather than on `LabConfig` alone."""
+        for key in self.lab.sweepable_keys:
+            if key.startswith(FORBIDDEN_AXIS_PREFIXES):
+                raise ValueError(
+                    f"lab.sweepable_keys entry {key!r} is under a forbidden prefix "
+                    f"{FORBIDDEN_AXIS_PREFIXES}"
+                )
+            if not _settings_has_key(key):
+                raise ValueError(f"lab.sweepable_keys entry {key!r} names a key Settings lacks")
+        return self
 
     def _validate_alert_channel_is_usable(self) -> None:
         """#544: `AlertsConfig._validate_channels` only checks that a non-store

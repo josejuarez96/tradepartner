@@ -11,14 +11,18 @@ from __future__ import annotations
 import os
 from datetime import date
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from tradepartner.config import (
+    FAMILY_PARENTS,
+    FORBIDDEN_AXIS_PREFIXES,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
     ExecutionConfig,
+    HypothesisFamily,
     PaperConfig,
     Settings,
     _default_env_file,
@@ -491,6 +495,165 @@ def test_env_example_names_no_holdout_key() -> None:
     assert "HOLDOUT__" not in env_example.read_text(encoding="utf-8").upper()
 
 
+# --- Strategy lab: `schedule` and `lab` sections (docs/specs/strategy-lab.md, T93) ---
+
+
+def test_env_example_names_schedule_and_lab_keys() -> None:
+    """`.env.example` gains the `schedule.*` and `lab.*` lines (spec, Config keys)."""
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    text = env_example.read_text(encoding="utf-8").upper()
+    assert "SCHEDULE__" in text
+    assert "LAB__" in text
+
+
+def test_schedule_defaults() -> None:
+    s = _settings().schedule
+    assert s.rebalance_cadence == "month_end"
+    assert s.signal_anchor == "month_end"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"rebalance_cadence": "quarterly"},
+        {"signal_anchor": "weekly"},
+    ],
+)
+def test_schedule_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, schedule=override)
+
+
+def test_lab_defaults() -> None:
+    lab = _settings().lab
+    assert lab.sweepable_keys == [
+        "strategy.formation_months",
+        "strategy.skip_months",
+        "strategy.top_fraction",
+        "strategy.weighting",
+        "strategy.signal_total_return",
+        "schedule.rebalance_cadence",
+        "schedule.signal_anchor",
+    ]
+    assert lab.max_variants_per_sweep == 100
+    assert lab.max_promotions_per_sweep == 1
+    assert lab.max_family_promotions == 2
+    assert lab.promotion_min_dsr_excess == pytest.approx(0.5)
+    assert lab.min_sharpe_variance_annual == pytest.approx(0.04)
+    assert lab.max_failures_per_variant == 2
+    assert lab.max_family_holdout_spends == 3
+    assert lab.sweep_time_budget_minutes == pytest.approx(480.0)
+    assert lab.sweep_detail_level == "summary"
+    assert lab.axis_lattice == {"strategy.top_fraction": 0.01}
+    assert lab.quiet_intervals == [("16:00", "21:00")]
+    assert lab.quiet_weekdays == [0, 1, 2, 3, 4]
+    assert lab.quiet_timezone == "America/New_York"
+    assert lab.paper_run_lead_minutes == 30
+    assert lab.registry_size_warn_gb == pytest.approx(20.0)
+    assert lab.registry_size_refuse_gb == pytest.approx(50.0)
+    assert lab.seconds_per_variant_default == {
+        "month_end": 1.0,
+        "week_end": 4.0,
+        "daily": 20.0,
+    }
+
+
+def test_forbidden_axis_prefixes_pinned() -> None:
+    """Pinned by value (strategy-lab spec req 1)."""
+    assert FORBIDDEN_AXIS_PREFIXES == (
+        "costs.",
+        "universe.",
+        "holdout.",
+        "gap.",
+        "adjust.",
+        "master.",
+        "metrics.",
+        "backtest.",
+        "benchmarks",
+        "alpaca.",
+        "execution.",
+    )
+
+
+@pytest.mark.parametrize("prefix", FORBIDDEN_AXIS_PREFIXES)
+def test_sweepable_keys_entry_under_a_forbidden_prefix_rejected(prefix: str) -> None:
+    key = prefix if prefix.endswith(".") else f"{prefix}."
+    with pytest.raises(ValidationError, match="forbidden prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": [f"{key}bogus"], "axis_lattice": {}})
+
+
+def test_sweepable_keys_entry_settings_lacks_rejected() -> None:
+    with pytest.raises(ValidationError, match="names a key Settings lacks"):
+        Settings(
+            _env_file=None,
+            lab={"sweepable_keys": ["strategy.not_a_real_key"], "axis_lattice": {}},
+        )
+
+
+def test_sweepable_keys_entry_unknown_top_level_section_rejected() -> None:
+    with pytest.raises(ValidationError, match="names a key Settings lacks"):
+        Settings(_env_file=None, lab={"sweepable_keys": ["not_a_section.key"], "axis_lattice": {}})
+
+
+def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
+    """Every family in `HypothesisFamily` except `oracle` needs a lineage entry
+    (strategy-lab spec open question 11)."""
+    non_oracle = {family for family in get_args(HypothesisFamily) if family != "oracle"}
+    assert non_oracle <= set(FAMILY_PARENTS)
+    assert FAMILY_PARENTS["momentum"] is None
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    ["America/New_York", "UTC", "Europe/London"],
+)
+def test_quiet_timezone_accepts_valid_iana_zones(timezone: str) -> None:
+    settings = Settings(_env_file=None, lab={"quiet_timezone": timezone})
+    assert settings.lab.quiet_timezone == timezone
+
+
+@pytest.mark.parametrize("timezone", ["Not/AZone", "EST5EDT9", ""])
+def test_quiet_timezone_rejects_an_invalid_iana_zone(timezone: str) -> None:
+    with pytest.raises(ValidationError, match="not a valid IANA timezone"):
+        Settings(_env_file=None, lab={"quiet_timezone": timezone})
+
+
+def test_axis_lattice_key_outside_sweepable_keys_rejected() -> None:
+    with pytest.raises(ValidationError, match=r"not in lab\.sweepable_keys"):
+        Settings(
+            _env_file=None,
+            lab={
+                "sweepable_keys": ["strategy.top_fraction"],
+                "axis_lattice": {"strategy.formation_months": 1.0},
+            },
+        )
+
+
+def test_axis_lattice_key_within_sweepable_keys_accepted() -> None:
+    settings = Settings(
+        _env_file=None,
+        lab={
+            "sweepable_keys": ["strategy.top_fraction", "strategy.formation_months"],
+            "axis_lattice": {"strategy.top_fraction": 0.01, "strategy.formation_months": 1.0},
+        },
+    )
+    assert settings.lab.axis_lattice == {
+        "strategy.top_fraction": 0.01,
+        "strategy.formation_months": 1.0,
+    }
+
+
+@pytest.mark.parametrize("weekday", [-1, 7])
+def test_quiet_weekdays_out_of_range_rejected(weekday: int) -> None:
+    with pytest.raises(ValidationError, match="0-6"):
+        Settings(_env_file=None, lab={"quiet_weekdays": [weekday]})
+
+
+def test_seconds_per_variant_default_missing_a_cadence_rejected() -> None:
+    with pytest.raises(ValidationError, match="missing an entry"):
+        Settings(_env_file=None, lab={"seconds_per_variant_default": {"month_end": 1.0}})
+
+
 @pytest.mark.parametrize("level", [float("nan"), float("inf")])
 def test_costs_non_finite_sensitivity_rejected(level: float) -> None:
     """A NaN level would silently turn that level's results into NaN."""
@@ -520,6 +683,8 @@ def test_hypotheses_families_empty_or_duplicate_rejected(families: list[str]) ->
         ("holdout", {"stat": "2024-01-01"}),
         ("backtest", {"initial_capitol": 1.0}),
         ("metrics", {"red_flag": 1.0}),
+        ("schedule", {"rebalance_cadenc": "month_end"}),
+        ("lab", {"max_variants_per_swee": 10}),
     ],
 )
 def test_phase3_sections_reject_unknown_keys(section: str, override: dict[str, object]) -> None:
