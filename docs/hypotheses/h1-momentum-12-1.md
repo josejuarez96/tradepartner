@@ -13,8 +13,10 @@ must not bind at the first and must bind at the second; the date was pinned on t
 pre-repair store, and the listing repairs since #818 and the rule 7 shares fallback (#849)
 can move either count). If the first binding month-end moved, he re-pins `in_sample_start`
 first, via a class-B PR that updates this file (the TOML value, the power-arithmetic session
-counts and the retirement window) and `tests/backtest/test_h1_file.py` (the date, the 50
-sessions and the first fill), and registers only after it merges. An edit before
+counts and the retirement window, and every passage and count that derives from them: the
+Q8 rationale and its iXBRL disclosure, the t-statistic table, the "nine of the 50") and
+`tests/backtest/test_h1_file.py` (the date, the 50 sessions and the first fill), and
+registers only after it merges. An edit before
 registration is not a new hypothesis. The registry hashes the whole file, so any edit after
 registration makes a new hypothesis.
 
@@ -193,8 +195,8 @@ Owner answers that set these values (spec open questions, answered on #156):
   bars from January 2016 (ADR 0009), so the lookback has about three years of slack and
   the start is set by listings, not by prices. Two data issues were found on the same
   store and fixed after the sweep: #845, share-count scale errors that put a few small
-  names at the top of the cap ranking (rule 7 now falls back to the last in-line fact,
-  #849), and #840, the benchmark rows invisible under #35 (benchmarks are now read by
+  names at the top of the cap ranking (rule 7 now rejects an out-of-line fact and uses the
+  last accepted one, #849), and #840, the benchmark rows invisible under #35 (benchmarks are now read by
   symbol, #857). Neither is expected to change which month-end the cut first binds; the
   pre-registration check in the preamble is what confirms that on the store the owner
   registers on. H1 is not registered on the owner's store, so this
@@ -233,14 +235,14 @@ Owner answers that set these values (spec open questions, answered on #156):
   because their filings did not yet carry the tag, not because they later failed or
   succeeded (the ref-invisible set is the one proxy that looks forward, and it is a
   measurement of the bias, not an input to any rebalance). The bias is in the universe's
-  composition: for nine of the 50 in-sample rebalances (2019-11-29 to 2020-07-31) the
-  bottom 6–12% of the book's eligible names is set by filer size, not by market cap, and
+  composition: for nine of the 50 in-sample rebalances (2019-11-29 to 2020-07-31) up to
+  the bottom 6–12% of the book's eligible names is set by filer size, not by market cap, and
   the top decile the signal selects is drawn from a slightly smaller, larger-filer-tilted
   pool. **How to read 2019-11 to 2020-07 results:** as a top-1000-of-large-filers
   momentum portfolio, not yet the ADR 0006 universe in substance; between about one
   eligible name in sixteen and one in eight at 2019-11 (the two proxies above, 60 as a
-  floor and 116 of 1000), falling to about one in ten by 2020-06 (27 and 102), could
-  differ under a full pool. From 2020-08-31 the
+  floor and 116 of 1000), falling to between about one in thirty-seven and one in ten by
+  2020-06 (27 and 102), could differ under a full pool. From 2020-08-31 the
   universe is the ADR 0006 top 1000 in substance. The first-trial metrics that the
   retirement condition reads cover all 50 rebalances; a reader comparing the first nine
   months with the rest should expect a universe-composition difference there before
