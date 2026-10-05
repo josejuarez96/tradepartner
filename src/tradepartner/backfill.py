@@ -25,7 +25,9 @@ source, `edgar` then `alpaca`, halting at the first chunk that is not `ok`:
   with its own count, not counted (#784); so is any other name with no bar
   in this month or the previous one (bars already committed), unless it is
   a benchmark or first listed this month, or the store has no bar at all in
-  the previous month.
+  the previous month. The names so reported (dark plus snapshot-only) make
+  the month stale when they are more than `ingest.max_dark_share` of the
+  listed names (#796).
 
 The EDGAR chunk is fetched with no store connection open (a recording
 pass) and committed in one short write transaction.
@@ -125,6 +127,7 @@ from tradepartner.ingest import (
     _bar_row,
     _clean,
     _counted,
+    _dark_stale,
     _fetched,
     _ingest_filings,
     _may_count,
@@ -151,7 +154,7 @@ from tradepartner.store.benchmarks import (
     benchmark_candidates,
     ticker_holders,
 )
-from tradepartner.store.classify import classifications_as_of
+from tradepartner.store.classify import EQUITY, classifications_as_of, listing_kind
 from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import _first_session, securities_as_of
@@ -206,7 +209,7 @@ def backfill(
         recorded = _Recorded(filings)
         run = _run_source(
             "edgar",
-            lambda conn: _ingest_filings(conn, settings, recorded, clock),
+            lambda conn, run_id: _ingest_filings(conn, settings, recorded, clock, run_id),
             settings,
             now,
             clock,
@@ -634,6 +637,8 @@ def _price_chunk(
                 f"have no bar in {first}..{last}: {', '.join(missing[:10])}"
                 f"{_reported_note(reported)}"
             )
+        if stale := _dark_stale(listed, reported, settings, f"in {first}..{last}"):
+            raise _Stale(stale)
         with open_for_write(settings) as conn:
             init_schema(conn)
             added = _add_rows(
@@ -680,7 +685,10 @@ def _window_names(
     settings: Settings,
 ) -> tuple[list[str], list[str], set[str], set[str] | None, str | None]:
     """From listings known at `t`: securities with a `_fetched` listing
-    live at some point in `window`, and the reference (to fetch), the
+    live at some point in `window` that a fetched bar could land on (#875:
+    an equity row by `listing_kind`, not superseded before the window by a
+    later row of its security; benchmarks exempt), and the reference (to
+    fetch), the
     benchmark names and the common names
     on one of `universe.exchanges` listed through the whole window,
     including any delisted only later (the staleness denominator), those
@@ -690,7 +698,12 @@ def _window_names(
 
     A listing counts from its `valid_from`; a delisted or transferred one
     still counts while its end session (last bar known) or `effective_on`
-    is inside or after the window, or while no end is known yet.
+    is inside or after the window, or while no end is known yet. For the
+    fetch, as for the price resolver, a row also ends where the security's
+    next later row starts: a row superseded on or before the window's first
+    day fetches nothing, whatever its own status (an older listing on
+    another exchange with no end, #875). The staleness denominator is not
+    changed by either rule.
     """
     first, last = window
     kinds = {
@@ -708,7 +721,11 @@ def _window_names(
     filed: set[str] = set()  # with a filing-based listing live in the window
     reference = None
     earliest: dict[str, date] = {}
-    for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
+    rows = list(listing_ends_as_of(conn, t, settings).iter_rows(named=True))
+    starts: dict[str, set[date]] = defaultdict(set)
+    for row in rows:
+        starts[row["security_id"]].add(row["valid_from"])
+    for row in rows:
         sid, status = row["security_id"], row["status"]
         earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
         if row["valid_from"] > last:
@@ -719,7 +736,11 @@ def _window_names(
         )
         if ended or status not in (LISTED, DELISTED, TRANSFERRED):
             continue
-        if _fetched(sid, row, benchmarks, types, settings):
+        superseded = any(row["valid_from"] < start <= first for start in starts[sid])
+        assignable = sid in benchmarks or (
+            listing_kind(row["ticker"], row["class_title"]) == EQUITY and not superseded
+        )
+        if assignable and _fetched(sid, row, benchmarks, types, settings):
             ids.add(sid)
         if row["provenance"] != STATIC:
             filed.add(sid)

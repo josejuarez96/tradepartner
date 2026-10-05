@@ -579,7 +579,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (10,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (11,)
     finally:
         conn.close()
 
@@ -975,7 +975,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `overrides.client_order_id`) is version 9; #660's `statement_facts`
     (T76) is version 10 (renumbered from 9 at ready time, T84/#714 landed
     version 9 first)."""
-    assert schema.CURRENT_SCHEMA_VERSION == 10
+    assert schema.CURRENT_SCHEMA_VERSION == 11
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------

@@ -78,17 +78,17 @@ Never delete a tree whose number matches its constant, `failed_filings.json` (it
 
 ## EDGAR input-validation list files
 
-When the EDGAR fetch pass finds inputs that do not parse (#578), the run fails before any store write. Its message names a JSON file under `edgar.cache_dir/validation/`, `failures-<UTC stamp>.json`, which holds the full list. Every failing run writes a new file, dry runs included. **Nothing prunes them** (#806): each is small, but they pile up across reruns. A run that passes the check writes nothing.
+When the EDGAR fetch pass finds inputs that do not parse (#578), the run fails before any store write. Its message names a JSON file under `edgar.cache_dir/validation/`, `failures-<UTC stamp>.json`, which holds the full list. Every failing run writes a new file, dry runs included. When the filing-failure check fails a run with per-document failures nobody accepted, its message names a second kind of file in the same directory, `filing-failures-<UTC stamp>.json`, with every one of them (#884): the message itself lists only the first `edgar.max_validation_listed`, and a dry run writes no `failed_filings.json`. **Nothing prunes either kind** (#806): each is small, but they pile up across reruns. A run that passes the check writes nothing.
 
 Once you have read a file and acted on it (fixed the cause, or removed the bad cached input it names), you may delete it. The run never reads these files back, so deleting one changes nothing about the next run. To list the files, then delete the ones older than 30 days:
 
 ```bash
 CACHE=$(uv run python -c "from tradepartner.config import get_settings; print(get_settings().edgar.cache_dir)")
 ls -lt "$CACHE/validation/"
-find "$CACHE/validation" -name 'failures-*.json' -mtime +30 -print -delete
+find "$CACHE/validation" \( -name 'failures-*.json' -o -name 'filing-failures-*.json' \) -mtime +30 -print -delete
 ```
 
-Delete only `validation/failures-*.json` this way. Never delete `failed_filings.json` (your accepted failures) or the cache trees (see "After an EDGAR cache version bump" above).
+Delete only `validation/failures-*.json` and `validation/filing-failures-*.json` this way. Never delete `failed_filings.json` (your accepted failures) or the cache trees (see "After an EDGAR cache version bump" above).
 
 ## PATH, working directory and `.env`
 

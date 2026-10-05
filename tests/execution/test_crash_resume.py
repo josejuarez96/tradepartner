@@ -107,6 +107,7 @@ _ALERT_SECRETS = {
 }
 
 MAY_2, MAY_3, MAY_6 = date(2019, 5, 2), date(2019, 5, 3), date(2019, 5, 6)
+UNTRADABLE = Asset(tradable=False, fractionable=True, status="active", cusip=None)
 
 
 # --- alert-kind suite helpers -----------------------------------------------------------------
@@ -845,12 +846,10 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     )
     monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
     env.new_fake(round_cash_to_cent=True)
-    # WNDX delists partway through the window; this test cares about
-    # rounding drift, not delisting handling, so it stays out of the
-    # momentum universe's picks (untradable, never bought).
-    env.fake.set_asset(
-        "WNDX", Asset(tradable=False, fractionable=True, status="active", cusip=None)
-    )
+    # WNDX delists partway through the window (last bar 2019-06-24): the
+    # broker reports it untradable from the next session, so the marks
+    # after its last bar carry its last close (#678) instead of failing.
+    env.fake.set_asset("WNDX", UNTRADABLE, from_session=date(2019, 6, 25))
 
     # The fixture's `frozen_json` (test_run_trade.py) leaves `paper.*` keys
     # out; req 14 freezes `min_rebalances` at `paper start` (config.py's
@@ -931,6 +930,61 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     # least one fill was made somewhere in the window, so this alone also
     # proves fills were made, not just that rounding was exercised.
     assert any_fill_needed_rounding  # at least one fill's exact notional needed cent rounding
+
+
+def test_a_mid_window_delisting_is_marked_at_its_last_close_then_force_exited(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#678 / T86, end to end: WNDX (SEC_WINDOW_DELIST) is bought by the real
+    momentum universe, its bars stop after 2019-06-24 and the broker reports
+    it untradable from the next session. The July run marks 06-25..06-28 at
+    the 06-24 close (`tradable` false) instead of failing; its Form 25,
+    accepted 2019-06-28 20:30Z, is after that run's cut (close(06-28)), so the
+    August run is the first to read it and reaches step 7's `delisted` forced
+    exit, closed at once as `skipped` `untradable`."""
+    env.open_window(
+        frozen=FROZEN.model_copy(
+            update={"max_position_weight": 1.0, "max_order_notional_fraction": 1.0}
+        ),
+        tmp_path=tmp_path,
+    )
+    monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
+    env.new_fake()
+    env.fake.set_asset("WNDX", UNTRADABLE, from_session=date(2019, 6, 25))
+    last_bar, gap = date(2019, 6, 24), [date(2019, 6, d) for d in (25, 26, 27, 28)]
+    june, july, august = date(2019, 6, 3), date(2019, 7, 1), date(2019, 8, 1)
+
+    for session in (F_0, june):
+        assert env.run(at(session)).status == "ok", env.result(env.latest_run())
+    assert env.held().get("WNDX", 0.0) > 0.0  # the premise: the universe bought it
+
+    july_run = env.run(at(july))
+    assert july_run.status == "ok", env.result(env.latest_run())
+    ((last_close,),) = env.query(
+        "SELECT close FROM prices_daily WHERE security_id = 'SEC_WINDOW_DELIST' "
+        "AND session = ? ORDER BY known_at DESC LIMIT 1",
+        [last_bar],
+    )
+    marked = env.query(
+        "SELECT session, mark_price, tradable FROM positions_daily "
+        "WHERE security_id = 'SEC_WINDOW_DELIST' AND session > ? AND session <= ? "
+        "ORDER BY session",
+        [last_bar, gap[-1]],
+    )
+    assert marked == [(day, pytest.approx(last_close), False) for day in gap]
+    assert env.query(
+        "SELECT count(*) FROM decisions "
+        "WHERE decision = 'forced_exit' AND security_id = 'SEC_WINDOW_DELIST'"
+    ) == [(0,)]
+
+    august_run = env.run(at(august))
+    assert august_run.status == "ok", env.result(env.latest_run())
+    exits = env.query(
+        "SELECT d.reason, e.status, e.reason, d.run_id FROM decisions d "
+        "JOIN decision_events e USING (decision_id) "
+        "WHERE d.decision = 'forced_exit' AND d.security_id = 'SEC_WINDOW_DELIST'"
+    )
+    assert exits == [("delisted", "skipped", "untradable", august_run.run_id)]
 
 
 # =============================================================================================

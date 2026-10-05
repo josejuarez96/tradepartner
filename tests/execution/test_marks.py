@@ -107,8 +107,14 @@ def _result(run_id: int, at: datetime, status: str) -> PaperRunResultRow:
     )
 
 
-def _bar(conn: duckdb.DuckDBPyConnection, security_id: str, session: date, close: float) -> None:
-    known_at = session_close(session)
+def _bar(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    session: date,
+    close: float,
+    known_at: datetime | None = None,
+) -> None:
+    known_at = known_at or session_close(session)
     insert_row(
         conn,
         "prices_daily",
@@ -351,6 +357,100 @@ def test_a_stale_earlier_bar_never_stands_in_for_a_missing_one(tmp_path) -> None
     with pytest.raises(ValueError, match="no price"):
         marks_for(conn, _window(), ledger, [d2], {A: True})
     conn.close()
+
+
+# A delisted name's bars stop (WNDX: last bar 2019-06-24, Form 25 known only
+# after close(2019-06-28)); the sessions after its last bar get no bar at all.
+D0 = date(2026, 10, 5)
+D1 = next_session(D0)
+D2 = next_session(D1)
+D3 = next_session(D2)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        pytest.param({A: False}, id="untradable"),
+        pytest.param({}, id="no-flag"),  # no current ticker, or not in the assets read
+    ],
+)
+def test_an_untradable_name_past_its_last_bar_is_marked_at_its_last_close(
+    tmp_path, caplog: pytest.LogCaptureFixture, flags: dict[str, bool]
+) -> None:
+    """#678 / T86 (spec req 7, "marked at its last close"): a held name whose
+    flag is false or absent and whose bars stopped carries its last known
+    close forward from the session after its last bar, with a `marks`
+    warning naming the stale close's date. 4 shares x 10.0 = 40.0."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)  # its last bar; D1 and D2 get none
+    ledger = _ledger_for({D1: {A: 4.0}, D2: {A: 4.0}})
+    with caplog.at_level("WARNING", logger="tradepartner.execution.marks"):
+        marks = marks_for(conn, _window(), ledger, [D1, D2], flags)
+    conn.close()
+
+    assert [(m.session, m.mark_price, m.value) for m in marks] == [
+        (D1, 10.0, 40.0),
+        (D2, 10.0, 40.0),
+    ]
+    assert all(m.tradable is flags.get(A) for m in marks)
+    warned = [r.getMessage() for r in caplog.records]
+    assert len(warned) == 2
+    assert all(A in w and D0.isoformat() in w for w in warned)
+
+
+def test_a_gap_before_the_names_last_bar_still_raises(tmp_path) -> None:
+    """A missing bar followed by a later bar is an ingest gap, not a delisting:
+    even untradable, the name is never marked at a stale close there."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    _bar(conn, A, D2, 12.0)  # D1 has no bar, but D2 does
+    ledger = _ledger_for({D1: {A: 1.0}, D2: {A: 1.0}})
+    with pytest.raises(ValueError, match="no price"):
+        marks_for(conn, _window(), ledger, [D1, D2], {A: False})
+    conn.close()
+
+
+def test_a_gap_on_a_name_sold_before_the_last_session_still_raises(tmp_path) -> None:
+    """A back-fill: the name is held on D1 only (sold before D2), so the run's
+    `assets` read gives it no flag, and its D1 bar is missing while D2's is
+    there. That is an ingest gap, not a delisting: it raises, though the name
+    is not held on the session that has the later bar."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    _bar(conn, A, D2, 12.0)
+    ledger = _ledger_for({D1: {A: 1.0}})  # flat on D2
+    with pytest.raises(ValueError, match="no price"):
+        marks_for(conn, _window(), ledger, [D1, D2], {})
+    conn.close()
+
+
+def test_a_name_with_no_bar_at_all_still_raises_when_untradable(tmp_path) -> None:
+    """No last close to carry: the untradable rule never invents a price."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    ledger = _ledger_for({D1: {A: 1.0}})
+    with pytest.raises(ValueError, match="no price"):
+        marks_for(conn, _window(), ledger, [D1], {A: False})
+    conn.close()
+
+
+def test_the_carried_close_reads_no_bar_after_the_session(tmp_path) -> None:
+    """No look-ahead: the D1 mark carries the D0 close as known at close(D1).
+    A revision of D0 known only after close(D1) prices D2's mark, not D1's,
+    and a bar dated after the last marked session is never read."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    _bar(conn, A, D0, 11.0, known_at=session_close(D1) + timedelta(minutes=1))
+    _bar(conn, A, D3, 99.0)  # after every marked session: never read
+    ledger = _ledger_for({D1: {A: 1.0}, D2: {A: 1.0}})
+    marks = marks_for(conn, _window(), ledger, [D1, D2], {A: False})
+    conn.close()
+
+    assert [(m.session, m.mark_price) for m in marks] == [(D1, 10.0), (D2, 11.0)]
 
 
 # --- missed_run -----------------------------------------------------------------

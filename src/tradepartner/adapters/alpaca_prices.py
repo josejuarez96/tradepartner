@@ -59,7 +59,11 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   it shadows other companies like a non-equity span;
 - two spans of one ticker starting on the same day, of two securities,
   are **ambiguous**: the ticker resolves to nothing while they are the
-  latest, and the run goes on;
+  latest, and the run goes on. Not so a repair successor (`<cik>@<date>`)
+  and its own company's span (#874): that is the predecessor's copy of the
+  successor's row, so the predecessor's span is dropped before rules 3
+  and 6 (the contested rule still sees it) and the successor holds the
+  ticker, also over an older successor of the company;
 - a span is **contested** when its ticker is later taken by another
   security that arrived at it through a rename (Roundhill's `META` ETF,
   then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
@@ -84,6 +88,24 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   holding-company successor (Xerox Holdings, NorthWestern
   Energy Group) takes the ticker from its start, its predecessor having
   left before.
+
+**Rename lead (#843).** A span's `valid_from` is the first cover page
+showing its ticker, often weeks after a ticker change, while Alpaca
+serves the renamed company's bars only under the new symbol from the
+change on (and copies its history onto it, #104). So when a security's
+equity span under a new ticker directly follows its own assigned span
+under another (a rename, neither cut by rule 7, the new span not
+contested), the new ticker also *leads* to the security on sessions from
+`alpaca.rename_lead_days` before the new span's start (never before the
+old span's start) up to it, while `resolve` gives the ticker to no one
+(`ListingResolver.lead`) and the old ticker to no other security (a reuse
+the master knows of is left to #869). `parse_bars` assigns such a row
+only when the security has no row (bar or placeholder) that session from
+the rest of the payload: the hole closes at the old symbol's last bar,
+and no session is stored twice. The mapping is the master's at the run,
+as for every row; a bar's `known_at` stays its session's close.
+Corporate actions take no lead, nor does `holds(..., lead=False)`, the
+repair's action check.
 
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
@@ -325,6 +347,7 @@ class ResolverReport:
     ended_spans: int = 0
     same_day_typos: int = 0
     kept_spans: int = 0
+    successor_duplicates: int = 0
     unreadable: int = 0
     stopped_spans: int = 0
 
@@ -342,6 +365,7 @@ class ResolverReport:
             f"claims on another company's ticker; {self.ended_spans} spans ended at their "
             f"own delisting, {self.kept_spans} kept through one by a later row of the "
             f"ticker; {self.same_day_typos} same-day typo listings dropped; "
+            f"{self.successor_duplicates} predecessor rows duplicated by a successor; "
             f"{self.unreadable} unreadable-ticker listings ignored; "
             f"{self.stopped_spans} spans ended at a stopped line despite a later row"
         )
@@ -483,6 +507,19 @@ def _sessions_between(first: date, last: date, cap: int) -> int:
 
 
 @dataclass(frozen=True)
+class RenameLead:
+    """A rename's lead window (#843): `security_id` traded as `old` and
+    then as `new` from `end` (its listing's `valid_from`); on sessions in
+    `[start, end)`, rows under `new` may be its own (see `lead`)."""
+
+    security_id: str
+    old: str
+    new: str
+    start: date
+    end: date
+
+
+@dataclass(frozen=True)
 class _Row:
     day: date
     ticker: str
@@ -504,6 +541,8 @@ class ListingResolver:
         self,
         listings: Iterable[Mapping[str, Any]],
         evidence: RegistrantEvidence | None = None,
+        *,
+        rename_lead_days: int = 0,
     ) -> None:
         self._evidence = evidence
         by_security: dict[str, list[_Row]] = defaultdict(list)
@@ -571,6 +610,20 @@ class ListingResolver:
                     same_day_listings += index - first
                 else:
                     self._by_ticker[ticker].append(span)
+        # A repair successor's row duplicating its predecessor's (#874) holds
+        # the ticker alone: the predecessor's span is dropped before any other
+        # rule, so it is never a tie (rule 4) nor a rival claim (rule 6). The
+        # contested rule still sees it, so a rename into the ticker counts.
+        duplicated = {
+            span
+            for spans in self._by_ticker.values()
+            for span in spans
+            if any(
+                o.start == span.start and _succeeds(o.security_id, span.security_id) for o in spans
+            )
+        }
+        for spans in self._by_ticker.values():
+            spans[:] = [span for span in spans if span not in duplicated]
         later_class = {
             span
             for spans in self._by_ticker.values()
@@ -612,7 +665,7 @@ class ListingResolver:
                 other.security_id != span.security_id
                 and other.start > span.start
                 and self._renamed_into(other)
-                for other in spans
+                for other in (*spans, *(d for d in duplicated if d.ticker == span.ticker))
             )
         )
         ambiguous = {
@@ -632,6 +685,23 @@ class ListingResolver:
         ]
         for span in ended:
             self._vacated[span.ticker].append(span)
+        self._leads: dict[str, list[RenameLead]] = defaultdict(list)  # by new ticker
+        self._leads_of: dict[str, list[RenameLead]] = defaultdict(list)  # by security
+        if rename_lead_days > 0:
+            for security_id, own in self._by_security.items():
+                for old, new in itertools.pairwise(own):
+                    if (
+                        old.ticker != new.ticker
+                        and old.end == new.start
+                        and old.start < new.start
+                        and old in self._assigned_spans
+                        and new in self._assigned_spans
+                        and new not in self._contested
+                    ):
+                        start = max(old.start, new.start - timedelta(days=rename_lead_days))
+                        lead = RenameLead(security_id, old.ticker, new.ticker, start, new.start)
+                        self._leads[new.ticker].append(lead)
+                        self._leads_of[security_id].append(lead)
         self.report = ResolverReport(
             placeholder=placeholder,
             non_equity=dict(non_equity),
@@ -645,6 +715,7 @@ class ListingResolver:
             ended_spans=len(ended),
             same_day_typos=same_day_typos,
             kept_spans=kept_spans,
+            successor_duplicates=len(duplicated),
             unreadable=unreadable,
             stopped_spans=stopped_spans,
         )
@@ -786,14 +857,40 @@ class ListingResolver:
             return None
         return owner
 
-    def holds(self, security_id: str, session: date) -> bool:
-        """True when some ticker resolves to `security_id` on `session`: a
-        row of it on that session is one this resolver would assign."""
+    def lead(self, ticker: str, session: date) -> str | None:
+        """The renamed security whose rename lead (#843) covers `ticker` on
+        `session`, or `None`: only while `resolve` gives the ticker to no
+        one and the old ticker to no other security (a reuse the master
+        knows of is #869's), and only one security's lead. A caller assigns
+        such a row only where the security has no row under its own symbols
+        that session (`parse_bars`)."""
+        owners = {
+            lead.security_id
+            for lead in self._leads.get(ticker, [])
+            if lead.start <= session < lead.end
+            and self.resolve(lead.old, session) in (None, lead.security_id)
+        }
+        if len(owners) != 1 or self.resolve(ticker, session) is not None:
+            return None
+        return owners.pop()
+
+    def holds(self, security_id: str, session: date, *, lead: bool = True) -> bool:
+        """True when some ticker resolves to `security_id` on `session`, or
+        (with `lead`, for bars only: actions take no lead) leads to it
+        (#843): a row of it on that session is one this resolver would
+        assign."""
         return any(
             span.covers(session)
             and self._assigned(span)
             and self.resolve(span.ticker, session) == security_id
             for span in self._by_security.get(security_id, [])
+        ) or (
+            lead
+            and any(
+                rename.start <= session < rename.end
+                and self.lead(rename.new, session) == security_id
+                for rename in self._leads_of.get(security_id, [])
+            )
         )
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
@@ -804,6 +901,9 @@ class ListingResolver:
             overlaps = span.start <= end and (span.end is None or start < span.end)
             if overlaps and span.ticker not in out and self._assigned(span):
                 out.append(span.ticker)
+        for lead in self._leads_of.get(security_id, []):  # #843: the new symbol too
+            if lead.start <= end and start < lead.end and lead.new not in out:
+                out.append(lead.new)
         return out
 
     def _assigned(self, span: TickerSpan) -> bool:
@@ -818,6 +918,26 @@ def _company(security_id: str) -> str:
     """The CIK of a `<cik>` or `<cik>:<class>` id; any other id is its own."""
     head, sep, _ = security_id.partition(":")
     return head if sep and head.isdigit() else security_id
+
+
+#: A repair successor's id (#820, `store.master`): `<cik>@<valid_from>`,
+#: with `-<n>` when that id was taken.
+_SUCCESSOR_ID = re.compile(r"(\d+)@(\d{4}-\d{2}-\d{2})(?:-(\d+))?")
+
+
+def _succeeds(successor: str, security_id: str) -> bool:
+    """True when `successor` is a repair successor id of `security_id`'s
+    company (#874): `<cik>@<date>` for `<cik>`, `<cik>:<class>`, or an
+    older successor `<cik>@<earlier date>` (a second relisting; on one
+    date, the `-<n>` id made later)."""
+    match = _SUCCESSOR_ID.fullmatch(successor)
+    if match is None or successor == security_id:
+        return False
+    older = _SUCCESSOR_ID.fullmatch(security_id)
+    if older is None:
+        return _company(security_id) == match[1]
+    mine = (match[2], int(match[3] or 1))
+    return older[1] == match[1] and (older[2], int(older[3] or 1)) < mine
 
 
 def _holds_before(holder: TickerSpan, span: TickerSpan) -> bool:
@@ -987,40 +1107,70 @@ class BarsParse:
     placeholders: tuple[tuple[str, date], ...]  # (security_id, session)
 
 
+def _bar(
+    symbol: str, session: date, row: Mapping[str, Any], security_id: str, source: str
+) -> Bar | None:
+    """The `Bar` of one payload row, or `None` for a zero-volume placeholder."""
+    trades = row["n"]
+    if isinstance(trades, bool) or not isinstance(trades, int) or trades < 0:
+        raise ValueError(f"{symbol} {session}: trade count must be an int, got {trades!r}")
+    if _is_int_zero(row["v"]) and trades == 0:
+        return None
+    return Bar(
+        security_id=security_id,
+        session=session,
+        open=row["o"],
+        high=row["h"],
+        low=row["l"],
+        close=row["c"],
+        volume=row["v"],
+        known_at=bar_known_at(session),
+        source=source,
+    )
+
+
 @_fail_closed
-def parse_bars(payload: Mapping[str, Any], resolve: Resolve) -> BarsParse:
+def parse_bars(
+    payload: Mapping[str, Any], resolve: Resolve, lead: Resolve | None = None
+) -> BarsParse:
     """`Bar`s from an `alpaca_raw.daily_bars` payload, each resolved with
-    `resolve(symbol, session)` and known at its session's close."""
+    `resolve(symbol, session)` and known at its session's close.
+
+    With `lead` (`ListingResolver.lead`, #843), a row `resolve` leaves out
+    goes to `lead(symbol, session)` when that security has no row (a bar
+    or a zero-volume placeholder) that session from the rest of the
+    payload (a renamed company's new symbol on the sessions after its old
+    symbol's last bar); otherwise it stays unresolved."""
     source = feed_source(payload)
     bars: list[Bar] = []
     unresolved: list[tuple[str, date]] = []
     placeholders: list[tuple[str, date]] = []
+    pending: list[tuple[str, date, Mapping[str, Any]]] = []
     for symbol, rows in payload["bars"].items():
         for row in rows:
             session = _session_of(row["t"])
             security_id = resolve(symbol, session)
             if security_id is None:
-                unresolved.append((symbol, session))
+                pending.append((symbol, session, row))
                 continue
-            trades = row["n"]
-            if isinstance(trades, bool) or not isinstance(trades, int) or trades < 0:
-                raise ValueError(f"{symbol} {session}: trade count must be an int, got {trades!r}")
-            if _is_int_zero(row["v"]) and trades == 0:
+            bar = _bar(symbol, session, row, security_id, source)
+            if bar is None:
                 placeholders.append((security_id, session))
-                continue
-            bars.append(
-                Bar(
-                    security_id=security_id,
-                    session=session,
-                    open=row["o"],
-                    high=row["h"],
-                    low=row["l"],
-                    close=row["c"],
-                    volume=row["v"],
-                    known_at=bar_known_at(session),
-                    source=source,
-                )
-            )
+            else:
+                bars.append(bar)
+    have = {bar.key for bar in bars} | set(placeholders)  # any own row stops the lead
+    for symbol, session, row in pending:
+        security_id = lead(symbol, session) if lead is not None else None
+        if security_id is None or (security_id, session) in have:
+            unresolved.append((symbol, session))
+            continue
+        key = (security_id, session)
+        bar = _bar(symbol, session, row, security_id, source)
+        have.add(key)
+        if bar is None:
+            placeholders.append(key)
+        else:
+            bars.append(bar)
     bars.sort(key=lambda b: (b.security_id, b.session))
     _require_unique([b.key for b in bars], "bar")
     return BarsParse(tuple(bars), tuple(unresolved), tuple(placeholders))
@@ -1168,7 +1318,9 @@ class AlpacaPriceSource(PriceSource):
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
             return []
-        parsed = parse_bars(self._fetch_bars(symbols, start, end), self._resolver.resolve)
+        parsed = parse_bars(
+            self._fetch_bars(symbols, start, end), self._resolver.resolve, self._resolver.lead
+        )
         self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
 

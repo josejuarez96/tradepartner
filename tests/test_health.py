@@ -925,7 +925,7 @@ def test_late_form25_is_checked_against_the_next_exchange_line_past_an_otc_row(
 
 @pytest.mark.parametrize("late_form25", [False, True])
 @pytest.mark.parametrize("class_title", ["Class A Common Stock", "CLASS A COMMON STOCK, $0.01 PAR"])
-def test_same_day_rows_differing_only_in_exchange_tag_are_tolerated(
+def test_same_day_rows_differing_only_in_exchange_tag_or_title_wording_are_tolerated(
     fixture_store: duckdb.DuckDBPyConnection, late_form25: bool, class_title: str
 ) -> None:
     # INTT/PLAG/PRPB.U/CEI (#822): the same ticker filed on the same day
@@ -992,6 +992,141 @@ def test_bar_on_a_later_listing_of_the_same_security_is_allowed(
         },
     )
     insert_row(fixture_store, "prices_daily", _bar("SEC_TRUNC_DELIST", date(2019, 3, 4)))
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == set()
+
+
+def test_bar_before_a_later_same_ticker_listing_is_allowed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #829: TRHX's next listing (2019-03-01) is the same ticker (resolver
+    # rule 7, #819): the span runs on through the 2018-06-24 delisting, so
+    # a bar between the effective date and that later row is the security's
+    # own, not a resumption to flag.
+    known = datetime(2019, 3, 1, 21, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "ticker": "TRHX",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 3, 1),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    insert_row(fixture_store, "prices_daily", _bar("SEC_TRUNC_DELIST", date(2018, 7, 2)))
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == set()
+
+
+def test_bar_before_a_later_different_ticker_listing_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Same shape as above, but the later row is a different ticker: a
+    # genuine reused-ticker or unrelated-security resumption, still flagged.
+    known = datetime(2019, 3, 1, 21, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "ticker": "TRHY",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 3, 1),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    insert_row(fixture_store, "prices_daily", _bar("SEC_TRUNC_DELIST", date(2018, 7, 2)))
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NO_BARS_AFTER_DELISTING}
+    check = next(c for c in checks if c.rule == NO_BARS_AFTER_DELISTING)
+    [row] = check.violations.to_dicts()
+    assert row["security_id"] == "SEC_TRUNC_DELIST"
+    assert row["session"] == date(2018, 7, 2)
+
+
+def test_bar_before_a_later_same_ticker_non_equity_row_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The resolver's rule 7 only runs a span on when both rows are EQUITY
+    # (spec data-foundation.md): a later row of the same ticker that is a
+    # non-equity class (a right, here) never does, so this is still a
+    # genuine resumption.
+    known = datetime(2019, 3, 1, 21, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "ticker": "TRHX",
+            "exchange": "NASDAQ",
+            "class_title": "Rights",
+            "valid_from": date(2019, 3, 1),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    insert_row(fixture_store, "prices_daily", _bar("SEC_TRUNC_DELIST", date(2018, 7, 2)))
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NO_BARS_AFTER_DELISTING}
+    check = next(c for c in checks if c.rule == NO_BARS_AFTER_DELISTING)
+    [row] = check.violations.to_dicts()
+    assert row["security_id"] == "SEC_TRUNC_DELIST"
+    assert row["session"] == date(2018, 7, 2)
+
+
+def test_bar_before_a_same_day_typo_pairs_real_continuation_is_allowed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #829 (code-review): the next listing after a delisting can itself be
+    # a same-day filer-typo pair (#846) -- the resolver follows the ticker
+    # the security held just before that day, not whichever row a sort
+    # happens to put first. Here the real continuation (NYSE/TRHX) sorts
+    # after the typo row (NASDAQ/TRHZ) by (exchange, ticker); both must be
+    # checked.
+    known = datetime(2019, 3, 1, 21, 0, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "ticker": "TRHZ",
+            "exchange": "NASDAQ",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 3, 1),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_TRUNC_DELIST",
+            "ticker": "TRHX",
+            "exchange": "NYSE",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 3, 1),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    insert_row(fixture_store, "prices_daily", _bar("SEC_TRUNC_DELIST", date(2018, 7, 2)))
     checks = integrity_checks(fixture_store, T_END, _settings())
     assert _failed(checks) == set()
 
@@ -1147,3 +1282,9 @@ def test_as_of_metrics_invariant_under_truncation(
         full_delisted = delisted_names(fixture_store, t, settings).frame
         assert full_delisted.equals(delisted_names(cut, t, settings).frame), t
         assert unclassifiable(fixture_store, t) == unclassifiable(cut, t), t
+        # The two integrity rules derived at `t` as the listings are read
+        # (module docstring), not merely read off stored rows (#827).
+        full_checks = {c.rule: c for c in integrity_checks(fixture_store, t, settings)}
+        cut_checks = {c.rule: c for c in integrity_checks(cut, t, settings)}
+        for rule in (NON_OVERLAPPING_LISTINGS, NO_BARS_AFTER_DELISTING):
+            assert full_checks[rule].violations.equals(cut_checks[rule].violations), (rule, t)

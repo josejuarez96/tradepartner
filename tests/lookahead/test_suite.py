@@ -33,6 +33,16 @@ is built, so its pass on those is close to automatic. The checks earn their
 keep on a real store: a price table row maps to `Ingested` directly (the
 record's columns plus `ingested_at`), which is how the data-validator (spec
 req 15) runs them.
+
+**`check_statement_fact_known_at_matches_acceptance`** (#660, T76b) is a
+sixth, separate check for `statement_facts`'s own rule (spec acceptance:
+"the stamp precedes the filing's acceptance"): a stored `known_at` must
+equal the filing's own acceptance, never a proxy. `broken_adapter.
+BrokenStatementFact`'s two `StatementFactViolation` cases (`AT_PERIOD_END_
+CLOSE`, `AT_FILED_MIDNIGHT`) are both caught by this one check -- the same
+shape as `check_prices_unadjusted` catching two price violations above --
+and `clean_statement_fact` proves it does not fire on a correctly stamped
+row.
 """
 
 from __future__ import annotations
@@ -51,8 +61,12 @@ from lookahead.broken_adapter import (
     ALL_TIME,
     UNIVERSE_DIR,
     BrokenPriceSource,
+    BrokenStatementFact,
     Ingested,
+    StatementFactViolation,
     Violation,
+    broken_statement_fact,
+    clean_statement_fact,
     fixture_history,
     security_ids,
     tickers,
@@ -244,6 +258,28 @@ _HISTORY_CHECKS: dict[str, Callable[[Sequence[Ingested]], list[str]]] = {
     "check_revisions_not_back_dated": check_revisions_not_back_dated,
 }
 
+
+def check_statement_fact_known_at_matches_acceptance(
+    items: Sequence[BrokenStatementFact],
+) -> list[str]:
+    """A stored `statement_facts` row's `known_at` must equal its record's
+    own `accepted_at` -- the filing's true acceptance (#660, T76b; spec
+    acceptance: "the stamp precedes the filing's acceptance") -- never a
+    proxy derived from `period_end` or from the companyfacts `filed` date.
+    """
+    findings = []
+    for item in items:
+        record = item.record
+        if item.known_at != record.accepted_at:
+            findings.append(
+                "statement fact known_at does not match acceptance: "
+                f"('StatementFact', {record.cik!r}, {record.fact_name!r}, "
+                f"{record.period_end!r}) known_at={item.known_at.isoformat()} "
+                f"accepted_at={record.accepted_at.isoformat() if record.accepted_at else None}"
+            )
+    return findings
+
+
 #: Which check must catch which violation.
 _CAUGHT_BY: dict[Violation, str] = {
     Violation.EARLY_KNOWN_AT: "check_early_known_at",
@@ -362,3 +398,24 @@ def test_fixture_history_covers_the_split_and_revision_cases() -> None:
     assert len(splits) >= 3
     revised = [group for group in _by_key(history).values() if len(group) > 1]
     assert {type(group[0].record) for group in revised} == {Bar, CorporateAction}
+
+
+def test_clean_statement_fact_passes() -> None:
+    """A correctly stamped statement fact (`known_at == accepted_at`)
+    passes, proving the check does not fire on correct data."""
+    assert check_statement_fact_known_at_matches_acceptance([clean_statement_fact()]) == []
+
+
+@pytest.mark.parametrize("violation", list(StatementFactViolation))
+def test_statement_fact_violation_is_caught_by_its_named_check(
+    violation: StatementFactViolation,
+) -> None:
+    """Both `StatementFactViolation` cases -- a statement fact stamped at
+    its own `period_end`'s session close, and one stamped at midnight of
+    its `filed` date -- are caught by `check_statement_fact_known_at_
+    matches_acceptance` (#660, T76b)."""
+    item = broken_statement_fact(violation)
+    assert item.known_at != item.record.accepted_at  # both proxies are early
+    (finding,) = check_statement_fact_known_at_matches_acceptance([item])
+    assert item.record.cik in finding
+    assert item.record.fact_name in finding

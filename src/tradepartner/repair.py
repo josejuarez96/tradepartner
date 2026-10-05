@@ -82,7 +82,8 @@ def store_resolver(
 ) -> ListingResolver:
     """The `ListingResolver` an ingest run at `at` builds: the listings
     known at `at`, with the `registrant_evidence` of the facts and listing
-    ends known then (#793) and `at`'s day as the run's day."""
+    ends known then (#793) and `at`'s day as the run's day, and
+    `alpaca.rename_lead_days` (#843)."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
         facts_as_of(conn, at).iter_rows(named=True),
@@ -91,7 +92,11 @@ def store_resolver(
         quiet_after_days=settings.alpaca.registrant_quiet_days,
         transfer_window_sessions=settings.master.transfer_window_sessions,
     )
-    return ListingResolver(listings_as_of(conn, at).iter_rows(named=True), evidence)
+    return ListingResolver(
+        listings_as_of(conn, at).iter_rows(named=True),
+        evidence,
+        rename_lead_days=settings.alpaca.rename_lead_days,
+    )
 
 
 @dataclass(frozen=True)
@@ -121,7 +126,7 @@ def misattributed(
     actions = {
         (sid, day): rows
         for sid, day, rows in action_keys
-        if not resolver.holds(sid, previous_session(day))
+        if not resolver.holds(sid, previous_session(day), lead=False)  # #843: no lead
     }
     return Misattributed(bars, actions)
 

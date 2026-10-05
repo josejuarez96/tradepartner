@@ -677,6 +677,24 @@ def test_a_name_dark_since_before_the_month_is_reported_not_counted(settings: Se
     assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in may.message
 
 
+def test_too_many_dark_names_make_the_month_stale(settings: Settings) -> None:
+    # #796 (i a): ACME dark since April is 1 of 4 listed names in May.
+    early = _filings(fetched_at=_at(2019, 4, 1))
+    dark = {(ACME, s) for s in _sessions(SINCE, date(2019, 6, 30))}
+    assert _backfill(_loose(settings), _History(gaps=dark), filings=early, now=APRIL_END).ok
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_dark_share": 0.2})}
+    )
+    result = _backfill(tuned, _History(gaps=dark), filings=early)
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    message = result.runs[-1].message
+    assert "1 of 4 listed names (25.0%, over 20.0%) are dark or snapshot-only" in message
+    assert ACME in message
+
+
 def test_a_name_with_a_bar_last_month_and_none_now_counts(settings: Settings) -> None:
     result = _backfill(settings, _History(gaps={(ACME, s) for s in MAY}))
     assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
@@ -1063,10 +1081,11 @@ UNASSIGNABLE = (SPAC_UNITS, SPAC_WARRANTS, TWIN, TWIN_2, ODD)
 
 
 def _with_unassignable() -> Any:
-    """`_filings` plus ids the fetch set holds but no fetched bar can land
-    on: a SPAC's units and warrants (non-equity rows the resolver drops),
-    two companies listing one ticker on one day (ambiguous), and a common
-    class whose ticker has no Alpaca symbol."""
+    """`_filings` plus ids no fetched bar can land on: a SPAC's units and
+    warrants (non-equity rows the resolver drops; since #875 not in the
+    fetch set either, so never a hole), and, in the fetch set, two
+    companies listing one ticker on one day (ambiguous) and a common class
+    whose ticker has no Alpaca symbol."""
     units = (
         "Units, each consisting of one share of Class A Common Stock and one-half of one warrant"
     )
@@ -1112,9 +1131,9 @@ def test_a_dry_run_lists_only_holes_the_resolver_can_assign_and_counts_the_rest(
     _unassignable_holes(settings)
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
     assert _holes(found) == [(ACME, MAY_WINDOW)]
-    assert dict(found.dropped) == {UNASSIGNED: 4, NOT_ALPACA: 1}
+    assert dict(found.dropped) == {UNASSIGNED: 2, NOT_ALPACA: 1}  # units, warrants: no hole
     assert found.summary().endswith(
-        f"; 5 holes the resolver cannot assign, not fetched (1 {NOT_ALPACA}, 4 {UNASSIGNED})"
+        f"; 3 holes the resolver cannot assign, not fetched (1 {NOT_ALPACA}, 2 {UNASSIGNED})"
     )
     assert found.named == ()
 
@@ -1129,9 +1148,9 @@ def test_a_fill_fetches_no_hole_the_resolver_cannot_assign(settings: Settings) -
     assert [r.status for r in result.runs] == [FILLED], result.runs
     assert prices.fetched == {date(2019, 5, 1): {ACME, SPY}}
     assert result.runs[0].message.startswith(
-        "holes of 1 names with no stored bar; 3 holes the resolver cannot assign, not fetched"
+        "holes of 1 names with no stored bar; 1 holes the resolver cannot assign, not fetched"
     )
-    assert dict(result.dropped) == {UNASSIGNED: 2, NOT_ALPACA: 1}
+    assert dict(result.dropped) == {NOT_ALPACA: 1}
 
 
 def test_named_securities_limit_the_holes_and_each_unfetched_one_is_listed(
