@@ -130,6 +130,10 @@ class FakeProvider:
         *,
         sessions_from: date | None = None,
     ) -> pl.DataFrame:
+        if isinstance(sessions_from, datetime):  # refused as the store refuses it (T99)
+            raise TypeError(
+                f"sessions_from must be a session date, not a datetime: {sessions_from!r}"
+            )
         t = self._record(
             "adjusted_prices",
             t,

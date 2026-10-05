@@ -67,6 +67,8 @@ def test_sessions_from_bounds_the_frame_after_the_as_of_read() -> None:
     jan = provider.adjusted_prices(T_FEB, ["A"], include_dividends=False, sessions_from=JAN)
     assert jan.select("session", "close").rows() == [(JAN, 5.0), (FEB, 11.0)]
     assert [call.sessions_from for call in provider.calls] == [FEB, JAN]
+    with pytest.raises(TypeError, match="sessions_from"):
+        provider.adjusted_prices(T_FEB, ["A"], include_dividends=False, sessions_from=T_FEB)
 
 
 def test_universe_members_and_other_reads() -> None:
