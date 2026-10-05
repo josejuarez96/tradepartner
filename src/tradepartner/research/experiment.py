@@ -333,11 +333,16 @@ def parse_experiment_file(
         raise ExperimentFileError(f"{path}: parameter block is not valid TOML: {exc}") from exc
 
     flat = _flatten(block)
-    # The spec's two Data / interfaces examples write `splits = [...]` directly after
-    # `[window]`'s `start`/`end` and before the next table header; TOML tables stay
-    # open until the next `[...]` header, so that line is literally `window.splits`,
-    # not the top-level `splits` req 2 names. Both fixtures must register cleanly
-    # (plan T82), so a bare `splits` placed there is accepted as the top-level key.
+    # The spec's two Data / interfaces worked examples used to write `splits = [...]`
+    # directly after `[window]`'s `start`/`end` and before the next table header; TOML
+    # tables stay open until the next `[...]` header, so that line was literally
+    # `window.splits`, not the top-level `splits` req 2 names. #938 fixed both examples
+    # to place `splits` at the true top level, but a file written the old way must
+    # still register (nothing forces every experiment file to be rewritten), so a bare
+    # `splits` nested under `[window]` is still accepted as the top-level key. The two
+    # fixtures derived from the spec examples (test_splits_hashes_the_same_whichever_
+    # table_the_file_puts_it_under, test_splits_given_in_both_places_is_refused in
+    # tests/research/test_experiment.py) exercise this stopgap directly.
     if "window.splits" in flat:
         if "splits" in flat:
             raise ExperimentFileError(f"{path}: splits given both at top level and under [window]")
