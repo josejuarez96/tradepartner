@@ -93,10 +93,12 @@ SEC serves this shape for a handful of CIKs, identically from the zip and
 the API) is identified by the CIK it was requested under (the zip member
 name, or the API URL), counted on `.facts_bulk_keyless`/`.facts_api_keyless`,
 and its facts carry that CIK; a `cik` that is present but differs still
-raises. A per-CIK submissions API answer of 200 `{}` (a CIK payload or an
+raises from the API and is recorded for the input-validation gate from the
+zip (#578, below). A per-CIK submissions API answer of 200 `{}` (a CIK payload or an
 older page) lists nothing: the rows it would stamp stay unstamped this run
 and are never cached as unstampable for it, counted on
-`.submissions_api_empty`. Any other malformed payload still fails the source.
+`.submissions_api_empty`. Any other malformed payload still fails the source
+(the gate's list, for a zip member).
 
 **Failure policy (T11h, owner decision (2); #610).** A per-document
 fetch/parse that raises `ValueError` (a malformed document, a fact

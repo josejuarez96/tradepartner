@@ -20,7 +20,7 @@ from typing import Any
 import duckdb
 import pytest
 
-from tradepartner.adapters.edgar_validation import ValidationFailures
+from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -747,6 +747,21 @@ def test_a_pass_that_stops_after_a_recorded_failure_still_lists_it(
     assert "InputValidationError: EDGAR input validation: 1 input(s)" in run.message
     assert "the pass then stopped: RuntimeError: no cached FSN period" in run.message
     assert "FSN period 2026q1" in run.message
+
+
+def test_an_unfrozen_source_handed_to_the_write_meets_the_gate(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578 (safety-reviewer on #864): `_ingest_filings` given a source no
+    `_prefetch` froze runs the fetch pass itself, then the same gate, so a
+    recorded input never becomes silently absent rows."""
+    conn = duckdb.connect(":memory:")
+    conn.execute("SET TimeZone='UTC'")
+    init_schema(conn)
+    with pytest.raises(InputValidationError, match="3 input"):
+        _ingest_filings(conn, settings, _validating(tmp_path, _CRASHES), lambda: NOW)
+    assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
+    conn.close()
 
 
 def test_a_pass_that_stops_with_nothing_recorded_raises_its_own_error(

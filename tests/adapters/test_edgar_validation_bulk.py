@@ -41,6 +41,7 @@ from test_edgar_source import (
     _synthetic,
 )
 
+from tradepartner.adapters.edgar_raw import InvalidFilingReferenceError
 from tradepartner.adapters.edgar_source import FSN_VERSION, EdgarFilingSource
 from tradepartner.adapters.edgar_validation import ValidationFailure
 from tradepartner.config import Settings
@@ -194,6 +195,24 @@ def test_a_duckdb_io_error_still_propagates(
     zips = {"2015q1": _one_period_zip("0000000011-15-000001", "11")}
     source = _source_ready(settings, _router_with_fsn(*zips, zips=zips))
     with pytest.raises(duckdb.IOException):
+        source._ensure_fsn()
+    assert len(source.validation_failures) == 0
+
+
+def test_a_path_safety_trip_inside_an_fsn_period_is_never_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#275: the guard is a `ValueError`, inside the FSN catch, and still
+    propagates (`record` re-raises it)."""
+
+    def tripped(*args: object, **kwargs: object) -> object:
+        raise InvalidFilingReferenceError("guard")
+
+    monkeypatch.setattr("tradepartner.adapters.edgar_source.parse_fsn", tripped)
+    settings = _fsn_settings(tmp_path)
+    zips = {"2015q1": _one_period_zip("0000000011-15-000001", "11")}
+    source = _source_ready(settings, _router_with_fsn(*zips, zips=zips))
+    with pytest.raises(InvalidFilingReferenceError):
         source._ensure_fsn()
     assert len(source.validation_failures) == 0
 
