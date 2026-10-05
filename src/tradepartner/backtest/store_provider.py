@@ -182,7 +182,12 @@ class StoreProvider:
         return universe_as_of(self._at(t), t, self.settings)
 
     def adjusted_prices(
-        self, t: datetime, ids: Sequence[str], include_dividends: bool
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
     ) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
         return adjusted_prices_as_of(
@@ -192,6 +197,7 @@ class StoreProvider:
             include_dividends=include_dividends,
             settings=self.settings,
             traded_only=True,
+            sessions_from=sessions_from,
         )
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:

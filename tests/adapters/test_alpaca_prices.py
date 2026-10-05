@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -459,8 +459,10 @@ def _ended(
     effective_on: date,
     status: str = "delisted",
     valid_from: date = date(1994, 1, 3),
+    end_session: date | None = None,
 ) -> dict[str, object]:
-    """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a Form 25."""
+    """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a
+    Form 25, its last bar before the security's next row `end_session`."""
     return {
         "security_id": security_id,
         "ticker": ticker,
@@ -468,7 +470,7 @@ def _ended(
         "valid_from": valid_from,
         "status": status,
         "effective_on": effective_on,
-        "end_session": None,
+        "end_session": end_session,
     }
 
 
@@ -480,7 +482,9 @@ def _evidence(
     ends: list[dict[str, object]] | None = None,
     as_of: date = RUN_DAY,
 ) -> RegistrantEvidence:
-    return registrant_evidence(facts, ends or [], as_of=as_of, quiet_after_days=180)
+    return registrant_evidence(
+        facts, ends or [], as_of=as_of, quiet_after_days=180, transfer_window_sessions=5
+    )
 
 
 # Real cases from backfill pre-flight F (#793), store values as filed.
@@ -756,12 +760,19 @@ class TestRegistrantCheck:
                 {**_shares(AEP, date(2027, 1, 2), 9, date(2027, 1, 2)), "fact_name": "revenue"},
             ],
             [
-                _ended("0000000001:class-a", "XA", "Class A Common Stock", date(2021, 1, 4)),
+                _ended(
+                    "0000000001:class-a",
+                    "XA",
+                    "Class A Common Stock",
+                    date(2021, 1, 4),
+                    end_session=date(2020, 12, 31),
+                ),
                 _ended("0000000001", "XA", "5.25% Notes due 2030", date(2022, 1, 4)),
                 _ended("0000000001", "XA", "Common Stock", date(2023, 1, 4), "transferred"),
             ],
             as_of=RUN_DAY,
             quiet_after_days=180,
+            transfer_window_sessions=5,
         )
         assert evidence.last_filed[AEP] == date(2026, 7, 30)
         assert evidence.same_count(AEP, AEP_TEXAS, date(2026, 7, 30))
@@ -771,6 +782,11 @@ class TestRegistrantCheck:
         assert evidence.delisted_listings == {
             "0000000001:class-a": ((date(1994, 1, 3), "XA", date(2021, 1, 4)),)
         }
+        # #847: the last bar of each delisted listing, and the stop window.
+        assert evidence.last_bars == {
+            ("0000000001:class-a", date(1994, 1, 3), "XA"): date(2020, 12, 31)
+        }
+        assert evidence.stop_after_sessions == 5
         # quiet: no share count for more than 180 days before the run
         assert evidence.left_on("0000000001:class-b", date(2019, 1, 2)) == date(2020, 1, 4)
         assert evidence.left_on("0000000001:class-a", date(2019, 1, 2)) == date(2020, 1, 4)
@@ -783,7 +799,9 @@ class TestRegistrantCheck:
             **_ended("0000000001", "XA", "Common Stock", date(2021, 1, 4)),
             "delisting_filed_at": datetime(2021, 1, 8, 21, tzinfo=UTC),
         }
-        evidence = registrant_evidence([], [row], as_of=RUN_DAY, quiet_after_days=180)
+        evidence = registrant_evidence(
+            [], [row], as_of=RUN_DAY, quiet_after_days=180, transfer_window_sessions=5
+        )
         assert evidence.delisted_on == {"0000000001": (date(2021, 1, 9),)}
 
 
@@ -1041,6 +1059,367 @@ class TestOwnDelisting:
         sessions = [date(y, m, 1) for y in range(2018, 2022) for m in range(1, 13)]
         for session in (s for s in sessions if s < date(2021, 6, 1)):
             assert with_end.resolve("GONE", session) == without.resolve("GONE", session)
+
+    SOTHEBYS = "0000823094"
+
+    def _sothebys(self, last_bar: date | None, later: date) -> ListingResolver:
+        # #847: Sotheby's went private (25-NSE 2019-10-03, effective 10-13;
+        # last bar 10-02) but filed a cover page for its debt on 2019-11-12
+        # naming BID; another issuer lists BID in 2026.
+        sid, listed = self.SOTHEBYS, date(2019, 7, 30)
+        return ListingResolver(
+            [
+                _listing(sid, "BID", listed, "Common Stock"),
+                _listing(sid, "BID", later, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=listed,
+                        end_session=last_bar,
+                    )
+                ],
+            ),
+        )
+
+    def test_a_cover_page_after_the_line_stopped_never_keeps_the_span(self) -> None:
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 11, 12))
+        assert resolver.resolve("BID", date(2019, 10, 2)) == self.SOTHEBYS
+        assert resolver.resolve("BID", date(2019, 10, 14)) is None
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+        assert not resolver.holds(self.SOTHEBYS, date(2026, 7, 20))
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (1, 0)
+        assert resolver.report.stopped_spans == 1
+        assert "1 spans ended at a stopped line despite a later row" in (resolver.report.summary())
+
+    def test_a_relisting_after_a_long_gap_is_cut_too(self) -> None:
+        # Accepted cost (spec rule 7, #847): a bar gap cannot tell a real
+        # relisting after months off-exchange from a cover page filed after
+        # going private; the span is cut and counted, and the repair's dry
+        # run lists its later bars for the owner to review.
+        resolver = self._sothebys(date(2019, 10, 2), date(2021, 3, 1))
+        assert resolver.resolve("BID", date(2021, 6, 1)) is None
+        assert resolver.report.stopped_spans == 1
+
+    def test_a_row_within_the_transfer_window_of_the_last_bar_still_keeps_it(self) -> None:
+        # Five sessions strictly between the last bar and the next row: the
+        # line may still have traded (a relisting the session after the
+        # Form 25 took effect, #835).
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 10, 10))
+        assert resolver.resolve("BID", date(2026, 7, 20)) == self.SOTHEBYS
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (0, 1)
+
+    def test_a_row_after_more_than_the_window_ends_the_span(self) -> None:
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 10, 11))  # six between
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+
+    def test_without_a_last_bar_the_later_row_still_keeps_it(self) -> None:
+        # No bar evidence (a listing before the store's first bar): as before.
+        resolver = self._sothebys(None, date(2019, 11, 12))
+        assert resolver.resolve("BID", date(2026, 7, 20)) == self.SOTHEBYS
+
+    def test_a_new_issuer_of_the_dead_ticker_takes_it(self) -> None:
+        sid, listed = self.SOTHEBYS, date(2019, 7, 30)
+        resolver = ListingResolver(
+            [
+                _listing(sid, "BID", listed, "Common Stock"),
+                _listing(sid, "BID", date(2019, 11, 12), "Common Stock"),
+                _listing("0002000001", "BID", date(2026, 7, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=listed,
+                        end_session=date(2019, 10, 2),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("BID", date(2026, 7, 20)) == "0002000001"
+
+    def test_the_stopped_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: every session before the effective day keeps its
+        # mapping, with or without the stop.
+        stopped = self._sothebys(date(2019, 10, 2), date(2019, 11, 12))
+        kept = self._sothebys(None, date(2019, 11, 12))
+        day = date(2019, 7, 30)
+        while day < date(2019, 10, 13):
+            assert stopped.resolve("BID", day) == kept.resolve("BID", day), day
+            day += timedelta(days=1)
+
+    SEAGATE = "0001137789"
+
+    def _seagate(self, first_last_bar: date = date(2016, 1, 29)) -> ListingResolver:
+        # #943, the owner's store's facts: Seagate's untitled snapshot row
+        # lists STX from 2002-10-11; the 2010 Cayman->Ireland 25-NSE
+        # (effective 2010-07-12) ends it, and its last bar before the next
+        # row is 2016-01-29 (the store's bars start 2016-01-04 and have a
+        # hole to 2019-10); cover pages list STX from 2019-11-01, 2021-06-01
+        # and 2021-08-06; the 2021 redomicile 25-NSE (effective 2021-05-28)
+        # ends the 2019 row, last bar 2021-05-28. STX never stopped trading.
+        sid, title = self.SEAGATE, "Ordinary Shares, par value $0.00001 per share"
+        return ListingResolver(
+            [
+                _listing(sid, "STX", date(2002, 10, 11)),
+                _listing(sid, "STX", date(2019, 11, 1), title),
+                _listing(sid, "STX", date(2021, 6, 1), title),
+                _listing(sid, "STX", date(2021, 8, 6), title),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "STX",
+                        "",
+                        date(2010, 7, 12),
+                        valid_from=date(2002, 10, 11),
+                        end_session=first_last_bar,
+                    ),
+                    _ended(
+                        sid,
+                        "STX",
+                        title,
+                        date(2021, 5, 28),
+                        valid_from=date(2019, 11, 1),
+                        end_session=date(2021, 5, 28),
+                    ),
+                ],
+            ),
+        )
+
+    def test_a_line_that_traded_past_its_form_25_never_stopped_at_it(self) -> None:
+        # #943 root cause: a bar on or after the delisting's effective day
+        # shows the line went on trading through it (Seagate's redomicile),
+        # so a later bar hole before the next row is no stop: the span runs
+        # on and keeps every bar, 2016 to 2026.
+        resolver = self._seagate()
+        for day in (date(2016, 1, 4), date(2018, 6, 1), date(2021, 5, 28), date(2026, 10, 2)):
+            assert resolver.resolve("STX", day) == self.SEAGATE, day
+            assert resolver.holds(self.SEAGATE, day), day
+        assert resolver.report.stopped_spans == 0
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (0, 1)
+
+    def test_a_last_bar_before_the_effective_day_still_stops_the_line(self) -> None:
+        # The #847 cut is unchanged where the line's last bar precedes its
+        # Form 25's effective day (Sotheby's, Valaris, MiMedx).
+        resolver = self._seagate(first_last_bar=date(2010, 7, 9))
+        assert resolver.resolve("STX", date(2016, 1, 4)) is None
+        assert resolver.report.stopped_spans == 1
+
+    def test_a_last_bar_on_the_effective_day_traded_through_it(self) -> None:
+        resolver = self._seagate(first_last_bar=date(2010, 7, 12))
+        assert resolver.resolve("STX", date(2016, 1, 4)) == self.SEAGATE
+
+    def test_the_seagate_fix_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the 2010 effective day every session maps
+        # the same whatever the last bar.
+        through, stopped = self._seagate(), self._seagate(first_last_bar=date(2010, 7, 9))
+        day = date(2002, 10, 11)
+        while day < date(2010, 7, 12):
+            assert through.resolve("STX", day) == stopped.resolve("STX", day) == self.SEAGATE
+            day += timedelta(days=7)
+
+    MIMEDX = "0001376339"
+    MDXG_EFFECTIVE = date(2019, 3, 8)
+    MDXG_RELISTED = date(2020, 11, 4)
+
+    def _mimedx(
+        self, accepted: frozenset[str] = frozenset(), last_bar: date | None = date(2018, 11, 7)
+    ) -> ListingResolver:
+        # #943, the issue's facts: MiMedx lists MDXG; Nasdaq delists it from
+        # 2019-03-08 (last Nasdaq bar long before), it trades OTC (no Alpaca
+        # bars) and relists on Nasdaq in November 2020 under the same id and
+        # ticker, then trades to 2026. Sotheby's (#847) sits beside it.
+        listed = date(2016, 3, 1)
+        sothebys = self.SOTHEBYS
+        return ListingResolver(
+            [
+                _listing(self.MIMEDX, "MDXG", listed, "Common Stock"),
+                _listing(self.MIMEDX, "MDXG", self.MDXG_RELISTED, "Common Stock"),
+                _listing(sothebys, "BID", date(2019, 7, 30), "Common Stock"),
+                _listing(sothebys, "BID", date(2019, 11, 12), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        self.MIMEDX,
+                        "MDXG",
+                        "Common Stock",
+                        self.MDXG_EFFECTIVE,
+                        valid_from=listed,
+                        end_session=last_bar,
+                    ),
+                    _ended(
+                        sothebys,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=date(2019, 7, 30),
+                        end_session=date(2019, 10, 2),
+                    ),
+                ],
+            ),
+            accepted_relistings=accepted,
+        )
+
+    def test_a_long_gap_relisting_is_cut_unless_the_owner_accepts_it(self) -> None:
+        # #943: without the owner's list the #847 accepted cost holds, as on
+        # the store: MiMedx loses its 2020-2026 bars.
+        resolver = self._mimedx()
+        assert resolver.resolve("MDXG", self.MDXG_RELISTED) is None
+        assert not resolver.holds(self.MIMEDX, date(2026, 10, 2))
+        assert resolver.report.stopped_spans == 2  # MiMedx and Sotheby's
+
+    def test_an_accepted_relisting_keeps_its_span(self) -> None:
+        # #943: `alpaca.accepted_relistings` lifts the stopped-line cut for
+        # that id only: the span runs on as before #905, kept through its
+        # delisting by the later row.
+        resolver = self._mimedx(frozenset({self.MIMEDX}))
+        for day in (self.MDXG_RELISTED, date(2023, 5, 1), date(2026, 10, 2)):
+            assert resolver.resolve("MDXG", day) == self.MIMEDX, day
+            assert resolver.holds(self.MIMEDX, day), day
+        assert resolver.report.stopped_spans == 1  # Sotheby's only
+        assert resolver.report.accepted_relistings == 1
+        assert resolver.report.kept_spans == 1
+        assert "1 kept through a stopped line by alpaca.accepted_relistings" in (
+            resolver.report.summary()
+        )
+
+    def test_the_accepted_list_never_lifts_another_ids_cut(self) -> None:
+        # The list keys on the security id: Sotheby's stays cut.
+        resolver = self._mimedx(frozenset({self.MIMEDX}))
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+        assert not resolver.holds(self.SOTHEBYS, date(2026, 7, 20))
+
+    def test_a_listed_id_that_never_stopped_counts_nothing(self) -> None:
+        # Listing an id whose line traded through changes nothing.
+        resolver = self._mimedx(frozenset({self.MIMEDX}), last_bar=None)
+        assert resolver.resolve("MDXG", date(2026, 10, 2)) == self.MIMEDX
+        assert resolver.report.accepted_relistings == 0
+
+    def test_the_accepted_list_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the Form 25's effective day every session
+        # maps the same with or without the list, and with or without the
+        # bar evidence.
+        cut = self._mimedx()
+        kept = self._mimedx(frozenset({self.MIMEDX}))
+        silent = self._mimedx(last_bar=None)
+        day = date(2016, 3, 1)
+        while day < self.MDXG_EFFECTIVE:
+            assert cut.resolve("MDXG", day) == kept.resolve("MDXG", day) == self.MIMEDX, day
+            assert silent.resolve("MDXG", day) == self.MIMEDX, day
+            day += timedelta(days=1)
+
+    MINIM = "0001467761"
+
+    def _minim(self, accepted: frozenset[str] = frozenset()) -> ListingResolver:
+        # #943, the owner's store's facts: Minim lists MINM from 2021-08-16;
+        # Nasdaq suspends it (last bar 2024-07-23) and its 25-NSE takes
+        # effect 2024-11-03; a cover page names MINM on 2024-11-19; Nasdaq
+        # trading resumes 2025-06-02 and the ticker becomes FIEE (row
+        # 2025-07-28). A genuine relisting the stopped-line cut cannot tell.
+        sid, title = self.MINIM, "Common Stock, $0.01 per share"
+        return ListingResolver(
+            [
+                _listing(sid, "MINM", date(2021, 8, 16), title),
+                _listing(sid, "MINM", date(2024, 11, 19), title),
+                _listing(sid, "FIEE", date(2025, 7, 28), title),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "MINM",
+                        title,
+                        date(2024, 11, 3),
+                        valid_from=date(2021, 8, 16),
+                        end_session=date(2024, 7, 23),
+                    )
+                ],
+            ),
+            accepted_relistings=accepted,
+        )
+
+    def test_minims_relisting_needs_the_owners_list(self) -> None:
+        # #943 verdict: the 2025 MINM bars are Minim's own (Nasdaq resumed
+        # 2025-06-02); the cut drops them, and listing the id keeps them.
+        assert self._minim().resolve("MINM", date(2025, 6, 2)) is None
+        kept = self._minim(frozenset({self.MINIM}))
+        assert kept.resolve("MINM", date(2025, 6, 2)) == self.MINIM
+        assert kept.resolve("MINM", date(2025, 7, 28)) is None
+        assert kept.resolve("FIEE", date(2025, 7, 28)) == self.MINIM
+
+    VALARIS = "0000314808"
+    VALARIS_NEW = "0000314808:common-shares"
+
+    def _valaris(self, last_bar: date | None = date(2020, 8, 14)) -> ListingResolver:
+        # #921, the store's facts: Valaris lists VAL (Class A) from
+        # 2019-08-01; a 25-NSE (filed 2020-09-04) delists the Class A from
+        # 2020-09-14, last bar 2020-08-14; a Chapter 11 10-Q on 2020-10-29
+        # writes `VAL*` (#844: read as VAL); the post-bankruptcy Common
+        # Shares list VAL from 2021-08-03 under a new class id.
+        listed = date(2019, 8, 1)
+        return ListingResolver(
+            [
+                _listing(self.VALARIS, "VAL", listed, "Class A Ordinary Shares"),
+                _listing(self.VALARIS, "VAL*", date(2020, 10, 29), "Class A Ordinary Shares"),
+                _listing(self.VALARIS_NEW, "VAL", date(2021, 8, 3), "Common Shares"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        self.VALARIS,
+                        "VAL",
+                        "Class A Ordinary Shares",
+                        date(2020, 9, 14),
+                        valid_from=listed,
+                        end_session=last_bar,
+                    )
+                ],
+            ),
+        )
+
+    def test_a_footnoted_cover_page_after_a_form_25_never_keeps_the_span(self) -> None:
+        # #921 cause 1: the `VAL*` row after the line stopped does not keep
+        # the pre-bankruptcy span alive (the #847 stopped-line cut).
+        resolver = self._valaris()
+        assert resolver.resolve("VAL", date(2020, 8, 14)) == self.VALARIS
+        assert resolver.resolve("VAL", date(2020, 9, 14)) is None
+        assert resolver.resolve("VAL", date(2021, 6, 1)) is None
+        assert not resolver.holds(self.VALARIS, date(2022, 1, 3))
+        assert resolver.report.stopped_spans == 1
+
+    def test_the_post_bankruptcy_class_takes_the_ticker(self) -> None:
+        # #921 cause 2: once the old class's span ended, the new class of
+        # the same company is no later class (rule 3) and holds VAL.
+        resolver = self._valaris()
+        for day in (date(2021, 8, 3), date(2023, 5, 1), date(2026, 10, 2)):
+            assert resolver.resolve("VAL", day) == self.VALARIS_NEW, day
+            assert resolver.holds(self.VALARIS_NEW, day), day
+        assert resolver.report.later_class_spans == 0
+
+    def test_the_valaris_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the Form 25's effective day every session
+        # maps as without the bar evidence.
+        cut, kept = self._valaris(), self._valaris(last_bar=None)
+        day = date(2019, 8, 1)
+        while day < date(2020, 9, 14):
+            assert cut.resolve("VAL", day) == kept.resolve("VAL", day) == self.VALARIS, day
+            day += timedelta(days=1)
 
     def test_without_evidence_nothing_is_cut(self) -> None:
         resolver = ListingResolver([_listing("0000000002", "GONE", date(2018, 3, 1))])

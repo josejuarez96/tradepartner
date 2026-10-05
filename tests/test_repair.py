@@ -254,3 +254,193 @@ def test_a_delete_that_misses_its_count_rolls_everything_back(
     assert _bars(store) == before
     assert _rows(store, "SELECT count(*) FROM corporate_actions") == [(2,)]
     assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+VALARIS, VALARIS_NEW = "0000314808", "0000314808:common-shares"
+
+
+def _titled(sid: str, ticker: str, valid_from: date, class_title: str) -> dict[str, Any]:
+    return {**_listing(sid, ticker, valid_from), "class_title": class_title}
+
+
+@pytest.fixture
+def valaris(settings: Settings) -> Settings:
+    """#921, the owner's store's facts: Valaris's Class A lists VAL from
+    2019-08-01; a 25-NSE filed 2020-09-04 delists it from 2020-09-14 (last
+    bar 2020-08-14); a Chapter 11 10-Q on 2020-10-29 writes `VAL*`; the
+    post-bankruptcy Common Shares list VAL from 2021-08-03 under their own
+    class id, with their own bars."""
+    class_a = "Class A Ordinary Shares"
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _titled(VALARIS, "VAL", date(2019, 8, 1), class_a),
+            _titled(VALARIS, "VAL*", date(2020, 10, 29), class_a),
+            _titled(VALARIS_NEW, "VAL", date(2021, 8, 3), "Common Shares"),
+        ):
+            insert_row(conn, "listings", row)
+        filed = datetime(2020, 9, 4, 20, tzinfo=UTC)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": VALARIS,
+                "form": "25-NSE",
+                "class_title": class_a,
+                "exchange": "NYSE",
+                "filed_at": filed,
+                "effective_on": date(2020, 9, 14),
+                "known_at": filed,
+                "ingested_at": RUN,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for sid, session in (
+            (VALARIS, date(2019, 8, 1)),
+            (VALARIS, date(2020, 8, 14)),
+            (VALARIS_NEW, date(2021, 8, 3)),
+            (VALARIS_NEW, date(2024, 3, 1)),
+            (VALARIS_NEW, date(2026, 10, 2)),
+        ):
+            insert_row(conn, "prices_daily", _bar(sid, session))
+    return settings
+
+
+def test_a_footnoted_row_after_a_form_25_leaves_both_valaris_lines_alone(
+    valaris: Settings,
+) -> None:
+    # #921 acceptance: the post-bankruptcy bars stay on the new class and the
+    # pre-bankruptcy bars on the old one; the repair proposes nothing.
+    result = repair_resolution(valaris, clock=lambda: RUN, dry_run=True)
+    assert (result.bar_rows, result.action_rows) == (0, 0)
+    assert result.found.securities == ()
+    with duckdb.connect(valaris.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, valaris)
+    assert resolver.resolve("VAL", date(2020, 8, 14)) == VALARIS
+    assert resolver.resolve("VAL", date(2020, 12, 1)) is None
+    for session in (date(2021, 8, 3), date(2024, 3, 1), date(2026, 10, 2)):
+        assert resolver.resolve("VAL", session) == VALARIS_NEW, session
+
+
+MIMEDX = "0001376339"
+
+
+@pytest.fixture
+def mimedx(settings: Settings) -> Settings:
+    """#943, the issue's facts: MiMedx lists MDXG; Nasdaq delists it from
+    2019-03-08 (Form 25 filed 2019-02-26, last Nasdaq bar 2018-11-07), it
+    trades OTC with no Alpaca bars and relists in November 2020 under the
+    same id and ticker, with bars to 2026."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _listing(MIMEDX, "MDXG", date(2016, 3, 1)),
+            _listing(MIMEDX, "MDXG", date(2020, 11, 4)),
+        ):
+            insert_row(conn, "listings", row)
+        filed = datetime(2019, 2, 26, 21, tzinfo=UTC)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": MIMEDX,
+                "form": "25-NSE",
+                "class_title": "Common Stock",
+                "exchange": "NYSE",
+                "filed_at": filed,
+                "effective_on": date(2019, 3, 8),
+                "known_at": filed,
+                "ingested_at": RUN,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for session in (date(2016, 3, 1), date(2018, 11, 7), date(2020, 11, 4), date(2026, 10, 2)):
+            insert_row(conn, "prices_daily", _bar(MIMEDX, session))
+    return settings
+
+
+def test_the_long_gap_relisting_loses_its_later_bars_by_default(mimedx: Settings) -> None:
+    # #943: the #847 accepted cost, as the owner's dry run shows it.
+    result = repair_resolution(mimedx, clock=lambda: RUN, dry_run=True)
+    assert result.found.securities == (MIMEDX,)
+    assert sorted(day for _, day in result.found.bars) == [date(2020, 11, 4), date(2026, 10, 2)]
+
+
+def test_an_accepted_relisting_keeps_every_bar(mimedx: Settings) -> None:
+    # #943 acceptance: with the owner's `ALPACA__ACCEPTED_RELISTINGS` line
+    # the dry run proposes nothing on MiMedx.
+    accepted = mimedx.model_copy(
+        update={"alpaca": mimedx.alpaca.model_copy(update={"accepted_relistings": [MIMEDX]})}
+    )
+    result = repair_resolution(accepted, clock=lambda: RUN, dry_run=True)
+    assert (result.bar_rows, result.action_rows) == (0, 0)
+    assert result.found.securities == ()
+
+
+SEAGATE = "0001137789"
+
+
+@pytest.fixture
+def seagate(settings: Settings) -> Settings:
+    """#943, the owner's store's facts: Seagate's untitled snapshot row
+    lists STX from 2002-10-11 and cover pages from 2019-11-01, 2021-06-01
+    and 2021-08-06; a 25-NSE filed 2010-07-02 (effective 07-12, the
+    Cayman->Ireland move) and one filed 2021-05-18 (effective 05-28, the
+    redomicile); bars from 2016-01-04 with a hole from 2016-01-29 to
+    2019-10-31, then to 2026."""
+    title = "Ordinary Shares, par value $0.00001 per share"
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        rows = [
+            {**_listing(SEAGATE, "STX", date(2002, 10, 11)), "class_title": None},
+            *(
+                {**_listing(SEAGATE, "STX", day), "class_title": title}
+                for day in (date(2019, 11, 1), date(2021, 6, 1), date(2021, 8, 6))
+            ),
+        ]
+        for row in rows:
+            insert_row(conn, "listings", {**row, "exchange": "NASDAQ"})
+        for filed, effective, cls in (
+            (datetime(2010, 7, 2, 20, 8, tzinfo=UTC), date(2010, 7, 12), "Common Stock"),
+            (
+                datetime(2021, 5, 18, 20, 27, tzinfo=UTC),
+                date(2021, 5, 28),
+                "Seagate Technology PLC Ordinary Shares",
+            ),
+        ):
+            insert_row(
+                conn,
+                "delistings",
+                {
+                    "security_id": SEAGATE,
+                    "form": "25-NSE",
+                    "class_title": cls,
+                    "exchange": "NASDAQ",
+                    "filed_at": filed,
+                    "effective_on": effective,
+                    "known_at": filed,
+                    "ingested_at": RUN,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+        for session in (
+            date(2016, 1, 4),
+            date(2016, 1, 29),
+            date(2019, 11, 1),
+            date(2021, 5, 28),
+            date(2021, 6, 1),
+            date(2026, 10, 2),
+        ):
+            insert_row(conn, "prices_daily", _bar(SEAGATE, session))
+        insert_row(conn, "corporate_actions", _dividend(SEAGATE, date(2024, 3, 26)))
+    return settings
+
+
+def test_a_live_name_with_a_bar_hole_keeps_every_bar(seagate: Settings) -> None:
+    # #943 acceptance: the repair proposes nothing on Seagate.
+    result = repair_resolution(seagate, clock=lambda: RUN, dry_run=True)
+    assert (result.bar_rows, result.action_rows) == (0, 0)
+    assert result.found.securities == ()

@@ -22,6 +22,7 @@ import pytest
 from conftest import load_universe_fixtures
 
 from tradepartner import gap as gap_module
+from tradepartner.backtest import store_provider as store_provider_module
 from tradepartner.backtest.provider import DataProvider, GapReading
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.config import Settings
@@ -287,6 +288,68 @@ def test_adjusted_prices_equal_the_as_of_read(store: Store, include_dividends: b
         )
     assert got.equals(want)
     assert _ids(got) == set(ids)
+
+
+def _spy_on_adjusted(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Record the keyword arguments of every `adjusted_prices_as_of` call the provider
+    makes, passing each through to the real read."""
+    seen: list[dict[str, Any]] = []
+
+    def spy(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        seen.append(kwargs)
+        return adjusted_prices_as_of(*args, **kwargs)
+
+    monkeypatch.setattr(store_provider_module, "adjusted_prices_as_of", spy)
+    return seen
+
+
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_sessions_from_reaches_the_as_of_read(
+    store: Store, monkeypatch: pytest.MonkeyPatch, include_dividends: bool
+) -> None:
+    """T99: the bound is passed through to `adjusted_prices_as_of`, and the frame is
+    the as-of read's bounded frame."""
+    ids = ["SEC_SPLIT_BETWEEN", "SEC_DIV_REVISED", "SEC_SPY"]
+    bound = date(2019, 2, 22)
+    seen = _spy_on_adjusted(monkeypatch)
+    with store.provider() as provider:
+        got = provider.adjusted_prices(T_MAR, ids, include_dividends, sessions_from=bound)
+    assert [call["sessions_from"] for call in seen] == [bound]
+    with store.direct() as conn:
+        want = adjusted_prices_as_of(
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=include_dividends,
+            settings=store.settings,
+            traded_only=True,
+            sessions_from=bound,
+        )
+    assert got.equals(want)
+    assert got["session"].min() == bound
+
+
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_the_default_bounds_nothing(
+    store: Store, monkeypatch: pytest.MonkeyPatch, include_dividends: bool
+) -> None:
+    """T99: without the keyword the provider passes no bound, so every existing call
+    reads exactly the frame it read before."""
+    ids = ["SEC_SPLIT_BETWEEN", "SEC_DIV_REVISED", "SEC_SPY"]
+    seen = _spy_on_adjusted(monkeypatch)
+    with store.provider() as provider:
+        got = provider.adjusted_prices(T_MAR, ids, include_dividends)
+    assert [call["sessions_from"] for call in seen] == [None]
+    with store.direct() as conn:
+        want = adjusted_prices_as_of(
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=include_dividends,
+            settings=store.settings,
+            traded_only=True,
+        )
+    assert got.equals(want)
 
 
 def test_raw_prices_equal_the_as_of_read(store: Store) -> None:

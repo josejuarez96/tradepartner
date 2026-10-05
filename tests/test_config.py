@@ -211,6 +211,85 @@ def test_master_defaults() -> None:
     assert s.master.static_columns == ["name", "ticker", "exchange"]
 
 
+def test_master_keep_successors_defaults_empty() -> None:
+    """#922: no owner-accepted successor is kept unless the owner lists it."""
+    assert _settings().master.keep_successors == []
+
+
+def test_master_keep_successors_reads_the_owner_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `.env` line the PR body gives the owner (MTCH, #828)."""
+    monkeypatch.setenv("MASTER__KEEP_SUCCESSORS", '["0000891103@2020-08-10"]')
+    assert _settings().master.keep_successors == ["0000891103@2020-08-10"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "0000891103",  # a primary id, not a successor
+        "0000891103:class-b",  # a class id, not a successor
+        "MTCH",
+        "891103@2020-08-10",  # CIK not ten digits
+        "0000891103@2020-13-01",  # no such day
+        "0000891103@2020-8-10",
+        "0000891103@2020-08-10-x",
+        " 0000891103@2020-08-10",
+        "",
+    ],
+)
+def test_master_keep_successors_fails_closed_on_a_malformed_id(entry: str) -> None:
+    """#922: a malformed id refuses the config, never keeps nothing silently."""
+    with pytest.raises(ValidationError, match="keep_successors"):
+        Settings(_env_file=None, master={"keep_successors": [entry]})
+
+
+def test_master_keep_successors_accepts_a_numbered_successor() -> None:
+    """`store.master._successor` numbers a second successor of one day `-2`."""
+    s = Settings(_env_file=None, master={"keep_successors": ["0000891103@2020-08-10-2"]})
+    assert s.master.keep_successors == ["0000891103@2020-08-10-2"]
+
+
+def test_alpaca_accepted_relistings_defaults_empty() -> None:
+    """#943: every span stays under the #847 stopped-line cut unless the owner lists it."""
+    assert _settings().alpaca.accepted_relistings == []
+
+
+def test_alpaca_accepted_relistings_reads_the_owner_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `.env` line the PR body gives the owner (MiMedx, #943)."""
+    monkeypatch.setenv("ALPACA__ACCEPTED_RELISTINGS", '["0001376339"]')
+    assert _settings().alpaca.accepted_relistings == ["0001376339"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["0001376339", "0000314808:common-shares", "0000891103@2020-08-10", "0000891103@2020-08-10-2"],
+)
+def test_alpaca_accepted_relistings_takes_every_security_id_shape(entry: str) -> None:
+    """A primary, a class and a successor id (#820) are all security ids."""
+    s = Settings(_env_file=None, alpaca={"accepted_relistings": [entry]})
+    assert s.alpaca.accepted_relistings == [entry]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MDXG",  # a ticker, not a security id
+        "1376339",  # CIK not ten digits
+        " 0001376339",
+        "0001376339 ",
+        "0001376339:",
+        "0001376339:Common Stock",
+        "0001376339@2020-13-01",  # no such day
+        "0001376339@2020-11-4",
+        "BENCH:SPY",
+        "",
+    ],
+)
+def test_alpaca_accepted_relistings_fails_closed_on_a_malformed_id(entry: str) -> None:
+    """#943: a malformed id refuses the config, never keeps nothing silently."""
+    with pytest.raises(ValidationError, match="accepted_relistings"):
+        Settings(_env_file=None, alpaca={"accepted_relistings": [entry]})
+
+
 def test_benchmarks_default() -> None:
     assert _settings().benchmarks == ["SPY", "MTUM"]
 
@@ -729,6 +808,16 @@ def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None
     for bad in (0, -1):
         with pytest.raises(ValidationError):
             Settings(_env_file=None, dashboard={"page_row_limit": bad})
+
+
+def test_research_experiments_dir_defaults_to_docs_experiments() -> None:
+    """docs/specs/research-registry.md req 2, req 14: the one key `experiment
+    register`/`dataset register` read from; no env var (spec, Config keys)."""
+    assert _settings().research.experiments_dir == "docs/experiments"
+    overridden = Settings(
+        _env_file=None, research={"experiments_dir": "tests/fixtures/experiments"}
+    )
+    assert overridden.research.experiments_dir == "tests/fixtures/experiments"
 
 
 def test_alerts_channels_default_store_and_macos() -> None:
