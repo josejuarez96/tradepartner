@@ -7,15 +7,17 @@ Every function here takes a tz-aware UTC `t` ("T" in the spec's
 Rows are never updated in place, so "latest revision" is always a query,
 never a stored flag.
 
-Five of the six as-of functions the spec lists live here: `prices_as_of`,
+Five of the eight as-of functions the spec lists live here: `prices_as_of`,
 `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of` and
 `statement_facts_as_of` (#660, T76b), plus `dropped_dividends_as_of`, which
-reports the dividends `adjusted_prices_as_of` leaves unapplied (#72).
-`securities_as_of` lives in `store.master` (T8; the security master owns
-`securities`/`listings` writes, and `statement_facts_as_of` below calls it
-rather than duplicating its latest-revision query); `universe_as_of` and
-`survivorship_gap` are later plan tasks (T13, T15) and are out of scope for
-this module.
+reports the dividends `adjusted_prices_as_of` leaves unapplied (#72) and is
+not itself one of the spec's eight. The other three live elsewhere, each
+owned by the module that writes its own table: `securities_as_of` in
+`store.master` (T8; the security master owns `securities`/`listings`
+writes, and `statement_facts_as_of` below calls it rather than duplicating
+its latest-revision query), `universe_as_of` in `universe.py` (T13) and
+`survivorship_gap` in `gap.py` (T15) -- all three shipped; out of scope
+for this module, not later tasks.
 
 **`statement_facts_as_of` has no revision to pick** (spec "Definitions" >
 Revision, exception): `statement_facts`'s `UNIQUE (cik, fact_name,
