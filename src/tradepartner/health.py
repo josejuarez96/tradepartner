@@ -63,6 +63,11 @@ here is this module's and is stated once:
   from `universe.accepted_shares_facts`. Universe rules 7 and 8 use the last
   accepted fact instead of an unaccepted one. `jumps_before` keeps only
   facts with an `as_of_date` before it.
+- **Accepted same-day pairs** (`accepted_same_day_pairs`, #855): every
+  same-start pair of different tickers that `non_overlapping_listings` would
+  fail but the owner accepted in `universe.accepted_same_day_pairs`
+  (`"<security_id>@<valid_from>"`), in that rule's row shape, so an accepted
+  pair is listed, never silently hidden.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
@@ -92,7 +97,11 @@ derived at `t`, as the data is read.
   their filers tagged (or the class title's wording), are one line; and a
   row on `OFF_EXCHANGE` (NONE or OTC) is no exchange line at all (the normal
   suspension, OTC quote, late Form 25 sequence), so a late filing is tested
-  against the next row that is neither.
+  against the next row that is neither. Every other same-start pair of
+  different tickers fails unless the owner lists it in
+  `universe.accepted_same_day_pairs` (#855). An accepted pair counts as one
+  line: a late Form 25 on its rows is still tested, against the next
+  exchange line after that day, and the report lists the pair.
 - `no_bars_after_delisting`: no bar known at `t` for a delisted listing's
   security that *resumes* after the delisting's `effective_on` and before the
   security's next listing on an exchange, if any (a NONE or OTC row, often
@@ -156,7 +165,12 @@ from tradepartner.adapters.alpaca_prices import (
     same_alpaca_symbol,
 )
 from tradepartner.calendar import all_sessions, last_completed_session
-from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
+from tradepartner.config import (
+    _GUARDED_EXCLUDE_SIC_RANGES,
+    Settings,
+    get_settings,
+    parse_accepted_same_day_pair,
+)
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
 from tradepartner.store.asof import _validate_t, price_jumps_as_of
@@ -369,6 +383,15 @@ class SharesOutliers:
 
 
 @dataclass(frozen=True, eq=False)
+class AcceptedSameDayPairs:
+    """Same-start listing pairs the owner accepted (#855), one row per pair in
+    `non_overlapping_listings`' violation shape; each would fail that rule
+    without its `universe.accepted_same_day_pairs` entry."""
+
+    frame: pl.DataFrame
+
+
+@dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
 
@@ -396,6 +419,7 @@ class HealthReport:
     delisted: DelistedNames
     price_jumps: PriceJumps
     shares_outliers: SharesOutliers
+    accepted_same_day_pairs: AcceptedSameDayPairs
     settings: dict[str, Any]
     integrity: tuple[IntegrityCheck, ...]
 
@@ -429,6 +453,7 @@ def health_report(
     current = _current_from(listings, session)
     securities = securities_as_of(conn, t)
     classes = classifications_as_of(conn, t)
+    overlaps, accepted_pairs = _overlapping_listings(listings, settings)
     return HealthReport(
         t=t,
         session=session,
@@ -441,11 +466,12 @@ def health_report(
         delisted=_delisted_names(current),
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
         shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
+        accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
         },
-        integrity=_integrity_checks(conn, t, settings, listings),
+        integrity=_integrity_checks(conn, t, settings, listings, overlaps),
     )
 
 
@@ -714,12 +740,20 @@ def integrity_checks(
 ) -> tuple[IntegrityCheck, ...]:
     """Every rule in `INTEGRITY_RULES`, in that order (module docstring)."""
     t = _validate_t(t)
-    return _integrity_checks(conn, t, settings, listing_ends_as_of(conn, t, settings))
+    listings = listing_ends_as_of(conn, t, settings)
+    overlaps, _ = _overlapping_listings(listings, settings)
+    return _integrity_checks(conn, t, settings, listings, overlaps)
 
 
 def _integrity_checks(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, listings: pl.DataFrame
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    listings: pl.DataFrame,
+    overlaps: pl.DataFrame,
 ) -> tuple[IntegrityCheck, ...]:
+    """`overlaps` is `_overlapping_listings`' violation frame for `listings`,
+    computed once by the caller, which also needs its accepted pairs."""
     window = settings.master.transfer_window_sessions
     violations: dict[str, pl.DataFrame] = {
         KNOWN_AT_NOT_NULL: _count_per_table(conn, "known_at IS NULL"),
@@ -728,7 +762,7 @@ def _integrity_checks(
         PROVENANCE_ALLOWED: _bad_provenance(conn),
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
-        NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
+        NON_OVERLAPPING_LISTINGS: overlaps,
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
         UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
@@ -884,8 +918,36 @@ def _same_day_typo_pair(
     )
 
 
-def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.DataFrame:
+def _overlap_row(
+    current: dict[str, Any], flagged: dict[str, Any], filing_session: date | None
+) -> dict[str, Any]:
+    return {
+        "security_id": current["security_id"],
+        "ticker": current["ticker"],
+        "exchange": current["exchange"],
+        "valid_from": current["valid_from"],
+        "status": current["status"],
+        "filing_session": filing_session,
+        "next_ticker": flagged["ticker"],
+        "next_exchange": flagged["exchange"],
+        "next_valid_from": flagged["valid_from"],
+    }
+
+
+def _overlapping_listings(
+    listings: pl.DataFrame, settings: Settings
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """`non_overlapping_listings`' violations, and the same-start pairs the
+    owner accepted in `universe.accepted_same_day_pairs` (#855), both in
+    `_OVERLAP_SCHEMA`. An accepted pair is excused from the same-start test
+    only, and counts as one line: the late-Form-25 test still runs on its
+    rows, against the next exchange line after that day."""
+    window_sessions = settings.master.transfer_window_sessions
+    accepted_days = {
+        parse_accepted_same_day_pair(entry) for entry in settings.universe.accepted_same_day_pairs
+    }
     rows: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
     for sid, ordered in sorted(_by_security(listings).items()):
         for i, current in enumerate(ordered[:-1]):
             following = ordered[i + 1]
@@ -899,12 +961,20 @@ def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.Da
             )
             filed = current["delisting_filed_at"]
             filing_session = None if filed is None else _filing_session(filed)
+            # An accepted pair is one line, as the owner reviewed it: its
+            # same-day partner is no second line for the late-Form-25 test.
+            one_line_day: date | None = None
+            if flagged is not None and (sid, current["valid_from"]) in accepted_days:
+                accepted.append(_overlap_row(current, flagged, filing_session))
+                flagged, one_line_day = None, current["valid_from"]
             if flagged is None and filing_session is not None:
                 exchange_line = next(
                     (
                         r
                         for r in ordered[i + 1 :]
-                        if r["exchange"] not in OFF_EXCHANGE and not _same_line(current, r)
+                        if r["exchange"] not in OFF_EXCHANGE
+                        and not _same_line(current, r)
+                        and r["valid_from"] != one_line_day
                     ),
                     None,
                 )
@@ -914,20 +984,11 @@ def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.Da
                 ):
                     flagged = exchange_line
             if flagged is not None:
-                rows.append(
-                    {
-                        "security_id": sid,
-                        "ticker": current["ticker"],
-                        "exchange": current["exchange"],
-                        "valid_from": current["valid_from"],
-                        "status": current["status"],
-                        "filing_session": filing_session,
-                        "next_ticker": flagged["ticker"],
-                        "next_exchange": flagged["exchange"],
-                        "next_valid_from": flagged["valid_from"],
-                    }
-                )
-    return pl.DataFrame(rows, schema=_OVERLAP_SCHEMA)
+                rows.append(_overlap_row(current, flagged, filing_session))
+    return (
+        pl.DataFrame(rows, schema=_OVERLAP_SCHEMA),
+        pl.DataFrame(accepted, schema=_OVERLAP_SCHEMA),
+    )
 
 
 def _missing_sessions(sessions: tuple[date, ...], after: date, before: date) -> int:

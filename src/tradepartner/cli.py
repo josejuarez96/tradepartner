@@ -330,6 +330,10 @@ def _print_report(report: HealthReport) -> None:
             f"as of {row['baseline_as_of']}"
         )
         echo(f"  {row['security_id']}@{row['as_of_date']} {row['value']:.0f} ({why})")
+    pairs = report.accepted_same_day_pairs.frame
+    echo(f"accepted same-day pairs: {pairs.height}")
+    for row in pairs.iter_rows(named=True):
+        echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     echo(f"settings: {report.settings}")
     echo("integrity:")
     for check in report.integrity:
