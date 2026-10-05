@@ -63,6 +63,16 @@ execution. It halts at the first month that is not `filled`. A re-run reads
 the holes again: filled months drop out, a hole the source still cannot
 fill is fetched again.
 
+A hole counts only if a fetched bar could land on it (#876): the store's
+resolver (`repair.store_resolver` at the clock the holes are read, the
+resolver an ingest run builds) holds the id on some session of the month
+under a ticker that is an Alpaca symbol (`alpaca_symbol`). The others are
+not fetched, and are counted per reason (`UNASSIGNED`, `NOT_ALPACA`): on
+the dry run's summary and in each month's run message. `securities`
+limits the holes to the named ids (a targeted refetch, the cursor, status
+and halt rules unchanged); a named id with no hole to fetch is listed with
+why (`NamedSecurity`), never an error.
+
 **One benchmark** (#840): `backfill_benchmark(settings, prices=...,
 symbol=..., since=...)` is the owner's one-off for a configured benchmark
 the store lacks (MTUM is in no EDGAR snapshot, so the master never seeds
@@ -88,14 +98,15 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections import defaultdict
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
+from tradepartner.adapters.alpaca_prices import ListingResolver, alpaca_symbol
 from tradepartner.adapters.filings import FilingSource
 from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import is_session, next_session
@@ -133,6 +144,7 @@ from tradepartner.ingest import (
     _write_run,
     expected_session,
 )
+from tradepartner.repair import store_resolver
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.benchmarks import (
     BenchmarkIdentityError,
@@ -150,6 +162,13 @@ BACKFILL = "backfill"
 #: `fill_holes`' run mode, and the status of a month it committed (never `ok`).
 HOLES = "holes"
 FILLED = "filled"
+#: Why a hole is not fetched (#876): no session of the month on which the
+#: resolver assigns the id anything, or only tickers with no Alpaca symbol.
+UNASSIGNED = "the resolver assigns it no session"
+NOT_ALPACA = "held only under a ticker that is not an Alpaca symbol"
+#: Why a named security (`securities`) has no hole to fetch.
+UNKNOWN = "unknown id: no listing known"
+NO_HOLE = "no hole in a committed month"
 
 
 def month_windows(start: date, end: date) -> list[tuple[date, date]]:
@@ -232,13 +251,26 @@ class Hole:
 
 
 @dataclass(frozen=True)
+class NamedSecurity:
+    """A security named to `fill_holes` that it fetched no hole of, and why
+    (`UNKNOWN`, `NO_HOLE`, `HALTED`, or its holes not fetched per reason)."""
+
+    security_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class HoleFill:
     """`fill_holes`' outcome: the holes a dry run found, or the runs of a
-    real one (one per month fetched, halted after one not `filled`)."""
+    real one (one per month fetched, halted after one not `filled`); the
+    holes not fetched, per reason (`UNASSIGNED`, `NOT_ALPACA`); and the
+    named securities with no hole fetched."""
 
     holes: tuple[Hole, ...]
     runs: tuple[SourceRun, ...]
     dry_run: bool
+    dropped: tuple[tuple[str, int], ...] = ()
+    named: tuple[NamedSecurity, ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -254,7 +286,13 @@ class HoleFill:
             f"{len(self.holes)} holes (security, month) over {len(securities)} securities "
             f"in {len(months)} months; {len(between)} of them between a security's stored "
             f"bars ({len({hole.security_id for hole in between})} securities)"
+            f"{self.dropped_note()}"
         )
+
+    def dropped_note(self) -> str:
+        """`"; N holes the resolver cannot assign, not fetched (...)"`, the
+        count per reason, or `""` when none was dropped."""
+        return _dropped_note(dict(self.dropped))
 
     def lines(self) -> list[str]:
         """One line per security, months grouped into runs of consecutive
@@ -285,7 +323,56 @@ class HoleFill:
                 f"  {sid} {holes[0].ticker or '-'}: {shown} ({len(holes)} months, "
                 f"{between} between its stored bars)"
             )
+        out.extend(f"  {named.security_id}: not fetched, {named.reason}" for named in self.named)
         return out
+
+
+HALTED = "not reached: the fill halted first"
+
+
+def _dropped_note(dropped: dict[str, int]) -> str:
+    if not dropped:
+        return ""
+    reasons = ", ".join(f"{n} {reason}" for reason, n in sorted(dropped.items()))
+    return f"; {sum(dropped.values())} holes the resolver cannot assign, not fetched ({reasons})"
+
+
+@dataclass
+class _Tally:
+    """What a real fill's months fetched and dropped, per security."""
+
+    fetched: set[str] = field(default_factory=set)
+    dropped: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
+
+    def add(self, fetched: Collection[str], dropped: dict[str, str]) -> None:
+        self.fetched.update(fetched)
+        for sid, reason in dropped.items():
+            self.dropped[sid][reason] += 1
+
+    def totals(self) -> tuple[tuple[str, int], ...]:
+        total: Counter[str] = Counter()
+        for reasons in self.dropped.values():
+            total.update(reasons)
+        return tuple(sorted(total.items()))
+
+
+def _named(
+    only: frozenset[str] | None, known: set[str], tally: _Tally, *, halted: bool
+) -> tuple[NamedSecurity, ...]:
+    """The named ids `tally` fetched no hole of, each with why."""
+    out = []
+    for sid in sorted(only or ()):
+        if sid in tally.fetched:
+            continue
+        if sid not in known:
+            reason = UNKNOWN
+        elif reasons := tally.dropped.get(sid):
+            shown = ", ".join(f"{n} {reason}" for reason, n in sorted(reasons.items()))
+            reason = f"{sum(reasons.values())} holes not fetched ({shown})"
+        else:
+            reason = HALTED if halted else NO_HOLE
+        out.append(NamedSecurity(sid, reason))
+    return tuple(out)
 
 
 def _next_month(month: date) -> date:
@@ -303,12 +390,18 @@ def fill_holes(
     since: date,
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
+    securities: Collection[str] | None = None,
 ) -> HoleFill:
     """Refetch the holes in the committed months of the backfill for
-    `since` (the module docstring's **Holes**); with `dry_run`, list them
-    and fetch nothing."""
+    `since` (the module docstring's **Holes**), only those of `securities`
+    when given; with `dry_run`, list them and fetch nothing."""
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
+    if isinstance(securities, str):
+        raise TypeError("securities must be a collection of ids, not one string")
+    only = None if securities is None else frozenset(securities)
+    if only is not None and not only:
+        raise ValueError("securities, when given, must name at least one id")
     cursor = f"{HOLES};since={since.isoformat()}"
     try:
         end = _resume_from(settings, since)
@@ -316,32 +409,96 @@ def fill_holes(
         run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
         return HoleFill((), (run,), dry_run)
     windows = month_windows(since, end - timedelta(days=1)) if end > since else []
+    tally = _Tally()
     if dry_run:
         try:
-            holes = _holes(settings, windows, ensure_tz_aware_utc(clock(), field_name="clock()"))
+            t = ensure_tz_aware_utc(clock(), field_name="clock()")
+            holes, known = _holes(settings, windows, t, only, tally)
         except StoreLockedError as exc:
             run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
             return HoleFill((), (run,), dry_run)
-        return HoleFill(tuple(holes), (), dry_run)
+        tally.fetched.update(hole.security_id for hole in holes)
+        named = _named(only, known, tally, halted=False)
+        return HoleFill(tuple(holes), (), dry_run, tally.totals(), named)
+    known = set()
+    if only is not None:
+        try:
+            with _read(settings) as conn:
+                at = ensure_tz_aware_utc(clock(), field_name="clock()")
+                known = set(listings_as_of(conn, at)["security_id"].to_list())
+        except StoreLockedError as exc:
+            run = SourceRun("alpaca", LOCKED, 0, cursor, _clean(str(exc), settings))
+            return HoleFill((), (run,), dry_run)
     runs: list[SourceRun] = []
+    halted = False
     for window in windows:
-        chunk = _price_chunk(settings, prices, since, window, clock, fill=True)
+        chunk = _price_chunk(
+            settings, prices, since, window, clock, fill=True, only=only, tally=tally
+        )
         if chunk is None:
             continue
         runs.append(chunk)
         if chunk.status != FILLED:
+            halted = True
             break
-    return HoleFill((), tuple(runs), dry_run)
+    named = _named(only, known, tally, halted=halted)
+    return HoleFill((), tuple(runs), dry_run, tally.totals(), named)
 
 
-def _holes(settings: Settings, windows: list[tuple[date, date]], t: datetime) -> list[Hole]:
-    """Every hole in `windows` as of `t`, a short read per month."""
-    if not windows:
-        return []
+def _sessions_in(window: tuple[date, date]) -> list[date]:
+    first, last = window
+    days = (first + timedelta(days=n) for n in range((last - first).days + 1))
+    return [day for day in days if is_session(day)]
+
+
+def _assignable(
+    resolver: ListingResolver, sids: list[str], window: tuple[date, date]
+) -> tuple[list[str], dict[str, str]]:
+    """`sids` split into those a fetched bar could land on in `window` and
+    the rest with why: kept when on some session the resolver resolves one
+    of the id's tickers to it (`ListingResolver.holds`) and that ticker is
+    an Alpaca symbol (else the fetch never sends it, `alpaca_symbol`)."""
+    sessions = _sessions_in(window)
+    keep: list[str] = []
+    dropped: dict[str, str] = {}
+    for sid in sids:
+        reason: str | None = UNASSIGNED
+        if resolver.symbols(sid, window[0], window[1]):
+            for day in sessions:
+                held = [
+                    t for t in resolver.symbols(sid, day, day) if resolver.resolve(t, day) == sid
+                ]
+                if any(alpaca_symbol(t) is not None for t in held):
+                    reason = None
+                    break
+                if held:
+                    reason = NOT_ALPACA
+        if reason is None:
+            keep.append(sid)
+        else:
+            dropped[sid] = reason
+    return keep, dropped
+
+
+def _holes(
+    settings: Settings,
+    windows: list[tuple[date, date]],
+    t: datetime,
+    only: frozenset[str] | None = None,
+    tally: _Tally | None = None,
+) -> tuple[list[Hole], set[str]]:
+    """Every hole in `windows` as of `t` that a fetched bar could land on
+    (of the `only` ids, when given), a short read per month; the dropped
+    ones are added to `tally`. Also the ids with a listing known at `t`."""
+    if not windows and only is None:
+        return [], set()
     with _read(settings) as conn:
         tickers: dict[str, list[tuple[date, str]]] = defaultdict(list)
         for row in listings_as_of(conn, t).iter_rows(named=True):
             tickers[row["security_id"]].append((row["valid_from"], row["ticker"]))
+        if not windows:
+            return [], set(tickers)
+        resolver = store_resolver(conn, t, settings)
         spans = {
             sid: (lo, hi)
             for sid, lo, hi in conn.execute(
@@ -356,16 +513,18 @@ def _holes(settings: Settings, windows: list[tuple[date, date]], t: datetime) ->
         with _read(settings) as conn:
             ids, *_ = _window_names(conn, t, window, settings)
             stored = _with_bars(conn, t, window)
-        for sid in ids:
-            if sid in stored:
-                continue
+        missing = [sid for sid in ids if sid not in stored and (only is None or sid in only)]
+        kept, dropped = _assignable(resolver, missing, window)
+        if tally is not None:
+            tally.add((), dropped)
+        for sid in kept:
             rows = sorted(tickers.get(sid, []))
             live = [ticker for start, ticker in rows if start <= last]
             ticker = live[-1] if live else (rows[0][1] if rows else None)
             lo, hi = spans.get(sid, (None, None))
             between = lo is not None and hi is not None and lo < first and hi > last
             holes.append(Hole(sid, ticker, window, between))
-    return holes
+    return holes, set(tickers)
 
 
 def _with_bars(conn: duckdb.DuckDBPyConnection, t: datetime, window: tuple[date, date]) -> set[str]:
@@ -411,13 +570,18 @@ def _price_chunk(
     clock: Callable[[], datetime],
     *,
     fill: bool = False,
+    only: frozenset[str] | None = None,
+    tally: _Tally | None = None,
 ) -> SourceRun | None:
     """One month. The store is read as of the clock when the month starts
     (after the EDGAR chunk committed) and rows are stamped with the clock
     after the fetch returns, so a revision is never dated before it was
     fetched. With `fill` (a hole fill), only the names with no bar known
-    then are fetched, with the reference; the stored bars count toward the
-    staleness share; and a month with no hole is skipped (`None`)."""
+    then (of the `only` ids, when given) that a fetched bar could land on
+    (`_assignable`, the store's resolver then) are fetched, with the
+    reference; the dropped ones are counted in the message and `tally`; the
+    stored bars count toward the staleness share; and a month with no hole
+    to fetch is skipped (`None`)."""
     first, last = window
     mode, done = (HOLES, FILLED) if fill else (BACKFILL, OK)
     cursor = f"{HOLES};{_cursor(since, last)}" if fill else _cursor(since, last)
@@ -433,8 +597,13 @@ def _price_chunk(
                 conn, started, window, settings
             )
             stored = _with_bars(conn, started, window) if fill else set()
-        holes = [sid for sid in ids if sid not in stored]
+            holes = [sid for sid in ids if sid not in stored and (only is None or sid in only)]
+            dropped: dict[str, str] = {}
+            if fill and holes:
+                holes, dropped = _assignable(store_resolver(conn, started, settings), holes, window)
         if fill:
+            if tally is not None:
+                tally.add(holes, dropped)
             if not holes:
                 return None
             ids = sorted({*holes, *([reference] if reference is not None else [])})
@@ -476,7 +645,12 @@ def _price_chunk(
                 params=[first, last],
             )
             added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
-            filled = f"holes of {len(holes)} names with no stored bar: " if fill else ""
+            filled = (
+                f"holes of {len(holes)} names with no stored bar"
+                f"{_dropped_note(dict(Counter(dropped.values())))}: "
+                if fill
+                else ""
+            )
             message = (
                 f"{filled}{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
                 f"{len(missing)} of {len(counted)} listed names without a bar"
