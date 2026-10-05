@@ -30,6 +30,12 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   also warns, without failing, when the latest EDGAR run row reports
   quarantined accessions (the T11h failure policy): those filings get no
   further request until the owner clears them.
+- `tradepartner master-retract [--apply --expect-rows N]` runs
+  `retract.master_retract` (#859): the dry run (the default) builds the
+  master as an EDGAR ingest would and lists every stored `securities` or
+  `listings` row the current rules no longer derive, changing nothing; with
+  `--apply` and the dry run's count it retracts them at the run's clock
+  (refused, writing nothing, on another count). Needs the EDGAR user agent.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -103,6 +109,7 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
+from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import registry, schema
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -608,6 +615,45 @@ def make_app(
             raise _fail(f"store busy: {exc}", 1) from None
         except RepairRefused as exc:
             raise _fail(f"repair refused: {exc}", 1) from None
+        typer.echo(result.summary())
+        for line in result.lines():
+            typer.echo(line)
+
+    @app.command("master-retract")
+    def master_retract_(
+        apply: Annotated[
+            bool, typer.Option("--apply", help="retract the rows (default: dry run)")
+        ] = False,
+        expect_rows: Annotated[
+            int | None, typer.Option(help="the dry run's row count (required with --apply)")
+        ] = None,
+    ) -> None:
+        """Retract stored master rows the current rules no longer derive (#859)."""
+        if apply and expect_rows is None:
+            raise _fail(
+                "run without --apply first, then pass its count as --expect-rows", USAGE_ERROR
+            )
+        if expect_rows is not None and not apply:
+            raise _fail("--expect-rows goes with --apply", USAGE_ERROR)
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        missing = _missing_secrets(s, "edgar")
+        if missing:
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        filings = EdgarFilingSource(s, client=edgar_client, clock=clock)
+        try:
+            result = master_retract(
+                s, filings=filings, clock=clock, dry_run=not apply, expect=expect_rows
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RetractRefused as exc:
+            raise _fail(f"retract refused: {_scrubbed(str(exc), s)}", 1) from None
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)

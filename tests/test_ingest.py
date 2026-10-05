@@ -1067,7 +1067,7 @@ def test_a_prefetched_source_is_built_once_more_with_the_same_rows(
         conn = duckdb.connect(":memory:")
         conn.execute("SET TimeZone='UTC'")
         init_schema(conn)
-        added, _ = _ingest_filings(conn, settings, source, lambda: NOW)
+        added, _ = _ingest_filings(conn, settings, source, lambda: NOW, "run-1")
         assert added > 0
         written.append(_filing_tables(conn))
         conn.close()

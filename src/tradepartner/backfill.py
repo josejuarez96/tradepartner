@@ -187,7 +187,7 @@ def backfill(
         recorded = _Recorded(filings)
         run = _run_source(
             "edgar",
-            lambda conn: _ingest_filings(conn, settings, recorded, clock),
+            lambda conn, run_id: _ingest_filings(conn, settings, recorded, clock, run_id),
             settings,
             now,
             clock,

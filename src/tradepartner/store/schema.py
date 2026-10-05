@@ -146,7 +146,21 @@ registry; #83 took version 2 first, so the registry is version 3):
   anything that loops over every `TABLE_NAMES` table expecting them all
   to exist (`health.py`, `registry.store_max_ingested_at`) — loudly, and
   the next writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 11**, with its own migration and a
+- **Version 11** (#859): retraction in the append-only master.
+  `securities` and `listings` gain `retracted BOOLEAN NOT NULL DEFAULT
+  FALSE`: a row with it set is a revision of its key, stamped at the
+  correcting run, that withdraws the key from its own `known_at` on, as
+  `corporate_actions.cancelled` withdraws an action (#108); an as-of read
+  before it still sees the old row. Also the non-fact `master_underived`
+  table (each master check's stored rows the current rules no longer
+  derive; `health`'s `underived_master_rows`). `_TABLE_DDL` stays pinned
+  at its version-4 shape, so after the DDL pass `init_schema` rebuilds the
+  two tables with the version-11 DDL (`_migrate_retracted`) on every
+  store without the column, a fresh one included, every row kept in
+  insertion order with `retracted = FALSE`. A read-only connection accepts
+  a version-10 store; its `securities` and `listings` reads fail loudly on
+  the missing column until a writing command (`ingest`) migrates it.
+- **A later DDL change goes to version 12**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -294,7 +308,13 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `known_at`: the table holds one vintage per period for ever, never a
 #:   revision (module docstring's "Schema versions" exception to the
 #:   "Definitions" revision rule).
-CURRENT_SCHEMA_VERSION = 10
+#: - 11 (#859): `securities` and `listings` gain `retracted BOOLEAN NOT NULL
+#:   DEFAULT FALSE` (a retraction is a revision with it set, as
+#:   `corporate_actions.cancelled`), and the non-fact `master_underived`
+#:   table. `_TABLE_DDL` keeps its version-4 pin, so every store, a fresh one
+#:   included, has the two tables rebuilt after the DDL pass with every row
+#:   kept and `retracted = FALSE`.
+CURRENT_SCHEMA_VERSION = 11
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -329,6 +349,11 @@ _PRE_SETTLE_ORDER_VERSION = 8
 #: other read; a `statement_facts` read there fails on the missing table,
 #: same as a journal table on a pre-journal store.
 _PRE_STATEMENT_FACTS_VERSION = 9
+
+#: The last version without `retracted` and `master_underived` (#859):
+#: read-only connections serve every read but `securities`, `listings` and
+#: `master_underived`, which fail loudly on the missing column or table.
+_PRE_RETRACTION_VERSION = 10
 
 
 class SchemaVersionError(RuntimeError):
@@ -595,6 +620,54 @@ _TABLE_DDL: tuple[str, ...] = (
 #: the next schema version with its own migration, exactly as `_TABLE_DDL`
 #: itself is guarded.
 _STATEMENT_FACTS_TABLE_DDL: tuple[str, ...] = (_CREATE_STATEMENT_FACTS,)
+
+#: The master tables a retraction can withdraw a row from (#859): each gains
+#: `retracted` at version 11.
+RETRACTABLE_TABLES: tuple[str, ...] = ("securities", "listings")
+
+#: The version-11 `securities` and `listings` (#859): the version-4 shape plus
+#: `retracted`, as #108 gave `corporate_actions` its `cancelled`. A row with
+#: `retracted = TRUE` is a revision that withdraws its key from its own
+#: `known_at` on. `_TABLE_DDL` keeps the version-4 shape (its pin), so
+#: `init_schema` rebuilds the two tables into these after its DDL pass.
+_RETRACTION_TABLE_DDL: dict[str, str] = {
+    table: ddl.replace(
+        "    UNIQUE (",
+        "    retracted BOOLEAN NOT NULL DEFAULT FALSE,\n    UNIQUE (",
+        1,
+    )
+    for table, ddl in (("securities", _CREATE_SECURITIES), ("listings", _CREATE_LISTINGS))
+}
+
+#: `master_underived` (#859, version 11): per master check (an EDGAR ingest
+#: chunk or a `master-retract` run), each stored `securities` or `listings`
+#: row the current rules no longer derive. Not a fact table: like
+#: `ingestion_runs` it records a job's finding, has no `known_at` of its own,
+#: and no as-of read path touches it; `health` reads it for
+#: `underived_master_rows`. `run_id` is the check's `ingestion_runs` row,
+#: `recorded_at` the check's clock (tz-aware UTC), `known_at` the stored
+#: row's. `ticker`, `exchange` and `valid_from` are NULL for a `securities`
+#: row.
+_CREATE_MASTER_UNDERIVED = """
+CREATE TABLE IF NOT EXISTS master_underived (
+    run_id VARCHAR NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    table_name VARCHAR NOT NULL,
+    security_id VARCHAR NOT NULL,
+    ticker VARCHAR,
+    exchange VARCHAR,
+    valid_from DATE,
+    known_at TIMESTAMPTZ NOT NULL,
+    CHECK (table_name IN ('securities', 'listings')),
+    CHECK ((table_name = 'listings') = (valid_from IS NOT NULL))
+)
+"""
+
+#: Tables new at version 11 (#859), created by `init_schema`'s DDL pass. Kept
+#: out of `TABLE_NAMES` (not a fact table; the look-ahead harness truncates
+#: only those).
+MASTER_CHECK_TABLE_NAMES: tuple[str, ...] = ("master_underived",)
+_MASTER_UNDERIVED_TABLE_DDL: tuple[str, ...] = (_CREATE_MASTER_UNDERIVED,)
 
 
 # Trial registry (schema version 3; Phase 3 spec "Data / interfaces" >
@@ -1479,12 +1552,15 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_ACCEPT_REJECTIONS_VERSION,
         _PRE_SETTLE_ORDER_VERSION,
         _PRE_STATEMENT_FACTS_VERSION,
+        _PRE_RETRACTION_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
         # read but `overrides` (no `client_order_id` before 9), and versions 5 to 7
         # none of `resume_invocations` and `resume_acceptances` either; version 9
-        # every read but `statement_facts`.
+        # every read but `statement_facts`; version 10 every read but
+        # `securities` and `listings` (no `retracted` before 11) and
+        # `master_underived`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -1730,9 +1806,35 @@ def _migrate_settle_order(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(f"ALTER TABLE {_OVERRIDES_STAGING_TABLE} RENAME TO overrides")
 
 
+def _migrate_retracted(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild each `RETRACTABLE_TABLES` table that lacks `retracted` with its
+    version-11 DDL (module docstring, "Schema versions"), every row kept in
+    insertion order with `retracted = FALSE` (no row before version 11 could
+    retract anything), so every as-of read returns what it did before. A
+    fresh store's tables come from `_TABLE_DDL` (the version-4 shape) and are
+    rebuilt empty. Idempotent: a table that has the column is left alone.
+    Runs inside `init_schema`'s transaction, after its DDL pass."""
+    for table in RETRACTABLE_TABLES:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        if "retracted" in columns:
+            continue
+        staging = f"{table}_v11"
+        conn.execute(
+            _RETRACTION_TABLE_DDL[table].replace(
+                f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1
+            )
+        )
+        conn.execute(
+            f"INSERT INTO {staging} BY NAME "
+            f"SELECT *, FALSE AS retracted FROM {table} ORDER BY rowid"
+        )
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 9 store to version 10.
+    version-2 to 10 store to version 11.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -1744,7 +1846,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; a version-9 store gets `statement_facts`
+    `CURRENT_SCHEMA_VERSION`; every store gets `securities` and `listings`
+    rebuilt with `retracted` (every row kept, `FALSE`) and
+    `master_underived` created, and a version-10 store a version-11 row
+    (#859); a version-9 store gets `statement_facts`
     created and a version-10 row (purely additive, #660); a version-8
     store gets that after `order_events` and `overrides` are rebuilt with
     the version-9 sets and column (every row kept) and a version-9 row; a
@@ -1761,7 +1866,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     registry tables and a version-3 row. Nothing else changes (module
     docstring, "Schema versions").
 
-    On a read-only connection no DDL runs: a version-10, 9, 8, 7, 6 or 5
+    On a read-only connection no DDL runs: a version-11, 10, 9, 8, 7, 6 or 5
     store passes (a version-9 store serves every read but
     `statement_facts`, missing there as a pre-journal store's journal
     tables are; a version-8 store serves every read but `overrides`,
@@ -1790,6 +1895,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_ACCEPT_REJECTIONS_VERSION,
         _PRE_SETTLE_ORDER_VERSION,
         _PRE_STATEMENT_FACTS_VERSION,
+        _PRE_RETRACTION_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -1816,9 +1922,14 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         ):
             _migrate_settle_order(conn)
         for ddl in (
-            _TABLE_DDL + _REGISTRY_TABLE_DDL + _JOURNAL_TABLE_DDL + _STATEMENT_FACTS_TABLE_DDL
+            _TABLE_DDL
+            + _REGISTRY_TABLE_DDL
+            + _JOURNAL_TABLE_DDL
+            + _STATEMENT_FACTS_TABLE_DDL
+            + _MASTER_UNDERIVED_TABLE_DDL
         ):
             conn.execute(ddl)
+        _migrate_retracted(conn)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1

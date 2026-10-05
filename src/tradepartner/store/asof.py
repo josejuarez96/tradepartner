@@ -5,7 +5,10 @@ Every function here takes a tz-aware UTC `t` ("T" in the spec's
 `known_at <= t`, the **latest revision** per natural key (spec
 "Definitions" > Revision: "the row with the greatest `known_at <= T`").
 Rows are never updated in place, so "latest revision" is always a query,
-never a stored flag.
+never a stored flag. In `securities` and `listings` the latest revision may
+be a retraction (#859, `retracted = TRUE`, `store.retraction`): the key then
+has no row from that revision's `known_at` on, and the old row still answers
+every T before it.
 
 Only four of the six as-of functions the spec lists live here:
 `prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`,
@@ -201,6 +204,7 @@ import polars as pl
 
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, get_settings, parse_accepted_jump
+from tradepartner.store.schema import RETRACTABLE_TABLES
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Natural key (excluding `known_at`) each table's rows are keyed by for
@@ -280,7 +284,10 @@ def _latest_as_of(
     """The latest-revision-as-of-`t` rows of `table`, as a `polars.
     DataFrame` sorted by `key_columns`: one row per distinct `key_columns`
     tuple among rows with `known_at <= t`, the one with the greatest
-    `known_at` (spec "Definitions" > Revision).
+    `known_at` (spec "Definitions" > Revision). For `securities` and
+    `listings` a key whose latest revision is a retraction (#859) returns
+    nothing, and the `retracted` column is left out (every row returned is
+    live), so a frame reads as it did before version 11.
 
     `security_ids`, when given, restricts to those `security_id` values
     (an empty sequence restricts to none, returning an empty frame with
@@ -290,8 +297,14 @@ def _latest_as_of(
     partition = ", ".join(key_columns)
     params: list[Any] = [t]
     security_filter = _security_filter(security_ids, params)
+    # A retraction (#859) is the latest revision of its key, so the filter
+    # applies after choosing it, as `cancelled` does for actions: the key is
+    # withdrawn from the retraction's `known_at` on, never before.
+    retractable = table in RETRACTABLE_TABLES
+    excluded = "_rn, retracted" if retractable else "_rn"
+    live = "AND NOT retracted" if retractable else ""
     sql = f"""
-        SELECT * EXCLUDE (_rn) FROM (
+        SELECT * EXCLUDE ({excluded}) FROM (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY {partition} ORDER BY known_at DESC
             ) AS _rn
@@ -299,7 +312,7 @@ def _latest_as_of(
             WHERE known_at <= ?
             {security_filter}
         )
-        WHERE _rn = 1
+        WHERE _rn = 1 {live}
         ORDER BY {partition}
     """
     return conn.execute(sql, params).pl()

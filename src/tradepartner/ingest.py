@@ -127,6 +127,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import MasterBuild, build_master, securities_as_of
+from tradepartner.store.retraction import record_underived, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
@@ -143,8 +144,11 @@ Row = dict[str, Any]
 #: Per table: the natural key an as-of read collapses on, and the value
 #: columns whose change makes a new row.
 _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "securities": (("security_id",), ("cik", "name", "benchmark")),
-    "listings": (("security_id", "ticker", "exchange", "valid_from"), ("class_title",)),
+    "securities": (("security_id",), ("cik", "name", "benchmark", "retracted")),
+    "listings": (
+        ("security_id", "ticker", "exchange", "valid_from"),
+        ("class_title", "retracted"),
+    ),
     "classifications": (("security_id",), ("sic", "security_type", "rule")),
     "delistings": (
         ("security_id", "form", "class_title", "exchange", "filed_at"),
@@ -155,6 +159,10 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 
 #: What makes an action row a new revision of its identity (`CorporateAction.same_values`).
+#: A value column a builder row may leave out, and what it means then: a
+#: master row is live unless a retraction says otherwise (#859).
+_VALUE_DEFAULTS: dict[str, Any] = {"retracted": False}
+
 _ACTION_VALUES: tuple[str, ...] = ("action_type", "ex_date", "ratio_or_amount", "cancelled")
 
 
@@ -221,9 +229,9 @@ def ingest_session(
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
-    work: dict[str, Callable[[duckdb.DuckDBPyConnection], tuple[int, str]]] = {
-        "edgar": lambda conn: _ingest_filings(conn, settings, recorded, clock),
-        "alpaca": lambda conn: _write_prices(conn, fetched["alpaca"]),
+    work: dict[str, Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]]] = {
+        "edgar": lambda conn, run_id: _ingest_filings(conn, settings, recorded, clock, run_id),
+        "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
     fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
@@ -258,7 +266,7 @@ def ingest_session(
 
 def _run_source(
     name: str,
-    work: Callable[[duckdb.DuckDBPyConnection], tuple[int, str]],
+    work: Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]],
     settings: Settings,
     now: datetime,
     clock: Callable[[], datetime],
@@ -269,7 +277,8 @@ def _run_source(
     after_commit: Callable[[], None] | None = None,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
-    `work` inside one write transaction with the run row, then -- only for a
+    `work` (given the run row's id) inside one write transaction with the
+    run row, then -- only for a
     committed `ok`, non-dry run -- `after_commit` (T11h's `record_failures`),
     called outside the write transaction; an exception from it is appended
     to the returned message only, the committed run row never rewritten."""
@@ -283,7 +292,7 @@ def _run_source(
             prepare()
         with open_for_write(settings) as conn:
             init_schema(conn)
-            rows, message = work(conn)
+            rows, message = work(conn, run_id)
             if dry_run:
                 raise _DryRun(rows, message)
             run = outcome(OK, rows, message)
@@ -540,7 +549,13 @@ def _ingest_filings(
     settings: Settings,
     filings: FilingSource,
     clock: Callable[[], datetime],
+    run_id: str,
 ) -> tuple[int, str]:
+    """The EDGAR chunk: build the master, delistings, classifications and
+    facts once more from the recorded answers, add what changes an as-of
+    read, then record the stored master rows this build no longer derives
+    under `run_id` (#859: `master_underived`, health's
+    `underived_master_rows`; `master-retract` withdraws them)."""
     recorded = _Recorded(filings)
     # The fetch pass, so `now` is read only after every source answer. When
     # `filings` is already a frozen fetch pass (`_prefetch`, as both callers
@@ -559,6 +574,7 @@ def _ingest_filings(
         ("facts", facts),
     ):
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
+    record_underived(conn, run_id, now, stored_underived(conn, master, now))
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
@@ -1300,8 +1316,13 @@ def _add_rows(
     def key(row: Mapping[str, Any]) -> tuple[Any, ...]:
         return tuple(row[c] for c in key_cols)
 
+    def value(row: Mapping[str, Any], column: str) -> Any:
+        return (
+            row.get(column, _VALUE_DEFAULTS[column]) if column in _VALUE_DEFAULTS else row[column]
+        )
+
     def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-        return all(a[c] == b[c] for c in value_cols)
+        return all(value(a, c) == value(b, c) for c in value_cols)
 
     ids = sorted({row["security_id"] for row in rows})
     cursor = conn.execute(

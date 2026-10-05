@@ -112,6 +112,12 @@ derived at `t`, as the data is read.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
+- `underived_master_rows` (#859): the stored `securities` and `listings` rows
+  the latest master check finished by `t` (an EDGAR ingest chunk or a
+  `master-retract --apply`) found the current rules no longer derive, and
+  that are still live at `t` (`store.retraction.underived_as_of`): table,
+  key, stored `known_at` and the check's run id. `tradepartner
+  master-retract` lists the same set from a fresh build and retracts it.
 
 This module holds no threshold; the only numbers in it are 0 and 1.
 """
@@ -148,6 +154,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import securities_as_of
+from tradepartner.store.retraction import underived_as_of
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 from tradepartner.universe import shares_as_of
 
@@ -171,6 +178,7 @@ NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
 GUARDED_SIC_DEFAULT = "guarded_sic_default"
+UNDERIVED_MASTER_ROWS = "underived_master_rows"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -183,6 +191,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
     GUARDED_SIC_DEFAULT,
+    UNDERIVED_MASTER_ROWS,
 )
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
@@ -704,6 +713,7 @@ def _integrity_checks(
         NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
+        UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
