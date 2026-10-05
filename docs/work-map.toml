@@ -297,7 +297,7 @@ why = "Closes the design standard's one open decision so the operations page (T6
 unblocks = ["task:T69"]
 
 [adr.0013]
-what = "Proposed: the research-measurement boundary under which a pretrained classification model (Jev first) may label facts in public filings and headlines for the owner's review; labels live only in the research store, fixes enter only as reviewed changes, tests hold the line, each task is a registered pilot under a spend ceiling."
+what = "The research-measurement boundary under which a pretrained classification model (Jev first) may label facts in public filings and headlines for the owner's review; labels live only in the research store, fixes enter only as reviewed changes, tests hold the line, each task is a registered pilot under a spend ceiling."
 why = "Unlocks the ML brief's model arms and the owner's data-refinement use (security-master second opinions, 8-K subtypes, headline types) without letting a model write a fact or touch the decision path; answers ADR 0008's open reading for typed classifiers."
 unblocks = ["research:2026-10-03-prospective-semantic-feature-spec"]
 

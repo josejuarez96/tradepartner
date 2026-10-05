@@ -1,6 +1,6 @@
 # 0013. Research-measurement boundary: pretrained classifiers may label facts for human review, never write them
 
-**Status:** Proposed  ·  **Date:** 2026-10-05  ·  **Issue:** #946  ·  **Amends:** ADR 0008 points 1 and 2 (readings, point 9 below; ADR 0008 itself is not edited)
+**Status:** Accepted (owner decisions of 2026-10-05 on the five questions, in chat to the orchestrator and recorded on #946; by merging PR #950)  ·  **Date:** 2026-10-05  ·  **Issue:** #946  ·  **Amends:** ADR 0008 points 1 and 2 (readings, point 9 below; ADR 0008 itself is not edited)
 
 *ADR number 0012 is reserved by strategy-lab plan task T92 (cadence as a hypothesis parameter, #939); this record is 0013.*
 
@@ -122,6 +122,16 @@ Each has options and a recommendation; the owner answers on #946 and the answers
 4. **Where the owner's review decisions are recorded.** (a) The review file in the research store, registered as a dataset version, cited by hash in every fix PR; no schema change. (b) As (a), plus a new `owner_decisions` kind (`label_review`) in the runtime store, one row per reviewed item holding the owner's decision, reason and the filing's accession, **never the model's label**, so the decisions are a query beside the gap sign-offs; a schema migration in the labeling plan, and an amendment of test (d) in point 3 to allow exactly that table's rows. **Recommendation: (a) for the pilot**; (b) if, after the pilot, the owner wants the review history on the dashboard, since the research view can then join it to runs.
 
 5. **Hosted first or local first.** (a) Hosted typed classifier (Jev) first: zero-shot over our option set, no training labels needed, list price negligible, terms line required. (b) A local encoder first: nothing leaves the laptop, but it needs labelled training data, which is what the pilot produces, so the pilot would measure the owner's labels, not a model's. (c) Both, as arms of the same registered benchmark, from the start. **Recommendation: (a) for the first pilot, (c) from the second**, when task A's gold labels exist and can train the local arm; a local arm that matches the hosted one at equal precision wins on terms and cost (TC §22).
+
+## Owner decisions 2026-10-05
+
+The owner answered the five questions on 2026-10-05 (in chat to orchestrator 7e93ee3b, posted on #946). The questions above stand as written; these answers govern.
+
+1. **Question 1: (b).** Hosted typed classifiers and local pretrained encoders fall under this ADR as a reading of ADR 0008; generative models stay under ADR 0008 and Phase 5 in every role, including as a benchmark arm. Point 1 applies as written.
+2. **Question 2: a $20 total for the pilot, not a monthly figure.** The owner holds a free $20 Jev credit; the pilot's whole budget is that credit, and **no paid spend beyond it** is authorized. The config key `research.spend_ceiling_usd_month` stays as point 7 defines it, set in his `.env`; for the pilot the owner sets it so that the cumulative spend over every pilot batch, computed from the inference records (point 7), never exceeds $20, and the job's pre-batch estimate is checked against both the month's ceiling and the $20 pilot total. Actual billing is recorded on #946 after first use. A budget beyond the credit is a new answer to question 2, recorded here in a dated section (point 10).
+3. **Question 3: (A), then (C), then (E).** The first pilot is task A, the security-master departure reason from the Form 25 and surrounding 8-K, starting with its corpus build; task C, price-jump triage, follows once (A)'s verdict is recorded; task E, GDELT headline-entity disambiguation, after #882's verdict.
+4. **Question 4: (a).** Review decisions are recorded in the review file in the research store, registered as a dataset version and cited by hash in every fix PR; no `owner_decisions` kind is added for the pilot.
+5. **Question 5: (a), then (c).** Jev first for the first pilot; from the second pilot, hosted and local arms run in the same registered benchmark.
 
 ## Consequences
 
