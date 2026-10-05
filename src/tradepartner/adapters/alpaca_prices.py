@@ -24,10 +24,11 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   its security's span (#844): it is dropped on a day that also lists a
   readable equity ticker of the security, else read as the ticker of the
   security's last row before it when that is a readable equity row
-  (Vulcan's 10-Qs naming the exchange for `VMC`). As its first row, or
-  after a placeholder or non-equity row, it stays as written. A footnote
-  marker or bracketed exchange after a symbol (`VAL*`, `BAX (NYSE)`) is
-  that symbol (`alpaca_symbol`);
+  (Vulcan's 10-Qs naming the exchange for `VMC`), and a delisting of its
+  listing ends that span under the rule below. As its first row, or after
+  a placeholder or non-equity row, it stays as written. A footnote marker
+  or bracketed exchange after a symbol (`VAL*`, `BAX (NYSE)`) is that
+  symbol (`alpaca_symbol`), never a bracketed class (`HEI (A)`);
 - a security listing two different tickers on equity rows of one day,
   one of them the ticker of its row just before that day (FutureFuel's
   cover page naming Ford's `F` beside its own `FF`), keeps that ticker:
@@ -218,9 +219,16 @@ _ALPACA_SYMBOL = re.compile(r"[A-Z]+(\.[A-Z]+)?")
 #: A one-letter share-class suffix written with `-` or `/` (`CRD-A`, `BRK/B`).
 _CLASS_SUFFIX = re.compile(r"([A-Z]+)[-/]([A-Z])")
 #: A filer's footnote marker or bracketed exchange after the symbol (#844):
-#: trailing asterisks (`VAL*`) or one trailing bracketed group (`UPH(1)`,
-#: `LCINQ (1)`, `BAX (NYSE)`), with the spaces before it.
-_FOOTNOTE = re.compile(r"(.*?[^\s*(])\s*(?:\*+|\([^()]*\))")
+#: trailing asterisks (`VAL*`), or one trailing bracketed footnote number
+#: (`UPH(1)`, `LCINQ (1)`) or exchange name (`BAX (NYSE)`), with the spaces
+#: before it. Any other bracketed group (`HEI (A)`, `GOOG (Class C)`,
+#: `BAC (Series L)`) names a class or series and is left alone, so it stays
+#: no symbol rather than another class's.
+_FOOTNOTE = re.compile(
+    r"(.*?[^\s*(])\s*(?:\*+|\(\s*(?:\d+|NYSE(?:\s+(?:AMERICAN|MKT|ARCA))?|NASDAQ(?:\s*[GC][SM])?"
+    r"|AMEX|CBOE|BATS)\s*\))",
+    re.IGNORECASE,
+)
 
 
 def _strip_footnote(ticker: str) -> str:
@@ -439,6 +447,7 @@ class _Row:
     day: date
     ticker: str
     kind: str  # EQUITY or the non-equity kind; "placeholder" for no ticker
+    written: str | None = None  # an unreadable ticker read as `ticker` (#844)
 
 
 _PLACEHOLDER = "placeholder"
@@ -488,7 +497,7 @@ class ListingResolver:
             readable, ignored = _ignore_unreadable(listed)
             unreadable += ignored
             rows, pair_day = _drop_same_day_typos(readable)
-            same_day_typos += len(listed) - len(rows)
+            same_day_typos += len(readable) - len(rows)
             index = 0
             while index < len(rows):
                 first = index
@@ -501,7 +510,8 @@ class ListingResolver:
                 left, kept = None, False
                 if kinds == {EQUITY}:
                     days = [r.day for r in rows[first:index]]
-                    left, kept = self._own_delisting(security_id, ticker, days, end)
+                    aliases = {(r.day, r.written) for r in rows[first:index] if r.written}
+                    left, kept = self._own_delisting(security_id, ticker, days, end, aliases)
                 span = TickerSpan(security_id, ticker, start, end if left is None else left)
                 if left is not None:
                     cut.add(span)
@@ -598,10 +608,18 @@ class ListingResolver:
         )
 
     def _own_delisting(
-        self, security_id: str, ticker: str, days: Sequence[date], end: date | None
+        self,
+        security_id: str,
+        ticker: str,
+        days: Sequence[date],
+        end: date | None,
+        aliases: Collection[tuple[date, str]] = (),
     ) -> tuple[date | None, bool]:
         """`(left, kept)` for an equity span of `security_id` under `ticker`
-        whose rows are on `days` (sorted), until `end` (#819).
+        whose rows are on `days` (sorted), until `end` (#819). `aliases`
+        are `(day, ticker)` of the span's unreadable rows read as `ticker`
+        (#844): a delisted listing under one of them is a listing of the
+        span too.
 
         `left` is the day the span stops holding its ticker because its own
         listing was delisted: the earliest effective day, inside the span,
@@ -617,7 +635,7 @@ class ListingResolver:
         inside = [
             (valid_from, day)
             for valid_from, listed, day in self._evidence.delisted_listings.get(security_id, ())
-            if listed == ticker
+            if (listed == ticker or (valid_from, listed) in aliases)
             and start <= valid_from
             and start < day
             and (end is None or day < end)
@@ -822,7 +840,7 @@ def _ignore_unreadable(rows: Sequence[_Row]) -> tuple[list[_Row], int]:
             continue
         before = [r for r in out if r.day < row.day]
         if before and before[-1].kind == EQUITY and not _unreadable(before[-1]):
-            out.append(replace(row, ticker=before[-1].ticker))
+            out.append(replace(row, ticker=before[-1].ticker, written=row.ticker))
             ignored += 1
             continue
         out.append(row)

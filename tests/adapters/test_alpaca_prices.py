@@ -1404,6 +1404,43 @@ class TestUnreadableTickers:
         assert resolver.knows("0000000001")
         assert resolver.report.unreadable == 0
 
+    def test_a_delisted_junk_last_row_still_ends_the_span(self) -> None:
+        # quant-auditor on #863: the Form 25 lands on the junk row's listing,
+        # keyed under the junk string; rule 7 must still cut the span.
+        junk_day = date(2021, 1, 4)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "XYZ", date(2019, 1, 2), "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", junk_day, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        "0000000001",
+                        "New York Stock Exchange",
+                        "Common Stock",
+                        date(2021, 3, 1),
+                        valid_from=junk_day,
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("XYZ", date(2021, 2, 1)) == "0000000001"
+        assert resolver.resolve("XYZ", date(2022, 6, 1)) is None
+        assert resolver.report.ended_spans == 1
+
+    def test_a_dropped_junk_row_is_counted_once(self) -> None:
+        day = date(2022, 6, 9)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "OLD", START, "Common Stock"),
+                _listing("0000000001", "NEWT", day, "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", day, "Common Stock"),
+            ]
+        )
+        assert (resolver.report.unreadable, resolver.report.same_day_typos) == (1, 0)
+
     def test_a_junk_row_never_changes_an_earlier_mapping(self) -> None:
         # No look-ahead: a junk row, and every row after it, change nothing
         # before its day; nor does it hand the ticker to another company.
@@ -1582,6 +1619,8 @@ class TestAlpacaSymbols:
             ("UPH(1)", "UPH"),
             ("LCINQ (1)", "LCINQ"),
             ("QTEKQ (1) ", "QTEKQ"),
+            ("ABC (Nasdaq GS)", "ABC"),
+            ("ABC (NYSE American)", "ABC"),
         ],
     )
     def test_safe_spellings_become_the_alpaca_symbol(self, ticker: str, symbol: str) -> None:
@@ -1594,6 +1633,12 @@ class TestAlpacaSymbols:
             "Trading SymbolSLP",
             "*",
             "(NYSE)",
+            # quant-auditor on #863: a bracketed class or series is no footnote.
+            "HEI (A)",
+            "BRK (A)",
+            "GOOG (Class C)",
+            "BAC (Series L)",
+            "XYZ (Pfd)",
             "F&G",
             "C/28",
             "CUBI/PC",
