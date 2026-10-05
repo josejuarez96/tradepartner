@@ -379,6 +379,9 @@ class EdgarFilingSource(FilingSource):
         # to, and the in-range periods whose manifests load (the lag window).
         self._fsn_extracted_accessions: frozenset[str] = frozenset()
         self._fsn_loaded_periods: tuple[str, ...] = ()
+        # #868: periods parsed cleanly after an earlier period failed whole,
+        # so not written; they still set where the lag window starts.
+        self._fsn_unwritten_periods: list[str] = []
         # T11f: Form 25/25-NSE primary documents skipped pre-fetch (not XML).
         self.pre_xml_delistings = 0
         self.unstamped_delistings = 0
@@ -754,7 +757,11 @@ class EdgarFilingSource(FilingSource):
         `accepted: False`), and `committed: False` until T11f's
         `record_failures()` sets it. An accession seen in two periods keeps
         the first extracted; the duplicate is counted on `.fsn_duplicates`.
-        A period is re-extracted only when `FSN_VERSION` changes.
+        A period is re-extracted only when `FSN_VERSION` changes. Once a
+        period fails whole (recorded on `.validation_failures`, #578), the
+        later periods of the pass are extracted but write no manifest or
+        cache (#868): otherwise a later period would claim an accession the
+        failed one shares, and keep it after the failed one is repaired.
 
         For periods already extracted (a manifest exists) and still listed
         on the data-set page, one `HEAD` compares their validators with the
@@ -775,6 +782,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_incomplete_listings = 0
         self.fsn_missing = 0
         self._fsn_extraction_failures_this_run = 0
+        self._fsn_unwritten_periods = []
 
         all_periods = edgar_raw.fsn_periods(settings=self._settings, client=self._client)
         listed = set(all_periods)
@@ -794,8 +802,15 @@ class EdgarFilingSource(FilingSource):
                 known_accessions.update(manifest["accessions_extracted"])
 
         kept_forms = {*self._settings.edgar.cover_page_forms, *self._settings.edgar.header_forms}
+        persist = True
         for period in to_extract:
-            self._extract_fsn_period(period, kept_forms, known_accessions)
+            # #868: after a period fails whole, the later periods of this pass
+            # are still extracted (every failure shows in one pass, #578) but
+            # write nothing, so none claims an accession the failed period
+            # shares; the gate fails the run, and the next run extracts them.
+            persist = self._extract_fsn_period(
+                period, kept_forms, known_accessions, persist=persist
+            )
 
         for period in self._cached_fsn_periods():
             if edgar_raw.fsn_period_year(period) < self._settings.edgar.fsn_first_year:
@@ -841,8 +856,15 @@ class EdgarFilingSource(FilingSource):
         self._fsn_ready = True
 
     def _extract_fsn_period(
-        self, period: str, kept_forms: set[str], known_accessions: set[str]
-    ) -> None:
+        self, period: str, kept_forms: set[str], known_accessions: set[str], *, persist: bool
+    ) -> bool:
+        """Extract one FSN period. When `persist` is `False` (an earlier
+        period of the pass failed whole, #868), the period is only downloaded
+        and parsed, so a whole-period failure is still recorded, and nothing
+        else happens: no accession is claimed, no counter moves, no cache row
+        or manifest is written (the period only counts toward where the lag
+        window starts, `_lag_window_start`). Returns `False` once a period has failed
+        whole (this one, or an earlier one), else `True`."""
         zip_path, headers = edgar_raw.fsn_zip(period, settings=self._settings, client=self._client)
         with zip_path.open("rb") as zip_file:  # streamed: FSN zips reach hundreds of MB
             content_hash = hashlib.file_digest(zip_file, "sha256").hexdigest()
@@ -884,11 +906,15 @@ class EdgarFilingSource(FilingSource):
             # next run downloads and extracts it again); `record` re-raises
             # a tripped path-safety guard.
             self.validation_failures.record("FSN period", period, error)
-            return
+            return False
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
             zip_path.unlink(missing_ok=True)  # the zip is deleted after extraction
 
+        if not persist:
+            # parsed only to record a whole-period failure (#868)
+            self._fsn_unwritten_periods.append(period)
+            return False
         form_by_accession = {str(row["adsh"]): str(row["form"]) for row in sub_rows}
         per_cik_new: dict[str, dict[str, FsnFiling]] = {}
         served: list[str] = []
@@ -940,6 +966,7 @@ class EdgarFilingSource(FilingSource):
         # changes (the zip is gone).
         self._fsn_extraction_failures_this_run += len(accessions_failed)
         self._update_failed_filings_count()
+        return True
 
     def _fsn_root(self) -> Path:
         return self._cache / "fsn" / f"v{FSN_VERSION}"
@@ -1009,10 +1036,14 @@ class EdgarFilingSource(FilingSource):
 
     def _lag_window_start(self) -> datetime:
         """The first day (Eastern midnight, as UTC) of the newest cached FSN
-        period at or after `edgar.fsn_first_year`. With no such period
-        (e.g. `fsn_first_year` past the newest listed period) it raises
-        rather than treating all history as the lag window."""
-        periods = self._fsn_loaded_periods  # in range, and the manifest loads
+        period at or after `edgar.fsn_first_year`, or of a newer one this
+        pass parsed but did not write after an earlier period failed whole
+        (#868: otherwise every filing since the last written period would be
+        fetched one by one on a run the gate fails anyway). With no such
+        period (e.g. `fsn_first_year` past the newest listed period) it
+        raises rather than treating all history as the lag window."""
+        # in range, and the manifest loads; or parsed but unwritten (#868)
+        periods = (*self._fsn_loaded_periods, *self._fsn_unwritten_periods)
         if not periods:
             # Fail closed: "everything is inside the lag window" would request
             # a header for every 8-K and 10-Q since 1993 (#249 safety review).
