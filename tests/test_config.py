@@ -79,6 +79,13 @@ def test_ingest_defaults() -> None:
     assert s.ingest.settle_delay_minutes == 60
     assert s.ingest.reference_symbol == "SPY"
     assert s.ingest.max_missing_share == pytest.approx(0.05)
+    assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.5, float("nan")])
+def test_max_dark_share_must_be_a_share(value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ingest={"max_dark_share": value})
 
 
 def test_edgar_defaults() -> None:
