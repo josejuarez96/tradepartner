@@ -108,7 +108,12 @@ derived at `t`, as the data is read.
   the store cannot show the line kept trading.
   Such a bar is another equity's resolved to this one (a reused ticker,
   EGLE), a relisting with no listing row, or bars on both sides of a hole in
-  the store.
+  the store. A delisting whose next listing of the security carries the
+  same ticker (compared as `alpaca_symbol` keys it) raises no violation at
+  all (#829): `ListingResolver`'s own rule 7 (module docstring of
+  `adapters.alpaca_prices`) keeps the span running under that ticker
+  through the delisting, so the bars between are the security's own, never
+  a resumption to flag, however long the gap.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
@@ -939,12 +944,24 @@ def _bars_after_delisting(
         for row in ordered:
             if row["status"] != DELISTED:
                 continue
-            later = [
-                o["valid_from"]
-                for o in ordered
-                if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
-            ]
-            bounds.append({**row, "_next": min(later, default=None)})
+            later = sorted(
+                (
+                    o
+                    for o in ordered
+                    if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
+                ),
+                key=lambda o: o["valid_from"],
+            )
+            next_row = later[0] if later else None
+            if next_row is not None and _resolver_ticker(
+                str(next_row["ticker"])
+            ) == _resolver_ticker(str(row["ticker"])):
+                # Resolver rule 7 (#819, module docstring of
+                # `adapters.alpaca_prices`): a later row of the same ticker
+                # means the span ran on through this delisting, so no bar
+                # before that row is a resumption to flag (#829).
+                continue
+            bounds.append({**row, "_next": None if next_row is None else next_row["valid_from"]})
     if not bounds:
         return pl.DataFrame([], schema=_AFTER_DELISTING_SCHEMA)
     ids = sorted({b["security_id"] for b in bounds})
