@@ -9,7 +9,8 @@ owns the writes and the alerts this task's outputs feed.
   holding at that session's close, priced by `store.asof.prices_as_of` at the
   same close, with `tradable` carried from the run's own `assets` read (the
   one broker read a mark needs, taken once by the caller and reused for
-  every back-filled session).
+  every back-filled session). An untradable held name past its last bar is
+  marked at its last close (spec req 7, #678); any other missing bar raises.
 - `lapses` finds the rebalance sessions a window's catch-up window has run
   out on as of `session`: `catch_up_lapsed` when the frozen
   `paper.max_catch_up_sessions` elapsed with the switch clear throughout,
@@ -30,6 +31,7 @@ Nothing here writes a row, delivers an alert or reads a clock.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -48,6 +50,8 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     RebalanceEventRow,
 )
+
+_logger = logging.getLogger(__name__)
 
 _PAPER_MAX_CATCH_UP = "paper.max_catch_up_sessions"
 _EXECUTED = "executed"
@@ -125,12 +129,45 @@ def marks_for(
     is `tradable_flags.get(security_id)`, the same flags for every session
     back-filled in one call, since a mark step reads `assets` once. A session
     with nothing held gets one `Mark(security_id=None, quantity=0.0, ...)` row
-    carrying the ledger's cash. Raises `ValueError` if `prices_as_of` has no
-    price for a held name at that close.
+    carrying the ledger's cash.
+
+    A held name with no bar for a session is marked at its last close (spec
+    req 7, #678) only when its flag is false or absent (untradable, no
+    current ticker, or not in the broker's assets read) and no later session
+    of `sessions` has a bar for it, so the gap runs from the session after
+    its last bar: that close is the latest bar on or before the session as
+    known at close(session), never a bar after it, and each such mark logs a
+    `marks` warning naming the stale close's date. Every other missing bar
+    (a tradable name, a gap before the name's last bar, or a name with no
+    bar at all) raises `ValueError`, so a stale mark is never carried
+    silently.
     """
+    books = {session: ledger(session) for session in sessions}
+    own: dict[date, dict[str, float]] = {}
+    last_known: dict[date, dict[str, tuple[date, float]]] = {}
+    last_bar: dict[str, date] = {}
+    for session in sessions:
+        held = sorted(books[session].positions)
+        if not held:
+            continue
+        prices = prices_as_of(conn, session_close(session), held)
+        # `prices_as_of` returns the latest-known revision of *every* session's
+        # bar on or before this close, one row per (security_id, session), not
+        # only `session`'s own: a security missing a bar for `session` would
+        # otherwise be silently priced off an older session's close (a stale
+        # mark). `own` keeps `session`'s bars only; `last_known` keeps each
+        # name's latest bar, which prices a mark only under the rule above.
+        own[session] = {}
+        last_known[session] = {}
+        for row in prices.sort("session").iter_rows(named=True):
+            security_id, bar_session, close = row["security_id"], row["session"], row["close"]
+            last_known[session][security_id] = (bar_session, close)
+            if bar_session == session:
+                own[session][security_id] = close
+                last_bar[security_id] = session
     marks: list[Mark] = []
     for session in sessions:
-        book = ledger(session)
+        book = books[session]
         if not book.positions:
             marks.append(
                 Mark(
@@ -144,24 +181,25 @@ def marks_for(
                 )
             )
             continue
-        held = sorted(book.positions)
-        prices = prices_as_of(conn, session_close(session), held)
-        # `prices_as_of` returns the latest-known revision of *every* session's
-        # bar on or before this close, one row per (security_id, session), not
-        # only `session`'s own: a security missing a bar for `session` would
-        # otherwise be silently priced off an older session's close (a stale
-        # mark). Filtering to `session` here turns that into the same
-        # "no price" `ValueError` as a name with no bar at all.
-        closes = {
-            row["security_id"]: row["close"]
-            for row in prices.iter_rows(named=True)
-            if row["session"] == session
-        }
-        for security_id in held:
-            if security_id not in closes:
-                raise ValueError(f"no price for {security_id} at close({session})")
+        for security_id in sorted(book.positions):
+            flag = tradable_flags.get(security_id)
+            if security_id in own[session]:
+                price = own[session][security_id]
+            else:
+                stale = last_known[session].get(security_id)
+                later = last_bar.get(security_id)
+                if flag is True or stale is None or (later is not None and later > session):
+                    raise ValueError(f"no price for {security_id} at close({session})")
+                stale_session, price = stale
+                _logger.warning(
+                    "marks: %s has no bar at close(%s); marked at its last close, %s's, "
+                    "as untradable (tradable flag %s)",
+                    security_id,
+                    session.isoformat(),
+                    stale_session.isoformat(),
+                    flag,
+                )
             quantity = book.positions[security_id]
-            price = closes[security_id]
             marks.append(
                 Mark(
                     session=session,
@@ -170,7 +208,7 @@ def marks_for(
                     mark_price=price,
                     value=quantity * price,
                     cash=book.cash,
-                    tradable=tradable_flags.get(security_id),
+                    tradable=flag,
                 )
             )
     return marks
