@@ -9,13 +9,17 @@ Merging this file does not register it. The owner runs
 `docs/research/` for holdout-period results published since this file was written and adds
 them to the disclosure below, and re-runs the Q8 amendment's coverage check on the store he
 registers on (`universe_as_of` at close of 2020-08-31: the top-1000 cut must bind, that is,
-at least `universe.top_n_by_cap` companies pass rules 1–7; the counts were taken on the
-pre-repair store, and the listing repairs since #818 and the rule 7 shares fallback (#849)
-can move them). Since the #975 re-pin the start is no longer the first binding month-end,
-so a moved first binding month-end alone does not move it; if the cut does not bind at
-2020-08-31, he re-pins `in_sample_start`
-first, via a class-B PR that updates this file (the TOML value, the power-arithmetic session
-counts and the retirement window, and every passage and count that derives from them: the
+at least `universe.top_n_by_cap` companies pass rules 1–7, and none of the 192 #974 names
+still listed there may fail rule 6 with `missing_bars`; the counts were taken on the pre-repair store, and the listing
+repairs since #818 and the rule 7 shares fallback (#849) can move them). With about 1480
+companies passing rules 1–7 at 2020-08-31 on that store the size half of the check has a
+wide margin; the `n_universe` red flag below watches every later rebalance. Since the #975
+re-pin the start is no longer the first binding month-end, so a moved first binding
+month-end alone does not move it; if either half of the check fails at 2020-08-31, he
+re-pins `in_sample_start` to the first later month-end at which both hold, never to an
+earlier one,
+before registering, via a class-B PR that updates this file (the TOML value, the
+power-arithmetic session counts and the retirement window, and every passage and count that derives from them: the
 Q8 rationale and its iXBRL disclosure, the t-statistic table, the rebalance counts in the
 disclosure) and `tests/backtest/test_h1_file.py` (the date, the 41 sessions and the first
 fill), and registers only after it merges. An edit before
@@ -197,13 +201,15 @@ Owner answers that set these values (spec open questions, answered on #156):
   closes from 2018-11-30 (`formation_months = 12`: close(month-end of T − 12) to close(month-end of
   T − 1), 2019-10-31) and rule 6 needs bars from December 2018; the store holds Alpaca
   bars from January 2016 (ADR 0009), so the lookback has about three years of slack and
-  the start is set by listings, not by prices. Two data issues were found on the same
+  the start is set by listings, not by prices (that did not hold for the 192 #974 names,
+  whose bars start in July or August 2019; the #975 amendment below). Two data issues were found on the same
   store and fixed after the sweep: #845, share-count scale errors that put a few small
   names at the top of the cap ranking (rule 7 now rejects an out-of-line fact and uses the
   last accepted one, #849), and #840, the benchmark rows invisible under #35 (benchmarks are now read by
-  symbol, #857). Neither is expected to change which month-end the cut first binds; the
-  pre-registration check in the preamble is what confirms that on the store the owner
-  registers on. H1 is not registered on the owner's store, so this
+  symbol, #857). Neither is expected to change which month-end the cut first binds; since
+  #975 the start no longer depends on that month-end, and the pre-registration check in
+  the preamble confirms the cut binds at the #975 start on the store the owner registers
+  on. H1 is not registered on the owner's store, so this
   edit changes the file before its first registration and is not a new hypothesis. The
   registry hashes the whole file, so this edit changes H1's hash; that is harmless because
   no registration exists on the owner's store for the new hash to differ from. #839
@@ -219,18 +225,22 @@ Owner answers that set these values (spec open questions, answered on #156):
   is short of full for the nine month-end rebalances from 2019-11-29 to 2020-07-31. On the
   same store copy, the companies
   passing rules 1–7 number **1065 at 2019-11-29**, 1177 at 2020-06-30, **1483 at
-  2020-08-31** (the accelerated filers' first iXBRL 10-Qs), 1704 at 2020-12-31 and about
+  2020-08-31** (the accelerated filers' first iXBRL 10-Qs, and the 81 + 111 #974 names
+  entering at 2020-07-31 and 2020-08-31), 1704 at 2020-12-31 and about
   1850 from 2021-06 on, flat after 2021-08. The rank-1000 cap cutoff divided by the median
   member cap steps from 0.17–0.22 (2019-11 to 2020-06) through 0.25 at 2020-07 to
   0.29–0.33 from 2020-08 on, a band it stays in through 2021-12: pool expansion, not the
-  market. Two proxies bracket how many members differ from a full-pool top 1000: at
+  market (part of the 2020-07 and 2020-08 steps is the #974 names entering, not iXBRL;
+  this check does not separate the two). Two proxies bracket how many members differ from a full-pool top 1000: at
   2019-11-29, **60 of 1000 (6%)** of the 2021-12-31 universe's companies were already
   trading but had no listing known at close(T), and **116 (12%)** members sat below
   0.30 × median cap, about the cutoff ratio the full pool imposes from 2020-08 (the names
   a full pool would push out); at 2020-06-30, 27 and 102; at 2020-08-31, 13 and 0; at
-  2021-06-30, 6 and 0, falling to 0 and 0 by 2021-11. None of these counts includes the
-  #974 names, which had a listing known at T but no bars before mid-2019 and failed rule 6;
-  the 2019-11 to 2020-07 bias was larger than the two proxies say. The 60 is a floor: the
+  2021-06-30, 6 and 0, falling to 0 and 0 by 2021-11. The 2019-11 to 2020-06 counts do not
+  include the #974 names, which had a listing known at T but no bars before mid-2019 and
+  failed rule 6, so the bias in those months was larger than the two proxies say; the
+  2020-07 and 2020-08 counts already include the names that entered then, so the fall to
+  13 and 0 at 2020-08-31 measures the iXBRL and #974 effects together. The 60 is a floor: the
   proxy cannot
   count a company that delisted before 2021-12. After 2020-08 the pool grows by about 220
   more companies by 2020-12 (later accelerated-filer filings) and by about 150 more with
@@ -265,18 +275,31 @@ Owner answers that set these values (spec open questions, answered on #156):
   throughout. Universe rule 6 (`universe.min_history_months = 12` trailing months of bars)
   then excluded them until the window cleared: 81 enter at 2020-07-31 and 111 at
   2020-08-31. That is about 1,650 member-months, roughly 19% of each universe from 2019-11
-  to 2020-06, across the COVID crash, and a selection bias rather than the coverage ramp the
+  to 2020-06 by #974's count (an upper bound on the members changed, since not every
+  excluded name would have made the top 1000), across the COVID crash, and a selection bias rather than the coverage ramp the
   #842 amendment assumed: rule 8 ranks only the names that pass rules 1–7, so each wrongly
   excluded large name handed its top-1000 slot to a smaller one. 2020-08-31 is the first
   month-end rebalance at which all 192 have entered the universe on the store as it stands
   (#974), and the same month-end from which the iXBRL disclosure above finds the universe the ADR 0006
-  top 1000 in substance. #974 fixes the data in parallel (size M); this re-pin does not
-  wait for it. The 2020-08-31 rebalance's signal reads closes from 2019-08-30 to 2020-07-31
-  (`formation_months = 12`, `skip_months = 1`) and rule 6 needs bars over the 12 months to
-  2020-08-31, inside the 192 names' bars (from July 2019) and the store's January 2016
-  start (ADR 0009). No other parameter changes. **No trial result was seen before this
-  choice either:** H1 has no trial on real data (the #842 statement above still holds; the
-  audit counted universe members and bar spans only). H1 is not registered on the owner's
+  top 1000 in substance. #974 fixes the data in parallel (size M). The owner's decision
+  (on #974) is to re-pin now and fix the data in parallel, and that T45b proceeds on the
+  2020-08-31 start after the fill-holes run closes the rename holes (#843, #891); this
+  file reads that as: 2020-08-31 is the registered start whether or not the #974 fix
+  merges before registration, so registration does not wait on a size-M fix, and a fix
+  landing first does not move the start back to 2019-11-29. The 2020-08-31 rebalance's
+  signal reads closes from 2019-08-30 to 2020-07-31 (`formation_months = 12`,
+  `skip_months = 1`) and rule 6 needs bars on every session from 2019-09-03 to 2020-08-31
+  (`universe.min_history_months = 12`), inside the store's January 2016 start (ADR 0009).
+  A #974 name whose first bar falls after 2019-08-30 passes rule 6 at 2020-08-31 but has
+  no 2019-08-30 close, so it is a member with no momentum score at that one rebalance;
+  that residual is accepted and reported, not removed. No other parameter changes. **No
+  result was seen before this choice either:** H1 has no trial on real data (the #842
+  statement above still holds), and the decision on #974 rests on the audit's universe
+  membership and bar-span counts only; no return, turnover or metric of any hypothesis
+  on the real store was consulted. The move drops the first quarter of 2020 (the COVID
+  crash) from the in-sample run; the owner and the agents know that period's broad shape
+  (as with the holdout, below), and the date was set by the #974 data reason, not by that
+  knowledge. H1 is not registered on the owner's
   store, so this edit before registration is not a new hypothesis; it changes the file's
   hash, which is harmless for the same reason as #842's.
 - **Q10, statistical threshold:** option (a), no numeric cut-off. The retirement condition
@@ -483,7 +506,7 @@ Stated before any run, per open question 10 (a).
 the base-level `excess_cagr_spy` and the run-time `dsr_excess` in `trial_results` (N and V
 at run time), not the page's recomputation with today's N and V. The trial is the **first**
 `ok`, non-synthetic, `in_sample` trial of this hypothesis over the full default window
-[2020-08-31, 2023-12-29] (the `in_sample_start` of the Q8 amendments, #842 and #975)
+[2020-08-31, 2023-12-29] (the `in_sample_start` of the #975 amendment to Q8)
 that passed
 `quant-auditor` (plan T45b). A later trial replaces
 it only when an audit logged a bug in the earlier one. Shorter or later-start in-sample
