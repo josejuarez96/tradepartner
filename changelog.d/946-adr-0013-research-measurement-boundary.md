@@ -1,0 +1,3 @@
+- ADR 0013 (Proposed, #946): research-measurement boundary for pretrained classifiers (Jev first): factual labels for human review only, never the store, config or a decision; five owner questions on the issue.
+### Added
+- ADR 0013 (Proposed): research-measurement boundary under which pretrained classification models may label facts in public filings and headlines for the owner's review; outputs live only in the research store, fixes enter only as reviewed changes (ADR 0008 point 3), enforcement tests, registered pilots, a research spend ceiling in config, and the ADR 0008 readings it amends (#946)

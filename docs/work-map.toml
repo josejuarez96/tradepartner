@@ -296,6 +296,11 @@ what = "Streamlit under the design standard for every dashboard page, no separat
 why = "Closes the design standard's one open decision so the operations page (T69) can be built; keeps one code path for the override write."
 unblocks = ["task:T69"]
 
+[adr.0013]
+what = "Proposed: the research-measurement boundary under which a pretrained classification model (Jev first) may label facts in public filings and headlines for the owner's review; labels live only in the research store, fixes enter only as reviewed changes, tests hold the line, each task is a registered pilot under a spend ceiling."
+why = "Unlocks the ML brief's model arms and the owner's data-refinement use (security-master second opinions, 8-K subtypes, headline types) without letting a model write a fact or touch the decision path; answers ADR 0008's open reading for typed classifiers."
+unblocks = ["issue:946"]
+
 [plan.data-foundation]
 what = "The Phase 2 build document: 25 tasks, one PR each, grouped in chains."
 why = "What the ready frontier is computed from."
@@ -686,6 +691,11 @@ unblocks = ["spec:research-registry"]
 what = "Flip the Status fields of the strategy-lab spec and the research-registry spec and plan to Accepted, recording the owner's decision of 2026-10-05."
 why = "A plan is written only from an accepted spec; the flip is the record in git that the owner approved these three documents."
 unblocks = ["plan:research-registry", "spec:strategy-lab"]
+
+[issue.946]
+what = "Draft ADR 0013, the research-measurement boundary for pretrained classification models used as factual labelers under human review, with the owner questions that decide its scope, spend ceiling and first pilot."
+why = "The ML brief and the prospective feature spec name this ADR as the precondition for any model arm; the owner wants Jev tested on data refinement, not signals, and this is the record that says how."
+unblocks = ["adr:0013"]
 
 [plan.strategy-lab]
 what = "How the strategy lab is built: twenty-nine tasks from the accepted spec, docs first (the ADR and the spec amendments), then the pure cadence, anchor, frozen-default, parser and quiet-interval modules, then the period-key rename, the engine at cadence, the lab registry, registration, the runner, the report, promotion and the spend rules, then the CLI, the page and the lab migration after T45b."
