@@ -5,7 +5,7 @@ file-level, no store or connection involved."""
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -58,6 +58,15 @@ def test_spec_examples_register_cleanly(
     assert parsed.splits == splits
     assert parsed.confirmatory is True
     assert parsed.claims  # non-empty, every id graded in the fixture claims.toml
+
+    # quant-auditor, PR #935 SHOULD FIX 2: both examples write `splits = [...]`
+    # directly after `[window]`'s keys, which parses as `window.splits` under TOML's
+    # table-scoping rules. The stored params_json must still carry a top-level
+    # `splits` (what req 2 and every later reader expect), not bury it under
+    # `window`, and the hash must match whichever table the file put it under.
+    stored = json.loads(parsed.params_json)
+    assert stored["splits"] == list(splits)
+    assert "splits" not in stored["window"]
 
 
 # --------------------------------------------------------------------------------
@@ -156,9 +165,74 @@ def test_canonical_json_is_key_sorted_compact_and_date_safe() -> None:
     )
 
 
-# --------------------------------------------------------------------------------
-# `dataset register` helpers (req 11; CLI's T83 calls these).
-# --------------------------------------------------------------------------------
+def _fixture_experiment_tree(tmp_path: Path, name: str, text: str) -> tuple[Path, Path]:
+    """A fresh `<experiments_dir>, <path>` pair under `tmp_path/name`, with the
+    fixture claims.toml as its sibling `research/claims.toml` and `text` written at
+    `<slug from text>.md`. Each test variant gets its own tree so two files that
+    must carry the *same* slug (one TOML text difference each) don't collide."""
+    root = tmp_path / name
+    experiments_dir = root / "experiments"
+    experiments_dir.mkdir(parents=True)
+    research_dir = root / "research"
+    research_dir.mkdir()
+    (research_dir / "claims.toml").write_text(
+        '[[claim]]\nid = "FX-1"\ngrade = "SUPPORTED"\n', encoding="utf-8"
+    )
+    path = experiments_dir / "e1h-demand-deterioration-revenue.md"
+    path.write_text(text, encoding="utf-8")
+    return experiments_dir, path
+
+
+def test_splits_hashes_the_same_whichever_table_the_file_puts_it_under(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """quant-auditor, PR #935 SHOULD FIX 2: one registration has one hash, whether
+    the author wrote `splits` before `[dataset]` (top level, as req 2 specifies) or
+    after `[window]`'s keys (as the spec's own two worked examples do, which a bare
+    TOML table-scoping reading would nest under `window`)."""
+    original = (FIXTURES / "e1h-demand-deterioration-revenue.md").read_text(encoding="utf-8")
+    original = original.replace('["ER-4", "ER-5", "INT-4"]', '["FX-1"]')
+    top_level = original.replace('\nsplits = ["pilot"]\n', "\n", 1).replace(
+        "seed = 20261003\n", 'seed = 20261003\nsplits = ["pilot"]\n'
+    )
+    assert "splits" not in top_level.split("[dataset]")[1].split("[primary]")[0]
+
+    window_dir, window_path = _fixture_experiment_tree(tmp_path, "window", original)
+    top_dir, top_path = _fixture_experiment_tree(tmp_path, "top", top_level)
+
+    from_window = parse_experiment_file(window_path, window_dir, settings=settings)
+    from_top = parse_experiment_file(top_path, top_dir, settings=settings)
+
+    assert from_window.splits == from_top.splits == ("pilot",)
+    assert from_window.params_sha256 == from_top.params_sha256
+
+
+def test_splits_given_in_both_places_is_refused(tmp_path: Path, settings: Settings) -> None:
+    original = (FIXTURES / "e1h-demand-deterioration-revenue.md").read_text(encoding="utf-8")
+    original = original.replace('["ER-4", "ER-5", "INT-4"]', '["FX-1"]')
+    duplicated = original.replace("seed = 20261003\n", 'seed = 20261003\nsplits = ["pilot"]\n')
+    experiments_dir, path = _fixture_experiment_tree(tmp_path, "duplicated", duplicated)
+    with pytest.raises(ExperimentFileError, match="given both at top level and under"):
+        parse_experiment_file(path, experiments_dir, settings=settings)
+
+
+def test_event_dates_are_normalised_to_utc_regardless_of_source_timezone(tmp_path: Path) -> None:
+    """quant-auditor, PR #935 SHOULD FIX 1: the same instant must read as the same
+    date whether the export stores it naive, in UTC, or in another zone, or a row
+    near a sealed-period edge could land on either side depending on the writer."""
+    import polars as pl
+
+    instant_et = datetime(
+        2025, 12, 31, 20, 0, tzinfo=timezone(timedelta(hours=-5))
+    )  # 2026-01-01 01:00 UTC
+    instant_utc = instant_et.astimezone(UTC)
+    naive = datetime(2026, 1, 1, 1, 0)  # noqa: DTZ001 -- deliberately naive; treated as UTC
+
+    for name, value in (("et", instant_et), ("utc", instant_utc), ("naive", naive)):
+        path = tmp_path / f"{name}.parquet"
+        pl.DataFrame({"event_date": [value]}).write_parquet(path)
+        values = read_event_column(path, "event_date")
+        assert values == [date(2026, 1, 1)], name
 
 
 def test_hash_file_is_deterministic(tmp_path: Path) -> None:

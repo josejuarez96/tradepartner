@@ -39,7 +39,7 @@ import re
 import tomllib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
@@ -170,11 +170,30 @@ def _flatten(table: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
     flat: dict[str, Any] = {}
     for key, value in table.items():
         dotted = f"{prefix}{key}"
-        if isinstance(value, dict):
+        # An empty table (`[foo]` with no keys) has nothing to recurse into; treat
+        # it as a leaf so it still reaches the unknown-key check instead of
+        # silently vanishing (quant-auditor, PR #935 NIT).
+        if isinstance(value, dict) and value:
             flat.update(_flatten(value, f"{dotted}."))
         else:
             flat[dotted] = value
     return flat
+
+
+def _unflatten(flat: Mapping[str, Any]) -> dict[str, Any]:
+    """The inverse of `_flatten`: dotted keys back into nested tables. Used to
+    build the canonical JSON from the *normalised* parsed keys (after the
+    `window.splits` → `splits` fallback below), so the stored hash reflects what
+    was actually parsed rather than the raw TOML block's own table layout
+    (quant-auditor, PR #935 SHOULD FIX 2)."""
+    nested: dict[str, Any] = {}
+    for dotted, value in flat.items():
+        *parents, leaf = dotted.split(".")
+        cursor = nested
+        for part in parents:
+            cursor = cursor.setdefault(part, {})
+        cursor[leaf] = value
+    return nested
 
 
 def _parameter_block(text: str, path: Path) -> str:
@@ -268,10 +287,19 @@ def _load_claims(claims_path: Path) -> dict[str, str]:
         raise ExperimentFileError(f"{claims_path}: not valid TOML: {exc}") from exc
     claims = doc.get("claim", [])
     grades: dict[str, str] = {}
+    seen: set[str] = set()
     for entry in claims:
         claim_id = entry.get("id")
-        if isinstance(claim_id, str):
-            grades[claim_id] = entry.get("grade", UNGRADED_GRADE)
+        if not isinstance(claim_id, str):
+            continue
+        if claim_id in seen:
+            # A duplicated id is ambiguous data, not this parser's call to referee
+            # (quant-auditor, PR #935 NIT): never let it quietly support a
+            # confirmatory registration just because the later entry's grade won.
+            grades[claim_id] = UNGRADED_GRADE
+            continue
+        seen.add(claim_id)
+        grades[claim_id] = entry.get("grade", UNGRADED_GRADE)
     return grades
 
 
@@ -477,6 +505,13 @@ def parse_experiment_file(
         else None
     )
 
+    # Hash the *normalised* keys (`flat`, after the `window.splits` fallback above),
+    # not the raw TOML block: otherwise the stored hash depends on which table the
+    # author happened to put `splits` under, and a reader of `params_json` would
+    # find no top-level `splits` for either of the spec's own worked examples
+    # (quant-auditor, PR #935 SHOULD FIX 2).
+    normalised = _unflatten(flat)
+
     return ParsedExperiment(
         path=path,
         slug=slug,
@@ -513,8 +548,8 @@ def parse_experiment_file(
         amends_sha256=amends_sha256,
         doc_path=path.as_posix(),
         doc_sha256=sha256(raw).hexdigest(),
-        params_json=canonical_experiment_json(block),
-        params_sha256=experiment_sha256(block),
+        params_json=canonical_experiment_json(normalised),
+        params_sha256=experiment_sha256(normalised),
     )
 
 
@@ -569,8 +604,14 @@ def _read_tabular(path: Path) -> pl.DataFrame:
 
 
 def _as_date(value: Any, path: Path, column: str) -> date:
+    """One fixed convention, so the same instant reads the same date whatever
+    timezone the export's reader (or writer) used (quant-auditor, PR #935 SHOULD
+    FIX 1): a naive datetime is treated as UTC (CLAUDE.md: datetimes are always
+    timezone-aware UTC), a tz-aware one is converted to UTC, and the calendar date
+    is taken only after that conversion."""
     if isinstance(value, datetime):
-        return value.date()
+        aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return aware.date()
     if isinstance(value, date):
         return value
     raise ExperimentFileError(f"{path}: event column {column!r} is not date-like, got {value!r}")
