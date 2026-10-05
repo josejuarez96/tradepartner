@@ -50,12 +50,20 @@ class DataProvider(Protocol):
         ...
 
     def adjusted_prices(
-        self, t: datetime, ids: Sequence[str], include_dividends: bool
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
     ) -> pl.DataFrame:
-        """`adjusted_prices_as_of(t, ids, include_dividends=...)`: bars known at `t`,
-        latest revision, adjusted for every action known at `t` with ex-date at or before
-        it; `security_id`, `session`, `open`, `high`, `low`, `close`, ... per the as-of API.
-        The marking frame (dividends included) and the signal frame are both this call."""
+        """`adjusted_prices_as_of(t, ids, include_dividends=..., sessions_from=...)`:
+        bars known at `t`, latest revision, adjusted for every action known at `t` with
+        ex-date at or before it; `security_id`, `session`, `open`, `high`, `low`, `close`,
+        ... per the as-of API. The marking frame (dividends included) and the signal frame
+        are both this call. `sessions_from` leaves bars before that session out of the
+        result after the as-of read, so the factors and the `known_at` cut are unchanged
+        and only the frame is shorter (strategy-lab T99); `None` bounds nothing."""
         ...
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
