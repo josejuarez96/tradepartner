@@ -58,6 +58,19 @@ def test_prices_are_latest_revision_known_at_t() -> None:
     assert feb.select("session", "close").rows() == [(JAN, 5.0), (FEB, 11.0)]
 
 
+def test_sessions_from_bounds_the_frame_after_the_as_of_read() -> None:
+    """T99: the fake honours the bound as the store does, after the latest-revision
+    selection, and records it on the call."""
+    provider = _provider()
+    feb = provider.adjusted_prices(T_FEB, ["A"], include_dividends=False, sessions_from=FEB)
+    assert feb.select("session", "close").rows() == [(FEB, 11.0)]
+    jan = provider.adjusted_prices(T_FEB, ["A"], include_dividends=False, sessions_from=JAN)
+    assert jan.select("session", "close").rows() == [(JAN, 5.0), (FEB, 11.0)]
+    assert [call.sessions_from for call in provider.calls] == [FEB, JAN]
+    with pytest.raises(TypeError, match="sessions_from"):
+        provider.adjusted_prices(T_FEB, ["A"], include_dividends=False, sessions_from=T_FEB)
+
+
 def test_universe_members_and_other_reads() -> None:
     provider = _provider()
     assert provider.universe(T_JAN).members["security_id"].to_list() == ["A"]
