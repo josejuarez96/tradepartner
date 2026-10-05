@@ -23,6 +23,8 @@
 - `settings` returns a `Settings` pointed at a tmp-path store file, with no
   `.env` loaded, for tests that need `Settings` rather than a live
   connection (e.g. `store.db` lock/retry tests).
+- `_single_threaded_duckdb` (autouse, session) makes every `duckdb.connect`
+  in the test process default to `threads=1` (#953): see its docstring.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import re
 import socket
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -91,6 +94,42 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked_connect_ex)
+
+
+_DUCKDB_CONNECT = duckdb.connect
+
+
+def _single_threaded_connect(
+    database: str | Path = ":memory:",
+    read_only: bool = False,
+    config: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> duckdb.DuckDBPyConnection:
+    """`duckdb.connect` with `threads=1` unless the caller set `threads`."""
+    return _DUCKDB_CONNECT(database, read_only, {"threads": 1, **(config or {})}, **kwargs)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _single_threaded_duckdb() -> Iterator[None]:
+    """Open every DuckDB database in the test process with `threads=1` (#953).
+
+    With the default (`threads` = CPU count), each database instance starts
+    `threads - 1` native worker threads and joins them when its last
+    connection closes. The tests open and close thousands of short-lived
+    instances per xdist worker (every `open_for_write`/`open_read_only` is
+    one), so that is tens of thousands of native thread exits. On Linux,
+    DuckDB 1.5.5 allocates through its bundled jemalloc
+    (5.3.0-196-ga25b9b8), whose thread-teardown path (`tsd_add_nominal`) can
+    segfault. jemalloc fixed this in 5.4.0 (jemalloc#2981), and DuckDB does
+    not ship that fix yet. On CI that killed a random xdist worker inside
+    `conn.close()`, with no Python thread marked current in the dump. With
+    `threads=1`, DuckDB starts no worker threads, so that teardown path
+    never runs. Query results are unchanged; only DuckDB's intra-query
+    parallelism goes. Production connections are untouched.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(duckdb, "connect", _single_threaded_connect)
+        yield
 
 
 @pytest.fixture(autouse=True)
