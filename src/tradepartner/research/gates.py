@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
-from tradepartner.calendar import session_close
+from tradepartner.calendar import is_session, previous_session, session_close
 
 WindowOutcome = Literal["ok", "refused_window"]
 SplitOutcome = Literal["ok", "refused_split"]
@@ -103,10 +103,18 @@ class WindowDecision:
     message: str
 
 
+def _close_on_or_before(day: date) -> datetime:
+    """`close(day)`: the official XNYS close of `day`, or of the last session
+    at or before it when `day` itself is not a session (a registration
+    window's dates are calendar dates, not necessarily sessions)."""
+    session = day if is_session(day) else previous_session(day)
+    return session_close(session)
+
+
 def check_window(bound_span: Span, window: Span, as_of: datetime | None = None) -> WindowDecision:
-    """Req 4: the bound dataset's (or bound split's) event span must lie inside
-    the registration's data window, and an as-of read must not reach later
-    than `close(window.end)`. `as_of` is `None` for a kind that never reads
+    """Req 4: the bound dataset's event span must lie inside the
+    registration's data window, and an as-of read must not reach later than
+    `close(window.end)`. `as_of` is `None` for a kind that never reads
     market or company data (every kind but `economic` and `return`)."""
     if not window.contains(bound_span):
         return WindowDecision(
@@ -115,7 +123,7 @@ def check_window(bound_span: Span, window: Span, as_of: datetime | None = None) 
             f"the registration window [{window.start}, {window.end}]",
         )
     if as_of is not None:
-        bound = session_close(window.end)
+        bound = _close_on_or_before(window.end)
         if as_of > bound:
             return WindowDecision(
                 "refused_window",
@@ -142,12 +150,27 @@ def check_split(split: str, allowed_splits: tuple[str, ...]) -> SplitDecision:
 
 
 @dataclass(frozen=True)
+class PriorSpend:
+    """A previously recorded spend of a protected window: `label` is
+    whatever the caller found it under (a run id, a slug, a backtest trial
+    id — for messages only) and `window` is the protected window it spent
+    (a family holdout, the bound split's own span when the spend sealed a
+    split by name, or a sealed period). The repeat decision below compares
+    `window` against what *this* run touches, by `Span.overlaps`, so the
+    caller never has to pre-filter by family or dataset name itself."""
+
+    label: str
+    window: Span
+
+
+@dataclass(frozen=True)
 class HoldoutDecision:
     outcome: HoldoutOutcome
     message: str
     holdout_spent: bool = False
     holdout_repeat: bool = False
     holdout_reason: str | None = None
+    touched: tuple[Span, ...] = ()
 
 
 def check_holdout(
@@ -159,46 +182,64 @@ def check_holdout(
     sealed_periods: tuple[Span, ...],
     flags: Flags,
     reasons: Reasons,
-    prior_spends: tuple[str, ...],
+    prior_spends: tuple[PriorSpend, ...],
 ) -> HoldoutDecision:
     """Req 5: a run whose window overlaps a protected window of its family
-    (`family_holdouts`), or that binds a sealed split (`bound_split` in
-    `sealed_splits` — `test` is always sealed, Definitions, Split) or whose
-    bound split's event span overlaps a sealed period of the dataset name
-    (`sealed_periods`), is refused unless the flags are given. A former
-    `test` row relabelled into another split still trips the check, because
-    `bound_split_span` is checked against `sealed_periods` whatever the
-    split's current label. `prior_spends` names every prior spend of this
-    protected window the caller found (any backtest `holdout` trial of the
-    family, any research run of the family, any research run on this dataset
-    name, synthetic excluded, this run's own id dropped): non-empty makes
-    the spend a repeat, which additionally needs `--holdout-repeat`."""
-    touches = (
-        any(window.overlaps(holdout) for holdout in family_holdouts)
-        or bound_split in sealed_splits
-        or any(bound_split_span.overlaps(period) for period in sealed_periods)
+    (`family_holdouts`), or that binds a sealed split (`bound_split` is
+    `"test"`, which is always sealed, Definitions, Split, or is otherwise in
+    `sealed_splits`) or whose bound split's event span overlaps a sealed
+    period of the dataset name (`sealed_periods`), is refused unless the
+    flags are given. A former `test` row relabelled into another split
+    still trips the check, because `bound_split_span` is checked against
+    `sealed_periods` whatever the split's current label.
+
+    `decision.touched` names exactly the protected windows this run
+    touched (the overlapped family holdouts, the bound split's own span
+    when sealed by name, the overlapped sealed periods), so the caller can
+    record "the window, split or period spent" (req 5) without redoing the
+    overlap arithmetic. The spend is a repeat when any `prior_spends` entry
+    overlaps one of `touched` (`prior_spends` is every prior spend the
+    caller found: any backtest `holdout` trial of the family, any research
+    run of the family, any research run on this dataset name, synthetic
+    excluded, this run's own id dropped); a repeat additionally needs
+    `--holdout-repeat`."""
+    touched_holdouts = tuple(holdout for holdout in family_holdouts if window.overlaps(holdout))
+    split_sealed_by_name = bound_split == "test" or bound_split in sealed_splits
+    touched_periods = tuple(
+        period for period in sealed_periods if bound_split_span.overlaps(period)
     )
-    if not touches:
+    touched = (
+        touched_holdouts + ((bound_split_span,) if split_sealed_by_name else ()) + touched_periods
+    )
+    if not touched:
         return HoldoutDecision("ok", "no protected window touched")
     if not flags.spend_holdout:
         return HoldoutDecision(
             "refused_holdout",
             "touches a protected window; spending it needs --spend-holdout",
+            touched=touched,
         )
     if not _has_text(reasons.holdout_reason):
-        return HoldoutDecision("refused_holdout", "--spend-holdout needs a --holdout-reason")
-    if prior_spends and not flags.holdout_repeat:
-        spent_by = ", ".join(prior_spends)
+        return HoldoutDecision(
+            "refused_holdout", "--spend-holdout needs a --holdout-reason", touched=touched
+        )
+    repeats = tuple(
+        spend for spend in prior_spends if any(spend.window.overlaps(t) for t in touched)
+    )
+    if repeats and not flags.holdout_repeat:
+        spent_by = ", ".join(spend.label for spend in repeats)
         return HoldoutDecision(
             "refused_holdout",
             f"already spent ({spent_by}); a repeat needs --holdout-repeat",
+            touched=touched,
         )
     return HoldoutDecision(
         "ok",
         "holdout spend recorded",
         holdout_spent=True,
-        holdout_repeat=bool(prior_spends),
+        holdout_repeat=bool(repeats),
         holdout_reason=reasons.holdout_reason,
+        touched=touched,
     )
 
 
@@ -217,11 +258,11 @@ def check_budget(
 ) -> BudgetDecision:
     """Req 6: `chain_run_count` and `chain_configurations` are the amendment
     chain's totals so far (every run row, failures and refusals included,
-    synthetic excluded), read under the latest registration's budget. The
-    run that would make the count reach `budget.runs` is refused (so the
-    `budget.runs`-th run opens and the next is refused); declaring
-    configurations that would push the chain's sum past
-    `budget.configurations` is refused before any write."""
+    synthetic excluded), read under the latest registration's budget, not
+    counting the run being opened. Opening is refused once that count has
+    already reached `budget.runs` (so the `budget.runs`-th run opens and
+    the next is refused); declaring configurations that would push the
+    chain's sum past `budget.configurations` is refused before any write."""
     if chain_run_count >= budget_runs:
         return BudgetDecision(
             "refused_budget",

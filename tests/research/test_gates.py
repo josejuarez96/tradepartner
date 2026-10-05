@@ -6,12 +6,13 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from tradepartner.calendar import session_close
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.research.gates import (
     BudgetDecision,
     ConfirmatoryDecision,
     Flags,
     HoldoutDecision,
+    PriorSpend,
     Reasons,
     Span,
     SplitDecision,
@@ -92,6 +93,22 @@ def test_window_refused_when_as_of_bound_is_after_close_of_window_end() -> None:
     assert "after close(window.end)" in decision.message
 
 
+def test_window_end_on_a_non_session_date_bounds_at_the_prior_session_close() -> None:
+    # 2023-12-31 is a Sunday, a legitimate calendar-date registration window end (req 2
+    # places no session constraint on window.end); the as-of bound falls back to the
+    # close of the last session at or before it rather than raising.
+    weekend_window = Span(date(2017, 1, 1), date(2023, 12, 31))
+    bound = session_close(previous_session(weekend_window.end))
+    ok = check_window(Span(date(2018, 1, 1), date(2019, 1, 1)), weekend_window, as_of=bound)
+    assert ok.outcome == "ok"
+    refused = check_window(
+        Span(date(2018, 1, 1), date(2019, 1, 1)),
+        weekend_window,
+        as_of=bound + timedelta(seconds=1),
+    )
+    assert refused.outcome == "refused_window"
+
+
 # --- check_split (req 5 / req 14) -----------------------------------------
 
 
@@ -124,7 +141,7 @@ def _holdout(
     sealed_periods: tuple[Span, ...] = (),
     flags: Flags = NO_FLAGS,
     reasons: Reasons = NO_REASONS,
-    prior_spends: tuple[str, ...] = (),
+    prior_spends: tuple[PriorSpend, ...] = (),
 ) -> HoldoutDecision:
     return check_holdout(
         window,
@@ -174,18 +191,29 @@ def test_relabelled_test_row_inside_sealed_period_is_a_spend() -> None:
     assert spent.holdout_repeat is False
 
 
+def test_test_split_is_sealed_even_when_sealed_splits_omits_it() -> None:
+    # Definitions, Split: "`test` is always sealed" — the dataset row's own sealed-set
+    # column need not list it for the gate to protect it.
+    decision = _holdout(split="test", sealed_splits=())
+    assert decision.outcome == "refused_holdout"
+    spent = _holdout(split="test", sealed_splits=(), flags=SPEND, reasons=SPEND_REASON)
+    assert spent.outcome == "ok"
+    assert spent.holdout_spent is True
+
+
 def test_first_test_scoring_is_the_spend_and_second_is_a_repeat() -> None:
     first = _holdout(split="test", sealed_splits=("test",), flags=SPEND, reasons=SPEND_REASON)
     assert first.outcome == "ok"
     assert first.holdout_spent is True
     assert first.holdout_repeat is False
+    assert first.touched == (UNTOUCHED,)  # the bound split's own span, sealed by name
 
     second_unflagged = _holdout(
         split="test",
         sealed_splits=("test",),
         flags=SPEND,
         reasons=SPEND_REASON,
-        prior_spends=("run 1",),
+        prior_spends=(PriorSpend("run 1", UNTOUCHED),),
     )
     assert second_unflagged.outcome == "refused_holdout"
     assert "a repeat needs --holdout-repeat" in second_unflagged.message
@@ -195,7 +223,7 @@ def test_first_test_scoring_is_the_spend_and_second_is_a_repeat() -> None:
         sealed_splits=("test",),
         flags=SPEND_REPEAT,
         reasons=SPEND_REASON,
-        prior_spends=("run 1",),
+        prior_spends=(PriorSpend("run 1", UNTOUCHED),),
     )
     assert second_flagged.outcome == "ok"
     assert second_flagged.holdout_spent is True
@@ -205,13 +233,16 @@ def test_first_test_scoring_is_the_spend_and_second_is_a_repeat() -> None:
 def test_repeat_across_slugs_and_dataset_names_is_still_a_repeat() -> None:
     # `prior_spends` is whatever the caller found: another slug's run, a run on a
     # different dataset name bound to the same family window, or a backtest holdout
-    # trial. The gate does not care about identity, only whether the list is non-empty.
+    # trial. The gate matches by window overlap, not by identity.
     decision = _holdout(
         window=FAMILY_HOLDOUT,
         family_holdouts=(FAMILY_HOLDOUT,),
         flags=SPEND_REPEAT,
         reasons=SPEND_REASON,
-        prior_spends=("other-slug run 4", "trial 9 (backtest holdout)"),
+        prior_spends=(
+            PriorSpend("other-slug run 4", FAMILY_HOLDOUT),
+            PriorSpend("trial 9 (backtest holdout)", FAMILY_HOLDOUT),
+        ),
     )
     assert decision.outcome == "ok"
     assert decision.holdout_repeat is True
@@ -221,9 +252,37 @@ def test_repeat_across_slugs_and_dataset_names_is_still_a_repeat() -> None:
         family_holdouts=(FAMILY_HOLDOUT,),
         flags=SPEND,
         reasons=SPEND_REASON,
-        prior_spends=("other-slug run 4",),
+        prior_spends=(PriorSpend("other-slug run 4", FAMILY_HOLDOUT),),
     )
     assert refused.outcome == "refused_holdout"
+
+
+def test_repeat_is_decided_per_touched_window_not_by_any_prior_spend() -> None:
+    other_family_holdout = Span(date(2021, 1, 1), date(2021, 12, 31))
+    # This run touches only `FAMILY_HOLDOUT`; a prior spend of the *other* protected
+    # window must not force a repeat here.
+    not_a_repeat = _holdout(
+        window=FAMILY_HOLDOUT,
+        family_holdouts=(FAMILY_HOLDOUT, other_family_holdout),
+        flags=SPEND,
+        reasons=SPEND_REASON,
+        prior_spends=(PriorSpend("unrelated run 2", other_family_holdout),),
+    )
+    assert not_a_repeat.outcome == "ok"
+    assert not_a_repeat.holdout_repeat is False
+
+    is_a_repeat = _holdout(
+        window=FAMILY_HOLDOUT,
+        family_holdouts=(FAMILY_HOLDOUT, other_family_holdout),
+        flags=SPEND_REPEAT,
+        reasons=SPEND_REASON,
+        prior_spends=(
+            PriorSpend("unrelated run 2", other_family_holdout),
+            PriorSpend("run 3", FAMILY_HOLDOUT),
+        ),
+    )
+    assert is_a_repeat.outcome == "ok"
+    assert is_a_repeat.holdout_repeat is True
 
 
 def test_window_overlapping_family_holdout_is_refused_without_flags() -> None:
@@ -266,6 +325,19 @@ def test_budget_ok_below_run_count_and_configurations() -> None:
         budget_configurations=5,
     )
     assert decision == BudgetDecision("ok", decision.message)
+
+
+def test_budget_opens_the_budget_runs_th_run() -> None:
+    # One below the limit: the chain so far has run count `budget_runs - 1`, so this
+    # run (the `budget.runs`-th) opens; the one after it is refused (next test).
+    decision = check_budget(
+        chain_run_count=2,
+        budget_runs=3,
+        chain_configurations=0,
+        configurations_declared=1,
+        budget_configurations=10,
+    )
+    assert decision.outcome == "ok"
 
 
 def test_budget_refused_at_the_run_count() -> None:
