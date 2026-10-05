@@ -755,6 +755,21 @@ class DashboardConfig(BaseModel):
     page_row_limit: int = Field(default=500, gt=0)
 
 
+class ResearchConfig(BaseModel):
+    """Research-experiment registry (docs/specs/research-registry.md req 2, req 14).
+
+    `experiments_dir` is the only directory `experiment register` accepts files
+    from; its sibling `research/` directory (`experiments_dir.parent / "research"`)
+    holds `claims.toml`, the claims register `research/experiment.py` checks
+    registrations against. Relative to the project root, as every other path-shaped
+    default in this module is.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    experiments_dir: str = "docs/experiments"
+
+
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
@@ -785,6 +800,7 @@ class Settings(BaseSettings):
     paper: PaperConfig = Field(default_factory=PaperConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    research: ResearchConfig = Field(default_factory=ResearchConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)

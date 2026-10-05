@@ -731,6 +731,16 @@ def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None
             Settings(_env_file=None, dashboard={"page_row_limit": bad})
 
 
+def test_research_experiments_dir_defaults_to_docs_experiments() -> None:
+    """docs/specs/research-registry.md req 2, req 14: the one key `experiment
+    register`/`dataset register` read from; no env var (spec, Config keys)."""
+    assert _settings().research.experiments_dir == "docs/experiments"
+    overridden = Settings(
+        _env_file=None, research={"experiments_dir": "tests/fixtures/experiments"}
+    )
+    assert overridden.research.experiments_dir == "tests/fixtures/experiments"
+
+
 def test_alerts_channels_default_store_and_macos() -> None:
     """#247 Q2: `[store, macos]`; `email` only when the owner sets the `ALERT_*` variables."""
     assert _settings().alerts.channels == ["store", "macos"]

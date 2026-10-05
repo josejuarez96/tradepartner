@@ -17,6 +17,7 @@ docs/
 ├── specs/                ← what & why per feature: <feature>.md
 ├── plans/                ← how per feature: <feature>.md (tasks → PRs)
 ├── hypotheses/           ← pre-registered backtest hypotheses: <slug>.md, frozen once registered
+├── experiments/          ← pre-registered research runs (non-backtest): <slug>.md, frozen once registered
 ├── retros/               ← phase-N.md
 └── templates/            ← copy these; don't edit in place
 ```
@@ -33,6 +34,7 @@ docs/
 | **STATUS** | Where are we right now? | Always exists | Living; updated every session | n/a |
 | **Architecture** | How do the pieces fit today? | Phase 1+ | Living; updated when structure changes | n/a |
 | **Hypothesis** | What exactly are we testing, with which parameters and holdout, and what would retire it? | Before any backtest run of a new idea | **Frozen** once registered: any edit is a new hypothesis | [hypothesis](templates/hypothesis.md) |
+| **Experiment** | What non-backtest run (agreement, benchmark, robustness, economic, return) are we registering, with which dataset, split, budget and decision rule? | Before any run of a new research design ([research-registry spec](specs/research-registry.md)) | **Frozen** once registered: any edit is a new registration (an amendment, never a silent change) | [experiment](templates/experiment.md) |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
 | **CHANGELOG** | What changed, per version? | Every PR | One fragment per PR in `changelog.d/` (its STATUS line and CHANGELOG bullets), folded by doc-keeper | n/a |
 | **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | When an issue, research brief, ADR, spec or plan is opened | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
