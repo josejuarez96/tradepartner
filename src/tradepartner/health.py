@@ -120,12 +120,18 @@ from typing import Any
 import duckdb
 import polars as pl
 
+from tradepartner.adapters.alpaca_prices import (
+    alpaca_symbol,
+    is_placeholder_ticker,
+    is_same_day_typo,
+    same_alpaca_symbol,
+)
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
 from tradepartner.store.asof import _validate_t, price_jumps_as_of
-from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
+from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
@@ -144,6 +150,9 @@ _COMMON = "common"
 #: registered with no exchange ("None") or quoted over the counter: a row on
 #: one of them is never a second exchange line (#822).
 OFF_EXCHANGE: frozenset[str] = frozenset({"NONE", "OTC"})
+#: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
+#: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
+_PLACEHOLDER_KIND = "placeholder"
 
 KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
@@ -748,13 +757,84 @@ def _same_line(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return bool(a["valid_from"] == b["valid_from"] and a["ticker"] == b["ticker"])
 
 
+def _row_kind(row: dict[str, Any]) -> str:
+    """`row`'s kind by the resolver's own classification (`EQUITY` or one
+    of `NON_EQUITY_KINDS`, or placeholder for no ticker), shared, never
+    copied, so a row health reads the same way the resolver would."""
+    ticker = str(row["ticker"])
+    if is_placeholder_ticker(ticker):
+        return _PLACEHOLDER_KIND
+    return listing_kind(ticker, row.get("class_title"))
+
+
+def _resolver_ticker(ticker: str) -> str:
+    """`ticker` as `ListingResolver` keys it (#846): `alpaca_symbol`'s
+    spelling fold (`BF-A` -> `BF.A`), or the raw ticker when it has none,
+    so health compares the same strings the resolver's own same-day-typo
+    rule does."""
+    return alpaca_symbol(ticker) or ticker
+
+
+def _held_ticker(
+    ordered: list[dict[str, Any]], index: int, day: date, pair_kind: str
+) -> str | None:
+    """The ticker (resolver-folded) `ordered[index]`'s security held just
+    before `day`, by the resolver's own rule: the row immediately before
+    `day`, and only when that row is itself `EQUITY` too while
+    `pair_kind` is `EQUITY` (either of the pair's own rows; a pair reads
+    a non-equity row's ticker no more than the resolver's
+    `_same_day_pair` does, #846) -- except a pair with neither row
+    `EQUITY`, which the resolver's EQUITY-only path never examines in the
+    first place, so there is no resolver opinion for health to drift
+    from; its own last ticker, of whatever kind, decides."""
+    previous = next((r for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
+    if previous is None:
+        return None
+    if pair_kind == EQUITY and _row_kind(previous) != EQUITY:
+        return None
+    return _resolver_ticker(str(previous["ticker"]))
+
+
+def _same_day_typo_pair(
+    ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
+) -> bool:
+    """True when `current`/`following`'s same-start pair is a cover
+    page's filer noise, not a genuine overlap (#846): the ticker the
+    security held just before is one of the tied tickers (the resolver's
+    own rule, `is_same_day_typo`, shared here, never copied, over the
+    same resolver-folded ticker spellings), or the two tickers are one
+    Alpaca symbol under different filer spellings (`same_alpaca_symbol`;
+    `MOTV U`/`MOTV.U`)."""
+    day = current["valid_from"]
+    tickers = {
+        _resolver_ticker(str(current["ticker"])),
+        _resolver_ticker(str(following["ticker"])),
+    }
+    # Either row being equity puts the pair on the resolver's EQUITY-only
+    # path (quant-auditor pass 2 on #846): gating on `current` alone let a
+    # mixed equity/non-equity pair's gate depend on which ticker happened
+    # to sort first in `ordered`, not on kind.
+    current_kind, following_kind = _row_kind(current), _row_kind(following)
+    pair_kind = EQUITY if EQUITY in (current_kind, following_kind) else current_kind
+    held = _held_ticker(ordered, index, day, pair_kind)
+    return is_same_day_typo(held, tickers) or same_alpaca_symbol(
+        str(current["ticker"]), str(following["ticker"])
+    )
+
+
 def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for sid, ordered in sorted(_by_security(listings).items()):
         for i, current in enumerate(ordered[:-1]):
             following = ordered[i + 1]
             same_start = current["valid_from"] == following["valid_from"]
-            flagged = following if same_start and not _same_line(current, following) else None
+            flagged = (
+                following
+                if same_start
+                and not _same_line(current, following)
+                and not _same_day_typo_pair(ordered, i, current, following)
+                else None
+            )
             filed = current["delisting_filed_at"]
             filing_session = None if filed is None else _filing_session(filed)
             if flagged is None and filing_session is not None:

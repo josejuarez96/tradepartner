@@ -560,6 +560,229 @@ def test_overlapping_listing_fails_its_rule(fixture_store: duckdb.DuckDBPyConnec
     assert check.violations["security_id"].to_list() == ["SEC_DUAL_A"]
 
 
+def test_same_day_typo_pair_beside_the_held_ticker_is_not_an_overlap(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #846: a cover-page typo beside the ticker the security already held
+    # (#819, #830) is filer noise, not a genuine overlap. SEC_DUAL_A
+    # already holds DUALA (fixture listing from 2017-01-03); a later
+    # cover page naming DUALX beside it, the same day, is the typo and
+    # DUALA is kept -- `health` must apply the resolver's own rule
+    # (`is_same_day_typo`, shared, never copied) so the two can't drift.
+    known = datetime(2019, 6, 3, 21, 0, tzinfo=UTC)
+    for ticker in ("DUALA", "DUALX"):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_DUAL_A",
+                "ticker": ticker,
+                "exchange": "NYSE",
+                "class_title": "Class A Common Stock",
+                "valid_from": date(2019, 6, 3),
+                "known_at": known,
+                "ingested_at": known,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_same_day_pair_with_no_held_ticker_match_still_fails_its_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control for the tolerance above: a same-start pair where neither
+    # ticker is the one the security held before, and the two are not one
+    # Alpaca symbol under different spellings, is still a genuine overlap
+    # (spec req 11, amendment #822: "Same-start rows of different tickers
+    # still fail").
+    known = datetime(2019, 6, 3, 21, 0, tzinfo=UTC)
+    for ticker in ("DUALY", "DUALZ"):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_DUAL_A",
+                "ticker": ticker,
+                "exchange": "NYSE",
+                "class_title": "Class A Common Stock",
+                "valid_from": date(2019, 6, 3),
+                "known_at": known,
+                "ingested_at": known,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+
+
+def test_a_held_ticker_from_a_non_equity_row_does_not_excuse_an_equity_pair(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Regression (code-review on #846): the resolver's own rule reads the
+    # held ticker off the row just before only when that row is itself an
+    # equity row (`ListingResolver._drop_same_day_typos`); a warrant row
+    # naming XYZ does not excuse a later XYZ/XYZQ equity pair the way an
+    # equity row would -- health must not disagree with the resolver here.
+    for ticker, class_title, valid_from in (
+        ("XYZ", "Warrants to purchase Common Stock", date(2018, 1, 2)),
+        ("XYZ", "Common Stock", date(2019, 6, 3)),
+        ("XYZQ", "Common Stock", date(2019, 6, 3)),
+    ):
+        known = session_close(valid_from)
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_MIXED_KIND",
+                "ticker": ticker,
+                "exchange": "NASDAQ",
+                "class_title": class_title,
+                "valid_from": valid_from,
+                "known_at": known,
+                "ingested_at": known,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_MIXED_KIND" in check.violations["security_id"].to_list()
+
+
+def test_a_held_non_equity_ticker_does_not_excuse_a_mixed_kind_pair(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Regression (quant-auditor pass 2 on #846): the gate must trigger
+    # when EITHER row of a same-start pair is equity, not only the one
+    # that happens to sort first alphabetically. WARR (warrant) continues
+    # its own non-equity ticker from before; ZNEW is a brand-new equity
+    # ticker the same day. WARR sorts before ZNEW, so gating on "current"
+    # alone (the pre-fix code) let WARR's non-equity history wrongly
+    # excuse ZNEW, an equity row the resolver's EQUITY-only path would
+    # never treat as a typo of a warrant's ticker.
+    known_before = session_close(date(2018, 1, 2))
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_MIXED_PAIR",
+            "ticker": "WARR",
+            "exchange": "NASDAQ",
+            "class_title": "Warrants to purchase Common Stock",
+            "valid_from": date(2018, 1, 2),
+            "known_at": known_before,
+            "ingested_at": known_before,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    known_pair = session_close(date(2019, 6, 3))
+    for ticker, class_title in (
+        ("WARR", "Warrants to purchase Common Stock"),
+        ("ZNEW", "Common Stock"),
+    ):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_MIXED_PAIR",
+                "ticker": ticker,
+                "exchange": "NASDAQ",
+                "class_title": class_title,
+                "valid_from": date(2019, 6, 3),
+                "known_at": known_pair,
+                "ingested_at": known_pair,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_MIXED_PAIR" in check.violations["security_id"].to_list()
+
+
+def test_held_ticker_matches_through_a_class_suffix_spelling(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Regression (code-review on #846): `ListingResolver` folds every
+    # ticker through `alpaca_symbol` (BF-A -> BF.A) before comparing the
+    # held ticker against a same-day pair; health must fold the same way,
+    # not compare raw spellings, or a held `BF-A` would not excuse a
+    # `BF.A`/`BF.B` pair the resolver already treats as the held ticker.
+    known_before = session_close(date(2018, 1, 2))
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_SUFFIX_FOLD",
+            "ticker": "BF-A",
+            "exchange": "NYSE",
+            "class_title": "Class A Common Stock",
+            "valid_from": date(2018, 1, 2),
+            "known_at": known_before,
+            "ingested_at": known_before,
+            "source": "fixture",
+            "provenance": "filing",
+        },
+    )
+    known_pair = session_close(date(2019, 6, 3))
+    for ticker in ("BF.A", "BF.B"):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_SUFFIX_FOLD",
+                "ticker": ticker,
+                "exchange": "NYSE",
+                "class_title": "Class A Common Stock",
+                "valid_from": date(2019, 6, 3),
+                "known_at": known_pair,
+                "ingested_at": known_pair,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert "SEC_SUFFIX_FOLD" not in check.violations["security_id"].to_list()
+
+
+def test_same_day_pair_is_one_alpaca_symbol_is_not_an_overlap(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #846: MOTV U / MOTV.U is one Alpaca symbol under two filer spellings
+    # for a unit's one-letter suffix; `alpaca_symbol` already folds `-`
+    # and `/` the same way for a class suffix (CRD-A / CRD.A), so a space
+    # is folded too (`same_alpaca_symbol`), without a resolver change.
+    known = datetime(2021, 12, 15, 21, 0, tzinfo=UTC)
+    for ticker in ("MOTV U", "MOTV.U"):
+        insert_row(
+            fixture_store,
+            "listings",
+            {
+                "security_id": "SEC_NEW_UNITS",
+                "ticker": ticker,
+                "exchange": "NASDAQ",
+                "class_title": "Units, each consisting of one share and one warrant",
+                "valid_from": date(2021, 12, 15),
+                "known_at": known,
+                "ingested_at": known,
+                "source": "fixture",
+                "provenance": "filing",
+            },
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
 def test_listing_live_after_the_next_one_started_fails_its_rule(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

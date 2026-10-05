@@ -23,9 +23,11 @@ from tradepartner.adapters.alpaca_prices import (
     RegistrantEvidence,
     alpaca_symbol,
     feed_source,
+    is_same_day_typo,
     parse_bars,
     parse_corporate_actions,
     registrant_evidence,
+    same_alpaca_symbol,
 )
 from tradepartner.adapters.prices import (
     ActionType,
@@ -1707,3 +1709,38 @@ class TestAlpacaSymbols:
         source.bars(["SEC_AAPL"], date(2020, 8, 3), date(2020, 8, 7))
         assert source.last_excluded_symbols == ()
         assert source.symbol_summary() == ""
+
+
+class TestSameDayTypoRule:
+    """#846: the rule `ListingResolver` uses to tell a cover-page typo
+    from a genuine same-day pair, shared with `health._overlapping_listings`
+    so the two can never drift."""
+
+    def test_the_held_ticker_in_the_pair_is_a_typo(self) -> None:
+        assert is_same_day_typo("FF", {"F", "FF"}) is True
+
+    def test_neither_ticker_held_is_a_genuine_pair(self) -> None:
+        assert is_same_day_typo("FF", {"F", "FFX"}) is False
+
+    def test_no_ticker_held_before_is_a_genuine_pair(self) -> None:
+        assert is_same_day_typo(None, {"F", "FF"}) is False
+
+
+class TestSameAlpacaSymbolFold:
+    """#846: MOTV U / MOTV.U is one Alpaca symbol under two filer
+    spellings of a unit's one-letter suffix, the same fold
+    `alpaca_symbol` already does for `-` and `/` (`CRD-A`, `CRD.A`)."""
+
+    @pytest.mark.parametrize(
+        ("one", "other"),
+        [("MOTV U", "MOTV.U"), ("MOTV.U", "MOTV U"), ("BRK B", "BRK.B"), ("crd a", "CRD.A")],
+    )
+    def test_a_space_class_suffix_is_the_dot_spelling(self, one: str, other: str) -> None:
+        assert same_alpaca_symbol(one, other) is True
+
+    @pytest.mark.parametrize(
+        ("one", "other"),
+        [("HACAR", "HCACR"), ("CLCR", "CLRC"), ("F", "FF"), ("BAX (NYSE)", "BAX")],
+    )
+    def test_different_tickers_are_not_one_symbol(self, one: str, other: str) -> None:
+        assert same_alpaca_symbol(one, other) is False
