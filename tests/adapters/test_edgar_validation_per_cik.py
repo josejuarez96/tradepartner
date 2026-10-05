@@ -80,6 +80,23 @@ def test_an_older_page_that_does_not_parse_stops_paging(tmp_path: Path) -> None:
     assert len(again.validation_failures) == 0
 
 
+@pytest.mark.parametrize("which", ["payload", "page"])
+def test_a_submissions_body_that_is_not_json_is_recorded(tmp_path: Path, which: str) -> None:
+    """quant-auditor on #881: a non-JSON body (an HTML error page served as
+    200) is recorded like a malformed payload, never a crash, and lists
+    nothing."""
+    settings = edgar_settings(tmp_path / "cache")
+    router = _router()
+    name = f"CIK{APPLE}.json" if which == "payload" else f"CIK{APPLE}-submissions-001.json"
+    router.add(f"{SUBMISSIONS_URL}{name}", b"<html>busy</html>")
+    source = _source(settings, router)
+    source.filing_index()
+    [failure] = source.validation_failures
+    assert (failure.input, failure.key) == ("submissions API", name)
+    assert failure.error.startswith("JSONDecodeError")
+    assert MISSING in {u.accession for u in source.unstamped_filings}
+
+
 # --- per-document failures: one policy, listed in the check's message ---------
 
 
@@ -102,10 +119,10 @@ def test_the_check_lists_the_unaccepted_per_document_failures(tmp_path: Path) ->
     with pytest.raises(FilingFailuresError) as raised:
         source.check_failures()
     message = str(raised.value)
-    assert "this run's unaccepted per-document failures: 6, first 6: " in message
+    assert "unaccepted filing failures (per-document and fact collisions): 6, first 6: " in message
     assert f"{accessions[1]} ValueError/10-K: bad {accessions[1]}" in message
     assert f"{accepted} ValueError" not in message
-    assert message.index("failed_filings.json") < message.index("unaccepted per-document")
+    assert message.index("failed_filings.json") < message.index("unaccepted filing failures")
 
 
 def test_the_listing_is_bounded_and_redacted(tmp_path: Path) -> None:
@@ -124,7 +141,7 @@ def test_the_listing_is_bounded_and_redacted(tmp_path: Path) -> None:
     with pytest.raises(FilingFailuresError) as raised:
         source.check_failures()
     message = str(raised.value)
-    assert "unaccepted per-document failures: 5, first 2: " in message
+    assert "fact collisions): 5, first 2: " in message
     assert accessions[1] in message and accessions[2] not in message
     assert secret not in message
 

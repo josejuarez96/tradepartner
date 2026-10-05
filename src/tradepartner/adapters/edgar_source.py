@@ -581,8 +581,14 @@ class EdgarFilingSource(FilingSource):
         nothing it would stamp is cached as unstampable this run."""
         memo = self._submissions.get(cik)
         if memo is None:
-            payload = edgar_raw.submissions(cik, settings=self._settings, client=self._client)
-            if _empty_object(payload):  # #576: SEC's "nothing here"; lists nothing
+            try:
+                payload = edgar_raw.submissions(cik, settings=self._settings, client=self._client)
+            except _UNDECODABLE as error:  # #578: a body that is not JSON
+                self.validation_failures.record(_SUBMISSIONS_API, f"CIK{cik}.json", error)
+                payload = _NOT_JSON
+            if payload is _NOT_JSON:
+                memo = self._submissions[cik] = _Submissions({}, [], self._now(), empty=True)
+            elif _empty_object(payload):  # #576: SEC's "nothing here"; lists nothing
                 self.submissions_api_empty += 1
                 memo = self._submissions[cik] = _Submissions({}, [], self._now(), empty=True)
             else:
@@ -594,7 +600,15 @@ class EdgarFilingSource(FilingSource):
                 self._submissions[cik] = memo
         while memo.pages and not wanted <= memo.records.keys():
             name = memo.pages.pop(0)
-            page = edgar_raw.submissions_page(name, settings=self._settings, client=self._client)
+            try:
+                page = edgar_raw.submissions_page(
+                    name, settings=self._settings, client=self._client
+                )
+            except _UNDECODABLE as error:  # #578: recorded; lists nothing, as below
+                self.validation_failures.record(_SUBMISSIONS_API, name, error)
+                memo.pages.clear()
+                memo.empty = True
+                break
             if _empty_object(page):  # #576: lists nothing; stop paging
                 self.submissions_api_empty += 1
                 memo.pages.clear()
@@ -1604,8 +1618,9 @@ class EdgarFilingSource(FilingSource):
         Raises `FilingFailuresError` (the chunk fails, nothing written) when
         any of plan T11h's three rules fires; see the module docstring.
 
-        The message then lists this run's per-document failures that no
-        `accepted` entry excuses (#578 part 3, owner option (a) on #808):
+        The message then lists this run's per-document failures (and
+        `facts()` collisions) that no `accepted` entry excuses (#578 part 3,
+        owner option (a) on #808):
         their count, then the first `edgar.max_validation_listed` as
         `accession error_class/base_form: message`, each message cleaned
         (`_stored_message`). The full list is `failed_filings.json` (written
@@ -1637,12 +1652,12 @@ class EdgarFilingSource(FilingSource):
             return ""
         limit = self._settings.edgar.max_validation_listed
         listed = "; ".join(
-            f"{accession} {error_class}/{base_form}: {self._stored_message(message)}"
+            self._stored_message(f"{accession} {error_class}/{base_form}: {message}")
             for accession, error_class, base_form, message in unaccepted[:limit]
         )
         return (
-            f"; this run's unaccepted per-document failures: {len(unaccepted)}, "
-            f"first {min(limit, len(unaccepted))}: {listed}"
+            f"; this run's unaccepted filing failures (per-document and fact collisions): "
+            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}"
         )
 
     def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
@@ -2017,6 +2032,9 @@ class EdgarFilingSource(FilingSource):
             if error.response.status_code != 404:
                 raise
             absent = True
+        except _UNDECODABLE as error:  # #578: a body that is not JSON; absent, nothing cached
+            self.validation_failures.record(_FACTS_API, f"CIK{cik}.json", error)
+            return None, False, None
         else:
             absent = _empty_object(payload)
             if absent:
@@ -2052,6 +2070,11 @@ _FSN_PARSE_ERRORS: tuple[type[Exception], ...] = (*PARSE_ERRORS, duckdb.InvalidI
 _FACTS_MEMBER = "companyfacts.zip member"
 _FACTS_API = "companyfacts API"
 _SUBMISSIONS_API = "submissions API"
+#: What `response.json()` raises on a per-CIK API body that is not JSON
+#: (#578 part 3): recorded like any other parse failure of that input.
+_UNDECODABLE: tuple[type[Exception], ...] = (json.JSONDecodeError, UnicodeDecodeError)
+#: `_fetch_submissions`'s marker for a recorded undecodable body.
+_NOT_JSON = object()
 
 
 def _message_hash(message: str) -> str:
@@ -2103,13 +2126,16 @@ def _holds_accession(payload: Any, cik: str, accession: str) -> bool:
     entry, of any concept, for `accession`."""
     if str(payload["cik"]).zfill(10) != cik:
         raise ValueError(f"company facts for CIK {payload['cik']!r} served for {cik}")
-    return any(
-        entry["accn"] == accession
-        for concepts in payload["facts"].values()
-        for concept in concepts.values()
-        for entries in concept["units"].values()
-        for entry in entries
-    )
+    try:
+        return any(
+            entry["accn"] == accession
+            for concepts in payload["facts"].values()
+            for concept in concepts.values()
+            for entries in concept["units"].values()
+            for entry in entries
+        )
+    except AttributeError as error:  # a list or string where an object belongs (#578)
+        raise ValueError(f"company facts: malformed: {error!r}") from error
 
 
 def _facts_key(latest: str, wanted: set[str]) -> str:

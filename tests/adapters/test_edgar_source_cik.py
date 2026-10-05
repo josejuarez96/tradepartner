@@ -1837,6 +1837,25 @@ def test_an_api_payload_for_another_cik_is_recorded(tmp_path: Path) -> None:
     _assert_api_recorded_and_absent(source, _shares(source, APPLE), "served for")
 
 
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        (b"<html>busy</html>", "JSONDecodeError"),
+        (b'{"cik": 320193, "facts": []}', "ValueError: company facts: malformed"),
+    ],
+    ids=["not-json", "facts-a-list"],
+)
+def test_an_api_body_that_is_not_json_or_has_the_wrong_shape_is_recorded(
+    tmp_path: Path, body: bytes, error: str
+) -> None:
+    """Reviewers on #881: a non-JSON body and a `facts` list (an
+    `AttributeError` in `_holds_accession`) are recorded, never a crash."""
+    settings = _settings(tmp_path)
+    source = _source(settings, _facts_router(**{APPLE: body}))
+    _seed_apple(source)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), error)
+
+
 def test_an_api_payload_whose_facts_do_not_parse_is_recorded(tmp_path: Path) -> None:
     """#578 part 3: `parse_company_facts` refusing an API payload (an
     impossible `end`) is recorded under the API, never cached."""
