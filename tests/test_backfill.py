@@ -1219,3 +1219,128 @@ def test_named_securities_must_be_ids(settings: Settings) -> None:
         fill_holes(settings, prices=_History(), since=SINCE, securities=ACME)
     with pytest.raises(ValueError):
         fill_holes(settings, prices=_History(), since=SINCE, securities=[])
+
+
+# --- rename-lead gaps in months with stored bars (#891) ----------------------
+
+RENAMED_ON = date(2019, 6, 20)  # the first cover page naming ACME's new ticker
+GAP = (date(2019, 6, 10), date(2019, 6, 19))  # old symbol stopped, cover page not yet out
+
+
+def _with_rename(**kwargs: Any) -> Any:
+    """`_filings` plus a cover page that renames ACME to `ACMX` on
+    `RENAMED_ON`: from then ACMX resolves to ACME, and before it, inside
+    `alpaca.rename_lead_days`, ACMX leads to ACME (#843)."""
+    accession = f"{ACME}-19-000002"
+    accepted = datetime.combine(RENAMED_ON, datetime.min.time(), UTC).replace(hour=20, minute=30)
+    page = CoverPage(ACME, accession, accepted, (CoverListing("Common Stock", "ACMX", "NYSE"),))
+    return _filings(
+        extra_index=[FilingIndexEntry(ACME, "Acme Corp", "10-Q", accession, accepted)],
+        extra_headers=[FilingHeader(ACME, accession, "10-Q", 3571, accepted)],
+        extra_covers=[page],
+        **kwargs,
+    )
+
+
+def _rename_gap(settings: Settings) -> None:
+    """A backfill of the renamed ACME, then ACME loses the gap's sessions:
+    June keeps its bars before and after the gap (FB -> META's June)."""
+    assert _backfill(settings, _History(), filings=_with_rename()).ok
+    _drop_bars(settings, ACME, GAP)
+
+
+def _no_lead(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={"alpaca": settings.alpaca.model_copy(update={"rename_lead_days": 0})}
+    )
+
+
+def test_a_rename_gap_inside_a_month_with_stored_bars_is_a_hole(settings: Settings) -> None:
+    _rename_gap(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    assert [hole.rename_gap for hole in found.holes] == [True]
+    assert found.summary() == (
+        "1 holes (security, month) over 1 securities in 1 months; 0 of them between a "
+        "security's stored bars (0 securities); 1 of them rename gaps in a month with "
+        "stored bars"
+    )
+    assert found.lines() == [
+        f"  {ACME} ACMX: 2019-06 (1 months, 0 between its stored bars, 1 rename gaps)"
+    ]
+
+
+def test_a_rename_gap_fill_stores_each_session_once_at_its_close(settings: Settings) -> None:
+    _rename_gap(settings)
+    prices = _History()
+    result = fill_holes(
+        settings, prices=prices, since=SINCE, clock=_ticking(LATER, timedelta(minutes=1))
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert prices.fetched == {date(2019, 6, 1): {ACME, SPY}}
+    assert result.runs[0].message.startswith(
+        "holes of 0 names with no stored bar and 1 with a rename gap: "
+    )
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-06-01' AND DATE '2019-06-30' ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(*JUNE_WINDOW)  # each session once
+    assert all(known == bar_known_at(s) for s, known in rows)  # no look-ahead
+    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert again.holes == ()
+
+
+def test_a_partial_month_gap_without_a_rename_lead_is_no_hole(settings: Settings) -> None:
+    # The lead off: the gap is no session a fetched bar could newly land on
+    # (`parse_bars` assigns the new symbol's rows only from its span).
+    _rename_gap(settings)
+    found = fill_holes(
+        _no_lead(settings), prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True
+    )
+    assert found.holes == ()
+    # And a gap after the rename, under ACMX's own span, is no rename gap.
+    plain = _no_lead(settings).model_copy(
+        update={"store": settings.store.model_copy(update={"path": settings.store.path + "2"})}
+    )
+    assert _backfill(plain, _History(), filings=_with_rename()).ok
+    _drop_bars(plain, ACME, (date(2019, 6, 24), date(2019, 6, 26)))
+    later = fill_holes(plain, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert later.holes == ()
+
+
+def test_a_named_rename_gap_is_fetched_and_others_are_not(settings: Settings) -> None:
+    _rename_gap(settings)
+    _drop_bars(settings, DUAL, MAY_WINDOW)
+    found = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[ACME],
+    )
+    assert _holes(found) == [(ACME, JUNE_WINDOW)] and found.named == ()
+
+
+def test_a_month_only_the_rename_lead_can_fill_is_assignable(settings: Settings) -> None:
+    # TWIN shares its old ticker with TWIN_2 from one day (ambiguous: no one
+    # resolves it), then is renamed to TWNX in June: before that, only the
+    # lead can land a bar on TWIN. TWIN_2 has no lead and stays unassigned.
+    accession = f"{TWIN}-19-000002"
+    accepted = _at(2019, 6, 20)
+    filings = _with_unassignable()
+    filings._cover_pages = sorted(
+        [
+            *filings._cover_pages,
+            CoverPage(TWIN, accession, accepted, (CoverListing("Common Stock", "TWNX", "NYSE"),)),
+        ],
+        key=lambda e: (e.accepted_at, e.accession),
+    )
+    assert _backfill(settings, _History(), filings=filings).ok
+    for sid in (TWIN, TWIN_2):
+        _drop_bars(settings, sid, MAY_WINDOW)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(TWIN, MAY_WINDOW)]
+    assert dict(found.dropped) == {UNASSIGNED: 1}
