@@ -419,8 +419,8 @@ N: (i) `basis = "cash"` (operating cash flow over assets, a proxy for cash-based
 profitability, not Ball et al.'s measure); (ii) `include_derived = false` (reported
 gross profit only); (iii) the brief's construction, top third of the scored names,
 cap-weighted, if the strategy lab adds `weighting = "cap"` (today `equal` is the only
-value). B4 (momentum plus profitability by equal ranks) is a fourth file in a **third
-family, `combined`** (B3-7 (b), decided 2026-10-04, #811): a root under the lab's
+value). B4 (momentum plus profitability by equal ranks) is a separate file, outside this
+budget, in a **third family, `combined`** (B3-7 (b), decided 2026-10-04, #811): a root under the lab's
 `FAMILY_PARENTS` with its own N, so B4's looks at both signals raise neither
 `momentum`'s nor `profitability`'s N alone; the family enters `hypotheses.families` by
 the reviewed code change that comes with B4's file, which is drafted only after B1 and
@@ -512,10 +512,10 @@ the intercept, its t-statistic and both loadings. Regressing B3's excess over SP
 MTUM's excess over SPY alone would force B3's market beta to 1 and put a low-beta tilt
 (QI-18) into the alpha, the brief's "confusing the market's return with tilt alpha".
 It runs on the **in-sample retirement trial only**, never on a holdout trial. Under the
-research-registry spec (draft, #661) that computation reads returns and is a
+research-registry spec (its open questions decided on #810) that computation reads returns and is a
 `return`-kind run in the `profitability` family, registered before it runs and counted
-in N (its req 9; it is in the trial budget above); until the registry exists it is not
-run, and it reads the retirement trial's `trial_equity` series through `load_dataset` as
+in N (its req 9; it is in the trial budget above). Until the registry exists it is not
+run. It reads the retirement trial's `trial_equity` series through `load_dataset` as
 an ordinary dataset version that a reviewed dataset-build step exports (that spec's open
 question 7, decided (d) by the owner on 2026-10-04, #810; its req 11; #728 filed the
 question). Its result informs the
