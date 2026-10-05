@@ -78,7 +78,7 @@ from tradepartner.store.retraction import (
     stored_underived,
     write_retractions,
 )
-from tradepartner.store.schema import CURRENT_SCHEMA_VERSION, _max_version, init_schema
+from tradepartner.store.schema import has_retracted, init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: CIKs not judged that the summary names; the rest are counted.
@@ -208,9 +208,12 @@ def master_retract(
         _read(settings) if dry_run else open_for_write(settings)
     )
     with opened as conn:
-        if dry_run and _max_version(conn) != CURRENT_SCHEMA_VERSION:
+        # The dry run reads `retracted` and `master_underived` (version 11, #859),
+        # never what a later version adds, so it asks for the column, not the
+        # current version (PR #940: version 12 must not refuse a version-11 store).
+        if dry_run and not has_retracted(conn, "listings"):
             raise RetractRefused(
-                f"the store is not at schema version {CURRENT_SCHEMA_VERSION} yet: run "
+                "the store is not at schema version 11 yet: run "
                 "`tradepartner ingest --source edgar` once to migrate it, then the dry run"
             )
         if not dry_run:

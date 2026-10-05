@@ -109,6 +109,7 @@ def _row(table: str, **overrides: Any) -> dict[str, Any]:
         "research_results": {
             "run_id": 1,
             "outcome": "ok",
+            "n_configurations": 1,
             "verdict": "pass",
             "known_at": KNOWN,
         },
@@ -481,6 +482,8 @@ def test_every_enumeration_check_accepts_its_set_and_refuses_anything_else(
     }[table]
     for i, value in enumerate(schema.RESEARCH_ENUMS[table, column], start=1):
         extra: dict[str, Any] = {key: i, column: value}
+        if (table, column, value) == ("research_registrations", "kind", "return"):
+            extra |= {"touches_returns": True, "family": "momentum"}
         if table == "research_results":
             # `verdict` is set exactly on an `ok` result.
             if column == "outcome":
@@ -522,6 +525,46 @@ def test_verdict_is_set_exactly_on_an_ok_result(conn: duckdb.DuckDBPyConnection)
         "research_results",
         _row("research_results", run_id=3, outcome="refused_holdout", verdict=None),
     )
+
+
+@pytest.mark.parametrize("n_configurations", [None, 0, -1])
+def test_an_ok_result_reports_at_least_one_configuration(
+    conn: duckdb.DuckDBPyConnection, n_configurations: int | None
+) -> None:
+    """`family_run_count` sums `n_configurations` over `ok` runs into N (req 9):
+    an `ok` row without a positive count would undercount N (quant audit of
+    PR #940). A row with no statistics needs none."""
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            conn,
+            "research_results",
+            _row("research_results", n_configurations=n_configurations),
+        )
+    insert_row(
+        conn,
+        "research_results",
+        _row("research_results", outcome="failed", verdict=None, n_configurations=None),
+    )
+
+
+@pytest.mark.parametrize("declared", [0, -1])
+def test_a_run_declares_at_least_one_configuration(
+    conn: duckdb.DuckDBPyConnection, declared: int
+) -> None:
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(conn, "research_runs", _row("research_runs", n_configurations_declared=declared))
+
+
+def test_a_return_registration_touches_returns_and_names_a_family(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Req 2's two rules N depends on, backstopped below the parser."""
+    reg = "research_registrations"
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(conn, reg, _row(reg, kind="return", touches_returns=False, family="momentum"))
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(conn, reg, _row(reg, kind="economic", touches_returns=True, family=None))
+    insert_row(conn, reg, _row(reg, kind="return", touches_returns=True, family="momentum"))
 
 
 def test_a_second_result_row_for_a_run_raises(conn: duckdb.DuckDBPyConnection) -> None:

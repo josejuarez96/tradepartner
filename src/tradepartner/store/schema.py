@@ -218,8 +218,10 @@ run's open, the result's close, the decision) and no `ingested_at`,
 (`store.research` exposes inserts and reads only). Schema-level backstops:
 a primary key on each table's own id (on `research_results`, the run id,
 so a run has one result), a `CHECK` on every column the spec enumerates
-(`RESEARCH_ENUMS` and `RESEARCH_STAGES`), and `verdict` set exactly on an
-`ok` result. No foreign keys; ids come from `store.research`.
+(`RESEARCH_ENUMS` and `RESEARCH_STAGES`), `verdict` and a positive
+`n_configurations` on exactly the `ok` results, a positive
+`n_configurations_declared`, and req 2's `return` implies `touches_returns`
+implies a `family`. No foreign keys; ids come from `store.research`.
 
 Design decisions (not pinned by the spec text, recorded here because
 they shape this DDL):
@@ -1596,9 +1598,11 @@ _JOURNAL_TABLE_DDL: tuple[str, ...] = (
 # is VARCHAR (no json extension, `configure_connection`). The schema-level
 # backstops are the primary keys, a `CHECK` on every column the spec
 # enumerates (each set a code constant below, pinned by a test: a new value is
-# a spec amendment) and `verdict` set exactly on an `ok` result (req 8). The
-# req 2 and req 11 refusals belong to the parser and `store.research`, not to
-# `CHECK`s: a refused registration or dataset never reaches these tables.
+# a spec amendment), `verdict` and a positive `n_configurations` set on an `ok`
+# result (req 8, req 9), and the two req 2 rules N depends on (`return` implies
+# `touches_returns` implies a `family`). The other req 2 and req 11 refusals
+# belong to the parser and `store.research`: a refused registration or dataset
+# never reaches these tables.
 
 #: `research_registrations.kind` (spec "Definitions", Kind).
 RESEARCH_KINDS: tuple[str, ...] = ("agreement", "benchmark", "robustness", "economic", "return")
@@ -1672,7 +1676,9 @@ def _research_check(table: str, column: str, *, nullable: bool = False) -> str:
 _RESEARCH_STAGE_CHECK = f"CHECK (stage IN ({', '.join(str(s) for s in RESEARCH_STAGES)}))"
 
 # One row per registration; an amendment is a new row pointing at the one it
-# supersedes (`amends_registration_id`, NULL on the first of a chain). `family`
+# supersedes (`amends_registration_id`, NULL on the first of a chain). Two of
+# req 2's refusals are backstopped here too, since N reads them: a `return`
+# registration touches returns, and one that touches returns names a family. `family`
 # is NULL unless the file names one (required when `touches_returns`, req 2);
 # `hypothesis_ref`, `dataset_sha256_pin`, `primary_threshold` and the
 # multiplicity family's id and size are optional in the file (req 2).
@@ -1721,7 +1727,9 @@ CREATE TABLE IF NOT EXISTS research_registrations (
     {_RESEARCH_STAGE_CHECK},
     {_research_check("research_registrations", "provenance")},
     {_research_check("research_registrations", "primary_direction")},
-    {_research_check("research_registrations", "multiplicity_method")}
+    {_research_check("research_registrations", "multiplicity_method")},
+    CHECK (kind <> 'return' OR touches_returns),
+    CHECK (NOT touches_returns OR family IS NOT NULL)
 )
 """
 
@@ -1758,7 +1766,8 @@ CREATE TABLE IF NOT EXISTS research_datasets (
 # One row per run, written at open and never updated (req 3); a refusal at
 # open is a run row too, its outcome the result row. `store_max_ingested_at`
 # is NULL for a run that reads no runtime-store data (or an empty store);
-# `holdout_reason` is NULL unless `holdout_spent`.
+# `holdout_reason` is NULL unless `holdout_spent`. At least one configuration
+# is declared (req 6, `--configurations` default 1).
 _CREATE_RESEARCH_RUNS = f"""
 CREATE TABLE IF NOT EXISTS research_runs (
     run_id BIGINT NOT NULL PRIMARY KEY,
@@ -1782,13 +1791,15 @@ CREATE TABLE IF NOT EXISTS research_runs (
     note VARCHAR,
     known_at TIMESTAMPTZ NOT NULL,
     {_research_check("research_runs", "split")},
-    {_research_check("research_runs", "confirmatory_basis")}
+    {_research_check("research_runs", "confirmatory_basis")},
+    CHECK (n_configurations_declared >= 1)
 )
 """
 
 # One row per run, the primary key, so a second result for a run raises
 # (req 8). The statistics are NULL unless `ok`; `verdict` is set exactly on an
-# `ok` row, computed by code from the interval.
+# `ok` row, computed by code from the interval, and an `ok` row reports at least
+# one evaluated configuration (`family_run_count` sums them into N, req 9).
 _CREATE_RESEARCH_RESULTS = f"""
 CREATE TABLE IF NOT EXISTS research_results (
     run_id BIGINT NOT NULL PRIMARY KEY,
@@ -1808,7 +1819,8 @@ CREATE TABLE IF NOT EXISTS research_results (
     known_at TIMESTAMPTZ NOT NULL,
     {_research_check("research_results", "outcome")},
     {_research_check("research_results", "verdict", nullable=True)},
-    CHECK ((outcome = 'ok') = (verdict IS NOT NULL))
+    CHECK ((outcome = 'ok') = (verdict IS NOT NULL)),
+    CHECK (outcome <> 'ok' OR (n_configurations IS NOT NULL AND n_configurations >= 1))
 )
 """
 
