@@ -1638,7 +1638,8 @@ def test_a_malformed_cik_is_refused_before_any_io(tmp_path: Path) -> None:
     assert router.urls == []
 
 
-def test_a_bulk_payload_for_another_cik_raises(tmp_path: Path) -> None:
+def test_a_bulk_payload_for_another_cik_is_recorded_and_absent(tmp_path: Path) -> None:
+    """#578: still never served, now recorded for the gate instead of raised."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as bulk:
         bulk.write(FIXTURES / "company_facts_dual_class.json", f"CIK{APPLE}.json")
@@ -1652,8 +1653,27 @@ def test_a_bulk_payload_for_another_cik_raises(tmp_path: Path) -> None:
         ALPHABET,
         {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
     )
-    with pytest.raises(ValueError, match="served for"):
-        _shares(source, APPLE)
+    records = _shares(source, APPLE)
+    _assert_member_recorded_and_absent(source, router, records, "served for")
+
+
+def _assert_member_recorded_and_absent(
+    source: EdgarFilingSource, router: EdgarRouter, records: list[FactRecord], error: str
+) -> None:
+    """#578: Apple's zip member is recorded once on the validation collector
+    and is absent for the run: no company facts (FSN's share alone, dated
+    min(ddate, acceptance)), no per-CIK API call (its answer would likely
+    share the shape, #599) and no facts cache written."""
+    [failure] = source.validation_failures
+    assert (failure.input, failure.key) == ("companyfacts.zip member", f"CIK{APPLE}.json")
+    assert error in failure.error
+    assert COMPANY_FACTS_URL.format(cik=APPLE) not in router.urls
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+    cache = Path(source._settings.edgar.cache_dir) / "facts" / f"v{PARSER_VERSION}"
+    assert not (cache / f"{APPLE}.json").exists()
+    assert (source.facts_bulk_empty, source.facts_bulk_keyless, source.facts_missing) == (0, 0, 0)
+    _shares(source, APPLE)  # asked again in the same run: memoised, not recorded twice
+    assert len(source.validation_failures) == 1
 
 
 # --- an empty or keyless companyfacts.zip member (#566) -------------------------
@@ -1725,12 +1745,23 @@ def test_a_good_bulk_member_is_unchanged_by_an_empty_neighbour(tmp_path: Path) -
     assert mixed.facts_bulk_empty == 0  # counted only when that CIK is asked for
 
 
-def test_a_bulk_member_that_is_not_json_still_raises(tmp_path: Path) -> None:
-    """Fail closed: only an empty or `cik`-less object counts as absent; a
-    member that is not JSON still fails the source."""
-    source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"not json"}))
-    with pytest.raises(ValueError):
-        _shares(source, APPLE)
+def test_a_bulk_member_that_is_not_json_is_recorded_and_absent(tmp_path: Path) -> None:
+    """Fail closed (#578): only an empty or `cik`-less object counts as
+    absent without a record; a member that is not JSON is recorded for the
+    gate, which fails the run before any store write."""
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"not json"}))
+    records = _shares(source, APPLE)
+    _assert_member_recorded_and_absent(source, router, records, "JSONDecodeError")
+
+
+def test_a_bulk_member_whose_facts_do_not_parse_is_recorded_and_absent(tmp_path: Path) -> None:
+    """#578: a member that holds the latest filing but whose entry
+    `parse_company_facts` refuses (an impossible `end`) is recorded under
+    the member, never cached, and the API is not asked."""
+    bad = json.dumps(_apple_entries(_entry(APPLE_ACCESSION, "2025-13-45", 5.0))).encode()
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: bad}))
+    records = _shares(source, APPLE)
+    _assert_member_recorded_and_absent(source, router, records, "ValueError")
 
 
 # --- a per-CIK companyfacts API 200 `{}` (#576) --------------------------------

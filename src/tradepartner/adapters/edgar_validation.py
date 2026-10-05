@@ -20,9 +20,10 @@ The cost of continuing (owner-accepted): a bad payload is absent for the
 rest of the pass, so a failure that depends on it may only show on the
 next run.
 
-This module holds the collector and the gate only. The parser call sites
-that record onto it are wired separately: bulk and index inputs, then the
-per-CIK and per-document inputs (#578 parts 2 and 3).
+This module holds the collector and the gate. The bulk and index inputs
+record onto it (#578 part 2: form.idx quarters, `submissions.zip` and
+`companyfacts.zip` members, FSN periods); the per-CIK and per-document
+inputs follow (#578 part 3).
 """
 
 from __future__ import annotations
@@ -102,7 +103,13 @@ class ValidationFailures:
             self.record(input, key, error)
             return None
 
-    def raise_if_any(self, settings: Settings, counted: Mapping[str, int] | None = None) -> None:
+    def raise_if_any(
+        self,
+        settings: Settings,
+        counted: Mapping[str, int] | None = None,
+        *,
+        stopped_by: BaseException | None = None,
+    ) -> None:
         """Do nothing when no failure was recorded. Otherwise write the full
         list (and `counted`, the source's not-failed counts such as empty
         `{}` payloads) to a new JSON file under the directory, and raise
@@ -113,7 +120,13 @@ class ValidationFailures:
         redacted, control characters replaced, cut to
         `ingest.max_message_chars`), in the file and in the message. A file
         that cannot be written is named as such in the message, which still
-        fails the run with every failure counted."""
+        fails the run with every failure counted.
+
+        `stopped_by` is the exception that stopped the fetch pass after
+        failures were recorded (a later step can fail because an input it
+        needs was treated as absent): it is named in the message, cleaned,
+        after the per-input totals, and chained, so it never hides the
+        list."""
         if not self._failures:
             return
         failures = [
@@ -137,6 +150,9 @@ class ValidationFailures:
             f"full list: {where}",
             "by input: " + ", ".join(f"{name} {n}" for name, n in sorted(by_input.items())),
         ]
+        if stopped_by is not None:
+            stopped = f"{type(stopped_by).__name__}: {stopped_by}"
+            parts.append("the pass then stopped: " + clean_message(stopped, settings))
         if counts:
             parts.append(
                 "counted, not failed: " + ", ".join(f"{k} {n}" for k, n in sorted(counts.items()))
@@ -145,7 +161,10 @@ class ValidationFailures:
             f"first {min(limit, len(failures))}: "
             + "; ".join(f"{f.input} {f.key}: {f.error}" for f in failures[:limit])
         )
-        raise InputValidationError(" | ".join(parts))
+        failed = InputValidationError(" | ".join(parts))
+        if stopped_by is not None:
+            raise failed from stopped_by
+        raise failed
 
     def _write(self, failures: list[ValidationFailure], counted: Mapping[str, int]) -> Path:
         now = ensure_tz_aware_utc(self._clock(), field_name="clock()")
