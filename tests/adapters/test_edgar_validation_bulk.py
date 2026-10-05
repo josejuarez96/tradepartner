@@ -181,6 +181,35 @@ def test_an_fsn_period_that_fails_whole_is_recorded_and_absent(tmp_path: Path) -
     assert source._fsn_extracted_accessions == {"0000000011-15-000001"}
 
 
+def test_after_a_period_fails_whole_later_periods_persist_nothing(tmp_path: Path) -> None:
+    """#868: once an FSN period fails whole, the later periods of the same
+    pass are still extracted (every failure is seen in one pass) but write
+    no manifest and no per-CIK cache, so a shared accession is not claimed
+    by the later period. On the next run, with the earlier period repaired,
+    the earlier period extracts it first and the later one counts it as the
+    duplicate (the oldest-first rule holds)."""
+    shared, cik = "0000000011-15-000001", "11"
+    settings = _fsn_settings(tmp_path)
+    broken = {"2015q1": _missing_member_zip(), "2015q2": _one_period_zip(shared, cik)}
+    source = _source_ready(settings, _router_with_fsn(*broken, zips=broken))
+    source._ensure_fsn()
+    assert _failures(source) == [("FSN period", "2015q1")]
+    fsn_root = Path(settings.edgar.cache_dir) / "fsn" / f"v{FSN_VERSION}"
+    assert not list((fsn_root / "manifests").glob("*.json"))
+    assert not list(fsn_root.glob("*.json"))
+    assert source._fsn_loaded_periods == ()
+
+    repaired = {"2015q1": _one_period_zip(shared, cik), "2015q2": _one_period_zip(shared, cik)}
+    again = _source_ready(settings, _router_with_fsn(*repaired, zips=repaired))
+    again._ensure_fsn()
+    assert _failures(again) == []
+    assert again.fsn_duplicates == 1
+    first = json.loads((fsn_root / "manifests" / "2015q1.json").read_bytes())
+    later = json.loads((fsn_root / "manifests" / "2015q2.json").read_bytes())
+    assert first["accessions_served"] == [shared]
+    assert later["accessions_served"] == []
+
+
 def test_a_duckdb_io_error_still_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
