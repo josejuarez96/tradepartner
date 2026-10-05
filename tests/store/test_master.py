@@ -1201,7 +1201,11 @@ class TestListingEvidenceAfterForm25:
             transfer_window_sessions=_settings().master.transfer_window_sessions,
         )
         evidence = registrant_evidence(
-            [], ends.to_dicts(), as_of=date(2026, 10, 4), quiet_after_days=180
+            [],
+            ends.to_dicts(),
+            as_of=date(2026, 10, 4),
+            quiet_after_days=180,
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
         )
         resolver = ListingResolver(build.listings, evidence)
         assert [resolver.resolve("OKE", day) for day in bars] == [cik] * len(bars)

@@ -682,8 +682,13 @@ what = "Draft the research-experiment registry spec (runs that are not backtests
 why = "Answers the ML validation brief's registry proposal and the annotation protocol's interim log before any such run happens."
 unblocks = ["spec:research-registry"]
 
+[issue.931]
+what = "Flip the Status fields of the strategy-lab spec and the research-registry spec and plan to Accepted, recording the owner's decision of 2026-10-05."
+why = "A plan is written only from an accepted spec; the flip is the record in git that the owner approved these three documents."
+unblocks = ["plan:research-registry", "spec:strategy-lab"]
+
 [plan.strategy-lab]
-what = "How the strategy lab is built: twenty-six tasks from the accepted spec, docs first (the ADR and the spec amendments), then the pure cadence, anchor, frozen-default, parser and quiet-interval modules, then the period-key rename, the engine at cadence, the lab registry, registration, the runner, the report, promotion and the spend rules, then the CLI, the page and the lab migration after T45b."
+what = "How the strategy lab is built: twenty-nine tasks from the accepted spec, docs first (the ADR and the spec amendments), then the pure cadence, anchor, frozen-default, parser and quiet-interval modules, then the period-key rename, the engine at cadence, the lab registry, registration, the runner, the report, promotion and the spend rules, then the CLI, the page and the lab migration after T45b."
 why = "The owner wants to test many strategies across horizons beside H1's paper run; without a plan the spec's guarantees (every variant a counted trial, no sweep near the holdout, one promotion per fingerprint) have no build order and no team can claim a task."
 unblocks = ["phase:3", "phase:4"]
 
