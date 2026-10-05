@@ -139,7 +139,7 @@ from tradepartner.store.benchmarks import (
     benchmark_candidates,
     ticker_holders,
 )
-from tradepartner.store.classify import classifications_as_of
+from tradepartner.store.classify import EQUITY, classifications_as_of, listing_kind
 from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import _first_session, securities_as_of
@@ -503,7 +503,10 @@ def _window_names(
     settings: Settings,
 ) -> tuple[list[str], list[str], set[str], set[str] | None, str | None]:
     """From listings known at `t`: securities with a `_fetched` listing
-    live at some point in `window`, and the reference (to fetch), the
+    live at some point in `window` that a fetched bar could land on (#875:
+    an equity row by `listing_kind`, not superseded before the window by a
+    later row of its security; benchmarks exempt), and the reference (to
+    fetch), the
     benchmark names and the common names
     on one of `universe.exchanges` listed through the whole window,
     including any delisted only later (the staleness denominator), those
@@ -513,7 +516,12 @@ def _window_names(
 
     A listing counts from its `valid_from`; a delisted or transferred one
     still counts while its end session (last bar known) or `effective_on`
-    is inside or after the window, or while no end is known yet.
+    is inside or after the window, or while no end is known yet. For the
+    fetch, as for the price resolver, a row also ends where the security's
+    next later row starts: a row superseded on or before the window's first
+    day fetches nothing, whatever its own status (an older listing on
+    another exchange with no end, #875). The staleness denominator is not
+    changed by either rule.
     """
     first, last = window
     kinds = {
@@ -531,7 +539,11 @@ def _window_names(
     filed: set[str] = set()  # with a filing-based listing live in the window
     reference = None
     earliest: dict[str, date] = {}
-    for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
+    rows = list(listing_ends_as_of(conn, t, settings).iter_rows(named=True))
+    starts: dict[str, set[date]] = defaultdict(set)
+    for row in rows:
+        starts[row["security_id"]].add(row["valid_from"])
+    for row in rows:
         sid, status = row["security_id"], row["status"]
         earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
         if row["valid_from"] > last:
@@ -542,7 +554,11 @@ def _window_names(
         )
         if ended or status not in (LISTED, DELISTED, TRANSFERRED):
             continue
-        if _fetched(sid, row, benchmarks, types, settings):
+        superseded = any(row["valid_from"] < start <= first for start in starts[sid])
+        assignable = sid in benchmarks or (
+            listing_kind(row["ticker"], row["class_title"]) == EQUITY and not superseded
+        )
+        if assignable and _fetched(sid, row, benchmarks, types, settings):
             ids.add(sid)
         if row["provenance"] != STATIC:
             filed.add(sid)
