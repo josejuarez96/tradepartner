@@ -75,6 +75,6 @@ fact sheets, live windows. "None" only if true. -->
 spec req 4). Leave this section out of any other hypothesis file. The parameter block above
 must reproduce the argmax variant's frozen set exactly, and the prior-evidence disclosure
 lists the sweep's results as evidence already seen. -->
-- **Sweep:** `<sweep-slug>`, registration id <sweep_id>; declared count n = <n>
-- **Variant:** `<sweep-slug>--r<sweep_id>-v<NNN>`, rank <k> of <n> by <selection_statistic>
+- **Sweep:** `<sweep-slug>`, registration id <sweep_id>; the family's declared count n = <n> at promotion
+- **Variant:** `<sweep-slug>--r<sweep_id>-v<NNN>`, rank 1 (the argmax) of the registration's <n_variants> variants by <selection_statistic>
 - **Base-level in-sample statistics at promotion:** `excess_cagr_spy` <pp>, `sharpe_annual_excess_spy` <value>, `dsr_excess` <value> (at the family's SR* high-water mark), `turnover_annual` <value>, `cost_drag` <pp>, `max_drawdown` <value>

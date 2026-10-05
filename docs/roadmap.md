@@ -29,7 +29,7 @@ Added 2026-09-30 (#388). Phase 4 exits after at least six monthly rebalances of 
 1. **The Phase 5 spec and plan** under [ADR 0008](decisions/0008-llm-role.md) (an advisory memo at most, never a number and never an order): the fixed input packet, the post-cutoff-only evaluation plan and the calibration record. Drafting can start once the Phase 4 journal schema is final, since the packet reads the journal.
 2. **Phase 6 preparation** as docs tasks the owner completes: the written stop criteria, the account-type decision and the employer compliance check.
 3. **The `data-validator` and `journal-analyst` agents** ([agents.md](ways-of-working/agents.md) candidates): the first is Phase 2's T23, whose agent half does not need the owner's scheduling evidence and can be split from it by a Phase 2 plan amendment; the second needs a real journal.
-4. **The strategy-lab engine**, now specified and planned: the [strategy-lab spec](specs/strategy-lab.md) (Accepted 2026-10-05, #931; #281 answered) and its [plan](plans/strategy-lab.md) (#933, T91 to T115) run as the Phase 4 side track above. **The event-data engine** once the owner answers #307, and the timestamped social collector side job, which needs its own ADR before it enters scope.
+4. **The strategy-lab engine**, specified and its plan drafted: the [strategy-lab spec](specs/strategy-lab.md) (Accepted 2026-10-05, #931; #281 answered) and its [plan](plans/strategy-lab.md) (#933, T91 to T115) run as the Phase 4 side track above. **The event-data engine** once the owner answers #307, and the timestamped social collector side job, which needs its own ADR before it enters scope.
 
 ## User experience
 

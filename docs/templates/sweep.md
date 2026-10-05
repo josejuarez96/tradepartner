@@ -34,7 +34,12 @@ The block below is the only part the registry parses. Rules (`backtest/sweep.py`
   distinct after `Settings` validation, continuous axes on the family rules' lattice
   (`lab.axis_lattice`, for example `strategy.top_fraction` on a 0.01 step). The variants are
   the Cartesian product, at most `lab.max_variants_per_sweep`; their canonical order is
-  ascending `params_sha256`, never the file's order.
+  ascending `params_sha256`, never the file's order. Two variants with one fingerprint are
+  refused, and so is any variant whose fingerprint is already registered anywhere.
+- `family = "oracle"` is refused on the real store, as for a hypothesis file.
+- A **new family's first file** may name `parent_family`; it must then equal the
+  `FAMILY_PARENTS` entry for the family (a file naming another parent is refused). The
+  first registration fixes the family rules for every later file in the family.
 - `[lab]`: `selection_statistic` (`dsr_excess`, `sharpe_annual_excess_spy` or
   `excess_cagr_spy`; `dsr_excess` is refused when `schedule.rebalance_cadence` is an axis),
   `expected_excess_cagr_spy_pp`, `expected_range_pp = [lo, hi]`, `promote_at_least` (a
