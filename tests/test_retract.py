@@ -535,3 +535,14 @@ def test_a_keep_id_of_a_cik_not_judged_is_not_called_a_typo(two: Settings) -> No
     assert result.kept == ()
     assert f"master.keep_successors not judged this run: {FALSE_ID}" in result.summary()
     assert "with no underived row" not in result.summary()
+
+
+def test_a_dry_run_works_on_a_version_11_store(store: Settings) -> None:
+    """Version 12 (#926) adds only the research registry, which retraction
+    never reads: a store at version 11 already has `retracted` and
+    `master_underived`, so its dry run needs no migrating ingest first
+    (code-review of PR #940)."""
+    with duckdb.connect(store.store.path) as conn:
+        conn.execute("DELETE FROM schema_version WHERE version > 11")
+    result = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    assert [u.table for u in result.found] == ["securities", "listings"]
