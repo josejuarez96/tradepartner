@@ -27,9 +27,11 @@ overall: a CIK with no `securities` row known at `t` contributes no rows
 (invisible at `t`, same as everywhere else in this module), and a
 multi-class CIK's one statement row is repeated once per `security_id`
 `securities_as_of(t)` lists for it at `t` -- so a class added after `t`
-does not yet pull the CIK's statement facts in under its own id, and a
-class delisted or retracted before `t` (whatever `securities_as_of`
-decides) drops out the same way every other function here defers to it.
+does not yet pull the CIK's statement facts in under its own id. A class
+`securities_as_of` ever stops listing at some T (a delisted class stays
+listed today; #859's retraction is a later task) would drop out here too,
+the same way every other function in this module defers to whatever that
+one function decides a security's existence is.
 
 **Return type: `polars.DataFrame`.** ADR 0004 adopts polars for
 dataframes, and it is already a T1 runtime dependency. Every function

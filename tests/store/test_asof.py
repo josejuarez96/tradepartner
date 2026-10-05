@@ -1321,10 +1321,14 @@ class TestStatementFactsAsOf:
     def test_no_revision_first_vintage_only(
         self, synthetic_store: duckdb.DuckDBPyConnection
     ) -> None:
-        """`statement_facts` holds no revision (its `UNIQUE` excludes
-        `known_at`), so this is a plain `known_at <= t` filter: a second
-        row for a *different* period on the same CIK simply adds a row,
-        never replaces the first."""
+        """`statement_facts` holds no revision (its `UNIQUE (cik, fact_name,
+        period_end, period_days)` excludes `known_at`), so this is a plain
+        `known_at <= t` filter, never a latest-revision query: a second row
+        for a *different* period on the same CIK simply adds a row, never
+        replaces the first, and the schema itself -- not this function --
+        is what stops a second row for the *same* key (quant-auditor on
+        #904: the earlier version of this test never inserted a colliding
+        row, so it tested nothing about that)."""
         security_known = datetime(2021, 1, 1, tzinfo=UTC)
         _security(synthetic_store, "SEC_FIRST_VINTAGE", "CIK0001234568", known_at=security_known)
         first_known = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
@@ -1336,9 +1340,36 @@ class TestStatementFactsAsOf:
             100.0,
             known_at=first_known,
         )
-        rows = statement_facts_as_of(synthetic_store, first_known + timedelta(days=1))
-        assert rows.height == 1
-        assert rows.row(0, named=True)["value"] == pytest.approx(100.0)
+        # A different period adds a second row.
+        _statement_fact(
+            synthetic_store,
+            "CIK0001234568",
+            "revenue",
+            date(2021, 3, 31),
+            25.0,
+            known_at=first_known + timedelta(days=90),
+            period_start=date(2021, 1, 1),
+        )
+        rows = statement_facts_as_of(synthetic_store, first_known + timedelta(days=200))
+        assert sorted(rows["period_end"]) == [date(2020, 12, 31), date(2021, 3, 31)]
+
+        # A later row for the *same* key (even a different value, even a
+        # later known_at) is not a revision -- the UNIQUE constraint itself
+        # raises, which is the schema enforcing "no revision" at the DDL
+        # level rather than this function silently picking one.
+        with pytest.raises(duckdb.ConstraintException):
+            _statement_fact(
+                synthetic_store,
+                "CIK0001234568",
+                "revenue",
+                date(2020, 12, 31),
+                999.0,
+                known_at=first_known + timedelta(days=30),
+            )
+        rows = statement_facts_as_of(synthetic_store, first_known + timedelta(days=200))
+        assert rows.filter(pl.col("period_end") == date(2020, 12, 31)).row(0, named=True)[
+            "value"
+        ] == pytest.approx(100.0)
 
     def test_empty_security_ids_returns_empty_frame_with_schema(
         self, fixture_store: duckdb.DuckDBPyConnection
