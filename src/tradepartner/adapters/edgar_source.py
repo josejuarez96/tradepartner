@@ -170,7 +170,8 @@ header, delisting notice) stay with the failure policy above, one policy
 (owner option (a) on #808): `check_failures` fails the run only where its
 rules fire, and its message lists the run's unaccepted per-document
 failures, bounded, naming a file under `edgar.cache_dir/validation/` that
-holds the full list on every run, dry or not (#884).
+holds the full list whenever the check fails with them, dry run or not
+(#884).
 """
 
 from __future__ import annotations
@@ -1627,26 +1628,32 @@ class EdgarFilingSource(FilingSource):
         owner option (a) on #808):
         their count, then the first `edgar.max_validation_listed` as
         `accession error_class/base_form: message`, each message cleaned
-        (`_stored_message`). The full list is written on every run, dry or
-        not, to a JSON file under `edgar.cache_dir/validation/` that the
-        message names before the entries (#884); `failed_filings.json`
-        (written on a non-dry run by `record_failed_check`) holds them too,
-        and accepting one stays the hand edit there."""
+        (`_stored_message`). Whenever the check fails with such failures, dry
+        run or not, the full list is written to a JSON file under
+        `edgar.cache_dir/validation/`, named at the very start of the
+        message, so the run row's `ingest.max_message_chars` cut keeps it
+        whatever the reasons' length (#884); `failed_filings.json` (written
+        on a non-dry run by `record_failed_check`) holds them too, and
+        accepting one stays the hand edit there."""
         reasons: list[str] = []
         self._check_fsn_group(reasons)
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
         if reasons:
+            full_list, listing = self._unaccepted_listing()
             raise FilingFailuresError(
-                "; ".join(reasons)
+                full_list
+                + "; ".join(reasons)
                 + f"; failure messages in {self._failed_filings_path()} (not on a dry run)"
                 + f" and the FSN manifests under {self._fsn_root() / 'manifests'}"
-                + self._unaccepted_listing()
+                + listing
             )
 
-    def _unaccepted_listing(self) -> str:
-        """`check_failures`'s bounded list of this run's unaccepted
-        per-document failures, or "" when there are none."""
+    def _unaccepted_listing(self) -> tuple[str, str]:
+        """`check_failures`'s message parts for this run's unaccepted
+        per-document failures: where their full list was written (the
+        message's first part) and the bounded list (its last); both "" when
+        there are none."""
         unaccepted = [
             (accession, error_class, base_form, message)
             for accession, (error_class, base_form, message) in sorted(
@@ -1655,7 +1662,7 @@ class EdgarFilingSource(FilingSource):
             if not self._accepted(accession, error_class, message)
         ]
         if not unaccepted:
-            return ""
+            return "", ""
         try:
             where = str(self._write_unaccepted_listing(unaccepted))
         except OSError as error:  # the check still fails, unlisted on disk
@@ -1666,8 +1673,9 @@ class EdgarFilingSource(FilingSource):
             for accession, error_class, base_form, message in unaccepted[:limit]
         )
         return (
+            f"full list of this run's {len(unaccepted)} unaccepted filing failures: {where}; ",
             f"; this run's unaccepted filing failures (per-document and fact collisions): "
-            f"{len(unaccepted)}, full list: {where}, first {min(limit, len(unaccepted))}: {listed}"
+            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}",
         )
 
     def _write_unaccepted_listing(self, unaccepted: Sequence[tuple[str, str, str, str]]) -> Path:
