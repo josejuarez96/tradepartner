@@ -13,7 +13,8 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   month) holes in the backfill's committed months, needs no Alpaca secret
   and fetches nothing; the real run refetches them and exits 0 only when
   every month it fetched is `filled`. Only holes the store's resolver can
-  assign are listed or fetched; the rest are counted per reason (#876).
+  assign are listed or fetched; the rest are counted per reason (#876). A
+  rename lead's gap inside a month with stored bars is a hole too (#891).
   `--security ID` (repeatable, or comma-separated) limits both to the named
   securities; a named id with no hole fetched is listed with why, not an
   error.

@@ -70,7 +70,24 @@ resolver (`repair.store_resolver` at the clock the holes are read, the
 resolver an ingest run builds) holds the id on some session of the month
 under a ticker that is an Alpaca symbol (`alpaca_symbol`). The others are
 not fetched, and are counted per reason (`UNASSIGNED`, `NOT_ALPACA`): on
-the dry run's summary and in each month's run message. `securities`
+the dry run's summary and in each month's run message. A ticker that only
+leads to the id (a rename lead, #843) counts, as it does for the bars
+(#891).
+
+**Rename gaps** (#891). A month in which a security has stored bars is
+also a hole when a rename lead (`ListingResolver.lead`, under an Alpaca
+symbol) assigns the security a session of it with no bar known at the
+clock and none later on a session the lead assigns it: the gap from the
+old symbol's last bar to the first cover page naming the new one starts or
+ends inside a month (FB -> META, June and July 2022). A missing session
+the old symbol traded after (a halt inside the lead window) is no rename
+gap: the new symbol has no bar there to fill it. The whole month is
+refetched like any hole, with the old and the new symbol (`symbols`);
+`parse_bars` takes a new-symbol row only where the security has no row of
+its own that session, and `ingest`'s rules add nothing for an unchanged
+stored bar, so no session is stored twice and each bar keeps its
+session-close `known_at`. A gap with no lead (a session after the cover
+page) is no hole, as before. `securities`
 limits the holes to the named ids (a targeted refetch, the cursor, status
 and halt rules unchanged); a named id with no hole to fetch is listed with
 why (`NamedSecurity`), never an error.
@@ -242,7 +259,9 @@ def backfill(
 
 @dataclass(frozen=True)
 class Hole:
-    """A month in which `security_id` is fetched but the store has no bar.
+    """A month in which `security_id` is fetched but the store has no bar,
+    or (`rename_gap`, #891) has bars but none on a session a rename lead
+    (#843) assigns it.
 
     `ticker` is its listing's on the month's last day (else its first);
     `between` is whether it has a stored bar before and after the month."""
@@ -251,6 +270,7 @@ class Hole:
     ticker: str | None
     window: tuple[date, date]
     between: bool
+    rename_gap: bool = False
 
 
 @dataclass(frozen=True)
@@ -285,11 +305,13 @@ class HoleFill:
         securities = {hole.security_id for hole in self.holes}
         months = {hole.window for hole in self.holes}
         between = [hole for hole in self.holes if hole.between]
+        gaps = sum(hole.rename_gap for hole in self.holes)
+        renamed = f"; {gaps} of them rename gaps in a month with stored bars" if gaps else ""
         return (
             f"{len(self.holes)} holes (security, month) over {len(securities)} securities "
             f"in {len(months)} months; {len(between)} of them between a security's stored "
             f"bars ({len({hole.security_id for hole in between})} securities)"
-            f"{self.dropped_note()}"
+            f"{renamed}{self.dropped_note()}"
         )
 
     def dropped_note(self) -> str:
@@ -322,9 +344,11 @@ class HoleFill:
                 for span in spans
             )
             between = sum(hole.between for hole in holes)
+            gaps = sum(hole.rename_gap for hole in holes)
+            renamed = f", {gaps} rename gaps" if gaps else ""
             out.append(
                 f"  {sid} {holes[0].ticker or '-'}: {shown} ({len(holes)} months, "
-                f"{between} between its stored bars)"
+                f"{between} between its stored bars{renamed})"
             )
         out.extend(f"  {named.security_id}: not fetched, {named.reason}" for named in self.named)
         return out
@@ -459,9 +483,10 @@ def _assignable(
     resolver: ListingResolver, sids: list[str], window: tuple[date, date]
 ) -> tuple[list[str], dict[str, str]]:
     """`sids` split into those a fetched bar could land on in `window` and
-    the rest with why: kept when on some session the resolver resolves one
-    of the id's tickers to it (`ListingResolver.holds`) and that ticker is
-    an Alpaca symbol (else the fetch never sends it, `alpaca_symbol`)."""
+    the rest with why: kept when on some session one of the id's tickers
+    resolves to it or leads to it (a rename lead, #843/#891: bars take the
+    lead, `ListingResolver.holds`) and that ticker is an Alpaca symbol (else
+    the fetch never sends it, `alpaca_symbol`)."""
     sessions = _sessions_in(window)
     keep: list[str] = []
     dropped: dict[str, str] = {}
@@ -469,9 +494,7 @@ def _assignable(
         reason: str | None = UNASSIGNED
         if resolver.symbols(sid, window[0], window[1]):
             for day in sessions:
-                held = [
-                    t for t in resolver.symbols(sid, day, day) if resolver.resolve(t, day) == sid
-                ]
+                held = [t for t in resolver.symbols(sid, day, day) if _lands(resolver, t, sid, day)]
                 if any(alpaca_symbol(t) is not None for t in held):
                     reason = None
                     break
@@ -482,6 +505,79 @@ def _assignable(
         else:
             dropped[sid] = reason
     return keep, dropped
+
+
+def _lands(resolver: ListingResolver, ticker: str, sid: str, day: date) -> bool:
+    """True when a bar of `ticker` on `day` is assigned `sid`: it resolves
+    to it, or it leads to it (#843)."""
+    return resolver.resolve(ticker, day) == sid or resolver.lead(ticker, day) == sid
+
+
+def _rename_gaps(
+    conn: duckdb.DuckDBPyConnection,
+    resolver: ListingResolver,
+    t: datetime,
+    window: tuple[date, date],
+    sids: Collection[str],
+    horizon: int,
+) -> set[str]:
+    """Those of `sids` (each with a bar known at `t` in `window`) with a
+    rename gap in `window` (#891): a session on which a rename lead (#843)
+    assigns it a bar of a ticker that is an Alpaca symbol, with no bar of
+    it known at `t` and none later on a session the lead assigns it -- the
+    run from the old symbol's last bar to the first cover page naming the
+    new one. A missing session the old symbol traded after (a halt, a
+    no-trade day) is none: the new symbol has no bar there to fill it.
+    `horizon` (`alpaca.rename_lead_days`, the longest a lead runs) bounds
+    the search for the next bar."""
+    sessions = _sessions_in(window)
+    led: dict[str, tuple[list[str], set[date]]] = {}
+    for sid in sids:
+        tickers = [tk for tk in resolver.symbols(sid, *window) if alpaca_symbol(tk) is not None]
+        days = {day for day in sessions if any(resolver.lead(tk, day) == sid for tk in tickers)}
+        if days:
+            led[sid] = (tickers, days)
+    if not led:
+        return set()
+    stored: dict[str, list[date]] = defaultdict(list)
+    for sid, session in conn.execute(
+        "SELECT DISTINCT security_id, session FROM prices_daily "
+        "WHERE session BETWEEN ? AND ? AND known_at <= ? AND list_contains(?, security_id) "
+        "ORDER BY session",
+        [window[0], window[1] + timedelta(days=horizon), t, sorted(led)],
+    ).fetchall():
+        stored[sid].append(session)
+    gaps: set[str] = set()
+    for sid, (tickers, days) in led.items():
+        have = stored[sid]
+        for day in sorted(days - set(have)):
+            later = next((session for session in have if session > day), None)
+            if later is None or not any(resolver.lead(tk, later) == sid for tk in tickers):
+                gaps.add(sid)
+                break
+    return gaps
+
+
+def _month_holes(
+    conn: duckdb.DuckDBPyConnection,
+    resolver: ListingResolver,
+    t: datetime,
+    window: tuple[date, date],
+    ids: Collection[str],
+    only: frozenset[str] | None,
+    horizon: int,
+) -> tuple[list[str], set[str], set[str], dict[str, str]]:
+    """The holes of `window` as of `t` among the fetched `ids` (of `only`,
+    when given): the ids to fetch, sorted; those of them that are rename
+    gaps (`_rename_gaps`); the ids with a bar known at `t` in `window`; and
+    the ids with no bar that no fetched bar could land on, with why
+    (`_assignable`)."""
+    stored = _with_bars(conn, t, window)
+    named = [sid for sid in ids if only is None or sid in only]
+    empty, dropped = _assignable(resolver, [sid for sid in named if sid not in stored], window)
+    with_bars = [sid for sid in named if sid in stored]
+    gaps = _rename_gaps(conn, resolver, t, window, with_bars, horizon)
+    return sorted({*empty, *gaps}), gaps, stored, dropped
 
 
 def _holes(
@@ -516,9 +612,9 @@ def _holes(
         first, last = window
         with _read(settings) as conn:
             ids, *_ = _window_names(conn, t, window, settings)
-            stored = _with_bars(conn, t, window)
-        missing = [sid for sid in ids if sid not in stored and (only is None or sid in only)]
-        kept, dropped = _assignable(resolver, missing, window)
+            kept, gaps, _, dropped = _month_holes(
+                conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
+            )
         if tally is not None:
             tally.add((), dropped)
         for sid in kept:
@@ -527,7 +623,7 @@ def _holes(
             ticker = live[-1] if live else (rows[0][1] if rows else None)
             lo, hi = spans.get(sid, (None, None))
             between = lo is not None and hi is not None and lo < first and hi > last
-            holes.append(Hole(sid, ticker, window, between))
+            holes.append(Hole(sid, ticker, window, between, sid in gaps))
     return holes, set(tickers)
 
 
@@ -580,10 +676,9 @@ def _price_chunk(
     """One month. The store is read as of the clock when the month starts
     (after the EDGAR chunk committed) and rows are stamped with the clock
     after the fetch returns, so a revision is never dated before it was
-    fetched. With `fill` (a hole fill), only the names with no bar known
-    then (of the `only` ids, when given) that a fetched bar could land on
-    (`_assignable`, the store's resolver then) are fetched, with the
-    reference; the dropped ones are counted in the message and `tally`; the
+    fetched. With `fill` (a hole fill), only the holes then (of the `only`
+    ids, when given: `_month_holes`, the store's resolver then) are
+    fetched, with the reference; the dropped ones are counted in the message and `tally`; the
     stored bars count toward the staleness share; and a month with no hole
     to fetch is skipped (`None`)."""
     first, last = window
@@ -600,11 +695,15 @@ def _price_chunk(
             ids, listed, static_only, may_count, reference = _window_names(
                 conn, started, window, settings
             )
-            stored = _with_bars(conn, started, window) if fill else set()
-            holes = [sid for sid in ids if sid not in stored and (only is None or sid in only)]
+            holes: list[str] = []
+            renames: set[str] = set()
+            stored: set[str] = set()
             dropped: dict[str, str] = {}
-            if fill and holes:
-                holes, dropped = _assignable(store_resolver(conn, started, settings), holes, window)
+            if fill:
+                resolver = store_resolver(conn, started, settings)
+                holes, renames, stored, dropped = _month_holes(
+                    conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
+                )
         if fill:
             if tally is not None:
                 tally.add((), dropped)
@@ -651,8 +750,9 @@ def _price_chunk(
                 params=[first, last],
             )
             added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
+            renamed = f" and {len(renames)} with a rename gap" if renames else ""
             filled = (
-                f"holes of {len(holes)} names with no stored bar"
+                f"holes of {len(holes) - len(renames)} names with no stored bar{renamed}"
                 f"{_dropped_note(dict(Counter(dropped.values())))}: "
                 if fill
                 else ""
