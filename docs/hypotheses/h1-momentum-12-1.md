@@ -239,8 +239,8 @@ Owner answers that set these values (spec open questions, answered on #156):
   2021-06-30, 6 and 0, falling to 0 and 0 by 2021-11. The 2019-11 to 2020-06 counts do not
   include the #974 names, which had a listing known at T but no bars before mid-2019 and
   failed rule 6, so the bias in those months was larger than the two proxies say; the
-  2020-07 and 2020-08 counts already include the names that entered then, so the fall to
-  13 and 0 at 2020-08-31 measures the iXBRL and #974 effects together. The 60 is a floor: the
+  2020-08-31 counts already include the names that entered at 2020-07-31 and 2020-08-31,
+  so the fall to 13 and 0 at 2020-08-31 measures the iXBRL and #974 effects together. The 60 is a floor: the
   proxy cannot
   count a company that delisted before 2021-12. After 2020-08 the pool grows by about 220
   more companies by 2020-12 (later accelerated-filer filings) and by about 150 more with
@@ -290,8 +290,8 @@ Owner answers that set these values (spec open questions, answered on #156):
   signal reads closes from 2019-08-30 to 2020-07-31 (`formation_months = 12`,
   `skip_months = 1`) and rule 6 needs bars on every session from 2019-09-03 to 2020-08-31
   (`universe.min_history_months = 12`), inside the store's January 2016 start (ADR 0009).
-  A #974 name whose first bar falls after 2019-08-30 passes rule 6 at 2020-08-31 but has
-  no 2019-08-30 close, so it is a member with no momentum score at that one rebalance;
+  A #974 name whose first bar is 2019-09-03, the first session after 2019-08-30, passes
+  rule 6 at 2020-08-31 but has no 2019-08-30 close, so it is a member with no momentum score at that one rebalance;
   that residual is accepted and reported, not removed. No other parameter changes. **No
   result was seen before this choice either:** H1 has no trial on real data (the #842
   statement above still holds), and the decision on #974 rests on the audit's universe
