@@ -18,6 +18,8 @@ import pytest
 
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import Settings
+from tradepartner.execution import report as report_module
+from tradepartner.execution.plan import stop_session
 from tradepartner.execution.report import (
     Journal,
     PriceOf,
@@ -32,6 +34,7 @@ from tradepartner.store.journal import (
     OrderedFill,
     PaperRunRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     PositionDailyRow,
     RebalanceEventRow,
 )
@@ -903,7 +906,31 @@ def test_month_uncompared_at_or_after_stop_session() -> None:
         _no_actions(),
         _no_price,
         _no_price,
-        stop_session=T1,
+        # A stop requested after close(T1) still falls in T1 (plan.stop_session).
+        stop_session=stop_session(_utc(T1, hour=22)),
     )
     assert result.months == ()
     assert result.passed  # vacuously, nothing to compare
+
+
+def _stop_row(at: datetime, state: str) -> PaperWindowStopRow:
+    return PaperWindowStopRow(window_id=WINDOW_ID, at=at, state=state, known_at=at, ingested_at=at)
+
+
+@pytest.mark.parametrize(
+    ("requested_at", "expected"),
+    [
+        pytest.param(_utc(T1, hour=22), T1, id="after-the-close"),
+        # Saturday 2026-10-31: the next session, Monday 2026-11-02.
+        pytest.param(datetime(2026, 10, 31, 15, tzinfo=UTC), date(2026, 11, 2), id="saturday"),
+    ],
+)
+def test_report_stop_session_is_plan_stop_session(requested_at: datetime, expected: date) -> None:
+    """report reads the stop session through `plan.stop_session` (#592), from the
+    earliest `requested` row; a `closed` row is not a request."""
+    stops = [
+        _stop_row(requested_at + timedelta(days=3), "closed"),
+        _stop_row(requested_at, "requested"),
+    ]
+    assert report_module._stop_session_of(stops) == stop_session(requested_at) == expected
+    assert report_module._stop_session_of([_stop_row(requested_at, "closed")]) is None

@@ -68,6 +68,12 @@ in the window through the window's runs, and rows dated after S are cut.
 (forced exits, which carry no rebalance session, never enter the test), and
 `pending` otherwise, planned or not.
 
+The **stop session** (`stop_session`, spec reqs 9 and 14) of a window's
+`requested` stop is the calendar session containing the row's `at` (its New
+York date), or the next session when that date is not one. It lives here, the
+one module `run`, `report` and `check` all import without a cycle, so the three
+share one rule.
+
 An order is terminal when **any** of its events is terminal (a `cancel_noop`
 may follow `expired`), and in flight otherwise, an order with no event at all
 included: that fails safe, since an in-flight decision is never re-ordered.
@@ -88,7 +94,7 @@ import polars as pl
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
 from tradepartner.backtest.engine import Plan
 from tradepartner.backtest.schedule import fill_session
-from tradepartner.calendar import previous_session, session_close
+from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution.ledger import Ledger
 from tradepartner.store.journal import (
@@ -118,6 +124,7 @@ from tradepartner.store.schema import (
     UNTARGETED_RECEIPT_REASON,
     WINDOW_STOP_REASON,
 )
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SPLIT = "split"
@@ -774,6 +781,14 @@ def rebalance_state(
     if mine and all(state.state in (State.CLOSED, State.SETTLED) for state in mine):
         return RebalanceState.EXECUTED
     return RebalanceState.PENDING
+
+
+def stop_session(requested_at: datetime) -> date:
+    """The stop session (spec reqs 9 and 14): the calendar session containing
+    the `requested` row's `at` (its New York date), or the next session when
+    that date is not a session. A naive `requested_at` raises `ValueError`."""
+    day = ensure_tz_aware_utc(requested_at, field_name="requested_at").astimezone(_NEW_YORK).date()
+    return day if is_session(day) else next_session(day)
 
 
 # --- decisions from a plan (T53b) --------------------------------------------------
