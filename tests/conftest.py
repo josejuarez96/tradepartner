@@ -17,6 +17,9 @@
 - `fixture_store` builds a fresh in-memory DuckDB store, initializes the
   schema, and loads `tests/fixtures/universe/` this way — a no-op until T5
   populates that directory.
+- `_reset_edgar_rate_limit_block` (autouse) clears `edgar_raw`'s
+  process-wide rate-limit block (#761), so a test that ends inside a
+  persistent `403` cannot make a later test's first `403` fail fast.
 - `settings` returns a `Settings` pointed at a tmp-path store file, with no
   `.env` loaded, for tests that need `Settings` rather than a live
   connection (e.g. `store.db` lock/retry tests).
@@ -34,6 +37,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
 from tradepartner.store import schema
 from tradepartner.store.db import configure_connection
@@ -87,6 +91,12 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked_connect_ex)
+
+
+@pytest.fixture(autouse=True)
+def _reset_edgar_rate_limit_block() -> None:
+    """Start every test with `edgar_raw`'s process-wide block cleared (#761)."""
+    edgar_raw._RATE_LIMIT_BLOCK.clear()
 
 
 @pytest.fixture

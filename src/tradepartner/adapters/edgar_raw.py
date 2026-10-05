@@ -22,20 +22,30 @@ streamed `GET`, each attempt and retry still behind `_RateLimiter`:
   or any other `httpx.TransportError`): capped exponential backoff,
   `edgar.retry_backoff_seconds * 2 ** attempt` up to
   `edgar.retry_backoff_cap_seconds`, up to `edgar.retry_max_attempts` tries
-  in total. A `429`/`503` response's own `Retry-After` is honoured instead
-  of the computed backoff when the response sends one and it's a finite,
-  non-negative number no larger than `edgar.max_retry_after_seconds` --
-  a response naming `nan`, `inf`, or an absurdly large value raises
-  instead of sleeping for it.
+  in total. A `429` still there once those tries are used up is treated as
+  SEC's rate-limit block (research #572 P2: SEC may signal it with a `429`
+  too) and gets the `403` wait below (#761). A `429`/`503` response's own
+  `Retry-After` is honoured instead of the computed backoff when the
+  response sends one and it's a finite, non-negative number no larger
+  than `edgar.max_retry_after_seconds` -- a response naming `nan`, `inf`,
+  or an absurdly large value raises instead of sleeping for it.
 - **`403`** (SEC uses it for its rate-limit block too, alongside the more
   standard `429`/`503`; the block lifts only once the request rate has
   stayed under the threshold for a while): one wait of
   `edgar.rate_limit_wait_seconds` (default 10 minutes), then one retry;
-  a second `403` fails outright rather than waiting again.
+  a second `403` fails outright rather than waiting again. The block is
+  remembered process-wide (`_RATE_LIMIT_BLOCK`, #761): once a block has
+  been waited out and no request has succeeded since, a later request's
+  `403` (or `429` past its backoff) fails at once instead of waiting
+  another 10 minutes, so a block that persists (e.g. a refused
+  `User-Agent`) costs one wait per run, not one per request. Any success
+  clears it.
 - **A corrupt or truncated bulk zip** (one that won't open, a member whose
   deflate data won't inflate or ends early, or `testzip()` naming a CRC
   mismatch): `_stream_to_with_headers` re-downloads it once more; a zip
-  still corrupt after that raises `zipfile.BadZipFile`.
+  still corrupt after that raises `zipfile.BadZipFile`. Each download is
+  checked in its temp file before it replaces the cached zip, so a corrupt
+  one never overwrites the previous good copy (#761).
 
 Every public function takes an optional `client: httpx.Client` so tests
 can inject an `httpx.MockTransport`-backed client without any real
@@ -68,6 +78,9 @@ _TRANSIENT_STATUS_CODES = frozenset({429, 503})
 #: SEC's rate-limit block, which it also signals with a plain `403`: waited
 #: out once (`edgar.rate_limit_wait_seconds`), never retried a second time.
 _RATE_LIMIT_STATUS_CODE = 403
+#: A `429` still returned once the backoff attempts are used up is SEC's
+#: block too (research #572 P2), and is waited out like a `403` (#761).
+_BLOCK_429_STATUS_CODE = 429
 # `.fullmatch()`, so no anchors needed: a partial/embedded match (or a
 # trailing-newline edge case `^...$` can admit) can never slip through.
 _ACCESSION_PATTERN = re.compile(r"\d{10}-\d{2}-\d{6}")
@@ -198,6 +211,34 @@ def _retry_after_seconds(response: httpx.Response, settings: Settings) -> float 
     return max(seconds, 0.0)
 
 
+class _RateLimitBlock:
+    """Process-wide memory of SEC's rate-limit block (#761): set when a
+    request waits a block out, cleared by any successful response. While
+    set, a block status fails at once rather than waiting again (module
+    docstring). `threading.Lock`-guarded, like `_RateLimiter`."""
+
+    def __init__(self) -> None:
+        self._waited_since_last_success = False
+        self._lock = threading.Lock()
+
+    def is_set(self) -> bool:
+        with self._lock:
+            return self._waited_since_last_success
+
+    def set(self) -> None:
+        with self._lock:
+            self._waited_since_last_success = True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._waited_since_last_success = False
+
+
+# Module-level and process-wide on purpose, like `_LIMITER`: SEC blocks the
+# client, not one request.
+_RATE_LIMIT_BLOCK = _RateLimitBlock()
+
+
 def _backoff_seconds(
     attempt_index: int, settings: Settings, response: httpx.Response | None
 ) -> float:
@@ -224,8 +265,9 @@ class _RetryPolicy:
     `_stream_to_with_headers`, so both follow the same policy.
 
     `429`/`503` responses and transport errors share one attempt counter,
-    capped at `edgar.retry_max_attempts`; a `403` is waited out once and
-    never advances that counter.
+    capped at `edgar.retry_max_attempts`; a `403`, or a `429` once that
+    counter is used up, is waited out once per request (and not at all
+    while `_RATE_LIMIT_BLOCK` is set) and never advances that counter.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -244,28 +286,39 @@ class _RetryPolicy:
         return True
 
     def retry_after_response(self, response: httpx.Response) -> bool:
-        """After a response: sleep and return `True` to retry a `403` (once)
-        or a `429`/`503` (until the attempts are used up); return `False`
-        for a success; otherwise raise `httpx.HTTPStatusError`
-        (`response.raise_for_status()`: a second `403`, a last `429`/`503`,
-        or any status this policy doesn't retry). Reads only the status and
-        headers, never the body, so a streamed response is not consumed."""
+        """After a response: sleep and return `True` to retry a `429`/`503`
+        (until the attempts are used up) or a block (`_wait_out_block`);
+        return `False` for a success, which also clears
+        `_RATE_LIMIT_BLOCK`; otherwise raise `httpx.HTTPStatusError`
+        (`response.raise_for_status()`: a block not waited out again, a
+        last `503`, or any status this policy doesn't retry). Reads only the
+        status and headers, never the body, so a streamed response is not
+        consumed."""
         status = response.status_code
-        edgar = self._settings.edgar
         if status == _RATE_LIMIT_STATUS_CODE:
-            if self._rate_limit_waited:
-                response.raise_for_status()
-            self._rate_limit_waited = True
-            time.sleep(edgar.rate_limit_wait_seconds)
-            return True
+            return self._wait_out_block(response)
         if status in _TRANSIENT_STATUS_CODES:
-            if self._attempt + 1 >= edgar.retry_max_attempts:
-                response.raise_for_status()
-            time.sleep(_backoff_seconds(self._attempt, self._settings, response))
-            self._attempt += 1
-            return True
+            if self._attempt + 1 < self._settings.edgar.retry_max_attempts:
+                time.sleep(_backoff_seconds(self._attempt, self._settings, response))
+                self._attempt += 1
+                return True
+            if status == _BLOCK_429_STATUS_CODE:
+                return self._wait_out_block(response)
         response.raise_for_status()
+        _RATE_LIMIT_BLOCK.clear()
         return False
+
+    def _wait_out_block(self, response: httpx.Response) -> bool:
+        """SEC's rate-limit block: sleep `edgar.rate_limit_wait_seconds` and
+        return `True` to retry, once per request; raise instead if this
+        request already waited, or if an earlier request's wait has not
+        been followed by any success (`_RATE_LIMIT_BLOCK`)."""
+        if self._rate_limit_waited or _RATE_LIMIT_BLOCK.is_set():
+            response.raise_for_status()
+        self._rate_limit_waited = True
+        _RATE_LIMIT_BLOCK.set()
+        time.sleep(self._settings.edgar.rate_limit_wait_seconds)
+        return True
 
 
 def _execute_with_retry(
@@ -544,20 +597,34 @@ def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client
     return _stream_to_with_headers(url, dest, settings=settings, client=client)[0]
 
 
-def _write_stream_atomic(dest: Path, chunks: Iterable[bytes]) -> None:
-    """Write `chunks` to `dest` through a temp file in the same directory and
-    `os.replace`, so a reader (or a mid-stream failure) never sees a
-    half-written file, and a previous `dest` is left untouched until the new
-    one is fully written."""
+def _write_stream_to_temp(dest: Path, chunks: Iterable[bytes]) -> Path:
+    """Write `chunks` to a new temp file beside `dest` and return its path,
+    leaving `dest` untouched; the caller checks it and then `os.replace`s it
+    over `dest` or deletes it (`_replace_if_valid_zip`). A mid-stream
+    failure deletes the temp file before re-raising."""
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as file:
             for chunk in chunks:
                 file.write(chunk)
-        os.replace(tmp, dest)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+    return Path(tmp)
+
+
+def _replace_if_valid_zip(tmp: Path, dest: Path) -> bool:
+    """Move `tmp` over `dest` if it is a sound zip and return `True`; else
+    delete it and return `False`, leaving any previous `dest` in place
+    (#761: the check runs before `os.replace`, never after). `tmp` is gone
+    either way, including on an error."""
+    try:
+        if _zip_is_corrupt(tmp):
+            return False
+        os.replace(tmp, dest)
+        return True
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _zip_is_corrupt(path: Path) -> bool:
@@ -582,9 +649,11 @@ def _stream_to_with_headers(
 
     Every destination streamed through this function is a zip
     (`bulk_submissions`, `bulk_company_facts`, `fsn_zip`): once a response
-    streams cleanly to `dest`, `dest` is opened and CRC-checked
-    (`_zip_is_corrupt`), and a corrupt or truncated result is re-downloaded
-    once more; a second corrupt result raises `zipfile.BadZipFile`. The
+    streams cleanly to a temp file beside `dest`, the temp file is opened
+    and CRC-checked (`_zip_is_corrupt`) and only a sound one replaces
+    `dest`; a corrupt or truncated result is re-downloaded once more, and a
+    second corrupt result raises `zipfile.BadZipFile` with the previous
+    `dest` (if any) untouched (#761). The
     status and transport-error decisions are `_RetryPolicy`'s, the same as
     every other request here.
     """
@@ -605,13 +674,13 @@ def _stream_to_with_headers(
                 if policy.retry_after_response(response):
                     continue
                 response_headers = response.headers
-                _write_stream_atomic(dest, response.iter_bytes())
+                tmp = _write_stream_to_temp(dest, response.iter_bytes())
         except httpx.TransportError:
             if policy.retry_after_transport_error():
                 continue
             raise
 
-        if _zip_is_corrupt(dest):
+        if not _replace_if_valid_zip(tmp, dest):
             if zip_redownloaded:
                 raise zipfile.BadZipFile(f"{dest} still corrupt after one re-download")
             zip_redownloaded = True
