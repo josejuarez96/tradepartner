@@ -205,7 +205,7 @@ The claim ids in the examples are illustrative; the plan's fixture claims file d
 - **Order path:** no code path from `tradepartner.research` or the research tables to `tradepartner.execution`, tested (req 13). The registry stores numbers and version ids, never a decision input.
 - **Secrets:** none read; CLI output scrubbed. **LLM inputs:** none; the registry neither calls nor authorizes a model (req 13), and a run row naming a model is a record, not a permission.
 - **Store locks:** registration, open and close are short write chunks; analysis reads use per-observation read-only connections or the dataset export, so a long run never holds the ingest job's lock. A research run during the paper-trading window's own run contends like a backtest does (accepted).
-- **Owner-only steps:** the first real registration, every holdout spend, every budget amendment and the interim import need the owner's store; agents stay on fixtures.
+- **Owner-only steps:** the first real registration, every holdout spend and every budget amendment need the owner's store (the interim import no longer exists, req 12); agents stay on fixtures.
 
 ## Open questions
 
