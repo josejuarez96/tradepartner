@@ -677,6 +677,24 @@ def test_a_name_dark_since_before_the_month_is_reported_not_counted(settings: Se
     assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in may.message
 
 
+def test_too_many_dark_names_make_the_month_stale(settings: Settings) -> None:
+    # #796 (i a): ACME dark since April is 1 of 4 listed names in May.
+    early = _filings(fetched_at=_at(2019, 4, 1))
+    dark = {(ACME, s) for s in _sessions(SINCE, date(2019, 6, 30))}
+    assert _backfill(_loose(settings), _History(gaps=dark), filings=early, now=APRIL_END).ok
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_dark_share": 0.2})}
+    )
+    result = _backfill(tuned, _History(gaps=dark), filings=early)
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    message = result.runs[-1].message
+    assert "1 of 4 listed names (25.0%, over 20.0%) are dark or snapshot-only" in message
+    assert ACME in message
+
+
 def test_a_name_with_a_bar_last_month_and_none_now_counts(settings: Settings) -> None:
     result = _backfill(settings, _History(gaps={(ACME, s) for s in MAY}))
     assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
