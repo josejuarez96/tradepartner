@@ -16,15 +16,18 @@ mirrors that table and must not change once the week starts):
   backoff on errors, never a second fetch of a file it holds. Raw zips are
   kept as fetched under `<root>/raw/`; `known_at` (our fetch time, UTC) and
   the listed size and MD5 go to `<root>/manifest.jsonl`.
-- `match` applies ONE fixed rule (`RULE_VERSION`) to the page title (the
-  `<PAGE_TITLE>` in V2EXTRASXML) and the URL only, never GDELT's machine-
-  extracted organisation or actor fields (ADR 0008; event-data spec req 2 (d)),
-  against a frozen universe CSV (columns `ticker,name`, optional `cik`,
-  `company_rank`).
+- `match` applies two fixed rules, the pre-registered `RULE_VERSION_V1` and
+  the amended `RULE_VERSION` (v2, the verdict rule; protocol "Amendment
+  2026-10-05"), to the page title (the `<PAGE_TITLE>` in V2EXTRASXML) and the
+  URL only, never GDELT's machine-extracted organisation or actor fields
+  (ADR 0008; event-data spec req 2 (d)), against a frozen universe CSV (columns
+  `ticker,name`, optional `cik`, `company_rank`). v2 also reads the pinned word
+  list `probe_gdelt_words.txt.gz` (built by `probe_gdelt_wordlist.py`).
 - `report` prints and writes coverage, headline share, cache bytes per day and
-  projected per year, file completeness and lag, a seeded random sample of
-  matches for hand labelling, and, given the labelled sample, the precision
-  and the PASS/FAIL verdict.
+  projected per year, file completeness and lag, a seeded random sample of v2's
+  matches for hand labelling (`precision_sample_v2.csv`), and, given the
+  labelled sample, the precision and the PASS/FAIL verdict, all for v2, with
+  v1's coverage and cache beside it for information.
 
 Nothing touches the store except `export-universe`, which the owner runs once
 (one short read-only connection). Spike code (#882), never merged.
@@ -33,6 +36,7 @@ Nothing touches the store except `export-universe`, which the owner runs once
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import fcntl
 import gzip
@@ -71,8 +75,14 @@ MAX_ATTEMPTS = 3  # polls that may try one missed label before it counts as miss
 TIMEOUT_SECONDS = 120.0
 GKG_COLUMNS = 27
 COL_SOURCE_NAME, COL_URL, COL_EXTRAS = 3, 4, 26
-RULE_VERSION = "name-title-url+ticker-tag/v1"
+RULE_VERSION_V1 = "name-title-url+ticker-tag/v1"  # pre-registered; still reported
+RULE_VERSION = "name-title-url+ticker-tag/v2"  # amendment of 2026-10-05; the verdict rule
+# v2's pinned word list (protocol, "Amendment 2026-10-05"); load_words checks the hash.
+# Built by scripts/probe_gdelt_wordlist.py; the hash is of the uncompressed text.
+WORDS_PATH = Path(__file__).with_name("probe_gdelt_words.txt.gz")
+WORDS_SHA256 = "76de929b7e6cd5b8449d7e175a7a88b1b4eabd7191916bc886ac0cd9853cc4c1"
 SAMPLE_SIZE = 200
+SAMPLE_FILE = "precision_sample_v2.csv"  # drawn from v2's window matches
 SAMPLE_SEED = 882
 PROBE_DAYS = 7
 
@@ -90,6 +100,8 @@ THRESHOLDS: dict[str, float] = {
 _LABEL = re.compile(r"^\d{14}$")
 _TITLE = re.compile(r"<PAGE_TITLE>(.*?)</PAGE_TITLE>", re.S)
 _SLASH_SEGMENT = re.compile(r"/[A-Za-z]{1,5}/")
+# v2: a trailing state or /NEW tag, closed or not ("CORP/CA", "INC /DE", "INC \\TX\\")
+_TRAILING_TAG = re.compile(r"\s*[/\\]\s*[A-Za-z]{1,5}\s*[/\\]?\s*$")
 _APOSTROPHES = re.compile("['`\u2018\u2019]")
 _WORD = re.compile(r"[A-Za-z0-9]+")
 _TICKER = r"([A-Z]{1,5}(?:[.\-/][A-Z]{1,2})?)"
@@ -123,6 +135,59 @@ LEGAL_SUFFIXES = frozenset(
         "group",
         "trust",
         "the",
+    ]
+)
+# v2 company evidence: the token right after an ambiguous name key (protocol,
+# "Amendment 2026-10-05"). (a) In a title or a URL path: a suffix stripped from that
+# company's own registrant name, or its variant spelling (SUFFIX_VARIANTS); "the"
+# never counts. (b) In a title only: a context word.
+SUFFIX_VARIANTS = (
+    frozenset({"inc", "incorporated"}),
+    frozenset({"corp", "corporation"}),
+    frozenset({"co", "company"}),
+    frozenset({"cos", "companies"}),
+    frozenset({"ltd", "limited"}),
+    frozenset({"holding", "holdings"}),
+)
+EVIDENCE_CONTEXT_WORDS = frozenset(
+    [
+        "stock",
+        "stocks",
+        "shares",
+        "shareholders",
+        "earnings",
+        "revenue",
+        "profit",
+        "dividend",
+        "ipo",
+        "ceo",
+        "cfo",
+        "q1",
+        "q2",
+        "q3",
+        "q4",
+        "nyse",
+        "nasdaq",
+    ]
+)
+# v2, every name key: an occurrence followed by one of these is a venue named after
+# the company (MetLife Stadium, Target Field), a place under the labelling rule.
+VENUE_WORDS = frozenset(
+    [
+        "stadium",
+        "arena",
+        "center",
+        "centre",
+        "field",
+        "ballpark",
+        "park",
+        "theater",
+        "theatre",
+        "amphitheater",
+        "amphitheatre",
+        "coliseum",
+        "pavilion",
+        "dome",
     ]
 )
 
@@ -391,17 +456,68 @@ def _tokens(text: str) -> list[str]:
     return _WORD.findall(_APOSTROPHES.sub("", text))
 
 
+def _strip_name(name: str, v2: bool = False) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    while v2 and _TRAILING_TAG.search(name):
+        name = _TRAILING_TAG.sub("", name)
+    toks = [t.lower() for t in _tokens(_SLASH_SEGMENT.sub(" ", f" {name} "))]
+    stripped: list[str] = []
+    while toks and toks[-1] in LEGAL_SUFFIXES:
+        stripped.append(toks.pop())
+    if toks and toks[0] == "the":
+        toks.pop(0)
+    core = tuple(toks) if sum(len(t) for t in toks) >= 3 else ()
+    return core, tuple(reversed(stripped))
+
+
 def name_core(name: str) -> tuple[str, ...]:
     """The fixed rule's name key: lowercase word tokens of the registrant name
     with `/XX/` state tags removed, apostrophes dropped, and legal or structural
     suffixes (`LEGAL_SUFFIXES`) stripped from the end (and a leading "the").
     Empty, or shorter than 3 characters in all, means no name match for it."""
-    toks = [t.lower() for t in _tokens(_SLASH_SEGMENT.sub(" ", f" {name} "))]
-    while toks and toks[-1] in LEGAL_SUFFIXES:
-        toks.pop()
-    if toks and toks[0] == "the":
-        toks.pop(0)
-    return tuple(toks) if sum(len(t) for t in toks) >= 3 else ()
+    return _strip_name(name)[0]
+
+
+def name_core_v2(name: str) -> tuple[str, ...]:
+    """v2's name key: v1's, after cutting trailing state or /NEW tags that v1's
+    `/XX/` pattern misses because they are not closed ("NVIDIA CORP/CA",
+    "APPLIED MATERIALS INC /DE", "RUSH ENTERPRISES INC \\TX\\")."""
+    return _strip_name(name, v2=True)[0]
+
+
+@dataclass(frozen=True)
+class Words:
+    """v2's pinned word list: `ordinary` (lowercase entries) and `proper`
+    (Capitalised entries, lowercased)."""
+
+    ordinary: frozenset[str]
+    proper: frozenset[str]
+
+
+def load_words(path: Path = WORDS_PATH, sha256: str = WORDS_SHA256) -> Words:
+    """The vendored word list (gzip), refused unless the SHA-256 of its text is
+    the pinned one."""
+    data = gzip.decompress(path.read_bytes())
+    got = hashlib.sha256(data).hexdigest()
+    if got != sha256:
+        raise ValueError(f"{path} has sha256 {got}, expected the pinned {sha256}")
+    entries = [w for w in data.decode("ascii").splitlines() if w and not w.startswith("#")]
+    return Words(
+        frozenset(w for w in entries if w.islower()),
+        frozenset(w.lower() for w in entries if not w.islower()),
+    )
+
+
+def ambiguity(core: tuple[str, ...], words: Words) -> str:
+    """v2's class of a name key: "one" when it is one token that is in the word
+    list in any case: an ordinary word, a proper noun or an acronym (Swift, Box,
+    Visa, Harris, API); "all_words" when it has several tokens and every one is an
+    ordinary (lowercase) word (General Motors, Five Below); "" otherwise
+    (Broadcom, Philip Morris, Goldman Sachs)."""
+    if not core:
+        return ""
+    if len(core) == 1:
+        return "one" if core[0] in words.ordinary or core[0] in words.proper else ""
+    return "all_words" if all(t in words.ordinary for t in core) else ""
 
 
 def norm_ticker(ticker: str) -> str:
@@ -416,11 +532,15 @@ class Company:
     key: str  # cik when given, else the normalised name
     tickers: tuple[str, ...]
     name: str
-    core: tuple[str, ...]
+    core: tuple[str, ...]  # v1's name key
+    core_v2: tuple[str, ...] = ()  # v2's name key (`name_core_v2`)
+    stripped: tuple[str, ...] = ()  # suffixes stripped to make core_v2 (v2 evidence)
+    ambiguity: str = ""  # v2: "", "one" or "all_words" of core_v2 (see `ambiguity`)
 
 
-def load_universe(path: Path) -> list[Company]:
-    """Companies from a universe CSV (`ticker,name`, optional `cik`)."""
+def load_universe(path: Path, words: Words | None = None) -> list[Company]:
+    """Companies from a universe CSV (`ticker,name`, optional `cik`). `words`
+    (v2's list) sets each company's ambiguity class; None leaves it ""."""
     by_key: dict[str, list[dict[str, str]]] = defaultdict(list)
     with path.open(newline="") as fh:
         for row in csv.DictReader(fh):
@@ -433,30 +553,72 @@ def load_universe(path: Path) -> list[Company]:
     out = []
     for key, rows in sorted(by_key.items()):
         tickers = tuple(sorted({norm_ticker(r["ticker"]) for r in rows}))
-        out.append(Company(key, tickers, rows[0]["name"].strip(), name_core(rows[0]["name"])))
+        name = rows[0]["name"]
+        core_v2, stripped = _strip_name(name, v2=True)
+        amb = ambiguity(core_v2, words) if words is not None else ""
+        out.append(Company(key, tickers, name.strip(), name_core(name), core_v2, stripped, amb))
     return out
+
+
+def own_suffixes(comp: Company) -> frozenset[str]:
+    """The suffixes stripped from `comp`'s registrant name, with their variant
+    spellings (`SUFFIX_VARIANTS`), "the" excluded."""
+    own = set(comp.stripped) - {"the"}
+    for group in SUFFIX_VARIANTS:
+        if own & group:
+            own |= group
+    return frozenset(own)
+
+
+def _evidence(comp: Company, nxt: str | None, in_title: bool) -> bool:
+    """v2: the token right after the name key is company evidence for `comp`."""
+    if nxt is None:
+        return False
+    return nxt in own_suffixes(comp) or (in_title and nxt in EVIDENCE_CONTEXT_WORDS)
 
 
 @dataclass(frozen=True)
 class Matcher:
-    """The frozen rule over a universe."""
+    """The frozen rule over a universe (`version` is v1 or v2)."""
 
     by_first: Mapping[str, Sequence[tuple[tuple[str, ...], Company]]]
     by_ticker: Mapping[str, Company]
+    version: str = RULE_VERSION_V1
 
     @classmethod
-    def build(cls, companies: Iterable[Company]) -> Matcher:
+    def build(cls, companies: Iterable[Company], version: str = RULE_VERSION_V1) -> Matcher:
         """Index name cores by first token and tickers by symbol."""
+        if version not in (RULE_VERSION_V1, RULE_VERSION):
+            raise ValueError(f"unknown rule version {version!r}")
         by_first: dict[str, list[tuple[tuple[str, ...], Company]]] = defaultdict(list)
         by_ticker: dict[str, Company] = {}
         for c in companies:
-            if c.core:
-                by_first[c.core[0]].append((c.core, c))
+            core = c.core_v2 if version == RULE_VERSION else c.core
+            if core:
+                by_first[core[0]].append((core, c))
             for t in c.tickers:
                 by_ticker[t] = c
         for v in by_first.values():
             v.sort(key=lambda pair: -len(pair[0]))  # longest name first
-        return cls(by_first, by_ticker)
+        return cls(by_first, by_ticker, version)
+
+    def _v2_ok(self, comp: Company, low: Sequence[str], orig: Sequence[str] | None, i: int) -> bool:
+        """v2's extra condition on a name hit at token i (v1: always true)."""
+        if self.version == RULE_VERSION_V1:
+            return True
+        j = i + len(comp.core_v2)
+        nxt = low[j] if j < len(low) else None
+        if nxt in VENUE_WORDS:
+            return False
+        in_title = orig is not None
+        if comp.ambiguity == "one":
+            return _evidence(comp, nxt, in_title)
+        if comp.ambiguity == "all_words":
+            # every word capitalised in a title; evidence in a URL path
+            if orig is not None:
+                return all(t[:1].isupper() for t in orig[i:j])
+            return _evidence(comp, nxt, in_title)
+        return True
 
     def _names(
         self, toks: Sequence[str], orig: Sequence[str] | None
@@ -470,6 +632,8 @@ class Matcher:
                 # single-word names in a title must be capitalised (proper noun)
                 if orig is not None and len(core) == 1 and not orig[i][:1].isupper():
                     continue
+                if not self._v2_ok(comp, low, orig, i):
+                    continue
                 found.setdefault(comp.key, (comp, " ".join(core)))
         return found
 
@@ -477,7 +641,11 @@ class Matcher:
         """(company, rule, matched text) per company the rule links to this row.
         Rules, in order: `title_ticker` (cashtag or exchange tag in the title),
         `title_name` (the name key as consecutive title words), `url_name` (the
-        name key as consecutive words of the URL path, case ignored)."""
+        name key as consecutive words of the URL path, case ignored). v2 adds:
+        no name hit right before a venue word; a "one" key needs company
+        evidence right after it (its own stripped suffix, or in a title a context
+        word); an "all_words" key needs every word capitalised in a title and its
+        own stripped suffix right after it in a URL path."""
         out: dict[str, tuple[Company, str, str]] = {}
         for rx in (_CASHTAG, _EXCHANGE_TAG):
             for m in rx.finditer(title):
@@ -528,29 +696,39 @@ FILE_FIELDS = [
     "rows",
     "bad_rows",
     "titled",
-    "matched_rows",
+    "matched_rows",  # v1
+    "matched_rows_v2",
 ]
+# derived/ outputs per rule version: (matches CSV, matched rows gz)
+OUTPUTS = {
+    RULE_VERSION_V1: ("matches.csv", "matched_rows.tsv.gz"),
+    RULE_VERSION: ("matches_v2.csv", "matched_rows_v2.tsv.gz"),
+}
 
 
 def match(root: Path, universe: Path) -> dict[str, Any]:
-    """Re-derive matches.csv, files.csv and matched_rows.tsv.gz under derived/
-    from every held raw zip. Deterministic and rerunnable; network not used."""
-    companies = load_universe(universe)
+    """Re-derive, under derived/, files.csv and per rule version (v1 and v2) the
+    matches CSV and matched-rows gz (`OUTPUTS`) from every held raw zip.
+    Deterministic and rerunnable; network not used."""
+    words = load_words()
+    companies = load_universe(universe, words)
     if not companies:
         raise ValueError(f"no companies in {universe}")
-    matcher = Matcher.build(companies)
+    versions = (RULE_VERSION_V1, RULE_VERSION)
+    matchers = {v: Matcher.build(companies, v) for v in versions}
     records = {r["label"]: r for r in read_manifest(root) if r["status"] == "ok"}
     out = root / "derived"
     out.mkdir(parents=True, exist_ok=True)
-    n_matches = 0
-    with (
-        (out / "matches.csv").open("w", newline="") as mfh,
-        (out / "files.csv").open("w", newline="") as ffh,
-        gzip.open(out / "matched_rows.tsv.gz", "wt", encoding="utf-8") as gz,
-    ):
-        mw = csv.DictWriter(mfh, MATCH_FIELDS)
+    n_matches = dict.fromkeys(versions, 0)
+    with contextlib.ExitStack() as stack:
+        mws, gzs = {}, {}
+        for v in versions:
+            mfh = stack.enter_context((out / OUTPUTS[v][0]).open("w", newline=""))
+            mws[v] = csv.DictWriter(mfh, MATCH_FIELDS)
+            mws[v].writeheader()
+            gzs[v] = stack.enter_context(gzip.open(out / OUTPUTS[v][1], "wt", encoding="utf-8"))
+        ffh = stack.enter_context((out / "files.csv").open("w", newline=""))
         fw = csv.DictWriter(ffh, FILE_FIELDS)
-        mw.writeheader()
         fw.writeheader()
         for label in sorted(records):
             rec = records[label]
@@ -559,7 +737,8 @@ def match(root: Path, universe: Path) -> dict[str, Any]:
                 continue
             known_at = datetime.fromisoformat(rec["known_at"])
             day = et_day(known_at).isoformat()
-            rows = bad = titled = matched_rows = 0
+            rows = bad = titled = 0
+            matched_rows = dict.fromkeys(versions, 0)
             for cols in iter_rows(path):
                 rows += 1
                 if len(cols) != GKG_COLUMNS:
@@ -567,27 +746,28 @@ def match(root: Path, universe: Path) -> dict[str, Any]:
                     continue
                 title = page_title(cols[COL_EXTRAS])
                 titled += bool(title)
-                hits = matcher.match(title, cols[COL_URL])
-                if hits:
-                    matched_rows += 1
-                    gz.write("\t".join(cols) + "\n")
-                for comp, rule, text in hits:
-                    n_matches += 1
-                    mw.writerow(
-                        {
-                            "label": label,
-                            "known_at": rec["known_at"],
-                            "et_date": day,
-                            "company_key": comp.key,
-                            "tickers": " ".join(comp.tickers),
-                            "name": comp.name,
-                            "rule": rule,
-                            "matched": text,
-                            "source": cols[COL_SOURCE_NAME],
-                            "title": title,
-                            "url": cols[COL_URL],
-                        }
-                    )
+                for v in versions:
+                    hits = matchers[v].match(title, cols[COL_URL])
+                    if hits:
+                        matched_rows[v] += 1
+                        gzs[v].write("\t".join(cols) + "\n")
+                    for comp, rule, text in hits:
+                        n_matches[v] += 1
+                        mws[v].writerow(
+                            {
+                                "label": label,
+                                "known_at": rec["known_at"],
+                                "et_date": day,
+                                "company_key": comp.key,
+                                "tickers": " ".join(comp.tickers),
+                                "name": comp.name,
+                                "rule": rule,
+                                "matched": text,
+                                "source": cols[COL_SOURCE_NAME],
+                                "title": title,
+                                "url": cols[COL_URL],
+                            }
+                        )
             fw.writerow(
                 {
                     "label": label,
@@ -598,17 +778,25 @@ def match(root: Path, universe: Path) -> dict[str, Any]:
                     "rows": rows,
                     "bad_rows": bad,
                     "titled": titled,
-                    "matched_rows": matched_rows,
+                    "matched_rows": matched_rows[RULE_VERSION_V1],
+                    "matched_rows_v2": matched_rows[RULE_VERSION],
                 }
             )
     meta = {
         "rule_version": RULE_VERSION,
+        "rule_version_v1": RULE_VERSION_V1,
+        "words_file": WORDS_PATH.name,
+        "words_sha256": WORDS_SHA256,
         "universe": str(universe),
         "universe_sha256": file_hash(universe),
         "companies": len(companies),
         "companies_with_name_key": sum(1 for c in companies if c.core),
+        "companies_with_name_key_v2": sum(1 for c in companies if c.core_v2),
+        "companies_ambiguous_one": sum(1 for c in companies if c.ambiguity == "one"),
+        "companies_ambiguous_all_words": sum(1 for c in companies if c.ambiguity == "all_words"),
         "files": len(records),
-        "matches": n_matches,
+        "matches": n_matches[RULE_VERSION],
+        "matches_v1": n_matches[RULE_VERSION_V1],
         "matched_at": utc_now().isoformat(),
     }
     (out / "match_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -690,8 +878,10 @@ def summarise(
     n_companies: int,
     matched_rows_bytes: int,
     labels: Sequence[Mapping[str, str]] | None,
+    rule_version: str = RULE_VERSION,
 ) -> dict[str, Any]:
-    """Every probe measure over the probe window, with the threshold verdicts."""
+    """Every probe measure over the probe window for one rule version's
+    matches, with the threshold verdicts."""
     days = probe_days(file_rows)
     in_window = {d.isoformat() for d in days}
     files = [r for r in file_rows if r["et_date"] in in_window]
@@ -716,6 +906,11 @@ def summarise(
     rows_all = sum(v["rows"] for v in per_day.values())
     titled_all = sum(int(r["titled"]) for r in files)
     week_companies = {m["company_key"] for m in match_rows if m["et_date"] in in_window}
+    week_matches = [m for m in match_rows if m["et_date"] in in_window]
+    by_name: dict[str, int] = defaultdict(int)
+    for m in week_matches:
+        by_name[m["name"]] += 1
+    top = sorted(by_name.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
     # bytes per held file times 96 files a day, so missed files do not shrink the projection
     raw_day = FILES_PER_DAY * sum(int(r["bytes"]) for r in files) / len(files) if files else 0.0
     matched_day = FILES_PER_DAY * matched_rows_bytes / len(file_rows) if file_rows else 0.0
@@ -737,7 +932,7 @@ def summarise(
     ]
     gb = 1e9
     s: dict[str, Any] = {
-        "rule_version": RULE_VERSION,
+        "rule_version": rule_version,
         "window": [days[0].isoformat(), days[-1].isoformat()] if days else [],
         "days": n_days,
         "files_expected": len(expected),
@@ -756,6 +951,9 @@ def summarise(
         "raw_gb_per_year": raw_day * 365 / gb,
         "matched_bytes_per_day": matched_day,
         "matched_gb_per_year": matched_day * 365 / gb,
+        "matches_in_window": len(week_matches),
+        "top_names": top,
+        "top10_share": sum(n for _name, n in top) / len(week_matches) if week_matches else 0.0,
         "lag_fetch_minus_label_min": _quantiles(lags),
         "lag_posted_minus_label_min": _quantiles(posted),
         "per_day": per_day,
@@ -847,7 +1045,7 @@ def render(s: Mapping[str, Any]) -> str:
     t4 = f"{s['matched_bytes_per_day'] / 1e6:.1f} MB/day, {s['matched_gb_per_year']:.2f} GB/yr"
     raw = f"{s['raw_bytes_per_day'] / 1e6:.1f} MB/day, {s['raw_gb_per_year']:.1f} GB/yr"
     lines = [
-        f"## GDELT probe (#882), {RULE_VERSION}",
+        f"## GDELT probe (#882), verdict rule {s['rule_version']}",
         "",
         f"Window (ET): {window} ({s['days']} days); files {files}; "
         f"non-ok manifest records {s['missing_or_error_records']}",
@@ -864,7 +1062,8 @@ def render(s: Mapping[str, Any]) -> str:
         f"| validity | {s['days']} days, {pct(s['completeness'])} of files "
         f"| 7 days, >= {pct(th['completeness_min'])} | {v['validity (completeness, 7 days)']} |",
         "",
-        f"Rows in window: {s['rows']:,}.",
+        f"Rows in window: {s['rows']:,}. Matches in window: {s['matches_in_window']:,}; "
+        f"top 10 names {pct(s['top10_share'])} of them: {_top(s)}.",
         f"Lag fetch minus label (min): {s['lag_fetch_minus_label_min']}.",
         f"Lag posted (Last-Modified) minus label (min): {s['lag_posted_minus_label_min']}.",
         "",
@@ -876,31 +1075,75 @@ def render(s: Mapping[str, Any]) -> str:
             f"| {d} | {x['files']} | {x['rows']:,} | {pct(x['titled_share'])} | {x['matches']:,} | "
             f"{x['companies']} | {pct(x['coverage'])} | {x['raw_bytes'] / 1e6:.1f} |"
         )
+    if "v1" in s:
+        lines += ["", *_render_v1(s, s["v1"])]
     return "\n".join(lines) + "\n"
 
 
+def _top(s: Mapping[str, Any]) -> str:
+    return ", ".join(f"{name} {n}" for name, n in s["top_names"]) or "none"
+
+
+def _render_v1(v2: Mapping[str, Any], v1: Mapping[str, Any]) -> list[str]:
+    """v1 beside v2, for information: the verdict reads v2 (amendment 2026-10-05)."""
+    pct = "{:.1%}".format
+
+    def row(label: str, f: Callable[[Mapping[str, Any]], str]) -> str:
+        return f"| {label} | {f(v1)} | {f(v2)} |"
+
+    return [
+        f"### {v1['rule_version']} (pre-registered) beside {v2['rule_version']}",
+        "",
+        "For information only: the verdict above reads v2 (protocol, amendment 2026-10-05). "
+        "T1 and validity do not depend on the rule; v1 gets no precision sample.",
+        "",
+        "| Measure | v1 | v2 |",
+        "|---|---|---|",
+        row("matches in window", lambda x: f"{x['matches_in_window']:,}"),
+        row("T3 coverage (week / mean day)", lambda x: f"{pct(x['coverage_week'])} / "
+            f"{pct(x['coverage_day_mean'])} ({x['verdicts']['T3 coverage']})"),
+        row("T4 matched rows gz, GB/yr", lambda x: f"{x['matched_gb_per_year']:.2f} "
+            f"({x['verdicts']['T4 cache (matched-rows form)']})"),
+        row("top 10 names' share", lambda x: pct(x["top10_share"])),
+        "",
+        f"v1 top 10: {_top(v1)}.",
+    ]  # fmt: skip
+
+
 def report(root: Path, labels: Path | None) -> dict[str, Any]:
-    """Summarise derived/ into report.md and report.json; write the sample CSV once."""
+    """Summarise derived/ into report.md and report.json, for v2 (the verdict
+    rule) and v1 (information); write v2's precision sample CSV
+    (`SAMPLE_FILE`) once. `labels` is the labelled v2 sample."""
     out = root / "derived"
     meta = json.loads((out / "match_meta.json").read_text())
+    if meta.get("rule_version") != RULE_VERSION or not (out / OUTPUTS[RULE_VERSION][0]).exists():
+        raise ValueError(f"derived/ was not made by rule {RULE_VERSION}: rerun `match` first")
     file_rows = _read_csv(out / "files.csv")
-    match_rows = _read_csv(out / "matches.csv")
     window = {d.isoformat() for d in probe_days(file_rows)}
-    sample_path = root / "precision_sample.csv"
-    if not sample_path.exists():
-        sample = sample_matches([m for m in match_rows if m["et_date"] in window])
-        with sample_path.open("w", newline="") as fh:
-            w = csv.DictWriter(fh, list(sample[0]) if sample else ["sample_id"])
-            w.writeheader()
-            w.writerows(sample)
-    s = summarise(
-        file_rows,
-        match_rows,
-        read_manifest(root),
-        int(meta["companies"]),
-        (out / "matched_rows.tsv.gz").stat().st_size,
-        _read_csv(labels) if labels else None,
-    )
+    manifest = read_manifest(root)
+    summaries: dict[str, dict[str, Any]] = {}
+    for version in (RULE_VERSION, RULE_VERSION_V1):
+        matches_file, rows_file = OUTPUTS[version]
+        match_rows = _read_csv(out / matches_file)
+        if version == RULE_VERSION:
+            sample_path = root / SAMPLE_FILE
+            if not sample_path.exists():
+                sample = sample_matches([m for m in match_rows if m["et_date"] in window])
+                with sample_path.open("w", newline="") as fh:
+                    w = csv.DictWriter(fh, list(sample[0]) if sample else ["sample_id"])
+                    w.writeheader()
+                    w.writerows(sample)
+        summaries[version] = summarise(
+            file_rows,
+            match_rows,
+            manifest,
+            int(meta["companies"]),
+            (out / rows_file).stat().st_size,
+            _read_csv(labels) if labels and version == RULE_VERSION else None,
+            version,
+        )
+    s = summaries[RULE_VERSION]
+    s["v1"] = summaries[RULE_VERSION_V1]
     s["match_meta"] = meta
     (root / "report.json").write_text(json.dumps(s, indent=2, default=str) + "\n")
     (root / "report.md").write_text(render(s))
