@@ -1,0 +1,60 @@
+# Fixture claims register for tests/research/test_experiment.py and the T82/T81
+# experiment fixtures under tests/fixtures/experiments/. Mirrors the real
+# docs/research/claims.toml format (see its header); ids here are fixture-only and
+# never appear in the real file.
+
+[[claim]]
+id = "ER-4"
+statement = "Fixture claim: demand-deterioration disclosures correlate with next-quarter revenue growth deceleration."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "ER-5"
+statement = "Fixture claim: the deceleration relation is partly absorbed once contemporaneous growth is controlled."
+kind = "empirical"
+grade = "MIXED"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "INT-4"
+statement = "Fixture claim: textual indicators add incremental signal over fundamentals alone."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "TX-1"
+statement = "Fixture claim: annotators reach tentative agreement on D1 and D3 cross-document."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "AP-1"
+statement = "Fixture claim: the annotation pilot's agreement protocol is reliable enough to proceed."
+kind = "principle"
+grade = "n/a"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "FX-1"
+statement = "Fixture claim used by the plain refusal fixtures; graded so it never trips the UNGRADED check by itself."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "FX-UNGRADED"
+statement = "Fixture claim deliberately left ungraded, for the confirmatory-UNGRADED refusal fixture."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "fixture"
+source = "fixture"
