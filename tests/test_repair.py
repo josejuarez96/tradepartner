@@ -254,3 +254,70 @@ def test_a_delete_that_misses_its_count_rolls_everything_back(
     assert _bars(store) == before
     assert _rows(store, "SELECT count(*) FROM corporate_actions") == [(2,)]
     assert _rows(store, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+VALARIS, VALARIS_NEW = "0000314808", "0000314808:common-shares"
+
+
+def _titled(sid: str, ticker: str, valid_from: date, class_title: str) -> dict[str, Any]:
+    return {**_listing(sid, ticker, valid_from), "class_title": class_title}
+
+
+@pytest.fixture
+def valaris(settings: Settings) -> Settings:
+    """#921, the owner's store's facts: Valaris's Class A lists VAL from
+    2019-08-01; a 25-NSE filed 2020-09-04 delists it from 2020-09-14 (last
+    bar 2020-08-14); a Chapter 11 10-Q on 2020-10-29 writes `VAL*`; the
+    post-bankruptcy Common Shares list VAL from 2021-08-03 under their own
+    class id, with their own bars."""
+    class_a = "Class A Ordinary Shares"
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _titled(VALARIS, "VAL", date(2019, 8, 1), class_a),
+            _titled(VALARIS, "VAL*", date(2020, 10, 29), class_a),
+            _titled(VALARIS_NEW, "VAL", date(2021, 8, 3), "Common Shares"),
+        ):
+            insert_row(conn, "listings", row)
+        filed = datetime(2020, 9, 4, 20, tzinfo=UTC)
+        insert_row(
+            conn,
+            "delistings",
+            {
+                "security_id": VALARIS,
+                "form": "25-NSE",
+                "class_title": class_a,
+                "exchange": "NYSE",
+                "filed_at": filed,
+                "effective_on": date(2020, 9, 14),
+                "known_at": filed,
+                "ingested_at": RUN,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for sid, session in (
+            (VALARIS, date(2019, 8, 1)),
+            (VALARIS, date(2020, 8, 14)),
+            (VALARIS_NEW, date(2021, 8, 3)),
+            (VALARIS_NEW, date(2024, 3, 1)),
+            (VALARIS_NEW, date(2026, 10, 2)),
+        ):
+            insert_row(conn, "prices_daily", _bar(sid, session))
+    return settings
+
+
+def test_a_footnoted_row_after_a_form_25_leaves_both_valaris_lines_alone(
+    valaris: Settings,
+) -> None:
+    # #921 acceptance: the post-bankruptcy bars stay on the new class and the
+    # pre-bankruptcy bars on the old one; the repair proposes nothing.
+    result = repair_resolution(valaris, clock=lambda: RUN, dry_run=True)
+    assert (result.bar_rows, result.action_rows) == (0, 0)
+    assert result.found.securities == ()
+    with duckdb.connect(valaris.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, valaris)
+    assert resolver.resolve("VAL", date(2020, 8, 14)) == VALARIS
+    assert resolver.resolve("VAL", date(2020, 12, 1)) is None
+    for session in (date(2021, 8, 3), date(2024, 3, 1), date(2026, 10, 2)):
+        assert resolver.resolve("VAL", session) == VALARIS_NEW, session

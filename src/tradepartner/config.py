@@ -256,6 +256,42 @@ class MasterConfig(BaseModel):
         ]
     )
     static_columns: list[str] = Field(default_factory=lambda: ["name", "ticker", "exchange"])
+    #: Successor ids (`<cik>@<YYYY-MM-DD>`, `-<n>` for a second one that day,
+    #: #820) the owner accepted although the current rules no longer derive
+    #: them (#922: MTCH's July 2020 IAC/Match separation, #828).
+    #: `master-retract` never proposes their rows and reports them as kept,
+    #: and an EDGAR ingest's check does not record them, so health's
+    #: `underived_master_rows` does not fail on them. A malformed id refuses
+    #: the config.
+    keep_successors: list[str] = Field(default_factory=list)
+
+    @field_validator("keep_successors")
+    @classmethod
+    def _check_keep_successors(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_successor_id(entry)
+        return value
+
+
+#: A successor `security_id` as `store.master._successor` writes it.
+_SUCCESSOR_ID = re.compile(r"(?P<cik>\d{10})@(?P<day>\d{4}-\d{2}-\d{2})(?:-(?P<n>[2-9]|[1-9]\d+))?")
+
+
+def parse_successor_id(entry: str) -> tuple[str, date]:
+    """A `master.keep_successors` entry, `"<cik>@<YYYY-MM-DD>"` with an
+    optional `-<n>` (n >= 2), as `(cik, valid_from)`. Raises `ValueError` on
+    any other shape or an invalid day."""
+    match = _SUCCESSOR_ID.fullmatch(entry)
+    if match is None:
+        raise ValueError(
+            f"master.keep_successors entry {entry!r} is not a successor id "
+            "'<10-digit cik>@<YYYY-MM-DD>' (optionally '-<n>')"
+        )
+    try:
+        day = date.fromisoformat(match["day"])
+    except ValueError:
+        raise ValueError(f"master.keep_successors entry {entry!r} names no valid day") from None
+    return match["cik"], day
 
 
 class AlpacaConfig(BaseModel):

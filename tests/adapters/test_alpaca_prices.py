@@ -1157,6 +1157,65 @@ class TestOwnDelisting:
             assert stopped.resolve("BID", day) == kept.resolve("BID", day), day
             day += timedelta(days=1)
 
+    VALARIS = "0000314808"
+    VALARIS_NEW = "0000314808:common-shares"
+
+    def _valaris(self, last_bar: date | None = date(2020, 8, 14)) -> ListingResolver:
+        # #921, the store's facts: Valaris lists VAL (Class A) from
+        # 2019-08-01; a 25-NSE (filed 2020-09-04) delists the Class A from
+        # 2020-09-14, last bar 2020-08-14; a Chapter 11 10-Q on 2020-10-29
+        # writes `VAL*` (#844: read as VAL); the post-bankruptcy Common
+        # Shares list VAL from 2021-08-03 under a new class id.
+        listed = date(2019, 8, 1)
+        return ListingResolver(
+            [
+                _listing(self.VALARIS, "VAL", listed, "Class A Ordinary Shares"),
+                _listing(self.VALARIS, "VAL*", date(2020, 10, 29), "Class A Ordinary Shares"),
+                _listing(self.VALARIS_NEW, "VAL", date(2021, 8, 3), "Common Shares"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        self.VALARIS,
+                        "VAL",
+                        "Class A Ordinary Shares",
+                        date(2020, 9, 14),
+                        valid_from=listed,
+                        end_session=last_bar,
+                    )
+                ],
+            ),
+        )
+
+    def test_a_footnoted_cover_page_after_a_form_25_never_keeps_the_span(self) -> None:
+        # #921 cause 1: the `VAL*` row after the line stopped does not keep
+        # the pre-bankruptcy span alive (the #847 stopped-line cut).
+        resolver = self._valaris()
+        assert resolver.resolve("VAL", date(2020, 8, 14)) == self.VALARIS
+        assert resolver.resolve("VAL", date(2020, 9, 14)) is None
+        assert resolver.resolve("VAL", date(2021, 6, 1)) is None
+        assert not resolver.holds(self.VALARIS, date(2022, 1, 3))
+        assert resolver.report.stopped_spans == 1
+
+    def test_the_post_bankruptcy_class_takes_the_ticker(self) -> None:
+        # #921 cause 2: once the old class's span ended, the new class of
+        # the same company is no later class (rule 3) and holds VAL.
+        resolver = self._valaris()
+        for day in (date(2021, 8, 3), date(2023, 5, 1), date(2026, 10, 2)):
+            assert resolver.resolve("VAL", day) == self.VALARIS_NEW, day
+            assert resolver.holds(self.VALARIS_NEW, day), day
+        assert resolver.report.later_class_spans == 0
+
+    def test_the_valaris_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the Form 25's effective day every session
+        # maps as without the bar evidence.
+        cut, kept = self._valaris(), self._valaris(last_bar=None)
+        day = date(2019, 8, 1)
+        while day < date(2020, 9, 14):
+            assert cut.resolve("VAL", day) == kept.resolve("VAL", day) == self.VALARIS, day
+            day += timedelta(days=1)
+
     def test_without_evidence_nothing_is_cut(self) -> None:
         resolver = ListingResolver([_listing("0000000002", "GONE", date(2018, 3, 1))])
         assert resolver.resolve("GONE", date(2026, 9, 30)) == "0000000002"

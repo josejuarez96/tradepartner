@@ -402,3 +402,136 @@ def test_the_command_dry_run_then_apply(store: Settings, monkeypatch: pytest.Mon
     assert done.exit_code == 0, done.output
     assert done.output.startswith("retracted 2 rows")
     assert FALSE_ID not in _listed(store, AFTER)
+
+
+# --- #922: `master.keep_successors`, an owner-accepted successor is kept ---
+
+OTHER = "0000000002"
+OTHER_ID = f"{OTHER}@2019-05-01"  # a second false successor, not kept
+
+
+def _keep(settings: Settings, *ids: str) -> Settings:
+    return settings.model_copy(
+        update={"master": settings.master.model_copy(update={"keep_successors": list(ids)})}
+    )
+
+
+@pytest.fixture
+def two(store: Settings) -> Settings:
+    """`store` plus a second false successor of another CIK."""
+    security, listing = _false_rows()
+    with open_for_write(store) as conn:
+        insert_row(conn, "securities", security | {"security_id": OTHER_ID, "cik": OTHER})
+        insert_row(conn, "listings", listing | {"security_id": OTHER_ID, "ticker": "OTHR"})
+    return store
+
+
+def test_a_kept_successor_is_never_proposed_and_the_set_and_digest_change(two: Settings) -> None:
+    every = master_retract(two, filings=_filings(), clock=lambda: CHECK)
+    assert every.rows == 4
+    kept = master_retract(_keep(two, FALSE_ID), filings=_filings(), clock=lambda: CHECK)
+    assert {u.row["security_id"] for u in kept.found} == {OTHER_ID}
+    assert kept.rows == 2
+    assert kept.digest != every.digest
+    only_other = RetractResult(
+        found=tuple(u for u in every.found if u.row["security_id"] == OTHER_ID),
+        at=CHECK,
+        dry_run=True,
+    )
+    assert kept.digest == only_other.digest  # the digest of exactly the proposed set
+    assert {u.row["security_id"] for u in kept.kept} == {FALSE_ID}
+    assert len(kept.kept) == 2  # its securities row and its listing
+
+
+def test_the_dry_run_reports_a_kept_row_with_the_reason(two: Settings) -> None:
+    result = master_retract(_keep(two, FALSE_ID), filings=_filings(), clock=lambda: CHECK)
+    assert result.summary().startswith("would retract 2 rows (1 securities, 1 listings), digest")
+    assert "; kept 2 rows on master.keep_successors (owner-accepted): " + FALSE_ID in (
+        result.summary()
+    )
+    kept_lines = [line for line in result.lines() if FALSE_ID in line]
+    assert kept_lines == [
+        f"securities: {FALSE_ID} (known {FALSE_KNOWN.isoformat()}) [kept: master.keep_successors]",
+        f"listings: {FALSE_ID} ACME NYSE 2019-05-01 (known {FALSE_KNOWN.isoformat()}) "
+        "[kept: master.keep_successors]",
+    ]
+    assert not any(OTHER_ID in line and "[kept" in line for line in result.lines())
+
+
+def test_a_keep_id_with_no_underived_row_is_named(two: Settings) -> None:
+    """A typo, or a successor the rules derive again, keeps nothing: say so."""
+    absent = f"{ACME}@2001-01-02"
+    result = master_retract(_keep(two, absent), filings=_filings(), clock=lambda: CHECK)
+    assert result.rows == 4
+    assert result.kept == ()
+    assert f"master.keep_successors with no underived row: {absent}" in result.summary()
+
+
+def test_the_apply_leaves_a_kept_successor_live_and_health_passes(two: Settings) -> None:
+    keep = _keep(two, FALSE_ID)
+    _ingest(keep, CHECK)
+    assert {r["security_id"] for r in _rule(keep, CHECK.replace(hour=3))} == {OTHER_ID}
+    result = _apply(keep, RETRACT_AT)
+    assert result.rows == 2
+    assert FALSE_ID in _listed(keep, AFTER) and FALSE_ID in _known(keep, AFTER)
+    assert OTHER_ID not in _listed(keep, AFTER)
+    with _read(keep) as conn:
+        recorded = conn.execute(
+            "SELECT DISTINCT security_id FROM master_underived u JOIN ingestion_runs r "
+            "USING (run_id) WHERE r.mode = ?",
+            [RETRACT],
+        ).fetchall()
+    assert recorded == [(OTHER_ID,)]
+    assert _rule(keep, AFTER) == []
+    assert master_retract(keep, filings=_filings(), clock=lambda: AFTER).found == ()
+
+
+def test_a_keep_list_never_rewrites_an_earlier_check(two: Settings) -> None:
+    """Point in time: health at T reads the check finished by T as it was
+    recorded; a keep list set later applies from the next check on."""
+    _ingest(two, CHECK)  # no keep list yet: all four rows recorded
+    before = _rule(two, CHECK.replace(hour=3))
+    assert {r["security_id"] for r in before} == {FALSE_ID, OTHER_ID}
+    keep = _keep(two, FALSE_ID)
+    assert _rule(keep, CHECK.replace(hour=3)) == before
+    _ingest(keep, AFTER)
+    assert {r["security_id"] for r in _rule(keep, AFTER.replace(hour=5))} == {OTHER_ID}
+    assert _rule(keep, CHECK.replace(hour=3)) == before
+
+
+def test_a_kept_id_the_build_derives_again_is_not_kept(store: Settings) -> None:
+    """Quant audit of #923: once the build derives the kept security again,
+    a stale listing of it is proposed like any other. ACME (derived) stands
+    in for a successor derived again: `model_copy` skips the id validator."""
+    stale = {
+        "security_id": ACME,
+        "ticker": "OLDA",
+        "exchange": "NYSE",
+        "class_title": "Common Stock",
+        "valid_from": date(2018, 3, 1),
+        "known_at": FALSE_KNOWN,
+        "ingested_at": FALSE_KNOWN,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", stale)
+    result = master_retract(_keep(store, ACME), filings=_filings(), clock=lambda: CHECK)
+    assert (ACME, "OLDA") in {(u.row["security_id"], u.row.get("ticker")) for u in result.found}
+    assert result.kept == ()
+    assert f"master.keep_successors derived again, not kept: {ACME}" in result.summary()
+
+
+def test_a_keep_id_of_a_cik_not_judged_is_not_called_a_typo(two: Settings) -> None:
+    """Code review of #923: a failed filing leaves the CIK unjudged, so its
+    kept id has no underived row for that reason alone."""
+
+    class Failing(FixtureFilingSource):
+        _pending_failures: ClassVar[dict[str, tuple[str, str, str]]] = {
+            f"{ACME}-18-1": ("ParseError", "10-K", "bad cover")
+        }
+
+    result = master_retract(_keep(two, FALSE_ID), filings=_filings(Failing), clock=lambda: CHECK)
+    assert result.kept == ()
+    assert f"master.keep_successors not judged this run: {FALSE_ID}" in result.summary()
+    assert "with no underived row" not in result.summary()
