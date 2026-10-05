@@ -319,6 +319,33 @@ def test_hash_directory_refuses_a_non_directory(tmp_path: Path) -> None:
         hash_directory(f)
 
 
+def test_empty_directory_does_not_hash_like_an_empty_file(tmp_path: Path) -> None:
+    """A directory with no files must not collide with `hash_file` of an empty
+    file: both would otherwise reduce to `sha256(b"")` (#938)."""
+    empty_dir = tmp_path / "empty_export"
+    empty_dir.mkdir()
+    empty_file = tmp_path / "empty.csv"
+    empty_file.write_text("", encoding="utf-8")
+
+    assert hash_directory(empty_dir) != hash_file(empty_file)
+
+
+def test_hash_directory_refuses_a_control_character_in_a_file_name(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "export_with_bad_name"
+    root.mkdir()
+    (root / "a\tb.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ExperimentFileError, match="control character"):
+        hash_directory(root)
+
+    root2 = tmp_path / "export_with_bad_name_2"
+    root2.mkdir()
+    (root2 / "a\nb.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ExperimentFileError, match="control character"):
+        hash_directory(root2)
+
+
 def test_read_event_column_from_csv_and_parquet(tmp_path: Path) -> None:
     import polars as pl
 

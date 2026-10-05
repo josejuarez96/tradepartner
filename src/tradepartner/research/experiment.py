@@ -577,18 +577,33 @@ def hash_file(path: Path, *, chunk_size: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+# Domain-separation prefix for `hash_directory`'s blob (#938): without it, a
+# directory with no files and a zero-byte file both reduce to `sha256(b"")`, so a
+# dataset export and a single-file export could be mistaken for one another. The
+# prefix is part of the hash contract, not a secret; changing it changes every
+# directory digest.
+_DIRECTORY_HASH_DOMAIN = b"dir-v1\n"
+
+
 def hash_directory(root: Path) -> str:
-    """SHA-256 of a directory export, independent of listing order (req 11): the
+    """SHA-256 of a directory export, independent of listing order (req 11): a
+    fixed domain-separation prefix (`_DIRECTORY_HASH_DOMAIN`), followed by the
     sorted list of `relative/path\\tsize\\tsha256` lines, one per file, hashed as
-    one blob."""
+    one blob. Refuses a relative file name containing a control character (tab,
+    newline, ...), which could otherwise forge a collision with a differently
+    laid out export."""
     if not root.is_dir():
         raise ExperimentFileError(f"{root}: not a directory")
     lines: list[str] = []
     for file_path in sorted(p for p in root.rglob("*") if p.is_file()):
         rel = file_path.relative_to(root).as_posix()
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in rel):
+            raise ExperimentFileError(
+                f"{file_path}: relative file name contains a control character"
+            )
         size = file_path.stat().st_size
         lines.append(f"{rel}\t{size}\t{hash_file(file_path)}")
-    blob = "\n".join(lines).encode("utf-8")
+    blob = _DIRECTORY_HASH_DOMAIN + "\n".join(lines).encode("utf-8")
     return sha256(blob).hexdigest()
 
 
