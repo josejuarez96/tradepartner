@@ -10,7 +10,9 @@ with plan task T78 ([data-foundation spec](../specs/data-foundation.md), amendme
 The owner runs `tradepartner hypothesis register docs/hypotheses/b3-gross-profitability.md`
 after both, on or after a date at which `holdout.end` is a completed month-end. Before
 registering, the owner answers the questions still open at the end of this file (B3-3
-to B3-8; B3-1 and B3-2 are decided), re-checks
+to B3-8; B3-1 and B3-2 are decided), confirms that `in_sample_start` and the counts
+below still equal H1's file as registered (H1 registers first; if its first binding
+month-end moved under its pre-registration check, this file follows it, #851), re-checks
 `docs/research/` and the trial registry for holdout-period results seen since this draft
 (H1's holdout spend included, since the two windows coincide) and adds them to the
 disclosure; an edit before registration is not a new hypothesis. The registry hashes the
@@ -121,9 +123,9 @@ tests have one source:
    accepted after that instant on the rebalance session T is **invisible** at that
    read and enters the next month's read; one accepted before it is visible, as it was
    to anyone reading EDGAR before the close. The close is the calendar's, not 16:00 New
-   York: two month-ends in the windows are half days (2019-11-29, the first in-sample
-   rebalance, and 2024-11-29 in the holdout, close 13:00 New York), where a 14:00
-   acceptance is invisible. The signal
+   York: three month-ends in the windows are half days (2019-11-29, the first in-sample
+   rebalance; 2024-11-29 and 2025-11-28 in the holdout; close 13:00 New York), where a
+   14:00 acceptance is invisible. The signal
    function takes `t` itself and filters `known_at ≤ t` again, so a frame that carries a
    later row (a fake provider in a test, a provider bug) cannot score it (amendment
    #720, "The signal"). No fact is ever pulled forward to its period end, and the engine
@@ -263,9 +265,10 @@ H1's where the question is the same):
   binds (at least `universe.top_n_by_cap` companies pass ADR 0006 rules 1–7) at
   2019-11-29, with the sweep table, the rule and the iXBRL phase-in disclosure. B3 reads
   the same store through the same `universe_as_of`, so the same month-end binds here, and
-  the pre-registration coverage check in H1's preamble covers B3 too: if H1 re-pins, B3
-  follows, before either registers. Statement facts exist in companyfacts from 2009 and
-  Alpaca bars from 2016-01-04 (ADR 0009), so neither facts nor prices bind; listings do,
+  the pre-registration coverage check in H1's preamble covers B3 too: H1 registers first,
+  and if it re-pins, B3 follows before B3 registers. Statement facts exist in companyfacts
+  from 2009 and Alpaca bars from 2016-01-04 (ADR 0009), so neither facts nor prices bind;
+  listings do,
   exactly as for H1, and B3 inherits the iXBRL phase-in bias H1 discloses (for nine of
   the 50 in-sample rebalances, 2019-11-29 to 2020-07-31, the pool the top-1000 cut binds
   against is tilted to larger filers; from 2020-08-31 the universe is the ADR 0006
