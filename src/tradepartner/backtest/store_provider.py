@@ -43,14 +43,17 @@ single as-of function and are built from `store.asof` reads:
   (latest `valid_from` on or before it, among rows known at `t`) is a
   `snapshot_static` row.
 
-`benchmark_ids(t)` maps each benchmark security known at `t`
-(`securities.benchmark`) to the ticker of its current listing (`SPY`,
-`MTUM`), keeping only the frozen `benchmarks` names.
+`benchmark_ids(t, through)` maps each frozen `benchmarks` name (`SPY`,
+`MTUM`) to its security **by symbol** (#840, owner decision 2026-10-04):
+`store.benchmarks.benchmark_security_ids` over `[session(t), through]`,
+not through the point-in-time listing gate, and refusing a missing,
+ambiguous or reused symbol by name. The bars stay point-in-time: they are
+read like any others, through `adjusted_prices` and `raw_prices` at `t`.
 
 A security's **current listing** is the one with the latest `valid_from` on
 or before `t`'s session; between two rows with the same `valid_from` the
 first in `listings_as_of` order wins, the same rule `universe_as_of` uses,
-so the static count and benchmark tickers agree with the universe.
+so the static count agrees with the universe.
 """
 
 from __future__ import annotations
@@ -77,9 +80,9 @@ from tradepartner.store.asof import (
     listings_as_of,
     prices_as_of,
 )
+from tradepartner.store.benchmarks import benchmark_security_ids
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delistings import listing_ends_as_of
-from tradepartner.store.master import securities_as_of
 from tradepartner.universe import Universe, universe_as_of
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -199,16 +202,11 @@ class StoreProvider:
         t, wanted = check_t(t), _ids(ids)
         return listing_ends_as_of(self._at(t), t, self.settings, wanted)
 
-    def benchmark_ids(self, t: datetime) -> Mapping[str, str]:
+    def benchmark_ids(self, t: datetime, through: date | None = None) -> Mapping[str, str]:
         t = check_t(t)
-        conn = self._at(t)
-        benchmarks = securities_as_of(conn, t).filter(pl.col("benchmark"))["security_id"].to_list()
-        names = set(self.settings.benchmarks)
-        out: dict[str, str] = {}
-        for row in self._current_listings(conn, t, benchmarks).values():
-            if row["ticker"] in names:
-                out[row["ticker"]] = row["security_id"]
-        return dict(sorted(out.items()))
+        return benchmark_security_ids(
+            self._at(t), self.settings.benchmarks, start=last_completed_session(t), through=through
+        )
 
     def survivorship_gap(self, t: datetime) -> GapReading:
         t = check_t(t)

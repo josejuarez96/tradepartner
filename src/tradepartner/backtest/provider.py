@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 import polars as pl
@@ -69,8 +69,11 @@ class DataProvider(Protocol):
         delisted, transferred) and `end_session`, derived from rows known at `t`."""
         ...
 
-    def benchmark_ids(self, t: datetime) -> Mapping[str, str]:
-        """Benchmark series name (`SPY`, `MTUM`) to `security_id`, as known at `t`."""
+    def benchmark_ids(self, t: datetime, through: date | None = None) -> Mapping[str, str]:
+        """Benchmark series name (`SPY`, `MTUM`) to `security_id`, by symbol (#840): not
+        gated on the master rows' `known_at`, and refused (`ValueError`) when a name is
+        missing, ambiguous, or its ticker is another security's in `[session(t),
+        through]` (`through=None`: open-ended). The bars are read point-in-time."""
         ...
 
     def survivorship_gap(self, t: datetime) -> GapReading:

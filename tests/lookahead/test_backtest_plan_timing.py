@@ -17,7 +17,8 @@ plan on the full store:
   exits and valuation after T_k are not: the cut has no strategy bar after T_k, so most
   fills on F_k are missing, by design.
 - **Benchmark-exempt cut** (owner decision on #201): a window starting at T_k (k >= 12,
-  once SPY and MTUM are known) buys the benchmarks on F_k, which a plain cut has no bar
+  once SPY and MTUM have bars; earlier windows run with no benchmarks, `BENCHMARK_START`)
+  buys the benchmarks on F_k, which a plain cut has no bar
   for. `BenchmarkExemptStore` keeps benchmark bars past the cut. That is safe only
   because no plan field reads a benchmark, which `test_benchmarks_are_never_plan_inputs`
   checks at every compared read.
@@ -72,6 +73,10 @@ UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 #: The fixture's bars run 2017-01-03 through 2020-06-30 (fixture README).
 FIXTURE_START = date(2017, 1, 3)
 FIXTURE_END = date(2020, 6, 30)
+#: The fixture benchmarks' (SPY, MTUM) first bar. Benchmarks are read by symbol (#840),
+#: so a window starting before it is run with `benchmarks=[]`: the engine refuses a
+#: benchmark with no bar at F_0, and no plan field reads a benchmark.
+BENCHMARK_START = date(2018, 1, 2)
 COST_LEVELS = (0.0, 15.0)
 #: The teeth case's T_k: a 2019 rebalance with several targets (as in T40).
 T_TEETH = date(2019, 1, 31)
@@ -200,8 +205,13 @@ class Fixture:
 
     def window(self, start: date, end: date, conn: duckdb.DuckDBPyConnection) -> Results:
         """`engine.run` over `[start, end]` reading `conn`, the handle checked here."""
-        with self.provider(conn) as provider:
-            return run(self.settings, provider, start, end, self.handle, COST_LEVELS)
+        settings = self.settings
+        if start < BENCHMARK_START:
+            settings = settings.model_copy(update={"benchmarks": []})
+        with StoreProvider(
+            _factory(conn), self.handle, settings, registry_connect=_factory(self.conn)
+        ) as provider:
+            return run(settings, provider, start, end, self.handle, COST_LEVELS)
 
     def planned(self, start: date, end: date, conn: duckdb.DuckDBPyConnection) -> Planned:
         """`window`, with every plan the run made (by session), recorded around whatever

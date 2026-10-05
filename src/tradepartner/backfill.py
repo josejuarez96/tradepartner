@@ -62,10 +62,31 @@ hole fill never counts as a fresh ingest for health, the cockpit or
 execution. It halts at the first month that is not `filled`. A re-run reads
 the holes again: filled months drop out, a hole the source still cannot
 fill is fetched again.
+
+**One benchmark** (#840): `backfill_benchmark(settings, prices=...,
+symbol=..., since=...)` is the owner's one-off for a configured benchmark
+the store lacks (MTUM is in no EDGAR snapshot, so the master never seeds
+it). It refuses a symbol outside `benchmarks`. If no benchmark security
+lists the symbol it seeds one first, from the owner's `BenchmarkSeed`
+(cik, name, exchange): `BENCH:<symbol>`, `benchmark = TRUE`, source
+`config`, a `snapshot_static` listing from the calendar's first session
+and an `etf` classification (rule `benchmark_config`), all stamped at the
+clock, like the master's own benchmark rows (`store.classify` builds only
+from the master, which never holds this one). It refuses a `since` that
+leaves no session to fetch, before writing anything, and it refuses
+when another security holds the ticker or `BENCH:<symbol>` is taken.
+Then it fetches that one security's bars and actions month by month
+from `since` to the expected session, written by `ingest`'s rules (bars
+keep their session-close `known_at`; a repeat adds nothing). A month with
+any session lacking a bar is stale and halts the run with nothing written
+for it. It writes **no** `ingestion_runs` row: an `ok` row is read as a
+fresh store by the paper-run and dashboard freshness checks, and this run
+refreshes one series only; its outcome is printed instead.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
@@ -113,10 +134,15 @@ from tradepartner.ingest import (
     expected_session,
 )
 from tradepartner.store.asof import listings_as_of
+from tradepartner.store.benchmarks import (
+    BenchmarkIdentityError,
+    benchmark_candidates,
+    ticker_holders,
+)
 from tradepartner.store.classify import classifications_as_of
-from tradepartner.store.db import StoreLockedError, open_for_write, utc_now
+from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
-from tradepartner.store.master import securities_as_of
+from tradepartner.store.master import _first_session, securities_as_of
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -536,3 +562,194 @@ def _window_names(
     before = first - timedelta(days=1)
     may_count = _may_count(conn, t, (before.replace(day=1), before), earliest, benchmarks)
     return sorted(ids), sorted(listed), static_only, may_count, reference
+
+
+# --- one benchmark (#840) -----------------------------------------------------
+
+_CIK = re.compile(r"\d{10}")
+#: `store.classify`'s rule for a config-seeded benchmark.
+_BENCH_RULE = "benchmark_config"
+
+
+@dataclass(frozen=True)
+class BenchmarkSeed:
+    """The master facts for a benchmark the store lacks, given by the owner."""
+
+    cik: str
+    name: str
+    exchange: str
+
+    def __post_init__(self) -> None:
+        if not _CIK.fullmatch(self.cik):
+            raise ValueError(f"cik must be a 10-digit zero-padded string, got {self.cik!r}")
+        for field_name in ("name", "exchange"):
+            value = getattr(self, field_name)
+            if not value.strip() or value != value.strip():
+                raise ValueError(f"{field_name} must be non-blank and trimmed, got {value!r}")
+
+
+@dataclass(frozen=True)
+class BenchmarkBackfill:
+    """`backfill_benchmark`'s outcome: the security, whether it was seeded, and one
+    `SourceRun` per month fetched (none is written to `ingestion_runs`)."""
+
+    symbol: str
+    security_id: str
+    seeded: bool
+    runs: tuple[SourceRun, ...]
+
+    @property
+    def ok(self) -> bool:
+        return all(run.status == OK for run in self.runs)
+
+    @property
+    def exit_code(self) -> int:
+        """0 when every month is `ok`, else 1."""
+        return 0 if self.ok else 1
+
+
+def backfill_benchmark(
+    settings: Settings,
+    *,
+    prices: PriceSource,
+    symbol: str,
+    since: date,
+    seed: BenchmarkSeed | None = None,
+    clock: Callable[[], datetime] = utc_now,
+) -> BenchmarkBackfill:
+    """Seed (if missing) and backfill one configured benchmark; see the module
+    docstring. Raises `ValueError` (before any fetch) for a symbol outside
+    `benchmarks`, a missing benchmark with no `seed`, or a taken identity."""
+    if symbol not in settings.benchmarks:
+        raise ValueError(
+            f"{symbol!r} is not a configured benchmark ({', '.join(settings.benchmarks)})"
+        )
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError(f"since must be a date, got {since!r}")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    if since < _first_session(settings):
+        raise ValueError(f"since {since} is before the calendar's first session")
+    windows = month_windows(since, expected_session(now, settings))
+    if not windows:
+        raise ValueError(f"since {since} leaves no session to fetch")
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        security_id, seeded = _seed_benchmark(conn, settings, symbol, seed, now)
+    runs: list[SourceRun] = []
+    for window in windows:
+        run = _benchmark_chunk(settings, prices, security_id, since, window, clock)
+        runs.append(run)
+        if run.status != OK:
+            break
+    return BenchmarkBackfill(symbol, security_id, seeded, tuple(runs))
+
+
+def _seed_benchmark(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    symbol: str,
+    seed: BenchmarkSeed | None,
+    now: datetime,
+) -> tuple[str, bool]:
+    """The one benchmark security listing `symbol`, seeded from `seed` if none does."""
+    found = benchmark_candidates(conn, symbol)
+    if len(found) > 1:
+        raise BenchmarkIdentityError(
+            f"benchmark {symbol} is ambiguous: securities {', '.join(found)} all list it"
+        )
+    if found:
+        return found[0], False
+    if seed is None:
+        raise ValueError(
+            f"benchmark {symbol} is not in the store; give its cik, name and exchange to seed it"
+        )
+    security_id = f"BENCH:{symbol}"
+    start = _first_session(settings)
+    holders = ticker_holders(conn, symbol, start=start, through=None)
+    taken = conn.execute(
+        "SELECT count(*) FROM securities WHERE security_id = ?", [security_id]
+    ).fetchone()
+    if holders or (taken is not None and taken[0]):
+        raise BenchmarkIdentityError(
+            f"benchmark {symbol}: cannot seed {security_id}: "
+            + (f"ticker held by {', '.join(holders)}" if holders else "the id is taken")
+        )
+    common = {"known_at": now, "ingested_at": now, "source": "config", "provenance": STATIC}
+    insert_row(
+        conn,
+        "securities",
+        {"security_id": security_id, "cik": seed.cik, "name": seed.name, "benchmark": True}
+        | common,
+    )
+    insert_row(
+        conn,
+        "listings",
+        {
+            "security_id": security_id,
+            "ticker": symbol,
+            "exchange": seed.exchange,
+            "class_title": None,
+            "valid_from": start,
+        }
+        | common,
+    )
+    # As `store.classify` does for a seeded benchmark: an `etf` by config.
+    insert_row(
+        conn,
+        "classifications",
+        {"security_id": security_id, "sic": None, "security_type": "etf", "rule": _BENCH_RULE}
+        | common,
+    )
+    return security_id, True
+
+
+def _benchmark_chunk(
+    settings: Settings,
+    prices: PriceSource,
+    security_id: str,
+    since: date,
+    window: tuple[date, date],
+    clock: Callable[[], datetime],
+) -> SourceRun:
+    """One month of one benchmark: stale (nothing written) unless every session
+    in `window` has a bar."""
+    first, last = window
+    cursor = f"benchmark={security_id};{_cursor(since, last)}"
+
+    def outcome(status: str, rows: int, message: str) -> SourceRun:
+        return SourceRun("alpaca", status, rows, cursor, _clean(message, settings))
+
+    try:
+        ids = [security_id]
+        bars = [
+            b
+            for b in prices.bars(ids, first, last)
+            if b.security_id == security_id and first <= b.session <= last
+        ]
+        actions = [a for a in prices.corporate_actions(ids, first, last) if a.security_id in ids]
+        with _read(settings) as conn:
+            plan = _replay_plan(conn, actions, window)
+        actions, covered = _replay_actions(prices, actions, window, plan)
+        ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")
+        have = {bar.session for bar in bars}
+        days = (first + timedelta(days=n) for n in range((last - first).days + 1))
+        gaps = [day for day in days if is_session(day) and day not in have]
+        if gaps:
+            shown = ", ".join(day.isoformat() for day in gaps[:10])
+            return outcome(STALE, 0, f"{security_id} has no bar for {len(gaps)} sessions: {shown}")
+        with open_for_write(settings) as conn:
+            added = _add_rows(
+                conn,
+                "prices_daily",
+                [_bar_row(bar, ingested_at) for bar in bars],
+                ingested_at=ingested_at,
+                current=True,
+                where="AND session BETWEEN ? AND ?",
+                params=[first, last],
+            )
+            added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
+        return outcome(OK, added, f"{len(bars)} bars and {len(actions)} actions")
+    except StoreLockedError as exc:
+        return outcome(LOCKED, 0, str(exc))
+    except Exception as exc:  # any source or parse failure halts the run
+        return outcome(FAILED, 0, _with_frames(f"{type(exc).__name__}: {exc}", exc, settings))

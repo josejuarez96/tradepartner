@@ -143,7 +143,7 @@ class FakeProvider:
         key = ["security_id", *(["valid_from"] if "valid_from" in self.listing_ends_rows else [])]
         return _latest(_for_ids(_known(self.listing_ends_rows, t), ids), key)
 
-    def benchmark_ids(self, t: datetime) -> Mapping[str, str]:
+    def benchmark_ids(self, t: datetime, through: date | None = None) -> Mapping[str, str]:
         self._record("benchmark_ids", t)
         return dict(self.benchmarks)
 

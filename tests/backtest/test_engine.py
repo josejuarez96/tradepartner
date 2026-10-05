@@ -6,7 +6,7 @@ import ast
 import dataclasses
 import itertools
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -153,6 +153,26 @@ class TestHandle:
         with pytest.raises(ValueError, match="two rebalance sessions"):
             run(_params(), provider, T0, date(2024, 2, 28), _handle(), [15.0])
         assert provider.calls == []
+
+    def test_a_benchmark_in_the_universe_is_refused(self) -> None:
+        """#840: a benchmark read by symbol is a reference series, never a member."""
+        members = {session: sorted(GROWTH) for session in rebalance_sessions(T0, HISTORY_END)}
+        provider = FakeProvider(prices=_price_rows(), members=members, benchmarks={"SPY": "A"})
+        with pytest.raises(ValueError, match="benchmark SPY is a universe member"):
+            _run(provider)
+
+    def test_the_benchmarks_are_read_over_the_run_window(self) -> None:
+        seen: list[date | None] = []
+        provider = _provider()
+        original = provider.benchmark_ids
+
+        def spy(t: datetime, through: date | None = None) -> Mapping[str, str]:
+            seen.append(through)
+            return original(t, through)
+
+        provider.benchmark_ids = spy  # type: ignore[method-assign]
+        _run(provider)
+        assert seen == [T3]
 
     def test_non_zero_cash_rate_is_refused(self) -> None:
         provider = _provider()

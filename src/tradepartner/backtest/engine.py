@@ -34,8 +34,9 @@ that decided the exit: the value sold is the close already marked. It pays
 session on and the proceeds sit in cash.
 Exit notional and costs are added to the row's `turnover` and `cost_paid`.
 
-**Benchmarks** (req 3): each series from `benchmark_ids` at close(T_0) is bought with
-the initial capital at F_0's fill price, sized after costs (the only trade), and then
+**Benchmarks** (req 3): each series from `benchmark_ids` at close(T_0) (by symbol over
+the run's window, #840; a run whose universe ever holds a benchmark id is refused) is
+bought with the initial capital at F_0's fill price, sized after costs (the only trade), and then
 carried and valued through every step's marking frame, which includes the benchmark
 ids, so dividends are reinvested exactly as for the strategy. Equity rows carry the
 series name and no cash.
@@ -204,6 +205,18 @@ def plan(provider: DataProvider, params: Settings, session: date) -> Plan:
     parameters). The backtest loop calls exactly this function (`_plan`) at every
     rebalance it plans."""
     return _plan(provider, params, session)
+
+
+def _no_benchmark_members(plan: Plan, benchmarks: Mapping[str, str]) -> Plan:
+    """`plan`, or `ValueError` if a benchmark security is a universe member: a benchmark
+    is a reference series read by symbol (#840), never a tradable name."""
+    inside = sorted(name for name, sid in benchmarks.items() if sid in plan.members)
+    if inside:
+        raise ValueError(
+            f"benchmark {', '.join(inside)} is a universe member at {plan.session.isoformat()}; "
+            "a benchmark is a reference series, never a tradable name"
+        )
+    return plan
 
 
 def _ended(listing_ends: pl.DataFrame, session: date) -> dict[str, date | None]:
@@ -475,7 +488,10 @@ def run(
 
     capital = params.backtest.initial_capital
     plan = _plan(provider, params, sessions[0])
-    benchmarks = dict(sorted(provider.benchmark_ids(read_time(sessions[0])).items()))
+    benchmarks = dict(
+        sorted(provider.benchmark_ids(read_time(sessions[0]), through=sessions[-1]).items())
+    )
+    _no_benchmark_members(plan, benchmarks)
     books = [
         _Book(
             level=level,
@@ -500,7 +516,11 @@ def run(
         dropped = provider.dropped_dividends(t, ids)
         ever_held = sorted({sid for book in books for sid in book.held_on})
         late = provider.late_dividends(t_prev, t, ever_held)
-        next_plan = _plan(provider, params, step_end) if index < len(sessions) - 1 else None
+        next_plan = (
+            _no_benchmark_members(_plan(provider, params, step_end), benchmarks)
+            if index < len(sessions) - 1
+            else None
+        )
         frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
         targets[plan.fill_session] = dict(plan.targets)
         for book in books:
