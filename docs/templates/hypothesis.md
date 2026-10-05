@@ -3,8 +3,12 @@
 <!--
 Copy to docs/hypotheses/<slug>.md. Merging the file does not register it: the owner runs
 `tradepartner hypothesis register docs/hypotheses/<slug>.md` after merge (spec req 10,
-docs/specs/backtest.md). The registry hashes the whole file, so any later edit, prose
-included, makes a new hypothesis. Settle the text before registering.
+docs/specs/backtest.md). A prose-only edit of an already-registered file (same slug, same
+fingerprint, new doc hash) is refused and writes nothing: it is neither a new hypothesis
+nor a re-registration (strategy-lab spec req 1). Once the lab is initialised, a changed
+parameter can no longer register as a standalone file either: write it as a one-value
+sweep (`docs/templates/sweep.md`) and register that instead. Settle the text before
+registering.
 -->
 
 **Family:** <from `hypotheses.families`>  ·  **Author:**  ·  **Date:** YYYY-MM-DD
@@ -20,8 +24,9 @@ The block below is the only part the registry parses. Rules (`backtest/hypothesi
 - It must name `in_sample_start`, `holdout.start`, `holdout.end` (TOML dates,
   `in_sample_start` before `holdout.start`) and **every** `strategy.*` and `costs.*` key.
   The holdout never comes from live settings.
-- It may pin any other frozen key: `universe.*`, `execution.fill_price`, `backtest.*`,
-  `adjust.*`, `master.*`, `gap.*`, `metrics.*`, `benchmarks`, `alpaca.historical_feed`.
+- It may pin any other frozen key: `schedule.*`, `universe.*`, `execution.fill_price`,
+  `backtest.*`, `adjust.*`, `master.*`, `gap.*`, `metrics.*`, `benchmarks`,
+  `alpaca.historical_feed`.
   Frozen keys it leaves out take the live config values at registration and are
   printed with the rest. Any other key is refused.
 - Keep other fenced blocks out of the parameter block; its first bare ``` line closes it.
