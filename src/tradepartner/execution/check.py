@@ -61,7 +61,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import is_session, last_session_of_month, next_session, session_close
+from tradepartner.calendar import last_session_of_month, session_close
 from tradepartner.config import Settings
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
@@ -69,6 +69,7 @@ from tradepartner.execution.outcomes import (
     REALISED_PNL,
     outcome_horizon,
 )
+from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.report import Journal, PriceOf, TrialMonths, compare_months
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
@@ -157,18 +158,11 @@ def _rebalance_session_before(session: date) -> date:
             return candidate
 
 
-def _stop_session(at: datetime) -> date:
-    """spec req 9: the calendar session containing `at`, or the next session
-    when `at` falls on a non-session day (`report._stop_session`)."""
-    day = _local_date(at)
-    return day if is_session(day) else next_session(day)
-
-
 def _stop_session_of(stops: Sequence[store_journal.PaperWindowStopRow]) -> date | None:
-    """The stop session of the window's `requested` stop, or None when the
-    window was never asked to stop (`report._stop_session_of`)."""
+    """The stop session (`plan.stop_session`) of the window's `requested` stop,
+    or None when the window was never asked to stop (`report._stop_session_of`)."""
     requested = [s for s in stops if s.state == _REQUESTED]
-    return _stop_session(min(s.at for s in requested)) if requested else None
+    return stop_session_of_request(min(s.at for s in requested)) if requested else None
 
 
 def _price_of(

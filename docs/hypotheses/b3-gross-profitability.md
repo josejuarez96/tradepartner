@@ -1,6 +1,6 @@
 # Hypothesis: B3, long-only gross profitability (GP/A) tilt, monthly
 
-**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 pending  ·  **Date:** 2026-10-03  ·  **Status:** draft, not registrable
+**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 recorded 2026-10-04 (#811)  ·  **Date:** 2026-10-03  ·  **Amended:** 2026-10-04 (#851, `in_sample_start` follows H1's #842 amendment); 2026-10-04 (#811, B3-3 to B3-8 decided as recommended: no parameter value changes, B4 goes to a third family `combined`, the spanning diagnostic stays outside the retirement rule)  ·  **Status:** draft, not registrable
 
 Merging this file does not register it, and today it **cannot** be registered: the
 `profitability` family, its frozen keys and its signal do not exist in the engine (the
@@ -9,8 +9,10 @@ says what must be built), and the statement facts it reads reach the owner's sto
 with plan task T78 ([data-foundation spec](../specs/data-foundation.md), amendment #660).
 The owner runs `tradepartner hypothesis register docs/hypotheses/b3-gross-profitability.md`
 after both, on or after a date at which `holdout.end` is a completed month-end. Before
-registering, the owner answers the questions still open at the end of this file (B3-3
-to B3-8; B3-1 and B3-2 are decided), re-checks
+registering, the owner (who has answered every question at the end of this file: B3-1
+and B3-2 on #720, B3-3 to B3-8 on #811) confirms that `in_sample_start` and the counts
+below still equal H1's file as registered (H1 registers first; if its first binding
+month-end moved under its pre-registration check, this file follows it, #851), re-checks
 `docs/research/` and the trial registry for holdout-period results seen since this draft
 (H1's holdout spend included, since the two windows coincide) and adds them to the
 disclosure; an edit before registration is not a new hypothesis. The registry hashes the
@@ -96,10 +98,10 @@ ranks (HO-10: weights fixed in advance, never fitted):
   `[350, 380]`: calendar years, 52- and 53-week fiscal years). Quarters, half-years,
   nine-month year-to-date rows and fiscal-year-change stubs are ignored.
 - **Fresh** means the session date of T minus `period_end` is at most
-  `profitability.max_fact_age_days` (default 548, 18 months; open question B3-3).
+  `profitability.max_fact_age_days` (548, 18 months; decided B3-3 (a), #811).
 - **Scope**: names whose SIC known at `t` lies in `profitability.exclude_sic_ranges`
-  (default `[[6000, 6999]]`, finance, insurance and real estate) are not scored (open
-  question B3-4). They stay in the universe and in the gap report.
+  (`[[6000, 6999]]`, finance, insurance and real estate) are not scored (decided
+  B3-4 (a), #811). They stay in the universe and in the gap report.
 - **Portfolio**: the top `profitability.top_fraction` (0.10) of the scored names,
   `profitability.weighting = equal`, long-only, remainder cash, through the existing
   `portfolio.target_weights`. One-month hold. No hysteresis band (a second hypothesis in
@@ -121,8 +123,9 @@ tests have one source:
    accepted after that instant on the rebalance session T is **invisible** at that
    read and enters the next month's read; one accepted before it is visible, as it was
    to anyone reading EDGAR before the close. The close is the calendar's, not 16:00 New
-   York: two month-ends in the windows are half days (2019-11-29 in sample, 2024-11-29 in
-   the holdout, close 13:00 New York), where a 14:00 acceptance is invisible. The signal
+   York: three month-ends in the windows are half days (2019-11-29, the first in-sample
+   rebalance; 2024-11-29 and 2025-11-28 in the holdout; close 13:00 New York), where a
+   14:00 acceptance is invisible. The signal
    function takes `t` itself and filters `known_at ≤ t` again, so a frame that carries a
    later row (a fake provider in a test, a provider bug) cannot score it (amendment
    #720, "The signal"). No fact is ever pulled forward to its period end, and the engine
@@ -164,7 +167,7 @@ tests have one source:
    is the filing's own arithmetic and carries its acceptance, so it is as point-in-time
    as a reported row. `profitability.include_derived = true` keeps those names; the share
    of derived scores among the ranked names is reported per rebalance (`n_derived`), and
-   excluding them is a pre-declared variant, not an edit (open question B3-6).
+   excluding them is a pre-declared variant, not an edit (decided B3-6 `true`, #811).
 7. **Where gross profit is undefined, the name is out of scope by rule, not by
    accident.** Banks, insurers and REITs report no cost of goods sold; some tag a
    `GrossProfit` anyway with a meaning the ratio cannot use. Rule 5 would exclude most of
@@ -213,7 +216,7 @@ this registration, and its overlap and standalone-file rules do not apply to it.
 slug = "b3-gross-profitability"
 family = "profitability"
 title = "B3: long-only gross profitability (GP/A) tilt, top 10% equal weight, monthly"
-in_sample_start = 2017-01-31
+in_sample_start = 2019-11-29
 
 [holdout]
 start = 2024-01-01
@@ -247,17 +250,30 @@ historical_feed = "sip"
 Proposed answers, one line each (the owner confirms or changes them on #720; they mirror
 H1's where the question is the same):
 
-- **Portfolio construction** (open question B3-5): the H1 construction, top 10% of the
+- **Portfolio construction** (decided B3-5 (a), #811): the H1 construction, top 10% of the
   scored names, equal weight. About 70 to 90 names when financials and names without
   facts are out of about 1000. ADR 0006's revisit trigger (about $1 per order at ~100
   names) fires as it did for H1; it is already recorded for the Phase 4 spec.
 - **Holdout window**: H1's, `[2024-01-01, 2026-09-30]`. Months after that are Phase 4
   tracking, never holdout. The holdout is named here and never read from live settings.
-- **`in_sample_start`**: `2017-01-31`, H1's. Statement facts exist in companyfacts from
-  2009, so the binding constraint is Alpaca price history (ADR 0009, from 2016-01-04)
-  and the pre-2019 `snapshot_static` listing reliance (#35), both reported per rebalance
-  as for H1. The first rebalance scores most December fiscal-year names on FY2015 (its
-  10-K accepted in early 2016).
+- **`in_sample_start`**: `2019-11-29`, H1's since its #842 amendment (this file followed
+  on #851; it read `2017-01-31`, H1's original value, before). The real-data dry run
+  (#839) found the ADR 0006 universe **empty at every month-end from 2017-01-31 to
+  2019-06-28** on the owner's store: under #35 the only pre-2019 listings are
+  `snapshot_static` rows known at their 2026-10-03 fetch, and cover-page listings arrive
+  only from mid-2019. H1's Q8 amendment pins the first month-end at which the size cut
+  binds (at least `universe.top_n_by_cap` companies pass ADR 0006 rules 1–7) at
+  2019-11-29, with the sweep table, the rule and the iXBRL phase-in disclosure. B3 reads
+  the same store through the same `universe_as_of`, so the same month-end binds here, and
+  the pre-registration coverage check in H1's preamble covers B3 too: H1 registers first,
+  and if it re-pins, B3 follows before B3 registers. Statement facts exist in companyfacts
+  from 2009 and Alpaca bars from 2016-01-04 (ADR 0009), so neither facts nor prices bind;
+  listings do,
+  exactly as for H1, and B3 inherits the iXBRL phase-in bias H1 discloses (for nine of
+  the 50 in-sample rebalances, 2019-11-29 to 2020-07-31, the pool the top-1000 cut binds
+  against is tilted to larger filers; from 2020-08-31 the universe is the ADR 0006
+  top 1000 in substance). The first rebalance scores most December fiscal-year names on
+  FY2018 (its 10-K accepted in early 2019, well inside `max_fact_age_days`).
 - **Costs**: the spec's placeholders, `per_side_bps = 15` and the ladder
   `[0, 30, 60, 100]`, as for H1, until Phase 4 paper fills recalibrate them; the
   strategy-lab family rules allow a higher base later, never a lower one.
@@ -335,7 +351,7 @@ run computes it.
   (`statement_none`, IFRS filers, held keys, the tag lists being too short; #660 open
   questions 5 and 7).
 - `n_excluded_stale_facts` spiking in February or March: `max_fact_age_days` is too
-  short for the filing calendar (open question B3-3), and the book is shrinking and
+  short for the filing calendar (B3-3, set at 548 to prevent this), and the book is shrinking and
   rebuilding every spring.
 - `n_derived` share jumping between adjacent rebalances: the derivation or the hold
   rule is unstable, and the ranked set with it.
@@ -344,17 +360,24 @@ run computes it.
   teeth for this table.
 - A `cost_drag` at 15 bp far from ≈ 12 × `turnover_monthly` × 2 × 15 bp, or a net CAGR
   that rises with the cost level: a cost-model bug.
-- A survivorship gap above `gap.count_share_threshold` at any rebalance, or a large
-  static-listing count in 2017–2018: a biased universe, as for H1.
+- A survivorship gap above `gap.count_share_threshold` at any rebalance: a biased
+  universe, as for H1. On the owner's store, a non-zero `n_static_listings` or an
+  `n_universe` below `universe.top_n_by_cap` at any rebalance: as for H1, whose red-flag
+  bullet says why the static count is zero by construction after #842 and why a short
+  universe means the size cut did not bind (a coverage hole inside the window). Before
+  #851 this bullet watched for a large static-listing count in 2017–2018; that reading is
+  moot with the window starting 2019-11-29.
 
 ## Power arithmetic
 
 Rebalance sessions and monthly returns are H1's exactly, since the windows and the
-calendar are the same (`tests/backtest/test_h1_file.py` checks the counts): **84
-rebalance sessions and 83 monthly returns** in sample (2017-01-31 to 2023-12-29; the
-2023-12-29 rebalance fills inside the holdout), **34 sessions and 33 returns** in the
-holdout run (`--start 2023-12-29 --end 2026-09-30`, which needs `--spend-holdout` and runs
-as `kind=holdout`), 116 returns together with no gap and no overlap.
+calendar are the same (`tests/backtest/test_h1_file.py` checks the counts): **50
+rebalance sessions and 49 monthly returns** in sample (2019-11-29 to 2023-12-29 since
+#842 and #851; 84 and 83 over 2017-01-31 to 2023-12-29 before; the first rebalance fills
+on 2019-12-02 and the 2023-12-29 rebalance fills inside the holdout), **34 sessions and
+33 returns** in the holdout run (`--start 2023-12-29 --end 2026-09-30`, which needs
+`--spend-holdout` and runs as `kind=holdout`), 82 returns together with no gap and no
+overlap.
 
 **t-statistic** (ADR 0005: t ≈ SR × √years, the excess Sharpe being the excess return
 over its tracking error), at the assumed 6%/yr tracking error and, for comparison, at
@@ -362,14 +385,17 @@ H1's 8.4%:
 
 | Window | Months | Years | t for +1 pp/yr at 6% TE | Excess needed for t ≈ 2 at 6% | Same at 8.4% TE |
 |---|---|---|---|---|---|
-| In-sample | 83 | 6.9 | **0.44** | **4.6 pp/yr** | 6.4 pp/yr |
+| In-sample | 49 | 4.1 | **0.34** | **5.9 pp/yr** | 8.3 pp/yr |
 | Holdout | 33 | 2.75 | 0.28 | 7.2 pp/yr | 10.1 pp/yr |
-| Both | 116 | 9.7 | 0.52 | 3.9 pp/yr | 5.4 pp/yr |
+| Both | 82 | 6.8 | 0.44 | 4.6 pp/yr | 6.4 pp/yr |
 
-A +0.5 pp/yr excess, the centre of the prior, would need about 580 years at 6%
-tracking error to reach t ≈ 2. Any in-sample excess large enough to be significant
-(about +4.6 pp/yr) is above the red-flag threshold, so it would read as a bug before it
-read as an edge. **The test cannot reach significance for any result the prior
+(Before #851 the in-sample row read 83 months, 6.9 years, t 0.44, 4.6 and 6.4 pp/yr,
+and the Both row 116 months, 9.7 years, 0.52, 3.9 and 5.4 pp/yr. The shorter window
+weakens an already powerless test; it does not change the conclusion below.) A +0.5
+pp/yr excess, the centre of the prior, would need about 580 years at 6% tracking error
+to reach t ≈ 2. Any in-sample excess large enough to be significant (about +5.9 pp/yr)
+is nearly twice the red-flag threshold, so it would read as a bug before it read as an
+edge. **The test cannot reach significance for any result the prior
 allows.** What the in-sample run can show is whether the engine reads annual facts
 correctly point-in-time (the look-ahead suites extended to this table), whether the
 coverage and turnover sit inside the prior, and whether the result sits inside it.
@@ -384,7 +410,7 @@ unrelated and each family counts its own looks at the data (strategy-lab spec op
 question 11, a root family).
 
 **Trial budget** (research-program §4 item 4; QI-11: a dozen prespecified variants, all
-counted). Proposed, for the owner to set (open question B3-7): this registration, one
+counted). Set by the owner (B3-7 (a), 2026-10-04, #811): this registration, one
 run over the default in-sample window and one holdout spend; **one spanning
 diagnostic** per audited in-sample trial (the `return`-kind research run of the
 Retirement condition, counted in this family's N under the research-registry spec); at
@@ -393,8 +419,12 @@ N: (i) `basis = "cash"` (operating cash flow over assets, a proxy for cash-based
 profitability, not Ball et al.'s measure); (ii) `include_derived = false` (reported
 gross profit only); (iii) the brief's construction, top third of the scored names,
 cap-weighted, if the strategy lab adds `weighting = "cap"` (today `equal` is the only
-value). B4 (momentum plus profitability by equal ranks) is a fourth file whose family is
-open question B3-7(b). Reruns for logged bugs are counted as the spec counts them.
+value). B4 (momentum plus profitability by equal ranks) is a separate file, outside this
+budget, in a **third family, `combined`** (B3-7 (b), decided 2026-10-04, #811): a root under the lab's
+`FAMILY_PARENTS` with its own N, so B4's looks at both signals raise neither
+`momentum`'s nor `profitability`'s N alone; the family enters `hypotheses.families` by
+the reviewed code change that comes with B4's file, which is drafted only after B1 and
+B3 have run. Reruns for logged bugs are counted as the spec counts them.
 Nothing else runs in this family without a backlog entry and an owner decision.
 
 ## Prior-evidence disclosure
@@ -451,7 +481,8 @@ Stated before any run, per spec open question 10 (a), and read the way H1's is.
 the base-level `excess_cagr_spy` and the run-time `dsr_excess` in `trial_results` (N and
 V at run time), not the page's recomputation with today's N and V. The trial is the
 **first** `ok`, non-synthetic, `in_sample` trial of this hypothesis over the full default
-window [2017-01-31, 2023-12-29] that passed `quant-auditor`. A later trial replaces it
+window [2019-11-29, 2023-12-29] (the `in_sample_start` of #842 and #851) that passed
+`quant-auditor`. A later trial replaces it
 only when an audit logged a bug in the earlier one (a look-ahead in the fact read, a
 period-band or staleness defect, a derivation defect). Shorter or later-start in-sample
 runs never count. The holdout run neither retires nor promotes B3; its result is
@@ -463,8 +494,9 @@ Unlike H1, B3 is not the Phase 4 paper vehicle, so retirement ends its line: a l
 revisit is a new hypothesis with its own registration and budget (research-program §6).
 
 **The −1 pp/yr line is a decision rule committed in advance, not a statistical
-finding.** Each pp/yr of excess is worth about t ≈ 0.44 over the in-sample window at the
-assumed tracking error, so −1 pp/yr is inside one standard error of zero and inside the
+finding.** Each pp/yr of excess is worth about t ≈ 0.34 over the in-sample window at the
+assumed tracking error (0.44 before #851), so −1 pp/yr is inside one standard error of
+zero and inside the
 prior's range. It is the same line H1 drew, chosen so the two families are read alike;
 its job is to be a line drawn before the run.
 
@@ -480,15 +512,16 @@ the intercept, its t-statistic and both loadings. Regressing B3's excess over SP
 MTUM's excess over SPY alone would force B3's market beta to 1 and put a low-beta tilt
 (QI-18) into the alpha, the brief's "confusing the market's return with tilt alpha".
 It runs on the **in-sample retirement trial only**, never on a holdout trial. Under the
-research-registry spec (draft, #661) that computation reads returns and is a
+research-registry spec (its open questions decided on #810) that computation reads returns and is a
 `return`-kind run in the `profitability` family, registered before it runs and counted
-in N (its req 9; it is in the trial budget above); until the registry exists it is not
-run, and whether a registry table (`trial_equity`) is an allowed input for a `return`
-run is that spec's open question 7 (its req 4 names the as-of API;
-#728 filed it). Its result informs the
+in N (its req 9; it is in the trial budget above). Until the registry exists it is not
+run. It reads the retirement trial's `trial_equity` series through `load_dataset` as
+an ordinary dataset version that a reviewed dataset-build step exports (that spec's open
+question 7, decided (d) by the owner on 2026-10-04, #810; its req 11; #728 filed the
+question). Its result informs the
 B4 decision (whether the two signals are worth combining) and the backlog's next
-ranking, never this retirement. Whether to make it part of the retirement rule by adding
-a metric key is open question B3-8.
+ranking, never this retirement. It is not part of the retirement rule and adds no
+`metrics` key (B3-8, decided 2026-10-04, #811).
 
 **Nothing promotes B3.** No result passes it, and no DSR value is a threshold. Whether it
 goes to paper or live is an owner decision under ADR 0005 after H1's paper period and the
@@ -502,7 +535,7 @@ audit, and the hypothesis stays unresolved until the audit ends.
 or the weighting, is a new file with a new slug, counted in the profitability family's
 N. This file is never edited after registration to fit a result.
 
-## Open questions for the owner (answers on #720; B3-1 and B3-2 decided 2026-10-03, the rest open)
+## Open questions for the owner (B3-1 and B3-2 decided 2026-10-03 on #720; B3-3 to B3-8 decided 2026-10-04 on #811; none open)
 
 - **B3-1. How the family's keys enter the file.** Decided (a), owner, 2026-10-03 (with
   spec open question 11): a new frozen section `profitability` required in full when
@@ -541,6 +574,7 @@ N. This file is never edited after registration to fit a result.
   book each spring. Recommendation: (a); (c) is wrong for annual facts. No option is a
   literature convention: the Fama–French June-to-June alignment is a different device
   (a fixed six-to-eighteen-month lag) that acceptance-timed facts do not need.
+  **Decided (a), owner, 2026-10-04 (#811):** 548, as the block above already reads.
 - **B3-4. Sector scope.** Options: (a) `profitability.exclude_sic_ranges = [[6000,
   6999]]` as a frozen signal key (above); (b) no scope key, financials excluded only
   when their facts are missing (rule 5), accepting that a bank with a tagged
@@ -550,16 +584,22 @@ N. This file is never edited after registration to fit a result.
   variant if coverage shows REITs are a large share of the exclusions. Also to confirm:
   this key is **not** the guarded `universe.exclude_sic_ranges` and needs no charter
   amendment, because it changes what is scored, not what may be traded.
+  **Decided (a), owner, 2026-10-04 (#811):** `[[6000, 6999]]` as a frozen signal key,
+  not the guarded `universe.*` key, no charter amendment; (c) stays a pre-declared
+  variant if coverage shows REITs are a large share of the exclusions.
 - **B3-5. Construction.** Options: (a) the H1 construction, top 10% of scored names,
   equal weight (above; B4-compatible; ADR 0006's small-order trigger already recorded);
   (b) the brief's sketch, top third of scored names cap-weighted (closer to the
   literature's value-weighted portfolios; needs a `weighting = "cap"` value and a cap
   read the engine does not do today); (c) top 50 equal weight. Recommendation: (a) now;
   (b) as the strategy lab's first `profitability` sweep axis once `cap` exists.
+  **Decided (a), owner, 2026-10-04 (#811):** top 10% of scored names, equal weight.
 - **B3-6. Derived gross profit.** `include_derived = true` (above) or `false`.
   Recommendation: `true`, with the derived share reported; excluding derived rows would
   drop every filer that reports cost of sales but no gross-profit subtotal, a sector-
   shaped hole, and the variant tests the difference if the share is large.
+  **Decided `true`, owner, 2026-10-04 (#811):** derived rows are scored and their share
+  is reported per rebalance (`n_derived`).
 - **B3-7. Family trial budget and where B4 lives.** (a) The budget: this file plus at
   most three pre-declared variants (above), or a different number; the strategy-lab
   spec's `lab.max_variants_per_sweep` and family caps apply on top once it lands. (b)
@@ -568,8 +608,17 @@ N. This file is never edited after registration to fit a result.
   lab's `FAMILY_PARENTS`). Recommendation: (a) as proposed; (b) a third family, since
   B4's trials are looks at both signals and should raise neither family's N alone while
   being counted somewhere; the owner may prefer to defer (b) until B1 and B3 have run.
+  **Decided, owner, 2026-10-04 (#811):** (a) as proposed, this file plus at most three
+  pre-declared variants; (b) a third family `combined`, a root under `FAMILY_PARENTS`
+  with its own N. The family is created by the reviewed code change that lands with
+  B4's file, and B4 is drafted only after B1 and B3 have run, so nothing is built now.
 - **B3-8. The spanning diagnostic.** Keep it a registered research run outside the
   retirement rule (above), or add a `metrics` key (`alpha_vs_mtum_monthly`, its t) by
   spec amendment so the rule can read it. Recommendation: keep it outside; a stored
-  regression on 83 months has no power either, and the rule stays readable from two
+  regression on 49 months has no power either, and the rule stays readable from two
   stored values.
+  **Decided outside, owner, 2026-10-04 (#811):** the diagnostic stays a registered
+  `return`-kind research run outside the retirement rule; no `metrics` key is added. Its
+  home is the research-registry spec's open question 7 (d), decided the same day (#810):
+  the retirement trial's `trial_equity` series is exported as an ordinary dataset version
+  and the run reads it through `load_dataset`.

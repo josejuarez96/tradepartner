@@ -539,13 +539,12 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
     naming the full list's file, before any store write, on a dry run too.
     `check_failures()` and `record_failed_check()` are then not called: a
     pass with absent inputs must not advance the per-document failure
-    counts."""
-    _build_filings(recorded, settings, _FETCH_PASS)
+    counts. If the pass itself raises after recording a parse failure (a
+    later step can fail because an input was treated as absent), the gate
+    still fails the run with the full list and names that error, so the
+    error never hides the list."""
+    _fetch_and_gate(recorded, settings)
     source = _unwrap(recorded)
-    validation = getattr(source, "validation_failures", None)
-    if validation is not None:
-        counted = {label: getattr(source, attribute, 0) for attribute, label in _EMPTY_COUNTS}
-        validation.raise_if_any(settings, counted)
     check_failures = getattr(source, "check_failures", None)
     if check_failures is not None:
         try:
@@ -562,6 +561,28 @@ def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None
                     ) from record_error
             raise
     recorded.frozen = True
+
+
+def _fetch_and_gate(recorded: _Recorded, settings: Settings) -> None:
+    """The fetch pass into `recorded`, then the input-validation gate (#578)
+    on the source under it: when the source exposes `validation_failures`
+    and anything was recorded, `InputValidationError` names them all, also
+    when the pass itself raised afterwards (named and chained). With
+    nothing recorded, the pass's own error propagates unchanged."""
+    source = _unwrap(recorded)
+    validation = getattr(source, "validation_failures", None)
+
+    def gate(stopped_by: BaseException | None = None) -> None:
+        if validation is not None:
+            counted = {label: getattr(source, attribute, 0) for attribute, label in _EMPTY_COUNTS}
+            validation.raise_if_any(settings, counted, stopped_by=stopped_by)
+
+    try:
+        _build_filings(recorded, settings, _FETCH_PASS)
+    except Exception as error:
+        gate(stopped_by=error)  # raises when anything was recorded
+        raise
+    gate()
 
 
 #: The source's counts of empty `{}` payloads (#566, #576): counted, never
@@ -590,9 +611,10 @@ def _ingest_filings(
     # The fetch pass, so `now` is read only after every source answer. When
     # `filings` is already a frozen fetch pass (`_prefetch`, as both callers
     # do) nothing is left to fetch and repeating its build would only
-    # recompute it (#564).
+    # recompute it (#564). A caller that hands an unfrozen source still
+    # meets the input-validation gate before any row is written (#578).
     if not (isinstance(filings, _Recorded) and filings.frozen):
-        _build_filings(recorded, settings, _FETCH_PASS)
+        _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
     added = 0
