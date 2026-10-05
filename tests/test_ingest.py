@@ -20,7 +20,7 @@ from typing import Any
 import duckdb
 import pytest
 
-from tradepartner.adapters.edgar_validation import ValidationFailures
+from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -722,6 +722,64 @@ def test_input_validation_runs_on_a_dry_run_and_writes_the_list(
     assert run.status == FAILED and "1 input(s) failed to parse" in run.message
     assert len(list((tmp_path / "validation").glob("failures-*.json"))) == 1
     assert (_counts(read), read("SELECT count(*) FROM ingestion_runs")) == before
+
+
+def test_a_pass_that_stops_after_a_recorded_failure_still_lists_it(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578: an input treated as absent can make a later step of the pass
+    raise; the gate still fails the run with the full list, naming that
+    error, so the error never hides the list."""
+
+    class Stops(_Validating):
+        def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+            super().facts(cik, names)
+            raise RuntimeError("no cached FSN period at or after edgar.fsn_first_year")
+
+    def make(**kwargs: Any) -> Stops:
+        source = Stops(**kwargs)
+        source.validation_failures = ValidationFailures(tmp_path / "validation", lambda: NOW)
+        source.bad = _CRASHES[2:]
+        return source
+
+    run = _run(settings, filings=_filings(cls=make), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "InputValidationError: EDGAR input validation: 1 input(s)" in run.message
+    assert "the pass then stopped: RuntimeError: no cached FSN period" in run.message
+    assert "FSN period 2026q1" in run.message
+
+
+def test_an_unfrozen_source_handed_to_the_write_meets_the_gate(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578 (safety-reviewer on #864): `_ingest_filings` given a source no
+    `_prefetch` froze runs the fetch pass itself, then the same gate, so a
+    recorded input never becomes silently absent rows."""
+    conn = duckdb.connect(":memory:")
+    conn.execute("SET TimeZone='UTC'")
+    init_schema(conn)
+    with pytest.raises(InputValidationError, match="3 input"):
+        _ingest_filings(conn, settings, _validating(tmp_path, _CRASHES), lambda: NOW)
+    assert conn.execute("SELECT count(*) FROM securities").fetchone() == (0,)
+    conn.close()
+
+
+def test_a_pass_that_stops_with_nothing_recorded_raises_its_own_error(
+    settings: Settings, tmp_path: Path
+) -> None:
+    class Stops(_Validating):
+        def facts(self, cik: str, names: Sequence[str]) -> list[FactRecord]:
+            raise RuntimeError("unrelated")
+
+    def make(**kwargs: Any) -> Stops:
+        source = Stops(**kwargs)
+        source.validation_failures = ValidationFailures(tmp_path / "validation", lambda: NOW)
+        return source
+
+    run = _run(settings, filings=_filings(cls=make), source="edgar").runs[0]
+    assert run.status == FAILED
+    assert "RuntimeError: unrelated" in run.message and "InputValidationError" not in run.message
+    assert not (tmp_path / "validation").exists()
 
 
 def test_a_clean_validation_passes_straight_through(settings: Settings, tmp_path: Path) -> None:
