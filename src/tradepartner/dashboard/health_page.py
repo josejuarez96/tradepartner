@@ -30,6 +30,12 @@ fact table at or before `t`; "last updated" the latest finish of an `ok`
 ingest run of any source; "stale" the number of sessions after the last
 bar session up to the last completed session, shown as a warning chip when
 positive.
+
+**Sources.** The "latest run" chip is green for `ok`, orange (a caution,
+not a failure) for a maintenance run's own status (`repair-resolution`'s
+`repaired`, `ingest --fill-holes`'s `filled`, issue 833: deliberately never
+`ok`, so neither counts as a fresh ingest for "last ok" or the staleness
+check above) or when the source has never run, and red for anything else.
 """
 
 from __future__ import annotations
@@ -44,16 +50,26 @@ import duckdb
 import polars as pl
 import streamlit as st
 
+from tradepartner.backfill import FILLED
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
 from tradepartner.health import HealthReport, health_report
+from tradepartner.repair import REPAIRED
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
 
 #: Sessions the window control starts with (a view default, not a threshold).
 DEFAULT_WINDOW_SESSIONS: Final = 60
+
+#: Statuses a maintenance run (`repair-resolution`, `ingest --fill-holes`)
+#: writes on success (issue 833): never `ok` (that stays the only "fresh"
+#: status, ingest's own staleness check, module docstring), but not a
+#: failure either, so the "Sources" card shows them as a caution, not an
+#: alarm. Shared from `repair`/`backfill`, never copied, so a renamed
+#: status can't drift silently out of this set.
+_MAINTENANCE_STATUSES: Final[frozenset[str]] = frozenset({REPAIRED, FILLED})
 
 _SERIES_SCHEMA: Final[dict[str, Any]] = {
     "session": pl.Date,
@@ -279,6 +295,10 @@ def _sources_card(report: HealthReport) -> None:
                 theme.status_badge("never run", "warning")
             elif ingest.latest_status == "ok":
                 theme.status_badge("latest run: ok", "good")
+            elif ingest.latest_status in _MAINTENANCE_STATUSES:
+                # A successful repair or hole-fill (issue 833): not a fresh
+                # ingest, but not a failure either.
+                theme.status_badge(f"latest run: {ingest.latest_status}", "warning")
             else:
                 theme.status_badge(f"latest run: {ingest.latest_status}", "critical")
             if ingest.latest_message:
