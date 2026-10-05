@@ -1046,9 +1046,15 @@ class Settings(BaseSettings):
         # a plain `raise`, means nothing but the already-validated `self` is ever
         # touched, so only the env var *names* below can appear in the message.
         self._validate_alert_channel_is_usable()
+        # Also deliberately *not* a `@model_validator` (see the comment above): the
+        # same `ValidationError`-embeds-the-whole-input-including-every-secret
+        # problem applies here, since this method, like
+        # `_validate_alert_channel_is_usable`, reads `self` after construction and
+        # raises a plain `ValueError` whose message names only the bad key, never a
+        # secret (code-review finding on #952).
+        self._validate_lab_sweepable_keys()
 
-    @model_validator(mode="after")
-    def _validate_lab_sweepable_keys(self) -> Settings:
+    def _validate_lab_sweepable_keys(self) -> None:
         """`lab.sweepable_keys` (strategy-lab spec req 1; Amendment 2026-10-05 (#952,
         owner)) may name only a real `Settings` key under `ALLOWED_AXIS_PREFIXES`
         (`strategy.*`/`schedule.*`) and outside `FORBIDDEN_AXIS_PREFIXES` (kept as a
@@ -1070,7 +1076,6 @@ class Settings(BaseSettings):
                 )
             if not _settings_has_key(key):
                 raise ValueError(f"lab.sweepable_keys entry {key!r} names a key Settings lacks")
-        return self
 
     def _validate_alert_channel_is_usable(self) -> None:
         """#544: `AlertsConfig._validate_channels` only checks that a non-store

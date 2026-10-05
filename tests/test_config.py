@@ -586,7 +586,7 @@ def test_allowed_axis_prefixes_pinned() -> None:
 @pytest.mark.parametrize("prefix", FORBIDDEN_AXIS_PREFIXES)
 def test_sweepable_keys_entry_under_a_forbidden_prefix_rejected(prefix: str) -> None:
     key = prefix if prefix.endswith(".") else f"{prefix}."
-    with pytest.raises(ValidationError, match="forbidden prefix"):
+    with pytest.raises(ValueError, match="forbidden prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": [f"{key}bogus"], "axis_lattice": {}})
 
 
@@ -604,12 +604,12 @@ def test_sweepable_keys_entry_outside_the_allowed_prefixes_rejected(key: str) ->
     """#955: a deny-list alone let `risk.*`, `paper.*` and `alerts.*` through; the
     allow-list (Amendment 2026-10-05 (#952, owner)) refuses any section but
     `strategy.*`/`schedule.*`, whether or not `Settings` actually has the key."""
-    with pytest.raises(ValidationError, match="not under an allowed prefix"):
+    with pytest.raises(ValueError, match="not under an allowed prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": [key], "axis_lattice": {}})
 
 
 def test_sweepable_keys_entry_settings_lacks_rejected() -> None:
-    with pytest.raises(ValidationError, match="names a key Settings lacks"):
+    with pytest.raises(ValueError, match="names a key Settings lacks"):
         Settings(
             _env_file=None,
             lab={"sweepable_keys": ["strategy.not_a_real_key"], "axis_lattice": {}},
@@ -619,7 +619,7 @@ def test_sweepable_keys_entry_settings_lacks_rejected() -> None:
 def test_sweepable_keys_entry_unknown_field_in_an_allowed_section_rejected() -> None:
     """A key under an allowed prefix but naming no real field still fails the
     `Settings`-existence check, reached only once it clears `ALLOWED_AXIS_PREFIXES`."""
-    with pytest.raises(ValidationError, match="names a key Settings lacks"):
+    with pytest.raises(ValueError, match="names a key Settings lacks"):
         Settings(
             _env_file=None,
             lab={"sweepable_keys": ["schedule.not_a_real_field"], "axis_lattice": {}},
@@ -638,7 +638,7 @@ def test_sweepable_keys_entry_without_a_dot_rejected(bare_key: str) -> None:
     outright (closing the gap where it slipped past the old `FORBIDDEN_AXIS_PREFIXES`
     `startswith` check, since a bare name never matches a dotted prefix; #952 reviewer
     findings), exercised directly below."""
-    with pytest.raises(ValidationError, match="not under an allowed prefix"):
+    with pytest.raises(ValueError, match="not under an allowed prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": [bare_key], "axis_lattice": {}})
 
 
@@ -664,7 +664,7 @@ def test_settings_has_key_accepts_a_real_dotted_field() -> None:
 def test_sweepable_keys_entry_bare_exact_forbidden_name_rejected() -> None:
     """`benchmarks` (no trailing dot: the one `FORBIDDEN_AXIS_PREFIXES` entry that is
     an exact field name, not a prefix) is still refused, by the prefix check itself."""
-    with pytest.raises(ValidationError, match="forbidden prefix"):
+    with pytest.raises(ValueError, match="forbidden prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": ["benchmarks"], "axis_lattice": {}})
 
 
