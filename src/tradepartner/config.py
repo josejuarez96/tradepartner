@@ -282,6 +282,10 @@ class AlpacaConfig(BaseModel):
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
     registrant_quiet_days: int = Field(default=180, ge=1)
+    # #843: how far before a rename's first cover-page row the new ticker may fill the
+    # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest
+    # liquid hole is GSX -> GOTU's 356 days; 0 turns the lead off.
+    rename_lead_days: int = Field(default=400, ge=0)
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.

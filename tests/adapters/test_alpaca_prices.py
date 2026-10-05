@@ -13,7 +13,7 @@ import copy
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -1329,6 +1329,152 @@ class TestCorporateActions:
     def test_malformed_action_raises_value_error(self, resolver: ListingResolver) -> None:
         with pytest.raises(ValueError, match="malformed"):
             parse_corporate_actions({"forward_splits": [{"symbol": "AAPL"}]}, resolver.resolve)
+
+
+def _row(day: date, close: float) -> dict[str, object]:
+    return {
+        "t": f"{day.isoformat()}T04:00:00Z",
+        "o": close,
+        "h": close,
+        "l": close,
+        "c": close,
+        "v": 1_000_000,
+        "n": 10_000,
+        "vw": close,
+    }
+
+
+class TestRenameLead:
+    """#843 (owner decision (d) -> (b)): a renamed company's new ticker also
+    resolves to it, inside the old ticker's span, on the sessions where the
+    company has no bar under its own symbols in the same payload, so the
+    hole between the old symbol's last bar and the cover page that shows
+    the new ticker closes. Alpaca copies a renamed company's history onto
+    the new symbol (#104 research: META's pre-rename bars equal FB's)."""
+
+    FB = "0001326801"
+    CHANGE = date(2022, 6, 9)  # META's first session
+    COVER = date(2022, 7, 27)  # the first cover page naming META
+    FB_DAYS: ClassVar[list[date]] = [date(2022, 6, 6), date(2022, 6, 7), date(2022, 6, 8)]
+    META_DAYS: ClassVar[list[date]] = [
+        *FB_DAYS,
+        date(2022, 6, 9),
+        date(2022, 6, 10),
+        date(2022, 7, 26),
+        date(2022, 7, 27),
+    ]
+
+    def _listings(self) -> list[dict[str, object]]:
+        return [
+            _listing(self.FB, "FB", START, "Class A Common Stock"),
+            _listing(self.FB, "META", self.COVER, "Class A Common Stock"),
+        ]
+
+    def _payload(self, **extra: list[dict[str, object]]) -> dict[str, Any]:
+        return {
+            "feed": "sip",
+            "bars": {
+                "FB": [_row(d, 190.0 + i) for i, d in enumerate(self.FB_DAYS)],
+                # Alpaca's META history repeats FB's closes before the change.
+                "META": [_row(d, 190.0 + i) for i, d in enumerate(self.META_DAYS)],
+                **extra,
+            },
+        }
+
+    def test_the_new_symbol_closes_the_hole_from_the_old_symbols_last_bar(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=400)
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        sessions = [b.session for b in parsed.bars if b.security_id == self.FB]
+        assert sessions == self.META_DAYS  # each once: FB's three, then META's
+        assert [b.close for b in parsed.bars][:3] == [190.0, 191.0, 192.0]
+        assert set(parsed.unresolved) == {("META", d) for d in self.FB_DAYS}
+        for bar in parsed.bars:
+            assert bar.known_at == bar_known_at(bar.session)  # no record stamped early
+
+    def test_without_a_lead_window_the_hole_stays(self) -> None:
+        resolver = ListingResolver(self._listings())
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [b.session for b in parsed.bars] == [*self.FB_DAYS, date(2022, 7, 27)]
+
+    def test_the_lead_never_changes_what_resolve_says(self) -> None:
+        # No look-ahead in the key mapping: the lead only fills sessions the
+        # security has no bar on, and `resolve` is the same with or without it.
+        sessions = [date(2022, m, d) for m in (5, 6, 7, 8) for d in (2, 9, 15, 27)]
+        with_lead = ListingResolver(self._listings(), rename_lead_days=400)
+        without = ListingResolver(self._listings())
+        for ticker in ("FB", "META"):
+            for session in sessions:
+                assert with_lead.resolve(ticker, session) == without.resolve(ticker, session)
+
+    def test_the_window_is_bounded_by_config(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=30)
+        assert resolver.lead("META", date(2022, 6, 27)) == self.FB
+        assert resolver.lead("META", date(2022, 6, 24)) is None  # 33 days before
+        assert resolver.lead("META", self.COVER) is None  # META's own span from here
+
+    def test_the_lead_is_fetched_held_and_kept_by_the_repair(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=400)
+        assert resolver.symbols(self.FB, date(2022, 6, 1), date(2022, 6, 30)) == ["FB", "META"]
+        assert resolver.symbols(self.FB, date(2020, 6, 1), date(2020, 6, 30)) == ["FB"]
+        assert resolver.holds(self.FB, date(2022, 6, 10))  # repair-resolution keeps it
+
+    def test_a_contested_holder_of_the_new_ticker_never_blocks_the_lead(self) -> None:
+        # Roundhill's META ETF (a span the rename contests) resolves to
+        # nothing; Alpaca's META history there is Facebook's.
+        resolver = ListingResolver(
+            [*self._listings(), _listing("SEC_ROUNDHILL", "META", date(2021, 6, 30))],
+            rename_lead_days=400,
+        )
+        assert resolver.lead("META", date(2022, 6, 10)) == self.FB
+        assert resolver.lead("META", date(2021, 9, 1)) == self.FB  # FB has bars: never used
+
+    def test_an_old_ticker_reused_at_once_is_filled_from_the_new_symbol(self) -> None:
+        # PROG -> PRG while the new Aaron's lists AAN the same day: AAN's
+        # rows resolve to Aaron's, so PROG has no bar and PRG's rows fill.
+        prog, aarons = "0001808834", "0001821393"
+        resolver = ListingResolver(
+            [
+                _listing(prog, "AAN", START, "Common Stock"),
+                _listing(prog, "PRG", date(2021, 2, 25), "Common Stock"),
+                _listing(aarons, "AAN", date(2020, 12, 1), "Common Stock"),
+            ],
+            rename_lead_days=400,
+        )
+        day = date(2020, 12, 2)
+        payload = {"feed": "sip", "bars": {"AAN": [_row(day, 18.41)], "PRG": [_row(day, 48.0)]}}
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert {(b.security_id, b.close) for b in parsed.bars} == {(aarons, 18.41), (prog, 48.0)}
+
+    def test_a_span_ended_at_its_own_delisting_has_no_lead(self) -> None:
+        sid = "0000000002"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "OLD", date(2018, 3, 1), "Common Stock"),
+                _listing(sid, "NEWT", date(2022, 3, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [_ended(sid, "OLD", "Common Stock", date(2021, 6, 1), valid_from=date(2018, 3, 1))],
+            ),
+            rename_lead_days=400,
+        )
+        assert resolver.lead("NEWT", date(2021, 9, 1)) is None
+
+    def test_the_price_source_asks_for_both_symbols_and_fills(self) -> None:
+        calls: list[list[str]] = []
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._payload()
+
+        source = AlpacaPriceSource(
+            ListingResolver(self._listings(), rename_lead_days=400),
+            fetch_bars=fetch,
+            settings=_settings(),
+        )
+        bars = source.bars([self.FB], date(2022, 6, 1), date(2022, 6, 30))
+        assert calls == [["FB", "META"]]
+        assert [b.session for b in bars] == [d for d in self.META_DAYS if d.month == 6]
 
 
 class _Recorded:
