@@ -213,7 +213,9 @@ class EdgarConfig(BaseModel):
     max_failed_filing_share: float = Field(default=0.01, gt=0, le=1)
     # #578: how many of the fetch pass's parse failures the run message names
     # (the full list goes to a file under `cache_dir/validation/` whose path
-    # the message gives), so a run with thousands stays readable.
+    # the message gives), so a run with thousands stays readable. Also bounds
+    # `check_failures`'s list of unaccepted filing failures (#578 part 3; the
+    # full list is `failed_filings.json`, written on a non-dry run).
     max_validation_listed: int = Field(default=20, gt=0)
 
     @property

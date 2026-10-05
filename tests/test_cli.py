@@ -22,7 +22,7 @@ from tradepartner import cli
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import PriceSource
-from tradepartner.backfill import FILLED, Hole, HoleFill
+from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, NamedSecurity
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, SourceRun
@@ -308,6 +308,57 @@ def test_inconsistent_fill_holes_flags_are_refused_before_any_work(
     result = _invoke(_with_store(secrets_set), args)
     assert result.exit_code == 2
     assert fill.calls == []
+
+
+def test_named_securities_reach_the_fill_and_its_drops_are_printed(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    # #876: --security repeats or takes ids joined by commas.
+    cursor = "holes;since=2016-01-01;through=2018-08-31"
+    calls: list[dict[str, Any]] = []
+
+    def fill(settings: Settings, **kwargs: Any) -> HoleFill:
+        calls.append(kwargs)
+        dry = bool(kwargs.get("dry_run", False))
+        runs = () if dry else (SourceRun("alpaca", FILLED, 40, cursor, "holes of 1 names"),)
+        named = (NamedSecurity("0000000002", NO_HOLE),)
+        return HoleFill((HOLE,) if dry else (), runs, dry, ((UNASSIGNED, 3),), named)
+
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    args = [
+        *["ingest", "--backfill", "--since", "2016-01-01", "--source", "alpaca", "--fill-holes"],
+        *["--security", "0001404912,0000000002", "--security", " 0000000003 "],
+    ]
+    dry = _invoke(_with_store(secrets_set), [*args, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    real = _invoke(secrets_set, args)
+    assert real.exit_code == 0, real.output
+    assert [c["securities"] for c in calls] == [["0001404912", "0000000002", "0000000003"]] * 2
+    note = f"3 holes the resolver cannot assign, not fetched (3 {UNASSIGNED})"
+    assert f"; {note}" in dry.output
+    assert f"alpaca: {note}" in real.output
+    for output in (dry.output, real.output):
+        assert f"  0000000002: not fetched, {NO_HOLE}" in output
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--security", "0000000002"],  # no --fill-holes
+        ["--fill-holes", "--source", "alpaca", "--security", "0000000002,"],  # a blank id
+    ],
+)
+def test_bad_security_flags_are_refused_before_any_work(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, extra: list[str]
+) -> None:
+    fill = _FillRecorder()
+    monkeypatch.setattr(cli, "fill_holes", fill)
+    filled = _patched(monkeypatch, "backfill", _ok("alpaca"))
+    result = _invoke(
+        _with_store(secrets_set), ["ingest", "--backfill", "--since", "2016-01-01", *extra]
+    )
+    assert result.exit_code == 2
+    assert fill.calls == [] and filled.calls == []
 
 
 def test_a_fill_holes_run_without_a_store_fails(
