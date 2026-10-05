@@ -1257,7 +1257,11 @@ def _no_lead(settings: Settings) -> Settings:
 
 def test_a_rename_gap_inside_a_month_with_stored_bars_is_a_hole(settings: Settings) -> None:
     _rename_gap(settings)
+    before = _read(settings, "SELECT count(*) FROM prices_daily")
+    runs = _read(settings, "SELECT count(*) FROM ingestion_runs")
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _read(settings, "SELECT count(*) FROM prices_daily") == before
+    assert _read(settings, "SELECT count(*) FROM ingestion_runs") == runs
     assert _holes(found) == [(ACME, JUNE_WINDOW)]
     assert [hole.rename_gap for hole in found.holes] == [True]
     assert found.summary() == (
@@ -1344,3 +1348,20 @@ def test_a_month_only_the_rename_lead_can_fill_is_assignable(settings: Settings)
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
     assert _holes(found) == [(TWIN, MAY_WINDOW)]
     assert dict(found.dropped) == {UNASSIGNED: 1}
+
+
+def test_a_missing_session_the_old_symbol_traded_after_is_no_rename_gap(
+    settings: Settings,
+) -> None:
+    # A halt (or a no-trade day) inside the lead window, with old-symbol bars
+    # after it, is no rename gap: the new symbol has no bar there to fill
+    # it, so it would be refetched on every run. Only the run of sessions
+    # from the old symbol's last bar to the new span is.
+    assert _backfill(settings, _History(), filings=_with_rename()).ok
+    _drop_bars(settings, ACME, (date(2019, 5, 15), date(2019, 5, 15)))
+    _drop_bars(settings, ACME, (date(2019, 6, 28), date(2019, 6, 28)))  # after the rename
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert found.holes == ()
+    _drop_bars(settings, ACME, GAP)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
