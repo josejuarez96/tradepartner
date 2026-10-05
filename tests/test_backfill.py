@@ -30,13 +30,20 @@ from test_ingest import (
     SPY,
     STAT,
     _at,
+    _fact,
     _filings,
     _loose,
     _with_newco,
     _with_stat,
 )
 
-from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling
+from tradepartner.adapters.filings import (
+    CoverListing,
+    CoverPage,
+    DelistingFiling,
+    FilingHeader,
+    FilingIndexEntry,
+)
 from tradepartner.adapters.prices import (
     ActionType,
     Bar,
@@ -45,7 +52,20 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
-from tradepartner.backfill import BACKFILL, FILLED, HOLES, backfill, fill_holes, month_windows
+from tradepartner.backfill import (
+    BACKFILL,
+    FILLED,
+    HALTED,
+    HOLES,
+    NO_HOLE,
+    NOT_ALPACA,
+    UNASSIGNED,
+    UNKNOWN,
+    NamedSecurity,
+    backfill,
+    fill_holes,
+    month_windows,
+)
 from tradepartner.calendar import is_session
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, LOCKED, OK, STALE, ingest_session
@@ -1030,3 +1050,153 @@ def test_a_listing_that_now_runs_on_makes_a_hole_that_the_fill_refetches(
         f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' "
         "AND session BETWEEN DATE '2019-06-01' AND DATE '2019-06-28'",
     ) == [(len(_sessions(*JUNE_WINDOW)),)]
+
+
+# --- holes the resolver cannot assign, and named securities (#876) -----------
+
+SPAC = "0000000005"  # SIC 6770: its unit and warrant class ids are typed spac
+SPAC_UNITS = f"{SPAC}:units"
+SPAC_WARRANTS = f"{SPAC}:redeemable-warrants"
+TWIN, TWIN_2 = "0000000006", "0000000007"  # both list TWIN on one day: ambiguous
+ODD = "0000000008"  # a common class under "ODD1", not an Alpaca symbol
+UNASSIGNABLE = (SPAC_UNITS, SPAC_WARRANTS, TWIN, TWIN_2, ODD)
+
+
+def _with_unassignable() -> Any:
+    """`_filings` plus ids the fetch set holds but no fetched bar can land
+    on: a SPAC's units and warrants (non-equity rows the resolver drops),
+    two companies listing one ticker on one day (ambiguous), and a common
+    class whose ticker has no Alpaca symbol."""
+    units = (
+        "Units, each consisting of one share of Class A Common Stock and one-half of one warrant"
+    )
+    companies = [
+        (
+            SPAC,
+            6770,
+            5,
+            (
+                CoverListing(units, "SPCU", "NASDAQ"),
+                CoverListing("Class A Common Stock", "SPC", "NASDAQ"),
+                CoverListing("Redeemable Warrants", "SPCW", "NASDAQ"),
+            ),
+        ),
+        (TWIN, 3571, 7, (CoverListing("Common Stock", "TWIN", "NYSE"),)),
+        (TWIN_2, 3571, 7, (CoverListing("Common Stock", "TWIN", "NYSE"),)),
+        (ODD, 3571, 8, (CoverListing("Common Stock", "ODD1", "NYSE"),)),
+    ]
+    index, headers, covers, facts = [], [], [], []
+    for cik, sic, day, listings in companies:
+        accession = f"{cik}-19-000001"
+        accepted = _at(2019, 3, day)
+        index.append(FilingIndexEntry(cik, f"Co {cik}", "10-K", accession, accepted))
+        headers.append(FilingHeader(cik, accession, "10-K", sic, accepted))
+        covers.append(CoverPage(cik, accession, accepted, listings))
+        facts.append(_fact(cik, "", 1_000_000, accession, accepted))
+    return _filings(
+        extra_index=index, extra_headers=headers, extra_covers=covers, extra_facts=facts
+    )
+
+
+def _unassignable_holes(settings: Settings, ids: Sequence[str] = UNASSIGNABLE) -> None:
+    """A backfill with the unassignable ids (the stub source has bars for
+    every id), then ACME and each of `ids` lose May."""
+    assert _backfill(settings, _History(), filings=_with_unassignable()).ok
+    for sid in (ACME, *ids):
+        _drop_bars(settings, sid, MAY_WINDOW)
+
+
+def test_a_dry_run_lists_only_holes_the_resolver_can_assign_and_counts_the_rest(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, MAY_WINDOW)]
+    assert dict(found.dropped) == {UNASSIGNED: 4, NOT_ALPACA: 1}
+    assert found.summary().endswith(
+        f"; 5 holes the resolver cannot assign, not fetched (1 {NOT_ALPACA}, 4 {UNASSIGNED})"
+    )
+    assert found.named == ()
+
+
+def test_a_fill_fetches_no_hole_the_resolver_cannot_assign(settings: Settings) -> None:
+    # ODD stays without a bar: 1 of 7 counted names is under the loosened
+    # share, so May fills (a counted name the fill skips still counts).
+    loose = _loose(settings)
+    _unassignable_holes(loose, (SPAC_UNITS, SPAC_WARRANTS, ODD))
+    prices = _History()
+    result = fill_holes(loose, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert prices.fetched == {date(2019, 5, 1): {ACME, SPY}}
+    assert result.runs[0].message.startswith(
+        "holes of 1 names with no stored bar; 3 holes the resolver cannot assign, not fetched"
+    )
+    assert dict(result.dropped) == {UNASSIGNED: 2, NOT_ALPACA: 1}
+
+
+def test_named_securities_limit_the_holes_and_each_unfetched_one_is_listed(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings, (TWIN,))
+    _drop_bars(settings, DUAL, JUNE_WINDOW)
+    named = [ACME, TWIN, DUAL_B, "0000009999"]
+    found = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=named,
+    )
+    assert _holes(found) == [(ACME, MAY_WINDOW)]  # not DUAL's June: not named
+    expected = (
+        NamedSecurity(DUAL_B, NO_HOLE),
+        NamedSecurity(TWIN, f"1 holes not fetched (1 {UNASSIGNED})"),
+        NamedSecurity("0000009999", UNKNOWN),
+    )
+    assert found.named == expected
+    assert dict(found.dropped) == {UNASSIGNED: 1}
+    assert found.lines()[-3:] == [
+        f"  {DUAL_B}: not fetched, {NO_HOLE}",
+        f"  {TWIN}: not fetched, 1 holes not fetched (1 {UNASSIGNED})",
+        f"  0000009999: not fetched, {UNKNOWN}",
+    ]
+    prices = _History()
+    result = fill_holes(
+        _loose(settings), prices=prices, since=SINCE, clock=lambda: LATER, securities=named
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert prices.fetched == {date(2019, 5, 1): {ACME, SPY}}
+    assert result.named == expected
+    assert [r[2] for r in _alpaca_runs(settings) if r[1] == HOLES] == [
+        "holes;since=2019-04-10;through=2019-05-31"
+    ]
+    # No committed month for that --since: a known id has no hole, not "unknown".
+    other = fill_holes(
+        settings,
+        prices=_History(),
+        since=date(2019, 4, 11),
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[ACME],
+    )
+    assert other.holes == () and other.named == (NamedSecurity(ACME, NO_HOLE),)
+
+
+def test_a_named_security_in_a_month_that_halts_is_listed_as_not_filled(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings, ())
+    prices = _History(gaps={(SPY, date(2019, 5, 15))})
+    result = fill_holes(
+        settings, prices=prices, since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [STALE]
+    assert result.named == (NamedSecurity(ACME, HALTED),)
+
+
+def test_named_securities_must_be_ids(settings: Settings) -> None:
+    with pytest.raises(TypeError):
+        fill_holes(settings, prices=_History(), since=SINCE, securities=ACME)
+    with pytest.raises(ValueError):
+        fill_holes(settings, prices=_History(), since=SINCE, securities=[])

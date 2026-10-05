@@ -22,8 +22,8 @@ A personal, local system for researching, testing and paper-trading (then small-
 
 ## Constraints
 - Runs locally, for personal use only.
-- Paper trading first. Live capital is about $100 at most until the charter is amended. ⬜ Account type (taxable or retirement): decide before Phase 6.
-- ⬜ **Compliance:** employer personal-trading policy reviewed. Required before Phase 6; blocks nothing earlier.
+- Paper trading first. Live capital is about $100 at most until the charter is amended. ✅ Account type, *decided 2026-10-04 ([#813](https://github.com/josejuarez96/tradepartner/issues/813#issuecomment-5982649128))*: a **taxable cash account**; falling back to a taxable margin account with margin never used only if the live API needs margin, in which case the Phase 6 live ADR must keep [ADR 0010](decisions/0010-phase-4-risk-rules.md) point 1 (buys sized within `account().cash`, never `buying_power`) and its item 6 reserve of our own open buys. That ADR also records the two broker facts this choice rests on (whether the live API needs margin; whether `account().cash` on a cash account includes unsettled sell proceeds) and the account actually opened. Retirement account rejected (#813).
+- ⬜ **Compliance:** employer personal-trading policy reviewed. Required before Phase 6; blocks nothing earlier. *Procedure decided 2026-10-04 ([#813](https://github.com/josejuarez96/tradepartner/issues/813#issuecomment-5982649128), option (a)):* the owner obtains the policy, records on #813 what it requires (pre-clearance, restricted list, holding period, duplicate statements), and ticks this line with the date, before plan task T75b.
 - **Budget:** set by [ADR 0009](decisions/0009-price-vendor.md) at $0/month for spend **by the running system** (data, APIs, LLM calls; development tooling excluded) from Phase 3 until a later ADR changes it (data-vendor spend had been deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md)).
 - **Time:** no fixed weekly hours. Build and review hours are recorded in each phase retro, and the 6-month stop criterion above applies. The owner reviews and merges every PR (~≤400 lines each).
 
