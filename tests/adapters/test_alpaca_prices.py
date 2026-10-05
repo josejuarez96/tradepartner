@@ -1383,8 +1383,50 @@ class TestSuccessorDuplicate:
         )
         assert resolver.resolve("FYBR", date(2022, 1, 3)) == "0000020520@2021-08-05-2"
 
+    @pytest.mark.parametrize("second", [False, True])
+    def test_a_successor_of_a_successor_holds_the_ticker(self, second: bool) -> None:
+        # code-review on #886: a second relisting succeeds the first successor.
+        day = date(2022, 1, 3)
+        newer = "0000000001@2021-06-01-2" if second else "0000000001@2022-01-03"
+        older = "0000000001@2021-06-01" if second else "0000000001@2018-01-02"
+        resolver = ListingResolver(
+            [
+                _listing(older, "CCC", day, "Common Stock"),
+                _listing(newer, "CCC", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("CCC", date(2023, 1, 3)) == newer
+        assert resolver.report.successor_duplicates == 1
+
+    @pytest.mark.parametrize("order", [1, -1])
+    def test_a_disputed_predecessor_never_outwaits_its_successor(self, order: int) -> None:
+        # quant-auditor and code-review on #886: both rows claim a live
+        # holder's ticker; once the holder moves on, the successor holds it.
+        holder, pred, succ = "0000000009", "0000000005", "0000000005@2020-08-10"
+        day, moved = date(2020, 8, 10), date(2021, 3, 1)
+        rows = [
+            _listing(holder, "XX", date(2010, 1, 4), "Common Stock"),
+            _listing(holder, "YY", moved, "Common Stock"),
+            _listing(pred, "PP", date(2010, 1, 4), "Common Stock"),
+            *[_listing(sid, "XX", day, "Common Stock") for sid in (pred, succ)[::order]],
+        ]
+        facts = [
+            _shares(holder, date(2022, 6, 30), 100.0, date(2022, 8, 1)),
+            _shares(pred, date(2022, 6, 30), 50.0, date(2022, 8, 1)),
+        ]
+        resolver = ListingResolver(rows, _evidence(facts))
+        assert resolver.resolve("XX", date(2020, 9, 1)) is None  # the holder's wait
+        assert resolver.resolve("XX", date(2022, 1, 3)) == succ
+        assert resolver.report.successor_duplicates == 1
+
     @pytest.mark.parametrize(
-        "other", ["0000000002@2021-08-05", "0000020520:x@2021-08-05", "0000020520@21-08-05"]
+        "other",
+        [
+            "0000000002@2021-08-05",
+            "0000020520:x@2021-08-05",
+            "0000020520@21-08-05",
+            "0000020520@2021-08-05x",
+        ],
     )
     def test_anything_else_on_the_same_day_stays_ambiguous(self, other: str) -> None:
         day = date(2021, 8, 5)

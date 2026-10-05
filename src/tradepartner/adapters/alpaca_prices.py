@@ -47,8 +47,9 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   are **ambiguous**: the ticker resolves to nothing while they are the
   latest, and the run goes on. Not so a repair successor (`<cik>@<date>`)
   and its own company's span (#874): that is the predecessor's copy of the
-  successor's row, so the predecessor's span is dropped (after the
-  contested rule) and the successor holds the ticker;
+  successor's row, so the predecessor's span is dropped before rules 3
+  and 6 (the contested rule still sees it) and the successor holds the
+  ticker, also over an older successor of the company;
 - a span is **contested** when its ticker is later taken by another
   security that arrived at it through a rename (Roundhill's `META` ETF,
   then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
@@ -497,6 +498,20 @@ class ListingResolver:
                     same_day_listings += index - first
                 else:
                     self._by_ticker[ticker].append(span)
+        # A repair successor's row duplicating its predecessor's (#874) holds
+        # the ticker alone: the predecessor's span is dropped before any other
+        # rule, so it is never a tie (rule 4) nor a rival claim (rule 6). The
+        # contested rule still sees it, so a rename into the ticker counts.
+        duplicated = {
+            span
+            for spans in self._by_ticker.values()
+            for span in spans
+            if any(
+                o.start == span.start and _succeeds(o.security_id, span.security_id) for o in spans
+            )
+        }
+        for spans in self._by_ticker.values():
+            spans[:] = [span for span in spans if span not in duplicated]
         later_class = {
             span
             for spans in self._by_ticker.values()
@@ -538,22 +553,9 @@ class ListingResolver:
                 other.security_id != span.security_id
                 and other.start > span.start
                 and self._renamed_into(other)
-                for other in spans
+                for other in (*spans, *(d for d in duplicated if d.ticker == span.ticker))
             )
         )
-        # A repair successor's row duplicating its predecessor's (#874) holds
-        # the ticker alone: the predecessor's span is dropped, never a tie.
-        # After the contested rule, so a rename into the ticker still counts.
-        duplicated = {
-            span
-            for spans in self._by_ticker.values()
-            for span in spans
-            if any(
-                o.start == span.start and _succeeds(o.security_id, span.security_id) for o in spans
-            )
-        }
-        for spans in self._by_ticker.values():
-            spans[:] = [span for span in spans if span not in duplicated]
         ambiguous = {
             span
             for spans in self._by_ticker.values()
@@ -737,14 +739,22 @@ def _company(security_id: str) -> str:
 
 #: A repair successor's id (#820, `store.master`): `<cik>@<valid_from>`,
 #: with `-<n>` when that id was taken.
-_SUCCESSOR_ID = re.compile(r"(\d+)@\d{4}-\d{2}-\d{2}(?:-\d+)?")
+_SUCCESSOR_ID = re.compile(r"(\d+)@(\d{4}-\d{2}-\d{2})(?:-(\d+))?")
 
 
 def _succeeds(successor: str, security_id: str) -> bool:
     """True when `successor` is a repair successor id of `security_id`'s
-    company (`<cik>@<date>` for `<cik>` or `<cik>:<class>`; #874)."""
+    company (#874): `<cik>@<date>` for `<cik>`, `<cik>:<class>`, or an
+    older successor `<cik>@<earlier date>` (a second relisting; on one
+    date, the `-<n>` id made later)."""
     match = _SUCCESSOR_ID.fullmatch(successor)
-    return match is not None and successor != security_id and _company(security_id) == match[1]
+    if match is None or successor == security_id:
+        return False
+    older = _SUCCESSOR_ID.fullmatch(security_id)
+    if older is None:
+        return _company(security_id) == match[1]
+    mine = (match[2], int(match[3] or 1))
+    return older[1] == match[1] and (older[2], int(older[3] or 1)) < mine
 
 
 def _holds_before(holder: TickerSpan, span: TickerSpan) -> bool:
