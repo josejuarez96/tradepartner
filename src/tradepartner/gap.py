@@ -26,7 +26,8 @@ not counted.
   filing) is not missing.
 - **Count share** = |M| / |L|. **Size share** = sum of value over M /
   sum over L, value = the latest `shares_outstanding` fact known at `t`
-  (universe rule 7's selection) x the last raw close known at `t`, the
+  (universe rule 7's selection, so an out-of-line fact falls back to the
+  last accepted one, #845) x the last raw close known at `t`, the
   shares moved to the close's session by every split known at `t` between
   the two dates. A name with no close or no single shares value is worth
   zero and still counted. Both shares are 0.0 when L is empty.
@@ -209,7 +210,7 @@ def survivorship_gap(
     ids = sorted(active & common)
 
     bars = _last_bars(conn, t, session, ids)
-    shares, _ = latest_shares_as_of(conn, t, ids)
+    shares, _ = latest_shares_as_of(conn, t, ids, settings)
     splits = _split_factors(conn, t, ids, session)
 
     def worth(sid: str) -> float:

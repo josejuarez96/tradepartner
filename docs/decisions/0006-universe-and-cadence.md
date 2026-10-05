@@ -44,6 +44,8 @@ Filters apply **in this order**; the top-N cut is last, so the result has exactl
 
 *Amendment 2026-10-04 (#787):* in rule 6 "a bar" means a traded bar (volume above zero). Rule 6 also fails a name with an unexplained one-day price jump in the window that the owner has not accepted (reason `price_jump`, not missing data). See the [data-foundation spec](../specs/data-foundation.md), "price-quality gate".
 
+*Amendment 2026-10-04 (#845):* in rule 7 the shares fact is the latest one known at T that is **in line** with the security's last accepted earlier fact. In line means a ratio within `universe.max_shares_ratio` (100) either way, after the splits known at T between the two dates; the owner can also accept a fact through `universe.accepted_shares_facts`. An out-of-line fact (a filer scale error) is rejected, and the last accepted fact is used instead, under the same age limit. See the [data-foundation spec](../specs/data-foundation.md), "shares plausibility".
+
 Names dropped by rules 1, 6 or 7 for **missing data** (unclassifiable type, truncated price history, no or stale shares fact) are counted in the survivorship-gap report (ADR 0003 rule 5) as separate categories, so every exclusion is visible.
 
 The owner confirmed on 2026-09-24 that the exclusion covers the **entire** SIC 4900–4999 division (electric, gas, water, sanitary services and related), with no carve-outs: nothing utilities-adjacent is in scope.

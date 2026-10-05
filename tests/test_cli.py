@@ -511,6 +511,50 @@ def test_health_prints_the_price_jump_review_list(tmp_path: Path, fixture_store_
     assert bad.exit_code == 2
 
 
+def _shares_fact(
+    conn: duckdb.DuckDBPyConnection, security_id: str, as_of: date, value: float
+) -> None:
+    known = datetime(as_of.year, as_of.month, as_of.day, 21, 0, tzinfo=UTC) + timedelta(days=1)
+    insert_row(
+        conn,
+        "facts",
+        {
+            "security_id": security_id,
+            "fact_name": "shares_outstanding",
+            "as_of_date": as_of,
+            "class_member": "",
+            "value": value,
+            "filing_accession": f"cli-{security_id}-{as_of.isoformat()}",
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_health_prints_the_shares_outlier_review_list(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#845: out-of-line shares facts are listed, a zero one too (no ratio)."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert "shares outliers: 0 to review, 0 in all" in plain.output
+    with open_for_write(settings) as conn:
+        _shares_fact(conn, "SEC_SPLIT_BETWEEN", date(2019, 2, 28), 15e9)
+        _shares_fact(conn, "SEC_SPLIT_BETWEEN", date(2019, 5, 31), 0)
+        _shares_fact(conn, "SEC_ZERO_FIRST", date(2019, 1, 31), 0)
+    checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert checked.exit_code == 0, checked.output
+    assert "shares outliers: 3 to review, 3 in all" in checked.output
+    assert "SEC_SPLIT_BETWEEN@2019-02-28 15000000000 (x1000 over 5000000" in checked.output
+    assert "SEC_SPLIT_BETWEEN@2019-05-31 0 (not a share count" in checked.output
+    assert "SEC_ZERO_FIRST@2019-01-31 0 (not a share count" in checked.output
+    assert "integrity:" in checked.output
+    capped = _invoke(settings, ["health", "--jumps-before", "2019-03-01"], clock=lambda: T_END)
+    assert "shares outliers before 2019-03-01: 2 to review, 2 in all" in capped.output
+
+
 def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

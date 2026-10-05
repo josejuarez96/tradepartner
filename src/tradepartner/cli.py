@@ -22,8 +22,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   a usage error (2), with nothing fetched.
 - `tradepartner health [--check] [--jumps-before DATE]` prints
   `health.health_report` at the current time; `--jumps-before` limits the
-  price-jump review list (#787) to sessions before DATE, so the owner can
-  review a hypothesis's in-sample jumps without reading its holdout period.
+  price-jump review list (#787) to sessions before DATE, and the
+  shares-outlier review list (#845) to facts dated before it, so the owner
+  can review a hypothesis's in-sample entries without reading its holdout
+  period.
   `--check` exits 1 when any integrity rule fails and names the rules. It
   also warns, without failing, when the latest EDGAR run row reports
   quarantined accessions (the T11h failure policy): those filings get no
@@ -295,6 +297,20 @@ def _print_report(report: HealthReport) -> None:
             f"  {row['security_id']}@{row['session']} {row['prev_close']} -> {row['close']} "
             f"(x{row['ratio']:.2f} since {row['prev_session']})"
         )
+    outliers = report.shares_outliers
+    shown = "" if outliers.before is None else f" before {outliers.before.isoformat()}"
+    echo(
+        f"shares outliers{shown}: {outliers.pending.height} to review, "
+        f"{outliers.frame.height} in all"
+    )
+    for row in outliers.pending.iter_rows(named=True):
+        why = (
+            "not a share count"
+            if row["ratio"] is None
+            else f"x{row['ratio']:.4g} over {row['baseline_value']:.0f} "
+            f"as of {row['baseline_as_of']}"
+        )
+        echo(f"  {row['security_id']}@{row['as_of_date']} {row['value']:.0f} ({why})")
     echo(f"settings: {report.settings}")
     echo("integrity:")
     for check in report.integrity:
@@ -604,7 +620,10 @@ def make_app(
         jumps_before: Annotated[
             str | None,
             typer.Option(
-                help="list only price jumps before this day (a holdout start), YYYY-MM-DD"
+                help=(
+                    "list only price jumps and shares outliers before this day "
+                    "(a holdout start), YYYY-MM-DD"
+                )
             ),
         ] = None,
     ) -> None:
