@@ -17,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from tradepartner.config import (
+    ALLOWED_AXIS_PREFIXES,
     FAMILY_PARENTS,
     FORBIDDEN_AXIS_PREFIXES,
     FROZEN_EXECUTION_KEYS,
@@ -26,6 +27,7 @@ from tradepartner.config import (
     PaperConfig,
     Settings,
     _default_env_file,
+    _settings_has_key,
 )
 
 
@@ -575,11 +577,35 @@ def test_forbidden_axis_prefixes_pinned() -> None:
     )
 
 
+def test_allowed_axis_prefixes_pinned() -> None:
+    """Pinned by value (Amendment 2026-10-05 (#952, owner): allow-listed to
+    `strategy.*` and `schedule.*`, closing #955's `risk.*`/`paper.*`/`alerts.*` gap)."""
+    assert ALLOWED_AXIS_PREFIXES == ("strategy.", "schedule.")
+
+
 @pytest.mark.parametrize("prefix", FORBIDDEN_AXIS_PREFIXES)
 def test_sweepable_keys_entry_under_a_forbidden_prefix_rejected(prefix: str) -> None:
     key = prefix if prefix.endswith(".") else f"{prefix}."
     with pytest.raises(ValidationError, match="forbidden prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": [f"{key}bogus"], "axis_lattice": {}})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "risk.max_drawdown",
+        "paper.tracking_k",
+        "alerts.delivery_timeout_seconds",
+        "lab.max_variants_per_sweep",
+        "store.path",
+    ],
+)
+def test_sweepable_keys_entry_outside_the_allowed_prefixes_rejected(key: str) -> None:
+    """#955: a deny-list alone let `risk.*`, `paper.*` and `alerts.*` through; the
+    allow-list (Amendment 2026-10-05 (#952, owner)) refuses any section but
+    `strategy.*`/`schedule.*`, whether or not `Settings` actually has the key."""
+    with pytest.raises(ValidationError, match="not under an allowed prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": [key], "axis_lattice": {}})
 
 
 def test_sweepable_keys_entry_settings_lacks_rejected() -> None:
@@ -590,24 +616,49 @@ def test_sweepable_keys_entry_settings_lacks_rejected() -> None:
         )
 
 
-def test_sweepable_keys_entry_unknown_top_level_section_rejected() -> None:
+def test_sweepable_keys_entry_unknown_field_in_an_allowed_section_rejected() -> None:
+    """A key under an allowed prefix but naming no real field still fails the
+    `Settings`-existence check, reached only once it clears `ALLOWED_AXIS_PREFIXES`."""
     with pytest.raises(ValidationError, match="names a key Settings lacks"):
-        Settings(_env_file=None, lab={"sweepable_keys": ["not_a_section.key"], "axis_lattice": {}})
+        Settings(
+            _env_file=None,
+            lab={"sweepable_keys": ["schedule.not_a_real_field"], "axis_lattice": {}},
+        )
 
 
 @pytest.mark.parametrize(
     "bare_key",
-    ["universe", "costs", "holdout", "alpaca_api_key"],
+    ["universe", "costs", "holdout", "alpaca_api_key", "not_a_section"],
 )
 def test_sweepable_keys_entry_without_a_dot_rejected(bare_key: str) -> None:
-    """A bare top-level name is refused even when `Settings` has a field by that
-    name: `universe`/`costs`/`holdout` name a whole section and `alpaca_api_key` a
-    secret scalar, and none is one `strategy.*`/`schedule.*`-shaped field a grid can
-    vary. Closes the gap where a bare forbidden-section name (`"universe"`, no
-    trailing dot) slipped past the `FORBIDDEN_AXIS_PREFIXES` `startswith` check,
-    since a bare name never matches a dotted prefix (#952 reviewer findings)."""
-    with pytest.raises(ValidationError, match="names a key Settings lacks"):
+    """A bare top-level name is refused, under `ALLOWED_AXIS_PREFIXES` (Amendment
+    2026-10-05 (#952, owner)): `universe`/`costs`/`holdout` name a whole section and
+    `alpaca_api_key` a secret scalar, and none is one `strategy.*`/`schedule.*`-shaped
+    field a grid can vary. `_settings_has_key` on its own also refuses a bare name
+    outright (closing the gap where it slipped past the old `FORBIDDEN_AXIS_PREFIXES`
+    `startswith` check, since a bare name never matches a dotted prefix; #952 reviewer
+    findings), exercised directly below."""
+    with pytest.raises(ValidationError, match="not under an allowed prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": [bare_key], "axis_lattice": {}})
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["universe", "costs", "alpaca_api_key", "not_a_section", "strategy", "strategy."],
+)
+def test_settings_has_key_refuses_every_bare_or_dotless_name(key: str) -> None:
+    """Unit test on `_settings_has_key` itself, independent of the allow-list: it
+    requires a non-empty `section.field` shape, so a bare name or a trailing-dot-only
+    string is never treated as a real key, whether or not `Settings` has a field or a
+    section by that name."""
+    assert _settings_has_key(key) is False
+
+
+def test_settings_has_key_accepts_a_real_dotted_field() -> None:
+    assert _settings_has_key("strategy.formation_months") is True
+    assert _settings_has_key("schedule.rebalance_cadence") is True
+    assert _settings_has_key("strategy.not_a_real_field") is False
+    assert _settings_has_key("not_a_section.key") is False
 
 
 def test_sweepable_keys_entry_bare_exact_forbidden_name_rejected() -> None:

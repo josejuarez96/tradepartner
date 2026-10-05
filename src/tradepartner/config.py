@@ -672,7 +672,9 @@ class ScheduleConfig(BaseModel):
 # tuned on P&L (ADR 0006 guard a), `execution.fill_price` is a convention (ADR 0006), and
 # the rest are data or accounting rules a hypothesis never varies. Pinned by value in
 # tests/test_config.py; the `Settings` validator below refuses any `lab.sweepable_keys`
-# entry under one of these.
+# entry under one of these, kept as a second, belt-and-braces check alongside
+# `ALLOWED_AXIS_PREFIXES` below (Amendment 2026-10-05 (#952, owner)): were a forbidden
+# prefix ever also an allowed one, this still refuses it.
 FORBIDDEN_AXIS_PREFIXES: tuple[str, ...] = (
     "costs.",
     "universe.",
@@ -686,6 +688,14 @@ FORBIDDEN_AXIS_PREFIXES: tuple[str, ...] = (
     "alpaca.",
     "execution.",
 )
+
+# Amendment 2026-10-05 (#952, owner): sweepable keys are allow-listed to `strategy.*`
+# and `schedule.*` rather than relying on `FORBIDDEN_AXIS_PREFIXES` alone (a deny-list
+# that, unamended, let `risk.*`, `paper.*` and `alerts.*` through, #955). A new axis
+# family needs a reviewed code change here, because `lab.sweepable_keys` itself comes
+# from config, which is set from the unreviewed `.env`. Pinned by value in
+# tests/test_config.py.
+ALLOWED_AXIS_PREFIXES: tuple[str, ...] = ("strategy.", "schedule.")
 
 _DEFAULT_SWEEPABLE_KEYS: tuple[str, ...] = (
     "strategy.formation_months",
@@ -714,8 +724,9 @@ class LabConfig(BaseModel):
     """Strategy-lab sweep rules (strategy-lab spec "Config keys").
 
     `sweepable_keys` names every `Settings` key a sweep file's `[grid]` may vary
-    (validated against `FORBIDDEN_AXIS_PREFIXES` and against `Settings` itself on the
-    `Settings` model, since that check needs the whole model); `axis_lattice` is a step
+    (validated against `ALLOWED_AXIS_PREFIXES`, `FORBIDDEN_AXIS_PREFIXES` and against
+    `Settings` itself on the `Settings` model, since that check needs the whole model);
+    `axis_lattice` is a step
     per continuous sweepable key (an integer axis needs none) and its keys must be a
     subset of `sweepable_keys`. `promotion_min_dsr_excess` and `min_sharpe_variance_annual`
     are the promotion floor and the V floor (spec open question 4); `max_variants_per_sweep`
@@ -1038,14 +1049,24 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_lab_sweepable_keys(self) -> Settings:
-        """`lab.sweepable_keys` (strategy-lab spec req 1) may name only a real
-        `Settings` key, outside `FORBIDDEN_AXIS_PREFIXES`; this needs the whole model
-        (to resolve a dotted key), so it lives here rather than on `LabConfig` alone."""
+        """`lab.sweepable_keys` (strategy-lab spec req 1; Amendment 2026-10-05 (#952,
+        owner)) may name only a real `Settings` key under `ALLOWED_AXIS_PREFIXES`
+        (`strategy.*`/`schedule.*`) and outside `FORBIDDEN_AXIS_PREFIXES` (kept as a
+        second, belt-and-braces check); this needs the whole model (to resolve a
+        dotted key), so it lives here rather than on `LabConfig` alone. The forbidden
+        check runs first only so its message names the specific prefix; in today's
+        two disjoint lists either order refuses the same keys."""
         for key in self.lab.sweepable_keys:
             if key.startswith(FORBIDDEN_AXIS_PREFIXES):
                 raise ValueError(
                     f"lab.sweepable_keys entry {key!r} is under a forbidden prefix "
                     f"{FORBIDDEN_AXIS_PREFIXES}"
+                )
+            if not key.startswith(ALLOWED_AXIS_PREFIXES):
+                raise ValueError(
+                    f"lab.sweepable_keys entry {key!r} is not under an allowed prefix "
+                    f"{ALLOWED_AXIS_PREFIXES}: a new axis family needs a reviewed code "
+                    "change (strategy-lab spec, Amendment 2026-10-05 (#952))"
                 )
             if not _settings_has_key(key):
                 raise ValueError(f"lab.sweepable_keys entry {key!r} names a key Settings lacks")
