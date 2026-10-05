@@ -169,7 +169,9 @@ per-accession FSN failure and every per-document failure (cover page, SGML
 header, delisting notice) stay with the failure policy above, one policy
 (owner option (a) on #808): `check_failures` fails the run only where its
 rules fire, and its message lists the run's unaccepted per-document
-failures, bounded, with `failed_filings.json` as the full list.
+failures, bounded, naming a file under `edgar.cache_dir/validation/` that
+holds the full list whenever the check fails with them, dry run or not
+(#884).
 """
 
 from __future__ import annotations
@@ -247,6 +249,9 @@ COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: Bumped when the layout of `check_failures`'s full-list file changes (#884).
+FILING_FAILURES_LIST_VERSION = 1
+
 #: Bumped to retry every accession in `failed_filings.json` (T11h): deleting
 #: an entry by hand un-quarantines one accession; bumping this un-quarantines
 #: every one and resets every count.
@@ -1654,24 +1659,32 @@ class EdgarFilingSource(FilingSource):
         owner option (a) on #808):
         their count, then the first `edgar.max_validation_listed` as
         `accession error_class/base_form: message`, each message cleaned
-        (`_stored_message`). The full list is `failed_filings.json` (written
-        on a non-dry run by `record_failed_check`); accepting one stays the
-        hand edit there."""
+        (`_stored_message`). Whenever the check fails with such failures, dry
+        run or not, the full list is written to a JSON file under
+        `edgar.cache_dir/validation/`, named at the very start of the
+        message, so the run row's `ingest.max_message_chars` cut keeps it
+        whatever the reasons' length (#884); `failed_filings.json` (written
+        on a non-dry run by `record_failed_check`) holds them too, and
+        accepting one stays the hand edit there."""
         reasons: list[str] = []
         self._check_fsn_group(reasons)
         self._check_per_document_group(reasons)
         self._check_cross_day_pairs(reasons)
         if reasons:
+            full_list, listing = self._unaccepted_listing()
             raise FilingFailuresError(
-                "; ".join(reasons)
+                full_list
+                + "; ".join(reasons)
                 + f"; failure messages in {self._failed_filings_path()} (not on a dry run)"
                 + f" and the FSN manifests under {self._fsn_root() / 'manifests'}"
-                + self._unaccepted_listing()
+                + listing
             )
 
-    def _unaccepted_listing(self) -> str:
-        """`check_failures`'s bounded list of this run's unaccepted
-        per-document failures, or "" when there are none."""
+    def _unaccepted_listing(self) -> tuple[str, str]:
+        """`check_failures`'s message parts for this run's unaccepted
+        per-document failures: where their full list was written (the
+        message's first part) and the bounded list (its last); both "" when
+        there are none."""
         unaccepted = [
             (accession, error_class, base_form, message)
             for accession, (error_class, base_form, message) in sorted(
@@ -1680,16 +1693,48 @@ class EdgarFilingSource(FilingSource):
             if not self._accepted(accession, error_class, message)
         ]
         if not unaccepted:
-            return ""
+            return "", ""
+        try:
+            where = str(self._write_unaccepted_listing(unaccepted))
+        except OSError as error:  # the check still fails, unlisted on disk
+            where = self._stored_message(f"not written ({type(error).__name__}: {error})")
         limit = self._settings.edgar.max_validation_listed
         listed = "; ".join(
             self._stored_message(f"{accession} {error_class}/{base_form}: {message}")
             for accession, error_class, base_form, message in unaccepted[:limit]
         )
         return (
+            f"full list of this run's {len(unaccepted)} unaccepted filing failures: {where}; ",
             f"; this run's unaccepted filing failures (per-document and fact collisions): "
-            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}"
+            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}",
         )
+
+    def _write_unaccepted_listing(self, unaccepted: Sequence[tuple[str, str, str, str]]) -> Path:
+        """Write every one of `check_failures`'s unaccepted failures to a new
+        JSON file under `edgar.cache_dir/validation/` (beside the input
+        validation gate's lists) and return its path (#884): a dry run
+        writes no `failed_filings.json`, and the message lists only the
+        first `edgar.max_validation_listed`. Messages are cleaned as on
+        disk elsewhere (`_stored_message`)."""
+        now = self._now()
+        path = (
+            self._cache / "validation" / f"filing-failures-{now.strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        )
+        payload = {
+            "version": FILING_FAILURES_LIST_VERSION,
+            "written_at": now.isoformat(),
+            "failures": [
+                {
+                    "accession": accession,
+                    "error_class": error_class,
+                    "base_form": base_form,
+                    "message": self._stored_message(message),
+                }
+                for accession, error_class, base_form, message in unaccepted
+            ],
+        }
+        edgar_raw.write_atomic(path, json.dumps(payload, indent=1).encode("utf-8"))
+        return path.resolve()
 
     def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
         min_n = self._settings.edgar.min_failed_filings
