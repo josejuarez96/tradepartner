@@ -24,6 +24,28 @@ A `PriceSource` record carries no `ingested_at` (ingest stamps it), so the
 suite checks an adapter's **ingest history**: each record paired with the
 `ingested_at` it was written at. For the fixture that pairing is the
 fixture CSVs themselves, which are the recorded ingest log.
+
+**`StatementFactViolation`** (#660, T76b) is a second, separate pair of
+broken constructs for `statement_facts`, below `BrokenPriceSource` and
+unrelated to it: a statement fact has no revision and no `ingested_at`
+ingest history of its own shape (module docstring above, and
+`store.schema`'s "no `known_at` in the key" note), only the single rule
+the spec's acceptance criterion names -- a stored `known_at` must be the
+filing's own acceptance, never a proxy derived from the fact's `period_end`
+or from the companyfacts `filed` date (both of which a real ingest reads,
+T77b, but never stamps `known_at` with):
+
+- `AT_PERIOD_END_CLOSE`: stamped at the XNYS session close of the fact's
+  own `period_end`, as if "when the period ended" were "when it became
+  knowable".
+- `AT_FILED_MIDNIGHT`: stamped at midnight UTC of the companyfacts `filed`
+  date, as if the ingest's hold-rule comparison date were itself a
+  `known_at`.
+
+Both proxies land strictly before the filing's true acceptance in this
+fixture's numbers (a period ends and a filing is drafted before SEC
+acceptance), so both are look-ahead in the as-of sense this module's other
+violations are: knowable, under the broken stamp, before they truly were.
 """
 
 from __future__ import annotations
@@ -31,11 +53,12 @@ from __future__ import annotations
 import csv
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from functools import cache
 from pathlib import Path
 
+from tradepartner.adapters.filings import StatementFactRecord
 from tradepartner.adapters.fixture_prices import FixturePriceSource
 from tradepartner.adapters.prices import (
     ActionType,
@@ -281,3 +304,63 @@ class BrokenPriceSource(PriceSource):
             ),
             key=lambda a: (a.key, a.known_at),
         )
+
+
+class StatementFactViolation(StrEnum):
+    """The two ways a statement fact's stored `known_at` could be wrong
+    (module docstring; spec acceptance: "the stamp precedes the filing's
+    acceptance")."""
+
+    AT_PERIOD_END_CLOSE = "statement_fact_at_period_end_close"
+    AT_FILED_MIDNIGHT = "statement_fact_at_filed_midnight"
+
+
+@dataclass(frozen=True)
+class BrokenStatementFact:
+    """One `StatementFactRecord` paired with the `known_at` the store
+    column would hold -- a correct ingest always stamps it at `record.
+    accepted_at` (T77b); `known_at` here may be that or one of the two
+    wrong proxies `broken_statement_fact` builds."""
+
+    record: StatementFactRecord
+    known_at: datetime
+
+
+#: Ground truth for `broken_statement_fact`/`clean_statement_fact`: a
+#: filing accepted after both its own period end and its `filed` date, so
+#: every proxy below lands strictly before the true acceptance.
+_STATEMENT_FACT_RECORD = StatementFactRecord(
+    cik="0009900001",
+    fact_name="revenue",
+    xbrl_tag="us-gaap:Revenues",
+    period_start=date(2020, 1, 1),
+    period_end=date(2020, 12, 31),
+    value=1_000_000.0,
+    unit="USD",
+    form="10-K",
+    accession="0009900001-21-000001",
+    accepted_at=datetime(2021, 2, 20, 21, 5, tzinfo=UTC),
+    filed=date(2021, 2, 18),
+    comparative=False,
+)
+
+
+def clean_statement_fact() -> BrokenStatementFact:
+    """`_STATEMENT_FACT_RECORD` stamped correctly, at its own
+    `accepted_at` -- the baseline a `StatementFactViolation` check must
+    pass, proving the check does not fire on correct data."""
+    accepted_at = _STATEMENT_FACT_RECORD.accepted_at
+    assert accepted_at is not None  # this record is always stamped
+    return BrokenStatementFact(_STATEMENT_FACT_RECORD, accepted_at)
+
+
+def broken_statement_fact(violation: StatementFactViolation) -> BrokenStatementFact:
+    """`_STATEMENT_FACT_RECORD` paired with the wrong `known_at`
+    `violation` stamps it at instead of its own `accepted_at` (module
+    docstring)."""
+    record = _STATEMENT_FACT_RECORD
+    if violation is StatementFactViolation.AT_PERIOD_END_CLOSE:
+        known_at = session_close(record.period_end)
+    else:
+        known_at = datetime.combine(record.filed, time.min, tzinfo=UTC)
+    return BrokenStatementFact(record, known_at)

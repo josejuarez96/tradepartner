@@ -146,8 +146,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_10() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 10
+def test_current_schema_version_is_11() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 11
 
 
 def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
@@ -164,16 +164,20 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 # --- fresh store and migration --------------------------------------------------------
 
 
-def test_fresh_init_creates_the_journal_at_version_10(journal: duckdb.DuckDBPyConnection) -> None:
+def test_fresh_init_creates_the_journal_at_version_11(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [10]
+    assert _versions(journal) == [11]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
     v4_path: Path,
 ) -> None:
     kept = schema.TABLE_NAMES + schema.REGISTRY_TABLE_NAMES
-    kept_without_versions = tuple(name for name in kept if name != "schema_version")
+    # Version 11 (#859) rebuilds the retractable master tables, every row kept
+    # (`tests/store/test_retraction_schema.py`).
+    kept_without_versions = tuple(
+        name for name in kept if name != "schema_version" and name not in schema.RETRACTABLE_TABLES
+    )
     conn = duckdb.connect(str(v4_path))
     try:
         assert _table_names(conn).isdisjoint(schema.JOURNAL_TABLE_NAMES)
@@ -188,8 +192,10 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         conn.close()
     assert after == before
     assert versions[:1] == applied_before
-    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10]
-    assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES)
+    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11]
+    assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
+        schema.MASTER_CHECK_TABLE_NAMES
+    )
 
 
 def test_migrated_journal_matches_a_fresh_store(
@@ -211,7 +217,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
         conn.close()
     with duckdb.connect(str(v4_path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10]
+        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11]
 
 
 def test_an_unknown_later_version_is_refused(tmp_path: Path) -> None:

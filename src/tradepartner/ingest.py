@@ -27,8 +27,11 @@ ended. Delisted names whose `effective_on` is not past are still fetched
 current listing is `snapshot_static` and that has no bar is named in the
 run message with its own count, not counted (#784); so is any other name
 with no bar now or at the previous session in the store, unless it is a
-benchmark or first listed this session, or the store has no bar at all at
-the previous session.
+benchmark or first listed on one of `universe.exchanges` this session (an
+up-listing from OTC is a first listing), or the store has no bar at all at
+the previous session. The names so reported (dark plus snapshot-only) make
+the run stale when they are more than `ingest.max_dark_share` of the listed
+names (#796).
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -84,7 +87,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -127,6 +130,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import MasterBuild, build_master, securities_as_of
+from tradepartner.store.retraction import record_underived, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
@@ -143,8 +147,11 @@ Row = dict[str, Any]
 #: Per table: the natural key an as-of read collapses on, and the value
 #: columns whose change makes a new row.
 _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "securities": (("security_id",), ("cik", "name", "benchmark")),
-    "listings": (("security_id", "ticker", "exchange", "valid_from"), ("class_title",)),
+    "securities": (("security_id",), ("cik", "name", "benchmark", "retracted")),
+    "listings": (
+        ("security_id", "ticker", "exchange", "valid_from"),
+        ("class_title", "retracted"),
+    ),
     "classifications": (("security_id",), ("sic", "security_type", "rule")),
     "delistings": (
         ("security_id", "form", "class_title", "exchange", "filed_at"),
@@ -155,6 +162,10 @@ _TABLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 
 #: What makes an action row a new revision of its identity (`CorporateAction.same_values`).
+#: A value column a builder row may leave out, and what it means then: a
+#: master row is live unless a retraction says otherwise (#859).
+_VALUE_DEFAULTS: dict[str, Any] = {"retracted": False}
+
 _ACTION_VALUES: tuple[str, ...] = ("action_type", "ex_date", "ratio_or_amount", "cancelled")
 
 
@@ -221,9 +232,9 @@ def ingest_session(
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
-    work: dict[str, Callable[[duckdb.DuckDBPyConnection], tuple[int, str]]] = {
-        "edgar": lambda conn: _ingest_filings(conn, settings, recorded, clock),
-        "alpaca": lambda conn: _write_prices(conn, fetched["alpaca"]),
+    work: dict[str, Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]]] = {
+        "edgar": lambda conn, run_id: _ingest_filings(conn, settings, recorded, clock, run_id),
+        "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
     fetched: dict[str, _PriceFetch] = {}
     prepare: dict[str, Callable[[], object] | None] = {
@@ -258,7 +269,7 @@ def ingest_session(
 
 def _run_source(
     name: str,
-    work: Callable[[duckdb.DuckDBPyConnection], tuple[int, str]],
+    work: Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]],
     settings: Settings,
     now: datetime,
     clock: Callable[[], datetime],
@@ -269,7 +280,8 @@ def _run_source(
     after_commit: Callable[[], None] | None = None,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
-    `work` inside one write transaction with the run row, then -- only for a
+    `work` (given the run row's id) inside one write transaction with the
+    run row, then -- only for a
     committed `ok`, non-dry run -- `after_commit` (T11h's `record_failures`),
     called outside the write transaction; an exception from it is appended
     to the returned message only, the committed run row never rewritten."""
@@ -283,7 +295,7 @@ def _run_source(
             prepare()
         with open_for_write(settings) as conn:
             init_schema(conn)
-            rows, message = work(conn)
+            rows, message = work(conn, run_id)
             if dry_run:
                 raise _DryRun(rows, message)
             run = outcome(OK, rows, message)
@@ -482,6 +494,36 @@ def _unwrap(filings: FilingSource) -> FilingSource:
     return filings
 
 
+@dataclass(frozen=True)
+class Unjudged:
+    """What a master check must not judge after a fetch pass (#859): the
+    CIKs with a filing that failed or was quarantined this run, and how many
+    failures name no accession that maps to a CIK."""
+
+    ciks: frozenset[str]
+    unmapped: int
+
+
+def _unjudged_ciks(filings: FilingSource) -> Unjudged:
+    """The CIKs whose filings the adapter under `filings` failed (T11h's
+    pending failures) or skipped as quarantined this run, mapped to CIKs
+    through the recorded full-history filing index; plus the failures it
+    cannot map (FSN extraction failures, which name no accession, and any
+    accession absent from the index). A source without the failure policy
+    (the fixture) has none. `filings` must already have answered
+    `filing_index(None)` (the fetch pass), so nothing is fetched here."""
+    source = _unwrap(filings)
+    pending: Mapping[str, Any] = getattr(source, "_pending_failures", {})
+    accessions = set(pending) | set(getattr(source, "_quarantined_this_run", set()))
+    unmapped = int(getattr(source, "_fsn_extraction_failures_this_run", 0))
+    if not accessions:
+        return Unjudged(frozenset(), unmapped)
+    by_accession = {entry.accession: entry.cik for entry in filings.filing_index(None)}
+    ciks = {by_accession[a] for a in accessions if a in by_accession}
+    unmapped += sum(1 for a in accessions if a not in by_accession)
+    return Unjudged(frozenset(ciks), unmapped)
+
+
 def _prefetch(recorded: _Recorded, settings: Settings, *, dry_run: bool) -> None:
     """The fetch pass: every filing question, with no store connection open;
     then `check_failures()` (T11h), if the source under `recorded` has one,
@@ -561,7 +603,13 @@ def _ingest_filings(
     settings: Settings,
     filings: FilingSource,
     clock: Callable[[], datetime],
+    run_id: str,
 ) -> tuple[int, str]:
+    """The EDGAR chunk: build the master, delistings, classifications and
+    facts once more from the recorded answers, add what changes an as-of
+    read, then record the stored master rows this build no longer derives
+    under `run_id` (#859: `master_underived`, health's
+    `underived_master_rows`; `master-retract` withdraws them)."""
     recorded = _Recorded(filings)
     # The fetch pass, so `now` is read only after every source answer. When
     # `filings` is already a frozen fetch pass (`_prefetch`, as both callers
@@ -581,6 +629,8 @@ def _ingest_filings(
         ("facts", facts),
     ):
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
+    skip = _unjudged_ciks(recorded).ciks
+    record_underived(conn, run_id, now, stored_underived(conn, master, now, skip))
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
@@ -803,6 +853,8 @@ def _fetch_prices(
             f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
             f"have no bar for {session}: {', '.join(missing[:10])}{_reported_note(reported)}"
         )
+    if stale := _dark_stale(listed, reported, settings, f"for {session}"):
+        raise _Stale(stale)
     message = (
         f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}"
@@ -939,8 +991,10 @@ def _may_count(
     benchmarks: set[str],
 ) -> set[str] | None:
     """The names whose miss may count (#784, dark names): those with a bar
-    in the `previous` chunk window already in the store at `t` (nothing this
-    chunk fetched), those first listed after it, and the benchmarks. `None`
+    in the `previous` chunk window already in the store at `t` (ingested by
+    `t`, so nothing this chunk fetched and nothing a later run stamped; #796),
+    those whose first listing in `earliest` (`_first_listed`) starts after
+    it, and the benchmarks. `None`
     when the store holds no bar at all in `previous` (no previous chunk):
     then every miss counts."""
     first, last = previous
@@ -948,13 +1002,23 @@ def _may_count(
         row[0]
         for row in conn.execute(
             "SELECT DISTINCT security_id FROM prices_daily "
-            "WHERE session BETWEEN ? AND ? AND known_at <= ?",
+            "WHERE session BETWEEN ? AND ? AND ingested_at <= ?",
             [first, last, t],
         ).fetchall()
     }
     if not had:
         return None
     return had | benchmarks | {sid for sid, start in earliest.items() if start > last}
+
+
+def _first_listed(earliest: dict[str, date], row: Row, settings: Settings) -> None:
+    """Fold listing `row` into `earliest`, each security's first `valid_from`
+    on one of `universe.exchanges` (`_may_count`'s new listings; #796, owner
+    option ii a): a move between those exchanges is a transfer, never a new
+    listing, while an up-listing from OTC starts the security's first one."""
+    if row["exchange"] in settings.universe.exchanges:
+        sid = row["security_id"]
+        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
 
 
 SNAPSHOT_ONLY = "snapshot-only names with no rows"
@@ -985,6 +1049,24 @@ def _staleness(
     return counted, missing, {SNAPSHOT_ONLY: static, DARK: dark}
 
 
+def _dark_stale(
+    listed: Sized, reported: Mapping[str, list[str]], settings: Settings, where: str
+) -> str | None:
+    """The stale message when the names `_staleness` reported rather than
+    counted (dark and snapshot-only) are more than `ingest.max_dark_share`
+    of the `listed` names (#796), else None. A gradual dropout leaves the
+    missing share by going dark, so it is bounded here instead."""
+    out = sorted({sid for names in reported.values() for sid in names})
+    share = len(out) / len(listed) if len(listed) else 0.0
+    limit = settings.ingest.max_dark_share
+    if share <= limit:
+        return None
+    return (
+        f"{len(out)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
+        f"are dark or snapshot-only {where}{_reported_note(reported)}"
+    )
+
+
 def _reported_note(reported: Mapping[str, list[str]]) -> str:
     """The run-message clauses naming `_staleness`'s reported names by
     cause (count and up to 10 names each), or `""`."""
@@ -1008,7 +1090,7 @@ def _price_names(
     earliest: dict[str, date] = {}
     for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
         sid = row["security_id"]
-        earliest[sid] = min(row["valid_from"], earliest.get(sid, row["valid_from"]))
+        _first_listed(earliest, row, settings)
         held = current.get(sid)
         if row["valid_from"] <= session and (
             held is None or row["valid_from"] > held["valid_from"]
@@ -1322,8 +1404,13 @@ def _add_rows(
     def key(row: Mapping[str, Any]) -> tuple[Any, ...]:
         return tuple(row[c] for c in key_cols)
 
+    def value(row: Mapping[str, Any], column: str) -> Any:
+        return (
+            row.get(column, _VALUE_DEFAULTS[column]) if column in _VALUE_DEFAULTS else row[column]
+        )
+
     def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-        return all(a[c] == b[c] for c in value_cols)
+        return all(value(a, c) == value(b, c) for c in value_cols)
 
     ids = sorted({row["security_id"] for row in rows})
     cursor = conn.execute(

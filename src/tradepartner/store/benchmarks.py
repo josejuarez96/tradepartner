@@ -28,6 +28,10 @@ upper-cased), and raises `BenchmarkIdentityError`, naming the symbol, when:
   or open-ended; `through=None` means open-ended too. Its listing ends are
   not consulted, so a reuse that ended by a delisting still refuses: the
   check errs toward refusing a run, never toward a wrong series.
+
+A row withdrawn by a retraction (#859) is no evidence either way: a
+`securities` row counts only when its latest revision is live, and a
+listing row only when its key's latest revision is.
 """
 
 from __future__ import annotations
@@ -38,9 +42,38 @@ from datetime import date
 
 import duckdb
 
+from tradepartner.store.schema import has_retracted
+
 
 class BenchmarkIdentityError(ValueError):
     """A configured benchmark symbol does not name exactly one security."""
+
+
+def _live_listings(conn: duckdb.DuckDBPyConnection) -> str:
+    """SQL for every `listings` key whose latest revision (any `known_at`) is
+    not a retraction (#859), as one row: the latest. Below schema version 11
+    there is no retraction, so every key."""
+    live = "AND NOT retracted" if has_retracted(conn, "listings") else ""
+    return f"""
+    SELECT * EXCLUDE (n) FROM (
+        SELECT *, row_number() OVER (
+            PARTITION BY security_id, ticker, exchange, valid_from ORDER BY known_at DESC
+        ) AS n
+        FROM listings
+    )
+    WHERE n = 1 {live}
+"""
+
+
+def _latest_securities(conn: duckdb.DuckDBPyConnection) -> str:
+    """SQL for each security's latest row with its `retracted` flag (FALSE
+    below schema version 11)."""
+    flag = "retracted" if has_retracted(conn, "securities") else "FALSE AS retracted"
+    return f"""
+            SELECT security_id, benchmark, {flag},
+                   row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) AS n
+            FROM securities
+"""
 
 
 def _norm(ticker: str) -> str:
@@ -51,15 +84,11 @@ def benchmark_candidates(conn: duckdb.DuckDBPyConnection, symbol: str) -> list[s
     """Every security flagged `benchmark` at its latest `securities` row with
     a listing row (any `known_at`) under `symbol`, sorted."""
     rows = conn.execute(
-        """
-        WITH latest AS (
-            SELECT security_id, benchmark,
-                   row_number() OVER (PARTITION BY security_id ORDER BY known_at DESC) AS n
-            FROM securities
-        )
+        f"""
+        WITH latest AS ({_latest_securities(conn)}), live AS ({_live_listings(conn)})
         SELECT DISTINCT l.security_id
-        FROM listings l JOIN latest s ON s.security_id = l.security_id AND s.n = 1
-        WHERE s.benchmark AND upper(trim(l.ticker)) = ?
+        FROM live l JOIN latest s ON s.security_id = l.security_id AND s.n = 1
+        WHERE s.benchmark AND NOT s.retracted AND upper(trim(l.ticker)) = ?
         ORDER BY l.security_id
         """,
         [_norm(symbol)],
@@ -78,10 +107,11 @@ def ticker_holders(
     """Securities other than `exclude` whose listing history (any `known_at`)
     holds `symbol` at some day in `[start, through]` (module docstring), sorted."""
     rows = conn.execute(
-        """
-        SELECT DISTINCT security_id, upper(trim(ticker)), valid_from FROM listings
+        f"""
+        WITH live AS ({_live_listings(conn)})
+        SELECT DISTINCT security_id, upper(trim(ticker)), valid_from FROM live
         WHERE security_id IN (
-            SELECT security_id FROM listings WHERE upper(trim(ticker)) = ?
+            SELECT security_id FROM live WHERE upper(trim(ticker)) = ?
         )
         """,
         [_norm(symbol)],

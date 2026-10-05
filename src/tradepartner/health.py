@@ -14,8 +14,9 @@ here is this module's and is stated once:
 
 - **Last ingest per source** (`last_ingests`): from `ingestion_runs` rows
   known at `t`, i.e. finished at or before `t` (ingest writes a run's row when
-  the run ends), per source (`ingest.SOURCES` first, then any other source in
-  the table, alphabetically): the finish time and cursor of the last `ok` run,
+  the run ends), other than `master-retract`'s (#859), per source
+  (`ingest.SOURCES` first, then any other source in the table,
+  alphabetically): the finish time and cursor of the last `ok` run,
   and the status, start and message of the latest run of any status. A source
   that never ran shows `None`s.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -108,17 +109,31 @@ derived at `t`, as the data is read.
   the store cannot show the line kept trading.
   Such a bar is another equity's resolved to this one (a reused ticker,
   EGLE), a relisting with no listing row, or bars on both sides of a hole in
-  the store. **Known limit (#827):** when there is no bar at all on or
-  before `effective_on` (the line's own history is unknown, not merely
-  absent), `effective_on` itself stands in for "the last bar on or before
-  it" when counting the first gap; a bar that is some other security's
-  reused ticker, not this line's own, still passes if it starts within
+  the store. A delisting whose next *equity* listing of the security
+  carries the same ticker (compared as `alpaca_symbol` keys it) raises no
+  violation at all (#829): the resolver's own rule 7 (`docs/specs/data-foundation.md`,
+  "Resolver rules"; #819) keeps the span running under that ticker through
+  the delisting, so the bars between are the security's own, never a
+  resumption to flag, however long the gap. A later row that shares the
+  ticker but is not EQUITY (a note, a right, a unit) does not count: the
+  resolver's rule only runs a span on when both rows are EQUITY. **Known
+  limit (#827):** when there is no bar at all on or before `effective_on`
+  (the line's own history is unknown, not merely absent), `effective_on`
+  itself stands in for "the last bar on or before it" when counting the
+  first gap; a bar that is some other security's reused ticker, not this
+  line's own, still passes if it starts within
   `master.transfer_window_sessions` of `effective_on`, the same grace a
   genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
   store.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
+- `underived_master_rows` (#859): the stored `securities` and `listings` rows
+  the latest master check finished by `t` (an EDGAR ingest chunk or a
+  `master-retract --apply`) found the current rules no longer derive, and
+  that are still live at `t` (`store.retraction.underived_as_of`): table,
+  key, stored `known_at` and the check's run id. `tradepartner
+  master-retract` lists the same set from a fresh build and retracts it.
 
 This module holds no threshold; the only numbers in it are 0 and 1.
 """
@@ -155,6 +170,7 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import securities_as_of
+from tradepartner.store.retraction import RETRACT, underived_as_of
 from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
 from tradepartner.universe import shares_as_of
 
@@ -178,6 +194,7 @@ NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
 GUARDED_SIC_DEFAULT = "guarded_sic_default"
+UNDERIVED_MASTER_ROWS = "underived_master_rows"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -190,6 +207,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
     GUARDED_SIC_DEFAULT,
+    UNDERIVED_MASTER_ROWS,
 )
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
@@ -452,15 +470,17 @@ def _shares_outliers(
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
     """Per source, the last `ok` run and the latest run whose row is known at
     `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
-    source."""
+    source. A `master-retract` run row (mode `retract`, #859) is not an
+    ingest and is left out, so it never hides the latest EDGAR run's status
+    or quarantine count."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ?
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode <> ?
         ORDER BY started_at, run_id
         """,
-        [t],
+        [t, RETRACT],
     ).fetchall()
     by_source: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     for run in runs:
@@ -711,6 +731,7 @@ def _integrity_checks(
         NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
+        UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
@@ -946,12 +967,31 @@ def _bars_after_delisting(
         for row in ordered:
             if row["status"] != DELISTED:
                 continue
-            later = [
-                o["valid_from"]
-                for o in ordered
-                if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
-            ]
-            bounds.append({**row, "_next": min(later, default=None)})
+            later = sorted(
+                (
+                    o
+                    for o in ordered
+                    if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
+                ),
+                key=lambda o: o["valid_from"],
+            )
+            next_valid_from = later[0]["valid_from"] if later else None
+            if next_valid_from is not None and _row_kind(row) == EQUITY:
+                # The resolver's own rule 7 (spec data-foundation.md,
+                # "Resolver rules"; #819) only keeps a span running under a
+                # later row of the same ticker when both rows are EQUITY,
+                # and only from the day that row actually holds the ticker:
+                # a same-day filer-typo pair (#846) is tied on `valid_from`,
+                # so every row of that day, not just the one `later` sorts
+                # first, is checked (#829).
+                own_ticker = _resolver_ticker(str(row["ticker"]))
+                same_day = [o for o in later if o["valid_from"] == next_valid_from]
+                if any(
+                    _row_kind(o) == EQUITY and _resolver_ticker(str(o["ticker"])) == own_ticker
+                    for o in same_day
+                ):
+                    continue
+            bounds.append({**row, "_next": next_valid_from})
     if not bounds:
         return pl.DataFrame([], schema=_AFTER_DELISTING_SCHEMA)
     ids = sorted({b["security_id"] for b in bounds})
