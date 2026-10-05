@@ -125,7 +125,7 @@ def misattributed(
     actions = {
         (sid, day): rows
         for sid, day, rows in action_keys
-        if not resolver.holds(sid, previous_session(day))
+        if not resolver.holds(sid, previous_session(day), lead=False)  # #843: no lead
     }
     return Misattributed(bars, actions)
 

@@ -1428,9 +1428,10 @@ class TestRenameLead:
         assert resolver.lead("META", date(2022, 6, 10)) == self.FB
         assert resolver.lead("META", date(2021, 9, 1)) == self.FB  # FB has bars: never used
 
-    def test_an_old_ticker_reused_at_once_is_filled_from_the_new_symbol(self) -> None:
+    def test_an_old_ticker_reused_at_once_takes_no_lead(self) -> None:
         # PROG -> PRG while the new Aaron's lists AAN the same day: AAN's
-        # rows resolve to Aaron's, so PROG has no bar and PRG's rows fill.
+        # rows resolve to Aaron's, and the lead steps aside (#869's case;
+        # code-review on #893: a stale AAN bar on PROG must stay repairable).
         prog, aarons = "0001808834", "0001821393"
         resolver = ListingResolver(
             [
@@ -1443,7 +1444,43 @@ class TestRenameLead:
         day = date(2020, 12, 2)
         payload = {"feed": "sip", "bars": {"AAN": [_row(day, 18.41)], "PRG": [_row(day, 48.0)]}}
         parsed = parse_bars(payload, resolver.resolve, resolver.lead)
-        assert {(b.security_id, b.close) for b in parsed.bars} == {(aarons, 18.41), (prog, 48.0)}
+        assert {(b.security_id, b.close) for b in parsed.bars} == {(aarons, 18.41)}
+        assert not resolver.holds(prog, day)
+        assert resolver.lead("PRG", date(2020, 11, 30)) == prog  # before the reuse
+
+    def test_a_placeholder_under_the_old_symbol_stops_the_lead(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=400)
+        day = date(2022, 6, 9)
+        placeholder = {**_row(day, 192.0), "v": 0, "n": 0}
+        payload = self._payload()
+        payload["bars"]["FB"].append(placeholder)
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert day not in [b.session for b in parsed.bars]
+        assert (self.FB, day) in parsed.placeholders
+        assert ("META", day) in parsed.unresolved
+
+    def test_the_repair_judges_actions_without_the_lead(self) -> None:
+        # quant-auditor and code-review on #893: actions take no lead. Here
+        # OLD is contested (another company renames into it later), so only
+        # the lead holds the renamed company's gap sessions.
+        from tradepartner.repair import misattributed
+
+        sid, other = "0000000003", "0000000004"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "OLD", START, "Common Stock"),
+                _listing(sid, "NEWT", date(2022, 7, 1), "Common Stock"),
+                _listing(other, "XO", START, "Common Stock"),
+                _listing(other, "OLD", date(2023, 1, 3), "Common Stock"),
+            ],
+            rename_lead_days=400,
+        )
+        day = date(2022, 6, 15)
+        assert resolver.holds(sid, day)
+        assert not resolver.holds(sid, day, lead=False)
+        found = misattributed(resolver, [(sid, day, 1)], [(sid, date(2022, 6, 16), 1)])
+        assert dict(found.bars) == {}
+        assert dict(found.actions) == {(sid, date(2022, 6, 16)): 1}
 
     def test_a_span_ended_at_its_own_delisting_has_no_lead(self) -> None:
         sid = "0000000002"

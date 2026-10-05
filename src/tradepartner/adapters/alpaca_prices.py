@@ -80,14 +80,14 @@ under another (a rename, neither cut by rule 7, the new span not
 contested), the new ticker also *leads* to the security on sessions from
 `alpaca.rename_lead_days` before the new span's start (never before the
 old span's start) up to it, while `resolve` gives the ticker to no one
-(`ListingResolver.lead`). `parse_bars` assigns such a row only when the
-security has no bar that session from the rest of the payload: the hole
-closes at the old symbol's last bar, and no session is stored twice. An
-old ticker reused at once by another company that the master knows of
-resolves to that company, so the renamed one is filled from its new
-symbol too. The mapping is the master's at the run, as for every row; a
-bar's `known_at` stays its session's close. Corporate actions take no
-lead.
+(`ListingResolver.lead`) and the old ticker to no other security (a reuse
+the master knows of is left to #869). `parse_bars` assigns such a row
+only when the security has no row (bar or placeholder) that session from
+the rest of the payload: the hole closes at the old symbol's last bar,
+and no session is stored twice. The mapping is the master's at the run,
+as for every row; a bar's `known_at` stays its session's close.
+Corporate actions take no lead, nor does `holds(..., lead=False)`, the
+repair's action check.
 
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
@@ -735,30 +735,37 @@ class ListingResolver:
     def lead(self, ticker: str, session: date) -> str | None:
         """The renamed security whose rename lead (#843) covers `ticker` on
         `session`, or `None`: only while `resolve` gives the ticker to no
-        one, and only one security's lead. A caller assigns such a row only
-        where the security has no bar under its own symbols that session
-        (`parse_bars`)."""
+        one and the old ticker to no other security (a reuse the master
+        knows of is #869's), and only one security's lead. A caller assigns
+        such a row only where the security has no row under its own symbols
+        that session (`parse_bars`)."""
         owners = {
             lead.security_id
             for lead in self._leads.get(ticker, [])
             if lead.start <= session < lead.end
+            and self.resolve(lead.old, session) in (None, lead.security_id)
         }
         if len(owners) != 1 or self.resolve(ticker, session) is not None:
             return None
         return owners.pop()
 
-    def holds(self, security_id: str, session: date) -> bool:
+    def holds(self, security_id: str, session: date, *, lead: bool = True) -> bool:
         """True when some ticker resolves to `security_id` on `session`, or
-        leads to it (#843): a row of it on that session is one this
-        resolver would assign."""
+        (with `lead`, for bars only: actions take no lead) leads to it
+        (#843): a row of it on that session is one this resolver would
+        assign."""
         return any(
             span.covers(session)
             and self._assigned(span)
             and self.resolve(span.ticker, session) == security_id
             for span in self._by_security.get(security_id, [])
-        ) or any(
-            lead.start <= session < lead.end and self.lead(lead.new, session) == security_id
-            for lead in self._leads_of.get(security_id, [])
+        ) or (
+            lead
+            and any(
+                rename.start <= session < rename.end
+                and self.lead(rename.new, session) == security_id
+                for rename in self._leads_of.get(security_id, [])
+            )
         )
 
     def symbols(self, security_id: str, start: date, end: date) -> list[str]:
@@ -942,10 +949,10 @@ def parse_bars(
     `resolve(symbol, session)` and known at its session's close.
 
     With `lead` (`ListingResolver.lead`, #843), a row `resolve` leaves out
-    goes to `lead(symbol, session)` when that security has no bar that
-    session from the rest of the payload (a renamed company's new symbol
-    on the sessions after its old symbol's last bar); otherwise it stays
-    unresolved."""
+    goes to `lead(symbol, session)` when that security has no row (a bar
+    or a zero-volume placeholder) that session from the rest of the
+    payload (a renamed company's new symbol on the sessions after its old
+    symbol's last bar); otherwise it stays unresolved."""
     source = feed_source(payload)
     bars: list[Bar] = []
     unresolved: list[tuple[str, date]] = []
@@ -963,7 +970,7 @@ def parse_bars(
                 placeholders.append((security_id, session))
             else:
                 bars.append(bar)
-    have = {bar.key for bar in bars}
+    have = {bar.key for bar in bars} | set(placeholders)  # any own row stops the lead
     for symbol, session, row in pending:
         security_id = lead(symbol, session) if lead is not None else None
         if security_id is None or (security_id, session) in have:
@@ -971,14 +978,11 @@ def parse_bars(
             continue
         key = (security_id, session)
         bar = _bar(symbol, session, row, security_id, source)
+        have.add(key)
         if bar is None:
-            if key not in placeholders:
-                placeholders.append(key)
+            placeholders.append(key)
         else:
             bars.append(bar)
-            have.add(key)
-            if key in placeholders:  # a trade under the new symbol is no placeholder
-                placeholders.remove(key)
     bars.sort(key=lambda b: (b.security_id, b.session))
     _require_unique([b.key for b in bars], "bar")
     return BarsParse(tuple(bars), tuple(unresolved), tuple(placeholders))
