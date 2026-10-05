@@ -157,13 +157,19 @@ never silently lifting an acceptance (#275).
 **Input validation (#578).** `.validation_failures` collects the fetch pass's
 parse failures (`edgar_validation`) for `ingest._prefetch`'s gate, which
 fails the run before any store write and lists them all in
-`edgar.cache_dir/validation/`. Recorded so far (part 2), each then absent
+`edgar.cache_dir/validation/`. Recorded (part 2), each then absent
 for the rest of the pass: a quarter's `form.idx` (its rows skipped), a
 `submissions.zip` member or older page (the CIK left unstamped, no per-CIK
 top-up), a `companyfacts.zip` member (no company facts for the CIK, nothing
 cached, no API call) and an FSN period whose extraction or parse fails
-whole (no manifest, so the next run extracts it again). A per-accession FSN
-failure stays with the failure policy above.
+whole (no manifest, so the next run extracts it again). Part 3: a per-CIK
+submissions API payload or older page (lists nothing, like SEC's `{}`) and
+a per-CIK companyfacts API payload (no company facts, nothing cached). A
+per-accession FSN failure and every per-document failure (cover page, SGML
+header, delisting notice) stay with the failure policy above, one policy
+(owner option (a) on #808): `check_failures` fails the run only where its
+rules fire, and its message lists the run's unaccepted per-document
+failures, bounded, with `failed_filings.json` as the full list.
 """
 
 from __future__ import annotations
@@ -567,26 +573,55 @@ class EdgarFilingSource(FilingSource):
 
     def _fetch_submissions(self, cik: str, wanted: set[str]) -> _Submissions:
         """`cik`'s submissions, memoised; older pages fetched while any of
-        `wanted` is still missing."""
+        `wanted` is still missing.
+
+        A payload or older page that does not parse is recorded on
+        `.validation_failures` (#578 part 3) and lists nothing, like an
+        empty answer (#576): paging stops and the memo is marked `empty`, so
+        nothing it would stamp is cached as unstampable this run."""
         memo = self._submissions.get(cik)
         if memo is None:
-            payload = edgar_raw.submissions(cik, settings=self._settings, client=self._client)
-            if _empty_object(payload):  # #576: SEC's "nothing here"; lists nothing
+            try:
+                payload = edgar_raw.submissions(cik, settings=self._settings, client=self._client)
+            except _UNDECODABLE as error:  # #578: a body that is not JSON
+                self.validation_failures.record(_SUBMISSIONS_API, f"CIK{cik}.json", error)
+                payload = _NOT_JSON
+            if payload is _NOT_JSON:
+                memo = self._submissions[cik] = _Submissions({}, [], self._now(), empty=True)
+            elif _empty_object(payload):  # #576: SEC's "nothing here"; lists nothing
                 self.submissions_api_empty += 1
                 memo = self._submissions[cik] = _Submissions({}, [], self._now(), empty=True)
             else:
-                records, pages = reduce_submissions(payload)
-                memo = self._submissions[cik] = _Submissions(records, pages, self._now())
+                parsed = self.validation_failures.collect(
+                    _SUBMISSIONS_API, f"CIK{cik}.json", partial(reduce_submissions, payload)
+                )
+                records, pages = parsed if parsed is not None else ({}, [])
+                memo = _Submissions(records, pages, self._now(), empty=parsed is None)
+                self._submissions[cik] = memo
         while memo.pages and not wanted <= memo.records.keys():
-            page = edgar_raw.submissions_page(
-                memo.pages.pop(0), settings=self._settings, client=self._client
-            )
+            name = memo.pages.pop(0)
+            try:
+                page = edgar_raw.submissions_page(
+                    name, settings=self._settings, client=self._client
+                )
+            except _UNDECODABLE as error:  # #578: recorded; lists nothing, as below
+                self.validation_failures.record(_SUBMISSIONS_API, name, error)
+                memo.pages.clear()
+                memo.empty = True
+                break
             if _empty_object(page):  # #576: lists nothing; stop paging
                 self.submissions_api_empty += 1
                 memo.pages.clear()
                 memo.empty = True
                 break
-            memo.records.update(reduce_submissions(page)[0])
+            older = self.validation_failures.collect(
+                _SUBMISSIONS_API, name, partial(reduce_submissions, page)
+            )
+            if older is None:  # recorded: lists nothing, as above
+                memo.pages.clear()
+                memo.empty = True
+                break
+            memo.records.update(older[0])
         return memo
 
     def _stamp_bulk(
@@ -1581,7 +1616,16 @@ class EdgarFilingSource(FilingSource):
     def check_failures(self) -> None:
         """Called by `_prefetch` after the fetch pass, before the lock.
         Raises `FilingFailuresError` (the chunk fails, nothing written) when
-        any of plan T11h's three rules fires; see the module docstring."""
+        any of plan T11h's three rules fires; see the module docstring.
+
+        The message then lists this run's per-document failures (and
+        `facts()` collisions) that no `accepted` entry excuses (#578 part 3,
+        owner option (a) on #808):
+        their count, then the first `edgar.max_validation_listed` as
+        `accession error_class/base_form: message`, each message cleaned
+        (`_stored_message`). The full list is `failed_filings.json` (written
+        on a non-dry run by `record_failed_check`); accepting one stays the
+        hand edit there."""
         reasons: list[str] = []
         self._check_fsn_group(reasons)
         self._check_per_document_group(reasons)
@@ -1591,7 +1635,30 @@ class EdgarFilingSource(FilingSource):
                 "; ".join(reasons)
                 + f"; failure messages in {self._failed_filings_path()} (not on a dry run)"
                 + f" and the FSN manifests under {self._fsn_root() / 'manifests'}"
+                + self._unaccepted_listing()
             )
+
+    def _unaccepted_listing(self) -> str:
+        """`check_failures`'s bounded list of this run's unaccepted
+        per-document failures, or "" when there are none."""
+        unaccepted = [
+            (accession, error_class, base_form, message)
+            for accession, (error_class, base_form, message) in sorted(
+                self._pending_failures.items()
+            )
+            if not self._accepted(accession, error_class, message)
+        ]
+        if not unaccepted:
+            return ""
+        limit = self._settings.edgar.max_validation_listed
+        listed = "; ".join(
+            self._stored_message(f"{accession} {error_class}/{base_form}: {message}")
+            for accession, error_class, base_form, message in unaccepted[:limit]
+        )
+        return (
+            f"; this run's unaccepted filing failures (per-document and fact collisions): "
+            f"{len(unaccepted)}, first {min(limit, len(unaccepted))}: {listed}"
+        )
 
     def _threshold_reason(self, label: str, failures: int, denominator: int) -> str | None:
         min_n = self._settings.edgar.min_failed_filings
@@ -1835,7 +1902,7 @@ class EdgarFilingSource(FilingSource):
         if cached is None:  # an empty memo is an answer too: asked once per run (#578)
             cached = _load_facts_cache(path, cik, key)
         if cached is None:
-            payload, complete, from_zip = self._company_facts_payload(cik, latest)
+            payload, complete, origin = self._company_facts_payload(cik, latest)
 
             def parse() -> _FactsCache:
                 if payload is None:  # T11h/T11e: no XBRL facts at all; not a filing failure
@@ -1845,8 +1912,8 @@ class EdgarFilingSource(FilingSource):
                     for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
                 ]
 
-            if from_zip:  # #578: a zip member that does not parse is recorded, absent
-                parsed = self.validation_failures.collect(_FACTS_MEMBER, f"CIK{cik}.json", parse)
+            if origin is not None:  # #578: a payload that does not parse is recorded, absent
+                parsed = self.validation_failures.collect(origin, f"CIK{cik}.json", parse)
                 cached, complete = ([], False) if parsed is None else (parsed, complete)
             else:
                 cached = parse()
@@ -1883,34 +1950,35 @@ class EdgarFilingSource(FilingSource):
                 out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
-    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool, bool]:
+    def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool, str | None]:
         """The raw company-facts payload, whether it already holds
-        `latest` (the filing the cache is keyed by) and whether it came from
-        the zip: from one
+        `latest` (the filing the cache is keyed by) and the validation input
+        it came from (`_FACTS_MEMBER`, `_FACTS_API`, or `None` with no
+        payload): from one
         `companyfacts.zip` when more than `edgar.bulk_stamp_threshold_ciks`
         stamped CIKs need a fetch (the stamping rule), else the per-CIK API;
         a CIK the zip lacks, or whose zip payload trails `latest` (the zip is
         rebuilt nightly), falls back to the API. A payload for another CIK
-        raises. A 404 from the per-CIK API (T11h, T11e's leftover: many
+        is recorded (below). A 404 from the per-CIK API (T11h, T11e's leftover: many
         issuers have no XBRL facts at all) is **not** a filing failure: the
         payload is `None`, complete `True` (an empty result is cached). An
         API 200 whose payload is an empty object (#576: SEC's answer for the
         CIKs whose zip member is `{}`) is handled exactly like that 404 and
         counted on `facts_api_empty`; any other payload without `cik` or
-        `facts` still raises. A payload that has `facts` but no `cik` (#599:
+        `facts` is recorded (below). A payload that has `facts` but no `cik` (#599:
         SEC ships this shape for a few CIKs, identically from the zip and the
         API) is identified by the CIK it was requested under (the zip member
         name, or the API URL) rather than treated as absent, and counted on
         `facts_bulk_keyless`/`facts_api_keyless`; a `cik` that is present but
-        differs still raises.
+        differs is recorded.
 
-        A zip member that does not parse (not JSON, or another CIK's facts,
-        or missing the fields `_holds_accession` reads) is recorded on
-        `.validation_failures` (#578) and is absent for this run: no facts
-        from company facts, nothing cached, and the per-CIK API is not
-        asked, since its answer would likely share the shape (#599). The
-        caller records a zip payload that `parse_company_facts` refuses the
-        same way."""
+        A zip member or API payload that does not parse (not JSON, or
+        another CIK's facts, or missing the fields `_holds_accession` reads)
+        is recorded on `.validation_failures` (#578 parts 2 and 3) and is
+        absent for this run: no facts from company facts and nothing cached;
+        for a zip member the per-CIK API is not asked, since its answer would
+        likely share the shape (#599). The caller records a payload that
+        `parse_company_facts` refuses the same way, under its origin."""
         if self._facts_bulk is None:
             stale = 0
             for stamps_path in self._stamps_path("0").parent.glob("*.json"):
@@ -1946,7 +2014,7 @@ class EdgarFilingSource(FilingSource):
 
             read = self.validation_failures.collect(_FACTS_MEMBER, f"CIK{cik}.json", member)
             if read is None:
-                return None, False, False
+                return None, False, None
             bulk_payload, shape, holds = read
             if shape == "keyless":
                 # #599: has facts despite missing `cik`; identified by the
@@ -1957,29 +2025,39 @@ class EdgarFilingSource(FilingSource):
                 # zip: the API is asked, never "no facts" assumed.
                 self.facts_bulk_empty += 1
             if holds:
-                return bulk_payload, True, True
+                return bulk_payload, True, _FACTS_MEMBER
         try:
             payload = edgar_raw.company_facts(cik, settings=self._settings, client=self._client)
         except httpx.HTTPStatusError as error:
             if error.response.status_code != 404:
                 raise
             absent = True
+        except _UNDECODABLE as error:  # #578: a body that is not JSON; absent, nothing cached
+            self.validation_failures.record(_FACTS_API, f"CIK{cik}.json", error)
+            return None, False, None
         else:
             absent = _empty_object(payload)
             if absent:
                 self.facts_api_empty += 1  # #576: SEC's 200 `{}` is its 404
-            elif _keyless_member(payload) and "facts" in payload:
-                # #599: as above, identified by the API URL it was requested under.
-                self.facts_api_keyless += 1
-                payload = _identified(payload, cik)
         if absent:
             if bulk_payload is not None:
                 # The zip has this CIK's facts, only trailing `latest`: serve
                 # them, marked incomplete so the next run asks again (#275).
-                return bulk_payload, False, True
+                return bulk_payload, False, _FACTS_MEMBER
             self.facts_missing += 1
-            return None, True, False  # no XBRL facts at all: an empty result is cached
-        return payload, _holds_accession(payload, cik, latest), False
+            return None, True, None  # no XBRL facts at all: an empty result is cached
+        # #599: as above, identified by the API URL it was requested under.
+        keyless = _keyless_member(payload) and "facts" in payload
+        if keyless:
+            payload = _identified(payload, cik)
+        held = self.validation_failures.collect(
+            _FACTS_API, f"CIK{cik}.json", partial(_holds_accession, payload, cik, latest)
+        )
+        if held is None:
+            return None, False, None
+        if keyless:
+            self.facts_api_keyless += 1
+        return payload, held, _FACTS_API
 
 
 #: What fails an FSN period whole (#578): a parser refusal, or DuckDB failing
@@ -1987,8 +2065,16 @@ class EdgarFilingSource(FilingSource):
 #: still propagate.
 _FSN_PARSE_ERRORS: tuple[type[Exception], ...] = (*PARSE_ERRORS, duckdb.InvalidInputException)
 
-#: The validation collector's input name for a `companyfacts.zip` member (#578).
+#: The validation collector's input names for company facts and per-CIK
+#: submissions (#578 parts 2 and 3).
 _FACTS_MEMBER = "companyfacts.zip member"
+_FACTS_API = "companyfacts API"
+_SUBMISSIONS_API = "submissions API"
+#: What `response.json()` raises on a per-CIK API body that is not JSON
+#: (#578 part 3): recorded like any other parse failure of that input.
+_UNDECODABLE: tuple[type[Exception], ...] = (json.JSONDecodeError, UnicodeDecodeError)
+#: `_fetch_submissions`'s marker for a recorded undecodable body.
+_NOT_JSON = object()
 
 
 def _message_hash(message: str) -> str:
@@ -2040,13 +2126,16 @@ def _holds_accession(payload: Any, cik: str, accession: str) -> bool:
     entry, of any concept, for `accession`."""
     if str(payload["cik"]).zfill(10) != cik:
         raise ValueError(f"company facts for CIK {payload['cik']!r} served for {cik}")
-    return any(
-        entry["accn"] == accession
-        for concepts in payload["facts"].values()
-        for concept in concepts.values()
-        for entries in concept["units"].values()
-        for entry in entries
-    )
+    try:
+        return any(
+            entry["accn"] == accession
+            for concepts in payload["facts"].values()
+            for concept in concepts.values()
+            for entries in concept["units"].values()
+            for entry in entries
+        )
+    except AttributeError as error:  # a list or string where an object belongs (#578)
+        raise ValueError(f"company facts: malformed: {error!r}") from error
 
 
 def _facts_key(latest: str, wanted: set[str]) -> str:
