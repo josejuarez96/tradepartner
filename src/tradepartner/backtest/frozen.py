@@ -34,6 +34,14 @@ from tradepartner.config import HypothesisFamily
 FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("schedule.rebalance_cadence", "month_end", 12),
     ("schedule.signal_anchor", "month_end", 12),
+    # The `profitability` family (backtest spec amendment #720, T85), at B3's values.
+    ("profitability.basis", "gross", 12),
+    ("profitability.annual_period_days", [350, 380], 12),
+    ("profitability.max_fact_age_days", 548, 12),
+    ("profitability.exclude_sic_ranges", [[6000, 6999]], 12),
+    ("profitability.include_derived", True, 12),
+    ("profitability.top_fraction", 0.10, 12),
+    ("profitability.weighting", "equal", 12),
 )
 
 #: The frozen key set before the lab (`frozen_keys()` on 2026-10-05, schema version 12).
@@ -91,7 +99,10 @@ LAB_BASELINE_FROZEN_KEYS: Final[frozenset[str]] = frozenset(
 
 #: Each family's own signal section: kept whole in the canonical set and the
 #: fingerprint, never left out as default-valued (backtest spec decision 13).
-FAMILY_SIGNAL_SECTIONS: Final[dict[HypothesisFamily, str]] = {"momentum": "strategy"}
+FAMILY_SIGNAL_SECTIONS: Final[dict[HypothesisFamily, str]] = {
+    "momentum": "strategy",
+    "profitability": "profitability",
+}
 
 #: Single keys the fingerprint reads besides the sections below (spec "Fingerprint").
 _FINGERPRINT_KEYS: Final = (
@@ -107,6 +118,9 @@ class _HasParams(Protocol):
     @property
     def params(self) -> Mapping[str, Any]: ...
 
+    @property
+    def family(self) -> str: ...
+
 
 def _defaults() -> dict[str, Any]:
     return {key: default for key, default, _version in FROZEN_KEY_DEFAULTS}
@@ -114,14 +128,17 @@ def _defaults() -> dict[str, Any]:
 
 def frozen_values(record: _HasParams) -> dict[str, Any]:
     """A registration's stored `params` with each table default overlaid for every key
-    the stored set lacks. The one accessor every reader of frozen values goes through."""
-    return _overlay_defaults(record.params)
+    the stored set lacks, outside the family's inert sections. The one accessor every
+    reader of frozen values goes through."""
+    return _overlay_defaults(record.params, record.family)
 
 
-def _overlay_defaults(params: Mapping[str, Any]) -> dict[str, Any]:
+def _overlay_defaults(params: Mapping[str, Any], family: str) -> dict[str, Any]:
+    inert = inert_sections(family)
     values = dict(params)
     for key, default in _defaults().items():
-        values.setdefault(key, default)
+        if _section(key) not in inert:
+            values.setdefault(key, default)
     return values
 
 
@@ -133,15 +150,26 @@ def _signal_section(family: str) -> str | None:
     return next((s for f, s in FAMILY_SIGNAL_SECTIONS.items() if f == family), None)
 
 
+def inert_sections(family: str) -> frozenset[str]:
+    """The other families' signal sections: never stored, overlaid, hashed or
+    fingerprinted for a `family` registration. A family without a signal section of its
+    own (`oracle`) reads momentum's."""
+    own = _signal_section(family) or FAMILY_SIGNAL_SECTIONS["momentum"]
+    return frozenset(FAMILY_SIGNAL_SECTIONS.values()) - {own}
+
+
 def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, Any]:
     """`params` read through the defaults, with every table key at its default left out,
-    except the keys of `family`'s signal section, which are always kept."""
+    except the keys of `family`'s signal section, which are always kept, and with the
+    other families' signal sections left out whole."""
     signal = _signal_section(family)
+    inert = inert_sections(family)
     defaults = _defaults()
     return {
         key: value
-        for key, value in _overlay_defaults(params).items()
-        if not (key in defaults and value == defaults[key] and _section(key) != signal)
+        for key, value in _overlay_defaults(params, family).items()
+        if _section(key) not in inert
+        and not (key in defaults and value == defaults[key] and _section(key) != signal)
     }
 
 

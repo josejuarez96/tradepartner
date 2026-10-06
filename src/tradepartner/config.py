@@ -560,8 +560,8 @@ class GapConfig(BaseModel):
 # The enumerated hypothesis families (spec "Config keys"). Trials are counted per family
 # for the deflated Sharpe, so a family cannot be invented by config: adding one is a
 # reviewed code change here. `oracle` is refused on the real store (registry, T31b).
-HypothesisFamily = Literal["momentum", "oracle"]
-_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
+HypothesisFamily = Literal["momentum", "oracle", "profitability"]
+_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle", "profitability")
 
 # Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
 # ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
@@ -575,7 +575,12 @@ SignalAnchor = Literal["month_end", "offset"]
 # change to the literal and this table together, whose PR states why it is a child or a
 # root; a child's holdout may only start after its parent's `holdout.end` and only once
 # the parent has spent its holdout or reached its spend cap (`store/registry.py`).
-FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {"momentum": None}
+# `profitability` (backtest spec amendment #720) is a root: gross profitability over
+# assets is a statement-fact signal unrelated to momentum's price returns.
+FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
+    "momentum": None,
+    "profitability": None,
+}
 
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
@@ -626,6 +631,40 @@ class StrategyConfig(BaseModel):
                 f"formation_months ({self.formation_months}) must be greater than "
                 f"skip_months ({self.skip_months})"
             )
+        return self
+
+
+class ProfitabilityConfig(BaseModel):
+    """The `profitability` family's signal keys (backtest spec amendment #720, "Config
+    keys"; hypothesis B3). Frozen per hypothesis and required in full by a
+    `family = "profitability"` file; the momentum keys are not reused, so each family's
+    section is complete on its own.
+
+    `basis` is `gross` only until the pre-declared `cash` variant registers.
+    `annual_period_days` is the inclusive day-length range an as-filed annual duration
+    may have; `max_fact_age_days` bounds a fact's age at the rebalance; and
+    `exclude_sic_ranges` is a signal-domain scope (inclusive ranges), not the guarded
+    `universe.exclude_sic_ranges`. `top_fraction` is a share of scored names in (0, 1].
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    basis: Literal["gross"] = "gross"
+    annual_period_days: tuple[int, int] = (350, 380)
+    max_fact_age_days: int = Field(default=548, gt=0)
+    exclude_sic_ranges: tuple[tuple[int, int], ...] = ((6000, 6999),)
+    include_derived: bool = True
+    top_fraction: float = Field(default=0.10, gt=0, le=1)
+    weighting: Literal["equal"] = "equal"
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> ProfitabilityConfig:
+        low, high = self.annual_period_days
+        if not 0 < low <= high:
+            raise ValueError(f"annual_period_days must be 0 < low <= high, got {low, high}")
+        for start, end in self.exclude_sic_ranges:
+            if start > end:
+                raise ValueError(f"exclude_sic_ranges entry {start, end} has start > end")
         return self
 
 
@@ -1158,6 +1197,7 @@ class Settings(BaseSettings):
     adjust: AdjustConfig = Field(default_factory=AdjustConfig)
     hypotheses: HypothesesConfig = Field(default_factory=HypothesesConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    profitability: ProfitabilityConfig = Field(default_factory=ProfitabilityConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)

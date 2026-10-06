@@ -63,7 +63,7 @@ def test_h1_file_records_owner_answers_and_spec_defaults() -> None:
 def test_h1_frozen_set_builds_over_default_settings() -> None:
     parsed = hypothesis.parse_file(H1_PATH)
     frozen = hypothesis.frozen_params(parsed, Settings(_env_file=None))
-    assert set(frozen) == set(hypothesis.frozen_keys())
+    assert set(frozen) == set(hypothesis.family_frozen_keys("momentum"))
     assert frozen["holdout.start"] == "2024-01-01"
     assert frozen["holdout.end"] == "2026-09-30"
     assert frozen["strategy.top_fraction"] == 0.10

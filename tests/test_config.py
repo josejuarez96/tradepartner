@@ -442,7 +442,7 @@ def test_env_file_override_via_tradepartner_env_file(
 
 
 def test_hypotheses_families_default() -> None:
-    assert _settings().hypotheses.families == ["momentum", "oracle"]
+    assert _settings().hypotheses.families == ["momentum", "oracle", "profitability"]
 
 
 def test_hypotheses_family_outside_the_list_rejected() -> None:
@@ -722,6 +722,64 @@ def test_sweepable_keys_entry_bare_exact_forbidden_name_rejected() -> None:
     an exact field name, not a prefix) is still refused, by the prefix check itself."""
     with pytest.raises(ValueError, match="forbidden prefix"):
         Settings(_env_file=None, lab={"sweepable_keys": ["benchmarks"], "axis_lattice": {}})
+
+
+# --- `profitability` family (backtest spec amendment #720, accepted 2026-10-06; T85) ---
+
+
+def test_profitability_is_a_root_family() -> None:
+    assert "profitability" in get_args(HypothesisFamily)
+    assert FAMILY_PARENTS["profitability"] is None
+
+
+def test_profitability_defaults() -> None:
+    p = _settings().profitability
+    assert p.basis == "gross"
+    assert p.annual_period_days == (350, 380)
+    assert p.max_fact_age_days == 548
+    assert p.exclude_sic_ranges == ((6000, 6999),)
+    assert p.include_derived is True
+    assert p.top_fraction == pytest.approx(0.10)
+    assert p.weighting == "equal"
+
+
+def test_profitability_basis_is_gross_only() -> None:
+    """`cash` joins the literal only when its pre-declared variant registers."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, profitability={"basis": "cash"})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"unknown_key": 1},
+        {"top_fraction": float("nan")},
+        {"top_fraction": float("inf")},
+        {"top_fraction": 0.0},
+        {"top_fraction": 1.5},
+        {"weighting": "cap"},
+        {"max_fact_age_days": 0},
+        {"annual_period_days": [380, 350]},
+        {"annual_period_days": [0, 380]},
+        {"exclude_sic_ranges": [[6999, 6000]]},
+    ],
+)
+def test_profitability_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, profitability=override)
+
+
+def test_profitability_keys_are_not_sweepable_by_default() -> None:
+    """`lab.sweepable_keys` is unchanged by T85 (spec open question 12 is a later,
+    reviewed config change)."""
+    assert not any(k.startswith("profitability.") for k in _settings().lab.sweepable_keys)
+
+
+def test_env_example_names_profitability_keys() -> None:
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    text = env_example.read_text(encoding="utf-8")
+    for name in Settings.model_fields["profitability"].annotation.model_fields:  # type: ignore[union-attr]
+        assert f"PROFITABILITY__{name.upper()}=" in text, name
 
 
 def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
