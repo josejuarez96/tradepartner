@@ -165,7 +165,7 @@ tests have one source:
    conflict-withheld value (#660, pitfall P13), a key held behind an unstamped
    accession, an IFRS filer or a non-USD filer (`statement_none`, `statement_non_usd`),
    and a company whose income statement has no cost of revenue line (the coverage
-   spike found about 115 such names per month-end in scope, V, MA, PYPL, DIS, XOM, MCD,
+   spike found about 107 such names per month-end in scope, V, MA, PYPL, DIS, XOM, MCD,
    CMCSA, UNP, UPS, LIN and CHTR among them; the tilt that leaves is disclosed under
    "What is scored" below). Exclusion is the only safe reading: zero would put every
    bank at the bottom and every untagged filer between the two tails.
@@ -447,7 +447,7 @@ filers that dropped the gross-profit subtotal (TMO, ORCL, INTU, DE, RTX, BKNG, G
 SIC division, the share of member-months with a usable pair: manufacturing 88%, wholesale
 89%, retail 84%, services 70%, construction 61%, mining and oil and gas 30%, transport,
 communications and utilities 26% (all members, financials included, below). By size
-decile of the universe (1 = the 100 largest): 70% in decile 1, 75% in decile 2, 80 to 82%
+decile of the universe (1 = the 100 largest): 70% in decile 1, 75% in decile 2, 79 to 82%
 in deciles 3 to 5, 74 to 79% in deciles 6 to 10, so the largest decile is the worst
 covered. Exchange makes no difference (NYSE 76%, NASDAQ 77%).
 
@@ -478,7 +478,7 @@ which is why the owner sent it to the backlog as a candidate follow-up (B3b).
 
 Rebalance sessions and monthly returns are H1's exactly, since the windows and the
 calendar are the same (`tests/backtest/test_h1_file.py` checks the counts; plan task
-T85e's `tests/backtest/test_b3_file.py` pins them against H1's file): **41 rebalance
+T85's `tests/backtest/test_b3_file.py` pins them against H1's file): **41 rebalance
 sessions and 40 monthly returns** in sample (2020-08-31 to 2023-12-29 since #975 and
 #1033; 50 and 49 over 2019-11-29 to 2023-12-29 under #842 and #851; 84 and 83 over
 2017-01-31 to 2023-12-29 before; the first rebalance fills on 2020-09-01 and the
@@ -657,14 +657,15 @@ N. This file is never edited after registration to fit a result.
   `strategy`; `profitability`: `profitability`; `costs` always), as the block above
   assumes; the file never names the inert `strategy.*` keys. The section lands with a
   defaults mechanism (the strategy-lab spec's `FROZEN_KEY_DEFAULTS` and `frozen_values`,
-  or a minimal equivalent in T85), because adding a frozen section today makes H1's
+  or a minimal equivalent in T85; T96 merged as #1021 on 2026-10-06, so plan task T85
+  builds on it), because adding a frozen section today makes H1's
   registration unrunnable until re-registered, which the lab spec forbids (amendment
   #720, "Frozen keys").
 - **B3-2. Registering B3 beside the strategy lab.** Decided (a), owner, 2026-10-03
   (with spec open question 13): B3 is registered **before** the lab migration, as a
   pre-lab registration, this file as written, under the Phase 3 rules for its runs and
   its one spend, grandfathered by `pre_lab_hypotheses`; the plan orders T85f before the
-  lab's migration task (the strategy-lab plan is not written, #281 open). So neither the
+  lab's migration task (the strategy-lab plan was not written then; it is #933 now). So neither the
   lab's holdout-overlap rule nor its standalone-file refusal applies to B3, and the one
   lab-spec sentence this draft changes is the fingerprint one (`family` and the family's
   own section in the fingerprint). Rejected: re-casting the file as a one-value sweep
@@ -673,7 +674,11 @@ N. This file is never edited after registration to fit a result.
   amendment marks a spend whose window overlaps another family's recorded spend
   (`holdout_seen_family`, reported, not a gate), an H1 holdout result is evidence this
   file must disclose at registration (above), and ADR 0005 means no holdout result
-  selects between the two families.
+  selects between the two families. **Superseded in part, 2026-10-06 (#1033, spec open
+  question 15):** the `holdout_seen_family` mark was dropped from the accepted amendment;
+  the overlap is a query over `trials` (`kind = 'holdout'`, the window columns, the
+  family through `hypotheses`), and the disclosure duty and the ADR 0005 rule stand. The
+  strategy-lab plan has since been written (#933); T85f is ordered before its T113.
 - **B3-3. `max_fact_age_days`.** The filing calendar (SEC deadlines, not register
   evidence): a 10-K is due 60, 75 or 90 days after fiscal year end for large
   accelerated, accelerated and non-accelerated filers, so a December fiscal year's
@@ -735,7 +740,7 @@ N. This file is never edited after registration to fit a result.
 - **B3-8. The spanning diagnostic.** Keep it a registered research run outside the
   retirement rule (above), or add a `metrics` key (`alpha_vs_mtum_monthly`, its t) by
   spec amendment so the rule can read it. Recommendation: keep it outside; a stored
-  regression on 49 months has no power either, and the rule stays readable from two
+  regression on 40 months (49 under #851) has no power either, and the rule stays readable from two
   stored values.
   **Decided outside, owner, 2026-10-04 (#811):** the diagnostic stays a registered
   `return`-kind research run outside the retirement rule; no `metrics` key is added. Its
