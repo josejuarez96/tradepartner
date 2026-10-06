@@ -624,6 +624,16 @@ def test_a_re_registered_hypothesis_is_a_plan_trial_error(env: Env) -> None:
     assert env.counts() == counts
 
 
+def test_a_family_the_engine_cannot_run_is_a_plan_trial_error(env: Env) -> None:
+    """A window whose hypothesis is `profitability` plans nothing until T85e dispatches
+    its signal (#1053). The family is changed by hand, as no window can start on one."""
+    env.conn.execute("UPDATE hypotheses SET family = 'profitability'")
+    counts = env.counts()
+    with pytest.raises(PlanTrialError, match="cannot run yet"):
+        env.plan()
+    assert env.counts() == counts
+
+
 def test_a_run_of_another_window_is_refused(env: Env) -> None:
     with pytest.raises(ValueError, match="not of window"):
         env.plan(run=replace(env.run, window_id=999))

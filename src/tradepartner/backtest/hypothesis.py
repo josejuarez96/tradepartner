@@ -7,14 +7,20 @@ fenced block whose info string is `toml hypothesis`. Its top level names `slug`
 config keys (`[holdout]`, `[strategy]`, `[costs]`, and any other frozen key the
 file wants to pin). Every other part of the file is prose, but it is hashed too.
 
-**The file must name** `in_sample_start`, `holdout.start`, `holdout.end` and every
-`strategy.*` and `costs.*` key, or it is refused; the holdout never comes from live
-`Settings`. A key outside the frozen list below is refused rather than ignored.
+**The file must name** `in_sample_start`, `holdout.start`, `holdout.end`, every
+`costs.*` key and every key of its family's signal section (`strategy.*` for
+`momentum`, `profitability.*` for `profitability`; `REQUIRED_SECTIONS`), or it is
+refused; the holdout never comes from live `Settings`. A key outside the frozen list
+below is refused rather than ignored, and so is a key of another family's signal
+section (`frozen.inert_sections`).
 
-**The frozen set** is every key of `strategy`, `schedule`, `universe`, `costs`,
-`backtest`, `adjust`, `master`, `gap`, `holdout` and `metrics`, plus `execution.fill_price`,
-`benchmarks` and `alpaca.historical_feed`. File values win for the keys the file
-names; the live `Settings` fill the rest at registration. The merged values are
+**The frozen set** is every key of `strategy`, `profitability`, `schedule`, `universe`,
+`costs`, `backtest`, `adjust`, `master`, `gap`, `holdout` and `metrics`, plus
+`execution.fill_price`, `benchmarks` and `alpaca.historical_feed`, less the family's
+inert sections: a registration stores only its own family's signal section, never
+reading the inert one from live `Settings` (backtest spec amendment #720), and a run
+keeps the live value of a section its family never reads. File values win for the
+keys the file names; the live `Settings` fill the rest at registration. The merged values are
 validated through `Settings` and stored in their JSON form (floats for float keys,
 ISO strings for dates), so `15` and `15.0` in a file hash the same.
 
@@ -54,6 +60,7 @@ from tradepartner.store import registry
 #: Settings sections frozen whole (spec req 10).
 FROZEN_SECTIONS: Final = (
     "strategy",
+    "profitability",
     "schedule",
     "universe",
     "costs",
@@ -66,8 +73,12 @@ FROZEN_SECTIONS: Final = (
 )
 #: Single frozen keys outside those sections.
 FROZEN_SINGLE_KEYS: Final = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
-#: Sections every one of whose keys the file must name.
-REQUIRED_SECTIONS: Final = ("strategy", "costs")
+#: Sections every one of whose keys the file must name, by family. A family not listed
+#: (`oracle`, and one the registry will refuse) is held to momentum's.
+REQUIRED_SECTIONS: Final[dict[str, tuple[str, ...]]] = {
+    "momentum": ("strategy", "costs"),
+    "profitability": ("profitability", "costs"),
+}
 #: Keys the file must name outside those sections.
 REQUIRED_SINGLE_KEYS: Final = ("holdout.start", "holdout.end")
 #: Top-level keys of the parameter block that are not config keys.
@@ -111,10 +122,16 @@ def frozen_keys() -> tuple[str, ...]:
     return tuple(keys)
 
 
-def required_keys() -> frozenset[str]:
-    """The config keys a hypothesis file must name (besides `in_sample_start`)."""
+def family_frozen_keys(family: str) -> tuple[str, ...]:
+    """`frozen_keys()` less `family`'s inert sections: what a registration stores."""
+    inert = frozen.inert_sections(family)
+    return tuple(k for k in frozen_keys() if k.partition(".")[0] not in inert)
+
+
+def required_keys(family: str = "momentum") -> frozenset[str]:
+    """The config keys a `family` hypothesis file must name (besides `in_sample_start`)."""
     keys = set(REQUIRED_SINGLE_KEYS)
-    for section in REQUIRED_SECTIONS:
+    for section in REQUIRED_SECTIONS.get(family, REQUIRED_SECTIONS["momentum"]):
         keys.update(_section_keys(section))
     return frozenset(keys)
 
@@ -164,7 +181,16 @@ def parse_file(path: Path) -> HypothesisFile:
         raise HypothesisFileError(
             f"{path}: keys outside the frozen list are refused: {', '.join(unknown)}"
         )
-    missing = sorted((required_keys() | {"slug", "family", "title", "in_sample_start"}) - set(flat))
+    family = flat.get("family")
+    family = family if isinstance(family, str) else "momentum"
+    inert = sorted(k for k in flat if k.partition(".")[0] in frozen.inert_sections(family))
+    if inert:
+        raise HypothesisFileError(
+            f"{path}: keys of another family's signal section are refused for "
+            f"family {family!r}: {', '.join(inert)}"
+        )
+    required = required_keys(family) | {"slug", "family", "title", "in_sample_start"}
+    missing = sorted(required - set(flat))
     if missing:
         raise HypothesisFileError(f"{path}: required keys missing: {', '.join(missing)}")
     for key in ("slug", "family", "title"):
@@ -210,23 +236,29 @@ def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
         raise HypothesisFileError(f"frozen values fail validation: {exc}") from exc
 
 
-def frozen_params_of(settings: Settings) -> dict[str, Any]:
-    """The frozen keys of `settings`, dotted, in their JSON form."""
+def frozen_params_of(settings: Settings, *, family: str = "momentum") -> dict[str, Any]:
+    """The frozen keys of `settings` a `family` registration stores, dotted, in their
+    JSON form (no inert section)."""
     dumped = settings.model_dump(mode="json")
     params: dict[str, Any] = {}
-    for key in frozen_keys():
+    for key in family_frozen_keys(family):
         section, _, field = key.partition(".")
         params[key] = dumped[section][field] if field else dumped[section]
     return params
 
 
-def frozen_hash_matches(settings: Settings, stored_sha256: str) -> bool:
-    """True when the frozen keys of `settings` are the registration whose stored hash is
-    `stored_sha256`: written out in full, or, for a registration stored before a suffix
-    of `FROZEN_KEY_DEFAULTS` landed, with those table keys (at their defaults) left out,
-    which is exactly what `frozen.frozen_values` overlaid when `load_frozen` built it."""
-    params = frozen_params_of(settings)
-    table = [(key, default) for key, default, _version in frozen.FROZEN_KEY_DEFAULTS]
+def frozen_hash_matches(
+    settings: Settings, stored_sha256: str, *, family: str = "momentum"
+) -> bool:
+    """True when the frozen keys of `settings` are the `family` registration whose
+    stored hash is `stored_sha256`: written out in full, or, for a registration stored
+    before a suffix of `FROZEN_KEY_DEFAULTS` landed, with those table keys (at their
+    defaults) left out, which is exactly what `frozen.frozen_values` overlaid when
+    `load_frozen` built it. The family's inert sections take no part."""
+    params = frozen_params_of(settings, family=family)
+    table = [
+        (key, default) for key, default, _version in frozen.FROZEN_KEY_DEFAULTS if key in params
+    ]
     for i in range(len(table), -1, -1):
         later = table[i:]
         if any(params.get(key) != default for key, default in later):
@@ -240,7 +272,7 @@ def frozen_hash_matches(settings: Settings, stored_sha256: str) -> bool:
 
 def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
     """The frozen set: the file's values over `settings` for every frozen key."""
-    return frozen_params_of(_overlay(settings, parsed.file_params))
+    return frozen_params_of(_overlay(settings, parsed.file_params), family=parsed.family)
 
 
 def register(
@@ -288,15 +320,18 @@ def load_frozen(
 ) -> Settings:
     """`Settings` for a run of `slug`'s latest registration: its frozen values (read
     through `frozen.frozen_values`) over the live `settings` (default: loaded config)
-    for every other key. `UnknownHypothesis` for an unregistered slug."""
+    for every other key, the family's inert sections included.
+    `UnknownHypothesis` for an unregistered slug."""
     record = registry.get_hypothesis(conn, slug)
     if registry.params_sha256(record.params) != record.params_sha256:
         raise HypothesisFileError(
             f"{slug!r}: stored parameters do not match their hash {record.params_sha256}"
         )
     values = frozen.frozen_values(record)
-    if set(values) != set(frozen_keys()):
-        drift = sorted(set(values) ^ set(frozen_keys()))
+    inert = frozen.inert_sections(record.family)
+    expected = {k for k in frozen_keys() if k.partition(".")[0] not in inert}
+    if set(values) != expected:
+        drift = sorted(set(values) ^ expected)
         raise HypothesisFileError(
             f"{slug!r}: registered with a different frozen key set ({', '.join(drift)}); "
             "re-register the hypothesis"

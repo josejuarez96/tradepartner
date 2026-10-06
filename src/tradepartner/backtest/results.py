@@ -74,7 +74,7 @@ FamilySharpesFn = Callable[..., FamilySharpes]
 
 def _check_frozen(handle: TrialHandle, params: Settings) -> None:
     """Refuse `params` that are not the trial's frozen `Settings`."""
-    if not frozen_hash_matches(params, handle.params_sha256):
+    if not frozen_hash_matches(params, handle.params_sha256, family=handle.family):
         raise ValueError(
             f"params are not trial {handle.trial_id}'s frozen settings (their frozen keys "
             "hash differently); pass the Settings the trial was opened with"

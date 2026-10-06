@@ -630,3 +630,31 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     stored = registry.get_hypothesis(conn, SLUG)
     assert stored.params_sha256 == hashed
     assert not any(key.startswith("schedule.") for key in stored.params)
+
+
+def test_a_family_the_engine_cannot_run_is_refused_before_any_trial(
+    fixture_store_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `profitability` registration is refused until T85e dispatches its signal
+    (#1053): otherwise the run would read the live, unfrozen `strategy.*`."""
+    frozen = _frozen()
+    with open_for_write(_store(fixture_store_path)) as conn:
+        registry.register_hypothesis(
+            conn,
+            slug="b3-run",
+            family="profitability",
+            title="not runnable yet",
+            doc_path="docs/hypotheses/b3-run.md",
+            doc_sha256="0" * 64,
+            params=frozen_params_of(frozen, family="profitability"),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="test",
+            settings=frozen,
+        )
+    calls = _spy(monkeypatch)
+    with pytest.raises(ValueError, match="cannot run yet"):
+        run_hypothesis("b3-run", None, None, Flags(), store_path=fixture_store_path)
+    assert calls == []
+    assert read().execute("SELECT COUNT(*) FROM trials").fetchone() == (0,)
