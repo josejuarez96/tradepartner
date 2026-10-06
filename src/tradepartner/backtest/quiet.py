@@ -166,12 +166,12 @@ def paper_interval(
     session_open: datetime | None,
 ) -> QuietInterval | None:
     """The paper interval on exchange day `day`, or None when no window is open or the
-    open does not fall on a quiet weekday.
+    plist's fire time does not fall on a quiet weekday.
 
-    `day` is an XNYS (New York) calendar date; the quiet-weekday gate reads the open's
-    weekday in `lab.quiet_timezone`, the zone the paper plist fires in, which is the
-    same day whenever that zone is the exchange's. `session_open` is the day's XNYS
-    open (tz-aware) or None on a non-session day, when
+    `day` is an XNYS (New York) calendar date; the quiet-weekday gate reads the weekday
+    of the interval's start (when the paper plist fires) in `lab.quiet_timezone`, the
+    zone launchd fires in, which is `day` itself whenever that zone is the exchange's.
+    `session_open` is the day's XNYS open (tz-aware) or None on a non-session day, when
     the regular open time stands in (the paper plist fires on weekday holidays too and
     writes a `no_session` row). The bounds move with the `paper.*` timing keys and
     `lab.paper_run_lead_minutes`, so no edit here follows a T70 timing change.
@@ -185,9 +185,6 @@ def paper_interval(
         if session_open.astimezone(_EXCHANGE_TZ).date() != day:
             raise ValueError(f"session_open {session_open.isoformat()} is not on {day}")
         open_at = session_open.astimezone(UTC)
-    quiet_zone = ZoneInfo(settings.lab.quiet_timezone)
-    if open_at.astimezone(quiet_zone).weekday() not in settings.lab.quiet_weekdays:
-        return None
     paper = settings.paper
     before = timedelta(
         minutes=paper.submit_window_before_open_minutes + settings.lab.paper_run_lead_minutes
@@ -195,7 +192,11 @@ def paper_interval(
     after = timedelta(
         minutes=paper.submit_window_after_open_minutes, seconds=paper.sell_wait_seconds
     )
-    return QuietInterval(open_at - before, open_at + after, ("paper",))
+    start = open_at - before
+    quiet_zone = ZoneInfo(settings.lab.quiet_timezone)
+    if start.astimezone(quiet_zone).weekday() not in settings.lab.quiet_weekdays:
+        return None
+    return QuietInterval(start, open_at + after, ("paper",))
 
 
 def _merge(intervals: Sequence[QuietInterval]) -> list[QuietInterval]:
@@ -307,8 +308,9 @@ def start_decision(
     ends at or before the next interval begins, or when its duration exceeds the
     longest gap between consecutive intervals (it can never fit, so it starts at once
     and pauses through each interval), and `wait` otherwise. With no interval ahead the
-    group starts. `intervals` is the timeline from `quiet_intervals_around`, which spans
-    a full week so the longest gap is the true one.
+    group starts. `intervals` is the timeline from `quiet_intervals_around`, which holds
+    every quiet weekday at least twice so the longest gap is the true weekly one; a
+    shorter caller-built timeline can understate it.
     """
     _require_aware(now, "now")
     if not math.isfinite(predicted_seconds) or predicted_seconds < 0:
@@ -333,7 +335,7 @@ def _system_offset(instant: datetime) -> timedelta:
 
 
 def system_timezone_matches(
-    settings: Settings, *, system_tz: tzinfo | None = None, around: datetime | None = None
+    settings: Settings, *, around: datetime, system_tz: tzinfo | None = None
 ) -> bool:
     """True when `lab.quiet_timezone` keeps the same UTC offsets as the system zone.
 
@@ -342,12 +344,10 @@ def system_timezone_matches(
     their offsets at instants every six hours from a year before `around` to two years
     after it (both DST transitions each year, the rules in force now and next), so an
     alias such as `US/Eastern` matches `America/New_York`. `system_tz` stands in for
-    the machine's zone and `around` for the clock (a test passes both); when omitted
-    the process's local time rules and the current time are read.
+    the machine's zone (a test passes one); when omitted the process's local time rules
+    are read. `around` is the clock, passed in like `now` elsewhere here.
     """
     zone = ZoneInfo(settings.lab.quiet_timezone)
-    if around is None:
-        around = datetime.now(UTC)
     _require_aware(around, "around")
     first = around.astimezone(UTC) - _TZ_SAMPLE_BEFORE
     for step in range(_TZ_SAMPLE_COUNT):

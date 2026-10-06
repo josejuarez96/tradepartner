@@ -318,13 +318,20 @@ def test_start_decision_refuses_a_naive_clock_or_negative_prediction() -> None:
     ],
 )
 def test_system_timezone_matches(zone: str, matches: bool) -> None:
-    assert system_timezone_matches(_settings(), system_tz=ZoneInfo(zone)) is matches
+    assert (
+        system_timezone_matches(_settings(), system_tz=ZoneInfo(zone), around=_ny(MONDAY, 12))
+        is matches
+    )
 
 
 def test_system_timezone_mismatch_with_a_configured_zone() -> None:
     settings = _settings(lab={"quiet_timezone": "Europe/London"})
-    assert system_timezone_matches(settings, system_tz=ZoneInfo("Europe/London"))
-    assert not system_timezone_matches(settings, system_tz=ZoneInfo("America/New_York"))
+    assert system_timezone_matches(
+        settings, system_tz=ZoneInfo("Europe/London"), around=_ny(MONDAY, 12)
+    )
+    assert not system_timezone_matches(
+        settings, system_tz=ZoneInfo("America/New_York"), around=_ny(MONDAY, 12)
+    )
 
 
 @pytest.mark.parametrize(("tz", "matches"), [("America/New_York", True), ("UTC", False)])
@@ -334,7 +341,7 @@ def test_system_timezone_read_from_the_process(
     monkeypatch.setenv("TZ", tz)
     time.tzset()
     try:
-        assert system_timezone_matches(_settings()) is matches
+        assert system_timezone_matches(_settings(), around=_ny(MONDAY, 12)) is matches
     finally:
         monkeypatch.undo()
         time.tzset()
@@ -391,7 +398,7 @@ def test_a_huge_prediction_starts_without_overflow() -> None:
 
 
 def test_paper_interval_gate_reads_the_open_in_the_quiet_zone() -> None:
-    # In Auckland, New York's Monday 09:30 open is Tuesday morning.
+    # In Auckland, New York's Monday 07:30 fire time is already Tuesday 00:30.
     settings = _settings(lab={"quiet_timezone": "Pacific/Auckland", "quiet_weekdays": [1]})
     interval = paper_interval(MONDAY, settings, True, _session_open(MONDAY))
     assert interval is not None and interval.start == _ny(MONDAY, 7, 30)
@@ -409,3 +416,13 @@ def test_system_timezone_sample_follows_the_clock() -> None:
     )
     with pytest.raises(ValueError, match="tz-aware"):
         system_timezone_matches(settings, system_tz=bahia, around=datetime(2026, 1, 1))  # noqa: DTZ001
+
+
+def test_paper_interval_gate_reads_the_fire_time_not_the_open() -> None:
+    # Brisbane (UTC+10, no DST): NY Friday 07:30 EDT fires Friday 21:30 local, while the
+    # 09:30 open is Friday 23:30; NY Thursday likewise stays Thursday. With Friday the
+    # only quiet weekday, only Friday's interval is kept.
+    settings = _settings(lab={"quiet_timezone": "Australia/Brisbane", "quiet_weekdays": [4]})
+    assert paper_interval(FRIDAY, settings, True, _session_open(FRIDAY)) is not None
+    thursday = FRIDAY - timedelta(days=1)
+    assert paper_interval(thursday, settings, True, _session_open(thursday)) is None
