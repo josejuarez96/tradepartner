@@ -69,6 +69,24 @@ here is this module's and is stated once:
   (`"<security_id>@<valid_from>"`), in that rule's row shape, so an accepted
   pair is listed, never silently hidden.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
+- **Statement facts** (`statement`, #660, T77c): `edgar.statement_facts_enabled`'s
+  state; while it is on, `statement_coverage`'s share of `universe_as_of(T)`
+  names whose issuer has a `revenue` and a `total_assets` row known at `t`
+  with `period_end` within `universe.max_shares_age_days` of the last
+  completed session at `t` (rule 7's own bound, measured the same way;
+  not any backtest family's own `max_fact_age_days`,
+  which can be wider; report-only, no rule reads it), and the derived share
+  of every known `gross_profit` row (`basis = derived`, over every CIK with
+  a `securities` row known at `t`, not only `universe_as_of(T)`'s members,
+  one row per `(cik, period_end, period_days)`: a parse-quality count, not
+  a portfolio one); while it is off, `coverage` is `None` -- nothing to
+  report on, and `universe_as_of` is not paid for. `counts` is
+  `statement_counts` of the latest EDGAR run's message, empty when it
+  names none. The data-health page's own card (dashboard T77c) shows a
+  warning badge while `vintage_late` is positive; `health --check` does
+  not, since this is a reported figure, not one of the integrity rules
+  below. A CLI warning, like the quarantined-count one `cli._quarantined`
+  already prints, is T77b's to add alongside the run message it reads.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
@@ -143,14 +161,30 @@ derived at `t`, as the data is read.
   that are still live at `t` (`store.retraction.underived_as_of`): table,
   key, stored `known_at` and the check's run id. `tradepartner
   master-retract` lists the same set from a fresh build and retracts it.
+- `statement_period_days` (#660, T77c): every `statement_facts` row has
+  `period_start` NULL exactly when `period_days = 0`, else `period_days =
+  period_end - period_start` in days. The schema's own `CHECK` already
+  blocks the first half; this restates both for a store's own confidence
+  (the schema comment's words), the shape a store built by other code, or
+  a future schema, could still break.
+- `statement_derived_matches_components`: every `basis = derived`
+  `gross_profit` row equals the difference of the two stored `revenue` and
+  `cost_of_revenue` rows sharing its `cik`, `period_end`, `period_days` and
+  `filing_accession`, both present -- a missing component row fails it too.
+  Cannot fail on correct data (spec "Health").
+- `statement_basis_allowed`: `statement_facts.basis` is in
+  `schema.STATEMENT_FACT_BASIS_VALUES` (`{reported, derived}`). The
+  schema's own `CHECK` already blocks this too.
 
 This module holds no threshold; the only numbers in it are 0 and 1.
 """
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -173,7 +207,7 @@ from tradepartner.config import (
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
-from tradepartner.store.asof import _validate_t, price_jumps_as_of
+from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
     DELISTED,
@@ -185,8 +219,8 @@ from tradepartner.store.delistings import (
 )
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
-from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
-from tradepartner.universe import shares_as_of
+from tradepartner.store.schema import STATEMENT_FACT_BASIS_VALUES, TABLE_PROVENANCE_VALUES
+from tradepartner.universe import shares_as_of, universe_as_of
 
 STATIC = "snapshot_static"
 #: The classification ingest's staleness check counts, with benchmarks.
@@ -209,6 +243,9 @@ NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
 GUARDED_SIC_DEFAULT = "guarded_sic_default"
 UNDERIVED_MASTER_ROWS = "underived_master_rows"
+STATEMENT_PERIOD_DAYS = "statement_period_days"
+STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
+STATEMENT_BASIS_ALLOWED = "statement_basis_allowed"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -222,6 +259,9 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NO_BARS_AFTER_DELISTING,
     GUARDED_SIC_DEFAULT,
     UNDERIVED_MASTER_ROWS,
+    STATEMENT_PERIOD_DAYS,
+    STATEMENT_DERIVED_MATCHES_COMPONENTS,
+    STATEMENT_BASIS_ALLOWED,
 )
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
@@ -254,6 +294,24 @@ _AFTER_DELISTING_SCHEMA: dict[str, Any] = {
     "effective_on": pl.Date,
 }
 _GUARD_SCHEMA: dict[str, Any] = {"setting": pl.Utf8, "value": pl.Utf8, "expected": pl.Utf8}
+_STATEMENT_PERIOD_SCHEMA: dict[str, Any] = {
+    "cik": pl.Utf8,
+    "fact_name": pl.Utf8,
+    "period_end": pl.Date,
+    "period_days": pl.Int64,
+    "period_start": pl.Date,
+    "filing_accession": pl.Utf8,
+}
+_STATEMENT_DERIVED_SCHEMA: dict[str, Any] = {
+    "cik": pl.Utf8,
+    "period_end": pl.Date,
+    "period_days": pl.Int64,
+    "filing_accession": pl.Utf8,
+    "value": pl.Float64,
+    "revenue": pl.Float64,
+    "cost_of_revenue": pl.Float64,
+}
+_STATEMENT_BASIS_SCHEMA: dict[str, Any] = {"basis": pl.Utf8, "rows": pl.Int64}
 _GAP_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "first_bar": pl.Date,
@@ -391,6 +449,54 @@ class AcceptedSameDayPairs:
     frame: pl.DataFrame
 
 
+@dataclass(frozen=True)
+class StatementCoverage:
+    """Statement-facts freshness and derived share at `t` (module
+    docstring, #660, T77c). `fresh`/`total` are over `universe_as_of(T)`
+    names (`total`); `derived`/`reported` count every known `gross_profit`
+    row by `basis`, one per `(cik, period_end, period_days)`, over every
+    CIK with a `securities` row known at `t` -- not only `universe_as_of`'s
+    members, so a name excluded from today's universe (delisted, stale
+    shares, ...) still counts here."""
+
+    fresh: int
+    total: int
+    derived: int
+    reported: int
+
+    @property
+    def share(self) -> float:
+        """Coverage share, 0.0 when `total` is 0 (this module's usual
+        empty-population convention, as `Coverage.share`)."""
+        return self.fresh / self.total if self.total else 0.0
+
+    @property
+    def derived_share(self) -> float:
+        """Derived share of known `gross_profit` rows, 0.0 when none."""
+        n = self.derived + self.reported
+        return self.derived / n if n else 0.0
+
+
+@dataclass(frozen=True)
+class StatementFacts:
+    """Statement-facts health at `t` (#660, T77c). `enabled` is
+    `edgar.statement_facts_enabled`; `coverage` is `None` while it is off
+    (nothing to report on, and `universe_as_of` is not run for nothing).
+    `counts` is `statement_counts` of the latest EDGAR run's message,
+    empty when it names none (the switch has always been off, or the run
+    predates T77b)."""
+
+    enabled: bool
+    coverage: StatementCoverage | None
+    counts: dict[str, int]
+
+    @property
+    def vintage_late(self) -> int:
+        """`statement_vintage_late` from the latest run's counts, 0 if
+        unnamed."""
+        return self.counts.get("vintage_late", 0)
+
+
 @dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
@@ -421,6 +527,7 @@ class HealthReport:
     shares_outliers: SharesOutliers
     accepted_same_day_pairs: AcceptedSameDayPairs
     settings: dict[str, Any]
+    statement: StatementFacts
     integrity: tuple[IntegrityCheck, ...]
 
     @property
@@ -454,10 +561,11 @@ def health_report(
     securities = securities_as_of(conn, t)
     classes = classifications_as_of(conn, t)
     overlaps, accepted_pairs = _overlapping_listings(listings, settings)
+    ingests = last_ingests(conn, t)
     return HealthReport(
         t=t,
         session=session,
-        ingests=last_ingests(conn, t),
+        ingests=ingests,
         coverage=_coverage(conn, t, session, current, securities, classes),
         gaps=bar_gaps(conn, t),
         survivorship=survivorship_gap(conn, t, settings),
@@ -471,6 +579,7 @@ def health_report(
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
         },
+        statement=_statement_facts_report(conn, t, settings, ingests),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps),
     )
 
@@ -491,6 +600,114 @@ def _shares_outliers(
     if before is not None:
         frame = frame.filter(pl.col("as_of_date") < before)
     return SharesOutliers(frame, before)
+
+
+#: `statement_<name>: <N>` (T77b's run-message convention, not yet built:
+#: `ingest._source_counts`'s `"label: N"` shape and `cli._QUARANTINED`'s
+#: pattern, generalised over every `statement_*` run-row count the spec
+#: names -- `held`, `unstampable`, `vintage_late`, `conflicts`, `restated`,
+#: `non_usd`, `malformed`, `derived`, `none` -- so this parser needs no
+#: change whichever of them, or in whatever order, a message carries.
+_STATEMENT_COUNT = re.compile(r"\bstatement_(\w+): (\d+)\b")
+
+
+def statement_counts(message: str | None) -> dict[str, int]:
+    """Every `statement_<name>: <N>` figure in an EDGAR run's message
+    (T77b, #660), keyed by `name` with the `statement_` prefix stripped
+    (e.g. `{"held": 3, "vintage_late": 0, "derived": 2}`). Empty when
+    `message` is `None` or names none (the switch has always been off, or
+    the run predates T77b)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _STATEMENT_COUNT.findall(message)}
+
+
+def statement_coverage(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+) -> StatementCoverage:
+    """`StatementCoverage` at `t` (module docstring), computed whether or
+    not `edgar.statement_facts_enabled` is on. `health_report` skips this
+    while the switch is off: there is nothing in the table to report on,
+    and no reason to pay for `universe_as_of`."""
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    return _statement_coverage(conn, t, settings)
+
+
+def _statement_coverage(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> StatementCoverage:
+    if "statement_facts" not in _present_tables(conn):
+        return StatementCoverage(fresh=0, total=0, derived=0, reported=0)
+    frame = statement_facts_as_of(conn, t)
+    members = universe_as_of(conn, t, settings).members["security_id"].to_list()
+    member_frame = frame.filter(pl.col("security_id").is_in(members)) if members else frame.clear()
+    session = last_completed_session(t)
+    fresh = _fresh_count(member_frame, members, session, settings.universe.max_shares_age_days)
+    derived, reported = _gross_profit_basis_counts(frame)
+    return StatementCoverage(fresh=fresh, total=len(members), derived=derived, reported=reported)
+
+
+def _fresh_count(frame: pl.DataFrame, members: Sequence[str], session: date, bound: int) -> int:
+    """How many of `members` have both a `revenue` and a `total_assets`
+    row in `frame` (already filtered to `members`) whose latest known
+    `period_end` is within `bound` days of `session` (module docstring:
+    rule 7's own freshness bound, measured the same way rule 7 measures
+    it -- from the last completed session, not `t` itself)."""
+    if not members or frame.is_empty():
+        return 0
+    latest = (
+        frame.filter(pl.col("fact_name").is_in(["revenue", "total_assets"]))
+        .group_by(["security_id", "fact_name"])
+        .agg(pl.col("period_end").max())
+    )
+    by_sid: dict[str, dict[str, date]] = defaultdict(dict)
+    for row in latest.iter_rows(named=True):
+        by_sid[row["security_id"]][row["fact_name"]] = row["period_end"]
+    fresh = 0
+    for sid in members:
+        facts = by_sid.get(sid)
+        if (
+            facts
+            and "revenue" in facts
+            and "total_assets" in facts
+            and all((session - pe).days <= bound for pe in facts.values())
+        ):
+            fresh += 1
+    return fresh
+
+
+def _gross_profit_basis_counts(frame: pl.DataFrame) -> tuple[int, int]:
+    """`(derived, reported)` counts of every known `gross_profit` row in
+    `frame` (every CIK with a `securities` row known at `t`, per
+    `_statement_coverage`'s caller), deduplicated to one per `(cik,
+    period_end, period_days)` (`frame` may repeat a dual-class issuer's
+    row once per class)."""
+    if frame.is_empty():
+        return 0, 0
+    gross_profit = frame.filter(pl.col("fact_name") == "gross_profit").unique(
+        ["cik", "period_end", "period_days"]
+    )
+    if gross_profit.is_empty():
+        return 0, 0
+    derived = int((gross_profit["basis"] == "derived").sum())
+    reported = int((gross_profit["basis"] == "reported").sum())
+    return derived, reported
+
+
+def _statement_facts_report(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    ingests: tuple[IngestStatus, ...],
+) -> StatementFacts:
+    message = next((i.latest_message for i in ingests if i.source == "edgar"), None)
+    enabled = settings.edgar.statement_facts_enabled
+    return StatementFacts(
+        enabled=enabled,
+        coverage=_statement_coverage(conn, t, settings) if enabled else None,
+        counts=statement_counts(message),
+    )
 
 
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
@@ -766,6 +983,9 @@ def _integrity_checks(
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
         UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
+        STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
+        STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
+        STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
@@ -1098,3 +1318,96 @@ def _guarded_sic(settings: Settings) -> pl.DataFrame:
             }
         )
     return pl.DataFrame(rows, schema=_GUARD_SCHEMA)
+
+
+def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`statement_period_days` (module docstring): `period_start` NULL
+    exactly when `period_days = 0`, else `period_days = period_end -
+    period_start` in days."""
+    if "statement_facts" not in _present_tables(conn):
+        return pl.DataFrame(schema=_STATEMENT_PERIOD_SCHEMA)
+    found = conn.execute(
+        """
+        SELECT cik, fact_name, period_end, period_days, period_start, filing_accession
+        FROM statement_facts
+        WHERE (period_days = 0) != (period_start IS NULL)
+           OR (period_days != 0 AND period_days != date_diff('day', period_start, period_end))
+        ORDER BY cik, fact_name, period_end, filing_accession
+        """
+    ).fetchall()
+    rows = [
+        {
+            "cik": cik,
+            "fact_name": fact_name,
+            "period_end": period_end,
+            "period_days": int(period_days),
+            "period_start": period_start,
+            "filing_accession": accession,
+        }
+        for cik, fact_name, period_end, period_days, period_start, accession in found
+    ]
+    return pl.DataFrame(rows, schema=_STATEMENT_PERIOD_SCHEMA)
+
+
+def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`statement_derived_matches_components` (module docstring): every
+    `basis = derived` `gross_profit` row must equal the difference of the
+    two stored `revenue` and `cost_of_revenue` rows sharing its `cik`,
+    `period_end`, `period_days` and `filing_accession`, both present (a
+    missing component row fails it too). Exact `DOUBLE` equality, no
+    tolerance: the ingest (T77b) derives the row by this same subtraction
+    at insert time (spec decision (e)), so a correct row's stored value
+    and this recomputation are bit-identical -- no config threshold is
+    needed, or would mean anything, for a check that cannot legitimately
+    differ by any amount on correct data."""
+    if "statement_facts" not in _present_tables(conn):
+        return pl.DataFrame(schema=_STATEMENT_DERIVED_SCHEMA)
+    found = conn.execute(
+        """
+        SELECT d.cik, d.period_end, d.period_days, d.filing_accession, d.value,
+               r.value, c.value
+        FROM statement_facts d
+        LEFT JOIN statement_facts r
+          ON r.cik = d.cik AND r.period_end = d.period_end AND r.period_days = d.period_days
+         AND r.filing_accession = d.filing_accession AND r.fact_name = 'revenue'
+        LEFT JOIN statement_facts c
+          ON c.cik = d.cik AND c.period_end = d.period_end AND c.period_days = d.period_days
+         AND c.filing_accession = d.filing_accession AND c.fact_name = 'cost_of_revenue'
+        WHERE d.fact_name = 'gross_profit' AND d.basis = 'derived'
+          AND (r.value IS NULL OR c.value IS NULL OR d.value != (r.value - c.value))
+        ORDER BY d.cik, d.period_end, d.filing_accession
+        """
+    ).fetchall()
+    rows = [
+        {
+            "cik": cik,
+            "period_end": period_end,
+            "period_days": int(period_days),
+            "filing_accession": accession,
+            "value": value,
+            "revenue": revenue,
+            "cost_of_revenue": cost,
+        }
+        for cik, period_end, period_days, accession, value, revenue, cost in found
+    ]
+    return pl.DataFrame(rows, schema=_STATEMENT_DERIVED_SCHEMA)
+
+
+def _statement_basis_allowed(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`statement_basis_allowed` (module docstring): `basis` outside
+    `schema.STATEMENT_FACT_BASIS_VALUES` (the schema's own `CHECK` already
+    blocks this, as `_statement_period_days`'s docstring notes)."""
+    if "statement_facts" not in _present_tables(conn):
+        return pl.DataFrame(schema=_STATEMENT_BASIS_SCHEMA)
+    allowed = STATEMENT_FACT_BASIS_VALUES
+    marks = ", ".join("?" for _ in allowed)
+    found = conn.execute(
+        f"""
+        SELECT basis, count(*) FROM statement_facts
+        WHERE basis IS NULL OR basis NOT IN ({marks})
+        GROUP BY basis ORDER BY basis NULLS FIRST
+        """,
+        list(allowed),
+    ).fetchall()
+    rows = [{"basis": basis, "rows": int(n)} for basis, n in found]
+    return pl.DataFrame(rows, schema=_STATEMENT_BASIS_SCHEMA)
