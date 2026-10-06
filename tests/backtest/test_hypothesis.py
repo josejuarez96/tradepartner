@@ -564,3 +564,40 @@ def test_h1_twin_registered_before_t85_still_loads_and_verifies(
     if dropped == ("profitability.",):
         assert _register(conn, FIXTURE, live).hypothesis_id == record.hypothesis_id
         assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
+
+
+def test_frozen_hash_matches_compares_a_table_default_by_type(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    """#1022: a live `True` is not a table default of `1`, so a registration stored
+    without that key does not match live settings that would run `True`."""
+    from tradepartner.backtest import frozen
+
+    key = "universe.liquidity_rule_enabled"
+    params = hypothesis.frozen_params_of(settings)
+    assert params[key] is True
+    without = registry.params_sha256({k: v for k, v in params.items() if k != key})
+    monkeypatch.setattr(frozen, "FROZEN_KEY_DEFAULTS", ((key, True, 99),))
+    assert hypothesis.frozen_hash_matches(settings, without)
+    monkeypatch.setattr(frozen, "FROZEN_KEY_DEFAULTS", ((key, 1, 99),))
+    assert not hypothesis.frozen_hash_matches(settings, without)
+
+
+def test_frozen_hash_matches_drops_only_an_at_default_suffix(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    """A later table key at its default is dropped even when an earlier one is not; the
+    earlier one stays in the hash at its live value."""
+    from tradepartner.backtest import frozen
+
+    first, second = "universe.liquidity_rule_enabled", "strategy.signal_total_return"
+    params = hypothesis.frozen_params_of(settings)
+    assert params[first] is True and params[second] is True
+    table = ((first, 1, 99), (second, True, 99))
+    monkeypatch.setattr(frozen, "FROZEN_KEY_DEFAULTS", table)
+    without_second = registry.params_sha256({k: v for k, v in params.items() if k != second})
+    without_both = registry.params_sha256(
+        {k: v for k, v in params.items() if k not in (first, second)}
+    )
+    assert hypothesis.frozen_hash_matches(settings, without_second)
+    assert not hypothesis.frozen_hash_matches(settings, without_both)

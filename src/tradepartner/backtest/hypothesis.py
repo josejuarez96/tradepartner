@@ -261,7 +261,7 @@ def frozen_hash_matches(
     ]
     for i in range(len(table), -1, -1):
         later = table[i:]
-        if any(params.get(key) != default for key, default in later):
+        if not all(frozen.is_default(params.get(key), default) for key, default in later):
             continue
         dropped = {key for key, _default in later}
         stored = {k: v for k, v in params.items() if k not in dropped}

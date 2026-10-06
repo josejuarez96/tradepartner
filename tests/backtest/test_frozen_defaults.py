@@ -41,9 +41,13 @@ def _pre_lab_params(settings: Settings) -> dict[str, Any]:
 
 def test_existing_table_entries_are_pinned_by_value() -> None:
     """Append-only and immutable: a later entry goes after these, never in place."""
-    assert frozen.FROZEN_KEY_DEFAULTS[:2] == (
-        ("schedule.rebalance_cadence", "month_end", 12),
-        ("schedule.signal_anchor", "month_end", 12),
+    # `is_default` (JSON form), not `==`: a `True` edited to `1` must fail (#1022).
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[:2],
+        (
+            ("schedule.rebalance_cadence", "month_end", 12),
+            ("schedule.signal_anchor", "month_end", 12),
+        ),
     )
 
 
@@ -59,7 +63,7 @@ def test_table_defaults_are_the_config_defaults() -> None:
     dumped = Settings(_env_file=None).model_dump(mode="json")  # type: ignore[call-arg]
     for key, default, _version in frozen.FROZEN_KEY_DEFAULTS:
         section, _, name = key.partition(".")
-        assert dumped[section][name] == default, key
+        assert frozen.is_default(dumped[section][name], default), key
 
 
 def test_frozen_module_is_a_leaf() -> None:
@@ -156,6 +160,45 @@ def test_family_and_its_signal_section_are_in_the_fingerprint(
     assert "strategy.extra" not in frozen.canonical_frozen_set(params, "oracle")
 
 
+@pytest.mark.parametrize(
+    ("default", "stored", "kept"),
+    [
+        (1, 1, False),
+        (1, True, True),
+        (1, 1.0, True),
+        (True, 1, True),
+        (True, True, False),
+        (1.0, 1, True),
+        ([1, 2], [1, 2], False),
+        ([1, 2], [1.0, 2], True),
+        ([1, 2], [True, 2], True),
+        ([1, 2], (1, 2), False),
+        ({"a": 1, "b": 2}, {"b": 2, "a": 1}, False),
+    ],
+)
+def test_canonical_set_compares_a_default_by_type_as_well(
+    monkeypatch: pytest.MonkeyPatch, default: Any, stored: Any, kept: bool
+) -> None:
+    """#1022: `True == 1 == 1.0` in Python, but they are different frozen values; a
+    stored value is left out only when it is the default in the same JSON form."""
+    monkeypatch.setattr(
+        frozen,
+        "FROZEN_KEY_DEFAULTS",
+        (*frozen.FROZEN_KEY_DEFAULTS, ("schedule.extra", default, 99)),
+    )
+    canonical = frozen.canonical_frozen_set({"schedule.extra": stored}, "momentum")
+    assert ("schedule.extra" in canonical) is kept
+    # The fingerprint tells a kept value from the default, and ignores a dropped one.
+    as_default = frozen.fingerprint("momentum", {"schedule.extra": default}, IN_SAMPLE_START)
+    as_stored = frozen.fingerprint("momentum", {"schedule.extra": stored}, IN_SAMPLE_START)
+    assert (as_stored != as_default) is kept
+
+
+def test_is_default_refuses_nan() -> None:
+    with pytest.raises(ValueError):
+        frozen.is_default(float("nan"), float("nan"))
+
+
 def test_fingerprint_reads_only_the_keys_that_decide_a_run(settings: Settings) -> None:
     params = _new_params(settings)
     base = frozen.fingerprint("momentum", params, IN_SAMPLE_START)
@@ -205,7 +248,7 @@ def _prof_params(settings: Settings) -> dict[str, Any]:
 
 
 def test_profitability_table_entries_are_pinned_by_value() -> None:
-    assert frozen.FROZEN_KEY_DEFAULTS[2:9] == PROFITABILITY_DEFAULTS
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[2:9], PROFITABILITY_DEFAULTS)
     assert frozen.FAMILY_SIGNAL_SECTIONS["profitability"] == "profitability"
 
 
