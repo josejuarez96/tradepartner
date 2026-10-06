@@ -1,6 +1,6 @@
 # 0014. Strategies are registered objects: one dispatch seam, one family registry, generic exclusions
 
-**Status:** Accepted (owner decisions of 2026-10-06, in chat to the orchestrator, recorded under "Owner decisions" below; by merging PR #1075, a class-B merge by the owner)  ·  **Date:** 2026-10-06  ·  **Issue:** #1074  ·  **Plan:** [strategy-interface](../plans/strategy-interface.md)  ·  **Related:** [backtest spec](../specs/backtest.md) (amendment #720, the `profitability` family), [backtest plan](../plans/backtest.md) (T85 to T85f), [strategy-lab spec](../specs/strategy-lab.md), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (benchmarks), [ADR 0012](0012-cadence-as-a-hypothesis-parameter.md) (cadence)
+**Status:** Accepted (owner decisions of 2026-10-06, in chat to the orchestrator, recorded under "Owner decisions" below; by merging PR #1077, a class-B merge by the owner)  ·  **Date:** 2026-10-06  ·  **Issue:** #1074  ·  **Plan:** [strategy-interface](../plans/strategy-interface.md)  ·  **Related:** [backtest spec](../specs/backtest.md) (amendment #720, the `profitability` family), [backtest plan](../plans/backtest.md) (T85 to T85f), [strategy-lab spec](../specs/strategy-lab.md), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (benchmarks), [ADR 0012](0012-cadence-as-a-hypothesis-parameter.md) (cadence)
 
 ## Context
 

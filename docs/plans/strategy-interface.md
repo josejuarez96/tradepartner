@@ -1,6 +1,6 @@
 # Plan: Strategy interface (strategies as registered objects)
 
-**Spec:** none; the governing document is [ADR 0014](../decisions/0014-strategies-as-registered-objects.md) (size M, development-process "Right-size the ceremony": an ADR for the hard-to-reverse part, the schema CHECK and the paper path, and this plan for the build order)  ·  **Status:** Approved (owner, by merging PR #1075; the six owner decisions of 2026-10-06 are in the ADR)  ·  **Issue:** #1074  ·  **Related plans:** [backtest](backtest.md) (T85 to T85f; T85e's line is amended by this PR), [strategy-lab](strategy-lab.md) (T97, T98, T98b, T100)
+**Spec:** none; the governing document is [ADR 0014](../decisions/0014-strategies-as-registered-objects.md) (size M, development-process "Right-size the ceremony": an ADR for the hard-to-reverse part, the schema CHECK and the paper path, and this plan for the build order)  ·  **Status:** Approved (owner, by merging PR #1077; the six owner decisions of 2026-10-06 are in the ADR)  ·  **Issue:** #1074  ·  **Related plans:** [backtest](backtest.md) (T85 to T85f; T85e's line is amended by this PR), [strategy-lab](strategy-lab.md) (T97, T98, T98b, T100)
 
 ## Approach (short)
 
