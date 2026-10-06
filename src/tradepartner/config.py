@@ -210,8 +210,9 @@ class EdgarConfig(BaseModel):
     SEC's 10 req/s is a ceiling, not a target; secedgar users saw 429s at
     9.7 req/s and edgartools defaults to 9.
 
-    An unknown key is refused (#1037), so a mistyped `EDGAR__...` override
-    fails instead of being silently ignored.
+    An unknown key is refused when the model is validated (#1037), so a
+    mistyped `EDGAR__...` override fails instead of being silently ignored
+    (`model_copy(update=...)` does not validate).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1249,10 +1250,14 @@ class ResearchConfig(BaseModel):
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
+    # `hide_input_in_errors` (#1037): a nested model with `extra="forbid"` would
+    # otherwise print a stray key's value, which may be a secret set under a
+    # mistyped name; the error still names the key and the rule.
     model_config = SettingsConfigDict(
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)

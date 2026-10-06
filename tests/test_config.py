@@ -235,6 +235,18 @@ def test_edgar_unknown_env_key_is_refused(monkeypatch: pytest.MonkeyPatch) -> No
         Settings(_env_file=None)
 
 
+def test_edgar_unknown_dotenv_key_is_refused_without_echoing_its_value(
+    tmp_path: Path,
+) -> None:
+    """#1037: a secret under a mistyped `EDGAR__` name in `.env` is refused by name,
+    and its value never reaches the error text."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("EDGAR__USER_AGENT=Owner owner-secret@example.com\n")
+    with pytest.raises(ValidationError, match="user_agent") as excinfo:
+        Settings(_env_file=env_file)
+    assert "owner-secret" not in str(excinfo.value)
+
+
 def test_edgar_failure_policy_defaults() -> None:
     """T11h's keys: quarantine after 3 consecutive counted days, and
     `check_failures()`'s count floor and share ceiling."""
