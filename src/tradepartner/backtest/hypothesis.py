@@ -11,8 +11,8 @@ file wants to pin). Every other part of the file is prose, but it is hashed too.
 `strategy.*` and `costs.*` key, or it is refused; the holdout never comes from live
 `Settings`. A key outside the frozen list below is refused rather than ignored.
 
-**The frozen set** is every key of `strategy`, `universe`, `costs`, `backtest`,
-`adjust`, `master`, `gap`, `holdout` and `metrics`, plus `execution.fill_price`,
+**The frozen set** is every key of `strategy`, `schedule`, `universe`, `costs`,
+`backtest`, `adjust`, `master`, `gap`, `holdout` and `metrics`, plus `execution.fill_price`,
 `benchmarks` and `alpaca.historical_feed`. File values win for the keys the file
 names; the live `Settings` fill the rest at registration. The merged values are
 validated through `Settings` and stored in their JSON form (floats for float keys,
@@ -24,10 +24,13 @@ the live `Settings`), and explicit values take priority over the environment, so
 environment variable can move a registered hypothesis's holdout or threshold. Because
 runs take the latest registration, `register` refuses to re-register a file whose
 record is an older one (a file reverted to an earlier version): what it would report
-is not what would run. It refuses a stored parameter
-set whose hash no longer matches, or whose keys differ from today's frozen list (a
-new config key in a frozen section makes every older hypothesis unrunnable until it
-is re-registered, rather than letting the live value in silently).
+is not what would run. `load_frozen` reads the stored set through
+`frozen.frozen_values`, which overlays the `FROZEN_KEY_DEFAULTS` default for every
+table key the set lacks (a registration from before `schedule.*` reads `month_end`
+for both keys, at its stored hash). It refuses a stored parameter set whose hash no
+longer matches, or whose keys still differ from today's frozen list after that
+overlay (a drift the table does not cover), rather than letting a live value in
+silently.
 """
 
 from __future__ import annotations
@@ -44,12 +47,14 @@ from typing import Any, Final
 import duckdb
 from pydantic import BaseModel, ValidationError
 
+from tradepartner.backtest import frozen
 from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
 
 #: Settings sections frozen whole (spec req 10).
 FROZEN_SECTIONS: Final = (
     "strategy",
+    "schedule",
     "universe",
     "costs",
     "backtest",
@@ -215,6 +220,24 @@ def frozen_params_of(settings: Settings) -> dict[str, Any]:
     return params
 
 
+def frozen_hash_matches(settings: Settings, stored_sha256: str) -> bool:
+    """True when the frozen keys of `settings` are the registration whose stored hash is
+    `stored_sha256`: written out in full, or, for a registration stored before a suffix
+    of `FROZEN_KEY_DEFAULTS` landed, with those table keys (at their defaults) left out,
+    which is exactly what `frozen.frozen_values` overlaid when `load_frozen` built it."""
+    params = frozen_params_of(settings)
+    table = [(key, default) for key, default, _version in frozen.FROZEN_KEY_DEFAULTS]
+    for i in range(len(table), -1, -1):
+        later = table[i:]
+        if any(params.get(key) != default for key, default in later):
+            continue
+        dropped = {key for key, _default in later}
+        stored = {k: v for k, v in params.items() if k not in dropped}
+        if registry.params_sha256(stored) == stored_sha256:
+            return True
+    return False
+
+
 def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
     """The frozen set: the file's values over `settings` for every frozen key."""
     return frozen_params_of(_overlay(settings, parsed.file_params))
@@ -263,19 +286,20 @@ def register(
 def load_frozen(
     conn: duckdb.DuckDBPyConnection, slug: str, *, settings: Settings | None = None
 ) -> Settings:
-    """`Settings` for a run of `slug`'s latest registration: its frozen values over the
-    live `settings` (default: loaded config) for every other key. `UnknownHypothesis`
-    for an unregistered slug."""
+    """`Settings` for a run of `slug`'s latest registration: its frozen values (read
+    through `frozen.frozen_values`) over the live `settings` (default: loaded config)
+    for every other key. `UnknownHypothesis` for an unregistered slug."""
     record = registry.get_hypothesis(conn, slug)
     if registry.params_sha256(record.params) != record.params_sha256:
         raise HypothesisFileError(
             f"{slug!r}: stored parameters do not match their hash {record.params_sha256}"
         )
-    if set(record.params) != set(frozen_keys()):
-        drift = sorted(set(record.params) ^ set(frozen_keys()))
+    values = frozen.frozen_values(record)
+    if set(values) != set(frozen_keys()):
+        drift = sorted(set(values) ^ set(frozen_keys()))
         raise HypothesisFileError(
             f"{slug!r}: registered with a different frozen key set ({', '.join(drift)}); "
             "re-register the hypothesis"
         )
     live = settings if settings is not None else get_settings()
-    return _overlay(live, record.params)
+    return _overlay(live, values)
