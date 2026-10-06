@@ -270,7 +270,47 @@ Comparing with the last *accepted* fact, not the previous one, also rejects a se
 
 *Accepted risk.* A genuine move of more than 100× in reported shares is rejected until the owner accepts it, for at most `max_shares_age_days`. Such moves are rare: a large reverse split is explained by its split action, and only a de-SPAC or a huge issuance would trigger it. A switch between an undimensioned total and a class row on consecutive dates is compared as is.
 
-*When the first fact is the bad one* (possibly WMG), there is nothing earlier to compare with. The first fact becomes the baseline, and the correct later facts show on the review list as out of line. The owner then accepts the **first correct fact** in `universe.accepted_shares_facts`. Each later fact is compared with it, so one entry repairs the series.
+*When the first fact is the bad one* (possibly WMG), there is nothing earlier to compare with. The first fact becomes the baseline, and the correct later facts show on the review list as out of line. The owner then accepts the **first correct fact** in `universe.accepted_shares_facts`. Each later fact is compared with it, so one entry repairs the series. (Superseded for the common case by the #853 amendment below, which re-anchors on its own once the bad baseline is stale.)
+
+**Amendment 2026-10-05 (#853): re-anchoring a stale shares baseline.** Under #845 the first positive shares fact is the baseline. When it is mis-scaled, every correct later fact is out of line with it and is rejected. The bad fact then ages past `universe.max_shares_age_days`, and the name fails rule 7 with `stale_shares` at every rebalance from then on. The H1 trial-1 audit (#853) found the bug, and a read-only probe of the owner's store (facts known at close 2023-12-29) shows its forms:
+- one bad first fact: EOG (2.52e11 on 2009-08-03, about 1,000× too large), Truist (6.48e14), West Pharma (3.33e13), Sempra (2.46e14), Eaton, Walgreens and Corteva (100 shares), TechnipFMC (1 share);
+- a short bad run: ICE (1 share, twice), Linde (25,000 shares, twice, from the shell company before the merger), Amcor (13,000);
+- a long run that is real: Ally (1.33e6 shares while private, then 4.8e8 from 2014-03-31, after the pre-IPO split that has no split action), WMG (about 1,060 shares of the subsidiary filer until 2020-01-31, then 8.86e7).
+
+Owner decision 2026-10-05 on #853: option (a), an automatic point-in-time re-anchor rather than entries in `universe.accepted_shares_facts`.
+
+*The rule.* The #845 walk is unchanged, with one addition. A rejected fact is **re-anchored**, meaning it is accepted and becomes the new baseline, when both of these hold:
+1. **The baseline is stale at the fact's date.** The fact's `as_of_date` is more than `universe.max_shares_age_days` after the baseline's `as_of_date`.
+2. **The fact is corroborated.** The fact just before it in the walk was also rejected and is in line with it: their ratio is within `universe.max_shares_ratio` either way, after the splits known at T with an ex-date after the earlier fact's `as_of_date` and on or before this fact's. "Just before" skips the facts the walk skips: dates with two class rows, and values that are not a share count.
+
+The walk keeps no other state. An accepted fact, whether in line, owner-accepted or re-anchored, ends any run of rejections. A value that is zero, negative, NaN **or infinite** is not a share count, so it is always rejected and is never a baseline (`math.isfinite` closes the +inf hole that the quant-auditor's pass 3 on #849 found).
+
+*Use and review.* Rules 7 and 8, the gap's size share and `shares_fallbacks` read a re-anchored fact like any other accepted fact. `SharesPick.outliers` and health's `shares_outliers` gain a `reanchored` column. A re-anchored fact appears there with `reanchored = true` and `accepted = false`, and it is not pending review: the rule already resolved it. The rejected facts before it stay listed and pending, as now.
+
+*Why these limits, and why no new key.* Both limits are existing frozen keys, used in their existing sense:
+- `max_shares_age_days` is how long rule 7 relies on a fact. A baseline older than that is one rule 7 already refuses to use. Letting it veto newer facts any longer can only keep the name out, so the re-anchor ends the veto exactly when the baseline stops being usable.
+- "Two facts in line with each other" is the least corroboration there is, because one fact cannot confirm its own scale. Requiring more facts would only add delay, since the age condition already makes a transient error wait out the age limit.
+
+The rule therefore adds no threshold, and the data-validity standard ("thresholds and limits come from config") holds with no new `universe.*` key. The precedent is `traded_only=True` above: a rule that is code, not a parameter, reaches a trial through its code version. A hypothesis's frozen set and hash do not change (H1 is registered at params sha256 `6a1d884e…`). A run after this change is a new trial of the same hypothesis, with the new `code_version` on its row, and every earlier trial still counts toward N.
+
+*Considered and rejected.*
+- **"N consecutive agreeing facts", with N as a new key.** A new `universe.*` key changes the frozen key set, so `load_frozen` refuses every registered hypothesis until it is registered again (T96's `FROZEN_KEY_DEFAULTS` would not help: an old registration would read the key's default, and only an "off" default reproduces the old behaviour). The rule is also less safe. On the same probe, N = 3 re-anchors CCRN, a #845 case, onto its bad ×1,000 scale in 2021, because its rejections are interleaved with in-line facts that keep refreshing the baseline. CCRN then sits in the top 1,000 at a market cap of about $1T at 15 rebalances. N = 2 puts names above $3.2T at 6 member-rebalances. The age rule puts none there.
+- **Owner entries** (`universe.accepted_shares_facts`): option (b) on #853. They change the frozen set too, and need one entry per name.
+
+*Measured effect* (H1's frozen settings, the 41 rebalances from 2020-08-31 to 2023-12-29, owner's store read-only, rule prototyped outside the tree):
+- **Members:** 14 to 17 change per rebalance (median 16) out of about 1,005.
+- **21 companies enter**, for example EOG, Corteva, West Pharma, Truist, Ally, Linde, ICE, Eaton, Amcor, Qorvo, DXC and Ensign at all 41 rebalances; Walgreens at 36, WMG at 31, TechnipFMC at 28, Viatris at 22. Every one had a mis-scaled or pre-listing first run (for example Qorvo 1,000 shares, Ensign 2.1e10, E*TRADE 2.2e11). They displace marginal names near the cap cut: 354 distinct names, most at only 1 to 3 rebalances.
+- **No member has a market cap above $3.2T** at any rebalance (the largest is Apple's $2.99T at 2023-12-29).
+- **Excluded by rule 7:** 48 → 26 companies at 2020-08-31 and 76 → 51 at 2023-12-29. The rest are not this bug (next paragraph).
+
+*Not this bug* (#991): Dick's and PBF have no shares fact; Simon Property, Fox, Vertiv, Watsco and Lithia have facts that stop years before the window, or that moved to a class id; Schwab and McCormick have two class rows on the latest date. The re-anchor does not touch them.
+
+*Point in time.* Only facts and splits known at T are read, as under #845. Both conditions compare `as_of_date`s of facts known at T, never T itself or a later filing, so a fact first known after T cannot re-anchor at T. The pick at T is a function of the rows known at T alone.
+
+*Accepted risks.*
+- **A filer at the wrong scale for longer than the age limit.** Two in-line bad facts then re-anchor onto the bad scale, and the corrected facts wait out the limit again. On the probe, no member reached an implausible cap from this.
+- **A genuine move of more than 100×** (a pre-IPO split with no action, a de-SPAC) still waits out `max_shares_age_days` before it is used. It used to wait for the owner, so the risk #845 accepted is now bounded automatically.
+- **After a gap in filings longer than the age limit**, two in-line facts re-anchor with nothing to check them against. Under #845 the name was `stale_shares` there anyway.
 
 **Amendment 2026-10-04 (#859): retracting a false master row.** `securities` and `listings` are append-only, and ingest writes only rows that change an as-of read, so a key the builder stops producing is never touched. When a master rule is corrected, the row the old rule wrote stays live: #826 created a false successor for WillScot, `0001647088@2020-08-10`; #835's rules no longer make it, yet the owner's store still lists it, and WSC's post-2020-08 bars sit under that id (owner decision on #859: options a, x, one PR).
 
