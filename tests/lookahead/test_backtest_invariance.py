@@ -1,7 +1,15 @@
-"""No look-ahead for the full backtest run (backtest spec req 13, "Look-ahead"; plan T40).
+"""No look-ahead for the full backtest run (backtest spec req 13, "Look-ahead"; plan T40),
+at every rebalance cadence (strategy-lab spec req 6; plan T98b).
+
+**Cadences.** Every test runs once per `Case` in `CASES`, one per cadence (`month_end`,
+`week_end`, `daily`), with `schedule.rebalance_cadence` frozen to it. `month_end` walks
+the whole fixture range as T40 did; `week_end` and `daily` walk a window of about forty
+rebalances around the teeth case (`Case`), because the walk runs `run(end=T_i)` from the
+window's first rebalance for every T_i (quadratic in the rebalance count). A later axis
+(the strategy family, T85e) extends `Case` and `CASES`, not the tests.
 
 `engine.run` over a `StoreProvider` on the fixture universe, at every rebalance
-session T_i of the fixture range:
+session T_i of the case's window:
 
 - **Truncation invariance**: `run(end=T_i)` on the full store equals `run(end=T_i)`
   with the data connection factory yielding `TruncatedStore.at(close(T_i))` and the
@@ -15,20 +23,25 @@ session T_i of the fixture range:
   bar revision at T_i on a held name, a dividend revision with ex-date T_i on a name
   held across it (only the `known_at` filter keeps it out of the earlier run; the
   ex-date filter does not), and a dividend revision with ex-date inside step i. Each
-  is checked alone, so any one reaching the earlier run fails.
+  is checked alone, so any one reaching the earlier run fails. Inside step i means the
+  session after the fill F_i, on a name filled there; at `daily` the step is the one
+  session F_i = T_{i+1}, so it is that session, on a name held across T_i and still a
+  target (the carry to the fill earns it).
 
 **Seeded revisions.** The fixture's own revisions (SEC_SPLIT_BACKFILLED's bar,
 SEC_DIV_REVISED's dividend) are on names the strategy never holds. So the store every
-test runs on (`_store`) adds, at `SEEDED_SESSIONS` and for each of `SEEDED_IDS` (every
-name the run holds in 2018-2019), a bar revision at T_k, a dividend first seen before
-its ex-date and restated after close(T_k), and a dividend first seen only after
-close(T_k) (late), all known an hour after close(T_k). The truncation walk then crosses
-revision-type facts (a row dated at or before T but known after it) on held names,
-which `test_the_run_is_not_vacuous` checks.
+test runs on (`_store`) adds, at the case's seeded sessions (`Case.seeded`) and for each
+of `SEEDED_IDS` (every name the run holds in 2018-2019), a bar revision at T_k, a
+dividend first seen before its ex-date and restated after close(T_k), and a dividend
+first seen only after close(T_k) (late), all known an hour after close(T_k); a seeded
+dividend never lands on a fixture action's ex-date (`_store`, #1099). The
+truncation walk then crosses revision-type facts (a row dated at or before T but known
+after it) on held names, which `test_the_run_is_not_vacuous` checks.
 
 The frozen settings are the defaults except `strategy.top_fraction = 0.5`, so the
 fixture's small universe (at most six names) yields several targets per rebalance
-instead of one; nothing else about the run changes.
+instead of one, the case's `schedule.rebalance_cadence`, and no benchmarks (`_frozen`);
+nothing else about the run changes.
 """
 
 from __future__ import annotations
@@ -38,6 +51,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import get_args
 
 import duckdb
 import polars as pl
@@ -49,7 +63,7 @@ from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, previous_session, session_close
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -61,19 +75,83 @@ FIXTURE_START = date(2017, 1, 3)
 FIXTURE_END = date(2020, 6, 30)
 COST_LEVELS = (0.0, 15.0)
 
-#: The teeth case's T_i: a 2019 rebalance where the run holds three names.
-T_TEETH = date(2019, 1, 31)
 #: When a synthetic revision becomes known: an hour after close(T), before the next close.
 REVISION_DELAY = timedelta(hours=1)
+#: The seeded dividends' ex-dates, in sessions before their T_k (restated, late).
+RESTATED_EX_SESSIONS = 5
+LATE_EX_SESSIONS = 3
 
 #: Names seeded with revisions: every name the run holds in 2018-2019.
 SEEDED_IDS = ("SEC_DUAL_A", "SEC_DUAL_B", "SEC_SPLIT_BETWEEN", "SEC_SPLIT_FUTURE", "SEC_TRANSFER")
-#: Rebalances seeded with revisions; the teeth case's T_i and T_{i+1} are left alone.
-SEEDED_SESSIONS = tuple(
-    t
-    for t in rebalance_sessions(date(2018, 6, 1), date(2019, 11, 30))
-    if t not in (T_TEETH, date(2019, 2, 28))
-)
+
+
+@dataclass(frozen=True)
+class Case:
+    """One cadence's walk: the run window `[start, end]`, the teeth case's T_i (a 2019
+    rebalance where the run holds three names) and the range seeded with revisions."""
+
+    cadence: Cadence
+    start: date
+    end: date
+    teeth: date
+    seed_from: date
+    seed_to: date
+
+    @property
+    def sessions(self) -> tuple[date, ...]:
+        return tuple(rebalance_sessions(self.start, self.end, self.cadence))
+
+    @property
+    def teeth_next(self) -> date:
+        return self.sessions[self.sessions.index(self.teeth) + 1]
+
+    @property
+    def seeded(self) -> tuple[date, ...]:
+        """Rebalances in the seeded range, less those at or after the teeth case's T_i
+        whose seeded ex-dates reach its step (T_i and T_{i+1} at `month_end`), so the
+        teeth case's own revisions are the only ones on its dates."""
+        return tuple(
+            t_k
+            for t_k in rebalance_sessions(self.seed_from, self.seed_to, self.cadence)
+            if not (
+                self.teeth <= t_k and _sessions_before(t_k, RESTATED_EX_SESSIONS) <= self.teeth_next
+            )
+        )
+
+
+#: One case per cadence; `month_end` is T40's walk unchanged.
+CASES: dict[Cadence, Case] = {
+    case.cadence: case
+    for case in (
+        Case(
+            "month_end",
+            FIXTURE_START,
+            FIXTURE_END,
+            teeth=date(2019, 1, 31),
+            seed_from=date(2018, 6, 1),
+            seed_to=date(2019, 11, 30),
+        ),
+        Case(
+            "week_end",
+            date(2018, 9, 1),
+            date(2019, 6, 30),
+            teeth=date(2019, 2, 1),
+            seed_from=date(2018, 10, 1),
+            seed_to=date(2019, 6, 30),
+        ),
+        # Seeded from the sixth rebalance on, so a restated dividend's ex-date (five
+        # sessions before its T_k) falls after the first fill.
+        Case(
+            "daily",
+            date(2018, 12, 14),
+            date(2019, 2, 15),
+            teeth=date(2019, 1, 31),
+            seed_from=date(2018, 12, 26),
+            seed_to=date(2019, 2, 15),
+        ),
+    )
+}
+assert tuple(CASES) == get_args(Cadence), "one case per cadence"
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
@@ -86,28 +164,43 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
 
 
-def _frozen() -> Settings:
-    # Every run starts in 2017, before the fixture benchmarks' first bar (2018-01-02).
-    # Benchmarks are read by symbol (#840) and the engine refuses one with no bar at
-    # F_0, so these runs name none, as they effectively did before (master rows unknown).
-    return Settings(_env_file=None, strategy={"top_fraction": 0.5}, benchmarks=[])
+def _frozen(cadence: Cadence) -> Settings:
+    # The `month_end` runs start in 2017, before the fixture benchmarks' first bar
+    # (2018-01-02). Benchmarks are read by symbol (#840) and the engine refuses one with
+    # no bar at F_0, so these runs name none, as they effectively did before (master
+    # rows unknown); the other cadences follow suit, so only the cadence differs.
+    return Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        schedule={"rebalance_cadence": cadence},
+        benchmarks=[],
+    )
 
 
-def _store() -> duckdb.DuckDBPyConnection:
-    """The fixture universe plus the seeded revisions (module docstring)."""
+def _store(case: Case) -> duckdb.DuckDBPyConnection:
+    """The fixture universe plus `case`'s seeded revisions (module docstring)."""
     conn = duckdb.connect(":memory:")
     configure_connection(conn)
     schema.init_schema(conn)
     load_universe_fixtures(conn, UNIVERSE_DIR)
-    for t_k in SEEDED_SESSIONS:
-        revised_at = read_time(t_k) + REVISION_DELAY
-        restated_ex = _sessions_before(t_k, 5)
-        late_ex = _sessions_before(t_k, 3)
+    fixture_actions = set(
+        conn.execute("SELECT security_id, ex_date FROM corporate_actions").fetchall()
+    )
+    for t_k in case.seeded:
+        revised_at = read_time(t_k, case.cadence) + REVISION_DELAY
+        restated_ex = _sessions_before(t_k, RESTATED_EX_SESSIONS)
+        late_ex = _sessions_before(t_k, LATE_EX_SESSIONS)
         for sid in SEEDED_IDS:
             _revise_bar(conn, sid, t_k, revised_at, factor=1.02)
-            _dividend(conn, sid, restated_ex, 0.2, session_close(previous_session(restated_ex)))
-            _dividend(conn, sid, restated_ex, 0.3, revised_at)
-            _dividend(conn, sid, late_ex, 0.25, revised_at)
+            # A seeded dividend never shares its ex-date with a fixture action (the
+            # fixture's splits): the adjusted read sums tied ex-dates' factors in scan
+            # order, so a cut store's view and the full store's table may differ in the
+            # last bit there (#1099). Only `week_end` and `daily` seeds reach those dates.
+            if (sid, restated_ex) not in fixture_actions:
+                _dividend(conn, sid, restated_ex, 0.2, session_close(previous_session(restated_ex)))
+                _dividend(conn, sid, restated_ex, 0.3, revised_at)
+            if (sid, late_ex) not in fixture_actions:
+                _dividend(conn, sid, late_ex, 0.25, revised_at)
     return conn
 
 
@@ -117,8 +210,11 @@ def _sessions_before(day: date, n: int) -> date:
     return day
 
 
-def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry.TrialHandle:
+def _open_trial(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, case: Case
+) -> registry.TrialHandle:
     """A synthetic trial on the in-memory store (never the real store)."""
+    sessions = case.sessions
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-lookahead",
@@ -127,7 +223,7 @@ def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry
         doc_path="docs/hypotheses/h-lookahead.md",
         doc_sha256="0" * 64,
         params={"costs.per_side_bps": COST_LEVELS[-1]},
-        in_sample_start=FIXTURE_START,
+        in_sample_start=case.start,
         holdout_start=date(2023, 1, 1),
         holdout_end=date(2025, 12, 31),
         registered_by="test",
@@ -137,9 +233,9 @@ def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry
         conn,
         hypothesis_id=hypothesis.hypothesis_id,
         kind="in_sample",
-        start_session=FIXTURE_START,
-        end_session=FIXTURE_END,
-        data_cutoff=read_time(rebalance_sessions(FIXTURE_START, FIXTURE_END)[-1]),
+        start_session=case.start,
+        end_session=case.end,
+        data_cutoff=read_time(sessions[-1], case.cadence),
         synthetic=True,
         run_by="test",
         settings=settings,
@@ -158,10 +254,14 @@ def _factory(conn: duckdb.DuckDBPyConnection) -> Connect:
 
 @dataclass(frozen=True)
 class Fixture:
+    case: Case
     conn: duckdb.DuckDBPyConnection
     settings: Settings
     handle: registry.TrialHandle
     sessions: tuple[date, ...]
+
+    def read_time(self, session: date) -> datetime:
+        return read_time(session, self.case.cadence)
 
     def run(
         self,
@@ -178,16 +278,18 @@ class Fixture:
             return run(self.settings, provider, self.sessions[0], end, self.handle, COST_LEVELS)
 
 
-@pytest.fixture(scope="module")
-def fixture() -> Iterator[Fixture]:
-    conn = _store()
-    settings = _frozen()
+@pytest.fixture(scope="module", params=list(CASES.values()), ids=list(CASES))
+def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
+    case: Case = request.param
+    conn = _store(case)
+    settings = _frozen(case.cadence)
     try:
         yield Fixture(
+            case=case,
             conn=conn,
             settings=settings,
-            handle=_open_trial(conn, settings),
-            sessions=tuple(rebalance_sessions(FIXTURE_START, FIXTURE_END)),
+            handle=_open_trial(conn, settings, case),
+            sessions=case.sessions,
         )
     finally:
         conn.close()
@@ -236,23 +338,27 @@ def _prefix(result: BacktestResult, end: date) -> BacktestResult:
 
 def test_the_run_is_not_vacuous(fixture: Fixture, full_runs: dict[date, Results]) -> None:
     result = full_runs[fixture.sessions[-1]][COST_LEVELS[-1]]
+    seeded = fixture.case.seeded
     assert len(fixture.sessions) > 40
+    # The frozen cadence reached the engine: it rebalanced on exactly the case's sessions.
+    assert [row.session for row in result.rebalances] == list(fixture.sessions[:-1])
     assert max(row.n_targets for row in result.rebalances) >= 3
     assert sum(row.turnover > 0 for row in result.rebalances) >= 10
     # The walk crosses seeded revisions on held names: at most seeded T_k a seeded
     # name is held at the close whose bar is revised, and late dividends are counted.
-    revised_and_held = [
-        t_k for t_k in SEEDED_SESSIONS if set(_held_at_close(result, t_k)) & set(SEEDED_IDS)
-    ]
-    assert len(revised_and_held) >= len(SEEDED_SESSIONS) - 2
+    revised_and_held = [t_k for t_k in seeded if set(_held_at_close(result, t_k)) & set(SEEDED_IDS)]
+    assert len(revised_and_held) >= len(seeded) - 2
     assert sum(row.n_late_dividends for row in result.rebalances) >= 5
     # And a restated seeded dividend is held across its ex-date.
     entitled = [
         t_k
-        for t_k in SEEDED_SESSIONS
-        if set(_held_at_close(result, previous_session(_sessions_before(t_k, 5)))) & set(SEEDED_IDS)
+        for t_k in seeded
+        if set(
+            _held_at_close(result, previous_session(_sessions_before(t_k, RESTATED_EX_SESSIONS)))
+        )
+        & set(SEEDED_IDS)
     ]
-    assert len(entitled) >= len(SEEDED_SESSIONS) - 2
+    assert len(entitled) >= len(seeded) - 2
 
 
 def test_truncation_invariance_at_every_rebalance(
@@ -261,7 +367,7 @@ def test_truncation_invariance_at_every_rebalance(
     truncated = TruncatedStore(fixture.conn)
     try:
         for end, full in full_runs.items():
-            cut_conn = truncated.at(read_time(end))
+            cut_conn = truncated.at(fixture.read_time(end))
             cut = fixture.run(end, connect=_factory(cut_conn))
             _assert_same(cut, full, f"run(end={end}) on the store truncated to close({end})")
     finally:
@@ -332,11 +438,10 @@ def _step_frame(result: BacktestResult, start: date) -> pl.DataFrame:
 def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
     fixture: Fixture, full_runs: dict[date, Results]
 ) -> None:
-    sessions = fixture.sessions
-    i = sessions.index(T_TEETH)
-    t_i, t_next = sessions[i], sessions[i + 1]
-    revised_at = read_time(t_i) + REVISION_DELAY
-    assert revised_at < read_time(t_next)
+    case = fixture.case
+    t_i, t_next = case.teeth, case.teeth_next
+    revised_at = fixture.read_time(t_i) + REVISION_DELAY
+    assert revised_at < fixture.read_time(t_next)
 
     base = full_runs[t_i][COST_LEVELS[-1]]
     # The bar revision hits a name held at close(T_i): carrying it to F_i reads that close.
@@ -346,16 +451,22 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
     # close(T_i) its ex-date filter admits it, so only `known_at` keeps the revision out.
     entitled = sorted(set(held) & set(_held_at_close(base, previous_session(t_i))))
     assert entitled, f"nothing held across {t_i}"
-    # The in-step dividend hits a name held through step i, ex-date inside (F_i, T_{i+1}].
-    fill = fill_session(t_i)
+    # The in-step dividend hits a name held through step i, ex-date inside (F_i, T_{i+1}];
+    # at `daily` that interval is empty, so ex-date F_i = T_{i+1} on a target held across
+    # T_i, which the carry to the fill pays.
+    fill = fill_session(t_i, case.cadence)
     targets = sorted(full_runs[t_next][COST_LEVELS[-1]].targets[fill])
     assert targets, f"no targets filled on {fill}"
     in_step_ex = next_session(fill)
-    assert in_step_ex <= t_next
+    if in_step_ex > t_next:
+        assert fill == t_next
+        in_step_ex = fill
+        targets = sorted(set(targets) & set(held))
+        assert targets, f"no target filled on {fill} is held across {t_i}"
     first_seen = session_close(previous_session(t_i)) - REVISION_DELAY
 
     def store(revision: str | None) -> duckdb.DuckDBPyConnection:
-        conn = _store()
+        conn = _store(case)
         # First seen before T_i in every variant, so only the revision differs.
         _dividend(conn, entitled[0], t_i, 0.5, first_seen)
         _dividend(conn, targets[0], in_step_ex, 0.5, first_seen)

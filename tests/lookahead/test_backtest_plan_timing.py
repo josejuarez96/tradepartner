@@ -1,4 +1,11 @@
-"""No plan reads later than its own rebalance (backtest spec req 13; plan T40b, #201).
+"""No plan reads later than its own rebalance (backtest spec req 13; plan T40b, #201), at
+every rebalance cadence (strategy-lab spec req 6; plan T98b).
+
+**Cadences.** Every test runs once per `Case` in `CASES`, one per cadence (`month_end`,
+`week_end`, `daily`), with `schedule.rebalance_cadence` frozen to it. `month_end` walks
+the whole fixture range as T40b did; `week_end` and `daily` walk the same windows of
+about forty rebalances as `test_backtest_invariance.py`. A later axis (the strategy
+family, T85e) extends `Case` and `CASES`, not the tests.
 
 T40's truncation and prefix invariance cannot see an engine that fills at F_k from
 targets planned with a read at close(T_{k+1}): every read stays inside both cuts. This
@@ -22,15 +29,17 @@ plan on the full store:
   for. `BenchmarkExemptStore` keeps benchmark bars past the cut. That is safe only
   because no plan field reads a benchmark, which `test_benchmarks_are_never_plan_inputs`
   checks at every compared read.
-- **Teeth**, at `T_TEETH`: (a) `_plan` reading at the next rebalance fails the check on
-  both windows while T40's truncation comparison still passes; (b) a copy of `_plan`
-  whose signal frame alone is read at the next rebalance fails it on a store with a
-  revised T_{k-1} month-end bar, and the unpatched engine passes on that same store.
+- **Teeth**, at the case's `teeth` rebalance: (a) `_plan` reading at the next rebalance
+  fails the check on both windows while T40's truncation comparison still passes; (b) a
+  copy of `_plan` whose signal frame alone is read at the next rebalance fails it on a
+  store with a revised skip-anchor bar (A_skip of T_k: the previous month end at the
+  frozen `month_end` anchor, whatever the cadence), and the unpatched engine passes on
+  that same store.
 
 **What the main check sees on the plain fixture store.** A late read changes a compared
 field only if the data it reaches differs: a late universe or gap read is caught (the
 cut store has no bars after T_k); a late signal-frame read is caught only where an
-anchor bar is revised after the read, i.e. by teeth (b) at `T_TEETH`; a late
+anchor bar is revised after the read, i.e. by teeth (b); a late
 `static_listing_count` read goes unseen, because the fixture's static-listing count
 never changes between rebalances. The spec asks for exactly this ("detects one that
 changes a compared plan field"; quant-auditor on PR #215).
@@ -48,7 +57,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import duckdb
 import polars as pl
@@ -60,10 +69,10 @@ from tradepartner.backtest import engine
 from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
-from tradepartner.backtest.signals import momentum_12_1
+from tradepartner.backtest.signals import MomentumSignal, anchor_sessions, momentum
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import session_close
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -78,8 +87,6 @@ FIXTURE_END = date(2020, 6, 30)
 #: benchmark with no bar at F_0, and no plan field reads a benchmark.
 BENCHMARK_START = date(2018, 1, 2)
 COST_LEVELS = (0.0, 15.0)
-#: The teeth case's T_k: a 2019 rebalance with several targets (as in T40).
-T_TEETH = date(2019, 1, 31)
 #: When a synthetic revision becomes known: an hour after close(T), before the next close.
 REVISION_DELAY = timedelta(hours=1)
 #: The `RebalanceRow` fields the plan at T_k decides.
@@ -91,6 +98,30 @@ PLAN_FIELDS = (
     "gap_count_share",
     "gap_size_share",
 )
+
+
+@dataclass(frozen=True)
+class Case:
+    """One cadence's walk: the window `[start, end]` and the teeth case's T_k (a 2019
+    rebalance with several targets, as in T40)."""
+
+    cadence: Cadence
+    start: date
+    end: date
+    teeth: date
+
+
+#: One case per cadence; `month_end` is T40b's walk unchanged, the others are
+#: `test_backtest_invariance.py`'s windows.
+CASES: dict[Cadence, Case] = {
+    case.cadence: case
+    for case in (
+        Case("month_end", FIXTURE_START, FIXTURE_END, teeth=date(2019, 1, 31)),
+        Case("week_end", date(2018, 9, 1), date(2019, 6, 30), teeth=date(2019, 2, 1)),
+        Case("daily", date(2018, 12, 14), date(2019, 2, 15), teeth=date(2019, 1, 31)),
+    )
+}
+assert tuple(CASES) == get_args(Cadence), "one case per cadence"
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
@@ -107,8 +138,10 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
 
 
-def _frozen() -> Settings:
-    return Settings(_env_file=None, strategy={"top_fraction": 0.5})
+def _frozen(cadence: Cadence) -> Settings:
+    return Settings(
+        _env_file=None, strategy={"top_fraction": 0.5}, schedule={"rebalance_cadence": cadence}
+    )
 
 
 def _store() -> duckdb.DuckDBPyConnection:
@@ -119,7 +152,9 @@ def _store() -> duckdb.DuckDBPyConnection:
     return conn
 
 
-def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry.TrialHandle:
+def _open_trial(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, case: Case
+) -> registry.TrialHandle:
     """A synthetic trial on the in-memory store (never the real store)."""
     hypothesis = registry.register_hypothesis(
         conn,
@@ -129,7 +164,7 @@ def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry
         doc_path="docs/hypotheses/h-plan-timing.md",
         doc_sha256="0" * 64,
         params={"costs.per_side_bps": COST_LEVELS[-1]},
-        in_sample_start=FIXTURE_START,
+        in_sample_start=case.start,
         holdout_start=date(2023, 1, 1),
         holdout_end=date(2025, 12, 31),
         registered_by="test",
@@ -139,9 +174,11 @@ def _open_trial(conn: duckdb.DuckDBPyConnection, settings: Settings) -> registry
         conn,
         hypothesis_id=hypothesis.hypothesis_id,
         kind="in_sample",
-        start_session=FIXTURE_START,
-        end_session=FIXTURE_END,
-        data_cutoff=read_time(rebalance_sessions(FIXTURE_START, FIXTURE_END)[-1]),
+        start_session=case.start,
+        end_session=case.end,
+        data_cutoff=read_time(
+            rebalance_sessions(case.start, case.end, case.cadence)[-1], case.cadence
+        ),
         synthetic=True,
         run_by="test",
         settings=settings,
@@ -193,10 +230,14 @@ class BenchmarkExemptStore(TruncatedStore):
 
 @dataclass(frozen=True)
 class Fixture:
+    case: Case
     conn: duckdb.DuckDBPyConnection
     settings: Settings
     handle: registry.TrialHandle
     sessions: tuple[date, ...]
+
+    def read_time(self, session: date) -> datetime:
+        return read_time(session, self.case.cadence)
 
     def provider(self, conn: duckdb.DuckDBPyConnection) -> StoreProvider:
         return StoreProvider(
@@ -233,16 +274,18 @@ class Fixture:
         return self.sessions[self.sessions.index(session) + 1]
 
 
-@pytest.fixture(scope="module")
-def fixture() -> Iterator[Fixture]:
+@pytest.fixture(scope="module", params=list(CASES.values()), ids=list(CASES))
+def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
+    case: Case = request.param
     conn = _store()
-    settings = _frozen()
+    settings = _frozen(case.cadence)
     try:
         yield Fixture(
+            case=case,
             conn=conn,
             settings=settings,
-            handle=_open_trial(conn, settings),
-            sessions=tuple(rebalance_sessions(FIXTURE_START, FIXTURE_END)),
+            handle=_open_trial(conn, settings, case),
+            sessions=tuple(rebalance_sessions(case.start, case.end, case.cadence)),
         )
     finally:
         conn.close()
@@ -265,7 +308,7 @@ def _plan_view(planned: Planned, t_k: date) -> PlanView:
     view: PlanView = {}
     for level, result in results.items():
         [row] = [r for r in result.rebalances if r.session == t_k]
-        targets = dict(result.targets[fill_session(t_k)])
+        targets = dict(result.targets[plans[t_k].fill_session])
         view[level] = (targets, tuple(getattr(row, name) for name in PLAN_FIELDS) + reads)
     return view
 
@@ -288,7 +331,7 @@ def test_benchmarks_are_never_plan_inputs(fixture: Fixture) -> None:
     seen = 0
     with fixture.provider(fixture.conn) as provider:
         for t_k in fixture.sessions[:-1]:
-            t = read_time(t_k)
+            t = fixture.read_time(t_k)
             members = set(provider.universe(t).members["security_id"].to_list())
             assert not exempted & members, f"exempted security in the universe at {t_k}"
             seen += bool(provider.benchmark_ids(t))
@@ -301,7 +344,7 @@ def test_every_plan_is_unchanged_on_a_store_cut_at_its_own_read(
     exempt = BenchmarkExemptStore(fixture.conn)
     try:
         for k, t_k in enumerate(fixture.sessions[:-1]):
-            cut = exempt.at(read_time(t_k))
+            cut = exempt.at(fixture.read_time(t_k))
             t_next = fixture.after(t_k)
             want = baseline[t_k]
             got = _plan_view(fixture.planned(t_k, t_next, cut), t_k)
@@ -324,7 +367,8 @@ def _late(fixture: Fixture, read: Callable[..., engine._Plan]) -> Callable[..., 
 
     def plan(provider: DataProvider, params: Settings, session: date) -> engine._Plan:
         late = read(provider, params, fixture.after(session))
-        return dataclasses.replace(late, session=session, fill_session=fill_session(session))
+        fill = fill_session(session, fixture.case.cadence)
+        return dataclasses.replace(late, session=session, fill_session=fill)
 
     return plan
 
@@ -333,24 +377,24 @@ def test_a_plan_read_at_the_next_rebalance_fails_the_check_but_not_truncation(
     fixture: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(engine, "_plan", _late(fixture, engine._plan))
-    t_k = T_TEETH
+    t_k = fixture.case.teeth
     k = fixture.sessions.index(t_k)
     exempt = BenchmarkExemptStore(fixture.conn)
     try:
         for start in (t_k, fixture.sessions[k - 1]):  # before the loop, inside it
             full = _plan_view(fixture.planned(start, fixture.after(t_k), fixture.conn), t_k)
             cut = _plan_view(
-                fixture.planned(start, fixture.after(t_k), exempt.at(read_time(t_k))), t_k
+                fixture.planned(start, fixture.after(t_k), exempt.at(fixture.read_time(t_k))), t_k
             )
             assert _fields(full, "gap_count_share") != _fields(cut, "gap_count_share"), start
     finally:
         exempt.close()
-    # T40's cut at close(T_TEETH) does not see it: every late read stays inside it.
+    # T40's cut at close(T_k) does not see it: every late read stays inside it.
     plain = TruncatedStore(fixture.conn)
     try:
         start = fixture.sessions[0]
         full_run = fixture.window(start, t_k, fixture.conn)
-        cut_run = fixture.window(start, t_k, plain.at(read_time(t_k)))
+        cut_run = fixture.window(start, t_k, plain.at(fixture.read_time(t_k)))
     finally:
         plain.close()
     for level, result in full_run.items():
@@ -359,20 +403,37 @@ def test_a_plan_read_at_the_next_rebalance_fails_the_check_but_not_truncation(
         assert cut_run[level].targets == result.targets
 
 
+def _signal(
+    provider: DataProvider, params: Settings, session: date, t: datetime, members: list[str]
+) -> MomentumSignal:
+    """`engine._signal`'s read and score at rebalance `session`, its frame read at `t`."""
+    strategy, schedule = params.strategy, params.schedule
+    a_form, _ = anchor_sessions(
+        session, strategy.formation_months, strategy.skip_months, schedule.signal_anchor
+    )
+    frame = provider.adjusted_prices(t, members, strategy.signal_total_return, sessions_from=a_form)
+    return momentum(
+        frame,
+        session,
+        strategy.formation_months,
+        strategy.skip_months,
+        schedule.signal_anchor,
+        schedule.rebalance_cadence,
+        security_ids=members,
+    )
+
+
 def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
     """A copy of `engine._plan` whose signal frame alone is read at the next rebalance."""
 
     def plan(provider: DataProvider, params: Settings, session: date) -> engine._Plan:
-        t, t_late = read_time(session), read_time(fixture.after(session))
+        t, t_late = fixture.read_time(session), fixture.read_time(fixture.after(session))
         members = sorted(provider.universe(t).members["security_id"].to_list())
         strategy = params.strategy
-        frame = provider.adjusted_prices(t_late, members, strategy.signal_total_return)
-        signal = momentum_12_1(
-            frame, session, strategy.formation_months, strategy.skip_months, security_ids=members
-        )
+        signal = _signal(provider, params, session, t_late, members)
         return engine._Plan(
             session=session,
-            fill_session=fill_session(session),
+            fill_session=fill_session(session, fixture.case.cadence),
             targets=engine.target_weights(signal.scores, strategy.top_fraction, strategy.weighting),
             n_universe=len(members),
             n_static_listings=provider.static_listing_count(t, members),
@@ -389,30 +450,33 @@ def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
 def test_a_late_signal_read_fails_the_check_and_the_engine_passes_it(
     fixture: Fixture, baseline: dict[date, PlanView], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    t_k = T_TEETH
+    t_k = fixture.case.teeth
     k = fixture.sessions.index(t_k)
-    anchor = fixture.sessions[k - 1]  # the 12-1 skip anchor at T_k: the previous month-end
+    previous = fixture.sessions[k - 1]  # the window that plans T_k inside the loop
+    strategy = fixture.settings.strategy
+    _, anchor = anchor_sessions(  # A_skip of T_k: the bar the revision lifts
+        t_k,
+        strategy.formation_months,
+        strategy.skip_months,
+        fixture.settings.schedule.signal_anchor,
+    )
     t_next = fixture.after(t_k)
     targets = baseline[t_k][COST_LEVELS[-1]][0]
     # A scored member outside the targets, lifted far across the top-fraction boundary
     # by a revision of its anchor bar known after read_time(T_k), before read_time(T_{k+1}).
     with fixture.provider(fixture.conn) as provider:
-        t = read_time(t_k)
+        t = fixture.read_time(t_k)
         members = sorted(provider.universe(t).members["security_id"].to_list())
-        strategy = fixture.settings.strategy
-        frame = provider.adjusted_prices(t, members, strategy.signal_total_return)
-        signal = momentum_12_1(
-            frame, t_k, strategy.formation_months, strategy.skip_months, security_ids=members
-        )
+        signal = _signal(provider, fixture.settings, t_k, t, members)
     outside = sorted(set(signal.scores) - set(targets))
     assert outside and targets, f"no scored non-target at {t_k}"
-    revised_at = read_time(t_k) + REVISION_DELAY
-    assert revised_at < read_time(t_next)
+    revised_at = fixture.read_time(t_k) + REVISION_DELAY
+    assert revised_at < fixture.read_time(t_next)
     revised = _store()
     _revise_bar(revised, outside[0], anchor, revised_at, factor=10.0)
     exempt = BenchmarkExemptStore(revised)
     try:
-        cut = exempt.at(read_time(t_k))
+        cut = exempt.at(fixture.read_time(t_k))
 
         def views() -> list[tuple[PlanView, PlanView]]:
             return [
@@ -420,7 +484,7 @@ def test_a_late_signal_read_fails_the_check_and_the_engine_passes_it(
                     _plan_view(fixture.planned(start, t_next, revised), t_k),
                     _plan_view(fixture.planned(start, t_next, cut), t_k),
                 )
-                for start in (t_k, anchor)
+                for start in (t_k, previous)
             ]
 
         # Control: the engine as built reads the signal on time and passes.
