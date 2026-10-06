@@ -964,6 +964,25 @@ class LabConfig(BaseModel):
             raise ValueError(f"lab.quiet_weekdays entries must be 0-6 (Monday-Sunday), got {bad}")
         return value
 
+    @field_validator("quiet_intervals")
+    @classmethod
+    def _validate_quiet_intervals(cls, value: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Refuse a pair whose times are not zero-padded `HH:MM` or whose end
+        is not after its start."""
+        hhmm = re.compile(r"\A([01]\d|2[0-3]):([0-5]\d)\Z")
+        for start_text, end_text in value:
+            for text in (start_text, end_text):
+                if not hhmm.match(text):
+                    raise ValueError(
+                        f"lab.quiet_intervals time {text!r} is not HH:MM (00:00 to 23:59)"
+                    )
+            if end_text <= start_text:
+                raise ValueError(
+                    f"lab.quiet_intervals pair [{start_text!r}, {end_text!r}] must end after it "
+                    "starts on the same day"
+                )
+        return value
+
     @field_validator("seconds_per_variant_default")
     @classmethod
     def _validate_seconds_per_variant_default(

@@ -943,6 +943,65 @@ def test_seconds_per_variant_default_missing_a_cadence_rejected() -> None:
         Settings(_env_file=None, lab={"seconds_per_variant_default": {"month_end": 1.0}})
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        [("16:00", "21:00")],
+        [("09:00", "17:00")],
+        [("00:00", "23:59")],
+        [("09:00", "12:00"), ("13:00", "17:00")],
+    ],
+    ids=["default", "business-hours", "full-day", "two-intervals"],
+)
+def test_quiet_intervals_accepts_valid_lists(value: list[tuple[str, str]]) -> None:
+    settings = Settings(_env_file=None, lab={"quiet_intervals": value})
+    assert settings.lab.quiet_intervals == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [("1600", "21:00")],
+        [("4:00", "21:00")],
+        [("24:00", "21:00")],
+        [("16:00", "16:60")],
+    ],
+    ids=["no-colon", "one-digit-hour", "24-hour", "60-minutes"],
+)
+def test_quiet_intervals_rejects_non_hh_mm_times(value: list[tuple[str, str]]) -> None:
+    with pytest.raises(ValidationError, match="is not HH:MM"):
+        Settings(_env_file=None, lab={"quiet_intervals": value})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [("16:00", "16:00")],
+        [("21:00", "16:00")],
+    ],
+    ids=["equal", "end-before-start"],
+)
+def test_quiet_intervals_rejects_end_not_after_start(value: list[tuple[str, str]]) -> None:
+    with pytest.raises(ValidationError, match="must end after it starts"):
+        Settings(_env_file=None, lab={"quiet_intervals": value})
+
+
+def test_quiet_intervals_rejects_non_hh_mm_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAB__QUIET_INTERVALS", '[["1600", "21:00"]]')
+    with pytest.raises(ValidationError, match="is not HH:MM"):
+        Settings(_env_file=None)
+
+
+def test_quiet_intervals_rejects_equal_pair_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAB__QUIET_INTERVALS", '[["16:00", "16:00"]]')
+    with pytest.raises(ValidationError, match="must end after it starts"):
+        Settings(_env_file=None)
+
+
 @pytest.mark.parametrize("level", [float("nan"), float("inf")])
 def test_costs_non_finite_sensitivity_rejected(level: float) -> None:
     """A NaN level would silently turn that level's results into NaN."""
