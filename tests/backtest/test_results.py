@@ -603,3 +603,30 @@ def test_module_writes_only_through_the_registry() -> None:
     source = Path(results_module.__file__).read_text(encoding="utf-8")
     assert "INSERT" not in source.upper().replace("INSERTS", "")
     assert "insert_row" not in source
+
+
+def test_a_profitability_trial_verifies_against_its_own_family(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """`_check_frozen` hashes the trial's own family's frozen set (T85, #1053): a
+    profitability registration stores no `strategy.*`, so a momentum-keyed hash could
+    never match it."""
+    settings = _settings(tmp_path)
+    registry.register_hypothesis(
+        conn,
+        slug="b3",
+        family="profitability",
+        title="b3 title",
+        doc_path="docs/hypotheses/b3.md",
+        doc_sha256="d" * 64,
+        params=frozen_params_of(settings, family="profitability"),
+        in_sample_start=START,
+        holdout_start=HOLDOUT[0],
+        holdout_end=HOLDOUT[1],
+        registered_by="owner",
+        settings=settings,
+    )
+    frozen = load_frozen(conn, "b3", settings=settings)
+    handle = _open(conn, frozen, tmp_path, slug="b3")
+    write_results(conn, handle, _run(frozen, handle), frozen)
+    assert _count(conn, "trial_metrics", handle.trial_id) > 0
