@@ -59,7 +59,7 @@ def test_table_defaults_are_the_config_defaults() -> None:
     dumped = Settings(_env_file=None).model_dump(mode="json")  # type: ignore[call-arg]
     for key, default, _version in frozen.FROZEN_KEY_DEFAULTS:
         section, _, name = key.partition(".")
-        assert dumped[section][name] == default, key
+        assert frozen.is_default(dumped[section][name], default), key
 
 
 def test_frozen_module_is_a_leaf() -> None:
@@ -168,6 +168,8 @@ def test_family_and_its_signal_section_are_in_the_fingerprint(
         ([1, 2], [1, 2], False),
         ([1, 2], [1.0, 2], True),
         ([1, 2], [True, 2], True),
+        ([1, 2], (1, 2), False),
+        ({"a": 1, "b": 2}, {"b": 2, "a": 1}, False),
     ],
 )
 def test_canonical_set_compares_a_default_by_type_as_well(
@@ -182,6 +184,15 @@ def test_canonical_set_compares_a_default_by_type_as_well(
     )
     canonical = frozen.canonical_frozen_set({"schedule.extra": stored}, "momentum")
     assert ("schedule.extra" in canonical) is kept
+    # The fingerprint tells a kept value from the default, and ignores a dropped one.
+    as_default = frozen.fingerprint("momentum", {"schedule.extra": default}, IN_SAMPLE_START)
+    as_stored = frozen.fingerprint("momentum", {"schedule.extra": stored}, IN_SAMPLE_START)
+    assert (as_stored != as_default) is kept
+
+
+def test_is_default_refuses_nan() -> None:
+    with pytest.raises(ValueError):
+        frozen.is_default(float("nan"), float("nan"))
 
 
 def test_fingerprint_reads_only_the_keys_that_decide_a_run(settings: Settings) -> None:

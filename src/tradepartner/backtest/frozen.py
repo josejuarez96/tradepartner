@@ -170,18 +170,20 @@ def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, An
         key: value
         for key, value in _overlay_defaults(params, family).items()
         if _section(key) not in inert
-        and not (key in defaults and _is_default(value, defaults[key]) and _section(key) != signal)
+        and not (key in defaults and is_default(value, defaults[key]) and _section(key) != signal)
     }
 
 
-def _is_default(value: Any, default: Any) -> bool:
-    """`value` is `default` in the same JSON form (#1022): Python's `True == 1 == 1.0`
-    would leave out a stored value the fingerprint's JSON tells apart."""
+def is_default(value: Any, default: Any) -> bool:
+    """`value` is the table `default` in the same JSON form the fingerprint hashes
+    (#1022): Python's `True == 1 == 1.0` would call a different value the default.
+    Every comparison of a frozen value with its table default goes through this.
+    Raises `ValueError` on a NaN or infinite value, as the fingerprint does."""
     return _canonical_json(value) == _canonical_json(default)
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def fingerprint(family: str, params: Mapping[str, Any], in_sample_start: date) -> str:
@@ -200,5 +202,4 @@ def fingerprint(family: str, params: Mapping[str, Any], in_sample_start: date) -
         if key in _FINGERPRINT_KEYS or _section(key) in sections
     }
     payload = {"family": family, "in_sample_start": in_sample_start.isoformat(), **chosen}
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return sha256(text.encode()).hexdigest()
+    return sha256(_canonical_json(payload).encode()).hexdigest()
