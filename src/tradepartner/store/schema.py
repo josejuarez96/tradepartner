@@ -2251,28 +2251,37 @@ def _migrate_retracted(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
 
 
+def _add_nullable_int_columns(
+    conn: duckdb.DuckDBPyConnection, table: str, columns: tuple[str, ...]
+) -> None:
+    """Add each name in `columns` to `table` as a nullable `INTEGER` where
+    missing, by `ALTER TABLE` (NULL on every existing row). Idempotent: a
+    column already present is left alone. Shared by `_migrate_n_research`
+    and `_migrate_profitability_rebalance_counts`, whose own docstrings carry
+    each column's schema-version story; this helper has none of its own.
+    Runs inside `init_schema`'s transaction, after its DDL pass."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    for column in columns:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} INTEGER")
+
+
 def _migrate_n_research(conn: duckdb.DuckDBPyConnection) -> None:
     """Add `trial_results.n_research INTEGER` (nullable, NULL on every existing
     row) where it is missing (module docstring, "Schema versions", version 12).
     `_REGISTRY_TABLE_DDL` keeps its version-4 pin, so a fresh store gets the
-    column here too. Idempotent: a table that has the column is left alone.
-    Runs inside `init_schema`'s transaction, after its DDL pass."""
-    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_results')").fetchall()}
-    if N_RESEARCH_COLUMN not in columns:
-        conn.execute(f"ALTER TABLE trial_results ADD COLUMN {N_RESEARCH_COLUMN} INTEGER")
+    column here too. Runs inside `init_schema`'s transaction, after its DDL
+    pass."""
+    _add_nullable_int_columns(conn, "trial_results", (N_RESEARCH_COLUMN,))
 
 
 def _migrate_profitability_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> None:
     """Add each of `PROFITABILITY_REBALANCE_COLUMNS` to `trial_rebalances`
     (nullable `INTEGER`, NULL on every existing row) where missing (module
     docstring, "Schema versions", version 13). `_REGISTRY_TABLE_DDL` keeps its
-    version-4 pin, so a fresh store gets the columns here too. Idempotent: a
-    column already present is left alone. Runs inside `init_schema`'s
-    transaction, after its DDL pass."""
-    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()}
-    for column in PROFITABILITY_REBALANCE_COLUMNS:
-        if column not in columns:
-            conn.execute(f"ALTER TABLE trial_rebalances ADD COLUMN {column} INTEGER")
+    version-4 pin, so a fresh store gets the columns here too. Runs inside
+    `init_schema`'s transaction, after its DDL pass."""
+    _add_nullable_int_columns(conn, "trial_rebalances", PROFITABILITY_REBALANCE_COLUMNS)
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:

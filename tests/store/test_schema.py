@@ -587,6 +587,50 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
 # --- version 13 (#720, #1033, T85d): profitability rebalance columns ----
 
 
+def _columns(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, tuple[str, bool]]:
+    """`{column: (dtype, notnull)}`, as `tests/store/test_research_schema.py`'s
+    helper of the same name does."""
+    return {
+        name: (dtype, notnull)
+        for _, name, dtype, notnull, _, _ in conn.execute(
+            f"PRAGMA table_info('{table}')"
+        ).fetchall()
+    }
+
+
+def _version_12_store(conn: duckdb.DuckDBPyConnection, *, with_rebalance_row: bool = False) -> None:
+    """Build a store on `conn` shaped exactly as version 12 left it: every
+    DDL version 13 (`_migrate_profitability_rebalance_counts`) itself does
+    not touch, and a version-12 `schema_version` row. With
+    `with_rebalance_row`, one `momentum`-shaped `trial_rebalances` row
+    (every column version 13 adds is absent, so there is nothing to fill
+    for it)."""
+    configure_connection(conn)
+    for ddl in (
+        schema._TABLE_DDL
+        + schema._REGISTRY_TABLE_DDL
+        + schema._JOURNAL_TABLE_DDL
+        + schema._STATEMENT_FACTS_TABLE_DDL
+        + schema._MASTER_UNDERIVED_TABLE_DDL
+        + schema._RESEARCH_TABLE_DDL
+    ):
+        conn.execute(ddl)
+    if with_rebalance_row:
+        conn.execute(
+            "INSERT INTO trial_rebalances (trial_id, cost_per_side_bps, session, "
+            "fill_session, n_universe, n_static_listings, n_targets, turnover, "
+            "cost_paid, gap_count_share, gap_size_share, n_missing_fill, "
+            "n_delisting_exits, n_stale_exits, n_excluded_no_history, "
+            "n_dropped_dividends, n_late_dividends) VALUES "
+            "(1, 15.0, '2018-01-31', '2018-02-01', 10, 1, 2, 0.5, 0.001, 0.01, "
+            "0.001, 0, 0, 0, 1, 0, 0)"
+        )
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (12, TIMESTAMPTZ "
+        "'2026-10-05 12:00:00+00')"
+    )
+
+
 def test_profitability_rebalance_columns_ddl_is_pinned() -> None:
     """`PROFITABILITY_REBALANCE_COLUMNS` arrive by `ALTER TABLE`
     (`_migrate_profitability_rebalance_counts`), never by editing
@@ -611,38 +655,14 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
     changed."""
     conn = duckdb.connect(":memory:")
     try:
-        configure_connection(conn)
-        for ddl in (
-            schema._TABLE_DDL
-            + schema._REGISTRY_TABLE_DDL
-            + schema._JOURNAL_TABLE_DDL
-            + schema._STATEMENT_FACTS_TABLE_DDL
-            + schema._MASTER_UNDERIVED_TABLE_DDL
-            + schema._RESEARCH_TABLE_DDL
-        ):
-            conn.execute(ddl)
-        conn.execute(
-            "INSERT INTO trial_rebalances (trial_id, cost_per_side_bps, session, "
-            "fill_session, n_universe, n_static_listings, n_targets, turnover, "
-            "cost_paid, gap_count_share, gap_size_share, n_missing_fill, "
-            "n_delisting_exits, n_stale_exits, n_excluded_no_history, "
-            "n_dropped_dividends, n_late_dividends) VALUES "
-            "(1, 15.0, '2018-01-31', '2018-02-01', 10, 1, 2, 0.5, 0.001, 0.01, "
-            "0.001, 0, 0, 0, 1, 0, 0)"
+        _version_12_store(conn, with_rebalance_row=True)
+        assert set(_columns(conn, "trial_rebalances")).isdisjoint(
+            schema.PROFITABILITY_REBALANCE_COLUMNS
         )
-        conn.execute(
-            "INSERT INTO schema_version (version, applied_at) VALUES (12, TIMESTAMPTZ "
-            "'2026-10-05 12:00:00+00')"
-        )
-        columns_before = {
-            row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
-        }
-        assert columns_before.isdisjoint(schema.PROFITABILITY_REBALANCE_COLUMNS)
         schema.init_schema(conn)
-        columns_after = {
-            row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
-        }
-        assert set(schema.PROFITABILITY_REBALANCE_COLUMNS) <= columns_after
+        assert set(schema.PROFITABILITY_REBALANCE_COLUMNS) <= set(
+            _columns(conn, "trial_rebalances")
+        )
         rows = conn.execute(
             "SELECT trial_id, cost_per_side_bps, n_universe, n_ranked, "
             "n_excluded_no_facts, n_excluded_stale_facts, n_excluded_sector, "
@@ -661,15 +681,10 @@ def test_a_fresh_store_has_the_six_columns_too() -> None:
     `trial_results`."""
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
-    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()}
-    assert set(schema.PROFITABILITY_REBALANCE_COLUMNS) <= columns
+    columns = _columns(conn, "trial_rebalances")
+    assert set(schema.PROFITABILITY_REBALANCE_COLUMNS) <= set(columns)
     for column in schema.PROFITABILITY_REBALANCE_COLUMNS:
-        info = next(
-            row
-            for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
-            if row[1] == column
-        )
-        _, _, dtype, notnull, _, _ = info
+        dtype, notnull = columns[column]
         assert dtype == "INTEGER"
         assert not notnull
 
@@ -682,30 +697,16 @@ def test_read_only_open_of_a_genuine_version_12_store_passes(tmp_path: Path) -> 
     path = tmp_path / "v12.duckdb"
     conn = duckdb.connect(str(path))
     try:
-        configure_connection(conn)
-        for ddl in (
-            schema._TABLE_DDL
-            + schema._REGISTRY_TABLE_DDL
-            + schema._JOURNAL_TABLE_DDL
-            + schema._STATEMENT_FACTS_TABLE_DDL
-            + schema._MASTER_UNDERIVED_TABLE_DDL
-            + schema._RESEARCH_TABLE_DDL
-        ):
-            conn.execute(ddl)
-        conn.execute(
-            "INSERT INTO schema_version (version, applied_at) VALUES (12, TIMESTAMPTZ "
-            "'2026-10-05 12:00:00+00')"
-        )
+        _version_12_store(conn)
     finally:
         conn.close()
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
         assert conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall() == [(12,)]
         assert conn.execute("SELECT COUNT(*) FROM trial_rebalances").fetchone() == (0,)
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
-        }
-        assert columns.isdisjoint(schema.PROFITABILITY_REBALANCE_COLUMNS)
+        assert set(_columns(conn, "trial_rebalances")).isdisjoint(
+            schema.PROFITABILITY_REBALANCE_COLUMNS
+        )
 
 
 # --- lock-error detection -----------------------------------------------

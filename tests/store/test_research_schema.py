@@ -615,6 +615,10 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     )
     assert ddl_after["trial_results"] != ddl_before["trial_results"]
     assert ddl_after["trial_rebalances"] != ddl_before["trial_rebalances"]
+    assert all(
+        c not in ddl_before["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS
+    )
+    assert all(c in ddl_after["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS)
     assert rows_after == rows_before
     # And the migrated store is shaped exactly as a fresh one.
     fresh = duckdb.connect(":memory:")
