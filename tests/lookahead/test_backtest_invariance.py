@@ -34,7 +34,8 @@ test runs on (`_store`) adds, at the case's seeded sessions (`Case.seeded`) and 
 of `SEEDED_IDS` (every name the run holds in 2018-2019), a bar revision at T_k, a
 dividend first seen before its ex-date and restated after close(T_k), and a dividend
 first seen only after close(T_k) (late), all known an hour after close(T_k); a seeded
-dividend never lands on a fixture action's ex-date (`_store`, #1099). The
+dividend never lands on a fixture action's ex-date (`_store`, #1099) or on another
+seeded one's (at `daily`, so only every third rebalance is seeded). The
 truncation walk then crosses revision-type facts (a row dated at or before T but known
 after it) on held names, which `test_the_run_is_not_vacuous` checks.
 
@@ -88,7 +89,8 @@ SEEDED_IDS = ("SEC_DUAL_A", "SEC_DUAL_B", "SEC_SPLIT_BETWEEN", "SEC_SPLIT_FUTURE
 @dataclass(frozen=True)
 class Case:
     """One cadence's walk: the run window `[start, end]`, the teeth case's T_i (a 2019
-    rebalance where the run holds three names) and the range seeded with revisions."""
+    rebalance where the run holds three names) and the range seeded with revisions, every
+    `seed_step`-th rebalance of it."""
 
     cadence: Cadence
     start: date
@@ -96,6 +98,7 @@ class Case:
     teeth: date
     seed_from: date
     seed_to: date
+    seed_step: int = 1
 
     @property
     def sessions(self) -> tuple[date, ...]:
@@ -112,7 +115,9 @@ class Case:
         teeth case's own revisions are the only ones on its dates."""
         return tuple(
             t_k
-            for t_k in rebalance_sessions(self.seed_from, self.seed_to, self.cadence)
+            for t_k in rebalance_sessions(self.seed_from, self.seed_to, self.cadence)[
+                :: self.seed_step
+            ]
             if not (
                 self.teeth <= t_k and _sessions_before(t_k, RESTATED_EX_SESSIONS) <= self.teeth_next
             )
@@ -140,7 +145,9 @@ CASES: dict[Cadence, Case] = {
             seed_to=date(2019, 6, 30),
         ),
         # Seeded from the sixth rebalance on, so a restated dividend's ex-date (five
-        # sessions before its T_k) falls after the first fill.
+        # sessions before its T_k) falls after the first fill; every third rebalance, so
+        # no T_k's late ex-date (three sessions back) is another's restated one (five
+        # back), which would make the late dividend a revision of that one (`_store`).
         Case(
             "daily",
             date(2018, 12, 14),
@@ -148,6 +155,7 @@ CASES: dict[Cadence, Case] = {
             teeth=date(2019, 1, 31),
             seed_from=date(2018, 12, 26),
             seed_to=date(2019, 2, 15),
+            seed_step=3,
         ),
     )
 }
@@ -186,6 +194,15 @@ def _store(case: Case) -> duckdb.DuckDBPyConnection:
     fixture_actions = set(
         conn.execute("SELECT security_id, ex_date FROM corporate_actions").fetchall()
     )
+    # A seeded dividend has no source id, so the as-of read keys it by (type, ex-date):
+    # two seeded on one ex-date would be revisions of one action, and a late dividend
+    # would read as a restated one. Every seeded ex-date is distinct.
+    ex_dates = [
+        _sessions_before(t_k, n)
+        for t_k in case.seeded
+        for n in (RESTATED_EX_SESSIONS, LATE_EX_SESSIONS)
+    ]
+    assert len(set(ex_dates)) == len(ex_dates), f"seeded dividends share an ex-date: {case}"
     for t_k in case.seeded:
         revised_at = read_time(t_k, case.cadence) + REVISION_DELAY
         restated_ex = _sessions_before(t_k, RESTATED_EX_SESSIONS)
@@ -349,6 +366,8 @@ def test_the_run_is_not_vacuous(fixture: Fixture, full_runs: dict[date, Results]
     revised_and_held = [t_k for t_k in seeded if set(_held_at_close(result, t_k)) & set(SEEDED_IDS)]
     assert len(revised_and_held) >= len(seeded) - 2
     assert sum(row.n_late_dividends for row in result.rebalances) >= 5
+    # One step per seeded T_k counts its late dividends (none merged into a restatement).
+    assert sum(row.n_late_dividends > 0 for row in result.rebalances) >= len(seeded) - 2
     # And a restated seeded dividend is held across its ex-date.
     entitled = [
         t_k
