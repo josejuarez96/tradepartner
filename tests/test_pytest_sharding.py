@@ -53,13 +53,16 @@ def test_assignment_is_deterministic_regardless_of_input_order() -> None:
     assert forward == backward
 
 
-def test_heavy_files_spread_across_shards_not_piled_on_one() -> None:
-    """Every known-heavy file should not all land on the same shard (the whole
-    point of weighting them): with 10 heavy files and 4 shards, no single
-    shard can hold more than a few of them if the greedy packing is working."""
+def test_heavy_files_are_balanced_by_weight_not_piled_on_one_shard() -> None:
+    """The whole point of weighting known-heavy files: total weight per shard stays
+    close, even though the files themselves vary a lot in individual weight."""
     assignment = shard_assignment(_HEAVY_TEST_FILE_WEIGHTS, shard_count=4)
-    counts = Counter(assignment.values())
-    assert max(counts.values()) <= 3
+    loads = Counter()
+    for path, shard in assignment.items():
+        loads[shard] += _HEAVY_TEST_FILE_WEIGHTS[path]
+    average = sum(loads.values()) / 4
+    # no shard is more than ~25% off the average load, across heavy files alone.
+    assert all(abs(load - average) <= 0.25 * average for load in loads.values()), loads
 
 
 def test_single_shard_count_keeps_everything() -> None:

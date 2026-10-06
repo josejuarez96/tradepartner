@@ -49,25 +49,57 @@ from tradepartner.store.db import configure_connection
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 
 # CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
-# one process, just split into N invocations with no new dependency. Weight is a
-# rough multiple of a "normal" file's run time, read off a local full-suite
-# `--durations=0` profile (2026-10-06); only files far from that norm are listed,
-# everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`. A stale weight still
-# balances fine — it only shifts which shard a slow file lands on, never which
-# tests run — so this table does not need to be kept in lockstep with the suite.
+# one process, just split into N invocations with no new dependency. Weight is each
+# file's own total seconds (`call` + `setup` + `teardown` summed per file) read off a
+# local `uv run pytest -n auto --durations=0` full-suite run (2026-10-06); only files
+# far above the pack are listed, everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`
+# (chosen near the median file's total). A stale weight still balances fine — it only
+# shifts which shard a slow file lands on, never which tests run — so this table does
+# not need to be kept in lockstep with the suite; re-measure and update it only if a
+# shard's wall clock drifts noticeably from the others.
 _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
-    "tests/lookahead/test_paper_invariance.py": 12.0,
-    "tests/lookahead/test_asof_invariance.py": 8.0,
-    "tests/lookahead/test_backtest_invariance.py": 7.0,
-    "tests/lookahead/test_backtest_plan_timing.py": 6.0,
-    "tests/oracle/test_bt_oracle.py": 6.0,
-    "tests/lookahead/test_suite.py": 5.0,
-    "tests/test_config.py": 3.0,
-    "tests/adapters/test_alpaca_prices.py": 2.5,
-    "tests/store/test_journal.py": 2.0,
-    "tests/test_merge_train.py": 2.0,
+    "tests/lookahead/test_backtest_invariance.py": 373.0,
+    "tests/lookahead/test_asof_invariance.py": 200.0,
+    "tests/lookahead/test_gap_invariance.py": 169.0,
+    "tests/execution/test_run_exits.py": 159.0,
+    "tests/lookahead/test_backtest_plan_timing.py": 128.0,
+    "tests/execution/test_crash_resume.py": 112.0,
+    "tests/lookahead/test_universe_invariance.py": 103.0,
+    "tests/execution/test_run_trade.py": 100.0,
+    "tests/test_cli_backtest.py": 86.0,
+    "tests/test_health.py": 82.0,
+    "tests/backtest/test_results.py": 75.0,
+    "tests/oracle/test_bt_oracle.py": 66.0,
+    "tests/execution/test_run_core.py": 65.0,
+    "tests/execution/test_run_stop.py": 62.0,
+    "tests/test_llm_boundary.py": 55.0,
+    "tests/test_backfill.py": 51.0,
+    "tests/execution/test_resume.py": 51.0,
+    "tests/backtest/test_run.py": 50.0,
+    "tests/execution/test_wrapper_phases.py": 48.0,
+    "tests/backtest/test_engine.py": 46.0,
+    "tests/execution/test_window_settle_gate.py": 36.0,
+    "tests/execution/test_window_stop.py": 35.0,
+    "tests/execution/test_planning.py": 26.0,
+    "tests/execution/test_run_marks.py": 24.0,
+    "tests/execution/test_wrapper_core.py": 21.0,
+    "tests/execution/test_window_settle.py": 20.0,
+    "tests/test_ingest.py": 20.0,
+    "tests/execution/test_window_start.py": 19.0,
+    "tests/test_fixture_universe.py": 18.0,
+    "tests/store/test_schema.py": 18.0,
+    "tests/execution/test_collect.py": 18.0,
+    "tests/execution/test_ops.py": 16.0,
+    "tests/store/test_delistings.py": 15.0,
+    "tests/adapters/test_fixture_prices.py": 15.0,
+    "tests/execution/test_reconcile_run.py": 14.0,
+    "tests/execution/test_wrapper_reattempts.py": 14.0,
+    "tests/dashboard/test_backtest_page.py": 14.0,
+    "tests/execution/test_run_plan.py": 13.0,
+    "tests/dashboard/test_health_page.py": 13.0,
+    "tests/test_universe.py": 12.0,
 }
-_DEFAULT_TEST_FILE_WEIGHT = 1.0
+_DEFAULT_TEST_FILE_WEIGHT = 0.4
 
 _SHARD_INDEX_ENV = "PYTEST_SHARD_INDEX"
 _SHARD_COUNT_ENV = "PYTEST_SHARD_COUNT"
