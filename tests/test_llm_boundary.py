@@ -17,6 +17,9 @@ reads them. Each test runs over the real tree and over the fixtures in
   tasks land, so they skip with `labeling modules pending` until then: T119
   removes (e)'s skip, T123 and T123b remove (d)'s. The snapshot (d) relies on and
   the recordings' contract (e) are pinned here already.
+
+Known limit: the text rules read literal text, so a string split across a
+concatenation (`"typesafe" + ".ai"`) passes them; reviewers read diffs for that.
 """
 
 from __future__ import annotations
@@ -27,13 +30,14 @@ import io
 import json
 import re
 import subprocess
+import sys
 import tokenize
 import tomllib
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import duckdb
 import pytest
@@ -42,6 +46,7 @@ from conftest import load_universe_fixtures
 from tradepartner.store.db import configure_connection
 from tradepartner.store.schema import (
     JOURNAL_TABLE_NAMES,
+    LATER_JOURNAL_TABLE_NAMES,
     MASTER_CHECK_TABLE_NAMES,
     REGISTRY_TABLE_NAMES,
     RESEARCH_TABLE_NAMES,
@@ -153,8 +158,14 @@ def dependency_violations(pyproject: Mapping[str, Any], labeling_status: str | N
     groups: dict[str, list[object]] = dict(pyproject.get("dependency-groups", {}))
     for extra, reqs in project.get("optional-dependencies", {}).items():
         groups[f"optional-dependencies.{extra}"] = reqs
+    uv_dev = pyproject.get("tool", {}).get("uv", {}).get("dev-dependencies")
+    if uv_dev is not None:
+        groups["tool.uv.dev-dependencies"] = uv_dev
     for group, reqs in sorted(groups.items()):
         names = {_requirement_name(r) for r in reqs}
+        includes = {r.get("include-group") for r in reqs if isinstance(r, dict)}
+        if group != "research" and "research" in includes:
+            found.append(f"dependency group {group!r} includes the research group")
         if group == "research":
             if not _accepted(labeling_status):
                 found.append(
@@ -175,7 +186,7 @@ def llm_package_violations(llm_package_exists: bool, llm_spec_status: str | None
     """ADR 0008 point 2: `tradepartner.llm` exists only once the Phase 5 spec is Accepted
     at its recorded path; the check keys on the spec, not on the package."""
     if llm_package_exists and not _accepted(llm_spec_status):
-        return ["src/tradepartner/llm/ exists while docs/specs/llm-analyst.md is not Accepted"]
+        return ["tradepartner.llm exists while docs/specs/llm-analyst.md is not Accepted"]
     return []
 
 
@@ -192,7 +203,8 @@ def test_real_pyproject_passes_test_a() -> None:
 
 def test_real_tree_passes_adr_0008_package_check() -> None:
     llm = REPO / "src" / "tradepartner" / "llm"
-    assert llm_package_violations(llm.exists(), _status_line(LLM_ANALYST_SPEC)) == []
+    exists = llm.exists() or llm.with_suffix(".py").exists()
+    assert llm_package_violations(exists, _status_line(LLM_ANALYST_SPEC)) == []
 
 
 DRAFT = "**Status:** Draft  ·  **Issue:** #963"
@@ -210,6 +222,7 @@ ACCEPTED = "**Status:** Accepted (owner, 2026-10-05, #964); amended 2026-10-06"
         ("pyproject_research_openai.toml", DRAFT, True),
         ("pyproject_research_openai.toml", ACCEPTED, True),
         ("pyproject_dev_torch.toml", ACCEPTED, True),
+        ("pyproject_dev_includes_research.toml", ACCEPTED, True),
     ],
 )
 def test_a_fixture_pyprojects(fixture: str, status: str | None, fails: bool) -> None:
@@ -242,10 +255,25 @@ RESEARCH = "tradepartner.research"
 MODELS = "tradepartner.research.models"
 #: C13: the one module that may import `research.models`.
 MODELS_IMPORTER = "tradepartner.research.labeling.job"
-#: (i)'s exceptions. `tradepartner.cli` is the spec's; `tradepartner.store.research`
-#: is the registry API, which T81 (#1007) built on `research.RunHandle` and
-#: `load_dataset` after ADR 0013 was written (an open question on this task's PR).
-RESEARCH_IMPORTERS = frozenset({"tradepartner.cli", "tradepartner.store.research"})
+#: (i)'s exceptions, each with the `tradepartner.research` modules it may import
+#: (None: any). `tradepartner.cli` is the spec's. `tradepartner.store.research` is the
+#: registry API, which T81 (#1007) built on `research.RunHandle`, `load_dataset`,
+#: `experiment` and `gates` after ADR 0013 was written (an open question on #1028);
+#: it may import those modules only, never the labeling code or `research.models`.
+RESEARCH_IMPORTERS: Mapping[str, frozenset[str] | None] = {
+    "tradepartner.cli": None,
+    "tradepartner.store.research": frozenset(
+        {RESEARCH, f"{RESEARCH}.experiment", f"{RESEARCH}.gates"}
+    ),
+}
+#: The facades the dashboard and the backtest read, which must not load the model
+#: code even transitively (checked in a subprocess).
+FACADES = (
+    RESEARCH,
+    "tradepartner.store.research",
+    "tradepartner.store.registry",
+    "tradepartner.backtest.results",
+)
 #: (iii): what `tradepartner.research` may never import, whatever the name.
 RESEARCH_FORBIDDEN = (
     "tradepartner.adapters",
@@ -267,6 +295,10 @@ STORE_READERS: Mapping[str, frozenset[str]] = {
     "tradepartner.store.master": frozenset({"securities_as_of", "primary_security_id"}),
 }
 _DYNAMIC = frozenset({"import_module", "__import__"})
+#: Loaders whose argument is a path, not a module name: never used under `src/`.
+_PATH_LOADERS = frozenset({"spec_from_file_location", "SourceFileLoader"})
+#: The target of an import the scan cannot read (a non-literal module name).
+UNREADABLE = "<unreadable>"
 
 
 def _under(module: str, package: str) -> bool:
@@ -307,7 +339,12 @@ class Edge:
 def _edges(path: str, source: str) -> Iterator[Edge]:
     importer = _module_of(path)
     is_package = path.endswith("__init__.py")
-    for node in ast.walk(ast.parse(source, filename=path)):
+    tree = ast.parse(source, filename=path)
+    loaders = set(_DYNAMIC | _PATH_LOADERS)
+    for node in ast.walk(tree):  # `from importlib import import_module as load`
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("importlib"):
+            loaders.update(a.asname for a in node.names if a.asname and a.name in loaders)
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 yield Edge(importer, alias.name, None)
@@ -315,20 +352,23 @@ def _edges(path: str, source: str) -> Iterator[Edge]:
             base = _resolve(importer, is_package, node.level, node.module)
             for alias in node.names:
                 yield Edge(importer, base, alias.name)
-        elif isinstance(node, ast.Call) and node.args:
+        elif isinstance(node, ast.Call):
             func = node.func
             called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            first = node.args[0]
-            if (
-                called in _DYNAMIC
-                and isinstance(first, ast.Constant)
-                and isinstance(first.value, str)
-            ):
-                target = first.value
-                if target.startswith("."):
-                    level = len(target) - len(target.lstrip("."))
-                    target = _resolve(importer, is_package, level, target.lstrip(".") or None)
-                yield Edge(importer, target, None)
+            if called not in loaders:
+                continue
+            args = [*node.args[:1], *(k.value for k in node.keywords if k.arg == "name")]
+            first = args[0] if args else None
+            literal = isinstance(first, ast.Constant) and isinstance(first.value, str)
+            if called in _PATH_LOADERS or not literal:
+                yield Edge(importer, UNREADABLE, called)
+                continue
+            assert isinstance(first, ast.Constant)
+            target = str(first.value)
+            if target.startswith("."):
+                level = len(target) - len(target.lstrip("."))
+                target = _resolve(importer, is_package, level, target.lstrip(".") or None)
+            yield Edge(importer, target, None)
 
 
 def _targets(edge: Edge) -> tuple[str, ...]:
@@ -339,19 +379,36 @@ def _targets(edge: Edge) -> tuple[str, ...]:
 
 
 def _store_import_allowed(edge: Edge) -> bool:
-    """(iii): may `tradepartner.research` take this from `tradepartner.store`?"""
-    if edge.target == "tradepartner.store" and edge.name is not None:
-        module, name = f"tradepartner.store.{edge.name}", None
+    """(iii): may `tradepartner.research` take this from `tradepartner.store`? A bare
+    `tradepartner.store` would reach every store module as an attribute, so it may not."""
+    if edge.target in ("tradepartner", "tradepartner.store") and edge.name is not None:
+        module, name = f"{edge.target}.{edge.name}", None
     else:
         module, name = edge.target, edge.name
-    if module in STORE_WHOLE or module == "tradepartner.store":
+    if not _under(module, "tradepartner.store"):
+        return True
+    if module in STORE_WHOLE:
         return True
     return name is not None and name in STORE_READERS.get(module, frozenset())
+
+
+def _research_import_allowed(edge: Edge, modules: frozenset[str]) -> bool:
+    """(i): is this import of `tradepartner.research` one of the listed exceptions?"""
+    if edge.importer not in RESEARCH_IMPORTERS:
+        return False
+    allowed = RESEARCH_IMPORTERS[edge.importer]
+    if allowed is None:
+        return True
+    reached = [
+        t for t in _targets(edge) if _under(t, RESEARCH) and (t in modules or t == edge.target)
+    ]
+    return all(t in allowed for t in reached)
 
 
 def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
     """Every (rule, message) the import scan reports over `tree` (path -> source)."""
     found: list[tuple[str, str]] = []
+    modules = frozenset(_module_of(p) for p in tree)
     for path, source in sorted(tree.items()):
         script = path.startswith("scripts/")
         for edge in _edges(path, source):
@@ -366,9 +423,18 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
                 found.append((rule, f"{path}: {what}: {edge.target}{name}"))
 
             in_research = _under(src, RESEARCH)
+            if edge.target == UNREADABLE:
+                if not script:
+                    report("dynamic", "a dynamic import the scan cannot read")
+                continue
             if hits("tradepartner.llm") and not _under(src, "tradepartner.llm"):
                 report("adr0008", "imports tradepartner.llm outside it")
-            if not script and hits(RESEARCH) and not in_research and src not in RESEARCH_IMPORTERS:
+            if (
+                not script
+                and hits(RESEARCH)
+                and not in_research
+                and not _research_import_allowed(edge, modules)
+            ):
                 report("i", "imports tradepartner.research from outside it and cli")
             if in_research and src != MODELS and hits("httpx"):
                 report("ii", "imports httpx under tradepartner.research outside research.models")
@@ -377,7 +443,7 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
             if in_research:
                 if any(hits(p) for p in RESEARCH_FORBIDDEN):
                     report("iii", "tradepartner.research imports an adapter or writer")
-                if _under(edge.target, "tradepartner.store") and not _store_import_allowed(edge):
+                if not _store_import_allowed(edge):
                     report("iii", "tradepartner.research imports a store name not allowlisted")
                 if hits("tradepartner.execution"):
                     report("iv", "tradepartner.research imports tradepartner.execution")
@@ -405,6 +471,20 @@ def test_b_fixture_snippets(case: Case) -> None:
         assert rules == set()
 
 
+def test_b_facades_do_not_load_the_model_code() -> None:
+    """The scan is direct-only; this pins the transitive closure of the modules the
+    dashboard and the backtest read: none loads `research.models` or the labeling code."""
+    code = (
+        "import importlib, sys\n"
+        f"for m in {FACADES!r}: importlib.import_module(m)\n"
+        "print('\\n'.join(sorted(sys.modules)))\n"
+    )
+    loaded = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=REPO
+    ).stdout.split()
+    assert [m for m in loaded if _under(m, MODELS) or _under(m, f"{RESEARCH}.labeling")] == []
+
+
 def test_b_resolves_relative_imports() -> None:
     edge = next(_edges("src/tradepartner/research/labeling/crosswalk.py", "from ..models import x"))
     assert (edge.target, edge.name) == (MODELS, "x")
@@ -414,10 +494,12 @@ def test_b_resolves_relative_imports() -> None:
 
 # --- (c) text (spec req 14 as C13 amends it) ------------------------------------------
 
-_HOST = re.compile(r"typesafe\.ai", re.IGNORECASE)
+_HOST = re.compile(r"typesafe\.ai|\bapi_base_url\b", re.IGNORECASE)
 KEY_NAME = "TYPESAFE_API_KEY"
-#: Where the vendor host and the key's name may appear (and `.env.example`, outside
-#: the scanned roots).
+#: The env name and the settings attribute that reads it (`typesafe_api_key`).
+_KEY = re.compile(KEY_NAME, re.IGNORECASE)
+#: Where the vendor host (and `research.labeling.api_base_url`, its config key) and the
+#: key's name may appear (and `.env.example`, outside the scanned roots).
 VENDOR_FILES = frozenset({"src/tradepartner/research/models.py", "src/tradepartner/config.py"})
 PACKET_MODULES = frozenset(
     {
@@ -431,6 +513,7 @@ STORE_TABLES = (
     frozenset(
         TABLE_NAMES
         + JOURNAL_TABLE_NAMES
+        + LATER_JOURNAL_TABLE_NAMES
         + MASTER_CHECK_TABLE_NAMES
         + REGISTRY_TABLE_NAMES
         + RESEARCH_TABLE_NAMES
@@ -466,7 +549,7 @@ def text_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
         if path not in VENDOR_FILES:
             if _HOST.search(text):
                 found.append(("host", f"{path} names the vendor host"))
-            if KEY_NAME in text:
+            if _KEY.search(text):
                 found.append(("key", f"{path} names {KEY_NAME}"))
         if path not in DATA_DIR_FILES and _DATA_DIR.search(text):
             found.append(("data_dir", f"{path} names the research store's directory"))
@@ -538,9 +621,9 @@ def _rel_to(path: Path, root: Path) -> str:
 
 
 def tracked_changes() -> str:
-    """`git status --porcelain` for tracked files."""
+    """`git status --porcelain`, new untracked files included (ignored ones are not)."""
     return subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
+        ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=REPO,
         capture_output=True,
         text=True,
@@ -582,7 +665,9 @@ def test_d_snapshot_catches_the_planted_write(tmp_path: Path) -> None:
 def test_d_store_tables_cover_every_named_table(tmp_path: Path) -> None:
     store = tmp_path / "store.duckdb"
     _fixture_store(store)
-    named = set(TABLE_NAMES + JOURNAL_TABLE_NAMES + MASTER_CHECK_TABLE_NAMES)
+    named = set(
+        TABLE_NAMES + JOURNAL_TABLE_NAMES + LATER_JOURNAL_TABLE_NAMES + MASTER_CHECK_TABLE_NAMES
+    )
     assert named | set(REGISTRY_TABLE_NAMES) | set(RESEARCH_TABLE_NAMES) <= set(_snapshot(store))
 
 
@@ -621,6 +706,8 @@ def _labeling_scenario(
     events = tmp_path / "events.duckdb"  # stand-in until `events.path` exists in config
     _fixture_store(store)
     events.write_bytes(b"events stand-in")
+    for name in (*_CEILING_ENV, KEY_NAME):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("STORE__PATH", str(store))
     monkeypatch.setenv("RESEARCH__DATA_DIR", str(data_dir))
     settings = Settings(_env_file=None)
@@ -738,15 +825,37 @@ def _handle() -> Any:
     )
 
 
-@pytest.fixture
-def no_httpx_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`httpx.Client` fails the test if anything constructs it."""
+def _refuse(what: str) -> Callable[..., NoReturn]:
+    def refuse(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail(f"{what} was called")
+
+    return refuse
+
+
+def _refuse_sends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every httpx send path fails the test, whatever the import style or order
+    (`httpx.post` and a `from httpx import Client` both end in a transport)."""
     import httpx
 
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("httpx.Client was constructed")
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _refuse("an httpx send"))
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _refuse("an httpx async send")
+    )
 
-    monkeypatch.setattr(httpx, "Client", refuse)
+
+def _refuse_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`httpx.Client` (spec req 16) and `httpx.AsyncClient` fail if constructed."""
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", _refuse("httpx.Client"))
+    monkeypatch.setattr(httpx, "AsyncClient", _refuse("httpx.AsyncClient"))
+
+
+@pytest.fixture
+def no_httpx_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No httpx client is constructed and nothing is sent."""
+    _refuse_clients(monkeypatch)
+    _refuse_sends(monkeypatch)
 
 
 def _public_methods(protocol: type) -> list[str]:
@@ -823,7 +932,12 @@ def test_e_the_real_client_needs_both_ceilings_and_a_key(
     monkeypatch: pytest.MonkeyPatch, env: Mapping[str, str], real: bool
 ) -> None:
     models = _models()
-    disabled = type(models.build_client(_settings(monkeypatch, {}), _handle()))
+    _refuse_sends(monkeypatch)
+    with monkeypatch.context() as m:
+        _refuse_clients(m)
+        disabled = type(models.build_client(_settings(monkeypatch, {}), _handle()))
+    if not real:
+        _refuse_clients(monkeypatch)
     client = models.build_client(_settings(monkeypatch, env), _handle())
     assert (type(client) is not disabled) is real
 

@@ -98,3 +98,39 @@ id = "llm-imported-outside-llm"
 path = "src/tradepartner/universe.py"
 source = "from tradepartner.llm import memo\n"
 rule = "adr0008"
+
+[[case]]
+id = "store-research-imports-job"
+path = "src/tradepartner/store/research.py"
+source = "from tradepartner.research.labeling import job\n"
+rule = "i"
+
+[[case]]
+id = "bare-store-in-research"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from tradepartner import store\n"
+rule = "iii"
+
+[[case]]
+id = "non-literal-import-module"
+path = "src/tradepartner/research/labeling/scoring.py"
+source = "import importlib\nNAME = 'tradepartner.research.' + 'models'\nmod = importlib.import_module(NAME)\n"
+rule = "dynamic"
+
+[[case]]
+id = "aliased-import-module"
+path = "src/tradepartner/research/labeling/scoring.py"
+source = "from importlib import import_module as load\nmod = load('tradepartner.research.models')\n"
+rule = "ii"
+
+[[case]]
+id = "keyword-import-module"
+path = "src/tradepartner/research/labeling/scoring.py"
+source = "import importlib\nmod = importlib.import_module(name='tradepartner.research.models')\n"
+rule = "ii"
+
+[[case]]
+id = "path-loader"
+path = "src/tradepartner/research/labeling/scoring.py"
+source = "from importlib.util import spec_from_file_location\nspec = spec_from_file_location('m', 'src/tradepartner/research/models.py')\n"
+rule = "dynamic"

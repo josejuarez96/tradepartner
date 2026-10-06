@@ -55,3 +55,15 @@ id = "data-dir-attribute-in-corpus"
 path = "src/tradepartner/corpus/departure_fetch.py"
 source = "def where(settings):\n    return settings.research.data_dir\n"
 rule = "data_dir"
+
+[[case]]
+id = "key-attribute-in-corpus"
+path = "src/tradepartner/corpus/departure_fetch.py"
+source = "def key(settings):\n    return settings.typesafe_api_key\n"
+rule = "key"
+
+[[case]]
+id = "base-url-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "def url(settings):\n    return settings.research.labeling.api_base_url + '/systemone'\n"
+rule = "host"
