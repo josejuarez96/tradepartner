@@ -338,3 +338,74 @@ def test_system_timezone_read_from_the_process(
     finally:
         monkeypatch.undo()
         time.tzset()
+
+
+# ── review fixes: sparse weekdays, DST edges, overflow, eager validation ────────
+
+
+@pytest.mark.parametrize("paper", [False, True])
+@pytest.mark.parametrize("weekday_offset", range(7))
+def test_longest_gap_is_the_weekly_one_with_a_single_quiet_weekday(
+    weekday_offset: int, paper: bool
+) -> None:
+    settings = _settings(lab={"quiet_weekdays": [0]})
+    now = _ny(MONDAY + timedelta(days=weekday_offset), 12)
+    intervals = _around(now, settings, paper=paper)
+    gaps = [b.start - a.end for a, b in pairwise(intervals)]
+    # Monday 21:00 to the next Monday's first interval (16:00, or 07:30 with paper).
+    weekly = timedelta(days=6, hours=19) if not paper else timedelta(days=6, hours=10, minutes=30)
+    assert max(gaps) == weekly
+
+
+def test_a_sparse_week_group_that_would_end_inside_monday_waits() -> None:
+    settings = _settings(lab={"quiet_weekdays": [0]})
+    now = _ny(FRIDAY, 12)
+    intervals = _around(now, settings, paper=True)
+    assert start_decision(now, 4 * 86400.0, intervals) == "wait"
+    assert start_decision(now, 7 * 86400.0, intervals) == "start"
+
+
+def test_dst_skipped_and_repeated_local_times_take_the_widest_reading() -> None:
+    every_day = {"quiet_weekdays": [0, 1, 2, 3, 4, 5, 6]}
+    spring = date(2027, 3, 14)  # a Sunday; 02:00-03:00 does not exist in New York
+    (skipped,) = configured_intervals(
+        spring, _settings(lab={**every_day, "quiet_intervals": [["02:30", "03:00"]]})
+    )
+    assert skipped.start < skipped.end
+    fall = date(2026, 11, 1)  # a Sunday; 01:00-02:00 happens twice
+    (repeated,) = configured_intervals(
+        fall, _settings(lab={**every_day, "quiet_intervals": [["01:15", "01:45"]]})
+    )
+    assert repeated.start == datetime(2026, 11, 1, 5, 15, tzinfo=UTC)  # first 01:15 (EDT)
+    assert repeated.end == datetime(2026, 11, 1, 6, 45, tzinfo=UTC)  # second 01:45 (EST)
+
+
+def test_malformed_interval_is_refused_on_a_non_quiet_day_too() -> None:
+    with pytest.raises(ValueError, match=r"lab\.quiet_intervals"):
+        configured_intervals(SATURDAY, _settings(lab={"quiet_intervals": [["4pm", "9pm"]]}))
+
+
+def test_a_huge_prediction_starts_without_overflow() -> None:
+    now = _ny(MONDAY, 14)
+    assert start_decision(now, 1e15, _around(now, _settings(), paper=False)) == "start"
+
+
+def test_paper_interval_gate_reads_the_open_in_the_quiet_zone() -> None:
+    # In Auckland, New York's Monday 09:30 open is Tuesday morning.
+    settings = _settings(lab={"quiet_timezone": "Pacific/Auckland", "quiet_weekdays": [1]})
+    interval = paper_interval(MONDAY, settings, True, _session_open(MONDAY))
+    assert interval is not None and interval.start == _ny(MONDAY, 7, 30)
+    assert paper_interval(FRIDAY, settings, True, _session_open(FRIDAY)) is None
+
+
+def test_system_timezone_sample_follows_the_clock() -> None:
+    # Sao Paulo kept DST until 2019 and Bahia did not: the zones differ around 2017
+    # and agree around 2026, so the sample must track the clock, not fixed years.
+    settings = _settings(lab={"quiet_timezone": "America/Sao_Paulo"})
+    bahia = ZoneInfo("America/Bahia")
+    assert system_timezone_matches(settings, system_tz=bahia, around=_ny(MONDAY, 12))
+    assert not system_timezone_matches(
+        settings, system_tz=bahia, around=datetime(2017, 6, 1, tzinfo=UTC)
+    )
+    with pytest.raises(ValueError, match="tz-aware"):
+        system_timezone_matches(settings, system_tz=bahia, around=datetime(2026, 1, 1))  # noqa: DTZ001

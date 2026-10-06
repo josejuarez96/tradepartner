@@ -65,15 +65,17 @@ _EXCHANGE_TZ: Final = ZoneInfo(str(XNYSExchangeCalendar.tz))
 _REGULAR_OPEN: Final = XNYSExchangeCalendar.open_times[-1][1]
 
 # How far the timeline reaches: from the day before `now` (an interval that began
-# yesterday may still hold) to this many days after, so it spans more than one whole
-# weekly cycle of `lab.quiet_weekdays` and the longest gap is the true one.
-_HORIZON_DAYS: Final = 8
+# yesterday may still hold) to this many days after, so it holds every quiet weekday
+# at least twice and the longest gap, even with a single quiet weekday, is the true
+# weekly one.
+_HORIZON_DAYS: Final = 14
 
 _HHMM = re.compile(r"\A([01]\d|2[0-3]):([0-5]\d)\Z")
 
-# Instants `system_timezone_matches` compares UTC offsets at: every six hours over
-# three years, so both DST transitions of each year are covered.
-_TZ_SAMPLE_START: Final = datetime(2024, 1, 1, tzinfo=UTC)
+# Instants `system_timezone_matches` compares UTC offsets at: every six hours from a
+# year before the check to two years after it, so both DST transitions of each year,
+# and the rules in force now and next, are covered.
+_TZ_SAMPLE_BEFORE: Final = timedelta(days=366)
 _TZ_SAMPLE_STEP: Final = timedelta(hours=6)
 _TZ_SAMPLE_COUNT: Final = 3 * 366 * 4
 
@@ -111,6 +113,31 @@ def _local_instant(day: date, hour: int, minute: int, zone: tzinfo) -> datetime:
     return datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone).astimezone(UTC)
 
 
+def _local_bounds(day: date, hour: int, minute: int, zone: tzinfo) -> tuple[datetime, datetime]:
+    """The earliest and latest UTC instants a local wall time names on `day`: one
+    instant normally, two an hour apart when DST makes the time ambiguous (fall back)
+    or skipped (spring forward). Interval bounds take the widest reading."""
+    readings = [
+        datetime(day.year, day.month, day.day, hour, minute, fold=fold, tzinfo=zone).astimezone(UTC)
+        for fold in (0, 1)
+    ]
+    return min(readings), max(readings)
+
+
+def _configured_pairs(settings: Settings) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """`lab.quiet_intervals` parsed and checked as same-day local wall-clock pairs."""
+    pairs = []
+    for start_text, end_text in settings.lab.quiet_intervals:
+        start, end = _parse_hhmm(start_text), _parse_hhmm(end_text)
+        if end <= start:
+            raise ValueError(
+                f"lab.quiet_intervals pair [{start_text!r}, {end_text!r}] must end after it "
+                "starts on the same day"
+            )
+        pairs.append((start, end))
+    return pairs
+
+
 def configured_intervals(day: date, settings: Settings) -> list[QuietInterval]:
     """The `lab.quiet_intervals` on local calendar day `day`, in start order.
 
@@ -120,18 +147,14 @@ def configured_intervals(day: date, settings: Settings) -> list[QuietInterval]:
     `HH:MM` or a pair whose end is not after its start.
     """
     lab = settings.lab
+    pairs = _configured_pairs(settings)  # checked on every day, quiet or not
     if day.weekday() not in lab.quiet_weekdays:
         return []
     zone = ZoneInfo(lab.quiet_timezone)
     intervals = []
-    for start_text, end_text in lab.quiet_intervals:
-        start = _local_instant(day, *_parse_hhmm(start_text), zone)
-        end = _local_instant(day, *_parse_hhmm(end_text), zone)
-        if end <= start:
-            raise ValueError(
-                f"lab.quiet_intervals pair [{start_text!r}, {end_text!r}] must end after it "
-                "starts on the same day"
-            )
+    for (start_h, start_m), (end_h, end_m) in pairs:
+        start = _local_bounds(day, start_h, start_m, zone)[0]
+        end = _local_bounds(day, end_h, end_m, zone)[1]
         intervals.append(QuietInterval(start, end, ("configured",)))
     return sorted(intervals, key=lambda i: i.start)
 
@@ -142,15 +165,18 @@ def paper_interval(
     paper_window_open: bool,
     session_open: datetime | None,
 ) -> QuietInterval | None:
-    """The paper interval on `day`, or None when no window is open or `day` is not a
-    quiet weekday.
+    """The paper interval on exchange day `day`, or None when no window is open or the
+    open does not fall on a quiet weekday.
 
-    `session_open` is the day's XNYS open (tz-aware) or None on a non-session day, when
+    `day` is an XNYS (New York) calendar date; the quiet-weekday gate reads the open's
+    weekday in `lab.quiet_timezone`, the zone the paper plist fires in, which is the
+    same day whenever that zone is the exchange's. `session_open` is the day's XNYS
+    open (tz-aware) or None on a non-session day, when
     the regular open time stands in (the paper plist fires on weekday holidays too and
     writes a `no_session` row). The bounds move with the `paper.*` timing keys and
     `lab.paper_run_lead_minutes`, so no edit here follows a T70 timing change.
     """
-    if not paper_window_open or day.weekday() not in settings.lab.quiet_weekdays:
+    if not paper_window_open:
         return None
     if session_open is None:
         open_at = _local_instant(day, _REGULAR_OPEN.hour, _REGULAR_OPEN.minute, _EXCHANGE_TZ)
@@ -159,6 +185,9 @@ def paper_interval(
         if session_open.astimezone(_EXCHANGE_TZ).date() != day:
             raise ValueError(f"session_open {session_open.isoformat()} is not on {day}")
         open_at = session_open.astimezone(UTC)
+    quiet_zone = ZoneInfo(settings.lab.quiet_timezone)
+    if open_at.astimezone(quiet_zone).weekday() not in settings.lab.quiet_weekdays:
+        return None
     paper = settings.paper
     before = timedelta(
         minutes=paper.submit_window_before_open_minutes + settings.lab.paper_run_lead_minutes
@@ -190,20 +219,22 @@ def quiet_intervals_around(
 ) -> list[QuietInterval]:
     """Every quiet interval from the day before `now` to `_HORIZON_DAYS` after it.
 
-    Configured and paper intervals together, sorted, with overlapping or touching ones
-    merged, so consecutive entries are separated by a real gap. The span covers more
-    than a full week, which `start_decision` needs to see the longest gap.
+    Configured intervals per `lab.quiet_timezone` day and paper intervals per XNYS day,
+    sorted, with overlapping or touching ones merged, so consecutive entries are
+    separated by a real gap. The span holds every weekday at least twice, which
+    `start_decision` needs to see the longest gap.
     """
     _require_aware(now, "now")
-    zone = ZoneInfo(settings.lab.quiet_timezone)
-    today = now.astimezone(zone).date()
+    local_today = now.astimezone(ZoneInfo(settings.lab.quiet_timezone)).date()
+    exchange_today = now.astimezone(_EXCHANGE_TZ).date()
     intervals: list[QuietInterval] = []
     for offset in range(-1, _HORIZON_DAYS + 1):
-        day = today + timedelta(days=offset)
-        intervals.extend(configured_intervals(day, settings))
-        paper = paper_interval(day, settings, paper_window_open, session_open(day))
-        if paper is not None:
-            intervals.append(paper)
+        intervals.extend(configured_intervals(local_today + timedelta(days=offset), settings))
+        if paper_window_open:
+            day = exchange_today + timedelta(days=offset)
+            paper = paper_interval(day, settings, paper_window_open, session_open(day))
+            if paper is not None:
+                intervals.append(paper)
     return _merge(intervals)
 
 
@@ -288,11 +319,11 @@ def start_decision(
     upcoming = [i for i in merged if i.start > now]
     if not upcoming:
         return "start"
-    duration = timedelta(seconds=predicted_seconds)
-    if now + duration <= upcoming[0].start:
+    # Compared in float seconds, so a huge prediction cannot overflow a datetime.
+    if predicted_seconds <= (upcoming[0].start - now).total_seconds():
         return "start"
     longest = _longest_gap(merged)
-    if longest is not None and duration > longest:
+    if longest is not None and predicted_seconds > longest.total_seconds():
         return "start"
     return "wait"
 
@@ -301,19 +332,26 @@ def _system_offset(instant: datetime) -> timedelta:
     return timedelta(seconds=time.localtime(instant.timestamp()).tm_gmtoff)
 
 
-def system_timezone_matches(settings: Settings, *, system_tz: tzinfo | None = None) -> bool:
+def system_timezone_matches(
+    settings: Settings, *, system_tz: tzinfo | None = None, around: datetime | None = None
+) -> bool:
     """True when `lab.quiet_timezone` keeps the same UTC offsets as the system zone.
 
     launchd fires the plists in the machine's zone, so the intervals mean what they say
     only when the two agree; `lab status` warns when they do not. Zones are compared by
-    their offsets at instants every six hours over three years (both DST transitions
-    each year), so an alias such as `US/Eastern` matches `America/New_York`.
-    `system_tz` stands in for the machine's zone (a test passes one); when omitted the
-    process's local time rules are read.
+    their offsets at instants every six hours from a year before `around` to two years
+    after it (both DST transitions each year, the rules in force now and next), so an
+    alias such as `US/Eastern` matches `America/New_York`. `system_tz` stands in for
+    the machine's zone and `around` for the clock (a test passes both); when omitted
+    the process's local time rules and the current time are read.
     """
     zone = ZoneInfo(settings.lab.quiet_timezone)
+    if around is None:
+        around = datetime.now(UTC)
+    _require_aware(around, "around")
+    first = around.astimezone(UTC) - _TZ_SAMPLE_BEFORE
     for step in range(_TZ_SAMPLE_COUNT):
-        instant = _TZ_SAMPLE_START + step * _TZ_SAMPLE_STEP
+        instant = first + step * _TZ_SAMPLE_STEP
         configured = instant.astimezone(zone).utcoffset()
         system = (
             instant.astimezone(system_tz).utcoffset()
