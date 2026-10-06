@@ -624,11 +624,17 @@ def test_a_re_registered_hypothesis_is_a_plan_trial_error(env: Env) -> None:
     assert env.counts() == counts
 
 
-def test_a_family_the_engine_cannot_run_is_a_plan_trial_error(env: Env) -> None:
-    """A window whose hypothesis is `profitability` plans nothing until T85e dispatches
-    its signal (#1053). The family is changed by hand, as no window can start on one."""
+def test_profitability_is_refused_by_the_paper_family_gate(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Profitability is engine-ready but cannot open a paper plan or provider."""
     env.conn.execute("UPDATE hypotheses SET family = 'profitability'")
     counts = env.counts()
+
+    def provider_used(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("provider must not open for a non-paper family")
+
+    monkeypatch.setattr(planning, "StoreProvider", provider_used)
     with pytest.raises(PlanTrialError, match="cannot run yet"):
         env.plan()
     assert env.counts() == counts

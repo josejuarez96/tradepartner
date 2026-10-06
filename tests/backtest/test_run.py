@@ -241,9 +241,11 @@ def test_frozen_params_used(store: Path, read: Read, monkeypatch: pytest.MonkeyP
     seen: list[tuple[Settings, date, date, list[float]]] = []
     real_run = engine.run
 
-    def spy_run(params: Settings, provider: Any, start: date, end: date, *rest: Any) -> Any:
+    def spy_run(
+        params: Settings, provider: Any, start: date, end: date, *rest: Any, **kw: Any
+    ) -> Any:
         seen.append((params, start, end, list(rest[1])))
-        return real_run(params, provider, start, end, *rest)
+        return real_run(params, provider, start, end, *rest, **kw)
 
     monkeypatch.setattr(engine, "run", spy_run)
     outcome = run_hypothesis(SLUG, None, None, Flags(), store_path=store)
@@ -632,18 +634,17 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     assert not any(key.startswith("schedule.") for key in stored.params)
 
 
-def test_a_family_the_engine_cannot_run_is_refused_before_any_trial(
+def test_profitability_registration_passes_its_stored_family_to_the_engine(
     fixture_store_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A `profitability` registration is refused until T85e dispatches its signal
-    (#1053): otherwise the run would read the live, unfrozen `strategy.*`."""
+    """The run path uses the stored family rather than momentum's default."""
     frozen = _frozen()
     with open_for_write(_store(fixture_store_path)) as conn:
         registry.register_hypothesis(
             conn,
             slug="b3-run",
             family="profitability",
-            title="not runnable yet",
+            title="family dispatch",
             doc_path="docs/hypotheses/b3-run.md",
             doc_sha256="0" * 64,
             params=frozen_params_of(frozen, family="profitability"),
@@ -653,8 +654,14 @@ def test_a_family_the_engine_cannot_run_is_refused_before_any_trial(
             registered_by="test",
             settings=frozen,
         )
-    calls = _spy(monkeypatch)
-    with pytest.raises(ValueError, match="cannot run yet"):
-        run_hypothesis("b3-run", None, None, Flags(), store_path=fixture_store_path)
-    assert calls == []
-    assert read().execute("SELECT COUNT(*) FROM trials").fetchone() == (0,)
+    seen: list[str] = []
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["family"])
+        raise RuntimeError("stopped after dispatch")
+
+    monkeypatch.setattr(engine, "run", capture)
+    outcome = run_hypothesis("b3-run", None, None, Flags(), store_path=fixture_store_path)
+    assert outcome.status == "failed"
+    assert seen == ["profitability"]
+    assert read().execute("SELECT COUNT(*) FROM trials").fetchone() == (1,)

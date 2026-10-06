@@ -20,11 +20,11 @@ so a run to T_n is exactly the prefix of a longer run. The order holds at every
 cadence: at `daily`, F_i = T_{i+1}, so the fill at F_i is applied and the period valued
 before the plan at close(T_{i+1}) reads the drifted weights, on the same session.
 
-**The plan** (`_plan`) reads the universe, then the signal (`_signal`, the one call
-site of the momentum signal): the frozen `schedule.signal_anchor` and cadence decide
-the anchors (`signals.momentum`), and the signal frame is read from the formation
-anchor A_form on (`sessions_from`), which leaves every anchor bar and so every score as
-the unbounded read gives it. The marking read is unbounded.
+**The plan** (`_plan`) reads the universe, then the registered family's signal inputs.
+For momentum, the frozen `schedule.signal_anchor` and cadence decide the anchors;
+its price frame starts at formation anchor A_form (`sessions_from`). Profitability
+instead reads annual facts and SICs at the same rebalance close. The marking read is
+unbounded for either family.
 
 **Exits** (req 5), decided from step i's read after the fill, on the names still held:
 
@@ -109,8 +109,8 @@ class Plan:
     """What the read at close(T_i) decides, identical for every cost level (public for
     Phase 4's tracking runs, which plan with the engine's own function, plan T53).
 
-    `members` (the universe, sorted), `scores` (the momentum signal) and
-    `excluded_no_history` (members without both anchor bars) are the reads behind the
+    `members` (the universe, sorted), `scores` and
+    `excluded_no_history` (momentum members without both anchor bars) are the reads behind the
     targets, kept for Phase 4's `decisions_from` (plan T53b); the loop does not read
     them."""
 
@@ -221,7 +221,7 @@ def plan(
     family: HypothesisFamily = "momentum",
 ) -> Plan:
     """The plan at rebalance session `session` (a rebalance session at the frozen
-    `schedule.rebalance_cadence`), read at close(`session`): universe, momentum signal,
+    `schedule.rebalance_cadence`), read at close(`session`): universe, family signal,
     targets and the gap, from `params` (the frozen hypothesis parameters). The backtest
     loop calls exactly this function (`_plan`) at every rebalance it plans."""
     return _plan(provider, params, session, family)
