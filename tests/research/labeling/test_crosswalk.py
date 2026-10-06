@@ -269,3 +269,18 @@ def test_shortlist_empty_input() -> None:
     result = shortlist([], seed=1)
     assert result.items == ()
     assert result.n_deferred == 0
+
+
+def test_shortlist_duplicate_listing_end_id_raises() -> None:
+    outcomes = [
+        _outcome("dupe", 1, ROW_1, "bankruptcy"),
+        _outcome("dupe", 2, ROW_1, "exchange_transfer"),
+    ]
+    with pytest.raises(ValueError, match="dupe"):
+        shortlist(outcomes, seed=1)
+
+
+def test_shortlist_unknown_selected_option_raises() -> None:
+    outcomes = [_outcome("weird", 1, ROW_1, "not_a_real_option")]
+    with pytest.raises(ValueError, match="weird"):
+        shortlist(outcomes, seed=1)

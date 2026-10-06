@@ -14,7 +14,9 @@ consistent set is a disagreement (`is_disagreement`); `unresolved` is neither a
 disagreement nor an agreement, by req 5's "Classes, crosswalk and the deterministic
 arm" and the human-path req 9's "a label outside the subset is a disagreement,
 `unresolved` is neither". Rows 6 and 7 (`rule_status` not `delisted`, or no
-`delistings` row joined) have an empty consistent set, so disagree with every label.
+`delistings` row joined) have an empty consistent set, so disagree with every
+label other than `unresolved` (which still lands in its own `unresolved` stratum,
+not `disagreement`).
 
 **The `rule_provision` arm** (`rule_provision_arm`) maps the Form 25's normalised
 provision (`12d2-2(a)(1)` etc., stripped of the `17 CFR 240.` prefix by the corpus
@@ -55,6 +57,12 @@ CLASSES: dict[str, frozenset[str]] = {
 
 #: Every option a class covers, for `class_of` and the "exactly one class" check.
 OPTIONS_WITH_A_CLASS: frozenset[str] = frozenset().union(*CLASSES.values())
+
+#: The nine options `shortlist` and `is_disagreement` recognise (req 4): the eight
+#: classed options plus `unresolved`. A `selected_option` outside this set is a
+#: bug upstream (the model client validates its own response against the sent
+#: criteria), so `shortlist` raises rather than silently calling it a disagreement.
+KNOWN_OPTIONS: frozenset[str] = OPTIONS_WITH_A_CLASS | {UNRESOLVED}
 
 
 def class_of(option: str) -> str | None:
@@ -201,7 +209,14 @@ class InferenceOutcome:
 class ShortlistItem:
     """One shortlisted listing end (req 9): its `stratum`, and, for the agreement
     stratum, the sampling rate it was drawn at (`1.0` for every other stratum,
-    since every disagreement and `unresolved` item is always shortlisted)."""
+    since every disagreement and `unresolved` item is always shortlisted).
+
+    `sampling_rate` is the rate the agreement stratum was drawn at over *every*
+    agreement, whether or not this particular item ends up `deferred`; a scorer
+    that inverse-weights by stratum (req 10's batch metrics) must use the
+    `deferred` items' rate too, since deferral narrows what got reviewed this
+    batch, not what the stratum's rate was drawn at.
+    """
 
     listing_end_id: str
     stratum: Stratum
@@ -220,10 +235,17 @@ class Shortlist:
 
 
 def _stratum(outcome: InferenceOutcome) -> Stratum | None:
-    """`outcome`'s stratum, or `None` for an agreement (not yet sampled)."""
+    """`outcome`'s stratum, or `None` for an agreement (not yet sampled).
+
+    Raises `ValueError` for a `selected_option` outside `KNOWN_OPTIONS` on an
+    `ok` outcome, rather than silently counting an unrecognised string as a
+    disagreement.
+    """
     option = outcome.selected_option
     if outcome.reason != "ok" or option is None or option == UNRESOLVED:
         return "unresolved"
+    if option not in KNOWN_OPTIONS:
+        raise ValueError(f"{outcome.listing_end_id}: unknown selected_option {option!r}")
     if is_disagreement(outcome.rule_answer, option):
         return "disagreement"
     return None
@@ -245,7 +267,16 @@ def shortlist(
     order). The combined set, in acceptance order (`accepted_at`, ties broken by
     `listing_end_id`), is kept active up to `max_items`; the rest are marked
     `deferred` and counted, never dropped.
+
+    Raises `ValueError` if `outcomes` repeats a `listing_end_id` (it must be one
+    row per listing end, never two: a duplicate would double-count it and let
+    the agreement draw depend on the input order through `n_agreements`).
     """
+    ids = [o.listing_end_id for o in outcomes]
+    if len(set(ids)) != len(ids):
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        raise ValueError(f"shortlist: duplicate listing_end_id(s): {duplicates}")
+
     disagreements: list[InferenceOutcome] = []
     unresolved: list[InferenceOutcome] = []
     agreements: list[InferenceOutcome] = []
