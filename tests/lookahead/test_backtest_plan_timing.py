@@ -4,7 +4,7 @@ every rebalance cadence (strategy-lab spec req 6; plan T98b).
 **Cadences.** Every test runs once per `Case` in `CASES`, one per cadence (`month_end`,
 `week_end`, `daily`), with `schedule.rebalance_cadence` frozen to it. `month_end` walks
 the whole fixture range as T40b did; `week_end` and `daily` walk the same windows of
-about forty rebalances as `test_backtest_invariance.py`. A later axis (the strategy
+about thirty rebalances as `test_backtest_invariance.py`. A later axis (the strategy
 family, T85e) extends `Case` and `CASES`, not the tests.
 
 T40's truncation and prefix invariance cannot see an engine that fills at F_k from
@@ -117,8 +117,8 @@ CASES: dict[Cadence, Case] = {
     case.cadence: case
     for case in (
         Case("month_end", FIXTURE_START, FIXTURE_END, teeth=date(2019, 1, 31)),
-        Case("week_end", date(2018, 9, 1), date(2019, 6, 30), teeth=date(2019, 2, 1)),
-        Case("daily", date(2018, 12, 14), date(2019, 2, 15), teeth=date(2019, 1, 31)),
+        Case("week_end", date(2018, 10, 12), date(2019, 5, 3), teeth=date(2019, 2, 1)),
+        Case("daily", date(2019, 1, 2), date(2019, 2, 15), teeth=date(2019, 1, 31)),
     )
 }
 assert tuple(CASES) == get_args(Cadence), "one case per cadence"

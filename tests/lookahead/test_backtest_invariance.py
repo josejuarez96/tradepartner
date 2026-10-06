@@ -3,9 +3,10 @@ at every rebalance cadence (strategy-lab spec req 6; plan T98b).
 
 **Cadences.** Every test runs once per `Case` in `CASES`, one per cadence (`month_end`,
 `week_end`, `daily`), with `schedule.rebalance_cadence` frozen to it. `month_end` walks
-the whole fixture range as T40 did; `week_end` and `daily` walk a window of about forty
+the whole fixture range as T40 did; `week_end` and `daily` walk a window of about thirty
 rebalances around the teeth case (`Case`), because the walk runs `run(end=T_i)` from the
-window's first rebalance for every T_i (quadratic in the rebalance count). A later axis
+window's first rebalance for every T_i (quadratic in the rebalance count) and CI runs it
+once per worker that draws a truncation or prefix test. A later axis
 (the strategy family, T85e) extends `Case` and `CASES`, not the tests.
 
 `engine.run` over a `StoreProvider` on the fixture universe, at every rebalance
@@ -138,11 +139,11 @@ CASES: dict[Cadence, Case] = {
         ),
         Case(
             "week_end",
-            date(2018, 9, 1),
-            date(2019, 6, 30),
+            date(2018, 10, 12),
+            date(2019, 5, 3),
             teeth=date(2019, 2, 1),
-            seed_from=date(2018, 10, 1),
-            seed_to=date(2019, 6, 30),
+            seed_from=date(2018, 10, 26),
+            seed_to=date(2019, 5, 3),
         ),
         # Seeded from the sixth rebalance on, so a restated dividend's ex-date (five
         # sessions before its T_k) falls after the first fill; every third rebalance, so
@@ -150,10 +151,10 @@ CASES: dict[Cadence, Case] = {
         # back), which would make the late dividend a revision of that one (`_store`).
         Case(
             "daily",
-            date(2018, 12, 14),
+            date(2019, 1, 2),
             date(2019, 2, 15),
             teeth=date(2019, 1, 31),
-            seed_from=date(2018, 12, 26),
+            seed_from=date(2019, 1, 9),
             seed_to=date(2019, 2, 15),
             seed_step=3,
         ),
@@ -314,8 +315,16 @@ def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
 
 @pytest.fixture(scope="module")
 def full_runs(fixture: Fixture) -> dict[date, Results]:
-    """`run(end=T_i)` on the full store for every T_i after the first."""
+    """`run(end=T_i)` on the full store for every T_i after the first: the walk's cost,
+    read only by the truncation and prefix tests (under xdist each worker that runs one
+    of them builds it again)."""
     return {end: fixture.run(end) for end in fixture.sessions[1:]}
+
+
+@pytest.fixture(scope="module")
+def longest(fixture: Fixture) -> Results:
+    """`run(end=T_n)` on the full store, for the tests that need only that run."""
+    return fixture.run(fixture.sessions[-1])
 
 
 # --- comparison ------------------------------------------------------------------
@@ -353,10 +362,10 @@ def _prefix(result: BacktestResult, end: date) -> BacktestResult:
 # --- the suite -------------------------------------------------------------------
 
 
-def test_the_run_is_not_vacuous(fixture: Fixture, full_runs: dict[date, Results]) -> None:
-    result = full_runs[fixture.sessions[-1]][COST_LEVELS[-1]]
+def test_the_run_is_not_vacuous(fixture: Fixture, longest: Results) -> None:
+    result = longest[COST_LEVELS[-1]]
     seeded = fixture.case.seeded
-    assert len(fixture.sessions) > 40
+    assert len(fixture.sessions) >= 30
     # The frozen cadence reached the engine: it rebalanced on exactly the case's sessions.
     assert [row.session for row in result.rebalances] == list(fixture.sessions[:-1])
     assert max(row.n_targets for row in result.rebalances) >= 3
@@ -454,15 +463,13 @@ def _step_frame(result: BacktestResult, start: date) -> pl.DataFrame:
     return frame
 
 
-def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
-    fixture: Fixture, full_runs: dict[date, Results]
-) -> None:
+def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(fixture: Fixture) -> None:
     case = fixture.case
     t_i, t_next = case.teeth, case.teeth_next
     revised_at = fixture.read_time(t_i) + REVISION_DELAY
     assert revised_at < fixture.read_time(t_next)
 
-    base = full_runs[t_i][COST_LEVELS[-1]]
+    base = fixture.run(t_i)[COST_LEVELS[-1]]
     # The bar revision hits a name held at close(T_i): carrying it to F_i reads that close.
     held = _held_at_close(base, t_i)
     assert held, f"nothing held at close({t_i})"
@@ -474,7 +481,7 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
     # at `daily` that interval is empty, so ex-date F_i = T_{i+1} on a target held across
     # T_i, which the carry to the fill pays.
     fill = fill_session(t_i, case.cadence)
-    targets = sorted(full_runs[t_next][COST_LEVELS[-1]].targets[fill])
+    targets = sorted(fixture.run(t_next)[COST_LEVELS[-1]].targets[fill])
     assert targets, f"no targets filled on {fill}"
     in_step_ex = next_session(fill)
     if in_step_ex > t_next:
