@@ -729,17 +729,21 @@ why = "Without a build order the ADR's guarantees (H1's fingerprint unchanged, p
 unblocks = ["phase:3", "phase:4"]
 
 [task.T127]
-what = "Plan.exclusions and the trial_rebalance_counts table; the paper signals.reason rule widens to excluded_<reason>; T85d's six columns migrated into the table."
-why = "The one real schema boundary the spike hit: today a strategy can only report 'no history', and the paper path refuses any other exclusion with a raw ValueError."
+what = "Plan.exclusions and the trial_rebalance_counts table (once per rebalance); the paper signals.reason CHECK widens to a prefix rule; T85d's six columns copied into the table."
+why = "The one real schema boundary the spike hit: today a strategy can only report 'no history', in Plan, a NOT NULL column and the journal CHECK."
+
+[task.T127b]
+what = "The paper planner's _signals partitions members over every declared exclusion reason and journals excluded_<reason> rows; H1's rows unchanged."
+why = "Without it the paper path refuses any exclusion but 'no history' with a raw ValueError; kept its own small task because it edits execution/."
 
 [task.T128]
 what = "config.FAMILIES, the one family registry; FAMILY_PARENTS, ENGINE_FAMILIES, PAPER_FAMILIES, FAMILY_SIGNAL_SECTIONS, REQUIRED_SECTIONS and the sweep prefixes derive from it; the momentum fallbacks go."
 why = "An unlisted family today silently freezes, hashes and requires momentum's keys; after this it fails, and the family list lives in one place."
 
 [task.T129]
-what = "The comparison benchmark becomes a registry attribute: momentum keeps MTUM and its metric keys byte for byte; a family may declare another or none."
-why = "Every family is benchmarked against a momentum ETF today; results refuses a trial without MTUM equity."
+what = "A family's registry entry may add one comparison benchmark beside SPY and MTUM, which stay required; momentum's MTUM keys unchanged byte for byte."
+why = "MTUM is wired in by name today, so a family cannot add a benchmark of its own; whether MTUM stays mandatory for every family is ADR 0014 open question 1."
 
 [task.T130]
-what = "B4 momentum plus profitability combined by fixed equal ranks, landed as one signal module, one registry entry, a Settings section and a fixture twin."
+what = "B4 momentum plus profitability combined by fixed equal ranks, landed as one signal module, one registry entry whose sections freeze both sub-signals' keys, a Settings section and a fixture twin."
 why = "The proof of ADR 0014: a third family that touches nothing under execution/ or store/, nor engine.py, run.py, results.py or hypothesis.py."
