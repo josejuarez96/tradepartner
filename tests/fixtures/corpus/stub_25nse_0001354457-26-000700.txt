@@ -1,0 +1,47 @@
+<SEC-DOCUMENT>0001354457-26-000700.txt : 20260715
+<SEC-HEADER>0001354457-26-000700.hdr.sgml : 20260715
+<ACCEPTANCE-DATETIME>20260715101500
+ACCESSION NUMBER:		0001354457-26-000700
+CONFORMED SUBMISSION TYPE:	25-NSE
+PUBLIC DOCUMENT COUNT:		2
+FILED AS OF DATE:		20260715
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>25-NSE
+<SEQUENCE>1
+<FILENAME>primary_doc.xml
+<TEXT>
+<XML>
+<?xml version="1.0"?>
+<notificationOfRemoval>
+    <schemaVersion>X0203</schemaVersion>
+    <exchange>
+        <cik>0001354457</cik>
+        <entityName>Nasdaq Stock Market LLC</entityName>
+    </exchange>
+    <issuer>
+        <cik>0001999999</cik>
+        <entityName>Stubco Therapeutics, Inc.</entityName>
+    </issuer>
+    <descriptionClassSecurity>Common Stock</descriptionClassSecurity>
+    <ruleProvision>17 CFR 240.12d2-2(a)(3)</ruleProvision>
+    <signatureData>
+        <signatureName>Tara Petta</signatureName>
+        <signatureTitle>Director</signatureTitle>
+        <signatureDate>2026-07-15</signatureDate>
+    </signatureData>
+</notificationOfRemoval>
+</XML>
+</TEXT>
+</DOCUMENT>
+<DOCUMENT>
+<TYPE>EX-99.25
+<SEQUENCE>2
+<FILENAME>stub-form25.txt
+<TEXT>
+Stub-form25
+
+
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>

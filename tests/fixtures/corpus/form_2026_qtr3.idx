@@ -1,0 +1,17 @@
+Description:           Master Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    September 30, 2026
+Comments:              webmaster at sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+
+
+
+
+Form Type   Company Name                                                  CIK         Date Filed  File Name
+---------------------------------------------------------------------------------------------------------------------------------------------
+10-Q             KLX Energy Services Holdings, Inc.                            1738827     2026-08-10  edgar/data/1738827/0001738827-26-000030.txt
+25               OLDCO INC                                                     1000001     2026-08-03  edgar/data/1000001/0001000001-26-000002.txt
+25-NSE           KLX Energy Services Holdings, Inc.                            1738827     2026-09-24  edgar/data/1738827/0001354457-26-000904.txt
+25-NSE           Nasdaq Stock Market LLC                                       1354457     2026-09-24  edgar/data/1354457/0001354457-26-000904.txt
+25-NSE           STUBCO THERAPEUTICS INC                                       1999999     2026-07-15  edgar/data/1999999/0001354457-26-000700.txt
+25-NSE/A         KLX Energy Services Holdings, Inc.                            1738827     2026-09-25  edgar/data/1738827/0001354457-26-000910.txt
+8-K              KLX Energy Services Holdings, Inc.                            1738827     2026-09-18  edgar/data/1738827/0001738827-26-000046.txt
