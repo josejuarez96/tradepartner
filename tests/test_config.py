@@ -28,6 +28,7 @@ from tradepartner.config import (
     Settings,
     _default_env_file,
     _settings_has_key,
+    clean_message,
 )
 
 
@@ -1131,6 +1132,109 @@ def test_research_experiments_dir_defaults_to_docs_experiments() -> None:
         _env_file=None, research={"experiments_dir": "tests/fixtures/experiments"}
     )
     assert overridden.research.experiments_dir == "tests/fixtures/experiments"
+
+
+def test_research_labeling_defaults() -> None:
+    """Research-labeling spec, amendment 2026-10-06's config table (plan T119): every
+    key and default; the two ceilings and the key are zero/absent in code."""
+    research = _settings().research
+    assert research.spend_ceiling_usd_month == 0.0
+    assert research.spend_ceiling_usd_total == 0.0
+    labeling = research.labeling
+    assert labeling.api_base_url == "https://api.typesafe.ai/v1"
+    assert labeling.price_usd_per_million_input_tokens == 0.042
+    assert labeling.chars_per_token == 2.5
+    assert labeling.max_packet_tokens == 8000
+    assert labeling.exhibit_max_chars == 4000
+    assert labeling.item_max_chars == 4000
+    assert labeling.eightk_max_chars == 12000
+    assert labeling.context_before_days == 45
+    assert labeling.context_after_days == 20
+    assert labeling.marker_after_days == 400
+    # Owner decision 2026-10-06 question 5 (E14), not the body's list.
+    assert labeling.eightk_items == ["3.01", "2.01", "1.03", "5.01", "3.03", "1.01", "8.01"]
+    assert labeling.requests_per_second == 2.0
+    assert labeling.request_timeout_seconds == 60.0
+    assert labeling.max_attempts == 3
+    # The amendment removed these two keys.
+    assert not hasattr(labeling, "estimate_margin")
+    assert not hasattr(labeling, "batch_max_usd")
+    assert _settings().typesafe_api_key is None
+
+
+def test_research_data_dir_is_under_the_repo_and_independent_of_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    data_dir = Path(_settings().research.data_dir)
+    assert data_dir.is_absolute()
+    assert data_dir == Path(__file__).resolve().parents[1] / "data" / "research"
+
+
+def test_research_ceilings_and_key_come_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three variables the spec names (req 8, req 17) and nothing else."""
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_MONTH", "40")
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_TOTAL", "40")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key-abc123")
+    monkeypatch.setenv("RESEARCH__DATA_DIR", "/tmp/research-x")
+    s = _settings()
+    assert s.research.spend_ceiling_usd_month == 40.0
+    assert s.research.spend_ceiling_usd_total == 40.0
+    assert s.research.data_dir == "/tmp/research-x"
+    assert s.typesafe_api_key is not None
+    assert s.typesafe_api_key.get_secret_value() == "ts-key-abc123"
+
+
+@pytest.mark.parametrize(
+    ("section", "values"),
+    [
+        ("research", {"spend_ceiling_usd_month": -1.0}),
+        ("research", {"spend_ceiling_usd_total": -0.01}),
+        ("research", {"spend_ceiling_usd_total": float("inf")}),
+        ("labeling", {"api_base_url": "http://api.typesafe.ai/v1"}),
+        ("labeling", {"chars_per_token": 0}),
+        ("labeling", {"max_packet_tokens": 0}),
+        ("labeling", {"exhibit_max_chars": 0}),
+        ("labeling", {"item_max_chars": 0}),
+        ("labeling", {"eightk_max_chars": 0}),
+        ("labeling", {"context_before_days": -1}),
+        ("labeling", {"requests_per_second": 0}),
+        ("labeling", {"request_timeout_seconds": 0}),
+        ("labeling", {"max_attempts": 0}),
+        ("labeling", {"price_usd_per_million_input_tokens": 0}),
+        ("labeling", {"eightk_items": []}),
+        ("labeling", {"eightk_items": ["3.01", "3.01"]}),
+        ("labeling", {"eightk_items": ["Item 3.01"]}),
+        ("labeling", {"estimate_margin": 0.25}),
+    ],
+)
+def test_research_labeling_rejects_nonsense(section: str, values: dict[str, object]) -> None:
+    research: dict[str, object] = dict(values) if section == "research" else {"labeling": values}
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, research=research)
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-1"])
+def test_research_ceilings_from_the_environment_reject_nonsense(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_TOTAL", value)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_typesafe_key_is_redacted_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec req 17: a `SecretStr` in `secret_values`, so `clean_message` (and
+    `cli_record`, which uses the same set) redacts it; absent from repr/str."""
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key-abc123")
+    s = _settings()
+    for blob in (repr(s), str(s), repr(s.typesafe_api_key)):
+        assert "ts-key-abc123" not in blob
+    cleaned = clean_message("401 for Bearer ts-key-abc123 on systemone", s)
+    assert "ts-key-abc123" not in cleaned
+    assert "[redacted]" in cleaned
 
 
 def test_alerts_channels_default_store_and_macos() -> None:

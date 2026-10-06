@@ -1,0 +1,4 @@
+# Test (a): a model client in project.dependencies fails under any spec status.
+[project]
+name = "fixture"
+dependencies = ["httpx>=0.27", "anthropic>=0.30"]
