@@ -45,6 +45,7 @@ from tradepartner.calendar import (
     last_session_of_month,
     next_session,
     previous_session,
+    session_close,
 )
 from tradepartner.config import Cadence, SignalAnchor
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -305,10 +306,12 @@ def gross_profitability(
     5. a non-finite numerator, or a non-positive or non-finite denominator: `malformed`;
     6. otherwise scored numerator / denominator (`ranked` gives rule 6's order).
 
-    A tz-aware `t` in any zone is read as the same instant in UTC.
+    A tz-aware `t` in any zone is read as the same instant in UTC. `t` must be a
+    session close (`close(T)`, half days included): any other instant would measure
+    rule 4's freshness from the previous session (#1084).
 
-    Raises `ValueError` for a naive `t` (or one out of UTC's range), a `basis` other
-    than `gross`, a frame missing a column, or a duplicate
+    Raises `ValueError` for a naive `t` (or one out of UTC's range), a `t` that is
+    not a session close, a `basis` other than `gross`, a frame missing a column, or a duplicate
     `(security_id, fact_name, period_end, period_days)` row.
     """
     t = ensure_tz_aware_utc(t, field_name="t")  # `known_at` is UTC; polars needs one zone
@@ -319,6 +322,11 @@ def gross_profitability(
         raise ValueError(f"facts frame lacks columns {missing}")
     numerator_name = _PROFITABILITY_NUMERATOR[basis]
     t_session = last_completed_session(t)
+    if t != session_close(t_session):
+        raise ValueError(
+            f"t {t.isoformat()} is not a session close; the last close at or before it "
+            f"is {session_close(t_session).isoformat()} ({t_session.isoformat()})"
+        )
     low_days, high_days = annual_period_days
     names = sorted(set(security_ids))
 

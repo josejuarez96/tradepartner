@@ -15,7 +15,7 @@ import pytest
 from tradepartner.backtest import signals
 from tradepartner.backtest.portfolio import target_weights
 from tradepartner.backtest.signals import ProfitabilitySignal, gross_profitability
-from tradepartner.calendar import last_session_of_month, session_close
+from tradepartner.calendar import is_half_day, last_session_of_month, session_close
 
 T_SESSION = last_session_of_month(2024, 6)  # 2024-06-28
 T = session_close(T_SESSION)
@@ -158,6 +158,31 @@ def test_t_out_of_utc_range_raises_value_error() -> None:
             [gp("A", 40.0), ta("A", 200.0)],
             t=datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))),
         )
+
+
+@pytest.mark.parametrize(
+    "t",
+    [
+        T - timedelta(hours=2),  # mid-session on T
+        T + timedelta(seconds=1),  # just after T's close
+        T - timedelta(days=1) + timedelta(hours=8),  # the night after the previous close
+        session_close(T_SESSION) + timedelta(days=1),  # Saturday, 24h after Friday's close
+        datetime(2024, 7, 4, 20, 0, tzinfo=UTC),  # a holiday at a normal close time
+    ],
+    ids=["mid-session", "after-close", "overnight", "weekend", "holiday"],
+)
+def test_t_that_is_not_a_session_close_raises(t: datetime) -> None:
+    """#1084: the spec's `t` is `close(T)`; any other instant would measure freshness
+    from the previous session, so it is refused."""
+    with pytest.raises(ValueError, match="not a session close"):
+        run([gp("A", 40.0), ta("A", 200.0)], t=t)
+
+
+def test_half_day_close_is_a_session_close() -> None:
+    half_day = date(2024, 7, 3)  # NYSE closes at 13:00 New York
+    assert is_half_day(half_day)
+    sig = run([gp("A", 40.0), ta("A", 200.0)], t=session_close(half_day))
+    assert sig.scores == {"A": pytest.approx(0.2)}
 
 
 def test_no_look_ahead_future_rows_never_change_the_result() -> None:
