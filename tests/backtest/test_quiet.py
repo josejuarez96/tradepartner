@@ -419,10 +419,11 @@ def test_system_timezone_sample_follows_the_clock() -> None:
 
 
 def test_paper_interval_gate_reads_the_fire_time_not_the_open() -> None:
-    # Brisbane (UTC+10, no DST): NY Friday 07:30 EDT fires Friday 21:30 local, while the
-    # 09:30 open is Friday 23:30; NY Thursday likewise stays Thursday. With Friday the
-    # only quiet weekday, only Friday's interval is kept.
-    settings = _settings(lab={"quiet_timezone": "Australia/Brisbane", "quiet_weekdays": [4]})
-    assert paper_interval(FRIDAY, settings, True, _session_open(FRIDAY)) is not None
-    thursday = FRIDAY - timedelta(days=1)
-    assert paper_interval(thursday, settings, True, _session_open(thursday)) is None
+    # Noumea (UTC+11, no DST): NY Friday's 07:30 EDT fire time is Friday 22:30 local,
+    # while its 09:30 open is already Saturday 00:30. The gate follows the fire time.
+    def gated(weekdays: list[int]) -> QuietInterval | None:
+        settings = _settings(lab={"quiet_timezone": "Pacific/Noumea", "quiet_weekdays": weekdays})
+        return paper_interval(FRIDAY, settings, True, _session_open(FRIDAY))
+
+    assert gated([4]) is not None
+    assert gated([5]) is None
