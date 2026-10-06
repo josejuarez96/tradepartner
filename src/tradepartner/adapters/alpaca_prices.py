@@ -126,8 +126,8 @@ under the span's ticker, on sessions from that first session up to the
 span's start (`FirstSpanLead`), when the span is assigned (its rule-7 end
 does not matter: a delisted name is the case to fix), not contested and
 starts after the first session. A first span that is non-equity,
-same-day, later-class or a claim means the earliest ticker evidence is in
-doubt: no lead. Any other security's span of the ticker, of any kind but
+same-day, later-class, ambiguous (rule 4) or a claim means the earliest
+ticker evidence is in doubt: no lead. Any other security's span of the ticker, of any kind but
 placeholder, covering a session of the window means a reuse the master
 knows of: the whole lead is refused and counted
 (`ResolverReport.first_span_refused`). On each session the lead answers
@@ -782,7 +782,9 @@ class ListingResolver:
         self._first_leads: dict[str, list[FirstSpanLead]] = defaultdict(list)  # by ticker
         self._first_lead_of: dict[str, FirstSpanLead] = {}  # by security
         first_span_refused = (
-            self._first_span_leads(first_sessions, placeholder_spans) if first_sessions else 0
+            self._first_span_leads(first_sessions, placeholder_spans, ambiguous)
+            if first_sessions
+            else 0
         )
         self.report = ResolverReport(
             placeholder=placeholder,
@@ -806,10 +808,15 @@ class ListingResolver:
         )
 
     def _first_span_leads(
-        self, first_sessions: Mapping[str, date], placeholder_spans: Collection[TickerSpan]
+        self,
+        first_sessions: Mapping[str, date],
+        placeholder_spans: Collection[TickerSpan],
+        ambiguous: Collection[TickerSpan],
     ) -> int:
         """Record each security's `FirstSpanLead` (#974, module docstring)
-        and return how many were refused for a reused ticker."""
+        and return how many were refused for a reused ticker. Placeholder
+        spans are passed over; an `ambiguous` first span (rule 4: a tie the
+        master refuses to assign) leads to nothing."""
         others: dict[str, list[TickerSpan]] = defaultdict(list)  # every non-placeholder span
         for history in self._history.values():
             for other in history:
@@ -821,6 +828,7 @@ class ListingResolver:
             if (
                 first_session is None
                 or first is None
+                or first in ambiguous
                 or first not in self._assigned_spans
                 or first in self._contested
                 or first.start <= first_session

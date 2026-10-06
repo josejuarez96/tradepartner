@@ -2025,6 +2025,18 @@ class TestFirstSpanLead:
         assert resolver.report.first_span_leads == 0
         assert resolver.report.first_span_refused == 0
 
+    def test_a_tied_first_span_takes_no_lead(self) -> None:
+        # code-review on #983: two securities' FB spans start the same day
+        # (rule 4): `resolve` gives FB to no one, so neither gets a lead.
+        resolver = ListingResolver(
+            [*self._listings(), _listing(self.OTHER, "FB", self.COVER, "Common Stock")],
+            first_sessions={self.META: self.FIRST, self.OTHER: date(2018, 1, 2)},
+        )
+        assert resolver.resolve("FB", self.COVER) is None
+        for session in (date(2014, 1, 2), date(2018, 6, 1)):
+            assert resolver.lead("FB", session) is None
+        assert resolver.report.first_span_leads == 0
+
     def test_an_earlier_non_equity_span_of_the_security_takes_no_lead(self) -> None:
         resolver = self._resolver(_listing(self.META, "FBN", date(2018, 1, 2), "Notes due 2025"))
         assert resolver.lead("FB", date(2017, 6, 1)) is None

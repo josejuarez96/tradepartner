@@ -66,7 +66,7 @@ from tradepartner.ingest import SourceRun, _read, _write_run
 from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.delistings import listing_ends_as_of
-from tradepartner.store.master import _session_of
+from tradepartner.store.master import _first_session, _session_of
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 REPAIR = "repair"
@@ -115,10 +115,11 @@ def first_sessions(
     of its New York day, else the next). A direct read of the table, never
     `securities_as_of`, whose latest revision is stamped at an ingest clock
     (a renamed, or retracted and restored, row would move the floor past
-    the first span and take the lead away). A `known_at` before
-    `calendar.start` maps from that day, the calendar's first."""
+    the first span and take the lead away). A `known_at` before the
+    calendar's first session maps to that session (the calendar raises
+    before it, `store.master._first_session`)."""
     at = ensure_tz_aware_utc(at, field_name="at")
-    floor = datetime.combine(settings.calendar.start, time(12), tzinfo=UTC)
+    floor = datetime.combine(_first_session(settings), time(12), tzinfo=UTC)
     rows = conn.execute(
         "SELECT security_id, min(known_at) FROM securities WHERE known_at <= ? GROUP BY ALL",
         [at],

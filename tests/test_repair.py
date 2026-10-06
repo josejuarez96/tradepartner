@@ -524,3 +524,17 @@ def test_a_bar_under_a_refused_lead_is_listed(led: Settings) -> None:
     result = repair_resolution(led, clock=lambda: RUN, dry_run=True)
     assert sorted(result.found.bars) == [(META, date(2017, 5, 31)), (META, date(2018, 7, 2))]
     assert sorted(result.found.actions) == [(META, date(2017, 6, 1))]
+
+
+def test_a_known_at_before_the_calendar_maps_to_its_first_session(led: Settings) -> None:
+    # code-review on #983: calendar.start (1990-01-01) is a holiday, before
+    # the first session; a floor from that day must not raise.
+    early = datetime(1989, 6, 1, 21, tzinfo=UTC)
+    with open_for_write(led) as conn:
+        insert_row(conn, "securities", _security(REUSER, early, "early filer"))
+    with duckdb.connect(led.store.path, read_only=True) as conn:
+        sessions = repair.first_sessions(conn, RUN, led)
+        resolver = store_resolver(conn, RUN, led)
+    assert sessions[REUSER] == date(1990, 1, 2)
+    assert sessions[META] == date(2012, 2, 1)
+    assert resolver.lead("FB", date(2012, 2, 1)) == META
