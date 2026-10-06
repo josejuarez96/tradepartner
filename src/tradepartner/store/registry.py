@@ -222,7 +222,14 @@ class WeightRow:
 
 @dataclass(frozen=True)
 class RebalanceRow:
-    """One `trial_rebalances` row (spec req 5 counts)."""
+    """One `trial_rebalances` row (spec req 5 counts).
+
+    The six `profitability`-family counts (#720, #1033, T85d:
+    `schema.PROFITABILITY_REBALANCE_COLUMNS`) are optional keyword fields,
+    defaulting to `None` (written as `NULL`), so a `momentum` row — which
+    never ranks or excludes by `statement_facts`/`sics` — is built the same
+    way it is today, and a later generic refactor can pass them all as one
+    mapping unchanged."""
 
     cost_per_side_bps: float
     session: date
@@ -240,6 +247,12 @@ class RebalanceRow:
     n_excluded_no_history: int
     n_dropped_dividends: int
     n_late_dividends: int
+    n_ranked: int | None = None
+    n_excluded_no_facts: int | None = None
+    n_excluded_stale_facts: int | None = None
+    n_excluded_sector: int | None = None
+    n_excluded_malformed: int | None = None
+    n_derived: int | None = None
 
 
 @dataclass(frozen=True)
