@@ -13,10 +13,11 @@ than the charter default, including an environment override, so it cannot
 be silently loosened; changing it is a charter amendment, not a config edit.
 
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
-Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` and the `ALERT_SMTP_*`
-credentials) are `SecretStr` so their values never appear in `repr()`/`str()`
-of `Settings`, including `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and
-`ALERT_EMAIL_FROM`, which embed a personal contact email.
+Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`, the `ALERT_SMTP_*`
+credentials and the research vendor's `TYPESAFE_API_KEY`) are `SecretStr` so
+their values never appear in `repr()`/`str()` of `Settings`, including
+`SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM`, which embed a
+personal contact email.
 
 `alpaca.paper` is guarded the same way as `universe.exclude_sic_ranges`: the
 order path reaches the paper endpoint only (Phase 4 spec req 2), and Phase 6
@@ -70,6 +71,14 @@ def _default_edgar_cache_dir() -> str:
     started writing there.
     """
     return str(Path(__file__).resolve().parents[2] / "data" / "edgar_cache")
+
+
+def _default_research_data_dir() -> str:
+    """`data/research` (the research store, research-labeling spec Definitions and
+    ADR 0013 point 3), anchored to the project root like `edgar.cache_dir`, so a
+    run launched from another working directory still finds it; gitignored by
+    `data/*`."""
+    return str(Path(__file__).resolve().parents[2] / "data" / "research")
 
 
 class CalendarConfig(BaseModel):
@@ -1043,6 +1052,65 @@ class DashboardConfig(BaseModel):
     page_row_limit: int = Field(default=500, gt=0)
 
 
+# The 8-K items a packet keeps, in priority order (research-labeling amendment
+# 2026-10-06 C2 and E14; owner decision 2026-10-06 question 5).
+_DEFAULT_EIGHTK_ITEMS = ("3.01", "2.01", "1.03", "5.01", "3.03", "1.01", "8.01")
+_EIGHTK_ITEM = re.compile(r"\d\.\d\d")
+
+
+class ResearchLabelingConfig(BaseModel):
+    """Research labeling, pilot A (docs/specs/research-labeling.md req 7 and the
+    amendment 2026-10-06's config table, which drops `estimate_margin` and
+    `batch_max_usd`).
+
+    `api_base_url` is the vendor's API root, read only by `research/models.py`
+    (ADR 0013 point 3 (c)); it must be `https`. `price_usd_per_million_input_tokens`
+    is the price snapshot (vendor Models page, 2026-10-05). `chars_per_token` is the
+    pre-call token estimate's divisor (E9: 4 ran 1.5 to 1.7x low).
+    `max_packet_tokens` is a refusal, never a truncation rule. The three `*_max_chars`
+    are the per-document cuts of C2's packets; the three `*_days` windows are
+    calendar days around the Form 25's filing date; `eightk_items` is the 8-K item
+    priority order. `max_attempts` counts the first send: only HTTP 429, 529 and a
+    connection error before any byte was sent are retried (req 7).
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    api_base_url: str = "https://api.typesafe.ai/v1"
+    price_usd_per_million_input_tokens: float = Field(default=0.042, gt=0)
+    chars_per_token: float = Field(default=2.5, gt=0)
+    max_packet_tokens: int = Field(default=8000, gt=0)
+    exhibit_max_chars: int = Field(default=4000, gt=0)
+    item_max_chars: int = Field(default=4000, gt=0)
+    eightk_max_chars: int = Field(default=12000, gt=0)
+    context_before_days: int = Field(default=45, ge=0)
+    context_after_days: int = Field(default=20, ge=0)
+    marker_after_days: int = Field(default=400, ge=0)
+    eightk_items: list[str] = Field(default_factory=lambda: list(_DEFAULT_EIGHTK_ITEMS))
+    requests_per_second: float = Field(default=2.0, gt=0)
+    request_timeout_seconds: float = Field(default=60.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+
+    @field_validator("api_base_url")
+    @classmethod
+    def _validate_api_base_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("research.labeling.api_base_url must be an https URL")
+        return value
+
+    @field_validator("eightk_items")
+    @classmethod
+    def _validate_eightk_items(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("research.labeling.eightk_items must name at least one item")
+        bad = [item for item in value if not _EIGHTK_ITEM.fullmatch(item)]
+        if bad:
+            raise ValueError(f"research.labeling.eightk_items entries must look like '3.01': {bad}")
+        if len(set(value)) != len(value):
+            raise ValueError(f"research.labeling.eightk_items must not repeat, got {value}")
+        return value
+
+
 class ResearchConfig(BaseModel):
     """Research-experiment registry (docs/specs/research-registry.md req 2, req 14).
 
@@ -1056,6 +1124,16 @@ class ResearchConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     experiments_dir: str = "docs/experiments"
+    # Research labeling (docs/specs/research-labeling.md, amendment 2026-10-06's
+    # config table; plan T119). `data_dir` is resolved by `research/datafiles.py`
+    # alone. The two ceilings are `0.0` in code and set only in the owner's `.env`
+    # (`RESEARCH__SPEND_CEILING_USD_MONTH`, `RESEARCH__SPEND_CEILING_USD_TOTAL`):
+    # at `0.0` the real model client cannot be built (ADR 0013 point 3 (e) and
+    # point 7). A PR that changes either default is labelled `hold`.
+    data_dir: str = Field(default_factory=_default_research_data_dir)
+    spend_ceiling_usd_month: float = Field(default=0.0, ge=0)
+    spend_ceiling_usd_total: float = Field(default=0.0, ge=0)
+    labeling: ResearchLabelingConfig = Field(default_factory=ResearchLabelingConfig)
 
 
 class Settings(BaseSettings):
@@ -1108,6 +1186,10 @@ class Settings(BaseSettings):
     alert_email_to: SecretStr | None = Field(default=None)
     # Optional sender for the email channel; the SMTP login when unset (#404).
     alert_email_from: SecretStr | None = Field(default=None)
+    # Research labeling (docs/specs/research-labeling.md req 17): the vendor key, read
+    # only by `research/models.py`, redacted by `secret_values`; with it absent the
+    # real model client cannot be built (ADR 0013 point 3 (e)).
+    typesafe_api_key: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so
