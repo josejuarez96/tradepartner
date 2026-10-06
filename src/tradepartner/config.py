@@ -428,6 +428,13 @@ def parse_accepted_shares_fact(entry: str) -> tuple[str, date]:
     return _parse_id_at_day(entry, "accepted shares fact")
 
 
+def parse_accepted_same_day_pair(entry: str) -> tuple[str, date]:
+    """`"<security_id>@<YYYY-MM-DD>"` (an `universe.accepted_same_day_pairs`
+    entry) as `(security_id, valid_from)`. Raises `ValueError` on any other
+    shape."""
+    return _parse_id_at_day(entry, "accepted same-day pair")
+
+
 class UniverseConfig(BaseModel):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
@@ -462,6 +469,12 @@ class UniverseConfig(BaseModel):
     max_jump_ratio: float = Field(default=2.5, gt=1, allow_inf_nan=False)
     min_jump_ratio: float = Field(default=0.4, gt=0, lt=1)
     accepted_price_jumps: list[str] = Field(default_factory=list)
+    # Owner-accepted same-day listing pairs (#855), read only by `health`: a
+    # same-start pair of different tickers that `non_overlapping_listings` would
+    # fail (spec req 11, #822) passes when the owner lists it here as
+    # "<security_id>@<YYYY-MM-DD>" (the pair's `valid_from`) after reviewing it.
+    # `health` lists every accepted pair. Never changes universe membership.
+    accepted_same_day_pairs: list[str] = Field(default_factory=list)
 
     @field_validator("accepted_price_jumps")
     @classmethod
@@ -475,6 +488,13 @@ class UniverseConfig(BaseModel):
     def _check_accepted_shares_facts(cls, value: list[str]) -> list[str]:
         for entry in value:
             parse_accepted_shares_fact(entry)
+        return value
+
+    @field_validator("accepted_same_day_pairs")
+    @classmethod
+    def _check_accepted_same_day_pairs(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_accepted_same_day_pair(entry)
         return value
 
     @field_validator("exclude_sic_ranges")
