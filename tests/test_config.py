@@ -33,6 +33,7 @@ from tradepartner.config import (
     _default_env_file,
     _settings_has_key,
     clean_message,
+    render_validation_errors,
 )
 
 
@@ -296,16 +297,34 @@ def test_no_config_validator_reads_a_secret_field() -> None:
     """#1093: custom validators format their value into their own message, which
     `hide_input_in_errors` does not hide; so none may validate a `SecretStr` field,
     and no model holding one has a `@model_validator` (its error carries the whole
-    input). `Settings`' own checks run after construction and name env vars only."""
+    input). `Settings`' own checks run after construction and name env vars only.
+    Not covered: a validator on a plain field reading a secret via `ValidationInfo.data`
+    (reviewers read diffs for that)."""
+    holders = {}
     for model in _config_models():
         secret_fields = {
             name for name, info in model.model_fields.items() if "SecretStr" in str(info.annotation)
         }
         decorators = model.__pydantic_decorators__
         for validator in decorators.field_validators.values():
-            assert not secret_fields & set(validator.info.fields), (model, validator)
+            checked = set(validator.info.fields)
+            reaches_secret = "*" in checked or secret_fields & checked
+            assert not (secret_fields and reaches_secret), (model, validator)
         if secret_fields:
+            holders[model] = secret_fields
             assert not decorators.model_validators, model
+    # Not vacuous: the secrets are found where they live.
+    assert {"alpaca_api_secret", "sec_edgar_user_agent"} <= holders.get(Settings, set())
+
+
+def test_render_validation_errors_shows_input_only_where_allowed() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        CostsConfig.model_validate({"per_side_bps": -1.0, "sensitivity_per_side_bps": [5.0, -2.0]})
+    shown = render_validation_errors(excinfo.value)
+    assert "per_side_bps = -1.0:" in shown
+    assert "sensitivity_per_side_bps.1 = -2.0:" in shown
+    hidden = render_validation_errors(excinfo.value, show_input=lambda _key: False)
+    assert "-1.0" not in hidden and "-2.0" not in hidden
 
 
 def test_edgar_failure_policy_defaults() -> None:

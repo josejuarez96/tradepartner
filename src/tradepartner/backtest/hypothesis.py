@@ -54,7 +54,7 @@ import duckdb
 from pydantic import BaseModel, ValidationError
 
 from tradepartner.backtest import frozen
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, render_validation_errors
 from tradepartner.store import registry
 
 #: Settings sections frozen whole (spec req 10).
@@ -233,22 +233,15 @@ def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
     try:
         return Settings.model_validate(values)
     except ValidationError as exc:
-        raise HypothesisFileError(
-            f"frozen values fail validation: {_render_errors(exc, params)}"
-        ) from exc
+        # `Settings` hides input values in its errors (#1093). `params` are frozen
+        # values (a file's, which may name frozen keys only, or a registration's
+        # stored ones), never secrets, so a location at or under one of them shows
+        # its value; any other location (a section rule, the live settings) does not.
+        def frozen(key: str) -> bool:
+            return any(key == k or key.startswith(f"{k}.") for k in params)
 
-
-def _render_errors(exc: ValidationError, params: Mapping[str, Any]) -> str:
-    """`exc`'s errors as `key = value: message`, the value taken from the file's own
-    `params` (#1093): `Settings` hides input values in its errors, and a file may name
-    frozen keys only, so its values are never secrets. A location that is not one of
-    the file's keys (a section-level rule) is shown without a value."""
-    lines = []
-    for error in exc.errors():
-        key = ".".join(str(part) for part in error["loc"])
-        shown = f"{key} = {params[key]!r}" if key in params else key
-        lines.append(f"{shown}: {error['msg']}")
-    return "; ".join(lines)
+        detail = render_validation_errors(exc, show_input=frozen)
+        raise HypothesisFileError(f"frozen values fail validation: {detail}") from exc
 
 
 def frozen_params_of(settings: Settings, *, family: str = "momentum") -> dict[str, Any]:

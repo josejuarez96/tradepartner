@@ -34,12 +34,21 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The only value `universe.exclude_sic_ranges` may take (ADR 0006): the full
@@ -1392,6 +1401,23 @@ def get_settings() -> Settings:
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def render_validation_errors(
+    exc: ValidationError, *, show_input: Callable[[str], bool] = lambda _key: True
+) -> str:
+    """`exc`'s errors as `key = <input>: <rule>` (#1093). The config models hide input
+    values in their own error text so a secret is never echoed; a caller whose input
+    holds no secret (a frozen section, a hypothesis file's frozen keys) uses this to
+    put the offending value back. `show_input(key)` decides per dotted location; a
+    location it refuses is shown without a value. Never pass a `Settings` error with
+    the default `show_input`: its input holds the secrets."""
+    parts = []
+    for error in exc.errors():
+        key = ".".join(str(part) for part in error["loc"])
+        shown = f"{key} = {error['input']!r}" if show_input(key) else key
+        parts.append(f"{shown}: {error['msg']}")
+    return "; ".join(parts)
 
 
 def clean_message(message: str, settings: Settings) -> str:

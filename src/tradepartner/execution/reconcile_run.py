@@ -98,7 +98,7 @@ from pydantic import ValidationError
 
 from tradepartner.adapters.broker import Account, Broker, Order, Position
 from tradepartner.calendar import is_session, previous_session, session_close
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger, from_journal
@@ -184,7 +184,9 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
     try:
         return RiskConfig.model_validate(risk)
     except ValidationError as exc:
-        raise ValueError(f"window {window.window_id} frozen risk section: {exc}") from exc
+        # Risk limits hold no secret: put the stored value back in the message (#1093).
+        detail = render_validation_errors(exc)
+        raise ValueError(f"window {window.window_id} frozen risk section: {detail}") from exc
 
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:

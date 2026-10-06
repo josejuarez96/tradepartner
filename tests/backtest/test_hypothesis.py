@@ -617,3 +617,15 @@ def test_invalid_frozen_value_names_its_key_and_the_file_value(
     message = str(excinfo.value)
     assert "strategy.top_fraction = 7.5" in message
     assert "less than or equal to 1" in message
+
+
+def test_invalid_list_element_names_its_index_and_value(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    text = FIXTURE.read_text()
+    old = "\nsensitivity_per_side_bps = [0.0, 30.0, 60.0, 100.0]\n"
+    assert old in text
+    path = _copy(tmp_path, text.replace(old, "\nsensitivity_per_side_bps = [0.0, -30.0]\n", 1))
+    with pytest.raises(HypothesisFileError) as excinfo:
+        _register(conn, path, settings)
+    assert "costs.sensitivity_per_side_bps.1 = -30.0" in str(excinfo.value)
