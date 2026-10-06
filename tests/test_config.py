@@ -207,6 +207,34 @@ def test_edgar_statement_keys_override() -> None:
     assert s.edgar.statement_units == ["USD", "EUR"]
 
 
+@pytest.mark.parametrize(
+    "edgar",
+    [
+        {"statement_tags": {}},
+        {"statement_tags": {"revenue": []}},
+        {"statement_forms": []},
+        {"statement_units": []},
+    ],
+    ids=["tags-empty", "tag-list-empty", "forms-empty", "units-empty"],
+)
+def test_edgar_statement_lists_must_not_be_empty(edgar: dict[str, object]) -> None:
+    """#1037: an empty list would silently read no statement facts at all."""
+    with pytest.raises(ValidationError, match="at least 1"):
+        Settings(_env_file=None, edgar=edgar)
+
+
+def test_edgar_unknown_key_is_refused() -> None:
+    """#1037: a mistyped nested key fails instead of being silently ignored."""
+    with pytest.raises(ValidationError, match="statement_unit"):
+        Settings(_env_file=None, edgar={"statement_unit": ["USD"]})
+
+
+def test_edgar_unknown_env_key_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EDGAR__REQUESTS_PER_SECONDS", "5")
+    with pytest.raises(ValidationError, match="requests_per_seconds"):
+        Settings(_env_file=None)
+
+
 def test_edgar_failure_policy_defaults() -> None:
     """T11h's keys: quarantine after 3 consecutive counted days, and
     `check_failures()`'s count floor and share ceiling."""
