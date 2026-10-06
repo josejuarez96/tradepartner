@@ -1,0 +1,100 @@
+# Test (b): module snippets the import scan must fail (or pass), spec req 13 as
+# amendment C13 reads it. Each snippet is appended to the real file at `path`
+# (or becomes a new file there), and the scan runs over src/ and scripts/ with
+# that one change. `rule` is the case it must report; "" means it must pass.
+
+[[case]]
+id = "dashboard-imports-research"
+path = "src/tradepartner/dashboard/research_peek.py"
+source = "import tradepartner.research\n"
+rule = "i"
+
+[[case]]
+id = "httpx-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import httpx\n"
+rule = "ii"
+
+[[case]]
+id = "relative-models-in-crosswalk"
+path = "src/tradepartner/research/labeling/crosswalk.py"
+source = "from ..models import build_client\n"
+rule = "ii"
+
+[[case]]
+id = "models-from-cli-record"
+path = "src/tradepartner/cli_record.py"
+source = "from tradepartner.research.models import build_client\n"
+rule = "ii"
+
+[[case]]
+id = "models-via-import-module"
+path = "src/tradepartner/research/labeling/scoring.py"
+source = "import importlib\nclient = importlib.import_module('tradepartner.research.models')\n"
+rule = "ii"
+
+[[case]]
+id = "adapter-in-research"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from tradepartner.adapters import edgar_raw\n"
+rule = "iii"
+
+[[case]]
+id = "open-for-write-in-research"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from tradepartner.store.db import open_for_write\n"
+rule = "iii"
+
+[[case]]
+id = "master-module-in-research"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from tradepartner.store import master\n"
+rule = "iii"
+
+[[case]]
+id = "ingest-via-dunder-import"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "ingest = __import__('tradepartner.ingest')\n"
+rule = "iii"
+
+[[case]]
+id = "delistings-reader-in-frame"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from tradepartner.store.delistings import listing_ends_as_of\n"
+rule = ""
+
+[[case]]
+id = "execution-imports-research"
+path = "src/tradepartner/execution/plan.py"
+source = "from tradepartner import research\n"
+rule = "iv"
+
+[[case]]
+id = "research-imports-execution"
+path = "src/tradepartner/research/gates.py"
+source = "from tradepartner.execution import risk\n"
+rule = "iv"
+
+[[case]]
+id = "script-imports-store-research"
+path = "scripts/peek_runs.py"
+source = "from tradepartner.store.research import list_runs\n"
+rule = "iv"
+
+[[case]]
+id = "frame-imports-corpus"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from tradepartner.corpus import departure_fetch\n"
+rule = "v"
+
+[[case]]
+id = "corpus-imports-research"
+path = "src/tradepartner/corpus/departure_fetch.py"
+source = "from tradepartner.research import load_dataset\n"
+rule = "v"
+
+[[case]]
+id = "llm-imported-outside-llm"
+path = "src/tradepartner/universe.py"
+source = "from tradepartner.llm import memo\n"
+rule = "adr0008"
