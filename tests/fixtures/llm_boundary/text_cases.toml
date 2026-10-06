@@ -28,6 +28,12 @@ source = "ENV = 'TYPESAFE_API_KEY'\n"
 rule = ""
 
 [[case]]
+id = "base-url-key-in-tests-passes"
+path = "tests/research/fake_model_client.py"
+source = "settings.research.labeling.api_base_url = 'http://127.0.0.1:9'\n"
+rule = ""
+
+[[case]]
 id = "key-name-in-cli"
 path = "src/tradepartner/cli.py"
 source = "_VENDOR_ENV = 'TYPESAFE_API_KEY'\n"

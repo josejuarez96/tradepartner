@@ -52,6 +52,18 @@ source = "from aiohttp import ClientSession\n"
 rule = "ii"
 
 [[case]]
+id = "bare-urllib-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import urllib\n"
+rule = "ii"
+
+[[case]]
+id = "urllib-star-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from urllib import *\n"
+rule = "ii"
+
+[[case]]
 id = "urllib-parse-in-job-passes"
 path = "src/tradepartner/research/labeling/job.py"
 source = "from urllib.parse import urlsplit\n"

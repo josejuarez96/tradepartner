@@ -26,6 +26,7 @@ concatenation (`"typesafe" + ".ai"`) passes them; reviewers read diffs for that.
 from __future__ import annotations
 
 import ast
+import functools
 import io
 import json
 import re
@@ -284,10 +285,12 @@ FACADES = (
     "tradepartner.store.registry",
     "tradepartner.backtest.results",
 )
-#: (iii): what `tradepartner.research` may never import, whatever the name.
 #: (ii): network clients only `research.models` may import under `tradepartner.research`
 #: (#1031: the standard library's and the common third-party ones, beside httpx).
 NETWORK_CLIENTS = ("httpx", "urllib.request", "http.client", "socket", "requests", "aiohttp")
+#: (ii): parents of a listed client whose bare (or `*`) import reaches it as an attribute.
+NETWORK_PARENTS = frozenset({"urllib", "http"})
+#: (iii): what `tradepartner.research` may never import, whatever the name.
 RESEARCH_FORBIDDEN = (
     "tradepartner.adapters",
     "tradepartner.ingest",
@@ -457,7 +460,8 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
                 and not _research_import_allowed(edge, modules)
             ):
                 report("i", "imports tradepartner.research from outside it and cli")
-            if in_research and src != MODELS and any(hits(p) for p in NETWORK_CLIENTS):
+            bare_parent = edge.target in NETWORK_PARENTS and edge.name in (None, "*")
+            if in_research and src != MODELS and (bare_parent or any(map(hits, NETWORK_CLIENTS))):
                 report("ii", "imports a network client under tradepartner.research outside models")
             if hits(MODELS) and src not in (MODELS, MODELS_IMPORTER):
                 report("ii", f"imports research.models; only {MODELS_IMPORTER} may")
@@ -518,6 +522,8 @@ def test_b_resolves_relative_imports() -> None:
 # --- (c) text (spec req 14 as C13 amends it) ------------------------------------------
 
 _HOST = re.compile(r"typesafe\.ai|\bapi_base_url\b", re.IGNORECASE)
+#: Under `tests/` only the host itself: a test may point `api_base_url` at a fake.
+_HOST_NAME = re.compile(r"typesafe\.ai", re.IGNORECASE)
 KEY_NAME = "TYPESAFE_API_KEY"
 #: The env name and the settings attribute that reads it (`typesafe_api_key`).
 _KEY = re.compile(KEY_NAME, re.IGNORECASE)
@@ -575,8 +581,10 @@ def _identifiers_and_strings(source: str) -> Iterator[str]:
             yield token.string
 
 
+@functools.cache
 def _text_tree() -> dict[str, str]:
-    """What the text scan reads: every file under `src/`, `scripts/` and `tests/`."""
+    """What the text scan reads: every file under `src/`, `scripts/` and `tests/`
+    (read once; callers copy it through `_with` and never mutate it)."""
     return _real_tree(suffix=None, roots=(*SCANNED_ROOTS, TESTS_ROOT))
 
 
@@ -586,7 +594,7 @@ def text_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for path, text in sorted(tree.items()):
         if path.startswith(f"{TESTS_ROOT}/"):
-            if path not in TEST_HOST_FILES and _HOST.search(text):
+            if path not in TEST_HOST_FILES and _HOST_NAME.search(text):
                 found.append(("host", f"{path} names the vendor host"))
             continue
         if path not in VENDOR_FILES:
