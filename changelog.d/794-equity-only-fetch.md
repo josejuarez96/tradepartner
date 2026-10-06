@@ -1,3 +1,0 @@
-- #794: backfill and daily ingest no longer fetch debt, preferreds, warrants, units, rights or OTC listings (owner blocklist, #802); every other name on universe.exchanges, unclassified names, benchmarks and the reference are fetched.
-### Fixed
-- Backfill and ingest no longer request notes and other debt, preferreds, warrants, units, rights or OTC listings from the price source. Everything else on `universe.exchanges` is still fetched, including SPACs, foreign, fund, depositary and unclassified names, plus benchmarks and the reference symbol; `universe.security_types` can re-admit a blocked type (#794).

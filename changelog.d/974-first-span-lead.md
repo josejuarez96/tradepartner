@@ -1,3 +1,0 @@
-- T116 first-span lead (#974, #981): a security's first assigned span leads its ticker back to its first session for bars and splits; refused whole on a known reuse; repair keeps it; alpaca.first_span_lead (default on).
-### Added
-- First-span lead (#974): `ListingResolver(first_sessions=...)` resolves a security's first ticker on the sessions from its first filing's session up to its first cover page, for bars and corporate actions, refused and counted when another security's span of the ticker covers the window; `repair-resolution` judges with it; `alpaca.first_span_lead` (default `true`) turns it off.

@@ -1,3 +1,0 @@
-- Universe rule 7 rejects filer shares scale errors (#845): a fact >100x (universe.max_shares_ratio) off the last accepted one falls back to it; allow-list universe.accepted_shares_facts; health lists them. Re-register hypotheses.
-### Fixed
-- Universe rule 7 and the survivorship gap no longer take a filer's x1,000 or x1,000,000 shares-outstanding scale error at face value: a fact more than `universe.max_shares_ratio` (100) from the security's last accepted fact, after splits known at T, falls back to that fact; `universe.accepted_shares_facts` accepts a genuine move, and `health` lists every out-of-line fact (#845).
