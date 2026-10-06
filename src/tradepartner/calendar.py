@@ -29,6 +29,8 @@ inode). Changing any of them re-reads the range.
 from __future__ import annotations
 
 import os
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Hashable
 from datetime import UTC, date, datetime
 from functools import lru_cache
 
@@ -37,7 +39,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from exchange_calendars.errors import DateOutOfBounds, NotSessionError
 
-from tradepartner.config import _default_env_file, get_settings
+from tradepartner.config import Cadence, _default_env_file, get_settings
 
 _CALENDAR_NAME = "XNYS"
 
@@ -204,3 +206,58 @@ def sessions_in_month_window(end_session: date, months: int) -> list[date]:
     start_ts = pd.Timestamp(start_exclusive)
     sessions = cal.sessions_in_range(start_ts, pd.Timestamp(end_session))
     return [_to_date(s) for s in sessions if s > start_ts]
+
+
+def last_session_of_week(iso_year: int, iso_week: int) -> date:
+    """The last XNYS session of ISO week `iso_week` of `iso_year` (Monday to Sunday).
+
+    Read from `all_sessions()`, never from weekday arithmetic: in a week whose Friday
+    is a holiday (Good Friday, a Friday Independence Day) the answer is the Thursday.
+    Raises `ValueError` for an invalid ISO week or a week with no session in the
+    configured calendar range.
+    """
+    try:
+        monday = date.fromisocalendar(iso_year, iso_week, 1)
+        sunday = date.fromisocalendar(iso_year, iso_week, 7)
+    except ValueError as exc:
+        raise ValueError(f"invalid ISO week {iso_year:04d}-W{iso_week:02d}") from exc
+    sessions = all_sessions()
+    i = bisect_right(sessions, sunday)
+    if i == 0 or sessions[i - 1] < monday:
+        raise ValueError(f"no XNYS sessions in ISO week {iso_year:04d}-W{iso_week:02d}")
+    return sessions[i - 1]
+
+
+_PERIOD_KEYS: dict[Cadence, Callable[[date], Hashable]] = {
+    "month_end": lambda s: (s.year, s.month),
+    "week_end": lambda s: s.isocalendar()[:2],
+    "daily": lambda s: s,
+}
+
+
+def rebalance_sessions_between(start: date, end: date, cadence: Cadence) -> list[date]:
+    """Every rebalance session T at `cadence` with `start <= T <= end`, ascending.
+
+    A rebalance session is the last session of its calendar month (`month_end`), of
+    its ISO week (`week_end`), or every session (`daily`), taken over the whole of
+    `all_sessions()` and then restricted to the window: a month or week counts only
+    if its last session falls inside `[start, end]`, so a window ending mid-week
+    rebalances last at the previous week's last session. Raises `ValueError` if
+    `start` is after `end`, `TypeError` for a datetime.
+    """
+    _reject_datetime(start, func="rebalance_sessions_between")
+    _reject_datetime(end, func="rebalance_sessions_between")
+    if start > end:
+        raise ValueError(f"start {start.isoformat()} is after end {end.isoformat()}")
+    key = _PERIOD_KEYS[cadence]
+    sessions = all_sessions()
+    # Widen to the sessions after `end` within its period, so the period's true last
+    # session decides membership (one extra month at most).
+    lo = bisect_left(sessions, start)
+    hi = bisect_right(sessions, end + relativedelta(months=1))
+    window = sessions[lo:hi]
+    return [
+        s
+        for s, after in zip(window, (*window[1:], None), strict=True)
+        if s <= end and (after is None or key(after) != key(s))
+    ]
