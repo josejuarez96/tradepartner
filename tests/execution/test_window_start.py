@@ -77,11 +77,12 @@ def _register(
     slug: str,
     holdout_end: date,
     params: dict[str, Any] | None = None,
+    family: str = "momentum",
 ) -> registry.HypothesisRecord:
     return registry.register_hypothesis(
         conn,
         slug=slug,
-        family="momentum",
+        family=family,
         title=f"{slug} title",
         doc_path=f"docs/hypotheses/{slug}.md",
         doc_sha256="d" * 64,
@@ -265,6 +266,22 @@ def test_refuses_without_gap_signoff(
             journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
         )
     assert exc.value.reason == "gap_signoff"
+
+
+def test_refuses_a_family_the_engine_cannot_run(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A `profitability` hypothesis with every other gate met is refused until T85e
+    dispatches its signal (#1053), before any broker call or write."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    broker = _fake(fixed_clock)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "b3")
+    assert exc.value.reason == "family_not_runnable"
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn) is None
 
 
 def test_refuses_on_synthetic_signoff_trial(

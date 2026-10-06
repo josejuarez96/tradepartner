@@ -17,6 +17,8 @@ from tradepartner.config import Settings
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "tradepartner"
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fixture-momentum.md"
+PROF_FIXTURE = FIXTURE.with_name("fixture-profitability.md")
+H1_FILE = SRC.parents[1] / "docs" / "hypotheses" / "h1-momentum-12-1.md"
 SCHEDULE_KEYS = ("schedule.rebalance_cadence", "schedule.signal_anchor")
 IN_SAMPLE_START = date(2019, 11, 29)
 
@@ -24,6 +26,7 @@ IN_SAMPLE_START = date(2019, 11, 29)
 @dataclass(frozen=True)
 class _Record:
     params: dict[str, Any] = field(default_factory=dict)
+    family: str = "momentum"
 
 
 def _new_params(settings: Settings) -> dict[str, Any]:
@@ -171,6 +174,101 @@ def test_fingerprint_reads_only_the_keys_that_decide_a_run(settings: Settings) -
     ):
         assert frozen.fingerprint("momentum", {**params, key: value}, IN_SAMPLE_START) != base
     assert frozen.fingerprint("momentum", params, date(2017, 1, 31)) != base
+
+
+# --- the `profitability` family (backtest spec amendment #720, T85) -----------
+
+#: Computed on main at cace512, before T85, over `Settings(_env_file=None)`.
+TWIN_FINGERPRINT = "bdbb8d9f81d744f24e8d2fc9c8598bbe4436e19c17e036636f19895f340fb496"
+TWIN_PARAMS_SHA256 = "77b0e33b533eb09ea964c04fdcb85dbce425d1b31d8fa99fdae53e383696e7d6"
+TWIN_PRE_LAB_PARAMS_SHA256 = "22fedb1cf5f53d68ecf69f9e6d5ec912cb573aee07ba2932728dcab3c178403d"
+H1_PRE_LAB_PARAMS_SHA256 = "09f34af0bb58adab0883ea6172683cf3dc11c457adfe4a5595868b36d5eeeb46"
+H1_FINGERPRINT = "534917a58a4f8c5dfe17330b3e2d06faf38111de553fd467886a06c147f609a4"
+
+PROFITABILITY_DEFAULTS = (
+    ("profitability.basis", "gross", 12),
+    ("profitability.annual_period_days", [350, 380], 12),
+    ("profitability.max_fact_age_days", 548, 12),
+    ("profitability.exclude_sic_ranges", [[6000, 6999]], 12),
+    ("profitability.include_derived", True, 12),
+    ("profitability.top_fraction", 0.10, 12),
+    ("profitability.weighting", "equal", 12),
+)
+
+
+def _defaults_settings() -> Settings:
+    return Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def _prof_params(settings: Settings) -> dict[str, Any]:
+    return hypothesis.frozen_params(hypothesis.parse_file(PROF_FIXTURE), settings)
+
+
+def test_profitability_table_entries_are_pinned_by_value() -> None:
+    assert frozen.FROZEN_KEY_DEFAULTS[2:9] == PROFITABILITY_DEFAULTS
+    assert frozen.FAMILY_SIGNAL_SECTIONS["profitability"] == "profitability"
+
+
+def test_h1_twin_canonical_set_fingerprint_and_hash_unchanged() -> None:
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    new = _new_params(settings)
+    pre_lab = _pre_lab_params(settings)
+    assert not any(k.startswith("profitability.") for k in new)
+    assert registry.params_sha256(new) == TWIN_PARAMS_SHA256
+    assert registry.params_sha256(pre_lab) == TWIN_PRE_LAB_PARAMS_SHA256
+    for params in (new, pre_lab):
+        assert frozen.fingerprint("momentum", params, date(2017, 1, 31)) == TWIN_FINGERPRINT
+        canonical = frozen.canonical_frozen_set(params, "momentum")
+        assert not any(k.startswith("profitability.") for k in canonical)
+    # The real H1 file over default settings: its pre-lab stored set and fingerprint.
+    parsed = hypothesis.parse_file(H1_FILE)
+    h1 = hypothesis.frozen_params(parsed, settings)
+    h1_pre_lab = {k: v for k, v in h1.items() if k not in SCHEDULE_KEYS}
+    assert registry.params_sha256(h1_pre_lab) == H1_PRE_LAB_PARAMS_SHA256
+    assert frozen.fingerprint("momentum", h1, parsed.in_sample_start) == H1_FINGERPRINT
+
+
+def test_momentum_record_overlays_no_profitability_default(settings: Settings) -> None:
+    values = frozen.frozen_values(_Record(_pre_lab_params(settings)))
+    assert not any(k.startswith("profitability.") for k in values)
+    prof = frozen.frozen_values(_Record({}, family="profitability"))
+    assert prof["profitability.max_fact_age_days"] == 548
+
+
+def test_profitability_fingerprint_differs_from_the_twin_by_family(settings: Settings) -> None:
+    momentum, prof = _new_params(settings), _prof_params(settings)
+    shared = set(momentum) & set(prof)
+    assert shared == {k for k in momentum if not k.startswith("strategy.")}
+    assert all(momentum[k] == prof[k] for k in shared)
+    assert frozen.fingerprint("profitability", prof, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", momentum, IN_SAMPLE_START
+    )
+    canonical = frozen.canonical_frozen_set(prof, "profitability")
+    assert {k for k in canonical if k.startswith("profitability.")} == {
+        key for key, _default, _version in PROFITABILITY_DEFAULTS
+    }  # its own section kept in full, default-valued keys included
+    assert not any(k.startswith("strategy.") for k in canonical)
+
+
+def test_profitability_hash_and_fingerprint_ignore_live_strategy(settings: Settings) -> None:
+    from tradepartner.store import registry
+
+    base = _prof_params(settings)
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"top_fraction": 0.5})}
+    )
+    moved = _prof_params(live)
+    assert registry.params_sha256(moved) == registry.params_sha256(base)
+    assert frozen.fingerprint("profitability", moved, IN_SAMPLE_START) == frozen.fingerprint(
+        "profitability", base, IN_SAMPLE_START
+    )
+    # A stray `strategy.*` key in a profitability set is never fingerprinted.
+    stray = {**base, "strategy.top_fraction": 0.5}
+    assert frozen.fingerprint("profitability", stray, IN_SAMPLE_START) == frozen.fingerprint(
+        "profitability", base, IN_SAMPLE_START
+    )
 
 
 # Today's readers of a `HypothesisRecord`'s `.params` outside `frozen.frozen_values` and
