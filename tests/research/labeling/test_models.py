@@ -242,7 +242,6 @@ def test_a_blank_key_gives_the_disabled_client(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.usefixtures("clean_env")
-@pytest.mark.usefixtures("clean_env")
 @pytest.mark.parametrize("bad", ["k\u00e9y-not-ascii", "key\nwith-newline", "key with space"])
 def test_a_key_that_cannot_go_in_a_header_is_refused_without_naming_it(
     monkeypatch: pytest.MonkeyPatch, bad: str
@@ -259,6 +258,7 @@ def test_a_key_that_cannot_go_in_a_header_is_refused_without_naming_it(
     assert caught.value.__context__ is None
 
 
+@pytest.mark.usefixtures("clean_env")
 def test_both_ceilings_and_a_key_give_the_real_client_without_connecting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
