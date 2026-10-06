@@ -236,6 +236,15 @@ def test_profitability_fingerprint_hashes_its_own_section_only(settings: Setting
     )
 
 
+def test_oracle_fingerprint_keeps_its_momentum_signal_section(settings: Settings) -> None:
+    params = _new_params(settings)
+    base = frozen.fingerprint("oracle", params, IN_SAMPLE_START)
+    assert (
+        frozen.fingerprint("oracle", {**params, "strategy.top_fraction": 0.9}, IN_SAMPLE_START)
+        != base
+    )
+
+
 # --- the `profitability` family (backtest spec amendment #720, T85) -----------
 
 #: Computed on main at cace512, before T85, over `Settings(_env_file=None)`.

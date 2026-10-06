@@ -193,9 +193,7 @@ def fingerprint(family: str, params: Mapping[str, Any], in_sample_start: date) -
     not a frozen param), `holdout.start` and `holdout.end`, through the canonical set."""
     canonical = canonical_frozen_set(params, family)
     sections = set(_FINGERPRINT_SECTIONS)
-    signal = _signal_section(family)
-    if signal is not None:
-        sections.add(signal)
+    sections.update(set(FAMILY_SIGNAL_SECTIONS.values()) - inert_sections(family))
     chosen = {
         key: value
         for key, value in canonical.items()

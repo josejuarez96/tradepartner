@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import polars as pl
@@ -52,9 +52,12 @@ def _facts() -> pl.DataFrame:
 
 
 class _Provider(FakeProvider):
+    facts_override: pl.DataFrame | None = None
+
     def statement_facts(self, t: datetime, ids: list[str]) -> pl.DataFrame:
         self._record("statement_facts", t, ids=ids)
-        return _facts().filter(pl.col("known_at") <= t, pl.col("security_id").is_in(ids))
+        facts = self.facts_override if self.facts_override is not None else _facts()
+        return facts.filter(pl.col("known_at") <= t, pl.col("security_id").is_in(ids))
 
     def sics(self, t: datetime, ids: list[str]) -> dict[str, int | None]:
         self._record("sics", t, ids=ids)
@@ -101,6 +104,23 @@ def test_momentum_never_reads_facts_and_keeps_profitability_counts_null() -> Non
     assert not {"statement_facts", "sics"} & {call.method for call in provider.calls}
     row = result[15.0].rebalances[0]
     assert (row.n_ranked, row.n_excluded_no_facts, row.n_derived) == (None, None, None)
+
+
+def test_fact_accepted_after_close_first_enters_the_next_plan() -> None:
+    provider = _provider_with_facts()
+    provider.facts_override = _facts().with_columns(
+        pl.when((pl.col("security_id") == "D") & (pl.col("fact_name") == "gross_profit"))
+        .then(pl.lit(session_close(T0) + timedelta(hours=1)))
+        .otherwise(pl.col("known_at"))
+        .alias("known_at")
+    )
+    params = _params(profitability={"top_fraction": 0.5})
+    at_t0 = plan(provider, params, T0, family="profitability")
+    at_t1 = plan(provider, params, T1, family="profitability")
+    assert (at_t0.counts["n_ranked"], at_t0.counts["n_excluded_no_facts"]) == (3, 1)
+    assert set(at_t0.targets) == {"B", "C"}
+    assert (at_t1.counts["n_ranked"], at_t1.counts["n_excluded_no_facts"]) == (4, 0)
+    assert set(at_t1.targets) == {"C", "D"}
 
 
 def test_unknown_family_raises_before_provider_read() -> None:
