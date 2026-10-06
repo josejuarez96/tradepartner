@@ -333,6 +333,62 @@ def test_page_reads_only_through_the_shells_connection(
     assert opened == [True]
 
 
+# --- Statement facts (#660, T77c) -------------------------------------------
+
+
+def test_statement_card_renders_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Statement facts" in text
+    assert "Switch (`edgar.statement_facts_enabled`): **off**" in text
+    assert "Switch is off: nothing to report." in text
+
+
+def test_statement_card_shows_the_last_run_counts_and_warns_on_vintage_late(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    _write(
+        store_path,
+        "UPDATE ingestion_runs SET message = ? WHERE source = 'edgar'",
+        ["statement_held: 2, statement_vintage_late: 3, statement_derived: 1"],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Last EDGAR run: derived 1, held 2, vintage_late 3" in text
+    # `theme.status_badge` renders as a `st.badge` markdown element (#660).
+    assert any("statement_vintage_late: 3" in str(m.value) for m in at.markdown)
+
+
+def test_statement_card_shows_no_warning_when_vintage_late_is_zero(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    _write(
+        store_path,
+        "UPDATE ingestion_runs SET message = ? WHERE source = 'edgar'",
+        ["statement_held: 2, statement_vintage_late: 0"],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert not any("statement_vintage_late" in str(m.value) for m in at.markdown)
+
+
+def test_statement_card_shows_coverage_when_the_switch_is_on(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("EDGAR__STATEMENT_FACTS_ENABLED", "true")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Switch (`edgar.statement_facts_enabled`): **on**" in text
+    assert "Coverage:" in text
+    assert "Derived gross profit:" in text
+    assert "Switch is off" not in text
+
+
 # --- theme -------------------------------------------------------------------
 
 

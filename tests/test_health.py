@@ -35,6 +35,9 @@ from tradepartner.health import (
     NON_OVERLAPPING_LISTINGS,
     PROVENANCE_ALLOWED,
     SOURCE_NOT_NULL,
+    STATEMENT_BASIS_ALLOWED,
+    STATEMENT_DERIVED_MATCHES_COMPONENTS,
+    STATEMENT_PERIOD_DAYS,
     HealthReport,
     bar_gaps,
     coverage,
@@ -42,6 +45,8 @@ from tradepartner.health import (
     health_report,
     integrity_checks,
     last_ingests,
+    statement_counts,
+    statement_coverage,
     static_reliance,
     unclassifiable,
 )
@@ -52,6 +57,14 @@ T_END = session_close(date(2020, 6, 30))
 #: Close of 2018-10-25: after SEC_TRANSFER's Form 25, before its NASDAQ
 #: listing is known (fixture README), so it counts as delisted there.
 T_TRANSFER_PROBE = datetime(2018, 10, 25, 20, 0, tzinfo=UTC)
+#: Close of 2018-12-17 (test_universe.py's `T_DUAL`): `universe_as_of` admits
+#: SEC_DUAL_A and SEC_DUAL_B (CIK0001000006, cap summed over both classes)
+#: among 5 members; neither statement fact below is known yet by any other
+#: fixture row, so inserting one directly is the only way to put a fresh
+#: fact under a real universe member without picking a T that also drags in
+#: unrelated exclusions.
+T_DUAL = datetime(2018, 12, 17, 21, 0, tzinfo=UTC)
+DUAL_CIK = "CIK0001000006"
 
 DELISTED_AT_END = (
     "SEC_25NSE",
@@ -92,6 +105,40 @@ def _settings(**overrides: Any) -> Settings:
 def settings() -> Settings:
     """Overrides conftest's `settings`: health reads no store path."""
     return _settings()
+
+
+def _statement_fact(
+    cik: str,
+    fact_name: str,
+    *,
+    period_end: date,
+    period_days: int = 364,
+    value: float = 100.0,
+    accession: str = "ACC",
+    basis: str = "reported",
+    known: datetime,
+) -> dict[str, Any]:
+    """A `statement_facts` row, the common test shape (period_start `None`
+    exactly when `period_days = 0`, as the schema's own `CHECK` requires)."""
+    period_start = None if period_days == 0 else period_end - timedelta(days=period_days)
+    return {
+        "cik": cik,
+        "fact_name": fact_name,
+        "xbrl_tag": f"us-gaap:{fact_name}",
+        "period_start": period_start,
+        "period_end": period_end,
+        "period_days": period_days,
+        "value": value,
+        "unit": "USD",
+        "form": "10-K",
+        "filing_accession": accession,
+        "basis": basis,
+        "comparative": False,
+        "known_at": known,
+        "ingested_at": known,
+        "source": "edgar",
+        "provenance": "filing",
+    }
 
 
 def _bar(
@@ -1414,3 +1461,293 @@ def test_an_accepted_day_is_one_line_for_every_row_of_that_day(
     report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
     assert report.ok, report.integrity
     assert report.accepted_same_day_pairs.frame["next_ticker"].to_list() == ["HCACR"]
+
+
+# --- Statement facts (#660, T77c) -------------------------------------------
+
+
+def test_statement_counts_parses_every_statement_underscore_figure() -> None:
+    message = (
+        "5 securities; statement_held: 3, statement_unstampable: 0, "
+        "statement_vintage_late: 2, statement_conflicts: 1, statement_restated: 4, "
+        "statement_non_usd: 0, statement_malformed: 0, statement_derived: 7, "
+        "statement_none: 1; missing benchmarks: none"
+    )
+    assert statement_counts(message) == {
+        "held": 3,
+        "unstampable": 0,
+        "vintage_late": 2,
+        "conflicts": 1,
+        "restated": 4,
+        "non_usd": 0,
+        "malformed": 0,
+        "derived": 7,
+        "none": 1,
+    }
+
+
+def test_statement_counts_empty_on_none_or_no_figures() -> None:
+    assert statement_counts(None) == {}
+    assert statement_counts("5 securities; missing benchmarks: none") == {}
+
+
+def test_statement_facts_is_disabled_by_default_and_reports_no_coverage(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    assert report.statement.enabled is False
+    assert report.statement.coverage is None
+    assert report.statement.counts == {}
+    assert report.statement.vintage_late == 0
+
+
+def test_statement_facts_report_reads_the_latest_edgar_run_message(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(
+        fixture_store,
+        "ingestion_runs",
+        {
+            "run_id": "edgar-1",
+            "started_at": T_END - timedelta(minutes=5),
+            "finished_at": T_END - timedelta(minutes=1),
+            "status": "ok",
+            "source": "edgar",
+            "mode": "daily",
+            "rows_added": 0,
+            "chunk_cursor": None,
+            "message": "0 securities; statement_vintage_late: 2, statement_derived: 1",
+        },
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.statement.counts == {"vintage_late": 2, "derived": 1}
+    assert report.statement.vintage_late == 2
+
+
+def test_statement_coverage_counts_a_fresh_member_with_both_facts(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # SEC_DUAL_A/SEC_DUAL_B (CIK0001000006) are both universe members at
+    # T_DUAL; inserting one fresh revenue and total_assets row under their
+    # cik makes both classes count, since the fact belongs to the issuer.
+    known = datetime(2018, 6, 8, 20, 30, tzinfo=UTC)
+    for name, days in (("revenue", 181), ("total_assets", 0)):
+        insert_row(
+            fixture_store,
+            "statement_facts",
+            _statement_fact(
+                DUAL_CIK, name, period_end=date(2018, 6, 30), period_days=days, known=known
+            ),
+        )
+    cov = statement_coverage(fixture_store, T_DUAL, _settings())
+    assert cov.fresh == 2
+    assert cov.total == 5
+    assert cov.share == pytest.approx(2 / 5)
+
+
+def test_statement_coverage_excludes_a_member_missing_one_fact(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2018, 6, 8, 20, 30, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "statement_facts",
+        _statement_fact(DUAL_CIK, "revenue", period_end=date(2018, 6, 30), known=known),
+    )
+    cov = statement_coverage(fixture_store, T_DUAL, _settings())
+    assert cov.fresh == 0
+    assert cov.total == 5
+
+
+def test_statement_coverage_excludes_a_stale_fact(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2016, 1, 10, 20, 30, tzinfo=UTC)
+    for name, days in (("revenue", 181), ("total_assets", 0)):
+        insert_row(
+            fixture_store,
+            "statement_facts",
+            # More than universe.max_shares_age_days (400) before T_DUAL.
+            _statement_fact(
+                DUAL_CIK, name, period_end=date(2016, 1, 1), period_days=days, known=known
+            ),
+        )
+    cov = statement_coverage(fixture_store, T_DUAL, _settings())
+    assert cov.fresh == 0
+    assert cov.total == 5
+
+
+def test_statement_coverage_ignores_a_fact_not_yet_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    before = datetime(2020, 2, 19, 20, 0, tzinfo=UTC)  # before CIK0001000003's known_at
+    after = datetime(2020, 2, 21, 20, 0, tzinfo=UTC)  # after it
+    assert statement_coverage(fixture_store, before, _settings()).derived == 0
+    assert statement_coverage(fixture_store, after, _settings()).derived == 1
+
+
+def test_statement_coverage_derived_share_is_store_wide_not_universe_scoped(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # SEC_CLEAN_MERGER (CIK0001000003) is delisted long before T_END and is
+    # never a universe member, yet its derived gross_profit row still
+    # counts: the derived share is a parse-quality count, not a portfolio
+    # one (module docstring).
+    cov = statement_coverage(fixture_store, T_END, _settings())
+    assert cov.derived == 1
+    assert cov.reported == 0
+    assert cov.derived_share == 1.0
+
+
+def test_statement_coverage_on_a_version_8_store_does_not_crash(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    fixture_store.execute("DELETE FROM schema_version WHERE version = 9")
+    fixture_store.execute("DROP TABLE statement_facts")
+    cov = statement_coverage(fixture_store, T_END, _settings())
+    assert cov.fresh == 0 and cov.total == 0 and cov.derived == 0 and cov.reported == 0
+
+
+def test_statement_period_days_rule_fails_on_an_injected_mismatch(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2020, 1, 1, tzinfo=UTC)
+    bad = _statement_fact("CIK9999999", "revenue", period_end=date(2019, 12, 31), known=known)
+    bad["period_days"] = 999  # does not equal period_end - period_start
+    insert_row(loose_store, "statement_facts", bad)
+    report = health_report(loose_store, T_END, _settings())
+    check = next(c for c in report.integrity if c.rule == STATEMENT_PERIOD_DAYS)
+    assert not check.passed
+    assert check.violations.height == 1
+    for other in report.integrity:
+        if other.rule != STATEMENT_PERIOD_DAYS:
+            assert other.passed, other.rule
+
+
+def test_statement_basis_rule_fails_on_an_injected_bad_basis(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2020, 1, 1, tzinfo=UTC)
+    bad = _statement_fact("CIK9999999", "revenue", period_end=date(2019, 12, 31), known=known)
+    bad["basis"] = "guessed"
+    insert_row(loose_store, "statement_facts", bad)
+    report = health_report(loose_store, T_END, _settings())
+    check = next(c for c in report.integrity if c.rule == STATEMENT_BASIS_ALLOWED)
+    assert not check.passed
+    assert check.violations.to_dicts() == [{"basis": "guessed", "rows": 1}]
+    for other in report.integrity:
+        if other.rule != STATEMENT_BASIS_ALLOWED:
+            assert other.passed, other.rule
+
+
+def test_statement_derived_matches_components_fails_on_a_wrong_value(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2020, 1, 1, tzinfo=UTC)
+    cik = "CIK7777777"
+    for name, value in (("revenue", 1000.0), ("cost_of_revenue", 600.0)):
+        insert_row(
+            fixture_store,
+            "statement_facts",
+            _statement_fact(
+                cik, name, period_end=date(2019, 12, 31), value=value, accession="ACC3", known=known
+            ),
+        )
+    insert_row(
+        fixture_store,
+        "statement_facts",
+        _statement_fact(
+            cik,
+            "gross_profit",
+            period_end=date(2019, 12, 31),
+            value=123.0,  # wrong: should be 1000.0 - 600.0 = 400.0
+            accession="ACC3",
+            basis="derived",
+            known=known,
+        ),
+    )
+    report = health_report(fixture_store, T_END, _settings())
+    check = next(c for c in report.integrity if c.rule == STATEMENT_DERIVED_MATCHES_COMPONENTS)
+    assert not check.passed
+    assert check.violations.to_dicts()[0]["revenue"] == 1000.0
+    assert check.violations.to_dicts()[0]["cost_of_revenue"] == 600.0
+
+
+def test_statement_derived_matches_components_fails_on_a_missing_component(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2020, 1, 1, tzinfo=UTC)
+    cik = "CIK6666666"
+    insert_row(
+        fixture_store,
+        "statement_facts",
+        _statement_fact(
+            cik, "revenue", period_end=date(2019, 12, 31), accession="ACC4", known=known
+        ),
+    )
+    insert_row(
+        fixture_store,
+        "statement_facts",
+        _statement_fact(
+            cik,
+            "gross_profit",
+            period_end=date(2019, 12, 31),
+            value=1.0,
+            accession="ACC4",
+            basis="derived",
+            known=known,
+        ),
+    )
+    report = health_report(fixture_store, T_END, _settings())
+    check = next(c for c in report.integrity if c.rule == STATEMENT_DERIVED_MATCHES_COMPONENTS)
+    assert not check.passed
+    assert check.violations.height == 1
+    row = check.violations.to_dicts()[0]
+    assert row["revenue"] == 100.0  # the inserted revenue value
+    assert row["cost_of_revenue"] is None
+
+
+def test_statement_derived_matches_components_passes_on_a_correct_value(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2020, 1, 1, tzinfo=UTC)
+    cik = "CIK5555555"
+    for name, value in (("revenue", 1000.0), ("cost_of_revenue", 600.0)):
+        insert_row(
+            fixture_store,
+            "statement_facts",
+            _statement_fact(
+                cik, name, period_end=date(2019, 12, 31), value=value, accession="ACC5", known=known
+            ),
+        )
+    insert_row(
+        fixture_store,
+        "statement_facts",
+        _statement_fact(
+            cik,
+            "gross_profit",
+            period_end=date(2019, 12, 31),
+            value=400.0,
+            accession="ACC5",
+            basis="derived",
+            known=known,
+        ),
+    )
+    report = health_report(fixture_store, T_END, _settings())
+    check = next(c for c in report.integrity if c.rule == STATEMENT_DERIVED_MATCHES_COMPONENTS)
+    assert check.passed
+
+
+def test_statement_integrity_rules_pass_on_a_version_8_store(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    fixture_store.execute("DELETE FROM schema_version WHERE version = 9")
+    fixture_store.execute("DROP TABLE statement_facts")
+    report = health_report(fixture_store, T_END, settings)
+    for rule in (
+        STATEMENT_PERIOD_DAYS,
+        STATEMENT_DERIVED_MATCHES_COMPONENTS,
+        STATEMENT_BASIS_ALLOWED,
+    ):
+        check = next(c for c in report.integrity if c.rule == rule)
+        assert check.passed, rule
