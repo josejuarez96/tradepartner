@@ -54,7 +54,7 @@ import duckdb
 from pydantic import BaseModel, ValidationError
 
 from tradepartner.backtest import frozen
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, render_validation_errors
 from tradepartner.store import registry
 
 #: Settings sections frozen whole (spec req 10).
@@ -233,7 +233,18 @@ def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
     try:
         return Settings.model_validate(values)
     except ValidationError as exc:
-        raise HypothesisFileError(f"frozen values fail validation: {exc}") from exc
+        # `Settings` hides input values in its errors (#1093). `params` are frozen
+        # values (a file's, which may name frozen keys only, or a registration's
+        # stored ones), never secrets, so a location at or under one of them shows
+        # its value; any other location (a section rule, the live settings) does not.
+        keys = set(params)
+
+        def frozen(key: str) -> bool:
+            parts = key.split(".")
+            return any(".".join(parts[:i]) in keys for i in range(1, len(parts) + 1))
+
+        detail = render_validation_errors(exc, show_input=frozen)
+        raise HypothesisFileError(f"frozen values fail validation: {detail}") from exc
 
 
 def frozen_params_of(settings: Settings, *, family: str = "momentum") -> dict[str, Any]:

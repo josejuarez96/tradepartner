@@ -35,12 +35,15 @@ NOW = datetime(2020, 7, 1, 23, 0, tzinfo=UTC)
 
 
 def _settings(tmp_path: Path, store: Path | None = None, **overrides: Any) -> Settings:
-    return Settings(
+    settings = Settings(
         _env_file=None,
         store={"path": str(store or tmp_path / "store.duckdb"), "lock_retry_seconds": 0},
-        edgar={"cache_dir": str(tmp_path / "edgar-cache"), "requests_per_second": 1000},
+        edgar={"cache_dir": str(tmp_path / "edgar-cache")},
         **overrides,
     )
+    # 1000 req/s (no real sleeps) is past the config's `le=10` (#1108): set unvalidated.
+    fast = settings.edgar.model_copy(update={"requests_per_second": 1000.0})
+    return settings.model_copy(update={"edgar": fast})
 
 
 def _invoke(settings: Settings, args: Sequence[str], **kwargs: Any) -> Any:  # click.testing.Result

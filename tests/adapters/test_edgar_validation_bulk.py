@@ -18,7 +18,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from edgar_transport import FIXTURES, SUBMISSIONS, edgar_settings, index_header
+from edgar_transport import FIXTURES, SUBMISSIONS, edgar_settings, index_header, unthrottled
 from test_edgar_failures import _NoPrices
 from test_edgar_fsn import (
     _fsn_zip_bytes,
@@ -274,11 +274,13 @@ def test_ingest_session_stops_a_real_source_at_the_validation_gate(tmp_path: Pat
     router.add_index(2026, 1, _synthetic(BAD_ROW))
     router.add_index(2026, 2, index_header())
     source = EdgarFilingSource(settings, client=router.client(), clock=lambda: now)
-    store_settings = Settings(
-        _env_file=None,
-        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
-        edgar=settings.edgar.model_dump(),
-        sec_edgar_user_agent=settings.sec_edgar_user_agent,
+    store_settings = unthrottled(
+        Settings(
+            _env_file=None,
+            store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+            edgar=settings.edgar.model_dump(exclude={"requests_per_second"}),
+            sec_edgar_user_agent=settings.sec_edgar_user_agent,
+        )
     )
     [run] = ingest_session(
         store_settings, prices=_NoPrices(), filings=source, source="edgar", clock=lambda: now

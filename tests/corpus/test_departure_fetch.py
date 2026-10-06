@@ -129,8 +129,13 @@ def _reset_edgar_raw_state() -> None:
 
 
 def _settings(cache_dir: Path, **edgar: Any) -> Settings:
-    overrides: dict[str, Any] = {"cache_dir": str(cache_dir), "requests_per_second": 1e6, **edgar}
-    return Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT, edgar=overrides)
+    overrides: dict[str, Any] = {"cache_dir": str(cache_dir), **edgar}
+    settings = Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT, edgar=overrides)
+    if "requests_per_second" in edgar:
+        return settings
+    # A negligible throttle is past the config's `le=10` (#1108): set it unvalidated.
+    fast = settings.edgar.model_copy(update={"requests_per_second": 1e6})
+    return settings.model_copy(update={"edgar": fast})
 
 
 def _run(settings: Settings, router: Router, *, now: datetime = NOW) -> departure_fetch.FetchResult:

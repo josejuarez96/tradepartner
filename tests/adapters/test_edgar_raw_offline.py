@@ -50,10 +50,16 @@ def _settings(
     cache_dir: Path | None = None,
     **edgar_kwargs: object,
 ) -> Settings:
-    edgar_overrides: dict[str, object] = {"requests_per_second": 1000.0, **edgar_kwargs}
+    edgar_overrides: dict[str, object] = dict(edgar_kwargs)
     if cache_dir is not None:
         edgar_overrides["cache_dir"] = str(cache_dir)
-    return Settings(_env_file=None, sec_edgar_user_agent=user_agent, edgar=edgar_overrides)
+    settings = Settings(_env_file=None, sec_edgar_user_agent=user_agent, edgar=edgar_overrides)
+    # 1000 req/s (no real sleeps) is past the config's `le=10` (#1108): set it past
+    # validation unless the test asks for its own rate.
+    if "requests_per_second" in edgar_kwargs:
+        return settings
+    fast = settings.edgar.model_copy(update={"requests_per_second": 1000.0})
+    return settings.model_copy(update={"edgar": fast})
 
 
 def _mock_client(handler: _Handler) -> httpx.Client:
