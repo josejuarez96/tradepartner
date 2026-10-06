@@ -30,7 +30,7 @@ from tradepartner.backtest.quiet import (
     start_decision,
     system_timezone_matches,
 )
-from tradepartner.config import Settings
+from tradepartner.config import LabConfig, Settings
 
 NY = ZoneInfo("America/New_York")
 
@@ -101,8 +101,15 @@ def test_several_configured_intervals_in_order() -> None:
     "pair", [["21:00", "16:00"], ["16:00", "16:00"], ["4pm", "9pm"], ["25:00", "26:00"]]
 )
 def test_malformed_configured_interval_is_refused(pair: list[str]) -> None:
+    default = Settings(_env_file=None)
+    lab_data = default.lab.model_dump()
+    lab_data["quiet_intervals"] = [pair]
+    lab = LabConfig.model_construct(**lab_data)
+    settings_data = default.model_dump()
+    settings_data["lab"] = lab
+    settings = Settings.model_construct(**settings_data)
     with pytest.raises(ValueError, match=r"lab\.quiet_intervals"):
-        configured_intervals(MONDAY, _settings(lab={"quiet_intervals": [pair]}))
+        configured_intervals(MONDAY, settings)
 
 
 # ── the paper interval ──────────────────────────────────────────────────────────
