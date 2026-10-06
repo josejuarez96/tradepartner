@@ -1,6 +1,7 @@
 # Sweep: Fixture momentum sweep, read groups (test fixture, not a real sweep)
 
-The read-group fixture: `strategy.top_fraction` (shares a read set),
+The read-group fixture: `strategy.top_fraction` (shares a read set; values apart from
+`fixture-sweep.md`'s so both register on one store),
 `strategy.signal_total_return` and `schedule.rebalance_cadence` (each splits one), 2 x 2 x 2 =
 8 variants in four read groups. Laid out as
 [docs/templates/sweep.md](../../../docs/templates/sweep.md) asks; its numbers are
@@ -41,7 +42,7 @@ signal_anchor = "month_end"
 count_share_threshold = 0.05
 
 [grid]
-"strategy.top_fraction" = [0.05, 0.20]
+"strategy.top_fraction" = [0.15, 0.25]
 "strategy.signal_total_return" = [true, false]
 "schedule.rebalance_cadence" = ["month_end", "week_end"]
 

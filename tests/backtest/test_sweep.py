@@ -25,6 +25,7 @@ from tradepartner.backtest.sweep import (
     DuplicateFingerprintError,
     DuplicateGridValueError,
     FixedAndGriddedError,
+    InvalidVariantError,
     LabBlockError,
     MissingRequiredKeyError,
     OffLatticeError,
@@ -229,6 +230,7 @@ def test_typed_errors_are_value_errors() -> None:
         DuplicateGridValueError,
         TooManyVariantsError,
         DuplicateFingerprintError,
+        InvalidVariantError,
     ):
         assert issubclass(error, SweepFileError)
 
@@ -335,7 +337,7 @@ def test_off_lattice_reads_config(tmp_path: Path) -> None:
             "signal_total_return = true\n\n[profitability]\ntop_fraction = 0.1",
             "profitability.top_fraction",
         ),
-        ('weighting = "equal"', 'weighting = "bogus"', "fail validation"),
+        ('weighting = "equal"', 'weighting = "bogus"', "weighting = 'bogus' fails validation"),
     ],
 )
 def test_structural_refusals(tmp_path: Path, old: str, new: str, match: str) -> None:
@@ -367,7 +369,7 @@ def test_read_groups() -> None:
         assert len(group) == 2
         assert len({v.values["schedule.rebalance_cadence"] for v in group}) == 1
         assert len({v.values["strategy.signal_total_return"] for v in group}) == 1
-        assert {v.values["strategy.top_fraction"] for v in group} == {0.05, 0.2}
+        assert {v.values["strategy.top_fraction"] for v in group} == {0.15, 0.25}
         assert [v.index for v in group] == sorted(v.index for v in group)
     lowest = [group[0].index for group in groups]
     assert lowest == sorted(lowest)
@@ -444,3 +446,80 @@ def test_fixture_variant_slugs() -> None:
     variants = expand_grid(parse_sweep_file(SWEEP, settings), settings)
     slugs = [variant_slug("fixture-sweep", 1, v.index, len(variants)) for v in variants]
     assert slugs == [f"fixture-sweep--r1-v{i}" for i in range(1, 5)]
+
+
+# ── review fixes ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("near", ["0.1000000001", "0.10000000001"])
+def test_near_duplicate_on_the_lattice_refused(tmp_path: Path, near: str) -> None:
+    path = _rewrite(tmp_path, SWEEP, "[0.05, 0.20]", f"[0.10, {near}]")
+    with pytest.raises((OffLatticeError, DuplicateGridValueError)):
+        parse_sweep_file(path, _settings())
+
+
+def test_one_value_near_the_lattice_refused(tmp_path: Path) -> None:
+    path = _rewrite(tmp_path, SWEEP, "[0.05, 0.20]", "[0.1000000001]")
+    with pytest.raises(OffLatticeError):
+        parse_sweep_file(path, _settings())
+
+
+def test_lattice_points_with_float_round_off_accepted(tmp_path: Path) -> None:
+    values = ", ".join(f"{0.01 * k:.2f}" for k in range(1, 101))
+    path = _rewrite(tmp_path, SWEEP, "[0.05, 0.20]", f"[{values}]")
+    path.write_text(path.read_text().replace('["month_end", "week_end"]', '["month_end"]'))
+    grid = parse_sweep_file(path, _settings()).grid["strategy.top_fraction"]
+    assert len(grid) == 100
+
+
+@pytest.mark.parametrize("step", [0.0, -0.01])
+def test_nonpositive_lattice_step_refused(step: float) -> None:
+    settings = _settings(lab={"axis_lattice": {"strategy.top_fraction": step}})
+    with pytest.raises(SweepFileError, match="must be > 0"):
+        parse_sweep_file(SWEEP, settings)
+
+
+def _two_window_axes(tmp_path: Path, formation: str, skip: str) -> Path:
+    path = _rewrite(tmp_path, SWEEP, "formation_months = 12\nskip_months = 1\n", "")
+    path.write_text(
+        path.read_text().replace(
+            "[grid]\n",
+            f'[grid]\n"strategy.formation_months" = {formation}\n"strategy.skip_months" = {skip}\n',
+        )
+    )
+    return path
+
+
+def test_grid_values_are_judged_alone_not_against_live_settings(tmp_path: Path) -> None:
+    # formation_months = 1 fails against the live skip_months = 1, but the file grids
+    # skip_months too: the parse must not refuse it, and the (1, 0) variant is valid.
+    path = _two_window_axes(tmp_path, "[1, 12]", "[0]")
+    settings = _settings()
+    variants = expand_grid(parse_sweep_file(path, settings), settings)
+    assert {v.values["strategy.formation_months"] for v in variants} == {1, 12}
+
+
+def test_a_combination_settings_refuses_is_a_typed_error(tmp_path: Path) -> None:
+    path = _two_window_axes(tmp_path, "[2, 12]", "[1, 3]")
+    settings = _settings()
+    parsed = parse_sweep_file(path, settings)
+    with pytest.raises(InvalidVariantError, match=r"strategy\.formation_months"):
+        expand_grid(parsed, settings)
+
+
+def test_cadence_axis_refusal_comes_before_the_retire_check(tmp_path: Path) -> None:
+    path = _rewrite(
+        tmp_path,
+        REFUSALS / "dsr-excess-cadence-axis.md",
+        "retire_below = 0.0",
+        "retire_below = 0.5",
+    )
+    with pytest.raises(CadenceAxisStatisticError):
+        parse_sweep_file(path, _settings())
+
+
+def test_groups_fixture_shares_no_fingerprint_with_the_sweep_fixture() -> None:
+    settings = _settings()
+    first = expand_grid(parse_sweep_file(SWEEP, settings), settings)
+    groups = expand_grid(parse_sweep_file(GROUPS, settings), settings)
+    assert not {v.fingerprint for v in first} & {v.fingerprint for v in groups}

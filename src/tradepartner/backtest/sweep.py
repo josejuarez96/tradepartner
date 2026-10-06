@@ -15,7 +15,8 @@ floors. The rest of the file is prose, hashed with the block.
 axis outside `lab.sweepable_keys` (or under `FORBIDDEN_AXIS_PREFIXES`); a `[lab]` block
 missing a field, with `promote_at_least` below `lab.promotion_min_dsr_excess`, or with
 `retire_below >= promote_at_least` under `dsr_excess`; `dsr_excess` with a cadence axis;
-a grid value off its `lab.axis_lattice` step; two grid values that validate to one.
+a grid value off its `lab.axis_lattice` step; two grid values that validate (or fall on
+the lattice) to one.
 `expand_grid` builds each variant's frozen set exactly as `hypothesis.frozen_params`
 builds a hypothesis's (file values over live `Settings`, validated, in JSON form),
 refuses a product above `lab.max_variants_per_sweep` and two variants with one
@@ -38,7 +39,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Final, Literal, get_args
+from typing import Annotated, Any, Final, Literal, get_args
+
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from tradepartner.backtest import frozen, hypothesis
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
@@ -52,6 +55,7 @@ __all__ = [
     "DuplicateFingerprintError",
     "DuplicateGridValueError",
     "FixedAndGriddedError",
+    "InvalidVariantError",
     "LabBlockError",
     "MissingRequiredKeyError",
     "OffLatticeError",
@@ -94,7 +98,10 @@ _CADENCE_KEY: Final = "schedule.rebalance_cadence"
 _DATE_KEYS: Final = ("in_sample_start", "holdout.start", "holdout.end")
 _BLOCK_OPEN: Final = re.compile(r"^```toml sweep[ \t]*$", re.MULTILINE)
 _BLOCK_CLOSE: Final = re.compile(r"^```[ \t]*$", re.MULTILINE)
-# A grid value is on its lattice when value / step is this close to an integer.
+# Float round-off allowed when matching a grid value to its lattice point k x step, as a
+# fraction of the step: far below any step a sweep would use and far above binary
+# round-off, so 0.1000000001 on a 0.01 step is off the lattice (a numerical tolerance,
+# not a research threshold).
 _LATTICE_TOLERANCE: Final = 1e-9
 
 
@@ -136,6 +143,11 @@ class DuplicateGridValueError(SweepFileError):
 
 class TooManyVariantsError(SweepFileError):
     """A grid whose product exceeds `lab.max_variants_per_sweep`."""
+
+
+class InvalidVariantError(SweepFileError):
+    """A grid combination `Settings` refuses as a whole (a cross-field rule such as
+    `strategy.formation_months > strategy.skip_months`), though each value is valid."""
 
 
 class DuplicateFingerprintError(SweepFileError):
@@ -255,15 +267,15 @@ def _parse_lab(raw: object, path: Path, settings: Settings, cadence_axis: bool) 
             f"{path}: [lab] promote_at_least {promote} is below "
             f"lab.promotion_min_dsr_excess {floor}"
         )
-    if statistic == "dsr_excess" and retire >= promote:
-        raise LabBlockError(
-            f"{path}: [lab] retire_below {retire} must be below promote_at_least {promote} "
-            "under dsr_excess, so no argmax can both retire and promote"
-        )
     if statistic == "dsr_excess" and cadence_axis:
         raise CadenceAxisStatisticError(
             f"{path}: selection_statistic dsr_excess is refused with {_CADENCE_KEY} as an axis "
             "(its T differs by cadence); use sharpe_annual_excess_spy or excess_cagr_spy"
+        )
+    if statistic == "dsr_excess" and retire >= promote:
+        raise LabBlockError(
+            f"{path}: [lab] retire_below {retire} must be below promote_at_least {promote} "
+            "under dsr_excess, so no argmax can both retire and promote"
         )
     return SweepLab(
         selection_statistic=statistic,
@@ -298,30 +310,60 @@ def _as_hypothesis(
     )
 
 
-def _frozen_set(parsed: hypothesis.HypothesisFile, settings: Settings) -> dict[str, Any]:
+def _frozen_set(
+    parsed: hypothesis.HypothesisFile, settings: Settings, values: Mapping[str, Any]
+) -> dict[str, Any]:
     try:
         return hypothesis.frozen_params(parsed, settings)
     except hypothesis.HypothesisFileError as exc:
-        raise SweepFileError(f"{parsed.path}: {exc}") from exc
+        raise InvalidVariantError(f"{parsed.path}: the variant {dict(values)} {exc}") from exc
 
 
 def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _on_lattice(value: object, step: float) -> bool:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return True
-    ratio = value / step
-    return abs(ratio - round(ratio)) <= _LATTICE_TOLERANCE * max(1.0, abs(ratio))
+def _field_adapter(key: str) -> TypeAdapter[Any]:
+    """A validator for one dotted `Settings` key alone: its type and field constraints,
+    without the section's cross-field rules, so a value is judged on its own and never
+    against another axis's live value."""
+    section, _, name = key.partition(".")
+    field = Settings.model_fields[section]
+    if name:
+        model = field.annotation
+        assert isinstance(model, type) and issubclass(model, BaseModel), key
+        field = model.model_fields[name]
+    annotated: Any = (
+        Annotated[field.annotation, *field.metadata] if field.metadata else field.annotation
+    )
+    return TypeAdapter(annotated, config=ConfigDict(allow_inf_nan=False))
+
+
+def _validated(path: Path, key: str, value: object) -> Any:
+    """`value` validated as `key` alone, in the JSON form a frozen set stores."""
+    adapter = _field_adapter(key)
+    try:
+        return adapter.dump_python(adapter.validate_python(value), mode="json")
+    except ValidationError as exc:
+        raise SweepFileError(f"{path}: {key} = {value!r} fails validation: {exc}") from exc
+
+
+def _lattice_index(value: float, step: float) -> int | None:
+    """The k with value = k x step up to round-off, or None when `value` is off the
+    lattice."""
+    k = round(value / step)
+    return k if abs(value - k * step) <= _LATTICE_TOLERANCE * step else None
 
 
 def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
     """Parse a sweep file and apply every file-level refusal of req 1.
 
     `settings` supplies `lab.sweepable_keys`, `lab.axis_lattice` and
-    `lab.promotion_min_dsr_excess`, and validates the grid values (default: the live
-    `get_settings()`). Raises a `SweepFileError` subclass naming the rule broken.
+    `lab.promotion_min_dsr_excess` (default: the live `get_settings()`). Every fixed value
+    and grid value is validated against its own field's type and constraints alone, so
+    no refusal here depends on another key's live value; a combination `Settings`
+    refuses as a whole (a cross-field rule) is `expand_grid`'s `InvalidVariantError`.
+    Raises a `SweepFileError` subclass naming the rule broken.
     """
     settings = settings if settings is not None else get_settings()
     raw = path.read_bytes()
@@ -389,10 +431,9 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
             f"{path}: required keys neither fixed nor gridded: {', '.join(missing)}"
         )
 
-    dates = {
-        key: _plain_date(key, fixed[key] if key in fixed else flat.get(key), path)
-        for key in _DATE_KEYS
-    }
+    dates = {key: _plain_date(key, flat.get(key), path) for key in _DATE_KEYS}
+    for key, value in fixed.items():
+        _validated(path, key, value)
     if dates["in_sample_start"] >= dates["holdout.start"]:
         raise SweepFileError(
             f"{path}: in_sample_start ({dates['in_sample_start']}) must be before "
@@ -403,29 +444,28 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
 
     grid: dict[str, tuple[Any, ...]] = {}
     for axis, values in grid_lists.items():
+        step = settings.lab.axis_lattice.get(axis)
+        if step is not None and not (math.isfinite(step) and step > 0):
+            raise SweepFileError(f"lab.axis_lattice step for {axis} must be > 0, got {step}")
         validated: list[Any] = []
         seen: dict[str, object] = {}
         for value in values:
-            params = _frozen_set(
-                _as_hypothesis(
-                    path, slug, family, title, dates, doc_sha256, {**fixed, axis: value}
-                ),
-                settings,
-            )
-            json_value = params[axis]
+            json_value = _validated(path, axis, value)
             key = _canonical_json(json_value)
+            if step is not None and isinstance(json_value, int | float):
+                index = _lattice_index(float(json_value), step)
+                if index is None:
+                    raise OffLatticeError(
+                        f"{path}: grid axis {axis} value {value!r} is not a multiple of its "
+                        f"lab.axis_lattice step {step}"
+                    )
+                key = f"lattice:{index}"
             if key in seen:
                 raise DuplicateGridValueError(
                     f"{path}: grid axis {axis} values {seen[key]!r} and {value!r} are one value "
                     f"({json_value!r}) after Settings validation"
                 )
             seen[key] = value
-            step = settings.lab.axis_lattice.get(axis)
-            if step is not None and not _on_lattice(json_value, step):
-                raise OffLatticeError(
-                    f"{path}: grid axis {axis} value {value!r} is not a multiple of its "
-                    f"lab.axis_lattice step {step}"
-                )
             validated.append(json_value)
         grid[axis] = tuple(validated)
 
@@ -450,9 +490,11 @@ def expand_grid(file: SweepFile, settings: Settings) -> list[Variant]:
     indexed from 1.
 
     Each frozen set is the file's fixed values plus the variant's axis values over
-    `settings`, built by `hypothesis.frozen_params` as for a standalone file. Raises
-    `TooManyVariantsError` above `lab.max_variants_per_sweep` (before any set is built)
-    and `DuplicateFingerprintError` when two variants share a fingerprint.
+    `settings`, built by `hypothesis.frozen_params` as for a standalone file. Pass the
+    `settings` `parse_sweep_file` checked the file against. Raises
+    `TooManyVariantsError` above `lab.max_variants_per_sweep` (before any set is built),
+    `InvalidVariantError` for a combination `Settings` refuses, and
+    `DuplicateFingerprintError` when two variants share a fingerprint.
     """
     axes = list(file.grid)
     n_variants = math.prod(len(file.grid[axis]) for axis in axes)
@@ -482,6 +524,7 @@ def expand_grid(file: SweepFile, settings: Settings) -> list[Variant]:
                 {**file.fixed_params, **values},
             ),
             settings,
+            values,
         )
         fp = frozen.fingerprint(file.family, params, file.in_sample_start)
         if fp in by_fingerprint:
