@@ -670,9 +670,9 @@ ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
 # silently to the default, and a NaN or infinite value must fail rather than turn a
-# result into NaN. Errors never echo the input value (#1093): `CostsConfig` and
-# `RiskConfig` are validated on their own in `execution/`, outside `Settings`' own
-# `hide_input_in_errors`.
+# result into NaN. Errors hide the input value by default (#1093), as `Settings` does:
+# a caller that knows its input holds no secret (`execution/`'s frozen costs and risk)
+# puts it back with `render_validation_errors`.
 _PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
@@ -1403,15 +1403,13 @@ def get_settings() -> Settings:
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
 
-def render_validation_errors(
-    exc: ValidationError, *, show_input: Callable[[str], bool] = lambda _key: True
-) -> str:
+def render_validation_errors(exc: ValidationError, *, show_input: Callable[[str], bool]) -> str:
     """`exc`'s errors as `key = <input>: <rule>` (#1093). The config models hide input
     values in their own error text so a secret is never echoed; a caller whose input
     holds no secret (a frozen section, a hypothesis file's frozen keys) uses this to
     put the offending value back. `show_input(key)` decides per dotted location; a
-    location it refuses is shown without a value. Never pass a `Settings` error with
-    the default `show_input`: its input holds the secrets."""
+    location it refuses is shown without a value. `show_input` has no default so every
+    caller decides: a `Settings` error's input holds the secrets."""
     parts = []
     for error in exc.errors():
         key = ".".join(str(part) for part in error["loc"])

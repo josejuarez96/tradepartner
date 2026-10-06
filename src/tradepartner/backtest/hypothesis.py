@@ -237,8 +237,11 @@ def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
         # values (a file's, which may name frozen keys only, or a registration's
         # stored ones), never secrets, so a location at or under one of them shows
         # its value; any other location (a section rule, the live settings) does not.
+        keys = set(params)
+
         def frozen(key: str) -> bool:
-            return any(key == k or key.startswith(f"{k}.") for k in params)
+            parts = key.split(".")
+            return any(".".join(parts[:i]) in keys for i in range(1, len(parts) + 1))
 
         detail = render_validation_errors(exc, show_input=frozen)
         raise HypothesisFileError(f"frozen values fail validation: {detail}") from exc

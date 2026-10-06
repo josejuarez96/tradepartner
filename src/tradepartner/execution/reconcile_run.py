@@ -185,7 +185,7 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
         return RiskConfig.model_validate(risk)
     except ValidationError as exc:
         # Risk limits hold no secret: put the stored value back in the message (#1093).
-        detail = render_validation_errors(exc)
+        detail = render_validation_errors(exc, show_input=lambda _key: True)
         raise ValueError(f"window {window.window_id} frozen risk section: {detail}") from exc
 
 

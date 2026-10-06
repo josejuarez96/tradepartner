@@ -313,6 +313,9 @@ def test_no_config_validator_reads_a_secret_field() -> None:
         if secret_fields:
             holders[model] = secret_fields
             assert not decorators.model_validators, model
+            for name in secret_fields:  # `Annotated[SecretStr, AfterValidator(...)]` too
+                metadata = model.model_fields[name].metadata
+                assert not [m for m in metadata if type(m).__name__.endswith("Validator")], name
     # Not vacuous: the secrets are found where they live.
     assert {"alpaca_api_secret", "sec_edgar_user_agent"} <= holders.get(Settings, set())
 
@@ -320,7 +323,7 @@ def test_no_config_validator_reads_a_secret_field() -> None:
 def test_render_validation_errors_shows_input_only_where_allowed() -> None:
     with pytest.raises(ValidationError) as excinfo:
         CostsConfig.model_validate({"per_side_bps": -1.0, "sensitivity_per_side_bps": [5.0, -2.0]})
-    shown = render_validation_errors(excinfo.value)
+    shown = render_validation_errors(excinfo.value, show_input=lambda _key: True)
     assert "per_side_bps = -1.0:" in shown
     assert "sensitivity_per_side_bps.1 = -2.0:" in shown
     hidden = render_validation_errors(excinfo.value, show_input=lambda _key: False)
