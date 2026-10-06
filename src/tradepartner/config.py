@@ -582,6 +582,13 @@ FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
     "profitability": None,
 }
 
+# The families the engine can run today (#1053, folded into T85 by owner decision
+# 2026-10-06). A registered family outside it is refused by `backtest run`, `paper start`
+# and the paper planning step before any trial, order or plan row: its signal is not
+# dispatched yet, so a run would read momentum's live, unfrozen `strategy.*` instead.
+# T85e adds `profitability` with the engine dispatch.
+ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
+
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
 # silently to the default, and a NaN or infinite value must fail rather than turn a

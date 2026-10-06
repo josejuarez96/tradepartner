@@ -76,7 +76,7 @@ from tradepartner.backtest.results import write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.cli_record import _configured_secrets, scrub_text
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import ENGINE_FAMILIES, Settings, get_settings
 from tradepartner.store import registry, schema
 from tradepartner.store.db import open_for_write, open_read_only
 
@@ -171,7 +171,8 @@ def run_hypothesis(
     The outcome carries the recorded status, the results written with an `ok` row
     and, on `failed`, the formatted traceback; the one-line message is in
     `trial_results`. Raises `registry.UnknownHypothesis` for an unregistered slug,
-    `registry.RealStoreRefused` for `synthetic=True` on `settings.store.path`, and
+    `registry.RealStoreRefused` for `synthetic=True` on `settings.store.path`,
+    `ValueError` for a family outside `config.ENGINE_FAMILIES` (#1053), and
     `ValueError` for `kind="tracking"` with a missing `start` or `end`, all before
     any trial exists.
     """
@@ -186,6 +187,11 @@ def run_hypothesis(
     with open_for_write(store) as conn:
         schema.init_schema(conn)
         hypothesis = registry.get_hypothesis(conn, slug)
+        if hypothesis.family not in ENGINE_FAMILIES:
+            raise ValueError(
+                f"{slug!r} is in family {hypothesis.family!r}, which the engine cannot run "
+                f"yet (engine families: {', '.join(ENGINE_FAMILIES)})"
+            )
         params = load_frozen(conn, slug, settings=live)
         frozen = Frozen.from_hypothesis(hypothesis)
         window = tracking_window if tracking else _window(frozen, start, end)
