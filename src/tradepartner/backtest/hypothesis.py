@@ -220,6 +220,24 @@ def frozen_params_of(settings: Settings) -> dict[str, Any]:
     return params
 
 
+def frozen_hash_matches(settings: Settings, stored_sha256: str) -> bool:
+    """True when the frozen keys of `settings` are the registration whose stored hash is
+    `stored_sha256`: written out in full, or, for a registration stored before a suffix
+    of `FROZEN_KEY_DEFAULTS` landed, with those table keys (at their defaults) left out,
+    which is exactly what `frozen.frozen_values` overlaid when `load_frozen` built it."""
+    params = frozen_params_of(settings)
+    table = [(key, default) for key, default, _version in frozen.FROZEN_KEY_DEFAULTS]
+    for i in range(len(table), -1, -1):
+        later = table[i:]
+        if any(params.get(key) != default for key, default in later):
+            continue
+        dropped = {key for key, _default in later}
+        stored = {k: v for k, v in params.items() if k not in dropped}
+        if registry.params_sha256(stored) == stored_sha256:
+            return True
+    return False
+
+
 def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
     """The frozen set: the file's values over `settings` for every frozen key."""
     return frozen_params_of(_overlay(settings, parsed.file_params))
