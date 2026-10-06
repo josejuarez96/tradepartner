@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tradepartner.backtest import run as run_module
 from tradepartner.backtest.holdout import (
     Decision,
     Flags,
@@ -20,6 +22,14 @@ from tradepartner.backtest.holdout import (
     gap_sessions,
     window_touches_holdout,
 )
+from tradepartner.backtest.hypothesis import frozen_params_of
+from tradepartner.backtest.provider import DataProvider
+from tradepartner.backtest.run import run_hypothesis
+from tradepartner.backtest.schedule import read_time, rebalance_sessions
+from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.config import Cadence, Settings
+from tradepartner.store import registry
+from tradepartner.store.db import open_for_write
 from tradepartner.store.registry import HoldoutSpend, HypothesisRecord
 
 HYPOTHESIS_ID = 7
@@ -458,3 +468,135 @@ def test_without_the_tracking_flag_a_post_holdout_window_is_still_refused() -> N
     """The Phase 3 rule is unchanged: sessions after `holdout.end` belong to tracking."""
     decision = _decide(Window(FIRST_TRACKING, date(2027, 3, 31)))
     assert decision.outcome == "refused_window"
+
+
+# --- cadence (strategy-lab spec req 6, "Holdout at cadence"; plan T98) ------------------
+
+#: A holdout starting on a Wednesday: 2024-12-31 is the last session before it, the
+#: Friday 2024-12-27 the last week end (its ISO week ends on 2025-01-03, inside it).
+FROZEN_2025 = Frozen(
+    hypothesis_id=1,
+    in_sample_start=date(2017, 1, 31),
+    holdout_start=date(2025, 1, 1),
+    holdout_end=date(2026, 8, 31),
+    gap_count_share_threshold=0.05,
+)
+
+
+@pytest.mark.parametrize(
+    ("cadence", "end"),
+    [
+        ("month_end", date(2024, 12, 31)),
+        ("week_end", date(2024, 12, 27)),
+        ("daily", date(2024, 12, 31)),
+    ],
+)
+def test_default_window_at_cadence_ends_before_holdout_start(cadence: Cadence, end: date) -> None:
+    window = default_in_sample_window(FROZEN_2025, cadence)
+    assert window == Window(FROZEN_2025.in_sample_start, end)
+    assert end == rebalance_sessions(date(2024, 12, 1), date(2024, 12, 31), cadence)[-1]
+
+
+def test_gap_sessions_at_week_end_are_the_week_ends_in_the_window() -> None:
+    sessions = gap_sessions(HOLDOUT, "week_end")
+    assert sessions == tuple(rebalance_sessions(HOLDOUT.start, HOLDOUT.end, "week_end"))
+    assert date(2024, 3, 28) in sessions  # the Good Friday week ends on Thursday
+    assert gap_sessions(Window(HOLDOUT.end, HOLDOUT.start), "week_end") == ()
+
+
+#: Touches the holdout (from 2024-01-01) only at the week end 2024-01-05, which ends no
+#: month: no month-end rebalance session of the window lies in the holdout.
+WEEK_ONLY = Window(date(2023, 12, 1), date(2024, 1, 5))
+
+
+def test_a_week_end_window_reaching_the_holdout_only_mid_month_is_refused_holdout() -> None:
+    weekly = decide(WEEK_ONLY, FROZEN, NO_FLAGS, NO_REASONS, None, (), cadence="week_end")
+    assert weekly.outcome == "refused_holdout"
+    assert "--spend-holdout" in weekly.message
+    # The same window at month_end reaches none of the holdout's rebalance sessions.
+    monthly = decide(WEEK_ONLY, FROZEN, NO_FLAGS, NO_REASONS, None, ())
+    assert monthly.outcome == "refused_window"
+    assert "reaches none of its rebalance sessions" in monthly.message
+
+
+def test_the_gap_gate_at_week_end_names_every_week_end_of_the_window() -> None:
+    decision = decide(WEEK_ONLY, FROZEN, SPEND, SPEND_REASON, None, (), cadence="week_end")
+    assert decision.outcome == "needs_gap"
+    week_ends = tuple(rebalance_sessions(WEEK_ONLY.start, WEEK_ONLY.end, "week_end"))
+    assert decision.gap_sessions == week_ends
+    series = dict.fromkeys(week_ends, 0.0)
+    with pytest.raises(ValueError, match="gap series has no value"):
+        partial = dict.fromkeys(week_ends[:-1], 0.0)
+        decide(WEEK_ONLY, FROZEN, SPEND, SPEND_REASON, partial, (), cadence="week_end")
+    ran = decide(WEEK_ONLY, FROZEN, SPEND, SPEND_REASON, series, (), cadence="week_end")
+    assert ran.outcome == "run"
+    assert ran.gap_sessions == week_ends
+
+
+class TestGapGateOnTheRunPath:
+    """A `week_end` hypothesis's gap gate reads `survivorship_gap` at every week-end
+    close of the window and nowhere else (recording provider, fixture store)."""
+
+    SLUG = "h-weekly-gap"
+    #: The fixture's gap count share is 0.0769 at 2019-06-28, a week end, so the frozen
+    #: threshold 0.05 refuses the spend after the gate reads every week end.
+    WINDOW = (date(2019, 5, 31), date(2019, 7, 12))
+
+    @pytest.fixture
+    def store(
+        self, fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> Path:
+        monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+        monkeypatch.setenv("STORE__PATH", str(tmp_path / "real_store.duckdb"))
+        frozen = Settings(
+            _env_file=None,
+            strategy={"top_fraction": 0.5},
+            schedule={"rebalance_cadence": "week_end"},
+            holdout={"start": date(2019, 6, 3), "end": date(2020, 6, 30)},
+            gap={"count_share_threshold": 0.05},
+        )
+        store = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+        with open_for_write(store) as conn:
+            registry.register_hypothesis(
+                conn,
+                slug=self.SLUG,
+                family="momentum",
+                title="weekly gap gate",
+                doc_path=f"docs/hypotheses/{self.SLUG}.md",
+                doc_sha256="0" * 64,
+                params=frozen_params_of(frozen),
+                in_sample_start=date(2018, 1, 31),
+                holdout_start=date(2019, 6, 3),
+                holdout_end=date(2020, 6, 30),
+                registered_by="test",
+                settings=frozen,
+            )
+        return fixture_store_path
+
+    def test_reads_the_gap_at_every_week_end_close_and_nowhere_else(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, datetime]] = []
+
+        class Recording(StoreProvider):
+            pass
+
+        def wrap(name: str) -> Any:
+            def method(self: StoreProvider, *args: Any, **kwargs: Any) -> Any:
+                calls.append((name, args[0]))
+                return getattr(StoreProvider, name)(self, *args, **kwargs)
+
+            return method
+
+        for name in DataProvider.__dict__:
+            if not name.startswith("_") and callable(getattr(StoreProvider, name, None)):
+                setattr(Recording, name, wrap(name))
+        monkeypatch.setattr(run_module, "StoreProvider", Recording)
+
+        outcome = run_hypothesis(
+            self.SLUG, *self.WINDOW, SPEND, store_path=store, reasons=SPEND_REASON
+        )
+        assert outcome.status == "refused_gap"
+        week_ends = rebalance_sessions(*self.WINDOW, "week_end")
+        assert len(week_ends) == 7
+        assert calls == [("survivorship_gap", read_time(s, "week_end")) for s in week_ends]
