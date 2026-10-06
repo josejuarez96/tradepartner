@@ -1154,6 +1154,15 @@ def test_research_labeling_rejects_nonsense(section: str, values: dict[str, obje
         Settings(_env_file=None, research=research)
 
 
+@pytest.mark.parametrize("value", ["inf", "nan", "-1"])
+def test_research_ceilings_from_the_environment_reject_nonsense(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_TOTAL", value)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
 def test_typesafe_key_is_redacted_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spec req 17: a `SecretStr` in `secret_values`, so `clean_message` (and
     `cli_record`, which uses the same set) redacts it; absent from repr/str."""

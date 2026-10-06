@@ -242,6 +242,23 @@ def test_a_blank_key_gives_the_disabled_client(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.usefixtures("clean_env")
+@pytest.mark.usefixtures("clean_env")
+@pytest.mark.parametrize("bad", ["k\u00e9y-not-ascii", "key\nwith-newline", "key with space"])
+def test_a_key_that_cannot_go_in_a_header_is_refused_without_naming_it(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    monkeypatch.setenv("TYPESAFE_API_KEY", bad)
+    _refuse_httpx_client(monkeypatch)
+    settings = _settings(spend_ceiling_usd_month=40.0, spend_ceiling_usd_total=40.0)
+    with pytest.raises(models.ModelKeyInvalid) as caught:
+        models.build_client(settings, _handle())
+    assert "TYPESAFE_API_KEY" in str(caught.value)
+    for blob in (str(caught.value), repr(caught.value), repr(caught.value.args)):
+        assert bad.strip() not in blob
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 def test_both_ceilings_and_a_key_give_the_real_client_without_connecting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -382,6 +399,34 @@ def test_a_mismatched_model_id_is_reported_not_hidden() -> None:
 )
 def test_a_malformed_200_raises(body: str) -> None:
     client, _ = _client(Stub([httpx.Response(200, text=body)]))
+    with pytest.raises(models.ModelResponseInvalid) as caught:
+        client.label(_request())
+    record = caught.value.response
+    assert (record.reason, record.http_status, record.attempts) == ("refused", 200, 1)
+    assert record.raw_response == body
+    assert record.selected_option is None
+
+
+def test_a_malformed_200_keeps_its_usage_for_the_spend_sum() -> None:
+    """It may have been billed: the record the job writes keeps the token counts."""
+    body = _body(answers={"departure_reason": {"choice": "Bankruptcy", "type": "choice"}})
+    client, _ = _client(Stub([_ok(body)]))
+    with pytest.raises(models.ModelResponseInvalid) as caught:
+        client.label(_request())
+    assert caught.value.response.input_tokens == 1351
+    assert caught.value.response.output_tokens == 116
+
+
+@pytest.mark.parametrize(
+    "probabilities",
+    [
+        {"bankruptcy": 0.9, "going_private": 0.1},  # an option that was not sent
+        {"merger_or_acquisition": 1.0},  # nothing on the choice
+    ],
+)
+def test_probabilities_must_be_over_the_options_sent(probabilities: dict[str, float]) -> None:
+    answer = {"choice": "bankruptcy", "probabilities": probabilities, "type": "choice"}
+    client, _ = _client(Stub([_ok(_body(answers={"departure_reason": answer}))]))
     with pytest.raises(models.ModelResponseInvalid):
         client.label(_request())
 

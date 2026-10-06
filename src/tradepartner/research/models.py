@@ -26,7 +26,9 @@ This is the one module that names the vendor's host (through
   with no answer. A final non-200 comes back as `reason = "refused"` with its status;
   401 and 403 raise `ModelAuthRejected` (a bad key fails every call, so the job
   stops); a 200 whose body is not the documented shape raises
-  `ModelResponseInvalid`; connection errors on every attempt raise
+  `ModelResponseInvalid`, which carries the call's `refused` record (it may have
+  been billed, so the job records it); a key that cannot go in a header raises
+  `ModelKeyInvalid` at construction; connection errors on every attempt raise
   `ModelUnreachable` (nothing was sent, so nothing was billed).
 - **`ModelResponse`** is frozen and carries what the inference record (C8) needs from
   the call: `raw_request` is the body exactly as sent and holds no header, so the
@@ -71,6 +73,8 @@ RETRY_STATUSES = frozenset({429, 529})
 #: Statuses that mean the key was refused.
 AUTH_STATUSES = frozenset({401, 403})
 ENDPOINT = "systemone"
+#: What a bearer token may hold: printable ASCII, no space (RFC 6750 `b64token` and more).
+_HEADER_TOKEN = re.compile(r"[\x21-\x7e]+")
 #: The first backoff when no usable `Retry-After` came back; doubled per attempt.
 BACKOFF_BASE_SECONDS = 1.0
 
@@ -93,8 +97,21 @@ class ModelUnreachable(RuntimeError):
     """No connection could be made on any attempt; nothing was sent."""
 
 
+class ModelKeyInvalid(ValueError):
+    """The configured key cannot be sent in an HTTP header."""
+
+
 class ModelResponseInvalid(RuntimeError):
-    """A 200 response whose body is not the documented shape."""
+    """A 200 response whose body is not the documented shape.
+
+    The call may have been billed, so `response` keeps what the record needs:
+    `reason = "refused"`, `http_status = 200`, the raw request and body as received,
+    and `usage.input_tokens` / `output_tokens` when the body still holds them, so the
+    job can record it before it stops."""
+
+    def __init__(self, message: str, response: ModelResponse) -> None:
+        super().__init__(message)
+        self.response = response
 
 
 @dataclass(frozen=True)
@@ -173,8 +190,8 @@ def encode_request(request: ModelRequest) -> str:
     return json.dumps(request_body(request), ensure_ascii=False)
 
 
-def _invalid(why: str) -> ModelResponseInvalid:
-    return ModelResponseInvalid(f"the model API's 200 response is not the documented shape: {why}")
+class _Malformed(Exception):
+    """Why a 200 body is not the documented shape (internal to `make_response`)."""
 
 
 def _number(value: object) -> bool:
@@ -183,6 +200,60 @@ def _number(value: object) -> bool:
 
 def _count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _usage_counts(data: object) -> tuple[int | None, int | None]:
+    """`usage.input_tokens` and `output_tokens` from a parsed body, each `None` when
+    absent or not a count (best effort, for a malformed body's record)."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None, None
+    input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
+    return (
+        input_tokens if _count(input_tokens) else None,
+        output_tokens if _count(output_tokens) else None,
+    )
+
+
+def _parse_answer(request: ModelRequest, data: object) -> dict[str, Any]:
+    """The answer fields of a 200 body, or `_Malformed` naming what is wrong. The
+    choice and every probability key must be options that were sent, and the choice
+    must carry a probability."""
+    if not isinstance(data, dict):
+        raise _Malformed("not a JSON object")
+    model = data.get("model")
+    if not isinstance(model, str) or not model:
+        raise _Malformed("no model id")
+    answers = data.get("answers")
+    answer = answers.get(request.question) if isinstance(answers, dict) else None
+    if not isinstance(answer, dict):
+        raise _Malformed(f"no answer to {request.question!r}")
+    choice = answer.get("choice")
+    if not isinstance(choice, str) or choice not in request.criteria:
+        raise _Malformed("the choice is not one of the options sent")
+    probabilities = answer.get("probabilities")
+    if not isinstance(probabilities, dict) or not all(
+        isinstance(k, str) and _number(v) for k, v in probabilities.items()
+    ):
+        raise _Malformed("no probability map")
+    if not set(probabilities) <= set(request.criteria):
+        raise _Malformed("a probability for an option that was not sent")
+    if choice not in probabilities:
+        raise _Malformed("no probability for the choice")
+    confidence = answer.get("confidence")
+    if confidence is not None and not _number(confidence):
+        raise _Malformed("a non-numeric confidence")
+    input_tokens, output_tokens = _usage_counts(data)
+    if input_tokens is None or output_tokens is None:
+        raise _Malformed("usage lacks input_tokens or output_tokens")
+    return {
+        "model_id_returned": model,
+        "selected_option": choice,
+        "probabilities": MappingProxyType({k: float(v) for k, v in probabilities.items()}),
+        "vendor_confidence": None if confidence is None else float(confidence),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
 
 
 def make_response(
@@ -195,8 +266,9 @@ def make_response(
     latency_ms: int,
 ) -> ModelResponse:
     """The `ModelResponse` for a finished call: parsed when `http_status` is 200,
-    `timeout` when nothing came back, `refused` for any other status. Shared with the
-    test double so both produce records through one parse."""
+    `timeout` when nothing came back, `refused` for any other status. A 200 body that
+    is not the documented shape raises `ModelResponseInvalid` carrying its `refused`
+    record. Shared with the test double so both produce records through one parse."""
     common: dict[str, Any] = {
         "model_id_requested": request.model,
         "client_version": CLIENT_VERSION,
@@ -206,57 +278,32 @@ def make_response(
         "http_status": http_status,
         "latency_ms": latency_ms,
     }
+    no_answer: dict[str, Any] = {
+        "model_id_returned": None,
+        "selected_option": None,
+        "probabilities": MappingProxyType({}),
+        "vendor_confidence": None,
+        "input_tokens": None,
+        "output_tokens": None,
+    }
     if http_status != 200:
-        return ModelResponse(
-            **common,
-            model_id_returned=None,
-            reason="timeout" if http_status is None else "refused",
-            selected_option=None,
-            probabilities=MappingProxyType({}),
-            vendor_confidence=None,
-            input_tokens=None,
-            output_tokens=None,
-        )
+        reason: Reason = "timeout" if http_status is None else "refused"
+        return ModelResponse(**common, **no_answer, reason=reason)
+    data: object = None
     try:
         data = json.loads(raw_response)
-    except ValueError:
-        raise _invalid("not JSON") from None
-    if not isinstance(data, dict):
-        raise _invalid("not a JSON object")
-    model = data.get("model")
-    if not isinstance(model, str) or not model:
-        raise _invalid("no model id")
-    answers = data.get("answers")
-    answer = answers.get(request.question) if isinstance(answers, dict) else None
-    if not isinstance(answer, dict):
-        raise _invalid(f"no answer to {request.question!r}")
-    choice = answer.get("choice")
-    if not isinstance(choice, str) or choice not in request.criteria:
-        raise _invalid("the choice is not one of the options sent")
-    probabilities = answer.get("probabilities")
-    if not isinstance(probabilities, dict) or not all(
-        isinstance(k, str) and _number(v) for k, v in probabilities.items()
-    ):
-        raise _invalid("no probability map")
-    confidence = answer.get("confidence")
-    if confidence is not None and not _number(confidence):
-        raise _invalid("a non-numeric confidence")
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
-        raise _invalid("no usage")
-    input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-    if not _count(input_tokens) or not _count(output_tokens):
-        raise _invalid("usage lacks input_tokens or output_tokens")
-    return ModelResponse(
-        **common,
-        model_id_returned=model,
-        reason="ok",
-        selected_option=choice,
-        probabilities=MappingProxyType({k: float(v) for k, v in probabilities.items()}),
-        vendor_confidence=None if confidence is None else float(confidence),
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-    )
+        return ModelResponse(**common, **_parse_answer(request, data), reason="ok")
+    except (ValueError, _Malformed) as exc:
+        why = str(exc) if isinstance(exc, _Malformed) else "not JSON"
+        input_tokens, output_tokens = _usage_counts(data)
+        record = ModelResponse(
+            **common,
+            **{**no_answer, "input_tokens": input_tokens, "output_tokens": output_tokens},
+            reason="refused",
+        )
+        raise ModelResponseInvalid(
+            f"the model API's 200 response is not the documented shape: {why}", record
+        ) from None
 
 
 class DisabledModelClient:
@@ -291,6 +338,13 @@ class HttpModelClient:
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if not _HEADER_TOKEN.fullmatch(api_key.get_secret_value().strip()):
+            # Checked here, once, so a bad key never reaches httpx (whose encoding
+            # error would carry the value); the message names the variable only.
+            raise ModelKeyInvalid(
+                "TYPESAFE_API_KEY is not a header-safe token (printable ASCII, no "
+                "spaces or control characters); fix it in .env"
+            )
         self._url = f"{base_url.rstrip('/')}/{ENDPOINT}"
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
