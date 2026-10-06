@@ -16,6 +16,66 @@ source = "import httpx\n"
 rule = "ii"
 
 [[case]]
+id = "urllib-request-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import urllib.request\n"
+rule = "ii"
+
+[[case]]
+id = "urllib-from-request-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from urllib import request\n"
+rule = "ii"
+
+[[case]]
+id = "http-client-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import http.client\n"
+rule = "ii"
+
+[[case]]
+id = "socket-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import socket\n"
+rule = "ii"
+
+[[case]]
+id = "requests-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import requests\n"
+rule = "ii"
+
+[[case]]
+id = "aiohttp-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from aiohttp import ClientSession\n"
+rule = "ii"
+
+[[case]]
+id = "bare-urllib-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import urllib\n"
+rule = "ii"
+
+[[case]]
+id = "urllib-star-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from urllib import *\n"
+rule = "ii"
+
+[[case]]
+id = "dotted-urllib-parse-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import urllib.parse\n"
+rule = "ii"
+
+[[case]]
+id = "urllib-parse-in-job-passes"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from urllib.parse import urlsplit\n"
+rule = ""
+
+[[case]]
 id = "relative-models-in-crosswalk"
 path = "src/tradepartner/research/labeling/crosswalk.py"
 source = "from ..models import build_client\n"
