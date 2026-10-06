@@ -19,8 +19,9 @@ amendment is a new row pointing at the old one plus a `budget_amend` decision.
 **Datasets** (req 11). `register_dataset` records what the caller computed (T83's
 CLI hashes the export and reads the event column with T82's helpers) and applies
 the store rules: sealing never shrinks under a name, the same export, split file
-and sealed set return the existing row, a split file needs an event column, and
-a sealed split needs an event column and sealed periods holding its event span
+and sealed set (and the same path, `locked` and seed) return the existing row, a
+split file needs an event column and labels no row `full` or `none`, and a sealed
+split needs an event column and sealed periods holding its event span
 (the row-level check is T82's `check_sealed_split_has_period`, run by the CLI).
 
 **Runs** (reqs 3 to 7). `open_run` and `attach_run` are the only constructors of
@@ -54,7 +55,13 @@ from typing import Any, Final, Literal
 import duckdb
 
 from tradepartner.config import Settings, get_settings
-from tradepartner.research import DatasetChanged, RunHandle, _issue_run_handle, load_dataset
+from tradepartner.research import (
+    EVERY_ROW_SPLITS,
+    DatasetChanged,
+    RunHandle,
+    _issue_run_handle,
+    load_dataset,
+)
 from tradepartner.research.experiment import ParsedExperiment
 from tradepartner.research.gates import (
     Flags,
@@ -497,8 +504,11 @@ def register_dataset(
     event column and the split file; without a split file the one split `full`
     spans `[event_start, event_end]`. `test` in `split_spans` seals `test` by
     implication. Refuses `split without event column`, `sealed split without
-    period` and `sealed set shrinks`; returns the existing row for the same
-    `(name, sha256, split_sha256)` and sealed set."""
+    period`, `sealed set shrinks` and a split file labelling rows `full` or
+    `none`; returns the existing row for the same `(name, sha256,
+    split_sha256)` and sealed set when the path, split path, `locked` and seed
+    match too (a moved export, or one locked after protocol §10 step 5, is a new
+    version rather than the stale row)."""
     require_research(conn)
     if event_end < event_start:
         raise ResearchError(f"event span end {event_end} is before its start {event_start}")
@@ -508,6 +518,10 @@ def register_dataset(
         split_spans is None
     ):
         raise ResearchError("split_path, split_sha256 and split_spans go together")
+    if split_spans is not None and EVERY_ROW_SPLITS & set(split_spans):
+        raise ResearchError(
+            "a split file cannot label rows `full` or `none`: those splits bind every row"
+        )
     spans = dict(split_spans) if split_spans is not None else {"full": (event_start, event_end)}
     sealed = set(sealed_splits) | ({"test"} if "test" in spans else set())
     periods = sorted(set(sealed_periods))
@@ -536,8 +550,9 @@ def register_dataset(
     existing = conn.execute(
         f"SELECT {_DATASET_COLUMNS} FROM research_datasets WHERE name = ? AND sha256 = ? "
         "AND split_sha256 IS NOT DISTINCT FROM ? AND sealed_splits_json = ? "
-        "AND sealed_periods_json = ? ORDER BY dataset_id LIMIT 1",
-        [name, sha256, split_sha256, sealed_json, periods_json],
+        "AND sealed_periods_json = ? AND path = ? AND split_path IS NOT DISTINCT FROM ? "
+        "AND locked = ? AND seed IS NOT DISTINCT FROM ? ORDER BY dataset_id LIMIT 1",
+        [name, sha256, split_sha256, sealed_json, periods_json, path, split_path, locked, seed],
     ).fetchone()
     if existing is not None:
         return _dataset_from_row(existing)
@@ -662,7 +677,8 @@ def open_run(
     amended registration opens no further runs). Raises, writing nothing, on
     `synthetic=True` on the real store, an unknown slug or dataset, a dataset of
     another name than the registration's, a dataset other than its pinned
-    `sha256`, and an unknown split."""
+    `sha256`, an unknown split, and a split the dataset has no rows of (`full`
+    and `none` always bind every row, so their span is the dataset's)."""
     require_research(conn)
     settings = settings if settings is not None else get_settings()
     flags = flags if flags is not None else Flags()
@@ -691,8 +707,14 @@ def open_run(
 
     window = Span(registration.window_start, registration.window_end)
     dataset_span = Span(dataset.event_start, dataset.event_end)
-    split_span = dataset.split_spans.get(split)
-    bound_split_span = Span(*split_span) if split_span is not None else dataset_span
+    if split in dataset.split_spans and split not in EVERY_ROW_SPLITS:
+        bound_split_span = Span(*dataset.split_spans[split])
+    elif split in EVERY_ROW_SPLITS or split not in registration.splits:
+        # `full` and `none` bind every row (req 5); an unlisted split is
+        # `refused_split` by the gate before its span matters.
+        bound_split_span = dataset_span
+    else:
+        raise ResearchError(f"dataset {dataset_id} has no {split!r} rows to bind")
     sealed_names, sealed_dates = _name_sealing(conn, dataset.name)
     sealed_splits = tuple(sorted(sealed_names))
     sealed_periods = tuple(Span(s, e) for s, e in sorted(sealed_dates))

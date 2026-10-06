@@ -1003,3 +1003,219 @@ def test_a_run_without_a_result_lists_as_unfinished(
 ) -> None:
     (summary,) = research.list_runs(conn, registration=opened.slug)
     assert (summary.run_id, summary.outcome, summary.verdict) == (opened.run_id, "unfinished", None)
+
+
+# --- quant-auditor pass 1 (PR #1007): every-row splits and repeat scoping ------------
+
+
+def test_a_split_file_may_not_label_rows_full_or_none(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    with pytest.raises(research.ResearchError, match="`full` or `none`"):
+        _dataset(conn, tmp_path, dates=_DEV_TEST, splits=["none", "dev"])
+
+
+def test_a_full_run_binds_every_row_so_it_touches_every_sealed_period(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """`full` reads the sealed `test` rows too, so the gate checks the dataset's
+    whole span (req 5), not one label's."""
+    research.register_experiment(
+        conn,
+        _variant(
+            e1h,
+            "b1",
+            kind="benchmark",
+            stage=3,
+            confirmatory=False,
+            dataset_name="labels",
+            splits=("full",),
+            budget_configurations=5,
+        ),
+        "owner",
+    )
+    ds = _dataset(
+        conn,
+        tmp_path,
+        name="labels",
+        dates=[date(2018, 3, 1), date(2022, 3, 1)],
+        splits=["dev", "test"],
+        periods=((date(2022, 1, 1), date(2022, 12, 31)),),
+    )
+    assert _open(conn, settings, tmp_path, "b1", ds.dataset_id).refusal == "refused_holdout"
+    spent = _open(conn, settings, tmp_path, "b1", ds.dataset_id, flags=SPEND, reasons=WHY)
+    assert spent.refusal is None
+    (values,) = conn.execute(
+        "SELECT values_json FROM research_decisions WHERE run_id = ?", [spent.run_id]
+    ).fetchone()  # type: ignore[misc]
+    assert json.loads(values)["sealed_periods"] == [["2022-01-01", "2022-12-31"]]
+    assert load_dataset(spent).height == 2
+
+
+def test_a_split_the_dataset_has_no_rows_of_is_refused_before_any_write(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    research.register_experiment(conn, replace(e1h, splits=("pilot", "dev")), "owner")
+    ds = _dataset(conn, tmp_path, name=e1h.dataset_name, splits=["pilot", "pilot"])
+    with pytest.raises(research.ResearchError, match="no 'dev' rows"):
+        _open(conn, settings, tmp_path, e1h.slug, ds.dataset_id, "dev")
+    assert conn.execute("SELECT COUNT(*) FROM research_runs").fetchone() == (0,)
+
+
+def test_a_moved_or_newly_locked_export_is_a_new_version(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    dates = [date(2021, 1, 4), date(2022, 6, 30)]
+    csv, _ = _export(tmp_path, "labels", dates)
+    moved = tmp_path / "moved.csv"
+    moved.write_bytes(csv.read_bytes())
+
+    def register(path: Path, locked: bool) -> research.DatasetRecord:
+        return research.register_dataset(
+            conn,
+            name="labels",
+            version="v1",
+            path=str(path),
+            sha256=hash_file(path),
+            event_start=dates[0],
+            event_end=dates[1],
+            locked=locked,
+            repo_dir=tmp_path,
+        )
+
+    first = register(csv, locked=False)
+    assert register(csv, locked=False) == first
+    locked = register(csv, locked=True)
+    assert (locked.dataset_id, locked.locked) == (first.dataset_id + 1, True)
+    assert register(moved, locked=True).path == str(moved)
+
+
+def test_a_spend_in_another_family_on_another_dataset_is_not_a_repeat(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    _gated(conn, settings, e1h)
+    registry.register_hypothesis(
+        conn,
+        slug="o1",
+        family="oracle",
+        title="o1",
+        doc_path="docs/hypotheses/o1.md",
+        doc_sha256="o" * 64,
+        params={"costs.per_side_bps": 15.0},
+        in_sample_start=date(2016, 1, 29),
+        holdout_start=HOLDOUT[0],
+        holdout_end=HOLDOUT[1],
+        registered_by="owner",
+        settings=settings,
+    )
+    research.register_experiment(
+        conn, _returns(e1h, "o", family="oracle", dataset_name="other"), "owner"
+    )
+    other = _dataset(conn, tmp_path, name="other")
+    assert (
+        _open(conn, settings, tmp_path, "o", other.dataset_id, flags=SPEND, reasons=WHY).refusal
+        is None
+    )
+    ds = _dataset(conn, tmp_path)
+    mine = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=SPEND, reasons=WHY)
+    assert mine.refusal is None
+    assert conn.execute(
+        "SELECT holdout_repeat FROM research_runs WHERE run_id = ?", [mine.run_id]
+    ).fetchone() == (False,)
+
+
+def test_a_synthetic_spend_is_not_a_repeat(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    _gated(conn, settings, e1h)
+    ds = _dataset(conn, tmp_path)
+    synthetic = _open(
+        conn, settings, tmp_path, "r1", ds.dataset_id, synthetic=True, flags=SPEND, reasons=WHY
+    )
+    assert synthetic.refusal is None
+    real = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=SPEND, reasons=WHY)
+    assert real.refusal is None
+    assert conn.execute(
+        "SELECT holdout_repeat FROM research_runs WHERE run_id = ?", [real.run_id]
+    ).fetchone() == (False,)
+
+
+def test_the_sealed_test_scored_on_one_version_makes_a_redrawn_version_a_repeat(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    research.register_experiment(
+        conn,
+        _variant(
+            e1h,
+            "b1",
+            kind="benchmark",
+            stage=3,
+            splits=("dev", "test"),
+            dataset_name="labels",
+            budget_runs=5,
+            budget_configurations=5,
+        ),
+        "owner",
+    )
+    p2022 = (date(2022, 1, 1), date(2022, 12, 31))
+    v1 = _dataset(
+        conn,
+        tmp_path,
+        name="labels",
+        stem="v1",
+        dates=[date(2018, 3, 1), date(2022, 3, 1)],
+        splits=["dev", "test"],
+        periods=(p2022,),
+        seed=e1h.seed,
+    )
+    assert (
+        _open(
+            conn, settings, tmp_path, "b1", v1.dataset_id, "test", flags=SPEND, reasons=WHY
+        ).refusal
+        is None
+    )
+    v2 = _dataset(
+        conn,
+        tmp_path,
+        name="labels",
+        stem="v2",
+        dates=[date(2018, 3, 1), date(2023, 3, 1)],
+        splits=["dev", "test"],
+        periods=(p2022, (date(2023, 1, 1), date(2023, 12, 31))),
+        seed=e1h.seed,
+    )
+    again = _open(conn, settings, tmp_path, "b1", v2.dataset_id, "test", flags=SPEND, reasons=WHY)
+    assert again.refusal == "refused_holdout"
+    assert "the sealed split was already scored" in str(again.message)
+
+
+def test_a_research_spend_marks_a_later_backtest_holdout_run_a_repeat(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    from tradepartner.backtest import holdout as backtest_holdout
+
+    _gated(conn, settings, e1h)
+    hypothesis = registry.get_hypothesis(conn, "h1")
+    ds = _dataset(conn, tmp_path)
+    spent = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=SPEND, reasons=WHY)
+    (spend,) = registry.family_holdout_spends(conn, "momentum")
+    assert (spend.source, spend.trial_id, spend.hypothesis_id) == (
+        "research_run",
+        spent.run_id,
+        None,
+    )
+    decision = backtest_holdout.decide(
+        backtest_holdout.Window(*HOLDOUT),
+        backtest_holdout.Frozen(
+            hypothesis_id=hypothesis.hypothesis_id,
+            in_sample_start=hypothesis.in_sample_start,
+            holdout_start=hypothesis.holdout_start,
+            holdout_end=hypothesis.holdout_end,
+            gap_count_share_threshold=0.05,
+        ),
+        backtest_holdout.Flags(spend_holdout=True),
+        backtest_holdout.Reasons(holdout_reason="backtest look"),
+        None,
+        [spend],
+    )
+    assert (decision.outcome, decision.holdout_repeat) == ("needs_gap", True)
