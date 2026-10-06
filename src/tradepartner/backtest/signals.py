@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
 import polars as pl
@@ -304,11 +304,14 @@ def gross_profitability(
     5. a non-finite numerator, or a non-positive or non-finite denominator: `malformed`;
     6. otherwise scored numerator / denominator (`ranked` gives rule 6's order).
 
+    A tz-aware `t` in any zone is read as the same instant in UTC.
+
     Raises `ValueError` for a naive `t`, a `basis` other than `gross`, a frame missing
     a column, or a duplicate `(security_id, fact_name, period_end, period_days)` row.
     """
     if t.tzinfo is None or t.utcoffset() is None:
         raise ValueError("t must be tz-aware")
+    t = t.astimezone(UTC)  # `known_at` is UTC; another zone fails polars' comparison
     if basis not in _PROFITABILITY_NUMERATOR:
         raise ValueError(f"profitability basis {basis!r} is not implemented; only 'gross'")
     missing = [c for c in _FACT_COLUMNS_READ if c not in facts.columns]
