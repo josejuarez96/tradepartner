@@ -102,9 +102,12 @@ and are never cached as unstampable for it, counted on
 
 **Statement facts (T77a, #660).** Behind `edgar.statement_facts_enabled`
 (off: no call, no request, no cache). `statement_facts(cik)` reads the same
-company-facts payload as `facts`: whichever of the two meets a stale cache
-first reads the payload once and fills both caches from it (`facts` comes
-first in the ingest's fetch pass). The parsed cache
+company-facts payload as `facts`: a `facts` call that reads the payload
+fills the statement cache from it too, while a `statement_facts` call that
+reads it fills only its own (it does not know the share names asked for),
+so the payload is read once per CIK per run when `facts` is asked first,
+as the ingest's fetch pass asks. A payload `parse_company_facts` refuses is
+recorded once and is absent for both caches. The parsed cache
 `statement_facts/v{STATEMENT_VERSION}/<cik>.json` holds the entries
 `parse_statement_facts` yields with no stamps (unfiltered, unstamped) and
 the conflicts, keyed by the CIK's latest stamped cover-form accession (the
@@ -2204,9 +2207,11 @@ class EdgarFilingSource(FilingSource):
                     for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
                 ]
 
+            recorded = False
             if origin is not None:  # #578: a payload that does not parse is recorded, absent
                 parsed = self.validation_failures.collect(origin, f"CIK{cik}.json", parse)
                 cached, complete = ([], False) if parsed is None else (parsed, complete)
+                recorded = parsed is None
             else:
                 cached = parse()
             self._facts_memo[cik, key] = cached  # one fetch per CIK per run, cached or not
@@ -2217,7 +2222,10 @@ class EdgarFilingSource(FilingSource):
                 and _cached_key(statement_path, cik, STATEMENT_VERSION)
                 != self._statement_key(latest)
             ):  # T77a: the one payload read serves the statement cache too
-                self._fill_statement_cache(cik, stamps, latest, payload, complete, origin)
+                if recorded:  # absent for both caches, and recorded once only
+                    self._fill_statement_cache(cik, stamps, latest, None, False, None)
+                else:
+                    self._fill_statement_cache(cik, stamps, latest, payload, complete, origin)
             if complete:  # else the payload trails the latest filing: fetch again next run
                 rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
                 data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}

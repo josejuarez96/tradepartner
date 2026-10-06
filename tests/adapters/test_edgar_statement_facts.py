@@ -789,6 +789,17 @@ def test_facts_and_statement_facts_share_one_payload_read(tmp_path: Path) -> Non
     assert records and source.statement_conflicts == 1  # counted on the first answer
 
 
+def test_a_payload_both_parsers_refuse_is_recorded_once(tmp_path: Path) -> None:
+    body = _company(CIK, {"Revenues": {"USD": [entry(K2022, FY2022, 1)]}})
+    del body["facts"]["dei"][SHARES]["units"]["shares"][0]["end"]
+    del body["facts"]["us-gaap"]["Revenues"]["units"]["USD"][0]["end"]
+    source = _adapter(_settings(tmp_path), _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, STAMPS)
+    assert source.facts(CIK, [SHARES]) == []
+    assert len(list(source.validation_failures)) == 1
+    assert source.statement_facts(CIK) == [] and source.requests == 1
+
+
 def test_a_trailing_payload_is_cached_under_the_accession_it_reached(tmp_path: Path) -> None:
     """The API payload trails the latest 10-K (holds only `Q2022`): served
     and cached for this run's second call, keyed by `Q2022`, so the next
