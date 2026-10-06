@@ -222,8 +222,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_12() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 12
+def test_current_schema_version_is_13() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 13
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -301,20 +301,20 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
 # --- fresh store ---------------------------------------------------------------------
 
 
-def test_a_fresh_store_has_every_research_table_at_version_12(
+def test_a_fresh_store_has_every_research_table_at_version_13(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [12]
+    assert _versions(conn) == [13]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
 
-def test_init_schema_is_idempotent_on_version_12(conn: duckdb.DuckDBPyConnection) -> None:
+def test_init_schema_is_idempotent_on_version_13(conn: duckdb.DuckDBPyConnection) -> None:
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [12]
+    assert _versions(conn) == [13]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -595,15 +595,18 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12]
+        assert _versions(c) == [10, 11, 12, 13]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]
         schema.require_research(c)
-    # No pre-existing table's DDL text changed but `trial_results`, which only
-    # gained the one nullable column; no row of any table changed.
-    assert {t: s for t, s in ddl_after.items() if t in ddl_before and t != "trial_results"} == {
-        t: s for t, s in ddl_before.items() if t != "trial_results"
+    # No pre-existing table's DDL text changed but `trial_results` (gained
+    # `n_research`, version 12) and `trial_rebalances` (gained
+    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13); no row of any table
+    # changed.
+    _moved = {"trial_results", "trial_rebalances"}
+    assert {t: s for t, s in ddl_after.items() if t in ddl_before and t not in _moved} == {
+        t: s for t, s in ddl_before.items() if t not in _moved
     }
     assert ddl_after["trial_results"] == ddl_before["trial_results"].replace(
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, ",
@@ -611,6 +614,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         "n_research INTEGER, ",
     )
     assert ddl_after["trial_results"] != ddl_before["trial_results"]
+    assert ddl_after["trial_rebalances"] != ddl_before["trial_rebalances"]
     assert rows_after == rows_before
     # And the migrated store is shaped exactly as a fresh one.
     fresh = duckdb.connect(":memory:")
@@ -657,8 +661,8 @@ def test_a_read_only_open_of_a_version_11_store_serves_every_other_read(
         assert _versions(c) == [10, 11]
 
 
-def test_a_read_only_open_of_a_version_12_store_passes(tmp_path: Path) -> None:
-    path = tmp_path / "v12.duckdb"
+def test_a_read_only_open_of_a_version_13_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "v13.duckdb"
     with duckdb.connect(str(path)) as c:
         schema.init_schema(c)
     with duckdb.connect(str(path), read_only=True) as c:

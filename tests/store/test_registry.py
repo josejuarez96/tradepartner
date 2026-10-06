@@ -603,25 +603,74 @@ def test_a_handle_from_another_store_is_refused(
         registry.close_trial(other, handle, "failed")
 
 
-def _rebalance_row() -> registry.RebalanceRow:
-    return registry.RebalanceRow(
-        cost_per_side_bps=15.0,
-        session=date(2018, 1, 31),
-        fill_session=date(2018, 2, 1),
-        n_universe=10,
-        n_static_listings=1,
-        n_targets=2,
-        turnover=0.5,
-        cost_paid=0.001,
-        gap_count_share=0.01,
-        gap_size_share=0.001,
-        n_missing_fill=0,
-        n_delisting_exits=0,
-        n_stale_exits=0,
-        n_excluded_no_history=1,
-        n_dropped_dividends=0,
-        n_late_dividends=0,
+def _rebalance_row(**overrides: Any) -> registry.RebalanceRow:
+    defaults: dict[str, Any] = {
+        "cost_per_side_bps": 15.0,
+        "session": date(2018, 1, 31),
+        "fill_session": date(2018, 2, 1),
+        "n_universe": 10,
+        "n_static_listings": 1,
+        "n_targets": 2,
+        "turnover": 0.5,
+        "cost_paid": 0.001,
+        "gap_count_share": 0.01,
+        "gap_size_share": 0.001,
+        "n_missing_fill": 0,
+        "n_delisting_exits": 0,
+        "n_stale_exits": 0,
+        "n_excluded_no_history": 1,
+        "n_dropped_dividends": 0,
+        "n_late_dividends": 0,
+    }
+    return registry.RebalanceRow(**{**defaults, **overrides})
+
+
+#: `schema.PROFITABILITY_REBALANCE_COLUMNS`, read back in the same order.
+_PROFITABILITY_READER = (
+    "SELECT n_ranked, n_excluded_no_facts, n_excluded_stale_facts, "
+    "n_excluded_sector, n_excluded_malformed, n_derived FROM trial_rebalances "
+    "WHERE trial_id = ?"
+)
+
+
+def test_a_rebalance_row_written_with_the_six_counts_reads_back(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A `profitability` trial's rebalance row carries its ranking and
+    exclusion counts (#720, #1033, T85d)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(
+        conn,
+        handle,
+        [
+            _rebalance_row(
+                n_ranked=58,
+                n_excluded_no_facts=12,
+                n_excluded_stale_facts=3,
+                n_excluded_sector=2,
+                n_excluded_malformed=1,
+                n_derived=4,
+            )
+        ],
     )
+    assert conn.execute(_PROFITABILITY_READER, [handle.trial_id]).fetchall() == [
+        (58, 12, 3, 2, 1, 4)
+    ]
+
+
+def test_a_rebalance_row_written_without_the_six_counts_reads_null(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A `momentum` trial never ranks or excludes by `statement_facts`/`sics`,
+    so its rebalance row leaves the six counts NULL, as it does today
+    (#720, #1033, T85d)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(conn, handle, [_rebalance_row()])
+    assert conn.execute(_PROFITABILITY_READER, [handle.trial_id]).fetchall() == [
+        (None, None, None, None, None, None)
+    ]
 
 
 # --- owner decisions -----------------------------------------------------

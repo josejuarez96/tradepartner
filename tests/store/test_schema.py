@@ -579,9 +579,99 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (12,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (13,)
     finally:
         conn.close()
+
+
+# --- version 13 (#720, #1033, T85d): profitability rebalance columns ----
+
+
+def test_profitability_rebalance_columns_ddl_is_pinned() -> None:
+    """`PROFITABILITY_REBALANCE_COLUMNS` arrive by `ALTER TABLE`
+    (`_migrate_profitability_rebalance_counts`), never by editing
+    `_CREATE_TRIAL_REBALANCES`/`_REGISTRY_TABLE_DDL` in place, so a later
+    registry DDL change still goes to the next schema version."""
+    assert "n_ranked" not in schema._CREATE_TRIAL_REBALANCES
+    assert schema.PROFITABILITY_REBALANCE_COLUMNS == (
+        "n_ranked",
+        "n_excluded_no_facts",
+        "n_excluded_stale_facts",
+        "n_excluded_sector",
+        "n_excluded_malformed",
+        "n_derived",
+    )
+
+
+def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_every_row() -> None:
+    """A store shaped exactly as version 12 left it (no
+    `PROFITABILITY_REBALANCE_COLUMNS`, a `momentum`-shaped `trial_rebalances`
+    row already in it) gains the six nullable columns, NULL on that
+    existing row, and a version-13 row, with nothing else about the row
+    changed."""
+    conn = duckdb.connect(":memory:")
+    try:
+        configure_connection(conn)
+        for ddl in (
+            schema._TABLE_DDL
+            + schema._REGISTRY_TABLE_DDL
+            + schema._JOURNAL_TABLE_DDL
+            + schema._STATEMENT_FACTS_TABLE_DDL
+            + schema._MASTER_UNDERIVED_TABLE_DDL
+            + schema._RESEARCH_TABLE_DDL
+        ):
+            conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO trial_rebalances (trial_id, cost_per_side_bps, session, "
+            "fill_session, n_universe, n_static_listings, n_targets, turnover, "
+            "cost_paid, gap_count_share, gap_size_share, n_missing_fill, "
+            "n_delisting_exits, n_stale_exits, n_excluded_no_history, "
+            "n_dropped_dividends, n_late_dividends) VALUES "
+            "(1, 15.0, '2018-01-31', '2018-02-01', 10, 1, 2, 0.5, 0.001, 0.01, "
+            "0.001, 0, 0, 0, 1, 0, 0)"
+        )
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (12, TIMESTAMPTZ "
+            "'2026-10-05 12:00:00+00')"
+        )
+        columns_before = {
+            row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
+        }
+        assert columns_before.isdisjoint(schema.PROFITABILITY_REBALANCE_COLUMNS)
+        schema.init_schema(conn)
+        columns_after = {
+            row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
+        }
+        assert set(schema.PROFITABILITY_REBALANCE_COLUMNS) <= columns_after
+        rows = conn.execute(
+            "SELECT trial_id, cost_per_side_bps, n_universe, n_ranked, "
+            "n_excluded_no_facts, n_excluded_stale_facts, n_excluded_sector, "
+            "n_excluded_malformed, n_derived FROM trial_rebalances"
+        ).fetchall()
+        assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (13,)
+    finally:
+        conn.close()
+
+
+def test_a_fresh_store_has_the_six_columns_too() -> None:
+    """`_migrate_profitability_rebalance_counts` runs unconditionally after
+    the DDL pass, so a fresh store gets the columns the same way a
+    migrated one does, exactly as `_migrate_n_research` does for
+    `trial_results`."""
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()}
+    assert set(schema.PROFITABILITY_REBALANCE_COLUMNS) <= columns
+    for column in schema.PROFITABILITY_REBALANCE_COLUMNS:
+        info = next(
+            row
+            for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
+            if row[1] == column
+        )
+        _, _, dtype, notnull, _, _ = info
+        assert dtype == "INTEGER"
+        assert not notnull
 
 
 # --- lock-error detection -----------------------------------------------
@@ -975,8 +1065,9 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `overrides.client_order_id`) is version 9; #660's `statement_facts`
     (T76) is version 10 (renumbered from 9 at ready time, T84/#714 landed
     version 9 first); #859's retraction is version 11; the research registry
-    (#926, T80) is version 12."""
-    assert schema.CURRENT_SCHEMA_VERSION == 12
+    (#926, T80) is version 12; the profitability rebalance columns (#720,
+    #1033, T85d) is version 13."""
+    assert schema.CURRENT_SCHEMA_VERSION == 13
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
