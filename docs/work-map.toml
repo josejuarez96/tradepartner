@@ -717,3 +717,29 @@ unblocks = ["phase:3", "phase:4"]
 what = "Write the strategy-lab plan from the accepted spec, with T-numbers, chains for team claims and the dependencies on the research-registry plan."
 why = "Turns the accepted spec into claimable tasks so the lab can be built beside the paper window."
 unblocks = ["plan:strategy-lab"]
+
+[adr.0014]
+what = "Strategies are registered objects: one dispatch seam keyed on the stored family inside run_hypothesis and plan_rebalance, one family registry the config, frozen and hypothesis tables derive from (momentum fallbacks removed), generic per-strategy exclusions and counts, per-family benchmarks; B4 is the proof."
+why = "B3 cost six plan tasks because a family is read by a dozen places on its own; after this the third family is one module plus one registry entry, and the CLI, paper run and tracking re-run agree on which strategy a slug is."
+unblocks = ["plan:strategy-interface", "task:T85e"]
+
+[plan.strategy-interface]
+what = "How the strategy-interface refactor is built: T85e amended into the one seam, then generic exclusions and counts (T127) beside the family registry (T128), per-family benchmarks after the lab's rename (T129), and B4 combined through the registry as the proof (T130)."
+why = "Without a build order the ADR's guarantees (H1's fingerprint unchanged, paper closed to profitability until the path is generic, one seam not two) have no owner and the refactor would race T85c, T85d and T98."
+unblocks = ["phase:3", "phase:4"]
+
+[task.T127]
+what = "Plan.exclusions and the trial_rebalance_counts table; the paper signals.reason rule widens to excluded_<reason>; T85d's six columns migrated into the table."
+why = "The one real schema boundary the spike hit: today a strategy can only report 'no history', and the paper path refuses any other exclusion with a raw ValueError."
+
+[task.T128]
+what = "config.FAMILIES, the one family registry; FAMILY_PARENTS, ENGINE_FAMILIES, PAPER_FAMILIES, FAMILY_SIGNAL_SECTIONS, REQUIRED_SECTIONS and the sweep prefixes derive from it; the momentum fallbacks go."
+why = "An unlisted family today silently freezes, hashes and requires momentum's keys; after this it fails, and the family list lives in one place."
+
+[task.T129]
+what = "The comparison benchmark becomes a registry attribute: momentum keeps MTUM and its metric keys byte for byte; a family may declare another or none."
+why = "Every family is benchmarked against a momentum ETF today; results refuses a trial without MTUM equity."
+
+[task.T130]
+what = "B4 momentum plus profitability combined by fixed equal ranks, landed as one signal module, one registry entry, a Settings section and a fixture twin."
+why = "The proof of ADR 0014: a third family that touches nothing under execution/ or store/, nor engine.py, run.py, results.py or hypothesis.py."
