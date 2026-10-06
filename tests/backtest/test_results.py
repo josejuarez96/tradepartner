@@ -23,7 +23,7 @@ import pytest
 from backtest.fake_provider import FakeProvider
 from tradepartner.backtest import results as results_module
 from tradepartner.backtest.engine import BacktestResult, run
-from tradepartner.backtest.hypothesis import frozen_params_of
+from tradepartner.backtest.hypothesis import frozen_params_of, load_frozen
 from tradepartner.backtest.metrics import (
     EXCESS_SPY_KEYS,
     METRIC_KEYS,
@@ -538,6 +538,40 @@ class TestRefusals:
         with pytest.raises(ValueError, match="frozen"):
             write_results(conn, handle, results, live)
         assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+    def test_a_pre_lab_registration_records_through_the_defaults(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """A registration stored without `schedule.*` (before T96) runs through
+        `load_frozen` and its results are recorded (strategy-lab T96)."""
+        settings = _settings(tmp_path)
+        params = {
+            k: v for k, v in frozen_params_of(settings).items() if not k.startswith("schedule.")
+        }
+        registry.register_hypothesis(
+            conn,
+            slug="h1",
+            family="momentum",
+            title="h1 title",
+            doc_path="docs/hypotheses/h1.md",
+            doc_sha256="d" * 64,
+            params=params,
+            in_sample_start=START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="owner",
+            settings=settings,
+        )
+        frozen = load_frozen(conn, "h1", settings=settings)
+        handle = _open(conn, frozen, tmp_path)
+        write_results(conn, handle, _run(frozen, handle), frozen)
+        assert _count(conn, "trial_metrics", handle.trial_id) > 0
+        daily = frozen.model_copy(
+            update={"schedule": frozen.schedule.model_copy(update={"rebalance_cadence": "daily"})}
+        )
+        handle2 = _open(conn, frozen, tmp_path)
+        with pytest.raises(ValueError, match="frozen"):
+            write_results(conn, handle2, _run(frozen, handle2), daily)
 
     def test_missing_benchmark_is_refused(
         self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
