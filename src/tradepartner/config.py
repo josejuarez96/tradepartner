@@ -209,7 +209,13 @@ class EdgarConfig(BaseModel):
     `requests_per_second` defaults to 9, not 10 (#656, research #572 E3):
     SEC's 10 req/s is a ceiling, not a target; secedgar users saw 429s at
     9.7 req/s and edgartools defaults to 9.
+
+    An unknown key is refused when the model is validated (#1037), so a
+    mistyped `EDGAR__...` override fails instead of being silently ignored
+    (`model_copy(update=...)` does not validate).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
     requests_per_second: float = Field(default=9.0, gt=0)
@@ -265,15 +271,19 @@ class EdgarConfig(BaseModel):
     # fact name to its ordered `taxonomy:tag` fallbacks (the order is the
     # precedence within one filing); `statement_forms` filters on the
     # submissions record's form, never the companyfacts entry's; only
-    # `statement_units` are read, any other unit is skipped and counted.
+    # `statement_units` are read, any other unit is skipped and counted. None of
+    # the three may be empty, nor any fact's fallback list (#1037): an empty one
+    # would silently read no statement facts at all.
     statement_facts_enabled: bool = False
-    statement_tags: dict[str, list[str]] = Field(
-        default_factory=lambda: {name: list(tags) for name, tags in _STATEMENT_TAGS.items()}
+    statement_tags: dict[str, Annotated[list[str], Field(min_length=1)]] = Field(
+        default_factory=lambda: {name: list(tags) for name, tags in _STATEMENT_TAGS.items()},
+        min_length=1,
     )
     statement_forms: list[str] = Field(
-        default_factory=lambda: ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
+        default_factory=lambda: ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"],
+        min_length=1,
     )
-    statement_units: list[str] = Field(default_factory=lambda: ["USD"])
+    statement_units: list[str] = Field(default_factory=lambda: ["USD"], min_length=1)
 
     @field_validator("statement_tags")
     @classmethod
@@ -1240,10 +1250,14 @@ class ResearchConfig(BaseModel):
 class Settings(BaseSettings):
     """Root application settings, loaded from env vars and an optional `.env`."""
 
+    # `hide_input_in_errors` (#1037): a nested model with `extra="forbid"` would
+    # otherwise print a stray key's value, which may be a secret set under a
+    # mistyped name; the error still names the key and the rule.
     model_config = SettingsConfigDict(
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
