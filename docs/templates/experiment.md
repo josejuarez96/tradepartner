@@ -54,6 +54,7 @@ family = "<from hypotheses.families, required when touches_returns>"
 claims = ["<claim id>", "..."]
 hypothesis_ref = "<optional: docs/hypotheses slug or backlog id such as B5>"
 seed = <published seed, integer>
+splits = ["<dev|cal|test|prospective|pilot|full|none>", "..."]
 
 [dataset]
 name = "<dataset name, registered separately with `dataset register`>"
@@ -62,8 +63,6 @@ name = "<dataset name, registered separately with `dataset register`>"
 [window]
 start = YYYY-MM-DD
 end = YYYY-MM-DD
-
-splits = ["<dev|cal|test|prospective|pilot|full|none>", "..."]
 
 [primary]
 metric = "<metric name>"
