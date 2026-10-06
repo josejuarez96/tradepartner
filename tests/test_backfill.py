@@ -1266,11 +1266,11 @@ def test_a_rename_gap_inside_a_month_with_stored_bars_is_a_hole(settings: Settin
     assert [hole.rename_gap for hole in found.holes] == [True]
     assert found.summary() == (
         "1 holes (security, month) over 1 securities in 1 months; 0 of them between a "
-        "security's stored bars (0 securities); 1 of them rename gaps in a month with "
+        "security's stored bars (0 securities); 1 of them lead gaps in a month with "
         "stored bars"
     )
     assert found.lines() == [
-        f"  {ACME} ACMX: 2019-06 (1 months, 0 between its stored bars, 1 rename gaps)"
+        f"  {ACME} ACMX: 2019-06 (1 months, 0 between its stored bars, 1 lead gaps)"
     ]
 
 
@@ -1283,7 +1283,7 @@ def test_a_rename_gap_fill_stores_each_session_once_at_its_close(settings: Setti
     assert [r.status for r in result.runs] == [FILLED], result.runs
     assert prices.fetched == {date(2019, 6, 1): {ACME, SPY}}
     assert result.runs[0].message.startswith(
-        "holes of 0 names with no stored bar and 1 with a rename gap: "
+        "holes of 0 names with no stored bar and 1 with a lead gap: "
     )
     rows = _read(
         settings,
@@ -1365,3 +1365,111 @@ def test_a_missing_session_the_old_symbol_traded_after_is_no_rename_gap(
     _drop_bars(settings, ACME, GAP)
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
     assert _holes(found) == [(ACME, JUNE_WINDOW)]
+
+
+# --- first-span lead months (#974) ---------------------------------------------
+
+FIRST_LED = "0000000031"  # first filing 2018-03-05; first cover page naming LEDY 2019-06-20
+LED_COVER = date(2019, 6, 20)
+APRIL_WINDOW = (SINCE, date(2019, 4, 30))
+
+
+def _with_first_span(**kwargs: Any) -> Any:
+    """`_filings` plus FIRST_LED, whose first ticker-bearing cover page
+    (LEDY, 2019-06-20) comes long after its first filing: LEDY leads to it
+    from 2018-03-05 (#974)."""
+    first, accession = f"{FIRST_LED}-18-000001", f"{FIRST_LED}-19-000001"
+    cover = _at(2019, 6, 20)
+    return _filings(
+        extra_index=[
+            FilingIndexEntry(FIRST_LED, "Led Co", "10-K", first, _at(2018, 3, 5)),
+            FilingIndexEntry(FIRST_LED, "Led Co", "10-Q", accession, cover),
+        ],
+        extra_headers=[FilingHeader(FIRST_LED, accession, "10-Q", 3571, cover)],
+        extra_covers=[
+            CoverPage(FIRST_LED, accession, cover, (CoverListing("Common Stock", "LEDY", "NYSE"),))
+        ],
+        **kwargs,
+    )
+
+
+def _led_store(settings: Settings) -> None:
+    """A backfill with FIRST_LED, then the store loses its bars before the
+    cover page, as a backfill before #974 left it: April and May empty, June
+    from the cover page on."""
+    assert _backfill(_loose(settings), _History(), filings=_with_first_span()).ok
+    _drop_bars(settings, FIRST_LED, (SINCE, LED_COVER - timedelta(days=1)))
+
+
+def test_the_backfill_fetches_a_led_id_in_the_months_its_lead_covers(settings: Settings) -> None:
+    prices = _History()
+    assert _backfill(_loose(settings), prices, filings=_with_first_span()).ok
+    assert all(FIRST_LED in ids for ids in prices.fetched.values())
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{FIRST_LED}' "
+        "ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(SINCE, JUNE_WINDOW[1])
+    assert all(known == bar_known_at(s) for s, known in rows)  # no look-ahead
+
+
+def test_a_dry_run_lists_a_led_ids_empty_months_and_its_partial_month(
+    settings: Settings,
+) -> None:
+    _led_store(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [
+        (FIRST_LED, APRIL_WINDOW),
+        (FIRST_LED, MAY_WINDOW),
+        (FIRST_LED, JUNE_WINDOW),
+    ]
+    assert [hole.rename_gap for hole in found.holes] == [False, False, True]
+    assert found.summary().endswith("; 1 of them lead gaps in a month with stored bars")
+    assert found.lines() == [
+        f"  {FIRST_LED} LEDY: 2019-04..2019-06 (3 months, 0 between its stored bars, 1 lead gaps)"
+    ]
+
+
+def test_a_led_fill_stores_each_session_once_at_its_close(settings: Settings) -> None:
+    _led_store(settings)
+    result = fill_holes(
+        _loose(settings),
+        prices=_History(),
+        since=SINCE,
+        clock=_ticking(LATER, timedelta(minutes=1)),
+    )
+    assert [r.status for r in result.runs] == [FILLED] * 3, result.runs
+    assert "1 with a lead gap" in result.runs[-1].message
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{FIRST_LED}' "
+        "ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(SINCE, JUNE_WINDOW[1])  # each session once
+    assert all(known == bar_known_at(s) for s, known in rows)
+    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert again.holes == ()
+
+
+def test_named_securities_limit_the_led_holes(settings: Settings) -> None:
+    _led_store(settings)
+    _drop_bars(settings, DUAL, MAY_WINDOW)
+    only_dual = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[DUAL],
+    )
+    assert _holes(only_dual) == [(DUAL, MAY_WINDOW)]
+    only_led = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[FIRST_LED],
+    )
+    assert {sid for sid, _ in _holes(only_led)} == {FIRST_LED}

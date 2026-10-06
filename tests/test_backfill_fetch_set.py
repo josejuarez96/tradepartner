@@ -36,6 +36,7 @@ from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.backfill import _window_names, fill_holes
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, _read
+from tradepartner.repair import store_resolver
 
 SPAC = "0000000005"  # SIC 6770: every class id of it is typed spac
 SPAC_WARRANTS = f"{SPAC}:redeemable-warrants"
@@ -96,9 +97,16 @@ def _with_non_equity(**kwargs: object) -> FixtureFilingSource:
 
 
 def _fetch_set(settings: Settings, window: tuple[date, date]) -> list[str]:
+    return _window(settings, window)[0]
+
+
+def _window(settings: Settings, window: tuple[date, date]) -> tuple[list[str], list[str]]:
+    """The fetch set and the staleness denominator of `window` at `LATER`,
+    with the store's resolver then, as `_price_chunk` builds it."""
     with _read(settings) as conn:
-        ids, *_ = _window_names(conn, LATER, window, settings)
-    return ids
+        resolver = store_resolver(conn, LATER, settings)
+        ids, listed, *_ = _window_names(conn, LATER, window, settings, resolver)
+    return ids, listed
 
 
 def test_non_equity_rows_typed_spac_or_depositary_are_not_fetched(settings: Settings) -> None:
@@ -152,3 +160,70 @@ def test_a_row_superseded_before_the_month_is_not_fetched(settings: Settings) ->
         dry_run=True,
     )
     assert found.holes == ()
+
+
+# --- the first-span lead's months (#974) --------------------------------------
+
+LED = "0000000021"  # first filing 2016-03-01, first cover page naming LEDX 2019-03-15
+REUSED = "0000000022"  # first span OLDT, which OLDCO listed from 2017-01-05
+OLDCO = "0000000023"
+OTC_LED = "0000000024"  # its first span is on OTC
+JUNE_2017 = (date(2017, 6, 1), date(2017, 6, 30))
+
+
+def _with_first_spans(**kwargs: object) -> FixtureFilingSource:
+    """`_filings` plus companies whose first ticker-bearing cover page
+    (2019-03-15) is years after their first filing (2016): LED leads LEDX
+    back to 2016; REUSED's OLDT is refused (OLDCO lists OLDT from 2017);
+    OTC_LED's first span is on OTC."""
+    index, headers, covers = [], [], []
+    for cik, ticker, exchange, first in (
+        (LED, "LEDX", "NYSE", _at(2016, 3, 1)),
+        (REUSED, "OLDT", "NYSE", _at(2016, 3, 2)),
+        (OTC_LED, "OTCX", "OTC", _at(2016, 3, 3)),
+    ):
+        index.append(FilingIndexEntry(cik, f"Co {cik}", "10-K", f"{cik}-16-000001", first))
+        accession = f"{cik}-19-000001"
+        cover = _at(2019, 3, 15)
+        index.append(FilingIndexEntry(cik, f"Co {cik}", "10-K", accession, cover))
+        headers.append(FilingHeader(cik, accession, "10-K", 3571, cover))
+        covers.append(
+            CoverPage(cik, accession, cover, (CoverListing("Common Stock", ticker, exchange),))
+        )
+    old = f"{OLDCO}-17-000001"
+    index.append(FilingIndexEntry(OLDCO, "Old Co", "10-K", old, _at(2017, 1, 5)))
+    headers.append(FilingHeader(OLDCO, old, "10-K", 3571, _at(2017, 1, 5)))
+    covers.append(
+        CoverPage(OLDCO, old, _at(2017, 1, 5), (CoverListing("Common Stock", "OLDT", "NYSE"),))
+    )
+    return _filings(
+        extra_index=index,
+        extra_headers=headers,
+        extra_covers=covers,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _first_span_lead_off(settings: Settings) -> Settings:
+    alpaca = settings.alpaca.model_copy(update={"first_span_lead": False})
+    return settings.model_copy(update={"alpaca": alpaca})
+
+
+def test_a_month_inside_a_first_span_lead_fetches_the_led_id(settings: Settings) -> None:
+    assert _backfill(settings, _History(), filings=_with_first_spans()).ok
+    ids, listed = _window(settings, JUNE_2017)
+    assert LED in ids
+    assert REUSED not in ids  # refused: OLDCO's OLDT covers the window
+    assert OTC_LED not in ids  # an OTC first span is never fetched
+    assert LED not in listed  # no listing of it known in the month: never counted
+    with _read(settings) as conn:
+        resolver = store_resolver(conn, LATER, settings)
+    assert resolver.lead("OLDT", date(2016, 6, 1)) is None
+    assert resolver.lead("OTCX", date(2017, 6, 1)) == OTC_LED  # led, but on OTC
+    assert resolver.report.first_span_refused == 1
+
+
+def test_the_switch_off_fetches_no_led_id(settings: Settings) -> None:
+    assert _backfill(settings, _History(), filings=_with_first_spans()).ok
+    ids, _ = _window(_first_span_lead_off(settings), JUNE_2017)
+    assert not {LED, REUSED, OTC_LED} & set(ids)
