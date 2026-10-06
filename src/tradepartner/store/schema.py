@@ -179,7 +179,27 @@ registry; #83 took version 2 first, so the registry is version 3):
   working, a research read raises `ResearchNotInitialised`
   (`require_research`, which the research readers call first) and a
   `trial_results.n_research` read fails on the missing column.
-- **A later DDL change goes to version 13**, with its own migration and a
+- **Version 13** (#720, #1033, T85d; profitability amendment #1033 B3): the
+  six `PROFITABILITY_REBALANCE_COLUMNS` on `trial_rebalances` — `n_ranked`,
+  `n_excluded_no_facts`, `n_excluded_stale_facts`, `n_excluded_sector`,
+  `n_excluded_malformed` and `n_derived` (each nullable `INTEGER`), the
+  `profitability` family's per-rebalance ranking and exclusion counts.
+  Purely additive, like version 12: the migration from version 12 (or any
+  earlier migratable version, after its own steps) adds the six columns by
+  `ALTER TABLE` so the pinned `_REGISTRY_TABLE_DDL` never changes (NULL on
+  every existing row; a fresh store gets the columns the same way), and
+  appends a version-13 row; no fact, journal, research or other registry
+  table changes. `store.registry.write_rebalances` can write the six counts
+  for a `profitability` trial's rows and leaves them NULL for a `momentum`
+  one (`store.registry.RebalanceRow`'s six new fields are optional,
+  defaulting to `None`; the engine itself does not fill them yet — T85e).
+  Any writing `init_schema` migrates, so the owner's
+  store takes version 13 at its first writing job after this version is
+  pulled. A read-only connection accepts a version-12 store without
+  migrating it: every other read keeps working; a read of the six columns
+  there fails on the missing columns, same as `n_research` on a
+  version-11 store.
+- **A later DDL change goes to version 14**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -353,7 +373,18 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   migratable version, after its steps) creates the tables, adds the column
 #:   by `ALTER TABLE` (NULL on every existing row) and appends a version-12
 #:   row; no fact, journal or other registry table changes.
-CURRENT_SCHEMA_VERSION = 12
+#: - 13 (#720, #1033, T85d): `trial_rebalances` gains the six
+#:   `PROFITABILITY_REBALANCE_COLUMNS` (nullable `INTEGER`): the
+#:   `profitability` family's per-rebalance `n_ranked` and its five
+#:   `n_excluded_*`/`n_derived` exclusion counts. Additive, like version 12:
+#:   the migration from version 12 (or any earlier migratable version, after
+#:   its steps) adds the six columns by `ALTER TABLE` (NULL on every existing
+#:   row, and on every `momentum` row going forward) and appends a
+#:   version-13 row; no fact, journal, research or other registry table
+#:   changes.
+#: - A later DDL change goes to version 14, with its own migration and a
+#:   note here, never a silent edit of the DDL below.
+CURRENT_SCHEMA_VERSION = 13
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -398,6 +429,11 @@ _PRE_RETRACTION_VERSION = 10
 #: .n_research` (#926, T80): read-only connections serve every other read; a
 #: research read there raises `ResearchNotInitialised` (`require_research`).
 _PRE_RESEARCH_VERSION = 11
+
+#: The last version without `PROFITABILITY_REBALANCE_COLUMNS` on
+#: `trial_rebalances` (#720, #1033, T85d): read-only connections serve every
+#: other read; a read of the six columns there fails on the missing columns.
+_PRE_PROFITABILITY_VERSION = 12
 
 
 class SchemaVersionError(RuntimeError):
@@ -1865,6 +1901,22 @@ _RESEARCH_TABLE_DDL: tuple[str, ...] = (
 #: `_REGISTRY_TABLE_DDL` never changes.
 N_RESEARCH_COLUMN = "n_research"
 
+#: The six columns version 13 adds to `trial_rebalances` (#720, #1033, T85d):
+#: the `profitability` family's per-rebalance ranking and exclusion counts,
+#: NULL on every row written before the migration and on every `momentum`
+#: row (that family never reads `statement_facts` or `sics`, so it never has
+#: these counts). Added by `ALTER TABLE` after the DDL pass
+#: (`_migrate_profitability_rebalance_counts`), so the pinned
+#: `_REGISTRY_TABLE_DDL` never changes.
+PROFITABILITY_REBALANCE_COLUMNS: tuple[str, ...] = (
+    "n_ranked",
+    "n_excluded_no_facts",
+    "n_excluded_stale_facts",
+    "n_excluded_sector",
+    "n_excluded_malformed",
+    "n_derived",
+)
+
 
 def require_research(conn: duckdb.DuckDBPyConnection) -> None:
     """Raise `ResearchNotInitialised` unless every `RESEARCH_TABLE_NAMES` table
@@ -1917,6 +1969,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_STATEMENT_FACTS_VERSION,
         _PRE_RETRACTION_VERSION,
         _PRE_RESEARCH_VERSION,
+        _PRE_PROFITABILITY_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -1925,7 +1978,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # every read but `statement_facts`; version 10 every read (no
         # `retracted` column: no retraction, see `has_retracted`); version 11
         # every read but the research tables (`require_research` raises
-        # `ResearchNotInitialised`) and `trial_results.n_research`.
+        # `ResearchNotInitialised`) and `trial_results.n_research`; version 12
+        # every read but `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2197,20 +2251,42 @@ def _migrate_retracted(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
 
 
+def _add_nullable_int_columns(
+    conn: duckdb.DuckDBPyConnection, table: str, columns: tuple[str, ...]
+) -> None:
+    """Add each name in `columns` to `table` as a nullable `INTEGER` where
+    missing, by `ALTER TABLE` (NULL on every existing row). Idempotent: a
+    column already present is left alone. Shared by `_migrate_n_research`
+    and `_migrate_profitability_rebalance_counts`, whose own docstrings carry
+    each column's schema-version story; this helper has none of its own.
+    Runs inside `init_schema`'s transaction, after its DDL pass."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    for column in columns:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} INTEGER")
+
+
 def _migrate_n_research(conn: duckdb.DuckDBPyConnection) -> None:
     """Add `trial_results.n_research INTEGER` (nullable, NULL on every existing
     row) where it is missing (module docstring, "Schema versions", version 12).
     `_REGISTRY_TABLE_DDL` keeps its version-4 pin, so a fresh store gets the
-    column here too. Idempotent: a table that has the column is left alone.
-    Runs inside `init_schema`'s transaction, after its DDL pass."""
-    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_results')").fetchall()}
-    if N_RESEARCH_COLUMN not in columns:
-        conn.execute(f"ALTER TABLE trial_results ADD COLUMN {N_RESEARCH_COLUMN} INTEGER")
+    column here too. Runs inside `init_schema`'s transaction, after its DDL
+    pass."""
+    _add_nullable_int_columns(conn, "trial_results", (N_RESEARCH_COLUMN,))
+
+
+def _migrate_profitability_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add each of `PROFITABILITY_REBALANCE_COLUMNS` to `trial_rebalances`
+    (nullable `INTEGER`, NULL on every existing row) where missing (module
+    docstring, "Schema versions", version 13). `_REGISTRY_TABLE_DDL` keeps its
+    version-4 pin, so a fresh store gets the columns here too. Runs inside
+    `init_schema`'s transaction, after its DDL pass."""
+    _add_nullable_int_columns(conn, "trial_rebalances", PROFITABILITY_REBALANCE_COLUMNS)
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 11 store to version 12.
+    version-2 to 12 store to version 13.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2222,39 +2298,43 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; every store gets the research-registry tables
-    created and `trial_results.n_research` added (NULL on every existing row),
-    and a version-11 store a version-12 row (#926, T80); every store gets
-    `securities` and `listings` rebuilt with `retracted` (every row kept,
-    `FALSE`) and `master_underived` created, and a version-10 store a
-    version-11 row (#859); a version-9 store gets `statement_facts`
-    created and a version-10 row (purely additive, #660); a version-8
-    store gets that after `order_events` and `overrides` are rebuilt with
-    the version-9 sets and column (every row kept) and a version-9 row; a
-    version-7 store gets that after `resume_invocations` is rebuilt with
-    `accept_rejections` (every row kept, `FALSE`) and the
-    `resume_acceptances` table created, and version-8 to version-10 rows;
-    a version-6 store gets `decisions` rebuilt with the reason `CHECK`
-    (every row kept) before that, and version-7 to version-10 rows; a
-    version-5 store gets `order_events` rebuilt likewise before that, and
-    version-6 to version-10 rows; a version-4 store gets the journal
-    tables and version-5 to version-10 rows; a version-3 store gets that
-    plus `corporate_actions` rebuilt with the version-4 columns (every row
-    kept) and a version-4 row; a version-2 store gets all of that plus the
-    registry tables and a version-3 row. Nothing else changes (module
-    docstring, "Schema versions").
+    `CURRENT_SCHEMA_VERSION`; every store gets `trial_rebalances`'s six
+    `PROFITABILITY_REBALANCE_COLUMNS` added (NULL on every existing row),
+    and a version-12 store a version-13 row (#720, #1033, T85d); every store
+    gets the research-registry tables created and `trial_results.n_research`
+    added (NULL on every existing row), and a version-11 store a version-12
+    row (#926, T80); every store gets `securities` and `listings` rebuilt
+    with `retracted` (every row kept, `FALSE`) and `master_underived`
+    created, and a version-10 store a version-11 row (#859); a version-9
+    store gets `statement_facts` created and a version-10 row (purely
+    additive, #660); a version-8 store gets that after `order_events` and
+    `overrides` are rebuilt with the version-9 sets and column (every row
+    kept) and a version-9 row; a version-7 store gets that after
+    `resume_invocations` is rebuilt with `accept_rejections` (every row
+    kept, `FALSE`) and the `resume_acceptances` table created, and
+    version-8 to version-10 rows; a version-6 store gets `decisions`
+    rebuilt with the reason `CHECK` (every row kept) before that, and
+    version-7 to version-10 rows; a version-5 store gets `order_events`
+    rebuilt likewise before that, and version-6 to version-10 rows; a
+    version-4 store gets the journal tables and version-5 to version-10
+    rows; a version-3 store gets that plus `corporate_actions` rebuilt with
+    the version-4 columns (every row kept) and a version-4 row; a
+    version-2 store gets all of that plus the registry tables and a
+    version-3 row. Nothing else changes (module docstring, "Schema
+    versions").
 
-    On a read-only connection no DDL runs: a version-12, 11, 10, 9, 8, 7, 6 or
-    5 store passes (a version-11 store serves every read but the research
-    tables, which `require_research` reports as `ResearchNotInitialised`, and
-    `trial_results.n_research`; a version-9 store serves every read but
-    `statement_facts`, missing there as a pre-journal store's journal
-    tables are; a version-8 store serves every read but `overrides`,
-    which needs `client_order_id`), and so does a version-4 store (fact
-    and registry reads work; the journal
-    tables are absent, which `store.journal` reports); a version-2 or
-    uninitialised store raises `RegistryNotInitialised`, and a version-3
-    store raises `SchemaVersionError`.
+    On a read-only connection no DDL runs: a version-13, 12, 11, 10, 9, 8, 7,
+    6 or 5 store passes (a version-12 store serves every read but
+    `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`; a version-11
+    store serves every read but the research tables, which `require_research`
+    reports as `ResearchNotInitialised`, and `trial_results.n_research`; a
+    version-9 store serves every read but `statement_facts`, missing there
+    as a pre-journal store's journal tables are; a version-8 store serves
+    every read but `overrides`, which needs `client_order_id`), and so does
+    a version-4 store (fact and registry reads work; the journal tables are
+    absent, which `store.journal` reports); a version-2 or uninitialised
+    store raises `RegistryNotInitialised`, and a version-3 store raises
+    `SchemaVersionError`.
 
     Raises `SchemaVersionError` if the store records any other version:
     this module has no migration from it, so operating on a store shaped
@@ -2277,6 +2357,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_STATEMENT_FACTS_VERSION,
         _PRE_RETRACTION_VERSION,
         _PRE_RESEARCH_VERSION,
+        _PRE_PROFITABILITY_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2313,6 +2394,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             conn.execute(ddl)
         _migrate_retracted(conn)
         _migrate_n_research(conn)
+        _migrate_profitability_rebalance_counts(conn)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1

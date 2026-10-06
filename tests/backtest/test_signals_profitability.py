@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import ast
 import math
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -130,6 +131,33 @@ def test_row_known_exactly_at_t_is_used() -> None:
 def test_naive_t_raises() -> None:
     with pytest.raises(ValueError, match="tz-aware"):
         run([gp("A", 40.0), ta("A", 200.0)], t=T.replace(tzinfo=None))
+
+
+@pytest.mark.parametrize("zone", ["America/New_York", "Asia/Tokyo"])
+def test_non_utc_t_is_read_as_the_same_instant(zone: str) -> None:
+    # #1051: a tz-aware close in another zone (Tokyo's wall date is the next day) is
+    # the same instant as the UTC close; `known_at <= t` holds at it and a row one
+    # second later stays unseen.
+    t_local = T.astimezone(ZoneInfo(zone))
+    late = T + timedelta(seconds=1)
+    rows = [
+        gp("A", 40.0, known_at=T),
+        ta("A", 200.0, known_at=T),
+        gp("B", 10.0, known_at=late),
+        ta("B", 100.0, known_at=late),
+    ]
+    sig = run(rows, t=t_local)
+    assert sig == run(rows)
+    assert sig.scores == {"A": pytest.approx(0.2)}
+    assert sig.excluded["no_facts"] == ("B",)
+
+
+def test_t_out_of_utc_range_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="out of the range"):
+        run(
+            [gp("A", 40.0), ta("A", 200.0)],
+            t=datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))),
+        )
 
 
 def test_no_look_ahead_future_rows_never_change_the_result() -> None:
