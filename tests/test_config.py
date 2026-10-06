@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import get_args
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from tradepartner.config import (
     ALLOWED_AXIS_PREFIXES,
@@ -22,13 +22,18 @@ from tradepartner.config import (
     FORBIDDEN_AXIS_PREFIXES,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
+    AlpacaConfig,
+    CostsConfig,
+    EdgarConfig,
     ExecutionConfig,
     HypothesisFamily,
     PaperConfig,
+    RiskConfig,
     Settings,
     _default_env_file,
     _settings_has_key,
     clean_message,
+    render_validation_errors,
 )
 
 
@@ -245,6 +250,99 @@ def test_edgar_unknown_dotenv_key_is_refused_without_echoing_its_value(
     with pytest.raises(ValidationError, match="user_agent") as excinfo:
         Settings(_env_file=env_file)
     assert "owner-secret" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", ["REQUESTS_PER_SECOND", "RETRY_BACKOFF_CAP_SECONDS"])
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan"])
+def test_edgar_refuses_non_finite_floats(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: str
+) -> None:
+    """#1093: `inf` passed `gt=0`, so `requests_per_second=inf` meant no SEC throttle."""
+    monkeypatch.setenv(f"EDGAR__{field}", value)
+    with pytest.raises(ValidationError, match=field.lower()):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("model", "data"),
+    [
+        (EdgarConfig, {"user_agent": "MARKER-VALUE"}),
+        (CostsConfig, {"per_side_bps": "MARKER-VALUE"}),
+        (RiskConfig, {"max_orders_per_run": "MARKER-VALUE"}),
+        (AlpacaConfig, {"symbols_per_request": "MARKER-VALUE"}),
+    ],
+    ids=["edgar-extra", "costs", "risk", "alpaca"],
+)
+def test_section_validated_on_its_own_hides_input_values(
+    model: type[BaseModel], data: dict[str, object]
+) -> None:
+    """#1093: a section validated outside `Settings` (`CostsConfig` and `RiskConfig`
+    in `execution/`) names the field and rule, never the value."""
+    with pytest.raises(ValidationError) as excinfo:
+        model.model_validate(data)
+    assert "MARKER-VALUE" not in str(excinfo.value)
+
+
+def _config_models() -> list[type[BaseModel]]:
+    import tradepartner.config as config_module
+
+    return [
+        obj
+        for obj in vars(config_module).values()
+        if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel
+    ]
+
+
+def test_no_config_validator_reads_a_secret_field() -> None:
+    """#1093: custom validators format their value into their own message, which
+    `hide_input_in_errors` does not hide; so none may validate a `SecretStr` field,
+    and no model holding one has a `@model_validator` (its error carries the whole
+    input). `Settings`' own checks run after construction and name env vars only.
+    Not covered: a validator on a plain field reading a secret via `ValidationInfo.data`
+    (reviewers read diffs for that)."""
+    holders = {}
+    for model in _config_models():
+        secret_fields = {
+            name for name, info in model.model_fields.items() if "SecretStr" in str(info.annotation)
+        }
+        decorators = model.__pydantic_decorators__
+        for validator in decorators.field_validators.values():
+            checked = set(validator.info.fields)
+            reaches_secret = "*" in checked or secret_fields & checked
+            assert not (secret_fields and reaches_secret), (model, validator)
+        if secret_fields:
+            holders[model] = secret_fields
+            assert not decorators.model_validators, model
+            for name in secret_fields:  # `Annotated[SecretStr, AfterValidator(...)]` too
+                metadata = model.model_fields[name].metadata
+                assert not [m for m in metadata if type(m).__name__.endswith("Validator")], name
+    # Not vacuous: the secrets are found where they live.
+    assert {"alpaca_api_secret", "sec_edgar_user_agent"} <= holders.get(Settings, set())
+
+
+def test_render_validation_errors_shows_input_only_where_allowed() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        CostsConfig.model_validate({"per_side_bps": -1.0, "sensitivity_per_side_bps": [5.0, -2.0]})
+    shown = render_validation_errors(excinfo.value, show_input=lambda _key: True)
+    assert "per_side_bps = -1.0:" in shown
+    assert "sensitivity_per_side_bps.1 = -2.0:" in shown
+    hidden = render_validation_errors(excinfo.value, show_input=lambda _key: False)
+    assert "-1.0" not in hidden and "-2.0" not in hidden
+
+
+@pytest.mark.parametrize("value", ["10.5", "1e12"])
+def test_edgar_requests_per_second_is_capped_at_secs_ceiling(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """#1108: a large finite rate would shrink `edgar_raw`'s interval toward 0."""
+    monkeypatch.setenv("EDGAR__REQUESTS_PER_SECOND", value)
+    with pytest.raises(ValidationError, match="requests_per_second"):
+        Settings(_env_file=None)
+
+
+def test_edgar_requests_per_second_accepts_secs_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EDGAR__REQUESTS_PER_SECOND", "10")
+    assert Settings(_env_file=None).edgar.requests_per_second == 10.0
 
 
 def test_edgar_failure_policy_defaults() -> None:

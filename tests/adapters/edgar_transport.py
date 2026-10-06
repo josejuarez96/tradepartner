@@ -33,14 +33,20 @@ _Route = Callable[[httpx.Request], httpx.Response]
 
 
 def edgar_settings(cache_dir: Path, **edgar: Any) -> Settings:
-    """Test settings: index from 2024, throttle negligible, cache in `cache_dir`."""
-    overrides: dict[str, Any] = {
-        "index_first_year": 2024,
-        "requests_per_second": 1e6,
-        "cache_dir": str(cache_dir),
-        **edgar,
-    }
-    return Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT, edgar=overrides)
+    """Test settings: index from 2024, throttle negligible, cache in `cache_dir`.
+
+    `edgar.requests_per_second` is capped at SEC's 10 (#1108), so the negligible
+    throttle is set past validation with `model_copy`."""
+    overrides: dict[str, Any] = {"index_first_year": 2024, "cache_dir": str(cache_dir), **edgar}
+    settings = Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT, edgar=overrides)
+    return unthrottled(settings) if "requests_per_second" not in edgar else settings
+
+
+def unthrottled(settings: Settings) -> Settings:
+    """`settings` with a negligible EDGAR throttle (1e6 req/s), past the config's
+    `le=10` (#1108). Tests only: the fake transport is not SEC."""
+    edgar = settings.edgar.model_copy(update={"requests_per_second": 1e6})
+    return settings.model_copy(update={"edgar": edgar})
 
 
 def load(name: str) -> Any:

@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
-from edgar_transport import USER_AGENT, edgar_settings, index_header
+from edgar_transport import USER_AGENT, edgar_settings, index_header, unthrottled
 from test_edgar_failures import _fsn_settings, _one_bad_period_zip
 from test_edgar_fsn import (
     _fsn_zip_bytes,
@@ -554,11 +554,13 @@ def _ingest_with_store(tmp_path: Path, *, accepted: bool) -> str:
     }
     _store_path(settings).write_text(json.dumps({"version": FAILURES_VERSION, "entries": entries}))
     source = EdgarFilingSource(settings, client=router.client(), clock=lambda: now)
-    store_settings = Settings(
-        _env_file=None,
-        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
-        edgar=settings.edgar.model_dump(),
-        sec_edgar_user_agent=settings.sec_edgar_user_agent,
+    store_settings = unthrottled(
+        Settings(
+            _env_file=None,
+            store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+            edgar=settings.edgar.model_dump(exclude={"requests_per_second"}),
+            sec_edgar_user_agent=settings.sec_edgar_user_agent,
+        )
     )
     [run] = ingest_session(
         store_settings, prices=_NoPrices(), filings=source, source="edgar", clock=lambda: now
