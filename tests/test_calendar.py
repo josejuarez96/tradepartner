@@ -416,3 +416,15 @@ def test_rebalance_sessions_between_partial_periods_and_bad_windows() -> None:
         tp_calendar.rebalance_sessions_between(
             datetime(2024, 1, 1, tzinfo=UTC), date(2024, 2, 1), "daily"
         )
+
+
+@pytest.mark.parametrize("cadence", ["month_end", "week_end", "daily"])
+def test_rebalance_sessions_between_refuses_a_window_past_the_calendar_range(
+    cadence: str,
+) -> None:
+    with pytest.raises(ValueError, match="outside the configured calendar range"):
+        tp_calendar.rebalance_sessions_between(
+            date(2035, 12, 1),
+            date(2036, 1, 31),
+            cadence,  # type: ignore[arg-type]
+        )

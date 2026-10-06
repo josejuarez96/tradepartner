@@ -243,12 +243,20 @@ def rebalance_sessions_between(start: date, end: date, cadence: Cadence) -> list
     `all_sessions()` and then restricted to the window: a month or week counts only
     if its last session falls inside `[start, end]`, so a window ending mid-week
     rebalances last at the previous week's last session. Raises `ValueError` if
-    `start` is after `end`, `TypeError` for a datetime.
+    `start` is after `end` or the window leaves the configured calendar range (as
+    `last_session_of_month` does), `TypeError` for a datetime.
     """
     _reject_datetime(start, func="rebalance_sessions_between")
     _reject_datetime(end, func="rebalance_sessions_between")
     if start > end:
         raise ValueError(f"start {start.isoformat()} is after end {end.isoformat()}")
+    lower, upper = _bounds()
+    if start < lower or end > upper:
+        # The calendar's last session would otherwise pass for a period end.
+        raise ValueError(
+            f"window {start.isoformat()}..{end.isoformat()} is outside the configured "
+            f"calendar range ({lower.isoformat()}..{upper.isoformat()})"
+        )
     key = _PERIOD_KEYS[cadence]
     sessions = all_sessions()
     # Widen to the sessions after `end` within its period, so the period's true last
