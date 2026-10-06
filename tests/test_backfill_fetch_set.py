@@ -10,7 +10,7 @@ fetched every month for nothing and showed up as permanent holes.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -100,12 +100,14 @@ def _fetch_set(settings: Settings, window: tuple[date, date]) -> list[str]:
     return _window(settings, window)[0]
 
 
-def _window(settings: Settings, window: tuple[date, date]) -> tuple[list[str], list[str]]:
-    """The fetch set and the staleness denominator of `window` at `LATER`,
+def _window(
+    settings: Settings, window: tuple[date, date], at: datetime = LATER
+) -> tuple[list[str], list[str]]:
+    """The fetch set and the staleness denominator of `window` at `at`,
     with the store's resolver then, as `_price_chunk` builds it."""
     with _read(settings) as conn:
-        resolver = store_resolver(conn, LATER, settings)
-        ids, listed, *_ = _window_names(conn, LATER, window, settings, resolver)
+        resolver = store_resolver(conn, at, settings)
+        ids, listed, *_ = _window_names(conn, at, window, settings, resolver)
     return ids, listed
 
 
@@ -227,3 +229,13 @@ def test_the_switch_off_fetches_no_led_id(settings: Settings) -> None:
     assert _backfill(settings, _History(), filings=_with_first_spans()).ok
     ids, _ = _window(_first_span_lead_off(settings), JUNE_2017)
     assert not {LED, REUSED, OTC_LED} & set(ids)
+
+
+def test_a_led_id_is_fetched_only_once_its_cover_page_is_known(settings: Settings) -> None:
+    # quant-auditor on #989: the fetch set reads the store at the clock. Before
+    # the cover page naming LEDX is known there is no span, so no lead.
+    assert _backfill(settings, _History(), filings=_with_first_spans()).ok
+    before, _ = _window(settings, JUNE_2017, at=_at(2019, 3, 14))
+    assert LED not in before
+    after, _ = _window(settings, JUNE_2017, at=_at(2019, 3, 16))
+    assert LED in after
