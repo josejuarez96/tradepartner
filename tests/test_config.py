@@ -144,6 +144,68 @@ def test_edgar_fsn_first_year_override() -> None:
     assert s.edgar.fsn_first_year == 2010
 
 
+def test_edgar_statement_facts_defaults() -> None:
+    """T77 (#660): the switch is off and the tag, form and unit lists are the
+    spec amendment's defaults, in its precedence order."""
+    s = Settings(_env_file=None)
+    assert s.edgar.statement_facts_enabled is False
+    assert s.edgar.statement_tags == {
+        "revenue": [
+            "us-gaap:Revenues",
+            "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+            "us-gaap:SalesRevenueNet",
+            "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
+            "us-gaap:SalesRevenueGoodsNet",
+            "us-gaap:SalesRevenueServicesNet",
+        ],
+        "cost_of_revenue": [
+            "us-gaap:CostOfRevenue",
+            "us-gaap:CostOfGoodsAndServicesSold",
+            "us-gaap:CostOfGoodsSold",
+            "us-gaap:CostOfServices",
+        ],
+        "gross_profit": ["us-gaap:GrossProfit"],
+        "total_assets": ["us-gaap:Assets"],
+        "operating_cash_flow": [
+            "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+            "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        ],
+    }
+    assert s.edgar.statement_forms == ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
+    assert s.edgar.statement_units == ["USD"]
+
+
+def test_edgar_statement_tags_default_is_not_shared() -> None:
+    """Mutating one instance's default lists never leaks into the next."""
+    first = Settings(_env_file=None)
+    first.edgar.statement_tags["revenue"].append("us-gaap:Other")
+    assert "us-gaap:Other" not in Settings(_env_file=None).edgar.statement_tags["revenue"]
+
+
+@pytest.mark.parametrize(
+    "tag", ["Revenues", "us-gaap:", ":Revenues", "us-gaap:Revenues:Net", "us gaap:Revenues"]
+)
+def test_edgar_statement_tag_must_be_taxonomy_qualified(tag: str) -> None:
+    with pytest.raises(ValidationError, match="taxonomy:tag"):
+        Settings(_env_file=None, edgar={"statement_tags": {"revenue": [tag]}})
+
+
+def test_edgar_statement_keys_override() -> None:
+    s = Settings(
+        _env_file=None,
+        edgar={
+            "statement_facts_enabled": True,
+            "statement_tags": {"revenue": ["ifrs-full:Revenue"]},
+            "statement_forms": ["10-K"],
+            "statement_units": ["USD", "EUR"],
+        },
+    )
+    assert s.edgar.statement_facts_enabled is True
+    assert s.edgar.statement_tags == {"revenue": ["ifrs-full:Revenue"]}
+    assert s.edgar.statement_forms == ["10-K"]
+    assert s.edgar.statement_units == ["USD", "EUR"]
+
+
 def test_edgar_failure_policy_defaults() -> None:
     """T11h's keys: quarantine after 3 consecutive counted days, and
     `check_failures()`'s count floor and share ceiling."""
