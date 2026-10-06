@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 import polars as pl
@@ -47,6 +47,7 @@ from tradepartner.calendar import (
     previous_session,
 )
 from tradepartner.config import Cadence, SignalAnchor
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 _PERIOD_NAMES: dict[Cadence, str] = {
     "month_end": "the last session of its month",
@@ -306,12 +307,11 @@ def gross_profitability(
 
     A tz-aware `t` in any zone is read as the same instant in UTC.
 
-    Raises `ValueError` for a naive `t`, a `basis` other than `gross`, a frame missing
-    a column, or a duplicate `(security_id, fact_name, period_end, period_days)` row.
+    Raises `ValueError` for a naive `t` (or one out of UTC's range), a `basis` other
+    than `gross`, a frame missing a column, or a duplicate
+    `(security_id, fact_name, period_end, period_days)` row.
     """
-    if t.tzinfo is None or t.utcoffset() is None:
-        raise ValueError("t must be tz-aware")
-    t = t.astimezone(UTC)  # `known_at` is UTC; another zone fails polars' comparison
+    t = ensure_tz_aware_utc(t, field_name="t")  # `known_at` is UTC; polars needs one zone
     if basis not in _PROFITABILITY_NUMERATOR:
         raise ValueError(f"profitability basis {basis!r} is not implemented; only 'gross'")
     missing = [c for c in _FACT_COLUMNS_READ if c not in facts.columns]
