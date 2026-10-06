@@ -1,3 +1,0 @@
-- #679 test_crash_resume follow-ups: public fake-broker hooks, point-in-time price vintage, frozen min_rebalances, cumulative-rounding check, kill_switch xfail re-pointed to #741 (PR #746)
-### Fixed
-- tests(execution): test_crash_resume.py follow-ups from the #637 reviews — drop the private fake-broker `_orders` reach (use `open_orders()`), filter the cent-rounding test's price lookup to one `known_at` vintage, read `paper.min_rebalances` from the window's frozen value instead of `Settings()`, assert the cumulative rounding drift stays in tolerance across the window, and re-point the `kill_switch` xfail off #677/#698 (which covered only skipped runs) onto new issue #741; the remaining `_fill_hidden_reads` private reach is tracked as #742 (#679)
