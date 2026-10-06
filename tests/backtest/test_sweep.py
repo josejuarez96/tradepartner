@@ -523,3 +523,40 @@ def test_groups_fixture_shares_no_fingerprint_with_the_sweep_fixture() -> None:
     first = expand_grid(parse_sweep_file(SWEEP, settings), settings)
     groups = expand_grid(parse_sweep_file(GROUPS, settings), settings)
     assert not {v.fingerprint for v in first} & {v.fingerprint for v in groups}
+
+
+def test_in_tolerance_duplicate_is_one_lattice_point(tmp_path: Path) -> None:
+    path = _rewrite(tmp_path, SWEEP, "[0.05, 0.20]", "[0.10, 0.10000000000001]")
+    with pytest.raises(DuplicateGridValueError, match=r"one lab\.axis_lattice point"):
+        parse_sweep_file(path, _settings())
+
+
+def test_in_tolerance_value_is_stored_as_the_lattice_point(tmp_path: Path) -> None:
+    path = _rewrite(tmp_path, SWEEP, "[0.05, 0.20]", "[0.05, 0.10000000000001]")
+    assert parse_sweep_file(path, _settings()).grid["strategy.top_fraction"] == (0.05, 0.1)
+
+
+def test_bool_axis_is_never_lattice_checked(tmp_path: Path) -> None:
+    settings = _settings(
+        lab={"axis_lattice": {"strategy.top_fraction": 0.01, "strategy.signal_total_return": 0.3}}
+    )
+    grid = parse_sweep_file(GROUPS, settings).grid["strategy.signal_total_return"]
+    assert grid == (True, False)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "match"),
+    [
+        (
+            "count_share_threshold = 0.05",
+            "count_share_threshold = 0.05\n\n[universe]\nexclude_sic_ranges = [[1, 2]]",
+            "fixed block",
+        ),
+        ("end = 2025-12-31", "end = 2023-01-02", "fixed block"),
+    ],
+)
+def test_fixed_block_validated_whole_outside_axis_sections(
+    tmp_path: Path, old: str, new: str, match: str
+) -> None:
+    with pytest.raises(SweepFileError, match=match):
+        parse_sweep_file(_rewrite(tmp_path, SWEEP, old, new), _settings())

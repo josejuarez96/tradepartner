@@ -29,6 +29,7 @@ the anchor check against the store's first session, the family rules' own lattic
 
 from __future__ import annotations
 
+import functools
 import itertools
 import json
 import math
@@ -323,15 +324,18 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+@functools.cache
 def _field_adapter(key: str) -> TypeAdapter[Any]:
     """A validator for one dotted `Settings` key alone: its type and field constraints,
     without the section's cross-field rules, so a value is judged on its own and never
-    against another axis's live value."""
+    against another axis's live value. Used for the sections a grid axis lives in
+    (`strategy`, `schedule`), which carry no per-field validators."""
     section, _, name = key.partition(".")
     field = Settings.model_fields[section]
     if name:
         model = field.annotation
-        assert isinstance(model, type) and issubclass(model, BaseModel), key
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            raise SweepFileError(f"{key}: {section} is not a settings section")
         field = model.model_fields[name]
     annotated: Any = (
         Annotated[field.annotation, *field.metadata] if field.metadata else field.annotation
@@ -432,8 +436,21 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
         )
 
     dates = {key: _plain_date(key, flat.get(key), path) for key in _DATE_KEYS}
+    # Sections no axis lives in are validated whole, field and section rules included
+    # (a guarded `universe.*` value, the holdout's ordering), exactly as a hypothesis
+    # file's are; an axis's section is validated field by field here, and as a whole per
+    # combination in `expand_grid`, so no refusal turns on another axis's live value.
+    axis_sections = {axis.partition(".")[0] for axis in grid_lists}
     for key, value in fixed.items():
-        _validated(path, key, value)
+        if key.partition(".")[0] in axis_sections:
+            _validated(path, key, value)
+    untouched = {k: v for k, v in fixed.items() if k.partition(".")[0] not in axis_sections}
+    try:
+        hypothesis.frozen_params(
+            _as_hypothesis(path, slug, family, title, dates, doc_sha256, untouched), settings
+        )
+    except hypothesis.HypothesisFileError as exc:
+        raise SweepFileError(f"{path}: the fixed block's {exc}") from exc
     if dates["in_sample_start"] >= dates["holdout.start"]:
         raise SweepFileError(
             f"{path}: in_sample_start ({dates['in_sample_start']}) must be before "
@@ -445,21 +462,32 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
     grid: dict[str, tuple[Any, ...]] = {}
     for axis, values in grid_lists.items():
         step = settings.lab.axis_lattice.get(axis)
-        if step is not None and not (math.isfinite(step) and step > 0):
-            raise SweepFileError(f"lab.axis_lattice step for {axis} must be > 0, got {step}")
+        if step is not None and step <= 0:
+            raise SweepFileError(
+                f"{path}: lab.axis_lattice step for {axis} must be > 0, got {step}"
+            )
         validated: list[Any] = []
         seen: dict[str, object] = {}
         for value in values:
             json_value = _validated(path, axis, value)
             key = _canonical_json(json_value)
-            if step is not None and isinstance(json_value, int | float):
+            numeric = isinstance(json_value, int | float) and not isinstance(json_value, bool)
+            if step is not None and numeric:
                 index = _lattice_index(float(json_value), step)
                 if index is None:
                     raise OffLatticeError(
                         f"{path}: grid axis {axis} value {value!r} is not a multiple of its "
                         f"lab.axis_lattice step {step}"
                     )
+                # Stored as the lattice point itself, so round-off never yields a second
+                # fingerprint for one point.
+                json_value = _validated(path, axis, round(index * step, 12))
                 key = f"lattice:{index}"
+                if key in seen:
+                    raise DuplicateGridValueError(
+                        f"{path}: grid axis {axis} values {seen[key]!r} and {value!r} fall on "
+                        f"one lab.axis_lattice point ({json_value!r}, step {step})"
+                    )
             if key in seen:
                 raise DuplicateGridValueError(
                     f"{path}: grid axis {axis} values {seen[key]!r} and {value!r} are one value "
