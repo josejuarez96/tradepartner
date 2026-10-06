@@ -165,11 +165,21 @@ def test_t_out_of_utc_range_raises_value_error() -> None:
     [
         T - timedelta(hours=2),  # mid-session on T
         T + timedelta(seconds=1),  # just after T's close
+        T + timedelta(microseconds=1),  # no tolerance around the close
+        datetime(2024, 7, 3, 20, 0, tzinfo=UTC),  # a half day at the normal 16:00 close
         T - timedelta(days=1) + timedelta(hours=8),  # the night after the previous close
         session_close(T_SESSION) + timedelta(days=1),  # Saturday, 24h after Friday's close
         datetime(2024, 7, 4, 20, 0, tzinfo=UTC),  # a holiday at a normal close time
     ],
-    ids=["mid-session", "after-close", "overnight", "weekend", "holiday"],
+    ids=[
+        "mid-session",
+        "after-close",
+        "after-close-1us",
+        "half-day-16h",
+        "overnight",
+        "weekend",
+        "holiday",
+    ],
 )
 def test_t_that_is_not_a_session_close_raises(t: datetime) -> None:
     """#1084: the spec's `t` is `close(T)`; any other instant would measure freshness
@@ -178,10 +188,16 @@ def test_t_that_is_not_a_session_close_raises(t: datetime) -> None:
         run([gp("A", 40.0), ta("A", 200.0)], t=t)
 
 
-def test_half_day_close_is_a_session_close() -> None:
-    half_day = date(2024, 7, 3)  # NYSE closes at 13:00 New York
-    assert is_half_day(half_day)
-    sig = run([gp("A", 40.0), ta("A", 200.0)], t=session_close(half_day))
+@pytest.mark.parametrize(
+    "day",
+    [date(2024, 7, 3), date(2024, 3, 11), date(2024, 11, 4)],
+    ids=["half-day", "after-spring-forward", "after-fall-back"],
+)
+def test_session_close_is_accepted_on_half_days_and_across_dst(day: date) -> None:
+    """The guard compares UTC instants: a 13:00 New York half-day close, and the 20:00Z
+    and 21:00Z closes either side of a DST switch, are all session closes."""
+    assert is_half_day(day) == (day == date(2024, 7, 3))
+    sig = run([gp("A", 40.0), ta("A", 200.0)], t=session_close(day))
     assert sig.scores == {"A": pytest.approx(0.2)}
 
 
