@@ -1,6 +1,6 @@
 # Hypothesis: H1, long-only 12-1 momentum, monthly
 
-**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only); 2026-10-05 (#975, `in_sample_start` re-pinned to 2020-08-31 for the #974 bar gap; owner decision on #974, 2026-10-05, before registration)
+**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only); 2026-10-05 (#975, `in_sample_start` re-pinned to 2020-08-31 for the #974 bar gap; owner decision on #974, 2026-10-05, before registration); 2026-10-05 (#984, Healthpeak 0000765880 named as a disclosed exception to the rule-6 half of the pre-registration check; owner decision (a) on #984, 2026-10-05, before registration)
 
 Merging this file does not register it. The owner runs
 `tradepartner hypothesis register docs/hypotheses/h1-momentum-12-1.md` after merge (spec req
@@ -10,9 +10,22 @@ Merging this file does not register it. The owner runs
 them to the disclosure below, and re-runs the Q8 amendment's coverage check on the store he
 registers on (`universe_as_of` at close of 2020-08-31: the top-1000 cut must bind, that is,
 at least `universe.top_n_by_cap` companies pass rules 1–7, and none of the 192 #974 names
-still listed there may fail rule 6 with `missing_bars`; the counts were taken on the pre-repair store, and the listing
-repairs since #818 and the rule 7 shares fallback (#849) can move them). With about 1480
-companies passing rules 1–7 at 2020-08-31 on that store the size half of the check has a
+still listed there may fail rule 6 with `history/missing_bars`, except Healthpeak, CIK
+0000765880, for the bar hole named below; the counts were taken on the pre-repair store, and the listing
+repairs since #818 and the rule 7 shares fallback (#849) can move them). **Named exception
+(#984; owner decision (a), 2026-10-05).** The read-only re-run of this check on the owner's
+store after the 2026-10-05 fill-holes run found 1,488 companies passing rules 1–7 and
+exactly one #974 name failing rule 6: Healthpeak (HCP renamed PEAK, November 2019). Its
+bars stop on 2019-11-04 and resume on 2020-02-12, the first PEAK cover page, a hole of 67
+sessions that the #843 rename lead did not fill (cause not confirmed). It is excluded with
+`history/missing_bars` from 2020-08-31 until the 12-month window clears the hole, at about
+the 2021-02-26 rebalance: about 6 rebalances and about 0.015% of in-sample universe-months
+(6 of 41 × 1000), far below the provisional 0.5% fix threshold of #969. Healthpeak failing
+rule 6 for that hole, at 2020-08-31 or at any month-end the start is re-pinned to, does not
+trigger or bound the re-pin below; it is accepted and reported, not removed (the #974
+disclosure under Q8 repeats it). Any other #974 name failing rule 6 does trigger it. With
+1,488 companies passing rules 1–7 at 2020-08-31 on that re-run (about 1480 on the
+pre-repair store) the size half of the check has a
 wide margin; the `n_universe` red flag below watches every later rebalance. Since the #975
 re-pin the start is no longer the first binding month-end, so a moved first binding
 month-end alone does not move it; if either half of the check fails at 2020-08-31, he
@@ -279,8 +292,8 @@ Owner answers that set these values (spec open questions, answered on #156):
   excluded name would have made the top 1000), across the COVID crash, and a selection bias rather than the coverage ramp the
   #842 amendment assumed: rule 8 ranks only the names that pass rules 1–7, so each wrongly
   excluded large name handed its top-1000 slot to a smaller one. 2020-08-31 is the first
-  month-end rebalance at which all 192 have entered the universe on the store as it stands
-  (#974), and the same month-end from which the iXBRL disclosure above finds the universe the ADR 0006
+  month-end rebalance at which all 192 have entered the universe on the store #974 counted
+  (#974; Healthpeak excepted after the fill-holes run, below), and the same month-end from which the iXBRL disclosure above finds the universe the ADR 0006
   top 1000 in substance. #974 fixes the data in parallel (size M). The owner's decision
   (on #974) is to re-pin now and fix the data in parallel, and that T45b proceeds on the
   2020-08-31 start after the fill-holes run closes the rename holes (#843, #891); this
@@ -292,7 +305,12 @@ Owner answers that set these values (spec open questions, answered on #156):
   (`universe.min_history_months = 12`), inside the store's January 2016 start (ADR 0009).
   A #974 name whose first bar is 2019-09-03, the first session after 2019-08-30, passes
   rule 6 at 2020-08-31 but has no 2019-08-30 close, so it is a member with no momentum score at that one rebalance;
-  that residual is accepted and reported, not removed. No other parameter changes. **No
+  that residual is accepted and reported, not removed. One #974 name is still out at
+  2020-08-31: Healthpeak, CIK 0000765880, the preamble's named exception (#984), whose
+  67-session bar hole from 2019-11-04 to 2020-02-12 keeps it out with
+  `history/missing_bars` until about the 2021-02-26 rebalance (about 6 rebalances, about
+  0.015% of in-sample universe-months); that residual is accepted and reported, not removed,
+  and does not move the start. No other parameter changes. **No
   result was seen before this choice either:** H1 has no trial on real data (the #842
   statement above still holds), and the decision on #974 rests on the audit's universe
   membership and bar-span counts only; no return, turnover or metric of any hypothesis

@@ -333,11 +333,16 @@ def parse_experiment_file(
         raise ExperimentFileError(f"{path}: parameter block is not valid TOML: {exc}") from exc
 
     flat = _flatten(block)
-    # The spec's two Data / interfaces examples write `splits = [...]` directly after
-    # `[window]`'s `start`/`end` and before the next table header; TOML tables stay
-    # open until the next `[...]` header, so that line is literally `window.splits`,
-    # not the top-level `splits` req 2 names. Both fixtures must register cleanly
-    # (plan T82), so a bare `splits` placed there is accepted as the top-level key.
+    # The spec's two Data / interfaces worked examples used to write `splits = [...]`
+    # directly after `[window]`'s `start`/`end` and before the next table header; TOML
+    # tables stay open until the next `[...]` header, so that line was literally
+    # `window.splits`, not the top-level `splits` req 2 names. #938 fixed both examples
+    # to place `splits` at the true top level, but a file written the old way must
+    # still register (nothing forces every experiment file to be rewritten), so a bare
+    # `splits` nested under `[window]` is still accepted as the top-level key. The two
+    # fixtures derived from the spec examples (test_splits_hashes_the_same_whichever_
+    # table_the_file_puts_it_under, test_splits_given_in_both_places_is_refused in
+    # tests/research/test_experiment.py) exercise this stopgap directly.
     if "window.splits" in flat:
         if "splits" in flat:
             raise ExperimentFileError(f"{path}: splits given both at top level and under [window]")
@@ -577,18 +582,33 @@ def hash_file(path: Path, *, chunk_size: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+# Domain-separation prefix for `hash_directory`'s blob (#938): without it, a
+# directory with no files and a zero-byte file both reduce to `sha256(b"")`, so a
+# dataset export and a single-file export could be mistaken for one another. The
+# prefix is part of the hash contract, not a secret; changing it changes every
+# directory digest.
+_DIRECTORY_HASH_DOMAIN = b"dir-v1\n"
+
+
 def hash_directory(root: Path) -> str:
-    """SHA-256 of a directory export, independent of listing order (req 11): the
+    """SHA-256 of a directory export, independent of listing order (req 11): a
+    fixed domain-separation prefix (`_DIRECTORY_HASH_DOMAIN`), followed by the
     sorted list of `relative/path\\tsize\\tsha256` lines, one per file, hashed as
-    one blob."""
+    one blob. Refuses a relative file name containing a control character (tab,
+    newline, ...), which could otherwise forge a collision with a differently
+    laid out export."""
     if not root.is_dir():
         raise ExperimentFileError(f"{root}: not a directory")
     lines: list[str] = []
     for file_path in sorted(p for p in root.rglob("*") if p.is_file()):
         rel = file_path.relative_to(root).as_posix()
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in rel):
+            raise ExperimentFileError(
+                f"{file_path}: relative file name contains a control character"
+            )
         size = file_path.stat().st_size
         lines.append(f"{rel}\t{size}\t{hash_file(file_path)}")
-    blob = "\n".join(lines).encode("utf-8")
+    blob = _DIRECTORY_HASH_DOMAIN + "\n".join(lines).encode("utf-8")
     return sha256(blob).hexdigest()
 
 

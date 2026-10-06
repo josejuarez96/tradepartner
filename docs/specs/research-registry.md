@@ -129,12 +129,12 @@ touches_returns = false
 claims = ["ER-4", "ER-5", "INT-4"]
 hypothesis_ref = "B5"
 seed = 20261003
+splits = ["pilot"]
 [dataset]
 name = "e1h-labels-revenue-panel"        # its own name: the locked label export (protocol §10 step 5) joined with as-filed revenue; this registration precedes the panel's first version (req 7, predates_dataset)
 [window]
 start = 2017-01-01                        # filings accepted; the pilot frame, protocol §4.1
 end = 2023-12-31
-splits = ["pilot"]
 [primary]
 metric = "coef_deteriorated"               # specification C, brief §8.1
 direction = "less"
@@ -164,12 +164,12 @@ touches_returns = false
 claims = ["TX-1", "AP-1"]
 hypothesis_ref = "B8"
 seed = 20261003                           # the seed published on #618 before the frame was built
+splits = ["pilot"]
 [dataset]
 name = "annotation-pilot-labels"
 [window]
 start = 2017-01-01
 end = 2023-12-31
-splits = ["pilot"]
 [primary]
 metric = "alpha_J_min_over_dimension_mode" # the lowest Krippendorff α(J) over dimension × mode, R excluding Q1-vs-10-K
 direction = "greater"
