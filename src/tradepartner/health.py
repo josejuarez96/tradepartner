@@ -1354,7 +1354,12 @@ def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl
     `basis = derived` `gross_profit` row must equal the difference of the
     two stored `revenue` and `cost_of_revenue` rows sharing its `cik`,
     `period_end`, `period_days` and `filing_accession`, both present (a
-    missing component row fails it too)."""
+    missing component row fails it too). Exact `DOUBLE` equality, no
+    tolerance: the ingest (T77b) derives the row by this same subtraction
+    at insert time (spec decision (e)), so a correct row's stored value
+    and this recomputation are bit-identical -- no config threshold is
+    needed, or would mean anything, for a check that cannot legitimately
+    differ by any amount on correct data."""
     if "statement_facts" not in _present_tables(conn):
         return pl.DataFrame(schema=_STATEMENT_DERIVED_SCHEMA)
     found = conn.execute(
@@ -1369,7 +1374,7 @@ def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl
           ON c.cik = d.cik AND c.period_end = d.period_end AND c.period_days = d.period_days
          AND c.filing_accession = d.filing_accession AND c.fact_name = 'cost_of_revenue'
         WHERE d.fact_name = 'gross_profit' AND d.basis = 'derived'
-          AND (r.value IS NULL OR c.value IS NULL OR abs(d.value - (r.value - c.value)) > 1e-6)
+          AND (r.value IS NULL OR c.value IS NULL OR d.value != (r.value - c.value))
         ORDER BY d.cik, d.period_end, d.filing_accession
         """
     ).fetchall()
