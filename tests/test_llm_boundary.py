@@ -38,6 +38,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NoReturn
 
 import duckdb
@@ -288,7 +289,8 @@ FACADES = (
 #: (ii): network clients only `research.models` may import under `tradepartner.research`
 #: (#1031: the standard library's and the common third-party ones, beside httpx).
 NETWORK_CLIENTS = ("httpx", "urllib.request", "http.client", "socket", "requests", "aiohttp")
-#: (ii): parents of a listed client whose bare (or `*`) import reaches it as an attribute.
+#: (ii): parents of a listed client. `import urllib` or `import urllib.parse` binds
+#: `urllib`, and a `*` import too, so each reaches the client as an attribute.
 NETWORK_PARENTS = frozenset({"urllib", "http"})
 #: (iii): what `tradepartner.research` may never import, whatever the name.
 RESEARCH_FORBIDDEN = (
@@ -460,7 +462,8 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
                 and not _research_import_allowed(edge, modules)
             ):
                 report("i", "imports tradepartner.research from outside it and cli")
-            bare_parent = edge.target in NETWORK_PARENTS and edge.name in (None, "*")
+            parent = edge.target.split(".")[0] in NETWORK_PARENTS
+            bare_parent = parent and (edge.name is None or edge.name == "*")
             if in_research and src != MODELS and (bare_parent or any(map(hits, NETWORK_CLIENTS))):
                 report("ii", "imports a network client under tradepartner.research outside models")
             if hits(MODELS) and src not in (MODELS, MODELS_IMPORTER):
@@ -521,20 +524,19 @@ def test_b_resolves_relative_imports() -> None:
 
 # --- (c) text (spec req 14 as C13 amends it) ------------------------------------------
 
-_HOST = re.compile(r"typesafe\.ai|\bapi_base_url\b", re.IGNORECASE)
 #: Under `tests/` only the host itself: a test may point `api_base_url` at a fake.
 _HOST_NAME = re.compile(r"typesafe\.ai", re.IGNORECASE)
+_HOST = re.compile(rf"{_HOST_NAME.pattern}|\bapi_base_url\b", re.IGNORECASE)
 KEY_NAME = "TYPESAFE_API_KEY"
 #: The env name and the settings attribute that reads it (`typesafe_api_key`).
 _KEY = re.compile(KEY_NAME, re.IGNORECASE)
 #: Where the vendor host (and `research.labeling.api_base_url`, its config key) and the
 #: key's name may appear (and `.env.example`, outside the scanned roots).
 VENDOR_FILES = frozenset({"src/tradepartner/research/models.py", "src/tradepartner/config.py"})
-#: Where the vendor host may appear under `tests/`: this test and its text fixtures,
-#: and the tests of the two vendor files.
+#: Where the vendor host may appear under `tests/`: this test's text fixtures and the
+#: tests of the two vendor files (this file names it only as a pattern, so is scanned).
 TEST_HOST_FILES = frozenset(
     {
-        "tests/test_llm_boundary.py",
         "tests/fixtures/llm_boundary/text_cases.toml",
         "tests/research/labeling/test_models.py",
         "tests/test_config.py",
@@ -582,10 +584,10 @@ def _identifiers_and_strings(source: str) -> Iterator[str]:
 
 
 @functools.cache
-def _text_tree() -> dict[str, str]:
-    """What the text scan reads: every file under `src/`, `scripts/` and `tests/`
-    (read once; callers copy it through `_with` and never mutate it)."""
-    return _real_tree(suffix=None, roots=(*SCANNED_ROOTS, TESTS_ROOT))
+def _text_tree() -> Mapping[str, str]:
+    """What the text scan reads: every file under `src/`, `scripts/` and `tests/`,
+    read once and read-only (`_with` copies it)."""
+    return MappingProxyType(_real_tree(suffix=None, roots=(*SCANNED_ROOTS, TESTS_ROOT)))
 
 
 def text_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:

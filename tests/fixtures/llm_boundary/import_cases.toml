@@ -64,6 +64,12 @@ source = "from urllib import *\n"
 rule = "ii"
 
 [[case]]
+id = "dotted-urllib-parse-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import urllib.parse\n"
+rule = "ii"
+
+[[case]]
 id = "urllib-parse-in-job-passes"
 path = "src/tradepartner/research/labeling/job.py"
 source = "from urllib.parse import urlsplit\n"
