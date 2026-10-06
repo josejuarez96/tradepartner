@@ -47,6 +47,33 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # carve-outs. Changing it is a charter amendment, not a code or config change.
 _GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 
+# `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
+# (a)): five canonical names, each an ordered list of fallbacks, every one the
+# concept itself, never a near relative.
+_STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
+    "revenue": (
+        "us-gaap:Revenues",
+        "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+        "us-gaap:SalesRevenueNet",
+        "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
+        "us-gaap:SalesRevenueGoodsNet",
+        "us-gaap:SalesRevenueServicesNet",
+    ),
+    "cost_of_revenue": (
+        "us-gaap:CostOfRevenue",
+        "us-gaap:CostOfGoodsAndServicesSold",
+        "us-gaap:CostOfGoodsSold",
+        "us-gaap:CostOfServices",
+    ),
+    "gross_profit": ("us-gaap:GrossProfit",),
+    "total_assets": ("us-gaap:Assets",),
+    "operating_cash_flow": (
+        "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+        "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    ),
+}
+_QUALIFIED_TAG = re.compile(r"[A-Za-z][A-Za-z0-9-]*:[A-Za-z_][A-Za-z0-9_]*")
+
 
 def _default_env_file() -> Path:
     """Resolve the `.env` path fresh on every `Settings()` construction.
@@ -232,6 +259,34 @@ class EdgarConfig(BaseModel):
     # `check_failures`'s list of unaccepted filing failures (#578 part 3; the
     # full list is `failed_filings.json`, written on a non-dry run).
     max_validation_listed: int = Field(default=20, gt=0)
+    # T77 (#660, spec amendment 2026-10-03): as-filed statement facts. The
+    # switch is off until T78 flips it after the real-store run; while off,
+    # nothing reads the other three keys. `statement_tags` maps each canonical
+    # fact name to its ordered `taxonomy:tag` fallbacks (the order is the
+    # precedence within one filing); `statement_forms` filters on the
+    # submissions record's form, never the companyfacts entry's; only
+    # `statement_units` are read, any other unit is skipped and counted.
+    statement_facts_enabled: bool = False
+    statement_tags: dict[str, list[str]] = Field(
+        default_factory=lambda: {name: list(tags) for name, tags in _STATEMENT_TAGS.items()}
+    )
+    statement_forms: list[str] = Field(
+        default_factory=lambda: ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
+    )
+    statement_units: list[str] = Field(default_factory=lambda: ["USD"])
+
+    @field_validator("statement_tags")
+    @classmethod
+    def _statement_tags_are_qualified(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Every tag is `taxonomy:tag` (#660), so `us-gaap:Revenues` and a
+        same-named concept in another taxonomy are never confused."""
+        for name, tags in value.items():
+            for tag in tags:
+                if not _QUALIFIED_TAG.fullmatch(tag):
+                    raise ValueError(
+                        f"edgar.statement_tags[{name!r}]: {tag!r} is not `taxonomy:tag`"
+                    )
+        return value
 
     @property
     def header_start_year(self) -> int:
