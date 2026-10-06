@@ -25,7 +25,6 @@ concatenation (`"typesafe" + ".ai"`) passes them; reviewers read diffs for that.
 from __future__ import annotations
 
 import ast
-import csv
 import io
 import json
 import re
@@ -255,6 +254,11 @@ RESEARCH = "tradepartner.research"
 MODELS = "tradepartner.research.models"
 #: C13: the one module that may import `research.models`.
 MODELS_IMPORTER = "tradepartner.research.labeling.job"
+#: C13: the review page imports the review modules and nothing else of the boundary
+#: (never `job`, `models` or `datafiles`). If T123b's split trigger fires, the gold
+#: module beside `review` joins this set by the same one-line amendment.
+REVIEW_PAGE = "tradepartner.research.labeling.review_page"
+REVIEW_MODULES = frozenset({"tradepartner.research.labeling.review"})
 #: (i)'s exceptions, each with the `tradepartner.research` modules it may import
 #: (None: any). `tradepartner.cli` is the spec's. `tradepartner.store.research` is the
 #: registry API, which T81 (#1007) built on `research.RunHandle`, `load_dataset`,
@@ -405,6 +409,14 @@ def _research_import_allowed(edge: Edge, modules: frozenset[str]) -> bool:
     return all(t in allowed for t in reached)
 
 
+def _review_page_allowed(edge: Edge) -> bool:
+    """C13 (ii): `review_page` takes from `tradepartner.research` only the review modules
+    (`from ..labeling import review`, `from .review import x`, `import ...review`)."""
+    if edge.name is not None and f"{edge.target}.{edge.name}" in REVIEW_MODULES:
+        return True
+    return edge.target in REVIEW_MODULES
+
+
 def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
     """Every (rule, message) the import scan reports over `tree` (path -> source)."""
     found: list[tuple[str, str]] = []
@@ -440,6 +452,8 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
                 report("ii", "imports httpx under tradepartner.research outside research.models")
             if hits(MODELS) and src not in (MODELS, MODELS_IMPORTER):
                 report("ii", f"imports research.models; only {MODELS_IMPORTER} may")
+            if src == REVIEW_PAGE and hits(RESEARCH) and not _review_page_allowed(edge):
+                report("ii", "review_page imports the boundary beyond the review modules")
             if in_research:
                 if any(hits(p) for p in RESEARCH_FORBIDDEN):
                     report("iii", "tradepartner.research imports an adapter or writer")
@@ -682,13 +696,15 @@ def _labeling_scenario(
 ) -> tuple[set[str], dict[str, str], dict[str, str], str, str]:
     """Req 15's scenario: a fixture store with the research tables and a two-row
     fixture frame, `research.data_dir` in `tmp_path`, a labeling run through the
-    scripted double (`job.run_batch`), the review sheet (`review.write_sheet`), every
-    item decided, and `review.finish`. Returns the tables changed, the workspace's
+    scripted double (`job.run_batch`), the review session
+    (`review.build_review_session`), `review.record_decision` for every item, and
+    `review.finish` (C13). Returns the tables changed, the workspace's
     file hashes before and after (the events file among them), and the tracked-file
     status before and after.
 
-    `run_batch` is called as T123's line writes it; `write_sheet` and `finish` are
-    T123b's, whose line names no signature. The task that lands the
+    `run_batch`, `build_review_session(run)` and `finish(session)` are called as the
+    T123 and T123b lines write them; `record_decision(...)` has no signature on its
+    line, so its call is a guess. The task that lands the
     second of them may edit these calls to match and names that in its PR. The
     two-row frame and its registration need T122's frame columns and a
     `departure-reason-batches` registration fixture, neither of which exists yet,
@@ -741,22 +757,15 @@ def _labeling_scenario(
         )
     finally:
         conn.close()
-    sheet = review.write_sheet(settings, run_id=run_id, out=tmp_path / "sheet.csv")
-    with sheet.open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        fields, rows = list(reader.fieldnames or []), list(reader)
-    for row in rows:
-        row.update(decision="a", reason="fixture", evidence_quote="q", evidence_url="u")
-    with sheet.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    review.finish(settings, run_id=run_id, sheet=sheet)
+    session = review.build_review_session(run_id)
+    for item in session.items:
+        review.record_decision(session, item, decision="a", reason="fixture")
+    review.finish(session)
 
     return (
         changed_tables(before_tables, _snapshot(store)),
         before_files,
-        file_hashes(tmp_path, skip=(store, data_dir, sheet)),
+        file_hashes(tmp_path, skip=(store, data_dir)),
         before_git,
         tracked_changes(),
     )

@@ -134,3 +134,27 @@ id = "path-loader"
 path = "src/tradepartner/research/labeling/scoring.py"
 source = "from importlib.util import spec_from_file_location\nspec = spec_from_file_location('m', 'src/tradepartner/research/models.py')\n"
 rule = "dynamic"
+
+[[case]]
+id = "review-page-imports-review"
+path = "src/tradepartner/research/labeling/review_page.py"
+source = "from . import review\nfrom .review import case_view\nfrom tradepartner.research.labeling.review import finish\n"
+rule = ""
+
+[[case]]
+id = "review-page-imports-job"
+path = "src/tradepartner/research/labeling/review_page.py"
+source = "from .job import run_batch\n"
+rule = "ii"
+
+[[case]]
+id = "review-page-imports-models"
+path = "src/tradepartner/research/labeling/review_page.py"
+source = "from tradepartner.research import models\n"
+rule = "ii"
+
+[[case]]
+id = "review-page-imports-datafiles"
+path = "src/tradepartner/research/labeling/review_page.py"
+source = "from ..datafiles import research_dir\n"
+rule = "ii"
