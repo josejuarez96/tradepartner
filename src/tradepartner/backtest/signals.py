@@ -315,18 +315,19 @@ def gross_profitability(
     `(security_id, fact_name, period_end, period_days)` row.
     """
     t = ensure_tz_aware_utc(t, field_name="t")  # `known_at` is UTC; polars needs one zone
+    t_session = last_completed_session(t)
+    t_close = session_close(t_session)
+    if t != t_close:
+        raise ValueError(
+            f"t {t.isoformat()} is not a session close; the last close at or before it "
+            f"is {t_close.isoformat()} ({t_session.isoformat()})"
+        )
     if basis not in _PROFITABILITY_NUMERATOR:
         raise ValueError(f"profitability basis {basis!r} is not implemented; only 'gross'")
     missing = [c for c in _FACT_COLUMNS_READ if c not in facts.columns]
     if missing:
         raise ValueError(f"facts frame lacks columns {missing}")
     numerator_name = _PROFITABILITY_NUMERATOR[basis]
-    t_session = last_completed_session(t)
-    if t != session_close(t_session):
-        raise ValueError(
-            f"t {t.isoformat()} is not a session close; the last close at or before it "
-            f"is {session_close(t_session).isoformat()} ({t_session.isoformat()})"
-        )
     low_days, high_days = annual_period_days
     names = sorted(set(security_ids))
 

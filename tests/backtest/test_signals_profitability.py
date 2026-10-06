@@ -168,7 +168,7 @@ def test_t_out_of_utc_range_raises_value_error() -> None:
         T + timedelta(microseconds=1),  # no tolerance around the close
         datetime(2024, 7, 3, 20, 0, tzinfo=UTC),  # a half day at the normal 16:00 close
         T - timedelta(days=1) + timedelta(hours=8),  # the night after the previous close
-        session_close(T_SESSION) + timedelta(days=1),  # Saturday, 24h after Friday's close
+        T + timedelta(days=1),  # Saturday, 24h after Friday's close
         datetime(2024, 7, 4, 20, 0, tzinfo=UTC),  # a holiday at a normal close time
     ],
     ids=[
