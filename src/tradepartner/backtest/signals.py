@@ -21,19 +21,31 @@ rebalance (as a later as-of read might) cannot leak into the score; an anchor af
 is refused here and, at registration, by `check_anchor_feasible`. Which adjustment the
 frame carries (splits only, or dividends too per `strategy.signal_total_return`) is the
 caller's choice when it reads the frame.
+
+`gross_profitability` is the `profitability` family's signal (backtest spec amendment
+#720, rules 0 to 6): annual gross profit over the total assets of the same fiscal year
+end, from a `statement_facts_as_of` frame. Every period length, age and SIC it uses is
+an argument, never a literal here.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Collection
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from typing import Literal
 
 import polars as pl
 from dateutil.relativedelta import relativedelta
 
-from tradepartner.calendar import is_session, last_session_of_month, next_session, previous_session
+from tradepartner.calendar import (
+    is_session,
+    last_completed_session,
+    last_session_of_month,
+    next_session,
+    previous_session,
+)
 from tradepartner.config import Cadence, SignalAnchor
 
 _PERIOD_NAMES: dict[Cadence, str] = {
@@ -207,4 +219,158 @@ def momentum_12_1(
         "month_end",
         "month_end",
         security_ids=security_ids,
+    )
+
+
+ProfitabilityExclusion = Literal["sector", "no_facts", "stale_facts", "malformed"]
+_PROFITABILITY_EXCLUSIONS: tuple[ProfitabilityExclusion, ...] = (
+    "sector",
+    "no_facts",
+    "stale_facts",
+    "malformed",
+)
+#: The numerator fact per implemented `profitability.basis`; `cash`
+#: (`operating_cash_flow`) arrives with B3b's file.
+_PROFITABILITY_NUMERATOR: dict[str, str] = {"gross": "gross_profit"}
+_PROFITABILITY_DENOMINATOR = "total_assets"
+#: `statement_facts`' key per name (its `UNIQUE` with `security_id` for `cik`).
+_FACT_KEY = ("security_id", "fact_name", "period_end", "period_days")
+_FACT_COLUMNS_READ = (*_FACT_KEY, "period_start", "value", "basis", "known_at")
+
+
+@dataclass(frozen=True)
+class ProfitabilitySignal:
+    """Scores of the names that passed rules 1 to 5, and every other requested name
+    under the reason that excluded it (spec amendment #720).
+
+    `scores` is ordered by `security_id`; each `excluded` tuple too, with every reason
+    present. `derived` lists the scored names whose numerator row has
+    `basis = derived` (`n_derived`).
+    """
+
+    scores: dict[str, float]
+    excluded: dict[ProfitabilityExclusion, tuple[str, ...]]
+    derived: tuple[str, ...]
+
+    @property
+    def ranked(self) -> tuple[str, ...]:
+        """Scored names by score descending, ties by `security_id` ascending (rule 6),
+        the order `portfolio.target_weights` selects from."""
+        return tuple(sorted(self.scores, key=lambda sid: (-self.scores[sid], sid)))
+
+    @property
+    def counts(self) -> dict[str, int]:
+        """The six `trial_rebalances` counts this signal reports (spec amendment #720)."""
+        return {
+            "n_ranked": len(self.scores),
+            **{
+                f"n_excluded_{reason}": len(self.excluded[reason])
+                for reason in _PROFITABILITY_EXCLUSIONS
+            },
+            "n_derived": len(self.derived),
+        }
+
+
+def _profitability_in_sector(sic: int | None, ranges: Sequence[tuple[int, int]]) -> bool:
+    return sic is not None and any(low <= sic <= high for low, high in ranges)
+
+
+def gross_profitability(
+    facts: pl.DataFrame,
+    sics: Mapping[str, int | None],
+    t: datetime,
+    *,
+    security_ids: Collection[str],
+    annual_period_days: tuple[int, int],
+    max_fact_age_days: int,
+    exclude_sic_ranges: Sequence[tuple[int, int]],
+    include_derived: bool,
+    basis: str,
+) -> ProfitabilitySignal:
+    """Gross profitability scores at read time `t` (spec amendment #720, rules 0 to 6).
+
+    `facts` is shaped like `statement_facts_as_of(t, ids)` (`security_id`,
+    `fact_name`, `period_start`, `period_end`, `period_days`, `value`, `basis`,
+    `known_at`); `sics` maps a name to its SIC known at `t` (missing or `None`: no SIC).
+    For each name in `security_ids`, in this order:
+
+    0. rows with `known_at > t` are dropped (the frame is not trusted to be as-of);
+    1. a SIC inside any inclusive `exclude_sic_ranges` range: `sector`;
+    2. the numerator: among the name's annual rows (`period_days` inside the inclusive
+       `annual_period_days`), the latest `period_end`, the larger `period_days` on a
+       tie; `basis = derived` rows only when `include_derived`. None: `no_facts`;
+    3. the `total_assets` instant row at the same `period_end`. None: `no_facts`;
+    4. `t`'s session minus `period_end` over `max_fact_age_days`: `stale_facts`;
+    5. a non-finite numerator, or a non-positive or non-finite denominator: `malformed`;
+    6. otherwise scored numerator / denominator (`ranked` gives rule 6's order).
+
+    Raises `ValueError` for a naive `t`, a `basis` other than `gross`, a frame missing
+    a column, or a duplicate `(security_id, fact_name, period_end, period_days)` row.
+    """
+    if t.tzinfo is None or t.utcoffset() is None:
+        raise ValueError("t must be tz-aware")
+    if basis not in _PROFITABILITY_NUMERATOR:
+        raise ValueError(f"profitability basis {basis!r} is not implemented; only 'gross'")
+    missing = [c for c in _FACT_COLUMNS_READ if c not in facts.columns]
+    if missing:
+        raise ValueError(f"facts frame lacks columns {missing}")
+    numerator_name = _PROFITABILITY_NUMERATOR[basis]
+    t_session = last_completed_session(t)
+    low_days, high_days = annual_period_days
+    names = sorted(set(security_ids))
+
+    visible = facts.select(_FACT_COLUMNS_READ).filter(
+        pl.col("known_at") <= t, pl.col("security_id").is_in(names)
+    )
+    if visible.select(pl.struct(_FACT_KEY).is_duplicated().any()).item():
+        raise ValueError(
+            "facts frame has a duplicate (security_id, fact_name, period_end, period_days) row"
+        )
+    numerators = visible.filter(
+        pl.col("fact_name") == numerator_name,
+        pl.col("period_days").is_between(low_days, high_days),
+        pl.lit(include_derived) | (pl.col("basis") != "derived"),
+    ).sort("security_id", "period_end", "period_days", descending=[False, True, True])
+    best: dict[str, tuple[date, float, bool]] = {}
+    for sid, period_end, value, row_basis in numerators.select(
+        "security_id", "period_end", "value", "basis"
+    ).iter_rows():
+        best.setdefault(sid, (period_end, value, row_basis == "derived"))
+    # An instant row (`period_days = 0`) is the one with no `period_start`: the
+    # table's CHECK ties the two, and this keeps a period length out of the code.
+    assets: dict[tuple[str, date], float] = {
+        (sid, period_end): value
+        for sid, period_end, value in visible.filter(
+            pl.col("fact_name") == _PROFITABILITY_DENOMINATOR, pl.col("period_start").is_null()
+        )
+        .select("security_id", "period_end", "value")
+        .iter_rows()
+    }
+
+    scores: dict[str, float] = {}
+    derived: list[str] = []
+    excluded: dict[ProfitabilityExclusion, list[str]] = {r: [] for r in _PROFITABILITY_EXCLUSIONS}
+    for sid in names:
+        if _profitability_in_sector(sics.get(sid), exclude_sic_ranges):
+            excluded["sector"].append(sid)
+            continue
+        numerator = best.get(sid)
+        denominator = None if numerator is None else assets.get((sid, numerator[0]))
+        if numerator is None or denominator is None:
+            excluded["no_facts"].append(sid)
+            continue
+        period_end, value, is_derived = numerator
+        if (t_session - period_end).days > max_fact_age_days:
+            excluded["stale_facts"].append(sid)
+            continue
+        if not (math.isfinite(value) and math.isfinite(denominator) and denominator > 0):
+            excluded["malformed"].append(sid)
+            continue
+        scores[sid] = value / denominator
+        if is_derived:
+            derived.append(sid)
+    return ProfitabilitySignal(
+        scores=scores,
+        excluded={reason: tuple(ids) for reason, ids in excluded.items()},
+        derived=tuple(derived),
     )
