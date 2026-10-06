@@ -1105,3 +1105,54 @@ def test_a_429_that_outlasts_the_block_wait_fails_without_a_second_wait(
         pytest.approx(2.0),
         pytest.approx(600.0),
     ]
+
+
+# --- reuse_cached (#660, T77a) ------------------------------------------------
+
+
+def _refuse(request: httpx.Request) -> httpx.Response:
+    pytest.fail(f"no request expected, got {request.url}")
+
+
+def test_reuse_cached_returns_the_cached_companyfacts_zip_with_no_request(
+    tmp_path: Path,
+) -> None:
+    cached = tmp_path / "bulk" / "companyfacts.zip"
+    cached.parent.mkdir()
+    cached.write_bytes(_valid_zip_bytes("CIK0000000001.json", b"{}"))
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(_refuse), reuse_cached=True
+    )
+    assert path == cached and path.read_bytes() == _valid_zip_bytes("CIK0000000001.json", b"{}")
+
+
+@pytest.mark.parametrize("body", [b"not a zip", None])
+def test_reuse_cached_raises_on_a_file_that_does_not_open_as_a_zip(
+    tmp_path: Path, body: bytes | None
+) -> None:
+    """A damaged file, or none at all, raises: never a silent download."""
+    if body is not None:
+        (tmp_path / "bulk").mkdir()
+        (tmp_path / "bulk" / "companyfacts.zip").write_bytes(body)
+    with pytest.raises(zipfile.BadZipFile, match="reuse_cached"):
+        edgar_raw.bulk_company_facts(
+            settings=_settings(cache_dir=tmp_path), client=_mock_client(_refuse), reuse_cached=True
+        )
+
+
+def test_without_reuse_cached_the_bulk_file_is_requested_over_a_cached_one(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "bulk").mkdir()
+    (tmp_path / "bulk" / "companyfacts.zip").write_bytes(_valid_zip_bytes("old.json"))
+    served: list[str] = []
+    fresh = _valid_zip_bytes("new.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(str(request.url))
+        return httpx.Response(200, content=fresh)
+
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+    assert len(served) == 1 and path.read_bytes() == fresh

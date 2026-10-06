@@ -12,19 +12,27 @@ from __future__ import annotations
 
 import json
 import math
+import zipfile
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from edgar_transport import EdgarRouter, edgar_settings
 
 from tradepartner.adapters.edgar import (
     StatementConflict,
     StatementFactsParse,
     parse_statement_facts,
 )
-from tradepartner.adapters.edgar_source import reduce_submissions
+from tradepartner.adapters.edgar_source import (
+    COVER_VERSION,
+    STATEMENT_VERSION,
+    EdgarFilingSource,
+    SubmissionRecord,
+    reduce_submissions,
+)
 from tradepartner.config import Settings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "edgar"
@@ -534,3 +542,381 @@ def test_recorded_fixtures_carry_no_statement_tags_yet(name: str) -> None:
     assert acceptance
     result = parse_statement_facts(facts, TAGS, FORMS, UNITS, acceptance)
     assert result == StatementFactsParse((), (), 0, 0)
+
+
+# --- the adapter: `EdgarFilingSource.statement_facts` (plan T77a) -----------------
+#
+# `filing_index()` and FSN are not run here (their own tests' job): the
+# source's `_filing_index_ran` and `_fsn_ready` flags are set and its
+# per-CIK stamps written with `_save_stamps`, the shortcut
+# `test_edgar_source_cik.py` takes. Every request goes through an
+# `EdgarRouter`, which fails the test on an unrouted URL; the autouse
+# socket fixture backs it up.
+
+API = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+SHARES = "EntityCommonStockSharesOutstanding"
+LATE = "0000123456-22-000098"  # no stamp record at first; a late 10-Q stamp
+LATE_ACCEPTED = datetime(2022, 8, 1, 20, 0, tzinfo=UTC)  # before K2022: same cache key
+
+
+def _settings(tmp_path: Path, **edgar: Any) -> Settings:
+    return edgar_settings(tmp_path / "cache", statement_facts_enabled=True, **edgar)
+
+
+def _adapter(settings: Settings, router: EdgarRouter, **kwargs: Any) -> EdgarFilingSource:
+    source = EdgarFilingSource(settings, client=router.client(), **kwargs)
+    source._filing_index_ran = True
+    source._fsn_ready = True  # no FSN period; the co-registrant test sets its accessions
+    source._fsn_loaded_periods = ("2099_01",)  # a lag window no filing here falls inside
+    return source
+
+
+def _stamps(
+    source: EdgarFilingSource, cik: str, stamps: dict[str, tuple[str, datetime | None]]
+) -> None:
+    source._save_stamps(
+        cik, {a: SubmissionRecord(a, form, "doc.htm", True, at) for a, (form, at) in stamps.items()}
+    )
+
+
+def _company(cik: str, units: dict[str, dict[str, list[dict[str, Any]]]]) -> dict[str, Any]:
+    """A companyfacts payload for `cik`: local tag -> unit -> entries, plus a
+    `dei` share entry under `K2022`, so the payload holds the latest filing."""
+    return {
+        "cik": int(cik),
+        "facts": {
+            "dei": {SHARES: {"units": {"shares": [entry(K2022, "2023-01-31", 10)]}}},
+            "us-gaap": {tag: {"units": by_unit} for tag, by_unit in units.items()},
+        },
+    }
+
+
+def _router(**payloads: dict[str, Any]) -> EdgarRouter:
+    router = EdgarRouter()
+    for cik, body in payloads.items():
+        router.add(API.format(cik=cik.removeprefix("c")), body)
+    return router
+
+
+def _cache_dir(settings: Settings) -> Path:
+    return Path(settings.edgar.cache_dir) / "statement_facts" / f"v{STATEMENT_VERSION}"
+
+
+#: CIK's stamps for the adapter tests: one 10-K, the latest cover-form filing.
+STAMPS: dict[str, tuple[str, datetime | None]] = {
+    K2022: ("10-K", datetime(2023, 2, 24, 21, 30, tzinfo=UTC)),
+}
+
+
+def test_switch_off_makes_no_call_no_request_and_no_cache(tmp_path: Path) -> None:
+    settings = edgar_settings(tmp_path / "cache")
+    assert settings.edgar.statement_facts_enabled is False  # the default
+    shares = _company(CIK, {})
+    router = _router(**{f"c{CIK}": shares})
+    source = _adapter(settings, router)
+    _stamps(source, CIK, STAMPS)
+    assert source.statement_facts(CIK) == []
+    assert source.requests == 0
+    source.facts(CIK, [SHARES])  # the shares path's payload read fills no statement cache
+    assert source.requests == 1
+    assert not _cache_dir(settings).exists()
+
+
+def _conflicted() -> dict[str, Any]:
+    return _company(
+        CIK,
+        {
+            "Revenues": {
+                "USD": [
+                    entry(K2022, FY2022, 300, filed="2023-02-24"),
+                    entry(K2022, FY2022, 301, filed="2023-02-24"),  # a same-tag conflict
+                    entry(LATE, FY2021, 200, filed="2022-08-01"),
+                ]
+            },
+            "Assets": {"USD": [entry(K2022, "2022-12-31", 900, filed="2023-02-24")]},
+        },
+    )
+
+
+def test_second_call_in_a_run_reads_the_cache_file_with_no_request(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    router = _router(**{f"c{CIK}": _conflicted()})
+    source = _adapter(settings, router)
+    _stamps(source, CIK, STAMPS)
+    first = source.statement_facts(CIK)
+    assert router.urls == [API.format(cik=CIK)]  # the per-CIK API, below the bulk threshold
+    conflict = StatementConflict(K2022, "revenue", date(2022, 1, 1), date(2022, 12, 31), (300, 301))
+    assert source.statement_conflict_keys == [conflict]
+    counts = (source.statement_conflicts, source.statement_unstampable)
+    assert counts == (1, 0)
+    # The unstamped accession's entry arrives with no stamp and its `filed`.
+    [late] = [r for r in first if r.accession == LATE]
+    assert (late.accepted_at, late.form, late.filed) == (None, "", date(2022, 8, 1))
+    [assets] = [r for r in first if r.fact_name == "total_assets"]
+    assert assets.accepted_at == STAMPS[K2022][1] and assets.form == "10-K"
+
+    source.statement_conflict_keys.clear()  # the write phase's read restores the list
+    assert source.statement_facts(CIK) == first
+    assert source.requests == 1
+    assert source.statement_conflict_keys == [conflict]
+    assert (source.statement_conflicts, source.statement_unstampable) == counts
+    source.statement_facts(CIK)
+    assert source.statement_conflict_keys == [conflict]  # listed once
+
+    # The second call is the file, never an in-memory memo of the records.
+    (_cache_dir(settings) / f"{CIK}.json").unlink()
+    with pytest.raises(RuntimeError, match="filled this run"):
+        source.statement_facts(CIK)
+    assert source.requests == 1
+
+
+def test_a_late_stamp_applies_on_the_next_read_with_no_request(tmp_path: Path) -> None:
+    """The stamp is a read-time lookup: once `LATE` has a 10-Q record its
+    entry is stamped, and once `EIGHT_K` turns out to be an 8-K its entries
+    and its conflict leave the output (#1037); a stamped entry ending after
+    its acceptance date is dropped, as the parser would."""
+    body = _company(
+        CIK,
+        {
+            "Revenues": {
+                "USD": [
+                    entry(LATE, FY2021, 200, filed="2022-08-01"),
+                    entry(LATE, ("2022-01-01", "2022-09-30"), 250, filed="2022-08-01"),
+                    entry(EIGHT_K, FY2020, 1, filed="2021-02-01"),
+                    entry(EIGHT_K, FY2020, 2, filed="2021-02-01"),
+                    entry(EIGHT_K, FY2019, 3, filed="2021-02-01"),
+                ]
+            }
+        },
+    )
+    settings = _settings(tmp_path)
+    source = _adapter(settings, _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, STAMPS)
+    before = source.statement_facts(CIK)
+    assert {(r.accession, r.accepted_at) for r in before} == {(LATE, None), (EIGHT_K, None)}
+    assert len(before) == 3 and source.statement_conflicts == 1
+
+    _stamps(source, CIK, {**STAMPS, LATE: ("10-Q", LATE_ACCEPTED), EIGHT_K: ("8-K", None)})
+    [after] = source.statement_facts(CIK)
+    assert source.requests == 1
+    assert (after.accession, after.form, after.accepted_at) == (LATE, "10-Q", LATE_ACCEPTED)
+    assert after.period_end == date(2021, 12, 31)  # 2022-09-30 ends after acceptance
+    assert after.comparative is False  # the dropped entry sets no latest end
+
+    fresh = _adapter(settings, EdgarRouter())  # the next run: a cache hit
+    assert fresh.statement_facts(CIK) == [after]
+    assert fresh.statement_conflict_keys == [] and fresh.statement_conflicts == 0
+    assert fresh.statement_unstampable == 0  # an 8-K is filtered, never unstampable
+
+
+ONE, NONE_TAGGED, UNSTAMPED = "0000000001", "0000000002", "0000000003"
+
+
+def _first_load_payloads() -> dict[str, dict[str, Any]]:
+    k = {ONE: "0000000001-23-000001", NONE_TAGGED: "0000000002-23-000001"}
+    k[UNSTAMPED] = "0000000003-23-000001"
+    no_record = "0000000003-22-000050"
+
+    def company(cik: str, units: dict[str, dict[str, list[dict[str, Any]]]]) -> dict[str, Any]:
+        body = _company(cik, units)
+        body["facts"]["dei"][SHARES]["units"]["shares"][0]["accn"] = k[cik]
+        return body
+
+    return {
+        ONE: company(
+            ONE,
+            {
+                "Revenues": {"USD": [entry(k[ONE], FY2022, 1), entry(k[ONE], FY2022, 2)]},
+                "GrossProfit": {"EUR": [entry(k[ONE], FY2022, 3)]},
+                "CostOfRevenue": {"USD": [entry(k[ONE], ("2022-12-31", "2022-12-31"), 4)]},
+                "Assets": {"USD": [entry(k[ONE], "2022-12-31", 5)]},
+            },
+        ),
+        NONE_TAGGED: company(
+            NONE_TAGGED, {"InventoryNet": {"USD": [entry(k[NONE_TAGGED], FY2022, 6)]}}
+        ),
+        UNSTAMPED: company(UNSTAMPED, {"Revenues": {"USD": [entry(no_record, FY2021, 7)]}}),
+    }
+
+
+def test_a_cross_run_cache_hit_restores_conflicts_and_unstampable_only(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    payloads = _first_load_payloads()
+    router = _router(**{f"c{cik}": body for cik, body in payloads.items()})
+    first = _adapter(settings, router)
+    accepted = datetime(2023, 2, 24, 21, 30, tzinfo=UTC)
+    for cik in payloads:
+        _stamps(first, cik, {f"{cik}-23-000001": ("10-K", accepted)})
+        first.statement_facts(cik)
+    assert first.requests == 3
+    counts = ("conflicts", "non_usd", "malformed", "none", "unstampable")
+    assert {c: getattr(first, f"statement_{c}") for c in counts} == {
+        "conflicts": 1,
+        "non_usd": 1,
+        "malformed": 1,
+        "none": 1,
+        "unstampable": 0,  # no stamp record yet: held for the ingest, not the adapter
+    }
+    no_record = "0000000003-22-000050"
+    _stamps(  # the stamps file settles the third's accession as unstampable
+        first,
+        UNSTAMPED,
+        {f"{UNSTAMPED}-23-000001": ("10-K", accepted), no_record: ("10-Q", None)},
+    )
+
+    second = _adapter(settings, EdgarRouter())  # any companyfacts request fails the test
+    served = {cik: second.statement_facts(cik) for cik in payloads}
+    assert second.requests == 0
+    assert {c: getattr(second, f"statement_{c}") for c in counts} == {
+        "conflicts": 1,
+        "non_usd": 0,
+        "malformed": 0,
+        "none": 0,
+        "unstampable": 1,
+    }
+    assert served[UNSTAMPED] == []
+    assert [r.fact_name for r in served[ONE]] == ["total_assets"]
+
+
+def test_facts_and_statement_facts_share_one_payload_read(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    router = _router(**{f"c{CIK}": _conflicted()})
+    source = _adapter(settings, router)
+    _stamps(source, CIK, STAMPS)
+    source.facts(CIK, [SHARES])
+    records = source.statement_facts(CIK)
+    assert router.urls == [API.format(cik=CIK)]
+    assert records and source.statement_conflicts == 1  # counted on the first answer
+
+
+def test_a_payload_both_parsers_refuse_is_recorded_once(tmp_path: Path) -> None:
+    body = _company(CIK, {"Revenues": {"USD": [entry(K2022, FY2022, 1)]}})
+    del body["facts"]["dei"][SHARES]["units"]["shares"][0]["end"]
+    del body["facts"]["us-gaap"]["Revenues"]["units"]["USD"][0]["end"]
+    source = _adapter(_settings(tmp_path), _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, STAMPS)
+    assert source.facts(CIK, [SHARES]) == []
+    assert len(list(source.validation_failures)) == 1
+    assert source.statement_facts(CIK) == [] and source.requests == 1
+
+
+def test_a_trailing_payload_is_cached_under_the_accession_it_reached(tmp_path: Path) -> None:
+    """The API payload trails the latest 10-K (holds only `Q2022`): served
+    and cached for this run's second call, keyed by `Q2022`, so the next
+    run asks again."""
+    body = {
+        "cik": int(CIK),
+        "facts": {"us-gaap": {"Revenues": {"units": {"USD": [entry(Q2022, FY2021, 5)]}}}},
+    }
+    settings = _settings(tmp_path)
+    stamps = {**STAMPS, Q2022: ("10-Q", datetime(2022, 7, 29, 20, 0, tzinfo=UTC))}
+    source = _adapter(settings, _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, stamps)
+    [record] = source.statement_facts(CIK)
+    assert record.accession == Q2022
+    assert source.statement_facts(CIK) == [record] and source.requests == 1
+    cached = json.loads((_cache_dir(settings) / f"{CIK}.json").read_bytes())
+    assert cached["key"].startswith(f"{Q2022}|")
+    again = _adapter(settings, _router(**{f"c{CIK}": body}))
+    again.statement_facts(CIK)
+    assert again.requests == 1
+
+
+def test_many_conflicting_accessions_never_fail_the_chunk(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, min_failed_filings=1)
+    accessions = [f"0000123456-2{n}-000001" for n in range(3)]
+    revenue = [entry(a, FY2020, v) for a in accessions for v in (1, 2)]
+    source = _adapter(
+        settings, _router(**{f"c{CIK}": _company(CIK, {"Revenues": {"USD": revenue}})})
+    )
+    accepted = datetime(2023, 2, 24, 21, 30, tzinfo=UTC)
+    _stamps(source, CIK, {**STAMPS, **{a: ("10-K", accepted) for a in accessions}})
+    source.statement_facts(CIK)
+    assert source.statement_conflicts == 3 > settings.edgar.min_failed_filings
+    source.check_failures()  # does not raise
+    source.record_failures()
+    failed = Path(settings.edgar.cache_dir) / "failed_filings.json"
+    assert not failed.exists() or json.loads(failed.read_text()).get("entries") == {}
+    assert source.failed_filings == 0
+
+
+def test_co_registrant_accessions_contribute_nothing(tmp_path: Path) -> None:
+    """An accession FSN extracted under another CIK (absent from this CIK's
+    FSN cache), and one whose cached cover page names another entity."""
+    settings = _settings(tmp_path)
+    body = _company(
+        CIK,
+        {"Revenues": {"USD": [entry(K2022, FY2022, 1), entry(Q2022, FY2021, 2)]}},
+    )
+    source = _adapter(settings, _router(**{f"c{CIK}": body}))
+    stamps = {**STAMPS, Q2022: ("10-Q", datetime(2022, 7, 29, 20, 0, tzinfo=UTC))}
+    _stamps(source, CIK, stamps)
+    source._fsn_extracted_accessions = frozenset({K2022})  # FSN holds it under another CIK
+    cover = source._cover_cache_path(Q2022)
+    cover.parent.mkdir(parents=True, exist_ok=True)
+    cover.write_text(
+        json.dumps(
+            {
+                "version": COVER_VERSION,
+                "accession": Q2022,
+                "cik": CIK,
+                "entity_cik": "0000999999",
+                "listings": [],
+                "facts": [],
+            }
+        )
+    )
+    assert source.statement_facts(CIK) == []
+    assert source.statement_conflicts == 0
+
+
+# --- bulk reuse (`reuse_cached`, `--bulk-from-cache`) -----------------------------
+
+
+def _bulk_zip(settings: Settings, members: dict[str, bytes]) -> Path:
+    path = Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return path
+
+
+def test_reuse_cached_serves_from_the_cached_zip_with_no_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    _bulk_zip(settings, {f"CIK{CIK}.json": json.dumps(_conflicted()).encode()})
+    source = _adapter(settings, EdgarRouter(), reuse_cached=True)
+    monkeypatch.setattr(source, "_stale_fact_caches", lambda: 0)
+    _stamps(source, CIK, STAMPS)
+    records = source.statement_facts(CIK)
+    assert records and source.requests == 0  # neither the zip nor the per-CIK API
+
+
+def test_reuse_cached_raises_on_a_zip_that_does_not_open(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    path = _bulk_zip(settings, {})
+    path.write_bytes(b"not a zip")
+    source = _adapter(settings, EdgarRouter(), reuse_cached=True)
+    _stamps(source, CIK, STAMPS)
+    with pytest.raises(zipfile.BadZipFile):
+        source.statement_facts(CIK)
+    assert source.requests == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_stale_statement_caches_count_only_while_the_switch_is_on(
+    tmp_path: Path, enabled: bool
+) -> None:
+    """A CIK whose facts cache is current but whose statement cache is
+    absent is stale for the bulk decision only with the switch on."""
+    settings = edgar_settings(tmp_path / "cache", statement_facts_enabled=enabled)
+    source = _adapter(settings, _router(**{f"c{CIK}": _conflicted()}))
+    _stamps(source, CIK, STAMPS)
+    if enabled:  # fill the facts cache alone, as a run before the switch did
+        off = _adapter(edgar_settings(tmp_path / "cache"), _router(**{f"c{CIK}": _conflicted()}))
+        off.facts(CIK, [SHARES])
+    else:
+        source.facts(CIK, [SHARES])
+    assert source._stale_fact_caches() == (1 if enabled else 0)

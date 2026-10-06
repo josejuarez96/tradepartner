@@ -809,13 +809,31 @@ def bulk_submissions(
 
 
 def bulk_company_facts(
-    *, settings: Settings | None = None, client: httpx.Client | None = None
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+    reuse_cached: bool = False,
 ) -> Path:
-    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`."""
+    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`.
+
+    With `reuse_cached` (`ingest --bulk-from-cache`, #660) the file already
+    there is returned as it stands with no request, provided it opens as a
+    zip; a missing file or one that does not open raises `BadZipFile`
+    rather than falling back to a download."""
     settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip"
+    if reuse_cached:
+        try:
+            with zipfile.ZipFile(dest):
+                pass
+        except (OSError, zipfile.BadZipFile) as error:
+            raise zipfile.BadZipFile(
+                f"{dest}: reuse_cached needs a companyfacts.zip that opens as a zip: {error}"
+            ) from error
+        return dest
     return _stream_to(
         "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
-        Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip",
+        dest,
         settings=settings,
         client=client,
     )

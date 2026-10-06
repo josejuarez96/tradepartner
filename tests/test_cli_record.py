@@ -9,6 +9,7 @@ message.
 
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -178,6 +179,23 @@ def test_trim_company_facts_keeps_dei_and_share_concepts_only() -> None:
     assert "ffd" not in out["facts"]
     assert payload["facts"]["us-gaap"].get("Revenues")  # input untouched
     assert cli_record.trim_company_facts({"no": "facts"}) == {"no": "facts"}
+
+
+def test_trim_company_facts_keeps_the_configured_statement_tags_only() -> None:
+    """#660 (T77a): a configured `taxonomy:tag` survives, an unlisted
+    concept and a same-named concept in another taxonomy do not."""
+    payload = {
+        "cik": 1,
+        "facts": {
+            "us-gaap": {"Revenues": {"units": {}}, "InventoryNet": {"units": {}}},
+            "ifrs-full": {"Revenues": {"units": {}}},
+        },
+    }
+    tags = Settings(_env_file=None).edgar.statement_tags
+    out = cli_record.trim_company_facts(payload, itertools.chain(*tags.values()))
+    assert "us-gaap:Revenues" in tags["revenue"]
+    assert set(out["facts"]["us-gaap"]) == {"Revenues"}
+    assert "ifrs-full" not in out["facts"]
 
 
 def test_trim_company_tickers_keeps_sample_and_recorded_rows() -> None:
