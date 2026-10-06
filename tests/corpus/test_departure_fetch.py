@@ -222,12 +222,12 @@ def test_notice_is_text_against_stub_against_none() -> None:
     none = notice_exhibit(_fixture("prexml_25_0001000001-26-000002.txt").decode(), max_chars=4000)
 
     assert klx.status == "text"
-    assert klx.type == "EX-99.25"
+    assert klx.document_type == "EX-99.25"
     assert klx.text is not None
     assert klx.text.startswith('The Nasdaq Stock Market LLC (the "Exchange") hereby notifies')
     assert "expired by their terms on September 23, 2026" in klx.text
-    assert (stub.status, stub.type, stub.text) == ("stub", "EX-99.25", None)
-    assert (none.status, none.type, none.text) == ("none", None, None)
+    assert (stub.status, stub.document_type, stub.text) == ("stub", "EX-99.25", None)
+    assert (none.status, none.document_type, none.text) == ("none", None, None)
 
 
 def test_the_text_notice_is_cut_at_a_sentence_boundary() -> None:
@@ -255,7 +255,7 @@ def test_an_encoded_document_is_never_taken_for_the_notice() -> None:
 
     notice = notice_exhibit(text, max_chars=4000)
 
-    assert (notice.status, notice.type) == ("stub", "EX-99.25")
+    assert (notice.status, notice.document_type) == ("stub", "EX-99.25")
 
 
 def test_the_record_carries_the_notice_with_the_raw_bytes_hash(tmp_path: Path) -> None:

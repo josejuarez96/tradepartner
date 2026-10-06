@@ -166,7 +166,7 @@ class Notice:
     `text` is set only for `text`."""
 
     status: str
-    type: str | None
+    document_type: str | None
     text: str | None
 
 
@@ -815,7 +815,7 @@ def _record(
         )
         exhibit = {
             "status": notice.status,
-            "type": notice.type,
+            "type": notice.document_type,
             "text": notice.text,
             "sha256": hashlib.sha256(filing.raw).hexdigest(),
         }
