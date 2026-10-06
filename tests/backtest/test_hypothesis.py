@@ -601,3 +601,19 @@ def test_frozen_hash_matches_drops_only_an_at_default_suffix(
     )
     assert hypothesis.frozen_hash_matches(settings, without_second)
     assert not hypothesis.frozen_hash_matches(settings, without_both)
+
+
+def test_invalid_frozen_value_names_its_key_and_the_file_value(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """#1093: `Settings` hides input values in its errors, so the refusal re-renders
+    the offending frozen key with the file's own value (frozen values are never
+    secrets: a file may name frozen keys only)."""
+    text = FIXTURE.read_text()
+    assert "\ntop_fraction = 0.10\n" in text
+    path = _copy(tmp_path, text.replace("\ntop_fraction = 0.10\n", "\ntop_fraction = 7.5\n", 1))
+    with pytest.raises(HypothesisFileError) as excinfo:
+        _register(conn, path, settings)
+    message = str(excinfo.value)
+    assert "strategy.top_fraction = 7.5" in message
+    assert "less than or equal to 1" in message

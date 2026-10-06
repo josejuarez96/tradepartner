@@ -233,7 +233,22 @@ def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
     try:
         return Settings.model_validate(values)
     except ValidationError as exc:
-        raise HypothesisFileError(f"frozen values fail validation: {exc}") from exc
+        raise HypothesisFileError(
+            f"frozen values fail validation: {_render_errors(exc, params)}"
+        ) from exc
+
+
+def _render_errors(exc: ValidationError, params: Mapping[str, Any]) -> str:
+    """`exc`'s errors as `key = value: message`, the value taken from the file's own
+    `params` (#1093): `Settings` hides input values in its errors, and a file may name
+    frozen keys only, so its values are never secrets. A location that is not one of
+    the file's keys (a section-level rule) is shown without a value."""
+    lines = []
+    for error in exc.errors():
+        key = ".".join(str(part) for part in error["loc"])
+        shown = f"{key} = {params[key]!r}" if key in params else key
+        lines.append(f"{shown}: {error['msg']}")
+    return "; ".join(lines)
 
 
 def frozen_params_of(settings: Settings, *, family: str = "momentum") -> dict[str, Any]:

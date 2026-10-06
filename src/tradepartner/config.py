@@ -212,10 +212,12 @@ class EdgarConfig(BaseModel):
 
     An unknown key is refused when the model is validated (#1037), so a
     mistyped `EDGAR__...` override fails instead of being silently ignored
-    (`model_copy(update=...)` does not validate).
+    (`model_copy(update=...)` does not validate). A non-finite float is
+    refused too (#1093): `inf` passes `gt=0`, and `requests_per_second=inf`
+    would turn `edgar_raw`'s throttle off. Errors never echo the input value.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
     requests_per_second: float = Field(default=9.0, gt=0)
@@ -419,7 +421,9 @@ class AlpacaConfig(BaseModel):
     the trading client (T48) passes the literal `paper=True` and never forwards this field.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", allow_inf_nan=False, hide_input_in_errors=True
+    )
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
@@ -657,8 +661,10 @@ ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
 # silently to the default, and a NaN or infinite value must fail rather than turn a
-# result into NaN.
-_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False)
+# result into NaN. Errors never echo the input value (#1093): `CostsConfig` and
+# `RiskConfig` are validated on their own in `execution/`, outside `Settings`' own
+# `hide_input_in_errors`.
+_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class HypothesesConfig(BaseModel):
