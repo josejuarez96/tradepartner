@@ -112,7 +112,7 @@ _FINGERPRINT_KEYS: Final = (
     "holdout.start",
     "holdout.end",
 )
-_FINGERPRINT_SECTIONS: Final = ("strategy", "schedule", "universe")
+_FINGERPRINT_SECTIONS: Final = ("schedule", "universe")
 
 
 class _HasParams(Protocol):
@@ -188,7 +188,7 @@ def _canonical_json(value: Any) -> str:
 
 def fingerprint(family: str, params: Mapping[str, Any], in_sample_start: date) -> str:
     """SHA-256 of the canonical JSON of the keys that decide what a run computes:
-    `family`, its signal section in full, `strategy.*`, `schedule.*`, `universe.*`,
+    `family`, its signal section in full, `schedule.*`, `universe.*`,
     `execution.fill_price`, `costs.per_side_bps`, `in_sample_start` (record metadata,
     not a frozen param), `holdout.start` and `holdout.end`, through the canonical set."""
     canonical = canonical_frozen_set(params, family)

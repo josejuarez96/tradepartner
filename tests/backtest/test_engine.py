@@ -583,8 +583,8 @@ class TestPublicPlan:
         recorded: list[engine.Plan] = []
         original = engine._plan
 
-        def recording(provider: Any, params: Settings, session: date) -> engine.Plan:
-            result = original(provider, params, session)
+        def recording(provider: Any, params: Settings, session: date, family: str) -> engine.Plan:
+            result = original(provider, params, session, family)
             recorded.append(result)
             return result
 
@@ -632,8 +632,8 @@ class TestPublicPlan:
         want = _run(_provider(provider_skip), end=T4)
         original = engine._plan
 
-        def emptied(provider: Any, params: Settings, session: date) -> engine.Plan:
-            plan = original(provider, params, session)
+        def emptied(provider: Any, params: Settings, session: date, family: str) -> engine.Plan:
+            plan = original(provider, params, session, family)
             return dataclasses.replace(plan, members=(), scores={}, excluded_no_history=())
 
         monkeypatch.setattr(engine, "_plan", emptied)

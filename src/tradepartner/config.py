@@ -652,7 +652,8 @@ FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
 # and the paper planning step before any trial, order or plan row: its signal is not
 # dispatched yet, so a run would read momentum's live, unfrozen `strategy.*` instead.
 # T85e adds `profitability` with the engine dispatch.
-ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
+ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle", "profitability")
+PAPER_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
