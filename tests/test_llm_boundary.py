@@ -14,8 +14,8 @@ reads them. Each test runs over the real tree and over the fixtures in
 - **(c) text**: the vendor host and key name, table and dataset names in the
   packet modules, and the research store's directory, each only where allowed.
 - **(d) store unchanged** and **(e) the zero default** exercise modules later
-  tasks land, so they skip with `labeling modules pending` until then: T119
-  removes (e)'s skip, T123 and T123b remove (d)'s. The snapshot (d) relies on and
+  tasks land: (e) runs since T119 landed `research.models`; (d) skips with
+  `labeling modules pending` until T123 and T123b remove its skips. The snapshot (d) relies on and
   the recordings' contract (e) are pinned here already.
 
 Known limit: the text rules read literal text, so a string split across a
@@ -797,7 +797,10 @@ _KEY_ENV = KEY_NAME
 
 
 def _models() -> Any:
-    return pytest.importorskip("tradepartner.research.models", reason=PENDING)
+    """T119 landed `research.models`, so (e) runs unconditionally (no skip)."""
+    from tradepartner.research import models
+
+    return models
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch, env: Mapping[str, str]) -> Any:

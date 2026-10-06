@@ -1,0 +1,3 @@
+- T119 (#1039): research labeling config keys, TYPESAFE_API_KEY as SecretStr, research.models (zero default, pinned id, 429/529-only retry), research.datafiles and the ScriptedModelClient double; boundary test (e) now runs.
+### Added
+- Research labeling config (`research.data_dir`, the two spend ceilings at 0.0, `research.labeling.*`), `Settings.typesafe_api_key`, `tradepartner.research.models` (disabled client unless both ceilings and the key are set; pinned `jev-X.Y.Z`, alias refusal; one POST per call, retrying 429/529 and pre-send connection errors only) and `tradepartner.research.datafiles` (the research store's paths, append-only JSONL) (T119, #1039).
