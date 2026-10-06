@@ -26,6 +26,7 @@ SLUG = "fixture-momentum"
 # Spec req 10: the frozen sections (every key) and the single frozen keys.
 FROZEN_SECTIONS = (
     "strategy",
+    "schedule",
     "universe",
     "costs",
     "backtest",
@@ -402,3 +403,49 @@ def test_load_frozen_refuses_a_stale_key_set(
     )
     with pytest.raises(HypothesisFileError, match="frozen key set"):
         hypothesis.load_frozen(conn, SLUG, settings=settings)
+
+
+# --- frozen-key defaults (strategy-lab T96) ----------------------------------
+
+
+def test_a_new_file_stores_both_schedule_keys(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, FIXTURE, settings)
+    assert record.params["schedule.rebalance_cadence"] == "month_end"
+    assert record.params["schedule.signal_anchor"] == "month_end"
+
+
+def test_load_frozen_on_the_pre_lab_fixture_twin(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A registration stored without `schedule.*` (as before the lab) runs, reads
+    `month_end` for both keys, and keeps its stored hash."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    params = {
+        k: v
+        for k, v in hypothesis.frozen_params(parsed, settings).items()
+        if not k.startswith("schedule.")
+    }
+    record = registry.register_hypothesis(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=FIXTURE.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=params,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=settings,
+    )
+    live = settings.model_copy(
+        update={"schedule": settings.schedule.model_copy(update={"rebalance_cadence": "daily"})}
+    )
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
+    assert loaded.schedule.rebalance_cadence == "month_end"
+    assert loaded.schedule.signal_anchor == "month_end"
+    assert registry.get_hypothesis(conn, SLUG).params_sha256 == record.params_sha256
+    assert registry.params_sha256(params) == record.params_sha256
