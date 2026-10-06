@@ -1,4 +1,5 @@
-"""Window, holdout and gap-gate decisions (backtest spec req 11; plan T36).
+"""Window, holdout and gap-gate decisions (backtest spec req 11; plan T36; at a cadence,
+strategy-lab spec req 6, plan T98).
 
 Pure: every input is passed in, and the only outside reference is the XNYS
 calendar. The run orchestration (T39) opens the trial handle first, then asks
@@ -32,7 +33,13 @@ no gap series is given yet, the outcome is `needs_gap`: the caller reads
 with the series. A flag given without its reason is refused at its rule, so
 a gate is never passed on an unexplained flag.
 
-Rebalance sessions are the last XNYS session of each month (ADR 0006).
+Rebalance sessions are those of the hypothesis's frozen `schedule.rebalance_cadence`
+(`schedule.rebalance_sessions`; ADR 0012): `decide`'s "touches the holdout but reaches
+none of its rebalance sessions" rule, the gap gate's sessions (`gap_sessions`) and the
+default in-sample window's end (`default_in_sample_window`) take it. The caller passes
+it from the frozen `Settings` (`hypothesis.load_frozen`, through
+`frozen.frozen_values`). Tracking windows stay monthly (Phase 4, strategy-lab spec
+req 11): `first_tracking_session` is a month end.
 """
 
 from __future__ import annotations
@@ -40,10 +47,13 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
+from tradepartner.backtest.frozen import frozen_values
+from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import last_session_of_month
+from tradepartner.config import Cadence
 from tradepartner.store.registry import HoldoutSpend, HypothesisRecord
 
 Outcome = Literal["run", "needs_gap", "refused_window", "refused_holdout", "refused_gap"]
@@ -85,8 +95,9 @@ class Frozen:
 
     @classmethod
     def from_hypothesis(cls, hypothesis: HypothesisRecord) -> Frozen:
-        """Read the decision inputs from a `hypotheses` row and its frozen params."""
-        threshold = hypothesis.params.get(GAP_THRESHOLD_KEY)
+        """Read the decision inputs from a `hypotheses` row and its frozen params,
+        through `frozen.frozen_values` (the one accessor of a registration's values)."""
+        threshold = frozen_values(hypothesis).get(GAP_THRESHOLD_KEY)
         if isinstance(threshold, bool) or not isinstance(threshold, int | float):
             raise ValueError(
                 f"hypothesis {hypothesis.slug!r} has no numeric frozen {GAP_THRESHOLD_KEY}"
@@ -146,20 +157,12 @@ def _next_month(day: date) -> tuple[int, int]:
     return (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
 
 
-def _previous_month(day: date) -> tuple[int, int]:
-    return (day.year - 1, 12) if day.month == 1 else (day.year, day.month - 1)
-
-
-def gap_sessions(window: Window) -> tuple[date, ...]:
-    """The rebalance sessions (last XNYS session of each month) inside `window`."""
-    sessions: list[date] = []
-    year, month = window.start.year, window.start.month
-    while (year, month) <= (window.end.year, window.end.month):
-        session = last_session_of_month(year, month)
-        if window.start <= session <= window.end:
-            sessions.append(session)
-        year, month = _next_month(date(year, month, 1))
-    return tuple(sessions)
+def gap_sessions(window: Window, cadence: Cadence = "month_end") -> tuple[date, ...]:
+    """The rebalance sessions at `cadence` inside `window` (none when it ends before it
+    starts): where the gap gate reads `survivorship_gap`."""
+    if window.end < window.start:
+        return ()
+    return tuple(rebalance_sessions(window.start, window.end, cadence))
 
 
 def window_touches_holdout(window: Window, frozen: Frozen) -> bool:
@@ -193,18 +196,18 @@ def _tracking(window: Window, frozen: Frozen) -> Decision:
     return Decision("run", "tracking", "tracking run; holdout and gap flags are not read")
 
 
-def default_in_sample_window(frozen: Frozen) -> Window:
-    """`[in_sample_start, last rebalance session strictly before holdout.start]`,
-    so an ordinary run cannot drift into the holdout."""
-    end = last_session_of_month(frozen.holdout_start.year, frozen.holdout_start.month)
-    if end >= frozen.holdout_start:
-        end = last_session_of_month(*_previous_month(frozen.holdout_start))
-    if end < frozen.in_sample_start:
+def default_in_sample_window(frozen: Frozen, cadence: Cadence = "month_end") -> Window:
+    """`[in_sample_start, last rebalance session at cadence strictly before
+    holdout.start]`, so an ordinary run cannot drift into the holdout."""
+    sessions = rebalance_sessions(
+        frozen.in_sample_start, frozen.holdout_start - timedelta(days=1), cadence
+    )
+    if not sessions:
         raise ValueError(
-            f"no rebalance session between in_sample_start {frozen.in_sample_start} "
-            f"and holdout.start {frozen.holdout_start}"
+            f"no rebalance session at {cadence} between in_sample_start "
+            f"{frozen.in_sample_start} and holdout.start {frozen.holdout_start}"
         )
-    return Window(frozen.in_sample_start, end)
+    return Window(frozen.in_sample_start, sessions[-1])
 
 
 def _window_refusal(window: Window, frozen: Frozen) -> str | None:
@@ -229,10 +232,13 @@ def decide(
     prior_spends: Sequence[HoldoutSpend],
     *,
     tracking: bool = False,
+    cadence: Cadence = "month_end",
 ) -> Decision:
     """Apply the window, holdout and gap rules (module docstring) to one run.
 
-    `gap_series` maps rebalance sessions to the survivorship-gap count share
+    `cadence` is the hypothesis's frozen `schedule.rebalance_cadence`: the rebalance
+    sessions the holdout must reach and the gap gate reads at. `gap_series` maps
+    rebalance sessions to the survivorship-gap count share
     read at their close, or is `None` before any read. `prior_spends` are the
     family's holdout trials **excluding this one**: a caller that opened this
     trial as `holdout` before reading `family_holdout_spends` drops its own id,
@@ -253,7 +259,8 @@ def decide(
         return Decision("run", "in_sample", f"in-sample run{ignored}")
 
     holdout = f"[{frozen.holdout_start}, {frozen.holdout_end}]"
-    if not any(frozen.holdout_start <= s <= frozen.holdout_end for s in gap_sessions(window)):
+    sessions = gap_sessions(window, cadence)
+    if not any(frozen.holdout_start <= s <= frozen.holdout_end for s in sessions):
         return Decision(
             "refused_window",
             None,
@@ -287,7 +294,6 @@ def decide(
     if flags.override_gap and not _has_text(reasons.gap_reason):
         return replace(spend, outcome="refused_gap", message="--override-gap needs a --gap-reason")
 
-    sessions = gap_sessions(window)
     if gap_series is None:
         return replace(
             spend,
