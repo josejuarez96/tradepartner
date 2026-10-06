@@ -128,6 +128,9 @@ def test_unknown_family_raises_before_provider_read() -> None:
     with pytest.raises(KeyError):
         plan(provider, _params(), T0, family="unknown")  # type: ignore[arg-type]
     assert provider.calls == []
+    with pytest.raises(KeyError):
+        run(_params(), provider, T0, T1, _handle(), [15.0], family="unknown")  # type: ignore[arg-type]
+    assert provider.calls == []
 
 
 def test_table_has_the_declared_reads_and_construction_sections() -> None:

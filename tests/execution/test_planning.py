@@ -640,6 +640,21 @@ def test_profitability_is_refused_by_the_paper_family_gate(
     assert env.counts() == counts
 
 
+def test_momentum_plan_uses_the_windows_stored_family(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_plan = engine.plan
+    seen: list[str] = []
+
+    def record(*args: Any, **kwargs: Any) -> engine.Plan:
+        seen.append(kwargs["family"])
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "plan", record)
+    assert env.plan().status == "planned"
+    assert seen == ["momentum"]
+
+
 def test_a_run_of_another_window_is_refused(env: Env) -> None:
     with pytest.raises(ValueError, match="not of window"):
         env.plan(run=replace(env.run, window_id=999))

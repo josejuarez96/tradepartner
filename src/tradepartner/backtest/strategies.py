@@ -9,8 +9,6 @@ from typing import Protocol, cast
 
 import polars as pl
 
-from tradepartner.backtest.provider import DataProvider
-from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.signals import anchor_sessions, gross_profitability, momentum
 from tradepartner.config import HypothesisFamily, Settings
 
@@ -38,14 +36,23 @@ class _ProfitabilityRead:
 _Read = _MomentumRead | _ProfitabilityRead
 
 
-class _FactProvider(Protocol):
+class _ProviderReads(Protocol):
+    def adjusted_prices(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
+    ) -> pl.DataFrame: ...
+
     def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame: ...
 
     def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]: ...
 
 
-_Reader = Callable[[DataProvider, Settings, date, Sequence[str]], _Read]
-_Signal = Callable[[_Read, Settings, date, Sequence[str]], SignalResult]
+_Reader = Callable[[object, Settings, date, datetime, Sequence[str]], _Read]
+_Signal = Callable[[_Read, Settings, date, datetime, Sequence[str]], SignalResult]
 
 
 @dataclass(frozen=True)
@@ -61,15 +68,19 @@ class Strategy:
 
 
 def _momentum_read(
-    provider: DataProvider, params: Settings, session: date, members: Sequence[str]
+    provider: object,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
 ) -> _Read:
     strategy, schedule = params.strategy, params.schedule
     a_form, _ = anchor_sessions(
         session, strategy.formation_months, strategy.skip_months, schedule.signal_anchor
     )
     return _MomentumRead(
-        provider.adjusted_prices(
-            read_time(session, schedule.rebalance_cadence),
+        cast(_ProviderReads, provider).adjusted_prices(
+            t,
             members,
             strategy.signal_total_return,
             sessions_from=a_form,
@@ -78,7 +89,11 @@ def _momentum_read(
 
 
 def _momentum_signal(
-    readings: _Read, params: Settings, session: date, members: Sequence[str]
+    readings: _Read,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
 ) -> SignalResult:
     frame = cast(_MomentumRead, readings).frame
     strategy, schedule = params.strategy, params.schedule
@@ -99,22 +114,29 @@ def _momentum_signal(
 
 
 def _profitability_read(
-    provider: DataProvider, params: Settings, session: date, members: Sequence[str]
+    provider: object,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
 ) -> _Read:
-    t = read_time(session, params.schedule.rebalance_cadence)
-    facts = cast(_FactProvider, provider)
+    facts = cast(_ProviderReads, provider)
     return _ProfitabilityRead(facts.statement_facts(t, members), facts.sics(t, members))
 
 
 def _profitability_signal(
-    readings: _Read, params: Settings, session: date, members: Sequence[str]
+    readings: _Read,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
 ) -> SignalResult:
     data = cast(_ProfitabilityRead, readings)
     config = params.profitability
     result = gross_profitability(
         data.facts,
         data.sics,
-        read_time(session, params.schedule.rebalance_cadence),
+        t,
         security_ids=members,
         annual_period_days=config.annual_period_days,
         max_fact_age_days=config.max_fact_age_days,

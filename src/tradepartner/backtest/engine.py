@@ -191,7 +191,7 @@ def _plan(
     universe = provider.universe(t)
     members = sorted(universe.members["security_id"].to_list())
     signal = strategy.signal(
-        strategy.reader(provider, params, session, members), params, session, members
+        strategy.reader(provider, params, session, t, members), params, session, t, members
     )
     construction = getattr(params, strategy.section)
     return Plan(
