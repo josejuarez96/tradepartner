@@ -32,10 +32,13 @@ whose primary document is downloaded and split on its `Item N.NN` headings
 `edgar.requests_per_second`, its User-Agent and retry policy). Raw responses
 are cached under `edgar.cache_dir/corpus/departure-reason/raw/`, which
 `_fetch_delisting`'s unlink of `cached_filing_path` never touches, and a rerun
-requests only what that cache lacks; a quarter's index is cached only once
-the quarter has ended. A document EDGAR answers with an HTTP error is recorded
-under the listing end's `missing` with its status, and a `404` or `410` is
-remembered so a rerun does not ask again. Output: `corpus.jsonl` (one object
+requests only what that cache lacks. Two things go stale and are fetched again:
+a quarter's index until `INDEX_SETTLE_DAYS` after the quarter ends, and an
+issuer's submissions JSON while a window of one of its listing ends was still
+open when it was fetched (so a later amendment, 8-K or marker is seen). A
+document EDGAR answers with an HTTP error is recorded under the listing end's
+`missing` with its status (a Form 25 not served leaves `exhibit` null), and a
+`404` or `410` is remembered so a rerun does not ask again. Output: `corpus.jsonl` (one object
 per listing end, sorted by filing date and accession) and `counts.json` beside
 `raw/`. This module imports nothing from `tradepartner.research`, never opens
 the runtime store, and writes nothing in the research store.
@@ -83,6 +86,12 @@ EXHIBIT_MIN_WORDS = 20
 #: Rule 12d2-2(d)(1): a removal takes effect 10 days after the Form 25 is filed;
 #: the notification XML states no effective date.
 EFFECTIVE_DAYS = 10
+#: A quarter's `form.idx` is cached as final only this many days after the quarter
+#: ends, so a run just after quarter end never freezes an index missing its last day.
+INDEX_SETTLE_DAYS = 3
+#: Submission documents that are never the notice (binary or uuencoded payloads).
+_NON_TEXT_TYPES = frozenset({"GRAPHIC", "PDF", "ZIP", "EXCEL", "XML", "JSON"})
+_UUENCODED = re.compile(r"(?m)^begin [0-7]{3} \S")
 #: Statuses that mean EDGAR does not have the document, remembered across reruns.
 _PERMANENT_STATUSES = frozenset({404, 410})
 #: `truncate_sentence` keeps a sentence cut only when it keeps at least this share.
@@ -162,8 +171,9 @@ class Notice:
 
 
 def notice_exhibit(submission_text: str, *, max_chars: int) -> Notice:
-    """The longest non-Form-25 document of a full-submission text (the EX-99.25
-    notice), classified at `EXHIBIT_MIN_WORDS` and cut at `max_chars`."""
+    """The longest text document of a full-submission text other than the
+    notification itself (the EX-99.25 notice; images, PDFs and uuencoded payloads
+    are skipped), classified at `EXHIBIT_MIN_WORDS` and cut at `max_chars`."""
     best_type, best_text = "", ""
     for doc_type, body in _DOCUMENT.findall(submission_text):
         doc_type = doc_type.strip()
@@ -171,6 +181,8 @@ def notice_exhibit(submission_text: str, *, max_chars: int) -> Notice:
             continue  # the notification itself
         found = _DOCUMENT_TEXT.search(body)
         raw = found.group(1) if found else body
+        if doc_type.upper() in _NON_TEXT_TYPES or "<PDF>" in raw or _UUENCODED.search(raw):
+            continue  # an image, PDF or other encoded payload is never the notice
         if _HTML_HINT.search(raw):
             text = html_to_text(raw)
         else:
@@ -274,8 +286,11 @@ class _NotServed:
 class _CachedEdgar:
     """`edgar_raw` calls behind a raw-response cache under `raw_dir`."""
 
-    def __init__(self, settings: Settings, client: httpx.Client | None, raw_dir: Path) -> None:
+    def __init__(
+        self, settings: Settings, client: httpx.Client | None, raw_dir: Path, now: datetime
+    ) -> None:
         self._settings = settings
+        self._now = now
         # `download_filing_file` caches under `edgar.cache_dir`; pointing a copy of the
         # settings at `raw_dir` keeps the corpus's documents out of the ingest cache.
         edgar = settings.edgar.model_copy(update={"cache_dir": str(raw_dir)})
@@ -321,17 +336,35 @@ class _CachedEdgar:
             return self._not_served(path, url, error)
         return downloaded.read_bytes()
 
-    def submissions(self, cik: str) -> Any:
-        """The issuer's submissions payload (`_NotServed` on an HTTP error)."""
+    def submissions(self, cik: str, *, open_until: date) -> Any:
+        """The issuer's submissions payload (`_NotServed` on an HTTP error).
+
+        The cached copy is stored with its fetch time and used only when it was
+        fetched after `open_until`, the last day of any window of this issuer's
+        listing ends; otherwise it is fetched again, so a filing (a new Form 25,
+        amendment, 8-K or marker) made since the last fetch is seen on a rerun.
+        """
         padded = f"{int(cik):010d}"
-        return self._json(
-            self._raw_dir / "submissions" / f"CIK{padded}.json",
-            f"https://data.sec.gov/submissions/CIK{padded}.json",
-            lambda: edgar_raw.submissions(cik, settings=self._settings, client=self._client),
-        )
+        path = self._raw_dir / "submissions" / f"CIK{padded}.json"
+        url = f"https://data.sec.gov/submissions/CIK{padded}.json"
+        if path.is_file():
+            cached = json.loads(path.read_bytes())
+            if datetime.fromisoformat(cached["fetched_at"]).date() > open_until:
+                return cached["payload"]
+        remembered = self._remembered(path)
+        if remembered is not None:
+            return remembered
+        try:
+            payload = edgar_raw.submissions(cik, settings=self._settings, client=self._client)
+        except httpx.HTTPStatusError as error:
+            return self._not_served(path, url, error)
+        stored = {"fetched_at": self._now.isoformat(), "payload": payload}
+        edgar_raw.write_atomic(path, json.dumps(stored).encode("utf-8"))
+        return payload
 
     def submissions_page(self, name: str) -> Any:
-        """One older submissions page (`_NotServed` on an HTTP error)."""
+        """One older submissions page (`_NotServed` on an HTTP error); a page
+        covers a closed range of older filings, so its cached copy is final."""
         if not _SUBMISSIONS_PAGE.fullmatch(name):
             raise edgar_raw.InvalidFilingReferenceError(f"bad submissions page name: {name!r}")
         return self._json(
@@ -463,12 +496,15 @@ def fetch_departure_corpus(
 
     `ciks` keeps only accessions with an index row under one of those CIKs;
     `limit` keeps the first `limit` accessions by filing date. Both narrow the
-    rows seen, so the counts identity holds over what was kept.
+    rows seen, so the counts identity holds over what was kept; `counts.json`
+    records the range, both filters and `fetched_at` (`now`, default the
+    current UTC time), so a narrowed corpus is never mistaken for the full one.
     """
     settings = settings or get_settings()
-    today = (now or datetime.now(UTC)).astimezone(UTC).date()
+    fetched_at = (now or datetime.now(UTC)).astimezone(UTC)
+    today = fetched_at.date()
     out_dir = corpus_dir(settings)
-    edgar = _CachedEdgar(settings, client, out_dir / "raw")
+    edgar = _CachedEdgar(settings, client, out_dir / "raw", fetched_at)
 
     groups = _accession_groups(edgar, since, until, today, ciks, limit)
     index_rows_seen = sum(len(rows) for rows in groups.values())
@@ -477,7 +513,7 @@ def fetch_departure_corpus(
     filings: list[_Filing] = []
     pre_xml = 0
     for accession, rows in groups.items():
-        head = rows[0]
+        head = _index_head(accession, rows)
         raw = edgar.document(head.cik, accession, f"{accession}.txt")
         if isinstance(raw, _NotServed):
             filings.append(
@@ -529,7 +565,15 @@ def fetch_departure_corpus(
     counts_path = out_dir / "counts.json"
     lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
     edgar_raw.write_atomic(corpus_path, lines.encode("utf-8"))
-    edgar_raw.write_atomic(counts_path, (json.dumps(counts.as_json(), indent=2) + "\n").encode())
+    summary = {
+        **counts.as_json(),
+        "since": since.isoformat(),
+        "until": until.isoformat(),
+        "ciks": sorted(f"{int(cik):010d}" for cik in ciks),
+        "limit": limit,
+        "fetched_at": fetched_at.isoformat(),
+    }
+    edgar_raw.write_atomic(counts_path, (json.dumps(summary, indent=2) + "\n").encode())
     return FetchResult(corpus_path, counts_path, counts)
 
 
@@ -555,7 +599,7 @@ def _accession_groups(
     """Index rows in range, grouped by accession in filing-date order."""
     rows: list[UnstampedFiling] = []
     for year, qtr in _quarters(since, until):
-        complete = _quarter_end(year, qtr) < today
+        complete = _quarter_end(year, qtr) + timedelta(days=INDEX_SETTLE_DAYS) < today
         quarter_rows = edgar.index_rows(year, qtr, complete=complete)
         rows.extend(row for row in quarter_rows if since <= row.filed_on <= until)
     rows.sort(key=lambda row: (row.filed_on, row.accession))  # stable: index order within
@@ -572,6 +616,14 @@ def _accession_groups(
     if limit is not None:
         groups = dict(list(groups.items())[:limit])
     return groups
+
+
+def _index_head(accession: str, rows: Sequence[UnstampedFiling]) -> UnstampedFiling:
+    """The row whose CIK the `.txt` is fetched under and that stands in for the
+    issuer when the notification names none: not the filer's own row (the
+    accession's prefix, the exchange for a 25-NSE) when the index lists another."""
+    filer = accession[:10]
+    return next((row for row in rows if row.cik != filer), rows[0])
 
 
 def _filing_rows(payload: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -601,7 +653,8 @@ def _load_submissions(
 
     tables: dict[str, _Submissions] = {}
     for issuer, issuer_filings in by_issuer.items():
-        payload = edgar.submissions(issuer)
+        open_until = max(f.filed_on for f in issuer_filings) + after
+        payload = edgar.submissions(issuer, open_until=open_until)
         if isinstance(payload, _NotServed):
             for filing in issuer_filings:
                 filing.missing.append(payload.missing("submissions"))
@@ -755,13 +808,17 @@ def _record(
     `exchange_name` and `orphan_amendment`)."""
     labeling = settings.research.labeling
     notification = filing.notification
+    exhibit: dict[str, Any] | None = None  # the Form 25 was not served: unknown
     if filing.raw is not None:
         notice = notice_exhibit(
             filing.raw.decode("utf-8", "replace"), max_chars=labeling.exhibit_max_chars
         )
-        sha256: str | None = hashlib.sha256(filing.raw).hexdigest()
-    else:
-        notice, sha256 = Notice("none", None, None), None
+        exhibit = {
+            "status": notice.status,
+            "type": notice.type,
+            "text": notice.text,
+            "sha256": hashlib.sha256(filing.raw).hexdigest(),
+        }
     raw_provision = notification.rule_provision_raw if notification else None
     eightk, note = _eightk(filing, table, edgar, settings)
     markers = _markers(filing, kept, table, settings)
@@ -781,12 +838,7 @@ def _record(
         "rule_provision": normalise_provision(raw_provision) if raw_provision else None,
         "amendments": list(filing.amendments),
         "orphan_amendment": filing.orphan_amendment,
-        "exhibit": {
-            "status": notice.status,
-            "type": notice.type,
-            "text": notice.text,
-            "sha256": sha256,
-        },
+        "exhibit": exhibit,
         "eightk": eightk,
         "eightk_note": note,
         "markers": markers,

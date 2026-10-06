@@ -35,6 +35,8 @@ FIXTURES = ROOT / "tests" / "fixtures" / "corpus"
 CORPUS_SRC = ROOT / "src" / "tradepartner" / "corpus"
 USER_AGENT = "TradePartner test-agent test@example.com"
 NOW = datetime(2026, 10, 6, 12, tzinfo=UTC)
+#: After every fixture window (the latest closes 400 days after 2026-09-25).
+LATER = datetime(2028, 1, 1, tzinfo=UTC)
 
 KLX = "0001354457-26-000904"
 KLX_AMENDMENT = "0001354457-26-000910"
@@ -131,14 +133,21 @@ def _settings(cache_dir: Path, **edgar: Any) -> Settings:
     return Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT, edgar=overrides)
 
 
-def _run(settings: Settings, router: Router) -> departure_fetch.FetchResult:
+def _run(settings: Settings, router: Router, *, now: datetime = NOW) -> departure_fetch.FetchResult:
     return fetch_departure_corpus(
         since=date(2026, 7, 1),
         until=date(2026, 9, 30),
         settings=settings,
         client=router.client(),
-        now=NOW,
+        now=now,
     )
+
+
+def _index_without(*accessions: str) -> bytes:
+    lines = _fixture("form_2026_qtr3.idx").decode().splitlines(keepends=True)
+    return "".join(
+        line for line in lines if not any(f"{acc}.txt" in line for acc in accessions)
+    ).encode()
 
 
 def _records(result: departure_fetch.FetchResult) -> list[dict[str, Any]]:
@@ -180,14 +189,18 @@ def test_one_listing_end_from_the_five_rows_with_the_counts_identity(tmp_path: P
         "exchange_copy": 1,
         "amendment_attached": 1,
         "identity_holds": True,
+        "since": "2026-07-01",
+        "until": "2026-09-30",
+        "ciks": [],
+        "limit": None,
+        "fetched_at": "2026-10-06T12:00:00+00:00",
     }
     assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen
 
 
 def test_an_amendment_with_no_original_is_its_own_listing_end(tmp_path: Path) -> None:
     routes = _routes()
-    lines = _fixture("form_2026_qtr3.idx").decode().splitlines(keepends=True)
-    routes[INDEX_URL] = (200, "".join(line for line in lines if f"{KLX}.txt" not in line).encode())
+    routes[INDEX_URL] = (200, _index_without(KLX))
 
     result = _run(_settings(tmp_path), Router(routes))
 
@@ -222,6 +235,27 @@ def test_the_text_notice_is_cut_at_a_sentence_boundary() -> None:
 
     assert notice.text is not None
     assert notice.text.endswith("on the Exchange. [...]")
+
+
+def test_an_encoded_document_is_never_taken_for_the_notice() -> None:
+    graphic = (
+        "begin 644 logo.jpg\n"
+        + "M_]C_X``02D9)1@`!`0$`8`!@``#_VP!#``@&!@<&!0@'!P<)\n" * 40
+        + "end\n"
+    )
+    text = (
+        _fixture("stub_25nse_0001354457-26-000700.txt")
+        .decode()
+        .replace(
+            "</SEC-DOCUMENT>",
+            f"<DOCUMENT>\n<TYPE>GRAPHIC\n<SEQUENCE>3\n<FILENAME>logo.jpg\n<TEXT>\n{graphic}"
+            "</TEXT>\n</DOCUMENT>\n</SEC-DOCUMENT>",
+        )
+    )
+
+    notice = notice_exhibit(text, max_chars=4000)
+
+    assert (notice.status, notice.type) == ("stub", "EX-99.25")
 
 
 def test_the_record_carries_the_notice_with_the_raw_bytes_hash(tmp_path: Path) -> None:
@@ -335,12 +369,12 @@ def test_every_request_is_at_or_under_the_pace(
 def test_a_rerun_makes_no_second_request(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     first_router = Router(_routes())
-    first = _run(settings, first_router)
+    first = _run(settings, first_router, now=LATER)
     first_corpus, first_counts = first.corpus_path.read_bytes(), first.counts_path.read_bytes()
     assert first_router.requests
 
     second_router = Router(_routes())
-    second = _run(settings, second_router)
+    second = _run(settings, second_router, now=LATER)
 
     assert second_router.requests == []
     assert second.corpus_path.read_bytes() == first_corpus
@@ -352,7 +386,7 @@ def test_a_document_edgar_does_not_serve_is_recorded_under_missing(tmp_path: Pat
     routes[EIGHTK_URL] = (404, b"Not Found")
     settings = _settings(tmp_path)
 
-    result = _run(settings, Router(routes))
+    result = _run(settings, Router(routes), now=LATER)
 
     klx = _records(result)[0]
     assert klx["listing_end_id"] == KLX
@@ -361,8 +395,49 @@ def test_a_document_edgar_does_not_serve_is_recorded_under_missing(tmp_path: Pat
     assert klx["missing"] == [{"document": "eightk", "url": EIGHTK_URL, "status": 404}]
 
     rerun = Router(routes)
-    _run(settings, rerun)
+    _run(settings, rerun, now=LATER)
     assert rerun.requests == []
+
+
+def test_a_rerun_refetches_submissions_whose_windows_were_open(tmp_path: Path) -> None:
+    """A filing made after the first fetch (here the 25-NSE/A, with the quarter
+    still open) is stamped on the rerun, not counted `unstamped`."""
+    settings = _settings(tmp_path)
+    routes = _routes()
+    routes[INDEX_URL] = (200, _index_without(KLX_AMENDMENT))
+    submissions = json.loads(_fixture("submissions_klx_CIK0001738827.json"))
+    recent = submissions["filings"]["recent"]
+    for column in recent.values():
+        del column[0]  # the 25-NSE/A row
+    routes[KLX_SUBMISSIONS_URL] = (200, json.dumps(submissions).encode())
+    first = _run(settings, Router(routes), now=datetime(2026, 9, 24, 23, tzinfo=UTC))
+    assert (first.counts.kept, first.counts.amendment_attached) == (1, 0)
+
+    rerun = Router(_routes())
+    second = _run(settings, rerun)
+
+    assert (second.counts.unstamped, second.counts.amendment_attached) == (1, 1)
+    assert _records(second)[0]["amendments"] == [KLX_AMENDMENT]
+    assert KLX_SUBMISSIONS_URL in rerun.urls()
+    assert EIGHTK_URL not in rerun.urls()
+
+
+def test_an_unserved_form25_takes_the_issuer_row_not_the_exchange_row(tmp_path: Path) -> None:
+    routes = _routes()
+    lines = _index_without(KLX_AMENDMENT).decode().splitlines(keepends=True)
+    klx_rows = [line for line in lines if f"{KLX}.txt" in line]
+    others = [line for line in lines if f"{KLX}.txt" not in line]
+    routes[INDEX_URL] = (200, "".join(others + klx_rows[::-1]).encode())  # exchange row first
+    routes[KLX_TXT_URL] = (404, b"Not Found")
+
+    result = _run(_settings(tmp_path), Router(routes))
+
+    klx = _records(result)[0]
+    assert klx["listing_end_id"] == KLX
+    assert klx["cik"] == "0001738827"
+    assert klx["exhibit"] is None
+    assert klx["missing"] == [{"document": "form25", "url": KLX_TXT_URL, "status": 404}]
+    assert result.counts.exchange_copy == 1
 
 
 def test_an_unfinished_quarter_index_is_not_cached(tmp_path: Path) -> None:
@@ -374,7 +449,7 @@ def test_an_unfinished_quarter_index_is_not_cached(tmp_path: Path) -> None:
             until=date(2026, 9, 30),
             settings=settings,
             client=router.client(),
-            now=datetime(2026, 9, 30, 23, tzinfo=UTC),
+            now=datetime(2026, 10, 2, 23, tzinfo=UTC),  # inside INDEX_SETTLE_DAYS
         )
         assert INDEX_URL in router.urls()
 
