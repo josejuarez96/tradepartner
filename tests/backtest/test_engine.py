@@ -6,22 +6,26 @@ import ast
 import dataclasses
 import itertools
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import polars as pl
 import pytest
 
 from backtest.fake_provider import FakeProvider
 from tradepartner.backtest import engine
 from tradepartner.backtest.costs import Commissions, trade_cost
-from tradepartner.backtest.engine import BacktestResult, run
+from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult, run
 from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
+from tradepartner.backtest.signals import momentum_12_1
+from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, session_close
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings, SignalAnchor
 from tradepartner.store import registry
 
 SRC = Path(__file__).parents[2] / "src" / "tradepartner" / "backtest"
@@ -610,7 +614,7 @@ class TestPublicPlan:
         members = sorted(provider.universe(t).members["security_id"].to_list())
         strategy = params.strategy
         frame = provider.adjusted_prices(t, members, strategy.signal_total_return)
-        signal = engine.momentum_12_1(
+        signal = momentum_12_1(
             frame, T0, strategy.formation_months, strategy.skip_months, security_ids=members
         )
         assert public.members == tuple(members) == ("A", "B", "C", "D")
@@ -638,3 +642,245 @@ class TestPublicPlan:
             assert got[level].equity == result.equity
             assert got[level].rebalances == result.rebalances
             assert got[level].targets == result.targets
+
+
+# --- cadence (strategy-lab spec req 6, plan T98) ------------------------------------
+
+#: E stops trading on this session but stays in the universe: at every rebalance below,
+#: its last bar precedes the signal frame's bound A_form.
+E_LAST_BAR = date(2023, 1, 20)
+
+
+def _cadence_provider(
+    cadence: Cadence, start: date, end: date, *, unbounded: bool = False
+) -> FakeProvider:
+    """`_provider`'s names plus the halted E, members at every rebalance at `cadence`."""
+    # E trades like A until it halts.
+    e_rows = (
+        _price_rows()
+        .filter((pl.col("security_id") == "A") & (pl.col("session") <= E_LAST_BAR))
+        .with_columns(pl.lit("E").alias("security_id"))
+    )
+    prices = pl.concat([_price_rows(), e_rows])
+    names = [*sorted(GROWTH), "E"]
+    members = {session: names for session in rebalance_sessions(start, end, cadence)}
+    kind = _UnboundedProvider if unbounded else FakeProvider
+    return kind(prices=prices, members=members, benchmarks={})
+
+
+class _UnboundedProvider(FakeProvider):
+    """The engine as it read before T98: every signal frame unbounded."""
+
+    def adjusted_prices(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
+    ) -> pl.DataFrame:
+        return super().adjusted_prices(t, ids, include_dividends)
+
+
+def _assert_same_results(
+    got: Mapping[float, BacktestResult], want: Mapping[float, BacktestResult]
+) -> None:
+    assert sorted(got) == sorted(want)
+    for level, result in want.items():
+        other = got[level]
+        assert other.equity == result.equity
+        assert other.rebalances == result.rebalances
+        assert other.weights == result.weights
+        assert other.targets == result.targets
+        assert other.position_values.equals(result.position_values)
+        assert len(other.marking_frames) == len(result.marking_frames)
+        for a, b in zip(other.marking_frames, result.marking_frames, strict=True):
+            assert (a.start, a.end) == (b.start, b.end)
+            assert a.frame.equals(b.frame)
+
+
+class TestSignalFrameBound:
+    """The signal frame read from A_form on gives the unbounded engine's results row
+    for row (plan T98)."""
+
+    @pytest.mark.parametrize(
+        ("cadence", "anchor", "start", "end"),
+        [
+            ("week_end", "month_end", date(2024, 1, 5), date(2024, 4, 26)),
+            # T = 2024-02-05: T - 12 months is Sunday 2023-02-05, so A_form is 2023-02-03.
+            ("daily", "offset", date(2024, 1, 29), date(2024, 2, 29)),
+        ],
+    )
+    def test_bounded_equals_unbounded_row_for_row(
+        self, cadence: Cadence, anchor: SignalAnchor, start: date, end: date
+    ) -> None:
+        params = _params(schedule={"rebalance_cadence": cadence, "signal_anchor": anchor})
+        levels = (0.0, 15.0)
+        bounded = _cadence_provider(cadence, start, end)
+        got = run(params, bounded, start, end, _handle(), levels)
+        want = run(
+            params,
+            _cadence_provider(cadence, start, end, unbounded=True),
+            start,
+            end,
+            _handle(),
+            levels,
+        )
+        _assert_same_results(got, want)
+
+        signal_reads = [
+            call
+            for call in bounded.calls
+            if call.method == "adjusted_prices" and call.sessions_from is not None
+        ]
+        sessions = rebalance_sessions(start, end, cadence)
+        assert len(signal_reads) == len(sessions) - 1  # one per plan, none at T_n
+        # The bound cut the halted name out of every signal frame, and E is never scored.
+        assert all(call.sessions_from > E_LAST_BAR for call in signal_reads)
+        assert all(row.n_excluded_no_history >= 1 for row in got[0.0].rebalances)
+        if anchor == "offset":
+            assert date(2024, 2, 5) in sessions
+            assert date(2023, 2, 5).weekday() == 6  # the weekend T - k
+            assert any(call.sessions_from == date(2023, 2, 3) for call in signal_reads)
+
+    def test_the_marking_read_is_unbounded(self) -> None:
+        provider = _provider()
+        _run(provider)
+        marking = [
+            call
+            for call in provider.calls
+            if call.method == "adjusted_prices" and call.sessions_from is None
+        ]
+        assert len(marking) == len(rebalance_sessions(T0, T3)) - 1
+
+
+class TestCombinationsAndLag:
+    """The spec's "Combinations and lag" criterion on a synthetic two-name case at
+    `daily`, where F_i = T_{i+1}: both names held at equal weight, close fills, no
+    costs, so every rebalance trades only the drift of the session before it."""
+
+    START, END = date(2024, 1, 29), date(2024, 2, 9)
+
+    def _result(self) -> BacktestResult:
+        prices = _price_rows().filter(pl.col("security_id").is_in(["A", "B"]))
+        members = {s: ["A", "B"] for s in rebalance_sessions(self.START, self.END, "daily")}
+        provider = FakeProvider(prices=prices, members=members, benchmarks={})
+        params = _params(
+            strategy={"top_fraction": 1.0, "weighting": "equal"},
+            schedule={"rebalance_cadence": "daily"},
+            execution={"fill_price": "close"},
+            costs={"per_side_bps": 0.0, "sensitivity_per_side_bps": []},
+        )
+        return run(params, provider, self.START, self.END, _handle(), (0.0,))[0.0]
+
+    def _close(self, sid: str) -> dict[date, float]:
+        prices = _price_rows().filter(pl.col("security_id") == sid)
+        return dict(prices.select("session", "close").iter_rows())
+
+    def test_the_next_rebalance_trades_from_the_fill_at_f_i(self) -> None:
+        """The plan read at close(T_{i+1}) = close(F_i) trades from the positions the
+        fill at F_i bought, drifted one session: its turnover is that drift alone (were
+        the plan read before the fill, the trade would start from cash: turnover 1/2)."""
+        result = self._result()
+        a, b = self._close("A"), self._close("B")
+        sessions = rebalance_sessions(self.START, self.END, "daily")
+        rows = result.rebalances
+        assert [row.fill_session for row in rows] == sessions[1:]  # F_i = T_{i+1}
+        assert math.isclose(rows[0].turnover, 0.5)  # the first buy, from cash
+        for previous, row in itertools.pairwise(rows):
+            f_prev, f = previous.fill_session, row.fill_session
+            growth_a, growth_b = a[f] / a[f_prev], b[f] / b[f_prev]
+            drift = abs(growth_a - growth_b) / (2 * (growth_a + growth_b))
+            assert math.isclose(row.turnover, drift, rel_tol=1e-9)
+            assert 0 < row.turnover < rows[0].turnover
+
+    def test_the_filled_position_earns_the_full_next_period(self) -> None:
+        """Bought at close(F_i), held at equal weight to close(F_{i+1}): equity grows by
+        the mean of the two names' close-to-close returns over that period, and holds
+        cash until close(F_0) -- a one-session lag (hand-computed equity)."""
+        result = self._result()
+        capital = _params().backtest.initial_capital
+        a, b = self._close("A"), self._close("B")
+        fills = [row.fill_session for row in result.rebalances]
+        expected = {self.START: capital, fills[0]: capital}
+        for f_prev, f in itertools.pairwise(fills):
+            expected[f] = expected[f_prev] * (a[f] / a[f_prev] + b[f] / b[f_prev]) / 2
+        equity = _equity(result)
+        assert set(equity) == set(expected)
+        for session, value in expected.items():
+            assert math.isclose(equity[session], value, rel_tol=1e-12)
+
+
+@pytest.fixture
+def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # `StoreProvider` refuses frozen calendar settings that differ from the live ones.
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+
+
+def _lend(conn: duckdb.DuckDBPyConnection) -> Callable[[], Any]:
+    @contextmanager
+    def _connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        yield conn
+
+    return _connect
+
+
+@pytest.mark.usefixtures("_no_env_file")
+@pytest.mark.parametrize(
+    ("cadence", "start", "end"),
+    [
+        ("week_end", date(2019, 1, 4), date(2019, 3, 29)),
+        ("daily", date(2019, 1, 2), date(2019, 2, 28)),
+    ],
+)
+def test_a_run_at_cadence_on_the_fixture_store_completes(
+    fixture_store: duckdb.DuckDBPyConnection, cadence: Cadence, start: date, end: date
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        schedule={"rebalance_cadence": cadence},
+    )
+    hypothesis = registry.register_hypothesis(
+        fixture_store,
+        slug=f"h-{cadence}",
+        family="momentum",
+        title=f"engine at {cadence}",
+        doc_path=f"docs/hypotheses/h-{cadence}.md",
+        doc_sha256="0" * 64,
+        params={"costs.per_side_bps": 15.0, "schedule.rebalance_cadence": cadence},
+        in_sample_start=start,
+        holdout_start=date(2023, 1, 1),
+        holdout_end=date(2025, 12, 31),
+        registered_by="test",
+        settings=settings,
+    )
+    sessions = rebalance_sessions(start, end, cadence)
+    handle = registry.open_trial(
+        fixture_store,
+        hypothesis_id=hypothesis.hypothesis_id,
+        kind="in_sample",
+        start_session=start,
+        end_session=end,
+        data_cutoff=read_time(sessions[-1], cadence),
+        synthetic=True,
+        run_by="test",
+        settings=settings,
+    )
+    connect = _lend(fixture_store)
+    with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
+        results = run(settings, provider, start, end, handle, (0.0, 15.0))
+    for result in results.values():
+        assert [row.session for row in result.rebalances] == sessions[:-1]
+        assert [row.fill_session for row in result.rebalances] == [
+            fill_session(t, cadence) for t in sessions[:-1]
+        ]
+        assert all(row.n_targets > 0 for row in result.rebalances)
+        strategy = sorted(r.session for r in result.equity if r.series == STRATEGY_SERIES)
+        assert strategy == [s for s in all_sessions() if sessions[0] <= s <= sessions[-1]]
+        assert all(math.isfinite(r.equity) and r.equity > 0 for r in result.equity)
+    if cadence == "daily":
+        assert all(
+            row.fill_session == t_next
+            for row, t_next in zip(results[0.0].rebalances, sessions[1:], strict=True)
+        )
