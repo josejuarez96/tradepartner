@@ -1,0 +1,8 @@
+# Test (a): a default-installed group that includes the research group fails.
+[project]
+name = "fixture"
+dependencies = ["httpx>=0.27"]
+
+[dependency-groups]
+dev = ["pytest>=8", {include-group = "research"}]
+research = ["typesafe-sdk>=0.1"]
