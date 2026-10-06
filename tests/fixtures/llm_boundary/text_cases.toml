@@ -1,0 +1,69 @@
+# Test (c): text snippets the text scan must fail (or pass), spec req 14 as
+# amendment C13 reads it. Appended to the real file at `path` (or a new file);
+# `rule` is the case it must report, "" means it must pass.
+
+[[case]]
+id = "api-host-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "URL = 'https://api.typesafe.ai/v1/systemone'\n"
+rule = "host"
+
+[[case]]
+id = "docs-host-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "# see docs.typesafe.ai for the schema\n"
+rule = "host"
+
+[[case]]
+id = "key-name-in-cli"
+path = "src/tradepartner/cli.py"
+source = "_VENDOR_ENV = 'TYPESAFE_API_KEY'\n"
+rule = "key"
+
+[[case]]
+id = "delistings-token-in-packets"
+path = "src/tradepartner/research/labeling/packets.py"
+source = "SOURCE = 'delistings'\n"
+rule = "table"
+
+[[case]]
+id = "research-runs-identifier-in-packets"
+path = "src/tradepartner/research/labeling/packets.py"
+source = "research_runs = None\n"
+rule = "table"
+
+[[case]]
+id = "security-word-in-questions"
+path = "src/tradepartner/research/labeling/questions.py"
+source = "DESCRIPTION = 'The security moved to another exchange.'\n"
+rule = ""
+
+[[case]]
+id = "gold-dataset-in-questions"
+path = "src/tradepartner/research/labeling/questions.py"
+source = "GOLD = 'departure-reason-gold'\n"
+rule = "dataset"
+
+[[case]]
+id = "research-dir-literal-in-cli"
+path = "src/tradepartner/cli.py"
+source = "_DEFAULT = 'data/research'\n"
+rule = "data_dir"
+
+[[case]]
+id = "data-dir-attribute-in-corpus"
+path = "src/tradepartner/corpus/departure_fetch.py"
+source = "def where(settings):\n    return settings.research.data_dir\n"
+rule = "data_dir"
+
+[[case]]
+id = "key-attribute-in-corpus"
+path = "src/tradepartner/corpus/departure_fetch.py"
+source = "def key(settings):\n    return settings.typesafe_api_key\n"
+rule = "key"
+
+[[case]]
+id = "base-url-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "def url(settings):\n    return settings.research.labeling.api_base_url + '/systemone'\n"
+rule = "host"
