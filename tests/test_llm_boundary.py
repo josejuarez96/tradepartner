@@ -12,7 +12,8 @@ reads them. Each test runs over the real tree and over the fixtures in
 - **(b) imports**: direct imports over `src/` and `scripts/`, relative imports
   resolved, `import_module` and `__import__` read, cases (i) to (v).
 - **(c) text**: the vendor host and key name, table and dataset names in the
-  packet modules, and the research store's directory, each only where allowed.
+  packet modules, and the research store's directory, each only where allowed; the
+  host rule also reads `tests/` (#1031).
 - **(d) store unchanged** and **(e) the zero default** exercise modules later
   tasks land: (e) runs since T119 landed `research.models`; (d) skips with
   `labeling modules pending` until T123 and T123b remove its skips. The snapshot (d) relies on and
@@ -59,6 +60,9 @@ TYPESAFE_RECORDINGS = REPO / "tests" / "fixtures" / "typesafe"
 LABELING_SPEC = REPO / "docs" / "specs" / "research-labeling.md"
 LLM_ANALYST_SPEC = REPO / "docs" / "specs" / "llm-analyst.md"
 SCANNED_ROOTS = ("src", "scripts")
+#: (c)'s host rule also reads `tests/` (#1031), so a fake or fixture cannot name the
+#: vendor host unseen.
+TESTS_ROOT = "tests"
 
 PENDING = "labeling modules pending"
 RECORDINGS_PENDING = "owner recordings pending"
@@ -68,11 +72,13 @@ def _rel(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
 
 
-def _real_tree(suffix: str | None = ".py") -> dict[str, str]:
-    """Every file under `src/` and `scripts/` (only `suffix` files when given),
-    keyed by its repo-relative POSIX path."""
+def _real_tree(
+    suffix: str | None = ".py", roots: tuple[str, ...] = SCANNED_ROOTS
+) -> dict[str, str]:
+    """Every file under `roots` (`src/` and `scripts/` by default; only `suffix`
+    files when given), keyed by its repo-relative POSIX path."""
     tree: dict[str, str] = {}
-    for root in SCANNED_ROOTS:
+    for root in roots:
         for path in sorted((REPO / root).rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
@@ -279,6 +285,9 @@ FACADES = (
     "tradepartner.backtest.results",
 )
 #: (iii): what `tradepartner.research` may never import, whatever the name.
+#: (ii): network clients only `research.models` may import under `tradepartner.research`
+#: (#1031: the standard library's and the common third-party ones, beside httpx).
+NETWORK_CLIENTS = ("httpx", "urllib.request", "http.client", "socket", "requests", "aiohttp")
 RESEARCH_FORBIDDEN = (
     "tradepartner.adapters",
     "tradepartner.ingest",
@@ -448,8 +457,8 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
                 and not _research_import_allowed(edge, modules)
             ):
                 report("i", "imports tradepartner.research from outside it and cli")
-            if in_research and src != MODELS and hits("httpx"):
-                report("ii", "imports httpx under tradepartner.research outside research.models")
+            if in_research and src != MODELS and any(hits(p) for p in NETWORK_CLIENTS):
+                report("ii", "imports a network client under tradepartner.research outside models")
             if hits(MODELS) and src not in (MODELS, MODELS_IMPORTER):
                 report("ii", f"imports research.models; only {MODELS_IMPORTER} may")
             if src == REVIEW_PAGE and hits(RESEARCH) and not _review_page_allowed(edge):
@@ -515,6 +524,16 @@ _KEY = re.compile(KEY_NAME, re.IGNORECASE)
 #: Where the vendor host (and `research.labeling.api_base_url`, its config key) and the
 #: key's name may appear (and `.env.example`, outside the scanned roots).
 VENDOR_FILES = frozenset({"src/tradepartner/research/models.py", "src/tradepartner/config.py"})
+#: Where the vendor host may appear under `tests/`: this test and its text fixtures,
+#: and the tests of the two vendor files.
+TEST_HOST_FILES = frozenset(
+    {
+        "tests/test_llm_boundary.py",
+        "tests/fixtures/llm_boundary/text_cases.toml",
+        "tests/research/labeling/test_models.py",
+        "tests/test_config.py",
+    }
+)
 PACKET_MODULES = frozenset(
     {
         "src/tradepartner/research/labeling/packets.py",
@@ -556,10 +575,20 @@ def _identifiers_and_strings(source: str) -> Iterator[str]:
             yield token.string
 
 
+def _text_tree() -> dict[str, str]:
+    """What the text scan reads: every file under `src/`, `scripts/` and `tests/`."""
+    return _real_tree(suffix=None, roots=(*SCANNED_ROOTS, TESTS_ROOT))
+
+
 def text_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
-    """Every (rule, message) the text scan reports over `tree` (path -> text)."""
+    """Every (rule, message) the text scan reports over `tree` (path -> text). Under
+    `tests/` only the host rule applies, outside `TEST_HOST_FILES`."""
     found: list[tuple[str, str]] = []
     for path, text in sorted(tree.items()):
+        if path.startswith(f"{TESTS_ROOT}/"):
+            if path not in TEST_HOST_FILES and _HOST.search(text):
+                found.append(("host", f"{path} names the vendor host"))
+            continue
         if path not in VENDOR_FILES:
             if _HOST.search(text):
                 found.append(("host", f"{path} names the vendor host"))
@@ -578,12 +607,12 @@ def text_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
 
 
 def test_real_tree_passes_test_c() -> None:
-    assert text_violations(_real_tree(suffix=None)) == []
+    assert text_violations(_text_tree()) == []
 
 
 @pytest.mark.parametrize("case", _cases("text_cases.toml"), ids=lambda c: c.id)
 def test_c_fixture_snippets(case: Case) -> None:
-    rules = {rule for rule, _ in text_violations(_with(_real_tree(suffix=None), case))}
+    rules = {rule for rule, _ in text_violations(_with(_text_tree(), case))}
     if case.rule:
         assert case.rule in rules, rules
     else:
