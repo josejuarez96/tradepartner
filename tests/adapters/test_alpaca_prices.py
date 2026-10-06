@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -1856,7 +1857,7 @@ class TestRenameLead:
         )
         day = date(2022, 6, 15)
         assert resolver.holds(sid, day)
-        assert not resolver.holds(sid, day, lead=False)
+        assert not resolver.holds(sid, day, actions=True)
         found = misattributed(resolver, [(sid, day, 1)], [(sid, date(2022, 6, 16), 1)])
         assert dict(found.bars) == {}
         assert dict(found.actions) == {(sid, date(2022, 6, 16)): 1}
@@ -1891,6 +1892,253 @@ class TestRenameLead:
         bars = source.bars([self.FB], date(2022, 6, 1), date(2022, 6, 30))
         assert calls == [["FB", "META"]]
         assert [b.session for b in bars] == [d for d in self.META_DAYS if d.month == 6]
+
+
+class TestFirstSpanLead:
+    """#974 (owner decision 2026-10-05, option (a)): a security's first
+    assigned equity span also leads back to the security's first session,
+    under the span's ticker. A META-shaped case: Facebook's first
+    ticker-bearing cover page (`FB`) is from 2019-07-24, its first filing
+    from 2012, and Alpaca serves `FB` bars from 2016 on."""
+
+    META = "0001326801"
+    FIRST = date(2012, 5, 18)  # the first session of the earliest securities row
+    COVER = date(2019, 7, 24)  # the first cover page naming FB
+    DAYS: ClassVar[list[date]] = [
+        date(2016, 6, 1),
+        date(2017, 5, 31),
+        date(2017, 6, 1),
+        date(2018, 7, 2),
+        date(2019, 7, 23),
+        date(2019, 7, 24),
+        date(2019, 7, 25),
+    ]
+    OTHER = "0000000099"
+
+    def _listings(self, *extra: dict[str, object]) -> list[dict[str, object]]:
+        return [_listing(self.META, "FB", self.COVER, "Class A Common Stock"), *extra]
+
+    def _resolver(
+        self, *extra: dict[str, object], first: date | None = FIRST, **kwargs: Any
+    ) -> ListingResolver:
+        sessions = None if first is None else {self.META: first}
+        return ListingResolver(self._listings(*extra), first_sessions=sessions, **kwargs)
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "feed": "sip",
+            "bars": {"FB": [_row(d, 150.0 + i) for i, d in enumerate(self.DAYS)]},
+        }
+
+    def _split(self, symbol: str, ex_date: date) -> dict[str, Any]:
+        row = {"symbol": symbol, "ex_date": ex_date.isoformat(), "new_rate": 2, "old_rate": 1}
+        return {"forward_splits": [row | {"id": f"split-{symbol}-{ex_date}"}]}
+
+    def test_bars_before_the_first_cover_page_are_assigned(self) -> None:
+        resolver = self._resolver()
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [(b.security_id, b.session) for b in parsed.bars] == [
+            (self.META, d) for d in self.DAYS
+        ]
+        assert parsed.unresolved == ()
+        for bar in parsed.bars:
+            assert bar.known_at == bar_known_at(bar.session)  # no record stamped early
+        # From the span's start its own rows win: the lead stops there.
+        assert resolver.lead("FB", self.COVER) is None
+        assert resolver.resolve("FB", self.COVER) == self.META
+        assert resolver.report.first_span_leads == 1
+        assert resolver.report.first_span_refused == 0
+        assert "1 securities led by a first-span lead" in resolver.report.summary()
+
+    def test_the_lead_never_changes_what_resolve_says(self) -> None:
+        # No look-ahead in the key mapping: the lead only fills sessions no
+        # span resolves, and `resolve` is the same with or without it.
+        listings = (
+            _listing(self.OTHER, "XO", date(2015, 1, 2), "Common Stock"),
+            _listing(self.OTHER, "XOX", date(2018, 3, 1), "Common Stock"),
+        )
+        with_lead = self._resolver(*listings)
+        without = self._resolver(*listings, first=None)
+        assert with_lead.report.first_span_leads == 1
+        sessions = [date(y, m, 3) for y in range(2011, 2023) for m in (1, 4, 7, 10)]
+        sessions += [self.FIRST, self.COVER, *self.DAYS]
+        for ticker in ("FB", "XO", "XOX"):
+            for session in sessions:
+                assert with_lead.resolve(ticker, session) == without.resolve(ticker, session)
+
+    def test_no_lead_before_the_first_session(self) -> None:
+        resolver = self._resolver()
+        assert resolver.lead("FB", date(2012, 5, 17)) is None
+        assert resolver.lead("FB", self.FIRST) == self.META
+        assert not resolver.holds(self.META, date(2012, 5, 17))
+        assert resolver.holds(self.META, self.FIRST)
+
+    def test_a_first_span_starting_on_the_first_session_has_no_lead(self) -> None:
+        resolver = self._resolver(first=self.COVER)
+        assert resolver.lead("FB", date(2019, 7, 23)) is None
+        assert resolver.report.first_span_leads == 0
+
+    def test_a_reused_ticker_refuses_the_whole_lead(self) -> None:
+        # Another security's assigned FB span covering 2017: a reuse the
+        # master knows of. No lead on any session, not only the reuse's.
+        resolver = self._resolver(
+            _listing(self.OTHER, "FB", date(2016, 6, 1), "Common Stock"),
+            _listing(self.OTHER, "OTHR", date(2017, 9, 1), "Common Stock"),
+        )
+        for session in (self.FIRST, date(2014, 1, 2), date(2017, 6, 1), date(2019, 7, 23)):
+            assert resolver.lead("FB", session) is None
+            assert not resolver.holds(self.META, session)
+        assert resolver.symbols(self.META, date(2013, 1, 2), date(2015, 12, 31)) == []
+        assert resolver.report.first_span_leads == 0
+        assert resolver.report.first_span_refused == 1
+        assert "1 refused one for a reused ticker" in resolver.report.summary()
+        payload = self._payload()
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert all(b.session >= self.COVER for b in parsed.bars if b.security_id == self.META)
+
+    def test_a_non_equity_span_of_the_ticker_in_the_window_refuses(self) -> None:
+        resolver = self._resolver(_listing(self.OTHER, "FB", date(2017, 3, 1), "Senior Notes"))
+        assert resolver.lead("FB", date(2014, 1, 2)) is None
+        assert resolver.report.first_span_refused == 1
+
+    def test_a_placeholder_span_of_the_ticker_never_refuses(self) -> None:
+        # Another security's rows under a placeholder never name FB.
+        resolver = self._resolver(_listing(self.OTHER, "N/A", date(2017, 3, 1), "Common Stock"))
+        assert resolver.lead("FB", date(2017, 6, 1)) == self.META
+        assert resolver.report.first_span_refused == 0
+
+    def test_another_securitys_span_outside_the_window_never_refuses(self) -> None:
+        resolver = self._resolver(
+            _listing(self.OTHER, "FB", date(2008, 1, 2), "Common Stock"),
+            _listing(self.OTHER, "OTHR", date(2011, 1, 3), "Common Stock"),
+        )
+        assert resolver.lead("FB", date(2017, 6, 1)) == self.META
+        assert resolver.report.first_span_refused == 0
+
+    def test_a_contested_first_span_takes_no_lead(self) -> None:
+        # Another security renames into FB later: META's span is contested.
+        resolver = self._resolver(
+            _listing(self.OTHER, "XO", date(2015, 1, 2), "Common Stock"),
+            _listing(self.OTHER, "FB", date(2021, 3, 1), "Common Stock"),
+        )
+        assert resolver.lead("FB", date(2017, 6, 1)) is None
+        assert resolver.report.first_span_leads == 0
+        assert resolver.report.first_span_refused == 0
+
+    def test_a_tied_first_span_takes_no_lead(self) -> None:
+        # code-review on #983: two securities' FB spans start the same day
+        # (rule 4): `resolve` gives FB to no one, so neither gets a lead.
+        resolver = ListingResolver(
+            [*self._listings(), _listing(self.OTHER, "FB", self.COVER, "Common Stock")],
+            first_sessions={self.META: self.FIRST, self.OTHER: date(2018, 1, 2)},
+        )
+        assert resolver.resolve("FB", self.COVER) is None
+        for session in (date(2014, 1, 2), date(2018, 6, 1)):
+            assert resolver.lead("FB", session) is None
+        assert resolver.report.first_span_leads == 0
+
+    def test_an_earlier_non_equity_span_of_the_security_takes_no_lead(self) -> None:
+        resolver = self._resolver(_listing(self.META, "FBN", date(2018, 1, 2), "Notes due 2025"))
+        assert resolver.lead("FB", date(2017, 6, 1)) is None
+        assert resolver.report.first_span_leads == 0
+
+    def test_an_earlier_placeholder_span_of_the_security_is_skipped(self) -> None:
+        resolver = self._resolver(_listing(self.META, "N/A", date(2018, 1, 2), "Common Stock"))
+        assert resolver.lead("FB", date(2017, 6, 1)) == self.META
+        assert resolver.lead("FB", date(2018, 6, 1)) == self.META
+        assert resolver.report.first_span_leads == 1
+
+    def test_symbols_cover_the_lead_window(self) -> None:
+        resolver = self._resolver()
+        assert resolver.symbols(self.META, date(2017, 1, 3), date(2017, 12, 29)) == ["FB"]
+        assert resolver.symbols(self.META, date(2011, 1, 3), date(2011, 12, 30)) == []
+
+    def test_holds_a_bar_and_an_action_in_the_window(self) -> None:
+        resolver = self._resolver()
+        day = date(2017, 5, 31)
+        assert resolver.holds(self.META, day)
+        assert resolver.holds(self.META, day, actions=True)
+
+    def test_actions_never_take_the_rename_lead(self) -> None:
+        # TestRenameLead's contested OLD: only the rename lead holds the gap.
+        sid, other = "0000000003", "0000000004"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "OLD", START, "Common Stock"),
+                _listing(sid, "NEWT", date(2022, 7, 1), "Common Stock"),
+                _listing(other, "XO", START, "Common Stock"),
+                _listing(other, "OLD", date(2023, 1, 3), "Common Stock"),
+            ],
+            rename_lead_days=400,
+            first_sessions={sid: self.FIRST, other: self.FIRST},
+        )
+        day = date(2022, 6, 15)  # inside OLD -> NEWT's #843 rename gap
+        assert resolver.holds(sid, day)
+        assert not resolver.holds(sid, day, actions=True)
+        assert resolver.lead("NEWT", day) == sid
+        assert resolver.lead("NEWT", day, actions=True) is None
+        assert not resolver.holds(sid, date(2014, 6, 2))  # OLD is contested: no first-span lead
+
+    def test_a_split_in_the_window_is_parsed_to_the_security(self) -> None:
+        resolver = self._resolver()
+        ex_date = date(2017, 6, 1)
+        parsed = parse_corporate_actions(
+            self._split("FB", ex_date), resolver.resolve, partial(resolver.lead, actions=True)
+        )
+        [split] = parsed.actions
+        assert (split.security_id, split.ex_date, split.ratio_or_amount) == (
+            self.META,
+            ex_date,
+            2.0,
+        )
+        assert split.known_at == action_first_seen_known_at(ex_date)
+        without = parse_corporate_actions(self._split("FB", ex_date), resolver.resolve)
+        assert without.actions == ()
+        assert without.unresolved == (("FB", ex_date),)
+
+    def test_a_split_in_a_rename_gap_is_still_not_parsed(self) -> None:
+        resolver = ListingResolver(TestRenameLead()._listings(), rename_lead_days=400)
+        ex_date = date(2022, 6, 15)
+        parsed = parse_corporate_actions(
+            self._split("META", ex_date), resolver.resolve, partial(resolver.lead, actions=True)
+        )
+        assert parsed.actions == ()
+        assert parsed.unresolved == (("META", ex_date),)
+
+    def test_the_price_source_asks_for_the_led_symbol_and_keeps_bars_and_split(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+
+        def fetch_bars(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(("bars", symbols))
+            return self._payload()
+
+        def fetch_actions(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(("actions", symbols))
+            return self._split("FB", date(2017, 6, 1))
+
+        source = AlpacaPriceSource(
+            self._resolver(),
+            fetch_bars=fetch_bars,
+            fetch_actions=fetch_actions,
+            settings=_settings(),
+        )
+        start, end = date(2017, 1, 3), date(2017, 12, 29)
+        bars = source.bars([self.META], start, end)
+        actions = source.corporate_actions([self.META], start, end)
+        assert calls == [("bars", ["FB"]), ("actions", ["FB"])]
+        assert [b.session for b in bars] == [date(2017, 5, 31), date(2017, 6, 1)]
+        assert [(a.security_id, a.ex_date) for a in actions] == [(self.META, date(2017, 6, 1))]
+        assert "1 securities led by a first-span lead" in source.resolution_summary()
+
+    def test_without_first_sessions_nothing_changes(self) -> None:
+        resolver = self._resolver(first=None)
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [b.session for b in parsed.bars] == [d for d in self.DAYS if d >= self.COVER]
+        assert resolver.lead("FB", date(2017, 6, 1)) is None
+        assert not resolver.holds(self.META, date(2017, 6, 1))
+        assert resolver.symbols(self.META, date(2017, 1, 3), date(2017, 12, 29)) == []
+        assert resolver.report.first_span_leads == 0
+        assert resolver.report.first_span_refused == 0
 
 
 class TestSuccessorDuplicate:

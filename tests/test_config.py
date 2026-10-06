@@ -296,6 +296,19 @@ def test_alpaca_accepted_relistings_fails_closed_on_a_malformed_id(entry: str) -
         Settings(_env_file=None, alpaca={"accepted_relistings": [entry]})
 
 
+def test_alpaca_first_span_lead_defaults_on() -> None:
+    """#974 (owner decision on #979): on by default; `false` is the kill switch."""
+    assert _settings().alpaca.first_span_lead is True
+    assert (
+        Settings(_env_file=None, alpaca={"first_span_lead": False}).alpaca.first_span_lead is False
+    )
+
+
+def test_alpaca_first_span_lead_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALPACA__FIRST_SPAN_LEAD", "false")
+    assert _settings().alpaca.first_span_lead is False
+
+
 def test_benchmarks_default() -> None:
     assert _settings().benchmarks == ["SPY", "MTUM"]
 

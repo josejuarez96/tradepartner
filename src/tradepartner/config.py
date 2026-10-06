@@ -354,6 +354,11 @@ class AlpacaConfig(BaseModel):
     # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest
     # liquid hole is GSX -> GOTU's 356 days; 0 turns the lead off.
     rename_lead_days: int = Field(default=400, ge=0)
+    # #974: a security's first assigned equity span also resolves its ticker back to
+    # the security's first session (`ListingResolver` `first_sessions`, built by
+    # `repair.store_resolver`), bars and corporate actions. Owner decision on #979:
+    # on by default; `false` is the kill switch and leaves every mapping as before.
+    first_span_lead: bool = True
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
