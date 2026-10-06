@@ -1,7 +1,8 @@
 """The H1 hypothesis file parses through `backtest.hypothesis` (plan T35b, spec req 18).
 
 `docs/hypotheses/h1-momentum-12-1.md` must name every required key with `family=momentum`
-and the owner's answers to spec open questions 1, 2 and 8 (#156; Q8 amended on #842).
+and the owner's answers to spec open questions 1, 2 and 8 (#156; Q8 amended on #842, re-pinned
+on #975).
 Nothing here registers it: the owner does that on the real store after merge (T45b).
 """
 
@@ -25,10 +26,11 @@ def test_h1_file_parses_with_slug_family_and_dates() -> None:
     assert parsed.family == "momentum"
     assert parsed.family in Settings(_env_file=None).hypotheses.families
     assert parsed.title
-    # Owner answers to spec open questions 8 and 2 (#156); Q8 amended on #842 (decision (b):
-    # the first month-end at which the real store's size cut binds, that is, at least
-    # universe.top_n_by_cap companies pass ADR 0006 rules 1-7).
-    assert parsed.in_sample_start == date(2019, 11, 29)
+    # Owner answers to spec open questions 8 and 2 (#156); Q8 amended on #842 (2019-11-29,
+    # the first month-end at which the size cut binds) and re-pinned on #975 (owner decision
+    # on #974: the first month-end at which the 192 names with no bars before mid-2019 have
+    # all entered the universe).
+    assert parsed.in_sample_start == date(2020, 8, 31)
     assert parsed.holdout_start == date(2024, 1, 1)
     assert parsed.holdout_end == date(2026, 9, 30)
 
@@ -61,7 +63,7 @@ def test_h1_file_records_owner_answers_and_spec_defaults() -> None:
 def test_h1_frozen_set_builds_over_default_settings() -> None:
     parsed = hypothesis.parse_file(H1_PATH)
     frozen = hypothesis.frozen_params(parsed, Settings(_env_file=None))
-    assert set(frozen) == set(hypothesis.frozen_keys())
+    assert set(frozen) == set(hypothesis.family_frozen_keys("momentum"))
     assert frozen["holdout.start"] == "2024-01-01"
     assert frozen["holdout.end"] == "2026-09-30"
     assert frozen["strategy.top_fraction"] == 0.10
@@ -73,15 +75,15 @@ def test_h1_frozen_set_builds_over_default_settings() -> None:
 def test_h1_power_arithmetic_counts() -> None:
     """The session counts the file's power arithmetic states, on the XNYS calendar."""
     parsed = hypothesis.parse_file(H1_PATH)
-    assert parsed.in_sample_start == last_session_of_month(2019, 11)
+    assert parsed.in_sample_start == last_session_of_month(2020, 8)
     # Spec req 11: the in-sample default window ends at the last rebalance before holdout.start.
     before_holdout = schedule.rebalance_sessions(
         parsed.in_sample_start, parsed.holdout_start - timedelta(days=1)
     )
     assert before_holdout[-1] == LAST_IN_SAMPLE_REBALANCE
-    # 50 sessions, 49 monthly returns (#842; 84 and 83 before the amendment).
-    assert len(before_holdout) == 50
-    assert schedule.fill_session(before_holdout[0]) == date(2019, 12, 2)
+    # 41 sessions, 40 monthly returns (#975; 50 and 49 under #842, 84 and 83 before it).
+    assert len(before_holdout) == 41
+    assert schedule.fill_session(before_holdout[0]) == date(2020, 9, 1)
     # The holdout window itself holds 33 month-ends; the pinned holdout run starts one
     # rebalance earlier so that January 2024 belongs to a window (34 sessions, 33 returns).
     assert len(schedule.rebalance_sessions(parsed.holdout_start, parsed.holdout_end)) == 33

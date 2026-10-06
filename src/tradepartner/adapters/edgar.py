@@ -47,13 +47,14 @@ Fact names are the XBRL concept's local name
 from __future__ import annotations
 
 import functools
+import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import lxml.etree  # type: ignore[import-untyped]
@@ -67,6 +68,7 @@ from tradepartner.adapters.filings import (
     FactRecord,
     FilingHeader,
     FilingIndexEntry,
+    StatementFactRecord,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -377,6 +379,210 @@ def parse_company_facts(
                     )
     facts.sort(key=lambda f: (f.accepted_at, f.accession, f.fact_name, f.as_of_date))
     return CompanyFactsParse(tuple(facts), tuple(unstamped))
+
+
+# --- statement facts (#660) -------------------------------------------------------
+
+#: Entry keys that would name a dimension. The companyfacts API carries no
+#: segment facts by construction, so one of these is schema drift (pitfall P9).
+_DIMENSION_KEYS = frozenset({"segment", "segments", "dimension", "dimensions"})
+
+
+class SubmissionStamp(Protocol):
+    """What `parse_statement_facts` reads from a submissions record (the
+    stamps file's `SubmissionRecord` satisfies it): the filing's form and
+    its acceptance, `None` for an accession settled as unstampable."""
+
+    @property
+    def form(self) -> str: ...
+
+    @property
+    def accepted_at(self) -> datetime | None: ...
+
+
+@dataclass(frozen=True)
+class StatementConflict:
+    """A key one filing carries with two values for its winning tag in one
+    unit (pitfall P13): withheld from that filing, never raised, so a later
+    filing's clean value can be the vintage. `values` are sorted."""
+
+    accession: str
+    fact_name: str
+    period_start: date | None
+    period_end: date
+    values: tuple[float, ...]
+
+    @property
+    def period_days(self) -> int:
+        """`0` for an instant, else the duration in days (the key's)."""
+        return 0 if self.period_start is None else (self.period_end - self.period_start).days
+
+
+@dataclass(frozen=True)
+class StatementFactsParse:
+    """`parse_statement_facts`' result: one record per (accession, fact,
+    period) the filing carries cleanly, the conflicts it withheld, and the
+    counts of (filing, fact) pairs skipped for their unit (`non_unit`: the
+    filing carries the fact only in units that are not read) and of
+    entries withheld as malformed (`malformed`)."""
+
+    records: tuple[StatementFactRecord, ...]
+    conflicts: tuple[StatementConflict, ...]
+    non_unit: int
+    malformed: int
+
+
+_StatementKey = tuple[str, str, date | None, date]  # accession, fact, start, end
+
+
+def _statement_period(
+    entry: Mapping[str, Any], stamp: SubmissionStamp | None
+) -> tuple[date | None, date, float] | None:
+    """An entry's `(start, end, value)`, or `None` when it is malformed: a
+    value that is not a finite number, a start on or after its end (a
+    zero-day duration is not an instant), or an end after the filing's
+    acceptance date in New York (checked only when the stamp is known)."""
+    raw = entry["val"]
+    end = date.fromisoformat(entry["end"])
+    start = date.fromisoformat(entry["start"]) if "start" in entry else None
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not math.isfinite(raw):
+        return None
+    if start is not None and start >= end:
+        return None
+    accepted_at = None if stamp is None else stamp.accepted_at
+    if accepted_at is not None and end > accepted_at.astimezone(_EASTERN).date():
+        return None
+    return start, end, float(raw)
+
+
+@_fail_closed
+def parse_statement_facts(
+    payload: Mapping[str, Any],
+    tags: Mapping[str, Sequence[str]],
+    forms: Iterable[str],
+    units: Sequence[str],
+    acceptance: Mapping[str, SubmissionStamp],
+) -> StatementFactsParse:
+    """As-filed statement-fact entries from a companyfacts payload (spec
+    amendment 2026-10-03, #660; plan T77). Pure: reported values only, no
+    derivation, no first-vintage choice (the ingest's, T77b).
+
+    `tags` maps each canonical fact name to its ordered `taxonomy:tag`
+    fallbacks (`edgar.statement_tags`). Per filing, fact and period:
+
+    - **Period** is the entry's own `(start, end)`; `fy`, `fp` and `frame`
+      are never read. No `start` is an instant (`period_start = None`).
+    - **Form** is the submissions record's (`acceptance[accn].form`), never
+      the entry's; a form outside `forms` drops the entry. An accession with
+      no record yet is emitted with `accepted_at = None` and `form = ""`
+      (unknown until submissions names it), unfiltered, so the ingest's hold
+      rule sees it; a record with `accepted_at = None` (settled unstampable)
+      keeps its form and filter and is emitted unstamped too.
+    - **Units**: only `units` are read, first listed first; entries in any
+      other unit are skipped; a filing that carries a fact only in unread
+      units, under every tag it uses for it, counts once on `non_unit`.
+    - **Malformed** entries (see `_statement_period`) are withheld and
+      counted; they are no value for the key and set no latest period.
+    - **Precedence**: the first listed tag the filing carries (read unit,
+      well formed) wins and is recorded in `xbrl_tag`. Two values for that
+      tag in that unit withhold the key from this filing as a
+      `StatementConflict` (never raised, and never a fall-back to the next
+      tag); identical duplicates collapse.
+    - **comparative** is TRUE when the period ends before the latest
+      `period_end` the filing carries for the same fact and `period_days`.
+
+    An entry naming a dimension raises `ValueError` (schema drift, P9), as
+    does any malformed payload structure (a missing key)."""
+    cik = _cik(payload["cik"])
+    allowed_forms = frozenset(forms)
+    unit_rank = {unit: rank for rank, unit in enumerate(units)}
+    facts: Mapping[str, Any] = payload["facts"]
+    # key -> (tag rank, unit rank) -> values; the filing's `filed` per key.
+    values: dict[_StatementKey, dict[tuple[int, int], set[float]]] = {}
+    filed: dict[_StatementKey, date] = {}
+    malformed = 0
+    # (accession, fact) pairs seen in an unread unit, and in a read one.
+    unread: set[tuple[str, str]] = set()
+    read: set[tuple[str, str]] = set()
+    for fact_name, fallbacks in tags.items():
+        for tag_rank, tag in enumerate(fallbacks):
+            taxonomy, _, local = tag.partition(":")
+            concept = facts.get(taxonomy, {}).get(local)
+            if concept is None:
+                continue
+            for unit, entries in concept["units"].items():
+                for entry in entries:
+                    if _DIMENSION_KEYS & entry.keys():
+                        raise ValueError(
+                            f"{tag} entry for {entry.get('accn')!r} names a dimension: {entry!r}"
+                        )
+                    accession = entry["accn"]
+                    stamp = acceptance.get(accession)
+                    if stamp is not None and stamp.form not in allowed_forms:
+                        continue
+                    if unit not in unit_rank:
+                        unread.add((accession, fact_name))
+                        continue
+                    read.add((accession, fact_name))
+                    period = _statement_period(entry, stamp)
+                    if period is None:
+                        malformed += 1
+                        continue
+                    start, end, value = period
+                    key = (accession, fact_name, start, end)
+                    values.setdefault(key, {}).setdefault((tag_rank, unit_rank[unit]), set()).add(
+                        value
+                    )
+                    entry_filed = date.fromisoformat(entry["filed"])
+                    filed[key] = min(filed.get(key, entry_filed), entry_filed)
+
+    non_unit = len(unread - read)
+    latest: dict[tuple[str, str, int], date] = {}
+    for accession, fact_name, start, end in values:
+        days = 0 if start is None else (end - start).days
+        group = (accession, fact_name, days)
+        if group not in latest or end > latest[group]:
+            latest[group] = end
+
+    records: list[StatementFactRecord] = []
+    conflicts: list[StatementConflict] = []
+    for key, candidates in values.items():
+        accession, fact_name, start, end = key
+        tag_rank, rank_of_unit = min(candidates)
+        found = sorted(candidates[(tag_rank, rank_of_unit)])
+        if len(found) > 1:
+            conflicts.append(StatementConflict(accession, fact_name, start, end, tuple(found)))
+            continue
+        stamp = acceptance.get(accession)
+        days = 0 if start is None else (end - start).days
+        records.append(
+            StatementFactRecord(
+                cik=cik,
+                fact_name=fact_name,
+                xbrl_tag=tags[fact_name][tag_rank],
+                period_start=start,
+                period_end=end,
+                value=found[0],
+                unit=units[rank_of_unit],
+                form="" if stamp is None else stamp.form,
+                accession=accession,
+                accepted_at=None if stamp is None else stamp.accepted_at,
+                filed=filed[key],
+                comparative=end < latest[(accession, fact_name, days)],
+            )
+        )
+    records.sort(
+        key=lambda r: (
+            r.accepted_at is None,
+            r.accepted_at or datetime.min.replace(tzinfo=UTC),
+            r.accession,
+            r.fact_name,
+            r.period_end,
+            r.period_days,
+        )
+    )
+    conflicts.sort(key=lambda c: (c.accession, c.fact_name, c.period_end, c.period_days))
+    return StatementFactsParse(tuple(records), tuple(conflicts), non_unit, malformed)
 
 
 # --- SGML header ---------------------------------------------------------------

@@ -365,3 +365,66 @@ def test_env_file_swapped_with_same_size_and_mtime_takes_effect(
     after = env_file.stat()
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
     assert tp_calendar.all_sessions()[-1] == date(2032, 12, 31)
+
+
+# --- cadence helpers (strategy-lab spec "Cadence"; T94) ------------------
+
+
+def test_last_session_of_week() -> None:
+    assert tp_calendar.last_session_of_week(2024, 24) == date(2024, 6, 14)  # a Friday
+    assert tp_calendar.last_session_of_week(2024, 13) == date(2024, 3, 28)  # Good Friday
+    assert tp_calendar.last_session_of_week(2025, 27) == date(2025, 7, 3)  # July 4th
+
+
+def test_last_session_of_week_without_a_session_raises() -> None:
+    with pytest.raises(ValueError, match="ISO week"):
+        tp_calendar.last_session_of_week(2024, 53)  # 2024 has 52 ISO weeks
+
+
+def test_last_session_of_week_reads_all_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    friday = date(2024, 6, 14)
+    synthetic = tuple(s for s in tp_calendar.all_sessions() if s != friday)
+    monkeypatch.setattr(tp_calendar, "all_sessions", lambda: synthetic)
+    assert tp_calendar.last_session_of_week(2024, 24) == date(2024, 6, 13)
+
+
+def test_rebalance_sessions_between_each_cadence() -> None:
+    start, end = date(2024, 3, 1), date(2024, 4, 30)
+    in_range = [s for s in tp_calendar.all_sessions() if start <= s <= end]
+    assert tp_calendar.rebalance_sessions_between(start, end, "daily") == in_range
+    assert tp_calendar.rebalance_sessions_between(start, end, "month_end") == [
+        date(2024, 3, 28),
+        date(2024, 4, 30),
+    ]
+    weekly = tp_calendar.rebalance_sessions_between(start, end, "week_end")
+    assert weekly[:2] == [date(2024, 3, 1), date(2024, 3, 8)]
+    assert date(2024, 3, 28) in weekly
+    assert weekly[-1] == date(2024, 4, 26)  # 2024-04-30 is a Tuesday
+
+
+def test_rebalance_sessions_between_partial_periods_and_bad_windows() -> None:
+    # A window ending before its month's last session does not rebalance that month.
+    assert tp_calendar.rebalance_sessions_between(
+        date(2024, 1, 1), date(2024, 2, 28), "month_end"
+    ) == [date(2024, 1, 31)]
+    assert (
+        tp_calendar.rebalance_sessions_between(date(2024, 6, 15), date(2024, 6, 16), "daily") == []
+    )
+    with pytest.raises(ValueError, match="after"):
+        tp_calendar.rebalance_sessions_between(date(2024, 2, 1), date(2024, 1, 1), "daily")
+    with pytest.raises(TypeError):
+        tp_calendar.rebalance_sessions_between(
+            datetime(2024, 1, 1, tzinfo=UTC), date(2024, 2, 1), "daily"
+        )
+
+
+@pytest.mark.parametrize("cadence", ["month_end", "week_end", "daily"])
+def test_rebalance_sessions_between_refuses_a_window_past_the_calendar_range(
+    cadence: str,
+) -> None:
+    with pytest.raises(ValueError, match="outside the configured calendar range"):
+        tp_calendar.rebalance_sessions_between(
+            date(2035, 12, 1),
+            date(2036, 1, 31),
+            cadence,  # type: ignore[arg-type]
+        )

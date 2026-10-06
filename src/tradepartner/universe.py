@@ -38,6 +38,10 @@ reported once, under the first rule it fails:
    inverse) is rejected unless `universe.accepted_shares_facts` names it,
    and the last accepted fact is used instead, its age judged the same
    way (#845, `shares_as_of`; `Universe.shares_fallbacks` lists them).
+   A run of rejected facts, each in line with the one before it, that
+   spans more than `universe.max_shares_age_days` re-anchors the baseline
+   on its latest fact (#853), so a mis-scaled first fact cannot keep a
+   name out for good.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -65,6 +69,7 @@ EDGAR's `EntityCommonStockSharesOutstanding` to it.
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections import defaultdict
 from collections.abc import Sequence
@@ -131,7 +136,9 @@ _MEMBER_SCHEMA: dict[str, Any] = {
 #: `SharesPick.outliers`: a fact out of line with the last accepted earlier
 #: fact (`baseline_*`, raw), `ratio` = value over the baseline moved by splits;
 #: a zero or negative value has a null `ratio` (and null `baseline_*` when it
-#: comes first).
+#: comes first). `reanchored` is true on the fact that re-anchored the
+#: baseline (#853); it keeps `accepted` false (the owner did not accept it), so
+#: health's review list still shows it.
 SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "as_of_date": pl.Date,
@@ -140,6 +147,7 @@ SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
     "baseline_value": pl.Float64,
     "ratio": pl.Float64,
     "accepted": pl.Boolean,
+    "reanchored": pl.Boolean,
 }
 #: `SharesPick.fallbacks` and `Universe.shares_fallbacks`: the rejected latest
 #: fact (`as_of_date`, `value`, `ratio`) and the accepted one used instead.
@@ -248,7 +256,7 @@ class SharesPick:
     use, raw (not split-moved). `ambiguous`: the ids whose latest
     `as_of_date` holds two class-member rows. `outliers`: every fact known at
     `t` out of line with its last accepted earlier fact, accepted by the
-    owner or not (`SHARES_OUTLIER_SCHEMA`). `fallbacks`: the securities whose
+    owner or not, re-anchored or not (`SHARES_OUTLIER_SCHEMA`). `fallbacks`: the securities whose
     latest fact was rejected, with the fact used instead
     (`SHARES_FALLBACK_SCHEMA`).
     """
@@ -283,14 +291,24 @@ def shares_as_of(
 
     Per security (every one when `ids` is `None`), its `shares_outstanding`
     facts known at `t` are walked in `as_of_date` order. The first is
-    accepted, unless it is zero, negative or NaN: such a value is always
-    rejected and never a baseline. Each later one is compared with the last accepted fact moved by
-    every split known at `t` with `accepted_as_of < ex_date <= as_of_date`:
-    a ratio above `universe.max_shares_ratio` or below its inverse is out of
-    line and rejected, unless `universe.accepted_shares_facts` names it. A
-    date with two class rows is skipped by the walk. The latest date decides:
-    ambiguous, its own value when accepted, else the last accepted fact.
-    Only facts and splits known at `t` are read, never a later filing.
+    accepted, unless it is zero, negative, NaN or infinite: such a value is
+    always rejected and never a baseline. Each later one is compared with the
+    last accepted fact moved by every split known at `t` with
+    `accepted_as_of < ex_date <= as_of_date`: a ratio above
+    `universe.max_shares_ratio` or below its inverse is out of line and
+    rejected, unless `universe.accepted_shares_facts` names it.
+
+    Re-anchor (#853): the rejected facts since the last accepted one form
+    runs, each fact in line (the same ratio test, split-moved) with the one
+    before it; an out-of-line one starts a new run and an accepted fact ends
+    it. A rejected fact dated more than `universe.max_shares_age_days` after
+    its run's first fact is accepted as the new baseline and flagged
+    `reanchored`. A date with two class rows, and a value that is not a share
+    count, neither extend nor break a run.
+
+    A date with two class rows is skipped by the walk. The latest date
+    decides: ambiguous, its own value when accepted, else the last accepted
+    fact. Only facts and splits known at `t` are read, never a later filing.
     """
     cfg = settings.universe
     accepted_list = {parse_accepted_shares_fact(e) for e in cfg.accepted_shares_facts}
@@ -308,15 +326,27 @@ def shares_as_of(
     ambiguous: set[str] = set()
     outliers: list[dict[str, Any]] = []
     fallbacks: list[dict[str, Any]] = []
+
+    def in_line(sid: str, earlier: tuple[date, float], as_of: date, value: float) -> float | None:
+        """The ratio of `value` over `earlier` moved by the splits known at
+        `t` between the two dates, or `None` when it is within the limit."""
+        moved = earlier[1]
+        for ex_date, ratio in splits.get(sid, []):
+            if earlier[0] < ex_date <= as_of:
+                moved *= ratio
+        change = value / moved if moved > 0 else float("inf")
+        return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
+
     for sid in sorted(rows):
         picks = _date_picks(rows[sid])
         base: tuple[date, float] | None = None
+        run: list[tuple[date, float]] = []  # rejected facts in line with each other
         latest_ok = False
         for as_of, value in picks.items():
             latest_ok = False
             if value is None:
                 continue
-            if not value > 0:  # zero, negative or NaN
+            if not (value > 0 and math.isfinite(value)):  # zero, negative, NaN, inf
                 # Not a share count: always rejected, never a baseline, and no
                 # owner entry accepts it.
                 outliers.append(
@@ -328,20 +358,22 @@ def shares_as_of(
                         "baseline_value": base[1] if base else None,
                         "ratio": None,
                         "accepted": False,
+                        "reanchored": False,
                     }
                 )
                 continue
             if base is None:
                 base, latest_ok = (as_of, value), True
                 continue
-            moved = base[1]
-            for ex_date, ratio in splits.get(sid, []):
-                if base[0] < ex_date <= as_of:
-                    moved *= ratio
-            change = value / moved if moved > 0 else float("inf")
-            out_of_line = not (1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio)
+            change = in_line(sid, base, as_of, value)
             owner_ok = (sid, as_of) in accepted_list
-            if out_of_line:
+            reanchored = False
+            if change is not None and not owner_ok:
+                if not run or in_line(sid, run[-1], as_of, value) is not None:
+                    run = []
+                run.append((as_of, value))
+                reanchored = (as_of - run[0][0]).days > cfg.max_shares_age_days
+            if change is not None:
                 outliers.append(
                     {
                         "security_id": sid,
@@ -351,10 +383,11 @@ def shares_as_of(
                         "baseline_value": base[1],
                         "ratio": change,
                         "accepted": owner_ok,
+                        "reanchored": reanchored,
                     }
                 )
-            if not out_of_line or owner_ok:
-                base, latest_ok = (as_of, value), True
+            if change is None or owner_ok or reanchored:
+                base, latest_ok, run = (as_of, value), True, []
         latest_as_of = max(picks)
         latest_value = picks[latest_as_of]
         if latest_value is None:

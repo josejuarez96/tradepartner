@@ -1,3 +1,0 @@
-- T91 (#951): strategy-lab amendments recorded in the backtest spec (15 dated items), paper spec (month_end only), roadmap and lab spec (decision 13, real-store store_path); sweep template and README Sweep row added
-### Added
-- Strategy-lab amendments recorded: backtest spec Definitions carry the 15 dated old-to-new items of the lab spec; paper spec note (month_end is the only paper cadence, refused_cadence); roadmap Phase 4 side-track sentence and item 4; lab spec notes for the backtest spec's decision 13 and the real-store store_path; docs/templates/sweep.md, the hypothesis template's Sweep provenance section, and the sweeps/ line and Sweep row in docs/README.md (T91, #951)

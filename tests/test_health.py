@@ -19,9 +19,10 @@ import duckdb
 import polars as pl
 import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
+from pydantic import ValidationError
 
 from tradepartner.calendar import all_sessions, last_session_of_month, session_close
-from tradepartner.config import Settings
+from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
@@ -1288,3 +1289,128 @@ def test_as_of_metrics_invariant_under_truncation(
         cut_checks = {c.rule: c for c in integrity_checks(cut, t, settings)}
         for rule in (NON_OVERLAPPING_LISTINGS, NO_BARS_AFTER_DELISTING):
             assert full_checks[rule].violations.equals(cut_checks[rule].violations), (rule, t)
+
+
+# --- Owner-accepted same-day pairs (#855) -----------------------------------
+
+#: #855's shape: a security's first-ever listing is a same-day pair of two
+#: tickers differing by a letter transposition (HACAR/HCACR, 2026-09-23 on the
+#: owner's store): no held ticker anchors the typo rule, and they are not one
+#: Alpaca symbol under two spellings.
+FIRST_PAIR_SID = "0002079013:share-rights"
+FIRST_PAIR_DAY = date(2019, 6, 3)
+FIRST_PAIR_ENTRY = f"{FIRST_PAIR_SID}@{FIRST_PAIR_DAY.isoformat()}"
+
+
+def _insert_first_listing_pair(conn: duckdb.DuckDBPyConnection) -> None:
+    for ticker in ("HACAR", "HCACR"):
+        insert_row(
+            conn,
+            "listings",
+            _listing_row(FIRST_PAIR_SID, ticker, "NASDAQ", FIRST_PAIR_DAY, "Rights"),
+        )
+
+
+def _accepting(*entries: str) -> Settings:
+    return _settings(universe={"accepted_same_day_pairs": list(entries)})
+
+
+def test_a_first_listing_same_day_pair_fails_until_the_owner_accepts_it(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert_first_listing_pair(fixture_store)
+    unaccepted = health_report(fixture_store, T_END, _settings())
+    assert unaccepted.failures == (NON_OVERLAPPING_LISTINGS,)
+    assert unaccepted.accepted_same_day_pairs.frame.is_empty()
+
+    report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
+    assert report.ok, report.failures
+    # Never silently hidden: the accepted pair is listed in the report.
+    [row] = report.accepted_same_day_pairs.frame.to_dicts()
+    assert (row["security_id"], row["ticker"], row["next_ticker"]) == (
+        FIRST_PAIR_SID,
+        "HACAR",
+        "HCACR",
+    )
+    assert row["valid_from"] == row["next_valid_from"] == FIRST_PAIR_DAY
+    # `integrity_checks` on its own reads the same list.
+    assert _failed(integrity_checks(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))) == set()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        f"{FIRST_PAIR_SID}@2019-06-04",  # another day
+        f"{FIRST_PAIR_SID}-x@{FIRST_PAIR_DAY.isoformat()}",  # another security
+        f"SEC_DUAL_A@{FIRST_PAIR_DAY.isoformat()}",  # another security, same day
+    ],
+)
+def test_an_accepted_pair_entry_excuses_only_its_own_security_and_day(
+    fixture_store: duckdb.DuckDBPyConnection, entry: str
+) -> None:
+    _insert_first_listing_pair(fixture_store)
+    report = health_report(fixture_store, T_END, _accepting(entry))
+    assert report.failures == (NON_OVERLAPPING_LISTINGS,)
+    check = next(c for c in report.integrity if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.violations["security_id"].to_list() == [FIRST_PAIR_SID]
+    assert report.accepted_same_day_pairs.frame.is_empty()
+
+
+def test_an_accepted_pair_does_not_excuse_a_late_form25_on_its_row(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The entry tolerates the same-start test only: a Form 25 on the pair's
+    # line filed months after the next exchange line started still fails.
+    _insert_first_listing_pair(fixture_store)
+    insert_row(
+        fixture_store,
+        "listings",
+        _listing_row(FIRST_PAIR_SID, "HCACR", "NYSE", date(2019, 7, 1), "Rights"),
+    )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row(FIRST_PAIR_SID, "NASDAQ", date(2020, 1, 10), date(2020, 1, 20)),
+    )
+    report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
+    check = next(c for c in report.integrity if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert not check.passed
+    assert set(check.violations["next_valid_from"].to_list()) == {date(2019, 7, 1)}
+    assert report.accepted_same_day_pairs.frame.height == 1
+
+
+@pytest.mark.parametrize("bad", ["SEC_A", "@2019-06-03", "SEC_A@2019-13-01", "SEC_A@"])
+def test_accepted_same_day_pair_entries_are_validated(bad: str) -> None:
+    assert parse_accepted_same_day_pair(FIRST_PAIR_ENTRY) == (FIRST_PAIR_SID, FIRST_PAIR_DAY)
+    with pytest.raises(ValueError):
+        parse_accepted_same_day_pair(bad)
+    with pytest.raises(ValidationError):
+        _accepting(bad)
+
+
+def test_accepted_same_day_pairs_default_empty() -> None:
+    assert _settings().universe.accepted_same_day_pairs == []
+
+
+def test_an_accepted_day_is_one_line_for_every_row_of_that_day(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Code-review on #917: HACAR tagged on two exchanges that day (one line,
+    # #822) sorts HACAR@NASDAQ, HACAR@NYSE, HCACR@NYSE. HACAR@NASDAQ's own
+    # Form 25, filed later, must not find the accepted partner HCACR as its
+    # "next exchange line": the accepted day is one line for all its rows.
+    for ticker, exchange in (("HACAR", "NASDAQ"), ("HACAR", "NYSE"), ("HCACR", "NYSE")):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row(FIRST_PAIR_SID, ticker, exchange, FIRST_PAIR_DAY, "Rights"),
+        )
+    insert_row(
+        fixture_store,
+        "delistings",
+        _form25_row(FIRST_PAIR_SID, "NASDAQ", date(2020, 1, 10), date(2020, 1, 20)),
+    )
+    assert health_report(fixture_store, T_END, _settings()).failures == (NON_OVERLAPPING_LISTINGS,)
+    report = health_report(fixture_store, T_END, _accepting(FIRST_PAIR_ENTRY))
+    assert report.ok, report.integrity
+    assert report.accepted_same_day_pairs.frame["next_ticker"].to_list() == ["HCACR"]

@@ -11,17 +11,24 @@ from __future__ import annotations
 import os
 from datetime import date
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from tradepartner.config import (
+    ALLOWED_AXIS_PREFIXES,
+    FAMILY_PARENTS,
+    FORBIDDEN_AXIS_PREFIXES,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
     ExecutionConfig,
+    HypothesisFamily,
     PaperConfig,
     Settings,
     _default_env_file,
+    _settings_has_key,
+    clean_message,
 )
 
 
@@ -136,6 +143,68 @@ def test_edgar_header_forms_defaults() -> None:
 def test_edgar_fsn_first_year_override() -> None:
     s = Settings(_env_file=None, edgar={"fsn_first_year": 2010})
     assert s.edgar.fsn_first_year == 2010
+
+
+def test_edgar_statement_facts_defaults() -> None:
+    """T77 (#660): the switch is off and the tag, form and unit lists are the
+    spec amendment's defaults, in its precedence order."""
+    s = Settings(_env_file=None)
+    assert s.edgar.statement_facts_enabled is False
+    assert s.edgar.statement_tags == {
+        "revenue": [
+            "us-gaap:Revenues",
+            "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+            "us-gaap:SalesRevenueNet",
+            "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
+            "us-gaap:SalesRevenueGoodsNet",
+            "us-gaap:SalesRevenueServicesNet",
+        ],
+        "cost_of_revenue": [
+            "us-gaap:CostOfRevenue",
+            "us-gaap:CostOfGoodsAndServicesSold",
+            "us-gaap:CostOfGoodsSold",
+            "us-gaap:CostOfServices",
+        ],
+        "gross_profit": ["us-gaap:GrossProfit"],
+        "total_assets": ["us-gaap:Assets"],
+        "operating_cash_flow": [
+            "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+            "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        ],
+    }
+    assert s.edgar.statement_forms == ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
+    assert s.edgar.statement_units == ["USD"]
+
+
+def test_edgar_statement_tags_default_is_not_shared() -> None:
+    """Mutating one instance's default lists never leaks into the next."""
+    first = Settings(_env_file=None)
+    first.edgar.statement_tags["revenue"].append("us-gaap:Other")
+    assert "us-gaap:Other" not in Settings(_env_file=None).edgar.statement_tags["revenue"]
+
+
+@pytest.mark.parametrize(
+    "tag", ["Revenues", "us-gaap:", ":Revenues", "us-gaap:Revenues:Net", "us gaap:Revenues"]
+)
+def test_edgar_statement_tag_must_be_taxonomy_qualified(tag: str) -> None:
+    with pytest.raises(ValidationError, match="taxonomy:tag"):
+        Settings(_env_file=None, edgar={"statement_tags": {"revenue": [tag]}})
+
+
+def test_edgar_statement_keys_override() -> None:
+    s = Settings(
+        _env_file=None,
+        edgar={
+            "statement_facts_enabled": True,
+            "statement_tags": {"revenue": ["ifrs-full:Revenue"]},
+            "statement_forms": ["10-K"],
+            "statement_units": ["USD", "EUR"],
+        },
+    )
+    assert s.edgar.statement_facts_enabled is True
+    assert s.edgar.statement_tags == {"revenue": ["ifrs-full:Revenue"]}
+    assert s.edgar.statement_forms == ["10-K"]
+    assert s.edgar.statement_units == ["USD", "EUR"]
 
 
 def test_edgar_failure_policy_defaults() -> None:
@@ -290,6 +359,19 @@ def test_alpaca_accepted_relistings_fails_closed_on_a_malformed_id(entry: str) -
         Settings(_env_file=None, alpaca={"accepted_relistings": [entry]})
 
 
+def test_alpaca_first_span_lead_defaults_on() -> None:
+    """#974 (owner decision on #979): on by default; `false` is the kill switch."""
+    assert _settings().alpaca.first_span_lead is True
+    assert (
+        Settings(_env_file=None, alpaca={"first_span_lead": False}).alpaca.first_span_lead is False
+    )
+
+
+def test_alpaca_first_span_lead_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALPACA__FIRST_SPAN_LEAD", "false")
+    assert _settings().alpaca.first_span_lead is False
+
+
 def test_benchmarks_default() -> None:
     assert _settings().benchmarks == ["SPY", "MTUM"]
 
@@ -422,7 +504,7 @@ def test_env_file_override_via_tradepartner_env_file(
 
 
 def test_hypotheses_families_default() -> None:
-    assert _settings().hypotheses.families == ["momentum", "oracle"]
+    assert _settings().hypotheses.families == ["momentum", "oracle", "profitability"]
 
 
 def test_hypotheses_family_outside_the_list_rejected() -> None:
@@ -533,6 +615,294 @@ def test_env_example_names_no_holdout_key() -> None:
     assert "HOLDOUT__" not in env_example.read_text(encoding="utf-8").upper()
 
 
+# --- Strategy lab: `schedule` and `lab` sections (docs/specs/strategy-lab.md, T93) ---
+
+
+def test_env_example_names_schedule_and_lab_keys() -> None:
+    """`.env.example` gains the `schedule.*` and `lab.*` lines (spec, Config keys)."""
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    text = env_example.read_text(encoding="utf-8").upper()
+    assert "SCHEDULE__" in text
+    assert "LAB__" in text
+
+
+def test_schedule_defaults() -> None:
+    s = _settings().schedule
+    assert s.rebalance_cadence == "month_end"
+    assert s.signal_anchor == "month_end"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"rebalance_cadence": "quarterly"},
+        {"signal_anchor": "weekly"},
+    ],
+)
+def test_schedule_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, schedule=override)
+
+
+def test_lab_defaults() -> None:
+    lab = _settings().lab
+    assert lab.sweepable_keys == [
+        "strategy.formation_months",
+        "strategy.skip_months",
+        "strategy.top_fraction",
+        "strategy.weighting",
+        "strategy.signal_total_return",
+        "schedule.rebalance_cadence",
+        "schedule.signal_anchor",
+    ]
+    assert lab.max_variants_per_sweep == 100
+    assert lab.max_promotions_per_sweep == 1
+    assert lab.max_family_promotions == 2
+    assert lab.promotion_min_dsr_excess == pytest.approx(0.5)
+    assert lab.min_sharpe_variance_annual == pytest.approx(0.04)
+    assert lab.max_failures_per_variant == 2
+    assert lab.max_family_holdout_spends == 3
+    assert lab.sweep_time_budget_minutes == pytest.approx(480.0)
+    assert lab.sweep_detail_level == "summary"
+    assert lab.axis_lattice == {"strategy.top_fraction": 0.01}
+    assert lab.quiet_intervals == [("16:00", "21:00")]
+    assert lab.quiet_weekdays == [0, 1, 2, 3, 4]
+    assert lab.quiet_timezone == "America/New_York"
+    assert lab.paper_run_lead_minutes == 30
+    assert lab.registry_size_warn_gb == pytest.approx(20.0)
+    assert lab.registry_size_refuse_gb == pytest.approx(50.0)
+    assert lab.seconds_per_variant_default == {
+        "month_end": 1.0,
+        "week_end": 4.0,
+        "daily": 20.0,
+    }
+
+
+def test_forbidden_axis_prefixes_pinned() -> None:
+    """Pinned by value (strategy-lab spec req 1)."""
+    assert FORBIDDEN_AXIS_PREFIXES == (
+        "costs.",
+        "universe.",
+        "holdout.",
+        "gap.",
+        "adjust.",
+        "master.",
+        "metrics.",
+        "backtest.",
+        "benchmarks",
+        "alpaca.",
+        "execution.",
+    )
+
+
+def test_allowed_axis_prefixes_pinned() -> None:
+    """Pinned by value (Amendment 2026-10-05 (#952, owner): allow-listed to
+    `strategy.*` and `schedule.*`, closing #955's `risk.*`/`paper.*`/`alerts.*` gap)."""
+    assert ALLOWED_AXIS_PREFIXES == ("strategy.", "schedule.")
+
+
+@pytest.mark.parametrize("prefix", FORBIDDEN_AXIS_PREFIXES)
+def test_sweepable_keys_entry_under_a_forbidden_prefix_rejected(prefix: str) -> None:
+    key = prefix if prefix.endswith(".") else f"{prefix}."
+    with pytest.raises(ValueError, match="forbidden prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": [f"{key}bogus"], "axis_lattice": {}})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "risk.max_drawdown",
+        "paper.tracking_k",
+        "alerts.delivery_timeout_seconds",
+        "lab.max_variants_per_sweep",
+        "store.path",
+    ],
+)
+def test_sweepable_keys_entry_outside_the_allowed_prefixes_rejected(key: str) -> None:
+    """#955: a deny-list alone let `risk.*`, `paper.*` and `alerts.*` through; the
+    allow-list (Amendment 2026-10-05 (#952, owner)) refuses any section but
+    `strategy.*`/`schedule.*`, whether or not `Settings` actually has the key."""
+    with pytest.raises(ValueError, match="not under an allowed prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": [key], "axis_lattice": {}})
+
+
+def test_sweepable_keys_entry_settings_lacks_rejected() -> None:
+    with pytest.raises(ValueError, match="names a key Settings lacks"):
+        Settings(
+            _env_file=None,
+            lab={"sweepable_keys": ["strategy.not_a_real_key"], "axis_lattice": {}},
+        )
+
+
+def test_sweepable_keys_entry_unknown_field_in_an_allowed_section_rejected() -> None:
+    """A key under an allowed prefix but naming no real field still fails the
+    `Settings`-existence check, reached only once it clears `ALLOWED_AXIS_PREFIXES`."""
+    with pytest.raises(ValueError, match="names a key Settings lacks"):
+        Settings(
+            _env_file=None,
+            lab={"sweepable_keys": ["schedule.not_a_real_field"], "axis_lattice": {}},
+        )
+
+
+@pytest.mark.parametrize(
+    "bare_key",
+    ["universe", "costs", "holdout", "alpaca_api_key", "not_a_section"],
+)
+def test_sweepable_keys_entry_without_a_dot_rejected(bare_key: str) -> None:
+    """A bare top-level name is refused, under `ALLOWED_AXIS_PREFIXES` (Amendment
+    2026-10-05 (#952, owner)): `universe`/`costs`/`holdout` name a whole section and
+    `alpaca_api_key` a secret scalar, and none is one `strategy.*`/`schedule.*`-shaped
+    field a grid can vary. `_settings_has_key` on its own also refuses a bare name
+    outright (closing the gap where it slipped past the old `FORBIDDEN_AXIS_PREFIXES`
+    `startswith` check, since a bare name never matches a dotted prefix; #952 reviewer
+    findings), exercised directly below."""
+    with pytest.raises(ValueError, match="not under an allowed prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": [bare_key], "axis_lattice": {}})
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["universe", "costs", "alpaca_api_key", "not_a_section", "strategy", "strategy."],
+)
+def test_settings_has_key_refuses_every_bare_or_dotless_name(key: str) -> None:
+    """Unit test on `_settings_has_key` itself, independent of the allow-list: it
+    requires a non-empty `section.field` shape, so a bare name or a trailing-dot-only
+    string is never treated as a real key, whether or not `Settings` has a field or a
+    section by that name."""
+    assert _settings_has_key(key) is False
+
+
+def test_settings_has_key_accepts_a_real_dotted_field() -> None:
+    assert _settings_has_key("strategy.formation_months") is True
+    assert _settings_has_key("schedule.rebalance_cadence") is True
+    assert _settings_has_key("strategy.not_a_real_field") is False
+    assert _settings_has_key("not_a_section.key") is False
+
+
+def test_sweepable_keys_entry_bare_exact_forbidden_name_rejected() -> None:
+    """`benchmarks` (no trailing dot: the one `FORBIDDEN_AXIS_PREFIXES` entry that is
+    an exact field name, not a prefix) is still refused, by the prefix check itself."""
+    with pytest.raises(ValueError, match="forbidden prefix"):
+        Settings(_env_file=None, lab={"sweepable_keys": ["benchmarks"], "axis_lattice": {}})
+
+
+# --- `profitability` family (backtest spec amendment #720, accepted 2026-10-06; T85) ---
+
+
+def test_profitability_is_a_root_family() -> None:
+    assert "profitability" in get_args(HypothesisFamily)
+    assert FAMILY_PARENTS["profitability"] is None
+
+
+def test_profitability_defaults() -> None:
+    p = _settings().profitability
+    assert p.basis == "gross"
+    assert p.annual_period_days == (350, 380)
+    assert p.max_fact_age_days == 548
+    assert p.exclude_sic_ranges == ((6000, 6999),)
+    assert p.include_derived is True
+    assert p.top_fraction == pytest.approx(0.10)
+    assert p.weighting == "equal"
+
+
+def test_profitability_basis_is_gross_only() -> None:
+    """`cash` joins the literal only when its pre-declared variant registers."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, profitability={"basis": "cash"})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"unknown_key": 1},
+        {"top_fraction": float("nan")},
+        {"top_fraction": float("inf")},
+        {"top_fraction": 0.0},
+        {"top_fraction": 1.5},
+        {"weighting": "cap"},
+        {"max_fact_age_days": 0},
+        {"annual_period_days": [380, 350]},
+        {"annual_period_days": [0, 380]},
+        {"exclude_sic_ranges": [[6999, 6000]]},
+    ],
+)
+def test_profitability_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, profitability=override)
+
+
+def test_profitability_keys_are_not_sweepable_by_default() -> None:
+    """`lab.sweepable_keys` is unchanged by T85 (spec open question 12 is a later,
+    reviewed config change)."""
+    assert not any(k.startswith("profitability.") for k in _settings().lab.sweepable_keys)
+
+
+def test_env_example_names_profitability_keys() -> None:
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    text = env_example.read_text(encoding="utf-8")
+    for name in Settings.model_fields["profitability"].annotation.model_fields:  # type: ignore[union-attr]
+        assert f"PROFITABILITY__{name.upper()}=" in text, name
+
+
+def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
+    """Every family in `HypothesisFamily` except `oracle` needs a lineage entry
+    (strategy-lab spec open question 11)."""
+    non_oracle = {family for family in get_args(HypothesisFamily) if family != "oracle"}
+    assert non_oracle <= set(FAMILY_PARENTS)
+    assert FAMILY_PARENTS["momentum"] is None
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    ["America/New_York", "UTC", "Europe/London"],
+)
+def test_quiet_timezone_accepts_valid_iana_zones(timezone: str) -> None:
+    settings = Settings(_env_file=None, lab={"quiet_timezone": timezone})
+    assert settings.lab.quiet_timezone == timezone
+
+
+@pytest.mark.parametrize("timezone", ["Not/AZone", "EST5EDT9", ""])
+def test_quiet_timezone_rejects_an_invalid_iana_zone(timezone: str) -> None:
+    with pytest.raises(ValidationError, match="not a valid IANA timezone"):
+        Settings(_env_file=None, lab={"quiet_timezone": timezone})
+
+
+def test_axis_lattice_key_outside_sweepable_keys_rejected() -> None:
+    with pytest.raises(ValidationError, match=r"not in lab\.sweepable_keys"):
+        Settings(
+            _env_file=None,
+            lab={
+                "sweepable_keys": ["strategy.top_fraction"],
+                "axis_lattice": {"strategy.formation_months": 1.0},
+            },
+        )
+
+
+def test_axis_lattice_key_within_sweepable_keys_accepted() -> None:
+    settings = Settings(
+        _env_file=None,
+        lab={
+            "sweepable_keys": ["strategy.top_fraction", "strategy.formation_months"],
+            "axis_lattice": {"strategy.top_fraction": 0.01, "strategy.formation_months": 1.0},
+        },
+    )
+    assert settings.lab.axis_lattice == {
+        "strategy.top_fraction": 0.01,
+        "strategy.formation_months": 1.0,
+    }
+
+
+@pytest.mark.parametrize("weekday", [-1, 7])
+def test_quiet_weekdays_out_of_range_rejected(weekday: int) -> None:
+    with pytest.raises(ValidationError, match="0-6"):
+        Settings(_env_file=None, lab={"quiet_weekdays": [weekday]})
+
+
+def test_seconds_per_variant_default_missing_a_cadence_rejected() -> None:
+    with pytest.raises(ValidationError, match="missing an entry"):
+        Settings(_env_file=None, lab={"seconds_per_variant_default": {"month_end": 1.0}})
+
+
 @pytest.mark.parametrize("level", [float("nan"), float("inf")])
 def test_costs_non_finite_sensitivity_rejected(level: float) -> None:
     """A NaN level would silently turn that level's results into NaN."""
@@ -562,6 +932,8 @@ def test_hypotheses_families_empty_or_duplicate_rejected(families: list[str]) ->
         ("holdout", {"stat": "2024-01-01"}),
         ("backtest", {"initial_capitol": 1.0}),
         ("metrics", {"red_flag": 1.0}),
+        ("schedule", {"rebalance_cadenc": "month_end"}),
+        ("lab", {"max_variants_per_swee": 10}),
     ],
 )
 def test_phase3_sections_reject_unknown_keys(section: str, override: dict[str, object]) -> None:
@@ -818,6 +1190,109 @@ def test_research_experiments_dir_defaults_to_docs_experiments() -> None:
         _env_file=None, research={"experiments_dir": "tests/fixtures/experiments"}
     )
     assert overridden.research.experiments_dir == "tests/fixtures/experiments"
+
+
+def test_research_labeling_defaults() -> None:
+    """Research-labeling spec, amendment 2026-10-06's config table (plan T119): every
+    key and default; the two ceilings and the key are zero/absent in code."""
+    research = _settings().research
+    assert research.spend_ceiling_usd_month == 0.0
+    assert research.spend_ceiling_usd_total == 0.0
+    labeling = research.labeling
+    assert labeling.api_base_url == "https://api.typesafe.ai/v1"
+    assert labeling.price_usd_per_million_input_tokens == 0.042
+    assert labeling.chars_per_token == 2.5
+    assert labeling.max_packet_tokens == 8000
+    assert labeling.exhibit_max_chars == 4000
+    assert labeling.item_max_chars == 4000
+    assert labeling.eightk_max_chars == 12000
+    assert labeling.context_before_days == 45
+    assert labeling.context_after_days == 20
+    assert labeling.marker_after_days == 400
+    # Owner decision 2026-10-06 question 5 (E14), not the body's list.
+    assert labeling.eightk_items == ["3.01", "2.01", "1.03", "5.01", "3.03", "1.01", "8.01"]
+    assert labeling.requests_per_second == 2.0
+    assert labeling.request_timeout_seconds == 60.0
+    assert labeling.max_attempts == 3
+    # The amendment removed these two keys.
+    assert not hasattr(labeling, "estimate_margin")
+    assert not hasattr(labeling, "batch_max_usd")
+    assert _settings().typesafe_api_key is None
+
+
+def test_research_data_dir_is_under_the_repo_and_independent_of_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    data_dir = Path(_settings().research.data_dir)
+    assert data_dir.is_absolute()
+    assert data_dir == Path(__file__).resolve().parents[1] / "data" / "research"
+
+
+def test_research_ceilings_and_key_come_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three variables the spec names (req 8, req 17) and nothing else."""
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_MONTH", "40")
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_TOTAL", "40")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key-abc123")
+    monkeypatch.setenv("RESEARCH__DATA_DIR", "/tmp/research-x")
+    s = _settings()
+    assert s.research.spend_ceiling_usd_month == 40.0
+    assert s.research.spend_ceiling_usd_total == 40.0
+    assert s.research.data_dir == "/tmp/research-x"
+    assert s.typesafe_api_key is not None
+    assert s.typesafe_api_key.get_secret_value() == "ts-key-abc123"
+
+
+@pytest.mark.parametrize(
+    ("section", "values"),
+    [
+        ("research", {"spend_ceiling_usd_month": -1.0}),
+        ("research", {"spend_ceiling_usd_total": -0.01}),
+        ("research", {"spend_ceiling_usd_total": float("inf")}),
+        ("labeling", {"api_base_url": "http://api.typesafe.ai/v1"}),
+        ("labeling", {"chars_per_token": 0}),
+        ("labeling", {"max_packet_tokens": 0}),
+        ("labeling", {"exhibit_max_chars": 0}),
+        ("labeling", {"item_max_chars": 0}),
+        ("labeling", {"eightk_max_chars": 0}),
+        ("labeling", {"context_before_days": -1}),
+        ("labeling", {"requests_per_second": 0}),
+        ("labeling", {"request_timeout_seconds": 0}),
+        ("labeling", {"max_attempts": 0}),
+        ("labeling", {"price_usd_per_million_input_tokens": 0}),
+        ("labeling", {"eightk_items": []}),
+        ("labeling", {"eightk_items": ["3.01", "3.01"]}),
+        ("labeling", {"eightk_items": ["Item 3.01"]}),
+        ("labeling", {"estimate_margin": 0.25}),
+    ],
+)
+def test_research_labeling_rejects_nonsense(section: str, values: dict[str, object]) -> None:
+    research: dict[str, object] = dict(values) if section == "research" else {"labeling": values}
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, research=research)
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-1"])
+def test_research_ceilings_from_the_environment_reject_nonsense(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RESEARCH__SPEND_CEILING_USD_TOTAL", value)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_typesafe_key_is_redacted_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec req 17: a `SecretStr` in `secret_values`, so `clean_message` (and
+    `cli_record`, which uses the same set) redacts it; absent from repr/str."""
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key-abc123")
+    s = _settings()
+    for blob in (repr(s), str(s), repr(s.typesafe_api_key)):
+        assert "ts-key-abc123" not in blob
+    cleaned = clean_message("401 for Bearer ts-key-abc123 on systemone", s)
+    assert "ts-key-abc123" not in cleaned
+    assert "[redacted]" in cleaned
 
 
 def test_alerts_channels_default_store_and_macos() -> None:

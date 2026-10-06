@@ -22,10 +22,14 @@ from tradepartner.store import registry, schema
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fixture-momentum.md"
 SLUG = "fixture-momentum"
+PROF_FIXTURE = FIXTURE.with_name("fixture-profitability.md")
+PROF_SLUG = "fixture-profitability"
 
 # Spec req 10: the frozen sections (every key) and the single frozen keys.
 FROZEN_SECTIONS = (
     "strategy",
+    "profitability",
+    "schedule",
     "universe",
     "costs",
     "backtest",
@@ -192,7 +196,8 @@ def test_out_of_range_value_is_refused(
 
 def test_frozen_set_is_exactly_the_spec_key_list(settings: Settings) -> None:
     frozen = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
-    assert set(frozen) == _spec_frozen_keys()
+    # A momentum registration stores no `profitability.*` key (amendment #720, T85).
+    assert set(frozen) == {k for k in _spec_frozen_keys() if not k.startswith("profitability.")}
     assert set(hypothesis.frozen_keys()) == _spec_frozen_keys()
     for key in (
         "metrics.risk_free_rate",
@@ -402,3 +407,160 @@ def test_load_frozen_refuses_a_stale_key_set(
     )
     with pytest.raises(HypothesisFileError, match="frozen key set"):
         hypothesis.load_frozen(conn, SLUG, settings=settings)
+
+
+# --- frozen-key defaults (strategy-lab T96) ----------------------------------
+
+
+def test_a_new_file_stores_both_schedule_keys(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, FIXTURE, settings)
+    assert record.params["schedule.rebalance_cadence"] == "month_end"
+    assert record.params["schedule.signal_anchor"] == "month_end"
+
+
+def test_load_frozen_on_the_pre_lab_fixture_twin(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A registration stored without `schedule.*` (as before the lab) runs, reads
+    `month_end` for both keys, and keeps its stored hash."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    params = {
+        k: v
+        for k, v in hypothesis.frozen_params(parsed, settings).items()
+        if not k.startswith("schedule.")
+    }
+    record = registry.register_hypothesis(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=FIXTURE.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=params,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=settings,
+    )
+    live = settings.model_copy(
+        update={"schedule": settings.schedule.model_copy(update={"rebalance_cadence": "daily"})}
+    )
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
+    assert loaded.schedule.rebalance_cadence == "month_end"
+    assert loaded.schedule.signal_anchor == "month_end"
+    assert registry.get_hypothesis(conn, SLUG).params_sha256 == record.params_sha256
+    assert registry.params_sha256(params) == record.params_sha256
+
+
+# --- the `profitability` family (backtest spec amendment #720, T85) -----------
+
+
+def _prof_copy(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "hypotheses" / f"{PROF_SLUG}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_profitability_file_registers_without_strategy_keys(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    parsed = hypothesis.parse_file(PROF_FIXTURE)
+    assert hypothesis.required_keys("profitability") <= set(parsed.file_params)
+    assert {k for k in _spec_frozen_keys() if k.startswith(("profitability.", "costs."))} <= (
+        hypothesis.required_keys("profitability")
+    )
+    record = _register(conn, PROF_FIXTURE, settings)
+    assert record.family == "profitability"
+    assert not any(k.startswith("strategy.") for k in record.params)
+    assert record.params["profitability.top_fraction"] == 0.2
+    stored = conn.execute(
+        "SELECT params_json FROM hypotheses WHERE hypothesis_id = ?", [record.hypothesis_id]
+    ).fetchone()
+    assert stored is not None and '"strategy.' not in stored[0]
+    assert set(record.params) == {k for k in _spec_frozen_keys() if not k.startswith("strategy.")}
+
+
+@pytest.mark.parametrize("line", ["top_fraction = 0.2", "max_fact_age_days = 548"])
+def test_profitability_file_missing_its_key_is_refused(tmp_path: Path, line: str) -> None:
+    text = PROF_FIXTURE.read_text().replace(f"\n{line}\n", "\n", 1)
+    with pytest.raises(HypothesisFileError, match="missing"):
+        hypothesis.parse_file(_prof_copy(tmp_path, text))
+
+
+def test_profitability_file_naming_a_strategy_key_is_refused(tmp_path: Path) -> None:
+    added = "\n[strategy]\nskip_months = 1\n\n[costs]\n"
+    text = PROF_FIXTURE.read_text().replace("\n[costs]\n", added, 1)
+    with pytest.raises(HypothesisFileError, match=r"strategy\.skip_months"):
+        hypothesis.parse_file(_prof_copy(tmp_path, text))
+
+
+def test_momentum_file_naming_a_profitability_key_is_refused(tmp_path: Path) -> None:
+    added = "\n[profitability]\ntop_fraction = 0.1\n\n[costs]\n"
+    text = FIXTURE.read_text().replace("\n[costs]\n", added, 1)
+    with pytest.raises(HypothesisFileError, match=r"profitability\.top_fraction"):
+        hypothesis.parse_file(_copy(tmp_path, text))
+
+
+def test_profitability_registration_ignores_live_strategy_settings(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """An unchanged B3-style file re-registers as a no-op whatever the live momentum
+    keys, and a run of it keeps the live `strategy.*` it never reads."""
+    first = _register(conn, PROF_FIXTURE, settings)
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"top_fraction": 0.5})}
+    )
+    again = _register(conn, PROF_FIXTURE, live)
+    assert again.hypothesis_id == first.hypothesis_id
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
+    loaded = hypothesis.load_frozen(conn, PROF_SLUG, settings=live)
+    assert loaded.profitability.top_fraction == 0.2
+    assert loaded.strategy.top_fraction == 0.5
+    assert hypothesis.frozen_hash_matches(loaded, first.params_sha256, family="profitability")
+    assert hypothesis.frozen_params_of(loaded, family="profitability") == first.params
+
+
+@pytest.mark.parametrize(
+    "dropped", [("profitability.",), ("schedule.", "profitability.")], ids=["today", "pre-lab"]
+)
+def test_h1_twin_registered_before_t85_still_loads_and_verifies(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, dropped: tuple[str, ...]
+) -> None:
+    """H1's fixture twin, stored before T85 (no `profitability.*`; the pre-lab twin, as
+    the owner's H1 is, also without `schedule.*`), loads at its stored hash with the
+    section's live values, `frozen_hash_matches` (what `record_results` checks) holds,
+    and `hypothesis register` on the unchanged file writes nothing new."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    params = {
+        k: v
+        for k, v in hypothesis.frozen_params(parsed, settings).items()
+        if not k.startswith(dropped)
+    }
+    record = registry.register_hypothesis(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=FIXTURE.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=params,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=settings,
+    )
+    live = settings.model_copy(
+        update={"profitability": settings.profitability.model_copy(update={"top_fraction": 0.5})}
+    )
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
+    assert loaded.profitability.top_fraction == 0.5  # live: momentum never reads it
+    assert registry.get_hypothesis(conn, SLUG).params_sha256 == record.params_sha256
+    assert hypothesis.frozen_hash_matches(loaded, record.params_sha256)
+    if dropped == ("profitability.",):
+        assert _register(conn, FIXTURE, live).hypothesis_id == record.hypothesis_id
+        assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)

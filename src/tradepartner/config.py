@@ -13,10 +13,11 @@ than the charter default, including an environment override, so it cannot
 be silently loosened; changing it is a charter amendment, not a config edit.
 
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
-Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` and the `ALERT_SMTP_*`
-credentials) are `SecretStr` so their values never appear in `repr()`/`str()`
-of `Settings`, including `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and
-`ALERT_EMAIL_FROM`, which embed a personal contact email.
+Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`, the `ALERT_SMTP_*`
+credentials and the research vendor's `TYPESAFE_API_KEY`) are `SecretStr` so
+their values never appear in `repr()`/`str()` of `Settings`, including
+`SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM`, which embed a
+personal contact email.
 
 `alpaca.paper` is guarded the same way as `universe.exclude_sic_ranges`: the
 order path reaches the paper endpoint only (Phase 4 spec req 2), and Phase 6
@@ -35,7 +36,8 @@ import os
 import re
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +46,33 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # SIC 4900-4999 division (electric, gas, water, sanitary services), no
 # carve-outs. Changing it is a charter amendment, not a code or config change.
 _GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
+
+# `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
+# (a)): five canonical names, each an ordered list of fallbacks, every one the
+# concept itself, never a near relative.
+_STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
+    "revenue": (
+        "us-gaap:Revenues",
+        "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+        "us-gaap:SalesRevenueNet",
+        "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
+        "us-gaap:SalesRevenueGoodsNet",
+        "us-gaap:SalesRevenueServicesNet",
+    ),
+    "cost_of_revenue": (
+        "us-gaap:CostOfRevenue",
+        "us-gaap:CostOfGoodsAndServicesSold",
+        "us-gaap:CostOfGoodsSold",
+        "us-gaap:CostOfServices",
+    ),
+    "gross_profit": ("us-gaap:GrossProfit",),
+    "total_assets": ("us-gaap:Assets",),
+    "operating_cash_flow": (
+        "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+        "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    ),
+}
+_QUALIFIED_TAG = re.compile(r"[A-Za-z][A-Za-z0-9-]*:[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _default_env_file() -> Path:
@@ -69,6 +98,14 @@ def _default_edgar_cache_dir() -> str:
     started writing there.
     """
     return str(Path(__file__).resolve().parents[2] / "data" / "edgar_cache")
+
+
+def _default_research_data_dir() -> str:
+    """`data/research` (the research store, research-labeling spec Definitions and
+    ADR 0013 point 3), anchored to the project root like `edgar.cache_dir`, so a
+    run launched from another working directory still finds it; gitignored by
+    `data/*`."""
+    return str(Path(__file__).resolve().parents[2] / "data" / "research")
 
 
 class CalendarConfig(BaseModel):
@@ -222,6 +259,34 @@ class EdgarConfig(BaseModel):
     # `check_failures`'s list of unaccepted filing failures (#578 part 3; the
     # full list is `failed_filings.json`, written on a non-dry run).
     max_validation_listed: int = Field(default=20, gt=0)
+    # T77 (#660, spec amendment 2026-10-03): as-filed statement facts. The
+    # switch is off until T78 flips it after the real-store run; while off,
+    # nothing reads the other three keys. `statement_tags` maps each canonical
+    # fact name to its ordered `taxonomy:tag` fallbacks (the order is the
+    # precedence within one filing); `statement_forms` filters on the
+    # submissions record's form, never the companyfacts entry's; only
+    # `statement_units` are read, any other unit is skipped and counted.
+    statement_facts_enabled: bool = False
+    statement_tags: dict[str, list[str]] = Field(
+        default_factory=lambda: {name: list(tags) for name, tags in _STATEMENT_TAGS.items()}
+    )
+    statement_forms: list[str] = Field(
+        default_factory=lambda: ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
+    )
+    statement_units: list[str] = Field(default_factory=lambda: ["USD"])
+
+    @field_validator("statement_tags")
+    @classmethod
+    def _statement_tags_are_qualified(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Every tag is `taxonomy:tag` (#660), so `us-gaap:Revenues` and a
+        same-named concept in another taxonomy are never confused."""
+        for name, tags in value.items():
+            for tag in tags:
+                if not _QUALIFIED_TAG.fullmatch(tag):
+                    raise ValueError(
+                        f"edgar.statement_tags[{name!r}]: {tag!r} is not `taxonomy:tag`"
+                    )
+        return value
 
     @property
     def header_start_year(self) -> int:
@@ -353,6 +418,11 @@ class AlpacaConfig(BaseModel):
     # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest
     # liquid hole is GSX -> GOTU's 356 days; 0 turns the lead off.
     rename_lead_days: int = Field(default=400, ge=0)
+    # #974: a security's first assigned equity span also resolves its ticker back to
+    # the security's first session (`ListingResolver` `first_sessions`, built by
+    # `repair.store_resolver`), bars and corporate actions. Owner decision on #979:
+    # on by default; `false` is the kill switch and leaves every mapping as before.
+    first_span_lead: bool = True
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
@@ -427,6 +497,13 @@ def parse_accepted_shares_fact(entry: str) -> tuple[str, date]:
     return _parse_id_at_day(entry, "accepted shares fact")
 
 
+def parse_accepted_same_day_pair(entry: str) -> tuple[str, date]:
+    """`"<security_id>@<YYYY-MM-DD>"` (an `universe.accepted_same_day_pairs`
+    entry) as `(security_id, valid_from)`. Raises `ValueError` on any other
+    shape."""
+    return _parse_id_at_day(entry, "accepted same-day pair")
+
+
 class UniverseConfig(BaseModel):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
@@ -461,6 +538,12 @@ class UniverseConfig(BaseModel):
     max_jump_ratio: float = Field(default=2.5, gt=1, allow_inf_nan=False)
     min_jump_ratio: float = Field(default=0.4, gt=0, lt=1)
     accepted_price_jumps: list[str] = Field(default_factory=list)
+    # Owner-accepted same-day listing pairs (#855), read only by `health`: a
+    # same-start pair of different tickers that `non_overlapping_listings` would
+    # fail (spec req 11, #822) passes when the owner lists it here as
+    # "<security_id>@<YYYY-MM-DD>" (the pair's `valid_from`) after reviewing it.
+    # `health` lists every accepted pair. Never changes universe membership.
+    accepted_same_day_pairs: list[str] = Field(default_factory=list)
 
     @field_validator("accepted_price_jumps")
     @classmethod
@@ -474,6 +557,13 @@ class UniverseConfig(BaseModel):
     def _check_accepted_shares_facts(cls, value: list[str]) -> list[str]:
         for entry in value:
             parse_accepted_shares_fact(entry)
+        return value
+
+    @field_validator("accepted_same_day_pairs")
+    @classmethod
+    def _check_accepted_same_day_pairs(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_accepted_same_day_pair(entry)
         return value
 
     @field_validator("exclude_sic_ranges")
@@ -525,8 +615,34 @@ class GapConfig(BaseModel):
 # The enumerated hypothesis families (spec "Config keys"). Trials are counted per family
 # for the deflated Sharpe, so a family cannot be invented by config: adding one is a
 # reviewed code change here. `oracle` is refused on the real store (registry, T31b).
-HypothesisFamily = Literal["momentum", "oracle"]
-_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
+HypothesisFamily = Literal["momentum", "oracle", "profitability"]
+_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle", "profitability")
+
+# Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
+# ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
+# `HypothesisFamily` since both are the enumerations a hypothesis file pins.
+Cadence = Literal["month_end", "week_end", "daily"]
+SignalAnchor = Literal["month_end", "offset"]
+
+# A family's lineage (strategy-lab spec open question 11): every non-`oracle` family in
+# `HypothesisFamily` has an entry here, either a parent family or `None` for a **root**
+# family whose signal is unrelated to momentum's. Adding a family is one reviewed code
+# change to the literal and this table together, whose PR states why it is a child or a
+# root; a child's holdout may only start after its parent's `holdout.end` and only once
+# the parent has spent its holdout or reached its spend cap (`store/registry.py`).
+# `profitability` (backtest spec amendment #720) is a root: gross profitability over
+# assets is a statement-fact signal unrelated to momentum's price returns.
+FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
+    "momentum": None,
+    "profitability": None,
+}
+
+# The families the engine can run today (#1053, folded into T85 by owner decision
+# 2026-10-06). A registered family outside it is refused by `backtest run`, `paper start`
+# and the paper planning step before any trial, order or plan row: its signal is not
+# dispatched yet, so a run would read momentum's live, unfrozen `strategy.*` instead.
+# T85e adds `profitability` with the engine dispatch.
+ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
@@ -577,6 +693,40 @@ class StrategyConfig(BaseModel):
                 f"formation_months ({self.formation_months}) must be greater than "
                 f"skip_months ({self.skip_months})"
             )
+        return self
+
+
+class ProfitabilityConfig(BaseModel):
+    """The `profitability` family's signal keys (backtest spec amendment #720, "Config
+    keys"; hypothesis B3). Frozen per hypothesis and required in full by a
+    `family = "profitability"` file; the momentum keys are not reused, so each family's
+    section is complete on its own.
+
+    `basis` is `gross` only until the pre-declared `cash` variant registers.
+    `annual_period_days` is the inclusive day-length range an as-filed annual duration
+    may have; `max_fact_age_days` bounds a fact's age at the rebalance; and
+    `exclude_sic_ranges` is a signal-domain scope (inclusive ranges), not the guarded
+    `universe.exclude_sic_ranges`. `top_fraction` is a share of scored names in (0, 1].
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    basis: Literal["gross"] = "gross"
+    annual_period_days: tuple[int, int] = (350, 380)
+    max_fact_age_days: int = Field(default=548, gt=0)
+    exclude_sic_ranges: tuple[tuple[int, int], ...] = ((6000, 6999),)
+    include_derived: bool = True
+    top_fraction: float = Field(default=0.10, gt=0, le=1)
+    weighting: Literal["equal"] = "equal"
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> ProfitabilityConfig:
+        low, high = self.annual_period_days
+        if not 0 < low <= high:
+            raise ValueError(f"annual_period_days must be 0 < low <= high, got {low, high}")
+        for start, end in self.exclude_sic_ranges:
+            if start > end:
+                raise ValueError(f"exclude_sic_ranges entry {start, end} has start > end")
         return self
 
 
@@ -637,15 +787,189 @@ class BacktestConfig(BaseModel):
 class MetricsConfig(BaseModel):
     """Metric settings (spec reqs 7 and 15).
 
-    No `periods_per_year`: `MONTHS_PER_YEAR = 12` is a constant derived from the ADR 0006
-    monthly cadence. `red_flag_excess_cagr_pp` marks a trial for a look-ahead and cost
-    audit; it is a reported flag, never a gate (spec open question 6).
+    No `periods_per_year`: `PERIODS_PER_YEAR` (12, 52, 252 by cadence; ADR 0012,
+    `backtest/schedule.py`, T94) is a derived constant table, not config, and
+    `MONTHS_PER_YEAR = 12` is its `month_end` entry. `red_flag_excess_cagr_pp` marks a
+    trial for a look-ahead and cost audit; it is a reported flag, never a gate (spec
+    open question 6).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     risk_free_rate: float = 0.0
     red_flag_excess_cagr_pp: float = Field(default=3.0, ge=0)
+
+
+# --- Strategy lab: schedule and lab sections (docs/specs/strategy-lab.md, T93) ---
+
+
+def _settings_has_key(dotted_key: str) -> bool:
+    """`True` iff `dotted_key` (e.g. `"strategy.formation_months"`) names a real field on
+    `Settings`, walked through its nested section models. Used only to validate
+    `lab.sweepable_keys` entries against typos: a key `Settings` lacks must be refused,
+    never silently accepted as an axis that can never vary.
+
+    Requires a `section.field` shape: a bare top-level name (no dot) is always
+    rejected, whether or not it happens to name a `Settings` field, since every real
+    sweepable key is one `strategy.*`/`schedule.*` field inside a section, never a
+    whole section (`"universe"`) or a top-level scalar such as a secret
+    (`"alpaca_api_key"`) (reviewer findings on #952, both reviewer passes)."""
+    section, sep, rest = dotted_key.partition(".")
+    if not sep or not rest:
+        return False
+    field = Settings.model_fields.get(section)
+    if field is None:
+        return False
+    model = field.annotation
+    if not (isinstance(model, type) and issubclass(model, BaseModel)):
+        return False
+    return rest in model.model_fields
+
+
+class ScheduleConfig(BaseModel):
+    """Cadence and signal anchor (strategy-lab spec "Config keys"; ADR 0012, superseding
+    ADR 0006's Cadence section). Frozen per hypothesis like the universe
+    (`backtest/frozen.py`, T96): once a hypothesis registers, these never change for it.
+    `paper start` refuses anything but `rebalance_cadence = month_end` (paper-trading
+    spec req 14); only the backtest path exercises `week_end` and `daily`.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    rebalance_cadence: Cadence = "month_end"
+    signal_anchor: SignalAnchor = "month_end"
+
+
+# Forbidden `lab.sweepable_keys` prefixes (strategy-lab spec req 1, "Config keys"):
+# costs are sensitivities inside a trial (backtest spec req 6), the universe is not
+# tuned on P&L (ADR 0006 guard a), `execution.fill_price` is a convention (ADR 0006), and
+# the rest are data or accounting rules a hypothesis never varies. Pinned by value in
+# tests/test_config.py; the `Settings` validator below refuses any `lab.sweepable_keys`
+# entry under one of these, kept as a second, belt-and-braces check alongside
+# `ALLOWED_AXIS_PREFIXES` below (Amendment 2026-10-05 (#952, owner)): were a forbidden
+# prefix ever also an allowed one, this still refuses it.
+FORBIDDEN_AXIS_PREFIXES: tuple[str, ...] = (
+    "costs.",
+    "universe.",
+    "holdout.",
+    "gap.",
+    "adjust.",
+    "master.",
+    "metrics.",
+    "backtest.",
+    "benchmarks",
+    "alpaca.",
+    "execution.",
+)
+
+# Amendment 2026-10-05 (#952, owner): sweepable keys are allow-listed to `strategy.*`
+# and `schedule.*` rather than relying on `FORBIDDEN_AXIS_PREFIXES` alone (a deny-list
+# that, unamended, let `risk.*`, `paper.*` and `alerts.*` through, #955). A new axis
+# family needs a reviewed code change here, because `lab.sweepable_keys` itself comes
+# from config, which is set from the unreviewed `.env`. Pinned by value in
+# tests/test_config.py.
+ALLOWED_AXIS_PREFIXES: tuple[str, ...] = ("strategy.", "schedule.")
+
+_DEFAULT_SWEEPABLE_KEYS: tuple[str, ...] = (
+    "strategy.formation_months",
+    "strategy.skip_months",
+    "strategy.top_fraction",
+    "strategy.weighting",
+    "strategy.signal_total_return",
+    "schedule.rebalance_cadence",
+    "schedule.signal_anchor",
+)
+
+# Placeholders (plan approach choice 4; open question 3 on #933, not yet answered): the
+# measured seconds a single backtest variant takes at each cadence. Until T114's
+# measurement run, these are scaled only by how many more rebalances a faster cadence
+# runs per year relative to `month_end` (about 4 ISO weeks and 21 XNYS sessions per
+# month), never measured; `backtest/quiet.py`'s `seconds_per_variant` (T106) falls back
+# to this table when no measured figure exists.
+_DEFAULT_SECONDS_PER_VARIANT: dict[Cadence, float] = {
+    "month_end": 1.0,
+    "week_end": 4.0,
+    "daily": 20.0,
+}
+
+
+class LabConfig(BaseModel):
+    """Strategy-lab sweep rules (strategy-lab spec "Config keys").
+
+    `sweepable_keys` names every `Settings` key a sweep file's `[grid]` may vary
+    (validated against `ALLOWED_AXIS_PREFIXES`, `FORBIDDEN_AXIS_PREFIXES` and against
+    `Settings` itself on the `Settings` model, since that check needs the whole model);
+    `axis_lattice` is a step
+    per continuous sweepable key (an integer axis needs none) and its keys must be a
+    subset of `sweepable_keys`. `promotion_min_dsr_excess` and `min_sharpe_variance_annual`
+    are the promotion floor and the V floor (spec open question 4); `max_variants_per_sweep`
+    bounds one sweep (open question 5); `max_family_holdout_spends` and
+    `max_family_promotions` are copied into `family_rules` at a family's first
+    registration (open question 10). `sweep_time_budget_minutes` and the
+    `registry_size_*` guards are placeholders the measurement task (T114) replaces.
+    `quiet_intervals`, `quiet_weekdays` and `quiet_timezone` describe the ingest plist's
+    window and days; `paper_run_lead_minutes` is how long before the submit window the
+    paper plist fires. `seconds_per_variant_default` is drafted here as config rather
+    than a code constant (code standards; approach choice 4); it is not in the spec's
+    "Config keys" list.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    sweepable_keys: list[str] = Field(default_factory=lambda: list(_DEFAULT_SWEEPABLE_KEYS))
+    max_variants_per_sweep: int = Field(default=100, gt=0)
+    max_promotions_per_sweep: int = Field(default=1, gt=0)
+    max_family_promotions: int = Field(default=2, gt=0)
+    promotion_min_dsr_excess: float = Field(default=0.5, ge=0)
+    min_sharpe_variance_annual: float = Field(default=0.04, ge=0)
+    max_failures_per_variant: int = Field(default=2, ge=0)
+    max_family_holdout_spends: int = Field(default=3, gt=0)
+    sweep_time_budget_minutes: float = Field(default=480.0, gt=0)
+    sweep_detail_level: Literal["full", "summary"] = "summary"
+    axis_lattice: dict[str, float] = Field(default_factory=lambda: {"strategy.top_fraction": 0.01})
+    quiet_intervals: list[tuple[str, str]] = Field(default_factory=lambda: [("16:00", "21:00")])
+    quiet_weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
+    quiet_timezone: str = "America/New_York"
+    paper_run_lead_minutes: int = Field(default=30, ge=0)
+    registry_size_warn_gb: float = Field(default=20.0, gt=0)
+    registry_size_refuse_gb: float = Field(default=50.0, gt=0)
+    seconds_per_variant_default: dict[Cadence, float] = Field(
+        default_factory=lambda: dict(_DEFAULT_SECONDS_PER_VARIANT)
+    )
+
+    @field_validator("quiet_timezone")
+    @classmethod
+    def _validate_quiet_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"lab.quiet_timezone {value!r} is not a valid IANA timezone") from exc
+        return value
+
+    @field_validator("quiet_weekdays")
+    @classmethod
+    def _validate_quiet_weekdays(cls, value: list[int]) -> list[int]:
+        bad = [day for day in value if day < 0 or day > 6]
+        if bad:
+            raise ValueError(f"lab.quiet_weekdays entries must be 0-6 (Monday-Sunday), got {bad}")
+        return value
+
+    @field_validator("seconds_per_variant_default")
+    @classmethod
+    def _validate_seconds_per_variant_default(
+        cls, value: dict[Cadence, float]
+    ) -> dict[Cadence, float]:
+        missing = sorted(set(get_args(Cadence)) - set(value))
+        if missing:
+            raise ValueError(f"lab.seconds_per_variant_default is missing an entry for {missing}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_axis_lattice_keys_are_sweepable(self) -> LabConfig:
+        unsweepable = sorted(set(self.axis_lattice) - set(self.sweepable_keys))
+        if unsweepable:
+            raise ValueError(f"lab.axis_lattice key(s) {unsweepable} are not in lab.sweepable_keys")
+        return self
 
 
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
@@ -829,6 +1153,65 @@ class DashboardConfig(BaseModel):
     page_row_limit: int = Field(default=500, gt=0)
 
 
+# The 8-K items a packet keeps, in priority order (research-labeling amendment
+# 2026-10-06 C2 and E14; owner decision 2026-10-06 question 5).
+_DEFAULT_EIGHTK_ITEMS = ("3.01", "2.01", "1.03", "5.01", "3.03", "1.01", "8.01")
+_EIGHTK_ITEM = re.compile(r"\d\.\d\d")
+
+
+class ResearchLabelingConfig(BaseModel):
+    """Research labeling, pilot A (docs/specs/research-labeling.md req 7 and the
+    amendment 2026-10-06's config table, which drops `estimate_margin` and
+    `batch_max_usd`).
+
+    `api_base_url` is the vendor's API root, read only by `research/models.py`
+    (ADR 0013 point 3 (c)); it must be `https`. `price_usd_per_million_input_tokens`
+    is the price snapshot (vendor Models page, 2026-10-05). `chars_per_token` is the
+    pre-call token estimate's divisor (E9: 4 ran 1.5 to 1.7x low).
+    `max_packet_tokens` is a refusal, never a truncation rule. The three `*_max_chars`
+    are the per-document cuts of C2's packets; the three `*_days` windows are
+    calendar days around the Form 25's filing date; `eightk_items` is the 8-K item
+    priority order. `max_attempts` counts the first send: only HTTP 429, 529 and a
+    connection error before any byte was sent are retried (req 7).
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    api_base_url: str = "https://api.typesafe.ai/v1"
+    price_usd_per_million_input_tokens: float = Field(default=0.042, gt=0)
+    chars_per_token: float = Field(default=2.5, gt=0)
+    max_packet_tokens: int = Field(default=8000, gt=0)
+    exhibit_max_chars: int = Field(default=4000, gt=0)
+    item_max_chars: int = Field(default=4000, gt=0)
+    eightk_max_chars: int = Field(default=12000, gt=0)
+    context_before_days: int = Field(default=45, ge=0)
+    context_after_days: int = Field(default=20, ge=0)
+    marker_after_days: int = Field(default=400, ge=0)
+    eightk_items: list[str] = Field(default_factory=lambda: list(_DEFAULT_EIGHTK_ITEMS))
+    requests_per_second: float = Field(default=2.0, gt=0)
+    request_timeout_seconds: float = Field(default=60.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+
+    @field_validator("api_base_url")
+    @classmethod
+    def _validate_api_base_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("research.labeling.api_base_url must be an https URL")
+        return value
+
+    @field_validator("eightk_items")
+    @classmethod
+    def _validate_eightk_items(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("research.labeling.eightk_items must name at least one item")
+        bad = [item for item in value if not _EIGHTK_ITEM.fullmatch(item)]
+        if bad:
+            raise ValueError(f"research.labeling.eightk_items entries must look like '3.01': {bad}")
+        if len(set(value)) != len(value):
+            raise ValueError(f"research.labeling.eightk_items must not repeat, got {value}")
+        return value
+
+
 class ResearchConfig(BaseModel):
     """Research-experiment registry (docs/specs/research-registry.md req 2, req 14).
 
@@ -842,6 +1225,16 @@ class ResearchConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     experiments_dir: str = "docs/experiments"
+    # Research labeling (docs/specs/research-labeling.md, amendment 2026-10-06's
+    # config table; plan T119). `data_dir` is resolved by `research/datafiles.py`
+    # alone. The two ceilings are `0.0` in code and set only in the owner's `.env`
+    # (`RESEARCH__SPEND_CEILING_USD_MONTH`, `RESEARCH__SPEND_CEILING_USD_TOTAL`):
+    # at `0.0` the real model client cannot be built (ADR 0013 point 3 (e) and
+    # point 7). A PR that changes either default is labelled `hold`.
+    data_dir: str = Field(default_factory=_default_research_data_dir)
+    spend_ceiling_usd_month: float = Field(default=0.0, ge=0)
+    spend_ceiling_usd_total: float = Field(default=0.0, ge=0)
+    labeling: ResearchLabelingConfig = Field(default_factory=ResearchLabelingConfig)
 
 
 class Settings(BaseSettings):
@@ -866,10 +1259,13 @@ class Settings(BaseSettings):
     adjust: AdjustConfig = Field(default_factory=AdjustConfig)
     hypotheses: HypothesesConfig = Field(default_factory=HypothesesConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    profitability: ProfitabilityConfig = Field(default_factory=ProfitabilityConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    lab: LabConfig = Field(default_factory=LabConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     paper: PaperConfig = Field(default_factory=PaperConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
@@ -892,6 +1288,10 @@ class Settings(BaseSettings):
     alert_email_to: SecretStr | None = Field(default=None)
     # Optional sender for the email channel; the SMTP login when unset (#404).
     alert_email_from: SecretStr | None = Field(default=None)
+    # Research labeling (docs/specs/research-labeling.md req 17): the vendor key, read
+    # only by `research/models.py`, redacted by `secret_values`; with it absent the
+    # real model client cannot be built (ADR 0013 point 3 (e)).
+    typesafe_api_key: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so
@@ -909,6 +1309,36 @@ class Settings(BaseSettings):
         # a plain `raise`, means nothing but the already-validated `self` is ever
         # touched, so only the env var *names* below can appear in the message.
         self._validate_alert_channel_is_usable()
+        # Also deliberately *not* a `@model_validator` (see the comment above): the
+        # same `ValidationError`-embeds-the-whole-input-including-every-secret
+        # problem applies here, since this method, like
+        # `_validate_alert_channel_is_usable`, reads `self` after construction and
+        # raises a plain `ValueError` whose message names only the bad key, never a
+        # secret (code-review finding on #952).
+        self._validate_lab_sweepable_keys()
+
+    def _validate_lab_sweepable_keys(self) -> None:
+        """`lab.sweepable_keys` (strategy-lab spec req 1; Amendment 2026-10-05 (#952,
+        owner)) may name only a real `Settings` key under `ALLOWED_AXIS_PREFIXES`
+        (`strategy.*`/`schedule.*`) and outside `FORBIDDEN_AXIS_PREFIXES` (kept as a
+        second, belt-and-braces check); this needs the whole model (to resolve a
+        dotted key), so it lives here rather than on `LabConfig` alone. The forbidden
+        check runs first only so its message names the specific prefix; in today's
+        two disjoint lists either order refuses the same keys."""
+        for key in self.lab.sweepable_keys:
+            if key.startswith(FORBIDDEN_AXIS_PREFIXES):
+                raise ValueError(
+                    f"lab.sweepable_keys entry {key!r} is under a forbidden prefix "
+                    f"{FORBIDDEN_AXIS_PREFIXES}"
+                )
+            if not key.startswith(ALLOWED_AXIS_PREFIXES):
+                raise ValueError(
+                    f"lab.sweepable_keys entry {key!r} is not under an allowed prefix "
+                    f"{ALLOWED_AXIS_PREFIXES}: a new axis family needs a reviewed code "
+                    "change (strategy-lab spec, Amendment 2026-10-05 (#952))"
+                )
+            if not _settings_has_key(key):
+                raise ValueError(f"lab.sweepable_keys entry {key!r} names a key Settings lacks")
 
     def _validate_alert_channel_is_usable(self) -> None:
         """#544: `AlertsConfig._validate_channels` only checks that a non-store

@@ -1,0 +1,8 @@
+# Test (a): a research group holding a name other than typesafe-sdk fails under
+# any spec status.
+[project]
+name = "fixture"
+dependencies = ["httpx>=0.27"]
+
+[dependency-groups]
+research = ["openai"]

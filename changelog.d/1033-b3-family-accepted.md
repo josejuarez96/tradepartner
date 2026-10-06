@@ -1,0 +1,5 @@
+- B3 (#1033): profitability-family amendment accepted, streamlined from the coverage spike; T85 to T85f in the backtest plan; T76b ticked; B3 file on H1's 2020-08-31 start, about 60 names, tilt disclosed; B3b (cash) in the backlog.
+### Changed
+- backtest spec: amendment #720 (the profitability family) accepted 2026-10-06 and streamlined: no holdout_seen_family column or page mark, no ingest-count block on the backtest page, T85 on T96's frozen defaults, fixture cases on existing issuers; open questions 15 to 17 (#1033)
+- docs/plans/backtest.md: amendment 2026-10-06 adds T85 to T85f (the profitability family, B3) with the graph numbers restated; docs/plans/data-foundation.md: T76b ticked (#885, PR #904)
+- B3 hypothesis file: in_sample_start 2020-08-31 after H1's #975 re-pin (#1002), 41 sessions and 40 returns, portfolio about 60 names, the coverage spike's scored-set table and sector/size tilt, the stale-facts baseline (about 70 abandoned tags, not lag), the owner's tag-list decision; backlog gains B3b, the cash-profitability variant (#1033)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -591,3 +592,69 @@ def test_tracking_run_needs_an_explicit_start_and_end(tracking_store: Path) -> N
             store_path=tracking_store,
             kind="tracking",
         )
+
+
+def test_a_pre_lab_registration_loads_backtests_and_records(
+    fixture_store_path: Path, read: Read
+) -> None:
+    """A registration frozen under the pre-T96 key set (no `schedule.*`, as H1 on the
+    owner's store) goes through `load_frozen` → backtest → `record_results` at
+    `month_end`, and its stored hash is untouched (strategy-lab T96)."""
+    frozen = _frozen()
+    params = {k: v for k, v in frozen_params_of(frozen).items() if not k.startswith("schedule.")}
+    hashed = sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with open_for_write(_store(fixture_store_path)) as conn:
+        record = registry.register_hypothesis(
+            conn,
+            slug=SLUG,
+            family="momentum",
+            title="pre-lab twin",
+            doc_path=f"docs/hypotheses/{SLUG}.md",
+            doc_sha256="0" * 64,
+            params=params,
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="test",
+            settings=frozen,
+        )
+    assert record.params_sha256 == hashed
+
+    outcome = run_hypothesis(
+        SLUG, None, None, Flags(), synthetic=True, store_path=fixture_store_path
+    )
+
+    assert (outcome.status, outcome.error) == ("ok", None)
+    conn = read()
+    assert _row(conn, "trial_results", outcome.trial_id)["status"] == "ok"
+    stored = registry.get_hypothesis(conn, SLUG)
+    assert stored.params_sha256 == hashed
+    assert not any(key.startswith("schedule.") for key in stored.params)
+
+
+def test_a_family_the_engine_cannot_run_is_refused_before_any_trial(
+    fixture_store_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `profitability` registration is refused until T85e dispatches its signal
+    (#1053): otherwise the run would read the live, unfrozen `strategy.*`."""
+    frozen = _frozen()
+    with open_for_write(_store(fixture_store_path)) as conn:
+        registry.register_hypothesis(
+            conn,
+            slug="b3-run",
+            family="profitability",
+            title="not runnable yet",
+            doc_path="docs/hypotheses/b3-run.md",
+            doc_sha256="0" * 64,
+            params=frozen_params_of(frozen, family="profitability"),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="test",
+            settings=frozen,
+        )
+    calls = _spy(monkeypatch)
+    with pytest.raises(ValueError, match="cannot run yet"):
+        run_hypothesis("b3-run", None, None, Flags(), store_path=fixture_store_path)
+    assert calls == []
+    assert read().execute("SELECT COUNT(*) FROM trials").fetchone() == (0,)

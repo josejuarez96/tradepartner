@@ -562,6 +562,45 @@ def test_health_prints_the_price_jump_review_list(tmp_path: Path, fixture_store_
     assert bad.exit_code == 2
 
 
+def test_health_lists_accepted_same_day_pairs_and_check_passes(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#855: an owner-accepted same-day pair passes `--check` and is listed."""
+    sid, day = "0002079013:share-rights", date(2019, 6, 3)
+    known = datetime(2019, 6, 3, 21, 0, tzinfo=UTC)
+    plain_settings = _settings(tmp_path, store=fixture_store_path)
+    with open_for_write(plain_settings) as conn:
+        for ticker in ("HACAR", "HCACR"):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    "security_id": sid,
+                    "ticker": ticker,
+                    "exchange": "NASDAQ",
+                    "class_title": "Rights",
+                    "valid_from": day,
+                    "known_at": known,
+                    "ingested_at": known,
+                    "source": "fixture",
+                    "provenance": "filing",
+                },
+            )
+    failing = _invoke(plain_settings, ["health", "--check"], clock=lambda: T_END)
+    assert failing.exit_code == 1
+    assert "non_overlapping_listings" in failing.output
+    assert "accepted same-day pairs: 0" in failing.output
+    accepted = _settings(
+        tmp_path,
+        store=fixture_store_path,
+        universe={"accepted_same_day_pairs": [f"{sid}@{day.isoformat()}"]},
+    )
+    checked = _invoke(accepted, ["health", "--check"], clock=lambda: T_END)
+    assert checked.exit_code == 0, checked.output
+    assert "accepted same-day pairs: 1" in checked.output
+    assert f"  {sid}@2019-06-03 HACAR/HCACR" in checked.output
+
+
 def _shares_fact(
     conn: duckdb.DuckDBPyConnection, security_id: str, as_of: date, value: float
 ) -> None:

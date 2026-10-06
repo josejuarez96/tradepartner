@@ -74,23 +74,36 @@ the dry run's summary and in each month's run message. A ticker that only
 leads to the id (a rename lead, #843) counts, as it does for the bars
 (#891).
 
-**Rename gaps** (#891). A month in which a security has stored bars is
-also a hole when a rename lead (`ListingResolver.lead`, under an Alpaca
-symbol) assigns the security a session of it with no bar known at the
-clock and none later on a session the lead assigns it: the gap from the
-old symbol's last bar to the first cover page naming the new one starts or
-ends inside a month (FB -> META, June and July 2022). A missing session
-the old symbol traded after (a halt inside the lead window) is no rename
-gap: the new symbol has no bar there to fill it. The whole month is
-refetched like any hole, with the old and the new symbol (`symbols`);
-`parse_bars` takes a new-symbol row only where the security has no row of
-its own that session, and `ingest`'s rules add nothing for an unchanged
-stored bar, so no session is stored twice and each bar keeps its
-session-close `known_at`. A gap with no lead (a session after the cover
-page) is no hole, as before. `securities`
-limits the holes to the named ids (a targeted refetch, the cursor, status
-and halt rules unchanged); a named id with no hole to fetch is listed with
-why (`NamedSecurity`), never an error.
+**Lead gaps** (#891). A month in which a security has stored bars is also
+a hole when a rename lead (or, #974, a first-span lead;
+`ListingResolver.lead`, under an Alpaca symbol) assigns the security a
+session of it with no bar known at the clock and none later on a session
+the lead assigns it: the gap from the old symbol's last bar to the first
+cover page naming the new one starts or ends inside a month (FB -> META,
+June and July 2022). A missing session the old symbol traded after (a halt
+inside the lead window) is no rename gap: the new symbol has no bar there
+to fill it. The whole month is refetched like any hole, with the old and
+the new symbol (`symbols`); `parse_bars` takes a new-symbol row only where
+the security has no row of its own that session, and `ingest`'s rules add
+nothing for an unchanged stored bar, so no session is stored twice and
+each bar keeps its session-close `known_at`. A gap with no lead (a session
+after the cover page) is no hole, as before. `securities` limits the holes
+to the named ids (a targeted refetch, the cursor, status and halt rules
+unchanged); a named id with no hole to fetch is listed with why
+(`NamedSecurity`), never an error.
+
+**First-span lead months** (#974). Every month (a backfill or a fill)
+reads the store's resolver (`repair.store_resolver`) and fetches, besides
+the listed names, every security whose first-span lead assigns it a
+session of the month under an Alpaca symbol, before its first
+ticker-bearing listing row, when that row passes `_fetched` (an OTC or
+skipped-type first span is not fetched). `since` bounds the fetch as for
+every month, so the lead reaches the backfill start at most. Such a
+security is never in the staleness denominator there: no listing of it
+is known in the month. `fill_holes` lists its empty months as holes and
+the partial month at the lead's end as a lead gap, either kind of lead
+counting (`Hole.rename_gap`). With `alpaca.first_span_lead` off nothing
+changes.
 
 **One benchmark** (#840): `backfill_benchmark(settings, prices=...,
 symbol=..., since=...)` is the owner's one-off for a configured benchmark
@@ -118,14 +131,19 @@ from __future__ import annotations
 import re
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
-from tradepartner.adapters.alpaca_prices import ListingResolver, alpaca_symbol
+from tradepartner.adapters.alpaca_prices import (
+    ListingResolver,
+    alpaca_symbol,
+    is_placeholder_ticker,
+)
 from tradepartner.adapters.filings import FilingSource
 from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import is_session, next_session
@@ -260,8 +278,9 @@ def backfill(
 @dataclass(frozen=True)
 class Hole:
     """A month in which `security_id` is fetched but the store has no bar,
-    or (`rename_gap`, #891) has bars but none on a session a rename lead
-    (#843) assigns it.
+    or (`rename_gap`, #891) has bars but none on a session a lead assigns
+    it: a lead gap, of either kind (a rename lead, #843, or a first-span
+    lead, #974, whose partial month at the window's end is one).
 
     `ticker` is its listing's on the month's last day (else its first);
     `between` is whether it has a stored bar before and after the month."""
@@ -306,7 +325,7 @@ class HoleFill:
         months = {hole.window for hole in self.holes}
         between = [hole for hole in self.holes if hole.between]
         gaps = sum(hole.rename_gap for hole in self.holes)
-        renamed = f"; {gaps} of them rename gaps in a month with stored bars" if gaps else ""
+        renamed = f"; {gaps} of them lead gaps in a month with stored bars" if gaps else ""
         return (
             f"{len(self.holes)} holes (security, month) over {len(securities)} securities "
             f"in {len(months)} months; {len(between)} of them between a security's stored "
@@ -345,7 +364,7 @@ class HoleFill:
             )
             between = sum(hole.between for hole in holes)
             gaps = sum(hole.rename_gap for hole in holes)
-            renamed = f", {gaps} rename gaps" if gaps else ""
+            renamed = f", {gaps} lead gaps" if gaps else ""
             out.append(
                 f"  {sid} {holes[0].ticker or '-'}: {shown} ({len(holes)} months, "
                 f"{between} between its stored bars{renamed})"
@@ -611,7 +630,7 @@ def _holes(
     for window in windows:
         first, last = window
         with _read(settings) as conn:
-            ids, *_ = _window_names(conn, t, window, settings)
+            ids, *_ = _window_names(conn, t, window, settings, resolver)
             kept, gaps, _, dropped = _month_holes(
                 conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
             )
@@ -692,15 +711,15 @@ def _price_chunk(
 
     try:
         with _read(settings) as conn:
+            resolver = store_resolver(conn, started, settings)
             ids, listed, static_only, may_count, reference = _window_names(
-                conn, started, window, settings
+                conn, started, window, settings, resolver
             )
             holes: list[str] = []
             renames: set[str] = set()
             stored: set[str] = set()
             dropped: dict[str, str] = {}
             if fill:
-                resolver = store_resolver(conn, started, settings)
                 holes, renames, stored, dropped = _month_holes(
                     conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
                 )
@@ -750,7 +769,7 @@ def _price_chunk(
                 params=[first, last],
             )
             added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
-            renamed = f" and {len(renames)} with a rename gap" if renames else ""
+            renamed = f" and {len(renames)} with a lead gap" if renames else ""
             filled = (
                 f"holes of {len(holes) - len(renames)} names with no stored bar{renamed}"
                 f"{_dropped_note(dict(Counter(dropped.values())))}: "
@@ -783,6 +802,7 @@ def _window_names(
     t: datetime,
     window: tuple[date, date],
     settings: Settings,
+    resolver: ListingResolver,
 ) -> tuple[list[str], list[str], set[str], set[str] | None, str | None]:
     """From listings known at `t`: securities with a `_fetched` listing
     live at some point in `window` that a fetched bar could land on (#875:
@@ -804,6 +824,13 @@ def _window_names(
     day fetches nothing, whatever its own status (an older listing on
     another exchange with no end, #875). The staleness denominator is not
     changed by either rule.
+
+    (#974) The fetch also takes every security whose first-span lead
+    (`resolver`, the store's at `t`) assigns it a session of `window`
+    under an Alpaca symbol, before its first ticker-bearing listing row,
+    when that row passes `_fetched` (an OTC or skipped-type first span is
+    not fetched); never the staleness denominator, since no listing of it
+    is known in the window.
     """
     first, last = window
     kinds = {
@@ -854,12 +881,47 @@ def _window_names(
             listed.add(sid)  # today's status must not drop a name delisted later
         if live and row["ticker"] == settings.ingest.reference_symbol:
             reference = sid
+    ids.update(_led(resolver, rows, ids, window, benchmarks, types, settings))
     if reference is not None:
         ids.add(reference)
     static_only = listed - filed - benchmarks
     before = first - timedelta(days=1)
     may_count = _may_count(conn, t, (before.replace(day=1), before), earliest, benchmarks)
     return sorted(ids), sorted(listed), static_only, may_count, reference
+
+
+def _led(
+    resolver: ListingResolver,
+    rows: list[dict[str, Any]],
+    ids: Collection[str],
+    window: tuple[date, date],
+    benchmarks: set[str],
+    types: Mapping[str, set[str]],
+    settings: Settings,
+) -> set[str]:
+    """The securities not in `ids` that a first-span lead (#974) assigns a
+    session of `window` under an Alpaca symbol, before the start of their
+    first ticker-bearing listing row (`rows`, `listing_ends_as_of`), when
+    that row passes `_fetched`. A rename lead (#843) runs only after a
+    security's first span, so a session before that row is the first-span
+    lead's."""
+    firsts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if is_placeholder_ticker(str(row["ticker"])):
+            continue
+        held = firsts.get(row["security_id"])
+        if held is None or row["valid_from"] < held["valid_from"]:
+            firsts[row["security_id"]] = row
+    sessions = _sessions_in(window)
+    out: set[str] = set()
+    for sid, row in firsts.items():
+        if sid in ids or not _fetched(sid, row, benchmarks, types, settings):
+            continue
+        before = [day for day in sessions if day < row["valid_from"]]
+        tickers = [tk for tk in resolver.symbols(sid, *window) if alpaca_symbol(tk) is not None]
+        if any(resolver.lead(tk, day) == sid for tk in tickers for day in before):
+            out.add(sid)
+    return out
 
 
 # --- one benchmark (#840) -----------------------------------------------------

@@ -6,3 +6,4 @@ Every backtest or strategy evaluation run is a trial: failures, refusals, parame
 - **API**: `src/tradepartner/store/registry.py` (register a hypothesis, open a trial, write its outcome and detail rows, owner decisions, N and V for the deflated Sharpe, holdout spends, listing).
 - **Reading it**: `tradepartner trials [--hypothesis] [--include-synthetic]` (Phase 3 plan T42), and the trial-registry view on the dashboard (T44).
 - **Rules**: [backtest spec](../specs/backtest.md) reqs 8 to 12.
+- **Research runs** (runs that are not backtests: agreement, benchmarks, regressions, feature studies) have their own registry in the same store: `src/tradepartner/store/research.py` and the [research-registry spec](../specs/research-registry.md).

@@ -170,8 +170,14 @@ def _no_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.delenv(f"UNIVERSE__{key.upper()}", raising=False)
 
 
+#: `universe` keys only `health` reads, which never change membership:
+#: `accepted_same_day_pairs` (#855) tolerates a listing pair in the
+#: `non_overlapping_listings` rule (tests/test_health.py).
+HEALTH_ONLY_KEYS = {"accepted_same_day_pairs"}
+
+
 def test_every_universe_key_has_an_override_case() -> None:
-    covered = {case.key for case in CASES} | GUARDED_KEYS
+    covered = {case.key for case in CASES} | GUARDED_KEYS | HEALTH_ONLY_KEYS
     assert covered == set(UniverseConfig.model_fields)
 
 

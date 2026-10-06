@@ -100,6 +100,37 @@ and are never cached as unstampable for it, counted on
 `.submissions_api_empty`. Any other malformed payload still fails the source
 (the gate's list, for a zip member).
 
+**Statement facts (T77a, #660).** Behind `edgar.statement_facts_enabled`
+(off: no call, no request, no cache). `statement_facts(cik)` reads the same
+company-facts payload as `facts`: a `facts` call that reads the payload
+fills the statement cache from it too, while a `statement_facts` call that
+reads it fills only its own (it does not know the share names asked for),
+so the payload is read once per CIK per run when `facts` is asked first,
+as the ingest's fetch pass asks. A payload `parse_company_facts` refuses is
+recorded once and is absent for both caches. The parsed cache
+`statement_facts/v{STATEMENT_VERSION}/<cik>.json` holds the entries
+`parse_statement_facts` yields with no stamps (unfiltered, unstamped) and
+the conflicts, keyed by the CIK's latest stamped cover-form accession (the
+accession a trailing payload reached, so the next run re-parses it) and a
+digest of `edgar.statement_tags` and `statement_units`. Every read stamps
+from `_load_stamps`: an accession with no record is emitted with
+`accepted_at = None`, form `""`; one whose form is outside
+`edgar.statement_forms` is dropped; one settled unstampable is dropped and
+its entries counted on `.statement_unstampable`; a stamped entry ending
+after the acceptance date (New York) is dropped (the parser's malformed
+rule, applied once the stamp is known); `comparative` is recomputed over
+what is kept; the co-registrant filters of `_company_facts` apply. The
+first call per CIK per instance counts `.statement_conflicts` and
+`.statement_unstampable` and lists the conflicts once on
+`.statement_conflict_keys`; a parse counts `.statement_non_usd`,
+`.statement_malformed` and `.statement_none` (a payload carrying none of
+the configured tags), so a cross-run cache hit adds zero to those three.
+Later calls in the run are cache-file reads, never requests, and add
+nothing to the counts. Conflicts are never `_record_failure`d. With
+`reuse_cached` the bulk path is forced from the cached `companyfacts.zip`
+with no request for it; stale statement caches count toward
+`edgar.bulk_stamp_threshold_ciks` only while the switch is on.
+
 **Failure policy (T11h, owner decision (2); #610).** A per-document
 fetch/parse that raises `ValueError` (a malformed document, a fact
 collision) or meets a 404/410 for the document or header itself is skipped,
@@ -189,7 +220,7 @@ import zipfile
 import zlib
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
@@ -205,6 +236,8 @@ from tradepartner.adapters.edgar import (
     CoverPageParse,
     FsnFiling,
     FsnShare,
+    StatementConflict,
+    StatementFactsParse,
     UnstampedFiling,
     acceptance_times,
     parse_company_facts,
@@ -214,6 +247,7 @@ from tradepartner.adapters.edgar import (
     parse_filing_index,
     parse_fsn,
     parse_sgml_header,
+    parse_statement_facts,
 )
 from tradepartner.adapters.edgar_validation import PARSE_ERRORS, ValidationFailures
 from tradepartner.adapters.filings import (
@@ -235,6 +269,9 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 #: cache version bump" says how to remove it, #615).
 #: Bumped when a parser change must re-stamp every cached accession.
 PARSER_VERSION = 1
+#: Bumped when the layout of the per-CIK statement-facts cache (T77a, #660)
+#: or `parse_statement_facts` changes and every CIK must be re-parsed.
+STATEMENT_VERSION = 1
 #: Bumped when a parser change must re-extract every cached FSN period.
 #: Separate from `PARSER_VERSION`, which stays the per-CIK stamps' key: a
 #: bump here re-downloads every period's zip (the PR states that cost).
@@ -352,8 +389,13 @@ class EdgarFilingSource(FilingSource):
         settings: Settings,
         client: httpx.Client | None = None,
         clock: Callable[[], datetime] | None = None,
+        *,
+        reuse_cached: bool = False,
     ) -> None:
         self._settings = settings
+        # #660 (`ingest --bulk-from-cache`): company facts always from the
+        # cached `companyfacts.zip`, with no request for it.
+        self._reuse_cached = reuse_cached
         self._client = client or httpx.Client(timeout=settings.edgar.request_timeout_seconds)
         hooks = self._client.event_hooks
         hooks["request"] = [*hooks.get("request", []), self._count]
@@ -394,6 +436,18 @@ class EdgarFilingSource(FilingSource):
         # False once the per-CIK API was chosen, None until decided.
         self._facts_bulk: tuple[Path, frozenset[str]] | bool | None = None
         self._facts_memo: dict[tuple[str, str], _FactsCache] = {}
+        # T77a (#660): plain counts set by the fetch pass (module docstring),
+        # and the conflicts withheld, each listed once.
+        self.statement_conflict_keys: list[StatementConflict] = []
+        self.statement_conflicts = 0
+        self.statement_non_usd = 0
+        self.statement_malformed = 0
+        self.statement_unstampable = 0
+        self.statement_none = 0
+        # CIK -> the key its statement cache was written or found under this
+        # run (never the records), and the CIKs already counted.
+        self._statement_filled: dict[str, str] = {}
+        self._statement_counted: set[str] = set()
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -1935,17 +1989,182 @@ class EdgarFilingSource(FilingSource):
         return out
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
-        """As-filed statement facts (amendment 2026-10-03, #660).
-
-        Placeholder for T76 (schema/records/fixture adapter only): always
-        empty. `edgar.statement_facts_enabled` defaults to `false`, so no
-        caller reaches this yet; the real companyfacts parse, cache and
-        stamping (reading `companyfacts.zip`/the per-CIK API, the
-        `statement_facts/v<N>/<cik>.json` cache, `statement_conflicts` and
-        the other plain-attribute counts) is T77a's.
-        """
+        """As-filed statement facts (amendment 2026-10-03, #660; module
+        docstring "Statement facts"): `[]` with no I/O while
+        `edgar.statement_facts_enabled` is off; otherwise the CIK's cached
+        entries stamped at read time, in the parser's order."""
         _validate_cik(cik)
-        return []
+        if not self._settings.edgar.statement_facts_enabled:
+            return []
+        self._ensure_fsn()
+        stamps = self._load_stamps(cik)
+        cached = self._statement_cache(cik, stamps)
+        if cached is None:
+            return []  # no stamped cover-form accession: nothing asked, as `facts`
+        records, conflicts, unstampable = self._stamp_statement(cik, cached, stamps)
+        if cik not in self._statement_counted:
+            self._statement_counted.add(cik)
+            self.statement_conflicts += len(conflicts)
+            self.statement_unstampable += unstampable
+        listed = set(self.statement_conflict_keys)
+        self.statement_conflict_keys.extend(c for c in conflicts if c not in listed)
+        return records
+
+    def _statement_cache_path(self, cik: str) -> Path:
+        return self._cache / "statement_facts" / f"v{STATEMENT_VERSION}" / f"{cik}.json"
+
+    def _statement_key(self, accession: str) -> str:
+        """The statement cache key: `accession` and a digest of the
+        configured tags (with their order, the precedence) and units."""
+        edgar = self._settings.edgar
+        config = json.dumps([edgar.statement_tags, edgar.statement_units])
+        return f"{accession}|{hashlib.sha256(config.encode('utf-8')).hexdigest()[:16]}"
+
+    def _statement_cache(
+        self, cik: str, stamps: Mapping[str, SubmissionRecord]
+    ) -> StatementFactsParse | None:
+        """`cik`'s unstamped statement entries: the cache file when it was
+        filled this run (never a request) or its key is current, else
+        parsed from the company-facts payload; `None` with no stamped
+        cover-form accession."""
+        path = self._statement_cache_path(cik)
+        written = self._statement_filled.get(cik)
+        if written is not None:
+            cached = _load_statement_cache(path, cik, written)
+            if cached is None:
+                raise RuntimeError(f"{path}: filled this run but no longer reads")
+            return cached
+        latest = self._facts_cache_key(stamps, set(self._settings.edgar.cover_page_forms))
+        if latest is None:
+            return None
+        key = self._statement_key(latest)
+        cached = _load_statement_cache(path, cik, key)
+        if cached is not None:
+            self._statement_filled[cik] = key
+            return cached
+        payload, complete, origin = self._company_facts_payload(cik, latest)
+        return self._fill_statement_cache(cik, stamps, latest, payload, complete, origin)
+
+    def _fill_statement_cache(
+        self,
+        cik: str,
+        stamps: Mapping[str, SubmissionRecord],
+        latest: str,
+        payload: Any | None,
+        complete: bool,
+        origin: str | None,
+    ) -> StatementFactsParse:
+        """Parse `payload` into `cik`'s statement cache and write it, keyed
+        by `latest` when the payload holds it, else by the latest stamped
+        cover-form accession it reached; count the parse-time skips. A
+        payload that does not parse is recorded under `origin` and cached
+        empty under a key no run matches."""
+        edgar = self._settings.edgar
+        tags, forms, units = edgar.statement_tags, edgar.statement_forms, edgar.statement_units
+
+        def parse() -> tuple[StatementFactsParse, StatementFactsParse, bool] | None:
+            if payload is None:  # no XBRL facts at all, or recorded upstream
+                return None
+            return (
+                parse_statement_facts(payload, tags, forms, units, {}),
+                parse_statement_facts(payload, tags, forms, units, stamps),
+                _carries_a_tag(payload, tags),
+            )
+
+        empty = StatementFactsParse((), (), 0, 0)
+        if origin is None:
+            parsed = parse()
+        else:  # #578: a payload `parse_statement_facts` refuses is recorded, absent
+            parsed = self.validation_failures.collect(origin, f"CIK{cik}.json", parse)
+        if parsed is None:
+            entries = empty
+            reached = latest if complete and payload is None else ""
+        else:
+            entries, stamped, carries = parsed
+            self.statement_non_usd += stamped.non_unit
+            self.statement_malformed += stamped.malformed
+            if not carries:
+                self.statement_none += 1
+            reached = latest if complete else _reached(payload, stamps, edgar.cover_page_forms)
+        key = self._statement_key(reached)
+        data = {
+            "version": STATEMENT_VERSION,
+            "cik": cik,
+            "key": key,
+            "records": [_statement_record_to_json(r) for r in entries.records],
+            "conflicts": [_statement_conflict_to_json(c) for c in entries.conflicts],
+        }
+        edgar_raw.write_atomic(self._statement_cache_path(cik), json.dumps(data).encode("utf-8"))
+        self._statement_filled[cik] = key
+        return entries
+
+    def _stamp_statement(
+        self, cik: str, cached: StatementFactsParse, stamps: Mapping[str, SubmissionRecord]
+    ) -> tuple[list[StatementFactRecord], list[StatementConflict], int]:
+        """Stamp cached entries from `stamps` (module docstring): the kept
+        records, the kept conflicts, and how many records an accession
+        settled as unstampable dropped."""
+        forms = frozenset(self._settings.edgar.statement_forms)
+        fsn_cache = self._load_fsn_cache(cik)
+        verdicts: dict[str, bool] = {}
+        unstampable = 0
+
+        def foreign(accession: str) -> bool:
+            """The co-registrant filters of `_company_facts`."""
+            if accession not in verdicts:
+                cover = self._load_cover_cache(accession)
+                verdicts[accession] = (
+                    accession in self._fsn_extracted_accessions and accession not in fsn_cache
+                ) or (cover is not None and cover.entity_cik != cik)
+            return verdicts[accession]
+
+        def kept(accession: str, end: date) -> bool:
+            record = stamps.get(accession)
+            if foreign(accession):
+                return False
+            if record is None:
+                return True  # no stamp record yet: emitted unstamped, for the hold rule
+            if record.form not in forms or record.accepted_at is None:
+                return False
+            return end <= record.accepted_at.astimezone(_EASTERN).date()
+
+        records: list[StatementFactRecord] = []
+        for r in cached.records:
+            if kept(r.accession, r.period_end):
+                records.append(r)
+                continue
+            stamp = stamps.get(r.accession)
+            settled = stamp is not None and stamp.accepted_at is None and stamp.form in forms
+            if settled and not foreign(r.accession):
+                unstampable += 1
+        conflicts = [c for c in cached.conflicts if kept(c.accession, c.period_end)]
+        latest: dict[tuple[str, str, int], date] = {}
+        items: list[StatementFactRecord | StatementConflict] = [*records, *conflicts]
+        for item in items:
+            group = (item.accession, item.fact_name, item.period_days)
+            latest[group] = max(latest.get(group, item.period_end), item.period_end)
+        out: list[StatementFactRecord] = []
+        for r in records:
+            stamp = stamps.get(r.accession)
+            out.append(
+                replace(
+                    r,
+                    form="" if stamp is None else stamp.form,
+                    accepted_at=None if stamp is None else stamp.accepted_at,
+                    comparative=r.period_end < latest[(r.accession, r.fact_name, r.period_days)],
+                )
+            )
+        out.sort(
+            key=lambda r: (
+                r.accepted_at is None,
+                r.accepted_at or datetime.min.replace(tzinfo=UTC),
+                r.accession,
+                r.fact_name,
+                r.period_end,
+                r.period_days,
+            )
+        )
+        return out, conflicts, unstampable
 
     def _facts_cache_key(
         self, stamps: Mapping[str, SubmissionRecord], cover_forms: set[str]
@@ -1988,12 +2207,25 @@ class EdgarFilingSource(FilingSource):
                     for f in parse_company_facts(payload, wanted, _EveryAccession()).facts
                 ]
 
+            recorded = False
             if origin is not None:  # #578: a payload that does not parse is recorded, absent
                 parsed = self.validation_failures.collect(origin, f"CIK{cik}.json", parse)
                 cached, complete = ([], False) if parsed is None else (parsed, complete)
+                recorded = parsed is None
             else:
                 cached = parse()
             self._facts_memo[cik, key] = cached  # one fetch per CIK per run, cached or not
+            statement_path = self._statement_cache_path(cik)
+            if (
+                self._settings.edgar.statement_facts_enabled
+                and cik not in self._statement_filled
+                and _cached_key(statement_path, cik, STATEMENT_VERSION)
+                != self._statement_key(latest)
+            ):  # T77a: the one payload read serves the statement cache too
+                if recorded:  # absent for both caches, and recorded once only
+                    self._fill_statement_cache(cik, stamps, latest, None, False, None)
+                else:
+                    self._fill_statement_cache(cik, stamps, latest, payload, complete, origin)
             if complete:  # else the payload trails the latest filing: fetch again next run
                 rows = [[n, a, d.isoformat(), v] for n, a, d, v in cached]
                 data = {"version": PARSER_VERSION, "cik": cik, "key": key, "facts": rows}
@@ -2026,6 +2258,29 @@ class EdgarFilingSource(FilingSource):
                 out.setdefault(accession, []).append(_CachedFact(name, capped, "", value))
         return out
 
+    def _stale_fact_caches(self) -> int:
+        """Stamped CIKs whose facts cache, or (only while the switch is on,
+        #660) statement cache, is not keyed by their latest cover-form
+        accession: the bulk decision's count."""
+        statements = self._settings.edgar.statement_facts_enabled
+        cover_forms = set(self._settings.edgar.cover_page_forms)
+        stale = 0
+        for stamps_path in self._stamps_path("0").parent.glob("*.json"):
+            other = stamps_path.stem
+            if not _CIK_PATTERN.fullmatch(other):
+                continue  # not a stamps file
+            other_latest = self._facts_cache_key(self._load_stamps(other), cover_forms)
+            if other_latest is None:
+                continue
+            cache = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{other}.json"
+            if _cached_latest(cache, other) != other_latest or (
+                statements
+                and _cached_key(self._statement_cache_path(other), other, STATEMENT_VERSION)
+                != self._statement_key(other_latest)
+            ):
+                stale += 1
+        return stale
+
     def _company_facts_payload(self, cik: str, latest: str) -> tuple[Any | None, bool, str | None]:
         """The raw company-facts payload, whether it already holds
         `latest` (the filing the cache is keyed by) and the validation input
@@ -2056,18 +2311,13 @@ class EdgarFilingSource(FilingSource):
         likely share the shape (#599). The caller records a payload that
         `parse_company_facts` refuses the same way, under its origin."""
         if self._facts_bulk is None:
-            stale = 0
-            for stamps_path in self._stamps_path("0").parent.glob("*.json"):
-                other = stamps_path.stem
-                if not _CIK_PATTERN.fullmatch(other):
-                    continue  # not a stamps file
-                cover_forms = set(self._settings.edgar.cover_page_forms)
-                other_latest = self._facts_cache_key(self._load_stamps(other), cover_forms)
-                cache = self._cache / "facts" / f"v{PARSER_VERSION}" / f"{other}.json"
-                if other_latest is not None and _cached_latest(cache, other) != other_latest:
-                    stale += 1
-            if stale > self._settings.edgar.bulk_stamp_threshold_ciks:
-                path = edgar_raw.bulk_company_facts(settings=self._settings, client=self._client)
+            if (
+                self._reuse_cached
+                or self._stale_fact_caches() > self._settings.edgar.bulk_stamp_threshold_ciks
+            ):
+                path = edgar_raw.bulk_company_facts(
+                    settings=self._settings, client=self._client, reuse_cached=self._reuse_cached
+                )
                 with zipfile.ZipFile(path) as bulk:
                     self._facts_bulk = (path, frozenset(bulk.namelist()))
             else:
@@ -2256,6 +2506,124 @@ def _cached_latest(path: Path, cik: str) -> str | None:
         if data["version"] != PARSER_VERSION or data["cik"] != cik:
             return None
         return str(data["key"]).split("|", 1)[0]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _cached_key(path: Path, cik: str, version: int) -> str | None:
+    """The key a per-CIK cache file was written under, or None when there is
+    no usable file (absent, truncated, another version or CIK)."""
+    try:
+        data = json.loads(path.read_bytes())
+        if data["version"] != version or data["cik"] != cik:
+            return None
+        return str(data["key"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _carries_a_tag(payload: Mapping[str, Any], tags: Mapping[str, Sequence[str]]) -> bool:
+    """Whether the payload carries any configured `taxonomy:tag` at all
+    (`statement_none` counts the CIKs that carry none)."""
+    facts = payload["facts"]
+    return any(
+        tag.partition(":")[2] in facts.get(tag.partition(":")[0], {})
+        for fallbacks in tags.values()
+        for tag in fallbacks
+    )
+
+
+def _reached(
+    payload: Any | None, stamps: Mapping[str, SubmissionRecord], cover_forms: Sequence[str]
+) -> str:
+    """The latest stamped cover-form accession a trailing payload holds, or
+    `""`: the key a trailing member's statement cache is written under."""
+    if payload is None:
+        return ""
+    held = {
+        entry["accn"]
+        for concepts in payload["facts"].values()
+        for concept in concepts.values()
+        for entries in concept["units"].values()
+        for entry in entries
+    }
+    bases = set(cover_forms)
+    candidates = [
+        r
+        for r in stamps.values()
+        if r.accession in held and r.accepted_at is not None and r.form.removesuffix("/A") in bases
+    ]
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda r: (r.accepted_at, r.accession)).accession
+
+
+def _statement_record_to_json(record: StatementFactRecord) -> list[object]:
+    """An unstamped cached entry: its form, stamp and `comparative` are
+    the read's (module docstring "Statement facts")."""
+    start = None if record.period_start is None else record.period_start.isoformat()
+    return [
+        record.fact_name,
+        record.xbrl_tag,
+        start,
+        record.period_end.isoformat(),
+        record.value,
+        record.unit,
+        record.accession,
+        record.filed.isoformat(),
+    ]
+
+
+def _statement_conflict_to_json(conflict: StatementConflict) -> list[object]:
+    start = None if conflict.period_start is None else conflict.period_start.isoformat()
+    return [
+        conflict.accession,
+        conflict.fact_name,
+        start,
+        conflict.period_end.isoformat(),
+        list(conflict.values),
+    ]
+
+
+def _optional_date(value: object) -> date | None:
+    return None if value is None else date.fromisoformat(str(value))
+
+
+def _load_statement_cache(path: Path, cik: str, key: str) -> StatementFactsParse | None:
+    """The cached unstamped entries and conflicts, or None when the file is
+    unusable or keyed otherwise."""
+    try:
+        data = json.loads(path.read_bytes())
+        if data["version"] != STATEMENT_VERSION or data["cik"] != cik or data["key"] != key:
+            return None
+        records = tuple(
+            StatementFactRecord(
+                cik=cik,
+                fact_name=str(name),
+                xbrl_tag=str(tag),
+                period_start=_optional_date(start),
+                period_end=date.fromisoformat(str(end)),
+                value=float(value),
+                unit=str(unit),
+                form="",
+                accession=str(accession),
+                accepted_at=None,
+                filed=date.fromisoformat(str(filed)),
+                comparative=False,
+            )
+            for name, tag, start, end, value, unit, accession, filed in data["records"]
+        )
+        conflicts = tuple(
+            StatementConflict(
+                str(accession),
+                str(name),
+                _optional_date(start),
+                date.fromisoformat(str(end)),
+                tuple(float(v) for v in values),
+            )
+            for accession, name, start, end, values in data["conflicts"]
+        )
+        return StatementFactsParse(records, conflicts, 0, 0)
     except (OSError, ValueError, KeyError, TypeError):
         return None
 

@@ -76,7 +76,7 @@ from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, is_session, previous_session, session_close
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import ENGINE_FAMILIES, RiskConfig, Settings
 from tradepartner.errors import StaleDataError, SystemFaultError
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import (
@@ -448,6 +448,11 @@ def _frozen_params(
     hypothesis re-registered since the window started has a different latest
     registration, whose parameters this window never froze: refused."""
     record = registry.get_hypothesis_by_id(conn, hypothesis_id)
+    if record.family not in ENGINE_FAMILIES:
+        raise ValueError(
+            f"hypothesis {record.slug!r} is in family {record.family!r}, which the engine "
+            f"cannot run yet (engine families: {', '.join(ENGINE_FAMILIES)})"
+        )
     latest = registry.get_hypothesis(conn, record.slug)
     if latest.hypothesis_id != hypothesis_id:
         raise ValueError(

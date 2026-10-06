@@ -27,6 +27,7 @@ T_STALE = datetime(2020, 4, 6, 20, 0, tzinfo=UTC)
 T_TRANSFER = datetime(2018, 10, 25, 20, 0, tzinfo=UTC)
 T_WINDOW_DELIST = datetime(2019, 6, 24, 20, 0, tzinfo=UTC)
 T_LATE = datetime(2019, 6, 28, 20, 0, tzinfo=UTC)
+RUN_INGEST = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
 
 
 def _settings(**universe: Any) -> Settings:
@@ -344,3 +345,81 @@ def test_missing_data_reasons_are_the_rule_1_6_7_kinds() -> None:
         "stale_shares",
         "ambiguous_shares",
     } == MISSING_DATA_REASONS
+
+
+def test_first_span_lead_bars_admit_no_name_before_its_listing_is_known() -> None:
+    """#974 no-look-ahead, at the read: bars stored under the first-span
+    lead from 2018-07 (each known at its session's close) never admit the
+    name before the FB listing (known 2019-07-25) is known: rule 2
+    `not_listed`, the #35 decision. Once it is known, rule 6 reads them."""
+    from tradepartner.calendar import next_session, session_close
+    from tradepartner.store.db import configure_connection
+    from tradepartner.store.schema import init_schema
+
+    sid, filed = "0001326801", datetime(2012, 2, 1, 21, tzinfo=UTC)
+    listed = datetime(2019, 7, 25, 21, tzinfo=UTC)
+    common = {"ingested_at": RUN_INGEST, "source": "edgar", "provenance": "filing"}
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    init_schema(conn)
+    insert_row(
+        conn,
+        "securities",
+        {"security_id": sid, "cik": sid, "name": "Facebook", "known_at": filed, **common},
+    )
+    insert_row(
+        conn,
+        "classifications",
+        {
+            "security_id": sid,
+            "sic": 7370,
+            "security_type": "common",
+            "rule": "common_default",
+            "known_at": filed,
+            **common,
+        },
+    )
+    insert_row(
+        conn,
+        "listings",
+        {
+            "security_id": sid,
+            "ticker": "FB",
+            "exchange": "NASDAQ",
+            "class_title": "Class A Common Stock",
+            "valid_from": date(2019, 7, 24),
+            "known_at": listed,
+            **common,
+        },
+    )
+    insert_row(
+        conn,
+        "facts",
+        {
+            "security_id": sid,
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2019, 10, 25),
+            "class_member": "",
+            "value": 2_400_000_000,
+            "filing_accession": None,
+            "known_at": datetime(2019, 10, 30, 21, tzinfo=UTC),
+            **common,
+        },
+    )
+    session = date(2018, 7, 2)
+    while session <= date(2019, 11, 29):
+        close = session_close(session)
+        bar = {"open": 200.0, "high": 200.0, "low": 200.0, "close": 200.0, "volume": 10**6}
+        insert_row(
+            conn,
+            "prices_daily",
+            {"security_id": sid, "session": session, **bar, "known_at": close}
+            | {"ingested_at": RUN_INGEST, "source": "alpaca_sip", "provenance": "bar"},
+        )
+        session = next_session(session)
+
+    before = universe_as_of(conn, session_close(date(2019, 6, 28)), _settings())
+    assert _excluded(before)[sid] == (2, "exchange", "not_listed")
+    after = universe_as_of(conn, session_close(date(2019, 11, 29)), _settings())
+    assert sid in _members(after)  # past rule 6 on the lead bars, and the rest
+    conn.close()
