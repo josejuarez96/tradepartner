@@ -1,0 +1,7 @@
+- ADR 0014 and the strategy-interface plan (#1074): strategies as registered objects; T85e amended into the one dispatch seam with the PAPER_FAMILIES gate; T127 to T130 (generic exclusions and counts, registry, benchmarks, B4 proof).
+### Added
+- ADR 0014: strategies are registered objects (one dispatch seam keyed on the stored family inside `run_hypothesis` and `plan_rebalance`, one family registry with the momentum fallbacks removed, generic per-strategy exclusions and counts, per-family benchmarks; B4 as strategy #3; six owner decisions of 2026-10-06 recorded).
+- Plan `strategy-interface`: T127 (Plan.exclusions, the `trial_rebalance_counts` table, the widened `signals.reason` CHECK), T127b (the paper planner reads the generic plan), T128 (`config.FAMILIES` with per-family sections, the tables derive, unknown family fails), T129 (an additive per-family benchmark; SPY and MTUM stay required), T130 (B4 `combined` through the registry).
+### Changed
+- Backtest plan T85e amended (#1074): `signal_for` in a new leaf `backtest/strategies.py` returning one record the engine follows with no per-family branch, `family` on `engine.run`/`engine.plan` passed from `run_hypothesis` and `_plan_at`, one `Plan.counts` mapping, `PAPER_FAMILIES` so `paper start` refuses `profitability`.
+- Backtest spec (Series, data model) and paper-trading spec (`signals`) carry dated ADR 0014 notes: an optional fourth series per family, `trial_rebalance_counts`, and `excluded_<reason>` journal reasons.
