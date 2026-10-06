@@ -422,8 +422,9 @@ class StatementConflict:
 class StatementFactsParse:
     """`parse_statement_facts`' result: one record per (accession, fact,
     period) the filing carries cleanly, the conflicts it withheld, and the
-    counts of entries skipped for their unit (`non_unit`, the filing's only
-    unit for the tag is not read) and as malformed (`malformed`)."""
+    counts of (filing, fact) pairs skipped for their unit (`non_unit`: the
+    filing carries the fact only in units that are not read) and of
+    entries withheld as malformed (`malformed`)."""
 
     records: tuple[StatementFactRecord, ...]
     conflicts: tuple[StatementConflict, ...]
@@ -478,8 +479,8 @@ def parse_statement_facts(
       rule sees it; a record with `accepted_at = None` (settled unstampable)
       keeps its form and filter and is emitted unstamped too.
     - **Units**: only `units` are read, first listed first; entries in any
-      other unit are skipped, counted on `non_unit` when the filing carries
-      the tag in no read unit.
+      other unit are skipped; a filing that carries a fact only in unread
+      units, under every tag it uses for it, counts once on `non_unit`.
     - **Malformed** entries (see `_statement_period`) are withheld and
       counted; they are no value for the key and set no latest period.
     - **Precedence**: the first listed tag the filing carries (read unit,
@@ -499,15 +500,16 @@ def parse_statement_facts(
     # key -> (tag rank, unit rank) -> values; the filing's `filed` per key.
     values: dict[_StatementKey, dict[tuple[int, int], set[float]]] = {}
     filed: dict[_StatementKey, date] = {}
-    non_unit = malformed = 0
+    malformed = 0
+    # (accession, fact) pairs seen in an unread unit, and in a read one.
+    unread: set[tuple[str, str]] = set()
+    read: set[tuple[str, str]] = set()
     for fact_name, fallbacks in tags.items():
         for tag_rank, tag in enumerate(fallbacks):
             taxonomy, _, local = tag.partition(":")
             concept = facts.get(taxonomy, {}).get(local)
             if concept is None:
                 continue
-            unread: dict[str, int] = {}
-            read: set[str] = set()
             for unit, entries in concept["units"].items():
                 for entry in entries:
                     if _DIMENSION_KEYS & entry.keys():
@@ -519,9 +521,9 @@ def parse_statement_facts(
                     if stamp is not None and stamp.form not in allowed_forms:
                         continue
                     if unit not in unit_rank:
-                        unread[accession] = unread.get(accession, 0) + 1
+                        unread.add((accession, fact_name))
                         continue
-                    read.add(accession)
+                    read.add((accession, fact_name))
                     period = _statement_period(entry, stamp)
                     if period is None:
                         malformed += 1
@@ -533,8 +535,8 @@ def parse_statement_facts(
                     )
                     entry_filed = date.fromisoformat(entry["filed"])
                     filed[key] = min(filed.get(key, entry_filed), entry_filed)
-            non_unit += sum(n for accession, n in unread.items() if accession not in read)
 
+    non_unit = len(unread - read)
     latest: dict[tuple[str, str, int], date] = {}
     for accession, fact_name, start, end in values:
         days = 0 if start is None else (end - start).days

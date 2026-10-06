@@ -271,14 +271,44 @@ def test_accession_with_no_stamp_record_is_emitted_unstamped() -> None:
 # --- unit filter ---------------------------------------------------------------
 
 
-def test_non_read_unit_is_skipped_and_counted() -> None:
-    result = parse(payload({"Revenues": [entry(K2020, FY2020, 300)]}, unit="EUR"))
+def test_non_read_unit_is_skipped_and_counted_once_per_filing_and_fact() -> None:
+    """A 10-K carrying revenue and two comparatives only in EUR counts once."""
+    result = parse(
+        payload(
+            {
+                "Revenues": [
+                    entry(K2023, FY2023, 3),
+                    entry(K2023, FY2022, 2),
+                    entry(K2023, FY2021, 1),
+                ]
+            },
+            unit="EUR",
+        )
+    )
     assert result.records == ()
     assert result.non_unit == 1
 
 
+def test_non_read_unit_counts_per_fact_across_tags() -> None:
+    """Two EUR-only revenue tags in one filing count once; a USD fallback tag
+    for the fact means the fact is read, so nothing is counted."""
+    eur_only = payload({"Revenues": [entry(K2020, FY2020, 300)]}, unit="EUR")
+    eur_only["facts"]["us-gaap"]["SalesRevenueNet"] = {
+        "units": {"EUR": [entry(K2020, FY2020, 300)]}
+    }
+    assert parse(eur_only).non_unit == 1
+    with_usd = payload({"Revenues": [entry(K2020, FY2020, 300)]}, unit="EUR")
+    with_usd["facts"]["us-gaap"]["SalesRevenueNet"] = {
+        "units": {"USD": [entry(K2020, FY2020, 290)]}
+    }
+    result = parse(with_usd)
+    (row,) = result.records
+    assert (row.xbrl_tag, row.unit) == ("us-gaap:SalesRevenueNet", "USD")
+    assert result.non_unit == 0
+
+
 def test_non_read_unit_beside_a_read_one_is_not_counted() -> None:
-    """Counted only when it is the filing's only unit for the tag."""
+    """Counted only when the filing carries the fact in no read unit."""
     data = payload({"Revenues": [entry(K2020, FY2020, 300)]})
     data["facts"]["us-gaap"]["Revenues"]["units"]["EUR"] = [entry(K2020, FY2020, 280)]
     result = parse(data)
@@ -452,19 +482,31 @@ def test_new_york_date_not_utc_date_bounds_the_period() -> None:
 @pytest.mark.parametrize(
     "bad",
     [
-        entry(K2020, ("2020-12-31", "2020-01-01"), 300),  # starts after it ends
-        entry(K2020, ("2020-12-31", "2020-12-31"), 300),  # zero-day duration
-        entry(K2020, FY2020, math.nan),
-        entry(K2020, FY2020, math.inf),
-        entry(K2020, FY2020, "300"),
-        entry(K2020, FY2020, True),
+        entry(K2022, ("2022-12-31", "2022-01-01"), 300),  # starts after it ends
+        entry(K2022, ("2022-12-31", "2022-12-31"), 300),  # zero-day duration
+        entry(K2022, FY2022, math.nan),
+        entry(K2022, FY2022, math.inf),
+        entry(K2022, FY2022, "300"),
+        entry(K2022, FY2022, True),
+        # 364 days like FY2021, ending after K2022's acceptance (2023-02-24)
+        entry(K2022, ("2022-03-01", "2023-02-28"), 300),
     ],
 )
 def test_malformed_entries_are_withheld_and_counted(bad: dict[str, Any]) -> None:
-    result = parse(payload({"Revenues": [bad, entry(K2020, FY2019, 200)]}))
-    assert [r.period_end for r in result.records] == [date(2019, 12, 31)]
+    result = parse(payload({"Revenues": [bad, entry(K2022, FY2021, 200)]}))
+    assert [r.period_end for r in result.records] == [date(2021, 12, 31)]
+    assert result.records[0].period_days == 364
     assert result.malformed == 1
     assert result.records[0].comparative is False  # a malformed entry sets no latest end
+
+
+def test_clean_same_length_column_does_flag_the_prior_one() -> None:
+    """Control for the malformed test: the same pair, well formed, flags FY2021."""
+    result = parse(payload({"Revenues": [entry(K2022, FY2022, 300), entry(K2022, FY2021, 200)]}))
+    assert {r.period_end: r.comparative for r in result.records} == {
+        date(2022, 12, 31): False,
+        date(2021, 12, 31): True,
+    }
 
 
 def test_missing_entry_field_raises() -> None:
