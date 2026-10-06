@@ -318,7 +318,6 @@ def test_profitability_hash_and_fingerprint_ignore_live_strategy(settings: Setti
 # `load_frozen`. T97, T98, T100 and T111 each remove their files from this list.
 PARAMS_READERS_ALLOWLIST = {
     "cli.py",
-    "backtest/holdout.py",
     "dashboard/backtest_page.py",
     "execution/check.py",
     "execution/report.py",
