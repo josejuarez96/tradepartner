@@ -195,6 +195,48 @@ def test_worst_case_lower_bound_counts_unlabelled_as_wrong() -> None:
     assert worst_case < ordinary.lower_bound
 
 
+# --- in_random_draw: excluded from the accuracy denominator, not from seeded_recall --
+
+
+def test_seed_not_in_random_draw_changes_seeded_recall_not_class_accuracy() -> None:
+    """req 10: a seed added beside the 150 drawn items (`in_random_draw=
+    False`) is excluded from the accuracy denominator but still counts
+    toward `seeded_recall` (which filters on `is_seed` alone, unaffected by
+    this flag)."""
+    row6 = crosswalk.RuleAnswer(status="listed")  # a disagreement by construction
+    drawn = _labelled_items(n_correct=10, n_wrong_option=0, n_timeout=0, n_unresolved=0)
+    extra_seed = scoring.ScoredItem(
+        "extra-seed",
+        "bankruptcy",
+        "bankruptcy",
+        "ok",
+        is_seed=True,
+        in_random_draw=False,
+        pre_fix_rule_answer=row6,
+    )
+    items = [*drawn, extra_seed]
+
+    accuracy = scoring.class_accuracy(items)
+    assert accuracy.n == 10  # the extra seed never enters the denominator
+    assert accuracy.correct == 10
+
+    recall = scoring.seeded_recall(items)
+    assert recall == 1.0  # the extra seed is caught (row6 disagrees with every option)
+
+
+def test_in_random_draw_excludes_from_unresolved_and_unlabelled_share() -> None:
+    not_drawn = scoring.ScoredItem(
+        "not-drawn", None, None, "timeout", is_seed=True, in_random_draw=False
+    )
+    items = [
+        scoring.ScoredItem("a", "bankruptcy", "bankruptcy", "ok"),
+        scoring.ScoredItem("b", None, "bankruptcy", "ok"),
+        not_drawn,
+    ]
+    assert scoring.unresolved_share(items) == 0.0  # only "a" and "b" counted, neither unresolved
+    assert scoring.unlabelled_share(items) == 0.5  # only "b" of the two drawn items
+
+
 # --- unresolved_share, unlabelled_share -----------------------------------------
 
 
@@ -301,6 +343,21 @@ def test_per_option_precision_recall_against_the_scipy_oracle() -> None:
     assert compliance.underpowered is True  # recall_n == 3, under 20
 
 
+def test_per_option_precision_recall_excludes_non_scorable_gold_from_precision() -> None:
+    """A model call on an item the owner left gold-`unresolved` or
+    unlabelled makes no claim precision can be scored against (quant-auditor
+    SHOULD FIX on PR #1069): it must not lower that option's precision."""
+    scorable_true_positive = scoring.ScoredItem("tp", "bankruptcy", "bankruptcy", "ok")
+    non_scorable_unresolved = scoring.ScoredItem("unresolved-gold", UNRESOLVED, "bankruptcy", "ok")
+    non_scorable_unlabelled = scoring.ScoredItem("unlabelled-gold", None, "bankruptcy", "ok")
+    items = [scorable_true_positive, non_scorable_unresolved, non_scorable_unlabelled]
+
+    result = scoring.per_option_precision_recall(items)
+    bankruptcy = result["bankruptcy"]
+    assert bankruptcy.precision_n == 1  # only the scorable item enters the denominator
+    assert bankruptcy.precision == 1.0
+
+
 def test_per_option_precision_recall_no_support_is_none() -> None:
     result = scoring.per_option_precision_recall([])
     merger = result["merger_or_acquisition"]
@@ -356,6 +413,40 @@ def test_rule_provision_arm_score_empty_is_zero() -> None:
     assert result.class_accuracy.n == 0
 
 
+def test_rule_provision_arm_score_scores_the_arm_against_gold_not_the_model() -> None:
+    """The arm's `class_accuracy` must answer "does the arm agree with
+    gold?", not "does the model agree with the arm?" (quant-auditor BLOCKER
+    on PR #1069): a one-class arm (`(a)(1)` -> `{instrument_retirement}`)
+    where the arm is *right* but the model disagrees with it must still
+    score correct, and one where the arm is *wrong* but the model happens
+    to agree with it must still score wrong."""
+    items = [
+        # arm right (gold == instrument_retirement), model disagrees with
+        # the arm (bankruptcy): must count correct for the arm.
+        scoring.ScoredItem(
+            "arm-right-model-wrong",
+            "instrument_retirement",
+            "bankruptcy",
+            "ok",
+            rule_provision="12d2-2(a)(1)",
+        ),
+        # arm wrong (gold == bankruptcy, outside the arm's one class), model
+        # happens to agree with the arm (instrument_retirement): must count
+        # wrong for the arm.
+        scoring.ScoredItem(
+            "arm-wrong-model-agrees-with-arm",
+            "bankruptcy",
+            "instrument_retirement",
+            "ok",
+            rule_provision="12d2-2(a)(1)",
+        ),
+    ]
+    result = scoring.rule_provision_arm_score(items)
+    assert result.class_accuracy.n == 2
+    assert result.class_accuracy.correct == 1  # only the first item: the arm itself is right
+    assert math.isclose(result.class_accuracy.point_estimate, 0.5, abs_tol=1e-9)
+
+
 # --- ece: a hand-built vector set against a worked value ------------------------
 
 
@@ -387,6 +478,49 @@ def test_ece_against_a_hand_worked_value() -> None:
 
 def test_ece_empty_is_zero() -> None:
     assert scoring.ece([]) == 0.0
+
+
+def test_ece_aggregates_option_probability_to_class_before_scoring() -> None:
+    """`ece` must score confidence and correctness at the *class* level, not
+    mix an option-level top probability with a class-level correctness
+    check (quant-auditor SHOULD FIX on PR #1069). Two options in the same
+    class (`terminal`: `merger_or_acquisition` 0.5, `going_private` 0.45)
+    sum to a 0.95 class probability; gold is `terminal`, so the item is
+    correct at p = 0.95, not p = 0.5 (the top option alone)."""
+    item = scoring.CalibrationItem(
+        probabilities={"merger_or_acquisition": 0.5, "going_private": 0.45, "bankruptcy": 0.05},
+        gold_class="terminal",
+    )
+    # one item: the whole mass sits in the last equal-mass bin regardless of
+    # n_bins, so ece == |accuracy - confidence| == |1 - 0.95| == 0.05.
+    assert math.isclose(scoring.ece([item]), 0.05, abs_tol=1e-9)
+
+
+def test_ece_and_classwise_reliability_are_permutation_invariant_on_ties() -> None:
+    """With tied confidences, `ece` and `classwise_reliability` must not
+    depend on the order the caller passes items in (quant-auditor SHOULD
+    FIX on PR #1069; E7: ties are the common case, median p = 1.000)."""
+    right = [
+        scoring.CalibrationItem(probabilities={"bankruptcy": 0.7}, gold_class="insolvency")
+        for _ in range(15)
+    ]
+    wrong = [
+        scoring.CalibrationItem(probabilities={"bankruptcy": 0.7}, gold_class="transfer")
+        for _ in range(15)
+    ]
+    right_first = right + wrong
+    interleaved = [item for pair in zip(right, wrong, strict=True) for item in pair]
+
+    ece_right_first = scoring.ece(right_first)
+    ece_interleaved = scoring.ece(interleaved)
+    assert math.isclose(ece_right_first, ece_interleaved, abs_tol=1e-9)
+
+    reliability_right_first = scoring.classwise_reliability(right_first)
+    reliability_interleaved = scoring.classwise_reliability(interleaved)
+    for class_name in reliability_right_first:
+        assert math.isclose(
+            reliability_right_first[class_name], reliability_interleaved[class_name], abs_tol=1e-9
+        )
 
 
 # --- multiclass_brier and classwise_reliability: a one-item hand-worked case ----

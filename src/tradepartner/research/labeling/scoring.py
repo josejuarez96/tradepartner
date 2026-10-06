@@ -147,7 +147,13 @@ class ScoredItem:
     `unresolved`), the model's final `predicted_option` (`None` for a
     `timeout` or `refused` call, which carries no answer) and `reason`, and,
     for the seeded error set, the pre-fix rule answer it is scored against
-    (`is_seed`, `pre_fix_rule_answer`; req 10's "seeded error set")."""
+    (`is_seed`, `pre_fix_rule_answer`; req 10's "seeded error set").
+    `in_random_draw` is `False` only for a seed item added beside the 150
+    drawn gold items (req 10: seeds are "excluded from the accuracy
+    denominator, except a seed the random draw itself picked" -- a seed that
+    the random draw happened to select keeps `in_random_draw=True`, its
+    default, and is scored normally; `seeded_recall` itself filters on
+    `is_seed` alone and is unaffected by this flag)."""
 
     listing_end_id: str
     gold_label: str | None
@@ -157,6 +163,7 @@ class ScoredItem:
     text_states: str | None = None
     probabilities: Mapping[str, float] | None = None
     is_seed: bool = False
+    in_random_draw: bool = True
     pre_fix_rule_answer: crosswalk.RuleAnswer | None = None
 
     @property
@@ -201,8 +208,14 @@ def class_accuracy(
     `against`) is not `None` (unlabelled) and not `questions.UNRESOLVED`
     (gold `unresolved`) -- both excluded from the denominator -- whose
     predicted class equals the gold class; a `timeout` or a model
-    `unresolved` on a scored item counts wrong, never excluded."""
-    scored = [item for item in items if _gold_label_of(item, against) not in (None, UNRESOLVED)]
+    `unresolved` on a scored item counts wrong, never excluded. A seed item
+    not in the random draw (`in_random_draw=False`) is excluded from the
+    denominator (req 10)."""
+    scored = [
+        item
+        for item in items
+        if item.in_random_draw and _gold_label_of(item, against) not in (None, UNRESOLVED)
+    ]
     n = len(scored)
     correct = 0
     for item in scored:
@@ -239,7 +252,10 @@ def unresolved_share(items: Sequence[ScoredItem]) -> float:
     """The share of `items` the model left unresolved (req 10's
     `unresolved_share`): a `timeout`, a `refused` call, or an `unresolved`
     answer, over every item passed (the batch's own denominator, not the
-    gold-scored one)."""
+    gold-scored one). A seed item not in the random draw
+    (`in_random_draw=False`) is excluded, matching `class_accuracy`'s
+    denominator."""
+    items = [item for item in items if item.in_random_draw]
     if not items:
         return 0.0
     count = sum(1 for item in items if item.reason != "ok" or item.predicted_option == UNRESOLVED)
@@ -248,7 +264,10 @@ def unresolved_share(items: Sequence[ScoredItem]) -> float:
 
 def unlabelled_share(items: Sequence[ScoredItem]) -> float:
     """The share of `items` the owner skipped twice (req 10's
-    `unlabelled_share`: `gold_label is None`)."""
+    `unlabelled_share`: `gold_label is None`). A seed item not in the random
+    draw (`in_random_draw=False`) is excluded, matching `class_accuracy`'s
+    denominator."""
+    items = [item for item in items if item.in_random_draw]
     if not items:
         return 0.0
     return sum(1 for item in items if item.gold_label is None) / len(items)
@@ -304,11 +323,25 @@ def per_option_precision_recall(
     "per-option precision and recall with Clopper-Pearson bounds and
     `underpowered` under 20"), scored against `gold_label` (options with no
     predicted or gold support get `None` scores, `underpowered` either
-    way)."""
+    way). Precision's denominator is restricted to items with a scorable
+    gold label (not `None`/unlabelled, not `questions.UNRESOLVED`): a model
+    call on an item the owner left gold-`unresolved` or unlabelled makes no
+    claim precision can be scored against, so it is excluded rather than
+    counted a false positive, matching `class_accuracy`'s own exclusions.
+    A seed item not in the random draw (`in_random_draw=False`) is excluded
+    from both precision and recall, matching `class_accuracy`'s
+    denominator."""
     result: dict[str, PrecisionRecall] = {}
     for option in sorted(crosswalk.OPTIONS_WITH_A_CLASS):
-        predicted_as = [i for i in items if i.reason == "ok" and i.predicted_option == option]
-        gold_as = [i for i in items if i.gold_label == option]
+        predicted_as = [
+            i
+            for i in items
+            if i.in_random_draw
+            and i.reason == "ok"
+            and i.predicted_option == option
+            and i.gold_label not in (None, UNRESOLVED)
+        ]
+        gold_as = [i for i in items if i.in_random_draw and i.gold_label == option]
         precision_n, recall_n = len(predicted_as), len(gold_as)
         precision = (
             sum(1 for i in predicted_as if i.gold_label == option) / precision_n
@@ -372,7 +405,10 @@ def rule_provision_arm_score(items: Sequence[ScoredItem]) -> ArmResult:
             covered += 1
         if len(arm_classes) == 1:
             one_class_n += 1
-            if _predicted_class(item) == next(iter(arm_classes)):
+            # the arm's own accuracy against gold, not the model's agreement
+            # with the arm (B8's question: does reading the filing add
+            # anything to a field code already has?).
+            if gold_class == next(iter(arm_classes)):
                 one_class_correct += 1
     arm_accuracy = AccuracyResult(
         n=one_class_n,
@@ -397,38 +433,86 @@ class CalibrationItem:
     gold_class: str
 
 
-def _max_probability_and_class(probabilities: Mapping[str, float]) -> tuple[float, str | None]:
-    option, p_max = max(probabilities.items(), key=lambda kv: kv[1])
-    predicted_class = None if option == UNRESOLVED else crosswalk.class_of(option)
+def _class_probabilities(probabilities: Mapping[str, float]) -> dict[str, float]:
+    """Each class's probability mass: the sum of its options' probabilities
+    (`unresolved`'s probability joins no class), as `multiclass_brier` and
+    `classwise_reliability` both compute it."""
+    class_probabilities: dict[str, float] = {}
+    for option, p in probabilities.items():
+        if option == UNRESOLVED:
+            continue
+        option_class = crosswalk.class_of(option)
+        assert option_class is not None
+        class_probabilities[option_class] = class_probabilities.get(option_class, 0.0) + p
+    return class_probabilities
+
+
+def _max_class_probability_and_class(
+    probabilities: Mapping[str, float],
+) -> tuple[float, str | None]:
+    """The predicted *class* (argmax over class probabilities, not over
+    options) and its probability -- aggregated the same way
+    `multiclass_brier` does, so `ece`'s notion of "confidence" and
+    "correct" both operate at the class level rather than mixing an
+    option-level confidence with a class-level correctness check."""
+    class_probabilities = _class_probabilities(probabilities)
+    if not class_probabilities:
+        return 0.0, None
+    predicted_class, p_max = max(class_probabilities.items(), key=lambda kv: kv[1])
     return p_max, predicted_class
 
 
-def _equal_mass_bins(n: int, n_bins: int) -> list[tuple[int, int]]:
-    """`n_bins` contiguous index ranges over a sequence of length `n`,
-    sorted by confidence ascending, each holding `n // n_bins` items, the
-    remainder spread over the last bins (15 equal-mass bins, req 10, C6)."""
-    return [((b * n) // n_bins, ((b + 1) * n) // n_bins) for b in range(n_bins)]
+def _equal_mass_bins(values: Sequence[float], n_bins: int) -> list[tuple[int, int]]:
+    """`n_bins` contiguous index ranges over `values` (already sorted
+    ascending), each holding about `len(values) // n_bins` items, the
+    remainder spread over the last bins (15 equal-mass bins, req 10, C6) --
+    except that no boundary falls inside a run of equal values: tied
+    confidences are never split across bins, so the result does not depend
+    on the input order among ties (E7: the median probability is 1.000, so
+    ties are the common case, not an edge case)."""
+    n = len(values)
+    if n == 0:
+        return []
+    raw_boundaries = [((b + 1) * n) // n_bins for b in range(n_bins)]
+    boundaries: list[int] = []
+    for b in raw_boundaries[:-1]:
+        while 0 < b < n and values[b] == values[b - 1]:
+            b += 1
+        boundaries.append(b)
+    boundaries.append(n)
+    ranges = []
+    start = 0
+    for b in boundaries:
+        if b > start:
+            ranges.append((start, b))
+            start = b
+    return ranges
 
 
 def ece(items: Sequence[CalibrationItem], *, n_bins: int = 15) -> float:
     """Expected calibration error with `n_bins` equal-mass bins (C6; req 10):
-    items sorted by their chosen option's probability, split into
-    equal-mass bins, each bin's `|accuracy - mean confidence|` weighted by
-    its share of `items`."""
+    items sorted by their predicted *class*'s aggregated probability
+    (ascending), split into equal-mass bins (ties kept in one bin), each
+    bin's `|accuracy - mean confidence|` weighted by its share of `items`.
+    "Confidence" and "correct" are both at the class level (as
+    `multiclass_brier` and `classwise_reliability` already are): an item's
+    confidence is its predicted class's total probability, and it is
+    correct when that class equals `gold_class`."""
     if not items:
         return 0.0
     pairs = sorted(
         (
             (p_max, predicted_class == item.gold_class)
             for item, (p_max, predicted_class) in (
-                (item, _max_probability_and_class(item.probabilities)) for item in items
+                (item, _max_class_probability_and_class(item.probabilities)) for item in items
             )
         ),
         key=lambda pair: pair[0],
     )
     n = len(pairs)
     total = 0.0
-    for start, end in _equal_mass_bins(n, n_bins):
+    values = [p for p, _ in pairs]
+    for start, end in _equal_mass_bins(values, n_bins):
         bucket = pairs[start:end]
         if not bucket:
             continue
@@ -449,15 +533,10 @@ def multiclass_brier(items: Sequence[CalibrationItem]) -> float:
     classes = sorted(crosswalk.CLASSES)
     total = 0.0
     for item in items:
-        class_probabilities = dict.fromkeys(classes, 0.0)
-        for option, p in item.probabilities.items():
-            if option == UNRESOLVED:
-                continue
-            option_class = crosswalk.class_of(option)
-            assert option_class is not None
-            class_probabilities[option_class] += p
+        class_probabilities = _class_probabilities(item.probabilities)
         total += sum(
-            (class_probabilities[c] - (1.0 if c == item.gold_class else 0.0)) ** 2 for c in classes
+            (class_probabilities.get(c, 0.0) - (1.0 if c == item.gold_class else 0.0)) ** 2
+            for c in classes
         )
     return total / len(items)
 
@@ -468,21 +547,20 @@ def classwise_reliability(
     """One-vs-rest ECE per class (C6's "classwise reliability"): for class
     `c`, the confidence is each item's `c`-probability (the sum of its
     options' probabilities, as in `multiclass_brier`) and the outcome is
-    whether `c` is the gold class, binned the same equal-mass way as `ece`."""
+    whether `c` is the gold class, binned the same tie-aware equal-mass way
+    as `ece` (ties kept in one bin, so the result does not depend on the
+    input order among ties)."""
     result: dict[str, float] = {}
     for target_class in sorted(crosswalk.CLASSES):
         pairs = []
         for item in items:
-            class_probability = sum(
-                p
-                for option, p in item.probabilities.items()
-                if option != UNRESOLVED and crosswalk.class_of(option) == target_class
-            )
+            class_probability = _class_probabilities(item.probabilities).get(target_class, 0.0)
             pairs.append((class_probability, item.gold_class == target_class))
         pairs.sort(key=lambda pair: pair[0])
         n = len(pairs)
         total = 0.0
-        for start, end in _equal_mass_bins(n, n_bins):
+        values = [p for p, _ in pairs]
+        for start, end in _equal_mass_bins(values, n_bins):
             bucket = pairs[start:end]
             if not bucket:
                 continue
