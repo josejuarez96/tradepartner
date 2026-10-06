@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import csv
 import errno
+import os
 import re
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,30 @@ from tradepartner.store import schema
 from tradepartner.store.db import configure_connection
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
+
+# CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
+# one process, just split into N invocations with no new dependency. Weight is a
+# rough multiple of a "normal" file's run time, read off a local full-suite
+# `--durations=0` profile (2026-10-06); only files far from that norm are listed,
+# everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`. A stale weight still
+# balances fine — it only shifts which shard a slow file lands on, never which
+# tests run — so this table does not need to be kept in lockstep with the suite.
+_HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
+    "tests/lookahead/test_paper_invariance.py": 12.0,
+    "tests/lookahead/test_asof_invariance.py": 8.0,
+    "tests/lookahead/test_backtest_invariance.py": 7.0,
+    "tests/lookahead/test_backtest_plan_timing.py": 6.0,
+    "tests/oracle/test_bt_oracle.py": 6.0,
+    "tests/lookahead/test_suite.py": 5.0,
+    "tests/test_config.py": 3.0,
+    "tests/adapters/test_alpaca_prices.py": 2.5,
+    "tests/store/test_journal.py": 2.0,
+    "tests/test_merge_train.py": 2.0,
+}
+_DEFAULT_TEST_FILE_WEIGHT = 1.0
+
+_SHARD_INDEX_ENV = "PYTEST_SHARD_INDEX"
+_SHARD_COUNT_ENV = "PYTEST_SHARD_COUNT"
 
 # An ISO-8601 UTC offset ("+00:00", "+0000", "-05:00") or a literal "Z"
 # suffix. Deliberately strict: a fixture author who forgets the offset
@@ -63,6 +88,69 @@ _BARE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
 _DATE_TYPE = "DATE"
+
+
+def shard_assignment(file_paths: Iterable[str], shard_count: int) -> dict[str, int]:
+    """Deterministically bucket test files into ``shard_count`` shards (#1112).
+
+    Greedy longest-processing-time bin packing: files are sorted heaviest-first
+    (ties broken by path, for a result that doesn't depend on set/hash
+    iteration order) from `_HEAVY_TEST_FILE_WEIGHTS` (default weight for
+    everything else) and each goes to the shard currently holding the least
+    weight, lowest index breaking ties. Bucketing is by file, not by test, so
+    a file's module/session-scoped fixtures are built at most once per shard
+    rather than once per shard that happens to get one of its tests.
+
+    Pure and total: every path in `file_paths` gets exactly one shard index in
+    ``[0, shard_count)``, and the mapping depends only on the input set, not on
+    the order items were collected in.
+    """
+    if shard_count < 1:
+        raise ValueError(f"shard_count must be >= 1, got {shard_count}")
+    loads = [0.0] * shard_count
+    assignment: dict[str, int] = {}
+    ordered = sorted(
+        set(file_paths),
+        key=lambda p: (-_HEAVY_TEST_FILE_WEIGHTS.get(p, _DEFAULT_TEST_FILE_WEIGHT), p),
+    )
+    for path in ordered:
+        weight = _HEAVY_TEST_FILE_WEIGHTS.get(path, _DEFAULT_TEST_FILE_WEIGHT)
+        shard = min(range(shard_count), key=lambda i: (loads[i], i))
+        assignment[path] = shard
+        loads[shard] += weight
+    return assignment
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keep only this shard's items, when CI sets `PYTEST_SHARD_INDEX`/`_COUNT` (#1112).
+
+    No-op when either is unset, so a local `uv run pytest` and `ready_pr.py`'s
+    targeted runs are unaffected. Bucketing is by test file (`shard_assignment`),
+    never by individual test, so a file's fixtures aren't split across shards.
+    """
+    count_raw = os.environ.get(_SHARD_COUNT_ENV)
+    index_raw = os.environ.get(_SHARD_INDEX_ENV)
+    if not count_raw or not index_raw:
+        return
+    shard_count = int(count_raw)
+    shard_index = int(index_raw)
+    if shard_count <= 1:
+        return
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"{_SHARD_INDEX_ENV}={shard_index} out of range for {_SHARD_COUNT_ENV}={shard_count}"
+        )
+    rootdir = config.rootpath
+    file_paths = {item.path.relative_to(rootdir).as_posix() for item in items}
+    assignment = shard_assignment(file_paths, shard_count)
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        rel = item.path.relative_to(rootdir).as_posix()
+        (kept if assignment[rel] == shard_index else deselected).append(item)
+    items[:] = kept
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
 
 
 def _blocked_connect(*_args: object, **_kwargs: object) -> None:

@@ -67,12 +67,54 @@ def test_the_checks_job_token_is_read_only() -> None:
     assert "if: github.event_name == 'pull_request'" in claims
 
 
-def test_tests_run_in_parallel_inside_the_single_checks_job() -> None:
-    """#581: the suite runs with xdist inside the one `checks` job, so the check name the
-    merge train and branch protection read does not change."""
+def test_tests_run_in_parallel_inside_each_shard() -> None:
+    """#581: each shard job still runs its slice with xdist."""
     text = CI.read_text()
     assert "run: uv run pytest -n auto" in text
+
+
+def test_checks_is_a_thin_aggregator_over_fast_and_shards() -> None:
+    """#1112: pytest moved into a `pytest-shard` matrix for wall-clock, but the required
+    check name every piece of merge tooling reads literally (the `protect-main` ruleset,
+    `ready_pr.checks_state`, `merge_train._REQUIRED_CHECKS`) must stay exactly `checks`, so
+    a final job by that name needs both the fast job and the shard matrix."""
+    text = CI.read_text()
+    assert "\n  checks-fast:\n" in text
+    assert "\n  pytest-shard:\n" in text
     assert "\n  checks:\n" in text
+    checks = text[text.index("\n  checks:\n") :].split("\n  claims:\n", 1)[0]
+    needs_line = checks.splitlines()[2].strip()
+    assert needs_line == "needs: [checks-fast, pytest-shard]", needs_line
+    assert "if: always()" in checks
+
+
+def test_pytest_shard_matrix_sets_the_index_and_count_env() -> None:
+    """Each shard tells `tests/conftest.py`'s bucketing hook which slice it is."""
+    text = CI.read_text()
+    shard = text[text.index("\n  pytest-shard:\n") : text.index("\n  checks:\n")]
+    assert "matrix:\n        shard: [0, 1, 2, 3]" in shard
+    assert "PYTEST_SHARD_INDEX: ${{ matrix.shard }}" in shard
+    assert "fail-fast: false" in shard
+
+
+def test_shard_count_matches_the_matrix_length() -> None:
+    """The workflow-level `PYTEST_SHARD_COUNT` and the matrix's shard list must agree, or
+    some shard index would never be requested (or some would be requested but unassigned)."""
+    text = CI.read_text()
+    m = re.search(r"PYTEST_SHARD_COUNT:\s*(\d+)", text)
+    assert m, "no workflow-level PYTEST_SHARD_COUNT"
+    count = int(m.group(1))
+    m = re.search(r"shard:\s*\[([^\]]+)\]", text)
+    assert m, "no shard matrix"
+    indices = [int(x) for x in m.group(1).split(",")]
+    assert indices == list(range(count)), indices
+
+
+def test_pytest_shard_skips_with_checks_fast_when_no_tests_needed() -> None:
+    """A docs-only PR must skip every shard too, not just the fast job's own Tests step."""
+    text = CI.read_text()
+    shard = text[text.index("\n  pytest-shard:\n") : text.index("\n  checks:\n")]
+    assert "if: needs.checks-fast.outputs.tests-needed != 'no'" in shard
 
 
 def test_uv_cache_is_keyed_on_the_lock_and_only_main_saves_it() -> None:
