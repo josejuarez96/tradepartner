@@ -76,7 +76,7 @@ from tradepartner.backtest.results import write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.cli_record import _configured_secrets, scrub_text
-from tradepartner.config import ENGINE_FAMILIES, Settings, get_settings
+from tradepartner.config import ENGINE_FAMILIES, Cadence, Settings, get_settings
 from tradepartner.store import registry, schema
 from tradepartner.store.db import open_for_write, open_read_only
 
@@ -109,8 +109,8 @@ def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
     return live.model_copy(update={"store": store})
 
 
-def _window(frozen: Frozen, start: date | None, end: date | None) -> Window:
-    default = default_in_sample_window(frozen)
+def _window(frozen: Frozen, start: date | None, end: date | None, cadence: Cadence) -> Window:
+    default = default_in_sample_window(frozen, cadence)
     return Window(
         start if start is not None else default.start,
         end if end is not None else default.end,
@@ -194,10 +194,13 @@ def run_hypothesis(
             )
         params = load_frozen(conn, slug, settings=live)
         frozen = Frozen.from_hypothesis(hypothesis)
-        window = tracking_window if tracking else _window(frozen, start, end)
+        cadence = params.schedule.rebalance_cadence
+        window = tracking_window if tracking else _window(frozen, start, end, cadence)
         spends = registry.family_holdout_spends(conn, hypothesis.family)
-        decision = decide(window, frozen, flags, reasons, None, spends, tracking=tracking)
-        sessions = gap_sessions(window)
+        decision = decide(
+            window, frozen, flags, reasons, None, spends, tracking=tracking, cadence=cadence
+        )
+        sessions = gap_sessions(window, cadence)
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
         # A refusal is always recorded `in_sample` (it spent nothing), whatever
@@ -211,7 +214,7 @@ def run_hypothesis(
             kind=trial_kind,
             start_session=window.start,
             end_session=window.end,
-            data_cutoff=read_time(sessions[-1]) if sessions else None,
+            data_cutoff=read_time(sessions[-1], cadence) if sessions else None,
             synthetic=synthetic,
             run_by=run_by,
             holdout_repeat=holdout and decision.holdout_repeat,
@@ -240,11 +243,11 @@ def run_hypothesis(
         with StoreProvider(partial(open_read_only, store), handle, params) as provider:
             if decision.outcome == "needs_gap":
                 series = {
-                    s: provider.survivorship_gap(read_time(s)).count_share
+                    s: provider.survivorship_gap(read_time(s, cadence)).count_share
                     for s in decision.gap_sessions
                 }
                 provider.end_step()
-                decision = decide(window, frozen, flags, reasons, series, spends)
+                decision = decide(window, frozen, flags, reasons, series, spends, cadence=cadence)
                 if decision.outcome != "run":
                     return _close(store, handle, cast(Status, decision.outcome), decision.message)
                 if decision.gap_override_reason is not None:
