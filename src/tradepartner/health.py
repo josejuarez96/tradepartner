@@ -72,16 +72,21 @@ here is this module's and is stated once:
 - **Statement facts** (`statement`, #660, T77c): `edgar.statement_facts_enabled`'s
   state; while it is on, `statement_coverage`'s share of `universe_as_of(T)`
   names whose issuer has a `revenue` and a `total_assets` row known at `t`
-  with `period_end` within `universe.max_shares_age_days` of `t` (rule 7's
-  own freshness bound -- not any backtest family's own `max_fact_age_days`,
+  with `period_end` within `universe.max_shares_age_days` of the last
+  completed session at `t` (rule 7's own bound, measured the same way;
+  not any backtest family's own `max_fact_age_days`,
   which can be wider; report-only, no rule reads it), and the derived share
-  of every known `gross_profit` row (`basis = derived`, store-wide, one per
-  `(cik, period_end, period_days)`, independent of universe membership: a
-  parse-quality count, not a portfolio one); while it is off, `coverage` is
-  `None` -- nothing to report on, and `universe_as_of` is not paid for.
-  `counts` is `statement_counts` of the latest EDGAR run's message, empty
-  when it names none; `health --check` warns while its `vintage_late` is
-  positive.
+  of every known `gross_profit` row (`basis = derived`, over every CIK with
+  a `securities` row known at `t`, not only `universe_as_of(T)`'s members,
+  one row per `(cik, period_end, period_days)`: a parse-quality count, not
+  a portfolio one); while it is off, `coverage` is `None` -- nothing to
+  report on, and `universe_as_of` is not paid for. `counts` is
+  `statement_counts` of the latest EDGAR run's message, empty when it
+  names none. The data-health page's own card (dashboard T77c) shows a
+  warning badge while `vintage_late` is positive; `health --check` does
+  not, since this is a reported figure, not one of the integrity rules
+  below. A CLI warning, like the quarantined-count one `cli._quarantined`
+  already prints, is T77b's to add alongside the run message it reads.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
@@ -449,8 +454,10 @@ class StatementCoverage:
     """Statement-facts freshness and derived share at `t` (module
     docstring, #660, T77c). `fresh`/`total` are over `universe_as_of(T)`
     names (`total`); `derived`/`reported` count every known `gross_profit`
-    row store-wide by `basis`, one per `(cik, period_end, period_days)`,
-    independent of universe membership."""
+    row by `basis`, one per `(cik, period_end, period_days)`, over every
+    CIK with a `securities` row known at `t` -- not only `universe_as_of`'s
+    members, so a name excluded from today's universe (delisted, stale
+    shares, ...) still counts here."""
 
     fresh: int
     total: int
@@ -635,16 +642,18 @@ def _statement_coverage(
     frame = statement_facts_as_of(conn, t)
     members = universe_as_of(conn, t, settings).members["security_id"].to_list()
     member_frame = frame.filter(pl.col("security_id").is_in(members)) if members else frame.clear()
-    fresh = _fresh_count(member_frame, members, t.date(), settings.universe.max_shares_age_days)
+    session = last_completed_session(t)
+    fresh = _fresh_count(member_frame, members, session, settings.universe.max_shares_age_days)
     derived, reported = _gross_profit_basis_counts(frame)
     return StatementCoverage(fresh=fresh, total=len(members), derived=derived, reported=reported)
 
 
-def _fresh_count(frame: pl.DataFrame, members: Sequence[str], as_of_date: date, bound: int) -> int:
+def _fresh_count(frame: pl.DataFrame, members: Sequence[str], session: date, bound: int) -> int:
     """How many of `members` have both a `revenue` and a `total_assets`
     row in `frame` (already filtered to `members`) whose latest known
-    `period_end` is within `bound` days of `as_of_date` (module docstring:
-    rule 7's own freshness bound)."""
+    `period_end` is within `bound` days of `session` (module docstring:
+    rule 7's own freshness bound, measured the same way rule 7 measures
+    it -- from the last completed session, not `t` itself)."""
     if not members or frame.is_empty():
         return 0
     latest = (
@@ -662,16 +671,18 @@ def _fresh_count(frame: pl.DataFrame, members: Sequence[str], as_of_date: date, 
             facts
             and "revenue" in facts
             and "total_assets" in facts
-            and all((as_of_date - pe).days <= bound for pe in facts.values())
+            and all((session - pe).days <= bound for pe in facts.values())
         ):
             fresh += 1
     return fresh
 
 
 def _gross_profit_basis_counts(frame: pl.DataFrame) -> tuple[int, int]:
-    """`(derived, reported)` counts of every known `gross_profit` row,
-    store-wide, deduplicated to one per `(cik, period_end, period_days)`
-    (`frame` may repeat a dual-class issuer's row once per class)."""
+    """`(derived, reported)` counts of every known `gross_profit` row in
+    `frame` (every CIK with a `securities` row known at `t`, per
+    `_statement_coverage`'s caller), deduplicated to one per `(cik,
+    period_end, period_days)` (`frame` may repeat a dual-class issuer's
+    row once per class)."""
     if frame.is_empty():
         return 0, 0
     gross_profit = frame.filter(pl.col("fact_name") == "gross_profit").unique(

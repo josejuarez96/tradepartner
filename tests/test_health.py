@@ -1586,7 +1586,7 @@ def test_statement_coverage_ignores_a_fact_not_yet_known_at_t(
     assert statement_coverage(fixture_store, after, _settings()).derived == 1
 
 
-def test_statement_coverage_derived_share_is_store_wide_not_universe_scoped(
+def test_statement_coverage_derived_share_is_not_scoped_to_the_universe(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
     # SEC_CLEAN_MERGER (CIK0001000003) is delisted long before T_END and is
@@ -1597,6 +1597,30 @@ def test_statement_coverage_derived_share_is_store_wide_not_universe_scoped(
     assert cov.derived == 1
     assert cov.reported == 0
     assert cov.derived_share == 1.0
+
+
+def test_statement_coverage_derived_share_counts_a_dual_class_row_once(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # DUAL_CIK (CIK0001000006) joins through securities_as_of once per
+    # class (SEC_DUAL_A, SEC_DUAL_B, SEC_DUAL_PFD): one derived gross_profit
+    # row for the issuer must count once, not three times.
+    known = datetime(2020, 1, 1, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "statement_facts",
+        _statement_fact(
+            DUAL_CIK,
+            "gross_profit",
+            period_end=date(2019, 12, 31),
+            basis="derived",
+            accession="DUALGP",
+            known=known,
+        ),
+    )
+    cov = statement_coverage(fixture_store, T_END, _settings())
+    assert cov.derived == 2  # CIK0001000003's existing fixture row, plus this one
+    assert cov.reported == 0
 
 
 def test_statement_coverage_on_a_version_8_store_does_not_crash(
