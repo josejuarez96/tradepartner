@@ -13,10 +13,11 @@ run and every stored fingerprint. `frozen_values(record)` overlays those default
 registration's stored `params` for every key the stored set lacks, at the stored hash,
 so a registration is never re-registered when a key lands.
 
-**The canonical frozen set** leaves out every table key whose value equals its default,
-except the keys of the family's own signal section, which are always kept; **the
-fingerprint** hashes the keys that decide what a run computes through that set, so a
-table entry added later changes neither.
+**The canonical frozen set** leaves out every table key whose value is its default (in
+the same JSON form, so `True`, `1` and `1.0` differ), except the keys of the family's
+own signal section, which are always kept; **the fingerprint** hashes the keys that
+decide what a run computes through that set, so a table entry added later changes
+neither.
 """
 
 from __future__ import annotations
@@ -169,8 +170,18 @@ def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, An
         key: value
         for key, value in _overlay_defaults(params, family).items()
         if _section(key) not in inert
-        and not (key in defaults and value == defaults[key] and _section(key) != signal)
+        and not (key in defaults and _is_default(value, defaults[key]) and _section(key) != signal)
     }
+
+
+def _is_default(value: Any, default: Any) -> bool:
+    """`value` is `default` in the same JSON form (#1022): Python's `True == 1 == 1.0`
+    would leave out a stored value the fingerprint's JSON tells apart."""
+    return _canonical_json(value) == _canonical_json(default)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def fingerprint(family: str, params: Mapping[str, Any], in_sample_start: date) -> str:

@@ -156,6 +156,34 @@ def test_family_and_its_signal_section_are_in_the_fingerprint(
     assert "strategy.extra" not in frozen.canonical_frozen_set(params, "oracle")
 
 
+@pytest.mark.parametrize(
+    ("default", "stored", "kept"),
+    [
+        (1, 1, False),
+        (1, True, True),
+        (1, 1.0, True),
+        (True, 1, True),
+        (True, True, False),
+        (1.0, 1, True),
+        ([1, 2], [1, 2], False),
+        ([1, 2], [1.0, 2], True),
+        ([1, 2], [True, 2], True),
+    ],
+)
+def test_canonical_set_compares_a_default_by_type_as_well(
+    monkeypatch: pytest.MonkeyPatch, default: Any, stored: Any, kept: bool
+) -> None:
+    """#1022: `True == 1 == 1.0` in Python, but they are different frozen values; a
+    stored value is left out only when it is the default in the same JSON form."""
+    monkeypatch.setattr(
+        frozen,
+        "FROZEN_KEY_DEFAULTS",
+        (*frozen.FROZEN_KEY_DEFAULTS, ("schedule.extra", default, 99)),
+    )
+    canonical = frozen.canonical_frozen_set({"schedule.extra": stored}, "momentum")
+    assert ("schedule.extra" in canonical) is kept
+
+
 def test_fingerprint_reads_only_the_keys_that_decide_a_run(settings: Settings) -> None:
     params = _new_params(settings)
     base = frozen.fingerprint("momentum", params, IN_SAMPLE_START)
