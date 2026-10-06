@@ -41,9 +41,13 @@ def _pre_lab_params(settings: Settings) -> dict[str, Any]:
 
 def test_existing_table_entries_are_pinned_by_value() -> None:
     """Append-only and immutable: a later entry goes after these, never in place."""
-    assert frozen.FROZEN_KEY_DEFAULTS[:2] == (
-        ("schedule.rebalance_cadence", "month_end", 12),
-        ("schedule.signal_anchor", "month_end", 12),
+    # `is_default` (JSON form), not `==`: a `True` edited to `1` must fail (#1022).
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[:2],
+        (
+            ("schedule.rebalance_cadence", "month_end", 12),
+            ("schedule.signal_anchor", "month_end", 12),
+        ),
     )
 
 
@@ -244,7 +248,7 @@ def _prof_params(settings: Settings) -> dict[str, Any]:
 
 
 def test_profitability_table_entries_are_pinned_by_value() -> None:
-    assert frozen.FROZEN_KEY_DEFAULTS[2:9] == PROFITABILITY_DEFAULTS
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[2:9], PROFITABILITY_DEFAULTS)
     assert frozen.FAMILY_SIGNAL_SECTIONS["profitability"] == "profitability"
 
 

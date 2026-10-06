@@ -170,7 +170,7 @@ def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, An
         key: value
         for key, value in _overlay_defaults(params, family).items()
         if _section(key) not in inert
-        and not (key in defaults and is_default(value, defaults[key]) and _section(key) != signal)
+        and not (key in defaults and _section(key) != signal and is_default(value, defaults[key]))
     }
 
 
