@@ -330,6 +330,21 @@ def test_render_validation_errors_shows_input_only_where_allowed() -> None:
     assert "-1.0" not in hidden and "-2.0" not in hidden
 
 
+@pytest.mark.parametrize("value", ["10.5", "1e12"])
+def test_edgar_requests_per_second_is_capped_at_secs_ceiling(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """#1108: a large finite rate would shrink `edgar_raw`'s interval toward 0."""
+    monkeypatch.setenv("EDGAR__REQUESTS_PER_SECOND", value)
+    with pytest.raises(ValidationError, match="requests_per_second"):
+        Settings(_env_file=None)
+
+
+def test_edgar_requests_per_second_accepts_secs_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EDGAR__REQUESTS_PER_SECOND", "10")
+    assert Settings(_env_file=None).edgar.requests_per_second == 10.0
+
+
 def test_edgar_failure_policy_defaults() -> None:
     """T11h's keys: quarantine after 3 consecutive counted days, and
     `check_failures()`'s count floor and share ceiling."""

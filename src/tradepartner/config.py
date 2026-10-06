@@ -229,7 +229,10 @@ class EdgarConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = Field(default=9.0, gt=0)
+    # `le=10` (#1108): SEC's ceiling is policy, not a tunable; a larger value would
+    # shrink `edgar_raw`'s minimum interval toward 0. Tests that need no throttle
+    # raise it with `model_copy(update=...)`, which does not validate.
+    requests_per_second: float = Field(default=9.0, gt=0, le=10)
     retry_backoff_seconds: float = Field(default=1.0, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
