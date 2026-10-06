@@ -674,6 +674,40 @@ def test_a_fresh_store_has_the_six_columns_too() -> None:
         assert not notnull
 
 
+def test_read_only_open_of_a_genuine_version_12_store_passes(tmp_path: Path) -> None:
+    """A read-only connection never migrates (quant-auditor finding on PR
+    #1076): a store still shaped exactly as version 12 left it — no
+    `PROFITABILITY_REBALANCE_COLUMNS` on `trial_rebalances` — is accepted,
+    `schema_version` stays at `[12]`, and every other read keeps working."""
+    path = tmp_path / "v12.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        for ddl in (
+            schema._TABLE_DDL
+            + schema._REGISTRY_TABLE_DDL
+            + schema._JOURNAL_TABLE_DDL
+            + schema._STATEMENT_FACTS_TABLE_DDL
+            + schema._MASTER_UNDERIVED_TABLE_DDL
+            + schema._RESEARCH_TABLE_DDL
+        ):
+            conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (12, TIMESTAMPTZ "
+            "'2026-10-05 12:00:00+00')"
+        )
+    finally:
+        conn.close()
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall() == [(12,)]
+        assert conn.execute("SELECT COUNT(*) FROM trial_rebalances").fetchone() == (0,)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
+        }
+        assert columns.isdisjoint(schema.PROFITABILITY_REBALANCE_COLUMNS)
+
+
 # --- lock-error detection -----------------------------------------------
 
 

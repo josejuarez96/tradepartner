@@ -189,10 +189,11 @@ registry; #83 took version 2 first, so the registry is version 3):
   `ALTER TABLE` so the pinned `_REGISTRY_TABLE_DDL` never changes (NULL on
   every existing row; a fresh store gets the columns the same way), and
   appends a version-13 row; no fact, journal, research or other registry
-  table changes. `store.registry.write_rebalances` writes the six counts
+  table changes. `store.registry.write_rebalances` can write the six counts
   for a `profitability` trial's rows and leaves them NULL for a `momentum`
   one (`store.registry.RebalanceRow`'s six new fields are optional,
-  defaulting to `None`). Any writing `init_schema` migrates, so the owner's
+  defaulting to `None`; the engine itself does not fill them yet — T85e).
+  Any writing `init_schema` migrates, so the owner's
   store takes version 13 at its first writing job after this version is
   pulled. A read-only connection accepts a version-12 store without
   migrating it: every other read keeps working; a read of the six columns
