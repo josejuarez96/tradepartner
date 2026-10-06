@@ -344,12 +344,16 @@ def trim_submissions_page(page: Any, *, accessions: Iterable[str]) -> Any:
     }
 
 
-def trim_company_facts(payload: Any) -> Any:
-    """Keep `dei` whole and only share-count concepts elsewhere; other keys untouched.
+def trim_company_facts(payload: Any, statement_tags: Iterable[str] = ()) -> Any:
+    """Keep `dei` whole, share-count concepts and the `taxonomy:tag` names in
+    `statement_tags` (#660: `edgar.statement_tags`' fallbacks) elsewhere;
+    other keys untouched.
 
-    Pure. Drops nothing the master/universe code reads (spec master table); the full
+    Pure. Drops nothing the master/universe code or the statement-facts
+    parser reads (spec master table, amendment 2026-10-03); the full
     payload is 2-8 MB per filer, the trimmed one under ~200 KB.
     """
+    keep_tags = frozenset(statement_tags)
     if not isinstance(payload, dict) or not isinstance(payload.get("facts"), dict):
         return payload
     facts: dict[str, Any] = {}
@@ -363,6 +367,7 @@ def trim_company_facts(payload: Any) -> Any:
             name: value
             for name, value in concepts.items()
             if any(s in name for s in COMPANY_FACTS_KEEP_CONCEPT_SUBSTRINGS)
+            or f"{namespace}:{name}" in keep_tags
         }
         if kept:
             facts[namespace] = kept
@@ -517,7 +522,8 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
         submissions = edgar_raw.submissions(cik, settings=settings)
         _write_json(EDGAR_FIXTURES_DIR / f"submissions_{label}.json", submissions, secrets=secrets)
 
-        facts = trim_company_facts(edgar_raw.company_facts(cik, settings=settings))
+        statement_tags = itertools.chain.from_iterable(settings.edgar.statement_tags.values())
+        facts = trim_company_facts(edgar_raw.company_facts(cik, settings=settings), statement_tags)
         _write_json(EDGAR_FIXTURES_DIR / f"company_facts_{label}.json", facts, secrets=secrets)
 
         # Older filings (and their acceptance times) live in paged files; keep only the
