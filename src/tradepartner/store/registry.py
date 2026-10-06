@@ -258,15 +258,19 @@ class FamilySharpes:
 
 @dataclass(frozen=True)
 class HoldoutSpend:
-    """A `holdout` trial of the family, whatever its outcome."""
+    """A `holdout` trial of the family, whatever its outcome, or (`source =
+    "research_run"`) a research run of the family that spent one of its
+    hypotheses' holdouts: then `trial_id` is the run id, `hypothesis_id` is
+    None, `slug` is the experiment's and `status` its outcome."""
 
     trial_id: int
-    hypothesis_id: int
+    hypothesis_id: int | None
     slug: str
     started_at: datetime
     synthetic: bool
     holdout_reason: str | None
     status: str
+    source: Literal["trial", "research_run"] = "trial"
 
 
 @dataclass(frozen=True)
@@ -843,10 +847,13 @@ def _base_sharpes(
 
 
 def family_holdout_spends(conn: duckdb.DuckDBPyConnection, family: str) -> list[HoldoutSpend]:
-    """Every `holdout` trial in `family`, oldest first, whatever its outcome:
-    a holdout run that failed, crashed or was refused still counts as a
-    spend (conservative; domain rule 3). A caller that reads spends to set
-    `holdout_repeat` does so in the same write chunk as its `open_trial`."""
+    """Every `holdout` trial in `family`, whatever its outcome, and every
+    research run of the family that spent one of its hypotheses' holdouts
+    (research-registry spec req 5), oldest first: a holdout run that failed,
+    crashed or was refused still counts as a spend (conservative; domain rule
+    3). A store before the research tables (a read-only open of version 11)
+    has trial spends only. A caller that reads spends to set `holdout_repeat`
+    does so in the same write chunk as its `open_trial`."""
     rows = conn.execute(
         "SELECT t.trial_id, t.hypothesis_id, h.slug, t.started_at, t.synthetic, "
         f"t.holdout_reason, COALESCE(r.status, '{UNFINISHED}') "
@@ -855,7 +862,29 @@ def family_holdout_spends(conn: duckdb.DuckDBPyConnection, family: str) -> list[
         "WHERE h.family = ? AND t.kind = 'holdout' ORDER BY t.trial_id",
         [family],
     ).fetchall()
-    return [HoldoutSpend(*row) for row in rows]
+    spends = [HoldoutSpend(*row) for row in rows]
+    has_research = conn.execute(
+        "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND table_name IN ('research_runs', 'research_decisions', 'research_registrations', "
+        "'research_results')"
+    ).fetchone()
+    if has_research is None or has_research[0] < 4:
+        return spends
+    research = conn.execute(
+        "SELECT r.run_id, g.slug, r.known_at, r.synthetic, r.holdout_reason, "
+        f"COALESCE(x.outcome, '{UNFINISHED}'), d.values_json "
+        "FROM research_decisions d JOIN research_runs r ON r.run_id = d.run_id "
+        "JOIN research_registrations g ON g.registration_id = r.registration_id "
+        "LEFT JOIN research_results x ON x.run_id = r.run_id "
+        "WHERE d.kind = 'holdout_spend' AND g.family = ? ORDER BY r.run_id",
+        [family],
+    ).fetchall()
+    spends += [
+        HoldoutSpend(run_id, None, slug, at, synthetic, reason, status, "research_run")
+        for run_id, slug, at, synthetic, reason, status, values in research
+        if json.loads(values)["family_holdouts"]
+    ]
+    return sorted(spends, key=lambda spend: spend.started_at)
 
 
 def list_trials(
