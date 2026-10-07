@@ -452,6 +452,7 @@ def test_the_release_resets_the_peak_to_the_equity_at_the_last_mark(
                 quantity=10.0,
                 mark_price=50.0,
                 value=500.0,
+                cash=cash,
                 known_at=at,
                 ingested_at=at,
             ),
@@ -527,14 +528,16 @@ def test_the_release_resets_the_peak_from_marks_fors_real_row_shape(
     assert released[0].peak_equity == cash + 500.0 + 100.0
 
 
-def test_only_the_max_marked_session_counts(
+def test_an_unreadable_earlier_mark_refuses_the_release(
     journal_settings: Settings,
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
-    """A broken earlier session (a position row with no value) must not sink
-    the read: only the rows of the highest `session` count."""
+    """A broken earlier session (a position row with no value) is one the
+    drawdown check selects (no release yet), so it refuses the release
+    rather than being skipped (#713 (ii)(a), #1116): a check that cannot
+    read its input does not pass, even when the last mark is readable."""
     run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
     at = DAY1 - timedelta(days=1)
     _append(
@@ -566,14 +569,12 @@ def test_only_the_max_marked_session_counts(
 
     outcome = _resume(journal_settings, fake, fixed_clock)
 
-    assert outcome.status == RELEASED, outcome.reasons
+    assert outcome.status == REFUSED
+    assert any("cannot read a mark" in r and "2026-09-29" in r for r in outcome.reasons)
+    assert _engaged(journal_settings, window)
     with open_read_only(journal_settings) as conn:
-        released = [
-            e
-            for e in kill_switch_events_for(conn, window.window_id)  # type: ignore[arg-type]
-            if e.state == "released"
-        ]
-    assert released[0].peak_equity == 93_500.0
+        states = [e.state for e in kill_switch_events_for(conn, window.window_id)]  # type: ignore[arg-type]
+    assert "released" not in states
 
 
 # --- refusals -------------------------------------------------------------------
@@ -1018,16 +1019,16 @@ def test_a_mismatch_found_with_nothing_engaged_engages_the_switch(
     assert _engaged(journal_settings, window)
 
 
-def test_a_last_mark_with_no_positive_equity_refuses(
+def test_a_last_mark_with_a_nan_cash_refuses(
     journal_settings: Settings,
     fake: SkewedFake,
     window: PaperWindowRow,
     fixed_clock: FixedClock,
 ) -> None:
     # Not -50.0: a finite negative equity is itself a drawdown crossing now
-    # (#648) and would be refused for that reason instead. NaN gives no
-    # usable equity (`mark_equity` returns None), so it reaches neither
-    # check's crossing and still exercises the peak's own validation below.
+    # (#648) and would be refused for that reason instead. A NaN cash is an
+    # unreadable mark (`marks.equity_at`), refused by the drawdown check
+    # before any peak is computed (#713 (ii)(a), #1116).
     run_id = _run(journal_settings, window, DAY1 - timedelta(days=1), finished=True)
     at = DAY1 - timedelta(days=1)
     _append(
@@ -1046,7 +1047,7 @@ def test_a_last_mark_with_no_positive_equity_refuses(
     outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == REFUSED
-    assert any("positive equity" in r for r in outcome.reasons)
+    assert any("cannot read a mark" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
 
 
@@ -1091,7 +1092,7 @@ def test_two_distinct_cash_values_at_the_last_mark_refuses(
     outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == REFUSED
-    assert any("positive equity" in r for r in outcome.reasons)
+    assert any("cannot read a mark" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
 
 
@@ -1122,7 +1123,7 @@ def test_a_held_position_row_with_no_value_refuses(
     outcome = _resume(journal_settings, fake, fixed_clock)
 
     assert outcome.status == REFUSED
-    assert any("positive equity" in r for r in outcome.reasons)
+    assert any("cannot read a mark" in r for r in outcome.reasons)
     assert _engaged(journal_settings, window)
 
 

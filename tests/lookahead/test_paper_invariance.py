@@ -645,7 +645,14 @@ def _marks(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime) -
         sessions.append(day)
         day = next_session(day)
     flags = dict.fromkeys(fixture.held, True)
-    return marks_for(conn, fixture.window, _ledger_for(fixture, conn, as_of), sessions, flags)
+    return marks_for(
+        conn,
+        fixture.window,
+        _ledger_for(fixture, conn, as_of),
+        sessions,
+        flags,
+        actions=live_actions_as_of(conn, CUT),
+    )
 
 
 def _known[R: _HasKnownAt](rows: Sequence[R], as_of: datetime | None) -> list[R]:

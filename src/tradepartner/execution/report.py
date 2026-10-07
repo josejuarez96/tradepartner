@@ -77,6 +77,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.store import journal as store_journal
@@ -223,21 +224,6 @@ def _frozen_paper(window: PaperWindowRow) -> tuple[float, str]:
 
 def _local(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
-
-
-def _equity_at(marks: Sequence[PositionDailyRow], session: date) -> float:
-    """Ledger equity stated for `session`: the cash of its row with no
-    `security_id` plus every name's value, from rows of that exact session.
-    Raises when the session has no usable mark (fail closed: a month this
-    module is asked to compare must be fully marked)."""
-    rows = [m for m in marks if m.session == session]
-    cash_rows = [m.cash for m in rows if m.security_id is None]
-    if len(cash_rows) != 1 or cash_rows[0] is None:
-        raise ValueError(f"no cash mark for {session}")
-    values = [m.value for m in rows if m.security_id is not None]
-    if any(v is None for v in values):
-        raise ValueError(f"a position mark for {session} has no value")
-    return cash_rows[0] + sum(v for v in values if v is not None)
 
 
 def _quantity_at(marks: Sequence[PositionDailyRow], security_id: str, session: date) -> float:
@@ -457,8 +443,8 @@ def compare_months(
             raise ValueError(f"trial has no equity for {t_i} or {t_next}")
         if t_i not in trial.cost_paid:
             raise ValueError(f"trial has no cost_paid for {t_i}")
-        paper_equity_i = _equity_at(journal.positions_daily, t_i)
-        paper_equity_next = _equity_at(journal.positions_daily, t_next)
+        paper_equity_i = equity_at(journal.positions_daily, t_i)
+        paper_equity_next = equity_at(journal.positions_daily, t_next)
         paper_return = paper_equity_next / paper_equity_i - 1
         trial_return = trial.equity[t_next] / trial.equity[t_i] - 1
         raw = paper_return - trial_return

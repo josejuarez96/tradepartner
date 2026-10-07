@@ -23,6 +23,12 @@ owns the writes and the alerts this task's outputs feed.
   run that crashed or was halted in that span with no `kill_switch` row
   (a halt-path write failure, or a hard crash) counts too, the same rule
   `execution.switch.derive` uses for a run with no result row.
+- `equity_at` is the one read of ledger equity from `positions_daily` rows,
+  shared by the run, `paper resume`, the drawdown check, the outcomes and the
+  monthly report (#1116): a session's cash read from any of its rows (every
+  row carries it; the `security_id IS NULL` row exists only on a flat
+  session) plus every held name's value, refused (`UnreadableMarkError`) when a
+  row cannot give it rather than skipped.
 - `missed_run` is one lookup: whether S-1 has no `paper_runs` row at all, the
   trigger for a `missed_run` alert (req 7).
 
@@ -32,11 +38,13 @@ Nothing here writes a row, delivers an alert or reads a clock.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import duckdb
+import polars as pl
 
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import next_session, previous_session, session_close
@@ -48,6 +56,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    PositionDailyRow,
     RebalanceEventRow,
 )
 
@@ -58,6 +67,7 @@ _EXECUTED = "executed"
 _MISSED = "missed"
 _CATCH_UP_LAPSED = "catch_up_lapsed"
 _KILL_SWITCH = "kill_switch"
+_SPLIT = "split"
 _KNOWN_STATUSES = frozenset({_EXECUTED, _MISSED})
 
 
@@ -78,6 +88,56 @@ class Mark:
     value: float | None
     cash: float
     tradable: bool | None
+
+
+class UnreadableMarkError(ValueError):
+    """A session's `positions_daily` rows cannot state its ledger equity:
+    no row at all, a row with no cash or a cash that disagrees with another
+    row's, a held name with no value, or a non-finite number. A check that
+    cannot read its input does not pass (#713 (ii)(a)), so callers refuse or
+    fault on it, never skip."""
+
+
+def equity_at(rows: Sequence[PositionDailyRow], session: date) -> float:
+    """Ledger equity at the marked `session`: its cash plus every held name's
+    value, from the rows of that exact session (#1116).
+
+    `marks_for`, the only writer of `positions_daily`, carries the ledger's
+    cash on every row, and writes the `security_id IS NULL` row only when the
+    window holds nothing, so cash is read from every row of the session: each
+    must carry the same finite cash. Raises `UnreadableMarkError` when the
+    session has no row, any row has no cash or a non-finite one, two rows
+    disagree on cash, or a held name's value is missing or non-finite. Each
+    number is checked before it is summed (`math.fsum` raises on +inf with
+    -inf rather than returning a value), and the total is checked too."""
+    today = [r for r in rows if r.session == session]
+    if not today:
+        raise UnreadableMarkError(f"no mark rows for {session.isoformat()}")
+    cash: set[float] = set()
+    for row in today:
+        if row.cash is None:
+            raise UnreadableMarkError(f"a mark row for {session.isoformat()} has no cash")
+        cash.add(row.cash)
+    if len(cash) != 1:
+        raise UnreadableMarkError(
+            f"the mark rows for {session.isoformat()} disagree on cash: {sorted(cash)}"
+        )
+    (cash_value,) = cash
+    if not math.isfinite(cash_value):
+        raise UnreadableMarkError(f"the cash marked for {session.isoformat()} is {cash_value!r}")
+    values: list[float] = []
+    for row in today:
+        if row.security_id is None:
+            continue
+        if row.value is None or not math.isfinite(row.value):
+            raise UnreadableMarkError(
+                f"the mark of {row.security_id} for {session.isoformat()} has value {row.value!r}"
+            )
+        values.append(row.value)
+    equity = cash_value + math.fsum(values)
+    if not math.isfinite(equity):
+        raise UnreadableMarkError(f"equity marked for {session.isoformat()} is {equity!r}")
+    return equity
 
 
 @dataclass(frozen=True)
@@ -128,12 +188,35 @@ def _last_bars(
     return last
 
 
+def _split_factor(actions: pl.DataFrame, security_id: str, after: date, through: date) -> float:
+    """The product of `security_id`'s split ratios in `actions` with
+    `after < ex_date <= through`: the splits the ledger's quantity at
+    `through` counts but a raw close of `after` predates. A non-finite or
+    non-positive ratio raises, as `ledger.from_journal` does."""
+    factor = 1.0
+    if actions.is_empty():
+        return factor
+    for row in actions.iter_rows(named=True):
+        if (
+            row["security_id"] == security_id
+            and row["action_type"] == _SPLIT
+            and after < row["ex_date"] <= through
+        ):
+            ratio = float(row["ratio_or_amount"])
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise ValueError(f"split of {security_id} has ratio {ratio!r}")
+            factor *= ratio
+    return factor
+
+
 def marks_for(
     conn: duckdb.DuckDBPyConnection,
     window: PaperWindowRow,
     ledger: LedgerFor,
     sessions: Sequence[date],
     tradable_flags: Mapping[str, bool],
+    *,
+    actions: pl.DataFrame,
 ) -> list[Mark]:
     """`Mark` rows for every session in `sessions` (ascending; the caller
     derives the range from the window's last mark, exclusive, through S-1,
@@ -158,7 +241,11 @@ def marks_for(
     for every name held on any of them), so the gap runs from the session
     after its last bar: that close is the latest bar on or before the session as
     known at close(session), never a bar after it, and each such mark logs a
-    `marks` warning naming the stale close's date. Every other missing bar
+    `marks` warning naming the stale close's date. A split of the name with
+    its ex-date after the stale close's session and on or before the marked
+    one (from `actions`, the same frame the caller's `ledger` applies, so the
+    ledger's quantity already counts it) divides the carried close by its
+    ratio, so the carried value stays on the quantity's own basis (#1116). Every other missing bar
     (a tradable name, a gap before the name's last bar, or a name with no
     bar at all) raises `ValueError`, so a stale mark is never carried
     silently.
@@ -210,7 +297,8 @@ def marks_for(
                 later = last_bar.get(security_id)
                 if flag is True or stale is None or (later is not None and later > session):
                     raise ValueError(f"no price for {security_id} at close({session})")
-                stale_session, price = stale
+                stale_session, stale_close = stale
+                price = stale_close / _split_factor(actions, security_id, stale_session, session)
                 _logger.warning(
                     "marks: %s has no bar at close(%s); marked at its last close, %s's, "
                     "as untradable (tradable flag %s)",
