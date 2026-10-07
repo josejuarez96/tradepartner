@@ -66,13 +66,19 @@ def _revise(
 
 
 def _action(
-    conn: duckdb.DuckDBPyConnection, kind: str, ex_date: date, amount: float, known_at: datetime
+    conn: duckdb.DuckDBPyConnection,
+    kind: str,
+    ex_date: date,
+    amount: float,
+    known_at: datetime,
+    *,
+    security_id: str = SID,
 ) -> None:
     insert_row(
         conn,
         "corporate_actions",
         {
-            "security_id": SID,
+            "security_id": security_id,
             "action_type": kind,
             "ex_date": ex_date,
             "ratio_or_amount": amount,
@@ -165,6 +171,52 @@ def test_a_dividend_explains_a_drop(fixture_store: duckdb.DuckDBPyConnection) ->
     _action(fixture_store, "dividend", BACK, 2 * original, REVISED_AT)
     jumps = price_jumps_as_of(fixture_store, T_LATE, [SID], settings=_settings())
     assert jumps["session"].to_list() == [JUMP]
+
+
+def test_an_implausible_dividend_does_not_hide_a_real_jump(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    original = _revise(fixture_store, close_times=3.0)
+    known = datetime(2019, 4, 1, 21, tzinfo=UTC)
+    _action(fixture_store, "dividend", BACK, 3 * original, known)
+    before = price_jumps_as_of(fixture_store, BACK_KNOWN, [SID], settings=_settings())
+    after = price_jumps_as_of(fixture_store, T_LATE, [SID], settings=_settings())
+    assert before["session"].to_list() == [JUMP, BACK]
+    assert after["session"].to_list() == [JUMP, BACK]
+    cut = TruncatedStore(fixture_store)
+    try:
+        for t, full in ((BACK_KNOWN, before), (T_LATE, after)):
+            assert full.equals(price_jumps_as_of(cut.at(t), t, [SID], settings=_settings())), t
+    finally:
+        cut.close()
+
+
+def test_a_negative_dividend_on_a_jump_candidate_raises(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Fail loud (#1119): a jump candidate's invalid action stops the jump check,
+    # universe rule 6 and health, naming the security, from when it is known.
+    _revise(fixture_store, close_times=3.0)
+    known = datetime(2019, 4, 1, 21, tzinfo=UTC)
+    _action(fixture_store, "dividend", BACK, -0.5, known)
+    assert price_jumps_as_of(fixture_store, BACK_KNOWN, [SID], settings=_settings()).height == 2
+    with pytest.raises(ValueError, match=SID):
+        price_jumps_as_of(fixture_store, T_LATE, [SID], settings=_settings())
+    with pytest.raises(ValueError, match=SID):
+        universe_as_of(fixture_store, T_LATE, _settings())
+
+
+def test_an_implausible_dividend_does_not_create_a_false_jump(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    sid, ex_date = "SEC_SPLIT_BETWEEN", date(2019, 1, 11)
+    raw = prices_as_of(fixture_store, T_LATE, [sid])
+    prior_close = raw.filter(pl.col("session") == date(2019, 1, 10))["close"].item()
+    known = datetime(2019, 2, 1, 21, tzinfo=UTC)
+    _action(fixture_store, "dividend", ex_date, prior_close, known, security_id=sid)
+    before = datetime(2019, 1, 31, 21, tzinfo=UTC)
+    assert price_jumps_as_of(fixture_store, before, [sid], settings=_settings()).is_empty()
+    assert price_jumps_as_of(fixture_store, T_LATE, [sid], settings=_settings()).is_empty()
 
 
 def test_the_jump_list_reads_only_rows_known_at_t(

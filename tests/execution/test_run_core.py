@@ -46,6 +46,7 @@ from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     DecisionRow,
+    JournalIntegrityError,
     KillSwitchRow,
     OrderEventRow,
     OrderRow,
@@ -327,7 +328,7 @@ def rebalance_env(env: Env, tmp_path: Path) -> Iterator[tuple[Env, PaperWindowRo
             title="tracking run core test",
             doc_path="docs/hypotheses/h-run-core.md",
             doc_sha256="0" * 64,
-            params=frozen_params_of(params),
+            params=frozen_params_of(params, family="momentum"),
             in_sample_start=IN_SAMPLE_START,
             holdout_start=HOLDOUT_START,
             holdout_end=HOLDOUT_END,
@@ -1448,3 +1449,47 @@ def test_a_late_fill_collected_at_step_3_does_not_halt_step_4(
         ("ok",),
         ("ok",),
     ]
+
+
+# --- the run's journal loader (#507) ---------------------------------------------------------
+
+
+def test_a_tracking_run_reads_its_derived_state_through_window_journal_inputs(
+    rebalance_env: tuple[Env, PaperWindowRow],
+    step_fails: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The look-ahead check (tests/lookahead/test_paper_invariance.py) reads the
+    cut store through `window_journal_inputs`; this pins that the run's own
+    `executed` test (step 3, before the trade step) does too, so the two cannot
+    drift apart into a parallel copy again."""
+    env, window = rebalance_env
+    env.ingest(_at(T_0, 21))
+    calls: list[int] = []
+    original = run_module.window_journal_inputs
+
+    def spy(conn: duckdb.DuckDBPyConnection, window_id: int) -> run_module.WindowJournalInputs:
+        calls.append(window_id)
+        return original(conn, window_id)
+
+    monkeypatch.setattr(run_module, "window_journal_inputs", spy)
+    with pytest.raises(RuntimeError, match="the step failed"):
+        env.run(_at(F_0))
+    assert calls
+    assert set(calls) == {window.window_id}
+
+
+def test_an_orphan_order_fails_the_run_with_an_alert_not_before_its_run_row(
+    env: Env, exits_done: list[object]
+) -> None:
+    """A journal integrity error in orders (an order whose run has no `paper_runs`
+    row) surfaces inside the run, whose failed path alerts and writes the result,
+    not in the run's start before its row exists (#507 safety review)."""
+    _marked(env)
+    env.order(999_999, "tp-orphan", _at(MON), submit=False)
+    with pytest.raises(JournalIntegrityError, match="tp-orphan"):
+        env.run(_at(TUE))
+    run_id = env.latest_run()
+    assert env.query("SELECT session FROM paper_runs WHERE run_id = ?", [run_id]) == [(TUE,)]
+    assert env.results()[run_id][:2] == ("failed", "JournalIntegrityError")
+    assert ("run_failed", run_id, TUE) in env.alerts()

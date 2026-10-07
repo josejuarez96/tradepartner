@@ -152,7 +152,7 @@ def run(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
                 title="bt oracle",
                 doc_path="tests/oracle/test_bt_oracle.py",
                 doc_sha256="0" * 64,
-                params=frozen_params_of(frozen),
+                params=frozen_params_of(frozen, family="momentum"),
                 in_sample_start=IN_SAMPLE_START,
                 holdout_start=HOLDOUT[0],
                 holdout_end=HOLDOUT[1],

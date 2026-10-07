@@ -28,6 +28,10 @@ reported once, under the first rule it fails:
    (`missing_bars`), and no session in them carries a price jump
    (`price_jump`, #787): `store.asof.price_jumps_as_of` at `t`, not in
    `universe.accepted_price_jumps`. `price_jump` is not missing data.
+   A jump candidate with an invalid corporate action (a negative dividend,
+   a non-positive or non-finite factor) raises `ValueError` naming the
+   security, from `price_jumps_as_of` (#1119): bad action data fails
+   loud instead of being read as a jump's explanation.
 7. `shares`: the latest `shares_outstanding` fact known at `t` is at most
    `universe.max_shares_age_days` old at the session. Rows sharing that
    `as_of_date` are never summed: the one row with a class member wins
@@ -433,7 +437,9 @@ def universe_as_of(
     """The universe at `t` from rows known at `t` (see the module docstring
     for the rules). `settings` defaults to `get_settings()` and is the only
     source of every `universe.*` value, also passed to `listing_ends_as_of`.
-    A bare date raises `TypeError`, a naive datetime `ValueError`."""
+    A bare date raises `TypeError`, a naive datetime `ValueError`; rule 6
+    raises `ValueError` when a jump candidate carries an invalid corporate
+    action (`price_jumps_as_of`)."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     cfg = settings.universe

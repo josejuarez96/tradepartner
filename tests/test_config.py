@@ -17,19 +17,26 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from tradepartner.config import (
+    _DEFAULT_SWEEPABLE_KEYS,
     ALLOWED_AXIS_PREFIXES,
+    ENGINE_FAMILIES,
+    FAMILIES,
     FAMILY_PARENTS,
+    FAMILY_SIGNAL_SECTIONS,
     FORBIDDEN_AXIS_PREFIXES,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
+    PAPER_FAMILIES,
     AlpacaConfig,
     CostsConfig,
     EdgarConfig,
     ExecutionConfig,
     HypothesisFamily,
     PaperConfig,
+    ProfitabilityConfig,
     RiskConfig,
     Settings,
+    StrategyConfig,
     _default_env_file,
     _settings_has_key,
     clean_message,
@@ -1022,6 +1029,96 @@ def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
     non_oracle = {family for family in get_args(HypothesisFamily) if family != "oracle"}
     assert non_oracle <= set(FAMILY_PARENTS)
     assert FAMILY_PARENTS["momentum"] is None
+
+
+# --- The family registry (ADR 0014 point 2, T128) ---
+
+
+def test_hypothesis_family_literal_equals_the_registry_keys() -> None:
+    """The `HypothesisFamily` `Literal` and `FAMILIES` must enumerate the same names:
+    the literal stays explicit for mypy strict, and a test pins the equality."""
+    assert tuple(get_args(HypothesisFamily)) == tuple(FAMILIES)
+
+
+def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
+    assert FAMILY_PARENTS == {"momentum": None, "profitability": None}
+
+
+def test_family_signal_sections_derives_without_oracle_at_today_s_values() -> None:
+    assert FAMILY_SIGNAL_SECTIONS == {"momentum": "strategy", "profitability": "profitability"}
+
+
+def test_engine_families_derives_at_today_s_value() -> None:
+    assert ENGINE_FAMILIES == ("momentum", "oracle", "profitability")
+
+
+def test_paper_families_derives_at_today_s_value() -> None:
+    assert PAPER_FAMILIES == ("momentum", "oracle")
+
+
+def test_default_sweepable_keys_derives_at_today_s_value() -> None:
+    assert _DEFAULT_SWEEPABLE_KEYS == (
+        "strategy.formation_months",
+        "strategy.skip_months",
+        "strategy.top_fraction",
+        "strategy.weighting",
+        "strategy.signal_total_return",
+        "schedule.rebalance_cadence",
+        "schedule.signal_anchor",
+    )
+
+
+def test_allowed_axis_prefixes_derives_at_today_s_value() -> None:
+    assert ALLOWED_AXIS_PREFIXES == ("strategy.", "schedule.")
+
+
+def test_momentum_family_spec() -> None:
+    spec = FAMILIES["momentum"]
+    assert spec.sections == ("strategy",)
+    assert spec.params_model is StrategyConfig
+    assert spec.parent is None
+    assert spec.engine_ready is True
+    assert spec.paper_ready is True
+    assert spec.exclusion_reasons == ("no_history",)
+    assert spec.count_names == ("n_excluded_no_history",)
+    assert spec.benchmark == "MTUM"
+    assert spec.sweepable_keys == (
+        "strategy.formation_months",
+        "strategy.skip_months",
+        "strategy.top_fraction",
+        "strategy.weighting",
+        "strategy.signal_total_return",
+    )
+
+
+def test_oracle_family_spec_reads_momentum_s_section() -> None:
+    """`oracle` is a test-only entry that reads momentum's `strategy` section."""
+    spec = FAMILIES["oracle"]
+    assert spec.sections == ("strategy",)
+    assert spec.params_model is StrategyConfig
+    assert spec.engine_ready is True
+    assert spec.paper_ready is True
+    assert spec.sweepable_keys == ()
+
+
+def test_profitability_family_spec() -> None:
+    spec = FAMILIES["profitability"]
+    assert spec.sections == ("profitability",)
+    assert spec.params_model is ProfitabilityConfig
+    assert spec.parent is None
+    assert spec.engine_ready is True
+    assert spec.paper_ready is False
+    assert spec.exclusion_reasons == ("sector", "no_facts", "stale_facts", "malformed")
+    assert spec.count_names == (
+        "n_ranked",
+        "n_excluded_no_facts",
+        "n_excluded_stale_facts",
+        "n_excluded_sector",
+        "n_excluded_malformed",
+        "n_derived",
+    )
+    assert spec.benchmark == "MTUM"
+    assert spec.sweepable_keys == ()
 
 
 @pytest.mark.parametrize(

@@ -30,12 +30,12 @@ two must be equal:
 - the journal-derived state: `plan.decision_state`, `plan.remainder`, `plan.residue`,
   `plan.rebalance_state` and `switch.derive`. These are pure over the rows they are
   given; per the owner's decision on #488 they are invariant because their journal
-  input is cut at `as_of` (`known_at <= as_of`) where it is loaded. No run loader
-  exists yet (T63), so `_derived` loads through `store.journal`'s readers and applies
-  that cut itself; on the cut store it applies none, so the check is that the `as_of`
-  rule and the harness's truncation give the same state. Until #507 routes it through
-  T63's loaders, that equality holds by construction; its liveness half is the
-  evidence that the loaders must cut;
+  input is cut at `as_of` (`known_at <= as_of`) where it is loaded. The run's
+  loader `window_journal_inputs` (step 4, step 7b, `_skipped`) reads
+  every row the window holds with no `as_of`; `_derived` uses it on the cut store
+  (`as_of is None`), and `_known` at `as_of=CUT` on the full store. The check
+  compares production reads on a truncated store against the rule; its liveness
+  half is the evidence that the loader must not drop, add or rescope rows.
 - a `stop` run's own two pure pieces, `outcomes.due_outcomes` and `exits.stop_exits`,
   given this window by hand as if S were a stop requested at T_PREV (`#598`: this
   window's own run on S is a rebalance, so no `stop` run of its own has read them).
@@ -96,6 +96,7 @@ from tradepartner.execution.marks import Mark, marks_for
 from tradepartner.execution.outcomes import OutcomeWindow
 from tradepartner.execution.reconcile import Explanations
 from tradepartner.execution.risk import unfilled_sells
+from tradepartner.execution.run import window_journal_inputs
 from tradepartner.store import journal, registry, schema
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -672,21 +673,50 @@ class Derived:
 
 
 def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime | None) -> Derived:
-    """Every derived state of the window on S from `conn`'s journal, cut at `as_of`
-    where loaded (None: no cut, every row `conn` holds). Store facts are read at
-    close(S-1) either way. #507: once T63's loaders exist, call them here with
-    `as_of` in place of `_known`, so the check tests production."""
+    """Every derived state of the window on S from `conn`'s journal.
+
+    On the cut store (`as_of is None`): loads all eleven journal inputs through
+    `window_journal_inputs` (the run's load path for step 4, step 7b's
+    `decision_state`/`rebalance_state` and `_skipped`'s `switch.derive`;
+    `_locked_run` reads the same runs, kill-switch and rebalance readers directly,
+    and `_exit_book` is excluded as it reads cross-window).
+
+    On the full store (`as_of=CUT`): loads through `store.journal` readers and
+    applies the `_known` cut at close(S-1).
+
+    Store facts (actions, prices) are read at close(S-1) either way.
+    """
     window_id = fixture.window_id
-    with_events = journal.decisions_for(conn, window_id)
-    decisions = _known([d.decision for d in with_events], as_of)
-    events = _known([e for d in with_events for e in d.events], as_of)
-    orders = _known(journal.orders_for(conn, window_id=window_id), as_of)
-    order_events = _known(journal.order_events_for(conn, window_id=window_id), as_of)
-    fills = [
-        f
-        for f in journal.fills_for(conn, window_id=window_id)
-        if as_of is None or f.fill.known_at <= as_of
-    ]
+    if as_of is None:
+        inputs = window_journal_inputs(conn, window_id)
+        with_events = inputs.decisions
+        decisions = [d.decision for d in with_events]
+        events = [e for d in with_events for e in d.events]
+        orders = inputs.orders
+        order_events = inputs.order_events
+        fills = inputs.fills
+        runs = inputs.runs
+        results = inputs.results
+        adjustments = inputs.adjustments
+        positions_daily = inputs.positions_daily
+        rebalance_events = inputs.rebalance_events
+        kill_switch = inputs.kill_switch_events
+    else:
+        with_events = journal.decisions_for(conn, window_id)
+        decisions = _known([d.decision for d in with_events], as_of)
+        events = _known([e for d in with_events for e in d.events], as_of)
+        orders = _known(journal.orders_for(conn, window_id=window_id), as_of)
+        order_events = _known(journal.order_events_for(conn, window_id=window_id), as_of)
+        fills = [
+            f for f in journal.fills_for(conn, window_id=window_id) if f.fill.known_at <= as_of
+        ]
+        runs_with = journal.runs_for(conn, window_id)
+        runs = _known([r.run for r in runs_with], as_of)
+        results = _known([r.result for r in runs_with if r.result is not None], as_of)
+        adjustments = _known(journal.adjustments_for(conn, window_id), as_of)
+        positions_daily = _known(journal.positions_daily_for(conn, window_id), as_of)
+        rebalance_events = _known(journal.rebalance_events_for(conn, window_id), as_of)
+        kill_switch = _known(journal.kill_switch_events_for(conn, window_id), as_of)
     actions = live_actions_as_of(conn, CUT)
     closes = {
         row["security_id"]: float(row["close"])
@@ -702,9 +732,6 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
         if d.decision_id is not None
     }
     [trim] = [d for d in decisions if d.decision_id == fixture.in_flight]
-    runs_with = journal.runs_for(conn, window_id)
-    runs = _known([r.run for r in runs_with], as_of)
-    results = _known([r.result for r in runs_with if r.result is not None], as_of)
     ledger = _ledger_for(fixture, conn, as_of or LATER)(S)
     return Derived(
         decisions=states,
@@ -713,10 +740,10 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
         ),
         residue=plan.residue(
             fixture.held[0],
-            _known(journal.adjustments_for(conn, window_id), as_of),
+            adjustments,
             decisions,
             events,
-            _known(journal.positions_daily_for(conn, window_id), as_of),
+            positions_daily,
             ledger,
             actions,
             window_id=window_id,
@@ -726,13 +753,13 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
             T_PREV,
             fixture.window,
             runs,
-            _known(journal.rebalance_events_for(conn, window_id), as_of),
+            rebalance_events,
             [(d, states[d.decision_id]) for d in decisions if d.decision_id is not None],
             session=S,
         ),
         switch=switch.derive(
             fixture.window,
-            _known(journal.kill_switch_events_for(conn, window_id), as_of),
+            kill_switch,
             runs,
             results,
             reading_run=fixture.run_s,

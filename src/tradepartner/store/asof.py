@@ -197,10 +197,14 @@ series (for the negative-dividend case) reach the caller.
 
 **Why this runs as one SQL statement, not a Python loop per bar.** Every
 step -- the latest-revision-as-of-`t` filter for both `prices_daily` and
-`corporate_actions`, each event's own factor, the **cumulative** factor per
-security (a running product of an event's factor and every later event's,
-expressed as `EXP(SUM(LN(factor)) OVER (PARTITION BY security_id ORDER BY
-ex_date DESC))` so it is a plain window aggregate, not a recursive query),
+`corporate_actions`, each event's own factor, one log factor per
+`(security_id, ex_date)` (the events sharing an ex-date summed as
+`SUM(LN(factor) ORDER BY action_type, ratio_or_amount)`, so a split and a
+dividend on one day sum in a fixed order whatever the scan order, #1099),
+the **cumulative** factor per security (a running product of an ex-date's
+factor and every later ex-date's, expressed as `EXP(SUM(log_factor) OVER
+(PARTITION BY security_id ORDER BY ex_date DESC))` so it is a plain window
+aggregate, not a recursive query),
 and attaching that cumulative factor to each bar -- happens inside one
 query (plus the small validation query above, which shares the same CTEs).
 Attaching uses DuckDB's `ASOF LEFT JOIN` (the same range-join operator used
@@ -440,16 +444,28 @@ def price_jumps_as_of(
     `universe.max_jump_ratio` or below `universe.min_jump_ratio` is a jump
     unless the splits and dividends known at `t` with an ex-date in
     `(prev_session, session]` explain it: `(close + dividends) * split
-    ratios / prev_close` is back inside the bounds. `accepted` is true when
+    ratios / prev_close` is back inside the bounds. A dividend reported as
+    `implausible_amount` by `dropped_dividends_as_of` does not explain a
+    jump; that bound is judged against the dividend's as-of prior close
+    (the latest bar before the ex-date, traded or not), while the jump
+    check uses the previous traded close. `accepted` is true when
     `universe.accepted_price_jumps` names `<security_id>@<session>`.
     `settings` defaults to `get_settings()`.
+
+    Raises `ValueError` naming the security when a jump candidate carries
+    an action `adjusted_prices_as_of` refuses (a negative dividend amount,
+    a non-positive or non-finite factor; `dropped_dividends_as_of`'s
+    validation). Fail loud on purpose: bad action data stops
+    `universe_as_of` (rule 6) and `health` rather than being read as an
+    explanation, or not, of a jump. Only candidates' actions are checked.
 
     Only rows known at `t` are read, so the list at `t` never depends on a
     later bar or a later-known action: a split first known after `t` leaves
     its jump on the list at `t`.
     """
     t = _validate_t(t)
-    cfg = (settings if settings is not None else get_settings()).universe
+    settings = settings if settings is not None else get_settings()
+    cfg = settings.universe
     params: list[Any] = [t]
     security_filter = _security_filter(security_ids, params)
     params += [cfg.max_jump_ratio, cfg.min_jump_ratio]
@@ -478,7 +494,17 @@ def price_jumps_as_of(
     candidates = conn.execute(sql, params).pl()
     if candidates.is_empty():
         return pl.DataFrame(schema=_JUMP_SCHEMA)
-    actions = live_actions_as_of(conn, t, candidates["security_id"].unique().sort().to_list())
+    candidate_ids = candidates["security_id"].unique().sort().to_list()
+    actions = live_actions_as_of(conn, t, candidate_ids)
+    implausible = {
+        (sid, ex_date, amount)
+        for sid, ex_date, amount, reason in dropped_dividends_as_of(
+            conn, t, candidate_ids, settings=settings
+        )
+        .select("security_id", "ex_date", "ratio_or_amount", "reason")
+        .iter_rows()
+        if reason == "implausible_amount"
+    }
     by_security: dict[str, list[tuple[str, date, float]]] = {}
     for sid, kind, ex_date, amount in actions.select(
         "security_id", "action_type", "ex_date", "ratio_or_amount"
@@ -493,7 +519,7 @@ def price_jumps_as_of(
                 continue
             if kind == "split":
                 splits *= amount
-            elif kind == "dividend":
+            elif kind == "dividend" and (row["security_id"], ex_date, amount) not in implausible:
                 dividends += amount
         explained = (row["close"] + dividends) * splits / row["prev_close"]
         if cfg.min_jump_ratio <= explained <= cfg.max_jump_ratio:
@@ -909,23 +935,24 @@ def _adjusted_select(common_ctes: str) -> str:
     """`adjusted_prices_as_of`'s main query over `common_ctes`."""
     return f"""
         WITH {common_ctes},
-        -- Cumulative factor per security: the product of this event's own
-        -- factor and every later event's (spec: a split or dividend
-        -- adjusts every bar before its ex-date, and multiple later events
-        -- compound). Expressed as EXP(SUM(LN(...))) so it is a plain
-        -- window aggregate, not a recursive query. ORDER BY ex_date DESC
-        -- is load-bearing: it accumulates from the latest event backward,
-        -- so each event's cum_factor is "itself and everything after it";
-        -- ASC would accumulate the wrong direction (see
-        -- tests/store/test_asof.py's compounding test, which asserts
-        -- distinct expected factors per date range and fails under ASC).
-        cum AS (
+        -- One factor per ex-date before the cumulative window: a split and
+        -- dividend on the same day must sum in a stable order, independent
+        -- of the table or truncated-view scan order (#1099).
+        event_day AS (
             SELECT security_id, ex_date,
-                EXP(SUM(LN(factor)) OVER (
-                    PARTITION BY security_id ORDER BY ex_date DESC
-                )) AS cum_factor
+                SUM(LN(factor) ORDER BY action_type, ratio_or_amount) AS log_factor
             FROM event_factor
             WHERE factor IS NOT NULL
+            GROUP BY security_id, ex_date
+        ),
+        -- Accumulate from the latest ex-date backward, so each date's factor
+        -- includes itself and every later date (ASC would be wrong).
+        cum AS (
+            SELECT security_id, ex_date,
+                EXP(SUM(log_factor) OVER (
+                    PARTITION BY security_id ORDER BY ex_date DESC
+                )) AS cum_factor
+            FROM event_day
         )
         SELECT
             b.security_id,

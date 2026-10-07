@@ -239,6 +239,83 @@ def test_unclassifiable_counts_only_names_listed_in_w(june: duckdb.DuckDBPyConne
     assert not {"U1", "U2"} & set(gap.listed)
 
 
+def test_zero_volume_tail_does_not_hide_a_truncated_tail(
+    june: duckdb.DuckDBPyConnection,
+) -> None:
+    # D last traded on 06-07. Halt markers through 06-20 do not repair its
+    # nine-session tail before the Form 25. A later-known traded revision
+    # changes the verdict only after it becomes known.
+    for session in _sessions(date(2019, 6, 10), date(2019, 6, 20)):
+        insert_row(
+            june,
+            "prices_daily",
+            {
+                "security_id": "D",
+                "session": session,
+                "open": 5.0,
+                "high": 5.0,
+                "low": 5.0,
+                "close": 5.0,
+                "volume": 0,
+            }
+            | _meta(session_close(session), "alpaca", "bar"),
+        )
+    late = T_JUNE + timedelta(hours=1)
+    insert_row(
+        june,
+        "prices_daily",
+        {
+            "security_id": "D",
+            "session": date(2019, 6, 20),
+            "open": 5.0,
+            "high": 5.0,
+            "low": 5.0,
+            "close": 5.0,
+            "volume": 1_000_000,
+        }
+        | _meta(late, "alpaca", "bar"),
+    )
+    at_close = survivorship_gap(june, T_JUNE, _settings())
+    row = at_close.missing.filter(at_close.missing["security_id"] == "D").row(0, named=True)
+    assert (row["reason"], row["last_bar"], row["tail_sessions"]) == (
+        "truncated_tail",
+        date(2019, 6, 7),
+        9,
+    )
+    assert "D" not in _missing(survivorship_gap(june, late, _settings()))
+
+
+def _bar_at_t(conn: duckdb.DuckDBPyConnection, sid: str, volume: int, known_at: datetime) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": sid,
+            "session": date(2019, 6, 28),
+            "open": 10.0,
+            "high": 10.0,
+            "low": 10.0,
+            "close": 10.0,
+            "volume": volume,
+        }
+        | _meta(known_at, "alpaca", "bar"),
+    )
+
+
+def test_a_zero_volume_bar_at_t_is_no_bar_at_t(june: duckdb.DuckDBPyConnection) -> None:
+    # Z traded through 06-27; its only bar at T is a halt marker (volume 0), so a
+    # live listing has no trade at T (#801 1a). A traded revision of that bar
+    # clears it, but only from the instant the revision is known.
+    _as_store(june).security("Z", bars=(date(2019, 5, 1), date(2019, 6, 27)), shares=100)
+    _bar_at_t(june, "Z", 0, T_JUNE)
+    late = T_JUNE + timedelta(hours=1)
+    _bar_at_t(june, "Z", 1_000_000, late)
+    at_close = survivorship_gap(june, T_JUNE, _settings())
+    row = at_close.missing.filter(at_close.missing["security_id"] == "Z").row(0, named=True)
+    assert (row["reason"], row["last_bar"]) == ("no_bar_at_t", date(2019, 6, 27))
+    assert "Z" not in _missing(survivorship_gap(june, late, _settings()))
+
+
 def test_boundary_tail_equal_to_the_threshold_is_not_missing(
     june: duckdb.DuckDBPyConnection,
 ) -> None:
