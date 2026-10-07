@@ -363,12 +363,14 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
     class it re-arms for relisting (#820).
 
     1. A title naming two or more common classes (#1163: "Class A Common
-       Stock and Class B Common Stock") delists each, if every one matches
-       exactly one class by title up to the first comma.
-    2. Otherwise the one class with the same title up to the first comma.
-    3. Otherwise, for a plain-common title, or one naming a single common
-       class among other classes ("Common stock and warrants"), that name
-       by title, else the one class whose titles are all plain common.
+       Stock and Class B Common Stock") delists each if every one matches
+       exactly one class by title up to the first comma, else nothing.
+    2. A title that is not itself plain common but names one common class
+       among others ("Units, Class A Common Stock and Warrants") resolves
+       through that name only, so a listed Units class never takes it.
+    3. Otherwise the one class with the same title up to the first comma;
+       failing that, for a plain-common title or name, the one class whose
+       titles are all plain common.
     Anything else is `()`: never a guess."""
 
     def by_title(name: str) -> list[K]:
@@ -383,13 +385,16 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
         found = [by_title(name) for name in named]
         if all(len(keys) == 1 for keys in found):
             return tuple(dict.fromkeys(keys[0] for keys in found))
-    exact = by_title(_norm_title(title))
-    if len(exact) == 1:
-        return (exact[0],)
-    if exact:
         return ()
-    if not _is_plain_common(title):
-        if len(named) != 1:
+    plain = _is_plain_common(title)
+    if plain or not named:
+        exact = by_title(_norm_title(title))
+        if len(exact) == 1:
+            return (exact[0],)
+        if exact:
+            return ()
+    if not plain:
+        if not named:
             return ()
         exact = by_title(named[0])
         if len(exact) == 1:

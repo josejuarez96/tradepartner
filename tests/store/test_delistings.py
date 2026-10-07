@@ -729,6 +729,10 @@ def _master() -> MasterBuild:
             "class_title": "6% Preferred Stock",
         },
         {
+            **_listing(f"{CIK_DUAL}:units", "DUAU", "NYSE", date(2015, 1, 6), _at(2015, 1, 5)),
+            "class_title": "Units, each consisting of one share of Class A Common Stock",
+        },
+        {
             **_listing(CIK_SOLO, "SOL", "NASDAQ", date(2015, 1, 6), _at(2015, 1, 5)),
             "class_title": "Common Stock",
         },
@@ -754,6 +758,7 @@ def _master() -> MasterBuild:
         securities=(
             _sec(CIK_DUAL, CIK_DUAL),
             _sec(f"{CIK_DUAL}:6-preferred-stock", CIK_DUAL),
+            _sec(f"{CIK_DUAL}:units", CIK_DUAL),
             _sec(CIK_SOLO, CIK_SOLO),
             _sec(CIK_SNAP, CIK_SNAP),
             _sec(CIK_WORD, CIK_WORD),
@@ -1009,6 +1014,20 @@ class TestCompoundTitles:
             "stock and one-half of one redeemable warrant"
         )
         assert self._ids(title, CIK_DUAL) == [CIK_DUAL]
+
+    def test_a_comma_led_title_never_resolves_to_its_units_class(self) -> None:
+        # code-review on #1170: "units" up to the first comma would match
+        # the listed Units class and leave the named common class listed.
+        assert self._ids("Units, Class A Common Stock and Warrants", CIK_DUAL) == [CIK_DUAL]
+
+    def test_a_units_filing_still_resolves_to_the_units_class(self) -> None:
+        title = "Units, each consisting of one share of Class A Common Stock"
+        assert self._ids(title, CIK_DUAL) == [f"{CIK_DUAL}:units"]
+
+    def test_an_unlisted_named_class_never_falls_back_to_the_listed_one(self) -> None:
+        # code-review on #1170: CIK_DUAL lists one common class (A); a
+        # filing naming A and C is unmatched, not read as A alone.
+        assert self._ids("Class A Common Stock and Class C Common Stock", CIK_DUAL) == []
 
     def test_two_named_common_classes_each_get_a_row(self) -> None:
         title = "Class A Common Stock and Class B Common Stock"
