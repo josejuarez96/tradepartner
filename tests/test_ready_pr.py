@@ -268,6 +268,14 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", running), "abc") == "pending"
     bad = (cr("checks", "COMPLETED", "FAILURE"), cr("claims", "COMPLETED", "SUCCESS"))
     assert ready_pr.checks_state(hc("abc", bad), "abc") == "failure"
+    # #1112: `checks` now `needs:` other jobs, so its own check run can be missing from
+    # the rollup while jobs it depends on have already finished green. That must read as
+    # pending, not success, or a PR could be marked ready before pytest ever started.
+    not_yet_queued = (
+        cr("checks-fast", "COMPLETED", "SUCCESS"),
+        cr("claims", "COMPLETED", "SUCCESS"),
+    )
+    assert ready_pr.checks_state(hc("abc", not_yet_queued), "abc") == "pending"
 
 
 # ── the flow, on a fake runner ──────────────────────────────────────────────────
