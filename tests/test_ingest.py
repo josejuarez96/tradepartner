@@ -1132,6 +1132,95 @@ def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None
     assert unmatched == ()
 
 
+#: A SPAC (#1165: VRT, HIMS, SOFI, IONQ): its common class is listed until the
+#: merger's cover page lists the merged company's class under a new title and
+#: ticker, a new security; no Form 25, so the old class stays classified common.
+_SPAC = "0000000098"
+_MERGED = f"{_SPAC}:common-stock"
+_MERGER_AT = datetime(2020, 5, 7, 10, tzinfo=UTC)
+_SPAC_INGESTED_AT = datetime(2021, 6, 1, tzinfo=UTC)
+
+
+def _spac_source(
+    facts: Sequence[FactRecord], *, merger: bool = True, both_after: bool = False
+) -> FixtureFilingSource:
+    spac = CoverListing("Class A ordinary shares", "SPAC", "NYSE")
+    merged = CoverListing("Common Stock, $0.0001 par value", "NEWC", "NYSE")
+    pages = [CoverPage(_SPAC, "s1", datetime(2019, 8, 6, 20, tzinfo=UTC), (spac,))]
+    if merger:
+        pages.append(CoverPage(_SPAC, "s2", _MERGER_AT, (merged,)))
+        pages.append(CoverPage(_SPAC, "s3", datetime(2020, 8, 6, 20, tzinfo=UTC), (merged,)))
+    if both_after:
+        pages.append(CoverPage(_SPAC, "s4", datetime(2020, 11, 5, 21, tzinfo=UTC), (spac, merged)))
+    return FixtureFilingSource(
+        index=[FilingIndexEntry(_SPAC, "Spac Co", "10-K", "k1", datetime(2019, 3, 1, tzinfo=UTC))],
+        cover_pages=pages,
+        headers=[FilingHeader(_SPAC, p.accession, "10-Q", 3679, p.accepted_at) for p in pages],
+        facts=list(facts),
+    )
+
+
+def _spac_shares(value: float, accession: str, at: datetime) -> FactRecord:
+    return FactRecord(
+        _SPAC, "EntityCommonStockSharesOutstanding", at.date(), "", value, accession, at
+    )
+
+
+def _spac_rows(
+    settings: Settings, facts: Sequence[FactRecord], **kwargs: bool
+) -> tuple[tuple[dict[str, Any], ...], tuple[FactRecord, ...]]:
+    source = _spac_source(facts, **kwargs)
+    at = _SPAC_INGESTED_AT
+    master = build_master(source, settings, ingested_at=at)
+    classes = build_classifications(source, master, settings, ingested_at=at)
+    return fact_rows(facts, master, classes, ingested_at=at)
+
+
+def test_shares_after_a_de_spac_go_to_the_merged_class(settings: Settings) -> None:
+    # #1165: the old SPAC class is shown on no cover page since the merged
+    # class first appeared, so it is no candidate for the merged company's count.
+    before = _spac_shares(34_500_000, "q1", datetime(2019, 11, 6, 20, tzinfo=UTC))
+    after = _spac_shares(326_000_000, "q2", datetime(2020, 8, 6, 20, 5, tzinfo=UTC))
+    rows, unmatched = _spac_rows(settings, [before, after])
+    assert [(r["security_id"], r["value"]) for r in rows] == [
+        (_SPAC, 34_500_000),
+        (_MERGED, 326_000_000),
+    ]
+    assert unmatched == ()
+
+
+def test_a_class_shown_again_beside_the_new_one_is_a_candidate_again(
+    settings: Settings,
+) -> None:
+    # Once a cover page shows both classes, a total is no one class's shares.
+    later = _spac_shares(330_000_000, "q3", datetime(2020, 11, 6, 20, tzinfo=UTC))
+    rows, unmatched = _spac_rows(settings, [later], both_after=True)
+    assert rows == () and unmatched == (later,)
+
+
+def test_classes_shown_together_stay_candidates_when_a_later_page_drops_one(
+    settings: Settings,
+) -> None:
+    # A page leaving out a class it showed beside the other is no de-SPAC.
+    dual_a_only = CoverPage(
+        DUAL,
+        f"{DUAL}-19-000009",
+        _at(2019, 6, 1),
+        (CoverListing("Class A Common Stock", "DUA", "NASDAQ"),),
+    )
+    total = _fact(DUAL, "", 10_000_000, f"{DUAL}-19-000010", _at(2019, 6, 2))
+    _, unmatched = _fact_rows(settings, _filings(extra_covers=[dual_a_only], extra_facts=[total]))
+    assert total in unmatched
+
+
+def test_a_de_spac_page_never_reaches_an_earlier_fact(settings: Settings) -> None:
+    # No look-ahead: a fact accepted before the merger's cover page is matched
+    # as if that page (and every later one) did not exist.
+    early = _spac_shares(34_500_000, "q0", _MERGER_AT - timedelta(seconds=1))
+    assert _spac_rows(settings, [early]) == _spac_rows(settings, [early], merger=False)
+    assert [r["security_id"] for r in _spac_rows(settings, [early])[0]] == [_SPAC]
+
+
 def _common(ticker: str) -> CoverListing:
     return CoverListing("Common Stock", ticker, "NYSE")
 
