@@ -258,7 +258,7 @@ def _plan_on_store(env: Env) -> engine.Plan:
             settings=env.settings,
         )
         with StoreProvider(lambda: _Lend(env.conn), handle, env.params) as provider:
-            return engine.plan(provider, env.params, T_I)
+            return engine.plan(provider, env.params, T_I, family="momentum")
     finally:
         env.conn.rollback()
 
@@ -345,7 +345,9 @@ def test_the_paper_targets_equal_the_backtest_targets(env: Env) -> None:
             settings=env.settings,
         )
         with StoreProvider(lambda: _Lend(env.conn), handle, env.params) as provider:
-            results = engine.run(env.params, provider, T_I, T_NEXT, handle, (0.0,))
+            results = engine.run(
+                env.params, provider, T_I, T_NEXT, handle, (0.0,), family="momentum"
+            )
     finally:
         env.conn.rollback()
     backtest = dict(results[0.0].targets[F_I])
@@ -624,14 +626,35 @@ def test_a_re_registered_hypothesis_is_a_plan_trial_error(env: Env) -> None:
     assert env.counts() == counts
 
 
-def test_a_family_the_engine_cannot_run_is_a_plan_trial_error(env: Env) -> None:
-    """A window whose hypothesis is `profitability` plans nothing until T85e dispatches
-    its signal (#1053). The family is changed by hand, as no window can start on one."""
+def test_profitability_is_refused_by_the_paper_family_gate(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Profitability is engine-ready but cannot open a paper plan or provider."""
     env.conn.execute("UPDATE hypotheses SET family = 'profitability'")
     counts = env.counts()
+
+    def provider_used(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("provider must not open for a non-paper family")
+
+    monkeypatch.setattr(planning, "StoreProvider", provider_used)
     with pytest.raises(PlanTrialError, match="cannot run yet"):
         env.plan()
     assert env.counts() == counts
+
+
+def test_momentum_plan_uses_the_windows_stored_family(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_plan = engine.plan
+    seen: list[str] = []
+
+    def record(*args: Any, **kwargs: Any) -> engine.Plan:
+        seen.append(kwargs["family"])
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "plan", record)
+    assert env.plan().status == "planned"
+    assert seen == ["momentum"]
 
 
 def test_a_run_of_another_window_is_refused(env: Env) -> None:

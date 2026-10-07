@@ -268,11 +268,11 @@ def test_refuses_without_gap_signoff(
     assert exc.value.reason == "gap_signoff"
 
 
-def test_refuses_a_family_the_engine_cannot_run(
+def test_refuses_a_family_paper_cannot_run(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:
-    """A `profitability` hypothesis with every other gate met is refused until T85e
-    dispatches its signal (#1053), before any broker call or write."""
+    """A `profitability` hypothesis remains outside `PAPER_FAMILIES`, before any
+    broker call or write, although the backtest engine can now run it."""
     with open_for_write(journal_settings) as conn:
         hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
         _sign_off(conn, journal_settings, hyp, tmp_path)
@@ -280,6 +280,7 @@ def test_refuses_a_family_the_engine_cannot_run(
     with pytest.raises(window.StartRefusedError) as exc:
         window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "b3")
     assert exc.value.reason == "family_not_runnable"
+    assert "profitability" in str(exc.value)
     with open_for_write(journal_settings) as conn:
         assert latest_window(conn) is None
 

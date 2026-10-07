@@ -156,7 +156,7 @@ def _run(
     start: date = START,
     levels: tuple[float, ...] = LEVELS,
 ) -> dict[float, BacktestResult]:
-    return run(settings, _provider(seed), start, END, handle, levels)
+    return run(settings, _provider(seed), start, END, handle, levels, family="momentum")
 
 
 def _trial(
@@ -581,7 +581,7 @@ class TestRefusals:
         handle = _open(conn, settings, tmp_path)
         members = {s: list(NAMES) for s in rebalance_sessions(START, HISTORY_END)}
         provider = FakeProvider(prices=_prices(7), members=members, benchmarks={"SPY": "S"})
-        results = run(settings, provider, START, END, handle, LEVELS)
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
         with pytest.raises(ValueError, match="MTUM"):
             write_results(conn, handle, results, settings)
         assert _count(conn, "trial_metrics", handle.trial_id) == 0

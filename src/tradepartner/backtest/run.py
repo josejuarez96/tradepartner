@@ -261,7 +261,9 @@ def run_hypothesis(
                             trial_id=handle.trial_id,
                         )
             levels = sorted({params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps})
-            results = engine.run(params, provider, window.start, window.end, handle, levels)
+            results = engine.run(
+                params, provider, window.start, window.end, handle, levels, family=hypothesis.family
+            )
         with open_for_write(store) as conn:
             status = write_results(conn, handle, results, params)
     except Exception as exc:

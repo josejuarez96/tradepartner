@@ -219,6 +219,32 @@ def test_fingerprint_reads_only_the_keys_that_decide_a_run(settings: Settings) -
     assert frozen.fingerprint("momentum", params, date(2017, 1, 31)) != base
 
 
+def test_profitability_fingerprint_hashes_its_own_section_only(settings: Settings) -> None:
+    params = hypothesis.frozen_params(hypothesis.parse_file(PROF_FIXTURE), settings)
+    base = frozen.fingerprint("profitability", params, IN_SAMPLE_START)
+    assert (
+        frozen.fingerprint(
+            "profitability", {**params, "strategy.top_fraction": 0.9}, IN_SAMPLE_START
+        )
+        == base
+    )
+    assert (
+        frozen.fingerprint(
+            "profitability", {**params, "profitability.top_fraction": 0.9}, IN_SAMPLE_START
+        )
+        != base
+    )
+
+
+def test_oracle_fingerprint_keeps_its_momentum_signal_section(settings: Settings) -> None:
+    params = _new_params(settings)
+    base = frozen.fingerprint("oracle", params, IN_SAMPLE_START)
+    assert (
+        frozen.fingerprint("oracle", {**params, "strategy.top_fraction": 0.9}, IN_SAMPLE_START)
+        != base
+    )
+
+
 # --- the `profitability` family (backtest spec amendment #720, T85) -----------
 
 #: Computed on main at cace512, before T85, over `Settings(_env_file=None)`.

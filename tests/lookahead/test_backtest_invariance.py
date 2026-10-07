@@ -9,6 +9,16 @@ window's first rebalance for every T_i (quadratic in the rebalance count) and CI
 once per worker that draws a truncation or prefix test. A later axis
 (the strategy family, T85e) extends `Case` and `CASES`, not the tests.
 
+**Families** (T85e). The three cadence cases run `family="momentum"`; the
+`profitability` case runs that family at `month_end` from 2018 (the fixture universe is
+empty before), so the truncated set includes `statement_facts` and `classifications`,
+whose fixture rows carry point-in-time cases on universe members (fixture README,
+"Statement facts"). Its own teeth: the FY2018 10-K of SEC_TRANSFER (CIK0001000007),
+accepted at 16:30 New York after close(2019-02-28), is not read by the plan at that
+close, so it leaves `run(end=2019-03-29)` (whose last plan is at 2019-02-28) unchanged,
+and changes `run(end=2019-04-30)`. A plan read at the fill session's close (2019-03-01)
+would see it.
+
 `engine.run` over a `StoreProvider` on the fixture universe, at every rebalance
 session T_i of the case's window:
 
@@ -51,7 +61,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import get_args
 
@@ -65,7 +75,7 @@ from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, previous_session, session_close
-from tradepartner.config import Cadence, Settings
+from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -100,6 +110,12 @@ class Case:
     seed_from: date
     seed_to: date
     seed_step: int = 1
+    family: HypothesisFamily = "momentum"
+
+    @property
+    def id(self) -> str:
+        """The pytest id: the cadence for a momentum case (ids unchanged), else the family."""
+        return self.cadence if self.family == "momentum" else self.family
 
     @property
     def sessions(self) -> tuple[date, ...]:
@@ -125,9 +141,10 @@ class Case:
         )
 
 
-#: One case per cadence; `month_end` is T40's walk unchanged.
-CASES: dict[Cadence, Case] = {
-    case.cadence: case
+#: One momentum case per cadence (`month_end` is T40's walk unchanged), then one per
+#: other family.
+CASES: dict[str, Case] = {
+    case.id: case
     for case in (
         Case(
             "month_end",
@@ -158,9 +175,21 @@ CASES: dict[Cadence, Case] = {
             seed_to=date(2019, 2, 15),
             seed_step=3,
         ),
+        Case(
+            "month_end",
+            date(2018, 1, 2),
+            FIXTURE_END,
+            teeth=date(2019, 1, 31),
+            seed_from=date(2018, 6, 1),
+            seed_to=date(2019, 11, 30),
+            family="profitability",
+        ),
     )
 }
-assert tuple(CASES) == get_args(Cadence), "one case per cadence"
+assert tuple(c.cadence for c in CASES.values() if c.family == "momentum") == get_args(Cadence)
+
+#: SEC_TRANSFER's FY2018 10-K (fixture README): its cik, acceptance and the close before.
+LATE_10K = ("CIK0001000007", datetime(2019, 2, 28, 21, 30, tzinfo=UTC), date(2019, 2, 28))
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
@@ -173,16 +202,19 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
 
 
-def _frozen(cadence: Cadence) -> Settings:
+def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
     # The `month_end` runs start in 2017, before the fixture benchmarks' first bar
     # (2018-01-02). Benchmarks are read by symbol (#840) and the engine refuses one with
     # no bar at F_0, so these runs name none, as they effectively did before (master
-    # rows unknown); the other cadences follow suit, so only the cadence differs.
+    # rows unknown); the other cadences follow suit, so only the cadence differs. A
+    # profitability case takes the same top fraction from its own section.
+    extra = {"profitability": {"top_fraction": 0.5}} if family == "profitability" else {}
     return Settings(
         _env_file=None,
         strategy={"top_fraction": 0.5},
         schedule={"rebalance_cadence": cadence},
         benchmarks=[],
+        **extra,
     )
 
 
@@ -236,7 +268,7 @@ def _open_trial(
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-lookahead",
-        family="momentum",
+        family=case.family,
         title="look-ahead suite",
         doc_path="docs/hypotheses/h-lookahead.md",
         doc_sha256="0" * 64,
@@ -293,14 +325,22 @@ class Fixture:
         with StoreProvider(
             data, self.handle, self.settings, registry_connect=_factory(self.conn)
         ) as provider:
-            return run(self.settings, provider, self.sessions[0], end, self.handle, COST_LEVELS)
+            return run(
+                self.settings,
+                provider,
+                self.sessions[0],
+                end,
+                self.handle,
+                COST_LEVELS,
+                family=self.case.family,
+            )
 
 
 @pytest.fixture(scope="module", params=list(CASES.values()), ids=list(CASES))
 def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
     case: Case = request.param
     conn = _store(case)
-    settings = _frozen(case.cadence)
+    settings = _frozen(case.cadence, case.family)
     try:
         yield Fixture(
             case=case,
@@ -525,3 +565,26 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(fixture: Fixture) 
             else:
                 changed = got.equity != want.equity
             assert changed, f"{revision} known at {revised_at} did not change run(end={t_next})"
+
+
+def test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i(
+    fixture: Fixture,
+) -> None:
+    if fixture.case.family != "profitability":
+        pytest.skip("only the profitability family reads statement facts")
+    cik, accepted, t_i = LATE_10K
+    i = fixture.sessions.index(t_i)
+    t_next, t_after = fixture.sessions[i + 1], fixture.sessions[i + 2]
+    # After the plan's read at T_i, before the fill session's close and the next plan's read.
+    fill_close = session_close(fill_session(t_i, fixture.case.cadence))
+    assert fixture.read_time(t_i) < accepted < fill_close < fixture.read_time(t_next)
+    without = _store(fixture.case)
+    try:
+        query = "DELETE FROM statement_facts WHERE cik = ? AND known_at = ?"
+        assert without.execute(query, [cik, accepted]).fetchone() == (2,)
+        _assert_same(fixture.run(t_next, conn=without), fixture.run(t_next), f"run to {t_next}")
+        got, want = fixture.run(t_after, conn=without), fixture.run(t_after)
+    finally:
+        without.close()
+    for level in COST_LEVELS:
+        assert got[level].targets != want[level].targets, f"run to {t_after}, level {level}"

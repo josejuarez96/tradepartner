@@ -7,6 +7,17 @@ the whole fixture range as T40b did; `week_end` and `daily` walk the same window
 about thirty rebalances as `test_backtest_invariance.py`. A later axis (the strategy
 family, T85e) extends `Case` and `CASES`, not the tests.
 
+**Families** (T85e). The cadence cases run `family="momentum"`; the `profitability` case
+runs that family at `month_end` from 2018, so the plans read `statement_facts` and
+`classifications` and the compared fields include the family's six counts. Teeth (b)
+revises a momentum anchor bar, so it runs on the momentum cases; the profitability
+case's teeth are the fixture's acceptance cases (`Accepted`, fixture README "Statement
+facts"): on a store without that case's rows, the plan at the close before acceptance
+is unchanged and the plan at the first close after it is not. A plan read at the fill
+session's close, or strictly before `session_close(T)`, fails at least one of them. A
+provider read past `t` alone is masked by the signal's rule 0 (`known_at <= t`); with
+that filter gone too, the 10-K case fails.
+
 T40's truncation and prefix invariance cannot see an engine that fills at F_k from
 targets planned with a read at close(T_{k+1}): every read stays inside both cuts. This
 file compares each rebalance's **plan** on a store cut at read_time(T_k) with the same
@@ -72,7 +83,7 @@ from tradepartner.backtest.schedule import fill_session, read_time, rebalance_se
 from tradepartner.backtest.signals import MomentumSignal, anchor_sessions, momentum
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import session_close
-from tradepartner.config import Cadence, Settings
+from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -97,7 +108,25 @@ PLAN_FIELDS = (
     "n_excluded_no_history",
     "gap_count_share",
     "gap_size_share",
+    "n_ranked",
+    "n_excluded_no_facts",
+    "n_excluded_stale_facts",
+    "n_excluded_sector",
+    "n_excluded_malformed",
+    "n_derived",
 )
+
+
+@dataclass(frozen=True)
+class Accepted:
+    """A fixture statement-fact case: `cik`'s rows accepted at `known_at`, unseen by the
+    plan at `before` and first read by the plan at `first`."""
+
+    name: str
+    cik: str
+    known_at: datetime
+    before: date
+    first: date
 
 
 @dataclass(frozen=True)
@@ -109,19 +138,78 @@ class Case:
     start: date
     end: date
     teeth: date
+    family: HypothesisFamily = "momentum"
+    accepted: tuple[Accepted, ...] = ()
+
+    @property
+    def id(self) -> str:
+        """The pytest id: the cadence for a momentum case (ids unchanged), else the family."""
+        return self.cadence if self.family == "momentum" else self.family
 
 
-#: One case per cadence; `month_end` is T40b's walk unchanged, the others are
-#: `test_backtest_invariance.py`'s windows.
-CASES: dict[Cadence, Case] = {
-    case.cadence: case
+#: The fixture's statement-fact acceptance cases on universe members (README; times UTC,
+#: close 21:00 on these sessions): a 10-K at 16:30 New York after close(2019-02-28); the
+#: stamps 15:00, 16:00 (= session_close) and 17:30 at 2019-01-31; and a total_assets
+#: (10-K/A, 2020-01-15) accepted after its gross_profit, leaving a no_facts name at
+#: 2019-12-31.
+ACCEPTED = (
+    Accepted(
+        "10-K after close",
+        "CIK0001000007",
+        datetime(2019, 2, 28, 21, 30, tzinfo=UTC),
+        date(2019, 2, 28),
+        date(2019, 3, 29),
+    ),
+    Accepted(
+        "15:00",
+        "CIK0001000002",
+        datetime(2019, 1, 31, 20, tzinfo=UTC),
+        date(2018, 12, 31),
+        date(2019, 1, 31),
+    ),
+    Accepted(
+        "16:00 = close",
+        "CIK0001000013",
+        datetime(2019, 1, 31, 21, tzinfo=UTC),
+        date(2018, 12, 31),
+        date(2019, 1, 31),
+    ),
+    Accepted(
+        "17:30",
+        "CIK0001000006",
+        datetime(2019, 1, 31, 22, 30, tzinfo=UTC),
+        date(2019, 1, 31),
+        date(2019, 2, 28),
+    ),
+    Accepted(
+        "total_assets later",
+        "CIK0001000016",
+        datetime(2020, 1, 15, 20, 30, tzinfo=UTC),
+        date(2019, 12, 31),
+        date(2020, 1, 31),
+    ),
+)
+
+
+#: One momentum case per cadence (`month_end` is T40b's walk unchanged, the others are
+#: `test_backtest_invariance.py`'s windows), then one per other family.
+CASES: dict[str, Case] = {
+    case.id: case
     for case in (
         Case("month_end", FIXTURE_START, FIXTURE_END, teeth=date(2019, 1, 31)),
         Case("week_end", date(2018, 10, 12), date(2019, 5, 3), teeth=date(2019, 2, 1)),
         Case("daily", date(2019, 1, 2), date(2019, 2, 15), teeth=date(2019, 1, 31)),
+        Case(
+            "month_end",
+            date(2018, 1, 2),
+            FIXTURE_END,
+            teeth=date(2019, 1, 31),
+            family="profitability",
+            accepted=ACCEPTED,
+        ),
     )
 }
-assert tuple(CASES) == get_args(Cadence), "one case per cadence"
+assert tuple(c.cadence for c in CASES.values() if c.family == "momentum") == get_args(Cadence)
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
@@ -138,9 +226,13 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
 
 
-def _frozen(cadence: Cadence) -> Settings:
+def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
+    extra = {"profitability": {"top_fraction": 0.5}} if family == "profitability" else {}
     return Settings(
-        _env_file=None, strategy={"top_fraction": 0.5}, schedule={"rebalance_cadence": cadence}
+        _env_file=None,
+        strategy={"top_fraction": 0.5},
+        schedule={"rebalance_cadence": cadence},
+        **extra,
     )
 
 
@@ -159,7 +251,7 @@ def _open_trial(
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-plan-timing",
-        family="momentum",
+        family=case.family,
         title="plan-read timing check",
         doc_path="docs/hypotheses/h-plan-timing.md",
         doc_sha256="0" * 64,
@@ -252,7 +344,9 @@ class Fixture:
         with StoreProvider(
             _factory(conn), self.handle, settings, registry_connect=_factory(self.conn)
         ) as provider:
-            return run(settings, provider, start, end, self.handle, COST_LEVELS)
+            return run(
+                settings, provider, start, end, self.handle, COST_LEVELS, family=self.case.family
+            )
 
     def planned(self, start: date, end: date, conn: duckdb.DuckDBPyConnection) -> Planned:
         """`window`, with every plan the run made (by session), recorded around whatever
@@ -260,8 +354,10 @@ class Fixture:
         plans: dict[date, engine.Plan] = {}
         planner = engine._plan
 
-        def recording(provider: DataProvider, params: Settings, session: date) -> engine.Plan:
-            plans[session] = planner(provider, params, session)
+        def recording(
+            provider: DataProvider, params: Settings, session: date, family: HypothesisFamily
+        ) -> engine.Plan:
+            plans[session] = planner(provider, params, session, family)
             return plans[session]
 
         engine._plan = recording
@@ -278,7 +374,7 @@ class Fixture:
 def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
     case: Case = request.param
     conn = _store()
-    settings = _frozen(case.cadence)
+    settings = _frozen(case.cadence, case.family)
     try:
         yield Fixture(
             case=case,
@@ -365,8 +461,10 @@ def test_every_plan_is_unchanged_on_a_store_cut_at_its_own_read(
 def _late(fixture: Fixture, read: Callable[..., engine._Plan]) -> Callable[..., engine._Plan]:
     """`read` at the next rebalance, its result relabelled as the plan at `session`."""
 
-    def plan(provider: DataProvider, params: Settings, session: date) -> engine._Plan:
-        late = read(provider, params, fixture.after(session))
+    def plan(
+        provider: DataProvider, params: Settings, session: date, family: HypothesisFamily
+    ) -> engine._Plan:
+        late = read(provider, params, fixture.after(session), family)
         fill = fill_session(session, fixture.case.cadence)
         return dataclasses.replace(late, session=session, fill_session=fill)
 
@@ -426,7 +524,9 @@ def _signal(
 def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
     """A copy of `engine._plan` whose signal frame alone is read at the next rebalance."""
 
-    def plan(provider: DataProvider, params: Settings, session: date) -> engine._Plan:
+    def plan(
+        provider: DataProvider, params: Settings, session: date, family: HypothesisFamily
+    ) -> engine._Plan:
         t, t_late = fixture.read_time(session), fixture.read_time(fixture.after(session))
         members = sorted(provider.universe(t).members["security_id"].to_list())
         strategy = params.strategy
@@ -450,6 +550,8 @@ def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
 def test_a_late_signal_read_fails_the_check_and_the_engine_passes_it(
     fixture: Fixture, baseline: dict[date, PlanView], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if fixture.case.family != "momentum":
+        pytest.skip("revises a momentum anchor bar; the profitability teeth are `Accepted`")
     t_k = fixture.case.teeth
     k = fixture.sessions.index(t_k)
     previous = fixture.sessions[k - 1]  # the window that plans T_k inside the loop
@@ -497,3 +599,24 @@ def test_a_late_signal_read_fails_the_check_and_the_engine_passes_it(
     finally:
         exempt.close()
         revised.close()
+
+
+def test_accepted_facts_first_reach_the_plan_at_the_first_close_after_acceptance(
+    fixture: Fixture,
+) -> None:
+    if not fixture.case.accepted:
+        pytest.skip("the family reads no statement facts")
+    for case in fixture.case.accepted:
+        assert fixture.after(case.before) == case.first, case.name
+        assert fixture.read_time(case.before) < case.known_at <= fixture.read_time(case.first)
+        without = _store()
+        try:
+            query = "DELETE FROM statement_facts WHERE cik = ? AND known_at = ?"
+            [(deleted,)] = without.execute(query, [case.cik, case.known_at]).fetchall()
+            assert deleted >= 1, case.name
+            for t_k, unchanged in ((case.before, True), (case.first, False)):
+                full = _plan_view(fixture.planned(t_k, fixture.after(t_k), fixture.conn), t_k)
+                cut = _plan_view(fixture.planned(t_k, fixture.after(t_k), without), t_k)
+                assert (full == cut) is unchanged, f"{case.name}: plan at {t_k}"
+        finally:
+            without.close()

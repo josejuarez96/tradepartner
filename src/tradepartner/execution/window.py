@@ -193,10 +193,10 @@ from dateutil.relativedelta import relativedelta
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
 from tradepartner.calendar import last_session_of_month, previous_session, session_close
 from tradepartner.config import (
-    ENGINE_FAMILIES,
     FROZEN_COSTS_KEYS,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
+    PAPER_FAMILIES,
     RiskConfig,
     Settings,
 )
@@ -587,11 +587,11 @@ def start(
     with run_lock(settings):
         with connect() as conn:
             hyp = registry.get_hypothesis(conn, slug)
-            if hyp.family not in ENGINE_FAMILIES:
+            if hyp.family not in PAPER_FAMILIES:
                 raise StartRefusedError(
                     "family_not_runnable",
-                    f"{slug!r} is in family {hyp.family!r}, which the engine cannot run "
-                    f"yet (engine families: {', '.join(ENGINE_FAMILIES)})",
+                    f"{slug!r} is in family {hyp.family!r}, which paper trading cannot run "
+                    f"yet (paper families: {', '.join(PAPER_FAMILIES)})",
                 )
             if not _gap_signoff_ok(conn, hyp.hypothesis_id):
                 raise StartRefusedError(

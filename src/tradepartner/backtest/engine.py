@@ -20,11 +20,11 @@ so a run to T_n is exactly the prefix of a longer run. The order holds at every
 cadence: at `daily`, F_i = T_{i+1}, so the fill at F_i is applied and the period valued
 before the plan at close(T_{i+1}) reads the drifted weights, on the same session.
 
-**The plan** (`_plan`) reads the universe, then the signal (`_signal`, the one call
-site of the momentum signal): the frozen `schedule.signal_anchor` and cadence decide
-the anchors (`signals.momentum`), and the signal frame is read from the formation
-anchor A_form on (`sessions_from`), which leaves every anchor bar and so every score as
-the unbounded read gives it. The marking read is unbounded.
+**The plan** (`_plan`) reads the universe, then the registered family's signal inputs.
+For momentum, the frozen `schedule.signal_anchor` and cadence decide the anchors;
+its price frame starts at formation anchor A_form (`sessions_from`). Profitability
+instead reads annual facts and SICs at the same rebalance close. The marking read is
+unbounded for either family.
 
 **Exits** (req 5), decided from step i's read after the fill, on the names still held:
 
@@ -68,7 +68,7 @@ from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.portfolio import target_weights
 from tradepartner.backtest.provider import DataProvider, GapReading
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
-from tradepartner.backtest.signals import MomentumSignal, anchor_sessions, momentum
+from tradepartner.backtest.strategies import signal_for
 from tradepartner.backtest.valuation import (
     StepFrame,
     carry_to_fill,
@@ -76,7 +76,7 @@ from tradepartner.backtest.valuation import (
     value_positions,
 )
 from tradepartner.calendar import all_sessions, previous_session
-from tradepartner.config import Settings
+from tradepartner.config import HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 
@@ -109,8 +109,8 @@ class Plan:
     """What the read at close(T_i) decides, identical for every cost level (public for
     Phase 4's tracking runs, which plan with the engine's own function, plan T53).
 
-    `members` (the universe, sorted), `scores` (the momentum signal) and
-    `excluded_no_history` (members without both anchor bars) are the reads behind the
+    `members` (the universe, sorted), `scores` and
+    `excluded_no_history` (momentum members without both anchor bars) are the reads behind the
     targets, kept for Phase 4's `decisions_from` (plan T53b); the loop does not read
     them."""
 
@@ -124,6 +124,7 @@ class Plan:
     members: tuple[str, ...]
     scores: dict[str, float]
     excluded_no_history: tuple[str, ...]
+    counts: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -178,53 +179,33 @@ def _sessions(first: date, last: date) -> list[date]:
     return list(sessions[bisect.bisect_left(sessions, first) : bisect.bisect_right(sessions, last)])
 
 
-def _signal(
-    provider: DataProvider, params: Settings, session: date, members: Sequence[str]
-) -> MomentumSignal:
-    """The momentum signal at rebalance session `session` over `members`, read at
-    close(`session`) from the frozen `strategy` and `schedule` keys (module docstring).
-
-    The signal frame starts at the formation anchor A_form: every bar the score reads
-    (A_form, A_skip, both <= `session`) is in it, so it scores exactly as the unbounded
-    frame does."""
-    strategy, schedule = params.strategy, params.schedule
-    anchor, cadence = schedule.signal_anchor, schedule.rebalance_cadence
-    a_form, _ = anchor_sessions(session, strategy.formation_months, strategy.skip_months, anchor)
-    frame = provider.adjusted_prices(
-        read_time(session, cadence),
-        members,
-        strategy.signal_total_return,
-        sessions_from=a_form,
-    )
-    return momentum(
-        frame,
-        session,
-        strategy.formation_months,
-        strategy.skip_months,
-        anchor,
-        cadence,
-        security_ids=members,
-    )
-
-
-def _plan(provider: DataProvider, params: Settings, session: date) -> Plan:
+def _plan(
+    provider: DataProvider,
+    params: Settings,
+    session: date,
+    family: HypothesisFamily,
+) -> Plan:
+    strategy = signal_for(family)
     cadence = params.schedule.rebalance_cadence
     t = read_time(session, cadence)
     universe = provider.universe(t)
     members = sorted(universe.members["security_id"].to_list())
-    strategy = params.strategy
-    signal = _signal(provider, params, session, members)
+    signal = strategy.signal(
+        strategy.reader(provider, params, session, t, members), params, session, t, members
+    )
+    construction = getattr(params, strategy.section)
     return Plan(
         session=session,
         fill_session=fill_session(session, cadence),
-        targets=target_weights(signal.scores, strategy.top_fraction, strategy.weighting),
+        targets=target_weights(signal.scores, construction.top_fraction, construction.weighting),
         n_universe=len(members),
         n_static_listings=provider.static_listing_count(t, members),
-        n_excluded_no_history=signal.n_excluded,
+        n_excluded_no_history=signal.counts.get("n_excluded_no_history", 0),
         gap=provider.survivorship_gap(t),
         members=tuple(members),
         scores=signal.scores,
-        excluded_no_history=signal.excluded,
+        excluded_no_history=signal.exclusions.get("no_history", ()),
+        counts=signal.counts,
     )
 
 
@@ -233,12 +214,17 @@ def _plan(provider: DataProvider, params: Settings, session: date) -> Plan:
 _Plan = Plan
 
 
-def plan(provider: DataProvider, params: Settings, session: date) -> Plan:
+def plan(
+    provider: DataProvider,
+    params: Settings,
+    session: date,
+    family: HypothesisFamily,
+) -> Plan:
     """The plan at rebalance session `session` (a rebalance session at the frozen
-    `schedule.rebalance_cadence`), read at close(`session`): universe, momentum signal,
+    `schedule.rebalance_cadence`), read at close(`session`): universe, family signal,
     targets and the gap, from `params` (the frozen hypothesis parameters). The backtest
     loop calls exactly this function (`_plan`) at every rebalance it plans."""
-    return _plan(provider, params, session)
+    return _plan(provider, params, session, family)
 
 
 def _no_benchmark_members(plan: Plan, benchmarks: Mapping[str, str]) -> Plan:
@@ -482,9 +468,17 @@ def _step(
             n_missing_fill=len(fill.missing),
             n_delisting_exits=sum(not e.stale for e in exits),
             n_stale_exits=sum(e.stale for e in exits),
-            n_excluded_no_history=plan.n_excluded_no_history,
+            n_excluded_no_history=plan.counts.get(
+                "n_excluded_no_history", plan.n_excluded_no_history
+            ),
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
+            n_ranked=plan.counts.get("n_ranked"),
+            n_excluded_no_facts=plan.counts.get("n_excluded_no_facts"),
+            n_excluded_stale_facts=plan.counts.get("n_excluded_stale_facts"),
+            n_excluded_sector=plan.counts.get("n_excluded_sector"),
+            n_excluded_malformed=plan.counts.get("n_excluded_malformed"),
+            n_derived=plan.counts.get("n_derived"),
         )
     )
 
@@ -502,6 +496,8 @@ def run(
     end: date,
     handle: TrialHandle,
     cost_levels: Sequence[float],
+    *,
+    family: HypothesisFamily,
 ) -> dict[float, BacktestResult]:
     """Run the strategy over the rebalance sessions in `[start, end]` at the frozen
     `schedule.rebalance_cadence`, at every cost level in `cost_levels` (per-side bps;
@@ -513,6 +509,7 @@ def run(
     rebalance sessions, a bad cost level or a non-zero `backtest.cash_rate` (interest on
     cash is not implemented), all before any provider call.
     """
+    signal_for(family)
     if not isinstance(handle, TrialHandle):
         raise TypeError(f"a run needs a TrialHandle from registry.open_trial, got {handle!r}")
     levels = _check_levels(cost_levels)
@@ -524,7 +521,7 @@ def run(
         raise ValueError(f"need at least two rebalance sessions in [{start}, {end}]")
 
     capital = params.backtest.initial_capital
-    plan = _plan(provider, params, sessions[0])
+    plan = _plan(provider, params, sessions[0], family)
     benchmarks = dict(
         sorted(
             provider.benchmark_ids(read_time(sessions[0], cadence), through=sessions[-1]).items()
@@ -556,7 +553,7 @@ def run(
         ever_held = sorted({sid for book in books for sid in book.held_on})
         late = provider.late_dividends(t_prev, t, ever_held)
         next_plan = (
-            _no_benchmark_members(_plan(provider, params, step_end), benchmarks)
+            _no_benchmark_members(_plan(provider, params, step_end, family), benchmarks)
             if index < len(sessions) - 1
             else None
         )
