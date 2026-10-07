@@ -383,8 +383,10 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
     git-tracked `*.py` files under `src/tradepartner/` plus `uv.lock` of the checkout
     holding `repo_dir` (default: this module's own), each as its path and the SHA-256
     of its working-tree bytes, in path order. A docs or test change, or an untracked
-    `__pycache__` file, leaves it unchanged; any source change under the package,
-    committed or not, or a dependency bump changes it. None outside a checkout."""
+    `__pycache__` file, leaves it unchanged; any change to a tracked source file under
+    the package, committed or not, or a dependency bump changes it. An untracked `.py`
+    file is outside the hash (the spec's git-tracked set); `code_dirty` flags it. None
+    outside a checkout."""
     cwd = repo_dir if repo_dir is not None else Path(__file__).resolve().parent
     try:
         root = Path(_git(cwd, "rev-parse", "--show-toplevel").strip())
