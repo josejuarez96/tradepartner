@@ -474,9 +474,15 @@ def window_journal_inputs(
     conn: duckdb.DuckDBPyConnection,
     window_id: int,
 ) -> WindowJournalInputs:
-    """The window's journal inputs for derived state, read the way the tracking
-    run reads them: every row the store holds, no `as_of` cut. Used by tests
-    and derived-state callers to mirror production reads."""
+    """The window's journal inputs for derived state (step 4, step 7b's
+    `decision_state`/`rebalance_state`, `_locked_run`'s `switch.derive`,
+    `_skipped`'s `switch.derive`), read the way the tracking run reads them:
+    every row the store holds for this window, no `as_of` cut.
+
+    `_exit_book` (step 7's forced-exit reads) is NOT included: it reads
+    `orders`, `order_events` and `fills` with `window_id=None` (across all
+    windows), so it cannot use this single-window loader."""
+    runs_with = runs_for(conn, window_id)
     return WindowJournalInputs(
         decisions=decisions_for(conn, window_id),
         orders=orders_for(conn, window_id=window_id),
@@ -484,8 +490,8 @@ def window_journal_inputs(
         fills=fills_for(conn, window_id=window_id),
         adjustments=adjustments_for(conn, window_id),
         rebalance_events=rebalance_events_for(conn, window_id),
-        runs=[r.run for r in runs_for(conn, window_id)],
-        results=[r.result for r in runs_for(conn, window_id) if r.result is not None],
+        runs=[r.run for r in runs_with],
+        results=[r.result for r in runs_with if r.result is not None],
         positions_daily=positions_daily_for(conn, window_id),
         kill_switch_events=kill_switch_events_for(conn, window_id),
     )
@@ -950,20 +956,19 @@ def _locked_run(
         raise SystemExit(WRITE_FAILED_EXIT_CODE)
 
     with open_read_only(settings) as conn:
-        runs = runs_for(conn, window_id)
-        rows = kill_switch_events_for(conn, window_id)
-        events = rebalance_events_for(conn, window_id)
+        inputs = window_journal_inputs(conn, window_id)
         stops = window_stops_for(conn, window_id)
-    run_rows = [r.run for r in runs]
+        earlier_runs = runs_for(conn, window_id)
+    run_rows = inputs.runs
     state = switch.derive(
         window,
-        rows,
+        inputs.kill_switch_events,
         run_rows,
-        [r.result for r in runs if r.result is not None],
+        inputs.results,
         reading_run=None,
         lock_free=True,
     )
-    due = _rebalance_kind(window, run_rows, events, day)
+    due = _rebalance_kind(window, run_rows, inputs.rebalance_events, day)
     kind = _STOP if any(s.state == _REQUESTED for s in stops) else (due or _MARK)
 
     stamp = gate.read_clock()
@@ -981,7 +986,7 @@ def _locked_run(
         )
         run_id = append(conn, row)
         assert run_id is not None
-        for earlier in runs:
+        for earlier in earlier_runs:
             if earlier.result is None and earlier.run.run_id is not None:
                 append(
                     conn,
@@ -1098,13 +1103,12 @@ class _Run:
         `switch.derive`'s own `engaged_row`, so the alert and the derivation
         share one definition of "latest" (#699)."""
         with open_read_only(self.settings) as conn:
-            rows = kill_switch_events_for(conn, self.window_id)
-            runs = runs_for(conn, self.window_id)
+            inputs = window_journal_inputs(conn, self.window_id)
         state = switch.derive(
             self.window,
-            rows,
-            [r.run for r in runs],
-            [r.result for r in runs if r.result is not None],
+            inputs.kill_switch_events,
+            inputs.runs,
+            inputs.results,
             reading_run=self.run_id,
             lock_free=True,
         )
@@ -1416,20 +1420,15 @@ class _Run:
         if fill_session(self.window.first_rebalance_session) > self.session:
             return []
         with open_read_only(self.settings) as conn:
-            run_rows = [r.run for r in runs_for(conn, self.window_id)]
-            events = rebalance_events_for(conn, self.window_id)
-            decisions = decisions_for(conn, self.window_id)
-            orders = orders_for(conn, window_id=self.window_id)
-            order_events = order_events_for(conn, window_id=self.window_id)
-            fills = fills_for(conn, window_id=self.window_id)
-        settled = {e.rebalance_session for e in events}
+            inputs = window_journal_inputs(conn, self.window_id)
+        settled = {e.rebalance_session for e in inputs.rebalance_events}
         executed: list[date] = []
         for t_i in rebalance_sessions(self.window.first_rebalance_session, self.session):
             if fill_session(t_i) > self.session or t_i in settled:
                 continue
             mine = [
                 d
-                for d in decisions
+                for d in inputs.decisions
                 if d.decision.rebalance_session == t_i and d.decision.decision != _FORCED_EXIT
             ]
             if not mine:
@@ -1440,9 +1439,9 @@ class _Run:
                     decision_state(
                         d.decision,
                         list(d.events),
-                        orders,
-                        order_events,
-                        fills,
+                        inputs.orders,
+                        inputs.order_events,
+                        inputs.fills,
                         actions,
                         prices.__getitem__,
                         self.frozen,
@@ -1452,7 +1451,7 @@ class _Run:
                 for d in mine
             ]
             verdict = rebalance_state(
-                t_i, self.window, run_rows, events, states, session=self.session
+                t_i, self.window, inputs.runs, inputs.rebalance_events, states, session=self.session
             )
             if verdict is RebalanceState.EXECUTED:
                 executed.append(t_i)

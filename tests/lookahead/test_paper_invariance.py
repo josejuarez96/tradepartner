@@ -30,12 +30,12 @@ two must be equal:
 - the journal-derived state: `plan.decision_state`, `plan.remainder`, `plan.residue`,
   `plan.rebalance_state` and `switch.derive`. These are pure over the rows they are
   given; per the owner's decision on #488 they are invariant because their journal
-  input is cut at `as_of` (`known_at <= as_of`) where it is loaded. No run loader
-  exists yet (T63), so `_derived` loads through `store.journal`'s readers and applies
-  that cut itself; on the cut store it applies none, so the check is that the `as_of`
-  rule and the harness's truncation give the same state. Until #507 routes it through
-  T63's loaders, that equality holds by construction; its liveness half is the
-  evidence that the loaders must cut;
+  input is cut at `as_of` (`known_at <= as_of`) where it is loaded. The run's
+  loader `window_journal_inputs` (step 4, step 7b, `_locked_run`, `_skipped`) reads
+  every row the window holds with no `as_of`; `_derived` uses it on the cut store
+  (`as_of is None`), and `_known` at `as_of=CUT` on the full store. The check
+  compares production reads on a truncated store against the rule; its liveness
+  half is the evidence that the loader must not drop, add or rescope rows.
 - a `stop` run's own two pure pieces, `outcomes.due_outcomes` and `exits.stop_exits`,
   given this window by hand as if S were a stop requested at T_PREV (`#598`: this
   window's own run on S is a rebalance, so no `stop` run of its own has read them).
@@ -673,11 +673,18 @@ class Derived:
 
 
 def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime | None) -> Derived:
-    """Every derived state of the window on S from `conn`'s journal, cut at `as_of`
-    where loaded (None: no cut, every row `conn` holds). Store facts are read at
-    close(S-1) either way. #507: on the cut store, decisions, events, orders,
-    order events and fills are read through `window_journal_inputs` (the run's
-    own load path, no `as_of`) instead of `_known`."""
+    """Every derived state of the window on S from `conn`'s journal.
+
+    On the cut store (`as_of is None`): loads all eleven journal inputs through
+    `window_journal_inputs` (the run's load path for step 4, step 7b's
+    `decision_state`/`rebalance_state`, `_locked_run` and `_skipped`'s
+    `switch.derive`; `_exit_book` is excluded as it reads cross-window).
+
+    On the full store (`as_of=CUT`): loads through `store.journal` readers and
+    applies the `_known` cut at close(S-1).
+
+    Store facts (actions, prices) are read at close(S-1) either way.
+    """
     window_id = fixture.window_id
     if as_of is None:
         inputs = window_journal_inputs(conn, window_id)
@@ -700,9 +707,7 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
         orders = _known(journal.orders_for(conn, window_id=window_id), as_of)
         order_events = _known(journal.order_events_for(conn, window_id=window_id), as_of)
         fills = [
-            f
-            for f in journal.fills_for(conn, window_id=window_id)
-            if as_of is None or f.fill.known_at <= as_of
+            f for f in journal.fills_for(conn, window_id=window_id) if f.fill.known_at <= as_of
         ]
         runs_with = journal.runs_for(conn, window_id)
         runs = _known([r.run for r in runs_with], as_of)
@@ -1130,3 +1135,27 @@ def test_a_cut_at_the_settle_gates_reading_does_not_see_its_rows(
             assert seen(store.at(result.known_at)) == (1, 1, [])
         finally:
             store.close()
+
+
+# --- wiring test -------------------------------------------------------------------
+
+
+def test_window_journal_inputs_callable(fixture: Fixture) -> None:
+    """`window_journal_inputs` is callable and returns all eleven inputs for the
+    fixture window."""
+    from tradepartner.execution.run import window_journal_inputs
+
+    inputs = window_journal_inputs(fixture.full, fixture.window_id)
+    assert isinstance(inputs.decisions, list)
+    assert isinstance(inputs.orders, list)
+    assert isinstance(inputs.order_events, list)
+    assert isinstance(inputs.fills, list)
+    assert isinstance(inputs.adjustments, list)
+    assert isinstance(inputs.rebalance_events, list)
+    assert isinstance(inputs.runs, list)
+    assert isinstance(inputs.results, list)
+    assert isinstance(inputs.positions_daily, list)
+    assert isinstance(inputs.kill_switch_events, list)
+    # The fixture has journal data, so at least some lists are non-empty
+    assert len(inputs.decisions) > 0
+    assert len(inputs.runs) > 0
