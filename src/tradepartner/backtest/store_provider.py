@@ -50,6 +50,13 @@ not through the point-in-time listing gate, and refusing a missing,
 ambiguous or reused symbol by name. The bars stay point-in-time: they are
 read like any others, through `adjusted_prices` and `raw_prices` at `t`.
 
+`statement_facts(t, ids)` is `store.asof.statement_facts_as_of` kept to
+`STATEMENT_FACT_NAMES` (the `profitability` family's two names), and
+`sics(t, ids)` is `store.classify.classifications_as_of`'s `sic` per id
+(`None` for an id with no row known at `t`, or no SIC). Both read through
+the step's connection like every other method (backtest spec amendment
+#720, plan T85c).
+
 A security's **current listing** is the one with the latest `valid_from` on
 or before `t`'s session; between two rows with the same `valid_from` the
 first in `listings_as_of` order wins, the same rule `universe_as_of` uses,
@@ -69,7 +76,7 @@ import duckdb
 import polars as pl
 
 from tradepartner import gap as gap_module
-from tradepartner.backtest.provider import GapReading, check_t
+from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, GapReading, check_t
 from tradepartner.calendar import last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
@@ -79,8 +86,10 @@ from tradepartner.store.asof import (
     dropped_dividends_as_of,
     listings_as_of,
     prices_as_of,
+    statement_facts_as_of,
 )
 from tradepartner.store.benchmarks import benchmark_security_ids
+from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.universe import Universe, universe_as_of
@@ -246,6 +255,17 @@ class StoreProvider:
         t, wanted = check_t(t), _ids(ids)
         current = self._current_listings(self._at(t), t, wanted)
         return sum(1 for row in current.values() if row["provenance"] == "snapshot_static")
+
+    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t, wanted = check_t(t), _ids(ids)
+        frame = statement_facts_as_of(self._at(t), t, wanted)
+        return frame.filter(pl.col("fact_name").is_in(STATEMENT_FACT_NAMES))
+
+    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
+        t, wanted = check_t(t), _ids(ids)
+        rows = classifications_as_of(self._at(t), t, wanted)
+        known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
+        return {sid: known.get(sid) for sid in wanted}
 
     # --- helpers --------------------------------------------------------------------
 
