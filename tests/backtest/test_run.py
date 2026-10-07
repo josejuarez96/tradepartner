@@ -14,7 +14,6 @@ used here, so the frozen threshold 0.05 refuses it.
 from __future__ import annotations
 
 import json
-import shutil
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -944,10 +943,22 @@ def test_on_a_plain_fixture_store_decide_gets_no_lab_state(
 
 
 def _unmarked_copy(source: Path, target: Path) -> Path:
-    shutil.copy(source, target)
-    with duckdb.connect(str(target)) as conn:
-        conn.execute("DELETE FROM store_markers WHERE kind = 'fixture'")
-        assert not lab_schema.has_fixture_marker(conn)
+    """`source`'s rows in every schema table, but no `store_markers` table: what a
+    copy of the real store looks like. (Built by copying rows, not by deleting the
+    marker, since only `lab_schema` may write `store_markers`.)"""
+    conn = duckdb.connect(str(target))
+    configure_connection(conn)
+    schema.init_schema(conn)
+    conn.execute(f"ATTACH '{source}' AS src (READ_ONLY)")
+    tables = conn.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE database_name = 'src' "
+        "AND table_name <> 'store_markers'"
+    ).fetchall()
+    for (table,) in tables:
+        conn.execute(f"INSERT INTO main.{table} SELECT * FROM src.main.{table}")
+    conn.execute("DETACH src")
+    assert not lab_schema.has_fixture_marker(conn)
+    conn.close()
     return target
 
 
