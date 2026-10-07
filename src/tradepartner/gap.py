@@ -75,7 +75,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.asof import _security_filter, _validate_t
-from tradepartner.store.classify import classifications_as_of
+from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
@@ -233,10 +233,17 @@ def survivorship_gap(
     securities = securities_as_of(conn, t).iter_rows(named=True)
     candidates = {r["security_id"] for r in securities if not r["benchmark"]}
     types = settings.universe.security_types
-    common = {
-        r["security_id"]
+    kinds = {
+        r["security_id"]: r["security_type"]
         for r in classifications_as_of(conn, t).iter_rows(named=True)
-        if r["security_type"] in types
+    }
+    common = {sid for sid, kind in kinds.items() if kind in types}
+    # The names L or the `unclassifiable` side category can count: the stale rule
+    # applies to all of them, so a stale name is in no side category either.
+    counted = {
+        sid
+        for sid in candidates
+        if sid in common or kinds.get(sid, UNCLASSIFIABLE) == UNCLASSIFIABLE
     }
     exchanges = settings.universe.exchanges
     by_security: dict[str, list[dict[str, Any]]] = {}
@@ -248,14 +255,14 @@ def survivorship_gap(
             continue
         by_security.setdefault(sid, []).append(listing)
 
-    bars = _last_bars(conn, t, session, sorted(by_security.keys() & common))
+    bars = _last_bars(conn, t, session, sorted(by_security.keys() & counted))
     dark_limit = settings.gap.stale_listing_sessions
     active: set[str] = set()
     current: dict[str, dict[str, Any]] = {}
     stale: list[dict[str, Any]] = []
     for sid, listings in by_security.items():
         latest = max(listings, key=lambda listing: listing["valid_from"])
-        last_bar = bars[sid][0] if sid in bars else None  # only `common` ids have bars
+        last_bar = bars[sid][0] if sid in bars else None  # only `counted` ids have bars
         if last_bar is not None and last_bar < low and _live(latest, session):
             dark = _sessions_after(last_bar, session)
             if dark > dark_limit:

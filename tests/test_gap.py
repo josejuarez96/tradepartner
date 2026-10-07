@@ -588,3 +588,35 @@ def test_a_bar_known_after_t_does_not_make_a_stale_name_live(
     gap = survivorship_gap(dark, T_JUNE, settings)
     assert _stale(gap) == {"S": (_S_LAST, _S_DARK)}
     assert "S" not in gap.listed
+
+
+def test_an_older_open_ended_row_does_not_keep_a_stale_security(
+    dark: duckdb.DuckDBPyConnection,
+) -> None:
+    # A ticker change leaves S's first row `listed` and open-ended beside the new one.
+    insert_row(
+        dark,
+        "listings",
+        {
+            "security_id": "S",
+            "ticker": "S2",
+            "exchange": "NYSE",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 2, 1),
+        }
+        | _filing(datetime(2019, 2, 1, 20, 30, tzinfo=UTC)),
+    )
+    gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=_S_DARK - 1))
+    assert _stale(gap) == {"S": (_S_LAST, _S_DARK)}
+    assert "S" not in gap.listed
+
+
+def test_a_stale_unclassifiable_name_leaves_its_side_category(
+    dark: duckdb.DuckDBPyConnection,
+) -> None:
+    _as_store(dark).security("U", security_type="unclassifiable", bars=(date(2019, 1, 2), _S_LAST))
+    live = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=_S_DARK))
+    assert "U" in live.unclassifiable and "U" not in _stale(live)
+    stale = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=_S_DARK - 1))
+    assert "U" not in stale.unclassifiable
+    assert _stale(stale)["U"] == (_S_LAST, _S_DARK)
