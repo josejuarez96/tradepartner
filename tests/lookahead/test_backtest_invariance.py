@@ -44,9 +44,10 @@ SEC_DIV_REVISED's dividend) are on names the strategy never holds. So the store 
 test runs on (`_store`) adds, at the case's seeded sessions (`Case.seeded`) and for each
 of `SEEDED_IDS` (every name the run holds in 2018-2019), a bar revision at T_k, a
 dividend first seen before its ex-date and restated after close(T_k), and a dividend
-first seen only after close(T_k) (late), all known an hour after close(T_k); a seeded
-dividend never lands on a fixture action's ex-date (`_store`, #1099) or on another
-seeded one's (at `daily`, so only every third rebalance is seeded). The
+first seen only after close(T_k) (late), all known an hour after close(T_k). A seeded
+dividend may land on a fixture split's ex-date (the adjusted read sums one ex-date's
+factors in a fixed order, #1099), but never on another seeded one's (at `daily`, so only
+every third rebalance is seeded). The
 truncation walk then crosses revision-type facts (a row dated at or before T but known
 after it) on held names, which `test_the_run_is_not_vacuous` checks.
 

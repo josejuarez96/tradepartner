@@ -185,11 +185,25 @@ def test_an_implausible_dividend_does_not_hide_a_real_jump(
     assert after["session"].to_list() == [JUMP, BACK]
     cut = TruncatedStore(fixture_store)
     try:
-        assert before.equals(
-            price_jumps_as_of(cut.at(BACK_KNOWN), BACK_KNOWN, [SID], settings=_settings())
-        )
+        for t, full in ((BACK_KNOWN, before), (T_LATE, after)):
+            assert full.equals(price_jumps_as_of(cut.at(t), t, [SID], settings=_settings())), t
     finally:
         cut.close()
+
+
+def test_a_negative_dividend_on_a_jump_candidate_raises(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Fail loud (#1119): a jump candidate's invalid action stops the jump check,
+    # universe rule 6 and health, naming the security, from when it is known.
+    _revise(fixture_store, close_times=3.0)
+    known = datetime(2019, 4, 1, 21, tzinfo=UTC)
+    _action(fixture_store, "dividend", BACK, -0.5, known)
+    assert price_jumps_as_of(fixture_store, BACK_KNOWN, [SID], settings=_settings()).height == 2
+    with pytest.raises(ValueError, match=SID):
+        price_jumps_as_of(fixture_store, T_LATE, [SID], settings=_settings())
+    with pytest.raises(ValueError, match=SID):
+        universe_as_of(fixture_store, T_LATE, _settings())
 
 
 def test_an_implausible_dividend_does_not_create_a_false_jump(

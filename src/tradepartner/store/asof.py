@@ -197,10 +197,14 @@ series (for the negative-dividend case) reach the caller.
 
 **Why this runs as one SQL statement, not a Python loop per bar.** Every
 step -- the latest-revision-as-of-`t` filter for both `prices_daily` and
-`corporate_actions`, each event's own factor, the **cumulative** factor per
-security (a running product of an event's factor and every later event's,
-expressed as `EXP(SUM(LN(factor)) OVER (PARTITION BY security_id ORDER BY
-ex_date DESC))` so it is a plain window aggregate, not a recursive query),
+`corporate_actions`, each event's own factor, one log factor per
+`(security_id, ex_date)` (the events sharing an ex-date summed as
+`SUM(LN(factor) ORDER BY action_type, ratio_or_amount)`, so a split and a
+dividend on one day sum in a fixed order whatever the scan order, #1099),
+the **cumulative** factor per security (a running product of an ex-date's
+factor and every later ex-date's, expressed as `EXP(SUM(log_factor) OVER
+(PARTITION BY security_id ORDER BY ex_date DESC))` so it is a plain window
+aggregate, not a recursive query),
 and attaching that cumulative factor to each bar -- happens inside one
 query (plus the small validation query above, which shares the same CTEs).
 Attaching uses DuckDB's `ASOF LEFT JOIN` (the same range-join operator used
@@ -442,9 +446,18 @@ def price_jumps_as_of(
     `(prev_session, session]` explain it: `(close + dividends) * split
     ratios / prev_close` is back inside the bounds. A dividend reported as
     `implausible_amount` by `dropped_dividends_as_of` does not explain a
-    jump. `accepted` is true when
+    jump; that bound is judged against the dividend's as-of prior close
+    (the latest bar before the ex-date, traded or not), while the jump
+    check uses the previous traded close. `accepted` is true when
     `universe.accepted_price_jumps` names `<security_id>@<session>`.
     `settings` defaults to `get_settings()`.
+
+    Raises `ValueError` naming the security when a jump candidate carries
+    an action `adjusted_prices_as_of` refuses (a negative dividend amount,
+    a non-positive or non-finite factor; `dropped_dividends_as_of`'s
+    validation). Fail loud on purpose: bad action data stops
+    `universe_as_of` (rule 6) and `health` rather than being read as an
+    explanation, or not, of a jump. Only candidates' actions are checked.
 
     Only rows known at `t` are read, so the list at `t` never depends on a
     later bar or a later-known action: a split first known after `t` leaves
