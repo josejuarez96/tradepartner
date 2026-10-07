@@ -238,6 +238,11 @@ def test_last_completed_session_half_day_close_boundary() -> None:
     assert tp_calendar.last_completed_session(at_close) == date(2025, 11, 28)
 
 
+def test_last_completed_session_at_configured_last_close() -> None:
+    last = tp_calendar.all_sessions()[-1]
+    assert tp_calendar.last_completed_session(tp_calendar.session_close(last)) == last
+
+
 def test_last_completed_session_requires_tz_aware() -> None:
     with pytest.raises(ValueError, match="tz-aware"):
         tp_calendar.last_completed_session(datetime(2025, 7, 7, 15, 0))  # noqa: DTZ001
@@ -416,6 +421,16 @@ def test_rebalance_sessions_between_partial_periods_and_bad_windows() -> None:
         tp_calendar.rebalance_sessions_between(
             datetime(2024, 1, 1, tzinfo=UTC), date(2024, 2, 1), "daily"
         )
+
+
+@pytest.mark.parametrize("cadence", ["month_end", "week_end"])
+def test_rebalance_sessions_between_does_not_treat_calendar_end_as_period_end(
+    monkeypatch: pytest.MonkeyPatch, cadence: str
+) -> None:
+    monkeypatch.setenv("CALENDAR__END", "2035-12-20")
+    last = tp_calendar.all_sessions()[-1]
+    assert last == date(2035, 12, 20)
+    assert last not in tp_calendar.rebalance_sessions_between(date(2035, 12, 1), last, cadence)
 
 
 @pytest.mark.parametrize("cadence", ["month_end", "week_end", "daily"])

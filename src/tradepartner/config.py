@@ -117,7 +117,13 @@ def _default_research_data_dir() -> str:
     return str(Path(__file__).resolve().parents[2] / "data" / "research")
 
 
-class CalendarConfig(BaseModel):
+class _ClosedConfig(BaseModel):
+    """Shared validation for early configuration sections."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+
+class CalendarConfig(_ClosedConfig):
     """XNYS calendar bounds.
 
     Pinned explicitly rather than left to `exchange_calendars`' default
@@ -130,7 +136,7 @@ class CalendarConfig(BaseModel):
     end: date = date(2035, 12, 31)
 
 
-class StoreConfig(BaseModel):
+class StoreConfig(_ClosedConfig):
     """Point-in-time DuckDB store location and single-writer locking.
 
     `lock_retry_initial_delay_seconds`/`.lock_retry_max_delay_seconds` are
@@ -166,7 +172,7 @@ class StoreConfig(BaseModel):
         return self
 
 
-class IngestConfig(BaseModel):
+class IngestConfig(_ClosedConfig):
     """Daily ingest staleness and reference-symbol settings."""
 
     settle_delay_minutes: int = 60
@@ -247,7 +253,9 @@ class EdgarConfig(BaseModel):
     index_first_year: int = Field(default=1993, ge=1993)
     index_settle_days: int = Field(default=3, ge=0)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
-    cover_page_forms: list[str] = Field(default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"])
+    cover_page_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"], min_length=1
+    )
     # T11g (#216, #231): the oldest year of the SEC Financial Statement and Notes
     # data sets to fetch. `2009` is FSN's own start; the default `2015` is
     # one year before the 2016 price start, so the latest SIC before any
@@ -257,8 +265,9 @@ class EdgarConfig(BaseModel):
     # the first run (no FSN_VERSION bump later). 8-K is included so a de-SPAC's
     # new SIC arrives with its 8-K. `header_first_year` None means
     # `fsn_first_year`, so an override of one follows the other.
-    header_forms: list[str] = Field(
-        default_factory=lambda: ["S-1", "F-1", "10-12B", "8-K", "10-K", "10-Q", "20-F", "40-F"]
+    header_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: ["S-1", "F-1", "10-12B", "8-K", "10-K", "10-Q", "20-F", "40-F"],
+        min_length=1,
     )
     header_first_year: int | None = Field(default=None, ge=1993)
     # T11h: the failure policy (a filing that fails the same way on every
@@ -318,7 +327,7 @@ class EdgarConfig(BaseModel):
         return self.fsn_first_year if self.header_first_year is None else self.header_first_year
 
 
-class MasterConfig(BaseModel):
+class MasterConfig(_ClosedConfig):
     """Security-master construction rules."""
 
     transfer_window_sessions: int = 5
@@ -490,7 +499,7 @@ class AlpacaConfig(BaseModel):
         return value
 
 
-class ExecutionConfig(BaseModel):
+class ExecutionConfig(_ClosedConfig):
     """Backtest/paper fill assumptions.
 
     `fill_price` stays `close` (T3): Alpaca's daily open is the first valid trade, not the
@@ -530,7 +539,7 @@ def parse_accepted_same_day_pair(entry: str) -> tuple[str, date]:
     return _parse_id_at_day(entry, "accepted same-day pair")
 
 
-class UniverseConfig(BaseModel):
+class UniverseConfig(_ClosedConfig):
     """ADR 0006 universe-construction thresholds, rules 1-8, in order."""
 
     security_types: list[str] = Field(default_factory=lambda: ["common"])
@@ -602,7 +611,7 @@ class UniverseConfig(BaseModel):
         return value
 
 
-class AdjustConfig(BaseModel):
+class AdjustConfig(_ClosedConfig):
     """Price-adjustment rules for `store.asof.adjusted_prices_as_of`.
 
     `max_prior_close_gap_sessions` is not in the spec's "Config keys" list;
@@ -629,7 +638,7 @@ class AdjustConfig(BaseModel):
     max_dividend_to_prior_close: float = Field(default=1.0, gt=0, le=1.0)
 
 
-class GapConfig(BaseModel):
+class GapConfig(_ClosedConfig):
     """Survivorship-gap reporting thresholds."""
 
     missing_tail_sessions: int = 5
