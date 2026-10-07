@@ -35,9 +35,11 @@ ticker), the row takes the first item's title.
 
 **Relistings** (#820, spec req 4). A Form 25 (`source.delistings()`, any
 of `DELISTING_FORMS`) is matched to a class known before it, as
-`store.delistings` resolves it: the one class listed on its exchange whose
-title matches up to the first comma, else, for a plain common-equity
-title, the one plain-common class on that exchange. The next cover page
+`store.delistings` resolves it (`_form25_classes`): the one class listed
+on its exchange whose title matches up to the first comma, else, for a
+plain common-equity title, the one plain-common class on that exchange; a
+title naming several classes ("Common stock and warrants", #1163) is
+matched through the common classes it names. The next cover page
 accepted after it that lists that class on that exchange opens a new row
 even for an unchanged pair (a holding-company reorganisation, a change of
 domicile, an LP or REIT conversion: CMPR, CG, WELL, FCFS, KIM), with
@@ -125,7 +127,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -329,18 +331,93 @@ def _is_plain_common(title: str) -> bool:
     return _is_common(title) and not any(word in norm for word in _NOT_COMMON_WORDS)
 
 
-def _delisted_class(classes: Sequence[_Class], filing: DelistingFiling) -> _Class | None:
-    """The live class `filing` delists, resolved like `store.delistings`
-    but only among classes already listed, or `None` if not certain."""
+#: Separators between the classes one Form 25 title names (#1163): "Common
+#: stock and warrants", "Class A Common Stock; Units, each consisting of ...".
+_TITLE_PARTS = re.compile(r"[;,]|\s+(?:and|&)\s+")
+#: Words that, before a part's first common word, make it a description of
+#: another class ("each consisting of one share of Class A common stock",
+#: "exercisable for one-half of one share of Common Stock"), not a class name.
+_DESCRIPTION_WORDS = frozenset({"each", "one", "of", "for", "into", "to"})
+
+
+def _named_common_titles(title: str) -> tuple[str, ...]:
+    """The normalised plain-common class names `title` lists (#1163), in
+    order: each part between `;`, `,`, "and" or "&", parentheses dropped,
+    that is plain common and no description of another class."""
+    names: list[str] = []
+    for part in _TITLE_PARTS.split(re.sub(r"\([^)]*\)", " ", title)):
+        norm = _norm_title(part)
+        if not norm or not _is_plain_common(norm):
+            continue
+        first = min(norm.find(word) for word in _COMMON_WORDS if word in norm)
+        if _DESCRIPTION_WORDS.isdisjoint(norm[:first].split()) and norm not in names:
+            names.append(norm)
+    return tuple(names)
+
+
+def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
+    """The keys of `classes` (each class listed on the Form 25's exchange,
+    with its titles there; `None` is an untitled row) that a Form 25
+    titled `title` delists, or `()` if that is not certain. Shared by
+    `_delisted_classes` and `store.delistings`, so a Form 25 ends the
+    class it re-arms for relisting (#820).
+
+    1. A title naming two or more common classes (#1163: "Class A Common
+       Stock and Class B Common Stock") delists each if every one matches
+       exactly one class by title up to the first comma.
+    2. A title that is not itself plain common but names one common class
+       among others ("Units, Class A Common Stock and Warrants") resolves
+       through that name first: the class with that title, else the one
+       class whose titles are all plain common.
+    3. Otherwise the one class with the whole title up to the first comma
+       (so a filing whose named classes do not all resolve keeps what an
+       exact title match gives, never a guessed class); failing that, for a
+       plain-common title naming at most one class, the one class whose
+       titles are all plain common.
+    Anything else is `()`: never a guess."""
+
+    def by_title(name: str) -> list[K]:
+        return [
+            key
+            for key, titles in classes.items()
+            if any(t is not None and _norm_title(t) == name for t in titles)
+        ]
+
+    def only_common() -> list[K]:
+        common = [
+            key
+            for key, titles in classes.items()
+            if all(t is None or _is_plain_common(t) for t in titles)
+        ]
+        return common if len(common) == 1 else []
+
+    named = _named_common_titles(title)
+    plain = _is_plain_common(title)
+    if len(named) > 1:
+        found = [by_title(name) for name in named]
+        if all(len(keys) == 1 for keys in found):
+            return tuple(dict.fromkeys(keys[0] for keys in found))
+    elif named and not plain:
+        exact = by_title(named[0])
+        if len(exact) == 1:
+            return (exact[0],)
+        if not exact and (common := only_common()):
+            return (common[0],)
+    exact = by_title(_norm_title(title))
+    if len(exact) == 1:
+        return (exact[0],)
+    if exact or not plain or len(named) > 1:
+        return ()
+    common = only_common()
+    return (common[0],) if common else ()
+
+
+def _delisted_classes(classes: Sequence[_Class], filing: DelistingFiling) -> list[_Class]:
+    """The live classes `filing` delists (`_form25_classes`), only among
+    classes already listed on its exchange; empty if not certain."""
     on_exchange = [c for c in classes if not c.retired and filing.exchange in c.exchanges]
-    title = _norm_title(filing.class_title)
-    by_title = [c for c in on_exchange if title in c.titles]
-    if len(by_title) == 1:
-        return by_title[0]
-    if by_title or not _is_plain_common(filing.class_title):
-        return None
-    common = [c for c in on_exchange if all(_is_plain_common(t) for t in c.titles)]
-    return common[0] if len(common) == 1 else None
+    keys = _form25_classes(filing.class_title, dict(enumerate(c.titles for c in on_exchange)))
+    return [on_exchange[key] for key in keys]
 
 
 def _sessions_around(session: date, sessions: int) -> tuple[date, date]:
@@ -530,19 +607,16 @@ class _Builder:
         cover page settles (CTO, #834)."""
         at, _, _, record = event
         if isinstance(record, DelistingFiling):
-            stopped = self._delisting(classes, record)
-            if stopped is None:
-                return
-            cls, stop = stopped
-            successor_issuer = any(
-                (stop.since is None or a > stop.since)
-                and a <= at
-                and stop.reorg_start <= _session_of(a)
-                for form in _SUCCESSOR_ISSUER_FORMS
-                for a in marks.get(form, ())
-            )
-            if successor_issuer and not _registered(stop, at, marks):
-                self._relist(first, classes, cls, record.exchange, at, "filing", marks)
+            for cls, stop in self._delisting(classes, record):
+                successor_issuer = any(
+                    (stop.since is None or a > stop.since)
+                    and a <= at
+                    and stop.reorg_start <= _session_of(a)
+                    for form in _SUCCESSOR_ISSUER_FORMS
+                    for a in marks.get(form, ())
+                )
+                if successor_issuer and not _registered(stop, at, marks):
+                    self._relist(first, classes, cls, record.exchange, at, "filing", marks)
             return
         lag = timedelta(days=self.settings.master.snapshot_relisting_lag_days)
         for cls in [c for c in classes if not c.retired]:
@@ -593,18 +667,18 @@ class _Builder:
 
     def _delisting(
         self, classes: list[_Class], filing: DelistingFiling
-    ) -> tuple[_Class, _Stop] | None:
-        """Record `filing` on the class it delists, if one is certain."""
-        cls = _delisted_class(classes, filing)
-        if cls is None:
-            return None
-        if filing.form.endswith("/A") and filing.exchange in cls.delisted_on:
-            return None  # amends a Form 25 already counted
-        cls.delisted_on.add(filing.exchange)
-        since = cls.history[-1][0] if cls.history else None
-        stop = _stop(filing, self.settings, since)
-        cls.ended[filing.exchange] = stop
-        return cls, stop
+    ) -> list[tuple[_Class, _Stop]]:
+        """Record `filing` on each class it delists, if they are certain."""
+        stopped: list[tuple[_Class, _Stop]] = []
+        for cls in _delisted_classes(classes, filing):
+            if filing.form.endswith("/A") and filing.exchange in cls.delisted_on:
+                continue  # amends a Form 25 already counted
+            cls.delisted_on.add(filing.exchange)
+            since = cls.history[-1][0] if cls.history else None
+            stop = _stop(filing, self.settings, since)
+            cls.ended[filing.exchange] = stop
+            stopped.append((cls, stop))
+        return stopped
 
     def _successor(
         self,

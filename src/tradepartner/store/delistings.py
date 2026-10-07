@@ -10,18 +10,28 @@ the filing's class title and exchange. `effective_on` is the filing's
 stated date, else the acceptance's New York date plus 10 days (Rule
 12d2-2); it never sets an end, and only the re-tag rule below reads it.
 
-**One class per filing.** A filing names a class, not a company, so it is
-resolved to the `security_id` of its CIK (known by the filing's acceptance,
-and not yet succeeded by new equity, #820) whose listing on the filing's
-exchange has the same title up to the first comma (master's
-`_norm_title`). Failing that, a filing whose title is plain common equity
-(master's `_is_common`, and no warrant, right, unit, preferred or
-depositary word) takes the one class on that exchange whose
+**Classes per filing.** A filing names classes, not a company, so it is
+resolved (master's `_form25_classes`, which the #820 relisting rule
+shares) among the classes of its CIK (known by the filing's acceptance,
+and not yet succeeded by new equity, #820) listed on the filing's
+exchange: the one whose listing has the same title up to the first comma
+(master's `_norm_title`). Failing that, a filing whose title is plain
+common equity (master's `_is_common`, and no warrant, right, unit,
+preferred or depositary word) takes the one class on that exchange whose
 listings are all common-titled or untitled (snapshot rows), so "Common
-Stock" still finds a class whose cover page says "Common Shares". Anything
-else, including a warrant or preferred title that matches no class, or
-two common classes, is returned in `unmatched`, never guessed: guessing
-would end the common listing on a warrant or preferred filing.
+Stock" still finds a class whose cover page says "Common Shares".
+**Compound titles** (#1163) list several classes: "Common stock and
+warrants", a SPAC's "Class A Common Stock; Units, each consisting of one
+share of Class A common stock and one-half of one warrant". The parts
+between `;`, `,`, "and" or "&" that are plain common and not a
+description of another class ("each consisting of one share of ...") are
+the common classes it names: one such part resolves as a plain-common
+title would; two or more ("Class A Common Stock and Class B Common
+Stock") each need an exact title match and give one row per class.
+Anything else, including a warrant or preferred title that matches no
+class, two common classes for one common name, or a named class that
+matches none, is returned in `unmatched`, never guessed: guessing would
+end the common listing on a warrant or preferred filing.
 
 Resolution is a key mapping and may use master rows known after the
 filing (the master is built from full history). That never makes anything
@@ -51,6 +61,15 @@ a filing ends only a listing already known at T.
   any title `_is_plain_title` refuses) never ends an untitled
   (`snapshot_static`) listing: that listing cannot show it is the class
   the filing names.
+- **Form 25 close** (#1163). A listing that starts in a session after the
+  filing session of a Form 25 that ended an earlier listing of the
+  security on the same exchange (a cover page re-opened it: an acquired
+  company's last 10-K naming the pair, Maxim, Rudolph, Nielsen) is ended
+  by the latest such filing, delisted, unless a bar known at T falls
+  after that filing's `effective_on`. Trading after the delisting took
+  effect is what tells a real relisting (#820: CMPR, CG, WELL) from a
+  stale cover page; until such a bar is known the conservative close
+  holds, as for the re-tag. A filing that ended no listing closes nothing.
 - It is a **transfer** at T if another listing of the security on another
   exchange is known at T with `valid_from` within
   `master.transfer_window_sessions` sessions of the filing session. The
@@ -88,7 +107,7 @@ from tradepartner.store.asof import (
     listings_as_of,
 )
 from tradepartner.store.db import insert_row
-from tradepartner.store.master import MasterBuild, _is_common, _norm_title
+from tradepartner.store.master import MasterBuild, _form25_classes, _is_common, _norm_title
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 # Amendments too (owner decision 2026-09-26, #262): EDGAR's history has them,
@@ -180,8 +199,8 @@ def _is_plain_title(title: str) -> bool:
 _OFF_EXCHANGE = frozenset({"", "NONE", "OTC"})
 
 
-def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
-    """The `security_id` `filing` delists, or `None` if it is not certain."""
+def _resolve(filing: DelistingFiling, master: MasterBuild) -> tuple[str, ...]:
+    """The `security_id`s `filing` delists, or `()` if that is not certain."""
     # #820: never a successor known later. An original Form 25 after a
     # succession names the successor; an amendment amends the old class's.
     known = [s for s in master.successions if s.known_at <= filing.accepted_at]
@@ -197,37 +216,18 @@ def _resolve(filing: DelistingFiling, master: MasterBuild) -> str | None:
         and row["known_at"] <= filing.accepted_at
         and row["security_id"] not in excluded
     }
-    on_exchange = [
-        row
-        for row in master.listings
-        if row["security_id"] in candidates and row["exchange"] == filing.exchange
-    ]
-    title = _norm_title(filing.class_title)
-    by_title: set[str] = {
-        row["security_id"]
-        for row in on_exchange
-        if row["class_title"] is not None and _norm_title(row["class_title"]) == title
-    }
-    if len(by_title) == 1:
-        return by_title.pop()
-    if by_title or not _is_plain_common(filing.class_title):
-        return None
     titles: dict[str, list[str | None]] = defaultdict(list)
-    for row in on_exchange:
-        titles[row["security_id"]].append(row["class_title"])
-    common = {
-        security_id
-        for security_id, seen in titles.items()
-        if all(t is None or _is_plain_common(t) for t in seen)
-    }
-    return common.pop() if len(common) == 1 else None
+    for row in master.listings:
+        if row["security_id"] in candidates and row["exchange"] == filing.exchange:
+            titles[row["security_id"]].append(row["class_title"])
+    return _form25_classes(filing.class_title, titles)
 
 
 def build_delistings(
     filings: Iterable[DelistingFiling], master: MasterBuild, *, ingested_at: datetime
 ) -> DelistingBuild:
     """`delistings` rows for every Form 25 and 25-NSE in `filings` that
-    resolves to one class of `master`.
+    resolves to classes of `master`, one row per class.
 
     Raises `ValueError` for any other form, or if a filing's acceptance is
     later than `ingested_at` (spec: `known_at <= ingested_at`).
@@ -243,14 +243,14 @@ def build_delistings(
                 f"{filing.accession}: accepted_at {filing.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        security_id = _resolve(filing, master)
-        if security_id is None:
+        security_ids = _resolve(filing, master)
+        if not security_ids:
             unmatched.append(filing)
             continue
         effective_on = filing.effective_on or _filing_day(filing.accepted_at) + timedelta(
             days=_DEFAULT_EFFECTIVE_DAYS
         )
-        rows.append(
+        rows.extend(
             {
                 "security_id": security_id,
                 "form": filing.form,
@@ -263,6 +263,7 @@ def build_delistings(
                 "source": "edgar",
                 "provenance": "filing",
             }
+            for security_id in security_ids
         )
     return DelistingBuild(delistings=tuple(rows), unmatched=tuple(unmatched))
 
@@ -329,6 +330,37 @@ def _ended_listing(
     return target
 
 
+def _reopened(
+    by_security: dict[str, list[Row]], ended: dict[int, Row], bars: dict[str, list[date]]
+) -> dict[int, Row]:
+    """Listings a later row re-opened after a Form 25 ended an earlier one
+    (#1163), each mapped to that Form 25: the latest filing that ended a
+    listing of the security on the row's exchange in a session before its
+    `valid_from`, when no bar known at T falls after that filing's
+    `effective_on`. Module docstring: the Form 25 close."""
+    out: dict[int, Row] = {}
+    for security_id, siblings in by_security.items():
+        closers = [(row, ended[row["_index"]]) for row in siblings if row["_index"] in ended]
+        if not closers:
+            continue
+        last_bar = max(bars.get(security_id, []), default=None)
+        for row in siblings:
+            if row["_index"] in ended:
+                continue
+            before = [
+                filing
+                for closed, filing in closers
+                if closed["exchange"] == row["exchange"]
+                and _filing_session(filing["filed_at"]) < row["valid_from"]
+            ]
+            if not before:
+                continue
+            filing = max(before, key=lambda f: f["filed_at"])
+            if last_bar is None or last_bar <= filing["effective_on"]:
+                out[row["_index"]] = filing
+    return out
+
+
 def derive_listing_ends(
     listings: pl.DataFrame,
     delistings: pl.DataFrame,
@@ -373,6 +405,8 @@ def derive_listing_ends(
         )
         if target is not None:
             ended.setdefault(target["_index"], delisting)
+    reopened = _reopened(by_security, ended, bars)
+    ended.update(reopened)
 
     out: list[Row] = []
     for index, row in enumerate(listing_rows):
@@ -397,7 +431,7 @@ def derive_listing_ends(
             if other["exchange"] != filing["exchange"] and low <= other["valid_from"] <= high
         )
         end: date | None
-        if successors:
+        if successors and index not in reopened:
             status, end = TRANSFERRED, previous_session(successors[0])
         else:
             later = [o["valid_from"] for o in siblings if o["valid_from"] > row["valid_from"]]
