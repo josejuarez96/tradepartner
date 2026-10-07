@@ -226,7 +226,11 @@ def test_rebuild_keeps_every_phase3_row_byte_identical() -> None:
     rebuilt = ("trial_results", "owner_decisions")
     before_rows = {table: _rows_in_order(conn, table) for table in rebuilt}
     before_columns = {table: _columns(conn, table) for table in rebuilt}
-    others = [t for t in schema.REGISTRY_TABLE_NAMES if t not in rebuilt]
+    others = [
+        t
+        for t in schema.REGISTRY_TABLE_NAMES
+        if t not in rebuilt and t not in lab_schema.LAB_TABLE_NAMES
+    ]
     before_others = {table: _checksum(conn, table) for table in others}
     assert all(before_rows.values())
     assert all(before_others[t][0] > 0 for t in others if t != "trial_rebalances")
@@ -407,10 +411,12 @@ def test_mark_pre_lab_writes_the_row(lab_store: duckdb.DuckDBPyConnection) -> No
 
 
 def test_lab_table_names_disjoint_from_every_other_table_list() -> None:
+    """Disjoint from every other list; `REGISTRY_TABLE_NAMES` gains them with the
+    lab migration (T113, #1195; spec "Data / interfaces" > Tables)."""
     lab = set(lab_schema.LAB_TABLE_NAMES)
+    assert lab <= set(schema.REGISTRY_TABLE_NAMES)
     for names in (
         schema.TABLE_NAMES,
-        schema.REGISTRY_TABLE_NAMES,
         schema.JOURNAL_TABLE_NAMES,
         schema.LATER_JOURNAL_TABLE_NAMES,
         schema.MASTER_CHECK_TABLE_NAMES,
@@ -530,8 +536,17 @@ def test_write_fixture_marker_called_only_from_load_universe_fixtures() -> None:
     assert callers == {("tests/conftest.py", "load_universe_fixtures")}
 
 
-def test_schema_py_does_not_call_the_lab_ddl() -> None:
-    """No call from `init_schema` and no edit to `schema.py` until T113."""
-    source = (REPO / "src/tradepartner/store/schema.py").read_text()
-    assert "lab_schema" not in source
-    assert "apply_lab_schema" not in source
+def test_schema_py_calls_the_lab_ddl_only_from_the_lab_migration() -> None:
+    """Since T113 (#1195) `init_schema` applies the lab DDL through the version-16
+    migration `_migrate_lab` only (a migrating store), never on a fresh store
+    (`tests/store/test_lab_migration.py`)."""
+    tree = ast.parse((REPO / "src/tradepartner/store/schema.py").read_text())
+    callers: dict[str, set[str]] = {}
+    for func in ast.walk(tree):
+        if isinstance(func, ast.FunctionDef):
+            for node in ast.walk(func):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute | ast.Name):
+                    name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                    callers.setdefault(str(name), set()).add(func.name)
+    assert callers["apply_lab_schema"] == {"_migrate_lab"}
+    assert callers["_migrate_lab"] == {"init_schema"}

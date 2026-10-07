@@ -19,7 +19,7 @@ import pytest
 
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.config import Settings
-from tradepartner.store import registry, schema
+from tradepartner.store import lab_schema, registry, schema
 
 _AT = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 _CUTOFF = datetime(2024, 9, 30, 20, 0, tzinfo=UTC)
@@ -47,7 +47,11 @@ _PHASE3: dict[str, float] = {
 }
 _EXCESS = ("sharpe_monthly_excess_spy", "skew_monthly_excess_spy", "kurtosis_monthly_excess_spy")
 _TRIALS_V15 = ("detail_level", "data_vintage", "code_tree_sha256")
-_CHANGED = {"schema_version", "trials", "trial_results", "trial_metrics"}
+#: The migration runs on to version 16 (#1195, T113), which rebuilds
+#: `owner_decisions` (every row kept) and adds the lab tables
+#: (`tests/store/test_lab_migration.py`).
+_CHANGED = {"schema_version", "trials", "trial_results", "trial_metrics", "owner_decisions"}
+_LAB = set(lab_schema.LAB_TABLE_NAMES)
 
 
 def _phase3_value(series: str, level: float, key: str) -> float | None:
@@ -143,8 +147,8 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
         conn.close()
 
 
-def test_current_schema_version_is_15() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 15
+def test_current_schema_version_is_16() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 16
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -202,7 +206,11 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (1, None),
         (2, None),
     ]
-    assert v14.execute("SELECT version FROM schema_version ORDER BY 1").fetchall() == [(14,), (15,)]
+    assert v14.execute("SELECT version FROM schema_version ORDER BY 1").fetchall() == [
+        (14,),
+        (15,),
+        (16,),
+    ]
 
 
 def test_every_other_table_is_byte_identical(v14: duckdb.DuckDBPyConnection) -> None:
@@ -211,7 +219,7 @@ def test_every_other_table_is_byte_identical(v14: duckdb.DuckDBPyConnection) -> 
     trials = v14.execute("SELECT * FROM trials ORDER BY rowid").fetchall()
     results = v14.execute("SELECT * FROM trial_results ORDER BY rowid").fetchall()
     schema.init_schema(v14)
-    assert [t for t in _tables(v14) if t not in _CHANGED] == others
+    assert [t for t in _tables(v14) if t not in _CHANGED | _LAB] == others
     assert _snapshot(v14, others) == before
     v15 = ", ".join(_TRIALS_V15)
     assert v14.execute(f"SELECT * EXCLUDE ({v15}) FROM trials ORDER BY rowid").fetchall() == trials
@@ -226,6 +234,7 @@ def test_the_migrated_store_is_shaped_as_a_fresh_one(v14: duckdb.DuckDBPyConnect
     fresh = duckdb.connect(":memory:")
     try:
         schema.init_schema(fresh)
+        lab_schema.apply_lab_schema(fresh)  # a fresh store has no lab table
         ddl = "SELECT table_name, sql FROM duckdb_tables() ORDER BY 1"
         assert v14.execute(ddl).fetchall() == fresh.execute(ddl).fetchall()
     finally:
@@ -237,7 +246,7 @@ def test_a_second_open_inserts_nothing_more(v14: duckdb.DuckDBPyConnection) -> N
     rows = _metric_rows(v14)
     schema.init_schema(v14)
     assert _metric_rows(v14) == rows
-    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (2,)
+    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (3,)
 
 
 def test_new_trials_after_the_migration_carry_no_detail_default(
