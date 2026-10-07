@@ -100,7 +100,7 @@ def test_family_reads_and_counts() -> None:
 
 def test_momentum_never_reads_facts_and_keeps_profitability_counts_null() -> None:
     provider = _provider_with_facts()
-    result = run(_params(), provider, T0, T1, _handle(), [15.0])
+    result = run(_params(), provider, T0, T1, _handle(), [15.0], family="momentum")
     assert not {"statement_facts", "sics"} & {call.method for call in provider.calls}
     row = result[15.0].rebalances[0]
     assert (row.n_ranked, row.n_excluded_no_facts, row.n_derived) == (None, None, None)

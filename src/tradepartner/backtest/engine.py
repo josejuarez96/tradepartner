@@ -183,7 +183,7 @@ def _plan(
     provider: DataProvider,
     params: Settings,
     session: date,
-    family: HypothesisFamily = "momentum",
+    family: HypothesisFamily,
 ) -> Plan:
     strategy = signal_for(family)
     cadence = params.schedule.rebalance_cadence
@@ -218,7 +218,7 @@ def plan(
     provider: DataProvider,
     params: Settings,
     session: date,
-    family: HypothesisFamily = "momentum",
+    family: HypothesisFamily,
 ) -> Plan:
     """The plan at rebalance session `session` (a rebalance session at the frozen
     `schedule.rebalance_cadence`), read at close(`session`): universe, family signal,
@@ -497,7 +497,7 @@ def run(
     handle: TrialHandle,
     cost_levels: Sequence[float],
     *,
-    family: HypothesisFamily = "momentum",
+    family: HypothesisFamily,
 ) -> dict[float, BacktestResult]:
     """Run the strategy over the rebalance sessions in `[start, end]` at the frozen
     `schedule.rebalance_cadence`, at every cost level in `cost_levels` (per-side bps;

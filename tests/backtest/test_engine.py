@@ -104,7 +104,7 @@ def _run(
     end: date = T3,
     levels: Sequence[float] = (15.0,),
 ) -> dict[float, BacktestResult]:
-    return run(params or _params(), provider, T0, end, _handle(), levels)
+    return run(params or _params(), provider, T0, end, _handle(), levels, family="momentum")
 
 
 def _equity(result: BacktestResult) -> dict[date, float]:
@@ -149,13 +149,13 @@ class TestHandle:
     def test_no_handle_raises_before_any_call(self, handle: object) -> None:
         provider = _provider()
         with pytest.raises(TypeError, match="TrialHandle"):
-            run(_params(), provider, T0, T3, handle, [15.0])  # type: ignore[arg-type]
+            run(_params(), provider, T0, T3, handle, [15.0], family="momentum")  # type: ignore[arg-type]
         assert provider.calls == []
 
     def test_a_window_with_one_rebalance_is_refused_before_any_call(self) -> None:
         provider = _provider()
         with pytest.raises(ValueError, match="two rebalance sessions"):
-            run(_params(), provider, T0, date(2024, 2, 28), _handle(), [15.0])
+            run(_params(), provider, T0, date(2024, 2, 28), _handle(), [15.0], family="momentum")
         assert provider.calls == []
 
     def test_a_benchmark_in_the_universe_is_refused(self) -> None:
@@ -594,10 +594,13 @@ class TestPublicPlan:
         # Every rebalance but the last is planned, in order, once.
         assert [p.session for p in recorded] == [T0, T1, T2, T3]
         for loop_plan in recorded:
-            assert engine.plan(_provider(), _params(), loop_plan.session) == loop_plan
+            assert (
+                engine.plan(_provider(), _params(), loop_plan.session, family="momentum")
+                == loop_plan
+            )
 
     def test_a_plan_carries_its_targets_and_reads(self) -> None:
-        public = engine.plan(_provider(), _params(), T0)
+        public = engine.plan(_provider(), _params(), T0, family="momentum")
         assert isinstance(public, engine.Plan)
         assert (public.session, public.fill_session) == (T0, F0)
         assert set(public.targets) == {"A", "B"}
@@ -609,7 +612,7 @@ class TestPublicPlan:
         the members' frame), and agree with the counts the rebalance row records."""
         provider = _provider(skip=[("D", date(2023, 12, 29))])  # D's skip-month anchor
         params = _params()
-        public = engine.plan(provider, params, T0)
+        public = engine.plan(provider, params, T0, family="momentum")
         t = read_time(T0)
         members = sorted(provider.universe(t).members["security_id"].to_list())
         strategy = params.strategy
@@ -717,7 +720,7 @@ class TestSignalFrameBound:
         params = _params(schedule={"rebalance_cadence": cadence, "signal_anchor": anchor})
         levels = (0.0, 15.0)
         bounded = _cadence_provider(cadence, start, end)
-        got = run(params, bounded, start, end, _handle(), levels)
+        got = run(params, bounded, start, end, _handle(), levels, family="momentum")
         want = run(
             params,
             _cadence_provider(cadence, start, end, unbounded=True),
@@ -725,6 +728,7 @@ class TestSignalFrameBound:
             end,
             _handle(),
             levels,
+            family="momentum",
         )
         _assert_same_results(got, want)
 
@@ -771,7 +775,9 @@ class TestCombinationsAndLag:
             execution={"fill_price": "close"},
             costs={"per_side_bps": 0.0, "sensitivity_per_side_bps": []},
         )
-        return run(params, provider, self.START, self.END, _handle(), (0.0,))[0.0]
+        return run(params, provider, self.START, self.END, _handle(), (0.0,), family="momentum")[
+            0.0
+        ]
 
     def _close(self, sid: str) -> dict[date, float]:
         prices = _price_rows().filter(pl.col("security_id") == sid)
@@ -869,7 +875,7 @@ def test_a_run_at_cadence_on_the_fixture_store_completes(
     )
     connect = _lend(fixture_store)
     with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
-        results = run(settings, provider, start, end, handle, (0.0, 15.0))
+        results = run(settings, provider, start, end, handle, (0.0, 15.0), family="momentum")
     for result in results.values():
         assert [row.session for row in result.rebalances] == sessions[:-1]
         assert [row.fill_session for row in result.rebalances] == [

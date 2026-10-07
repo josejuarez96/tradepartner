@@ -133,7 +133,7 @@ def _run(
     end: date = T2,
     levels: Sequence[float] = (LEVEL,),
 ) -> dict[float, BacktestResult]:
-    return run(params, provider, T0, end, _handle(), levels)
+    return run(params, provider, T0, end, _handle(), levels, family="momentum")
 
 
 def _strategy(result: BacktestResult) -> dict[date, tuple[float, float | None]]:
@@ -435,7 +435,7 @@ class TestBenchmarks:
     @pytest.mark.parametrize("fill_price", ["close", "open"])
     def test_equal_hand_computed_total_return(self, fill_price: str) -> None:
         params = _params(execution={"fill_price": fill_price})
-        results = run(params, self._provider(), T0, T3, _handle(), [0.0, LEVEL])
+        results = run(params, self._provider(), T0, T3, _handle(), [0.0, LEVEL], family="momentum")
         for level, result in results.items():
             for series, sid in self.BENCHMARKS.items():
                 rows = [row for row in result.equity if row.series == series]
@@ -447,7 +447,9 @@ class TestBenchmarks:
                     assert got[session] == pytest.approx(value, rel=1e-9), (series, session)
 
     def test_one_initial_cost_only(self) -> None:
-        results = run(_params(), self._provider(), T0, T3, _handle(), [0.0, LEVEL])
+        results = run(
+            _params(), self._provider(), T0, T3, _handle(), [0.0, LEVEL], family="momentum"
+        )
         for series in self.BENCHMARKS:
             free = {r.session: r.equity for r in results[0.0].equity if r.series == series}
             paid = {r.session: r.equity for r in results[LEVEL].equity if r.series == series}
@@ -457,7 +459,7 @@ class TestBenchmarks:
 
     def test_benchmarks_are_read_once_and_marked_with_the_held_names(self) -> None:
         provider = self._provider()
-        result = run(_params(), provider, T0, T3, _handle(), [LEVEL])[LEVEL]
+        result = run(_params(), provider, T0, T3, _handle(), [LEVEL], family="momentum")[LEVEL]
         reads = [call for call in provider.calls if call.method == "benchmark_ids"]
         assert [call.t for call in reads] == [read_time(T0)]
         stitched = result.stitched_returns()
@@ -469,11 +471,15 @@ class TestBenchmarks:
             ~((pl.col("security_id") == "M") & (pl.col("session") == F0))
         )
         with pytest.raises(ValueError, match="MTUM"):
-            run(_params(), provider, T0, T3, _handle(), [LEVEL])
+            run(_params(), provider, T0, T3, _handle(), [LEVEL], family="momentum")
 
     def test_prefix_invariance_holds_with_benchmarks(self) -> None:
-        short = run(_params(), self._provider(), T0, T2, _handle(), [LEVEL])[LEVEL]
-        long = run(_params(), self._provider(), T0, T3, _handle(), [LEVEL])[LEVEL]
+        short = run(_params(), self._provider(), T0, T2, _handle(), [LEVEL], family="momentum")[
+            LEVEL
+        ]
+        long = run(_params(), self._provider(), T0, T3, _handle(), [LEVEL], family="momentum")[
+            LEVEL
+        ]
         assert short.equity == tuple(row for row in long.equity if row.session <= T2)
 
 

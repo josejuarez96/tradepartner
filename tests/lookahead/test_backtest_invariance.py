@@ -293,7 +293,15 @@ class Fixture:
         with StoreProvider(
             data, self.handle, self.settings, registry_connect=_factory(self.conn)
         ) as provider:
-            return run(self.settings, provider, self.sessions[0], end, self.handle, COST_LEVELS)
+            return run(
+                self.settings,
+                provider,
+                self.sessions[0],
+                end,
+                self.handle,
+                COST_LEVELS,
+                family="momentum",
+            )
 
 
 @pytest.fixture(scope="module", params=list(CASES.values()), ids=list(CASES))

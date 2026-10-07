@@ -419,7 +419,7 @@ def _plan_at(
     session: date,
 ) -> engine.Plan:
     with StoreProvider(_lend(conn), handle, settings, registry_connect=_lend(registry_conn)) as p:
-        return engine.plan(p, settings, session)
+        return engine.plan(p, settings, session, family="momentum")
 
 
 @pytest.fixture(scope="module")

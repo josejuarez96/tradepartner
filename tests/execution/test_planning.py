@@ -258,7 +258,7 @@ def _plan_on_store(env: Env) -> engine.Plan:
             settings=env.settings,
         )
         with StoreProvider(lambda: _Lend(env.conn), handle, env.params) as provider:
-            return engine.plan(provider, env.params, T_I)
+            return engine.plan(provider, env.params, T_I, family="momentum")
     finally:
         env.conn.rollback()
 
@@ -345,7 +345,9 @@ def test_the_paper_targets_equal_the_backtest_targets(env: Env) -> None:
             settings=env.settings,
         )
         with StoreProvider(lambda: _Lend(env.conn), handle, env.params) as provider:
-            results = engine.run(env.params, provider, T_I, T_NEXT, handle, (0.0,))
+            results = engine.run(
+                env.params, provider, T_I, T_NEXT, handle, (0.0,), family="momentum"
+            )
     finally:
         env.conn.rollback()
     backtest = dict(results[0.0].targets[F_I])

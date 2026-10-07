@@ -72,7 +72,7 @@ from tradepartner.backtest.schedule import fill_session, read_time, rebalance_se
 from tradepartner.backtest.signals import MomentumSignal, anchor_sessions, momentum
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import session_close
-from tradepartner.config import Cadence, Settings
+from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -252,7 +252,7 @@ class Fixture:
         with StoreProvider(
             _factory(conn), self.handle, settings, registry_connect=_factory(self.conn)
         ) as provider:
-            return run(settings, provider, start, end, self.handle, COST_LEVELS)
+            return run(settings, provider, start, end, self.handle, COST_LEVELS, family="momentum")
 
     def planned(self, start: date, end: date, conn: duckdb.DuckDBPyConnection) -> Planned:
         """`window`, with every plan the run made (by session), recorded around whatever
@@ -260,8 +260,10 @@ class Fixture:
         plans: dict[date, engine.Plan] = {}
         planner = engine._plan
 
-        def recording(provider: DataProvider, params: Settings, session: date) -> engine.Plan:
-            plans[session] = planner(provider, params, session)
+        def recording(
+            provider: DataProvider, params: Settings, session: date, family: HypothesisFamily
+        ) -> engine.Plan:
+            plans[session] = planner(provider, params, session, family)
             return plans[session]
 
         engine._plan = recording
@@ -365,8 +367,10 @@ def test_every_plan_is_unchanged_on_a_store_cut_at_its_own_read(
 def _late(fixture: Fixture, read: Callable[..., engine._Plan]) -> Callable[..., engine._Plan]:
     """`read` at the next rebalance, its result relabelled as the plan at `session`."""
 
-    def plan(provider: DataProvider, params: Settings, session: date) -> engine._Plan:
-        late = read(provider, params, fixture.after(session))
+    def plan(
+        provider: DataProvider, params: Settings, session: date, family: HypothesisFamily
+    ) -> engine._Plan:
+        late = read(provider, params, fixture.after(session), family)
         fill = fill_session(session, fixture.case.cadence)
         return dataclasses.replace(late, session=session, fill_session=fill)
 
@@ -426,7 +430,9 @@ def _signal(
 def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
     """A copy of `engine._plan` whose signal frame alone is read at the next rebalance."""
 
-    def plan(provider: DataProvider, params: Settings, session: date) -> engine._Plan:
+    def plan(
+        provider: DataProvider, params: Settings, session: date, family: HypothesisFamily
+    ) -> engine._Plan:
         t, t_late = fixture.read_time(session), fixture.read_time(fixture.after(session))
         members = sorted(provider.universe(t).members["security_id"].to_list())
         strategy = params.strategy
