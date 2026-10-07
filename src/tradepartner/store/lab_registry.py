@@ -46,7 +46,7 @@ from typing import Any, Final
 
 import duckdb
 
-from tradepartner.backtest.frozen import frozen_values, is_default
+from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS, frozen_values, is_default
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.metrics import expected_max_sharpe
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
@@ -669,10 +669,15 @@ def _rule_differences(record: HypothesisRecord, rules: FamilyRules) -> tuple[str
             continue
         if key not in values or not is_default(value, rule):
             differences.append(key)
+    # Rules written before a table key landed lack it: they are read at its default too,
+    # as `frozen_values` reads the registration (#1199's `gap.stale_listing_sessions`).
+    defaults = {key: default for key, default, _version in FROZEN_KEY_DEFAULTS}
     differences += sorted(
         key
         for key in values
-        if key not in rules.fixed_params and key.startswith(FORBIDDEN_AXIS_PREFIXES)
+        if key not in rules.fixed_params
+        and key.startswith(FORBIDDEN_AXIS_PREFIXES)
+        and not (key in defaults and is_default(values[key], defaults[key]))
     )
     return tuple(differences)
 

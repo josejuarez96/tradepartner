@@ -604,7 +604,12 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     `month_end`, and its stored hash is untouched (strategy-lab T96)."""
     frozen = _frozen()
     all_params = frozen_params_of(frozen, family="momentum")
-    params = {k: v for k, v in all_params.items() if not k.startswith("schedule.")}
+    # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) landed.
+    params = {
+        k: v
+        for k, v in all_params.items()
+        if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+    }
     hashed = sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with open_for_write(_store(fixture_store_path)) as conn:
         record = registry.register_hypothesis(
