@@ -756,6 +756,37 @@ class TestRelistingAfterForm25:
         relisted = [row for row in build.listings if row["known_at"] == _at(2023, 2, 2)]
         assert [(row["security_id"], row["ticker"]) for row in relisted] == [(cik, "RLC")]
 
+    def test_a_compound_title_form_25_rearms_the_common_class(self) -> None:
+        # #1163: master resolves a "Common stock and warrants" Form 25 as
+        # `store.delistings` does, so the next cover page still relists.
+        cik = self.CIK
+        common = ("Common Stock, par value $0.0001", "RLC", "NASDAQ")
+        warrant = ("Warrants, each exercisable for one share", "RLCW", "NASDAQ")
+        build = self._build(
+            [_cover(cik, _at(2019, 8, 9), common, warrant), _cover(cik, _at(2020, 1, 29), common)],
+            [_form25(cik, "Common stock and warrants", "NASDAQ", _at(2019, 12, 3))],
+        )
+        relisted = [row for row in build.listings if row["known_at"] == _at(2020, 1, 29)]
+        assert [(row["security_id"], row["ticker"]) for row in relisted] == [(cik, "RLC")]
+
+    def test_a_form_25_naming_two_classes_rearms_both(self) -> None:
+        cik = self.CIK
+        a = ("Class A Common Stock", "RLCA", "NASDAQ")
+        b = ("Class B Common Stock", "RLCB", "NASDAQ")
+        build = self._build(
+            [_cover(cik, _at(2019, 8, 9), a, b), _cover(cik, _at(2020, 1, 29), a, b)],
+            [
+                _form25(
+                    cik,
+                    "Class A Common Stock and Class B Common Stock",
+                    "NASDAQ",
+                    _at(2019, 12, 3),
+                )
+            ],
+        )
+        relisted = [row["ticker"] for row in build.listings if row["known_at"] == _at(2020, 1, 29)]
+        assert sorted(relisted) == ["RLCA", "RLCB"]
+
     def test_an_amendment_after_the_relisting_opens_no_second_row(self) -> None:
         cik = self.CIK
         build = self._build(
@@ -780,10 +811,14 @@ class TestRelistingAfterForm25:
             _form25(cik, "Ordinary Shares", "NASDAQ", _at(2020, 1, 6), form="25-NSE/A"),
         ]
         delistings = build_delistings(filings, build, ingested_at=INGESTED_AT)
+        # The relisting trades after the Form 25's effective day (12-13): a
+        # real relisting, which the #1163 Form 25 close leaves listed.
         ends = derive_listing_ends(
             pl.DataFrame(list(build.listings)),
             pl.DataFrame(list(delistings.delistings)),
-            pl.DataFrame({"security_id": [cik], "session": [date(2019, 12, 13)]}),
+            pl.DataFrame(
+                {"security_id": [cik, cik], "session": [date(2019, 12, 13), date(2019, 12, 17)]}
+            ),
             transfer_window_sessions=_settings().master.transfer_window_sessions,
         )
         assert ends.select("valid_from", "status").rows() == [

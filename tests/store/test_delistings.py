@@ -977,6 +977,185 @@ class TestBuild:
         assert read["security_id"].to_list() == [CIK_SOLO]
 
 
+class TestCompoundTitles:
+    """#1163 (C): a Form 25 naming several classes in one title ("Common
+    stock and warrants", a SPAC's "Class A Common Stock; Units, each
+    consisting of ...") resolves through the common classes it names; a
+    clause describing another class ("each consisting of one share of
+    ...") never names one, and nothing is guessed."""
+
+    def _ids(self, title: str, cik: str, exchange: str = "NYSE") -> list[str]:
+        build = build_delistings(
+            [_filing(cik, title, exchange, _at(2019, 3, 5))], _master(), ingested_at=INGESTED_AT
+        )
+        return [r["security_id"] for r in build.delistings]
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Common stock and warrants",
+            "Common Stock & Warrant",
+            "Units and Common Stock",
+            "Units, Common Stock, and Warrants",
+            "Common Stock; Rights, each exchangeable into one-twentieth of a share of Common Stock",
+        ],
+    )
+    def test_common_and_other_classes_resolve_to_the_single_common_class(self, title: str) -> None:
+        assert self._ids(title, CIK_SOLO, "NASDAQ") == [CIK_SOLO]
+
+    def test_semicolon_spac_title_resolves_by_its_common_title(self) -> None:
+        title = (
+            "Class A Common Stock; Units, each consisting of one share of Class A common "
+            "stock and one-half of one redeemable warrant"
+        )
+        assert self._ids(title, CIK_DUAL) == [CIK_DUAL]
+
+    def test_two_named_common_classes_each_get_a_row(self) -> None:
+        title = "Class A Common Stock and Class B Common Stock"
+        build = build_delistings(
+            [_filing(CIK_TWO, title, "NYSE", _at(2019, 3, 5))], _master(), ingested_at=INGESTED_AT
+        )
+        assert sorted(r["security_id"] for r in build.delistings) == [CIK_TWO, f"{CIK_TWO}:b"]
+        assert {r["class_title"] for r in build.delistings} == {title}
+        assert build.unmatched == ()
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Units, each consisting of one share of Common Stock and one Warrant",
+            "Warrants, exercisable for one-half of one share of Common Stock",
+            "Rights to purchase Common Stock and Units",
+        ],
+    )
+    def test_a_described_common_share_names_no_class(self, title: str) -> None:
+        assert self._ids(title, CIK_SOLO, "NASDAQ") == []
+
+    def test_one_common_part_never_guesses_between_two_common_classes(self) -> None:
+        assert self._ids("Common Stock and Warrants", CIK_TWO) == []
+
+    def test_a_named_class_that_matches_nothing_never_guesses(self) -> None:
+        # Class C is not listed: the filing is unmatched, not read as A alone.
+        assert self._ids("Class A Common Stock and Class C Common Stock", CIK_TWO) == []
+
+    def test_compound_row_is_known_only_from_the_acceptance(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        master = _master()
+        filed = _at(2019, 3, 5)
+        build = build_delistings(
+            [_filing(CIK_SOLO, "Common stock and warrants", "NASDAQ", filed)],
+            master,
+            ingested_at=INGESTED_AT,
+        )
+        assert build.delistings[0]["known_at"] == filed
+        write_delistings(synthetic, build)
+        for row in master.listings:
+            insert_row(synthetic, "listings", row)
+        ids = [CIK_SOLO]
+        before = listing_ends_as_of(synthetic, filed - PROBE_EPSILON, _settings(), ids)
+        assert before["status"].to_list() == ["listed"]
+        after = listing_ends_as_of(synthetic, filed, _settings(), ids)
+        assert after["status"].to_list() == ["delisted"]
+        truncated = TruncatedStore(synthetic, tables=("listings", "delistings", "prices_daily"))
+        try:
+            for t in probe_timestamps(synthetic, ("listings", "delistings")):
+                full = listing_ends_as_of(synthetic, t, _settings())
+                assert full.equals(listing_ends_as_of(truncated.at(t), t, _settings())), t
+        finally:
+            truncated.close()
+
+
+class TestFormTwentyFiveCloseOverRelisting:
+    """#1163 (A): a later cover page re-opens a listing a Form 25 ended
+    (Maxim, Rudolph, Nielsen: an acquired company's last 10-K still names
+    the pair). Unless a bar known at T falls after the Form 25's effective
+    day, that filing closes the re-opened row too; a real relisting (#820:
+    CMPR, CG, WELL keep trading) stays listed."""
+
+    FILED = _at(2021, 8, 26)  # effective 2021-09-05
+
+    def _store(self, conn: duckdb.DuckDBPyConnection, *bars: date) -> None:
+        insert_row(
+            conn, "listings", _listing("S", "MX", "NASDAQ", date(2019, 10, 30), _at(2019, 10, 30))
+        )
+        insert_row(conn, "delistings", _delisting("S", "NASDAQ", self.FILED))
+        insert_row(
+            conn, "listings", _listing("S", "MX", "NASDAQ", date(2021, 9, 7), _at(2021, 9, 7))
+        )
+        for day in (date(2021, 8, 24), date(2021, 8, 25), *bars):
+            insert_row(conn, "prices_daily", _bar("S", day))
+
+    def test_reopened_row_without_a_later_bar_is_closed_by_the_form_25(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._store(synthetic)
+        df = listing_ends_as_of(synthetic, _at(2023, 10, 31), _settings()).sort("valid_from")
+        assert df["status"].to_list() == ["delisted", "delisted"]
+        reopened = df.row(1, named=True)
+        assert reopened["delisting_filed_at"] == self.FILED
+        assert reopened["effective_on"] == date(2021, 9, 5)
+        assert reopened["end_session"] is None
+        assert df.row(0, named=True)["end_session"] == date(2021, 8, 25)
+
+    def test_a_bar_after_the_effective_day_keeps_the_relisting(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._store(synthetic, date(2021, 9, 8))
+        df = listing_ends_as_of(synthetic, _at(2023, 10, 31), _settings()).sort("valid_from")
+        assert df["status"].to_list() == ["delisted", "listed"]
+
+    def test_the_relisting_reads_live_from_its_first_later_bar_known(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Between the cover page and the first bar after the effective day
+        # the conservative read holds, as for the #818 re-tag.
+        self._store(synthetic, date(2021, 9, 8))
+        bar_known = session_close(date(2021, 9, 8))
+        early = listing_ends_as_of(synthetic, bar_known - PROBE_EPSILON, _settings())
+        late = listing_ends_as_of(synthetic, bar_known, _settings())
+        assert early.sort("valid_from")["status"].to_list() == ["delisted", "delisted"]
+        assert late.sort("valid_from")["status"].to_list() == ["delisted", "listed"]
+
+    def test_a_form_25_that_ended_nothing_closes_nothing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Maxim's 2007 25-NSE predates every listing row: it ends none, so
+        # it never closes the 2019 row either.
+        insert_row(
+            synthetic,
+            "listings",
+            _listing("S", "MX", "NASDAQ", date(2019, 10, 30), _at(2019, 10, 30)),
+        )
+        insert_row(synthetic, "delistings", _delisting("S", "NASDAQ", _at(2007, 10, 17)))
+        df = listing_ends_as_of(synthetic, _at(2019, 12, 2), _settings())
+        assert df["status"].to_list() == ["listed"]
+
+    def test_a_form_25_on_another_exchange_closes_nothing(
+        self, synthetic: duckdb.DuckDBPyConnection
+    ) -> None:
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NYSE", date(2019, 1, 2), _at(2018, 12, 3))
+        )
+        insert_row(synthetic, "delistings", _delisting("S", "NYSE", _at(2019, 3, 5)))
+        insert_row(
+            synthetic, "listings", _listing("S", "A", "NASDAQ", date(2019, 5, 1), _at(2019, 4, 25))
+        )
+        df = listing_ends_as_of(synthetic, LATE, _settings())
+        assert _status(df, "S", "NASDAQ")["status"] == "listed"
+
+    def test_no_look_ahead(self, synthetic: duckdb.DuckDBPyConnection) -> None:
+        self._store(synthetic, date(2021, 9, 8), date(2021, 9, 9))
+        truncated = TruncatedStore(synthetic, tables=("listings", "delistings", "prices_daily"))
+        probes = set(probe_timestamps(synthetic, ("listings", "delistings", "prices_daily")))
+        settings = _settings()
+        try:
+            for t in sorted(probes):
+                full = listing_ends_as_of(synthetic, t, settings)
+                assert full.equals(listing_ends_as_of(truncated.at(t), t, settings)), f"T={t!r}"
+        finally:
+            truncated.close()
+
+
 # ------------------------------------------------------------------ look-ahead
 
 
