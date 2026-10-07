@@ -78,6 +78,27 @@ message also names where the error was raised: `_with_frames` appends
 line or a local/argument value), itself bounded by `ingest.max_where_frames`
 and `ingest.max_where_chars` so a long trail is cut, never the error text,
 before the redaction and `max_message_chars` cut above (#573).
+
+**Statement facts** (amendment 2026-10-03, #660; plan T77b), only while
+`edgar.statement_facts_enabled` is on (off: no call, no row). The fetch pass
+asks `statement_facts(cik)` for every issuer CIK, so the adapter fills its
+per-CIK cache before the lock; `_Recorded` keeps only which CIKs were
+filled, never the records. Under the lock the write phase asks again, one
+CIK at a time (a cache read that adds nothing to the adapter's own
+`statement_*` counts), and `statement_fact_rows` keeps the **first vintage**
+of each `(fact_name, period_end, period_days)` key in acceptance order:
+insert-or-skip against the CIK's stored keys, never `_add_rows`' revision
+logic. A key is held while an unstamped carrier (`accepted_at = None`) has a
+`filed` date on or before the stamped carrier's; a later differing value is
+counted restated, an earlier-accepted one surfacing after its key was stored
+is counted `statement_vintage_late`; a `gross_profit` the filing does not
+carry is derived from its own stored `revenue` and `cost_of_revenue`
+vintages at the filing's turn, unless the key is held or the filing's
+`GrossProfit` is on the source's `statement_conflict_keys`. Each CIK's rows
+go in one bulk insert, the frame's timestamps tz-checked once.
+`rebuild_statement_facts` first deletes every `statement_facts` row in the
+same transaction. The counts go into the run message as `statement_<name>:
+N` (`health.statement_counts`).
 """
 
 from __future__ import annotations
@@ -87,7 +108,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -95,6 +116,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pyarrow as pa
 
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -222,18 +244,33 @@ def ingest_session(
     source: str = "all",
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
+    rebuild_statement_facts: bool = False,
 ) -> IngestResult:
     """Ingest the expected session from `source` (`edgar`, `alpaca` or
     `all`); see the module docstring. `clock` gives the run's instant, used
     for the expected session, `ingested_at` and the run row's times. A dry
-    run rolls every chunk back and writes no run row."""
+    run rolls every chunk back and writes no run row.
+    `rebuild_statement_facts` (#660) deletes and re-ingests `statement_facts`
+    in the EDGAR chunk's transaction; it needs the switch on and the EDGAR
+    source (`ValueError` otherwise, before anything runs)."""
     if source not in ("all", *SOURCES):
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
+    if rebuild_statement_facts and not settings.edgar.statement_facts_enabled:
+        raise ValueError(_REBUILD_NEEDS_SWITCH)
+    if rebuild_statement_facts and source == "alpaca":
+        raise ValueError("rebuild_statement_facts needs the edgar source")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
     work: dict[str, Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]]] = {
-        "edgar": lambda conn, run_id: _ingest_filings(conn, settings, recorded, clock, run_id),
+        "edgar": lambda conn, run_id: _ingest_filings(
+            conn,
+            settings,
+            recorded,
+            clock,
+            run_id,
+            rebuild_statement_facts=rebuild_statement_facts,
+        ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
     fetched: dict[str, _PriceFetch] = {}
@@ -443,6 +480,7 @@ class _Recorded(FilingSource):
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._answers: dict[tuple[Any, ...], Any] = {}
+        self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self.frozen = False
 
     def _ask(self, method: str, *args: Any) -> Any:
@@ -472,18 +510,21 @@ class _Recorded(FilingSource):
         return list(self._ask("delistings", since))
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
-        """Memoized like every other question above, but not yet asked
-        anywhere: `#660`'s switch defaults off, and no caller reaches this
-        until T77b wires a per-CIK call into `_build_filings`'s fetch
-        pass. That wiring is not free of this class's own rules, despite
-        the shared `_ask` cache: the proxy's memo would otherwise hold
-        every record in memory (the spec's "Ingest" section says the
-        fetch pass must record only *which* CIKs were filled, never the
-        records themselves, for a payload the shares path already reads
-        once per CIK). T77b's wiring therefore cannot simply call this
-        method and keep the answer; it needs a dedicated memo keyed on
-        "CIK filled: yes/no", not the generic `_ask` cache used here."""
-        return list(self._ask("statement_facts", cik))
+        """Not memoized (#660, spec "Ingest"): the fetch pass's call fills
+        the adapter's per-CIK cache and this proxy records only that `cik`
+        was filled, never the records (the first load's 10^7 records would
+        not fit). Every later call, the write phase's one per CIK under the
+        lock included, goes to the source, which answers from that cache;
+        once `frozen`, a CIK the pass did not fill raises."""
+        if cik not in self._statement_filled:
+            if self.frozen:
+                raise RuntimeError(
+                    f"filing source asked statement_facts({cik!r}) after the fetch pass"
+                )
+            records = self._source.statement_facts(cik)
+            self._statement_filled.add(cik)
+            return records
+        return self._source.statement_facts(cik)
 
 
 def _unwrap(filings: FilingSource) -> FilingSource:
@@ -581,7 +622,7 @@ def _fetch_and_gate(recorded: _Recorded, settings: Settings) -> None:
             validation.raise_if_any(settings, counted, stopped_by=stopped_by)
 
     try:
-        _build_filings(recorded, settings, _FETCH_PASS)
+        _build_filings(recorded, settings, _FETCH_PASS, fetch=True)
     except Exception as error:
         gate(stopped_by=error)  # raises when anything was recorded
         raise
@@ -604,10 +645,14 @@ def _ingest_filings(
     filings: FilingSource,
     clock: Callable[[], datetime],
     run_id: str,
+    *,
+    rebuild_statement_facts: bool = False,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
-    read, then record the stored master rows this build no longer derives
+    read, write the statement facts' first vintages while the switch is on
+    (module docstring; `rebuild_statement_facts` deletes the table first),
+    then record the stored master rows this build no longer derives
     under `run_id` (#859: `master_underived`, health's
     `underived_master_rows`; `master-retract` withdraws them), except the
     rows of an owner-kept successor (`master.keep_successors`, #922)."""
@@ -630,6 +675,15 @@ def _ingest_filings(
         ("facts", facts),
     ):
         added += _add_rows(conn, table, rows, ingested_at=now, current=False)
+    statements = ""
+    if settings.edgar.statement_facts_enabled:
+        tally = _write_statement_facts(
+            conn, recorded, _issuer_ciks(master), now, rebuild=rebuild_statement_facts
+        )
+        added += tally.added
+        statements = tally.message(_unwrap(filings))
+    elif rebuild_statement_facts:
+        raise ValueError(_REBUILD_NEEDS_SWITCH)
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
     derived = frozenset(row["security_id"] for row in master.securities)
@@ -638,7 +692,7 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{_source_counts(filings)}; "
+        f"{statements}{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
@@ -701,15 +755,360 @@ def _source_counts(filings: FilingSource) -> str:
 
 
 def _build_filings(
-    filings: FilingSource, settings: Settings, ingested_at: datetime
+    filings: FilingSource, settings: Settings, ingested_at: datetime, *, fetch: bool = False
 ) -> tuple[MasterBuild, Any, ClassificationBuild, tuple[Row, ...], tuple[FactRecord, ...]]:
+    """The builds over `filings`. The fetch pass (`fetch`) also asks
+    `statement_facts` for every issuer CIK while the switch is on (#660),
+    after `facts`, so one payload read fills both caches; the records are
+    dropped here and read again per CIK under the lock."""
     master = build_master(filings, settings, ingested_at=ingested_at)
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
-    ciks = sorted({row["cik"] for row in master.securities if not row["benchmark"]})
+    ciks = _issuer_ciks(master)
     records = [record for cik in ciks for record in filings.facts(cik, list(FACT_NAMES))]
+    if fetch and settings.edgar.statement_facts_enabled:
+        for cik in ciks:
+            filings.statement_facts(cik)
     facts, unmatched = fact_rows(records, master, classes, ingested_at=ingested_at)
     return master, delistings, classes, facts, unmatched
+
+
+def _issuer_ciks(master: MasterBuild) -> list[str]:
+    """The issuer CIKs the facts and statement facts are asked for, sorted."""
+    return sorted({row["cik"] for row in master.securities if not row["benchmark"]})
+
+
+#: Why a rebuild is refused while the switch is off: it would delete the
+#: table and re-ingest nothing.
+_REBUILD_NEEDS_SWITCH = (
+    "rebuild_statement_facts needs edgar.statement_facts_enabled: with the switch off "
+    "it would delete every statement_facts row and re-ingest none"
+)
+
+#: `statement_facts`' columns, in schema order (the bulk insert's frame).
+_STATEMENT_COLUMNS: tuple[str, ...] = (
+    "cik",
+    "fact_name",
+    "xbrl_tag",
+    "period_start",
+    "period_end",
+    "period_days",
+    "value",
+    "unit",
+    "form",
+    "filing_accession",
+    "basis",
+    "comparative",
+    "known_at",
+    "ingested_at",
+    "source",
+    "provenance",
+)
+
+#: The adapter's own `statement_*` counts (spec "Ingest"), set by the fetch
+#: pass only and read from the unwrapped source as `_source_counts` reads.
+_STATEMENT_SOURCE_COUNTS: tuple[str, ...] = (
+    "unstampable",
+    "conflicts",
+    "non_usd",
+    "malformed",
+    "none",
+)
+
+#: A statement fact's key: `(fact_name, period_end, period_days)` within a CIK.
+StatementKey = tuple[str, date, int]
+
+#: A conflict on the source's `statement_conflict_keys`, as the ingest looks
+#: it up: `(accession, fact_name, period_end, period_days)`.
+ConflictKey = tuple[str, str, date, int]
+
+GROSS_PROFIT, REVENUE, COST_OF_REVENUE = "gross_profit", "revenue", "cost_of_revenue"
+
+
+@dataclass(frozen=True)
+class StatementVintage:
+    """A stored key's vintage, as the first-vintage pass compares against it."""
+
+    known_at: datetime
+    value: float
+    accession: str
+
+
+@dataclass
+class StatementCounts:
+    """The ingest's own `statement_*` run-row counts (spec "Ingest"); the
+    adapter's are read from it. `deleted` is set by a rebuild only."""
+
+    added: int = 0
+    held: int = 0
+    vintage_late: int = 0
+    restated: int = 0
+    derived: int = 0
+    deleted: int | None = None
+
+    def add(self, other: StatementCounts) -> None:
+        """Fold one CIK's counts into the run's."""
+        self.added += other.added
+        self.held += other.held
+        self.vintage_late += other.vintage_late
+        self.restated += other.restated
+        self.derived += other.derived
+
+    def message(self, source: FilingSource) -> str:
+        """`"; statement_added: N, ..."` for the run row (`health.statement_counts`
+        reads it back), with the adapter's counts `source` exposes."""
+        figures = [("added", self.added)]
+        if self.deleted is not None:
+            figures.append(("deleted", self.deleted))
+        figures += [
+            ("held", self.held),
+            ("vintage_late", self.vintage_late),
+            ("restated", self.restated),
+            ("derived", self.derived),
+        ]
+        for name in _STATEMENT_SOURCE_COUNTS:
+            value = getattr(source, f"statement_{name}", None)
+            if value is not None:
+                figures.append((name, int(value)))
+        return "; " + ", ".join(f"statement_{name}: {n}" for name, n in figures)
+
+
+def _statement_key(record: StatementFactRecord) -> StatementKey:
+    return (record.fact_name, record.period_end, record.period_days)
+
+
+def statement_fact_rows(
+    records: Iterable[StatementFactRecord],
+    stored: Mapping[StatementKey, StatementVintage],
+    conflicts: Container[ConflictKey],
+    *,
+    ingested_at: datetime,
+) -> tuple[list[Row], StatementCounts]:
+    """One CIK's new `statement_facts` rows (first vintages, spec amendment
+    2026-10-03 "First vintage" and "Derived gross profit") and its counts.
+
+    Stamped records are taken filing by filing in acceptance order (then
+    accession). A key in `stored`, or stored earlier in this pass, skips:
+    from the vintage's own accession silently, accepted before the vintage
+    as `vintage_late`, else with a different value as `restated`. An unstored
+    key is **held** for the rest of the pass when an unstamped record of it
+    (`accepted_at = None`) has `filed` on or before the carrier's (a same-day
+    tie holds); `held` counts each holding entry once. After a filing's
+    reported keys, each period it carries both `revenue` and
+    `cost_of_revenue` for, in one unit, whose stored vintages are both this
+    filing's, and for which it carries no `gross_profit` and `conflicts`
+    lists none, yields a `derived` `gross_profit` candidate (the difference,
+    tags joined by `-`), subject to the same stored and held rules; a stored
+    key skips it uncounted. Raises `ValueError` for a record accepted after
+    `ingested_at`."""
+    records = list(records)
+    unstamped: dict[StatementKey, list[StatementFactRecord]] = defaultdict(list)
+    filings: dict[tuple[datetime, str], list[StatementFactRecord]] = defaultdict(list)
+    for record in records:
+        if record.accepted_at is None:
+            unstamped[_statement_key(record)].append(record)
+        else:
+            filings[(record.accepted_at, record.accession)].append(record)
+    vintages = dict(stored)
+    held: set[StatementKey] = set()
+    holders: set[tuple[str, StatementKey]] = set()
+    counts = StatementCounts()
+    rows: list[Row] = []
+
+    def holds(key: StatementKey, filed: date) -> bool:
+        if key in held:
+            return True
+        found = [u for u in unstamped.get(key, ()) if u.filed <= filed]
+        holders.update((u.accession, key) for u in found)
+        if found:
+            held.add(key)
+        return bool(found)
+
+    def store(key: StatementKey, row: Row) -> None:
+        if row["known_at"] > ingested_at:
+            raise ValueError(
+                f"{row['filing_accession']}: accepted_at {row['known_at'].isoformat()} is after "
+                f"ingested_at {ingested_at.isoformat()}"
+            )
+        rows.append(row)
+        vintages[key] = StatementVintage(row["known_at"], row["value"], row["filing_accession"])
+
+    for (accepted_at, accession), filing in sorted(filings.items()):
+        for record in filing:
+            key = _statement_key(record)
+            vintage = vintages.get(key)
+            if vintage is not None:
+                if vintage.accession == accession:
+                    continue
+                if accepted_at < vintage.known_at:
+                    counts.vintage_late += 1
+                elif record.value != vintage.value:
+                    counts.restated += 1
+                continue
+            if not holds(key, record.filed):
+                store(key, _statement_row(record, ingested_at))
+        for row in _derived_candidates(filing, vintages, conflicts, ingested_at):
+            key = (GROSS_PROFIT, row["period_end"], row["period_days"])
+            filed = row.pop("_filed")
+            if key not in vintages and not holds(key, filed):
+                store(key, row)
+                counts.derived += 1
+    counts.held = len(holders)
+    counts.added = len(rows)
+    return rows, counts
+
+
+def _statement_row(record: StatementFactRecord, ingested_at: datetime) -> Row:
+    return {
+        "cik": record.cik,
+        "fact_name": record.fact_name,
+        "xbrl_tag": record.xbrl_tag,
+        "period_start": record.period_start,
+        "period_end": record.period_end,
+        "period_days": record.period_days,
+        "value": record.value,
+        "unit": record.unit,
+        "form": record.form,
+        "filing_accession": record.accession,
+        "basis": "reported",
+        "comparative": record.comparative,
+        "known_at": record.accepted_at,
+        "ingested_at": ingested_at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _derived_candidates(
+    filing: Sequence[StatementFactRecord],
+    vintages: Mapping[StatementKey, StatementVintage],
+    conflicts: Container[ConflictKey],
+    ingested_at: datetime,
+) -> list[Row]:
+    """`filing`'s derived `gross_profit` rows (`statement_fact_rows`), each
+    with a `_filed` entry for the hold rule. `comparative` follows the
+    Periods rule over the periods the filing can derive, per `period_days`."""
+    by_period: dict[tuple[date, int], dict[str, StatementFactRecord]] = defaultdict(dict)
+    for record in filing:
+        by_period[(record.period_end, record.period_days)][record.fact_name] = record
+    pairs = {
+        period: (facts[REVENUE], facts[COST_OF_REVENUE])
+        for period, facts in by_period.items()
+        if REVENUE in facts and COST_OF_REVENUE in facts
+    }
+    latest: dict[int, date] = {}
+    for end, days in pairs:
+        latest[days] = max(latest.get(days, end), end)
+    out: list[Row] = []
+    for (end, days), (revenue, cost) in sorted(pairs.items()):
+        accession = revenue.accession
+        if (
+            revenue.unit != cost.unit
+            or GROSS_PROFIT in by_period[(end, days)]
+            or (accession, GROSS_PROFIT, end, days) in conflicts
+            or any(
+                (vintage := vintages.get(_statement_key(r))) is None
+                or vintage.accession != accession
+                for r in (revenue, cost)
+            )
+        ):
+            continue
+        row = _statement_row(revenue, ingested_at)
+        row.update(
+            fact_name=GROSS_PROFIT,
+            xbrl_tag=f"{revenue.xbrl_tag}-{cost.xbrl_tag}",
+            value=revenue.value - cost.value,
+            basis="derived",
+            comparative=end < latest[days],
+            _filed=max(revenue.filed, cost.filed),
+        )
+        out.append(row)
+    return out
+
+
+class _ConflictIndex:
+    """The source's `statement_conflict_keys` as `ConflictKey`s, indexed as
+    the list grows (each per-CIK read restores its CIK's entries; a source
+    without the attribute has none)."""
+
+    def __init__(self, source: FilingSource) -> None:
+        self._source = source
+        self._keys: set[ConflictKey] = set()
+        self._seen = 0
+
+    def keys(self) -> set[ConflictKey]:
+        listed = getattr(self._source, "statement_conflict_keys", ())
+        if len(listed) < self._seen:  # the list was replaced or cleared: re-index
+            self._keys.clear()
+            self._seen = 0
+        for conflict in listed[self._seen :]:
+            self._keys.add(
+                (conflict.accession, conflict.fact_name, conflict.period_end, conflict.period_days)
+            )
+        self._seen = len(listed)
+        return self._keys
+
+
+def _write_statement_facts(
+    conn: duckdb.DuckDBPyConnection,
+    filings: FilingSource,
+    ciks: Sequence[str],
+    ingested_at: datetime,
+    *,
+    rebuild: bool,
+) -> StatementCounts:
+    """The write phase (module docstring): with `rebuild`, delete every row
+    first; then per CIK, one `statement_facts` read, its stored keys, its new
+    rows, and one bulk insert, holding one CIK's records at a time."""
+    total = StatementCounts()
+    if rebuild:
+        deleted = conn.execute("DELETE FROM statement_facts").fetchone()
+        total.deleted = int(deleted[0]) if deleted else 0
+    conflicts = _ConflictIndex(_unwrap(filings))
+    for cik in ciks:
+        records = filings.statement_facts(cik)
+        if not records:
+            continue
+        rows, counts = statement_fact_rows(
+            records, _stored_vintages(conn, cik), conflicts.keys(), ingested_at=ingested_at
+        )
+        if rows:
+            insert_statement_frame(conn, statement_frame(rows))
+        total.add(counts)
+    return total
+
+
+def _stored_vintages(
+    conn: duckdb.DuckDBPyConnection, cik: str
+) -> dict[StatementKey, StatementVintage]:
+    return {
+        (name, end, days): StatementVintage(known_at, value, accession)
+        for name, end, days, known_at, value, accession in conn.execute(
+            "SELECT fact_name, period_end, period_days, known_at, value, filing_accession "
+            "FROM statement_facts WHERE cik = ?",
+            [cik],
+        ).fetchall()
+    }
+
+
+def statement_frame(rows: Sequence[Mapping[str, Any]]) -> pa.Table:
+    """`rows` as one Arrow frame in `statement_facts`' column order."""
+    return pa.table({column: [row[column] for row in rows] for column in _STATEMENT_COLUMNS})
+
+
+def insert_statement_frame(conn: duckdb.DuckDBPyConnection, frame: pa.Table) -> None:
+    """Insert `frame` into `statement_facts` in one statement. Its timestamp
+    columns are checked once for the frame, not per row: a column without a
+    time zone (a naive timestamp) raises `TypeError` before the insert."""
+    for column in ("known_at", "ingested_at"):
+        kind = frame.schema.field(column).type
+        if not pa.types.is_timestamp(kind) or kind.tz is None:
+            raise TypeError(f"statement_facts.{column} must be tz-aware timestamps, got {kind}")
+    conn.register("_statement_rows", frame)
+    try:
+        conn.execute("INSERT INTO statement_facts BY NAME SELECT * FROM _statement_rows")
+    finally:
+        conn.unregister("_statement_rows")
 
 
 _MEMBER_CLASS = re.compile(r"Class([A-Z])(?![a-z])")

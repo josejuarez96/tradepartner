@@ -18,8 +18,12 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import httpx
 import pytest
 
+from tradepartner import ingest as ingest_module
+from tradepartner.adapters.edgar import StatementConflict
+from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
 from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -29,6 +33,8 @@ from tradepartner.adapters.filings import (
     FactRecord,
     FilingHeader,
     FilingIndexEntry,
+    FilingSource,
+    StatementFactRecord,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.adapters.prices import (
@@ -40,13 +46,19 @@ from tradepartner.adapters.prices import (
     bar_known_at,
 )
 from tradepartner.config import Settings
+from tradepartner.health import statement_counts
 from tradepartner.ingest import (
     FACT_NAMES,
     FAILED,
     LOCKED,
     OK,
     STALE,
+    ConflictKey,
     IngestResult,
+    SourceRun,
+    StatementCounts,
+    StatementKey,
+    StatementVintage,
     _add_rows,
     _fetched,
     _ingest_filings,
@@ -57,8 +69,16 @@ from tradepartner.ingest import (
     expected_session,
     fact_rows,
     ingest_session,
+    insert_statement_frame,
+    statement_fact_rows,
+    statement_frame,
 )
-from tradepartner.store.asof import facts_as_of, live_actions_as_of, prices_as_of
+from tradepartner.store.asof import (
+    facts_as_of,
+    live_actions_as_of,
+    prices_as_of,
+    statement_facts_as_of,
+)
 from tradepartner.store.classify import build_classifications
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import build_master
@@ -1904,4 +1924,549 @@ def test_the_secret_guard_flags_what_the_scrub_would_miss() -> None:
         "nested.token",
         "raw",
         "tupled",
+    ]
+
+
+# --- statement facts: first vintages (#660, T77b) ----------------------------
+
+F1 = f"{ACME}-19-000101"  # FY2018 10-K
+F2 = f"{ACME}-19-000102"  # a later filing carrying FY2018 as a comparative
+F3 = f"{ACME}-19-000103"
+UNSTAMPED = f"{ACME}-19-000199"  # no stamp record yet
+AT1, AT2, AT3 = _at(2019, 3, 1), _at(2019, 5, 1), _at(2019, 6, 3)
+FY18 = (date(2018, 1, 1), date(2018, 12, 31))
+FY17 = (date(2017, 1, 1), date(2017, 12, 31))
+_TAG = {
+    "revenue": "us-gaap:Revenues",
+    "cost_of_revenue": "us-gaap:CostOfRevenue",
+    "gross_profit": "us-gaap:GrossProfit",
+    "total_assets": "us-gaap:Assets",
+}
+
+
+def _sf(
+    fact: str,
+    value: float,
+    accession: str,
+    accepted_at: datetime | None,
+    *,
+    period: tuple[date | None, date] = FY18,
+    filed: date | None = None,
+    cik: str = ACME,
+    unit: str = "USD",
+    comparative: bool = False,
+) -> StatementFactRecord:
+    """One statement record; `filed` defaults to the acceptance date."""
+    if filed is None:
+        assert accepted_at is not None, "an unstamped record needs its filed date"
+        filed = accepted_at.date()
+    return StatementFactRecord(
+        cik=cik,
+        fact_name=fact,
+        xbrl_tag=_TAG[fact],
+        period_start=period[0],
+        period_end=period[1],
+        value=value,
+        unit=unit,
+        form="" if accepted_at is None else "10-K",
+        accession=accession,
+        accepted_at=accepted_at,
+        filed=filed,
+        comparative=comparative,
+    )
+
+
+def _rows(
+    records: Sequence[StatementFactRecord],
+    stored: dict[StatementKey, StatementVintage] | None = None,
+    conflicts: set[ConflictKey] | None = None,
+) -> tuple[dict[tuple[str, date], dict[str, Any]], StatementCounts]:
+    rows, counts = statement_fact_rows(records, stored or {}, conflicts or set(), ingested_at=NOW)
+    return {(r["fact_name"], r["period_end"]): r for r in rows}, counts
+
+
+def _gp_key(period: tuple[date | None, date] = FY18) -> StatementKey:
+    start, end = period
+    return ("gross_profit", end, 0 if start is None else (end - start).days)
+
+
+def test_first_vintage_is_kept_across_a_restating_filing() -> None:
+    rows, counts = _rows(
+        [
+            _sf("revenue", 110, F2, AT2, comparative=True),  # restated a year later
+            _sf("revenue", 100, F1, AT1),
+            _sf("total_assets", 500, F1, AT1, period=(None, date(2018, 12, 31))),
+            _sf("total_assets", 500, F2, AT2, period=(None, date(2018, 12, 31))),  # identical
+        ]
+    )
+    revenue = rows[("revenue", FY18[1])]
+    assert (revenue["value"], revenue["known_at"], revenue["filing_accession"]) == (100, AT1, F1)
+    assert revenue["basis"] == "reported" and revenue["xbrl_tag"] == "us-gaap:Revenues"
+    assessed = rows[("total_assets", FY18[1])]
+    assert (assessed["period_start"], assessed["period_days"]) == (None, 0)
+    assert (counts.added, counts.restated, counts.vintage_late) == (2, 1, 0)
+
+
+def test_a_stored_key_skips_every_carrier_and_its_own_accession_silently() -> None:
+    stored = {("revenue", FY18[1], 364): StatementVintage(AT1, 100.0, F1)}
+    rows, counts = _rows([_sf("revenue", 100, F1, AT1), _sf("revenue", 120, F2, AT2)], stored)
+    assert rows == {}
+    assert (counts.restated, counts.vintage_late, counts.added) == (1, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("filed", "held"),
+    [(date(2019, 2, 27), True), (AT1.date(), True), (date(2019, 3, 2), False)],
+    ids=["earlier", "same-day tie", "later"],
+)
+def test_an_unstamped_carrier_filed_on_or_before_holds_the_key(filed: date, held: bool) -> None:
+    records = [
+        _sf("revenue", 100, F1, AT1),
+        _sf("revenue", 90, UNSTAMPED, None, filed=filed),
+        _sf("revenue", 100, F2, AT2, comparative=True),  # a later carrier stays held too
+    ]
+    rows, counts = _rows(records)
+    assert (("revenue", FY18[1]) in rows) is not held
+    assert counts.held == int(held)
+
+
+def test_once_stamped_the_earlier_carrier_is_the_vintage() -> None:
+    stamped = _at(2019, 2, 27)
+    rows, counts = _rows([_sf("revenue", 100, F1, AT1), _sf("revenue", 90, UNSTAMPED, stamped)])
+    assert rows[("revenue", FY18[1])]["filing_accession"] == UNSTAMPED
+    assert (counts.held, counts.restated) == (0, 1)
+
+
+def test_a_record_accepted_before_its_stored_vintage_is_late_not_written() -> None:
+    stored = {("revenue", FY18[1], 364): StatementVintage(AT2, 110.0, F2)}
+    rows, counts = _rows([_sf("revenue", 100, F1, AT1)], stored)
+    assert rows == {}
+    assert (counts.vintage_late, counts.restated) == (1, 0)
+
+
+def test_a_record_accepted_after_the_run_raises() -> None:
+    with pytest.raises(ValueError, match="after ingested_at"):
+        _rows([_sf("revenue", 100, F1, NOW + timedelta(seconds=1))])
+
+
+def _components(
+    accession: str, accepted_at: datetime, *, period: tuple[date | None, date] = FY18
+) -> list[StatementFactRecord]:
+    return [
+        _sf("revenue", 100, accession, accepted_at, period=period),
+        _sf("cost_of_revenue", 60, accession, accepted_at, period=period),
+    ]
+
+
+def test_one_accessions_components_derive_gross_profit_at_its_acceptance() -> None:
+    """Also the case of a `GrossProfit` the parser skipped as non-USD or
+    malformed: it reaches the ingest as no record, so the candidate stands."""
+    rows, counts = _rows(
+        [*_components(F1, AT1), *_components(F1, AT1, period=FY17)]  # FY17: a comparative
+    )
+    derived = rows[("gross_profit", FY18[1])]
+    assert derived["value"] == 40
+    assert (derived["known_at"], derived["filing_accession"], derived["basis"]) == (
+        AT1,
+        F1,
+        "derived",
+    )
+    assert derived["xbrl_tag"] == "us-gaap:Revenues-us-gaap:CostOfRevenue"
+    assert derived["comparative"] is False
+    assert rows[("gross_profit", FY17[1])]["comparative"] is True
+    assert counts.derived == 2
+
+
+def test_components_from_two_accessions_derive_nothing() -> None:
+    rows, counts = _rows(
+        [_sf("revenue", 100, F1, AT1), _sf("cost_of_revenue", 60, F2, AT2, comparative=True)]
+    )
+    assert ("gross_profit", FY18[1]) not in rows and counts.derived == 0
+
+
+def test_a_withheld_component_derives_nothing_from_either_filing() -> None:
+    """F1's cost of revenue was withheld (a conflict: no record), so its
+    vintage is F2's and neither filing holds both vintages."""
+    rows, counts = _rows([_sf("revenue", 100, F1, AT1), *_components(F2, AT2)])
+    assert rows[("cost_of_revenue", FY18[1])]["filing_accession"] == F2
+    assert ("gross_profit", FY18[1]) not in rows and counts.derived == 0
+
+
+def test_a_filed_gross_profit_in_the_first_carrier_is_reported_nothing_derived() -> None:
+    rows, counts = _rows([*_components(F1, AT1), _sf("gross_profit", 41, F1, AT1)])
+    assert rows[("gross_profit", FY18[1])]["basis"] == "reported"
+    assert rows[("gross_profit", FY18[1])]["value"] == 41
+    assert counts.derived == 0
+
+
+def test_a_later_filed_gross_profit_is_restated_also_in_one_run() -> None:
+    rows, counts = _rows(
+        [*_components(F1, AT1), _sf("gross_profit", 45, F2, AT2, comparative=True)]
+    )
+    derived = rows[("gross_profit", FY18[1])]
+    assert (derived["basis"], derived["known_at"], derived["value"]) == ("derived", AT1, 40)
+    assert (counts.derived, counts.restated) == (1, 1)
+
+
+def test_a_held_gross_profit_key_derives_nothing_and_counts_held_once() -> None:
+    rows, counts = _rows(
+        [
+            *_components(F1, AT1),
+            _sf("gross_profit", 41, UNSTAMPED, None, filed=AT1.date()),
+            _sf("gross_profit", 41, F2, AT2, comparative=True),
+        ]
+    )
+    assert ("gross_profit", FY18[1]) not in rows
+    assert ("revenue", FY18[1]) in rows and ("cost_of_revenue", FY18[1]) in rows
+    assert (counts.held, counts.derived) == (1, 0)
+
+
+def test_a_conflict_withheld_gross_profit_derives_nothing_until_a_clean_filing() -> None:
+    conflict = {(F1, "gross_profit", FY18[1], 364)}
+    rows, counts = _rows(_components(F1, AT1), conflicts=conflict)
+    assert ("gross_profit", FY18[1]) not in rows and counts.derived == 0
+
+    later = _sf("gross_profit", 42, F2, AT2, comparative=True)
+    rows, counts = _rows([*_components(F1, AT1), later], conflicts=conflict)
+    vintage = rows[("gross_profit", FY18[1])]
+    assert (vintage["basis"], vintage["filing_accession"], vintage["comparative"]) == (
+        "reported",
+        F2,
+        True,
+    )
+
+
+def test_components_in_two_units_derive_nothing() -> None:
+    rows, _ = _rows([_sf("revenue", 100, F1, AT1), _sf("cost_of_revenue", 60, F1, AT1, unit="EUR")])
+    assert ("gross_profit", FY18[1]) not in rows
+
+
+# --- statement facts through the EDGAR chunk ---------------------------------
+
+
+class _StatementSource(FixtureFilingSource):
+    """A fixture source answering `statement_facts` as the adapter does:
+    `conflicts` restored onto `statement_conflict_keys` on every read, the
+    adapter's counts as plain attributes, and every call logged."""
+
+    def __init__(
+        self,
+        records: Sequence[StatementFactRecord],
+        *,
+        conflicts: Sequence[StatementConflict] = (),
+        unstampable: int = 0,
+    ) -> None:
+        base = _filings()
+        super().__init__(
+            index=base._index,
+            snapshot=base._snapshot,
+            facts=base._facts,
+            headers=base._headers,
+            cover_pages=base._cover_pages,
+            delistings=base._delistings,
+            statement_facts=records,
+        )
+        self._conflicts = list(conflicts)
+        self.statement_conflict_keys: list[StatementConflict] = []
+        self.statement_conflicts = len(conflicts)
+        self.statement_unstampable = unstampable
+        self.calls: list[str] = []
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        self.calls.append(cik)
+        listed = set(self.statement_conflict_keys)
+        self.statement_conflict_keys.extend(c for c in self._conflicts if c not in listed)
+        return super().statement_facts(cik)
+
+
+def _switched(settings: Settings, on: bool = True) -> Settings:
+    edgar = settings.edgar.model_copy(update={"statement_facts_enabled": on})
+    return settings.model_copy(update={"edgar": edgar})
+
+
+def _edgar(settings: Settings, source: FilingSource, **kwargs: Any) -> SourceRun:
+    result = _run(settings, filings=source, source="edgar", **kwargs)  # type: ignore[arg-type]
+    (run,) = result.runs
+    assert run.status == OK, run.message
+    return run
+
+
+def _statement_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read(
+        "SELECT fact_name, period_end, value, filing_accession, basis, known_at "
+        "FROM statement_facts ORDER BY fact_name, period_end"
+    )
+
+
+def test_ingest_keeps_the_first_vintage_and_a_rerun_adds_nothing(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _switched(settings)
+    source = _StatementSource(
+        [_sf("revenue", 100, F1, AT1), _sf("revenue", 110, F2, AT2, comparative=True)]
+    )
+    first = _edgar(on, source)
+    assert statement_counts(first.message) == {
+        "added": 1,
+        "held": 0,
+        "vintage_late": 0,
+        "restated": 1,
+        "derived": 0,
+        "unstampable": 0,
+        "conflicts": 0,
+    }
+    assert _statement_rows(read) == [("revenue", FY18[1], 100, F1, "reported", AT1)]
+    with duckdb.connect(on.store.path, read_only=True) as conn:
+        for t in (AT1, AT2, NOW):
+            frame = statement_facts_as_of(conn, t)
+            assert frame["value"].to_list() == [100.0], t
+        assert statement_facts_as_of(conn, AT1 - timedelta(microseconds=1)).is_empty()
+    rows_before = _counts(read)
+    again = _edgar(on, source)
+    assert statement_counts(again.message)["added"] == 0
+    assert _counts(read) == rows_before
+    assert len(_statement_rows(read)) == 1
+
+
+def test_known_at_is_the_acceptance_never_the_filed_date(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """No look-ahead: an after-hours filing (accepted 18:30 New York, `filed`
+    the next day) is visible from the acceptance instant, not before."""
+    accepted = datetime(2019, 3, 1, 23, 30, tzinfo=UTC)
+    _edgar(
+        _switched(settings),
+        _StatementSource([_sf("revenue", 100, F1, accepted, filed=date(2019, 3, 4))]),
+    )
+    assert _statement_rows(read)[0][-1] == accepted
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert statement_facts_as_of(conn, accepted - timedelta(microseconds=1)).is_empty()
+        assert len(statement_facts_as_of(conn, accepted)) == 1
+
+
+def test_a_late_record_is_counted_and_the_rebuild_makes_it_the_vintage(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _switched(settings)
+    _edgar(on, _StatementSource([_sf("revenue", 110, F2, AT2)]))
+    both = _StatementSource([_sf("revenue", 100, F1, AT1), _sf("revenue", 110, F2, AT2)])
+    late = _edgar(on, both)
+    assert statement_counts(late.message)["vintage_late"] == 1
+    assert [r[3] for r in _statement_rows(read)] == [F2]
+
+    rebuilt = _edgar(on, both, rebuild_statement_facts=True)
+    counts = statement_counts(rebuilt.message)
+    assert (counts["deleted"], counts["added"], counts["vintage_late"]) == (1, 1, 0)
+    assert counts["restated"] == 1
+    assert [r[3] for r in _statement_rows(read)] == [F1]
+
+
+def test_an_unstampable_accession_holds_nothing_and_its_count_is_reported(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The adapter drops a settled-unstampable accession's entries and counts
+    them; nothing reaches the hold rule, so the stamped carrier is stored."""
+    run = _edgar(
+        _switched(settings), _StatementSource([_sf("revenue", 100, F1, AT1)], unstampable=3)
+    )
+    counts = statement_counts(run.message)
+    assert (counts["unstampable"], counts["held"], counts["added"]) == (3, 0, 1)
+
+
+def test_a_conflict_withheld_gross_profit_stays_empty_across_runs_until_clean(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The second run's source restores the conflict list from its cache on
+    every read, so the candidate stays withheld and no row is added."""
+    on = _switched(settings)
+    conflict = StatementConflict(F1, "gross_profit", *FY18, (40.0, 41.0))
+    for _ in range(2):
+        run = _edgar(on, _StatementSource(_components(F1, AT1), conflicts=[conflict]))
+        assert statement_counts(run.message)["derived"] == 0
+        assert [r[0] for r in _statement_rows(read)] == ["cost_of_revenue", "revenue"]
+    clean = [*_components(F1, AT1), _sf("gross_profit", 41, F2, AT2, comparative=True)]
+    _edgar(on, _StatementSource(clean, conflicts=[conflict]))
+    gross = [r for r in _statement_rows(read) if r[0] == "gross_profit"]
+    assert gross == [("gross_profit", FY18[1], 41, F2, "reported", AT2)]
+
+
+def test_switch_off_asks_nothing_and_adds_no_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert settings.edgar.statement_facts_enabled is False  # the default
+    source = _StatementSource(_components(F1, AT1))
+    run = _edgar(settings, source)
+    assert source.calls == []
+    assert "statement_" not in run.message
+    assert read("SELECT count(*) FROM statement_facts") == [(0,)]
+    with pytest.raises(ValueError, match="statement_facts_enabled"):
+        _run(settings, filings=source, source="edgar", rebuild_statement_facts=True)
+    assert read("SELECT count(*) FROM statement_facts") == [(0,)]
+
+
+def test_each_cik_is_one_bulk_insert(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    inserts: list[set[str]] = []
+    real = ingest_module.insert_statement_frame
+
+    def counted(conn: duckdb.DuckDBPyConnection, frame: Any) -> None:
+        inserts.append(set(frame.column("cik").to_pylist()))
+        real(conn, frame)
+
+    monkeypatch.setattr(ingest_module, "insert_statement_frame", counted)
+    records = [
+        *_components(F1, AT1),
+        _sf("revenue", 7, f"{DUAL}-19-000101", AT1, cik=DUAL),
+        _sf("total_assets", 9, f"{DUAL}-19-000101", AT1, cik=DUAL, period=(None, FY18[1])),
+    ]
+    _edgar(_switched(settings), _StatementSource(records))
+    assert inserts == [{ACME}, {DUAL}]
+    assert read("SELECT cik, count(*) FROM statement_facts GROUP BY cik ORDER BY cik") == [
+        (ACME, 3),
+        (DUAL, 2),
+    ]
+
+
+def test_a_frame_with_a_naive_timestamp_is_refused_before_the_insert(settings: Settings) -> None:
+    row = _statement_row_for_test()
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        with pytest.raises(TypeError, match="known_at must be tz-aware"):
+            insert_statement_frame(
+                conn, statement_frame([{**row, "known_at": AT1.replace(tzinfo=None)}])
+            )
+        assert conn.execute("SELECT count(*) FROM statement_facts").fetchone() == (0,)
+        insert_statement_frame(conn, statement_frame([row]))
+        assert conn.execute("SELECT count(*) FROM statement_facts").fetchone() == (1,)
+
+
+def _statement_row_for_test() -> dict[str, Any]:
+    rows, _ = statement_fact_rows([_sf("revenue", 100, F1, AT1)], {}, set(), ingested_at=NOW)
+    return rows[0]
+
+
+# --- statement facts: the fetch pass and the lock, over the EDGAR adapter ------
+
+
+class _AdapterStatements(FixtureFilingSource):
+    """The fixture master's answers, with `statement_facts` and its counts
+    served by a real `EdgarFilingSource` over a fake transport; `calls`
+    logs each CIK asked and whether the write phase was running."""
+
+    def __init__(self, adapter: EdgarFilingSource) -> None:
+        base = _filings()
+        super().__init__(
+            index=base._index,
+            snapshot=base._snapshot,
+            facts=base._facts,
+            headers=base._headers,
+            cover_pages=base._cover_pages,
+            delistings=base._delistings,
+        )
+        self.adapter = adapter
+        self.writing = False
+        self.calls: list[tuple[str, bool]] = []
+
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        self.calls.append((cik, self.writing))
+        return self.adapter.statement_facts(cik)
+
+    def __getattr__(self, name: str) -> Any:  # the adapter's plain statement_* attributes
+        if name.startswith("statement_"):
+            return getattr(self.adapter, name)
+        raise AttributeError(name)
+
+
+def _companyfacts_entry(accession: str, period: tuple[date, date] | date, value: float) -> Any:
+    row: dict[str, Any] = {"accn": accession, "val": value, "fy": 2018, "fp": "FY"}
+    row.update(form="10-K", filed="2019-03-01")
+    if isinstance(period, tuple):
+        row["start"], row["end"] = period[0].isoformat(), period[1].isoformat()
+    else:
+        row["end"] = period.isoformat()
+    return row
+
+
+def test_under_the_lock_each_cik_is_one_cache_read_and_the_proxy_holds_no_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        sec_edgar_user_agent="TradePartner test-agent test@example.com",
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        edgar={"cache_dir": str(tmp_path / "cache"), "statement_facts_enabled": True},
+    )
+    settings = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"requests_per_second": 1e6})}
+    )
+    accession = f"{ACME}-19-000001"  # the fixture's cover-page 10-K
+    body = {
+        "cik": int(ACME),
+        "facts": {
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {
+                    "units": {"shares": [_companyfacts_entry(accession, date(2019, 2, 15), 5)]}
+                }
+            },
+            "us-gaap": {
+                "Revenues": {"units": {"USD": [_companyfacts_entry(accession, FY18, 100)]}},
+                "CostOfRevenue": {"units": {"USD": [_companyfacts_entry(accession, FY18, 60)]}},
+                "GrossProfit": {
+                    "units": {
+                        "USD": [  # a same-tag conflict for FY2017: withheld, listed
+                            _companyfacts_entry(accession, FY17, 30),
+                            _companyfacts_entry(accession, FY17, 31),
+                        ]
+                    }
+                },
+            },
+        },
+    }
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        assert str(request.url) == f"https://data.sec.gov/api/xbrl/companyfacts/CIK{ACME}.json"
+        return httpx.Response(200, json=body)
+
+    adapter = EdgarFilingSource(
+        settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    adapter._filing_index_ran = True
+    adapter._fsn_ready = True
+    adapter._fsn_loaded_periods = ("2099_01",)
+    adapter._save_stamps(
+        ACME, {accession: SubmissionRecord(accession, "10-K", "doc.htm", True, _at(2019, 3, 1))}
+    )  # DUAL has no stamped filing: answered with no request, as `facts` is
+    source = _AdapterStatements(adapter)
+    recorded = _Recorded(source)
+    _prefetch(recorded, settings, dry_run=False)
+    assert source.calls == [(ACME, False), (DUAL, False)]
+    assert not any(key[0] == "statement_facts" for key in recorded._answers)
+    fetched = (adapter.requests, adapter.statement_conflicts, adapter.statement_none)
+    assert fetched == (1, 1, 0)
+
+    real = ingest_module._write_statement_facts
+
+    def locked(*args: Any, **kwargs: Any) -> Any:
+        source.writing = True
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_write_statement_facts", locked)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        _, message = _ingest_filings(conn, settings, recorded, lambda: NOW, "run-1")
+    assert [cik for cik, writing in source.calls if writing] == [ACME, DUAL]
+    assert (adapter.requests, adapter.statement_conflicts, adapter.statement_none) == fetched
+    assert urls == [f"https://data.sec.gov/api/xbrl/companyfacts/CIK{ACME}.json"]
+    assert not any(key[0] == "statement_facts" for key in recorded._answers)
+    assert statement_counts(message)["derived"] == 1
+    assert ("gross_profit", FY17[1], 0.0) not in [(r[0], r[1], r[2]) for r in _statement_rows(read)]
+    assert [r[:3] for r in _statement_rows(read)] == [
+        ("cost_of_revenue", FY18[1], 60),
+        ("gross_profit", FY18[1], 40),
+        ("revenue", FY18[1], 100),
     ]
