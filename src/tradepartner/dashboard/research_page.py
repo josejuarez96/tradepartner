@@ -42,11 +42,18 @@ _REGISTRATIONS_SCHEMA: Final[dict[str, pl.DataType]] = {
     "stage": pl.Int64(),
     "title": pl.Utf8(),
     "confirmatory": pl.Boolean(),
+    "touches returns": pl.Boolean(),
     "provenance": pl.Utf8(),
     "family": pl.Utf8(),
     "dataset": pl.Utf8(),
     "window": pl.Utf8(),
     "splits": pl.Utf8(),
+    "primary metric": pl.Utf8(),
+    "direction": pl.Utf8(),
+    "threshold": pl.Float64(),
+    "CI level": pl.Float64(),
+    "min clusters": pl.Int64(),
+    "stop rule": pl.Utf8(),
     "budget runs": pl.Utf8(),
     "budget configurations": pl.Utf8(),
     "amends": pl.Int64(),
@@ -113,11 +120,18 @@ class RegistrationRow:
     title: str
     confirmatory: bool
     provenance: str
+    touches_returns: bool
     family: str | None
     dataset_name: str
     window_start: date
     window_end: date
     splits: tuple[str, ...]
+    primary_metric: str
+    primary_direction: str
+    primary_threshold: float | None
+    primary_ci_level: float
+    primary_min_clusters: int
+    stop_rule: str
     budget_runs: int
     budget_configurations: int
     amends_registration_id: int | None
@@ -213,8 +227,10 @@ def _registrations(
     rows = _rows(
         conn,
         "SELECT registration_id, slug, kind, stage, title, confirmatory, provenance, "
-        "family, dataset_name, window_start, window_end, splits_json, budget_runs, "
-        "budget_configurations, amends_registration_id, registered_by, known_at "
+        "touches_returns, family, dataset_name, window_start, window_end, splits_json, "
+        "primary_metric, primary_direction, primary_threshold, primary_ci_level, "
+        "primary_min_clusters, stop_rule, budget_runs, budget_configurations, "
+        "amends_registration_id, registered_by, known_at "
         "FROM research_registrations ORDER BY registration_id DESC",
     )
     out: list[RegistrationRow] = []
@@ -229,11 +245,18 @@ def _registrations(
                 title=row["title"],
                 confirmatory=row["confirmatory"],
                 provenance=row["provenance"],
+                touches_returns=row["touches_returns"],
                 family=row["family"],
                 dataset_name=row["dataset_name"],
                 window_start=row["window_start"],
                 window_end=row["window_end"],
                 splits=tuple(json.loads(row["splits_json"])),
+                primary_metric=row["primary_metric"],
+                primary_direction=row["primary_direction"],
+                primary_threshold=row["primary_threshold"],
+                primary_ci_level=row["primary_ci_level"],
+                primary_min_clusters=row["primary_min_clusters"],
+                stop_rule=row["stop_rule"],
                 budget_runs=row["budget_runs"],
                 budget_configurations=row["budget_configurations"],
                 amends_registration_id=row["amends_registration_id"],
@@ -271,22 +294,24 @@ def _families(
 
 def _dataset_spends(
     conn: duckdb.DuckDBPyConnection,
-) -> tuple[dict[int, set[str]], dict[int, set[tuple[date, date]]]]:
-    """The sealed splits and periods each dataset id has spent, from the
-    `holdout_spend` decisions (req 5)."""
-    split_spends: dict[int, set[str]] = {}
-    period_spends: dict[int, set[tuple[date, date]]] = {}
-    for (raw,) in conn.execute(
-        "SELECT values_json FROM research_decisions WHERE kind = 'holdout_spend'"
-    ).fetchall():
+) -> tuple[dict[str, set[str]], dict[str, set[tuple[date, date]]]]:
+    """The sealed splits and periods each dataset name has spent, from the
+    `holdout_spend` decisions (req 5). Keyed by dataset name across versions,
+    like the gate, and synthetic runs are excluded, as the gate excludes them."""
+    split_spends: dict[str, set[str]] = {}
+    period_spends: dict[str, set[tuple[date, date]]] = {}
+    rows = conn.execute(
+        "SELECT ds.name, x.values_json FROM research_decisions x "
+        "JOIN research_runs r ON r.run_id = x.run_id "
+        "JOIN research_datasets ds ON ds.dataset_id = r.dataset_id "
+        "WHERE x.kind = 'holdout_spend' AND NOT r.synthetic"
+    ).fetchall()
+    for name, raw in rows:
         values = json.loads(raw)
-        dataset_id = values.get("dataset_id")
-        if dataset_id is None:
-            continue
         if values.get("sealed_split") is not None:
-            split_spends.setdefault(dataset_id, set()).add(values["sealed_split"])
+            split_spends.setdefault(name, set()).add(values["sealed_split"])
         for start, end in values.get("sealed_periods") or []:
-            period_spends.setdefault(dataset_id, set()).add(
+            period_spends.setdefault(name, set()).add(
                 (date.fromisoformat(start), date.fromisoformat(end))
             )
     return split_spends, period_spends
@@ -307,10 +332,11 @@ def _datasets(conn: duckdb.DuckDBPyConnection) -> tuple[DatasetRow, ...]:
             for name, (start, end) in json.loads(row["split_spans_json"]).items()
         }
         dataset_id = row["dataset_id"]
+        name = row["name"]
         out.append(
             DatasetRow(
                 dataset_id=dataset_id,
-                name=row["name"],
+                name=name,
                 version=row["version"],
                 n_rows=row["n_rows"],
                 event_start=row["event_start"],
@@ -321,8 +347,8 @@ def _datasets(conn: duckdb.DuckDBPyConnection) -> tuple[DatasetRow, ...]:
                     (date.fromisoformat(start), date.fromisoformat(end))
                     for start, end in json.loads(row["sealed_periods_json"])
                 ),
-                spent_splits=tuple(sorted(split_spends.get(dataset_id, set()))),
-                spent_periods=tuple(sorted(period_spends.get(dataset_id, set()))),
+                spent_splits=tuple(sorted(split_spends.get(name, set()))),
+                spent_periods=tuple(sorted(period_spends.get(name, set()))),
                 locked=row["locked"],
                 seed=row["seed"],
                 known_at=row["known_at"],
@@ -403,11 +429,18 @@ def _registrations_table(rows: Sequence[RegistrationRow]) -> pl.DataFrame:
                 "stage": row.stage,
                 "title": row.title,
                 "confirmatory": row.confirmatory,
+                "touches returns": row.touches_returns,
                 "provenance": row.provenance,
                 "family": row.family,
                 "dataset": row.dataset_name,
                 "window": _window(row.window_start, row.window_end),
                 "splits": ", ".join(row.splits) or "-",
+                "primary metric": row.primary_metric,
+                "direction": row.primary_direction,
+                "threshold": row.primary_threshold,
+                "CI level": row.primary_ci_level,
+                "min clusters": row.primary_min_clusters,
+                "stop rule": row.stop_rule,
                 "budget runs": f"{row.chain_runs}/{row.budget_runs}",
                 "budget configurations": (
                     f"{row.chain_configurations}/{row.budget_configurations}"

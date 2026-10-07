@@ -159,6 +159,7 @@ def _dataset(
     tmp_path: Path,
     *,
     name: str = "panel",
+    version: str = "v1",
     stem: str | None = None,
     dates: list[date] | None = None,
     splits: list[str] | None = None,
@@ -172,7 +173,7 @@ def _dataset(
     return research.register_dataset(
         conn,
         name=name,
-        version="v1",
+        version=version,
         path=str(csv),
         sha256=hash_file(csv),
         event_start=min(dates),
@@ -344,6 +345,63 @@ def _seed(store_path: Path, tmp_path: Path) -> Seeded:
         research.close_run(conn, abandon, "abandoned", "changed mind")
         seeded.abandoned = abandon.run_id
         seeded.budget = _open(conn, seed_settings, tmp_path, "b1", panel.dataset_id, "full").run_id
+
+        # A synthetic run's spend is not a spend: the page must not mark it.
+        syn_labels = _dataset(
+            conn,
+            tmp_path,
+            name="syn-labels",
+            dates=[date(2022, 2, 1), date(2022, 8, 1)],
+            splits=["dev", "test"],
+            periods=((date(2022, 1, 1), date(2022, 12, 31)),),
+            seed=e1h.seed,
+        )
+        research.register_experiment(conn, _labels(e1h, "sb1", dataset_name="syn-labels"), "owner")
+        _open(
+            conn,
+            seed_settings,
+            tmp_path,
+            "sb1",
+            syn_labels.dataset_id,
+            "test",
+            flags=SPEND,
+            reasons=WHY,
+            synthetic=True,
+        )
+
+        # A spend is keyed by dataset name: a spend on v1 shows on v2.
+        multi_v1 = _dataset(
+            conn,
+            tmp_path,
+            name="multi",
+            version="v1",
+            dates=[date(2022, 2, 1), date(2022, 8, 1)],
+            splits=["dev", "test"],
+            periods=((date(2022, 1, 1), date(2022, 12, 31)),),
+            seed=e1h.seed,
+        )
+        _dataset(
+            conn,
+            tmp_path,
+            name="multi",
+            version="v2",
+            stem="multi-v2",
+            dates=[date(2022, 3, 1), date(2022, 9, 1)],
+            splits=["dev", "test"],
+            periods=((date(2022, 1, 1), date(2022, 12, 31)),),
+            seed=e1h.seed,
+        )
+        research.register_experiment(conn, _labels(e1h, "m1", dataset_name="multi"), "owner")
+        _open(
+            conn,
+            seed_settings,
+            tmp_path,
+            "m1",
+            multi_v1.dataset_id,
+            "test",
+            flags=SPEND,
+            reasons=WHY,
+        )
     return seeded
 
 
@@ -427,6 +485,32 @@ def test_render_lists_registrations_budgets_and_amendments(
     assert any(value is not None for value in registrations["amends"])
 
 
+def test_render_registration_shows_its_block_fields(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    at = _app(monkeypatch, seeded_store[0])
+    assert not at.exception
+    registrations = _frame(at, "budget runs")
+    for column in (
+        "touches returns",
+        "primary metric",
+        "direction",
+        "threshold",
+        "CI level",
+        "min clusters",
+        "stop rule",
+    ):
+        assert column in registrations.columns
+    row = registrations[registrations["slug"] == "r1"].iloc[0]
+    assert bool(row["touches returns"]) is True
+    assert row["primary metric"] == "coef_deteriorated"
+    assert row["direction"] == "less"
+    assert row["threshold"] == 0.0
+    assert row["CI level"] == 0.95
+    assert row["min clusters"] == 30
+    assert "confirmatory only" in row["stop rule"]
+
+
 def test_render_family_sums_beside_the_backtest_n(
     monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
 ) -> None:
@@ -462,7 +546,15 @@ def test_render_runs_newest_first_with_every_state_and_synthetic_hidden(
         assert column in runs.columns
     listed = list(runs["run"])
     assert listed == sorted(listed, reverse=True)
-    states = {"ok", "failed", "refused_window", "refused_split", "refused_holdout", "abandoned"}
+    states = {
+        "ok",
+        "failed",
+        "refused_window",
+        "refused_split",
+        "refused_holdout",
+        "refused_budget",
+        "abandoned",
+    }
     assert states <= set(runs["outcome"])
     assert "unfinished" in set(runs["outcome"])
     assert seeded.synthetic not in listed
@@ -498,6 +590,41 @@ def test_render_datasets_with_sealed_splits_periods_and_spends(
     labels = datasets[datasets["name"] == "labels"].iloc[0]
     assert labels["sealed splits (spent)"] == "test (spent)"
     assert "2022-01-01 to 2022-12-31 (spent)" in labels["sealed periods (spent)"]
+
+
+def test_render_synthetic_spend_does_not_mark_a_split_spent(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, _ = seeded_store
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        (synthetic_spends,) = conn.execute(
+            "SELECT COUNT(*) FROM research_decisions x "
+            "JOIN research_runs r ON r.run_id = x.run_id "
+            "JOIN research_datasets ds ON ds.dataset_id = r.dataset_id "
+            "WHERE x.kind = 'holdout_spend' AND r.synthetic AND ds.name = 'syn-labels'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert synthetic_spends == 1
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    datasets = _frame(at, "sealed splits (spent)")
+    row = datasets[datasets["name"] == "syn-labels"].iloc[0]
+    assert row["sealed splits (spent)"] == "test"
+    assert "(spent)" not in row["sealed periods (spent)"]
+
+
+def test_render_spend_on_one_version_shows_on_every_version(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    at = _app(monkeypatch, seeded_store[0])
+    assert not at.exception
+    datasets = _frame(at, "sealed splits (spent)")
+    rows = datasets[datasets["name"] == "multi"]
+    assert len(rows) == 2
+    assert set(rows["sealed splits (spent)"]) == {"test (spent)"}
+    assert all("(spent)" in value for value in rows["sealed periods (spent)"])
 
 
 def test_render_decisions(
