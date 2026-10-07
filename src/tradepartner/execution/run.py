@@ -252,6 +252,10 @@ from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
     DecisionRow,
+    DecisionWithEvents,
+    KillSwitchRow,
+    OrderedFill,
+    OrderEventRow,
     OrderRow,
     PaperRunResultRow,
     PaperRunRow,
@@ -283,6 +287,7 @@ __all__ = [
     "INVOKED_BY_ENV",
     "RunOutcome",
     "StepContext",
+    "WindowJournalInputs",
     "exits_step",
     "invoked_by",
     "stop_session",
@@ -290,6 +295,7 @@ __all__ = [
     "submit_window",
     "tracking_run",
     "trade_step",
+    "window_journal_inputs",
 ]
 
 #: The environment variable the scheduler's plist sets (spec "Env vars").
@@ -369,6 +375,23 @@ class StepContext:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class WindowJournalInputs:
+    """The window's journal inputs for derived-state computation, read the way the
+    tracking run reads them: every row the store holds, no `as_of` cut."""
+
+    decisions: list[DecisionWithEvents]
+    orders: list[OrderRow]
+    order_events: list[OrderEventRow]
+    fills: list[OrderedFill]
+    adjustments: list[AdjustmentRow]
+    rebalance_events: list[RebalanceEventRow]
+    runs: list[PaperRunRow]
+    results: list[PaperRunResultRow]
+    positions_daily: list[PositionDailyRow]
+    kill_switch_events: list[KillSwitchRow]
+
+
 def trade_step(context: StepContext) -> BatchOutcome | None:
     """Step 6's trading half on a rebalance or catch-up run (module
     docstring): inside the submit window, the plan's decisions and this
@@ -444,6 +467,27 @@ def submit_window(settings: Settings, session: date) -> tuple[datetime, datetime
     return (
         opening - timedelta(minutes=paper.submit_window_before_open_minutes),
         opening + timedelta(minutes=paper.submit_window_after_open_minutes),
+    )
+
+
+def window_journal_inputs(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+) -> WindowJournalInputs:
+    """The window's journal inputs for derived state, read the way the tracking
+    run reads them: every row the store holds, no `as_of` cut. Used by tests
+    and derived-state callers to mirror production reads."""
+    return WindowJournalInputs(
+        decisions=decisions_for(conn, window_id),
+        orders=orders_for(conn, window_id=window_id),
+        order_events=order_events_for(conn, window_id=window_id),
+        fills=fills_for(conn, window_id=window_id),
+        adjustments=adjustments_for(conn, window_id),
+        rebalance_events=rebalance_events_for(conn, window_id),
+        runs=[r.run for r in runs_for(conn, window_id)],
+        results=[r.result for r in runs_for(conn, window_id) if r.result is not None],
+        positions_daily=positions_daily_for(conn, window_id),
+        kill_switch_events=kill_switch_events_for(conn, window_id),
     )
 
 
