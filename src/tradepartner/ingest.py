@@ -1134,7 +1134,11 @@ def fact_rows(
 
     Candidates are the CIK's **common** classes, by the classification in
     force at the fact's acceptance (no later knowledge picks the class),
-    without a class whose successor is known by then (`MasterBuild.successions`);
+    without a class whose successor is known by then (`MasterBuild.successions`)
+    and without a dead class: one that no cover page known at the acceptance
+    has shown since another candidate first appeared on one
+    (`MasterBuild.shown`; a de-SPAC's old SPAC common, still classified
+    common with no Form 25, beside the merged company's new class, #1165);
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
@@ -1156,9 +1160,32 @@ def fact_rows(
             by_cik[row["cik"]].append(row["security_id"])
     succeeded = {s.predecessor_id: s.known_at for s in master.successions}
 
+    spans: dict[str, list[tuple[datetime, datetime]]] = defaultdict(list)
+    for span in master.shown:
+        spans[span.security_id].append((span.first_at, span.last_at))
+    first_shown = {sid: min(at for at, _ in runs) for sid, runs in spans.items()}
+
+    def dead_at(sid: str, others: list[str], t: datetime) -> bool:
+        """`sid` was shown on a cover page known at `t`, but on none from
+        the first page showing another of `others` (known at `t`) to `t`.
+        A span starting by `t` and reaching that page puts `sid` on it, as
+        spans run over consecutive pages; a class never shown by `t` (a
+        snapshot-only listing) is never dead."""
+        runs = [(start, end) for start, end in spans.get(sid, []) if start <= t]
+        if not runs:
+            return False
+        for other in others:
+            appeared = first_shown.get(other)
+            if appeared is None or appeared > t or other == sid:
+                continue
+            if all(end < appeared for _, end in runs):
+                return True
+        return False
+
     def common_at(cik: str, t: datetime) -> list[str]:
         """The CIK's classes classified `common` by the latest row known at
-        `t`, less any whose successor (new equity, #820) is known at `t`."""
+        `t`, less any whose successor (new equity, #820) is known at `t` and
+        any dead at `t` (#1165)."""
         out = []
         for sid in by_cik.get(cik, []):
             if sid in succeeded and succeeded[sid] <= t:
@@ -1166,7 +1193,7 @@ def fact_rows(
             known = [kind for at, kind in kinds[sid] if at <= t]
             if known and known[-1] == "common":
                 out.append(sid)
-        return out
+        return [sid for sid in out if not dead_at(sid, out, t)]
 
     letters: dict[str, set[str]] = defaultdict(set)
     for row in master.listings:
