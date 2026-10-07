@@ -76,6 +76,96 @@ source = "from urllib.parse import urlsplit\n"
 rule = ""
 
 [[case]]
+id = "ssl-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import ssl\n"
+rule = "ii"
+
+[[case]]
+id = "asyncio-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import asyncio\n"
+rule = "ii"
+
+[[case]]
+id = "urllib3-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import urllib3\n"
+rule = "ii"
+
+[[case]]
+id = "httplib2-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import httplib2\n"
+rule = "ii"
+
+[[case]]
+id = "websockets-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from websockets.sync.client import connect\n"
+rule = "ii"
+
+[[case]]
+id = "ftplib-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from ftplib import FTP\n"
+rule = "ii"
+
+[[case]]
+id = "smtplib-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import smtplib\n"
+rule = "ii"
+
+[[case]]
+id = "xmlrpc-client-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import xmlrpc.client\n"
+rule = "ii"
+
+[[case]]
+id = "xmlrpc-from-client-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from xmlrpc import client\n"
+rule = "ii"
+
+[[case]]
+id = "bare-xmlrpc-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import xmlrpc\n"
+rule = "ii"
+
+[[case]]
+id = "subprocess-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "import subprocess\n"
+rule = "ii"
+
+[[case]]
+id = "subprocess-run-in-job"
+path = "src/tradepartner/research/labeling/job.py"
+source = "from subprocess import run\n"
+rule = "ii"
+
+[[case]]
+id = "subprocess-in-frame-passes"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "from subprocess import run\n"
+rule = ""
+
+[[case]]
+id = "subprocess-in-scoring"
+path = "src/tradepartner/research/labeling/scoring.py"
+source = "import subprocess\n"
+rule = "ii"
+
+[[case]]
+id = "ssl-in-frame"
+path = "src/tradepartner/research/labeling/frame.py"
+source = "import ssl\n"
+rule = "ii"
+
+[[case]]
 id = "relative-models-in-crosswalk"
 path = "src/tradepartner/research/labeling/crosswalk.py"
 source = "from ..models import build_client\n"
