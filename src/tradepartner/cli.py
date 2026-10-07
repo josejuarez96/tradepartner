@@ -97,6 +97,22 @@ Research registry (research-registry spec req 11 and req 14; plan T83):
   export, checks the declared span against the event column and every sealed
   split's rows against the sealed periods, and records the version.
 
+Paper trading (Phase 4 plan T90; ADR 0010 amendment 2026-10-04):
+
+- `tradepartner paper lots-reconcile --export <file> --tax-year <y>` parses the
+  broker's realised-gains or 1099-B export (`execution.lots_reconcile_export`,
+  a stub that refuses every file until the first real export) and compares it,
+  through `execution.lots_reconcile.compare`, with the latest journaled
+  lot-ledger set's disposals of that tax year, read through
+  `store.db.open_read_only`. It writes nothing and has no fix, adjust or write
+  flag. It exits 0 only when at least one row matched and nothing differs, 3
+  on any difference (an unmatched row on either side is one), and
+  `LOTS_RECONCILE_REFUSAL_EXIT`'s code per refusal: `unknown_export_format`,
+  `no_disposals` (none in the tax year), `locked` (store busy), `no_window`
+  (no journal or no window) and `no_store`. The ledger holds one window's
+  rebuild (spec req 13), so the report names that window and every other
+  window that reaches the tax year, whose disposals are not compared.
+
 There is no `--synthetic` flag, no store-path option, and no edit, delete,
 unseal, reopen or import command: every run the CLI opens is a non-synthetic
 run on the store it is configured for.
@@ -114,7 +130,8 @@ configured secret redacted, and names of variables. It never prints a setting's
 value.
 
 `make_app` takes every edge a test replaces (settings, clock, the EDGAR HTTP
-client, the price source, the dashboard launcher); `main` is the console script
+client, the price source, the dashboard launcher, the broker export parser);
+`main` is the console script
 over the real ones.
 """
 
@@ -124,10 +141,13 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields
 from datetime import date, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import httpx
@@ -145,6 +165,10 @@ from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
+from tradepartner.execution import lots_reconcile
+from tradepartner.execution.lots_reconcile import BrokerLotRow
+from tradepartner.execution.lots_reconcile_export import UnknownExportFormat
+from tradepartner.execution.lots_reconcile_export import parse_export as parse_broker_export
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
@@ -167,7 +191,7 @@ from tradepartner.research.experiment import (
 from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
 from tradepartner.retract import RetractRefused, master_retract
-from tradepartner.store import registry, research, schema
+from tradepartner.store import journal, registry, research, schema
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -593,6 +617,143 @@ def _flag_names(run: research.RunSummary) -> str:
     return ",".join(flags) or "-"
 
 
+# --- Phase 4: paper lots-reconcile (plan T90) -------------------------------------
+
+#: `paper lots-reconcile` exits this on any difference (an unmatched row is one).
+LOTS_RECONCILE_DIFFERENCE_EXIT = 3
+#: `paper lots-reconcile`'s exit code per refusal, each distinct (plan T90).
+LOTS_RECONCILE_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
+    {
+        "unknown_export_format": 4,
+        "no_disposals": 5,
+        "locked": 6,
+        "no_window": 7,
+        "no_store": 8,
+    }
+)
+_NEW_YORK = ZoneInfo("America/New_York")
+#: Every table of one lot-ledger set shares the set's stamp, the latest `lots.known_at`.
+_LATEST_SET = "known_at = (SELECT max(known_at) FROM lots)"
+
+
+class _LotsRefused(Exception):
+    """A `paper lots-reconcile` refusal: its `LOTS_RECONCILE_REFUSAL_EXIT` key and message."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class _LedgerSet:
+    """The latest journaled lot-ledger set, as written, and the windows around it."""
+
+    window_id: int
+    window_started: date
+    other_windows: tuple[int, ...]  # other windows reaching the tax year
+    lots: list[journal.LotRow]
+    disposals: list[journal.DisposalRow]
+    flags: list[journal.WashSaleFlagRow]
+
+
+def _set_rows(conn: duckdb.DuckDBPyConnection, row_type: Any, order: str) -> list[Any]:
+    """`row_type`'s rows of the latest lot-ledger set, exactly as written."""
+    names = [f.name for f in fields(row_type)]
+    columns = ", ".join(f'"{name}"' for name in names)
+    rows = conn.execute(
+        f"SELECT {columns} FROM {row_type.TABLE} WHERE {_LATEST_SET} ORDER BY {order}"
+    ).fetchall()
+    return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
+
+
+def _local(at: datetime) -> date:
+    return at.astimezone(_NEW_YORK).date()
+
+
+def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerSet:
+    """The latest lot-ledger set, the window it belongs to (the last window
+    started by the set's stamp) and every other window that reaches the tax
+    year, or a `no_window` refusal. Read-only."""
+    try:
+        journal.require_journal(conn)
+    except journal.JournalNotInitialised:
+        raise _LotsRefused("no_window", "no_window: the store has no paper journal") from None
+    windows = [
+        (int(w), s)
+        for w, s in conn.execute(
+            "SELECT window_id, started_at FROM paper_windows ORDER BY window_id"
+        ).fetchall()
+    ]
+    if not windows:
+        raise _LotsRefused("no_window", "no_window: no paper window was ever started")
+    stamp_row = conn.execute("SELECT max(known_at) FROM lots").fetchone()
+    stamp = None if stamp_row is None else stamp_row[0]
+    started = [(w, s) for w, s in windows if stamp is None or s <= stamp]
+    window_id, window_started = (started or windows)[-1]
+    ended = {
+        int(w): _local(at)
+        for w, at in conn.execute(
+            'SELECT window_id, min("at") FROM paper_window_stops WHERE list_contains(?, state) '
+            "GROUP BY window_id",
+            [list(journal.CLOSING_STOP_STATES)],
+        ).fetchall()
+    }
+    others = tuple(
+        w
+        for w, s in windows
+        if w != window_id
+        and _local(s).year <= tax_year
+        and (w not in ended or ended[w].year >= tax_year)
+    )
+    return _LedgerSet(
+        window_id=window_id,
+        window_started=_local(window_started),
+        other_windows=others,
+        lots=_set_rows(conn, journal.LotRow, "lot_id"),
+        disposals=_set_rows(conn, journal.DisposalRow, "disposal_id"),
+        flags=_set_rows(conn, journal.WashSaleFlagRow, "flag_id"),
+    )
+
+
+def _row_text(row: BrokerLotRow) -> str:
+    cusip = f" ({row.cusip})" if row.cusip else ""
+    return f"{row.symbol}{cusip} {row.trade_date} qty {row.quantity}"
+
+
+def _lots_report_lines(report: lots_reconcile.Report, ledger: _LedgerSet) -> list[str]:
+    """Every difference with both figures, every expected difference, every
+    unmatched row on either side, then the result."""
+    symbol = {lot.lot_id: lot.symbol for lot in ledger.lots}
+    disallowed = lots_reconcile.disallowed_by_disposal(ledger.flags)
+    lines = [f"matched: {len(report.matched)}"]
+    for m in report.matched:
+        lot = f"lot {m.lot_id}, {symbol[m.lot_id]}"
+        head = f"disposal {m.disposal_id} ({lot}) <- {_row_text(m.row)}"
+        lines.extend(
+            f"difference: {head}: {d.figure} broker {d.broker} ledger {d.ledger}"
+            for d in m.mismatches
+        )
+        lines.extend(
+            f"expected (carry-forward not modelled): {head}: {d.figure} "
+            f"broker {d.broker} ledger {d.ledger}"
+            for d in m.expected
+        )
+    lines.extend(
+        f"unmatched export row: {_row_text(row)} proceeds {row.proceeds} "
+        f"cost basis {row.cost_basis} box 1g {row.disallowed_loss}"
+        for row in report.unmatched_rows
+    )
+    for d in report.unmatched_disposals:
+        figures = lots_reconcile.ledger_figures(d, disallowed)
+        lines.append(
+            f"unmatched ledger disposal: {d.disposal_id} (lot {d.lot_id}, {symbol[d.lot_id]}) "
+            f"{d.trade_date_local} qty {d.quantity} "
+            + " ".join(f"{name} {figures[name]}" for name in lots_reconcile.FIGURES)
+        )
+    lines.append(f"result: {'clean' if report.clean else 'differences'}")
+    return lines
+
+
 def make_app(
     *,
     settings: Callable[[], Settings] = get_settings,
@@ -600,6 +761,7 @@ def make_app(
     edgar_client: httpx.Client | None = None,
     price_source: Callable[[Settings], PriceSource] | None = None,
     launcher: Launcher = subprocess.call,
+    parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""
     app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
@@ -1377,6 +1539,70 @@ def make_app(
             + (", ".join(f"{a} to {b}" for a, b in record.sealed_periods) or "-")
         )
         typer.echo(f"  locked {_fmt(record.locked)}, seed {_fmt(record.seed)}")
+
+    paper_app = typer.Typer(no_args_is_help=True, help="Paper trading (Phase 4).")
+    app.add_typer(paper_app, name="paper")
+
+    @paper_app.command("lots-reconcile")
+    def lots_reconcile_(
+        export: Annotated[
+            Path,
+            typer.Option(
+                help="the broker's realised-gains or 1099-B export",
+                exists=True,
+                dir_okay=False,
+                readable=True,
+            ),
+        ],
+        tax_year: Annotated[int, typer.Option(help="the tax year the export covers")],
+    ) -> None:
+        """Compare a broker 1099-B export with the lot ledger; writes nothing."""
+        s = settings()
+
+        def refuse(code: str, message: str) -> typer.Exit:
+            return _fail(_scrubbed(f"refused: {message}", s), LOTS_RECONCILE_REFUSAL_EXIT[code])
+
+        if not Path(s.store.path).exists():
+            raise refuse("no_store", f"no store at {s.store.path}")
+        try:
+            rows = parse_export(export)
+        except UnknownExportFormat as exc:
+            raise refuse("unknown_export_format", str(exc)) from None
+        try:
+            with open_read_only(s) as conn:
+                ledger = _read_ledger_set(conn, tax_year)
+        except StoreLockedError as exc:
+            raise refuse("locked", f"locked: store busy: {exc}") from None
+        except _LotsRefused as exc:
+            raise refuse(exc.code, str(exc)) from None
+
+        def echo(line: str) -> None:
+            typer.echo(_scrubbed(line, s))
+
+        echo(
+            f"lots-reconcile: tax year {tax_year}, the ledger of window {ledger.window_id} "
+            f"(started {ledger.window_started}); the store holds one window's rebuild"
+        )
+        if ledger.other_windows:
+            names = ", ".join(str(w) for w in ledger.other_windows)
+            echo(
+                f"scope: tax year {tax_year} also reaches window(s) {names}, whose "
+                "disposals the store no longer holds and are not compared"
+            )
+        disposals = [d for d in ledger.disposals if d.tax_year == tax_year]
+        if not disposals:
+            raise refuse(
+                "no_disposals",
+                f"no_disposals: the ledger has no disposal in tax year {tax_year}",
+            )
+        in_year = [r for r in rows if r.trade_date.year == tax_year]
+        if skipped := len(rows) - len(in_year):
+            echo(f"export rows outside tax year {tax_year}, not compared: {skipped}")
+        report = lots_reconcile.compare(in_year, disposals, ledger.lots, ledger.flags)
+        for line in _lots_report_lines(report, ledger):
+            echo(line)
+        if not report.clean:
+            raise typer.Exit(LOTS_RECONCILE_DIFFERENCE_EXIT)
 
     return app
 
