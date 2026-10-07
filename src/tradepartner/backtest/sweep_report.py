@@ -745,7 +745,8 @@ def sweep_report(
         expected_range_share=_share(
             counted,
             lambda r: (
-                r.excess_cagr_spy is not None and lo <= r.excess_cagr_spy * _PERCENT_POINTS <= hi
+                r.excess_cagr_spy is not None
+                and lo / _PERCENT_POINTS <= r.excess_cagr_spy <= hi / _PERCENT_POINTS
             ),
         ),
         red_flag_count=sum(1 for r in counted if r.red_flag),

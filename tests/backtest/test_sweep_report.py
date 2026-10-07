@@ -213,6 +213,7 @@ def _sweep(
     slug: str = "mom-grid",
     statistic: str = "sharpe_annual_excess_spy",
     first_index_fingerprint: int = 0,
+    expected_range_pp: tuple[float, float] = (-2.0, 2.0),
 ) -> tuple[lab_registry.SweepRecord, list[registry.HypothesisRecord]]:
     sweep = lab_registry.register_sweep(
         conn,
@@ -225,7 +226,7 @@ def _sweep(
         n_variants=len(values),
         selection_statistic=statistic,
         expected_excess_cagr_spy_pp=0.0,
-        expected_range_pp=(-2.0, 2.0),
+        expected_range_pp=expected_range_pp,
         promote_at_least=0.5,
         retire_below=0.0,
         in_sample_start=IN_SAMPLE_START,
@@ -472,6 +473,19 @@ def test_retire_below_met_and_promotion_against_the_high_water_mark(
     assert verdicts.retire_below_met is True
     assert verdicts.promote_at_least_met is False
     assert "retire_below 0.0: met" in sweep_report.format_report(report)
+
+
+def test_an_excess_exactly_at_the_range_bound_is_inside(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings
+) -> None:
+    # 0.07 * 100 is 7.000000000000001; the bound is converted to a fraction instead.
+    store, _twin = world
+    _sweep_record, records = _sweep(store.conn, settings, [0.15], expected_range_pp=(0.0, 7.0))
+    store.trial(
+        records[0].hypothesis_id, metrics=_metrics(excess_cagr=0.07, sharpe_annual_excess=0.4)
+    )
+    report = sweep_report.sweep_report(store.conn, "mom-grid", code_vintage=CODE)
+    assert report.expected_range_share == 1.0
 
 
 # --- variant states ---------------------------------------------------------------------
