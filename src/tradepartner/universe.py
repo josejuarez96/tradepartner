@@ -41,7 +41,12 @@ reported once, under the first rule it fails:
    A run of rejected facts, each in line with the one before it, that
    spans more than `universe.max_shares_age_days` re-anchors the baseline
    on its latest fact (#853), so a mis-scaled first fact cannot keep a
-   name out for good.
+   name out for good. EDGAR files the shares fact under the issuer, so the
+   store keeps it on the bare-CIK security (`security_id == cik`); a
+   sub-class security (`<cik>:<class>`) with no shares fact of its own
+   known at `t` reads the bare-CIK facts when it is its issuer's only
+   class passing rules 1-2 at `t` (#1165). With two such classes the
+   facts are never assigned to either: the class stays `no_shares`.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -72,7 +77,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import cache
@@ -258,13 +263,15 @@ class SharesPick:
     `t` out of line with its last accepted earlier fact, accepted by the
     owner or not, re-anchored or not (`SHARES_OUTLIER_SCHEMA`). `fallbacks`: the securities whose
     latest fact was rejected, with the fact used instead
-    (`SHARES_FALLBACK_SCHEMA`).
+    (`SHARES_FALLBACK_SCHEMA`). `mapped`: per security that read its
+    bare-CIK security's facts (`bare_sources`, #1165), that source's id.
     """
 
     shares: dict[str, tuple[date, float]]
     ambiguous: set[str]
     outliers: pl.DataFrame
     fallbacks: pl.DataFrame
+    mapped: dict[str, str] = field(default_factory=dict)
 
 
 def _date_picks(rows: list[dict[str, Any]]) -> dict[date, float | None]:
@@ -286,6 +293,7 @@ def shares_as_of(
     t: datetime,
     ids: Sequence[str] | None,
     settings: Settings,
+    bare_sources: Mapping[str, str] | None = None,
 ) -> SharesPick:
     """Rule 7's shares selection at `t` with the plausibility check (#845).
 
@@ -309,13 +317,28 @@ def shares_as_of(
     A date with two class rows is skipped by the walk. The latest date
     decides: ambiguous, its own value when accepted, else the last accepted
     fact. Only facts and splits known at `t` are read, never a later filing.
+
+    `bare_sources` (#1165) maps a security to the bare-CIK security its
+    issuer's shares facts sit on; the caller passes only an issuer's single
+    listed common class (`universe_as_of`). Such a security with no shares
+    fact of its own known at `t` is walked over the source's facts known at
+    `t` instead, with its own splits, and listed in `SharesPick.mapped`.
     """
     cfg = settings.universe
     accepted_list = {parse_accepted_shares_fact(e) for e in cfg.accepted_shares_facts}
-    rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in facts_as_of(conn, t, ids).iter_rows(named=True):
+    sources = dict(bare_sources or {})
+    wanted = None if ids is None else set(ids)
+    fetch = None if ids is None else sorted(set(ids) | set(sources.values()))
+    found: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in facts_as_of(conn, t, fetch).iter_rows(named=True):
         if row["fact_name"] == SHARES_FACT:
-            rows[row["security_id"]].append(row)
+            found[row["security_id"]].append(row)
+    rows = {sid: r for sid, r in found.items() if wanted is None or sid in wanted}
+    mapped: dict[str, str] = {}
+    for sid, source in sorted(sources.items()):
+        if sid not in rows and source in found and (wanted is None or sid in wanted):
+            rows[sid] = found[source]
+            mapped[sid] = source
     splits: dict[str, list[tuple[date, float]]] = defaultdict(list)
     split_ids = None if ids is None else sorted(rows)
     for action in live_actions_as_of(conn, t, split_ids).iter_rows(named=True):
@@ -414,6 +437,7 @@ def shares_as_of(
             "security_id", "as_of_date"
         ),
         fallbacks=pl.DataFrame(fallbacks, schema=SHARES_FALLBACK_SCHEMA).sort("security_id"),
+        mapped=mapped,
     )
 
 
@@ -473,6 +497,9 @@ def universe_as_of(
         "exchange",
         {sid: _listing_reason(listings.get(sid), session, cfg.exchanges) for sid in alive},
     )
+    listed_classes: dict[str, int] = defaultdict(int)  # per cik, classes passing rules 1-2
+    for sid in alive:
+        listed_classes[securities[sid]["cik"]] += 1
 
     def utility(sid: str) -> str:
         sic = classes[sid]["sic"]
@@ -515,7 +542,12 @@ def universe_as_of(
     )
     apply("history", dict.fromkeys(jumps["security_id"].to_list(), "price_jump"))
 
-    pick = shares_as_of(conn, t, sized, settings)
+    bare_sources = {
+        sid: securities[sid]["cik"]
+        for sid in sized
+        if sid != securities[sid]["cik"] and listed_classes[securities[sid]["cik"]] == 1
+    }
+    pick = shares_as_of(conn, t, sized, settings, bare_sources)
     latest_shares, ambiguous = pick.shares, pick.ambiguous
 
     def shares_reason(sid: str) -> str:
