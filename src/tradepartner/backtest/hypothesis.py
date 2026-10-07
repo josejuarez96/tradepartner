@@ -9,7 +9,7 @@ file wants to pin). Every other part of the file is prose, but it is hashed too.
 
 **The file must name** `in_sample_start`, `holdout.start`, `holdout.end`, every
 `costs.*` key and every key of its family's signal section (`strategy.*` for
-`momentum`, `profitability.*` for `profitability`; `REQUIRED_SECTIONS`), or it is
+`momentum`, `profitability.*` for `profitability`; `FAMILIES[family].sections`), or it is
 refused; the holdout never comes from live `Settings`. A key outside the frozen list
 below is refused rather than ignored, and so is a key of another family's signal
 section (`frozen.inert_sections`).
