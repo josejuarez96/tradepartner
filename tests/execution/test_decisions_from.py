@@ -330,10 +330,9 @@ def test_a_scored_member_also_excluded_raises() -> None:
         _run(plan, _ledger({}))
 
 
-def test_an_undeclared_reason_raises() -> None:
+def test_excluded_no_history_outside_the_declared_set_raises() -> None:
     """`excluded_no_history` non-empty while the family's `exclusions` do not
-    declare `no_history` at all: the reason is outside the family's declared set,
-    which the database's prefix-only `CHECK` would not itself catch."""
+    declare `no_history` at all names a reason outside the family's declared set."""
     plan = _plan(
         scores={"A": 0.5, "B": 0.4, "C": 0.1, "D": 0.0},
         members=("A", "B", "C", "D", "E"),
@@ -341,6 +340,35 @@ def test_an_undeclared_reason_raises() -> None:
         exclusions={"sector": ("E",)},  # declares "sector", not "no_history"
     )
     with pytest.raises(ValueError, match="no_history"):
+        _run(plan, _ledger({}))
+
+
+def test_excluded_no_history_disagreeing_with_its_declared_ids_raises() -> None:
+    """`no_history` is declared, but `excluded_no_history` names a different id
+    than `exclusions["no_history"]` does: the legacy field and the generic
+    mapping disagree, rather than one of them being simply absent."""
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=("D",),  # the legacy field says D
+        exclusions={"no_history": ("E",)},  # the mapping says E
+    )
+    with pytest.raises(ValueError, match="disagrees"):
+        _run(plan, _ledger({}))
+
+
+def test_an_undeclared_reason_key_raises() -> None:
+    """A reason key of the wrong shape, or already carrying the `excluded_`
+    prefix the database adds, is refused: the only thing `_signals` can check
+    against, since `Plan` carries no family, is the key's own shape, which the
+    database's prefix-only `CHECK` would not itself catch."""
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=(),
+        exclusions={"": ("D",), "excluded_no_facts": ("E",)},
+    )
+    with pytest.raises(ValueError, match="malformed"):
         _run(plan, _ledger({}))
 
 

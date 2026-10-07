@@ -82,6 +82,7 @@ included: that fails safe, since an in-flight decision is never re-ordered.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -927,27 +928,55 @@ def _ranked(scores: Mapping[str, float]) -> dict[str, int]:
     return {sid: rank for rank, sid in enumerate(order, start=1)}
 
 
+#: A `plan.exclusions` key's shape (`_signals`): lowercase letters, digits and
+#: underscores, not starting with the `excluded_` prefix the database itself adds.
+#: `Plan.exclusions` is built only by `backtest.engine._plan`, which already refuses
+#: a signal's exclusion key the family's registry does not declare (`engine.py:202-204`,
+#: against `config.FAMILIES[family].exclusion_reasons`); `_signals` has no `family` to
+#: re-check that set against (`Plan` does not carry one), so this is the cheaper, local
+#: half of that defense -- a malformed key (empty, double-prefixed, or holding
+#: whitespace/punctuation the `signals.reason` `CHECK` would still accept because it
+#: tests only the `excluded_` prefix) is refused here instead of reaching the journal.
+_EXCLUSION_REASON_SHAPE = re.compile(r"[a-z][a-z0-9_]*")
+
+
 def _signals(plan: Plan) -> tuple[Signal, ...]:
     """One `Signal` per universe member: `selected` or `below_cut` for a scored
     member, `f"{EXCLUDED_REASON_PREFIX}{reason}"` for each reason `plan.exclusions`
     declares (ADR 0014 point 3, #1153; T127b, #1209) -- `excluded_no_history` for
     momentum, unchanged. `plan.exclusions` holds every reason the plan's family
-    declares, so its keys *are* the family's declared set; `excluded_no_history`
-    (kept on `Plan` for Phase 4's `decisions_from`) must agree with
-    `exclusions.get("no_history", ())`, else it names a reason -- `no_history` --
-    outside that set, and this raises rather than silently trusting the legacy
-    field. The database checks only that a `signals` reason starts with
-    `excluded_` (`EXCLUDED_REASON_PREFIX`); that its suffix is a reason the
-    family actually declares is enforced here."""
+    declares (enforced by the one builder, `backtest.engine._plan`), so its keys
+    are trusted as the family's declared set; a key of the wrong shape
+    (`_EXCLUSION_REASON_SHAPE`) or starting with `EXCLUDED_REASON_PREFIX` already
+    raises here instead, and `excluded_no_history` (kept on `Plan` for Phase 4's
+    `decisions_from`) must agree with `exclusions.get("no_history", ())`, else it
+    raises rather than silently trusting the legacy field. The database checks
+    only that a `signals` reason starts with `excluded_` (`EXCLUDED_REASON_PREFIX`);
+    `_signals` is the one place that checks the suffix is shaped like a real
+    reason and that the legacy momentum field agrees with it."""
     for sid, score in plan.scores.items():
         _finite(score, f"score of {sid}")
     ranks = _ranked(plan.scores)
     members = set(plan.members)
     declared = set(plan.exclusions)
-    if set(plan.excluded_no_history) != set(plan.exclusions.get("no_history", ())):
+    malformed = sorted(
+        reason
+        for reason in declared
+        if not _EXCLUSION_REASON_SHAPE.fullmatch(reason)
+        or reason.startswith(EXCLUDED_REASON_PREFIX)
+    )
+    if malformed:
+        raise ValueError(f"plan.exclusions has malformed reason key(s) {malformed}")
+    no_history_ids = set(plan.exclusions.get("no_history", ()))
+    if set(plan.excluded_no_history) != no_history_ids:
+        if "no_history" not in declared:
+            raise ValueError(
+                f"excluded_no_history is non-empty but the plan's declared exclusion "
+                f"reasons {sorted(declared)} do not include no_history"
+            )
         raise ValueError(
-            f"excluded_no_history disagrees with the plan's declared exclusion reasons "
-            f"{sorted(declared)}: no_history is outside the family's declared set"
+            f"excluded_no_history {sorted(plan.excluded_no_history)} disagrees with "
+            f"exclusions['no_history'] {sorted(no_history_ids)}"
         )
     reason_of: dict[str, str] = {}
     for reason, ids in plan.exclusions.items():
