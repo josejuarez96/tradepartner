@@ -364,12 +364,15 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
 
     1. A title naming two or more common classes (#1163: "Class A Common
        Stock and Class B Common Stock") delists each if every one matches
-       exactly one class by title up to the first comma, else nothing.
+       exactly one class by title up to the first comma.
     2. A title that is not itself plain common but names one common class
        among others ("Units, Class A Common Stock and Warrants") resolves
-       through that name only, so a listed Units class never takes it.
-    3. Otherwise the one class with the same title up to the first comma;
-       failing that, for a plain-common title or name, the one class whose
+       through that name first: the class with that title, else the one
+       class whose titles are all plain common.
+    3. Otherwise the one class with the whole title up to the first comma
+       (so a filing whose named classes do not all resolve keeps what an
+       exact title match gives, never a guessed class); failing that, for a
+       plain-common title naming at most one class, the one class whose
        titles are all plain common.
     Anything else is `()`: never a guess."""
 
@@ -380,33 +383,33 @@ def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) 
             if any(t is not None and _norm_title(t) == name for t in titles)
         ]
 
+    def only_common() -> list[K]:
+        common = [
+            key
+            for key, titles in classes.items()
+            if all(t is None or _is_plain_common(t) for t in titles)
+        ]
+        return common if len(common) == 1 else []
+
     named = _named_common_titles(title)
+    plain = _is_plain_common(title)
     if len(named) > 1:
         found = [by_title(name) for name in named]
         if all(len(keys) == 1 for keys in found):
             return tuple(dict.fromkeys(keys[0] for keys in found))
-        return ()
-    plain = _is_plain_common(title)
-    if plain or not named:
-        exact = by_title(_norm_title(title))
-        if len(exact) == 1:
-            return (exact[0],)
-        if exact:
-            return ()
-    if not plain:
-        if not named:
-            return ()
+    elif named and not plain:
         exact = by_title(named[0])
         if len(exact) == 1:
             return (exact[0],)
-        if exact:
-            return ()
-    common = [
-        key
-        for key, titles in classes.items()
-        if all(t is None or _is_plain_common(t) for t in titles)
-    ]
-    return (common[0],) if len(common) == 1 else ()
+        if not exact and (common := only_common()):
+            return (common[0],)
+    exact = by_title(_norm_title(title))
+    if len(exact) == 1:
+        return (exact[0],)
+    if exact or not plain or len(named) > 1:
+        return ()
+    common = only_common()
+    return (common[0],) if common else ()
 
 
 def _delisted_classes(classes: Sequence[_Class], filing: DelistingFiling) -> list[_Class]:
