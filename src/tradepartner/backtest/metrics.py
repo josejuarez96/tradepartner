@@ -8,11 +8,16 @@ Pure functions over plain sequences of returns and equity values.
 - Skew and kurtosis are population moments (kurtosis non-excess, so a normal series
   gives 3), as Bailey & López de Prado use them.
 - PSR and DSR are our own code.
-- Monthly returns are the unit (spec: "Month i return"), and `MONTHS_PER_YEAR` is
-  derived from the ADR 0006 monthly cadence, not config.
+- Period returns are the unit (strategy-lab spec "Period", req 8): the return between
+  consecutive rebalance sessions at the hypothesis's cadence, annualised with that
+  cadence's `periods_per_year` (`schedule.PERIODS_PER_YEAR`, a constant, not config).
+  `MONTHS_PER_YEAR` is its `month_end` entry, re-exported here.
+- The deflated Sharpe (req 9) is computed at the trial's own period, against V over
+  the family's **annualised** Sharpes: SR*_annual from V and N, and the trial's
+  SR* = SR*_annual / sqrt(periods_per_year).
 
 Units: every return, CAGR and drawdown is a fraction (0.03 = 3%).
-`metrics.risk_free_rate` is an annual rate, compounded to a monthly one.
+`metrics.risk_free_rate` is an annual rate, compounded to a per-period one.
 `metrics.red_flag_excess_cagr_pp` is in percentage points.
 """
 
@@ -28,9 +33,8 @@ import empyrical
 import numpy as np
 import numpy.typing as npt
 
+from tradepartner.backtest.schedule import MONTHS_PER_YEAR as MONTHS_PER_YEAR
 from tradepartner.config import Settings
-
-MONTHS_PER_YEAR = 12
 
 # Bailey & López de Prado's gamma in the expected maximum Sharpe (spec req 8).
 EULER_GAMMA = np.euler_gamma
@@ -41,40 +45,46 @@ PERCENT_POINTS_PER_UNIT = 100
 Series = Literal["strategy", "SPY", "MTUM"]
 Basis = Literal["raw", "excess_spy"]
 
+#: The strategy-lab spec's req 8 keys, in its order. The Phase 3 `*_monthly` and
+#: `n_months` keys are no longer written; schema version 15 copied them to these.
 METRIC_KEYS: tuple[str, ...] = (
     "cagr",
     "vol_annual",
-    "sharpe_monthly",
+    "sharpe_period",
     "sharpe_annual",
-    "sharpe_monthly_excess_spy",
+    "sharpe_period_excess_spy",
+    "sharpe_annual_excess_spy",
     "max_drawdown",
-    "turnover_monthly",
+    "turnover_period",
+    "turnover_annual",
     "cost_drag",
     "excess_cagr_spy",
     "excess_cagr_mtum",
     "tracking_error_spy",
     "tracking_error_mtum",
-    "skew_monthly",
-    "kurtosis_monthly",
-    "skew_monthly_excess_spy",
-    "kurtosis_monthly_excess_spy",
-    "n_months",
+    "skew_period",
+    "kurtosis_period",
+    "skew_period_excess_spy",
+    "kurtosis_period_excess_spy",
+    "n_periods",
+    "periods_per_year",
 )
 
 # Stored as null for the SPY series: its excess over itself is identically zero (req 7).
 EXCESS_SPY_KEYS: tuple[str, ...] = (
-    "sharpe_monthly_excess_spy",
-    "skew_monthly_excess_spy",
-    "kurtosis_monthly_excess_spy",
+    "sharpe_period_excess_spy",
+    "sharpe_annual_excess_spy",
+    "skew_period_excess_spy",
+    "kurtosis_period_excess_spy",
 )
 
-# The metric keys each DSR basis reads: (Sharpe, skew, kurtosis).
+# The metric keys each DSR basis reads: (Sharpe, skew, kurtosis), all per period.
 _BASIS_KEYS: dict[Basis, tuple[str, str, str]] = {
-    "raw": ("sharpe_monthly", "skew_monthly", "kurtosis_monthly"),
+    "raw": ("sharpe_period", "skew_period", "kurtosis_period"),
     "excess_spy": (
-        "sharpe_monthly_excess_spy",
-        "skew_monthly_excess_spy",
-        "kurtosis_monthly_excess_spy",
+        "sharpe_period_excess_spy",
+        "skew_period_excess_spy",
+        "kurtosis_period_excess_spy",
     ),
 }
 
@@ -87,16 +97,17 @@ def _array(values: Sequence[float]) -> FloatArray:
     return np.asarray(values, dtype=np.float64)
 
 
-def _cagr(monthly: FloatArray) -> float:
-    return float(empyrical.cagr(monthly, annualization=MONTHS_PER_YEAR))
+def _cagr(returns: FloatArray, periods_per_year: int) -> float:
+    """Years = n_periods / periods_per_year."""
+    return float(empyrical.cagr(returns, annualization=periods_per_year))
 
 
-def _annualized_std(monthly: FloatArray) -> float:
-    return float(empyrical.annual_volatility(monthly, annualization=MONTHS_PER_YEAR))
+def _annualized_std(returns: FloatArray, periods_per_year: int) -> float:
+    return float(empyrical.annual_volatility(returns, annualization=periods_per_year))
 
 
-def _monthly_sharpe(monthly: FloatArray, risk_free_monthly: float = 0.0) -> float:
-    return float(empyrical.sharpe_ratio(monthly, risk_free=risk_free_monthly, annualization=1))
+def _period_sharpe(returns: FloatArray, risk_free_period: float = 0.0) -> float:
+    return float(empyrical.sharpe_ratio(returns, risk_free=risk_free_period, annualization=1))
 
 
 def _skew(x: FloatArray) -> float:
@@ -112,7 +123,7 @@ def _kurtosis(x: FloatArray) -> float:
 
 
 def _require_finite(name: str, x: FloatArray) -> None:
-    """empyrical skips NaN while the month still counts toward `n_months`, which
+    """empyrical skips NaN while the period still counts toward `n_periods`, which
     flatters CAGR; refuse any non-finite value instead."""
     if not bool(np.all(np.isfinite(x))):
         raise ValueError(f"{name} must be finite, got a NaN or infinite value")
@@ -132,43 +143,51 @@ def _require_variance(name: str, x: FloatArray) -> None:
 def series_metrics(
     series: Series,
     *,
-    monthly: Sequence[float],
-    gross_monthly: Sequence[float],
+    period_returns: Sequence[float],
+    gross_period_returns: Sequence[float],
     daily_equity: Sequence[float],
     turnover: Sequence[float],
-    spy_monthly: Sequence[float],
-    mtum_monthly: Sequence[float],
+    spy_period_returns: Sequence[float],
+    mtum_period_returns: Sequence[float],
+    periods_per_year: int,
     risk_free_rate: float,
 ) -> dict[str, float | None]:
-    """Every req 7 key for one series at one cost level.
+    """Every req 8 key for one series at one cost level.
 
-    `monthly` holds this series' month returns net of costs at this level.
-    `gross_monthly` holds the same series at zero cost, for `cost_drag`. `spy_monthly` and
-    `mtum_monthly` are the benchmarks' month returns over the same months. `daily_equity`
-    is the equity on every session, for `max_drawdown`. `turnover` is the one-sided
-    turnover per rebalance; an empty sequence gives 0. `risk_free_rate` is annual.
-    The `*_excess_spy` keys are None when `series` is `SPY`. Raises `ValueError` when
-    the series (or, except for SPY, its excess over SPY) is constant.
+    `period_returns` holds this series' period returns net of costs at this level, one
+    per rebalance period at the hypothesis's cadence; `periods_per_year` is that
+    cadence's constant (`schedule.periods_per_year`). `gross_period_returns` holds the
+    same series at zero cost, for `cost_drag`. `spy_period_returns` and
+    `mtum_period_returns` are the benchmarks' returns over the same periods.
+    `daily_equity` is the equity on every session, for `max_drawdown`. `turnover` is the
+    one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_rate` is
+    annual, compounded to the period. The `*_excess_spy` keys are None when `series` is
+    `SPY`. Raises `ValueError` when the series (or, except for SPY, its excess over SPY)
+    is constant, or `periods_per_year` is not positive.
     """
-    net = _array(monthly)
+    if periods_per_year < 1:
+        raise ValueError(f"periods_per_year must be positive, got {periods_per_year}")
+    ppy = periods_per_year
+    net = _array(period_returns)
     n = len(net)
     for name, other in (
-        ("gross_monthly", gross_monthly),
-        ("spy_monthly", spy_monthly),
-        ("mtum_monthly", mtum_monthly),
+        ("gross_period_returns", gross_period_returns),
+        ("spy_period_returns", spy_period_returns),
+        ("mtum_period_returns", mtum_period_returns),
     ):
         if len(other) != n:
-            raise ValueError(f"{name} has {len(other)} months, monthly has {n}")
+            raise ValueError(f"{name} has {len(other)} periods, period_returns has {n}")
     if n < 2:
-        raise ValueError(f"need at least 2 monthly returns for a Sharpe ratio, got {n}")
+        raise ValueError(f"need at least 2 period returns for a Sharpe ratio, got {n}")
     equity = _array(daily_equity)
-    gross, spy, mtum = _array(gross_monthly), _array(spy_monthly), _array(mtum_monthly)
+    gross = _array(gross_period_returns)
+    spy, mtum = _array(spy_period_returns), _array(mtum_period_returns)
     turnover_values = _array(turnover)
     for name, values in (
-        ("monthly", net),
-        ("gross_monthly", gross),
-        ("spy_monthly", spy),
-        ("mtum_monthly", mtum),
+        ("period_returns", net),
+        ("gross_period_returns", gross),
+        ("spy_period_returns", spy),
+        ("mtum_period_returns", mtum),
         ("daily_equity", equity),
         ("turnover", turnover_values),
     ):
@@ -177,37 +196,44 @@ def series_metrics(
         raise ValueError("daily_equity must be non-empty and strictly positive")
 
     ex_spy, ex_mtum = net - spy, net - mtum
-    _require_variance("monthly", net)
+    _require_variance("period_returns", net)
     if series != "SPY":
-        _require_variance("monthly minus spy_monthly", ex_spy)
-    rf_monthly = (1 + risk_free_rate) ** (1 / MONTHS_PER_YEAR) - 1
-    cagr = _cagr(net)
-    sharpe_monthly = _monthly_sharpe(net, rf_monthly)
+        _require_variance("period_returns minus spy_period_returns", ex_spy)
+    rf_period = (1 + risk_free_rate) ** (1 / ppy) - 1
+    root_ppy = math.sqrt(ppy)
+    cagr = _cagr(net, ppy)
+    sharpe_period = _period_sharpe(net, rf_period)
+    turnover_period = float(np.mean(turnover_values)) if len(turnover_values) else 0.0
     daily_returns = equity[1:] / equity[:-1] - 1
 
     out: dict[str, float | None] = {
         "cagr": cagr,
-        "vol_annual": _annualized_std(net),
-        "sharpe_monthly": sharpe_monthly,
-        "sharpe_annual": sharpe_monthly * math.sqrt(MONTHS_PER_YEAR),
-        "sharpe_monthly_excess_spy": None,
+        "vol_annual": _annualized_std(net, ppy),
+        "sharpe_period": sharpe_period,
+        "sharpe_annual": sharpe_period * root_ppy,
+        "sharpe_period_excess_spy": None,
+        "sharpe_annual_excess_spy": None,
         "max_drawdown": float(empyrical.max_drawdown(daily_returns)) if len(daily_returns) else 0.0,
-        "turnover_monthly": float(np.mean(turnover_values)) if len(turnover_values) else 0.0,
-        "cost_drag": _cagr(gross) - cagr,
-        "excess_cagr_spy": cagr - _cagr(spy),
-        "excess_cagr_mtum": cagr - _cagr(mtum),
-        "tracking_error_spy": _annualized_std(ex_spy),
-        "tracking_error_mtum": _annualized_std(ex_mtum),
-        "skew_monthly": _skew(net),
-        "kurtosis_monthly": _kurtosis(net),
-        "skew_monthly_excess_spy": None,
-        "kurtosis_monthly_excess_spy": None,
-        "n_months": float(n),
+        "turnover_period": turnover_period,
+        "turnover_annual": turnover_period * ppy,
+        "cost_drag": _cagr(gross, ppy) - cagr,
+        "excess_cagr_spy": cagr - _cagr(spy, ppy),
+        "excess_cagr_mtum": cagr - _cagr(mtum, ppy),
+        "tracking_error_spy": _annualized_std(ex_spy, ppy),
+        "tracking_error_mtum": _annualized_std(ex_mtum, ppy),
+        "skew_period": _skew(net),
+        "kurtosis_period": _kurtosis(net),
+        "skew_period_excess_spy": None,
+        "kurtosis_period_excess_spy": None,
+        "n_periods": float(n),
+        "periods_per_year": float(ppy),
     }
     if series != "SPY":
-        out["sharpe_monthly_excess_spy"] = _monthly_sharpe(ex_spy)
-        out["skew_monthly_excess_spy"] = _skew(ex_spy)
-        out["kurtosis_monthly_excess_spy"] = _kurtosis(ex_spy)
+        sharpe_excess = _period_sharpe(ex_spy)
+        out["sharpe_period_excess_spy"] = sharpe_excess
+        out["sharpe_annual_excess_spy"] = sharpe_excess * root_ppy
+        out["skew_period_excess_spy"] = _skew(ex_spy)
+        out["kurtosis_period_excess_spy"] = _kurtosis(ex_spy)
     return out
 
 
@@ -230,34 +256,39 @@ def expected_max_sharpe(n_trials: int, variance: float) -> float:
 
 
 def probabilistic_sharpe(
-    sharpe: float, sharpe_benchmark: float, n_months: int, skew: float, kurtosis: float
+    sharpe: float, sharpe_benchmark: float, n_periods: int, skew: float, kurtosis: float
 ) -> float:
-    """PSR: the probability that the true monthly Sharpe exceeds `sharpe_benchmark`.
+    """PSR: the probability that the true per-period Sharpe exceeds `sharpe_benchmark`.
 
     Phi((SR - SR_b) * sqrt(T - 1) / sqrt(1 - skew*SR + (kurtosis - 1)/4 * SR^2)), with a
-    monthly, non-annualized SR and non-excess kurtosis.
+    per-period, non-annualized SR, T periods and non-excess kurtosis.
     """
-    if n_months < 2:
-        raise ValueError(f"n_months must be at least 2, got {n_months}")
+    if n_periods < 2:
+        raise ValueError(f"n_periods must be at least 2, got {n_periods}")
     variance_term = 1 - skew * sharpe + (kurtosis - 1) / 4 * sharpe**2
     if not variance_term > 0:
         raise ValueError(
             f"PSR variance term 1 - skew*SR + (kurtosis-1)/4*SR^2 = {variance_term} is not "
             f"positive (SR={sharpe}, skew={skew}, kurtosis={kurtosis})"
         )
-    z = (sharpe - sharpe_benchmark) * math.sqrt(n_months - 1) / math.sqrt(variance_term)
+    z = (sharpe - sharpe_benchmark) * math.sqrt(n_periods - 1) / math.sqrt(variance_term)
     return _NORMAL.cdf(z)
 
 
 @dataclass(frozen=True)
 class DeflatedSharpe:
-    """One DSR basis for one trial, as stored in `trial_results` (spec req 8)."""
+    """One DSR basis for one trial (strategy-lab spec req 9).
+
+    `sharpe_variance` (V) and `sr_star` (SR*_annual) are in **annual** units, as
+    `trial_results` stores them with `sharpe_unit = annual`; `sr_star_period` is the
+    trial's own threshold, SR*_annual / sqrt(periods_per_year), which the DSR uses."""
 
     basis: Basis
     dsr_basis: Literal["dsr", "psr"]
     n_trials: int
     sharpe_variance: float | None
     sr_star: float
+    sr_star_period: float
     psr_zero: float
     dsr: float
 
@@ -268,34 +299,49 @@ def deflated_sharpe(
     *,
     n_trials: int,
     pair_sharpes: Sequence[float],
+    periods_per_year: int,
 ) -> DeflatedSharpe:
-    """DSR of one trial on `basis`, from its base-level `metrics`.
+    """DSR of one trial on `basis`, from its base-level `metrics` (req 9).
 
     `n_trials` is N: the family's `ok`, non-synthetic, in-sample trials, reruns and
-    this one included. `pair_sharpes` are this basis' monthly Sharpes of the latest
-    `ok` trial for each distinct (parameter hash, window) pair; V is their sample
-    variance. With fewer than two pairs, SR* = 0 and the result is labelled `psr`.
+    this one included (`results.family_n`). `pair_sharpes` are this basis' **annualised**
+    Sharpes of the latest `ok` trial for each distinct (canonical frozen set, window)
+    pair; V is their sample variance, SR*_annual = `expected_max_sharpe(N, V)` and the
+    trial's SR* = SR*_annual / sqrt(`periods_per_year`), compared with its per-period
+    Sharpe over its `n_periods`. With fewer than two pairs, SR* = 0 and the result is
+    labelled `psr`. `periods_per_year` is the trial's cadence constant; when `metrics`
+    holds a `periods_per_year` row it must agree.
     """
     if n_trials < max(1, len(pair_sharpes)):
         raise ValueError(
             f"n_trials ({n_trials}) must be at least 1 and at least the number of "
             f"pairs ({len(pair_sharpes)}): N counts every trial, reruns included"
         )
+    if periods_per_year < 1:
+        raise ValueError(f"periods_per_year must be positive, got {periods_per_year}")
+    stored_ppy = metrics.get("periods_per_year")
+    if stored_ppy is not None and stored_ppy != periods_per_year:
+        raise ValueError(
+            f"metrics were computed at {stored_ppy} periods per year, not {periods_per_year}"
+        )
     sharpe_key, skew_key, kurtosis_key = _BASIS_KEYS[basis]
     sharpe, skew, kurtosis = metrics[sharpe_key], metrics[skew_key], metrics[kurtosis_key]
-    n_months = metrics["n_months"]
-    if sharpe is None or skew is None or kurtosis is None or n_months is None:
+    n_periods = metrics["n_periods"]
+    if sharpe is None or skew is None or kurtosis is None or n_periods is None:
         raise ValueError(f"basis {basis} needs {sharpe_key}, {skew_key}, {kurtosis_key}")
-    _require_finite(f"{basis} basis inputs", _array([sharpe, skew, kurtosis, n_months]))
+    _require_finite(f"{basis} basis inputs", _array([sharpe, skew, kurtosis, n_periods]))
     _require_finite("pair_sharpes", _array(pair_sharpes))
-    months = int(n_months)
-    psr_zero = probabilistic_sharpe(sharpe, 0.0, months, skew, kurtosis)
+    periods = int(n_periods)
+    psr_zero = probabilistic_sharpe(sharpe, 0.0, periods, skew, kurtosis)
     if len(pair_sharpes) < 2:
-        return DeflatedSharpe(basis, "psr", n_trials, None, 0.0, psr_zero, psr_zero)
+        return DeflatedSharpe(basis, "psr", n_trials, None, 0.0, 0.0, psr_zero, psr_zero)
     variance = float(np.var(_array(pair_sharpes), ddof=1))
-    sr_star = expected_max_sharpe(n_trials, variance)
-    dsr = probabilistic_sharpe(sharpe, sr_star, months, skew, kurtosis)
-    return DeflatedSharpe(basis, "dsr", n_trials, variance, sr_star, psr_zero, dsr)
+    sr_star_annual = expected_max_sharpe(n_trials, variance)
+    sr_star_period = sr_star_annual / math.sqrt(periods_per_year)
+    dsr = probabilistic_sharpe(sharpe, sr_star_period, periods, skew, kurtosis)
+    return DeflatedSharpe(
+        basis, "dsr", n_trials, variance, sr_star_annual, sr_star_period, psr_zero, dsr
+    )
 
 
 def red_flag(metrics: Mapping[str, float | None], settings: Settings) -> bool:

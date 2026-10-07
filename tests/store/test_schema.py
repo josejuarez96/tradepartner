@@ -579,7 +579,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (15,)
     finally:
         conn.close()
 
@@ -669,7 +669,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (15,)
     finally:
         conn.close()
 
@@ -791,7 +791,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
         _version_13_store(conn)
         before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
         schema.init_schema(conn)
-        assert _versions(conn) == [12, 13, 14]
+        assert _versions(conn) == [12, 13, 14, 15]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
@@ -1285,8 +1285,9 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     version 9 first); #859's retraction is version 11; the research registry
     (#926, T80) is version 12; the profitability rebalance columns (#720,
     #1033, T85d) is version 13; the generic rebalance counts and the
-    `signals.reason` prefix `CHECK` (#1153, T127) is version 14."""
-    assert schema.CURRENT_SCHEMA_VERSION == 14
+    `signals.reason` prefix `CHECK` (#1153, T127) is version 14; the period keys
+    (#1179, T97) are version 15."""
+    assert schema.CURRENT_SCHEMA_VERSION == 15
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------

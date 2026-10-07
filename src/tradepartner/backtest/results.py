@@ -10,9 +10,11 @@ the caller's write transaction and only through `store.registry`:
    and a 0 bp level must both be present (`cost_drag` is gross minus net CAGR, and
    gross is the 0 bp run); every result's own level must match its key; and both
    benchmarks (`SPY`, `MTUM`) must have equity rows.
-2. **Metrics** (req 7): per series (`strategy`, `SPY`, `MTUM`) and level, from month
-   returns (equity at close(T_{i+1}) over equity at close(T_i), minus one, over the
-   rebalance sessions of the run), the benchmarks at the same level, the 0 bp run of
+2. **Metrics** (req 7; strategy-lab spec req 8): per series (`strategy`, `SPY`,
+   `MTUM`) and level, from period returns (equity at close(T_{i+1}) over equity at
+   close(T_i), minus one, over the rebalance sessions of the run at the hypothesis's
+   `schedule.rebalance_cadence`, read through `frozen_values`) annualised with that
+   cadence's `periods_per_year`, the benchmarks at the same level, the 0 bp run of
    the same series as gross, every session's equity for drawdown, and the strategy's
    one-sided turnover per rebalance. "Gross" is gross of the per-side bps only: the
    0 bp run still pays `costs.commission_per_share` and `commission_per_order`, which
@@ -22,15 +24,21 @@ the caller's write transaction and only through `store.registry`:
    initial buy.
 3. **Detail rows**: metrics, equity per level, weights at the base level only (targets
    are the same at every level), rebalances per level.
-4. **Result row** (req 8, 15): N and the per-basis pair Sharpes from `family_sharpes`
-   with this trial as `pending`, so an `ok` in-sample, non-synthetic run counts itself
-   and any other run (synthetic, holdout, tracking) is deflated against the family as
-   it stands without changing it. Both bases (`raw`, `excess_spy`) from the base-level
-   strategy metrics, each with its own inputs; `n_trials` is N as counted (0 for an
-   uncounted run in an empty family, where there is nothing to deflate and DSR is
-   PSR(0)). The red flag from the base-level strategy `excess_cagr_spy`; the gap
-   maxima over the base level's rebalances. `write_result` records `failed` instead
-   when the store changed during the run.
+4. **Result row** (req 8, 15; strategy-lab spec req 9): N from `family_n` and the
+   per-basis annualised pair Sharpes from `family_sharpes`, both with this trial as
+   `pending`, so an `ok` in-sample, non-synthetic run counts itself and any other run
+   (synthetic, holdout, tracking) is deflated against the family as it stands without
+   changing it. Both bases (`raw`, `excess_spy`) from the base-level strategy metrics,
+   each with its own inputs, V and SR* stored in annual units (`sharpe_unit =
+   annual`); `n_trials` is N as counted (0 for an uncounted run in an empty family,
+   where there is nothing to deflate and DSR is PSR(0)). The red flag from the
+   base-level strategy `excess_cagr_spy`; the gap maxima over the base level's
+   rebalances. `write_result` records `failed` instead when the store changed during
+   the run.
+
+**One N function** (strategy-lab plan, approach). `family_n(conn, family)` is the one
+place the family's N is computed: `write_results` stores it, and the backtest page and
+every lab module call it rather than counting trial rows themselves.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ from itertools import pairwise
 import duckdb
 
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.hypothesis import frozen_hash_matches
 from tradepartner.backtest.metrics import (
     DeflatedSharpe,
@@ -50,8 +59,8 @@ from tradepartner.backtest.metrics import (
     red_flag,
     series_metrics,
 )
-from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.config import Settings
+from tradepartner.backtest.schedule import periods_per_year, rebalance_sessions
+from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry
 from tradepartner.store.registry import (
     EquityRow,
@@ -70,6 +79,27 @@ SERIES: tuple[Series, ...] = ("strategy", SPY_SERIES, MTUM_SERIES)
 GROSS_LEVEL = 0.0
 
 FamilySharpesFn = Callable[..., FamilySharpes]
+
+#: The frozen key the period ends are read from (strategy-lab spec, "Cadence").
+CADENCE_KEY = "schedule.rebalance_cadence"
+
+
+def family_n(
+    conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
+) -> int:
+    """N of `family`: its `ok`, non-synthetic, in-sample trials, reruns and every
+    variant's included (backtest spec req 8; strategy-lab spec req 3). `pending` counts
+    a trial still being written as `registry.family_sharpes` does. The one place N is
+    computed (module docstring, "One N function")."""
+    return registry.count_counted_trials(conn, family, pending)
+
+
+def hypothesis_cadence(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> Cadence:
+    """The trial's frozen `schedule.rebalance_cadence`, read through `frozen_values`
+    (a registration without the key reads its `month_end` default)."""
+    record = registry.get_hypothesis_by_id(conn, handle.hypothesis_id)
+    cadence: Cadence = frozen_values(record)[CADENCE_KEY]
+    return cadence
 
 
 def _check_frozen(handle: TrialHandle, params: Settings) -> None:
@@ -106,14 +136,15 @@ def _series_equity(result: BacktestResult, series: str) -> list[EquityRow]:
     return sorted((row for row in result.equity if row.series == series), key=lambda r: r.session)
 
 
-def _month_ends(result: BacktestResult) -> list[date]:
-    """The run's rebalance sessions T_0..T_n, from its first and last equity session."""
+def _period_ends(result: BacktestResult, cadence: Cadence) -> list[date]:
+    """The run's rebalance sessions T_0..T_n at `cadence`, from its first and last
+    equity session."""
     sessions = [row.session for row in result.equity]
-    return rebalance_sessions(min(sessions), max(sessions))
+    return rebalance_sessions(min(sessions), max(sessions), cadence)
 
 
-def _monthly(rows: Sequence[EquityRow], ends: Sequence[date]) -> list[float]:
-    """Month i return: equity at close(T_{i+1}) / equity at close(T_i) - 1."""
+def _period_returns(rows: Sequence[EquityRow], ends: Sequence[date]) -> list[float]:
+    """Period i return: equity at close(T_{i+1}) / equity at close(T_i) - 1."""
     equity = {row.session: row.equity for row in rows}
     missing = [session for session in ends if session not in equity]
     if missing:
@@ -121,26 +152,30 @@ def _monthly(rows: Sequence[EquityRow], ends: Sequence[date]) -> list[float]:
     return [equity[b] / equity[a] - 1 for a, b in pairwise(ends)]
 
 
-def metric_rows(results: Mapping[float, BacktestResult], params: Settings) -> list[MetricRow]:
-    """Every req 7 metric per series and level, as `trial_metrics` rows."""
+def metric_rows(
+    results: Mapping[float, BacktestResult], params: Settings, *, cadence: Cadence
+) -> list[MetricRow]:
+    """Every req 8 metric per series and level at `cadence`, as `trial_metrics` rows."""
     _check(results, params)
     gross = results[GROSS_LEVEL]
+    ppy = periods_per_year(cadence)
     rows: list[MetricRow] = []
     for level in sorted(results):
         result = results[level]
-        ends = _month_ends(result)
-        monthly = {s: _monthly(_series_equity(result, s), ends) for s in SERIES}
+        ends = _period_ends(result, cadence)
+        returns = {s: _period_returns(_series_equity(result, s), ends) for s in SERIES}
         for series in SERIES:
             values = series_metrics(
                 series,
-                monthly=monthly[series],
-                gross_monthly=_monthly(_series_equity(gross, series), ends),
+                period_returns=returns[series],
+                gross_period_returns=_period_returns(_series_equity(gross, series), ends),
                 daily_equity=[row.equity for row in _series_equity(result, series)],
                 turnover=(
                     [r.turnover for r in result.rebalances] if series == STRATEGY_SERIES else []
                 ),
-                spy_monthly=monthly[SPY_SERIES],
-                mtum_monthly=monthly[MTUM_SERIES],
+                spy_period_returns=returns[SPY_SERIES],
+                mtum_period_returns=returns[MTUM_SERIES],
+                periods_per_year=ppy,
                 risk_free_rate=params.metrics.risk_free_rate,
             )
             rows.extend(MetricRow(series, level, key, value) for key, value in values.items())
@@ -157,14 +192,25 @@ def result_statistics(
     base_rebalances: Sequence[RebalanceRow],
     family: FamilySharpes,
     params: Settings,
+    *,
+    n_trials: int,
+    cadence: Cadence,
 ) -> ResultStatistics:
     """The `ok` result row's statistics from the base-level strategy metrics, the
-    family's N and pair Sharpes (this trial included when it counts) and the base
-    level's rebalances (module docstring, step 4)."""
-    n = family.n_trials
-    raw = deflated_sharpe(base_metrics, "raw", n_trials=max(n, 1), pair_sharpes=family.raw)
+    family's N (`n_trials`, from `family_n`) and annualised pair Sharpes (this trial
+    included when it counts), the trial's `cadence` and the base level's rebalances
+    (module docstring, step 4)."""
+    n = n_trials
+    ppy = periods_per_year(cadence)
+    raw = deflated_sharpe(
+        base_metrics, "raw", n_trials=max(n, 1), pair_sharpes=family.raw, periods_per_year=ppy
+    )
     excess = deflated_sharpe(
-        base_metrics, "excess_spy", n_trials=max(n, 1), pair_sharpes=family.excess_spy
+        base_metrics,
+        "excess_spy",
+        n_trials=max(n, 1),
+        pair_sharpes=family.excess_spy,
+        periods_per_year=ppy,
     )
     return ResultStatistics(
         n_trials=n,
@@ -206,7 +252,8 @@ def write_results(
     transaction.
     """
     _check_frozen(handle, params)
-    rows = metric_rows(results, params)
+    cadence = hypothesis_cadence(conn, handle)
+    rows = metric_rows(results, params, cadence=cadence)
     base_level = params.costs.per_side_bps
     base = results[base_level]
     registry.write_metrics(conn, handle, rows)
@@ -220,5 +267,8 @@ def write_results(
         if row.series == STRATEGY_SERIES and row.cost_per_side_bps == base_level
     }
     family = family_sharpes(conn, handle.family, pending=handle)
-    stats = result_statistics(base_metrics, base.rebalances, family, params)
+    n = family_n(conn, handle.family, pending=handle)
+    stats = result_statistics(
+        base_metrics, base.rebalances, family, params, n_trials=n, cadence=cadence
+    )
     return registry.write_result(conn, handle, stats)

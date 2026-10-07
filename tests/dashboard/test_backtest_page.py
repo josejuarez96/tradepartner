@@ -21,7 +21,7 @@ import duckdb
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from tradepartner.backtest.metrics import deflated_sharpe
+from tradepartner.backtest.metrics import METRIC_KEYS, deflated_sharpe
 from tradepartner.config import Settings
 from tradepartner.dashboard import backtest_page, theme
 from tradepartner.store import registry, schema
@@ -41,21 +41,24 @@ def _metrics(sharpe: float, excess: float) -> dict[str, float | None]:
     return {
         "cagr": 0.08,
         "vol_annual": 0.15,
-        "sharpe_monthly": sharpe,
+        "sharpe_period": sharpe,
         "sharpe_annual": sharpe * math.sqrt(12),
-        "sharpe_monthly_excess_spy": excess,
+        "sharpe_period_excess_spy": excess,
+        "sharpe_annual_excess_spy": excess * math.sqrt(12),
         "max_drawdown": -0.2,
-        "turnover_monthly": 0.1,
+        "turnover_period": 0.1,
+        "turnover_annual": 1.2,
         "cost_drag": 0.002,
         "excess_cagr_spy": 0.01,
         "excess_cagr_mtum": -0.005,
         "tracking_error_spy": 0.05,
         "tracking_error_mtum": 0.04,
-        "skew_monthly": -0.3,
-        "kurtosis_monthly": 3.5,
-        "skew_monthly_excess_spy": 0.1,
-        "kurtosis_monthly_excess_spy": 3.2,
-        "n_months": 36.0,
+        "skew_period": -0.3,
+        "kurtosis_period": 3.5,
+        "skew_period_excess_spy": 0.1,
+        "kurtosis_period_excess_spy": 3.2,
+        "n_periods": 36.0,
+        "periods_per_year": 12.0,
     }
 
 
@@ -260,12 +263,22 @@ def test_recomputed_dsr_uses_todays_n_and_v(seeded_store: tuple[Path, Seeded]) -
     finally:
         conn.close()
 
-    # Today: three ok non-synthetic in-sample trials, three distinct pairs.
+    # Today: three ok non-synthetic in-sample trials, three distinct pairs, each
+    # Sharpe annualised with its trial's periods per year (strategy-lab spec req 9).
+    r12 = math.sqrt(12)
     expected_raw = deflated_sharpe(
-        _metrics(0.20, 0.05), "raw", n_trials=3, pair_sharpes=[0.20, 0.10, 0.30]
+        _metrics(0.20, 0.05),
+        "raw",
+        n_trials=3,
+        pair_sharpes=[0.20 * r12, 0.10 * r12, 0.30 * r12],
+        periods_per_year=12,
     )
     expected_excess = deflated_sharpe(
-        _metrics(0.20, 0.05), "excess_spy", n_trials=3, pair_sharpes=[0.05, 0.02, 0.09]
+        _metrics(0.20, 0.05),
+        "excess_spy",
+        n_trials=3,
+        pair_sharpes=[0.05 * r12, 0.02 * r12, 0.09 * r12],
+        periods_per_year=12,
     )
     raw, excess = view.dsr_rows
     assert raw.basis == "raw"
@@ -273,7 +286,55 @@ def test_recomputed_dsr_uses_todays_n_and_v(seeded_store: tuple[Path, Seeded]) -
     assert raw.stored_dsr == pytest.approx(0.9)
     assert raw.today == expected_raw
     assert excess.today == expected_excess
+    assert raw.today is not None and raw.today.sharpe_variance == pytest.approx(12 * 0.01)
     assert excess.stored_dsr == pytest.approx(0.6)
+
+
+def _stored(conn: duckdb.DuckDBPyConnection, trial_id: int, unit: str | None) -> None:
+    """Give an `ok` trial stored statistics V = 0.01 and SR* = 0.19 in `unit`. A
+    pre-version-15 row has NULL there; only a test rewrites a result row."""
+    conn.execute(
+        "UPDATE trial_results SET sharpe_variance = 0.01, sr_star = 0.19, "
+        "sharpe_variance_excess = 0.004, sr_star_excess = 0.12, sharpe_unit = ? "
+        "WHERE trial_id = ?",
+        [unit, trial_id],
+    )
+
+
+@pytest.mark.parametrize(
+    ("unit", "scale_v", "scale_sr"),
+    [(None, 12.0, math.sqrt(12)), ("monthly", 12.0, math.sqrt(12)), ("annual", 1.0, 1.0)],
+)
+def test_stored_v_and_sr_star_are_shown_in_annual_units(
+    seeded_store: tuple[Path, Seeded], unit: str | None, scale_v: float, scale_sr: float
+) -> None:
+    """A pre-lab row (`sharpe_unit` NULL, read as monthly) is converted to annual
+    beside today's values; an `annual` row is shown as stored (req 9)."""
+    store_path, seeded = seeded_store
+    with duckdb.connect(str(store_path)) as conn:
+        _stored(conn, seeded.detailed, unit)
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        raw, excess = backtest_page.load_trial_view(conn, seeded.detailed).dsr_rows
+    finally:
+        conn.close()
+    assert raw.stored_v == pytest.approx(0.01 * scale_v, rel=1e-12)
+    assert raw.stored_sr_star == pytest.approx(0.19 * scale_sr, rel=1e-12)
+    assert excess.stored_v == pytest.approx(0.004 * scale_v, rel=1e-12)
+    assert excess.stored_sr_star == pytest.approx(0.12 * scale_sr, rel=1e-12)
+
+
+def test_annual_stored_keeps_none() -> None:
+    assert backtest_page.annual_stored(None, 0.0, None) == (None, 0.0)
+    assert backtest_page.annual_stored(None, None, "annual") == (None, None)
+
+
+def test_page_reads_only_the_period_keys() -> None:
+    """Text check (strategy-lab spec, "Metrics" acceptance): the page reads no
+    `*_monthly` key and no `n_months`; the metrics table lists `METRIC_KEYS`."""
+    source = Path(backtest_page.__file__).read_text(encoding="utf-8")
+    assert "_monthly" not in source and "n_months" not in source
+    assert not any("monthly" in key for key in METRIC_KEYS)
 
 
 def test_view_reads_base_level_rows(seeded_store: tuple[Path, Seeded]) -> None:
@@ -344,6 +405,8 @@ def test_render_detailed_trial_shows_every_element(
 
     charts = at.get("vega_lite_chart")
     assert len(charts) == 4  # equity, drawdowns, turnover, costs
+    titles = [json.loads(c.proto.spec)["encoding"]["y"]["title"] for c in charts[2:]]
+    assert titles == ["turnover per period (one-sided)", "cost paid per period ($)"]
     equity_spec = json.loads(charts[0].proto.spec)
     assert equity_spec["encoding"]["y"]["scale"] == {"type": "log"}
     assert equity_spec["encoding"]["color"]["field"] == "series"

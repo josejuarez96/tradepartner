@@ -206,19 +206,25 @@ def _version_11_store(path: Path) -> None:
         )
 
 
+#: The columns version 15 (#1179, T97) adds to `trials`.
+_TRIALS_V15 = ("detail_level", "data_vintage", "code_tree_sha256")
+
+
 def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
     """Every pre-version-12 table's rows in insertion order (`trial_results`
-    without `n_research` when it has the column)."""
+    without `n_research` and `sharpe_unit`, `trials` without the version-15
+    columns, when they have them)."""
     out = {}
     later = {*schema.RESEARCH_TABLE_NAMES, schema.REBALANCE_COUNTS_TABLE_NAME}
     for table in _tables(c) - later:
         if table == "schema_version":
             continue
-        exclude = (
-            " EXCLUDE (n_research)"
-            if table == "trial_results" and "n_research" in _columns(c, table)
-            else ""
-        )
+        later_columns = [
+            column
+            for column in ("n_research", "sharpe_unit", *_TRIALS_V15)
+            if column in _columns(c, table)
+        ]
+        exclude = f" EXCLUDE ({', '.join(later_columns)})" if later_columns else ""
         out[table] = c.execute(f"SELECT *{exclude} FROM {table} ORDER BY rowid").fetchall()
     return out
 
@@ -226,8 +232,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_14() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 14
+def test_current_schema_version_is_15() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 15
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -307,20 +313,20 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
 # --- fresh store ---------------------------------------------------------------------
 
 
-def test_a_fresh_store_has_every_research_table_at_version_14(
+def test_a_fresh_store_has_every_research_table_at_version_15(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [14]
+    assert _versions(conn) == [15]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
 
-def test_init_schema_is_idempotent_on_version_14(conn: duckdb.DuckDBPyConnection) -> None:
+def test_init_schema_is_idempotent_on_version_15(conn: duckdb.DuckDBPyConnection) -> None:
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [14]
+    assert _versions(conn) == [15]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -601,24 +607,25 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12, 13, 14]
+        assert _versions(c) == [10, 11, 12, 13, 14, 15]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]
         schema.require_research(c)
     # No pre-existing table's DDL text changed but `trial_results` (gained
     # `n_research`, version 12) and `trial_rebalances` (gained
-    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13); no row of any table
-    # changed.
-    _moved = {"trial_results", "trial_rebalances"}
+    # `PROFITABILITY_REBALANCE_COLUMNS`, version 13) and `trials` (gained its
+    # vintage and detail columns, version 15); no row of any table changed.
+    _moved = {"trial_results", "trial_rebalances", "trials"}
     assert {t: s for t, s in ddl_after.items() if t in ddl_before and t not in _moved} == {
         t: s for t, s in ddl_before.items() if t not in _moved
     }
     assert ddl_after["trial_results"] == ddl_before["trial_results"].replace(
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, ",
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, "
-        "n_research INTEGER, ",
+        "n_research INTEGER, sharpe_unit VARCHAR, ",
     )
+    assert all(f"{column} " in ddl_after["trials"] for column in _TRIALS_V15)
     assert ddl_after["trial_results"] != ddl_before["trial_results"]
     assert ddl_after["trial_rebalances"] != ddl_before["trial_rebalances"]
     assert all(
@@ -671,8 +678,8 @@ def test_a_read_only_open_of_a_version_11_store_serves_every_other_read(
         assert _versions(c) == [10, 11]
 
 
-def test_a_read_only_open_of_a_version_14_store_passes(tmp_path: Path) -> None:
-    path = tmp_path / "v14.duckdb"
+def test_a_read_only_open_of_a_version_15_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "v15.duckdb"
     with duckdb.connect(str(path)) as c:
         schema.init_schema(c)
     with duckdb.connect(str(path), read_only=True) as c:
