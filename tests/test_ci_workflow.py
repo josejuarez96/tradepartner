@@ -22,13 +22,8 @@ def _concurrency_block() -> dict[str, str]:
 
 
 TRAIN = "startsWith(github.ref, 'refs/heads/train/')"
-DISPATCH = "github.event_name == 'workflow_dispatch'"
 MAIN_PER_COMMIT = (
-    "ci-${{ "
-    + DISPATCH
-    + " && format('dispatch-{0}', github.sha) || ((github.ref == 'refs/heads/main' || "
-    + TRAIN
-    + ") && github.sha || github.ref) }}"
+    "ci-${{ (github.ref == 'refs/heads/main' || " + TRAIN + ") && github.sha || github.ref }}"
 )
 
 
@@ -36,21 +31,18 @@ def test_main_runs_are_never_cancelled() -> None:
     """On 2026-09-25 each push to main cancelled the run before it, so two broken merges
     went unseen (#189, #193). `cancel-in-progress: false` is not enough: a group keeps one
     running and one pending run, and a third push cancels the pending one. So main gets
-    one group per commit, and no main run shares a group with another. #1192: a dispatched
-    run (ready_pr's full run on a draft) also gets a per-commit group, prefixed so it can
-    never share (and so drop) a main run's, and is never cancelled either."""
+    one group per commit, and no main run shares a group with another."""
     block = _concurrency_block()
     assert block["group"] == MAIN_PER_COMMIT, block
     assert block["cancel-in-progress"] == (
-        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " && github.event_name != "
-        "'workflow_dispatch' }}"
+        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " }}"
     ), block
 
 
 def test_pr_branches_still_cancel_superseded_runs() -> None:
     """Off main the group falls back to the ref, and a new push cancels the old run."""
     block = _concurrency_block()
-    assert "|| github.ref) }}" in block["group"], block
+    assert "|| github.ref }}" in block["group"], block
     assert "github.ref != 'refs/heads/main'" in block["cancel-in-progress"], block
 
 
@@ -108,20 +100,19 @@ def _job(name: str, nxt: str) -> str:
     return text[text.index(f"\n  {name}:\n") : text.index(f"\n  {nxt}:\n")]
 
 
-DRAFT_NEEDING_TESTS = (
-    "github.event.pull_request.draft == true && needs.checks-fast.outputs.tests-needed != 'no'"
+DRAFT = (
+    "github.event.pull_request.draft == true && "
+    "!contains(github.event.pull_request.labels.*.name, 'ci:full')"
 )
+DRAFT_NEEDING_TESTS = DRAFT + " && needs.checks-fast.outputs.tests-needed != 'no'"
 
 
 def test_a_draft_pr_runs_no_shard_and_never_reports_the_required_checks() -> None:
-    """#1192: a draft runs `checks-fast` only. Its aggregator must then report under a
-    name other than the required `checks`, so a draft's run can never satisfy it; every
-    other run (non-draft PR, push, dispatch) reports `checks` as before."""
+    """#1192: a draft without `ci:full` runs `checks-fast` only. Its aggregator must then
+    report under a name other than the required `checks`, so such a run can never satisfy
+    it; every other run (non-draft or labelled PR, push) reports `checks` as before."""
     shard = _job("pytest-shard", "checks")
-    assert (
-        "if: needs.checks-fast.outputs.tests-needed != 'no' && "
-        "github.event.pull_request.draft != true" in shard
-    )
+    assert f"if: needs.checks-fast.outputs.tests-needed != 'no' && !({DRAFT})" in shard
     checks = _job("checks", "claims")
     assert (
         "name: ${{ (" + DRAFT_NEEDING_TESTS + ") && 'checks (draft, no shards)' || 'checks' }}"
@@ -130,14 +121,14 @@ def test_a_draft_pr_runs_no_shard_and_never_reports_the_required_checks() -> Non
     assert 'if [ "${{ ' + DRAFT_NEEDING_TESTS + ' }}" = "true" ]; then' in checks
 
 
-def test_ready_pr_can_dispatch_the_full_run_and_ready_for_review_starts_none() -> None:
-    """#1192: ready_pr dispatches the full run on a draft's head before marking it ready;
-    marking ready must not start a second full run of the same head."""
+def test_a_label_starts_the_full_run_and_ready_for_review_starts_none() -> None:
+    """#1192: ready_pr labels a draft `ci:full` to get the full run as a pull_request run
+    (a dispatched run never shows on the PR); marking ready must not start a second full
+    run of the same head."""
     text = CI.read_text()
     on = text[text.index("\non:\n") : text.index("\nconcurrency:\n")]
-    assert "\n  workflow_dispatch:\n" in on
-    assert "\n  pull_request:\n" in on
-    assert "types:" not in on and "ready_for_review" not in on
+    assert "    types: [opened, synchronize, reopened, labeled]\n" in on
+    assert "ready_for_review]" not in on and "workflow_dispatch:" not in on
 
 
 def test_only_a_push_to_main_may_skip_the_shards_on_a_tested_tree() -> None:

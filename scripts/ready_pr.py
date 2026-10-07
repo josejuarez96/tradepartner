@@ -34,9 +34,10 @@ Steps, in order (each one stops the run with a reason on failure):
    ``PASS WITH FIXES`` needs a re-review after the fixes that posts ``PASS``.
 6. Push, wait for CI on **that exact commit**, then ``gh pr ready``. A draft PR's own CI
    runs ``checks-fast`` only (#1192) and never reports the required ``checks``, so for a
-   draft this step also dispatches the CI workflow on the branch (``gh workflow run``):
-   that run scopes and shards the suite like a ready PR's, and the PR is marked ready only
-   once a ``checks`` on this commit is green. Marking ready does not start another run.
+   draft this step first adds the ``ci:full`` label (before the push): the push's run, or
+   the label's own run when the push changes nothing, then shards the suite like a ready
+   PR's, and the PR is marked ready only once a ``checks`` on this commit is green. Marking
+   ready does not start another run.
 
 Usage::
 
@@ -180,7 +181,8 @@ TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
-CI_WORKFLOW = "ci.yml"
+FULL_CI_LABEL = "ci:full"
+DRAFT_CHECKS = "checks (draft, no shards)"
 CI_POLL_S = 20
 
 
@@ -196,6 +198,7 @@ class Pr:
     draft: bool
     body: str
     comments: tuple[str, ...]
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,7 +225,7 @@ class Runner(Protocol):
     def pr(self, number: int) -> Pr: ...
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
-    def dispatch_ci(self, branch: str) -> None: ...
+    def add_label(self, number: int, label: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
 
 
@@ -326,17 +329,31 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     matters since #1112: ``checks`` now ``needs:`` other jobs, so GitHub does not create
     its check run until those finish, and a rollup can otherwise show every run so far
     (e.g. ``checks-fast``, ``claims``) green while the run that actually gates pytest
-    hasn't started. Since #1192 a draft PR's run never reports ``checks`` at all (its
-    aggregator is named ``checks (draft, no shards)``), so a draft's head stays pending
-    here until the dispatched full run reports it.
+    hasn't started.
+
+    Since #1192 a draft's run (no ``ci:full`` label) never reports ``checks``: its
+    aggregator is ``checks (draft, no shards)``, which gates nothing and is ignored here,
+    so a draft's head stays pending until a full run reports ``checks``. That full run
+    (``ready_pr`` labels the draft) can cancel a draft run still going on the same head;
+    a ``CANCELLED`` run is ignored when another run of the same name is on the head, so
+    the superseded run does not read as a failure. A lone ``CANCELLED`` still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
-    if not any(r.name == "checks" for r in checks.runs):
+    live = [r for r in checks.runs if r.name != DRAFT_CHECKS]
+    not_cancelled = {
+        r.name
+        for r in live
+        if r.conclusion.upper() != "CANCELLED" or r.status.upper() != "COMPLETED"
+    }
+    runs = [
+        r for r in live if not (r.conclusion.upper() == "CANCELLED" and r.name in not_cancelled)
+    ]
+    if not any(r.name == "checks" for r in runs):
         return "pending"
-    if any(r.status.upper() != "COMPLETED" for r in checks.runs):
+    if any(r.status.upper() != "COMPLETED" for r in runs):
         return "pending"
-    if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in checks.runs):
+    if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in runs):
         return "success"
     return "failure"
 
@@ -618,13 +635,14 @@ def ready(
 
     # 6. push, wait for CI on this commit, mark ready
     sha = r.git("rev-parse", "HEAD")
+    if pr.draft and FULL_CI_LABEL not in pr.labels:
+        # A draft's run skips the shards and never reports `checks` (#1192). With the label
+        # on before the push, the push's run (or, if the push is a no-op, the label's own
+        # run on this head) is the full one.
+        r.add_label(number, FULL_CI_LABEL)
+        say(f"draft PR: added {FULL_CI_LABEL} so CI runs every shard on this head")
     r.git("push", "origin", f"HEAD:{pr.branch}")
     say(f"pushed {sha[:7]}")
-    if pr.draft:
-        # A draft's own run skips the shards and never reports `checks` (#1192); this run
-        # is the full one, on the branch head just pushed.
-        r.dispatch_ci(pr.branch)
-        say(f"draft PR: dispatched the full CI run ({CI_WORKFLOW}) on {pr.branch}")
     if not wait:
         say("not waiting for CI (--no-wait); PR left as is")
         return 0
@@ -744,7 +762,7 @@ class ShellRunner:
                 "view",
                 str(number),
                 "--json",
-                "number,headRefName,baseRefName,isDraft,body,comments",
+                "number,headRefName,baseRefName,isDraft,body,comments,labels",
             )
         )
         return Pr(
@@ -754,6 +772,7 @@ class ShellRunner:
             bool(raw["isDraft"]),
             str(raw.get("body") or ""),
             tuple(str(c.get("body", "")) for c in raw.get("comments", [])),
+            tuple(str(lb.get("name", "")) for lb in raw.get("labels") or []),
         )
 
     def head_checks(self, number: int) -> HeadChecks:
@@ -773,8 +792,8 @@ class ShellRunner:
     def mark_ready(self, number: int) -> None:
         self._gh("pr", "ready", str(number))
 
-    def dispatch_ci(self, branch: str) -> None:
-        self._gh("workflow", "run", CI_WORKFLOW, "--ref", branch)
+    def add_label(self, number: int, label: str) -> None:
+        self._gh("pr", "edit", str(number), "--add-label", label)
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
