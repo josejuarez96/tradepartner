@@ -432,7 +432,7 @@ def test_load_frozen_on_the_pre_lab_fixture_twin(
     params = {
         k: v
         for k, v in hypothesis.frozen_params(parsed, settings).items()
-        if not k.startswith("schedule.")
+        if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
     }
     record = registry.register_hypothesis(
         conn,

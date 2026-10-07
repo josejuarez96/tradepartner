@@ -698,7 +698,9 @@ def _register_more(
     frozen = Settings(_env_file=None, **overrides)
     params = frozen_params_of(frozen, family="momentum")
     if drop_schedule:
-        params = {k: v for k, v in params.items() if not k.startswith("schedule.")}
+        # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) landed.
+        later = ("schedule.", "gap.stale_listing_sessions")
+        params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
         record = registry.register_hypothesis(
             conn,
