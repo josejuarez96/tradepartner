@@ -328,9 +328,12 @@ def test_a_store_delisting_with_no_corpus_record_is_reported_unmatched(
     conn.close()
 
     corpus_path = tmp_path / "corpus.jsonl"
-    corpus_path.write_text(
-        json.dumps(_minimal_record("LEG", "0003000004", "NASDAQ", accepted)) + "\n"
-    )
+    with corpus_path.open("w") as handle:
+        handle.write(json.dumps(_minimal_record("LEG", "0003000004", "NASDAQ", accepted)) + "\n")
+        # A second, unrelated record so the corpus's fetched span (its
+        # accepted_at range) covers `orphan_accepted` too.
+        later = datetime(2026, 9, 1, 14, tzinfo=UTC)
+        handle.write(json.dumps(_minimal_record("LEH", "0003000099", "NASDAQ", later)) + "\n")
 
     result = frame_mod.build_frame(corpus_path, T, out)
 
@@ -339,6 +342,42 @@ def test_a_store_delisting_with_no_corpus_record_is_reported_unmatched(
             security_id="0003000004", exchange="NASDAQ", filed_at=orphan_accepted
         ),
     )
+
+
+def test_a_store_delisting_outside_the_corpus_span_is_not_reported(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The survivorship check is restricted to the corpus's own fetched
+    span: a store `delistings` row for a CIK the corpus names, but filed
+    outside every `form25_accepted_at` the corpus carries, is a filing a
+    `--since`/`--until`-restricted fetch never asked EDGAR for -- not a
+    drift to report."""
+    research = settings.research.model_copy(update={"data_dir": str(tmp_path / "research")})
+    out = settings.model_copy(update={"research": research})
+    accepted = datetime(2026, 1, 15, 14, tzinfo=UTC)
+    outside_span = datetime(2026, 12, 1, 14, tzinfo=UTC)
+
+    conn = duckdb.connect(out.store.path)
+    configure_connection(conn)
+    schema.init_schema(conn)
+    _security(conn, "0003000010", "0003000010", EARLY)
+    _listing(conn, "0003000010", "KKK", "NASDAQ", date(2020, 1, 1), EARLY)
+    _delisting(conn, "0003000010", "NASDAQ", accepted, date(2026, 1, 25))
+    # Outside the corpus's own span (the fetch was `--until <some earlier
+    # date>`, say): known before T, but the corpus names no record anywhere
+    # near this date.
+    _delisting(conn, "0003000010", "NASDAQ", outside_span, date(2026, 12, 11))
+    conn.commit()
+    conn.close()
+
+    corpus_path = tmp_path / "corpus.jsonl"
+    corpus_path.write_text(
+        json.dumps(_minimal_record("LEN", "0003000010", "NASDAQ", accepted)) + "\n"
+    )
+
+    result = frame_mod.build_frame(corpus_path, T, out)
+
+    assert result.unmatched_delistings == ()
 
 
 # --- no-look-ahead ------------------------------------------------------------
@@ -377,6 +416,48 @@ def test_a_listing_row_with_valid_from_after_t_does_not_relist(
 
     df = pl.read_parquet(result.frame_path)
     row = _row(df, "LEF")
+    assert (row["rule_status"], row["rule_relisted"]) == ("delisted", False)
+
+
+def test_a_listing_row_known_only_after_t_does_not_relist(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A relisting `listings` row whose `valid_from` is on or before `t`
+    (so a latest-state read would include it) but not yet `known_at <= t`
+    must not make `rule_relisted` true either: this is the as-of read
+    itself (`listings_as_of`), not the extra `valid_from` guard the sibling
+    test above checks."""
+    research = settings.research.model_copy(update={"data_dir": str(tmp_path / "research")})
+    out = settings.model_copy(update={"research": research})
+    accepted = datetime(2026, 2, 2, 14, tzinfo=UTC)
+
+    conn = duckdb.connect(out.store.path)
+    configure_connection(conn)
+    schema.init_schema(conn)
+    _security(conn, "0003000011", "0003000011", EARLY)
+    _listing(conn, "0003000011", "LLL", "NASDAQ", date(2020, 1, 1), EARLY)
+    _delisting(conn, "0003000011", "NASDAQ", accepted, date(2026, 2, 12))
+    # `valid_from` is well before T, but it is not known until after T.
+    _listing(
+        conn,
+        "0003000011",
+        "LLL",
+        "NASDAQ",
+        date(2026, 3, 1),
+        datetime(2027, 6, 1, tzinfo=UTC),
+    )
+    conn.commit()
+    conn.close()
+
+    corpus_path = tmp_path / "corpus.jsonl"
+    corpus_path.write_text(
+        json.dumps(_minimal_record("LEJ", "0003000011", "NASDAQ", accepted)) + "\n"
+    )
+
+    result = frame_mod.build_frame(corpus_path, T, out)
+
+    df = pl.read_parquet(result.frame_path)
+    row = _row(df, "LEJ")
     assert (row["rule_status"], row["rule_relisted"]) == ("delisted", False)
 
 
@@ -483,6 +564,67 @@ def test_a_form15_marker_outside_the_window_does_not_veto(
     assert _row(df, "LEW")["rule_form15_in_window"] is False
 
 
+# LE5's own Form 25 (`frame_settings`) is accepted 2026-05-04T14:00Z, a
+# session; `master.reorganisation_window_sessions` (10, default) around its
+# filing session gives the window [2026-04-20, 2026-05-18], one session
+# short of 2026-05-19 (checked against the real XNYS calendar when these
+# tests were written).
+def test_a_form15_marker_on_the_window_edge_vetoes_by_its_own_session(
+    frame_settings: Settings,
+) -> None:
+    """A `15-12B` accepted at 18:00 ET on the window's last session (so its
+    EDGAR `filed_on`, by the SEC's own late-acceptance convention, lands
+    the *next* session, one beyond the window) must still veto: the
+    session comes from the marker's own `accepted_at`, never `filed_on`
+    (SHOULD FIX 2)."""
+    corpus_path = Path(frame_settings.research.data_dir).parent / "corpus_edge_in.jsonl"
+    accepted = datetime(2026, 5, 4, 14, tzinfo=UTC)
+    record = _minimal_record("LEE1", "0001000005", "NASDAQ", accepted)
+    record["markers"] = [
+        {
+            "form": "15-12B",
+            "accession": "0001000005-26-000003",
+            # EDGAR's own `filingDate` for an 18:00 ET acceptance: the next
+            # session, one beyond the window -- the pass-1 bug would read
+            # this and wrongly refuse to veto.
+            "filed_on": "2026-05-19",
+            "accepted_at": "2026-05-18T22:00:00+00:00",
+        }
+    ]
+    corpus_path.parent.mkdir(parents=True, exist_ok=True)
+    corpus_path.write_text(json.dumps(record) + "\n")
+
+    result = frame_mod.build_frame(corpus_path, T, frame_settings)
+
+    df = pl.read_parquet(result.frame_path)
+    assert _row(df, "LEE1")["rule_form15_in_window"] is True
+
+
+def test_a_form15_marker_one_session_beyond_the_edge_does_not_veto(
+    frame_settings: Settings,
+) -> None:
+    """A `15-12B` whose own `accepted_at` falls one session beyond the
+    window (2026-05-19) must not veto."""
+    corpus_path = Path(frame_settings.research.data_dir).parent / "corpus_edge_out.jsonl"
+    accepted = datetime(2026, 5, 4, 14, tzinfo=UTC)
+    record = _minimal_record("LEE2", "0001000005", "NASDAQ", accepted)
+    record["markers"] = [
+        {
+            "form": "15-12B",
+            "accession": "0001000005-26-000004",
+            "filed_on": "2026-05-19",
+            "accepted_at": "2026-05-19T14:00:00+00:00",
+        }
+    ]
+    corpus_path.parent.mkdir(parents=True, exist_ok=True)
+    corpus_path.write_text(json.dumps(record) + "\n")
+
+    result = frame_mod.build_frame(corpus_path, T, frame_settings)
+
+    df = pl.read_parquet(result.frame_path)
+    assert _row(df, "LEE2")["rule_form15_in_window"] is False
+
+
 def test_next_bound_is_the_earliest_later_time_or_none() -> None:
     """`_next_bound` (the per-episode bound `rule_relisted` and
     `rule_successor_id` are computed under): the earliest time strictly
@@ -507,15 +649,16 @@ def test_tightest_bound_is_the_earliest_non_none() -> None:
     assert frame_mod._tightest_bound(None, None) is None
 
 
-def test_two_episodes_of_one_security_each_get_their_own_relisting_answer(
+def test_a_relisting_after_the_next_episode_does_not_bound_back(
     settings: Settings, tmp_path: Path
 ) -> None:
-    """Two listing ends of the same security (the second's own listing is
-    necessarily a relisting of the first, since `derive_listing_ends` never
-    attaches a delisting to a listing an earlier filing already ended): each
-    episode's `rule_relisted` is computed against its *own* bound (the next
-    episode's acceptance for the first, nothing for the second), never the
-    other's."""
+    """Two listing ends of the same security, with a relisting row between
+    them (the second's own listing: `derive_listing_ends` never attaches a
+    delisting to a listing an earlier filing already ended) *and* a further
+    relisting after the second episode. Without the bound, the first
+    episode's `rule_relisted` would wrongly pick up the later relisting too
+    (it is after its `effective_on` and on or before `t`); with the bound
+    (the second episode's own acceptance), it must not."""
     research = settings.research.model_copy(update={"data_dir": str(tmp_path / "research")})
     out = settings.model_copy(update={"research": research})
     first_accepted = datetime(2026, 1, 15, 14, tzinfo=UTC)
@@ -527,12 +670,17 @@ def test_two_episodes_of_one_security_each_get_their_own_relisting_answer(
     _security(conn, "0003000007", "0003000007", EARLY)
     _listing(conn, "0003000007", "JJJ", "NASDAQ", date(2020, 1, 1), EARLY)
     _delisting(conn, "0003000007", "NASDAQ", first_accepted, date(2026, 1, 25))
-    # The relisting the first episode's own `rule_relisted` must see.
+    # The second episode's own listing: on the first episode's own
+    # `effective_on`, so it is *not* the first episode's relisting (a
+    # relisting row is strictly after `effective_on`) but is still an
+    # eligible target for the second delisting (`valid_from` on or before
+    # its filing session).
     _listing(
-        conn, "0003000007", "JJJ", "NASDAQ", date(2026, 3, 1), datetime(2026, 3, 1, tzinfo=UTC)
+        conn, "0003000007", "JJJ", "NASDAQ", date(2026, 1, 25), datetime(2026, 1, 25, tzinfo=UTC)
     )
     _delisting(conn, "0003000007", "NASDAQ", second_accepted, date(2026, 6, 11))
-    # After the second episode: must bound only the second's own check.
+    # After the second episode: must bound only the second episode's own
+    # check, never leak back into the first's.
     _listing(
         conn, "0003000007", "JJJ", "NASDAQ", date(2026, 7, 1), datetime(2026, 7, 1, tzinfo=UTC)
     )
@@ -553,8 +701,54 @@ def test_two_episodes_of_one_security_each_get_their_own_relisting_answer(
     df = pl.read_parquet(result.frame_path)
     first = _row(df, "LE1ST")
     second = _row(df, "LE2ND")
-    assert (first["rule_status"], first["rule_relisted"]) == ("delisted", True)
+    # Bounded correctly: the first episode sees no relisting of its own
+    # (the only candidate row is exactly at its `effective_on`, excluded,
+    # and the later one is beyond its bound); the second does, from the
+    # unbounded later relisting.
+    assert (first["rule_status"], first["rule_relisted"]) == ("delisted", False)
     assert (second["rule_status"], second["rule_relisted"]) == ("delisted", True)
+
+
+def test_a_successor_after_the_next_episode_does_not_bound_back(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """Two listing ends of the same CIK on different securities (dual
+    class), with a `<cik>@<date>` successor after the *second* episode's
+    acceptance: it must count for the second episode's `rule_successor_id`
+    (nothing bounds it) but never leak back into the first's, which the
+    second episode's own acceptance bounds."""
+    research = settings.research.model_copy(update={"data_dir": str(tmp_path / "research")})
+    out = settings.model_copy(update={"research": research})
+    first_accepted = datetime(2026, 1, 15, 14, tzinfo=UTC)
+    second_accepted = datetime(2026, 6, 1, 14, tzinfo=UTC)
+
+    conn = duckdb.connect(out.store.path)
+    configure_connection(conn)
+    schema.init_schema(conn)
+    cik = "0003000012"
+    _security(conn, cik, cik, EARLY)
+    _listing(conn, cik, "MMM", "NASDAQ", date(2020, 1, 1), EARLY)
+    _delisting(conn, cik, "NASDAQ", first_accepted, date(2026, 1, 25))
+    _security(conn, f"{cik}:B", cik, EARLY)
+    _listing(conn, f"{cik}:B", "MMMB", "NASDAQ", date(2020, 1, 1), EARLY)
+    _delisting(conn, f"{cik}:B", "NASDAQ", second_accepted, date(2026, 6, 11))
+    # Known before T, dated after the second episode's acceptance.
+    _security(conn, f"{cik}@2026-07-01", cik, datetime(2026, 7, 2, tzinfo=UTC))
+    conn.commit()
+    conn.close()
+
+    corpus_path = tmp_path / "corpus.jsonl"
+    with corpus_path.open("w") as handle:
+        handle.write(json.dumps(_minimal_record("LE1ST", cik, "NASDAQ", first_accepted)) + "\n")
+        handle.write(json.dumps(_minimal_record("LE2ND", cik, "NASDAQ", second_accepted)) + "\n")
+
+    result = frame_mod.build_frame(corpus_path, T, out)
+
+    df = pl.read_parquet(result.frame_path)
+    first = _row(df, "LE1ST")
+    second = _row(df, "LE2ND")
+    assert first["rule_successor_id"] is None
+    assert second["rule_successor_id"] == f"{cik}@2026-07-01"
 
 
 def test_the_listing_end_accepted_after_t_is_absent_and_counted(

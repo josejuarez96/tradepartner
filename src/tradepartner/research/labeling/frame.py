@@ -39,11 +39,14 @@ and closed before `frame.parquet` or `counts.json` is written:
   in `counts.json`'s `delistings_ending_no_listing` by `security_id` (a live
   line with a Form 25 is a disagreement by construction, ADR 0013 point 2
   row A).
-- **Survivorship** (req 2): every `delistings` row at `t`, for a security of
-  a CIK the corpus names at all, must join some corpus record by `(exchange,
+- **Survivorship** (req 2): every `delistings` row at `t` within the
+  corpus's own fetched span (`[min, max]` of every `form25_accepted_at` it
+  carries, kept or dropped for being after `t`), for a security of a CIK the
+  corpus names at all, must join some corpus record by `(exchange,
   filed_at)`; one that joins none is reported in `counts.json`'s
   `unmatched_delistings` -- the join key drifted, or ingest kept a filing the
-  index does not list.
+  index does not list. A row outside that span is out of scope: a corpus
+  built with `--since`/`--until`/`--cik` never asked EDGAR for it.
 - `rule_relisted`, `rule_successor_id`, `rule_form15_in_window`: computed
   only when `rule_status == "delisted"` (the crosswalk's rows 2 to 5); each
   bounded by the tighter of the *next* listing end of the same security and
@@ -485,8 +488,15 @@ def build_frame(corpus_path: Path, as_of: datetime, settings: Settings) -> Frame
             (record["exchange"], _parse_utc(record["form25_accepted_at"])) for record in records
         }
         all_ids = sorted({sid for ids in ids_by_cik.values() for sid in ids})
-        if all_ids:
+        accepted_ats = [_parse_utc(r["form25_accepted_at"]) for r in records]
+        # Restricted to the corpus's own fetched span: a `--since`/`--until`
+        # (or `--cik`) build must not report a CIK's store delistings outside
+        # what it ever asked EDGAR for as "drifted".
+        span = (min(accepted_ats), max(accepted_ats)) if accepted_ats else None
+        if all_ids and span is not None:
             for row in delistings_as_of(conn, t, all_ids).iter_rows(named=True):
+                if not span[0] <= row["filed_at"] <= span[1]:
+                    continue
                 if (row["exchange"], row["filed_at"]) not in seen_keys:
                     unmatched_store_rows.append(
                         UnjoinedDelisting(row["security_id"], row["exchange"], row["filed_at"])
