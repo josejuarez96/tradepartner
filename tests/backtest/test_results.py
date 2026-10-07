@@ -44,7 +44,7 @@ from tradepartner.backtest.results import (
 )
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.research.experiment import ParsedExperiment, hash_file, parse_experiment_file
 from tradepartner.research.gates import Flags, Reasons
 from tradepartner.store import registry, research, schema
@@ -1006,3 +1006,111 @@ def test_a_profitability_trial_verifies_against_its_own_family(
     handle = _open(conn, frozen, tmp_path, slug="b3")
     write_results(conn, handle, _run(frozen, handle), frozen)
     assert _count(conn, "trial_metrics", handle.trial_id) > 0
+
+
+# --- detail level (strategy-lab spec req 12 and 13, "Storage and compute"; plan T105) --
+
+#: (cadence, start): each cadence's window ends at END; daily starts later to stay short.
+DETAIL_WINDOWS: dict[str, tuple[Cadence, date]] = {
+    "month_end": ("month_end", START),
+    "week_end": ("week_end", START),
+    "daily": ("daily", date(2024, 8, 1)),
+}
+
+
+def _detail_trial(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    start: date,
+    detail_level: results_module.DetailLevel,
+) -> tuple[registry.TrialHandle, dict[float, BacktestResult]]:
+    handle = _open(conn, settings, tmp_path, start=start)
+    results = _run(settings, handle, start=start)
+    assert write_results(conn, handle, results, settings, detail_level=detail_level) == "ok"
+    return handle, results
+
+
+def _all_metrics(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, level: float
+) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT series, metric, value FROM trial_metrics "
+        "WHERE trial_id = ? AND cost_per_side_bps = ? ORDER BY ALL",
+        [trial_id, level],
+    ).fetchall()
+
+
+class TestDetailLevel:
+    """A `summary` trial stores the req 13 arithmetic's rows and a `full` trial's
+    metrics; a standalone hypothesis writes `full`."""
+
+    @pytest.mark.parametrize("window", list(DETAIL_WINDOWS.values()), ids=list(DETAIL_WINDOWS))
+    def test_a_summary_trial_has_the_req_13_row_counts(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, window: tuple[Cadence, date]
+    ) -> None:
+        cadence, start = window
+        settings = _settings(tmp_path, schedule={"rebalance_cadence": cadence})
+        _register(conn, settings)
+        handle, _ = _detail_trial(conn, settings, tmp_path, start, "summary")
+        # From the calendar: T_0..T_n at the cadence, every session from T_0 to T_n.
+        ends = rebalance_sessions(start, END, cadence)
+        sessions = [s for s in all_sessions() if ends[0] <= s <= ends[-1]]
+        series, levels = 3, len(LEVELS)
+        trial = handle.trial_id
+        assert _count(conn, "trial_equity", trial) == (
+            series * len(sessions) + series * (levels - 1) * len(ends)
+        )
+        assert _count(conn, "trial_weights", trial) == 0
+        assert _count(conn, "trial_rebalances", trial) == levels * (len(ends) - 1)
+        assert _count(conn, "trial_metrics", trial) == series * levels * len(METRIC_KEYS)
+        base = conn.execute(
+            "SELECT COUNT(*) FROM trial_equity WHERE trial_id = ? AND cost_per_side_bps = ?",
+            [trial, BASE],
+        ).fetchone()
+        assert base == (series * len(sessions),)
+        if cadence == "daily":  # every session is a rebalance: summary saves no equity rows
+            assert _count(conn, "trial_equity", trial) == series * levels * len(sessions)
+
+    @pytest.mark.parametrize("level", LEVELS)
+    def test_a_summary_trials_metrics_equal_the_full_trials(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, level: float
+    ) -> None:
+        """`max_drawdown` included: the metrics come from the full in-memory result."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        summary, _ = _detail_trial(conn, settings, tmp_path, START, "summary")
+        full, _ = _detail_trial(conn, settings, tmp_path, START, "full")
+        got, want = (
+            _all_metrics(conn, summary.trial_id, level),
+            _all_metrics(conn, full.trial_id, level),
+        )
+        assert got == want
+        assert any(metric == "max_drawdown" for _, metric, _ in got)
+        # Fewer rows stored, the same metrics: they come from the full in-memory curve.
+        assert _count(conn, "trial_equity", summary.trial_id) < _count(
+            conn, "trial_equity", full.trial_id
+        )
+
+    def test_a_standalone_trial_writes_full_by_default(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle, results, status = _trial(conn, settings, tmp_path)
+        assert status == "ok"
+        assert _count(conn, "trial_equity", handle.trial_id) == sum(
+            len(r.equity) for r in results.values()
+        )
+        assert _count(conn, "trial_weights", handle.trial_id) == len(results[BASE].weights) > 0
+
+    def test_an_unknown_detail_level_is_refused_before_any_write(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        with pytest.raises(ValueError, match="detail level"):
+            write_results(conn, handle, results, settings, detail_level="partial")  # type: ignore[arg-type]
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0

@@ -45,6 +45,16 @@ that decided the exit: the value sold is the close already marked. It pays
 session on and the proceeds sit in cash.
 Exit notional and costs are added to the row's `turnover` and `cost_paid`.
 
+**Read groups** (strategy-lab spec req 2, plan T105): `run_many` runs several
+variants that differ only in keys that change the computation, not the reads, in
+lockstep from one read set per step: each step's marking reads are made once for the
+union of the variants' ids, and the plan's universe, gap and signal read once for the
+group (the signal read for the union of what each variant's reader asks, from the
+earliest `sessions_from`). Each variant is served exactly its own ids and bound, so its
+result equals a separate `run`'s; `run` is `run_many` with one variant, whose every
+request is one provider call as asked. A variant's own failure drops only it; a failed
+read fails the group (`SharedReadFailed`).
+
 **Benchmarks** (req 3): each series from `benchmark_ids` at close(T_0) (by symbol over
 the run's window, #840; a run whose universe ever holds a benchmark id is refused) is
 bought with the initial capital at F_0's fill price, sized after costs (the only trade), and then
@@ -57,9 +67,10 @@ from __future__ import annotations
 
 import bisect
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
+from typing import Final, TypeVar, cast
 
 import polars as pl
 
@@ -79,6 +90,7 @@ from tradepartner.calendar import all_sessions, previous_session
 from tradepartner.config import HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
+from tradepartner.universe import Universe
 
 STRATEGY_SERIES = "strategy"
 
@@ -507,7 +519,8 @@ def run(
 ) -> dict[float, BacktestResult]:
     """Run the strategy over the rebalance sessions in `[start, end]` at the frozen
     `schedule.rebalance_cadence`, at every cost level in `cost_levels` (per-side bps;
-    commissions from `params.costs`) from one read set.
+    commissions from `params.costs`) from one read set: `run_many` with one variant,
+    whose failure, shared read or not, is raised as the error itself.
 
     `params` is the trial's frozen `Settings` (`hypothesis.load_frozen`, which reads the
     schedule keys through `frozen.frozen_values`). Raises `TypeError` without a
@@ -515,71 +528,497 @@ def run(
     rebalance sessions, a bad cost level or a non-zero `backtest.cash_rate` (interest on
     cash is not implemented), all before any provider call.
     """
-    signal_for(family)
-    if not isinstance(handle, TrialHandle):
-        raise TypeError(f"a run needs a TrialHandle from registry.open_trial, got {handle!r}")
+    failure: Exception | None = None
+    outcome = RunManyResults()
+    try:
+        outcome = run_many([(params, handle)], provider, start, end, cost_levels, family=family)
+    except SharedReadFailed as exc:
+        failure = exc.cause
+    if failure is None and outcome.failures:
+        failure = outcome.failures[handle.trial_id]
+    if failure is not None:
+        raise failure
+    return outcome[handle.trial_id]
+
+
+# --- read groups (strategy-lab spec req 2, plan T105) --------------------------------
+
+#: The message every open variant of a read group fails with when a read it shares
+#: fails (strategy-lab spec req 2).
+SHARED_READ_FAILED: Final = "shared read failed"
+
+
+class SharedReadFailed(RuntimeError):
+    """A provider read shared by a read group failed, so every variant still open fails
+    with it (strategy-lab spec req 2). `trial_ids` names them, `cause` is the
+    provider's error."""
+
+    def __init__(self, trial_ids: Sequence[int], cause: Exception) -> None:
+        self.trial_ids = tuple(trial_ids)
+        self.cause = cause
+        names = ", ".join(str(trial_id) for trial_id in self.trial_ids)
+        super().__init__(f"{SHARED_READ_FAILED} (trials {names}): {type(cause).__name__}: {cause}")
+
+
+class RunManyResults(dict[int, dict[float, BacktestResult]]):
+    """`run_many`'s result: trial id to that variant's per-level results, for every
+    variant that completed. `failures` maps each variant whose own computation raised
+    (its signal, targets, fills or valuation) to the error; the others are unaffected."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures: dict[int, Exception] = {}
+
+
+class _ReadError(Exception):
+    """A real provider call made by `_SharedReads` failed (its `__cause__`)."""
+
+
+_Key = tuple[object, ...]
+_Request = tuple[tuple[str, ...], date | None]
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """One real keyed read: the ids and session bound it was made for, and its value."""
+
+    ids: tuple[str, ...]
+    sessions_from: date | None
+    value: object
+
+    def covers(self, ids: Sequence[str], sessions_from: date | None) -> bool:
+        bounded = self.sessions_from is None or (
+            sessions_from is not None and sessions_from >= self.sessions_from
+        )
+        return bounded and set(ids) <= set(self.ids)
+
+    def restricted(self, ids: Sequence[str], sessions_from: date | None) -> object:
+        """The value as a read for exactly `ids` from `sessions_from` returns it: rows
+        of other ids, and bars before the bound, left out (the bound applies after the
+        as-of read, provider docstring, so the factors are unchanged)."""
+        if tuple(ids) == self.ids and sessions_from == self.sessions_from:
+            return self.value
+        if isinstance(self.value, pl.DataFrame):
+            frame = self.value.filter(pl.col("security_id").is_in(list(ids)))
+            if sessions_from is not None and sessions_from != self.sessions_from:
+                frame = frame.filter(pl.col("session") >= sessions_from)
+            return frame
+        mapping = cast(Mapping[str, object], self.value)
+        return {sid: mapping[sid] for sid in ids}
+
+
+def _keyed_call(provider: DataProvider, key: _Key, ids: list[str], bound: date | None) -> object:
+    """The provider read `key` names, for `ids` (and `bound`, the price read's only)."""
+    method, *args = key
+    t = cast(datetime, args[0])
+    if method == "adjusted_prices":
+        include_dividends = cast(bool, args[1])
+        if bound is None:
+            return provider.adjusted_prices(t, ids, include_dividends)
+        return provider.adjusted_prices(t, ids, include_dividends, sessions_from=bound)
+    if method == "late_dividends":
+        return provider.late_dividends(t, cast(datetime, args[1]), ids)
+    read = cast(Callable[[datetime, list[str]], object], getattr(provider, cast(str, method)))
+    return read(t, ids)
+
+
+class _SharedReads:
+    """The provider as every variant of a read group sees it within one step: each read
+    the group shares is made once, for the union of the variants' ids (`share`), and
+    each variant's own request is served from it restricted to its ids. A request no
+    shared read covers is made as asked. With `covering` false (a group of one, `run`)
+    a read serves only the one request it was made for, so every request is one
+    provider call exactly as asked. Every real call's error is a `_ReadError`."""
+
+    def __init__(self, provider: DataProvider, *, covering: bool) -> None:
+        self._provider = provider
+        self._covering = covering
+        self._entries: dict[_Key, list[_Entry]] = {}
+        self._memo: dict[_Key, object] = {}
+
+    def new_step(self) -> None:
+        """Drop the previous step's reads (every key holds its read time)."""
+        self._entries.clear()
+        self._memo.clear()
+
+    def _real(self, call: Callable[[], _T]) -> _T:
+        try:
+            return call()
+        except Exception as exc:
+            raise _ReadError from exc
+
+    def share(self, key: _Key, requests: Sequence[_Request]) -> None:
+        """Make the read `key` names once for every request in `requests`: one request's
+        ids as given, several requests' union (sorted) from the earliest bound."""
+        if len(requests) == 1:
+            ids, bound = requests[0]
+        else:
+            ids = tuple(sorted({sid for request_ids, _ in requests for sid in request_ids}))
+            bounds = [request_bound for _, request_bound in requests]
+            bound = None if None in bounds else min(b for b in bounds if b is not None)
+        value = self._real(lambda: _keyed_call(self._provider, key, list(ids), bound))
+        self._entries.setdefault(key, []).append(_Entry(tuple(ids), bound, value))
+
+    def _read(self, key: _Key, ids: Sequence[str], bound: date | None = None) -> object:
+        entries = self._entries.setdefault(key, [])
+        exact = [e for e in entries if e.ids == tuple(ids) and e.sessions_from == bound]
+        if not self._covering:
+            if not exact:
+                self.share(key, [(tuple(ids), bound)])
+                exact = [entries[-1]]
+            entries.remove(exact[0])
+            return exact[0].value
+        for entry in [*exact, *entries]:
+            if entry.covers(ids, bound):
+                return entry.restricted(ids, bound)
+        self.share(key, [(tuple(ids), bound)])
+        return entries[-1].value
+
+    def _once(self, key: _Key, call: Callable[[], _T]) -> _T:
+        if not self._covering:
+            return self._real(call)
+        if key not in self._memo:
+            self._memo[key] = self._real(call)
+        return cast(_T, self._memo[key])
+
+    # --- DataProvider ------------------------------------------------------------
+
+    def universe(self, t: datetime) -> Universe:
+        return self._once(("universe", t), lambda: self._provider.universe(t))
+
+    def adjusted_prices(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
+    ) -> pl.DataFrame:
+        key = ("adjusted_prices", t, include_dividends)
+        return cast(pl.DataFrame, self._read(key, ids, sessions_from))
+
+    def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("raw_prices", t), ids))
+
+    def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("listing_ends", t), ids))
+
+    def benchmark_ids(self, t: datetime, through: date | None = None) -> Mapping[str, str]:
+        return self._once(
+            ("benchmark_ids", t, through), lambda: self._provider.benchmark_ids(t, through)
+        )
+
+    def survivorship_gap(self, t: datetime) -> GapReading:
+        return self._once(("survivorship_gap", t), lambda: self._provider.survivorship_gap(t))
+
+    def dropped_dividends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("dropped_dividends", t), ids))
+
+    def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("late_dividends", t_prev, t), ids))
+
+    def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
+        return self._once(
+            ("static_listing_count", t, tuple(ids)),
+            lambda: self._provider.static_listing_count(t, ids),
+        )
+
+    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("statement_facts", t), ids))
+
+    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
+        return cast(Mapping[str, int | None], self._read(("sics", t), ids))
+
+
+class _Requests:
+    """A stand-in provider a variant's signal reader runs against to say which keyed
+    reads it needs (each returns an empty value the reader only wraps); every other
+    read goes to the shared view."""
+
+    def __init__(self, view: _SharedReads) -> None:
+        self.view = view
+        self.asked: dict[_Key, list[_Request]] = {}
+
+    def _ask(self, key: _Key, ids: Sequence[str], bound: date | None = None) -> pl.DataFrame:
+        self.asked.setdefault(key, []).append((tuple(ids), bound))
+        return pl.DataFrame()
+
+    def universe(self, t: datetime) -> Universe:
+        return self.view.universe(t)
+
+    def adjusted_prices(
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
+    ) -> pl.DataFrame:
+        return self._ask(("adjusted_prices", t, include_dividends), ids, sessions_from)
+
+    def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("raw_prices", t), ids)
+
+    def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("listing_ends", t), ids)
+
+    def benchmark_ids(self, t: datetime, through: date | None = None) -> Mapping[str, str]:
+        return self.view.benchmark_ids(t, through)
+
+    def survivorship_gap(self, t: datetime) -> GapReading:
+        return self.view.survivorship_gap(t)
+
+    def dropped_dividends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("dropped_dividends", t), ids)
+
+    def late_dividends(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("late_dividends", t_prev, t), ids)
+
+    def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
+        return self.view.static_listing_count(t, ids)
+
+    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        return self._ask(("statement_facts", t), ids)
+
+    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
+        self._ask(("sics", t), ids)
+        return {}
+
+
+@dataclass
+class _Variant:
+    """One variant's run state between steps."""
+
+    settings: Settings
+    handle: TrialHandle
+    plan: Plan | None = None
+    books: list[_Book] = field(default_factory=list)
+    frames: list[StepFrame] = field(default_factory=list)
+    targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
+
+    @property
+    def trial_id(self) -> int:
+        return self.handle.trial_id
+
+
+def _check_variants(
+    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float]
+) -> list[float]:
+    """Every refusal before any read; the checked cost levels."""
+    if not variants:
+        raise ValueError("run_many needs at least one variant")
+    for _, handle in variants:
+        if not isinstance(handle, TrialHandle):
+            raise TypeError(f"a run needs a TrialHandle from registry.open_trial, got {handle!r}")
     levels = _check_levels(cost_levels)
-    if params.backtest.cash_rate != 0:
-        raise ValueError("backtest.cash_rate other than 0 is not implemented")
-    cadence = params.schedule.rebalance_cadence
+    ids = [handle.trial_id for _, handle in variants]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"each variant needs its own trial, got trial ids {ids}")
+    for params, _ in variants:
+        if params.backtest.cash_rate != 0:
+            raise ValueError("backtest.cash_rate other than 0 is not implemented")
+    cadences = {params.schedule.rebalance_cadence for params, _ in variants}
+    if len(cadences) != 1:
+        raise ValueError(f"a read group runs at one cadence, got {sorted(cadences)}")
+    return levels
+
+
+def _plan_all(
+    view: _SharedReads,
+    group: list[_Variant],
+    session: date,
+    family: HypothesisFamily,
+    on_failure: Callable[[_Variant, Exception], None],
+) -> dict[int, Plan]:
+    """Each open variant's plan at `session`, from one signal read for the group: with
+    several variants, each one's reader first says what it reads (`_Requests`), and
+    each keyed read is made once for their union before any variant plans."""
+    if len(group) > 1:
+        strategy = signal_for(family)
+        t = read_time(session, group[0].settings.schedule.rebalance_cadence)
+        members = sorted(view.universe(t).members["security_id"].to_list())
+        requests = _Requests(view)
+        for variant in list(group):
+            try:
+                strategy.reader(requests, variant.settings, session, t, members)
+            except _ReadError:
+                raise
+            except Exception as exc:
+                on_failure(variant, exc)
+        for key, asked in requests.asked.items():
+            view.share(key, asked)
+    plans: dict[int, Plan] = {}
+    for variant in list(group):
+        try:
+            plans[variant.trial_id] = _plan(view, variant.settings, session, family)
+        except _ReadError:
+            raise
+        except Exception as exc:
+            on_failure(variant, exc)
+    return plans
+
+
+def run_many(
+    variants: Sequence[tuple[Settings, TrialHandle]],
+    provider: DataProvider,
+    start: date,
+    end: date,
+    cost_levels: Sequence[float],
+    *,
+    family: HypothesisFamily,
+) -> RunManyResults:
+    """Run a read group's variants (strategy-lab spec req 2): every variant's frozen
+    `Settings` with its own `TrialHandle`, over the rebalance sessions in `[start, end]`
+    at their one cadence, at every cost level, from **one read set per step**: the
+    marking reads for the union of the variants' ids and one signal read for the union
+    of their requests, each variant served its own ids only, so each result equals a
+    separate `run`'s.
+
+    Raises `TypeError` when any variant lacks a `TrialHandle` and `ValueError` for the
+    refusals `run` names, two variants sharing a trial or cadences that differ, all
+    before any provider call. A failure inside one variant's own computation (its
+    signal, targets, fills or valuation) is recorded in `failures` against that
+    variant only, which is then dropped; a failed provider read raises
+    `SharedReadFailed` naming every variant still open.
+    """
+    signal_for(family)
+    levels = _check_variants(variants, cost_levels)
+    cadence = variants[0][0].schedule.rebalance_cadence
     sessions = rebalance_sessions(start, end, cadence)
     if len(sessions) < 2:
         raise ValueError(f"need at least two rebalance sessions in [{start}, {end}]")
 
-    capital = params.backtest.initial_capital
-    plan = _plan(provider, params, sessions[0], family)
-    benchmarks = dict(
-        sorted(
-            provider.benchmark_ids(read_time(sessions[0], cadence), through=sessions[-1]).items()
-        )
-    )
-    _no_benchmark_members(plan, benchmarks)
-    books = [
-        _Book(
-            level=level,
-            cash=capital,
-            benchmarks={name: _Holding(sid, capital) for name, sid in benchmarks.items()},
-        )
-        for level in levels
-    ]
-    for book in books:
-        book.equity.append(EquityRow(STRATEGY_SERIES, book.level, sessions[0], capital, capital))
-        for name in benchmarks:
-            book.equity.append(EquityRow(name, book.level, sessions[0], capital, None))
-    frames: list[StepFrame] = []
-    targets: dict[date, Mapping[str, float]] = {}
-    for index, step_end in enumerate(sessions[1:], start=1):
-        t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
-        ids = sorted({*plan.targets, *(sid for book in books for sid in book.positions)})
-        marked = sorted({*ids, *benchmarks.values()})
-        frame = provider.adjusted_prices(t, marked, True)
-        raw = provider.raw_prices(t, marked)
-        ended = _ended(provider.listing_ends(t, ids), step_end)
-        dropped = provider.dropped_dividends(t, ids)
-        ever_held = sorted({sid for book in books for sid in book.held_on})
-        late = provider.late_dividends(t_prev, t, ever_held)
-        next_plan = (
-            _no_benchmark_members(_plan(provider, params, step_end, family), benchmarks)
-            if index < len(sessions) - 1
-            else None
-        )
-        frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
-        targets[plan.fill_session] = dict(plan.targets)
-        for book in books:
-            _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)
-            _benchmark_step(book, plan, step_end, frame, raw, params)
-        if next_plan is not None:
-            plan = next_plan
+    out = RunManyResults()
+    group = [_Variant(params, handle) for params, handle in variants]
 
-    return {
-        book.level: BacktestResult(
-            cost_per_side_bps=book.level,
-            equity=tuple(book.equity),
-            rebalances=tuple(book.rebalances),
-            weights=tuple(book.weights),
-            position_values=pl.concat([pl.DataFrame(schema=_POSITION_SCHEMA), *book.values]),
-            marking_frames=tuple(frames),
-            targets=dict(targets),
-        )
-        for book in books
-    }
+    def failed(variant: _Variant, exc: Exception) -> None:
+        out.failures[variant.trial_id] = exc
+        group.remove(variant)
+
+    view = _SharedReads(provider, covering=len(group) > 1)
+    try:
+        _run_group(view, group, sessions, levels, family, failed)
+    except _ReadError as exc:
+        cause = exc.__cause__
+        assert isinstance(cause, Exception)
+        raise SharedReadFailed([v.trial_id for v in group], cause) from cause
+
+    for variant in group:
+        out[variant.trial_id] = {
+            book.level: BacktestResult(
+                cost_per_side_bps=book.level,
+                equity=tuple(book.equity),
+                rebalances=tuple(book.rebalances),
+                weights=tuple(book.weights),
+                position_values=pl.concat([pl.DataFrame(schema=_POSITION_SCHEMA), *book.values]),
+                marking_frames=tuple(variant.frames),
+                targets=dict(variant.targets),
+            )
+            for book in variant.books
+        }
+    return out
+
+
+def _run_group(
+    view: _SharedReads,
+    group: list[_Variant],
+    sessions: Sequence[date],
+    levels: Sequence[float],
+    family: HypothesisFamily,
+    failed: Callable[[_Variant, Exception], None],
+) -> None:
+    """`run_many`'s loop over `group` (the module docstring's steps, in lockstep); a
+    failed variant leaves `group` through `failed`."""
+    cadence = group[0].settings.schedule.rebalance_cadence
+    plans = _plan_all(view, group, sessions[0], family, failed)
+    if not group:
+        return
+    benchmarks = dict(
+        sorted(view.benchmark_ids(read_time(sessions[0], cadence), through=sessions[-1]).items())
+    )
+    for variant in list(group):
+        try:
+            variant.plan = _no_benchmark_members(plans[variant.trial_id], benchmarks)
+        except Exception as exc:
+            failed(variant, exc)
+            continue
+        capital = variant.settings.backtest.initial_capital
+        variant.books = [
+            _Book(
+                level=level,
+                cash=capital,
+                benchmarks={name: _Holding(sid, capital) for name, sid in benchmarks.items()},
+            )
+            for level in levels
+        ]
+        for book in variant.books:
+            book.equity.append(
+                EquityRow(STRATEGY_SERIES, book.level, sessions[0], capital, capital)
+            )
+            for name in benchmarks:
+                book.equity.append(EquityRow(name, book.level, sessions[0], capital, None))
+
+    for index, step_end in enumerate(sessions[1:], start=1):
+        if not group:
+            return
+        view.new_step()
+        t = read_time(step_end, cadence)
+        own = [_marking_ids(variant, benchmarks) for variant in group]
+        t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
+        view.share(("adjusted_prices", t, True), [(marked, None) for _, marked, _ in own])
+        view.share(("raw_prices", t), [(marked, None) for _, marked, _ in own])
+        view.share(("listing_ends", t), [(ids, None) for ids, _, _ in own])
+        view.share(("dropped_dividends", t), [(ids, None) for ids, _, _ in own])
+        view.share(("late_dividends", t_prev, t), [(held, None) for _, _, held in own])
+        last = index == len(sessions) - 1
+        next_plans = {} if last else _plan_all(view, group, step_end, family, failed)
+        for variant in list(group):
+            try:
+                _variant_step(view, variant, step_end, benchmarks, next_plans.get(variant.trial_id))
+            except _ReadError:
+                raise
+            except Exception as exc:
+                failed(variant, exc)
+
+
+def _marking_ids(
+    variant: _Variant, benchmarks: Mapping[str, str]
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """The variant's step reads' ids: planned and held names, those plus the
+    benchmarks (marked), and every name it ever held (late dividends)."""
+    plan = cast(Plan, variant.plan)
+    ids = sorted({*plan.targets, *(sid for book in variant.books for sid in book.positions)})
+    marked = sorted({*ids, *benchmarks.values()})
+    ever_held = sorted({sid for book in variant.books for sid in book.held_on})
+    return tuple(ids), tuple(marked), tuple(ever_held)
+
+
+def _variant_step(
+    view: _SharedReads,
+    variant: _Variant,
+    step_end: date,
+    benchmarks: Mapping[str, str],
+    next_plan: Plan | None,
+) -> None:
+    """One variant's step through `step_end` from the shared reads, restricted to its
+    own ids: carry, fill, value and exit every level, then take `next_plan`."""
+    plan = cast(Plan, variant.plan)
+    params = variant.settings
+    cadence = params.schedule.rebalance_cadence
+    t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
+    ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
+    frame = view.adjusted_prices(t, marked, True)
+    raw = view.raw_prices(t, marked)
+    ended = _ended(view.listing_ends(t, ids), step_end)
+    dropped = view.dropped_dividends(t, ids)
+    late = view.late_dividends(t_prev, t, ever_held)
+    if next_plan is not None:
+        next_plan = _no_benchmark_members(next_plan, benchmarks)
+    variant.frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
+    variant.targets[plan.fill_session] = dict(plan.targets)
+    for book in variant.books:
+        _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)
+        _benchmark_step(book, plan, step_end, frame, raw, params)
+    if next_plan is not None:
+        variant.plan = next_plan

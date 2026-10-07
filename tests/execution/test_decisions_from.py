@@ -60,8 +60,12 @@ def _plan(
     scores: Mapping[str, float] | None = None,
     members: tuple[str, ...] = ("A", "B", "C", "D", "E"),
     excluded: tuple[str, ...] = ("E",),
+    exclusions: Mapping[str, tuple[str, ...]] | None = None,
 ) -> Plan:
     scores = dict(scores or {"A": 0.5, "B": 0.4, "C": 0.1, "D": -0.2})
+    # Momentum's one declared reason by default, as every plan built here was before
+    # T127b (#1209) generalised `Plan.exclusions` to every family's declared reasons.
+    exclusions = dict(exclusions) if exclusions is not None else {"no_history": excluded}
     return Plan(
         session=T,
         fill_session=S,
@@ -73,6 +77,7 @@ def _plan(
         members=members,
         scores=scores,
         excluded_no_history=excluded,
+        exclusions=exclusions,
     )
 
 
@@ -258,6 +263,113 @@ def test_rows_carry_the_run_and_stamps() -> None:
     assert (c.decision, c.reason, c.planned_quantity) == ("trade", "left_targets", 5.0)
     signal_rows = [s.row(run_id=7, known_at=stamp, ingested_at=stamp) for s in result.signals]
     assert all(isinstance(r, SignalRow) and r.run_id == 7 for r in signal_rows)
+
+
+# --- generic exclusions (T127b, #1209: the paper planner reads the generic plan) -----
+
+
+def test_momentum_fixture_plans_signals_rows_are_byte_identical() -> None:
+    """The default plan (momentum's one `no_history` reason) journals exactly the
+    rows it did before `Plan.exclusions` generalised past momentum: no reordering,
+    no reason-string change."""
+    assert [(s.security_id, s.reason, s.score, s.rank) for s in _run().signals] == [
+        ("A", "selected", 0.5, 1),
+        ("B", "selected", 0.4, 2),
+        ("C", "below_cut", 0.1, 3),
+        ("D", "below_cut", -0.2, 4),
+        ("E", "excluded_no_history", None, None),
+    ]
+
+
+def test_signals_journal_every_declared_exclusion_reason() -> None:
+    """A plan whose family declares more than one exclusion reason (profitability's
+    shape, not momentum's) journals one `excluded_<reason>` row per reason."""
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=(),
+        exclusions={"sector": ("D",), "no_facts": ("E",)},
+    )
+    signals = {s.security_id: s for s in _run(plan, _ledger({})).signals}
+    assert signals["D"].reason == "excluded_sector"
+    assert signals["E"].reason == "excluded_no_facts"
+    assert (signals["D"].score, signals["D"].rank) == (None, None)
+    assert (signals["E"].score, signals["E"].rank) == (None, None)
+
+
+def test_a_member_excluded_for_two_reasons_raises() -> None:
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=(),
+        exclusions={"sector": ("D",), "no_facts": ("D", "E")},
+    )
+    with pytest.raises(ValueError, match="both"):
+        _run(plan, _ledger({}))
+
+
+def test_a_member_left_out_of_scores_and_exclusions_raises() -> None:
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=(),
+        exclusions={"sector": ("D",)},  # E is neither scored nor excluded
+    )
+    with pytest.raises(ValueError, match="partition"):
+        _run(plan, _ledger({}))
+
+
+def test_a_scored_member_also_excluded_raises() -> None:
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1, "D": 0.0},
+        members=("A", "B", "C", "D", "E"),
+        excluded=(),
+        exclusions={"sector": ("D",), "no_facts": ("E",)},  # D scored and excluded
+    )
+    with pytest.raises(ValueError, match="partition"):
+        _run(plan, _ledger({}))
+
+
+def test_excluded_no_history_outside_the_declared_set_raises() -> None:
+    """`excluded_no_history` non-empty while the family's `exclusions` do not
+    declare `no_history` at all names a reason outside the family's declared set."""
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1, "D": 0.0},
+        members=("A", "B", "C", "D", "E"),
+        excluded=("E",),
+        exclusions={"sector": ("E",)},  # declares "sector", not "no_history"
+    )
+    with pytest.raises(ValueError, match="no_history"):
+        _run(plan, _ledger({}))
+
+
+def test_excluded_no_history_disagreeing_with_its_declared_ids_raises() -> None:
+    """`no_history` is declared, but `excluded_no_history` names a different id
+    than `exclusions["no_history"]` does: the legacy field and the generic
+    mapping disagree, rather than one of them being simply absent."""
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=("D",),  # the legacy field says D
+        exclusions={"no_history": ("E",)},  # the mapping says E
+    )
+    with pytest.raises(ValueError, match="disagrees"):
+        _run(plan, _ledger({}))
+
+
+def test_an_undeclared_reason_key_raises() -> None:
+    """A reason key of the wrong shape, or already carrying the `excluded_`
+    prefix the database adds, is refused: the only thing `_signals` can check
+    against, since `Plan` carries no family, is the key's own shape, which the
+    database's prefix-only `CHECK` would not itself catch."""
+    plan = _plan(
+        scores={"A": 0.5, "B": 0.4, "C": 0.1},
+        members=("A", "B", "C", "D", "E"),
+        excluded=(),
+        exclusions={"": ("D",), "excluded_no_facts": ("E",)},
+    )
+    with pytest.raises(ValueError, match="malformed"):
+        _run(plan, _ledger({}))
 
 
 # --- overrides ----------------------------------------------------------------------
