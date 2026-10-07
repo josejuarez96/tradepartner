@@ -185,10 +185,10 @@ def test_edgar_fsn_first_year_override() -> None:
 
 
 def test_edgar_statement_facts_defaults() -> None:
-    """T77 (#660): the switch is off and the tag, form and unit lists are the
-    spec amendment's defaults, in its precedence order."""
+    """T77 (#660): the tag, form and unit lists are the spec amendment's
+    defaults, in its precedence order; T78 (#1127) turned the switch on."""
     s = Settings(_env_file=None)
-    assert s.edgar.statement_facts_enabled is False
+    assert s.edgar.statement_facts_enabled is True
     assert s.edgar.statement_tags == {
         "revenue": [
             "us-gaap:Revenues",

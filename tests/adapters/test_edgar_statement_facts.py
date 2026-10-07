@@ -5,7 +5,8 @@ constructed companyfacts payloads: comparatives on their own dates, a
 misleading `fy`, the form filter on the submissions record's form, the
 unit filter, a 10-K/A first carrier, a dimension raising, tag precedence,
 and a same-tag conflict returned (never raised). The recorded fixtures
-carry no statement tags until T78 re-records them, so they yield no rows.
+carry the statement tags since T78 re-recorded them (#1127), so they yield
+the recorded issuers' rows.
 """
 
 from __future__ import annotations
@@ -532,16 +533,65 @@ def test_payload_without_the_taxonomy_yields_nothing() -> None:
 # --- recorded fixtures -----------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["plain_issuer", "dual_class", "delisted_25nse"])
-def test_recorded_fixtures_carry_no_statement_tags_yet(name: str) -> None:
+def _parse_recorded(name: str) -> StatementFactsParse:
+    """The recorded fixture `name`'s statement facts, stamped from its submissions."""
     facts = json.loads((FIXTURES / f"company_facts_{name}.json").read_text())
     acceptance: dict[str, Any] = {}
     for path in sorted(FIXTURES.glob(f"submissions_{name}*.json")):
         records, _ = reduce_submissions(json.loads(path.read_text()))
         acceptance.update(records)
     assert acceptance
-    result = parse_statement_facts(facts, TAGS, FORMS, UNITS, acceptance)
-    assert result == StatementFactsParse((), (), 0, 0)
+    return parse_statement_facts(facts, TAGS, FORMS, UNITS, acceptance)
+
+
+@pytest.mark.parametrize(
+    ("name", "facts"),
+    [
+        (
+            "plain_issuer",
+            {"revenue", "cost_of_revenue", "gross_profit", "operating_cash_flow", "total_assets"},
+        ),
+        ("dual_class", {"revenue", "cost_of_revenue", "operating_cash_flow", "total_assets"}),
+        ("delisted_25nse", {"revenue", "cost_of_revenue", "operating_cash_flow", "total_assets"}),
+    ],
+)
+def test_recorded_fixtures_yield_the_issuers_statement_rows(name: str, facts: set[str]) -> None:
+    """T78 re-recorded the fixtures with the statement tags (#1127): every
+    recorded issuer yields clean rows, each stamped with its filing's
+    acceptance time from the recorded submissions, with no conflict."""
+    result = _parse_recorded(name)
+    assert result.records
+    assert {r.fact_name for r in result.records} == facts
+    assert all(r.accepted_at is not None for r in result.records)
+    assert all(r.form in FORMS for r in result.records)
+    assert result.conflicts == ()
+    assert (result.non_unit, result.malformed) == (0, 0)
+
+
+def test_recorded_plain_issuer_fy2022_matches_the_10k() -> None:
+    """Apple's FY2022 10-K (0000320193-22-000108), hand-checked against the
+    filing: each fact's current-year value, known at the filing's acceptance
+    (2022-10-27 18:01:14 New York, 22:01:14 UTC), not at its `filed` date."""
+    accession = "0000320193-22-000108"
+    accepted = datetime(2022, 10, 27, 22, 1, 14, tzinfo=UTC)
+    rows = {
+        r.fact_name: r
+        for r in _parse_recorded("plain_issuer").records
+        if r.accession == accession and not r.comparative
+    }
+    assert {name: r.value for name, r in rows.items()} == {
+        "revenue": 394_328_000_000,
+        "cost_of_revenue": 223_546_000_000,
+        "gross_profit": 170_782_000_000,
+        "operating_cash_flow": 122_151_000_000,
+        "total_assets": 352_755_000_000,
+    }
+    assert {r.accepted_at for r in rows.values()} == {accepted}
+    assert {r.form for r in rows.values()} == {"10-K"}
+    assert rows["revenue"].period_start == date(2021, 9, 26)
+    assert rows["revenue"].period_end == date(2022, 9, 24)
+    assert rows["total_assets"].period_start is None
+    assert rows["total_assets"].period_end == date(2022, 9, 24)
 
 
 # --- the adapter: `EdgarFilingSource.statement_facts` (plan T77a) -----------------
@@ -609,8 +659,7 @@ STAMPS: dict[str, tuple[str, datetime | None]] = {
 
 
 def test_switch_off_makes_no_call_no_request_and_no_cache(tmp_path: Path) -> None:
-    settings = edgar_settings(tmp_path / "cache")
-    assert settings.edgar.statement_facts_enabled is False  # the default
+    settings = edgar_settings(tmp_path / "cache", statement_facts_enabled=False)
     shares = _company(CIK, {})
     router = _router(**{f"c{CIK}": shares})
     source = _adapter(settings, router)
@@ -915,7 +964,8 @@ def test_stale_statement_caches_count_only_while_the_switch_is_on(
     source = _adapter(settings, _router(**{f"c{CIK}": _conflicted()}))
     _stamps(source, CIK, STAMPS)
     if enabled:  # fill the facts cache alone, as a run before the switch did
-        off = _adapter(edgar_settings(tmp_path / "cache"), _router(**{f"c{CIK}": _conflicted()}))
+        off_settings = edgar_settings(tmp_path / "cache", statement_facts_enabled=False)
+        off = _adapter(off_settings, _router(**{f"c{CIK}": _conflicted()}))
         off.facts(CIK, [SHARES])
     else:
         source.facts(CIK, [SHARES])

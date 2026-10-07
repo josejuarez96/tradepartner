@@ -494,7 +494,8 @@ def test_edgar_run_message_names_only_the_counts_the_source_exposes(settings: Se
     class OnlyFacts(FixtureFilingSource):
         unstamped_facts = ("c",)
 
-    message = _run(settings, filings=_filings(cls=OnlyFacts), source="edgar").runs[0].message
+    off = _switched(settings, False)  # the statement counts are their own tests' job
+    message = _run(off, filings=_filings(cls=OnlyFacts), source="edgar").runs[0].message
     assert " facts; unstamped: 1 facts; missing benchmarks:" in message
 
 
@@ -2304,7 +2305,7 @@ def test_a_conflict_withheld_gross_profit_stays_empty_across_runs_until_clean(
 def test_switch_off_asks_nothing_and_adds_no_row(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
-    assert settings.edgar.statement_facts_enabled is False  # the default
+    settings = _switched(settings, False)  # on by default since T78 (#1127)
     source = _StatementSource(_components(F1, AT1))
     run = _edgar(settings, source)
     assert source.calls == []

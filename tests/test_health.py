@@ -1495,10 +1495,11 @@ def test_statement_counts_empty_on_none_or_no_figures() -> None:
     assert statement_counts("5 securities; missing benchmarks: none") == {}
 
 
-def test_statement_facts_is_disabled_by_default_and_reports_no_coverage(
-    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+def test_statement_facts_switched_off_reports_no_coverage(
+    fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
-    report = health_report(fixture_store, T_END, settings)
+    off = _settings(edgar={"statement_facts_enabled": False})  # on by default since T78
+    report = health_report(fixture_store, T_END, off)
     assert report.statement.enabled is False
     assert report.statement.coverage is None
     assert report.statement.counts == {}

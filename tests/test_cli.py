@@ -189,8 +189,8 @@ class _SourceRecorder:
         return object()
 
 
-def _statements_on(settings: Settings) -> Settings:
-    edgar = settings.edgar.model_copy(update={"statement_facts_enabled": True})
+def _statements_on(settings: Settings, on: bool = True) -> Settings:
+    edgar = settings.edgar.model_copy(update={"statement_facts_enabled": on})
     return settings.model_copy(update={"edgar": edgar})
 
 
@@ -231,7 +231,8 @@ def test_ingest_refuses_statement_flags_where_they_cannot_apply(
 ) -> None:
     session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
     filled = _patched(monkeypatch, "backfill", _ok("edgar"))
-    settings = secrets_set if args == ["--rebuild-statement-facts"] else _statements_on(secrets_set)
+    off = args == ["--rebuild-statement-facts"]  # the switch is set off: on by default (T78)
+    settings = _statements_on(secrets_set, on=not off)
     result = _invoke(settings, ["ingest", *args])
     assert result.exit_code == 2, result.output
     assert session.calls == [] and filled.calls == []

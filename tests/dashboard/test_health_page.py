@@ -336,9 +336,10 @@ def test_page_reads_only_through_the_shells_connection(
 # --- Statement facts (#660, T77c) -------------------------------------------
 
 
-def test_statement_card_renders_off_by_default(
+def test_statement_card_renders_off_when_switched_off(
     monkeypatch: pytest.MonkeyPatch, store_path: Path
 ) -> None:
+    monkeypatch.setenv("EDGAR__STATEMENT_FACTS_ENABLED", "false")  # on by default since T78
     at = _app(monkeypatch, store_path)
     assert not at.exception
     text = _text(at)
