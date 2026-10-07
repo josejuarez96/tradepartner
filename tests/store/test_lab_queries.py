@@ -1,23 +1,26 @@
 """Tests for the strategy-lab run-planning reads (plan T103b,
 `store/lab_queries.py`) on the `lab_store` fixture with hand-inserted trials.
 
-Covers every branch the plan names: `counted_trial` is the latest `ok`,
-non-synthetic, `in_sample` trial over the default window; `is_current` /
-`is_stale` by the data vintage at the trial's own cutoff and the checkout's
-code vintage; req 2's counting rule branch by branch (two identical clean
-current failures terminal, three excluded-kind failures not, two dirty or
-other-vintage failures not, an `ok` after two failures counted, a stale `ok`
-neither counts nor blocks, different messages not); `sweep_state`'s complete,
-incomplete (stale) and incomplete (unrun); `plan_run`'s stale and unrun
-variants, its read-group order and its `--rerun` refusal; and the measured
-seconds per variant by cadence. Every function raises `LabNotInitialised` on a
-plain `fixture_store`.
+Covers every branch the plan names: `counted_trial` is the latest current
+`ok`, non-synthetic, `in_sample` trial over the default window (and the latest
+stale `ok` only when none is current); `is_current` / `is_stale` by the data
+vintage at the trial's own cutoff and the checkout's code vintage; req 2's
+counting rule branch by branch (two identical clean current failures terminal,
+three excluded-kind failures not, two dirty or other-vintage failures not, an
+`ok` after two failures counted, a stale `ok` neither counts nor blocks,
+different messages not, synthetic or other-window failures not, another
+registration's failures not); `sweep_state`'s complete, incomplete (stale) and
+incomplete (unrun); `plan_run`'s stale and unrun variants, its read-group order
+and its `--rerun` refusal; the measured seconds per variant by cadence from
+`ok` trials only; and vintage at the trial's own cutoff with a realistic fact.
+Every function raises `LabNotInitialised` on a plain `fixture_store`.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -33,14 +36,9 @@ HOLDOUT_END = date(2026, 9, 30)
 #: The default in-sample window at `month_end`: the last month-end session
 #: strictly before `HOLDOUT_START`.
 DEFAULT_END = date(2023, 12, 29)
-_CUTOFF = datetime(2100, 1, 1, tzinfo=UTC)
+#: A realistic cutoff: the close of `DEFAULT_END`.
+_CUTOFF = datetime(2023, 12, 29, 21, 0, tzinfo=UTC)
 _OLD_VINTAGE = datetime(2019, 1, 1, tzinfo=UTC)
-_FIXED = {
-    "costs.per_side_bps": 15.0,
-    "execution.fill_price": "close",
-    "gap.count_share_threshold": 0.02,
-    "universe.top_n_by_cap": 500,
-}
 
 
 @lru_cache(maxsize=1)
@@ -116,6 +114,32 @@ def _sweep(
     )
 
 
+def _write_variant(
+    conn: duckdb.DuckDBPyConnection,
+    sweep: lab_registry.SweepRecord,
+    index: int,
+    record: registry.HypothesisRecord,
+    *,
+    fingerprint: str | None = None,
+    variant_params: dict[str, Any] | None = None,
+) -> str:
+    """Link `record` to `sweep` as variant `index` and return the fingerprint
+    (the caller writes the fingerprint row once, since one registration writes
+    it once even when the same variant is linked to a second sweep)."""
+    used = fingerprint if fingerprint is not None else f"{index:064x}"
+    lab_registry.write_sweep_variant(
+        conn,
+        sweep_id=sweep.sweep_id,
+        variant_index=index,
+        hypothesis_id=record.hypothesis_id,
+        fingerprint=used,
+        variant_params=variant_params
+        if variant_params is not None
+        else {"strategy.top_fraction": 0.1 * index},
+    )
+    return used
+
+
 def _variant(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -130,15 +154,7 @@ def _variant(
         family=sweep.family,
         params=params if params is not None else _params(**{"strategy.top_fraction": 0.1 * index}),
     )
-    fingerprint = f"{index:064x}"
-    lab_registry.write_sweep_variant(
-        conn,
-        sweep_id=sweep.sweep_id,
-        variant_index=index,
-        hypothesis_id=record.hypothesis_id,
-        fingerprint=fingerprint,
-        variant_params={"strategy.top_fraction": 0.1 * index},
-    )
+    fingerprint = _write_variant(conn, sweep, index, record)
     lab_registry.write_fingerprint(conn, record.hypothesis_id, fingerprint)
     return record
 
@@ -217,10 +233,70 @@ def _insert_trial(
     return trial_id
 
 
+def _open_run(
+    conn: duckdb.DuckDBPyConnection, sweep: lab_registry.SweepRecord, tmp_path: Path
+) -> int:
+    """An open `sweep_runs` row of `sweep`, so a trial can be linked to it as
+    the runner links one (one `sweep_trials` row per trial)."""
+    return lab_registry.open_sweep_run(
+        conn,
+        sweep_id=sweep.sweep_id,
+        time_budget_minutes=480,
+        n_declared=sweep.n_variants,
+        n_planned=sweep.n_variants,
+        code_tree_sha256=_checkout(),
+        run_by="test",
+        repo_dir=tmp_path,
+    )
+
+
+def _record_failure(
+    conn: duckdb.DuckDBPyConnection,
+    hypothesis_id: int,
+    run_id: int,
+    *,
+    message: str = "boom",
+    **kwargs: Any,
+) -> int:
+    """Insert a `failed` trial and its `sweep_trials` row, as the runner does."""
+    trial_id = _insert_trial(conn, hypothesis_id, status="failed", message=message, **kwargs)
+    lab_registry.write_sweep_trial(
+        conn, sweep_run_id=run_id, trial_id=trial_id, read_group_index=1, seconds=1.0
+    )
+    return trial_id
+
+
+def _insert_price_fact(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    security_id: str,
+    session: date,
+    known_at: datetime,
+    ingested_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": security_id,
+            "session": session,
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "test",
+            "provenance": "bar",
+        },
+    )
+
+
 # --- counted_trial -------------------------------------------------------------
 
 
-def test_counted_trial_is_the_latest_ok_trial_over_the_default_window(
+def test_counted_trial_is_the_latest_current_ok_trial(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
@@ -230,6 +306,33 @@ def test_counted_trial_is_the_latest_ok_trial_over_the_default_window(
     assert found is not None
     assert found.trial_id == latest
     assert found.status == "ok"
+    assert lab_queries.is_current(lab_store, found)
+
+
+def test_counted_trial_prefers_a_current_older_ok_over_a_newer_stale_one(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """The counted trial is "the latest `ok` ... that is current": an older
+    current `ok` beats a newer stale one (e.g. the checkout went back to the
+    older code vintage), so the variant is counted, not stale."""
+    sweep, record = _one_variant(lab_store, settings)
+    older = _insert_trial(lab_store, record.hypothesis_id)
+    _insert_trial(lab_store, record.hypothesis_id, code_tree_sha256_value="0" * 64)
+    found = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert found is not None and found.trial_id == older
+    assert lab_queries.is_current(lab_store, found)
+    assert not lab_queries.is_stale(lab_store, found)
+
+
+def test_counted_trial_returns_the_latest_ok_when_none_is_current(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    sweep, record = _one_variant(lab_store, settings)
+    _insert_trial(lab_store, record.hypothesis_id, data_vintage_value=_OLD_VINTAGE)
+    latest = _insert_trial(lab_store, record.hypothesis_id, data_vintage_value=_OLD_VINTAGE)
+    found = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert found is not None and found.trial_id == latest
+    assert lab_queries.is_stale(lab_store, found)
 
 
 def test_counted_trial_ignores_synthetic_failed_holdout_and_off_window(
@@ -315,68 +418,142 @@ def test_a_failed_trial_is_never_stale(
     )
 
 
+def test_vintage_is_measured_at_the_trials_own_cutoff(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """`_is_current` must read the vintage at the trial's own cutoff, not the
+    store-wide one: a fact known after the cutoff leaves the trial current,
+    while a late fact inside the window changes the vintage and makes it
+    stale."""
+    sweep, record = _one_variant(lab_store, settings)
+    vintage = registry.data_vintage(lab_store, _CUTOFF)
+    assert vintage is not None
+    _insert_trial(
+        lab_store,
+        record.hypothesis_id,
+        data_cutoff=_CUTOFF,
+        data_vintage_value=vintage,
+    )
+    trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert trial is not None and lab_queries.is_current(lab_store, trial)
+    # A fact known after the cutoff does not move the vintage at the cutoff.
+    _insert_price_fact(
+        lab_store,
+        security_id="SEC_AFTER",
+        session=date(2024, 1, 2),
+        known_at=datetime(2024, 1, 2, 21, 0, tzinfo=UTC),
+        ingested_at=datetime(2024, 1, 2, 21, 10, tzinfo=UTC),
+    )
+    trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert trial is not None and lab_queries.is_current(lab_store, trial)
+    # A late fact for an in-window session moves the vintage: stale.
+    _insert_price_fact(
+        lab_store,
+        security_id="SEC_LATE",
+        session=date(2020, 6, 30),
+        known_at=datetime(2020, 6, 30, 20, 0, tzinfo=UTC),
+        ingested_at=vintage + timedelta(days=1),
+    )
+    trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert trial is not None and lab_queries.is_stale(lab_store, trial)
+    assert lab_queries.sweep_state(lab_store, sweep.sweep_id).state == "incomplete (stale)"
+
+
 # --- the counting rule, branch by branch ---------------------------------------
 
 
 def test_two_identical_clean_current_failures_are_terminal(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(lab_store, record.hypothesis_id, status="failed", message="boom")
+        _record_failure(lab_store, record.hypothesis_id, run_id)
     assert lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
 
 
 def test_three_excluded_kind_failures_are_not_terminal(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for message in ("store changed during run", "shared read failed", "store changed during run"):
-        _insert_trial(lab_store, record.hypothesis_id, status="failed", message=message)
+        _record_failure(lab_store, record.hypothesis_id, run_id, message=message)
     assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
 
 
 def test_two_dirty_failures_are_not_terminal(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(
-            lab_store, record.hypothesis_id, status="failed", message="boom", code_dirty=True
-        )
+        _record_failure(lab_store, record.hypothesis_id, run_id, code_dirty=True)
     assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
 
 
 def test_two_other_vintage_failures_are_not_terminal(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(
-            lab_store,
-            record.hypothesis_id,
-            status="failed",
-            message="boom",
-            code_tree_sha256_value="0" * 64,
-        )
+        _record_failure(lab_store, record.hypothesis_id, run_id, code_tree_sha256_value="0" * 64)
     assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
 
 
 def test_two_different_messages_are_not_terminal(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
-    _insert_trial(lab_store, record.hypothesis_id, status="failed", message="boom")
-    _insert_trial(lab_store, record.hypothesis_id, status="failed", message="bang")
+    run_id = _open_run(lab_store, sweep, tmp_path)
+    _record_failure(lab_store, record.hypothesis_id, run_id, message="boom")
+    _record_failure(lab_store, record.hypothesis_id, run_id, message="bang")
     assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
 
 
-def test_an_ok_trial_after_two_failures_is_counted_not_terminal(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+def test_synthetic_or_other_window_failures_are_not_terminal(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(lab_store, record.hypothesis_id, status="failed", message="boom")
+        _record_failure(lab_store, record.hypothesis_id, run_id, synthetic=True)
+    for _ in range(2):
+        _record_failure(
+            lab_store,
+            record.hypothesis_id,
+            run_id,
+            window=(IN_SAMPLE_START, date(2023, 11, 30)),
+        )
+    assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
+
+
+def test_another_registrations_failures_do_not_count(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A hypothesis linked to two sweep registrations does not take the other
+    registration's failures."""
+    first = _sweep(lab_store, settings, slug="sweep-a")
+    second = _sweep(lab_store, settings, slug="sweep-b")
+    record = _register(lab_store, settings, "shared-variant")
+    fingerprint = _write_variant(lab_store, first, 1, record)
+    lab_registry.write_fingerprint(lab_store, record.hypothesis_id, fingerprint)
+    _write_variant(lab_store, second, 1, record, fingerprint=fingerprint)
+    run_id = _open_run(lab_store, first, tmp_path)
+    for _ in range(2):
+        _record_failure(lab_store, record.hypothesis_id, run_id)
+    assert lab_queries.terminal_failed(lab_store, record.hypothesis_id, first, _checkout())
+    assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, second, _checkout())
+
+
+def test_an_ok_trial_after_two_failures_is_counted_not_terminal(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
+    for _ in range(2):
+        _record_failure(lab_store, record.hypothesis_id, run_id)
     _insert_trial(lab_store, record.hypothesis_id)
     assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
     counted = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
@@ -384,11 +561,12 @@ def test_an_ok_trial_after_two_failures_is_counted_not_terminal(
 
 
 def test_a_stale_ok_after_two_failures_neither_counts_nor_blocks(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(lab_store, record.hypothesis_id, status="failed", message="boom")
+        _record_failure(lab_store, record.hypothesis_id, run_id)
     stale = _insert_trial(lab_store, record.hypothesis_id, data_vintage_value=_OLD_VINTAGE)
     counted = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
     assert counted is not None and counted.trial_id == stale
@@ -447,14 +625,15 @@ def test_sweep_state_incomplete_unrun_lists_the_unrun_variant(
 
 
 def test_terminal_failed_counts_as_complete_and_is_listed(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep = _sweep(lab_store, settings, n_variants=2)
     first = _variant(lab_store, settings, sweep, 1)
     second = _variant(lab_store, settings, sweep, 2)
     _insert_trial(lab_store, first.hypothesis_id)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(lab_store, second.hypothesis_id, status="failed", message="boom")
+        _record_failure(lab_store, second.hypothesis_id, run_id)
     state = lab_queries.sweep_state(lab_store, sweep.sweep_id)
     assert state.state == "complete" and state.complete
     assert [variant.variant_index for variant in state.terminal_failed] == [2]
@@ -504,14 +683,15 @@ def test_plan_run_lists_the_stale_and_unrun_variants_in_read_group_order(
 
 
 def test_plan_run_rerun_lists_every_variant_when_complete(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep = _sweep(lab_store, settings, n_variants=2)
     first = _variant(lab_store, settings, sweep, 1)
     second = _variant(lab_store, settings, sweep, 2)
     _insert_trial(lab_store, first.hypothesis_id)
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for _ in range(2):
-        _insert_trial(lab_store, second.hypothesis_id, status="failed", message="boom")
+        _record_failure(lab_store, second.hypothesis_id, run_id)
     plan = lab_queries.plan_run(lab_store, sweep.sweep_id, rerun=True)
     assert plan.rerun
     assert [planned.variant.variant_index for planned in plan.variants] == [1, 2]
@@ -531,8 +711,8 @@ def test_plan_run_refuses_rerun_on_an_incomplete_sweep(
 # --- seconds per variant by cadence --------------------------------------------
 
 
-def test_seconds_per_variant_by_cadence_averages_the_sweeps_trials(
-    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Any
+def test_seconds_per_variant_by_cadence_averages_the_sweeps_ok_trials(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     sweep = _sweep(lab_store, settings, n_variants=3)
     month = _variant(
@@ -556,21 +736,17 @@ def test_seconds_per_variant_by_cadence_averages_the_sweeps_trials(
         3,
         _params(**{"strategy.top_fraction": 0.3, "schedule.rebalance_cadence": "daily"}),
     )
-    run_id = lab_registry.open_sweep_run(
-        lab_store,
-        sweep_id=sweep.sweep_id,
-        time_budget_minutes=480,
-        n_declared=3,
-        n_planned=3,
-        code_tree_sha256=_checkout(),
-        run_by="test",
-        repo_dir=tmp_path,
-    )
+    run_id = _open_run(lab_store, sweep, tmp_path)
     for variant, seconds in ((month, 10.0), (week, 4.0), (week, 6.0), (daily, 20.0)):
         trial_id = _insert_trial(lab_store, variant.hypothesis_id)
         lab_registry.write_sweep_trial(
             lab_store, sweep_run_id=run_id, trial_id=trial_id, read_group_index=1, seconds=seconds
         )
+    # A failed trial's near-zero seconds are not a run time and must not move it.
+    failure = _insert_trial(lab_store, month.hypothesis_id, status="failed", message="boom")
+    lab_registry.write_sweep_trial(
+        lab_store, sweep_run_id=run_id, trial_id=failure, read_group_index=1, seconds=0.001
+    )
     measured = lab_queries.seconds_per_variant_by_cadence(lab_store, sweep.sweep_id)
     assert measured == {"month_end": 10.0, "week_end": 5.0, "daily": 20.0}
 
