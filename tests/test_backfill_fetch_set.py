@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
+import duckdb
 import pytest
 from test_backfill import (
     JUNE_WINDOW,
@@ -33,10 +36,12 @@ from tradepartner.adapters.filings import (
     FilingIndexEntry,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
-from tradepartner.backfill import _window_names, fill_holes
+from tradepartner.backfill import _price_chunk, _window_names, fill_holes
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, _read
 from tradepartner.repair import store_resolver
+from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.schema import init_schema
 
 SPAC = "0000000005"  # SIC 6770: every class id of it is typed spac
 SPAC_WARRANTS = f"{SPAC}:redeemable-warrants"
@@ -239,3 +244,153 @@ def test_a_led_id_is_fetched_only_once_its_cover_page_is_known(settings: Setting
     assert LED not in before
     after, _ = _window(settings, JUNE_2017, at=_at(2019, 3, 16))
     assert LED in after
+
+
+UNREADABLE_LED = "0000000025"  # first filing 2016; first span's ticker reads as junk (#844)
+
+
+def _with_unreadable_first_span(**kwargs: object) -> FixtureFilingSource:
+    """`_filings` plus a company whose first span's only row has an
+    unreadable ticker (#844: `alpaca_prices._unreadable`) -- kept "as
+    written" since it is the security's first row (no earlier readable
+    ticker to read it as, `_clean_rows`'s docstring), so the resolver
+    still records a `FirstSpanLead` for it, under that unreadable
+    string."""
+    cik = UNREADABLE_LED
+    accession = f"{cik}-19-000001"
+    cover = _at(2019, 3, 15)
+    index = [
+        FilingIndexEntry(cik, f"Co {cik}", "10-K", f"{cik}-16-000001", _at(2016, 3, 1)),
+        FilingIndexEntry(cik, f"Co {cik}", "10-K", accession, cover),
+    ]
+    headers = [FilingHeader(cik, accession, "10-K", 3571, cover)]
+    covers = [CoverPage(cik, accession, cover, (CoverListing("Common Stock", "F&G", "NYSE"),))]
+    return _filings(
+        extra_index=index,
+        extra_headers=headers,
+        extra_covers=covers,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_an_unreadable_first_span_ticker_is_never_fetched(settings: Settings) -> None:
+    """quant-auditor (PR #1132): `_led` must still check the first-span
+    lead's ticker is an Alpaca symbol before admitting it. An unreadable
+    ticker on a security's only (first) row is kept as written, never
+    dropped (#844's "as written" rule), so the resolver records a
+    `FirstSpanLead` for it anyway -- the fetch must not send that
+    ticker, the same guard `_assignable` applies to an ordinary span."""
+    assert _backfill(settings, _History(), filings=_with_unreadable_first_span()).ok
+    ids, _ = _window(settings, JUNE_2017)
+    assert UNREADABLE_LED not in ids
+    with _read(settings) as conn:
+        resolver = store_resolver(conn, LATER, settings)
+    lead = resolver.first_span_lead(UNREADABLE_LED)
+    assert lead is not None and lead.ticker == "F&G"  # recorded, but unreadable
+
+
+def test_price_chunk_builds_its_resolver_at_the_clock_when_the_month_starts(
+    settings: Settings,
+) -> None:
+    """#1122 item 3 (#990.4): `_price_chunk` must read the store's
+    resolver at the clock it calls when the month starts (`started`), not
+    at any later `clock()` call within the same chunk (`ingested_at`, the
+    write's `finished_at`, ...). The store is built directly (not via
+    `backfill()`) so every row's `known_at` is under this test's control:
+    the reference symbol is known well before either probe, and LEDX's
+    cover page is known at `_at(2019, 3, 15)`. The fake clock returns a
+    value just before that cover page on its *first* call only, and a
+    value well after it on every call after that (never running out, so
+    a wrong call reads "after" regardless of how many times `_price_
+    chunk` calls `clock()`) -- it would wrongly fetch LED here if the
+    resolver read anything but the very first call."""
+    filed = _at(2016, 3, 1)
+    cover = _at(2019, 3, 15)
+    filing_common = {"ingested_at": filed, "source": "edgar", "provenance": "filing"}
+    ref_known = _at(2010, 1, 1)
+    ref_common = {"ingested_at": ref_known, "source": "edgar", "provenance": "filing"}
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(
+            conn,
+            "securities",
+            {"security_id": LED, "cik": LED, "name": "Led Co", "known_at": filed} | filing_common,
+        )
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": LED,
+                "sic": 3571,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": filed,
+            }
+            | filing_common,
+        )
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": LED,
+                "ticker": "LEDX",
+                "exchange": "NYSE",
+                "class_title": "Common Stock",
+                "valid_from": date(2019, 3, 15),
+                "known_at": cover,
+                "ingested_at": cover,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        insert_row(
+            conn,
+            "securities",
+            {"security_id": SPY, "cik": "0000884394", "name": "SPY Trust", "known_at": ref_known}
+            | ref_common,
+        )
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": SPY,
+                "sic": None,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": ref_known,
+            }
+            | ref_common,
+        )
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": SPY,
+                "ticker": "SPY",
+                "exchange": "NYSE",
+                "class_title": "Common Stock",
+                "valid_from": date(2010, 1, 1),
+                "known_at": ref_known,
+            }
+            | ref_common,
+        )
+    first_call = iter([_at(2019, 3, 14)])
+
+    def clock() -> datetime:
+        return next(first_call, _at(2019, 3, 16))
+
+    calls: list[datetime] = []
+
+    def spy(conn: duckdb.DuckDBPyConnection, at: datetime, settings: Settings) -> Any:
+        calls.append(at)
+        return store_resolver(conn, at, settings)
+
+    prices = _History()
+    with patch("tradepartner.backfill.store_resolver", side_effect=spy):
+        chunk = _price_chunk(settings, prices, SINCE, JUNE_2017, clock)
+    assert chunk is not None and chunk.status == OK, chunk
+    # Pinned directly, not just inferred from an admission boundary: the
+    # resolver is built at the very first clock() call ("started"), never
+    # at `ingested_at` or the write's `finished_at` (both later calls).
+    assert calls == [_at(2019, 3, 14)]
+    assert LED not in prices.fetched[date(2017, 6, 1)]
