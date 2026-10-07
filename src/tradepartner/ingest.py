@@ -916,13 +916,11 @@ def statement_fact_rows(
     rows: list[Row] = []
 
     def holds(key: StatementKey, filed: date) -> bool:
-        if key in held:
-            return True
         found = [u for u in unstamped.get(key, ()) if u.filed <= filed]
         holders.update((u.accession, key) for u in found)
         if found:
             held.add(key)
-        return bool(found)
+        return key in held
 
     def store(key: StatementKey, row: Row) -> None:
         if row["known_at"] > ingested_at:

@@ -2030,6 +2030,17 @@ def test_an_unstamped_carrier_filed_on_or_before_holds_the_key(filed: date, held
     assert counts.held == int(held)
 
 
+def test_held_counts_an_entry_that_holds_only_a_later_carrier() -> None:
+    records = [
+        _sf("revenue", 100, F1, AT1),
+        _sf("revenue", 90, UNSTAMPED, None, filed=AT1.date()),
+        _sf("revenue", 95, f"{ACME}-19-000198", None, filed=date(2019, 4, 1)),
+        _sf("revenue", 100, F2, AT2, comparative=True),
+    ]
+    _, counts = _rows(records)
+    assert counts.held == 2
+
+
 def test_once_stamped_the_earlier_carrier_is_the_vintage() -> None:
     stamped = _at(2019, 2, 27)
     rows, counts = _rows([_sf("revenue", 100, F1, AT1), _sf("revenue", 90, UNSTAMPED, stamped)])
