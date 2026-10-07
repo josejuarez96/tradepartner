@@ -312,10 +312,17 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
 def checks_state(checks: HeadChecks, sha: str) -> str:
     """``pending`` | ``success`` | ``failure`` for the CI on one commit.
 
-    ``pending`` also covers "GitHub has not seen this commit yet" and "no runs reported
-    yet": neither is green (git-workflow: CI must have run on the exact commit).
+    ``pending`` also covers "GitHub has not seen this commit yet", "no runs reported
+    yet", and "the required ``checks`` run hasn't appeared in the rollup yet": none of
+    those is green (git-workflow: CI must have run on the exact commit). The last case
+    matters since #1112: ``checks`` now ``needs:`` other jobs, so GitHub does not create
+    its check run until those finish, and a rollup can otherwise show every run so far
+    (e.g. ``checks-fast``, ``claims``) green while the run that actually gates pytest
+    hasn't started.
     """
     if checks.sha != sha or not checks.runs:
+        return "pending"
+    if not any(r.name == "checks" for r in checks.runs):
         return "pending"
     if any(r.status.upper() != "COMPLETED" for r in checks.runs):
         return "pending"
