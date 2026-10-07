@@ -44,6 +44,12 @@ _NOW = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
 _SESSION = date(2026, 10, 1)
 #: Nullable columns a valid sample row still needs (a position row names its security).
 _SAMPLE_EXTRAS: dict[str, dict[str, Any]] = {"positions_daily": {"security_id": "SEC_A"}}
+#: The closed enums plus `signals.reason`'s closed part (its own prefix `CHECK`
+#: since version 14, #1153), so a sample row takes a value its `CHECK` accepts.
+_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
+    **schema.JOURNAL_ENUMS,
+    ("signals", "reason"): schema.SIGNAL_REASONS,
+}
 _PYTHON_TYPES = {
     "BIGINT": "int",
     "INTEGER": "int",
@@ -79,7 +85,7 @@ def _sample(row_type: type[Any], **values: Any) -> Any:
     for f in fields(row_type):
         if f.default is not MISSING:
             continue
-        enum = schema.JOURNAL_ENUMS.get((row_type.TABLE, f.name))
+        enum = _ENUMS.get((row_type.TABLE, f.name))
         kwargs[f.name] = enum[0] if enum else _TYPES[_field_type(row_type, f.name)]
     return row_type(**{**kwargs, **_SAMPLE_EXTRAS.get(row_type.TABLE, {}), **values})
 
