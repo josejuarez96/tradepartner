@@ -30,7 +30,8 @@ plan on the full store:
   state-free, so a window's plan at T_k is a full run's.
 - Compared: `targets[fill_session(T_k)]` and the T_k `RebalanceRow`'s plan fields
   (`PLAN_FIELDS`), at every cost level, and the plan's own `PLAN_READS` (the universe
-  members, the signal scores and the names excluded for no history, which Phase 4's
+  members, the signal scores, the names excluded for no history and every declared
+  exclusion by reason (#1153, T127), which Phase 4's
   `decisions_from` reads; T53b), recorded around `engine._plan` during the run. Fills,
   exits and valuation after T_k are not: the cut has no strategy bar after T_k, so most
   fills on F_k are missing, by design.
@@ -216,7 +217,7 @@ Results = Mapping[float, BacktestResult]
 PlanView = dict[float, tuple[dict[str, float], tuple[Any, ...]]]
 Planned = tuple[Results, Mapping[date, engine.Plan]]
 #: The `Plan` fields `decisions_from` reads (T53b), compared like the row's plan fields.
-PLAN_READS = ("members", "scores", "excluded_no_history")
+PLAN_READS = ("members", "scores", "excluded_no_history", "exclusions")
 
 
 @pytest.fixture(autouse=True)
@@ -405,7 +406,8 @@ def _plan_view(planned: Planned, t_k: date) -> PlanView:
     for level, result in results.items():
         [row] = [r for r in result.rebalances if r.session == t_k]
         targets = dict(result.targets[plans[t_k].fill_session])
-        view[level] = (targets, tuple(getattr(row, name) for name in PLAN_FIELDS) + reads)
+        columns = row.columns()  # the counts by name, as `write_rebalances` writes them
+        view[level] = (targets, tuple(columns[name] for name in PLAN_FIELDS) + reads)
     return view
 
 
