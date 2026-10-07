@@ -74,9 +74,9 @@ Team directories live **outside the repo** on purpose: a session that lists file
 **During**
 - One `implementer` per claimed task, one writer per branch. Run several in parallel only on tasks with disjoint files. Read-only helpers and the reviewers may run alongside; the table in [agents.md](agents.md#parallelism-inside-a-team) says what goes in parallel and what does not.
 - Reviewers (`spec-critic`, `quant-auditor`, `safety-reviewer`) post their full report as the PR's verdict comment and return a ten-line summary; a window never pastes a report into its own context or its messages (#352).
-- **Two review passes per reviewer per PR** (#489): pass 1 is the review; pass 2 verifies the fixes and reads everything pushed to the PR's own files since pass 1 (commits a merge of `main` brought in are skipped). An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices is fixed in the PR if it takes under about 15 minutes, dropped if it is a nit, and filed (one `size:S` issue at most) only if it is a real defect or an owner decision, never a third pass. The rule and its one exception are in [agents.md](agents.md#review-passes).
+- **Two review passes per reviewer per PR** (#489): pass 1 is the review; pass 2 verifies the fixes and reads everything pushed to the PR's own files since pass 1 (commits a merge of `main` brought in are skipped). An unfixed finding, a BLOCKER, or a new SHOULD FIX on the order path fails it; what else it notices is dropped if it is a nit and filed (one `size:S` issue at most) only if it is a real defect or an owner decision, never a third pass. A pass-1 finding under about 15 minutes is fixed in the pass-1 fix commit instead ([agents.md](agents.md#review-passes) rule 6). The rule and its one exception are in [agents.md](agents.md#review-passes).
 - An implementer never claims or releases; it checks that its issue carries the team label and stops if not.
-- Anything you notice outside your task becomes an issue (`gh issue create`), unclaimed, for any team to pick up.
+- Anything you notice outside your task that is a real defect or an owner decision becomes an issue (`gh issue create`), unclaimed, for any team to pick up; a nit is dropped ([agents.md](agents.md#review-passes) rule 6).
 
 **Messages between windows** (#489)
 
