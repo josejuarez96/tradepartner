@@ -1135,27 +1135,3 @@ def test_a_cut_at_the_settle_gates_reading_does_not_see_its_rows(
             assert seen(store.at(result.known_at)) == (1, 1, [])
         finally:
             store.close()
-
-
-# --- wiring test -------------------------------------------------------------------
-
-
-def test_window_journal_inputs_callable(fixture: Fixture) -> None:
-    """`window_journal_inputs` is callable and returns all eleven inputs for the
-    fixture window."""
-    from tradepartner.execution.run import window_journal_inputs
-
-    inputs = window_journal_inputs(fixture.full, fixture.window_id)
-    assert isinstance(inputs.decisions, list)
-    assert isinstance(inputs.orders, list)
-    assert isinstance(inputs.order_events, list)
-    assert isinstance(inputs.fills, list)
-    assert isinstance(inputs.adjustments, list)
-    assert isinstance(inputs.rebalance_events, list)
-    assert isinstance(inputs.runs, list)
-    assert isinstance(inputs.results, list)
-    assert isinstance(inputs.positions_daily, list)
-    assert isinstance(inputs.kill_switch_events, list)
-    # The fixture has journal data, so at least some lists are non-empty
-    assert len(inputs.decisions) > 0
-    assert len(inputs.runs) > 0

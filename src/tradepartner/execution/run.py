@@ -475,9 +475,14 @@ def window_journal_inputs(
     window_id: int,
 ) -> WindowJournalInputs:
     """The window's journal inputs for derived state (step 4, step 7b's
-    `decision_state`/`rebalance_state`, `_locked_run`'s `switch.derive`,
-    `_skipped`'s `switch.derive`), read the way the tracking run reads them:
-    every row the store holds for this window, no `as_of` cut.
+    `decision_state`/`rebalance_state`, `_skipped`'s `switch.derive`), read the
+    way the tracking run reads them: every row the store holds for this window,
+    no `as_of` cut.
+
+    `_locked_run` does NOT use it: before its run row exists it reads only runs,
+    kill-switch events and rebalance events (the same readers), so a journal
+    integrity error in orders or fills is raised inside `_Run.execute`, which
+    alerts and writes the failed result.
 
     `_exit_book` (step 7's forced-exit reads) is NOT included: it reads
     `orders`, `order_events` and `fills` with `window_id=None` (across all
@@ -955,20 +960,25 @@ def _locked_run(
         )
         raise SystemExit(WRITE_FAILED_EXIT_CODE)
 
+    # Only the three readers the switch and the rebalance kind need, not
+    # `window_journal_inputs`: an orders/fills integrity error must surface inside
+    # `_Run.execute`, whose `_fail` path alerts and writes the failed result, not
+    # here before the run row exists (#507 safety review).
     with open_read_only(settings) as conn:
-        inputs = window_journal_inputs(conn, window_id)
+        runs = runs_for(conn, window_id)
+        rows = kill_switch_events_for(conn, window_id)
+        events = rebalance_events_for(conn, window_id)
         stops = window_stops_for(conn, window_id)
-        earlier_runs = runs_for(conn, window_id)
-    run_rows = inputs.runs
+    run_rows = [r.run for r in runs]
     state = switch.derive(
         window,
-        inputs.kill_switch_events,
+        rows,
         run_rows,
-        inputs.results,
+        [r.result for r in runs if r.result is not None],
         reading_run=None,
         lock_free=True,
     )
-    due = _rebalance_kind(window, run_rows, inputs.rebalance_events, day)
+    due = _rebalance_kind(window, run_rows, events, day)
     kind = _STOP if any(s.state == _REQUESTED for s in stops) else (due or _MARK)
 
     stamp = gate.read_clock()
@@ -986,7 +996,7 @@ def _locked_run(
         )
         run_id = append(conn, row)
         assert run_id is not None
-        for earlier in earlier_runs:
+        for earlier in runs:
             if earlier.result is None and earlier.run.run_id is not None:
                 append(
                     conn,
