@@ -330,7 +330,8 @@ class TestCash:
         assert [row.session for row in result.rebalances] == [T0, T1, T2]
         assert [row.fill_session for row in result.rebalances] == [F0, F1, F2]
         row = _rows(result, T0)
-        assert (row.n_universe, row.n_targets, row.n_excluded_no_history) == (4, 2, 0)
+        assert (row.n_universe, row.n_targets) == (4, 2)
+        assert row.counts == {"n_excluded_no_history": 0}
         assert row.cost_per_side_bps == 15.0
 
 
@@ -627,6 +628,9 @@ class TestPublicPlan:
         assert public.n_universe == len(public.members)
         assert public.n_excluded_no_history == len(public.excluded_no_history)
         assert set(public.targets) <= set(public.scores)
+        # The generic fields (#1153, T127) agree with the momentum-named ones.
+        assert public.exclusions == {"no_history": public.excluded_no_history}
+        assert public.counts == {"n_excluded_no_history": public.n_excluded_no_history}
 
     def test_the_new_fields_leave_the_run_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No behaviour change: a run whose plans drop the new fields' contents gives
@@ -741,7 +745,7 @@ class TestSignalFrameBound:
         assert len(signal_reads) == len(sessions) - 1  # one per plan, none at T_n
         # The bound cut the halted name out of every signal frame, and E is never scored.
         assert all(call.sessions_from > E_LAST_BAR for call in signal_reads)
-        assert all(row.n_excluded_no_history >= 1 for row in got[0.0].rebalances)
+        assert all(row.counts["n_excluded_no_history"] >= 1 for row in got[0.0].rebalances)
         if anchor == "offset":
             assert date(2024, 2, 5) in sessions
             assert date(2023, 2, 5).weekday() == 6  # the weekend T - k

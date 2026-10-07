@@ -144,7 +144,7 @@ def _ok_trial(
                     n_missing_fill=0,
                     n_delisting_exits=1,
                     n_stale_exits=0,
-                    n_excluded_no_history=3,
+                    counts={"n_excluded_no_history": 3},
                     n_dropped_dividends=2,
                     n_late_dividends=5 + i,
                 )

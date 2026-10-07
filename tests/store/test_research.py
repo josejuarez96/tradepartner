@@ -480,6 +480,50 @@ def test_dataset_versions_under_one_name(conn: duckdb.DuckDBPyConnection, tmp_pa
         _dataset(conn, tmp_path, dates=_DEV_TEST, splits=["dev", "test"], periods=_TEST_PERIOD)
 
 
+def test_register_dataset_refuses_an_unknown_sealed_split_name(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1149: `register_dataset` itself (not only the CLI) refuses a sealed name
+    outside `RESEARCH_SPLITS`, so a direct API caller cannot record a sealed name
+    the store never recognises."""
+    with pytest.raises(research.ResearchError, match="not among the splits"):
+        _dataset(conn, tmp_path, dates=_DEV_TEST, sealed=("cla",), periods=_TEST_PERIOD)
+
+
+def test_register_dataset_checks_a_sealed_full_against_the_whole_event_span(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1149: a sealed `full` has no entry in `split_spans` (a split file never
+    labels a row `full`), so the per-split span check used to skip it entirely.
+    `full` binds every row, so it must be checked against `[event_start,
+    event_end]`: the dataset's dev row (2023-03-01) lies outside the sealed
+    period, which only the test row (2024-03-01) falls in."""
+    with pytest.raises(research.ResearchError, match="sealed split without period"):
+        _dataset(
+            conn,
+            tmp_path,
+            dates=_DEV_TEST,
+            splits=["dev", "test"],
+            sealed=("full",),
+            periods=_TEST_PERIOD,
+        )
+
+
+def test_register_dataset_checks_a_sealed_none_against_the_whole_event_span(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1149: same gap as `full`, for `none` (and without a split file, so `spans`
+    never has a `none` entry either)."""
+    with pytest.raises(research.ResearchError, match="sealed split without period"):
+        _dataset(
+            conn,
+            tmp_path,
+            dates=_DEV_TEST,
+            sealed=("none",),
+            periods=_TEST_PERIOD,
+        )
+
+
 # --- gates: every refusal is a run row with its outcome --------------------------------
 
 

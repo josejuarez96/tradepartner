@@ -199,7 +199,32 @@ registry; #83 took version 2 first, so the registry is version 3):
   migrating it: every other read keeps working; a read of the six columns
   there fails on the missing columns, same as `n_research` on a
   version-11 store.
-- **A later DDL change goes to version 14**, with its own migration and a
+- **Version 14** (#1074, #1153, strategy-interface plan T127; ADR 0014
+  point 3): generic rebalance counts and exclusion reasons. The
+  `trial_rebalance_counts(trial_id, session, name, value)` table
+  (`REBALANCE_COUNTS_TABLE_NAME`, `UNIQUE (trial_id, session, name)`), one
+  row per count a rebalance's plan reports, written once per rebalance at
+  the trial's base cost level, as `trial_weights` is; `trial_rebalances
+  .n_excluded_no_history` becomes nullable (NULL for a family that does not
+  report it, as the six `PROFITABILITY_REBALANCE_COLUMNS` are for
+  `momentum`); and `signals.reason` leaves `JOURNAL_ENUMS` for its own
+  `CHECK`, `selected`, `below_cut` or any `excluded_<reason>`
+  (`SIGNAL_REASONS`, `EXCLUDED_REASON_PREFIX`). The migration from version
+  13 (or any earlier migratable version, after its steps) is additive: it
+  rebuilds `signals` with the wider `CHECK` and every row kept in insertion
+  order (a journal store, versions 5 to 13; DuckDB cannot alter a `CHECK`
+  in place, as for `order_events` at version 6), creates the counts table
+  and fills it from each `(trial_id, session)`'s lowest-cost
+  `trial_rebalances` row, one row per `REBALANCE_COUNT_COLUMNS` column that
+  is not NULL, drops the NOT NULL by `ALTER TABLE` (so the pinned
+  `_REGISTRY_TABLE_DDL` never changes; a fresh store loses it the same
+  way), and appends a version-14 row, all in `init_schema`'s one
+  transaction, so a failed step leaves the store at its previous version.
+  The fixed count columns are still written, from the same counts by name
+  (`store.registry.write_rebalances`), until a later issue retires them. A
+  read-only connection accepts a version-13 store without migrating it:
+  every read but `trial_rebalance_counts` works.
+- **A later DDL change goes to version 15**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -382,9 +407,15 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   row, and on every `momentum` row going forward) and appends a
 #:   version-13 row; no fact, journal, research or other registry table
 #:   changes.
-#: - A later DDL change goes to version 14, with its own migration and a
+#: - 14 (#1074, #1153, T127): the `trial_rebalance_counts` table,
+#:   `trial_rebalances.n_excluded_no_history` nullable, and `signals.reason`'s
+#:   own prefix `CHECK`. Additive: the migration from version 13 (or any
+#:   earlier migratable version, after its steps) rebuilds `signals` with
+#:   every row kept, fills the counts table from the fixed count columns and
+#:   appends a version-14 row (module docstring, "Schema versions").
+#: - A later DDL change goes to version 15, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -434,6 +465,12 @@ _PRE_RESEARCH_VERSION = 11
 #: `trial_rebalances` (#720, #1033, T85d): read-only connections serve every
 #: other read; a read of the six columns there fails on the missing columns.
 _PRE_PROFITABILITY_VERSION = 12
+
+#: The last version without `trial_rebalance_counts`, with a NOT NULL
+#: `trial_rebalances.n_excluded_no_history` and with `signals.reason` in
+#: `JOURNAL_ENUMS` (#1153, T127): read-only connections serve every read but
+#: `trial_rebalance_counts`.
+_PRE_REBALANCE_COUNTS_VERSION = 13
 
 
 class SchemaVersionError(RuntimeError):
@@ -948,6 +985,26 @@ _REGISTRY_TABLE_DDL: tuple[str, ...] = (
     _CREATE_OWNER_DECISIONS,
 )
 
+#: The generic per-rebalance counts table (version 14, #1153, T127; ADR 0014
+#: point 3): one row per count name a rebalance's plan reports, written once
+#: per rebalance at the trial's base cost level (a plan's counts are the same
+#: at every level, as `trial_weights` assumes). A registry table by role, kept
+#: out of the version-3 `REGISTRY_TABLE_NAMES` and `_REGISTRY_TABLE_DDL`,
+#: whose pin never moves, as `statement_facts` is kept out of `_TABLE_DDL`.
+REBALANCE_COUNTS_TABLE_NAME = "trial_rebalance_counts"
+
+_CREATE_TRIAL_REBALANCE_COUNTS = """
+CREATE TABLE IF NOT EXISTS trial_rebalance_counts (
+    trial_id BIGINT NOT NULL,
+    session DATE NOT NULL,
+    name VARCHAR NOT NULL,
+    value INTEGER NOT NULL,
+    UNIQUE (trial_id, session, name)
+)
+"""
+
+_REBALANCE_COUNTS_TABLE_DDL: tuple[str, ...] = (_CREATE_TRIAL_REBALANCE_COUNTS,)
+
 
 # Paper-trading journal (schema version 5; Phase 4 spec "Data / interfaces"
 # > Tables and module docstring). Every JSON payload is VARCHAR, as in the
@@ -1036,7 +1093,6 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "skip_cap",
         WINDOW_STOP_REASON,
     ),
-    ("signals", "reason"): ("selected", "below_cut", "excluded_no_history"),
     ("decisions", "side"): SIDES,
     ("decisions", "decision"): (
         "trade",
@@ -1222,7 +1278,21 @@ CREATE TABLE IF NOT EXISTS paper_reports (
 )
 """
 
-# score and rank are NULL for a name excluded for lack of history.
+#: `signals.reason`'s closed part (version 14, #1153, T127). Any other reason
+#: is an exclusion, `EXCLUDED_REASON_PREFIX` plus a reason the family's signal
+#: declares (`excluded_no_history` for `momentum`): the database enforces the
+#: prefix only, and the paper planner checks the suffix against the family
+#: (ADR 0014 point 3), so a new family's reason needs no `store/` edit. Not in
+#: `JOURNAL_ENUMS`, which holds closed sets only.
+SIGNAL_REASONS: tuple[str, ...] = ("selected", "below_cut")
+EXCLUDED_REASON_PREFIX = "excluded_"
+
+_SIGNAL_REASONS_SQL = ", ".join(f"'{reason}'" for reason in SIGNAL_REASONS)
+_SIGNALS_REASON_CHECK = (
+    f"CHECK (reason IN ({_SIGNAL_REASONS_SQL}) OR starts_with(reason, '{EXCLUDED_REASON_PREFIX}'))"
+)
+
+# score and rank are NULL for an excluded name.
 _CREATE_SIGNALS = f"""
 CREATE TABLE IF NOT EXISTS signals (
     run_id BIGINT NOT NULL,
@@ -1232,7 +1302,7 @@ CREATE TABLE IF NOT EXISTS signals (
     rank INTEGER,
     reason VARCHAR NOT NULL,
     {_JOURNAL_TIMESTAMPS},
-    {_check("signals", "reason")}
+    {_SIGNALS_REASON_CHECK}
 )
 """
 
@@ -1917,6 +1987,15 @@ PROFITABILITY_REBALANCE_COLUMNS: tuple[str, ...] = (
     "n_derived",
 )
 
+#: Every fixed `trial_rebalances` count column (version 14, #1153, T127): each
+#: is written from the rebalance's counts by name, NULL when the family does
+#: not report it, and the version-14 migration copies each non-NULL value into
+#: `trial_rebalance_counts` under the column's name.
+REBALANCE_COUNT_COLUMNS: tuple[str, ...] = (
+    "n_excluded_no_history",
+    *PROFITABILITY_REBALANCE_COLUMNS,
+)
+
 
 def require_research(conn: duckdb.DuckDBPyConnection) -> None:
     """Raise `ResearchNotInitialised` unless every `RESEARCH_TABLE_NAMES` table
@@ -1970,6 +2049,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RETRACTION_VERSION,
         _PRE_RESEARCH_VERSION,
         _PRE_PROFITABILITY_VERSION,
+        _PRE_REBALANCE_COUNTS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -1979,7 +2059,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `retracted` column: no retraction, see `has_retracted`); version 11
         # every read but the research tables (`require_research` raises
         # `ResearchNotInitialised`) and `trial_results.n_research`; version 12
-        # every read but `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`.
+        # every read but `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`;
+        # version 13 every read but `trial_rebalance_counts`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2284,9 +2365,71 @@ def _migrate_profitability_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> 
     _add_nullable_int_columns(conn, "trial_rebalances", PROFITABILITY_REBALANCE_COLUMNS)
 
 
+#: Where `_migrate_signal_reasons` builds the version-14 table before it takes
+#: the name `signals`.
+_SIGNALS_STAGING_TABLE = "signals_v14"
+
+
+def _migrate_signal_reasons(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild a version-5 to 13 `signals` with the version-14 reason `CHECK`
+    (module docstring, "Schema versions"), every row kept in insertion order.
+    The `CHECK` only widens, so no stored row can be refused. Runs inside
+    `init_schema`'s transaction, before its DDL pass."""
+    conn.execute(
+        _CREATE_SIGNALS.replace(
+            "CREATE TABLE IF NOT EXISTS signals (",
+            f"CREATE TABLE {_SIGNALS_STAGING_TABLE} (",
+            1,
+        )
+    )
+    # Keep the insertion order, as `_migrate_order_event_reasons` does.
+    conn.execute(
+        f"INSERT INTO {_SIGNALS_STAGING_TABLE} BY NAME SELECT * FROM signals ORDER BY rowid"
+    )
+    conn.execute("DROP TABLE signals")
+    conn.execute(f"ALTER TABLE {_SIGNALS_STAGING_TABLE} RENAME TO signals")
+
+
+def _relax_no_history_count(conn: duckdb.DuckDBPyConnection) -> None:
+    """Drop the NOT NULL on `trial_rebalances.n_excluded_no_history` where it
+    is still there (version 14): the column is NULL for a family that does not
+    report the count. `_REGISTRY_TABLE_DDL` keeps its version-4 pin, so a fresh
+    store loses it here too. Idempotent. Runs inside `init_schema`'s
+    transaction, after its DDL pass."""
+    notnull = {
+        row[1]: bool(row[3])
+        for row in conn.execute("PRAGMA table_info('trial_rebalances')").fetchall()
+    }
+    if notnull["n_excluded_no_history"]:
+        conn.execute(
+            "ALTER TABLE trial_rebalances ALTER COLUMN n_excluded_no_history DROP NOT NULL"
+        )
+
+
+def _migrate_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> None:
+    """Fill `trial_rebalance_counts` from a pre-version-14 store's fixed count
+    columns (module docstring, "Schema versions", version 14): for each
+    `(trial_id, session)`, its lowest-cost `trial_rebalances` row gives one row
+    per `REBALANCE_COUNT_COLUMNS` column that is not NULL (a plan's counts are
+    the same at every level). Runs inside `init_schema`'s transaction, after
+    `_migrate_profitability_rebalance_counts` (so every column exists) and
+    only on a store migrating from an earlier version."""
+    selects = " UNION ALL ".join(
+        f"SELECT trial_id, session, '{column}' AS name, {column} AS value "
+        f"FROM base WHERE {column} IS NOT NULL"
+        for column in REBALANCE_COUNT_COLUMNS
+    )
+    conn.execute(
+        f"INSERT INTO {REBALANCE_COUNTS_TABLE_NAME} (trial_id, session, name, value) "
+        "WITH base AS (SELECT * FROM trial_rebalances QUALIFY row_number() OVER "
+        "(PARTITION BY trial_id, session ORDER BY cost_per_side_bps) = 1) "
+        f"{selects}"
+    )
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 12 store to version 13.
+    version-2 to 13 store to version 14.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2298,7 +2441,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; every store gets `trial_rebalances`'s six
+    `CURRENT_SCHEMA_VERSION`; every store gets `trial_rebalance_counts`
+    created and `trial_rebalances.n_excluded_no_history` made nullable, and a
+    version-5 to 13 store `signals` rebuilt with the version-14 reason `CHECK`
+    (every row kept), the counts table filled from its fixed count columns
+    and a version-14 row (#1153, T127); every store gets `trial_rebalances`'s six
     `PROFITABILITY_REBALANCE_COLUMNS` added (NULL on every existing row),
     and a version-12 store a version-13 row (#720, #1033, T85d); every store
     gets the research-registry tables created and `trial_results.n_research`
@@ -2323,7 +2470,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-13, 12, 11, 10, 9, 8, 7,
+    On a read-only connection no DDL runs: a version-14, 13 (every read but
+    `trial_rebalance_counts`), 12, 11, 10, 9, 8, 7,
     6 or 5 store passes (a version-12 store serves every read but
     `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`; a version-11
     store serves every read but the research tables, which `require_research`
@@ -2358,6 +2506,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RETRACTION_VERSION,
         _PRE_RESEARCH_VERSION,
         _PRE_PROFITABILITY_VERSION,
+        _PRE_REBALANCE_COUNTS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2383,6 +2532,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _PRE_SETTLE_ORDER_VERSION,
         ):
             _migrate_settle_order(conn)
+        journal_before_14 = range(_PRE_JOURNAL_VERSION + 1, _PRE_REBALANCE_COUNTS_VERSION + 1)
+        if max_version in journal_before_14:
+            _migrate_signal_reasons(conn)
         for ddl in (
             _TABLE_DDL
             + _REGISTRY_TABLE_DDL
@@ -2390,11 +2542,15 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _STATEMENT_FACTS_TABLE_DDL
             + _MASTER_UNDERIVED_TABLE_DDL
             + _RESEARCH_TABLE_DDL
+            + _REBALANCE_COUNTS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
         _migrate_n_research(conn)
         _migrate_profitability_rebalance_counts(conn)
+        _relax_no_history_count(conn)
+        if max_version is not None and max_version <= _PRE_REBALANCE_COUNTS_VERSION:
+            _migrate_rebalance_counts(conn)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1

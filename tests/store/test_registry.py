@@ -618,7 +618,7 @@ def _rebalance_row(**overrides: Any) -> registry.RebalanceRow:
         "n_missing_fill": 0,
         "n_delisting_exits": 0,
         "n_stale_exits": 0,
-        "n_excluded_no_history": 1,
+        "counts": {"n_excluded_no_history": 1},
         "n_dropped_dividends": 0,
         "n_late_dividends": 0,
     }
@@ -645,12 +645,14 @@ def test_a_rebalance_row_written_with_the_six_counts_reads_back(
         handle,
         [
             _rebalance_row(
-                n_ranked=58,
-                n_excluded_no_facts=12,
-                n_excluded_stale_facts=3,
-                n_excluded_sector=2,
-                n_excluded_malformed=1,
-                n_derived=4,
+                counts={
+                    "n_ranked": 58,
+                    "n_excluded_no_facts": 12,
+                    "n_excluded_stale_facts": 3,
+                    "n_excluded_sector": 2,
+                    "n_excluded_malformed": 1,
+                    "n_derived": 4,
+                }
             )
         ],
     )
@@ -671,6 +673,58 @@ def test_a_rebalance_row_written_without_the_six_counts_reads_null(
     assert conn.execute(_PROFITABILITY_READER, [handle.trial_id]).fetchall() == [
         (None, None, None, None, None, None)
     ]
+
+
+_FIXED_COUNTS_READER = (
+    "SELECT cost_per_side_bps, n_excluded_no_history, n_ranked, n_excluded_no_facts, "
+    "n_excluded_stale_facts, n_excluded_sector, n_excluded_malformed, n_derived "
+    "FROM trial_rebalances WHERE trial_id = ? ORDER BY cost_per_side_bps"
+)
+
+
+def test_counts_are_one_table_row_per_name_and_equal_columns_on_every_level(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A rebalance's counts reach `trial_rebalance_counts` once (the base level,
+    15 bps here) and the fixed columns by name on every level's row, NULL for
+    a name not reported, so both reads agree (#1153, T127)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    counts = {"n_ranked": 58, "n_excluded_sector": 2, "n_excluded_no_facts": 12}
+    for level in (0.0, 15.0):
+        registry.write_rebalances(
+            conn, handle, [_rebalance_row(cost_per_side_bps=level, counts=counts)]
+        )
+    assert registry.rebalance_counts(conn, handle.trial_id) == {date(2018, 1, 31): counts}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM trial_rebalance_counts WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone() == (3,)
+    assert conn.execute(_FIXED_COUNTS_READER, [handle.trial_id]).fetchall() == [
+        (level, None, 58, 12, None, 2, None, None) for level in (0.0, 15.0)
+    ]
+
+
+def test_a_rebalance_without_counts_reads_null_columns_and_no_rows(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(conn, handle, [_rebalance_row(counts={})])
+    assert registry.rebalance_counts(conn, handle.trial_id) == {}
+    assert conn.execute(_FIXED_COUNTS_READER, [handle.trial_id]).fetchall() == [
+        (15.0, None, None, None, None, None, None, None)
+    ]
+
+
+def test_a_count_that_is_not_an_int_is_refused_before_any_write(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    for bad in (1.5, True, None):
+        with pytest.raises(TypeError, match="n_ranked"):
+            registry.write_rebalances(conn, handle, [_rebalance_row(counts={"n_ranked": bad})])
+    assert conn.execute("SELECT COUNT(*) FROM trial_rebalances").fetchone() == (0,)
 
 
 # --- owner decisions -----------------------------------------------------
