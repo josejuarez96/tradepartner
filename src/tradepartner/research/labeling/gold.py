@@ -91,6 +91,22 @@ SECONDS_CAP = 600.0
 #: C10's "relied on" choice: the notice, an 8-K item, or outside the shown text.
 _ITEM_REF = re.compile(r"8-K item \d+\.\d{2}")
 CONFIDENCE = frozenset({"high", "low"})
+#: The gold columns the lock joins to the sampled frame rows (C10).
+GOLD_SCHEMA: dict[str, pl.DataType] = {
+    "listing_end_id": pl.String(),
+    "gold_label": pl.String(),
+    "text_states": pl.String(),
+    "gold_class": pl.String(),
+    "relied_on": pl.String(),
+    "passage_ref": pl.String(),
+    "confidence": pl.String(),
+    "seconds_spent": pl.Float64(),
+    "idle": pl.Boolean(),
+    "labeled_at": pl.Datetime("us", "UTC"),
+    "seed_case": pl.Boolean(),
+    "in_random_draw": pl.Boolean(),
+    "unlabelled": pl.Boolean(),
+}
 EDGAR_INDEX_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
     "&type=&dateb={dateb}&owner=include&count=100"
@@ -619,7 +635,7 @@ def _writable(session: GoldSession, listing_end_id: str) -> dict[str, Status]:
 def _seconds(value: float) -> tuple[float, bool]:
     if value < 0:
         raise GoldRefused(f"seconds_spent must be >= 0, got {value}")
-    return min(value, SECONDS_CAP), value > SECONDS_CAP
+    return float(min(value, SECONDS_CAP)), value > SECONDS_CAP
 
 
 def _now() -> str:
@@ -778,22 +794,24 @@ def lock_gold(
         if not unlabelled:
             _check_label(session, final)
             label = final["gold_label"]
-        row = dict(session.rows[case.listing_end_id])
-        row.update(
-            gold_label=label,
-            text_states=(final.get("text_states") or label) if label else None,
-            gold_class=class_of(label) if label else None,
-            relied_on=final.get("relied_on"),
-            passage_ref=final.get("passage_ref"),
-            confidence=final.get("confidence"),
-            seconds_spent=final.get("seconds_spent"),
-            idle=final.get("idle"),
-            labeled_at=final.get("labeled_at"),
-            seed_case=case.seed_case,
-            in_random_draw=case.in_random_draw,
-            unlabelled=unlabelled,
+        labeled_at = final.get("labeled_at")
+        out.append(
+            {
+                "listing_end_id": case.listing_end_id,
+                "gold_label": label,
+                "text_states": (final.get("text_states") or label) if label else None,
+                "gold_class": class_of(label) if label else None,
+                "relied_on": final.get("relied_on"),
+                "passage_ref": final.get("passage_ref"),
+                "confidence": final.get("confidence"),
+                "seconds_spent": final.get("seconds_spent"),
+                "idle": final.get("idle"),
+                "labeled_at": datetime.fromisoformat(labeled_at) if labeled_at else None,
+                "seed_case": case.seed_case,
+                "in_random_draw": case.in_random_draw,
+                "unlabelled": unlabelled,
+            }
         )
-        out.append(row)
         splits.append(case.split)
         if case.split == "pilot" and case.in_random_draw and label not in (None, "unresolved"):
             scorable += 1
@@ -803,7 +821,18 @@ def lock_gold(
         "frame_sha256": session.frame.sha256,
         "seed": str(session.seed),
     }
-    export = _parquet_bytes(pl.DataFrame(out), metadata)
+    # The frame's own column types, joined to gold columns of a fixed schema, so a
+    # column null in the first rows never breaks type inference on a later value.
+    ids = [row["listing_end_id"] for row in out]
+    table = (
+        _read_frame(session.frame)
+        .filter(pl.col("listing_end_id").is_in(ids))
+        .join(pl.DataFrame(out, schema=GOLD_SCHEMA), on="listing_end_id", how="inner")
+        .sort("listing_end_id")
+    )
+    if table.height != len(out):
+        raise FrameChanged(f"the frame export no longer holds all {len(out)} sampled rows")
+    export = _parquet_bytes(table, metadata)
     sha = hashlib.sha256(export).hexdigest()
     split_bytes = (json.dumps({"splits": splits}) + "\n").encode("utf-8")
     export_path = datafiles.gold_path(session.settings, sha)
@@ -813,7 +842,7 @@ def lock_gold(
     days = {
         s: [
             _accepted_day(r["form25_accepted_at"])
-            for r, x in zip(out, splits, strict=True)
+            for r, x in zip(table.iter_rows(named=True), splits, strict=True)
             if x == s
         ]
         for s in ("dev", "pilot")

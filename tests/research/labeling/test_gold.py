@@ -68,16 +68,19 @@ def _documents(i: int, cik: str, filed: date, amendments: list[str]) -> str:
     )
 
 
-def _frame_rows(amend: dict[int, list[str]] | None = None) -> list[dict[str, Any]]:
-    """40 listing ends; CIK `i // 2` for i < 8 (two per issuer), else one each."""
+def _frame_rows(
+    amend: dict[int, list[str]] | None = None, *, total: int = 40, dev_rows: int = DEV_ROWS
+) -> list[dict[str, Any]]:
+    """`total` listing ends, the first `dev_rows` in the dev span; CIK `i // 2` for
+    i < 8 (two per issuer), else one each."""
     amend = amend or {}
     rows = []
-    for i in range(40):
+    for i in range(total):
         cik = f"{(i // 2 if i < 8 else i) + 1000:010d}"
-        if i < DEV_ROWS:
-            accepted = datetime(2016, 1, 4, 15, tzinfo=UTC) + timedelta(days=7 * i)
+        if i < dev_rows:
+            accepted = datetime(2016, 1, 4, 15, tzinfo=UTC) + timedelta(days=i)
         else:
-            accepted = datetime(2017, 1, 4, 15, tzinfo=UTC) + timedelta(days=7 * (i - DEV_ROWS))
+            accepted = datetime(2017, 1, 4, 15, tzinfo=UTC) + timedelta(days=(i - dev_rows))
         rows.append(
             {
                 "listing_end_id": f"LE{i:03d}",
@@ -102,7 +105,7 @@ def _write_frame(
     tmp_path: Path, rows: list[dict[str, Any]], name: str = "frame"
 ) -> gold.FrameExport:
     buffer = io.BytesIO()
-    pl.DataFrame(rows).write_parquet(buffer)
+    pl.DataFrame(rows, infer_schema_length=None).write_parquet(buffer)
     data = buffer.getvalue()
     path = tmp_path / f"{name}.parquet"
     path.write_bytes(data)
@@ -645,3 +648,46 @@ def test_no_runtime_store_connection_outside_the_lock(
     assert calls == []
     gold.lock_gold(resumed, _connect(gsettings))
     assert len(calls) == 1  # the caller's own write connection, for the registration
+
+
+def test_lock_a_session_over_a_hundred_cases(gsettings: Settings, tmp_path: Path) -> None:
+    """The export keeps the frame's column types and the gold columns' fixed ones:
+    a column null in the first hundred rows and set later still locks."""
+    rows = _frame_rows(total=260, dev_rows=130)
+    rows[-1]["rule_successor_id"] = "0000001259@2017-09-01"
+    frame = _write_frame(tmp_path, rows)
+    session = gold.build_gold_session(
+        frame,
+        SEED,
+        230,
+        _exclusion(tmp_path, []),
+        settings=gsettings,
+        n_dev=110,
+        dev_span_min_rows=130,
+    ).session
+    ids = sorted(c.listing_end_id for c in session.cases)
+    for case in session.cases:
+        lid = case.listing_end_id
+        if lid == ids[-1]:
+            gold.record_label(
+                session,
+                lid,
+                label="bankruptcy",
+                relied_on="outside",
+                passage_ref="https://www.sec.gov/x",
+                seconds_spent=12,
+            )
+        else:
+            gold.record_label(
+                session, lid, label="bankruptcy", relied_on="notice", seconds_spent=30
+            )
+    result = gold.lock_gold(session, _connect(gsettings))
+    export = pl.read_parquet(datafiles.gold_path(gsettings, result.sha256))
+    assert export.height == len(session.cases)
+    assert export["passage_ref"].drop_nulls().to_list() == ["https://www.sec.gov/x"]
+    assert export.schema["seconds_spent"] == pl.Float64
+    assert export.schema["labeled_at"] == pl.Datetime("us", "UTC")
+    assert (
+        export.schema["form25_accepted_at"]
+        == pl.read_parquet(frame.path).schema["form25_accepted_at"]
+    )
