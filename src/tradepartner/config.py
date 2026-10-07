@@ -292,8 +292,8 @@ class EdgarConfig(BaseModel):
     # `check_failures`'s list of unaccepted filing failures (#578 part 3; the
     # full list is `failed_filings.json`, written on a non-dry run).
     max_validation_listed: int = Field(default=20, gt=0)
-    # T77 (#660, spec amendment 2026-10-03): as-filed statement facts. The
-    # switch is off until T78 flips it after the real-store run; while off,
+    # T77 (#660, spec amendment 2026-10-03): as-filed statement facts. T78
+    # (#1127) turned the switch on after the real-store run passed; while off,
     # nothing reads the other three keys. `statement_tags` maps each canonical
     # fact name to its ordered `taxonomy:tag` fallbacks (the order is the
     # precedence within one filing); `statement_forms` filters on the
@@ -301,7 +301,7 @@ class EdgarConfig(BaseModel):
     # `statement_units` are read, any other unit is skipped and counted. None of
     # the three may be empty, nor any fact's fallback list (#1037): an empty one
     # would silently read no statement facts at all.
-    statement_facts_enabled: bool = False
+    statement_facts_enabled: bool = True
     statement_tags: dict[str, Annotated[list[str], Field(min_length=1)]] = Field(
         default_factory=lambda: {name: list(tags) for name, tags in _STATEMENT_TAGS.items()},
         min_length=1,
