@@ -174,9 +174,6 @@ _SKIP_ZERO = "skip_zero"
 #: `signals.reason` values.
 _SELECTED = "selected"
 _BELOW_CUT = "below_cut"
-#: Momentum's one declared exclusion reason, kept so a momentum plan's `signals` rows
-#: stay byte-identical (T127b, #1209): still exactly `f"{EXCLUDED_REASON_PREFIX}no_history"`.
-_EXCLUDED_NO_HISTORY = f"{EXCLUDED_REASON_PREFIX}no_history"
 
 
 class RebalanceState(StrEnum):
