@@ -195,7 +195,49 @@ def test_worst_case_lower_bound_counts_unlabelled_as_wrong() -> None:
     assert worst_case < ordinary.lower_bound
 
 
+def test_worst_case_lower_bound_excludes_a_seed_not_in_the_random_draw() -> None:
+    """The worst-case bound is reported beside `class_accuracy` and the
+    `TP-` claim quotes both (quant-auditor SHOULD FIX on PR #1069, pass 2):
+    a seed added beside the 150 drawn items must not change either bound's
+    denominator."""
+    drawn = _labelled_items(n_correct=10, n_wrong_option=0, n_timeout=0, n_unresolved=0)
+    without_seed = scoring.worst_case_lower_bound(drawn)
+
+    extra_seed = scoring.ScoredItem(
+        "extra-seed", "bankruptcy", "exchange_transfer", "ok", is_seed=True, in_random_draw=False
+    )
+    with_seed = scoring.worst_case_lower_bound([*drawn, extra_seed])
+
+    assert with_seed == without_seed
+
+
 # --- in_random_draw: excluded from the accuracy denominator, not from seeded_recall --
+
+
+def test_in_random_draw_true_seed_counts_in_both_class_accuracy_and_seeded_recall() -> None:
+    """A seed the random draw itself picked keeps `in_random_draw=True`
+    (its default) and must count toward both `class_accuracy` and
+    `seeded_recall` (req 10's exception: "except a seed the random draw
+    itself picked")."""
+    row6 = crosswalk.RuleAnswer(status="listed")  # a disagreement by construction
+    drawn_seed = scoring.ScoredItem(
+        "drawn-seed", "bankruptcy", "bankruptcy", "ok", is_seed=True, pre_fix_rule_answer=row6
+    )
+    items = [
+        *_labelled_items(n_correct=9, n_wrong_option=0, n_timeout=0, n_unresolved=0),
+        drawn_seed,
+    ]
+
+    accuracy = scoring.class_accuracy(items)
+    assert accuracy.n == 10  # the drawn seed enters the denominator
+    assert accuracy.correct == 10
+
+    assert scoring.seeded_recall(items) == 1.0  # row6 disagrees with every non-unresolved option
+
+
+def test_scored_item_rejects_in_random_draw_false_on_a_non_seed() -> None:
+    with pytest.raises(ValueError):
+        scoring.ScoredItem("x", "bankruptcy", "bankruptcy", "ok", in_random_draw=False)
 
 
 def test_seed_not_in_random_draw_changes_seeded_recall_not_class_accuracy() -> None:
@@ -413,6 +455,38 @@ def test_rule_provision_arm_score_empty_is_zero() -> None:
     assert result.class_accuracy.n == 0
 
 
+def test_rule_provision_arm_score_excludes_a_seed_not_in_the_random_draw() -> None:
+    """The arm is "scored on the same gold items" as the model (req 5):
+    a seed added beside the 150 drawn items must not change the arm's
+    coverage or accuracy either (quant-auditor SHOULD FIX on PR #1069,
+    pass 2)."""
+    drawn = [
+        scoring.ScoredItem(
+            "one-class-correct",
+            "instrument_retirement",
+            "instrument_retirement",
+            "ok",
+            rule_provision="12d2-2(a)(1)",
+        )
+    ]
+    without_seed = scoring.rule_provision_arm_score(drawn)
+
+    extra_seed = scoring.ScoredItem(
+        "extra-seed",
+        "bankruptcy",
+        "bankruptcy",
+        "ok",
+        rule_provision="12d2-2(a)(1)",
+        is_seed=True,
+        in_random_draw=False,
+    )
+    with_seed = scoring.rule_provision_arm_score([*drawn, extra_seed])
+
+    assert with_seed.coverage == without_seed.coverage
+    assert with_seed.class_accuracy.n == without_seed.class_accuracy.n
+    assert with_seed.class_accuracy.correct == without_seed.class_accuracy.correct
+
+
 def test_rule_provision_arm_score_scores_the_arm_against_gold_not_the_model() -> None:
     """The arm's `class_accuracy` must answer "does the arm agree with
     gold?", not "does the model agree with the arm?" (quant-auditor BLOCKER
@@ -521,6 +595,25 @@ def test_ece_and_classwise_reliability_are_permutation_invariant_on_ties() -> No
         assert math.isclose(
             reliability_right_first[class_name], reliability_interleaved[class_name], abs_tol=1e-9
         )
+
+
+def test_ece_class_tie_breaks_on_class_name_not_dict_order() -> None:
+    """When two classes tie exactly on probability, the predicted class
+    must not depend on the probability mapping's key order (quant-auditor
+    follow-up on PR #1069, pass 2): `insolvency` (`bankruptcy`) and
+    `transfer` (`exchange_transfer`) tie at 0.5 regardless of which key is
+    written first."""
+    gold_insolvency = scoring.CalibrationItem(
+        probabilities={"bankruptcy": 0.5, "exchange_transfer": 0.5}, gold_class="insolvency"
+    )
+    reordered = scoring.CalibrationItem(
+        probabilities={"exchange_transfer": 0.5, "bankruptcy": 0.5}, gold_class="insolvency"
+    )
+    assert scoring.ece([gold_insolvency]) == scoring.ece([reordered])
+    # the tie breaks on the alphabetically first class name, "insolvency" < "transfer":
+    # the item's gold class ("insolvency") matches the predicted class, so it's correct at
+    # confidence 0.5, giving ece = |1 - 0.5| = 0.5 regardless of the mapping's key order.
+    assert scoring.ece([gold_insolvency]) == 0.5
 
 
 # --- multiclass_brier and classwise_reliability: a one-item hand-worked case ----

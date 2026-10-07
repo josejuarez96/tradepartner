@@ -166,6 +166,14 @@ class ScoredItem:
     in_random_draw: bool = True
     pre_fix_rule_answer: crosswalk.RuleAnswer | None = None
 
+    def __post_init__(self) -> None:
+        if not self.in_random_draw and not self.is_seed:
+            raise ValueError(
+                f"{self.listing_end_id}: in_random_draw=False is only for a seed item "
+                "(is_seed=True); a non-seed item dropped from every accuracy denominator "
+                "would go unnoticed"
+            )
+
     @property
     def text_states_label(self) -> str | None:
         """`text_states` when the owner recorded one, else `gold_label`
@@ -235,8 +243,14 @@ def worst_case_lower_bound(
     """The worst-case bound of req 10: every `unlabelled` item (gold `None`)
     counts as wrong and joins the denominator, beside the ordinary scoring
     rule for every other item (gold `unresolved` stays excluded: the owner
-    made no claim to score against)."""
-    scored = [item for item in items if _gold_label_of(item, against) != UNRESOLVED]
+    made no claim to score against). A seed item not in the random draw
+    (`in_random_draw=False`) is excluded, matching `class_accuracy`'s
+    denominator."""
+    scored = [
+        item
+        for item in items
+        if item.in_random_draw and _gold_label_of(item, against) != UNRESOLVED
+    ]
     n = len(scored)
     correct = 0
     for item in scored:
@@ -389,9 +403,13 @@ class ArmResult:
 def rule_provision_arm_score(items: Sequence[ScoredItem]) -> ArmResult:
     """req 5 and C3: `coverage` and, where the arm names one class,
     `class_accuracy`, over every item with a usable `gold_label` and a
-    `rule_provision`."""
+    `rule_provision`. A seed item not in the random draw
+    (`in_random_draw=False`) is excluded, matching `class_accuracy`'s
+    denominator."""
     scored = [
-        item for item in items if item.gold_label not in (None, UNRESOLVED) and item.rule_provision
+        item
+        for item in items
+        if item.in_random_draw and item.gold_label not in (None, UNRESOLVED) and item.rule_provision
     ]
     if not scored:
         return ArmResult(coverage=0.0, class_accuracy=AccuracyResult(0, 0, 0.0, 0.0))
@@ -454,11 +472,14 @@ def _max_class_probability_and_class(
     options) and its probability -- aggregated the same way
     `multiclass_brier` does, so `ece`'s notion of "confidence" and
     "correct" both operate at the class level rather than mixing an
-    option-level confidence with a class-level correctness check."""
+    option-level confidence with a class-level correctness check. A tie
+    between two classes' probabilities breaks on the class name
+    (alphabetically first), not on probability-mapping key order, so the
+    result does not depend on dict insertion order."""
     class_probabilities = _class_probabilities(probabilities)
     if not class_probabilities:
         return 0.0, None
-    predicted_class, p_max = max(class_probabilities.items(), key=lambda kv: kv[1])
+    predicted_class, p_max = min(class_probabilities.items(), key=lambda kv: (-kv[1], kv[0]))
     return p_max, predicted_class
 
 
