@@ -9,7 +9,7 @@ file wants to pin). Every other part of the file is prose, but it is hashed too.
 
 **The file must name** `in_sample_start`, `holdout.start`, `holdout.end`, every
 `costs.*` key and every key of its family's signal section (`strategy.*` for
-`momentum`, `profitability.*` for `profitability`; `REQUIRED_SECTIONS`), or it is
+`momentum`, `profitability.*` for `profitability`; `FAMILIES[family].sections`), or it is
 refused; the holdout never comes from live `Settings`. A key outside the frozen list
 below is refused rather than ignored, and so is a key of another family's signal
 section (`frozen.inert_sections`).
@@ -54,13 +54,24 @@ import duckdb
 from pydantic import BaseModel, ValidationError
 
 from tradepartner.backtest import frozen
-from tradepartner.config import Settings, get_settings, render_validation_errors
+from tradepartner.config import FAMILIES, Settings, get_settings, render_validation_errors
 from tradepartner.store import registry
 
-#: Settings sections frozen whole (spec req 10).
+
+def _family_frozen_sections() -> tuple[str, ...]:
+    """Every section any family lists in `FAMILIES` (ADR 0014 point 2), in dict order
+    without duplicates: today `("strategy", "profitability")`."""
+    seen: dict[str, None] = {}
+    for spec in FAMILIES.values():
+        for section in spec.sections:
+            seen.setdefault(section, None)
+    return tuple(seen)
+
+
+#: Settings sections frozen whole (spec req 10). The family part derives from `FAMILIES`
+#: (ADR 0014 point 2, T128); the fixed sections are listed as today.
 FROZEN_SECTIONS: Final = (
-    "strategy",
-    "profitability",
+    *_family_frozen_sections(),
     "schedule",
     "universe",
     "costs",
@@ -73,12 +84,6 @@ FROZEN_SECTIONS: Final = (
 )
 #: Single frozen keys outside those sections.
 FROZEN_SINGLE_KEYS: Final = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
-#: Sections every one of whose keys the file must name, by family. A family not listed
-#: (`oracle`, and one the registry will refuse) is held to momentum's.
-REQUIRED_SECTIONS: Final[dict[str, tuple[str, ...]]] = {
-    "momentum": ("strategy", "costs"),
-    "profitability": ("profitability", "costs"),
-}
 #: Keys the file must name outside those sections.
 REQUIRED_SINGLE_KEYS: Final = ("holdout.start", "holdout.end")
 #: Top-level keys of the parameter block that are not config keys.
@@ -128,10 +133,13 @@ def family_frozen_keys(family: str) -> tuple[str, ...]:
     return tuple(k for k in frozen_keys() if k.partition(".")[0] not in inert)
 
 
-def required_keys(family: str = "momentum") -> frozenset[str]:
-    """The config keys a `family` hypothesis file must name (besides `in_sample_start`)."""
+def required_keys(family: str) -> frozenset[str]:
+    """The config keys a `family` hypothesis file must name (besides `in_sample_start`):
+    every key of its listed sections (`FAMILIES[family].sections`) plus every `costs.*`
+    key. Raises `KeyError` for an unlisted family (ADR 0014 point 2: the momentum
+    fallback goes)."""
     keys = set(REQUIRED_SINGLE_KEYS)
-    for section in REQUIRED_SECTIONS.get(family, REQUIRED_SECTIONS["momentum"]):
+    for section in (*FAMILIES[family].sections, "costs"):  # type: ignore[index]
         keys.update(_section_keys(section))
     return frozenset(keys)
 
@@ -181,9 +189,15 @@ def parse_file(path: Path) -> HypothesisFile:
         raise HypothesisFileError(
             f"{path}: keys outside the frozen list are refused: {', '.join(unknown)}"
         )
-    family = flat.get("family")
-    family = family if isinstance(family, str) else "momentum"
-    inert = sorted(k for k in flat if k.partition(".")[0] in frozen.inert_sections(family))
+    family_value = flat.get("family")
+    if not isinstance(family_value, str) or not family_value.strip():
+        raise HypothesisFileError(f"{path}: family must be a non-empty string")
+    family = family_value
+    try:
+        inert_set = frozen.inert_sections(family)
+    except KeyError as exc:
+        raise HypothesisFileError(f"{path}: family {family!r} is not listed in FAMILIES") from exc
+    inert = sorted(k for k in flat if k.partition(".")[0] in inert_set)
     if inert:
         raise HypothesisFileError(
             f"{path}: keys of another family's signal section are refused for "
@@ -247,9 +261,10 @@ def _overlay(settings: Settings, params: Mapping[str, Any]) -> Settings:
         raise HypothesisFileError(f"frozen values fail validation: {detail}") from exc
 
 
-def frozen_params_of(settings: Settings, *, family: str = "momentum") -> dict[str, Any]:
+def frozen_params_of(settings: Settings, *, family: str) -> dict[str, Any]:
     """The frozen keys of `settings` a `family` registration stores, dotted, in their
-    JSON form (no inert section)."""
+    JSON form (no inert section). Raises `KeyError` for an unlisted family (ADR 0014
+    point 2: the momentum fallback goes)."""
     dumped = settings.model_dump(mode="json")
     params: dict[str, Any] = {}
     for key in family_frozen_keys(family):
@@ -258,9 +273,7 @@ def frozen_params_of(settings: Settings, *, family: str = "momentum") -> dict[st
     return params
 
 
-def frozen_hash_matches(
-    settings: Settings, stored_sha256: str, *, family: str = "momentum"
-) -> bool:
+def frozen_hash_matches(settings: Settings, stored_sha256: str, *, family: str) -> bool:
     """True when the frozen keys of `settings` are the `family` registration whose
     stored hash is `stored_sha256`: written out in full, or, for a registration stored
     before a suffix of `FROZEN_KEY_DEFAULTS` landed, with those table keys (at their

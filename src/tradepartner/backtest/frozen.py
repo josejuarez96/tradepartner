@@ -28,7 +28,8 @@ from datetime import date
 from hashlib import sha256
 from typing import Any, Final, Protocol
 
-from tradepartner.config import HypothesisFamily
+from tradepartner.config import FAMILIES, HypothesisFamily
+from tradepartner.config import FAMILY_SIGNAL_SECTIONS as _CONFIG_FAMILY_SIGNAL_SECTIONS
 
 #: (key, behaviour-preserving default in JSON form, schema version when it landed).
 #: Append-only; every entry is pinned by value in `tests/backtest/test_frozen_defaults.py`.
@@ -99,11 +100,12 @@ LAB_BASELINE_FROZEN_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 #: Each family's own signal section: kept whole in the canonical set and the
-#: fingerprint, never left out as default-valued (backtest spec decision 13).
-FAMILY_SIGNAL_SECTIONS: Final[dict[HypothesisFamily, str]] = {
-    "momentum": "strategy",
-    "profitability": "profitability",
-}
+#: fingerprint, never left out as default-valued (backtest spec decision 13). Re-exported
+#: from `config.FAMILY_SIGNAL_SECTIONS` (ADR 0014 point 2, T128) so callers that already
+#: import it from here keep working; `inert_sections` and `fingerprint` below use the
+#: full `FAMILIES[family].sections` tuple instead, which is `(signal_section,)` for every
+#: family today.
+FAMILY_SIGNAL_SECTIONS: Final[dict[HypothesisFamily, str]] = dict(_CONFIG_FAMILY_SIGNAL_SECTIONS)
 
 #: Single keys the fingerprint reads besides the sections below (spec "Fingerprint").
 _FINGERPRINT_KEYS: Final = (
@@ -147,30 +149,37 @@ def _section(key: str) -> str:
     return key.partition(".")[0]
 
 
-def _signal_section(family: str) -> str | None:
-    return next((s for f, s in FAMILY_SIGNAL_SECTIONS.items() if f == family), None)
+def _own_sections(family: str) -> frozenset[str]:
+    """The sections `family` lists in `FAMILIES` (ADR 0014 point 2): its own signal
+    section first, then any other family's section its signal reads. Raises `KeyError`
+    for an unlisted family instead of inheriting momentum's identity."""
+    return frozenset(FAMILIES[family].sections)  # type: ignore[index]
+
+
+def _all_sections() -> frozenset[str]:
+    """Every section listed by any family in `FAMILIES`."""
+    return frozenset(section for spec in FAMILIES.values() for section in spec.sections)
 
 
 def inert_sections(family: str) -> frozenset[str]:
-    """The other families' signal sections: never stored, overlaid, hashed or
-    fingerprinted for a `family` registration. A family without a signal section of its
-    own (`oracle`) reads momentum's."""
-    own = _signal_section(family) or FAMILY_SIGNAL_SECTIONS["momentum"]
-    return frozenset(FAMILY_SIGNAL_SECTIONS.values()) - {own}
+    """The sections `family` does not list: never stored, overlaid, hashed or
+    fingerprinted for a `family` registration. Raises `KeyError` for an unlisted family
+    (ADR 0014 point 2: the momentum fallback goes)."""
+    return _all_sections() - _own_sections(family)
 
 
 def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, Any]:
     """`params` read through the defaults, with every table key at its default left out,
-    except the keys of `family`'s signal section, which are always kept, and with the
-    other families' signal sections left out whole."""
-    signal = _signal_section(family)
-    inert = inert_sections(family)
+    except the keys of `family`'s own listed sections, which are always kept, and with
+    the sections `family` does not list left out whole."""
+    own = _own_sections(family)
+    inert = _all_sections() - own
     defaults = _defaults()
     return {
         key: value
         for key, value in _overlay_defaults(params, family).items()
         if _section(key) not in inert
-        and not (key in defaults and _section(key) != signal and is_default(value, defaults[key]))
+        and not (key in defaults and _section(key) not in own and is_default(value, defaults[key]))
     }
 
 
@@ -188,12 +197,11 @@ def _canonical_json(value: Any) -> str:
 
 def fingerprint(family: str, params: Mapping[str, Any], in_sample_start: date) -> str:
     """SHA-256 of the canonical JSON of the keys that decide what a run computes:
-    `family`, its signal section in full, `schedule.*`, `universe.*`,
+    `family`, every section it lists in full, `schedule.*`, `universe.*`,
     `execution.fill_price`, `costs.per_side_bps`, `in_sample_start` (record metadata,
     not a frozen param), `holdout.start` and `holdout.end`, through the canonical set."""
     canonical = canonical_frozen_set(params, family)
-    sections = set(_FINGERPRINT_SECTIONS)
-    sections.update(set(FAMILY_SIGNAL_SECTIONS.values()) - inert_sections(family))
+    sections = set(_FINGERPRINT_SECTIONS) | set(_own_sections(family))
     chosen = {
         key: value
         for key, value in canonical.items()
