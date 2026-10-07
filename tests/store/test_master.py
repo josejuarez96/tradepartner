@@ -36,6 +36,7 @@ from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import configure_connection
 from tradepartner.store.delistings import DELISTED, LISTED, build_delistings, derive_listing_ends
 from tradepartner.store.master import (
+    ClassTitle,
     MasterBuild,
     Succession,
     build_master,
@@ -512,6 +513,38 @@ class TestNoLookAhead:
             for read in (securities_as_of, listings_as_of):
                 assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
             partial.close()
+
+
+class TestClassTitles:
+    """#1166: a later cover page that retitles a class under the same pair
+    adds no listing row, but its title is kept, known at that page."""
+
+    CIK = "0000000077"
+
+    def _source(self) -> FixtureFilingSource:
+        return FixtureFilingSource(
+            index=[_filing(self.CIK, "Beer Co", "10-K", _at(2018, 2, 1))],
+            cover_pages=[
+                _cover(self.CIK, _at(2019, 7, 25), ("Common Stock", "SAM", "NYSE")),
+                _cover(self.CIK, _at(2019, 10, 24), ("Class A Common Stock", "SAM", "NYSE")),
+                _cover(self.CIK, _at(2020, 2, 20), ("Class A Common Stock", "SAM", "NYSE")),
+            ],
+        )
+
+    def test_a_retitled_class_keeps_each_title_at_its_first_page(self) -> None:
+        build = build_master(self._source(), _settings(), ingested_at=INGESTED_AT)
+        assert [r["class_title"] for r in build.listings] == ["Common Stock"]
+        assert build.class_titles == (
+            ClassTitle(self.CIK, "Common Stock", _at(2019, 7, 25)),
+            ClassTitle(self.CIK, "Class A Common Stock", _at(2019, 10, 24)),
+        )
+
+    def test_titles_built_from_pages_known_at_t_agree(self) -> None:
+        source = self._source()
+        full = build_master(source, _settings(), ingested_at=INGESTED_AT).class_titles
+        for t in sorted(k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)):
+            partial = build_master(source.known_by(t), _settings(), ingested_at=INGESTED_AT)
+            assert partial.class_titles == tuple(c for c in full if c.known_at <= t), f"T={t!r}"
 
 
 class TestDuplicatePairPerPage:

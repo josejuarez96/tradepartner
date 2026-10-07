@@ -564,7 +564,7 @@ class TestGapGateOnTheRunPath:
                 title="weekly gap gate",
                 doc_path=f"docs/hypotheses/{self.SLUG}.md",
                 doc_sha256="0" * 64,
-                params=frozen_params_of(frozen),
+                params=frozen_params_of(frozen, family="momentum"),
                 in_sample_start=date(2018, 1, 31),
                 holdout_start=date(2019, 6, 3),
                 holdout_end=date(2020, 6, 30),

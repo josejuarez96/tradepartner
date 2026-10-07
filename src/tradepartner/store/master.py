@@ -176,6 +176,19 @@ class MasterBuild:
     missing_benchmarks: tuple[str, ...]
     unlisted_securities: tuple[str, ...] = ()
     successions: tuple[Succession, ...] = ()
+    class_titles: tuple[ClassTitle, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClassTitle:
+    """A title a class showed on a cover page, known from `known_at` (that
+    page's acceptance), once per class and title. A listing row keeps only
+    the title of the page that first showed its pair; a later retitling
+    ("Common Stock" to "Class A Common Stock" for one pair) is here (#1166)."""
+
+    security_id: str
+    title: str
+    known_at: datetime
 
 
 @dataclass(frozen=True)
@@ -450,6 +463,7 @@ class _Builder:
         self.listings: list[Row] = []
         self.unmatched: list[CompanySnapshotEntry] = []
         self.successions: list[Succession] = []
+        self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
 
     def security(
         self,
@@ -545,6 +559,9 @@ class _Builder:
                 start = starts.get((cls.security_id, item.exchange), valid_from)
                 claimed[cls.security_id] = item.ticker
                 cls.titles.add(_norm_title(item.title))
+                key = (cls.security_id, item.title)
+                if key not in self.class_titles:
+                    self.class_titles[key] = ClassTitle(cls.security_id, item.title, known_at)
                 pair = (item.ticker, item.exchange)
                 shown_already = pair in shown[cls.security_id]
                 shown[cls.security_id].add(pair)
@@ -866,6 +883,7 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
             row["security_id"] for row in builder.securities if row["security_id"] not in listed
         ),
         successions=tuple(builder.successions),
+        class_titles=tuple(builder.class_titles.values()),
     )
 
 

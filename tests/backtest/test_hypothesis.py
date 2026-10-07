@@ -97,7 +97,7 @@ def test_fixture_file_parses(settings: Settings) -> None:
 
 def test_fixture_file_names_every_required_key() -> None:
     parsed = hypothesis.parse_file(FIXTURE)
-    required = hypothesis.required_keys()
+    required = hypothesis.required_keys("momentum")
     assert {"holdout.start", "holdout.end"} <= required
     assert {k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))} <= required
     assert required <= set(parsed.file_params)
@@ -322,7 +322,10 @@ def test_family_outside_the_list_is_refused(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
     text = FIXTURE.read_text().replace('family = "momentum"', 'family = "value"', 1)
-    with pytest.raises(registry.RegistryError, match="family"):
+    # Since T128 (ADR 0014 point 2), parse_file refuses an unlisted family itself (no
+    # inherit-momentum fallback through `inert_sections`), rather than letting it reach
+    # the registry's `hypotheses.families` check.
+    with pytest.raises(HypothesisFileError, match="FAMILIES"):
         _register(conn, _copy(tmp_path, text), settings)
     assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
 
@@ -343,7 +346,7 @@ def test_load_frozen_returns_the_frozen_values(
     assert frozen.holdout.start == date(2023, 1, 3)
     assert frozen.holdout.end == date(2025, 12, 31)
     assert frozen.strategy.top_fraction == 0.10
-    assert hypothesis.frozen_params_of(frozen) == record.params
+    assert hypothesis.frozen_params_of(frozen, family="momentum") == record.params
     # Keys outside the frozen list stay live.
     assert frozen.store.path == settings.store.path
 
@@ -560,7 +563,7 @@ def test_h1_twin_registered_before_t85_still_loads_and_verifies(
     loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
     assert loaded.profitability.top_fraction == 0.5  # live: momentum never reads it
     assert registry.get_hypothesis(conn, SLUG).params_sha256 == record.params_sha256
-    assert hypothesis.frozen_hash_matches(loaded, record.params_sha256)
+    assert hypothesis.frozen_hash_matches(loaded, record.params_sha256, family="momentum")
     if dropped == ("profitability.",):
         assert _register(conn, FIXTURE, live).hypothesis_id == record.hypothesis_id
         assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
@@ -574,13 +577,13 @@ def test_frozen_hash_matches_compares_a_table_default_by_type(
     from tradepartner.backtest import frozen
 
     key = "universe.liquidity_rule_enabled"
-    params = hypothesis.frozen_params_of(settings)
+    params = hypothesis.frozen_params_of(settings, family="momentum")
     assert params[key] is True
     without = registry.params_sha256({k: v for k, v in params.items() if k != key})
     monkeypatch.setattr(frozen, "FROZEN_KEY_DEFAULTS", ((key, True, 99),))
-    assert hypothesis.frozen_hash_matches(settings, without)
+    assert hypothesis.frozen_hash_matches(settings, without, family="momentum")
     monkeypatch.setattr(frozen, "FROZEN_KEY_DEFAULTS", ((key, 1, 99),))
-    assert not hypothesis.frozen_hash_matches(settings, without)
+    assert not hypothesis.frozen_hash_matches(settings, without, family="momentum")
 
 
 def test_frozen_hash_matches_drops_only_an_at_default_suffix(
@@ -591,7 +594,7 @@ def test_frozen_hash_matches_drops_only_an_at_default_suffix(
     from tradepartner.backtest import frozen
 
     first, second = "universe.liquidity_rule_enabled", "strategy.signal_total_return"
-    params = hypothesis.frozen_params_of(settings)
+    params = hypothesis.frozen_params_of(settings, family="momentum")
     assert params[first] is True and params[second] is True
     table = ((first, 1, 99), (second, True, 99))
     monkeypatch.setattr(frozen, "FROZEN_KEY_DEFAULTS", table)
@@ -599,8 +602,8 @@ def test_frozen_hash_matches_drops_only_an_at_default_suffix(
     without_both = registry.params_sha256(
         {k: v for k, v in params.items() if k not in (first, second)}
     )
-    assert hypothesis.frozen_hash_matches(settings, without_second)
-    assert not hypothesis.frozen_hash_matches(settings, without_both)
+    assert hypothesis.frozen_hash_matches(settings, without_second, family="momentum")
+    assert not hypothesis.frozen_hash_matches(settings, without_both, family="momentum")
 
 
 def test_invalid_frozen_value_names_its_key_and_the_file_value(
@@ -629,3 +632,46 @@ def test_invalid_list_element_names_its_index_and_value(
     with pytest.raises(HypothesisFileError) as excinfo:
         _register(conn, path, settings)
     assert "costs.sensitivity_per_side_bps.1 = -30.0" in str(excinfo.value)
+
+
+# --- The family registry: unlisted-family failures (ADR 0014, T128) ----------
+
+
+def test_required_keys_unchanged_for_momentum_and_profitability(settings: Settings) -> None:
+    """The derived `required_keys` returns today's sets for both families."""
+    momentum_required = hypothesis.required_keys("momentum")
+    assert {"holdout.start", "holdout.end"} <= momentum_required
+    assert {k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))} <= (
+        momentum_required
+    )
+    assert not any(k.startswith("profitability.") for k in momentum_required)
+    profitability_required = hypothesis.required_keys("profitability")
+    assert {"holdout.start", "holdout.end"} <= profitability_required
+    assert {k for k in _spec_frozen_keys() if k.startswith(("profitability.", "costs."))} <= (
+        profitability_required
+    )
+    assert not any(k.startswith("strategy.") for k in profitability_required)
+
+
+def test_required_keys_raises_for_an_unlisted_family() -> None:
+    with pytest.raises(KeyError):
+        hypothesis.required_keys("nosuch")
+
+
+def test_frozen_params_of_raises_for_an_unlisted_family(settings: Settings) -> None:
+    """The momentum fallback goes (ADR 0014 point 2): an unlisted family raises instead
+    of inheriting momentum's identity."""
+    with pytest.raises(KeyError):
+        hypothesis.frozen_params_of(settings, family="nosuch")
+
+
+def test_frozen_hash_matches_raises_for_an_unlisted_family(settings: Settings) -> None:
+    with pytest.raises(KeyError):
+        hypothesis.frozen_hash_matches(settings, "0" * 64, family="nosuch")
+
+
+def test_parse_file_refuses_a_non_string_family(tmp_path: Path) -> None:
+    """`:185`'s non-string default raises (ADR 0014 point 2)."""
+    text = FIXTURE.read_text().replace('family = "momentum"', "family = 3", 1)
+    with pytest.raises(HypothesisFileError, match="family"):
+        hypothesis.parse_file(_copy(tmp_path, text))

@@ -22,12 +22,13 @@ not counted.
   delisted (not transferred) by a Form 25 filed inside W whose last bar is
   more than `gap.missing_tail_sessions` sessions before the last session
   before the filing session, or who have no bar at all
-  (`truncated_tail`). A clean merger (last bar the session before the
-  filing) is not missing.
+  (`truncated_tail`). Only the latest revision of a bar known at `t`
+  with positive volume counts; halt markers are not trades. A clean
+  merger (last traded bar before the filing) is not missing.
 - **Count share** = |M| / |L|. **Size share** = sum of value over M /
   sum over L, value = the latest `shares_outstanding` fact known at `t`
   (universe rule 7's selection, so an out-of-line fact falls back to the
-  last accepted one, #845) x the last raw close known at `t`, the
+  last accepted one, #845) x the last traded raw close known at `t`, the
   shares moved to the close's session by every split known at `t` between
   the two dates. A name with no close or no single shares value is worth
   zero and still counted. Both shares are 0.0 when L is empty.
@@ -136,20 +137,26 @@ def _active_end(listing: dict[str, Any]) -> date | None:
 def _last_bars(
     conn: duckdb.DuckDBPyConnection, t: datetime, session: date, ids: list[str]
 ) -> dict[str, tuple[date, float]]:
-    """Per security, `(session, close)` of its latest bar on or before
-    `session` known at `t` (the latest revision of that bar)."""
+    """Per security, `(session, close)` of its latest traded bar on or before
+    `session` known at `t` (the latest revision of each bar must have volume)."""
     params: list[Any] = [t, session]
     security_filter = _security_filter(ids, params)
     sql = f"""
-        SELECT security_id, session, close FROM (
-            SELECT security_id, session, close, ROW_NUMBER() OVER (
-                PARTITION BY security_id ORDER BY session DESC, known_at DESC
-            ) AS _rn
+        WITH latest AS (
+            SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                PARTITION BY security_id, session ORDER BY known_at DESC
+            ) AS _revision
             FROM prices_daily
             WHERE known_at <= ? AND session <= ?
             {security_filter}
+        ), traded AS (
+            SELECT security_id, session, close, ROW_NUMBER() OVER (
+                PARTITION BY security_id ORDER BY session DESC
+            ) AS _rn
+            FROM latest
+            WHERE _revision = 1 AND volume > 0
         )
-        WHERE _rn = 1
+        SELECT security_id, session, close FROM traded WHERE _rn = 1
     """
     return {sid: (day, close) for sid, day, close in conn.execute(sql, params).fetchall()}
 

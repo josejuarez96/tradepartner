@@ -1110,7 +1110,17 @@ def insert_statement_frame(conn: duckdb.DuckDBPyConnection, frame: pa.Table) -> 
 
 
 _MEMBER_CLASS = re.compile(r"Class([A-Z])(?![a-z])")
-_TITLE_CLASS = re.compile(r"\bclass ([a-z])\b")
+#: A title naming its class by letter: "Class B Common Stock", or one that
+#: starts "Series C" ("Series C common stock": Liberty Broadband, Liberty
+#: TripAdvisor; #1166). "Series" only leads, so a common title that mentions
+#: "Series A Junior Participating Preferred Stock Purchase Rights" names no class.
+_TITLE_CLASS = re.compile(r"\bclass ([a-z])\b|^\s*series ([a-z])\b")
+
+
+def _title_letter(title: str) -> str | None:
+    """The class letter `title` names (`_TITLE_CLASS`), upper case, or `None`."""
+    match = _TITLE_CLASS.search(title.lower())
+    return (match.group(1) or match.group(2)).upper() if match else None
 
 
 def fact_rows(
@@ -1128,7 +1138,10 @@ def fact_rows(
     a listed preferred, warrant or note never takes shares. A fact whose
     member names a class letter (`us-gaap:CommonClassBMember`) goes to the
     one common class whose listing title names that letter ("Class B Common
-    Stock"), and is unmatched if none does (an unlisted class). Any other
+    Stock", "Series B common stock"), or whose cover-page title known at the
+    fact's acceptance does (`MasterBuild.class_titles`: a class first listed
+    as "Common Stock" and retitled "Class A Common Stock" later, #1166), and
+    is unmatched if none does (an unlisted class). Any other
     fact (undimensioned, or a member with no letter) goes to the sole common
     class, and is unmatched when there are several: a total is no one
     class's shares. Raises `ValueError` for a record accepted after
@@ -1157,9 +1170,19 @@ def fact_rows(
 
     letters: dict[str, set[str]] = defaultdict(set)
     for row in master.listings:
-        match = _TITLE_CLASS.search((row["class_title"] or "").lower())
-        if match:
-            letters[row["security_id"]].add(match.group(1).upper())
+        letter = _title_letter(row["class_title"] or "")
+        if letter:
+            letters[row["security_id"]].add(letter)
+    titled: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+    for title in master.class_titles:
+        letter = _title_letter(title.title)
+        if letter:
+            titled[title.security_id].append((title.known_at, letter))
+
+    def letters_at(sid: str, t: datetime) -> set[str]:
+        """The letters `sid`'s listing titles name, plus those its cover-page
+        titles known at `t` name (no later page names an earlier fact's class)."""
+        return letters[sid] | {letter for at, letter in titled[sid] if at <= t}
 
     rows: list[Row] = []
     unmatched: list[FactRecord] = []
@@ -1172,7 +1195,7 @@ def fact_rows(
         ids = common_at(record.cik, record.accepted_at)
         member = _MEMBER_CLASS.search(record.class_member)
         if member:
-            ids = [sid for sid in ids if member.group(1) in letters[sid]]
+            ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
         if record.fact_name not in FACT_NAMES or len(ids) != 1:
             unmatched.append(record)
             continue

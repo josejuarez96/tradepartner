@@ -32,6 +32,7 @@ import duckdb
 import polars as pl
 import pytest
 
+from tradepartner.calendar import next_session
 from tradepartner.config import AdjustConfig, Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import (
@@ -1454,3 +1455,63 @@ def test_dividend_queries_work_on_a_read_only_connection_and_drop_their_view(
             rw.execute("SELECT * FROM _asof_xnys_sessions")
     finally:
         rw.close()
+
+
+#: Two ex-dates, each carrying a split and a dividend (#1099, #1119 item 3). These
+#: amounts made the pre-#1119 read differ in the last bit by insertion order and
+#: between the table and a truncated view.
+_SAME_DAY_ACTIONS = [
+    ("split", date(2021, 1, 11), 0.409),
+    ("dividend", date(2021, 1, 11), 2.113),
+    ("split", date(2021, 1, 19), 4.919),
+    ("dividend", date(2021, 1, 19), 0.301),
+]
+
+
+def _same_day_store(actions: list[tuple[str, date, float]]) -> duckdb.DuckDBPyConnection:
+    # Several threads, as production reads run: under the test suite's
+    # threads=1 (#953) the scan order never varies, so the old sum never showed it.
+    conn = duckdb.connect(":memory:", config={"threads": 4})
+    configure_connection(conn)
+    schema.init_schema(conn)
+    known = datetime(2021, 1, 4, 21, 0, tzinfo=UTC)
+    closes = [10.3, 10.7, 11.1, 9.9, 33.7, 31.9, 32.3, 33.1, 47.3, 46.9]
+    day = date(2021, 1, 4)
+    for close in closes:
+        _bar(conn, "SEC_X", day, close, known_at=known)
+        day = next_session(day)
+    for kind, ex_date, amount in actions:
+        _action(conn, "SEC_X", kind, ex_date, amount, known_at=known)
+    return conn
+
+
+def test_a_split_and_dividend_on_one_ex_date_read_bit_equal_full_and_cut() -> None:
+    """One ex-date's factors sum in a fixed order (#1099): the full table and a
+    truncated view yield bit-identical adjusted frames, whatever the actions'
+    insertion order, and the factor is the split's times the dividend's."""
+    from lookahead.harness import TruncatedStore
+
+    t = datetime(2021, 1, 29, 21, 0, tzinfo=UTC)
+    forward = _same_day_store(_SAME_DAY_ACTIONS)
+    backward = _same_day_store(list(reversed(_SAME_DAY_ACTIONS)))
+    try:
+        full = adjusted_prices_as_of(forward, t, include_dividends=True)
+        # The old scan-order sum differed on about 3 reads in 5; repeat to catch it.
+        for _ in range(10):
+            for store in (forward, backward):
+                assert full.equals(adjusted_prices_as_of(store, t, include_dividends=True))
+                cut = TruncatedStore(store)
+                try:
+                    cut_frame = adjusted_prices_as_of(cut.at(t), t, include_dividends=True)
+                    assert full.equals(cut_frame)
+                finally:
+                    cut.close()
+        raw = prices_as_of(forward, t)
+        prior_1 = _one(raw, session=date(2021, 1, 8))["close"]
+        prior_2 = _one(raw, session=date(2021, 1, 15))["close"]
+        assert isinstance(prior_1, float) and isinstance(prior_2, float)
+        factor = (1 - 2.113 / prior_1) / 0.409 * (1 - 0.301 / prior_2) / 4.919
+        assert _one(full, session=date(2021, 1, 8))["close"] == pytest.approx(prior_1 * factor)
+    finally:
+        forward.close()
+        backward.close()

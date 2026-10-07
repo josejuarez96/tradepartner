@@ -157,7 +157,10 @@ def test_family_and_its_signal_section_are_in_the_fingerprint(
     momentum = frozen.canonical_frozen_set(params, "momentum")
     assert momentum["strategy.extra"] == 1
     assert "schedule.rebalance_cadence" not in momentum
-    assert "strategy.extra" not in frozen.canonical_frozen_set(params, "oracle")
+    # Since T128 (ADR 0014 point 2), `oracle` resolves through its registry entry
+    # whose `sections=("strategy",)`, so default-valued `strategy.*` keys are kept
+    # as for `momentum`. The hash still differs by `family` in the payload (above).
+    assert frozen.canonical_frozen_set(params, "oracle")["strategy.extra"] == 1
 
 
 @pytest.mark.parametrize(
@@ -197,6 +200,48 @@ def test_canonical_set_compares_a_default_by_type_as_well(
 def test_is_default_refuses_nan() -> None:
     with pytest.raises(ValueError):
         frozen.is_default(float("nan"), float("nan"))
+
+
+# --- The family registry: unlisted-family failures (ADR 0014, T128) ----------
+
+
+def test_inert_sections_raises_for_an_unlisted_family() -> None:
+    """The momentum fallback goes (ADR 0014 point 2)."""
+    with pytest.raises(KeyError):
+        frozen.inert_sections("nosuch")
+
+
+def test_fingerprint_raises_for_an_unlisted_family() -> None:
+    with pytest.raises(KeyError):
+        frozen.fingerprint("nosuch", {}, IN_SAMPLE_START)
+
+
+def test_two_section_family_hashes_both_and_has_no_inert_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A test-only spec that lists two sections freezes and hashes both and has no
+    inert section (ADR 0014 point 2: `combined` is the real caller, T130)."""
+    from tradepartner import config as config_module
+
+    original = config_module.FAMILIES["momentum"]
+    two_sections = type(original)(
+        sections=("strategy", "profitability"),
+        params_model=original.params_model,
+        parent=None,
+        engine_ready=True,
+        paper_ready=False,
+        exclusion_reasons=original.exclusion_reasons,
+        count_names=original.count_names,
+        benchmark=None,
+        sweepable_keys=(),
+    )
+    monkeypatch.setitem(config_module.FAMILIES, "momentum", two_sections)
+    assert frozen.inert_sections("momentum") == frozenset()
+    params = {"strategy.top_fraction": 0.3, "profitability.top_fraction": 0.4}
+    base = frozen.fingerprint("momentum", params, IN_SAMPLE_START)
+    for key in ("strategy.top_fraction", "profitability.top_fraction"):
+        moved = {**params, key: params[key] + 0.1}
+        assert frozen.fingerprint("momentum", moved, IN_SAMPLE_START) != base
 
 
 def test_fingerprint_reads_only_the_keys_that_decide_a_run(settings: Settings) -> None:
