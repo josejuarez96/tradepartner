@@ -28,6 +28,14 @@ spec req 9): a result row whose `sharpe_unit` is NULL or `monthly` (written
 before schema version 15) has its stored V times 12 and SR* times sqrt(12).
 Only an `ok` trial has statistics; any other trial shows its state and
 message and no results.
+
+**Today's N split** (research-registry spec req 9; backtest spec req 8 as
+amended 2026-10-07, issue 901). Today's N is `results.family_n_split`'s total and the
+table shows its two parts beside it, backtest trials and research runs, with the
+stored `trial_results.n_research` beside the stored N. On a store a read-only
+connection opened before the research registry (no research tables, no
+`n_research` column) both research cells are blank and today's N is the
+backtest count.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ import streamlit as st
 from tradepartner.backtest.engine import STRATEGY_SERIES
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.metrics import METRIC_KEYS, Basis, DeflatedSharpe, deflated_sharpe
-from tradepartner.backtest.results import CADENCE_KEY, family_n
+from tradepartner.backtest.results import CADENCE_KEY, FamilyN, family_n_split
 from tradepartner.backtest.schedule import MONTHS_PER_YEAR, periods_per_year
 from tradepartner.dashboard import header, theme
 from tradepartner.store import registry, schema
@@ -99,17 +107,23 @@ def annual_stored(
 @dataclass(frozen=True)
 class DsrRow:
     """One DSR basis: the stored statistics and today's recomputation.
-    `today` is None when it cannot be recomputed; `today_error` says why."""
+    `today` is None when it cannot be recomputed; `today_error` says why. The N
+    split: `stored_n_research` (None on a row written before the research
+    registry), and today's `today_n_backtest` and `today_n_research` (None when
+    the store has no research registry, or the family read failed)."""
 
     basis: Basis
     stored_basis: str | None
     stored_n: int | None
+    stored_n_research: int | None
     stored_v: float | None
     stored_sr_star: float | None
     stored_psr_zero: float | None
     stored_dsr: float | None
     today: DeflatedSharpe | None
     today_error: str | None
+    today_n_backtest: int | None = None
+    today_n_research: int | None = None
 
 
 @dataclass(frozen=True)
@@ -164,11 +178,11 @@ def _dsr_rows(
     ppy: int,
 ) -> tuple[DsrRow, ...]:
     today: registry.FamilySharpes | None = None
-    n_today = 0
+    split: FamilyN | None = None
     family_error: str | None = None
     try:
         today = registry.family_sharpes(conn, family)
-        n_today = family_n(conn, family)
+        split = family_n_split(conn, family)
     except registry.RegistryError as exc:
         family_error = str(exc)
     out = []
@@ -177,11 +191,15 @@ def _dsr_rows(
         v, sr_star = annual_stored(stored_v, stored_sr_star, result.get("sharpe_unit"))
         recomputed: DeflatedSharpe | None = None
         error = family_error
-        if today is not None:
+        if today is not None and split is not None:
             pairs = today.raw if basis == "raw" else today.excess_spy
             try:
                 recomputed = deflated_sharpe(
-                    base_metrics, basis, n_trials=n_today, pair_sharpes=pairs, periods_per_year=ppy
+                    base_metrics,
+                    basis,
+                    n_trials=split.total,
+                    pair_sharpes=pairs,
+                    periods_per_year=ppy,
                 )
             except (KeyError, ValueError) as exc:
                 error = str(exc)
@@ -190,12 +208,15 @@ def _dsr_rows(
                 basis=basis,
                 stored_basis=result["dsr_basis"],
                 stored_n=result["n_trials"],
+                stored_n_research=result.get("n_research"),
                 stored_v=v,
                 stored_sr_star=sr_star,
                 stored_psr_zero=psr_zero,
                 stored_dsr=dsr,
                 today=recomputed,
                 today_error=error,
+                today_n_backtest=split.trials if split else None,
+                today_n_research=split.research if split else None,
             )
         )
     return tuple(out)
@@ -336,11 +357,14 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
                 "basis": r.basis,
                 "stored label": r.stored_basis,
                 "stored N": r.stored_n,
+                "stored N research": r.stored_n_research,
                 "stored V": r.stored_v,
                 "stored SR*": r.stored_sr_star,
                 "stored PSR(0)": r.stored_psr_zero,
                 "stored DSR (N at run time)": r.stored_dsr,
                 "today N": r.today.n_trials if r.today else None,
+                "today N backtest": r.today_n_backtest,
+                "today N research": r.today_n_research,
                 "today V": r.today.sharpe_variance if r.today else None,
                 "today SR*": r.today.sr_star if r.today else None,
                 "today label": r.today.dsr_basis if r.today else None,
@@ -348,7 +372,16 @@ def _dsr_table(rows: Sequence[DsrRow]) -> pl.DataFrame:
             }
             for r in rows
         ],
-        schema_overrides={"today N": pl.Int64, "stored N": pl.Int64},
+        schema_overrides={
+            column: pl.Int64
+            for column in (
+                "stored N",
+                "stored N research",
+                "today N",
+                "today N backtest",
+                "today N research",
+            )
+        },
     )
 
 
@@ -405,7 +438,10 @@ def _render_results(view: TrialView) -> None:
     st.subheader("Deflated Sharpe")
     st.caption(
         "Stored: N at run time (N and V as they were when the trial ran; they go stale). "
-        "Today: recomputed with the family's current N and V. V and SR* in annual units "
+        "Today: recomputed with the family's current N and V. N is the family's backtest "
+        "trials plus its research runs' configurations (research-registry spec req 9; "
+        "blank research cells: the store has no research registry); V is the backtest "
+        "trials' alone. V and SR* in annual units "
         "(rows stored in monthly units before the lab converted); DSR at the trial's own "
         "period."
     )
