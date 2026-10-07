@@ -587,7 +587,7 @@ class _Caller:
     sequence: int = 0
 
     @property
-    def path(self) -> Path:
+    def records_path(self) -> Path:
         return datafiles.inference_path(self.settings, self.handle.run_id)
 
     def _write(
@@ -606,7 +606,7 @@ class _Caller:
             cost_usd=cost,
             settings=self.settings,
         )
-        datafiles.append_jsonl(self.path, [record])
+        datafiles.append_jsonl(self.records_path, [record])
         self.sums = self.sums.plus(cost, response.known_at)
 
     def close(self) -> None:
@@ -790,7 +790,7 @@ def _run_drift(
         finally:
             caller.close()
         rate = scoring.flip_rate(comparisons)
-        path = caller.path
+        path = caller.records_path
         outcome = write_result(
             conn,
             handle,
@@ -1001,7 +1001,7 @@ def _label_batch(
             refused += [f"{row['listing_end_id']}:{k}" for k in _label_row(caller, row, limits)]
     finally:
         caller.close()
-    path = caller.path
+    path = caller.records_path
     records = datafiles.read_jsonl(path) if path.is_file() else []
     inferences_id = _register_records(conn, handle, path, rows, len(records)) if records else None
     artifact_sha = _file_sha256(path) if records else ""
