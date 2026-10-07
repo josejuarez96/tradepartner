@@ -6,8 +6,11 @@ updated" and a stale chip; a KPI row (coverage, interior gaps, delisted
 names, last update); the hero chart of each session's missing share against
 `ingest.max_missing_share`; supporting cards (bars per session, integrity
 checks as status chips, per-source ingest status, survivorship gap,
-unclassifiable and `snapshot_static` reliance, settings); and the gap,
-delisted and missing-name tables. Read-only.
+unclassifiable and `snapshot_static` reliance, settings, statement facts
+(issue 660, T77c: the switch's state, coverage and derived share while it
+is on, the last EDGAR run's `statement_*` counts and a warning badge while
+`statement_vintage_late > 0`)); and the gap, delisted and missing-name
+tables. Read-only.
 
 Two layers, like the other pages: `load_health_view` reads everything
 through the connection it is given (the shell's single read-only
@@ -336,6 +339,32 @@ def _data_card(report: HealthReport) -> None:
         st.markdown(f"Liquidity rule: {rule} · Fill price: {report.settings['fill_price']}")
 
 
+def _statement_card(report: HealthReport) -> None:
+    statement = report.statement
+    with st.container(border=True):
+        st.subheader("Statement facts")
+        state = "on" if statement.enabled else "off"
+        st.markdown(f"Switch (`edgar.statement_facts_enabled`): **{state}**")
+        if statement.coverage is None:
+            st.caption("Switch is off: nothing to report.")
+        else:
+            cov = statement.coverage
+            st.markdown(
+                f"Coverage: {cov.fresh} of {cov.total} universe names "
+                f"({cov.share:.1%}) have a fresh revenue and total assets row "
+                "(rule 7's `universe.max_shares_age_days` bound)"
+            )
+            gross_profit = cov.derived + cov.reported
+            st.markdown(
+                f"Derived gross profit: {cov.derived} of {gross_profit} ({cov.derived_share:.1%})"
+            )
+        if statement.counts:
+            counts = ", ".join(f"{k} {v}" for k, v in sorted(statement.counts.items()))
+            st.caption(f"Last EDGAR run: {counts}")
+        if statement.vintage_late > 0:
+            theme.status_badge(f"statement_vintage_late: {statement.vintage_late}", "warning")
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -373,4 +402,5 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     with right:
         _sources_card(view.report)
         _survivorship_card(view.report)
+        _statement_card(view.report)
     _tables(view.report)

@@ -45,8 +45,10 @@ from tradepartner.calendar import (
     last_session_of_month,
     next_session,
     previous_session,
+    session_close,
 )
 from tradepartner.config import Cadence, SignalAnchor
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 _PERIOD_NAMES: dict[Cadence, str] = {
     "month_end": "the last session of its month",
@@ -304,18 +306,28 @@ def gross_profitability(
     5. a non-finite numerator, or a non-positive or non-finite denominator: `malformed`;
     6. otherwise scored numerator / denominator (`ranked` gives rule 6's order).
 
-    Raises `ValueError` for a naive `t`, a `basis` other than `gross`, a frame missing
-    a column, or a duplicate `(security_id, fact_name, period_end, period_days)` row.
+    A tz-aware `t` in any zone is read as the same instant in UTC. `t` must be a
+    session close (`close(T)`, half days included): any other instant would measure
+    rule 4's freshness from the previous session (#1084).
+
+    Raises `ValueError` for a naive `t` (or one out of UTC's range), a `t` that is
+    not a session close, a `basis` other than `gross`, a frame missing a column, or a duplicate
+    `(security_id, fact_name, period_end, period_days)` row.
     """
-    if t.tzinfo is None or t.utcoffset() is None:
-        raise ValueError("t must be tz-aware")
+    t = ensure_tz_aware_utc(t, field_name="t")  # `known_at` is UTC; polars needs one zone
+    t_session = last_completed_session(t)
+    t_close = session_close(t_session)
+    if t != t_close:
+        raise ValueError(
+            f"t {t.isoformat()} is not a session close; the last close at or before it "
+            f"is {t_close.isoformat()} ({t_session.isoformat()})"
+        )
     if basis not in _PROFITABILITY_NUMERATOR:
         raise ValueError(f"profitability basis {basis!r} is not implemented; only 'gross'")
     missing = [c for c in _FACT_COLUMNS_READ if c not in facts.columns]
     if missing:
         raise ValueError(f"facts frame lacks columns {missing}")
     numerator_name = _PROFITABILITY_NUMERATOR[basis]
-    t_session = last_completed_session(t)
     low_days, high_days = annual_period_days
     names = sorted(set(security_ids))
 

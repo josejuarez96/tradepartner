@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
-from edgar_transport import edgar_settings
+from edgar_transport import edgar_settings, unthrottled
 from test_edgar_failures import _bare_source
 from test_edgar_source import (
     ALPHABET,
@@ -129,11 +129,13 @@ def test_the_check_lists_the_unaccepted_per_document_failures(tmp_path: Path) ->
 def test_the_listing_is_bounded_and_redacted(tmp_path: Path) -> None:
     secret = "sk-sentinel-808"
     base = edgar_settings(tmp_path / "cache", max_validation_listed=2)
-    settings = Settings(
-        _env_file=None,
-        edgar=base.edgar.model_dump(),
-        sec_edgar_user_agent=base.sec_edgar_user_agent,
-        alpaca_api_secret=secret,
+    settings = unthrottled(
+        Settings(
+            _env_file=None,
+            edgar=base.edgar.model_dump(exclude={"requests_per_second"}),
+            sec_edgar_user_agent=base.sec_edgar_user_agent,
+            alpaca_api_secret=secret,
+        )
     )
     source = EdgarFilingSource(settings, client=_router().client())
     accessions = [f"0000320193-26-000{k:03d}" for k in range(5)]
@@ -155,11 +157,13 @@ def test_the_full_listing_is_written_to_disk_and_named_first(tmp_path: Path) -> 
     run writes no `failed_filings.json`, so this file is its only full list."""
     secret = "sk-sentinel-884"
     base = edgar_settings(tmp_path / "cache", max_validation_listed=2)
-    settings = Settings(
-        _env_file=None,
-        edgar=base.edgar.model_dump(),
-        sec_edgar_user_agent=base.sec_edgar_user_agent,
-        alpaca_api_secret=secret,
+    settings = unthrottled(
+        Settings(
+            _env_file=None,
+            edgar=base.edgar.model_dump(exclude={"requests_per_second"}),
+            sec_edgar_user_agent=base.sec_edgar_user_agent,
+            alpaca_api_secret=secret,
+        )
     )
     source = EdgarFilingSource(settings, client=_router().client())
     accessions = [f"0000320193-26-000{k:03d}" for k in range(5)]

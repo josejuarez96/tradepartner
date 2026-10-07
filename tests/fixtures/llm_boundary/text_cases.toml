@@ -1,5 +1,6 @@
 # Test (c): text snippets the text scan must fail (or pass), spec req 14 as
-# amendment C13 reads it. Appended to the real file at `path` (or a new file);
+# amendment C13 reads it; paths under tests/ get the host rule only (#1031).
+# Appended to the real file at `path` (or a new file);
 # `rule` is the case it must report, "" means it must pass.
 
 [[case]]
@@ -13,6 +14,24 @@ id = "docs-host-in-job"
 path = "src/tradepartner/research/labeling/job.py"
 source = "# see docs.typesafe.ai for the schema\n"
 rule = "host"
+
+[[case]]
+id = "host-in-fake-model-client"
+path = "tests/research/fake_model_client.py"
+source = "BASE = 'https://api.typesafe.ai/v1'\n"
+rule = "host"
+
+[[case]]
+id = "key-name-in-tests-passes"
+path = "tests/research/fake_model_client.py"
+source = "ENV = 'TYPESAFE_API_KEY'\n"
+rule = ""
+
+[[case]]
+id = "base-url-key-in-tests-passes"
+path = "tests/research/fake_model_client.py"
+source = "settings.research.labeling.api_base_url = 'http://127.0.0.1:9'\n"
+rule = ""
 
 [[case]]
 id = "key-name-in-cli"

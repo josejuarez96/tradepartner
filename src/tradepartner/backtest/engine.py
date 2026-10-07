@@ -1,11 +1,14 @@
-"""The backtest loop (backtest spec reqs 1-6; plan T37b).
+"""The backtest loop (backtest spec reqs 1-6; plan T37b; at a cadence, strategy-lab
+spec req 6, plan T98).
 
-Rebalance sessions T_0..T_n come from the calendar; the run reads the provider only at
-their closes. At close(T_0) it plans the first targets. Step i (i = 0..n-1) then reads
-once at t = close(T_{i+1}): the marking frame (held and target names, dividends
-included), raw bars for share counts, dropped and late dividends, and, unless T_{i+1} is
-the last rebalance, the next plan (universe, signal frame, gap, static listings). Every
-cost level is evaluated from that one read set:
+Rebalance sessions T_0..T_n come from the calendar at the frozen
+`schedule.rebalance_cadence` (`month_end`, `week_end` or `daily`), through
+`schedule.rebalance_sessions`; the run reads the provider only at their closes, and
+each step covers one period (T_i, T_{i+1}]. At close(T_0) it plans the first targets.
+Step i (i = 0..n-1) then reads once at t = close(T_{i+1}): the marking frame (held and
+target names, dividends included), raw bars for share counts, dropped and late
+dividends, and, unless T_{i+1} is the last rebalance, the next plan (universe, signal
+frame, gap, static listings). Every cost level is evaluated from that one read set:
 
 1. carry the positions from close(T_i) to the fill price on F_i (`carry_to_fill`);
 2. trade to the targets planned at close(T_i) (`fills.apply_trades`);
@@ -13,7 +16,15 @@ cost level is evaluated from that one read set:
 
 The rebalance row for T_i records that plan, the fill on F_i and the dividends step i
 read. No plan is made at the last rebalance T_n: its fill falls after the data cutoff,
-so a run to T_n is exactly the prefix of a longer run.
+so a run to T_n is exactly the prefix of a longer run. The order holds at every
+cadence: at `daily`, F_i = T_{i+1}, so the fill at F_i is applied and the period valued
+before the plan at close(T_{i+1}) reads the drifted weights, on the same session.
+
+**The plan** (`_plan`) reads the universe, then the signal (`_signal`, the one call
+site of the momentum signal): the frozen `schedule.signal_anchor` and cadence decide
+the anchors (`signals.momentum`), and the signal frame is read from the formation
+anchor A_form on (`sessions_from`), which leaves every anchor bar and so every score as
+the unbounded read gives it. The marking read is unbounded.
 
 **Exits** (req 5), decided from step i's read after the fill, on the names still held:
 
@@ -57,7 +68,7 @@ from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.portfolio import target_weights
 from tradepartner.backtest.provider import DataProvider, GapReading
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
-from tradepartner.backtest.signals import momentum_12_1
+from tradepartner.backtest.signals import MomentumSignal, anchor_sessions, momentum
 from tradepartner.backtest.valuation import (
     StepFrame,
     carry_to_fill,
@@ -167,22 +178,45 @@ def _sessions(first: date, last: date) -> list[date]:
     return list(sessions[bisect.bisect_left(sessions, first) : bisect.bisect_right(sessions, last)])
 
 
-def _plan(provider: DataProvider, params: Settings, session: date) -> Plan:
-    t = read_time(session)
-    universe = provider.universe(t)
-    members = sorted(universe.members["security_id"].to_list())
-    strategy = params.strategy
-    frame = provider.adjusted_prices(t, members, strategy.signal_total_return)
-    signal = momentum_12_1(
+def _signal(
+    provider: DataProvider, params: Settings, session: date, members: Sequence[str]
+) -> MomentumSignal:
+    """The momentum signal at rebalance session `session` over `members`, read at
+    close(`session`) from the frozen `strategy` and `schedule` keys (module docstring).
+
+    The signal frame starts at the formation anchor A_form: every bar the score reads
+    (A_form, A_skip, both <= `session`) is in it, so it scores exactly as the unbounded
+    frame does."""
+    strategy, schedule = params.strategy, params.schedule
+    anchor, cadence = schedule.signal_anchor, schedule.rebalance_cadence
+    a_form, _ = anchor_sessions(session, strategy.formation_months, strategy.skip_months, anchor)
+    frame = provider.adjusted_prices(
+        read_time(session, cadence),
+        members,
+        strategy.signal_total_return,
+        sessions_from=a_form,
+    )
+    return momentum(
         frame,
         session,
         strategy.formation_months,
         strategy.skip_months,
+        anchor,
+        cadence,
         security_ids=members,
     )
+
+
+def _plan(provider: DataProvider, params: Settings, session: date) -> Plan:
+    cadence = params.schedule.rebalance_cadence
+    t = read_time(session, cadence)
+    universe = provider.universe(t)
+    members = sorted(universe.members["security_id"].to_list())
+    strategy = params.strategy
+    signal = _signal(provider, params, session, members)
     return Plan(
         session=session,
-        fill_session=fill_session(session),
+        fill_session=fill_session(session, cadence),
         targets=target_weights(signal.scores, strategy.top_fraction, strategy.weighting),
         n_universe=len(members),
         n_static_listings=provider.static_listing_count(t, members),
@@ -200,10 +234,10 @@ _Plan = Plan
 
 
 def plan(provider: DataProvider, params: Settings, session: date) -> Plan:
-    """The plan at rebalance session `session`, read at close(`session`): universe,
-    momentum signal, targets and the gap, from `params` (the frozen hypothesis
-    parameters). The backtest loop calls exactly this function (`_plan`) at every
-    rebalance it plans."""
+    """The plan at rebalance session `session` (a rebalance session at the frozen
+    `schedule.rebalance_cadence`), read at close(`session`): universe, momentum signal,
+    targets and the gap, from `params` (the frozen hypothesis parameters). The backtest
+    loop calls exactly this function (`_plan`) at every rebalance it plans."""
     return _plan(provider, params, session)
 
 
@@ -364,7 +398,7 @@ def _step(
     ended: dict[str, date | None],
     params: Settings,
 ) -> None:
-    """Carry, fill, value and exit one cost level through step (T_i, T_{i+1}]."""
+    """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}]."""
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -469,10 +503,12 @@ def run(
     handle: TrialHandle,
     cost_levels: Sequence[float],
 ) -> dict[float, BacktestResult]:
-    """Run the strategy over the rebalance sessions in `[start, end]` at every cost level
-    in `cost_levels` (per-side bps; commissions from `params.costs`) from one read set.
+    """Run the strategy over the rebalance sessions in `[start, end]` at the frozen
+    `schedule.rebalance_cadence`, at every cost level in `cost_levels` (per-side bps;
+    commissions from `params.costs`) from one read set.
 
-    `params` is the trial's frozen `Settings`. Raises `TypeError` without a
+    `params` is the trial's frozen `Settings` (`hypothesis.load_frozen`, which reads the
+    schedule keys through `frozen.frozen_values`). Raises `TypeError` without a
     `TrialHandle` (no id, no run; ADR 0005) and `ValueError` for fewer than two
     rebalance sessions, a bad cost level or a non-zero `backtest.cash_rate` (interest on
     cash is not implemented), all before any provider call.
@@ -482,14 +518,17 @@ def run(
     levels = _check_levels(cost_levels)
     if params.backtest.cash_rate != 0:
         raise ValueError("backtest.cash_rate other than 0 is not implemented")
-    sessions = rebalance_sessions(start, end)
+    cadence = params.schedule.rebalance_cadence
+    sessions = rebalance_sessions(start, end, cadence)
     if len(sessions) < 2:
         raise ValueError(f"need at least two rebalance sessions in [{start}, {end}]")
 
     capital = params.backtest.initial_capital
     plan = _plan(provider, params, sessions[0])
     benchmarks = dict(
-        sorted(provider.benchmark_ids(read_time(sessions[0]), through=sessions[-1]).items())
+        sorted(
+            provider.benchmark_ids(read_time(sessions[0], cadence), through=sessions[-1]).items()
+        )
     )
     _no_benchmark_members(plan, benchmarks)
     books = [
@@ -507,7 +546,7 @@ def run(
     frames: list[StepFrame] = []
     targets: dict[date, Mapping[str, float]] = {}
     for index, step_end in enumerate(sessions[1:], start=1):
-        t, t_prev = read_time(step_end), read_time(plan.session)
+        t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
         ids = sorted({*plan.targets, *(sid for book in books for sid in book.positions)})
         marked = sorted({*ids, *benchmarks.values()})
         frame = provider.adjusted_prices(t, marked, True)

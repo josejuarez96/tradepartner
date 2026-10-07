@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import pytest
-from edgar_transport import edgar_settings, index_header
+from edgar_transport import edgar_settings, index_header, unthrottled
 from test_edgar_fsn import (
     _fsn_zip_bytes,
     _fsn_zip_url,
@@ -613,11 +613,13 @@ def test_ingest_session_halts_when_check_failures_raises(tmp_path: Path) -> None
     )
     source = EdgarFilingSource(settings, client=router.client(), clock=lambda: now)
 
-    store_settings = Settings(
-        _env_file=None,
-        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
-        edgar=settings.edgar.model_dump(),
-        sec_edgar_user_agent=settings.sec_edgar_user_agent,
+    store_settings = unthrottled(
+        Settings(
+            _env_file=None,
+            store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+            edgar=settings.edgar.model_dump(exclude={"requests_per_second"}),
+            sec_edgar_user_agent=settings.sec_edgar_user_agent,
+        )
     )
     result = ingest_session(
         store_settings,
