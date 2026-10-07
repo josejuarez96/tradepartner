@@ -790,7 +790,7 @@ class _Requests:
 class _Variant:
     """One variant's run state between steps."""
 
-    params: Settings
+    settings: Settings
     handle: TrialHandle
     plan: Plan | None = None
     books: list[_Book] = field(default_factory=list)
@@ -836,12 +836,12 @@ def _plan_all(
     each keyed read is made once for their union before any variant plans."""
     if len(group) > 1:
         strategy = signal_for(family)
-        t = read_time(session, group[0].params.schedule.rebalance_cadence)
+        t = read_time(session, group[0].settings.schedule.rebalance_cadence)
         members = sorted(view.universe(t).members["security_id"].to_list())
         requests = _Requests(view)
         for variant in list(group):
             try:
-                strategy.reader(requests, variant.params, session, t, members)
+                strategy.reader(requests, variant.settings, session, t, members)
             except _ReadError:
                 raise
             except Exception as exc:
@@ -851,7 +851,7 @@ def _plan_all(
     plans: dict[int, Plan] = {}
     for variant in list(group):
         try:
-            plans[variant.trial_id] = _plan(view, variant.params, session, family)
+            plans[variant.trial_id] = _plan(view, variant.settings, session, family)
         except _ReadError:
             raise
         except Exception as exc:
@@ -930,7 +930,7 @@ def _run_group(
 ) -> None:
     """`run_many`'s loop over `group` (the module docstring's steps, in lockstep); a
     failed variant leaves `group` through `failed`."""
-    cadence = group[0].params.schedule.rebalance_cadence
+    cadence = group[0].settings.schedule.rebalance_cadence
     plans = _plan_all(view, group, sessions[0], family, failed)
     if not group:
         return
@@ -943,7 +943,7 @@ def _run_group(
         except Exception as exc:
             failed(variant, exc)
             continue
-        capital = variant.params.backtest.initial_capital
+        capital = variant.settings.backtest.initial_capital
         variant.books = [
             _Book(
                 level=level,
@@ -1004,7 +1004,7 @@ def _variant_step(
     """One variant's step through `step_end` from the shared reads, restricted to its
     own ids: carry, fill, value and exit every level, then take `next_plan`."""
     plan = cast(Plan, variant.plan)
-    params = variant.params
+    params = variant.settings
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
