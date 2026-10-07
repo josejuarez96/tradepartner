@@ -263,10 +263,12 @@ MODELS = "tradepartner.research.models"
 #: C13: the one module that may import `research.models`.
 MODELS_IMPORTER = "tradepartner.research.labeling.job"
 #: C13: the review page imports the review modules and nothing else of the boundary
-#: (never `job`, `models` or `datafiles`). If T123b's split trigger fires, the gold
-#: module beside `review` joins this set by the same one-line amendment.
+#: (never `job`, `models` or `datafiles`). T123b's split trigger fired (#1177): the
+#: gold module beside `review` (T131) joins this set.
 REVIEW_PAGE = "tradepartner.research.labeling.review_page"
-REVIEW_MODULES = frozenset({"tradepartner.research.labeling.review"})
+REVIEW_MODULES = frozenset(
+    {"tradepartner.research.labeling.review", "tradepartner.research.labeling.gold"}
+)
 #: (i)'s exceptions, each with the `tradepartner.research` modules it may import
 #: (None: any). `tradepartner.cli` is the spec's. `tradepartner.store.research` is the
 #: registry API, which T81 (#1007) built on `research.RunHandle`, `load_dataset`,
@@ -308,7 +310,11 @@ STORE_WHOLE = frozenset(
 )
 #: (iii): the reader names it may import from any other store module.
 STORE_READERS: Mapping[str, frozenset[str]] = {
-    "tradepartner.store.db": frozenset({"open_read_only", "utc_now", "ensure_tz_aware"}),
+    #: `StoreLockedError` is the exception class only (T131's lock maps it to "store
+    #: busy" on the caller's connection); never `open_for_write`.
+    "tradepartner.store.db": frozenset(
+        {"open_read_only", "utc_now", "ensure_tz_aware", "StoreLockedError"}
+    ),
     "tradepartner.store.delistings": frozenset({"listing_ends_as_of", "delistings_as_of"}),
     "tradepartner.store.master": frozenset({"securities_as_of", "primary_security_id"}),
 }
