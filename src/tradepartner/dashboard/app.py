@@ -22,8 +22,9 @@ This module is deliberately split into two layers:
   connection to the page so a page never has to open its own.
 
 Navigation maps each entry to a page's `render(conn)`: "Data health"
-(`health_page`, T21), "Backtest" (T43), "Trial registry" (T44) and
-"Operations" (`ops_page`, T69) and "Override" (`override_page`, T69b).
+(`health_page`, T21), "Backtest" (T43), "Trial registry" (T44), "Research"
+(`research_page`, T83c), "Operations" (`ops_page`, T69) and "Override"
+(`override_page`, T69b).
 
 **Submit before render (ADR 0011 Decision 2, #273; T69b).** The override page
 is the dashboard's only write, and a DuckDB write connection cannot open
@@ -82,6 +83,7 @@ from tradepartner.dashboard import (
     health_page,
     ops_page,
     override_page,
+    research_page,
     trials_page,
 )
 from tradepartner.store.db import StoreLockedError, open_read_only
@@ -191,6 +193,7 @@ _PAGES: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "Data health": health_page.render,
     "Backtest": backtest_page.render,
     "Trial registry": trials_page.render,
+    "Research": research_page.render,
     "Operations": ops_page.render,
     _OVERRIDE_PAGE: override_page.render,
 }

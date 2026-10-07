@@ -90,9 +90,59 @@ def test_checks_is_a_thin_aggregator_over_fast_and_shards() -> None:
     assert "\n  pytest-shard:\n" in text
     assert "\n  checks:\n" in text
     checks = text[text.index("\n  checks:\n") :].split("\n  claims:\n", 1)[0]
-    needs_line = checks.splitlines()[2].strip()
-    assert needs_line == "needs: [checks-fast, pytest-shard]", needs_line
+    lines = [ln.strip() for ln in checks.splitlines()]
+    assert "needs: [checks-fast, pytest-shard]" in lines, lines
     assert "if: always()" in checks
+
+
+def _job(name: str, nxt: str) -> str:
+    text = CI.read_text()
+    return text[text.index(f"\n  {name}:\n") : text.index(f"\n  {nxt}:\n")]
+
+
+DRAFT = (
+    "github.event.pull_request.draft == true && "
+    "!contains(github.event.pull_request.labels.*.name, 'ci:full')"
+)
+DRAFT_NEEDING_TESTS = DRAFT + " && needs.checks-fast.outputs.tests-needed != 'no'"
+
+
+def test_a_draft_pr_runs_no_shard_and_never_reports_the_required_checks() -> None:
+    """#1192: a draft without `ci:full` runs `checks-fast` only. Its aggregator must then
+    report under a name other than the required `checks`, so such a run can never satisfy
+    it; every other run (non-draft or labelled PR, push) reports `checks` as before."""
+    shard = _job("pytest-shard", "checks")
+    assert f"if: needs.checks-fast.outputs.tests-needed != 'no' && !({DRAFT})" in shard
+    checks = _job("checks", "claims")
+    assert (
+        "name: ${{ (" + DRAFT_NEEDING_TESTS + ") && 'checks (draft, no shards)' || 'checks' }}"
+    ) in checks
+    # the step's draft branch tests the same condition, so the name and the exit agree
+    assert 'if [ "${{ ' + DRAFT_NEEDING_TESTS + ' }}" = "true" ]; then' in checks
+
+
+def test_a_label_starts_the_full_run_and_ready_for_review_starts_none() -> None:
+    """#1192: ready_pr labels a draft `ci:full` to get the full run as a pull_request run
+    (a dispatched run never shows on the PR); marking ready must not start a second full
+    run of the same head."""
+    text = CI.read_text()
+    on = text[text.index("\non:\n") : text.index("\nconcurrency:\n")]
+    assert "    types: [opened, synchronize, reopened, labeled]\n" in on
+    assert "ready_for_review]" not in on and "workflow_dispatch:" not in on
+
+
+def test_only_a_push_to_main_may_skip_the_shards_on_a_tested_tree() -> None:
+    """#1192: main skips the shards only on the exact word `skip`; a failed lookup reads as
+    `run`. The lookup sits in the push-to-main branch alone, not on PRs or `train/**`."""
+    fast = _job("checks-fast", "pytest-shard")
+    assert (
+        'elif [ "${{ github.event_name }}" = "push" ] && '
+        '[ "${{ github.ref }}" = "refs/heads/main" ]; then\n'
+        '            decision=$(python3 scripts/ci_tested_tree.py "$GITHUB_SHA") '
+        "|| decision=run\n"
+        '            if [ "$decision" = "skip" ]; then\n'
+    ) in fast
+    assert fast.count('ci_tested_tree.py "') == 1
 
 
 def test_pytest_shard_matrix_sets_the_index_and_count_env() -> None:
