@@ -35,6 +35,7 @@ computes no annual V.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
@@ -48,7 +49,7 @@ import duckdb
 from tradepartner.backtest.frozen import frozen_values, is_default
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.metrics import expected_max_sharpe
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
@@ -548,11 +549,14 @@ def family_sr_star_high_water_mark(
     the parent's mark seeded into the rules (`sr_star_seed_annual`), and today's
     value, `expected_max_sharpe(n_trials_today, V)` with V floored at the rules'
     `min_sharpe_variance_annual` (a None V, fewer than two pairs, is the floor).
-    Today's value is 0 with no counted trial. Refuses a family with no rules."""
+    Today's value is 0 with no counted trial. Refuses a family with no rules
+    and a non-finite V."""
     require_lab(conn)
     rules = family_rules(conn, family)
     if rules is None:
         raise LabRegistryError(f"family {family!r} has no family rules")
+    if sharpe_variance_annual_today is not None and not math.isfinite(sharpe_variance_annual_today):
+        raise LabRegistryError(f"today's annual V is not finite: {sharpe_variance_annual_today}")
     variance = max(sharpe_variance_annual_today or 0.0, rules.min_sharpe_variance_annual)
     marks = [expected_max_sharpe(n_trials_today, variance) if n_trials_today >= 1 else 0.0]
     if rules.sr_star_seed_annual is not None:
@@ -591,13 +595,15 @@ def family_declared_count(conn: duckdb.DuckDBPyConnection, family: str) -> int:
 
 def family_ready_for_sweep(conn: duckdb.DuckDBPyConnection, family: str) -> bool:
     """Req 1(c): false while any standalone hypothesis of `family` (one that is
-    no sweep's variant: H1, a promoted file) has no `ok`, non-synthetic
-    `in_sample` trial over its default window (`holdout.default_in_sample_window`
-    at its frozen cadence). True for a family with no standalone hypothesis."""
+    no sweep's variant: H1, a promoted file), read as the latest registration
+    of each slug (the one `backtest <slug>` runs; an older row of a re-registered
+    slug never gets a trial), has no `ok`, non-synthetic `in_sample` trial over
+    its default window (`holdout.default_in_sample_window` at its frozen
+    cadence). True for a family with no standalone hypothesis."""
     require_lab(conn)
     standalone = conn.execute(
-        "SELECT hypothesis_id FROM hypotheses WHERE family = ? AND hypothesis_id NOT IN "
-        "(SELECT hypothesis_id FROM sweep_variants) ORDER BY hypothesis_id",
+        "SELECT MAX(hypothesis_id) FROM hypotheses WHERE family = ? AND hypothesis_id NOT IN "
+        "(SELECT hypothesis_id FROM sweep_variants) GROUP BY slug ORDER BY 1",
         [family],
     ).fetchall()
     for (hypothesis_id,) in standalone:
@@ -663,13 +669,19 @@ def _rule_differences(record: HypothesisRecord, rules: FamilyRules) -> tuple[str
             continue
         if key not in values or not is_default(value, rule):
             differences.append(key)
+    differences += sorted(
+        key
+        for key in values
+        if key not in rules.fixed_params and key.startswith(FORBIDDEN_AXIS_PREFIXES)
+    )
     return tuple(differences)
 
 
 def grandfathered_members(conn: duckdb.DuckDBPyConnection) -> list[GrandfatheredMember]:
     """Pre-lab registrations whose window or frozen values differ from their
-    family's rules (spec req 13; `costs.per_side_bps` higher is no difference),
-    in id order. A family without rules lists nothing."""
+    family's rules (spec req 13; `costs.per_side_bps` higher is no difference;
+    a `FORBIDDEN_AXIS_PREFIXES` key the rules lack is one), in id order. A
+    family without rules lists nothing."""
     require_lab(conn)
     rows = conn.execute(
         "SELECT p.hypothesis_id FROM pre_lab_hypotheses p "

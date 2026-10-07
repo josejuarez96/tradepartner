@@ -36,7 +36,12 @@ HOLDOUT_END = date(2026, 9, 30)
 #: strictly before `HOLDOUT_START`.
 DEFAULT_END = date(2023, 12, 29)
 _CUTOFF = datetime(2023, 12, 29, 21, 0, tzinfo=UTC)
-_FIXED = {"costs.per_side_bps": 15.0, "execution.fill_price": "close", "universe.top_n_by_cap": 500}
+_FIXED = {
+    "costs.per_side_bps": 15.0,
+    "execution.fill_price": "close",
+    "gap.count_share_threshold": 0.02,
+    "universe.top_n_by_cap": 500,
+}
 
 
 def _params(**extra: Any) -> dict[str, Any]:
@@ -486,6 +491,9 @@ def test_high_water_mark_is_the_maximum_of_runs_parent_and_today_with_the_v_floo
     other_sweep = _sweep(lab_store, settings, "c", family="profitability")
     _run(lab_store, other_sweep.sweep_id, tmp_path, 5.0)
     assert mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=None) == 1.7
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(lab_registry.LabRegistryError, match="not finite"):
+            mark(lab_store, "momentum", n_trials_today=2, sharpe_variance_annual_today=bad)
     with pytest.raises(lab_registry.LabRegistryError, match="no family rules"):
         mark(lab_store, "oracle", n_trials_today=2, sharpe_variance_annual_today=None)
 
@@ -545,6 +553,12 @@ def test_family_ready_for_sweep_false_before_and_true_after_the_twins_first_ok_t
         _trial(lab_store, settings, tmp_path, twin.hypothesis_id, window=window)
     assert not lab_registry.family_ready_for_sweep(lab_store, "momentum")
     _trial(lab_store, settings, tmp_path, twin.hypothesis_id)
+    assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
+    # An older registration of a re-registered slug is not read: only the latest row
+    # (the one `backtest h1` runs) needs its first ok trial.
+    newer = _register(lab_store, settings, "h1", doc_sha256="e" * 64)
+    assert not lab_registry.family_ready_for_sweep(lab_store, "momentum")
+    _trial(lab_store, settings, tmp_path, newer.hypothesis_id)
     assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
     # A second standalone (a promoted file) blocks again until its own first ok trial.
     promoted = _register(lab_store, settings, "promoted")
@@ -618,13 +632,16 @@ def test_grandfathered_members_lists_pre_lab_members_off_the_rules(
     wider = _register(lab_store, settings, "wider", params=_params(**{top_n: 1000}))
     moved = _register(lab_store, settings, "moved", holdout_start=date(2024, 2, 1))
     after_lab = _register(lab_store, settings, "after", params=_params(**{top_n: 9}))
-    for record in (h1, dearer, cheaper, wider, moved):
+    capital = "backtest.initial_capital"
+    extra = _register(lab_store, settings, "extra", params=_params(**{capital: 1.0}))
+    for record in (h1, dearer, cheaper, wider, moved, extra):
         mark_pre_lab(lab_store, record.hypothesis_id)
     members = lab_registry.grandfathered_members(lab_store)
     assert [(m.slug, m.differences) for m in members] == [
         ("cheaper", ("costs.per_side_bps",)),
         ("wider", ("universe.top_n_by_cap",)),
         ("moved", ("holdout_start",)),
+        ("extra", ("backtest.initial_capital",)),
     ]
     assert after_lab.hypothesis_id not in {m.hypothesis_id for m in members}
 
