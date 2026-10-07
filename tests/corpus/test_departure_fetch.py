@@ -180,7 +180,9 @@ def test_one_listing_end_from_the_five_rows_with_the_counts_identity(tmp_path: P
     assert klx["form25_filed_on"] == "2026-09-24"
     assert klx["signature_date"] == "2026-09-24"
     assert klx["effective_on"] == "2026-10-04"
-    assert klx["amendments"] == [KLX_AMENDMENT]
+    assert klx["amendments"] == [
+        {"accession": KLX_AMENDMENT, "accepted_at": "2026-09-25T13:00:00+00:00"}
+    ]
     assert klx["orphan_amendment"] is False
     assert klx["missing"] == []
 
@@ -216,6 +218,30 @@ def test_an_amendment_with_no_original_is_its_own_listing_end(tmp_path: Path) ->
     assert result.counts.orphan_amendment == 1
     assert result.counts.amendment_attached == 0
     assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen == 3
+
+
+def test_a_blank_acceptance_in_submissions_is_counted_unstamped_not_raised(
+    tmp_path: Path,
+) -> None:
+    """A row with an empty `acceptanceDateTime` anywhere in an issuer's
+    submissions used to make `edgar.acceptance_times` raise and abort the
+    whole fetch (#1055 item 3); it should instead leave that one accession
+    unstamped, same as a row the submissions carry no acceptance for."""
+    submissions = json.loads(_fixture("submissions_klx_CIK0001738827.json"))
+    recent = submissions["filings"]["recent"]
+    index = recent["accessionNumber"].index(KLX)
+    recent["acceptanceDateTime"][index] = ""
+    routes = _routes()
+    routes[KLX_SUBMISSIONS_URL] = (200, json.dumps(submissions).encode())
+
+    result = _run(_settings(tmp_path), Router(routes))
+
+    records = _records(result)
+    assert [r["listing_end_id"] for r in records] == [KLX_AMENDMENT]
+    assert records[0]["orphan_amendment"] is True
+    # Plus the fixture's existing unstamped row (Stubco), unrelated to KLX.
+    assert result.counts.unstamped == 2
+    assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen == 5
 
 
 # --- the notice exhibit -----------------------------------------------------
@@ -422,7 +448,9 @@ def test_a_rerun_refetches_submissions_whose_windows_were_open(tmp_path: Path) -
     second = _run(settings, rerun)
 
     assert (second.counts.unstamped, second.counts.amendment_attached) == (1, 1)
-    assert _records(second)[0]["amendments"] == [KLX_AMENDMENT]
+    assert _records(second)[0]["amendments"] == [
+        {"accession": KLX_AMENDMENT, "accepted_at": "2026-09-25T13:00:00+00:00"}
+    ]
     assert KLX_SUBMISSIONS_URL in rerun.urls()
     assert EIGHTK_URL not in rerun.urls()
 

@@ -208,13 +208,18 @@ def _filing_columns(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 @_fail_closed
 def acceptance_times(*payloads: Mapping[str, Any]) -> dict[str, datetime]:
     """Accession -> acceptance instant (UTC) from submissions payloads and
-    their older pages (`submissions_page`), in any mix."""
+    their older pages (`submissions_page`), in any mix. A row with a blank
+    `acceptanceDateTime` is skipped rather than stamped, so one malformed row
+    does not abort the whole payload; its accession simply stays unstamped
+    for the caller, as a row with no entry at all already does."""
     times: dict[str, datetime] = {}
     for payload in payloads:
         columns = _filing_columns(payload)
         for accession, stamp in zip(
             columns["accessionNumber"], columns["acceptanceDateTime"], strict=True
         ):
+            if not stamp:
+                continue
             times[accession] = _parse_utc(stamp)
     return times
 

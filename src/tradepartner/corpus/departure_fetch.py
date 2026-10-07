@@ -461,7 +461,7 @@ class _Filing:
     notification: Notification | None
     missing: list[dict[str, Any]]
     accepted_at: datetime | None = None
-    amendments: list[str] = field(default_factory=list)
+    amendments: list[dict[str, str]] = field(default_factory=list)
     orphan_amendment: bool = False
 
     @property
@@ -700,7 +700,9 @@ def _attach_amendments(stamped: Sequence[_Filing]) -> tuple[list[_Filing], int]:
             and _stamp(original) < _stamp(amendment)
         ]
         if earlier:
-            earlier[-1].amendments.append(amendment.accession)
+            earlier[-1].amendments.append(
+                {"accession": amendment.accession, "accepted_at": _stamp(amendment).isoformat()}
+            )
             attached += 1
         else:
             amendment.orphan_amendment = True

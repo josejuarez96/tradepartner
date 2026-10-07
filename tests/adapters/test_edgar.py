@@ -113,6 +113,27 @@ class TestAcceptance:
         page = _json("submissions_dual_class_001.json")
         assert acceptance[page["accessionNumber"][0]] == _utc(page["acceptanceDateTime"][0])
 
+    def test_a_blank_acceptance_is_skipped_not_raised(self) -> None:
+        # One row with an empty acceptanceDateTime anywhere in a payload used
+        # to raise ValueError from datetime.fromisoformat and abort the whole
+        # fetch (#1055 item 3); it should be skipped like a row with no entry
+        # for that accession at all, leaving the other rows stamped.
+        payload = _json("submissions_plain_issuer.json")
+        columns = payload["filings"]["recent"]
+        blanked = dict(columns)
+        blanked["acceptanceDateTime"] = [
+            "" if i == 0 else t for i, t in enumerate(blanked["acceptanceDateTime"])
+        ]
+        blank_payload = {
+            **payload,
+            "filings": {"recent": blanked, "files": payload["filings"]["files"]},
+        }
+
+        times = acceptance_times(blank_payload)
+
+        assert columns["accessionNumber"][0] not in times
+        assert columns["accessionNumber"][1] in times
+
     def test_submissions_entries(self) -> None:
         payload = _json("submissions_delisted_25nse.json")
         entries = parse_submissions(payload)
