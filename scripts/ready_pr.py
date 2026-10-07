@@ -32,7 +32,11 @@ Steps, in order (each one stops the run with a reason on failure):
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
    the template's own wording), and the latest one is ``quant-auditor: PASS``. A
    ``PASS WITH FIXES`` needs a re-review after the fixes that posts ``PASS``.
-6. Push, wait for CI on **that exact commit**, then ``gh pr ready``.
+6. Push, wait for CI on **that exact commit**, then ``gh pr ready``. A draft PR's own CI
+   runs ``checks-fast`` only (#1192) and never reports the required ``checks``, so for a
+   draft this step also dispatches the CI workflow on the branch (``gh workflow run``):
+   that run scopes and shards the suite like a ready PR's, and the PR is marked ready only
+   once a ``checks`` on this commit is green. Marking ready does not start another run.
 
 Usage::
 
@@ -131,6 +135,8 @@ SAFETY_PREFIXES = (
     "scripts/no_push_to_main.sh",
     "scripts/merge_train.py",
     "tests/test_merge_train.py",
+    "scripts/ci_tested_tree.py",
+    "tests/test_ci_tested_tree.py",
     ".github/workflows/",
     ".github/rulesets/",
     ".claude/agents/",
@@ -174,6 +180,7 @@ TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
+CI_WORKFLOW = "ci.yml"
 CI_POLL_S = 20
 
 
@@ -215,6 +222,7 @@ class Runner(Protocol):
     def pr(self, number: int) -> Pr: ...
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
+    def dispatch_ci(self, branch: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
 
 
@@ -318,7 +326,9 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     matters since #1112: ``checks`` now ``needs:`` other jobs, so GitHub does not create
     its check run until those finish, and a rollup can otherwise show every run so far
     (e.g. ``checks-fast``, ``claims``) green while the run that actually gates pytest
-    hasn't started.
+    hasn't started. Since #1192 a draft PR's run never reports ``checks`` at all (its
+    aggregator is named ``checks (draft, no shards)``), so a draft's head stays pending
+    here until the dispatched full run reports it.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
@@ -610,6 +620,11 @@ def ready(
     sha = r.git("rev-parse", "HEAD")
     r.git("push", "origin", f"HEAD:{pr.branch}")
     say(f"pushed {sha[:7]}")
+    if pr.draft:
+        # A draft's own run skips the shards and never reports `checks` (#1192); this run
+        # is the full one, on the branch head just pushed.
+        r.dispatch_ci(pr.branch)
+        say(f"draft PR: dispatched the full CI run ({CI_WORKFLOW}) on {pr.branch}")
     if not wait:
         say("not waiting for CI (--no-wait); PR left as is")
         return 0
@@ -757,6 +772,9 @@ class ShellRunner:
 
     def mark_ready(self, number: int) -> None:
         self._gh("pr", "ready", str(number))
+
+    def dispatch_ci(self, branch: str) -> None:
+        self._gh("workflow", "run", CI_WORKFLOW, "--ref", branch)
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)

@@ -1,16 +1,27 @@
 name: CI
 
+# A draft PR runs `checks-fast` only (#1192): the pytest shards run on a non-draft PR, on
+# every push to main or `train/**`, and on a `workflow_dispatch`, which is how
+# `scripts/ready_pr.py` gets the full suite run on a draft's head before it marks the PR
+# ready. `ready_for_review` is deliberately not a trigger: ready_pr marks a PR ready only
+# after that dispatched run is green, and another full run then would only repeat it. A PR
+# marked ready by hand has no `checks` on its head until its next push or dispatch, so the
+# required check blocks its merge (fail closed).
 on:
   pull_request:
   push:
     branches: [main, 'train/**']
+  workflow_dispatch:
 
 # PR branches cancel superseded runs. Main and merge-train branches (`train/**`) never do,
 # so every merge and every train batch gets a completed run (#198; merge-train spec req 4):
-# one group per commit, since a shared group would still drop a pending run.
+# one group per commit, since a shared group would still drop a pending run. A dispatched
+# run gets a group of its own commit too (prefixed, so it never shares main's group) and is
+# never cancelled: a second ready_pr on the same head waits on both runs, it does not turn
+# the first one's `checks` red by cancelling it.
 concurrency:
-  group: ci-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/train/')) && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/train/') }}
+  group: ci-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.sha) || ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/train/')) && github.sha || github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/train/') && github.event_name != 'workflow_dispatch' }}
 
 # Pytest shard count (#1112): tests/conftest.py's `pytest_collection_modifyitems` buckets
 # test FILES (not individual tests, so a file's module/session fixtures build once per
@@ -34,8 +45,12 @@ jobs:
     runs-on: ubuntu-latest
     # Read-only: a `train/**` push runs batch code with the repository's token, and this job
     # only reads (merge-train spec, CI amendment; req 1 (0) is the first line of defence).
+    # `pull-requests` and `checks` (read) let main's tested-tree lookup find the merged PR
+    # and its head's check runs (#1192); both are public on this repository anyway.
     permissions:
       contents: read
+      pull-requests: read
+      checks: read
     outputs:
       tests-needed: ${{ steps.scope.outputs.needed }}
     steps:
@@ -63,26 +78,47 @@ jobs:
         run: uv run mypy
       # A PR that touches no code, tests, scripts, deps or CI skips pytest (same rule as
       # ready_pr.py), which skips every shard below too (their `if:` reads this output).
-      # Fails closed: a failed diff fails the step, an empty diff or anything but "no" runs
-      # tests.
+      # A push to main skips the shards only when scripts/ci_tested_tree.py prints exactly
+      # `skip`: the commit's tree is a PR head's tree that already passed every shard (#1192).
+      # A dispatch (ready_pr on a draft) scopes its diff against main like a PR does;
+      # `train/**` pushes always need tests. Fails closed: a failed diff fails
+      # the step, an empty diff or anything but "no" runs tests, and the tree lookup prints
+      # `run` (or fails, read as `run`) on any doubt.
       - name: Test scope
         id: scope
         env:
           BASE_REF: ${{ github.base_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           needed=yes
+          base=
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            files=$(git -c core.quotePath=false diff --no-renames --name-only "origin/$BASE_REF...HEAD")
+            base="origin/$BASE_REF"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            base=origin/main
+          fi
+          if [ -n "$base" ]; then
+            files=$(git -c core.quotePath=false diff --no-renames --name-only "$base...HEAD")
             if [ -n "$files" ]; then
               needed=$(printf '%s\n' "$files" | python3 scripts/ready_pr.py --tests-needed)
+            fi
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            decision=$(python3 scripts/ci_tested_tree.py "$GITHUB_SHA") || decision=run
+            if [ "$decision" = "skip" ]; then
+              echo "Main: this tree already passed the full suite on its PR head; skipping the pytest shards (#1192)."
+              needed=no
+            else
+              echo "Main: running the full suite."
             fi
           fi
           echo "Tests needed: $needed"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
 
+  # Skipped when no tests are needed, and on a draft PR (#1192): `checks` below then takes
+  # a name the ruleset does not require, so a draft's run can never satisfy `checks`.
   pytest-shard:
     needs: checks-fast
-    if: needs.checks-fast.outputs.tests-needed != 'no'
+    if: needs.checks-fast.outputs.tests-needed != 'no' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -105,15 +141,20 @@ jobs:
       # `pytest --collect-only -q` count (verified by hand on this issue's PR).
       - name: Collected count (this shard)
         run: uv run pytest --collect-only -q | tail -1
-      # xdist: one worker per core; each test already gets its own tmp_path (#581)
+      # xdist: one worker per core; each test already gets its own tmp_path (#581). The
+      # durations table is what tests/conftest.py's shard weights are re-measured from.
       - name: Tests (this shard)
-        run: uv run pytest -n auto
+        run: uv run pytest -n auto --durations=0 --durations-min=1.0
 
   # Required check name every piece of merge tooling reads literally: the `protect-main`
   # ruleset, scripts/ready_pr.py's `checks_state`, and scripts/merge_train.py's
   # `_REQUIRED_CHECKS`. It must stay named exactly `checks` and must succeed if and only if
-  # checks-fast and (when tests ran) every pytest shard succeeded.
+  # checks-fast and (when tests ran) every pytest shard succeeded. On a draft PR that needs
+  # tests no shard runs (#1192), so the job takes another name there: the required `checks`
+  # is never reported for that run, and it stays missing (merge blocked, ready_pr waiting)
+  # until a full run reports it.
   checks:
+    name: ${{ (github.event.pull_request.draft == true && needs.checks-fast.outputs.tests-needed != 'no') && 'checks (draft, no shards)' || 'checks' }}
     needs: [checks-fast, pytest-shard]
     if: always()
     runs-on: ubuntu-latest
@@ -123,14 +164,20 @@ jobs:
       - name: Verify checks-fast and every pytest shard passed
         run: |
           echo "checks-fast: ${{ needs.checks-fast.result }}"
-          echo "pytest-shard: ${{ needs.pytest-shard.result }} (tests-needed: ${{ needs.checks-fast.outputs.tests-needed }})"
+          echo "pytest-shard: ${{ needs.pytest-shard.result }} (tests-needed: ${{ needs.checks-fast.outputs.tests-needed }}, draft: ${{ github.event.pull_request.draft == true }})"
           if [ "${{ needs.checks-fast.result }}" != "success" ]; then
             echo "checks-fast did not succeed" >&2
             exit 1
           fi
+          if [ "${{ github.event.pull_request.draft == true && needs.checks-fast.outputs.tests-needed != 'no' }}" = "true" ]; then
+            # Draft: reported as `checks (draft, no shards)`, never as the required `checks`.
+            echo "Draft PR: no pytest shard ran. ready_pr dispatches the full run before it marks the PR ready."
+            exit 0
+          fi
           if [ "${{ needs.checks-fast.outputs.tests-needed }}" = "no" ]; then
             # No shard ran (job-level `if:` skipped the whole matrix): that is the
-            # expected, successful outcome for a docs-only PR, not a failure.
+            # expected, successful outcome for a docs-only PR, or for a push to main
+            # whose tree already passed every shard on its PR head (#1192).
             if [ "${{ needs.pytest-shard.result }}" != "skipped" ]; then
               echo "tests-needed was 'no' but pytest-shard did not report skipped" >&2
               exit 1

@@ -22,8 +22,13 @@ def _concurrency_block() -> dict[str, str]:
 
 
 TRAIN = "startsWith(github.ref, 'refs/heads/train/')"
+DISPATCH = "github.event_name == 'workflow_dispatch'"
 MAIN_PER_COMMIT = (
-    "ci-${{ (github.ref == 'refs/heads/main' || " + TRAIN + ") && github.sha || github.ref }}"
+    "ci-${{ "
+    + DISPATCH
+    + " && format('dispatch-{0}', github.sha) || ((github.ref == 'refs/heads/main' || "
+    + TRAIN
+    + ") && github.sha || github.ref) }}"
 )
 
 
@@ -31,18 +36,21 @@ def test_main_runs_are_never_cancelled() -> None:
     """On 2026-09-25 each push to main cancelled the run before it, so two broken merges
     went unseen (#189, #193). `cancel-in-progress: false` is not enough: a group keeps one
     running and one pending run, and a third push cancels the pending one. So main gets
-    one group per commit, and no main run shares a group with another."""
+    one group per commit, and no main run shares a group with another. #1192: a dispatched
+    run (ready_pr's full run on a draft) also gets a per-commit group, prefixed so it can
+    never share (and so drop) a main run's, and is never cancelled either."""
     block = _concurrency_block()
     assert block["group"] == MAIN_PER_COMMIT, block
     assert block["cancel-in-progress"] == (
-        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " }}"
+        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " && github.event_name != "
+        "'workflow_dispatch' }}"
     ), block
 
 
 def test_pr_branches_still_cancel_superseded_runs() -> None:
     """Off main the group falls back to the ref, and a new push cancels the old run."""
     block = _concurrency_block()
-    assert "|| github.ref }}" in block["group"], block
+    assert "|| github.ref) }}" in block["group"], block
     assert "github.ref != 'refs/heads/main'" in block["cancel-in-progress"], block
 
 
@@ -90,9 +98,60 @@ def test_checks_is_a_thin_aggregator_over_fast_and_shards() -> None:
     assert "\n  pytest-shard:\n" in text
     assert "\n  checks:\n" in text
     checks = text[text.index("\n  checks:\n") :].split("\n  claims:\n", 1)[0]
-    needs_line = checks.splitlines()[2].strip()
-    assert needs_line == "needs: [checks-fast, pytest-shard]", needs_line
+    lines = [ln.strip() for ln in checks.splitlines()]
+    assert "needs: [checks-fast, pytest-shard]" in lines, lines
     assert "if: always()" in checks
+
+
+def _job(name: str, nxt: str) -> str:
+    text = CI.read_text()
+    return text[text.index(f"\n  {name}:\n") : text.index(f"\n  {nxt}:\n")]
+
+
+DRAFT_NEEDING_TESTS = (
+    "github.event.pull_request.draft == true && needs.checks-fast.outputs.tests-needed != 'no'"
+)
+
+
+def test_a_draft_pr_runs_no_shard_and_never_reports_the_required_checks() -> None:
+    """#1192: a draft runs `checks-fast` only. Its aggregator must then report under a
+    name other than the required `checks`, so a draft's run can never satisfy it; every
+    other run (non-draft PR, push, dispatch) reports `checks` as before."""
+    shard = _job("pytest-shard", "checks")
+    assert (
+        "if: needs.checks-fast.outputs.tests-needed != 'no' && "
+        "github.event.pull_request.draft != true" in shard
+    )
+    checks = _job("checks", "claims")
+    assert (
+        "name: ${{ (" + DRAFT_NEEDING_TESTS + ") && 'checks (draft, no shards)' || 'checks' }}"
+    ) in checks
+    # the step's draft branch tests the same condition, so the name and the exit agree
+    assert 'if [ "${{ ' + DRAFT_NEEDING_TESTS + ' }}" = "true" ]; then' in checks
+
+
+def test_ready_pr_can_dispatch_the_full_run_and_ready_for_review_starts_none() -> None:
+    """#1192: ready_pr dispatches the full run on a draft's head before marking it ready;
+    marking ready must not start a second full run of the same head."""
+    text = CI.read_text()
+    on = text[text.index("\non:\n") : text.index("\nconcurrency:\n")]
+    assert "\n  workflow_dispatch:\n" in on
+    assert "\n  pull_request:\n" in on
+    assert "types:" not in on and "ready_for_review" not in on
+
+
+def test_only_a_push_to_main_may_skip_the_shards_on_a_tested_tree() -> None:
+    """#1192: main skips the shards only on the exact word `skip`; a failed lookup reads as
+    `run`. The lookup sits in the push-to-main branch alone, not on PRs or `train/**`."""
+    fast = _job("checks-fast", "pytest-shard")
+    assert (
+        'elif [ "${{ github.event_name }}" = "push" ] && '
+        '[ "${{ github.ref }}" = "refs/heads/main" ]; then\n'
+        '            decision=$(python3 scripts/ci_tested_tree.py "$GITHUB_SHA") '
+        "|| decision=run\n"
+        '            if [ "$decision" = "skip" ]; then\n'
+    ) in fast
+    assert fast.count('ci_tested_tree.py "') == 1
 
 
 def test_pytest_shard_matrix_sets_the_index_and_count_env() -> None:

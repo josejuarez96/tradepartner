@@ -276,6 +276,17 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
         cr("claims", "COMPLETED", "SUCCESS"),
     )
     assert ready_pr.checks_state(hc("abc", not_yet_queued), "abc") == "pending"
+    # #1192: a draft's run reports its aggregator under another name and runs no shard;
+    # green as it is, it is not the required `checks`, so the head is still pending.
+    draft_run = (
+        cr("checks-fast", "COMPLETED", "SUCCESS"),
+        cr("pytest-shard", "COMPLETED", "SKIPPED"),
+        cr("checks (draft, no shards)", "COMPLETED", "SUCCESS"),
+        cr("claims", "COMPLETED", "SUCCESS"),
+    )
+    assert ready_pr.checks_state(hc("abc", draft_run), "abc") == "pending"
+    full = (*draft_run, cr("checks", "COMPLETED", "SUCCESS"))
+    assert ready_pr.checks_state(hc("abc", full), "abc") == "success"
 
 
 # ── the flow, on a fake runner ──────────────────────────────────────────────────
@@ -318,6 +329,8 @@ class FakeRunner:
         self.checks_run: list[tuple[str, ...]] = []
         self.readied: list[int] = []
         self.pushed: list[str] = []
+        self.events: list[str] = []
+        self.dispatched: list[str] = []
 
     def git(self, *args: str) -> str:
         self.calls.append(("git", *args))
@@ -346,6 +359,7 @@ class FakeRunner:
                 return "\n".join([*self.test_sources, "tests/fixtures/a.json"])
             case ("push", *_):
                 self.pushed.append(args[-1])
+                self.events.append("push")
         return ""
 
     def git_ok(self, *args: str) -> bool:
@@ -376,6 +390,7 @@ class FakeRunner:
         return self._pr
 
     def head_checks(self, number: int) -> ready_pr.HeadChecks:
+        self.events.append("wait")
         state = self.checks_after.pop(0) if self.checks_after else "success"
         run = ready_pr.CheckRun(
             "checks", "COMPLETED", "SUCCESS" if state == "success" else "FAILURE"
@@ -386,6 +401,11 @@ class FakeRunner:
 
     def mark_ready(self, number: int) -> None:
         self.readied.append(number)
+        self.events.append("ready")
+
+    def dispatch_ci(self, branch: str) -> None:
+        self.dispatched.append(branch)
+        self.events.append("dispatch")
 
     def sleep(self, seconds: float) -> None:
         pass
@@ -397,6 +417,36 @@ def test_happy_path_pushes_waits_and_marks_ready() -> None:
     assert r.pushed == ["HEAD:feat/69-x"]
     assert r.readied == [69]
     assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", BUDGET]
+
+
+def test_a_draft_gets_a_dispatched_full_run_before_it_is_marked_ready() -> None:
+    # #1192: a draft's own CI skips the shards and never reports `checks`, so ready_pr
+    # dispatches the full run on the pushed head, waits for it, and only then marks ready.
+    r = FakeRunner(checks_after=["pending", "success"])
+    assert ready_pr.ready(r, 69, poll_s=0) == 0
+    assert r.dispatched == ["feat/69-x"]
+    assert r.events == ["push", "dispatch", "wait", "wait", "ready"]
+
+
+def test_a_failed_full_run_leaves_the_draft_a_draft() -> None:
+    r = FakeRunner(checks_after=["failure"])
+    with pytest.raises(ready_pr.ReadyError, match="CI failure"):
+        ready_pr.ready(r, 69, poll_s=0)
+    assert r.dispatched == ["feat/69-x"]
+    assert r.readied == []
+
+
+def test_a_ready_pr_runs_the_full_suite_on_its_own_push_and_is_not_dispatched() -> None:
+    r = FakeRunner(draft=False)
+    assert ready_pr.ready(r, 69, poll_s=0) == 0
+    assert r.dispatched == []
+    assert r.readied == []
+
+
+def test_dry_run_dispatches_nothing() -> None:
+    r = FakeRunner()
+    assert ready_pr.ready(r, 69, dry_run=True) == 0
+    assert r.dispatched == [] and r.pushed == []
 
 
 def test_wrong_branch_main_branch_and_dirty_tree_stop_early() -> None:
