@@ -18,11 +18,15 @@ amendment is a new row pointing at the old one plus a `budget_amend` decision.
 
 **Datasets** (req 11). `register_dataset` records what the caller computed (T83's
 CLI hashes the export and reads the event column with T82's helpers) and applies
-the store rules: sealing never shrinks under a name, the same export, split file
-and sealed set (and the same path, `locked` and seed) return the existing row, a
-split file needs an event column and labels no row `full` or `none`, and a sealed
-split needs an event column and sealed periods holding its event span
-(the row-level check is T82's `check_sealed_split_has_period`, run by the CLI).
+the store rules itself, so every caller is protected, not only the CLI: sealing
+never shrinks under a name, the same export, split file and sealed set (and the
+same path, `locked` and seed) return the existing row, a split file needs an
+event column and labels no row `full` or `none`, a sealed split name must be one
+of `RESEARCH_SPLITS`, and a sealed split needs an event column and sealed
+periods holding its event span (`full` and `none` against the whole declared
+`[event_start, event_end]`, since a split file never labels a row `full` or
+`none`; #1149). The row-level check for a labelled split's actual rows is T82's
+`check_sealed_split_has_period`, run by the CLI, which has the rows to check.
 
 **Runs** (reqs 3 to 7). `open_run` and `attach_run` are the only constructors of
 `RunHandle`. `open_run` reads the rows the gates need, asks `research.gates` in
@@ -522,6 +526,9 @@ def register_dataset(
         raise ResearchError(
             "a split file cannot label rows `full` or `none`: those splits bind every row"
         )
+    unknown = sorted(set(sealed_splits) - set(RESEARCH_SPLITS))
+    if unknown:
+        raise ResearchError(f"--sealed {unknown}: not among the splits {RESEARCH_SPLITS}")
     spans = dict(split_spans) if split_spans is not None else {"full": (event_start, event_end)}
     sealed = set(sealed_splits) | ({"test"} if "test" in spans else set())
     periods = sorted(set(sealed_periods))
@@ -531,7 +538,12 @@ def register_dataset(
                 f"sealed split without period: {split!r} is sealed, which needs an event "
                 "column and a sealed period holding its rows"
             )
-        span = spans.get(split)
+        # `full` and `none` bind every row whatever the split file labels them
+        # (req 3): a split file never labels a row `full`/`none`, so sealing
+        # `full` with one has no entry in `spans`, and `none` never has one
+        # (with or without a split file). Check the dataset's whole declared
+        # event span instead (#1149).
+        span = (event_start, event_end) if split in EVERY_ROW_SPLITS else spans.get(split)
         if span is not None and not all(
             any(start <= day <= end for start, end in periods) for day in span
         ):
