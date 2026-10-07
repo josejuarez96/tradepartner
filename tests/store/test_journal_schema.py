@@ -201,9 +201,10 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
     assert after == before
     assert versions[:1] == applied_before
     assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
         schema.MASTER_CHECK_TABLE_NAMES
-    ) | set(schema.RESEARCH_TABLE_NAMES) | {schema.REBALANCE_COUNTS_TABLE_NAME}
+    ) | set(schema.RESEARCH_TABLE_NAMES) | {schema.REBALANCE_COUNTS_TABLE_NAME, "store_markers"}
 
 
 def test_migrated_journal_matches_a_fresh_store(
