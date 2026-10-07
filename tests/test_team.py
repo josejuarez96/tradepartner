@@ -525,6 +525,33 @@ def test_load_tasks_reads_the_git_ref_not_the_working_tree(root: Path) -> None:
         team.load_tasks(root, "no-such-ref")
 
 
+def test_merged_task_ids_reads_squash_merged_code_subjects() -> None:
+    subjects = [
+        "feat(data): statement facts health metrics and page block (T77c) (#1067)",
+        "test(lookahead): look-ahead suites at every cadence (T98b) (#1100)",
+        "docs(plans): amend the T85e line (T85e) (#1074)",  # a plan edit is not the task
+        "feat(backtest): sweep parser (#1097)",  # no task id
+        "fix(config): something (T12)",  # not a squash merge (no PR number)
+    ]
+    assert team.merged_task_ids(subjects) == frozenset({"T77c", "T98b"})
+
+
+def test_a_task_merged_on_the_ref_counts_as_done_before_its_box_is_ticked(root: Path) -> None:
+    """#1130: a merged PR waiting for a fold no longer blocks its dependants."""
+    git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
+    subprocess.run([*git, "add", "docs"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "plan"], check=True)
+    subprocess.run(
+        [*git, "commit", "-q", "--allow-empty", "-m", "feat(data): fixture universe (T5) (#22)"],
+        check=True,
+    )
+    tasks = team.load_tasks(root, "HEAD")
+    assert {t.id: t.done for t in tasks}["T5"] is True
+    assert "T8b" in [t.id for t in team.ready_tasks(tasks)]
+    assert {t.id: t.done for t in team.load_tasks(root, None)}["T5"] is False  # working tree
+
+
 # ── start and register ──────────────────────────────────────────────────────────
 
 

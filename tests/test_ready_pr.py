@@ -396,7 +396,7 @@ def test_happy_path_pushes_waits_and_marks_ready() -> None:
     assert ready_pr.ready(r, 69, poll_s=0) == 0
     assert r.pushed == ["HEAD:feat/69-x"]
     assert r.readied == [69]
-    assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", BUDGET, "-q"]
+    assert [c[-1] for c in r.checks_run] == [".", ".", "mypy", "check", BUDGET]
 
 
 def test_wrong_branch_main_branch_and_dirty_tree_stop_early() -> None:
@@ -556,8 +556,12 @@ def test_pytest_runs_locally_only_when_needed_unless_forced_or_skipped() -> None
     docs_only = ["docs/plans/p.md", "docs/status.d/69-x.md", "changelog.d/69-x.md"]
     code = FakeRunner()
     assert ready_pr.ready(code, 69, dry_run=True) == 0
-    assert _ran_pytest(code)
-    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", BUDGET, "-q"]
+    assert not _ran_suite(code)  # CI runs the full suite on a code diff (#1130)
+    assert [c[-1] for c in code.checks_run] == [".", ".", "mypy", "check", BUDGET]
+
+    code_forced = FakeRunner()
+    assert ready_pr.ready(code_forced, 69, dry_run=True, run_tests=True) == 0
+    assert [c[-1] for c in code_forced.checks_run] == [".", ".", "mypy", "check", BUDGET, "-q"]
 
     docs = FakeRunner(touched=docs_only, comments=())
     assert ready_pr.ready(docs, 69, dry_run=True) == 0
@@ -580,6 +584,8 @@ def test_pytest_decision_is_printed(capsys: pytest.CaptureFixture[str]) -> None:
         dry_run=True,
     )
     assert "skipping local pytest" in capsys.readouterr().out
+    ready_pr.ready(FakeRunner(), 69, dry_run=True)
+    assert "CI runs the full suite" in capsys.readouterr().out
     ready_pr.ready(FakeRunner(), 69, dry_run=True, run_tests=False)
     assert "--no-tests" in capsys.readouterr().out
 
@@ -743,11 +749,11 @@ def test_a_deleted_module_falls_back_to_the_full_suite() -> None:
     assert ready_pr.targeted_tests([gone], SOURCES, deleted=[gone]) is None
 
 
-def test_the_flow_runs_only_the_mapped_tests_unless_full_tests(
+def test_tests_runs_only_the_mapped_tests_unless_full_tests(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     targeted = FakeRunner(test_sources=SOURCES)
-    assert ready_pr.ready(targeted, 69, dry_run=True) == 0
+    assert ready_pr.ready(targeted, 69, dry_run=True, run_tests=True) == 0
     assert targeted.checks_run[-1] == (
         *ready_pr.PYTEST_CHECK,
         *sorted({"tests/store/test_asof.py", "tests/lookahead/test_la.py", *SRC_WIDE}),
@@ -761,14 +767,14 @@ def test_the_flow_runs_only_the_mapped_tests_unless_full_tests(
 
     unclear = FakeRunner(test_sources=SOURCES, touched=["uv.lock", "changelog.d/69-x.md"])
     unclear._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
-    assert ready_pr.ready(unclear, 69, dry_run=True) == 0
+    assert ready_pr.ready(unclear, 69, dry_run=True, run_tests=True) == 0
     assert unclear.checks_run[-1] == ready_pr.PYTEST_CHECK
 
     ci_only = FakeRunner(touched=[".github/ISSUE_TEMPLATE/bug.yml", "changelog.d/69-x.md"])
     ci_only._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, ("safety-reviewer: PASS",))
     assert ready_pr.ready(ci_only, 69, dry_run=True) == 0
     assert not _ran_suite(ci_only)
-    assert "no test maps" in capsys.readouterr().out
+    assert "CI runs the full suite" in capsys.readouterr().out
 
 
 def test_a_moved_module_counts_as_deleted_at_its_old_path() -> None:
@@ -781,7 +787,7 @@ def test_a_moved_module_counts_as_deleted_at_its_old_path() -> None:
         ],
         deleted=["src/tradepartner/store/asof.py"],
     )
-    assert ready_pr.ready(moved, 69, dry_run=True) == 0
+    assert ready_pr.ready(moved, 69, dry_run=True, run_tests=True) == 0
     assert moved.checks_run[-1] == ready_pr.PYTEST_CHECK
     assert (
         "git",
