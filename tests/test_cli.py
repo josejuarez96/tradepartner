@@ -178,6 +178,65 @@ def test_ingest_passes_source_and_dry_run(
     assert session.calls[0]["dry_run"] is True
 
 
+class _SourceRecorder:
+    """Stands in for `EdgarFilingSource`, recording its keyword arguments."""
+
+    def __init__(self) -> None:
+        self.kwargs: list[dict[str, Any]] = []
+
+    def __call__(self, settings: Settings, **kwargs: Any) -> object:
+        self.kwargs.append(kwargs)
+        return object()
+
+
+def _statements_on(settings: Settings) -> Settings:
+    edgar = settings.edgar.model_copy(update={"statement_facts_enabled": True})
+    return settings.model_copy(update={"edgar": edgar})
+
+
+def test_ingest_statement_flags_reach_the_adapter_and_are_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """#660: `--bulk-from-cache` builds the EDGAR source with `reuse_cached`
+    and `--rebuild-statement-facts` reaches `ingest_session`; T78 runs
+    `ingest --source edgar --bulk-from-cache` with the switch on."""
+    built = _SourceRecorder()
+    monkeypatch.setattr(cli, "EdgarFilingSource", built)
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    assert _invoke(secrets_set, ["ingest", "--source", "edgar"]).exit_code == 0
+    assert built.kwargs[0]["reuse_cached"] is False
+    assert session.calls[0]["rebuild_statement_facts"] is False
+
+    on = _statements_on(secrets_set)
+    args = ["ingest", "--source", "edgar", "--bulk-from-cache", "--rebuild-statement-facts"]
+    result = _invoke(on, args)
+    assert result.exit_code == 0, result.output
+    assert built.kwargs[1]["reuse_cached"] is True
+    assert session.calls[1]["rebuild_statement_facts"] is True
+    assert session.calls[1]["filings"] is not None
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--rebuild-statement-facts"],  # the switch is off
+        ["--source", "alpaca", "--bulk-from-cache"],
+        ["--source", "alpaca", "--rebuild-statement-facts"],
+        ["--backfill", "--since", "2016-01-04", "--bulk-from-cache"],
+        ["--backfill", "--since", "2016-01-04", "--rebuild-statement-facts"],
+    ],
+)
+def test_ingest_refuses_statement_flags_where_they_cannot_apply(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, args: list[str]
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    filled = _patched(monkeypatch, "backfill", _ok("edgar"))
+    settings = secrets_set if args == ["--rebuild-statement-facts"] else _statements_on(secrets_set)
+    result = _invoke(settings, ["ingest", *args])
+    assert result.exit_code == 2, result.output
+    assert session.calls == [] and filled.calls == []
+
+
 def test_ingest_refuses_an_unknown_source(secrets_set: Settings) -> None:
     result = _invoke(secrets_set, ["ingest", "--source", "yahoo"])
     assert result.exit_code == 2
