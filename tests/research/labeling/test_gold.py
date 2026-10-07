@@ -109,7 +109,7 @@ def _write_frame(
     data = buffer.getvalue()
     path = tmp_path / f"{name}.parquet"
     path.write_bytes(data)
-    return gold.FrameExport(dataset_id=1, path=path, sha256=hashlib.sha256(data).hexdigest())
+    return gold.FrameExport(dataset_id=1, file=path, sha256=hashlib.sha256(data).hexdigest())
 
 
 def _exclusion(tmp_path: Path, rows: list[tuple[str, str]], name: str = "exclude.csv") -> Path:
@@ -241,7 +241,7 @@ def test_exclusion_by_accession_amendment_and_cik(gsettings: Settings, tmp_path:
     ex = built.result.exclusion
     assert (ex.accessions_matched, ex.ciks, ex.rows_removed) == (2, 3, 4)
     assert ex.unmatched == ("NO-SUCH-ACC",)
-    doc = json.loads(built.session.path.read_text(encoding="utf-8"))
+    doc = json.loads(built.session.session_file.read_text(encoding="utf-8"))
     assert doc["exclusion"]["sha256"] == hashlib.sha256(built.exclude.read_bytes()).hexdigest()
 
 
@@ -297,12 +297,12 @@ def test_resume_refuses_a_file_planted_after_the_build(gsettings: Settings, tmp_
     built = _build(gsettings, tmp_path)
     _plant(gsettings, "stray/x.bin")
     with pytest.raises(gold.InferenceFilesPresent):
-        gold.open_gold_session(built.session.path, gold.GoldFlags(), settings=gsettings)
+        gold.open_gold_session(built.session.session_file, gold.GoldFlags(), settings=gsettings)
 
 
 def test_frame_hash_mismatch_is_refused(gsettings: Settings, tmp_path: Path) -> None:
     frame = _write_frame(tmp_path, _frame_rows())
-    wrong = gold.FrameExport(frame.dataset_id, frame.path, "0" * 64)
+    wrong = gold.FrameExport(frame.dataset_id, frame.file, "0" * 64)
     with pytest.raises(gold.FrameChanged):
         gold.build_gold_session(
             wrong,
@@ -319,7 +319,7 @@ def test_resume_with_no_flags_and_refusing_different_flags(
     gsettings: Settings, tmp_path: Path
 ) -> None:
     built = _build(gsettings, tmp_path)
-    path = built.session.path
+    path = built.session.session_file
     same = gold.GoldFlags(frame_dataset_id=1, seed=SEED, n=N, exclude=built.exclude)
     assert (
         gold.open_gold_session(path, gold.GoldFlags(), settings=gsettings).cases
@@ -450,7 +450,7 @@ def test_skip_restart_skip_ends_unlabelled(gsettings: Settings, tmp_path: Path) 
         gold.record_label(
             session, case.listing_end_id, label="bankruptcy", relied_on="notice", seconds_spent=1
         )
-    resumed = gold.open_gold_session(session.path, gold.GoldFlags(), settings=gsettings)
+    resumed = gold.open_gold_session(session.session_file, gold.GoldFlags(), settings=gsettings)
     assert gold.next_case(resumed) == 0
     gold.record_skip(resumed, first)
     assert _working(resumed)[-1]["unlabelled"] is True
@@ -472,7 +472,7 @@ def test_next_case_resumes_with_the_skipped_case_last(gsettings: Settings, tmp_p
         relied_on="notice",
         seconds_spent=1,
     )
-    resumed = gold.open_gold_session(session.path, gold.GoldFlags(), settings=gsettings)
+    resumed = gold.open_gold_session(session.session_file, gold.GoldFlags(), settings=gsettings)
     assert gold.next_case(resumed) == 2
     for case in resumed.cases[2:]:
         gold.record_label(
@@ -642,7 +642,7 @@ def test_no_runtime_store_connection_outside_the_lock(
 
     monkeypatch.setattr(duckdb, "connect", recording)
     session = _build(gsettings, tmp_path).session
-    resumed = gold.open_gold_session(session.path, gold.GoldFlags(), settings=gsettings)
+    resumed = gold.open_gold_session(session.session_file, gold.GoldFlags(), settings=gsettings)
     gold.case_view(resumed, 0)
     _label_all(resumed)
     assert calls == []
@@ -689,5 +689,5 @@ def test_lock_a_session_over_a_hundred_cases(gsettings: Settings, tmp_path: Path
     assert export.schema["labeled_at"] == pl.Datetime("us", "UTC")
     assert (
         export.schema["form25_accepted_at"]
-        == pl.read_parquet(frame.path).schema["form25_accepted_at"]
+        == pl.read_parquet(frame.file).schema["form25_accepted_at"]
     )

@@ -150,7 +150,7 @@ class FrameExport:
     given on the command line, and the row's SHA-256."""
 
     dataset_id: int
-    path: Path
+    file: Path
     sha256: str
 
 
@@ -191,7 +191,7 @@ class GoldFlags:
 class GoldSession:
     """An open gold session: `session.json`'s content plus the sampled frame rows."""
 
-    path: Path
+    session_file: Path
     settings: Settings
     frame: FrameExport
     seed: int
@@ -211,7 +211,7 @@ class GoldSession:
     @property
     def lock_path(self) -> Path:
         """Written once the lock's registration has committed."""
-        return self.path.with_name("lock.json")
+        return self.session_file.with_name("lock.json")
 
 
 @dataclass(frozen=True)
@@ -290,11 +290,11 @@ def refuse_if_inference_files(settings: Settings) -> None:
 
 
 def _read_frame(frame: FrameExport) -> pl.DataFrame:
-    data = frame.path.read_bytes()
+    data = frame.file.read_bytes()
     actual = hashlib.sha256(data).hexdigest()
     if actual != frame.sha256:
         raise FrameChanged(
-            f"frame {frame.path} has SHA-256 {actual}, dataset {frame.dataset_id}'s row "
+            f"frame {frame.file} has SHA-256 {actual}, dataset {frame.dataset_id}'s row "
             f"has {frame.sha256}"
         )
     return pl.read_parquet(io.BytesIO(data))
@@ -457,7 +457,7 @@ def build_gold_session(
     doc = {
         "frame": {
             "dataset_id": frame.dataset_id,
-            "path": str(frame.path),
+            "path": str(frame.file),
             "sha256": frame.sha256,
         },
         "seed": seed,
@@ -509,7 +509,7 @@ def _session_from(
     )
     start, end = (date.fromisoformat(d) for d in doc["pilot_period"])
     return GoldSession(
-        path=path,
+        session_file=path,
         settings=settings,
         frame=frame,
         seed=doc["seed"],
@@ -625,7 +625,7 @@ def _states(session: GoldSession) -> tuple[dict[str, Status], dict[str, int], di
 
 def _writable(session: GoldSession, listing_end_id: str) -> dict[str, Status]:
     if session.lock_path.exists():
-        raise SessionLocked(f"the gold session {session.path} is locked")
+        raise SessionLocked(f"the gold session {session.session_file} is locked")
     status, _, _ = _states(session)
     if listing_end_id not in status:
         raise GoldRefused(f"{listing_end_id!r} is not a case of this session")
