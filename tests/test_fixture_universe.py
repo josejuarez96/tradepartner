@@ -706,14 +706,17 @@ def test_five_acceptance_stamps() -> None:
     ordinary, half_day = date(2019, 1, 31), date(2019, 11, 29)
     assert not is_half_day(ordinary) and session_close(ordinary) == _new_york(ordinary, 16)
     assert is_half_day(half_day) and session_close(half_day) == _new_york(half_day, 13)
+    both = {"gross_profit", "total_assets"}
     stamps = {
-        _new_york(ordinary, 15): "CIK0001000002",
-        _new_york(ordinary, 16): "CIK0001000013",
-        _new_york(ordinary, 17, 30): "CIK0001000006",
-        _new_york(half_day, 12, 30): "CIK0001000012",
-        _new_york(half_day, 14): "CIK0001000020",
+        _new_york(ordinary, 15): ("CIK0001000002", both),
+        _new_york(ordinary, 16): ("CIK0001000013", both),
+        _new_york(ordinary, 17, 30): ("CIK0001000006", both),
+        # On the half day, one issuer (that session's only universe member):
+        # its 10-K before the close, its 10-K/A with the assets after it.
+        _new_york(half_day, 12, 30): ("CIK0001000012", {"gross_profit"}),
+        _new_york(half_day, 14): ("CIK0001000012", {"total_assets"}),
     }
-    for known_at, cik in stamps.items():
+    for known_at, (cik, fact_names) in stamps.items():
         filed = [r for r in _statement_rows() if _known(r) == known_at]
         assert {r["cik"] for r in filed} == {cik}, known_at
-        assert {r["fact_name"] for r in filed} == {"gross_profit", "total_assets"}
+        assert {r["fact_name"] for r in filed} == fact_names, known_at

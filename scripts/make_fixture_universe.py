@@ -1866,7 +1866,7 @@ _ASSETS_TAG = "us-gaap:Assets"
 #: year ends (12 unless a case needs a filing in another month). The index
 #: in this tuple sets the issuer's baseline values.
 _PROFITABILITY_ISSUERS: tuple[tuple[str, int], ...] = tuple(
-    (f"CIK{1000000 + n:010d}", {12: 8, 16: 9, 20: 8}.get(n, 12)) for n in range(1, 23)
+    (f"CIK{1000000 + n:010d}", {12: 8, 16: 9}.get(n, 12)) for n in range(1, 23)
 )
 #: The baseline's fiscal years: FY2015's filings make every fixture
 #: rebalance from 2017-01-31 on see a fresh annual pair.
@@ -1883,6 +1883,7 @@ _CROSSING_CIK = "CIK0001000007"  # SEC_TRANSFER, a universe member 2018-04 to 20
 _RESTATED_CIK = "CIK0001000005"  # the T76 restated-FY issuer
 _ASSETS_LATER_CIK = "CIK0001000016"  # SEC_FACTS_RESTATED, a member 2019-12 and 2020-01
 _DUAL_CIK = "CIK0001000006"
+_HALF_DAY_CIK = "CIK0001000012"  # SEC_SPLIT_BETWEEN, 2019-11-29's only universe member
 _LOW_BP, _HIGH_BP = 500, 9500  # the crossing issuer's GP/A before and after, basis points
 
 
@@ -1968,14 +1969,11 @@ def _statement_facts_profitability(rows: Rows) -> None:
             _new_york(_STAMP_MONTH_END, 17, 30),
             _statement_accession(_DUAL_CIK, 2019, 101),
         ),
-        # Half-day month-end stamps: 12:30 and 14:00 New York (close 13:00).
-        ("CIK0001000012", 2019): (
+        # Half-day month-end stamp: the 10-K at 12:30 New York (close 13:00); its
+        # total_assets comes in a 10-K/A at 14:00 (below).
+        (_HALF_DAY_CIK, 2019): (
             _new_york(_STAMP_HALF_DAY, 12, 30),
-            _statement_accession("CIK0001000012", 2019, 101),
-        ),
-        ("CIK0001000020", 2019): (
-            _new_york(_STAMP_HALF_DAY, 14),
-            _statement_accession("CIK0001000020", 2019, 101),
+            _statement_accession(_HALF_DAY_CIK, 2019, 101),
         ),
         # Filings an earlier case already owns.
         ("CIK0001000001", 2016): (
@@ -2004,6 +2002,7 @@ def _statement_facts_profitability(rows: Rows) -> None:
         ("CIK0001000003", 2019, "gross_profit"),  # the derived row
         (_RESTATED_CIK, 2019, "total_assets"),  # first carried by the 10-K/A
         (_ASSETS_LATER_CIK, 2019, "total_assets"),  # carried by the later 10-K/A below
+        (_HALF_DAY_CIK, 2019, "total_assets"),  # carried by the 14:00 10-K/A below
     }
     stamps: dict[str, datetime] = {}
     for index, (cik, end_month) in enumerate(_PROFITABILITY_ISSUERS):
@@ -2030,30 +2029,36 @@ def _statement_facts_profitability(rows: Rows) -> None:
                     _profitability_row(rows, cik, fact_name, period, value, known_at, accession)
             stamps[f"{cik} FY{fiscal_year}"] = known_at
 
-    # total_assets accepted after its gross-profit filing: the FY2019 10-K
-    # carries gross_profit only; a 10-K/A in the next month carries the assets.
-    later_period = _fiscal_period(2019, 9)
-    later_index = [c for c, _ in _PROFITABILITY_ISSUERS].index(_ASSETS_LATER_CIK)
+    # total_assets accepted after its gross-profit filing, twice: the FY2019
+    # 10-K carries gross_profit only and a 10-K/A carries the assets, in the
+    # next month (the case) and an hour and a half later, after the half-day
+    # close (the 14:00 stamp).
+    ciks = [c for c, _ in _PROFITABILITY_ISSUERS]
     later_known = _filing_acceptance(_session_on_or_after(date(2020, 1, 15)))
     later_accession = _statement_accession(_ASSETS_LATER_CIK, 2020, 102)
-    _profitability_row(
-        rows,
-        _ASSETS_LATER_CIK,
-        "total_assets",
-        later_period,
-        float(1_000_000 + 50_000 * later_index + 10_000 * (2019 - 2015)),
-        later_known,
-        later_accession,
-        form="10-K/A",
-    )
+    half_day_known = _new_york(_STAMP_HALF_DAY, 14)
+    for cik, end_month, known_at, accession in (
+        (_ASSETS_LATER_CIK, 9, later_known, later_accession),
+        (_HALF_DAY_CIK, 8, half_day_known, _statement_accession(_HALF_DAY_CIK, 2019, 102)),
+    ):
+        _profitability_row(
+            rows,
+            cik,
+            "total_assets",
+            _fiscal_period(2019, end_month),
+            float(1_000_000 + 50_000 * ciks.index(cik) + 10_000 * (2019 - 2015)),
+            known_at,
+            accession,
+            form="10-K/A",
+        )
 
     rows.statement_case(
         "Profitability baseline: an annual gross_profit (duration) and total_assets "
         "(instant, same period_end) pair per fiscal year for every non-benchmark issuer",
         "CIK0001000001 to CIK0001000022 (22 issuers)",
         "gross_profit, total_assets: FY2015-FY2019 (CIK0001000006: FY2018 only); fiscal "
-        "years end in December except CIK0001000012 and CIK0001000020 (August) and "
-        "CIK0001000016 (September)",
+        "years end in December except CIK0001000012 (August) and CIK0001000016 "
+        "(September)",
         "each 10-K about six weeks after its fiscal year end, on one of four sessions, "
         "unless a case below sets it",
         "at least 15 issuers have a fresh pair (annual_period_days, max_fact_age_days "
@@ -2108,14 +2113,14 @@ def _statement_facts_profitability(rows: Rows) -> None:
     rows.statement_case(
         f"Acceptance stamps on the half-day month-end ({_STAMP_HALF_DAY.isoformat()}, "
         "close 13:00 New York): 12:30 and 14:00",
-        "CIK0001000012, CIK0001000020",
-        "gross_profit, total_assets FY2019 (fiscal years end 2019-08-31)",
-        f"12:30 {stamps['CIK0001000012 FY2019'].isoformat()} (CIK0001000012); 14:00 "
-        f"{stamps['CIK0001000020 FY2019'].isoformat()} (CIK0001000020); session_close "
+        _HALF_DAY_CIK,
+        "gross_profit FY2019 (10-K), total_assets FY2019 (10-K/A); fiscal year ends 2019-08-31",
+        f"12:30 10-K {stamps[f'{_HALF_DAY_CIK} FY2019'].isoformat()}; 14:00 10-K/A "
+        f"{half_day_known.isoformat()}; session_close "
         f"{session_close(_STAMP_HALF_DAY).isoformat()}",
-        "the 12:30 filing is visible at that close and the 14:00 one is not; "
-        "SEC_SPLIT_BETWEEN (CIK0001000012) is that month-end's only universe member, "
-        "so the 14:00 issuer (SEC_SPLIT_REDATED) shows the cut at the provider read only",
+        "SEC_SPLIT_BETWEEN is that month-end's only universe member: at the close its "
+        "FY2019 gross_profit is visible and its total_assets is not (no_facts); a cut "
+        "after 14:00 would score it, one before 12:30 would score FY2018",
     )
 
 

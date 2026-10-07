@@ -722,16 +722,17 @@ def test_ordinary_month_end_stamps(store: Store) -> None:
 
 
 def test_half_day_month_end_stamps(store: Store) -> None:
-    # 2019-11-29 closes at 13:00 New York: accepted 12:30 (SEC_SPLIT_BETWEEN's
-    # issuer) is visible at that close, 14:00 (SEC_SPLIT_REDATED's) is not.
+    # 2019-11-29 closes at 13:00 New York: SEC_SPLIT_BETWEEN's FY2019 10-K,
+    # accepted 12:30, is visible at that close; its 10-K/A with the FY2019
+    # total_assets, accepted 14:00, is not.
     close = session_close(date(2019, 11, 29))
-    ids = ["SEC_SPLIT_BETWEEN", "SEC_SPLIT_REDATED"]
+    sid = "SEC_SPLIT_BETWEEN"
     with store.provider() as provider:
-        at_close = provider.statement_facts(close, ids)
-        next_close = provider.statement_facts(session_close(date(2019, 12, 31)), ids)
-    assert 2019 in _fiscal_years(at_close, "SEC_SPLIT_BETWEEN", "gross_profit")
-    assert 2019 not in _fiscal_years(at_close, "SEC_SPLIT_REDATED", "gross_profit")
-    assert 2019 in _fiscal_years(next_close, "SEC_SPLIT_REDATED", "gross_profit")
+        at_close = provider.statement_facts(close, [sid])
+        next_close = provider.statement_facts(session_close(date(2019, 12, 31)), [sid])
+    assert 2019 in _fiscal_years(at_close, sid, "gross_profit")
+    assert 2019 not in _fiscal_years(at_close, sid, "total_assets")
+    assert 2019 in _fiscal_years(next_close, sid, "total_assets")
 
 
 def test_ten_k_accepted_after_the_close_is_read_at_the_next_rebalance(store: Store) -> None:
