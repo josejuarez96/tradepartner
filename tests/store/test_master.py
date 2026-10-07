@@ -38,6 +38,7 @@ from tradepartner.store.delistings import DELISTED, LISTED, build_delistings, de
 from tradepartner.store.master import (
     ClassTitle,
     MasterBuild,
+    ShownSpan,
     Succession,
     build_master,
     primary_security_id,
@@ -545,6 +546,61 @@ class TestClassTitles:
         for t in sorted(k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)):
             partial = build_master(source.known_by(t), _settings(), ingested_at=INGESTED_AT)
             assert partial.class_titles == tuple(c for c in full if c.known_at <= t), f"T={t!r}"
+
+
+class TestShownSpans:
+    """#1165: each run of consecutive cover pages showing a class, so a
+    reader can tell whether a class was shown after another first appeared."""
+
+    CIK = "0000000078"
+    NEW = f"{CIK}:common-stock"
+
+    def _source(self) -> FixtureFilingSource:
+        spac = ("Class A ordinary shares", "SPAC", "NYSE")
+        new = ("Common Stock", "NEWC", "NYSE")
+        return FixtureFilingSource(
+            index=[_filing(self.CIK, "Spac Co", "10-K", _at(2019, 2, 1))],
+            cover_pages=[
+                _cover(self.CIK, _at(2019, 3, 1), spac),
+                _cover(self.CIK, _at(2019, 5, 1), spac),
+                _cover(self.CIK, _at(2019, 8, 1)),  # lists nothing: no break
+                _cover(self.CIK, _at(2019, 11, 1), spac),
+                _cover(self.CIK, _at(2020, 5, 1), new),  # the de-SPAC
+                _cover(self.CIK, _at(2020, 8, 1), new),
+                _cover(self.CIK, _at(2020, 11, 1), spac, new),  # shown again
+            ],
+        )
+
+    def test_spans_run_over_consecutive_pages_showing_the_class(self) -> None:
+        build = build_master(self._source(), _settings(), ingested_at=INGESTED_AT)
+        assert sorted(build.shown, key=lambda s: (s.security_id, s.first_at)) == [
+            ShownSpan(self.CIK, _at(2019, 3, 1), _at(2019, 11, 1)),
+            ShownSpan(self.CIK, _at(2020, 11, 1), _at(2020, 11, 1)),
+            ShownSpan(self.NEW, _at(2020, 5, 1), _at(2020, 11, 1)),
+        ]
+
+    def test_spans_built_from_pages_known_at_t_agree(self) -> None:
+        # No look-ahead: the spans known at t are the full build's spans
+        # cut at t (a span ending later ends at the last page known at t).
+        source = self._source()
+        full = build_master(source, _settings(), ingested_at=INGESTED_AT).shown
+        ticker = {self.CIK: "SPAC", self.NEW: "NEWC"}
+        pages = {
+            sid: [p.accepted_at for p in source.cover_pages(self.CIK) if tk in str(p.listings)]
+            for sid, tk in ticker.items()
+        }
+        for t in sorted(k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)):
+            partial = build_master(source.known_by(t), _settings(), ingested_at=INGESTED_AT)
+            cut = {
+                ShownSpan(
+                    s.security_id,
+                    s.first_at,
+                    max(p for p in pages[s.security_id] if p <= min(s.last_at, t)),
+                )
+                for s in full
+                if s.first_at <= t
+            }
+            assert set(partial.shown) == cut, f"T={t!r}"
 
 
 class TestDuplicatePairPerPage:
