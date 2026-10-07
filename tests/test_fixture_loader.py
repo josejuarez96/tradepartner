@@ -12,7 +12,7 @@ import duckdb
 import pytest
 from conftest import load_universe_fixtures
 
-from tradepartner.store import schema
+from tradepartner.store import lab_schema, schema
 from tradepartner.store.db import configure_connection
 
 
@@ -30,6 +30,7 @@ def test_missing_fixtures_dir_is_a_no_op(
     load_universe_fixtures(store_conn, tmp_path / "does-not-exist")
     (count,) = store_conn.execute("SELECT COUNT(*) FROM prices_daily").fetchone()  # type: ignore[misc]
     assert count == 0
+    assert not lab_schema.has_fixture_marker(store_conn)
 
 
 def test_columns_bind_by_header_name_not_order(
@@ -168,3 +169,30 @@ def test_empty_not_null_varchar_cell_loads_as_empty_string_not_null(
     ).fetchone()  # type: ignore[misc]
     assert class_member == ""
     assert is_null is False
+
+
+def _table_names(conn: duckdb.DuckDBPyConnection) -> set[str]:
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = current_database()"
+        ).fetchall()
+    }
+
+
+def test_loader_creates_store_markers_and_writes_the_fixture_marker(
+    tmp_path: Path, store_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Strategy-lab plan T101: the fixture loader is the writer of the `fixture`
+    marker (spec, Definitions, Fixture marker); `init_schema` alone never
+    creates `store_markers`, so the real store has neither table nor row."""
+    assert "store_markers" not in _table_names(store_conn)
+    fixtures_dir = tmp_path / "universe"
+    fixtures_dir.mkdir()
+
+    load_universe_fixtures(store_conn, fixtures_dir)
+    load_universe_fixtures(store_conn, fixtures_dir)
+
+    assert "store_markers" in _table_names(store_conn)
+    rows = store_conn.execute("SELECT kind, written_by FROM store_markers").fetchall()
+    assert rows == [("fixture", "tests/conftest.py:load_universe_fixtures")]
