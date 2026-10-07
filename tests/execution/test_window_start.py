@@ -285,6 +285,47 @@ def test_refuses_a_family_paper_cannot_run(
         assert latest_window(conn) is None
 
 
+@pytest.mark.parametrize("cadence", ["week_end", "daily"])
+def test_refuses_a_non_monthly_cadence_before_any_broker_call(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, cadence: str
+) -> None:
+    """Strategy-lab spec req 11 (T100): a hypothesis whose `frozen_values` cadence
+    is not `month_end` is refused `refused_cadence`, before any broker call or write."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "h1",
+            HOLDOUT_END_PAST,
+            params=_params(**{"schedule.rebalance_cadence": cadence}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    broker = _fake(fixed_clock)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "refused_cadence"
+    assert cadence in str(exc.value)
+    assert broker.calls == ()
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+@pytest.mark.parametrize("stored", [{"schedule.rebalance_cadence": "month_end"}, {}])
+def test_accepts_a_month_end_and_a_pre_lab_registration(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, stored: dict[str, Any]
+) -> None:
+    """A `month_end` registration and one without `schedule.*` keys (a pre-lab
+    registration, read as `month_end` through `frozen_values`) both start."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST, params=_params(**stored))
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    assert ("schedule.rebalance_cadence" in hyp.params) == bool(stored)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+
+
 def test_refuses_on_synthetic_signoff_trial(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:

@@ -67,6 +67,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import polars as pl
 
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
@@ -800,7 +801,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
         raise ValueError(f"no trial {trial_id}")
     hypothesis_id, start_session, end_session = found
     hypothesis = registry.get_hypothesis_by_id(conn, hypothesis_id)
-    base_level = float(hypothesis.params[registry.BASE_COST_KEY])
+    base_level = float(frozen_values(hypothesis)[registry.BASE_COST_KEY])
     sessions = tuple(rebalance_sessions(start_session, end_session))
     equity_rows = conn.execute(
         "SELECT session, equity FROM trial_equity "
