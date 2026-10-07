@@ -1,4 +1,4 @@
-"""CI workflow guards (#198): every merge to main gets a completed CI run."""
+"""CI workflow guards (#198, #1222): a main run in progress always completes."""
 
 from __future__ import annotations
 
@@ -22,18 +22,21 @@ def _concurrency_block() -> dict[str, str]:
 
 
 TRAIN = "startsWith(github.ref, 'refs/heads/train/')"
-MAIN_PER_COMMIT = (
-    "ci-${{ (github.ref == 'refs/heads/main' || " + TRAIN + ") && github.sha || github.ref }}"
+MAIN_SHARED = (
+    "ci-${{ github.ref == 'refs/heads/main' && 'main' || ("
+    + TRAIN
+    + " && github.sha || github.ref) }}"
 )
 
 
-def test_main_runs_are_never_cancelled() -> None:
+def test_main_runs_in_progress_are_never_cancelled() -> None:
     """On 2026-09-25 each push to main cancelled the run before it, so two broken merges
-    went unseen (#189, #193). `cancel-in-progress: false` is not enough: a group keeps one
-    running and one pending run, and a third push cancels the pending one. So main gets
-    one group per commit, and no main run shares a group with another."""
+    went unseen (#189, #193). Main never cancels a run in progress, so every main run that
+    starts completes and a red main is always seen. Since #1222 main pushes share one
+    group: a group keeps one running and one pending run, so of the commits that land
+    while a run is in progress only the newest runs next (it tests the cumulative tree)."""
     block = _concurrency_block()
-    assert block["group"] == MAIN_PER_COMMIT, block
+    assert block["group"] == MAIN_SHARED, block
     assert block["cancel-in-progress"] == (
         "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " }}"
     ), block
@@ -42,7 +45,7 @@ def test_main_runs_are_never_cancelled() -> None:
 def test_pr_branches_still_cancel_superseded_runs() -> None:
     """Off main the group falls back to the ref, and a new push cancels the old run."""
     block = _concurrency_block()
-    assert "|| github.ref }}" in block["group"], block
+    assert "|| github.ref) }}" in block["group"], block
     assert "github.ref != 'refs/heads/main'" in block["cancel-in-progress"], block
 
 

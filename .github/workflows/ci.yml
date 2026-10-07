@@ -21,7 +21,8 @@ on:
 # group (#1222): the run in progress completes, and of the commits that land meanwhile
 # GitHub keeps only the newest pending run, which tests the cumulative tree, so a burst of
 # merges costs one full run, not one per commit, and PR runs stop queueing behind them. A
-# red newest run is bisected by re-running CI on the burst's earlier commits. `train/**`
+# red newest run is bisected by re-running CI on the burst's earlier commits (such a re-run
+# joins `ci-main` too, so start it when no merge is landing). `train/**`
 # keeps one group per commit, so every train batch gets a completed run (merge-train spec req 4).
 concurrency:
   group: ci-${{ github.ref == 'refs/heads/main' && 'main' || (startsWith(github.ref, 'refs/heads/train/') && github.sha || github.ref) }}
