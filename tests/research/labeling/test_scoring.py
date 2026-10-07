@@ -597,23 +597,23 @@ def test_ece_and_classwise_reliability_are_permutation_invariant_on_ties() -> No
         )
 
 
-def test_ece_class_tie_breaks_on_class_name_not_dict_order() -> None:
-    """When two classes tie exactly on probability, the predicted class
-    must not depend on the probability mapping's key order (quant-auditor
-    follow-up on PR #1069, pass 2): `insolvency` (`bankruptcy`) and
-    `transfer` (`exchange_transfer`) tie at 0.5 regardless of which key is
-    written first."""
-    gold_insolvency = scoring.CalibrationItem(
-        probabilities={"bankruptcy": 0.5, "exchange_transfer": 0.5}, gold_class="insolvency"
+def test_max_class_probability_tie_breaks_on_class_name_not_dict_order() -> None:
+    """When two classes tie exactly on probability, `_max_class_probability_
+    and_class` must pick the same class regardless of the probability
+    mapping's key order (quant-auditor follow-up on PR #1069, pass 3):
+    `insolvency` (`bankruptcy`) and `transfer` (`exchange_transfer`) tie at
+    0.5, and must both resolve to `insolvency` (alphabetically first),
+    whichever key is written first. An `ece`-level test cannot distinguish
+    this (with one item at a 0.5 tie, `ece` is 0.5 whichever class wins,
+    since `|1 - 0.5| == |0 - 0.5|`), so this tests the helper directly."""
+    p_max_first, class_first = scoring._max_class_probability_and_class(
+        {"bankruptcy": 0.5, "exchange_transfer": 0.5}
     )
-    reordered = scoring.CalibrationItem(
-        probabilities={"exchange_transfer": 0.5, "bankruptcy": 0.5}, gold_class="insolvency"
+    p_max_second, class_second = scoring._max_class_probability_and_class(
+        {"exchange_transfer": 0.5, "bankruptcy": 0.5}
     )
-    assert scoring.ece([gold_insolvency]) == scoring.ece([reordered])
-    # the tie breaks on the alphabetically first class name, "insolvency" < "transfer":
-    # the item's gold class ("insolvency") matches the predicted class, so it's correct at
-    # confidence 0.5, giving ece = |1 - 0.5| = 0.5 regardless of the mapping's key order.
-    assert scoring.ece([gold_insolvency]) == 0.5
+    assert class_first == class_second == "insolvency"
+    assert p_max_first == p_max_second == 0.5
 
 
 # --- multiclass_brier and classwise_reliability: a one-item hand-worked case ----
