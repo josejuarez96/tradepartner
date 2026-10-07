@@ -32,7 +32,12 @@ Steps, in order (each one stops the run with a reason on failure):
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
    the template's own wording), and the latest one is ``quant-auditor: PASS``. A
    ``PASS WITH FIXES`` needs a re-review after the fixes that posts ``PASS``.
-6. Push, wait for CI on **that exact commit**, then ``gh pr ready``.
+6. Push, wait for CI on **that exact commit**, then ``gh pr ready``. A draft PR's own CI
+   runs ``checks-fast`` only (#1192) and never reports the required ``checks``, so for a
+   draft this step, once the PR's head is the pushed commit, adds the ``ci:full`` label:
+   the label's run shards the suite on that head like a ready PR's (superseding the
+   push's draft run), and the PR is marked ready only once a ``checks`` on this commit is
+   green. Marking ready does not start another run.
 
 Usage::
 
@@ -131,6 +136,8 @@ SAFETY_PREFIXES = (
     "scripts/no_push_to_main.sh",
     "scripts/merge_train.py",
     "tests/test_merge_train.py",
+    "scripts/ci_tested_tree.py",
+    "tests/test_ci_tested_tree.py",
     ".github/workflows/",
     ".github/rulesets/",
     ".claude/agents/",
@@ -174,6 +181,8 @@ TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
+FULL_CI_LABEL = "ci:full"
+DRAFT_CHECKS = "checks (draft, no shards)"
 CI_POLL_S = 20
 
 
@@ -189,6 +198,7 @@ class Pr:
     draft: bool
     body: str
     comments: tuple[str, ...]
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -215,6 +225,7 @@ class Runner(Protocol):
     def pr(self, number: int) -> Pr: ...
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
+    def add_label(self, number: int, label: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
 
 
@@ -319,14 +330,30 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     its check run until those finish, and a rollup can otherwise show every run so far
     (e.g. ``checks-fast``, ``claims``) green while the run that actually gates pytest
     hasn't started.
+
+    Since #1192 a draft's run (no ``ci:full`` label) never reports ``checks``: its
+    aggregator is ``checks (draft, no shards)``, which gates nothing and is ignored here,
+    so a draft's head stays pending until a full run reports ``checks``. That full run
+    (``ready_pr`` labels the draft) can cancel a draft run still going on the same head;
+    a ``CANCELLED`` run is ignored when another run of the same name is on the head, so
+    the superseded run does not read as a failure. A lone ``CANCELLED`` still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
-    if not any(r.name == "checks" for r in checks.runs):
+    live = [r for r in checks.runs if r.name != DRAFT_CHECKS]
+    not_cancelled = {
+        r.name
+        for r in live
+        if r.conclusion.upper() != "CANCELLED" or r.status.upper() != "COMPLETED"
+    }
+    runs = [
+        r for r in live if not (r.conclusion.upper() == "CANCELLED" and r.name in not_cancelled)
+    ]
+    if not any(r.name == "checks" for r in runs):
         return "pending"
-    if any(r.status.upper() != "COMPLETED" for r in checks.runs):
+    if any(r.status.upper() != "COMPLETED" for r in runs):
         return "pending"
-    if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in checks.runs):
+    if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in runs):
         return "success"
     return "failure"
 
@@ -610,6 +637,16 @@ def ready(
     sha = r.git("rev-parse", "HEAD")
     r.git("push", "origin", f"HEAD:{pr.branch}")
     say(f"pushed {sha[:7]}")
+    if pr.draft and FULL_CI_LABEL not in pr.labels:
+        # A draft's run skips the shards and never reports `checks` (#1192). Labelled only
+        # once GitHub shows the pushed head on the PR, the label's run is on this head and
+        # comes after the push's draft run (which it cancels; `checks_state` reads that as
+        # superseded). Labelling before the push could let the label's run on the old head
+        # start last and cancel the full run on this one (code review on #1196).
+        if not _wait_for_head(r, number, sha, timeout_s, poll_s):
+            raise ReadyError(f"PR #{number} head is not {sha[:7]} on GitHub yet; run again")
+        r.add_label(number, FULL_CI_LABEL)
+        say(f"draft PR: added {FULL_CI_LABEL} so CI runs every shard on {sha[:7]}")
     if not wait:
         say("not waiting for CI (--no-wait); PR left as is")
         return 0
@@ -659,6 +696,16 @@ def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
         r.git("add", path)
         say(f"resolved append conflict in {path} (kept both sides)")
     r.git("commit", "--no-edit")
+
+
+def _wait_for_head(r: Runner, number: int, sha: str, timeout_s: int, poll_s: int) -> bool:
+    """Wait until GitHub reports ``sha`` as the PR's head; False on timeout."""
+    deadline = time.monotonic() + timeout_s
+    while r.head_checks(number).sha != sha:
+        if time.monotonic() >= deadline:
+            return False
+        r.sleep(poll_s)
+    return True
 
 
 def _wait_for_ci(
@@ -729,7 +776,7 @@ class ShellRunner:
                 "view",
                 str(number),
                 "--json",
-                "number,headRefName,baseRefName,isDraft,body,comments",
+                "number,headRefName,baseRefName,isDraft,body,comments,labels",
             )
         )
         return Pr(
@@ -739,6 +786,7 @@ class ShellRunner:
             bool(raw["isDraft"]),
             str(raw.get("body") or ""),
             tuple(str(c.get("body", "")) for c in raw.get("comments", [])),
+            tuple(str(lb.get("name", "")) for lb in raw.get("labels") or []),
         )
 
     def head_checks(self, number: int) -> HeadChecks:
@@ -757,6 +805,9 @@ class ShellRunner:
 
     def mark_ready(self, number: int) -> None:
         self._gh("pr", "ready", str(number))
+
+    def add_label(self, number: int, label: str) -> None:
+        self._gh("pr", "edit", str(number), "--add-label", label)
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
