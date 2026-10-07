@@ -131,6 +131,7 @@ from typing import Annotated, Any
 
 import duckdb
 import httpx
+import polars as pl
 import typer
 
 from tradepartner.adapters import alpaca_raw
@@ -147,7 +148,9 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
+from tradepartner.research import EVERY_ROW_SPLITS
 from tradepartner.research.experiment import (
+    SPLITS,
     ExperimentFileError,
     _read_tabular,
     check_declared_event_span,
@@ -530,6 +533,8 @@ def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings:
 _TABULAR_SUFFIXES = frozenset({".csv", ".tsv", ".parquet"})
 #: Errors a research command reports as a refusal (exit 2): nothing was written.
 _RESEARCH_REFUSALS = (ExperimentFileError, registry.RegistryError, ValueError)
+#: `dataset register` also refuses an export or split file it cannot read or parse.
+_DATASET_REFUSALS = (*_RESEARCH_REFUSALS, OSError, pl.exceptions.PolarsError)
 
 
 def _experiments_dir(settings: Settings) -> Path:
@@ -542,12 +547,13 @@ def _refusal(exc: BaseException, settings: Settings) -> typer.Exit:
     return _fail(_scrubbed(f"refused: {exc}", settings), USAGE_ERROR)
 
 
-def _read_config(path: Path) -> dict[str, Any]:
+def _read_config(path: Path, settings: Settings) -> dict[str, Any]:
     """`--config`'s JSON object, refused (exit 2) before anything is written."""
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise _fail(f"--config {path}: not a readable JSON file ({exc})", USAGE_ERROR) from None
+        message = f"--config {path}: not a readable JSON file ({exc})"
+        raise _fail(_scrubbed(message, settings), USAGE_ERROR) from None
     if not isinstance(config, dict):
         raise _fail(f"--config {path}: must be a JSON object", USAGE_ERROR)
     return config
@@ -1158,8 +1164,8 @@ def make_app(
             raise _fail("--holdout-repeat goes with --spend-holdout", USAGE_ERROR)
         if configurations < 1:
             raise _fail("--configurations must be at least 1", USAGE_ERROR)
-        run_config = _read_config(config)
         s = settings()
+        run_config = _read_config(config, s)
         try:
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
@@ -1234,7 +1240,7 @@ def make_app(
                 listed = research.list_runs(conn, registration, family, kind, include_synthetic)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
-        except schema.ResearchNotInitialised:
+        except (schema.ResearchNotInitialised, schema.RegistryNotInitialised):
             raise _fail("research registry not initialised", 1) from None
         except schema.SchemaVersionError as exc:
             raise _fail(str(exc), 1) from None
@@ -1291,10 +1297,17 @@ def make_app(
                 raise ExperimentFileError(
                     "split without event column: --split-json needs --event-column"
                 )
-            if path.is_dir() and (event_column is not None or explicit_sealed):
+            unknown = sorted(set(explicit_sealed) - set(SPLITS))
+            if unknown:
+                raise ExperimentFileError(f"--sealed {unknown}: not among the splits {SPLITS}")
+            if path.is_dir() and explicit_sealed:
                 raise ExperimentFileError(
                     "sealed split without period: a directory export has no event column, "
-                    "so it cannot carry an event column or a sealed split"
+                    "so it cannot seal a split"
+                )
+            if path.is_dir() and event_column is not None:
+                raise ExperimentFileError(
+                    "--event-column needs a tabular export; a directory export has no rows"
                 )
             sha = hash_export(path)
             values = read_event_column(path, event_column) if event_column is not None else None
@@ -1317,10 +1330,12 @@ def make_app(
                         f"sealed split without period: {split!r} is sealed, which needs "
                         "--event-column and a sealed period holding its rows"
                     )
+                # `full` and `none` bind every row (req 3), so sealing one
+                # seals every row, whatever the split file labels them.
                 rows = (
-                    [v for v, a in zip(values, assignment, strict=True) if a == split]
-                    if assignment is not None
-                    else (list(values) if split == "full" else [])
+                    list(values)
+                    if split in EVERY_ROW_SPLITS or assignment is None
+                    else [v for v, a in zip(values, assignment, strict=True) if a == split]
                 )
                 check_sealed_split_has_period(split, rows, periods)
             with open_for_write(s) as conn:
@@ -1346,7 +1361,7 @@ def make_app(
                 )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
-        except _RESEARCH_REFUSALS as exc:
+        except _DATASET_REFUSALS as exc:
             raise _refusal(exc, s) from None
         typer.echo(
             f"dataset {record.dataset_id}: {record.name} {record.version}, "

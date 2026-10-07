@@ -508,6 +508,13 @@ def test_experiments_without_a_store_exits_1() -> None:
     assert out.exit_code == 1
 
 
+def test_experiments_on_an_uninitialised_store_file_exits_1(live: Path) -> None:
+    duckdb.connect(str(live)).close()
+    out = _cli("experiments")
+    assert out.exit_code == 1
+    assert "research registry not initialised" in out.output
+
+
 def test_experiments_on_a_store_without_research_tables_says_so(live: Path) -> None:
     with duckdb.connect(str(live)) as conn:
         schema.init_schema(conn)
@@ -620,6 +627,9 @@ def test_dataset_register_hashes_a_directory_export(tmp_path: Path) -> None:
     sealed = _register(export, "--sealed", "dev", "--sealed-period", "2020-01-01", "2020-12-31")
     assert sealed.exit_code == 2
     assert "sealed split without period" in sealed.output
+    column = _register(export, "--event-column", "event_date")
+    assert column.exit_code == 2
+    assert "tabular export" in column.output
 
 
 @pytest.mark.parametrize(
@@ -652,6 +662,34 @@ def test_dataset_register_hashes_a_directory_export(tmp_path: Path) -> None:
         (["--sealed-period", "2024-01-01"], "--sealed-period"),
         (["--sealed-period", "2024-01-01", "not-a-date"], "--sealed-period"),
         (["--synthetic"], "--synthetic"),
+        (["--sealed", "cla"], "not among the splits"),
+        (
+            [
+                "--event-column",
+                "event_date",
+                "--split-json",
+                "SPLIT",
+                "--sealed",
+                "full",
+                "--sealed-period",
+                "2024-01-01",
+                "2024-12-31",
+            ],
+            "sealed split without period",
+        ),
+        (
+            [
+                "--event-column",
+                "event_date",
+                "--sealed",
+                "none",
+                "--sealed-period",
+                "2030-01-01",
+                "2030-01-02",
+            ],
+            "sealed split without period",
+        ),
+        (["--event-column", "event_date", "--split-json", "MISSING"], "refused"),
     ],
 )
 def test_dataset_register_refusals_write_nothing(
@@ -659,10 +697,19 @@ def test_dataset_register_refusals_write_nothing(
 ) -> None:
     dates = [date(2021, 3, 1), date(2024, 9, 1)]
     csv, split_file = _csv(tmp_path, "labels", dates, ["dev", "test"])
-    args = [str(split_file) if a == "SPLIT" else a for a in extra]
+    swap = {"SPLIT": str(split_file), "MISSING": str(tmp_path / "missing.json")}
+    args = [swap.get(a, a) for a in extra]
     out = _register(csv, *args)
     assert out.exit_code == 2, out.output
     assert message in out.output
+    assert _count("research_datasets") == 0
+
+
+def test_dataset_register_refuses_an_unparseable_export(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"not parquet at all")
+    out = _register(bad, "--event-column", "event_date")
+    assert out.exit_code == 2, out.output
     assert _count("research_datasets") == 0
 
 
