@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -32,11 +34,20 @@ from tradepartner.backtest.metrics import (
     series_metrics,
 )
 from tradepartner.backtest.provider import GapReading
-from tradepartner.backtest.results import family_n, hypothesis_cadence, metric_rows, write_results
+from tradepartner.backtest.results import (
+    FamilyN,
+    family_n,
+    family_n_split,
+    hypothesis_cadence,
+    metric_rows,
+    write_results,
+)
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import Settings
-from tradepartner.store import registry
+from tradepartner.research.experiment import ParsedExperiment, hash_file, parse_experiment_file
+from tradepartner.research.gates import Flags, Reasons
+from tradepartner.store import registry, research, schema
 from tradepartner.store.db import insert_row
 
 HISTORY_START, HISTORY_END = date(2022, 12, 1), date(2024, 10, 31)
@@ -561,6 +572,185 @@ class TestFamilyN:
         assert family_n(conn, "momentum", pending=pending) == 2
         write_results(conn, pending, _run(settings, pending), settings)
         assert family_n(conn, "momentum") == 2 == _result_row(conn, pending.trial_id)["n_trials"]
+
+
+# --- research runs in N (research-registry spec req 9; T83b) ---------------------------
+
+_EXPERIMENTS = Path(__file__).resolve().parents[1] / "fixtures" / "experiments"
+#: Before the fixture hypothesis's holdout (2025-01-02 on); its window ends 2024-12-31.
+_IN_SAMPLE_DATES = [date(2024, 2, 1), date(2024, 6, 28)]
+#: Reaches the fixture hypothesis's holdout; its window then ends 2025-12-31.
+_HOLDOUT_DATES = [date(2024, 2, 1), date(2025, 3, 31)]
+
+
+def _experiment(
+    settings: Settings, slug: str, *, kind: str = "return", **changes: Any
+) -> ParsedExperiment:
+    """The T82 fixture E1-H as an exploratory `kind` experiment of family `momentum`."""
+    base = parse_experiment_file(
+        _EXPERIMENTS / "e1h-demand-deterioration-revenue.md", _EXPERIMENTS, settings=settings
+    )
+    fields: dict[str, Any] = {
+        "slug": slug,
+        "params_sha256": sha256(slug.encode()).hexdigest(),
+        "kind": kind,
+        "stage": 6 if kind == "return" else 3,
+        "touches_returns": kind == "return",
+        "family": "momentum",
+        "confirmatory": False,
+        "window_start": date(2020, 1, 1),
+        "window_end": date(2024, 12, 31),
+        "splits": ("full",),
+        "dataset_name": f"{slug}-panel",
+        "budget_runs": 10,
+        "budget_configurations": 20,
+    }
+    fields.update(changes)
+    return replace(base, **fields)
+
+
+def _research_run(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    slug: str,
+    *,
+    kind: str = "return",
+    configurations: int = 1,
+    dates: list[date] = _IN_SAMPLE_DATES,
+    flags: Flags | None = None,
+) -> str:
+    """Register `slug`, its dataset, open one run and close it `ok` with
+    `configurations` evaluated; return the outcome."""
+    window_end = date(2025, 12, 31) if flags is not None else date(2024, 12, 31)
+    parsed = _experiment(settings, slug, kind=kind, window_end=window_end)
+    research.register_experiment(conn, parsed, "owner")
+    csv = tmp_path / f"{slug}.csv"
+    csv.write_text(
+        "event_date,value\n" + "".join(f"{d.isoformat()},{i}\n" for i, d in enumerate(dates)),
+        encoding="utf-8",
+    )
+    dataset = research.register_dataset(
+        conn,
+        name=parsed.dataset_name,
+        version="v1",
+        path=str(csv),
+        sha256=hash_file(csv),
+        event_start=min(dates),
+        event_end=max(dates),
+        n_rows=len(dates),
+        event_column="event_date",
+        repo_dir=tmp_path,
+    )
+    spend = flags is not None
+    handle = research.open_run(
+        conn,
+        slug,
+        dataset.dataset_id,
+        "full",
+        {"seed": 1},
+        "test",
+        settings=settings,
+        repo_dir=tmp_path,
+        configurations=configurations,
+        **({"flags": flags, "reasons": Reasons(holdout_reason="planned look")} if spend else {}),
+    )
+    assert handle.refusal is None, handle.message
+    return research.write_result(
+        conn,
+        handle,
+        primary_value=-0.5,
+        primary_ci_low=-0.9,
+        primary_ci_high=-0.1,
+        n_observations=400,
+        n_clusters=40,
+        n_configurations=configurations,
+        artifact_sha256="a" * 64,
+        artifact_path="/tmp/report.html",
+    )
+
+
+class TestResearchRunsInN:
+    """N = the family's counted backtest trials plus `family_run_count`; V is the
+    backtest pairs' alone (research-registry spec req 9; backtest spec req 8 as
+    amended by T83b)."""
+
+    def test_a_counted_run_raises_n_by_its_configurations_and_leaves_v(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        first, _, _ = _trial(conn, settings, tmp_path)
+        assert _result_row(conn, first.trial_id)["n_research"] == 0
+        assert _research_run(conn, settings, tmp_path, "r0", configurations=3) == "ok"
+        assert family_n(conn, "momentum") == 1 + 3
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=3)
+        second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        row = _result_row(conn, second.trial_id)
+        assert row["n_trials"] == 2 + 3
+        assert row["n_research"] == 3
+        # V and the pair Sharpes are the two backtest pairs' only.
+        family = registry.family_sharpes(conn, "momentum")
+        assert family.n_trials == 2
+        pairs = [
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
+        ]
+        assert sorted(family.raw) == pytest.approx(sorted(pairs))
+        base = _metrics(conn, second.trial_id, "strategy", BASE)
+        expected = deflated_sharpe(base, "raw", n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+        assert row["sharpe_variance"] == pytest.approx(expected.sharpe_variance)
+        assert row["sr_star"] == pytest.approx(expected.sr_star)
+        assert row["dsr"] == pytest.approx(expected.dsr)
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            {"kind": "return", "dates": _HOLDOUT_DATES, "flags": Flags(spend_holdout=True)},
+            {"kind": "agreement"},
+            {"kind": "benchmark"},
+        ],
+        ids=["holdout-spending", "agreement", "benchmark"],
+    )
+    def test_an_uncounted_run_leaves_n_unchanged(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, run: dict[str, Any]
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        assert _research_run(conn, settings, tmp_path, "x0", configurations=3, **run) == "ok"
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=0)
+        after, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        row = _result_row(conn, after.trial_id)
+        assert (row["n_trials"], row["n_research"]) == (2, 0)
+
+    def test_a_store_without_the_research_registry_reads_research_as_none(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """A read-only open of a pre-version-12 store has no research tables: the split
+        says so (None) and N is the backtest count alone."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        for table in reversed(schema.RESEARCH_TABLE_NAMES):
+            conn.execute(f"DROP TABLE {table}")
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=None)
+        assert family_n(conn, "momentum") == 1
+
+    def test_write_results_refuses_a_store_without_the_research_registry(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """Writing commands migrate first, so an unmigrated store here is a bug: refused
+        before any row, never stored with the research share silently left out."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        for table in reversed(schema.RESEARCH_TABLE_NAMES):
+            conn.execute(f"DROP TABLE {table}")
+        with pytest.raises(schema.ResearchNotInitialised):
+            write_results(conn, handle, results, settings)
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
 
 
 class TestVersionPColumns:

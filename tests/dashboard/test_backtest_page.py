@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,8 @@ from streamlit.testing.v1 import AppTest
 from tradepartner.backtest.metrics import METRIC_KEYS, deflated_sharpe
 from tradepartner.config import Settings
 from tradepartner.dashboard import backtest_page, theme
-from tradepartner.store import registry, schema
+from tradepartner.research.experiment import hash_file, parse_experiment_file
+from tradepartner.store import registry, research, schema
 from tradepartner.store.db import open_for_write
 
 _APP_PATH = str(
@@ -576,3 +578,158 @@ def test_equity_chart_accents_the_strategy_and_mutes_benchmarks(
     dash = spec["encoding"]["strokeDash"]["scale"]["range"]
     assert dash[0] == [] and all(d for d in dash[1:])
     assert spec["config"]["axis"]["gridColor"] == palette.border
+
+
+# --- today's N split: backtest trials and research runs (T83b) ------------------------
+
+_EXPERIMENTS = Path(__file__).resolve().parents[1] / "fixtures" / "experiments"
+
+
+def _research_run(store_path: Path, tmp_path: Path, configurations: int) -> None:
+    """One counted research run in family `momentum` (an `ok`, non-synthetic return
+    run outside the seeded holdout) evaluating `configurations` configurations."""
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    parsed = replace(
+        parse_experiment_file(
+            _EXPERIMENTS / "e1h-demand-deterioration-revenue.md",
+            _EXPERIMENTS,
+            settings=seed_settings,
+        ),
+        slug="r0",
+        params_sha256="e" * 64,
+        kind="return",
+        stage=6,
+        touches_returns=True,
+        family="momentum",
+        confirmatory=False,
+        window_start=date(2018, 1, 1),
+        window_end=date(2022, 12, 31),
+        splits=("full",),
+        dataset_name="panel",
+        budget_runs=10,
+        budget_configurations=20,
+    )
+    dates = [date(2019, 6, 28), date(2021, 6, 30)]
+    csv = tmp_path / "panel.csv"
+    csv.write_text(
+        "event_date,value\n" + "".join(f"{d.isoformat()},{i}\n" for i, d in enumerate(dates)),
+        encoding="utf-8",
+    )
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        research.register_experiment(conn, parsed, "owner")
+        dataset = research.register_dataset(
+            conn,
+            name="panel",
+            version="v1",
+            path=str(csv),
+            sha256=hash_file(csv),
+            event_start=min(dates),
+            event_end=max(dates),
+            n_rows=len(dates),
+            event_column="event_date",
+            repo_dir=tmp_path,
+        )
+        handle = research.open_run(
+            conn,
+            "r0",
+            dataset.dataset_id,
+            "full",
+            {"seed": 1},
+            "owner",
+            settings=seed_settings,
+            repo_dir=tmp_path,
+            configurations=configurations,
+        )
+        assert handle.refusal is None, handle.message
+        outcome = research.write_result(
+            conn,
+            handle,
+            primary_value=-0.5,
+            primary_ci_low=-0.9,
+            primary_ci_high=-0.1,
+            n_observations=400,
+            n_clusters=40,
+            n_configurations=configurations,
+            artifact_sha256="a" * 64,
+            artifact_path="/tmp/report.html",
+        )
+        assert outcome == "ok"
+
+
+def _pre_migration(store_path: Path) -> None:
+    """Turn the seeded store into one a read-only connection sees before version 12:
+    no research table, no `trial_results.n_research`, and version 11 its latest."""
+    with duckdb.connect(str(store_path)) as conn:
+        for table in reversed(schema.RESEARCH_TABLE_NAMES):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("ALTER TABLE trial_results DROP COLUMN n_research")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (11, now())")
+
+
+def test_todays_n_is_split_into_backtest_trials_and_research_runs(
+    seeded_store: tuple[Path, Seeded], tmp_path: Path
+) -> None:
+    """Today's N = the three counted trials + the research run's three configurations;
+    V is the three trials' pairs alone (research-registry spec req 9)."""
+    store_path, seeded = seeded_store
+    _research_run(store_path, tmp_path, configurations=3)
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute(
+            "UPDATE trial_results SET n_research = 2 WHERE trial_id = ?", [seeded.detailed]
+        )
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        raw, excess = backtest_page.load_trial_view(conn, seeded.detailed).dsr_rows
+    finally:
+        conn.close()
+    r12 = math.sqrt(12)
+    expected = deflated_sharpe(
+        _metrics(0.20, 0.05),
+        "raw",
+        n_trials=6,
+        pair_sharpes=[0.20 * r12, 0.10 * r12, 0.30 * r12],
+        periods_per_year=12,
+    )
+    assert raw.today == expected
+    for row in (raw, excess):
+        assert (row.today_n_backtest, row.today_n_research) == (3, 3)
+        assert row.today is not None and row.today.n_trials == 6
+        assert row.stored_n_research == 2
+
+
+def test_render_shows_the_n_split(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded], tmp_path: Path
+) -> None:
+    store_path, seeded = seeded_store
+    _research_run(store_path, tmp_path, configurations=3)
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    assert not at.exception
+    dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
+    assert list(dsr["today N"]) == [6, 6]
+    assert list(dsr["today N backtest"]) == [3, 3]
+    assert list(dsr["today N research"]) == [3, 3]
+    assert "stored N research" in dsr.columns
+    assert "research runs" in _text(at)
+
+
+def test_a_pre_migration_store_renders_with_n_research_blank(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    """A read-only open of a store before the research registry: the trial renders,
+    today's N is the backtest count, and both research cells are blank."""
+    store_path, seeded = seeded_store
+    _pre_migration(store_path)
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        raw, _ = backtest_page.load_trial_view(conn, seeded.detailed).dsr_rows
+    finally:
+        conn.close()
+    assert (raw.stored_n_research, raw.today_n_research, raw.today_n_backtest) == (None, None, 3)
+    assert raw.today is not None and raw.today.n_trials == 3
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    assert not at.exception
+    dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
+    assert list(dsr["today N"]) == [3, 3]
+    assert dsr["today N research"].isna().all()
+    assert dsr["stored N research"].isna().all()
