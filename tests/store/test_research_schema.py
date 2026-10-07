@@ -14,7 +14,7 @@ import duckdb
 import pytest
 from lookahead.harness import _FACT_TABLES
 
-from tradepartner.store import schema
+from tradepartner.store import lab_schema, schema
 from tradepartner.store.db import configure_connection, insert_row
 
 KNOWN = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
@@ -215,7 +215,11 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
     without `n_research` and `sharpe_unit`, `trials` without the version-15
     columns, when they have them)."""
     out = {}
-    later = {*schema.RESEARCH_TABLE_NAMES, schema.REBALANCE_COUNTS_TABLE_NAME}
+    later = {
+        *schema.RESEARCH_TABLE_NAMES,
+        schema.REBALANCE_COUNTS_TABLE_NAME,
+        *lab_schema.LAB_TABLE_NAMES,
+    }
     for table in _tables(c) - later:
         if table == "schema_version":
             continue
@@ -232,8 +236,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_15() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 15
+def test_current_schema_version_is_16() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 16
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -313,20 +317,20 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
 # --- fresh store ---------------------------------------------------------------------
 
 
-def test_a_fresh_store_has_every_research_table_at_version_15(
+def test_a_fresh_store_has_every_research_table_at_version_16(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [15]
+    assert _versions(conn) == [16]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
 
-def test_init_schema_is_idempotent_on_version_15(conn: duckdb.DuckDBPyConnection) -> None:
+def test_init_schema_is_idempotent_on_version_16(conn: duckdb.DuckDBPyConnection) -> None:
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [15]
+    assert _versions(conn) == [16]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -607,7 +611,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12, 13, 14, 15]
+        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]
@@ -615,12 +619,17 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # No pre-existing table's DDL text changed but `trial_results` (gained
     # `n_research`, version 12) and `trial_rebalances` (gained
     # `PROFITABILITY_REBALANCE_COLUMNS`, version 13) and `trials` (gained its
-    # vintage and detail columns, version 15); no row of any table changed.
-    _moved = {"trial_results", "trial_rebalances", "trials"}
+    # vintage and detail columns, version 15) and `owner_decisions` and
+    # `trial_results` (their `CHECK` widened by the lab migration, version 16,
+    # `tests/store/test_lab_migration.py`); no row of any table changed.
+    _moved = {"trial_results", "trial_rebalances", "trials", "owner_decisions"}
     assert {t: s for t, s in ddl_after.items() if t in ddl_before and t not in _moved} == {
         t: s for t, s in ddl_before.items() if t not in _moved
     }
-    assert ddl_after["trial_results"] == ddl_before["trial_results"].replace(
+    lab_status = ", " + ", ".join(f"'{v}'" for v in lab_schema.LAB_TRIAL_STATUSES)
+    assert ddl_after["trial_results"].replace(lab_status, "") == ddl_before[
+        "trial_results"
+    ].replace(
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, ",
         "red_flag BOOLEAN, gap_max_count_share DOUBLE, gap_max_size_share DOUBLE, "
         "n_research INTEGER, sharpe_unit VARCHAR, ",
@@ -636,6 +645,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # And the migrated store is shaped exactly as a fresh one.
     fresh = duckdb.connect(":memory:")
     schema.init_schema(fresh)
+    lab_schema.apply_lab_schema(fresh)  # a fresh store has no lab table
     assert ddl_after == _ddl(fresh)
 
 
