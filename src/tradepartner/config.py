@@ -675,6 +675,9 @@ class GapConfig(_ClosedConfig):
 
     missing_tail_sessions: int = 5
     count_share_threshold: float = 0.05
+    # ADR 0003 amendment #1199: a live listing dark longer than this many sessions,
+    # its last bar before the window, counts as ended at that bar for the gap only.
+    stale_listing_sessions: int = Field(default=63, ge=0)
 
 
 # --- Phase 3: backtest engine and trial registry (docs/specs/backtest.md, T30) ---

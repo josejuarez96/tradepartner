@@ -528,7 +528,10 @@ def test_profitability_registration_ignores_live_strategy_settings(
 
 
 @pytest.mark.parametrize(
-    "dropped", [("profitability.",), ("schedule.", "profitability.")], ids=["today", "pre-lab"]
+    "dropped",
+    # The pre-lab twin also predates `gap.stale_listing_sessions` (#1199), as H1 does.
+    [("profitability.",), ("schedule.", "profitability.", "gap.stale_listing_sessions")],
+    ids=["today", "pre-lab"],
 )
 def test_h1_twin_registered_before_t85_still_loads_and_verifies(
     conn: duckdb.DuckDBPyConnection, settings: Settings, dropped: tuple[str, ...]

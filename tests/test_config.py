@@ -642,6 +642,7 @@ def test_gap_defaults() -> None:
     s = _settings()
     assert s.gap.missing_tail_sessions == 5
     assert s.gap.count_share_threshold == pytest.approx(0.05)
+    assert s.gap.stale_listing_sessions == 63
 
 
 def test_adjust_defaults() -> None:

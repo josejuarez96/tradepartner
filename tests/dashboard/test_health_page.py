@@ -239,6 +239,7 @@ def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: 
         "Liquidity rule",
         "Fill price",
         "Gap report",
+        "Stale listings, out of the gap",
     ):
         assert label in text, label
     for rule in INTEGRITY_RULES:

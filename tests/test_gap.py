@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 
 from tradepartner.calendar import next_session, session_close
@@ -435,3 +436,155 @@ def test_side_categories_are_reported_separately(
     for gap in (late, stale):
         side = set(gap.unclassifiable) | set(gap.truncated_history) | set(gap.stale_shares)
         assert not side & set(_missing(gap))
+
+
+# --- stale listings (ADR 0003 amendment #1199; spec acceptance criterion) -----
+
+#: S's last bar: before W (June 2019); Good Friday and Memorial Day fall after it.
+_S_LAST = date(2019, 3, 29)
+#: Sessions after S's last bar up to T's session, counted on the XNYS calendar.
+_S_DARK = len(_sessions(next_session(_S_LAST), date(2019, 6, 28)))
+
+
+def _bar(conn: duckdb.DuckDBPyConnection, sid: str, session: date, known_at: datetime) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": sid,
+            "session": session,
+            "open": 10.0,
+            "high": 10.0,
+            "low": 10.0,
+            "close": 10.0,
+            "volume": 1_000_000,
+        }
+        | _meta(known_at, "alpaca", "bar"),
+    )
+
+
+@pytest.fixture
+def dark() -> Iterator[duckdb.DuckDBPyConnection]:
+    """June 2019 again (W = the June sessions), with long-dark names.
+
+    | id | case |
+    |---|---|
+    | A | survivor with a bar at T |
+    | B | listed, last bar 06-26 (inside W), none at T |
+    | I | listed, never a bar |
+    | S | listed, last bar 03-29 (before W), `_S_DARK` sessions dark at T |
+    | K | as S, plus its NYSE listing ended by a Form 25 filed 06-14 (inside W)
+    |   | and a NASDAQ listing from 06-25 (not a transfer: 7 sessions later) |
+    """
+    store = _Store()
+    s = store.security
+    s("A", bars=(date(2019, 1, 2), date(2019, 6, 28)), shares=1_000)
+    s("B", bars=(date(2019, 1, 2), date(2019, 6, 26)), shares=100)
+    s("I", shares=100)
+    s("S", bars=(date(2019, 1, 2), _S_LAST), shares=100)
+    s("K", bars=(date(2019, 1, 2), _S_LAST), shares=100)
+    store.form_25("K", date(2019, 6, 14))
+    store.listing("K", "NASDAQ", date(2019, 6, 25), datetime(2019, 6, 25, 20, 30, tzinfo=UTC))
+    try:
+        yield store.conn
+    finally:
+        store.conn.close()
+
+
+def _stale(gap: SurvivorshipGap) -> dict[str, tuple[date, int]]:
+    return {
+        r["security_id"]: (r["last_bar"], r["dark_sessions"])
+        for r in gap.stale_listings.iter_rows(named=True)
+    }
+
+
+def test_the_default_is_63_sessions() -> None:
+    assert Settings(_env_file=None).gap.stale_listing_sessions == 63
+
+
+def test_a_stale_listing_leaves_l_and_m_and_is_reported(dark: duckdb.DuckDBPyConnection) -> None:
+    gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=_S_DARK - 1))
+    assert _stale(gap) == {"S": (_S_LAST, _S_DARK)}
+    assert "S" not in gap.listed and "S" not in _missing(gap)
+    side = set(gap.unclassifiable) | set(gap.truncated_history) | set(gap.stale_shares)
+    assert "S" not in side
+    assert gap.listed == ("A", "B", "I", "K")
+    assert _missing(gap) == {"B": "no_bar_at_t", "I": "no_bar_at_t", "K": "truncated_tail"}
+    assert gap.count_share == pytest.approx(3 / 4)
+    assert gap.settings["gap"]["stale_listing_sessions"] == _S_DARK - 1
+
+
+def test_dark_exactly_the_key_is_still_no_bar_at_t(dark: duckdb.DuckDBPyConnection) -> None:
+    gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=_S_DARK))
+    assert gap.stale_listings.is_empty()
+    assert _missing(gap)["S"] == "no_bar_at_t"
+
+
+def test_the_dark_count_is_in_sessions_not_days(dark: duckdb.DuckDBPyConnection) -> None:
+    # 03-29 to 06-28 is 91 days and two weekday holidays (Good Friday, Memorial Day).
+    weekdays = sum(
+        1
+        for n in range(1, (date(2019, 6, 28) - _S_LAST).days + 1)
+        if (_S_LAST + timedelta(days=n)).weekday() < 5
+    )
+    assert weekdays - 2 == _S_DARK
+    for key, stale in ((_S_DARK - 1, True), (_S_DARK, False)):
+        gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=key))
+        assert ("S" in _stale(gap)) is stale
+
+
+def test_a_key_below_w_never_makes_a_death_inside_w_stale(
+    dark: duckdb.DuckDBPyConnection,
+) -> None:
+    # B is dark 1 session at T, its last bar inside W: never stale, whatever the key.
+    gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=0))
+    assert set(_stale(gap)) == {"S"}
+    assert _missing(gap)["B"] == "no_bar_at_t"
+
+
+def test_a_listing_with_no_bar_at_all_stays_no_bar_at_t(dark: duckdb.DuckDBPyConnection) -> None:
+    gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=0))
+    assert _missing(gap)["I"] == "no_bar_at_t"
+    assert "I" not in _stale(gap)
+
+
+def test_a_form_25_inside_w_keeps_a_stale_security_in_l_as_truncated_tail(
+    dark: duckdb.DuckDBPyConnection,
+) -> None:
+    gap = survivorship_gap(dark, T_JUNE, _settings(stale_listing_sessions=0))
+    assert "K" in gap.listed and "K" not in _stale(gap)
+    row = gap.missing.filter(pl.col("security_id") == "K").row(0, named=True)
+    assert (row["reason"], row["last_bar"], row["reference_session"]) == (
+        "truncated_tail",
+        _S_LAST,
+        date(2019, 6, 13),
+    )
+
+
+def test_the_delisted_path_is_unchanged(june: duckdb.DuckDBPyConnection) -> None:
+    before = survivorship_gap(june, T_JUNE, _settings(stale_listing_sessions=10**6))
+    after = survivorship_gap(june, T_JUNE, _settings(stale_listing_sessions=0))
+    assert after.missing.equals(before.missing) and after.listed == before.listed
+    assert after.stale_listings.is_empty()
+
+
+def test_a_stale_name_with_a_new_bar_is_live_again(dark: duckdb.DuckDBPyConnection) -> None:
+    settings = _settings(stale_listing_sessions=_S_DARK - 1)
+    _bar(dark, "S", date(2019, 7, 15), session_close(date(2019, 7, 15)))
+    at_bar = survivorship_gap(dark, session_close(date(2019, 7, 15)), settings)
+    assert "S" in at_bar.listed and "S" not in _missing(at_bar)
+    later = survivorship_gap(dark, session_close(date(2019, 7, 31)), settings)
+    assert _missing(later)["S"] == "no_bar_at_t" and "S" not in _stale(later)
+    assert "K" in _stale(later)  # its Form 25 (06-14) is before July's W now
+
+
+def test_a_bar_known_after_t_does_not_make_a_stale_name_live(
+    dark: duckdb.DuckDBPyConnection,
+) -> None:
+    settings = _settings(stale_listing_sessions=_S_DARK - 1)
+    # A June bar first known in July, and a bar on a session after T's.
+    _bar(dark, "S", date(2019, 6, 10), datetime(2019, 7, 2, 20, 30, tzinfo=UTC))
+    _bar(dark, "S", date(2019, 7, 1), session_close(date(2019, 7, 1)))
+    gap = survivorship_gap(dark, T_JUNE, settings)
+    assert _stale(gap) == {"S": (_S_LAST, _S_DARK)}
+    assert "S" not in gap.listed

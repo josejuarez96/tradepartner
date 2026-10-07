@@ -18,6 +18,11 @@ from lookahead.harness import TruncatedStore, probe_timestamps
 from tradepartner.config import Settings
 from tradepartner.gap import survivorship_gap
 
+#: The fixture sees no name dark 63 sessions; 0 makes the stale-listing rule
+#: (#1199) fire wherever a live name's last bar is before W. The probes take the
+#: two keys in turn, so the test costs what it did before the rule.
+STALE_KEYS = (63, 0)
+
 
 @pytest.fixture
 def truncated(fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedStore]:
@@ -31,9 +36,10 @@ def truncated(fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedSto
 def test_survivorship_gap_invariant_under_truncation(
     fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
 ) -> None:
-    settings = Settings(_env_file=None)
-    missing_seen = 0
-    for t in probe_timestamps(fixture_store):
+    missing_seen = stale_seen = 0
+    for i, t in enumerate(probe_timestamps(fixture_store)):
+        stale_listing_sessions = STALE_KEYS[i % len(STALE_KEYS)]
+        settings = Settings(_env_file=None, gap={"stale_listing_sessions": stale_listing_sessions})
         full = survivorship_gap(fixture_store, t, settings)
         cut = survivorship_gap(truncated.at(t), t, settings)
         assert full.listed == cut.listed, f"L disagrees at T={t!r}"
@@ -44,6 +50,9 @@ def test_survivorship_gap_invariant_under_truncation(
             cut.truncated_history,
             cut.stale_shares,
         ), f"side categories disagree at T={t!r}"
+        assert full.stale_listings.equals(cut.stale_listings), f"stale disagrees at T={t!r}"
         missing_seen += full.missing.height
-    # Not vacuous: some probe finds a missing name.
+        stale_seen += full.stale_listings.height
+    # Not vacuous: some probe finds a missing name, and some a stale one.
     assert missing_seen > 0
+    assert stale_seen > 0
