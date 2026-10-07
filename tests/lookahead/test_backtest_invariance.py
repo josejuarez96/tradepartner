@@ -224,9 +224,6 @@ def _store(case: Case) -> duckdb.DuckDBPyConnection:
     configure_connection(conn)
     schema.init_schema(conn)
     load_universe_fixtures(conn, UNIVERSE_DIR)
-    fixture_actions = set(
-        conn.execute("SELECT security_id, ex_date FROM corporate_actions").fetchall()
-    )
     # A seeded dividend has no source id, so the as-of read keys it by (type, ex-date):
     # two seeded on one ex-date would be revisions of one action, and a late dividend
     # would read as a restated one. Every seeded ex-date is distinct.
@@ -242,15 +239,11 @@ def _store(case: Case) -> duckdb.DuckDBPyConnection:
         late_ex = _sessions_before(t_k, LATE_EX_SESSIONS)
         for sid in SEEDED_IDS:
             _revise_bar(conn, sid, t_k, revised_at, factor=1.02)
-            # A seeded dividend never shares its ex-date with a fixture action (the
-            # fixture's splits): the adjusted read sums tied ex-dates' factors in scan
-            # order, so a cut store's view and the full store's table may differ in the
-            # last bit there (#1099). Only `week_end` and `daily` seeds reach those dates.
-            if (sid, restated_ex) not in fixture_actions:
-                _dividend(conn, sid, restated_ex, 0.2, session_close(previous_session(restated_ex)))
-                _dividend(conn, sid, restated_ex, 0.3, revised_at)
-            if (sid, late_ex) not in fixture_actions:
-                _dividend(conn, sid, late_ex, 0.25, revised_at)
+            # Seeded dividends may share an ex-date with a fixture split. The
+            # full and truncated stores must still yield bit-identical frames.
+            _dividend(conn, sid, restated_ex, 0.2, session_close(previous_session(restated_ex)))
+            _dividend(conn, sid, restated_ex, 0.3, revised_at)
+            _dividend(conn, sid, late_ex, 0.25, revised_at)
     return conn
 
 

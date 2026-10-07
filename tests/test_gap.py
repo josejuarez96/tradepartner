@@ -239,6 +239,52 @@ def test_unclassifiable_counts_only_names_listed_in_w(june: duckdb.DuckDBPyConne
     assert not {"U1", "U2"} & set(gap.listed)
 
 
+def test_zero_volume_tail_does_not_hide_a_truncated_tail(
+    june: duckdb.DuckDBPyConnection,
+) -> None:
+    # D last traded on 06-07. Halt markers through 06-20 do not repair its
+    # nine-session tail before the Form 25. A later-known traded revision
+    # changes the verdict only after it becomes known.
+    for session in _sessions(date(2019, 6, 10), date(2019, 6, 20)):
+        insert_row(
+            june,
+            "prices_daily",
+            {
+                "security_id": "D",
+                "session": session,
+                "open": 5.0,
+                "high": 5.0,
+                "low": 5.0,
+                "close": 5.0,
+                "volume": 0,
+            }
+            | _meta(session_close(session), "alpaca", "bar"),
+        )
+    late = T_JUNE + timedelta(hours=1)
+    insert_row(
+        june,
+        "prices_daily",
+        {
+            "security_id": "D",
+            "session": date(2019, 6, 20),
+            "open": 5.0,
+            "high": 5.0,
+            "low": 5.0,
+            "close": 5.0,
+            "volume": 1_000_000,
+        }
+        | _meta(late, "alpaca", "bar"),
+    )
+    at_close = survivorship_gap(june, T_JUNE, _settings())
+    row = at_close.missing.filter(at_close.missing["security_id"] == "D").row(0, named=True)
+    assert (row["reason"], row["last_bar"], row["tail_sessions"]) == (
+        "truncated_tail",
+        date(2019, 6, 7),
+        9,
+    )
+    assert "D" not in _missing(survivorship_gap(june, late, _settings()))
+
+
 def test_boundary_tail_equal_to_the_threshold_is_not_missing(
     june: duckdb.DuckDBPyConnection,
 ) -> None:
