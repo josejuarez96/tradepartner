@@ -31,7 +31,7 @@ two must be equal:
   `plan.rebalance_state` and `switch.derive`. These are pure over the rows they are
   given; per the owner's decision on #488 they are invariant because their journal
   input is cut at `as_of` (`known_at <= as_of`) where it is loaded. The run's
-  loader `window_journal_inputs` (step 4, step 7b, `_locked_run`, `_skipped`) reads
+  loader `window_journal_inputs` (step 4, step 7b, `_skipped`) reads
   every row the window holds with no `as_of`; `_derived` uses it on the cut store
   (`as_of is None`), and `_known` at `as_of=CUT` on the full store. The check
   compares production reads on a truncated store against the rule; its liveness
@@ -677,8 +677,9 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
 
     On the cut store (`as_of is None`): loads all eleven journal inputs through
     `window_journal_inputs` (the run's load path for step 4, step 7b's
-    `decision_state`/`rebalance_state`, `_locked_run` and `_skipped`'s
-    `switch.derive`; `_exit_book` is excluded as it reads cross-window).
+    `decision_state`/`rebalance_state` and `_skipped`'s `switch.derive`;
+    `_locked_run` reads the same runs, kill-switch and rebalance readers directly,
+    and `_exit_book` is excluded as it reads cross-window).
 
     On the full store (`as_of=CUT`): loads through `store.journal` readers and
     applies the `_known` cut at close(S-1).
