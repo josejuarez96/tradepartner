@@ -29,10 +29,19 @@ _Handler = Callable[[httpx.Request], httpx.Response]
 
 def _valid_zip_bytes(member: str = "a.txt", content: bytes = b"hi") -> bytes:
     """A real, openable zip (unlike a bare `b"PK ..."` placeholder), so tests
-    that aren't about zip-corruption detection don't trip it by accident."""
+    that aren't about zip-corruption detection don't trip it by accident.
+
+    A fixed `date_time` makes two calls byte-identical regardless of when each
+    runs: `ZipInfo` otherwise stamps "now" (2-second resolution) at construction,
+    so a caller that builds one copy to write to a cache and a second to compare
+    against it (as `test_reuse_cached_returns_the_cached_companyfacts_zip_with_no_
+    request` below does) would intermittently see different bytes for identical
+    content whenever those two calls straddled a clock tick — observed failing
+    under a full, loaded `-n auto` run and passing every time in isolation (#1126).
+    """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr(member, content)
+        archive.writestr(zipfile.ZipInfo(member, date_time=(2020, 1, 1, 0, 0, 0)), content)
     return buffer.getvalue()
 
 
@@ -1111,6 +1120,17 @@ def test_a_429_that_outlasts_the_block_wait_fails_without_a_second_wait(
         pytest.approx(2.0),
         pytest.approx(600.0),
     ]
+
+
+def test_valid_zip_bytes_is_byte_identical_across_separate_calls() -> None:
+    """Regression (#1126): two calls with the same args must be byte-identical
+    regardless of wall-clock time, or any test comparing their output (like the one
+    below) is flaky by construction. Fails before the `date_time` fix whenever the
+    two calls straddle a 2-second clock tick; a fixed `date_time` makes that
+    impossible to observe either way."""
+    assert _valid_zip_bytes("CIK0000000001.json", b"{}") == _valid_zip_bytes(
+        "CIK0000000001.json", b"{}"
+    )
 
 
 # --- reuse_cached (#660, T77a) ------------------------------------------------
