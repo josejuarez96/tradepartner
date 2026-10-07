@@ -1157,3 +1157,22 @@ def test_code_version_defaults_to_this_checkout() -> None:
     version, dirty = registry.code_version()
     assert re.fullmatch(r"[0-9a-f]{40}", version)
     assert isinstance(dirty, bool)
+
+
+def test_a_store_without_the_version_15_columns_records_trials_without_them(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A store written through the registry before `init_schema` migrated it (a
+    test's version-4 store) still records trials; only the new columns are absent."""
+    for table, column in (
+        ("trials", "detail_level"),
+        ("trials", "data_vintage"),
+        ("trials", "code_tree_sha256"),
+        ("trial_results", "sharpe_unit"),
+    ):
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    _register(conn, settings)
+    handle = _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    assert conn.execute(
+        "SELECT status FROM trial_results WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone() == ("ok",)

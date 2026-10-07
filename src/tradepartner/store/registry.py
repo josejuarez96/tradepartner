@@ -424,6 +424,25 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
     return row[0] if row is not None else None
 
 
+#: The columns schema version 15 adds (`schema._PERIOD_COLUMNS`), by table.
+_VERSION_15_COLUMNS: Final[dict[str, frozenset[str]]] = {
+    "trials": frozenset({"detail_level", "data_vintage", "code_tree_sha256"}),
+    "trial_results": frozenset({"sharpe_unit"}),
+}
+
+
+def _version_15_present(
+    conn: duckdb.DuckDBPyConnection, table: str, row: dict[str, Any]
+) -> dict[str, Any]:
+    """`row` without the version-15 columns `table` does not have yet. Every writing
+    command migrates the store first (`schema.init_schema`), so the real store always
+    has them; only a store written through the registry without that step (a test's
+    version-4 store) lacks them, and its rows then carry none."""
+    present = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    absent = _VERSION_15_COLUMNS[table] - present
+    return {key: value for key, value in row.items() if key not in absent}
+
+
 def _present_fact_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
     present = {
         name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
@@ -704,27 +723,31 @@ def open_trial(
     insert_row(
         conn,
         "trials",
-        {
-            "trial_id": trial_id,
-            "hypothesis_id": hypothesis.hypothesis_id,
-            "kind": kind,
-            "started_at": started_at,
-            "start_session": start_session,
-            "end_session": end_session,
-            "data_cutoff": data_cutoff,
-            "store_max_ingested_at": max_ingested,
-            "code_version": version,
-            "code_dirty": dirty,
-            "synthetic": synthetic,
-            "holdout_repeat": holdout_repeat,
-            "holdout_reason": holdout_reason,
-            "gap_override_reason": gap_override_reason,
-            "run_by": run_by,
-            "note": note,
-            "detail_level": DETAIL_LEVEL_FULL,
-            "data_vintage": vintage,
-            "code_tree_sha256": code_tree_sha256(repo_dir),
-        },
+        _version_15_present(
+            conn,
+            "trials",
+            {
+                "trial_id": trial_id,
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "kind": kind,
+                "started_at": started_at,
+                "start_session": start_session,
+                "end_session": end_session,
+                "data_cutoff": data_cutoff,
+                "store_max_ingested_at": max_ingested,
+                "code_version": version,
+                "code_dirty": dirty,
+                "synthetic": synthetic,
+                "holdout_repeat": holdout_repeat,
+                "holdout_reason": holdout_reason,
+                "gap_override_reason": gap_override_reason,
+                "run_by": run_by,
+                "note": note,
+                "detail_level": DETAIL_LEVEL_FULL,
+                "data_vintage": vintage,
+                "code_tree_sha256": code_tree_sha256(repo_dir),
+            },
+        ),
     )
     return _issue_handle(
         trial_id=trial_id,
@@ -795,7 +818,7 @@ def _insert_result(
         "sharpe_unit": SHARPE_UNIT_ANNUAL,
         **{f.name: getattr(stats, f.name) for f in fields(stats)},
     }
-    insert_row(conn, "trial_results", row)
+    insert_row(conn, "trial_results", _version_15_present(conn, "trial_results", row))
 
 
 # --- detail rows -----------------------------------------------------------
