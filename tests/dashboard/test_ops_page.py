@@ -280,6 +280,7 @@ def test_page_is_in_the_shell_navigation(
         "Data health",
         "Backtest",
         "Trial registry",
+        "Research",
         _PAGE,
         "Override",
     ]

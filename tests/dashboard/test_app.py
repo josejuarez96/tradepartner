@@ -215,6 +215,7 @@ def test_render_ok_state_shows_navigation_and_placeholder_page(
         "Data health",
         "Backtest",
         "Trial registry",
+        "Research",
         "Operations",
         "Override",
     ]
