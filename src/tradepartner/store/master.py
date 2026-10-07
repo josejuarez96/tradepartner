@@ -177,6 +177,21 @@ class MasterBuild:
     unlisted_securities: tuple[str, ...] = ()
     successions: tuple[Succession, ...] = ()
     class_titles: tuple[ClassTitle, ...] = ()
+    shown: tuple[ShownSpan, ...] = ()
+
+
+@dataclass(frozen=True)
+class ShownSpan:
+    """A run of a CIK's consecutive cover pages that all show one class,
+    from `first_at` to `last_at` (the first and last page's acceptance; a
+    page listing nothing is skipped, never a break). A class missing from a
+    page starts a new span when it shows again. Lets a reader tell, at any
+    `t`, whether a class was shown on a page known at `t` after another
+    class first appeared (#1165: a de-SPAC's old common class never is)."""
+
+    security_id: str
+    first_at: datetime
+    last_at: datetime
 
 
 @dataclass(frozen=True)
@@ -472,6 +487,7 @@ class _Builder:
         self.unmatched: list[CompanySnapshotEntry] = []
         self.successions: list[Succession] = []
         self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
+        self.shown: list[ShownSpan] = []
 
     def security(
         self,
@@ -526,6 +542,7 @@ class _Builder:
         cik = first.cik
         marks = marks or {}
         classes: list[_Class] = []
+        open_spans: dict[str, int] = {}  # security_id -> its span on the previous page
         # Form 25s, 8-K12Bs and snapshot fetches in time order (in that order on a tie).
         events: list[_Event] = [(f.accepted_at, 0, f.accession, f) for f in delistings]
         events += [
@@ -589,11 +606,34 @@ class _Builder:
                     listed_on = {exchange for _, exchange in cls.pairs}
                     for exchange in [e for e in cls.ended if e not in listed_on]:
                         del cls.ended[exchange]
+            if shown:
+                self._spans(classes, shown, open_spans, known_at)
         for event in events:  # after the last cover page
             self._event(first, classes, event, marks)
         if not classes:
             classes.append(_Class(primary_security_id(cik), first.accepted_at))
         return classes
+
+    def _spans(
+        self,
+        classes: list[_Class],
+        shown: Mapping[str, object],
+        open_spans: dict[str, int],
+        known_at: datetime,
+    ) -> None:
+        """Extend the span of each class `shown` on this page (known at
+        `known_at`) that was shown on the previous page, else open one;
+        close the span of every class the page leaves out."""
+        for cls in classes:
+            sid = cls.security_id
+            if sid not in shown:
+                open_spans.pop(sid, None)
+            elif sid in open_spans:
+                i = open_spans[sid]
+                self.shown[i] = ShownSpan(sid, self.shown[i].first_at, known_at)
+            else:
+                open_spans[sid] = len(self.shown)
+                self.shown.append(ShownSpan(sid, known_at, known_at))
 
     def _event(
         self, first: FilingIndexEntry, classes: list[_Class], event: _Event, marks: _Marks
@@ -892,6 +932,7 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         ),
         successions=tuple(builder.successions),
         class_titles=tuple(builder.class_titles.values()),
+        shown=tuple(builder.shown),
     )
 
 
