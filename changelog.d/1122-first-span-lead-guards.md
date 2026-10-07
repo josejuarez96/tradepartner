@@ -1,4 +1,4 @@
-- #1122 Backfill's first-span lead reads the resolver's own span, not a recomputed listing row; pinned the clock `_price_chunk` builds its resolver at; added a truncation-invariance case for lead bars (PR #TBD)
+- #1122 Backfill's first-span lead reads the resolver's own span, not a recomputed listing row; pinned the clock `_price_chunk` builds its resolver at; added a truncation-invariance case for lead bars (PR #1132)
 ### Added
 - Tests: a first-span-lead case in the truncation-invariance harness (tests/lookahead/test_universe_invariance.py), and a test pinning the clock `_price_chunk` builds its store resolver at (#1122, #980, #990)
 ### Fixed
