@@ -146,8 +146,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_14() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 14
+def test_current_schema_version_is_15() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 15
 
 
 def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
@@ -164,9 +164,9 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 # --- fresh store and migration --------------------------------------------------------
 
 
-def test_fresh_init_creates_the_journal_at_version_14(journal: duckdb.DuckDBPyConnection) -> None:
+def test_fresh_init_creates_the_journal_at_version_15(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [14]
+    assert _versions(journal) == [15]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -179,11 +179,12 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
     # version 13 (#720, #1033, T85d) adds `trial_rebalances`'s six
     # `PROFITABILITY_REBALANCE_COLUMNS` (`tests/store/test_schema.py`);
     # version 14 (#1153, T127) makes its `n_excluded_no_history` nullable and
-    # adds `trial_rebalance_counts`.
+    # adds `trial_rebalance_counts`; version 15 (#1179, T97) adds `trials`'
+    # vintage and detail columns (`tests/store/test_schema_period.py`).
     kept_without_versions = tuple(
         name
         for name in kept
-        if name not in ("schema_version", "trial_results", "trial_rebalances")
+        if name not in ("schema_version", "trial_results", "trial_rebalances", "trials")
         and name not in schema.RETRACTABLE_TABLES
     )
     conn = duckdb.connect(str(v4_path))
@@ -200,7 +201,7 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         conn.close()
     assert after == before
     assert versions[:1] == applied_before
-    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
         schema.MASTER_CHECK_TABLE_NAMES
@@ -226,7 +227,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
         conn.close()
     with duckdb.connect(str(v4_path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 
 def test_an_unknown_later_version_is_refused(tmp_path: Path) -> None:

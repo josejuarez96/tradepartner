@@ -1,8 +1,8 @@
 """Backtest page (Phase 3 T43, spec req 17).
 
 One trial at a time, picked from every trial in the registry: equity of the
-strategy and both benchmarks on a log axis, drawdowns, monthly turnover and
-cost bars, metrics per cost level, both deflated-Sharpe bases stored and
+strategy and both benchmarks on a log axis, drawdowns, per-period turnover
+and cost bars, metrics per cost level, both deflated-Sharpe bases stored and
 recomputed, per-rebalance gap, universe size, static reliance and late
 dividends, the trial's kind and flag states, and the family's holdout
 spends. Read-only, no run button: runs are CLI only.
@@ -13,20 +13,26 @@ connection) and computes the derived numbers (drawdowns, today's DSR); it
 needs no Streamlit. `render` draws that view.
 
 **Cost level.** Equity, drawdowns and per-rebalance rows are shown at the
-trial's base cost level (`costs.per_side_bps` of its hypothesis), the level
-N, V and DSR use (spec req 6). Metrics are shown at every stored level.
+trial's base cost level (`costs.per_side_bps` of its hypothesis, read
+through `frozen_values`), the level N, V and DSR use (spec req 6). Metrics
+are shown at every stored level.
 
 **Stored vs today's DSR** (spec req 8). The stored statistics used N and V
 at run time and go stale as the family grows; the page recomputes both
-bases with today's N and V (a fresh `registry.family_sharpes` read) from
-the trial's own base-level `trial_metrics`, via `metrics.deflated_sharpe`,
-and shows the two side by side, the stored one labelled "N at run time".
+bases with today's N (`results.family_n`) and V (a fresh
+`registry.family_sharpes` read, annualised Sharpes) from the trial's own
+base-level `trial_metrics` period keys at its cadence's periods per year, via
+`metrics.deflated_sharpe`, and shows the two side by side, the stored one
+labelled "N at run time". V and SR* are shown in annual units (strategy-lab
+spec req 9): a result row whose `sharpe_unit` is NULL or `monthly` (written
+before schema version 15) has its stored V times 12 and SR* times sqrt(12).
 Only an `ok` trial has statistics; any other trial shows its state and
 message and no results.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,7 +44,10 @@ import polars as pl
 import streamlit as st
 
 from tradepartner.backtest.engine import STRATEGY_SERIES
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.metrics import METRIC_KEYS, Basis, DeflatedSharpe, deflated_sharpe
+from tradepartner.backtest.results import CADENCE_KEY, family_n
+from tradepartner.backtest.schedule import MONTHS_PER_YEAR, periods_per_year
 from tradepartner.dashboard import header, theme
 from tradepartner.store import registry, schema
 
@@ -69,6 +78,22 @@ _REBALANCE_COLUMNS: Final = (
 )
 
 Row = dict[str, Any]
+
+#: `trial_results.sharpe_unit` values; NULL (a pre-version-15 row) reads as monthly.
+_ANNUAL: Final = "annual"
+
+
+def annual_stored(
+    v: float | None, sr_star: float | None, unit: str | None
+) -> tuple[float | None, float | None]:
+    """A stored (V, SR*) in annual units: unchanged when `unit` is `annual`, else (a
+    pre-lab monthly row) V times 12 and SR* times sqrt(12) (strategy-lab spec req 9)."""
+    if unit == _ANNUAL:
+        return v, sr_star
+    return (
+        None if v is None else v * MONTHS_PER_YEAR,
+        None if sr_star is None else sr_star * math.sqrt(MONTHS_PER_YEAR),
+    )
 
 
 @dataclass(frozen=True)
@@ -136,23 +161,27 @@ def _dsr_rows(
     family: str,
     result: Row,
     base_metrics: Mapping[str, float | None],
+    ppy: int,
 ) -> tuple[DsrRow, ...]:
     today: registry.FamilySharpes | None = None
+    n_today = 0
     family_error: str | None = None
     try:
         today = registry.family_sharpes(conn, family)
+        n_today = family_n(conn, family)
     except registry.RegistryError as exc:
         family_error = str(exc)
     out = []
     for basis in _BASES:
-        v, sr_star, psr_zero, dsr = (result[c] for c in _STORED_COLUMNS[basis])
+        stored_v, stored_sr_star, psr_zero, dsr = (result[c] for c in _STORED_COLUMNS[basis])
+        v, sr_star = annual_stored(stored_v, stored_sr_star, result.get("sharpe_unit"))
         recomputed: DeflatedSharpe | None = None
         error = family_error
         if today is not None:
             pairs = today.raw if basis == "raw" else today.excess_spy
             try:
                 recomputed = deflated_sharpe(
-                    base_metrics, basis, n_trials=today.n_trials, pair_sharpes=pairs
+                    base_metrics, basis, n_trials=n_today, pair_sharpes=pairs, periods_per_year=ppy
                 )
             except (KeyError, ValueError) as exc:
                 error = str(exc)
@@ -186,7 +215,9 @@ def load_trial_view(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialView
     )
     results = _rows(conn, "SELECT * FROM trial_results WHERE trial_id = ?", [trial_id])
     result = results[0] if results else None
-    base = float(hypothesis.params[registry.BASE_COST_KEY])
+    frozen = frozen_values(hypothesis)
+    base = float(frozen[registry.BASE_COST_KEY])
+    ppy = periods_per_year(frozen[CADENCE_KEY])
     equity = _rows(
         conn,
         "SELECT series, session, equity FROM trial_equity "
@@ -211,7 +242,7 @@ def load_trial_view(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialView
         if r["series"] == "strategy" and r["cost_per_side_bps"] == base
     }
     dsr = (
-        _dsr_rows(conn, hypothesis.family, result, base_metrics)
+        _dsr_rows(conn, hypothesis.family, result, base_metrics, ppy)
         if result is not None and result["status"] == "ok"
         else ()
     )
@@ -364,9 +395,9 @@ def _render_results(view: TrialView) -> None:
     _line_chart(view.drawdowns, "drawdown", "drawdown", palette, fmt="%")
 
     st.subheader("Turnover and costs")
-    st.caption("Per rebalance at the base cost level.")
-    _bar_chart(view.rebalances, "turnover", "turnover (one-sided)", palette, fmt="%")
-    _bar_chart(view.rebalances, "cost_paid", "cost paid ($)", palette)
+    st.caption("Per rebalance period at the base cost level.")
+    _bar_chart(view.rebalances, "turnover", "turnover per period (one-sided)", palette, fmt="%")
+    _bar_chart(view.rebalances, "cost_paid", "cost paid per period ($)", palette)
 
     st.subheader("Metrics per cost level")
     st.dataframe(_metrics_table(view), hide_index=True)
@@ -374,7 +405,9 @@ def _render_results(view: TrialView) -> None:
     st.subheader("Deflated Sharpe")
     st.caption(
         "Stored: N at run time (N and V as they were when the trial ran; they go stale). "
-        "Today: recomputed with the family's current N and V. Monthly, non-annualized Sharpe."
+        "Today: recomputed with the family's current N and V. V and SR* in annual units "
+        "(rows stored in monthly units before the lab converted); DSR at the trial's own "
+        "period."
     )
     st.dataframe(_dsr_table(view.dsr_rows), hide_index=True)
     for row in view.dsr_rows:

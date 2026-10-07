@@ -5,14 +5,16 @@ holdout" acceptance lines: inserts and reads only; ids increase; closing
 twice raises; a handle is built only by `open_trial`; the oracle family
 and synthetic trials are refused on `settings.store.path`; `family_sharpes`
 counts N over every `ok`, non-synthetic, `in_sample` trial and takes V per
-basis over the latest trial per (parameter hash, window) pair, never
-reading an annualized value; holdout spends; `unfinished` listing;
-decision rows; code version and dirty flag.
+basis over the latest trial per (canonical frozen set hash, window) pair,
+in annual units from the period keys and `periods_per_year` (strategy-lab
+spec reqs 3, 9); holdout spends; `unfinished` listing; decision rows; code
+version and dirty flag; the data and code vintages.
 """
 
 from __future__ import annotations
 
 import inspect
+import math
 import os
 import re
 import statistics
@@ -31,6 +33,13 @@ from tradepartner.store.db import insert_row
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 _W1 = (date(2018, 1, 31), date(2022, 12, 30))
 _W2 = (date(2019, 1, 31), date(2022, 12, 30))
+#: A monthly trial's period Sharpe times this is its annualised Sharpe.
+R12 = math.sqrt(12)
+
+
+def _annual(*monthly: float) -> Any:
+    """`pytest.approx` of monthly period Sharpes annualised."""
+    return pytest.approx(tuple(v * R12 for v in monthly), rel=1e-12)
 
 
 def _params(per_side_bps: float = 15.0, **extra: Any) -> dict[str, Any]:
@@ -110,17 +119,19 @@ def _metrics(
     raw: float,
     excess: float,
     level: float = 15.0,
+    ppy: float | None = 12.0,
 ) -> None:
-    registry.write_metrics(
-        conn,
-        handle,
-        [
-            registry.MetricRow("strategy", level, "sharpe_monthly", raw),
-            registry.MetricRow("strategy", level, "sharpe_monthly_excess_spy", excess),
-            registry.MetricRow("strategy", level, "sharpe_annual", 99.0),
-            registry.MetricRow("SPY", level, "sharpe_monthly", 5.0),
-        ],
-    )
+    rows = [
+        registry.MetricRow("strategy", level, "sharpe_period", raw),
+        registry.MetricRow("strategy", level, "sharpe_period_excess_spy", excess),
+        registry.MetricRow("strategy", level, "sharpe_annual", 99.0),
+        registry.MetricRow("strategy", level, "sharpe_annual_excess_spy", 99.0),
+        registry.MetricRow("strategy", level, "sharpe_monthly", 77.0),
+        registry.MetricRow("SPY", level, "sharpe_period", 5.0),
+    ]
+    if ppy is not None:
+        rows.append(registry.MetricRow("strategy", level, "periods_per_year", ppy))
+    registry.write_metrics(conn, handle, rows)
 
 
 def _ok_trial(
@@ -129,11 +140,12 @@ def _ok_trial(
     tmp_path: Path,
     raw: float,
     excess: float,
+    ppy: float | None = 12.0,
     **kwargs: Any,
 ) -> registry.TrialHandle:
     handle = _open(conn, settings, tmp_path, **kwargs)
-    _metrics(conn, handle, raw, excess)
-    _metrics(conn, handle, raw + 7.0, excess + 7.0, level=50.0)
+    _metrics(conn, handle, raw, excess, ppy=ppy)
+    _metrics(conn, handle, raw + 7.0, excess + 7.0, level=50.0, ppy=ppy)
     assert registry.write_result(conn, handle, registry.ResultStatistics()) == "ok"
     return handle
 
@@ -545,7 +557,7 @@ def test_detail_rows_are_written(
         for table in ("trial_metrics", "trial_equity", "trial_weights", "trial_rebalances")
     }
     assert counts == {
-        "trial_metrics": 4,
+        "trial_metrics": 7,  # `_metrics` writes seven rows
         "trial_equity": 2,
         "trial_weights": 2,
         "trial_rebalances": 1,
@@ -789,10 +801,10 @@ def test_family_sharpes_counts_n_over_ok_in_sample_and_v_over_latest_per_pair(
     result = registry.family_sharpes(conn, "momentum")
 
     assert result.n_trials == 3
-    assert result.raw == (0.30, 0.20)
-    assert result.excess_spy == (0.03, 0.02)
-    assert result.variance("raw") == pytest.approx(statistics.variance([0.30, 0.20]))
-    assert result.variance("excess_spy") == pytest.approx(statistics.variance([0.03, 0.02]))
+    assert result.raw == _annual(0.30, 0.20)
+    assert result.excess_spy == _annual(0.03, 0.02)
+    assert result.variance("raw") == pytest.approx(12 * statistics.variance([0.30, 0.20]))
+    assert result.variance("excess_spy") == pytest.approx(12 * statistics.variance([0.03, 0.02]))
 
 
 def test_family_sharpes_with_one_pair_has_no_variance(
@@ -802,7 +814,7 @@ def test_family_sharpes_with_one_pair_has_no_variance(
     _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
     _ok_trial(conn, settings, tmp_path, 0.2, 0.02)
     result = registry.family_sharpes(conn, "momentum")
-    assert (result.n_trials, result.raw) == (2, (0.2,))
+    assert (result.n_trials, result.raw) == (2, _annual(0.2))
     assert result.variance("raw") is None
 
 
@@ -817,7 +829,7 @@ def test_family_sharpes_counts_a_pending_trial_as_the_latest_of_its_pair(
     assert registry.family_sharpes(conn, "momentum").n_trials == 2
     result = registry.family_sharpes(conn, "momentum", pending=pending)
     assert result.n_trials == 3
-    assert result.raw == (0.2, 0.5)
+    assert result.raw == _annual(0.2, 0.5)
 
 
 def test_requested_windows_that_resolve_alike_are_one_pair(
@@ -830,7 +842,7 @@ def test_requested_windows_that_resolve_alike_are_one_pair(
     _ok_trial(conn, settings, tmp_path, 0.3, 0.03, window=(date(2018, 1, 31), date(2022, 12, 31)))
     _ok_trial(conn, settings, tmp_path, 0.2, 0.02, window=_W2)
     result = registry.family_sharpes(conn, "momentum")
-    assert (result.n_trials, result.raw) == (3, (0.3, 0.2))
+    assert (result.n_trials, result.raw) == (3, _annual(0.3, 0.2))
 
 
 def test_family_sharpes_refuses_a_nan_sharpe(
@@ -862,7 +874,7 @@ def test_family_sharpes_reads_the_base_level_of_each_hypothesis(
     _metrics(conn, handle, 0.4, 0.04, level=5.0)
     _metrics(conn, handle, 0.9, 0.09, level=15.0)
     registry.write_result(conn, handle, registry.ResultStatistics())
-    assert registry.family_sharpes(conn, "momentum").raw == (0.4,)
+    assert registry.family_sharpes(conn, "momentum").raw == _annual(0.4)
 
 
 def test_family_sharpes_raises_when_an_ok_trial_lacks_its_base_sharpe(
@@ -871,13 +883,197 @@ def test_family_sharpes_raises_when_an_ok_trial_lacks_its_base_sharpe(
     _register(conn, settings)
     handle = _open(conn, settings, tmp_path)
     registry.write_result(conn, handle, registry.ResultStatistics())
-    with pytest.raises(registry.RegistryError, match="sharpe_monthly"):
+    with pytest.raises(registry.RegistryError, match="sharpe_period"):
         registry.family_sharpes(conn, "momentum")
 
 
-def test_family_sharpes_never_reads_an_annualized_value() -> None:
-    source = inspect.getsource(registry.family_sharpes) + inspect.getsource(registry._base_sharpes)
-    assert "annual" not in source
+def test_family_sharpes_reads_only_the_new_keys() -> None:
+    """The text check on the SQL (strategy-lab spec, "Metrics" acceptance): the
+    period Sharpes and `periods_per_year`, never a `*_monthly` key or `n_months`, and
+    never a stored annual Sharpe (the annualisation is the trial's own ppy)."""
+    source = (
+        inspect.getsource(registry.family_sharpes)
+        + inspect.getsource(registry._annual_sharpes)
+        + registry._COUNTED_FROM
+    )
+    read = " ".join(registry._BASIS_METRICS.values()) + " " + registry.PERIODS_PER_YEAR_METRIC
+    assert "monthly" not in source + read
+    assert "n_months" not in source
+    assert "sharpe_annual" not in source + read
+    assert set(registry._BASIS_METRICS.values()) == {"sharpe_period", "sharpe_period_excess_spy"}
+
+
+def test_family_sharpes_returns_monthly_and_weekly_trials_in_annual_units(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Each trial's period Sharpe times the square root of its own periods per year
+    (strategy-lab spec req 9), so V is over one unit across cadences."""
+    _register(conn, settings)
+    _register(
+        conn, settings, slug="weekly", params=_params(**{"schedule.rebalance_cadence": "week_end"})
+    )
+    _ok_trial(conn, settings, tmp_path, 0.25, 0.05)
+    _ok_trial(conn, settings, tmp_path, 0.12, 0.03, ppy=52.0, slug="weekly")
+    result = registry.family_sharpes(conn, "momentum")
+    assert result.n_trials == 2
+    assert result.raw == pytest.approx((0.25 * R12, 0.12 * math.sqrt(52)), rel=1e-12)
+    assert result.excess_spy == pytest.approx((0.05 * R12, 0.03 * math.sqrt(52)), rel=1e-12)
+
+
+def test_frozen_sets_differing_only_in_a_default_schedule_key_share_one_pair(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The V pair key is the canonical frozen set's hash (strategy-lab spec req 3):
+    a registration that writes `schedule.rebalance_cadence = month_end` out and one
+    that omits it are one pair; a changed strategy key is another."""
+    _register(conn, settings)
+    _register(
+        conn,
+        settings,
+        slug="explicit",
+        params=_params(**{"schedule.rebalance_cadence": "month_end"}),
+    )
+    _register(conn, settings, slug="tighter", params={**_params(), "strategy.top_fraction": 0.2})
+    assert (
+        registry.get_hypothesis(conn, "h1").params_sha256
+        != registry.get_hypothesis(conn, "explicit").params_sha256
+    )
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, slug="explicit")
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, result.raw) == (2, _annual(0.3))
+    _ok_trial(conn, settings, tmp_path, 0.2, 0.02, slug="tighter")
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, result.raw) == (3, _annual(0.3, 0.2))
+
+
+@pytest.mark.parametrize("ppy", [None, 0.0, float("nan")])
+def test_family_sharpes_refuses_a_trial_without_a_positive_periods_per_year(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path, ppy: float | None
+) -> None:
+    _register(conn, settings)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, ppy=ppy)
+    with pytest.raises(registry.RegistryError, match="periods_per_year"):
+        registry.family_sharpes(conn, "momentum")
+
+
+def test_count_counted_trials_matches_family_sharpes(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    _ok_trial(conn, settings, tmp_path, 9.0, 9.0, synthetic=True)
+    pending = _open(conn, settings, tmp_path)
+    _metrics(conn, pending, 0.5, 0.05)
+    for p in (None, pending):
+        assert (
+            registry.count_counted_trials(conn, "momentum", p)
+            == registry.family_sharpes(conn, "momentum", pending=p).n_trials
+        )
+    assert registry.count_counted_trials(conn, "momentum", pending) == 2
+
+
+# --- vintages ------------------------------------------------------------------
+
+
+def _price(conn: duckdb.DuckDBPyConnection, sid: str, known: datetime, ingested: datetime) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": sid,
+            "session": known.date(),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "known_at": known,
+            "ingested_at": ingested,
+            "source": "test",
+            "provenance": "bar",
+        },
+    )
+
+
+def test_data_vintage_is_the_latest_ingest_of_facts_known_at_the_cutoff(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A later session's ingest leaves it unchanged; a late fact for an in-window
+    session changes it (strategy-lab spec, Definitions "Vintage")."""
+    cutoff = datetime(2024, 6, 28, 20, 0, tzinfo=UTC)
+    assert registry.data_vintage(conn, cutoff) is None
+    known = datetime(2024, 6, 27, 20, 0, tzinfo=UTC)
+    first = datetime(2024, 6, 28, 1, 0, tzinfo=UTC)
+    _price(conn, "A", known, first)
+    assert registry.data_vintage(conn, cutoff) == first
+    nightly = datetime(2024, 7, 2, 1, 0, tzinfo=UTC)
+    _price(conn, "A", datetime(2024, 7, 1, 20, 0, tzinfo=UTC), nightly)
+    assert registry.data_vintage(conn, cutoff) == first
+    late = datetime(2024, 7, 3, 1, 0, tzinfo=UTC)
+    _price(conn, "B", known, late)
+    assert registry.data_vintage(conn, cutoff) == late
+    with pytest.raises(ValueError, match="timezone"):
+        registry.data_vintage(conn, datetime(2024, 6, 28, 20, 0))  # noqa: DTZ001
+
+
+def test_open_trial_records_the_data_vintage_at_its_cutoff(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    ingested = _T0.replace(hour=1)
+    _price(conn, "A", _T0.replace(hour=0), ingested)
+    handle = _open(conn, settings, tmp_path)
+    row = conn.execute(
+        "SELECT detail_level, data_vintage, code_tree_sha256 FROM trials WHERE trial_id = ?",
+        [handle.trial_id],
+    ).fetchone()
+    assert row == ("full", ingested, None)  # tmp_path is no checkout
+
+
+def test_code_tree_sha256_hashes_package_sources_and_the_lock_only(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src" / "tradepartner").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    _git(repo, "init", "-q")
+    module = repo / "src" / "tradepartner" / "m.py"
+    module.write_text("x = 1\n")
+    (repo / "uv.lock").write_text("lock 1\n")
+    (repo / "docs" / "d.md").write_text("doc\n")
+    (repo / "src" / "tradepartner" / "data.toml").write_text("a = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "c")
+    base = registry.code_tree_sha256(repo)
+    assert base is not None and re.fullmatch(r"[0-9a-f]{64}", base)
+    assert registry.code_tree_sha256(repo / "docs") == base  # any directory in the checkout
+    (repo / "docs" / "d.md").write_text("changed doc\n")
+    (repo / "src" / "tradepartner" / "data.toml").write_text("a = 2\n")
+    (repo / "src" / "tradepartner" / "__pycache__").mkdir()
+    (repo / "src" / "tradepartner" / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\0")
+    (repo / "src" / "tradepartner" / "untracked.py").write_text("y = 2\n")
+    assert registry.code_tree_sha256(repo) == base
+    module.write_text("x = 2\n")  # uncommitted source change counts
+    changed = registry.code_tree_sha256(repo)
+    assert changed != base
+    module.write_text("x = 1\n")
+    (repo / "uv.lock").write_text("lock 2\n")
+    assert registry.code_tree_sha256(repo) not in (base, changed)
+
+
+def test_code_tree_sha256_is_none_outside_a_checkout(tmp_path: Path) -> None:
+    assert registry.code_tree_sha256(tmp_path) is None
+
+
+def test_result_rows_record_the_annual_sharpe_unit(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    ok = _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    failed = _open(conn, settings, tmp_path)
+    registry.close_trial(conn, failed, "failed", "boom")
+    units = conn.execute("SELECT sharpe_unit FROM trial_results ORDER BY trial_id").fetchall()
+    assert units == [("annual",), ("annual",)]
+    assert ok.trial_id < failed.trial_id
 
 
 # --- holdout spends and listing ------------------------------------------
@@ -961,3 +1157,22 @@ def test_code_version_defaults_to_this_checkout() -> None:
     version, dirty = registry.code_version()
     assert re.fullmatch(r"[0-9a-f]{40}", version)
     assert isinstance(dirty, bool)
+
+
+def test_a_store_without_the_version_15_columns_records_trials_without_them(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A store written through the registry before `init_schema` migrated it (a
+    test's version-4 store) still records trials; only the new columns are absent."""
+    for table, column in (
+        ("trials", "detail_level"),
+        ("trials", "data_vintage"),
+        ("trials", "code_tree_sha256"),
+        ("trial_results", "sharpe_unit"),
+    ):
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    _register(conn, settings)
+    handle = _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    assert conn.execute(
+        "SELECT status FROM trial_results WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone() == ("ok",)

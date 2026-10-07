@@ -224,7 +224,25 @@ registry; #83 took version 2 first, so the registry is version 3):
   (`store.registry.write_rebalances`), until a later issue retires them. A
   read-only connection accepts a version-13 store without migrating it:
   every read but `trial_rebalance_counts` works.
-- **A later DDL change goes to version 15**, with its own migration and a
+- **Version 15** (#1179, strategy-lab plan T97, version "P"; strategy-lab
+  spec reqs 8 and 9, Definitions "Vintage" and "Detail level"): the
+  period keys. `trials` gains `detail_level VARCHAR` (`full` on every
+  existing row), `data_vintage TIMESTAMPTZ` and `code_tree_sha256 VARCHAR`
+  (NULL on every existing row), and `trial_results` gains `sharpe_unit
+  VARCHAR` (NULL on every existing row, read as `monthly`; `annual` on
+  every row written from now on), all by `ALTER TABLE` after the DDL pass,
+  so the pinned `_REGISTRY_TABLE_DDL` never changes and a fresh store gets
+  them the same way. The migration from version 14 (or any earlier
+  migratable version, after its steps) also inserts into `trial_metrics`,
+  for every existing trial's rows, each `*_monthly` row copied under its
+  `*_period` name, `n_periods` from `n_months`, `periods_per_year = 12`,
+  `turnover_annual = 12 * turnover_monthly` and `sharpe_annual_excess_spy =
+  sqrt(12) * sharpe_monthly_excess_spy` (NULL stays NULL, as for SPY): every
+  pre-version-15 trial is `month_end`. The `*_monthly` and `n_months` rows
+  stay (append-only) and nothing reads them afterwards. No other table
+  changes. A read-only connection accepts a version-14 store without
+  migrating it: every read but the four columns and the period rows works.
+- **A later DDL change goes to version 16**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -295,6 +313,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Final
 
 import duckdb
 
@@ -413,9 +432,13 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   earlier migratable version, after its steps) rebuilds `signals` with
 #:   every row kept, fills the counts table from the fixed count columns and
 #:   appends a version-14 row (module docstring, "Schema versions").
-#: - A later DDL change goes to version 15, with its own migration and a
+#: - 15 (#1179, strategy-lab plan T97, version "P"): `trials.detail_level`,
+#:   `trials.data_vintage`, `trials.code_tree_sha256` and
+#:   `trial_results.sharpe_unit`, and the period-key rows inserted for every
+#:   existing trial (module docstring, "Schema versions").
+#: - A later DDL change goes to version 16, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 15
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -471,6 +494,11 @@ _PRE_PROFITABILITY_VERSION = 12
 #: `JOURNAL_ENUMS` (#1153, T127): read-only connections serve every read but
 #: `trial_rebalance_counts`.
 _PRE_REBALANCE_COUNTS_VERSION = 13
+
+#: The last version without the period keys, the vintage columns and
+#: `trial_results.sharpe_unit` (#1179, T97): read-only connections serve every
+#: read but those columns and the `*_period` metric rows.
+_PRE_PERIOD_KEYS_VERSION = 14
 
 
 class SchemaVersionError(RuntimeError):
@@ -2050,6 +2078,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESEARCH_VERSION,
         _PRE_PROFITABILITY_VERSION,
         _PRE_REBALANCE_COUNTS_VERSION,
+        _PRE_PERIOD_KEYS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2060,7 +2089,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # every read but the research tables (`require_research` raises
         # `ResearchNotInitialised`) and `trial_results.n_research`; version 12
         # every read but `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`;
-        # version 13 every read but `trial_rebalance_counts`.
+        # version 13 every read but `trial_rebalance_counts`; version 14 every
+        # read but the version-15 columns and the `*_period` metric rows.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2427,9 +2457,82 @@ def _migrate_rebalance_counts(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+#: Every `trial_metrics` key version 15 renames, Phase 3 name to period name.
+PERIOD_KEY_RENAMES: Final[dict[str, str]] = {
+    "sharpe_monthly": "sharpe_period",
+    "sharpe_monthly_excess_spy": "sharpe_period_excess_spy",
+    "turnover_monthly": "turnover_period",
+    "skew_monthly": "skew_period",
+    "kurtosis_monthly": "kurtosis_period",
+    "skew_monthly_excess_spy": "skew_period_excess_spy",
+    "kurtosis_monthly_excess_spy": "kurtosis_period_excess_spy",
+    "n_months": "n_periods",
+}
+
+#: Every trial before version 15 rebalanced at `month_end`: its periods per year
+#: (`backtest.schedule.MONTHS_PER_YEAR`, which this leaf module does not import).
+_PHASE3_PERIODS_PER_YEAR: Final = 12
+
+#: The columns version 15 adds, by table: (name, type, value on existing rows).
+_PERIOD_COLUMNS: Final[dict[str, tuple[tuple[str, str, str | None], ...]]] = {
+    "trials": (
+        ("detail_level", "VARCHAR", "full"),
+        ("data_vintage", "TIMESTAMPTZ", None),
+        ("code_tree_sha256", "VARCHAR", None),
+    ),
+    "trial_results": (("sharpe_unit", "VARCHAR", None),),
+}
+
+
+def _migrate_period_columns(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add each version-15 column where missing (module docstring, "Schema
+    versions", version 15): by `ALTER TABLE`, `detail_level` with a `'full'`
+    default dropped straight after (so every existing row reads `full` without an
+    `UPDATE`, and no later insert inherits it), the rest NULL. Idempotent.
+    `_REGISTRY_TABLE_DDL` keeps its version-4 pin, so a fresh store gets the
+    columns here too. Runs inside `init_schema`'s transaction, after its DDL
+    pass."""
+    for table, columns in _PERIOD_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        for name, type_, existing_value in columns:
+            if name in existing:
+                continue
+            if existing_value is None:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {type_}")
+                continue
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {type_} DEFAULT '{existing_value}'"
+            )
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN {name} DROP DEFAULT")
+
+
+def _migrate_period_metrics(conn: duckdb.DuckDBPyConnection) -> None:
+    """Insert the period-key rows for every existing trial (module docstring,
+    "Schema versions", version 15): each `PERIOD_KEY_RENAMES` row copied under
+    its new name, `periods_per_year = 12` beside every `n_months` row,
+    `turnover_annual = 12 * turnover_monthly` and `sharpe_annual_excess_spy =
+    sqrt(12) * sharpe_monthly_excess_spy`. The old rows stay. Runs inside
+    `init_schema`'s transaction, only on a store migrating from version 14 or
+    earlier."""
+    renames = ", ".join(f"('{old}', '{new}')" for old, new in PERIOD_KEY_RENAMES.items())
+    ppy = _PHASE3_PERIODS_PER_YEAR
+    conn.execute(
+        "INSERT INTO trial_metrics (trial_id, series, cost_per_side_bps, metric, value) "
+        f"WITH renames(old, new) AS (VALUES {renames}) "
+        "SELECT m.trial_id, m.series, m.cost_per_side_bps, r.new, m.value "
+        "FROM trial_metrics m JOIN renames r ON m.metric = r.old "
+        f"UNION ALL SELECT trial_id, series, cost_per_side_bps, 'periods_per_year', {ppy}.0 "
+        "FROM trial_metrics WHERE metric = 'n_months' "
+        f"UNION ALL SELECT trial_id, series, cost_per_side_bps, 'turnover_annual', {ppy} * value "
+        "FROM trial_metrics WHERE metric = 'turnover_monthly' "
+        "UNION ALL SELECT trial_id, series, cost_per_side_bps, 'sharpe_annual_excess_spy', "
+        f"sqrt({ppy}) * value FROM trial_metrics WHERE metric = 'sharpe_monthly_excess_spy'"
+    )
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 13 store to version 14.
+    version-2 to 14 store to version 15.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2441,7 +2544,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; every store gets `trial_rebalance_counts`
+    `CURRENT_SCHEMA_VERSION`; every store gets the version-15 columns
+    (`trials.detail_level`, `full` on existing rows, `data_vintage`,
+    `code_tree_sha256`; `trial_results.sharpe_unit`), and a version-2 to 14
+    store the period-key `trial_metrics` rows for every existing trial and a
+    version-15 row (#1179, T97); every store gets `trial_rebalance_counts`
     created and `trial_rebalances.n_excluded_no_history` made nullable, and a
     version-5 to 13 store `signals` rebuilt with the version-14 reason `CHECK`
     (every row kept), the counts table filled from its fixed count columns
@@ -2470,7 +2577,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-14, 13 (every read but
+    On a read-only connection no DDL runs: a version-15, 14 (every read but
+    the version-15 columns and period rows), 13 (every read but
     `trial_rebalance_counts`), 12, 11, 10, 9, 8, 7,
     6 or 5 store passes (a version-12 store serves every read but
     `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`; a version-11
@@ -2507,6 +2615,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_RESEARCH_VERSION,
         _PRE_PROFITABILITY_VERSION,
         _PRE_REBALANCE_COUNTS_VERSION,
+        _PRE_PERIOD_KEYS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2551,6 +2660,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _relax_no_history_count(conn)
         if max_version is not None and max_version <= _PRE_REBALANCE_COUNTS_VERSION:
             _migrate_rebalance_counts(conn)
+        _migrate_period_columns(conn)
+        if max_version is not None and max_version <= _PRE_PERIOD_KEYS_VERSION:
+            _migrate_period_metrics(conn)
         forget_column_types(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
