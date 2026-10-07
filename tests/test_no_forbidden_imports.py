@@ -282,3 +282,57 @@ def test_a_module_outside_the_allowlist_would_fail() -> None:
             ("tradepartner.dashboard.research_page", "tradepartner.dashboard"),
         ]
     )
+
+
+# --- Strategy-lab isolation (strategy-lab plan T103, approach "One N function") ---
+#
+# The lab modules import no `execution` or adapter module, and `execution` imports no
+# lab module: a sweep reads the store and writes the trial registry, never an order.
+# The list is the plan's files (choice 4); a module not built yet is skipped, and the
+# ones built so far must be found, so the scan is never vacuous. `backtest.frozen` (T96)
+# is not one: it is the one accessor of frozen values every reader goes through,
+# `paper start` included (spec, Definitions, Frozen-key defaults).
+
+LAB_MODULES = (
+    "tradepartner.store.lab_schema",  # T101
+    "tradepartner.store.lab_registry",  # T103
+    "tradepartner.store.lab_queries",  # T103b
+    "tradepartner.backtest.sweep",  # T102
+    "tradepartner.backtest.quiet",  # T106
+    "tradepartner.backtest.lab",  # T107
+    "tradepartner.backtest.sweep_report",  # T108
+    "tradepartner.backtest.promotion",  # T109
+)
+_LAB_BUILT = ("tradepartner.store.lab_schema", "tradepartner.store.lab_registry")
+
+
+def test_lab_modules_import_no_execution_or_adapter_module() -> None:
+    lab = [(module, tree) for module, tree in _sources(TRADEPARTNER) if module in LAB_MODULES]
+    assert {module for module, _ in lab} >= set(_LAB_BUILT)
+    offenders = [
+        module
+        for module, tree in lab
+        if _imports_any(tree, ("tradepartner.execution", "tradepartner.adapters"))
+    ]
+    assert offenders == []
+
+
+def test_execution_imports_no_lab_module() -> None:
+    offenders = [
+        module
+        for module, tree in _sources(TRADEPARTNER / "execution")
+        if _imports_any(tree, LAB_MODULES)
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from tradepartner.store import lab_registry",
+        "from tradepartner.store.lab_schema import require_lab",
+        "import tradepartner.backtest.lab",
+    ],
+)
+def test_the_detector_catches_a_lab_import(source: str) -> None:
+    assert _imports_any(ast.parse(source), LAB_MODULES)
