@@ -1037,6 +1037,61 @@ def test_a_class_member_needs_a_matching_title_even_for_one_class(settings: Sett
     assert (ACME, 7) in {(r["security_id"], r["value"]) for r in matched[0]}
 
 
+def test_a_series_letter_in_the_title_names_the_class(settings: Settings) -> None:
+    # #1166: Liberty Broadband (LBRDA/LBRDK) and Liberty TripAdvisor title
+    # their classes "Series A/C common stock" and tag CommonClassA/CMember.
+    series = (
+        CoverListing("Series A common stock", "DUA", "NASDAQ"),
+        CoverListing("Series C common stock", "DUC", "NASDAQ"),
+    )
+    class_c = _fact(DUAL, "us-gaap:CommonClassCMember", 3_000_000, f"{DUAL}-19-1", _at(2019, 3, 4))
+    rows, unmatched = _fact_rows(settings, _filings(dual_listings=series, extra_facts=[class_c]))
+    dual = {(r["security_id"], r["value"]) for r in rows if r["security_id"] != ACME}
+    assert dual == {(DUAL, 9_000_000), (f"{DUAL}:series-c-common-stock", 3_000_000)}
+    assert [u.class_member for u in unmatched] == ["us-gaap:CommonClassBMember"]  # unlisted
+
+
+def test_a_series_in_a_rights_clause_names_no_class(settings: Settings) -> None:
+    # code-review on #1168: a plain common title mentioning a preferred
+    # series' purchase rights must not let an unlisted Class A take its place.
+    title = "Common Stock, and Series A Junior Participating Preferred Stock Purchase Rights"
+    member = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", _at(2019, 3, 1))
+    _, unmatched = _fact_rows(settings, _filings(acme_title=title, extra_facts=[member]))
+    assert member in unmatched
+
+
+#: A later cover page retitles ACME's one listed class "Class A" (#1166: SAM,
+#: PBF, OPY, GOCO, WEBR): same pair, so no new listing row.
+_RETITLED_AT = _at(2019, 5, 1)
+_RETITLE = CoverPage(
+    ACME, f"{ACME}-19-000005", _RETITLED_AT, (CoverListing("Class A Common Stock", "ACME", "NYSE"),)
+)
+
+
+def test_a_class_letter_from_a_later_cover_title_names_the_class(settings: Settings) -> None:
+    after = _RETITLED_AT + timedelta(days=1)
+    member = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-000006", after)
+    other = _fact(ACME, "us-gaap:CommonClassBMember", 2, f"{ACME}-19-000006", after)
+    rows, unmatched = _fact_rows(settings, _filings(extra_covers=[_RETITLE], extra_facts=[member]))
+    assert (ACME, "us-gaap:CommonClassAMember", 7) in {
+        (r["security_id"], r["class_member"], r["value"]) for r in rows
+    }
+    assert member not in unmatched
+    _, unmatched = _fact_rows(settings, _filings(extra_covers=[_RETITLE], extra_facts=[other]))
+    assert other in unmatched  # Class B is not the listed class
+
+
+def test_a_later_cover_title_never_names_an_earlier_facts_class(settings: Settings) -> None:
+    # No look-ahead (#1166): a fact accepted before the cover page that first
+    # titles the class "Class A" is matched as if that page did not exist.
+    before = _RETITLED_AT - timedelta(days=1)
+    early = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-000004", before)
+    with_later = _fact_rows(settings, _filings(extra_covers=[_RETITLE], extra_facts=[early]))
+    without = _fact_rows(settings, _filings(extra_facts=[early]))
+    assert early in with_later[1] and early in without[1]
+    assert with_later == without
+
+
 def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:
     # #820: post-bankruptcy equity is a new security; the old common no
     # longer takes the company's share count once the successor is known.
