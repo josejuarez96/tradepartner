@@ -27,7 +27,7 @@ uv run python scripts/team.py start <name>  # new session: own directory + regis
 uv run python scripts/team.py status      # who holds what, ready frontier
 uv run python scripts/team.py claim T5    # or an issue number; release to give back
 ```
-Run lint, format and mypy before every push, and the targeted pytest `ready_pr` picks (`--full-tests` for all) when the change touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version`. CI runs the full suite on such PRs and on every push to main.
+Run lint, format and mypy before every push, and the test files your change touches. `ready_pr` leaves pytest to CI (`--tests` runs the mapped tests locally, `--full-tests` all): CI runs the full suite, sharded, on every PR touching `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version`, and on every push to main.
 
 ## Code standards
 - Python 3.12, `src/tradepartner/` layout, type hints everywhere (mypy strict), docstrings on public functions.
