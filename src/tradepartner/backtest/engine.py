@@ -112,7 +112,12 @@ class Plan:
     `members` (the universe, sorted), `scores` and
     `excluded_no_history` (momentum members without both anchor bars) are the reads behind the
     targets, kept for Phase 4's `decisions_from` (plan T53b); the loop does not read
-    them."""
+    them. `exclusions` (reason to ids) holds every reason the family's signal declares,
+    empty or not, and `counts` (name to value) its counts, written whole to the trial
+    registry (ADR 0014 point 3; #1153, T127); `excluded_no_history` and
+    `n_excluded_no_history` are `exclusions.get("no_history", ())` and its length, kept as
+    fields so a `Plan` is built as before. Both mappings default to empty, so a plan
+    built without them records no counts."""
 
     session: date
     fill_session: date
@@ -125,6 +130,7 @@ class Plan:
     scores: dict[str, float]
     excluded_no_history: tuple[str, ...]
     counts: Mapping[str, int] = field(default_factory=dict)
+    exclusions: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -193,6 +199,13 @@ def _plan(
     signal = strategy.signal(
         strategy.reader(provider, params, session, t, members), params, session, t, members
     )
+    undeclared = set(signal.exclusions) - set(strategy.exclusion_reasons)
+    if undeclared:
+        raise ValueError(f"{family} signal reported undeclared exclusions {sorted(undeclared)}")
+    exclusions = {
+        reason: tuple(signal.exclusions.get(reason, ())) for reason in strategy.exclusion_reasons
+    }
+    no_history = exclusions.get("no_history", ())
     construction = getattr(params, strategy.section)
     return Plan(
         session=session,
@@ -200,12 +213,13 @@ def _plan(
         targets=target_weights(signal.scores, construction.top_fraction, construction.weighting),
         n_universe=len(members),
         n_static_listings=provider.static_listing_count(t, members),
-        n_excluded_no_history=signal.counts.get("n_excluded_no_history", 0),
+        n_excluded_no_history=len(no_history),
         gap=provider.survivorship_gap(t),
         members=tuple(members),
         scores=signal.scores,
-        excluded_no_history=signal.exclusions.get("no_history", ()),
-        counts=signal.counts,
+        excluded_no_history=no_history,
+        counts=dict(signal.counts),
+        exclusions=exclusions,
     )
 
 
@@ -468,17 +482,9 @@ def _step(
             n_missing_fill=len(fill.missing),
             n_delisting_exits=sum(not e.stale for e in exits),
             n_stale_exits=sum(e.stale for e in exits),
-            n_excluded_no_history=plan.counts.get(
-                "n_excluded_no_history", plan.n_excluded_no_history
-            ),
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
-            n_ranked=plan.counts.get("n_ranked"),
-            n_excluded_no_facts=plan.counts.get("n_excluded_no_facts"),
-            n_excluded_stale_facts=plan.counts.get("n_excluded_stale_facts"),
-            n_excluded_sector=plan.counts.get("n_excluded_sector"),
-            n_excluded_malformed=plan.counts.get("n_excluded_malformed"),
-            n_derived=plan.counts.get("n_derived"),
+            counts=plan.counts,
         )
     )
 
