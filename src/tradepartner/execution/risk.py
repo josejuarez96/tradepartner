@@ -683,8 +683,9 @@ def size_buys(
         low = [b for b in active if below_minimum(b, scale)]
         if not low:
             break
-        deferred.update(id(b) for b in low)
-        active = [b for b in active if id(b) not in deferred]
+        dropped = min(low, key=lambda b: (b.remainder.notional, b.decision.security_id))
+        deferred.add(id(dropped))
+        active = [b for b in active if id(b) != id(dropped)]
 
     notionals = {
         id(b): _dec(attempt(b, scale))
