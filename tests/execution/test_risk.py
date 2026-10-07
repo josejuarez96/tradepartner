@@ -626,13 +626,13 @@ def test_a_whole_share_buy_that_does_not_fit_the_cash_left_is_deferred() -> None
 @pytest.mark.parametrize(
     ("a_remainder", "b_remainder", "kept"),
     [(600.0, 500.0, "A"), (500.0, 500.0, "B")],
-    ids=["smallest-remainder", "symbol-tie-break"],
+    ids=["smallest-remainder", "security-id-tie-break"],
 )
 def test_below_minimum_whole_share_buys_are_deferred_one_at_a_time(
     a_remainder: float, b_remainder: float, kept: str
 ) -> None:
     """At the shared scale neither $400 name buys a share; dropping just the
-    smallest remainder (or A on a tie) lets the other buy one."""
+    smallest remainder (or the lower security_id on a tie) lets the other buy one."""
     buys = [
         _buy(2, "B", b_remainder, whole_share=True),
         _buy(1, "A", a_remainder, whole_share=True),
@@ -640,6 +640,21 @@ def test_below_minimum_whole_share_buys_are_deferred_one_at_a_time(
     sizings = size_buys(buys, 700.0, {"A": 400.0, "B": 400.0}.__getitem__, RiskConfig(), _NO_COSTS)
     assert [(s.security_id, s.quantity, s.deferred) for s in sizings] == [
         (name, 1.0 if name == kept else None, name != kept) for name in ("B", "A")
+    ]
+
+
+def test_whole_share_buy_impossible_at_full_scale_is_deferred_first() -> None:
+    """B cannot buy a buffered share even at full scale; A can after B defers."""
+    buys = [
+        _buy(1, "A", 500.0, whole_share=True),
+        _buy(2, "B", 1000.0, whole_share=True),
+    ]
+    sizings = size_buys(
+        buys, 1000.0, {"A": 400.0, "B": 1200.0}.__getitem__, RiskConfig(), _NO_COSTS
+    )
+    assert [(s.security_id, s.quantity, s.deferred) for s in sizings] == [
+        ("A", 1.0, False),
+        ("B", None, True),
     ]
 
 

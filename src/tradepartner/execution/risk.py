@@ -70,8 +70,10 @@ the largest notional once (a `ValueError` if that takes it below the minimum),
 so every sized batch passes `check_phase`'s cash rule. A notional buy whose
 scaled attempt falls below `risk.min_order_notional`, or a whole-share buy that
 floors to no share (or to less than the minimum), is deferred and the others
-rescaled without it;
-whole-share buys come last, by floor at the buffered price, while that fits the
+rescaled without it. Buys that cannot meet the minimum even at full scale are
+set aside first; then one below-minimum buy is deferred per pass, smallest
+remainder first, with ties by `security_id` ascending. Whole-share buys come
+last, by floor at the buffered price, while that fits the
 cash left, else deferred.
 """
 
@@ -678,11 +680,15 @@ def size_buys(
 
     active = [b for b in decisions if b.remainder.notional > 0]
     deferred: set[int] = {id(b) for b in decisions if b.remainder.notional <= 0}
+    never_fit = {id(b) for b in active if below_minimum(b, Decimal(1))}
+    deferred.update(never_fit)
+    active = [b for b in active if id(b) not in never_fit]
     while True:
         scale = scale_for(active)
         low = [b for b in active if below_minimum(b, scale)]
         if not low:
             break
+        # Ties by security_id ascending: stable and always present; the owner's #409 said symbol.
         dropped = min(low, key=lambda b: (b.remainder.notional, b.decision.security_id))
         deferred.add(id(dropped))
         active = [b for b in active if id(b) != id(dropped)]
