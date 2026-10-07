@@ -22,9 +22,15 @@ builds a hypothesis's (file values over live `Settings`, validated, in JSON form
 refuses a product above `lab.max_variants_per_sweep` and two variants with one
 fingerprint, and returns the variants in canonical order (ascending `params_sha256`).
 
-Store-level refusals (family rules, a fingerprint already registered, family readiness,
-the anchor check against the store's first session, the family rules' own lattice and
-`oracle` on the real store) belong to `register` (T104). Nothing here touches a store.
+`register` (T104) applies the **store-level** refusals of req 1 before any row is
+written, in a sweep's existing family: `oracle` on the real store, the family rules
+(holdout, `in_sample_start`, every forbidden-prefix key; `costs.per_side_bps` may only
+rise), a fingerprint already registered anywhere, family readiness, the anchor check
+against the store's first session and the family rules' own lattice. It then writes the
+`sweeps` row, one `hypotheses`, `sweep_variants` and `hypothesis_fingerprints` row per
+variant, and leaves the transaction to the caller. A family with no `family_rules` row
+is refused here; its first registration is T104b's. Every function above `register`
+reads a file and `Settings` only.
 """
 
 from __future__ import annotations
@@ -37,38 +43,53 @@ import re
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, get_args
 
+import duckdb
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from tradepartner.backtest import frozen, hypothesis
+from tradepartner.backtest.holdout import Frozen, default_in_sample_window
+from tradepartner.backtest.schedule import rebalance_sessions
+from tradepartner.backtest.signals import check_anchor_feasible
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
-from tradepartner.store import registry
+from tradepartner.store import lab_registry, registry
+from tradepartner.store.lab_schema import require_lab
 
 __all__ = [
     "FORBIDDEN_AXIS_PREFIXES",
     "READ_GROUP_FREE_KEYS",
+    "AnchorInfeasibleError",
     "AxisNotSweepableError",
     "CadenceAxisStatisticError",
     "DuplicateFingerprintError",
     "DuplicateGridValueError",
+    "FamilyLatticeError",
+    "FamilyNotReadyError",
+    "FamilyRuleError",
+    "FingerprintRegisteredError",
     "FixedAndGriddedError",
     "InvalidVariantError",
     "LabBlockError",
     "MissingRequiredKeyError",
+    "NoFamilyRulesError",
     "OffLatticeError",
     "SelectionStatistic",
     "SweepFile",
     "SweepFileError",
     "SweepLab",
+    "SweepRegistration",
+    "SweepRegistrationError",
     "TooManyVariantsError",
     "Variant",
     "expand_grid",
+    "family_rule_params",
     "parse_sweep_file",
     "read_groups",
+    "register",
     "variant_slug",
 ]
 
@@ -590,3 +611,299 @@ def variant_slug(sweep_slug: str, sweep_id: int, index: int, n_variants: int) ->
         raise ValueError(f"sweep_id must be >= 0, got {sweep_id}")
     width = len(str(n_variants))
     return f"{sweep_slug}--r{sweep_id}-v{index:0{width}d}"
+
+
+# --- registration (T104) ---------------------------------------------------------
+
+
+class SweepRegistrationError(ValueError):
+    """A sweep file that breaks a store-level rule of req 1. Raised before any row is
+    written."""
+
+
+class NoFamilyRulesError(SweepRegistrationError):
+    """The sweep's family has no `family_rules` row: its first registration (a new
+    family) is not this path's."""
+
+
+class FamilyRuleError(SweepRegistrationError):
+    """Req 1(a): the file's holdout, `in_sample_start` or a forbidden-prefix value
+    differs from the family rules (`costs.per_side_bps` may only rise)."""
+
+
+class FingerprintRegisteredError(SweepRegistrationError):
+    """Req 1(b): a variant's fingerprint is already registered (a standalone
+    hypothesis or a variant of any sweep, in any family)."""
+
+
+class FamilyNotReadyError(SweepRegistrationError):
+    """Req 1(c): a standalone hypothesis of the family has no `ok`, non-synthetic,
+    in-sample trial over its default window yet."""
+
+
+class AnchorInfeasibleError(SweepRegistrationError):
+    """Req 1(d): a variant whose signal anchor can fall after T, or whose formation
+    anchor at the window's first rebalance precedes the store's first bar session."""
+
+
+class FamilyLatticeError(SweepRegistrationError):
+    """Req 1(e): a grid value off its axis's step in the family rules' lattice."""
+
+
+@dataclass(frozen=True)
+class SweepRegistration:
+    """A sweep registration: its `sweeps` row, its variants' `sweep_variants` rows and
+    `hypotheses` records in canonical order, and whether this call wrote them (`False`
+    when an unchanged file returned the existing registration)."""
+
+    sweep: lab_registry.SweepRecord
+    variants: tuple[lab_registry.SweepVariant, ...]
+    hypotheses: tuple[registry.HypothesisRecord, ...]
+    created: bool
+
+
+_HOLDOUT_PREFIX: Final = "holdout."
+
+
+def family_rule_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    """The keys of a frozen set the family rules fix as values (Definitions, Family
+    rules): every key under `FORBIDDEN_AXIS_PREFIXES` except `holdout.*`, which the
+    rules hold in their own date columns."""
+    return {
+        key: value
+        for key, value in params.items()
+        if key.startswith(FORBIDDEN_AXIS_PREFIXES) and not key.startswith(_HOLDOUT_PREFIX)
+    }
+
+
+def _rule_differences(
+    file: SweepFile, params: Mapping[str, Any], rules: lab_registry.FamilyRules
+) -> list[str]:
+    """The family rules `file` and one variant's frozen set `params` break, by name."""
+    differences = [
+        name
+        for name, ours, theirs in (
+            ("holdout.start", file.holdout_start, rules.holdout_start),
+            ("holdout.end", file.holdout_end, rules.holdout_end),
+            ("in_sample_start", file.in_sample_start, rules.in_sample_start),
+        )
+        if ours != theirs
+    ]
+    for key, rule in sorted(rules.fixed_params.items()):
+        value = params.get(key)
+        if key == registry.BASE_COST_KEY:
+            if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
+                continue
+            differences.append(f"{key} (lower than the family's {rule})")
+        elif key not in params or not frozen.is_default(value, rule):
+            differences.append(key)
+    table_defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key, value in sorted(family_rule_params(params).items()):
+        if key in rules.fixed_params:
+            continue
+        # A frozen key that landed after the rules were written, at its behaviour-
+        # preserving default, is the rules' behaviour; any other value is not.
+        if key in table_defaults and frozen.is_default(value, table_defaults[key]):
+            continue
+        differences.append(f"{key} (not fixed by the family rules)")
+    return differences
+
+
+def _unrun_standalone(conn: duckdb.DuckDBPyConnection, family: str) -> list[str]:
+    """The slugs of `family`'s standalone hypotheses (latest registration per slug, no
+    sweep's variant) without an `ok`, non-synthetic, in-sample trial over the default
+    window: the names refusal 1(c) gives. `lab_registry.family_ready_for_sweep` decides."""
+    rows = conn.execute(
+        "SELECT MAX(hypothesis_id) FROM hypotheses WHERE family = ? AND hypothesis_id NOT IN "
+        "(SELECT hypothesis_id FROM sweep_variants) GROUP BY slug ORDER BY 1",
+        [family],
+    ).fetchall()
+    names: list[str] = []
+    for (hypothesis_id,) in rows:
+        record = registry.get_hypothesis_by_id(conn, hypothesis_id)
+        cadence = frozen.frozen_values(record)[lab_registry.CADENCE_KEY]
+        window = default_in_sample_window(Frozen.from_hypothesis(record), cadence)
+        found = conn.execute(
+            "SELECT 1 FROM trials t JOIN trial_results r USING (trial_id) "
+            "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
+            "AND r.status = 'ok' AND t.start_session = ? AND t.end_session = ?",
+            [hypothesis_id, window.start, window.end],
+        ).fetchone()
+        if found is None:
+            names.append(record.slug)
+    return names
+
+
+def _anchor_refusal(file: SweepFile, variant: Variant, first_session: date | None) -> str | None:
+    """Refusal 1(d) for one variant, or None. Only a family whose signal reads the
+    `strategy` anchors (momentum, oracle) has anchors to check."""
+    params = variant.frozen_set
+    if "strategy.formation_months" not in params:
+        return None
+    if first_session is None:
+        return "the store has no bar sessions, so no formation anchor can be read"
+    cadence = params[lab_registry.CADENCE_KEY]
+    sessions = rebalance_sessions(
+        file.in_sample_start, file.holdout_start - timedelta(days=1), cadence
+    )
+    if not sessions:
+        return (
+            f"no rebalance session at {cadence} between in_sample_start "
+            f"{file.in_sample_start} and holdout.start {file.holdout_start}"
+        )
+    return check_anchor_feasible(
+        params["strategy.formation_months"],
+        params["strategy.skip_months"],
+        params["schedule.signal_anchor"],
+        cadence,
+        sessions[0],
+        first_session,
+    )
+
+
+def _existing_registration(
+    conn: duckdb.DuckDBPyConnection, file: SweepFile, variants: Sequence[Variant]
+) -> SweepRegistration | None:
+    """The slug's latest registration when it is this file with these frozen sets."""
+    latest = lab_registry.sweep_by_slug(conn, file.slug)
+    if latest is None or latest.doc_sha256 != file.doc_sha256:
+        return None
+    rows = lab_registry.sweep_variants(conn, latest.sweep_id)
+    records = [registry.get_hypothesis_by_id(conn, row.hypothesis_id) for row in rows]
+    if [r.params_sha256 for r in records] != [v.params_sha256 for v in variants]:
+        return None
+    return SweepRegistration(
+        sweep=latest, variants=tuple(rows), hypotheses=tuple(records), created=False
+    )
+
+
+def register(
+    conn: duckdb.DuckDBPyConnection,
+    file: Path,
+    settings: Settings | None = None,
+    *,
+    registered_by: str,
+) -> SweepRegistration:
+    """Register the sweep in `file` in its existing family (req 1) and return it.
+
+    `LabNotInitialised` first, on a store without the lab tables. Then the file-level
+    refusals (`parse_sweep_file`, `expand_grid`) and every store-level one, before any
+    row is written: `oracle` on the real store (`registry.RealStoreRefused`), a family
+    with no rules (`NoFamilyRulesError`), (a) `FamilyRuleError`, (b)
+    `FingerprintRegisteredError` naming the registration that holds it, (c)
+    `FamilyNotReadyError` naming the unrun hypothesis, (d) `AnchorInfeasibleError`
+    against `lab_registry.first_session`, (e) `FamilyLatticeError`. An unchanged file
+    with unchanged frozen sets returns the slug's latest registration and writes
+    nothing; a changed file is a new registration, so its unchanged variants are
+    refused by (b). Writes the `sweeps` row (copying the lab caps), then per variant in
+    canonical order its `hypotheses` row through `registry.register_hypothesis` (the
+    sweep file as `doc_path`), one `sweep_variants` and one `hypothesis_fingerprints`
+    row. The transaction is the caller's.
+    """
+    require_lab(conn)
+    settings = settings if settings is not None else get_settings()
+    parsed = parse_sweep_file(file, settings)
+    variants = expand_grid(parsed, settings)
+    if parsed.family == registry.ORACLE_FAMILY and registry._is_real_store(conn, settings):
+        raise registry.RealStoreRefused(
+            f"{file}: family {registry.ORACLE_FAMILY!r} is refused on the real store"
+        )
+    existing = _existing_registration(conn, parsed, variants)
+    if existing is not None:
+        return existing
+
+    rules = lab_registry.family_rules(conn, parsed.family)
+    if rules is None:
+        raise NoFamilyRulesError(
+            f"{file}: family {parsed.family!r} has no family rules; a new family's first "
+            "registration is not supported by this command yet"
+        )
+    broken = sorted({d for v in variants for d in _rule_differences(parsed, v.frozen_set, rules)})
+    if broken:
+        raise FamilyRuleError(
+            f"{file}: differs from family {parsed.family!r}'s rules: {', '.join(broken)}"
+        )
+    for variant in variants:
+        holder = lab_registry.fingerprint_registered(conn, variant.fingerprint)
+        if holder is not None:
+            raise FingerprintRegisteredError(
+                f"{file}: variant {variant.values} has the fingerprint of registered "
+                f"hypothesis {holder.slug!r} (id {holder.hypothesis_id}); the existing "
+                "registration is the record"
+            )
+    if not lab_registry.family_ready_for_sweep(conn, parsed.family):
+        unrun = _unrun_standalone(conn, parsed.family)
+        raise FamilyNotReadyError(
+            f"{file}: family {parsed.family!r} is not ready for a sweep: "
+            f"{', '.join(repr(s) for s in unrun)} has no ok, non-synthetic, in-sample "
+            "trial over its default window yet"
+        )
+    first = lab_registry.first_session(conn)
+    for variant in variants:
+        reason = _anchor_refusal(parsed, variant, first)
+        if reason is not None:
+            raise AnchorInfeasibleError(f"{file}: variant {variant.values}: {reason}")
+    for axis, values in parsed.grid.items():
+        step = rules.axis_lattice.get(axis)
+        if step is None:
+            continue
+        for value in values:
+            numeric = isinstance(value, int | float) and not isinstance(value, bool)
+            if numeric and _lattice_index(float(value), step) is None:
+                raise FamilyLatticeError(
+                    f"{file}: grid axis {axis} value {value!r} is not a multiple of the "
+                    f"family rules' lattice step {step}"
+                )
+
+    sweep = lab_registry.register_sweep(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=file.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        grid={axis: list(values) for axis, values in parsed.grid.items()},
+        n_variants=len(variants),
+        selection_statistic=parsed.lab.selection_statistic,
+        expected_excess_cagr_spy_pp=parsed.lab.expected_excess_cagr_spy_pp,
+        expected_range_pp=parsed.lab.expected_range_pp,
+        promote_at_least=parsed.lab.promote_at_least,
+        retire_below=parsed.lab.retire_below,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by=registered_by,
+        settings=settings,
+    )
+    records: list[registry.HypothesisRecord] = []
+    for variant in variants:
+        record = registry.register_hypothesis(
+            conn,
+            slug=variant_slug(parsed.slug, sweep.sweep_id, variant.index, len(variants)),
+            family=parsed.family,
+            title=f"{parsed.title} (variant {variant.index})",
+            doc_path=file.as_posix(),
+            doc_sha256=parsed.doc_sha256,
+            params=variant.frozen_set,
+            in_sample_start=parsed.in_sample_start,
+            holdout_start=parsed.holdout_start,
+            holdout_end=parsed.holdout_end,
+            registered_by=registered_by,
+            settings=settings,
+        )
+        lab_registry.write_sweep_variant(
+            conn,
+            sweep_id=sweep.sweep_id,
+            variant_index=variant.index,
+            hypothesis_id=record.hypothesis_id,
+            fingerprint=variant.fingerprint,
+            variant_params=variant.values,
+        )
+        lab_registry.write_fingerprint(conn, record.hypothesis_id, variant.fingerprint)
+        records.append(record)
+    return SweepRegistration(
+        sweep=sweep,
+        variants=tuple(lab_registry.sweep_variants(conn, sweep.sweep_id)),
+        hypotheses=tuple(records),
+        created=True,
+    )
