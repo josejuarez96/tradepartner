@@ -14,6 +14,7 @@ used here, so the frozen threshold 0.05 refuses it.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -22,17 +23,19 @@ from typing import Any
 
 import duckdb
 import pytest
+from conftest import load_universe_fixtures, mark_pre_lab
 
 from tradepartner.backtest import engine
 from tradepartner.backtest import run as run_module
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Flags, Reasons
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.config import Settings
-from tradepartner.store import registry
-from tradepartner.store.db import insert_row, open_for_write, utc_now
+from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings
+from tradepartner.store import lab_registry, lab_schema, registry, schema
+from tradepartner.store.db import configure_connection, insert_row, open_for_write, utc_now
 
 SLUG = "h-run"
 IN_SAMPLE_START = date(2018, 1, 31)
@@ -666,3 +669,349 @@ def test_profitability_registration_passes_its_stored_family_to_the_engine(
     assert outcome.status == "failed"
     assert seen == ["profitability"]
     assert read().execute("SELECT COUNT(*) FROM trials").fetchone() == (1,)
+
+
+# --- the strategy-lab rules on the run path (strategy-lab spec req 5; plan T110) ----
+
+
+def _register_more(
+    path: Path,
+    slug: str,
+    *,
+    doc_sha256: str = "2" * 64,
+    pre_lab: bool = False,
+    drop_schedule: bool = False,
+    **frozen_overrides: Any,
+) -> registry.HypothesisRecord:
+    """Another `momentum` hypothesis on `path` with the module's window and holdout
+    (a different `strategy.top_fraction` by default, so a different frozen set)."""
+    overrides: dict[str, Any] = {
+        "strategy": {"top_fraction": 0.4},
+        "holdout": {"start": HOLDOUT[0], "end": HOLDOUT[1]},
+        "gap": {"count_share_threshold": 0.05},
+        **frozen_overrides,
+    }
+    frozen = Settings(_env_file=None, **overrides)
+    params = frozen_params_of(frozen, family="momentum")
+    if drop_schedule:
+        params = {k: v for k, v in params.items() if not k.startswith("schedule.")}
+    with open_for_write(_store(path)) as conn:
+        record = registry.register_hypothesis(
+            conn,
+            slug=slug,
+            family="momentum",
+            title=slug,
+            doc_path=f"docs/hypotheses/{slug}.md",
+            doc_sha256=doc_sha256,
+            params=params,
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=frozen.holdout.end,
+            registered_by="test",
+            settings=frozen,
+        )
+        if pre_lab:
+            mark_pre_lab(conn, record.hypothesis_id)
+    return record
+
+
+@pytest.fixture
+def lab_path(store: Path) -> Path:
+    """`store` (H1's twin `SLUG` registered) with the lab tables applied and the twin
+    marked pre-lab, as the lab migration (T113) would leave it."""
+    with open_for_write(_store(store)) as conn:
+        lab_schema.apply_lab_schema(conn)
+        mark_pre_lab(conn, registry.get_hypothesis(conn, SLUG).hypothesis_id)
+    return store
+
+
+def _family_rules(path: Path, cap: int) -> None:
+    rules = Settings(_env_file=None, lab={"max_family_holdout_spends": cap})
+    with open_for_write(_store(path)) as conn:
+        first = registry.get_hypothesis(conn, SLUG)
+        fixed = {
+            key: value
+            for key, value in frozen_values(first).items()
+            if key.startswith(FORBIDDEN_AXIS_PREFIXES)
+        }
+        lab_registry.write_family_rules(
+            conn,
+            family="momentum",
+            first_hypothesis_id=first.hypothesis_id,
+            parent_family=None,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            in_sample_start=IN_SAMPLE_START,
+            fixed_params=fixed,
+            sr_star_seed_annual=None,
+            settings=rules,
+        )
+
+
+def _sweep_variant(path: Path, slug: str = "mom-grid--r1-v1") -> registry.HypothesisRecord:
+    """A one-variant sweep whose variant is `slug`."""
+    record = _register_more(path, slug, doc_sha256="5" * 64)
+    with open_for_write(_store(path)) as conn:
+        sweep = lab_registry.register_sweep(
+            conn,
+            slug="mom-grid",
+            family="momentum",
+            title="grid",
+            doc_path="docs/sweeps/mom-grid.md",
+            doc_sha256="5" * 64,
+            grid={"strategy.top_fraction": [0.4]},
+            n_variants=1,
+            selection_statistic="sharpe_annual_excess_spy",
+            expected_excess_cagr_spy_pp=2.0,
+            expected_range_pp=(0.0, 4.0),
+            promote_at_least=0.6,
+            retire_below=0.1,
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="test",
+            settings=Settings(_env_file=None),
+        )
+        lab_registry.write_sweep_variant(
+            conn,
+            sweep_id=sweep.sweep_id,
+            variant_index=1,
+            hypothesis_id=record.hypothesis_id,
+            fingerprint="f" * 64,
+            variant_params={"strategy.top_fraction": 0.4},
+        )
+    return record
+
+
+def _spend(slug: str, path: Path, repeat: bool = False) -> run_module.RunOutcome:
+    flags = Flags(spend_holdout=True, override_gap=True, holdout_repeat=repeat)
+    return run_hypothesis(
+        slug, *HOLDOUT_WINDOW, flags, reasons=OVERRIDE_REASONS, synthetic=True, store_path=path
+    )
+
+
+def test_backtest_of_a_variant_is_refused_variant_with_its_rows_and_no_provider_call(
+    lab_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spec's `backtest <variant-slug>` criterion at the run path: a trial and a
+    result row with status `refused_variant`, no provider call, N and V unchanged. (The
+    CLI's exit code 2 for the status is T111's `STATUS_EXIT` entry.)"""
+    variant = _sweep_variant(lab_path)
+    first = run_hypothesis(SLUG, None, None, Flags(), store_path=lab_path)
+    assert first.status == "ok"
+    conn = read()
+    before = registry.family_sharpes(conn, "momentum")
+    conn.close()
+    calls = _spy(monkeypatch)
+
+    outcome = run_hypothesis(variant.slug, None, None, Flags(), store_path=lab_path)
+
+    assert (outcome.status, outcome.results) == ("refused_variant", None)
+    assert calls == []
+    conn = read()
+    result = _row(conn, "trial_results", outcome.trial_id)
+    assert result["status"] == "refused_variant"
+    assert "sweep run" in result["message"]
+    trial = _row(conn, "trials", outcome.trial_id)
+    assert (trial["hypothesis_id"], trial["kind"]) == (variant.hypothesis_id, "in_sample")
+    assert registry.family_sharpes(conn, "momentum") == before
+
+
+def test_a_variant_cannot_spend_the_holdout_either(
+    lab_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = _sweep_variant(lab_path)
+    calls = _spy(monkeypatch)
+    outcome = _spend(variant.slug, lab_path)
+    assert outcome.status == "refused_variant"
+    assert calls == []
+    conn = read()
+    assert _row(conn, "trials", outcome.trial_id)["kind"] == "in_sample"
+    assert _decisions(conn, outcome.trial_id) == {}
+
+
+@pytest.mark.parametrize("with_sweep", [False, True], ids=["no-sweep", "sweep"])
+def test_a_direct_row_without_a_pre_lab_row_is_refused_holdout(
+    lab_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch, with_sweep: bool
+) -> None:
+    """A `hypotheses` row inserted by the test (a nudged `top_fraction`, a new
+    fingerprint) with no `pre_lab_hypotheses` row and no promotion cannot spend."""
+    if with_sweep:
+        _sweep_variant(lab_path)
+    nudged = _register_more(lab_path, "h-nudged", strategy={"top_fraction": 0.51})
+    calls = _spy(monkeypatch)
+    outcome = _spend(nudged.slug, lab_path)
+    assert (outcome.status, outcome.results) == ("refused_holdout", None)
+    assert calls == []
+    conn = read()
+    assert "pre-lab or promoted" in _row(conn, "trial_results", outcome.trial_id)["message"]
+    assert _row(conn, "trials", outcome.trial_id)["kind"] == "in_sample"
+    assert registry.family_holdout_spends(conn, "momentum") == []
+
+
+def test_a_promoted_hypothesis_spends(lab_path: Path, read: Read) -> None:
+    promoted = _register_more(lab_path, "h-promoted")
+    with open_for_write(_store(lab_path)) as conn:
+        conn.execute(
+            "INSERT INTO owner_decisions VALUES (?, ?, 'promotion', ?, NULL, '{}', 'argmax')",
+            [100, utc_now(), promoted.hypothesis_id],
+        )
+    outcome = _spend(promoted.slug, lab_path)
+    assert outcome.status == "ok"
+    assert _row(read(), "trials", outcome.trial_id)["kind"] == "holdout"
+
+
+@pytest.mark.parametrize("drop_schedule", [False, True], ids=["schedule-keys", "pre-lab-keys"])
+def test_h1_twin_with_its_pre_lab_row_spends(
+    fixture_store_path: Path, read: Read, drop_schedule: bool
+) -> None:
+    """H1's twin spends with its `pre_lab_hypotheses` row, whether its stored params
+    carry `schedule.*` or not."""
+    with open_for_write(_store(fixture_store_path)) as conn:
+        lab_schema.apply_lab_schema(conn)
+    twin = _register_more(fixture_store_path, "h1-twin", pre_lab=True, drop_schedule=drop_schedule)
+    assert any(k.startswith("schedule.") for k in twin.params) is not drop_schedule
+    outcome = _spend(twin.slug, fixture_store_path)
+    assert outcome.status == "ok"
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert (trial["kind"], trial["holdout_repeat"]) == ("holdout", False)
+
+
+def test_the_family_cap_at_one_refuses_a_second_spend_naming_the_first(
+    lab_path: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _family_rules(lab_path, cap=1)
+    member = _register_more(lab_path, "h-member", pre_lab=True)
+    first = _spend(SLUG, lab_path)
+    assert first.status == "ok"
+
+    calls = _spy(monkeypatch)
+    second = _spend(member.slug, lab_path)
+    assert (second.status, second.results) == ("refused_holdout", None)
+    assert calls == []
+    message = _row(read(), "trial_results", second.trial_id)["message"]
+    assert "cap of 1 holdout spends" in message
+    assert f"{SLUG} (trial {first.trial_id}, ok)" in message
+
+
+def test_below_the_cap_a_grandfathered_member_spends_as_a_holdout_repeat(
+    lab_path: Path, read: Read
+) -> None:
+    """A pre-lab member whose frozen values differ from the family rules (a later
+    holdout end, a higher threshold: grandfathered) spends under the Phase 3 rules,
+    marked `holdout_repeat` after the twin's spend, below a cap of 2."""
+    _family_rules(lab_path, cap=2)
+    member = _register_more(
+        lab_path,
+        "h-grandfathered",
+        pre_lab=True,
+        holdout={"start": HOLDOUT[0], "end": date(2020, 5, 29)},
+        gap={"count_share_threshold": 0.06},
+    )
+    with open_for_write(_store(lab_path)) as conn:
+        assert [m.slug for m in lab_registry.grandfathered_members(conn)] == [member.slug]
+    first = _spend(SLUG, lab_path)
+    second = _spend(member.slug, lab_path)
+    assert (first.status, second.status) == ("ok", "ok")
+    conn = read()
+    trials = [_row(conn, "trials", o.trial_id) for o in (first, second)]
+    marks = [(t["kind"], t["holdout_repeat"]) for t in trials]
+    assert marks == [("holdout", False), ("holdout", True)]
+
+
+def test_on_a_plain_fixture_store_decide_gets_no_lab_state(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store without the lab tables (the owner's store at version P) decides
+    exactly as Phase 3: `decide` is called with `lab=None` on every call, and a
+    hypothesis with no pre-lab row and no promotion spends."""
+    seen: list[object] = []
+    real_decide = run_module.decide
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("lab", "missing"))
+        return real_decide(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "decide", spy)
+    nudged = _register_more(store, "h-nudged", strategy={"top_fraction": 0.51})
+    outcome = _spend(nudged.slug, store)
+    assert outcome.status == "ok"
+    assert seen == [None, None]  # the open, then the gap gate
+    assert _row(read(), "trials", outcome.trial_id)["kind"] == "holdout"
+
+
+# --- the fixture marker on the backtest path (spec, Definitions, Fixture marker) -----
+
+
+def _unmarked_copy(source: Path, target: Path) -> Path:
+    shutil.copy(source, target)
+    with duckdb.connect(str(target)) as conn:
+        conn.execute("DELETE FROM store_markers WHERE kind = 'fixture'")
+        assert not lab_schema.has_fixture_marker(conn)
+    return target
+
+
+def test_a_store_without_the_fixture_marker_is_refused_before_any_trial(
+    store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = _unmarked_copy(store, tmp_path / "copy_of_real.duckdb")
+    calls = _spy(monkeypatch)
+    for synthetic in (False, True):
+        with pytest.raises(registry.UnmarkedStoreRefused, match="fixture"):
+            run_hypothesis(SLUG, None, None, Flags(), synthetic=synthetic, store_path=copy)
+    assert calls == []
+    with duckdb.connect(str(copy), read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trials").fetchone() == (0,)
+
+
+def test_the_fixture_store_is_accepted_and_every_trial_on_it_is_synthetic(
+    store: Path, read: Read
+) -> None:
+    outcome = run_hypothesis(SLUG, None, None, Flags(), synthetic=False, store_path=store)
+    assert outcome.status == "ok"
+    conn = read()
+    assert _row(conn, "trials", outcome.trial_id)["synthetic"] is True
+    assert registry.family_sharpes(conn, "momentum").n_trials == 0
+
+
+def test_the_backtest_runner_temp_store_carries_the_marker_and_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `backtest-runner` agent's recipe (`.claude/agents/backtest-runner.md`, step
+    1): `init_schema`, then `load_universe_fixtures`; its store carries the row."""
+    path = tmp_path / "runner" / "store.duckdb"
+    path.parent.mkdir()
+    conn = duckdb.connect(str(path))
+    configure_connection(conn)
+    schema.init_schema(conn)
+    load_universe_fixtures(conn, Path(__file__).resolve().parents[1] / "fixtures" / "universe")
+    assert lab_schema.has_fixture_marker(conn)
+    conn.close()
+    _register_more(path, SLUG)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=path)
+    assert outcome.status == "ok"
+
+
+def test_a_tracking_run_on_the_real_store_needs_no_marker(
+    tracking_store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`store_path` equal to `settings.store.path` is the real store, not a copy: the
+    paper report's tracking trial (non-synthetic, `kind="tracking"`) runs on it as
+    before, though it has no marker row."""
+    real = _unmarked_copy(tracking_store, tmp_path / "real.duckdb")
+    monkeypatch.setenv("STORE__PATH", str(real))
+    _spy(monkeypatch)
+    outcome = run_hypothesis(
+        TRACKING_SLUG,
+        TRACKING_START,
+        TRACKING_END,
+        Flags(),
+        synthetic=False,
+        store_path=real,
+        kind="tracking",
+    )
+    assert outcome.status == "ok"
+    with duckdb.connect(str(real), read_only=True) as conn:
+        trial = _row(conn, "trials", outcome.trial_id)
+        assert (trial["kind"], trial["synthetic"]) == ("tracking", False)
+        assert not lab_schema.has_fixture_marker(conn)

@@ -33,6 +33,23 @@ no gap series is given yet, the outcome is `needs_gap`: the caller reads
 with the series. A flag given without its reason is refused at its rule, so
 a gate is never passed on an unexplained flag.
 
+**Strategy-lab rules** (strategy-lab spec req 5; plan T110). `decide(..., lab=...)`
+takes a `LabState` that the caller reads **only when the store is lab-initialised**
+(`lab_schema.is_lab_initialised`); with `lab=None`, the default, every rule above
+applies exactly as in Phase 3, so a store without the lab tables (the owner's store
+at version P, a plain fixture store) decides as it always has. With a `LabState`:
+
+0. **Variant.** A sweep variant is `refused_variant` before any other rule, the
+   tracking rule included: variants run only through `sweep run`, which cannot
+   spend the holdout (req 5(a)).
+2b. **Spend gate.** A holdout spend (rule 2's flag and reason given) by a
+   hypothesis that is neither pre-lab (`is_pre_lab`) nor named by a `promotion`
+   decision is `refused_holdout` (req 5(b)).
+2c. **Family cap.** A spend when the family already has the family rules'
+   `max_family_holdout_spends` holdout spends of any outcome (`prior_spends`,
+   research spends included) is `refused_holdout`, naming them (req 5(d)); below
+   the cap a family repeat is marked `holdout_repeat` as before.
+
 Rebalance sessions are those of the hypothesis's frozen `schedule.rebalance_cadence`
 (`schedule.rebalance_sessions`; ADR 0012): `decide`'s "touches the holdout but reaches
 none of its rebalance sessions" rule, the gap gate's sessions (`gap_sessions`) and the
@@ -56,7 +73,9 @@ from tradepartner.calendar import last_session_of_month
 from tradepartner.config import Cadence
 from tradepartner.store.registry import HoldoutSpend, HypothesisRecord
 
-Outcome = Literal["run", "needs_gap", "refused_window", "refused_holdout", "refused_gap"]
+Outcome = Literal[
+    "run", "needs_gap", "refused_window", "refused_holdout", "refused_gap", "refused_variant"
+]
 RunKind = Literal["in_sample", "holdout", "tracking"]
 
 GAP_THRESHOLD_KEY = "gap.count_share_threshold"
@@ -109,6 +128,28 @@ class Frozen:
             holdout_end=hypothesis.holdout_end,
             gap_count_share_threshold=float(threshold),
         )
+
+
+@dataclass(frozen=True)
+class LabState:
+    """The strategy-lab inputs to `decide` (module docstring, "Strategy-lab rules"),
+    read by the caller from a lab-initialised store and never otherwise.
+
+    `is_variant`: the hypothesis is a sweep variant (a `sweep_variants` row).
+    `is_pre_lab`: it has a `pre_lab_hypotheses` row. `promoted`: a `promotion`
+    decision names it. `max_family_holdout_spends`: the family rules' spend cap.
+    """
+
+    is_variant: bool
+    is_pre_lab: bool
+    promoted: bool
+    max_family_holdout_spends: int
+
+    def __post_init__(self) -> None:
+        if self.max_family_holdout_spends < 1:
+            raise ValueError(
+                f"max_family_holdout_spends must be positive, got {self.max_family_holdout_spends}"
+            )
 
 
 @dataclass(frozen=True)
@@ -223,6 +264,24 @@ def _window_refusal(window: Window, frozen: Frozen) -> str | None:
     return None
 
 
+def _lab_spend_refusal(lab: LabState, prior_spends: Sequence[HoldoutSpend]) -> str | None:
+    """Rules 2b and 2c (module docstring) for a spend, or None when both pass."""
+    if not (lab.is_pre_lab or lab.promoted):
+        return (
+            "only a pre-lab or promoted hypothesis may spend the holdout; this one is "
+            "neither (write it as a one-value sweep and promote its argmax)"
+        )
+    cap = lab.max_family_holdout_spends
+    if len(prior_spends) >= cap:
+        listed = ", ".join(
+            f"{s.slug} ({'research run' if s.source == 'research_run' else 'trial'} "
+            f"{s.trial_id}, {s.status})"
+            for s in prior_spends
+        )
+        return f"the family has its cap of {cap} holdout spends: {listed}"
+    return None
+
+
 def decide(
     window: Window,
     frozen: Frozen,
@@ -233,6 +292,7 @@ def decide(
     *,
     tracking: bool = False,
     cadence: Cadence = "month_end",
+    lab: LabState | None = None,
 ) -> Decision:
     """Apply the window, holdout and gap rules (module docstring) to one run.
 
@@ -247,7 +307,17 @@ def decide(
 
     With `tracking=True` only the tracking-window rule applies (module
     docstring): `flags`, `reasons`, `gap_series` and `prior_spends` are not read.
+
+    `lab` is `None` on a store without the lab tables, and then nothing here differs
+    from Phase 3; otherwise the variant, spend-gate and family-cap rules apply
+    (module docstring, "Strategy-lab rules").
     """
+    if lab is not None and lab.is_variant:
+        return Decision(
+            "refused_variant",
+            None,
+            "this hypothesis is a sweep variant: variants run only through `sweep run`",
+        )
     if tracking:
         return _tracking(window, frozen)
     refusal = _window_refusal(window, frozen)
@@ -274,6 +344,10 @@ def decide(
         )
     if not _has_text(reasons.holdout_reason):
         return Decision("refused_holdout", None, "--spend-holdout needs a --holdout-reason")
+    if lab is not None:
+        refusal = _lab_spend_refusal(lab, prior_spends)
+        if refusal is not None:
+            return Decision("refused_holdout", None, refusal)
     same_hypothesis = [s for s in prior_spends if s.hypothesis_id == frozen.hypothesis_id]
     if same_hypothesis and not flags.holdout_repeat:
         trials = ", ".join(str(s.trial_id) for s in same_hypothesis)

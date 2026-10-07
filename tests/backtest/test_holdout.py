@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from tradepartner.backtest.holdout import (
     Decision,
     Flags,
     Frozen,
+    LabState,
     Reasons,
     Window,
     decide,
@@ -600,3 +602,107 @@ class TestGapGateOnTheRunPath:
         week_ends = rebalance_sessions(*self.WINDOW, "week_end")
         assert len(week_ends) == 7
         assert calls == [("survivorship_gap", read_time(s, "week_end")) for s in week_ends]
+
+
+# --- strategy-lab rules (spec req 5; plan T110) -------------------------------------
+
+PRE_LAB = LabState(is_variant=False, is_pre_lab=True, promoted=False, max_family_holdout_spends=3)
+
+
+def _lab(**overrides: Any) -> LabState:
+    return replace(PRE_LAB, **overrides)
+
+
+def _decide_lab(
+    window: Window,
+    lab: LabState | None,
+    flags: Flags = SPEND,
+    reasons: Reasons = SPEND_REASON,
+    prior_spends: tuple[HoldoutSpend, ...] = (),
+    tracking: bool = False,
+) -> Decision:
+    return decide(
+        window, FROZEN, flags, reasons, _gap(0.0), prior_spends, tracking=tracking, lab=lab
+    )
+
+
+def _research_spend(run_id: int = 9) -> HoldoutSpend:
+    return HoldoutSpend(
+        trial_id=run_id,
+        hypothesis_id=None,
+        slug="exp-1",
+        started_at=datetime(2026, 9, 2, tzinfo=UTC),
+        synthetic=False,
+        holdout_reason="research spend",
+        status="ok",
+        source="research_run",
+    )
+
+
+@pytest.mark.parametrize("window", [IN_SAMPLE, HOLDOUT])
+@pytest.mark.parametrize("tracking", [False, True])
+def test_a_variant_is_refused_before_any_other_rule(window: Window, tracking: bool) -> None:
+    decision = _decide_lab(window, _lab(is_variant=True), tracking=tracking)
+    assert (decision.outcome, decision.kind) == ("refused_variant", None)
+    assert "sweep run" in decision.message
+
+
+def test_without_lab_state_a_not_pre_lab_spend_runs_as_in_phase_3() -> None:
+    """`lab=None` (a store without the lab tables) is the Phase 3 decision exactly."""
+    for spends in [(), (_spend(HYPOTHESIS_ID + 1), _spend(HYPOTHESIS_ID + 2, trial_id=2))]:
+        assert _decide_lab(HOLDOUT, None, prior_spends=spends) == _decide(
+            HOLDOUT, SPEND, SPEND_REASON, gap_series=_gap(0.0), prior_spends=spends
+        )
+
+
+def test_a_spend_by_a_hypothesis_neither_pre_lab_nor_promoted_is_refused_holdout() -> None:
+    decision = _decide_lab(HOLDOUT, _lab(is_pre_lab=False))
+    assert (decision.outcome, decision.kind) == ("refused_holdout", None)
+    assert "pre-lab or promoted" in decision.message
+
+
+@pytest.mark.parametrize(
+    "lab", [_lab(), _lab(is_pre_lab=False, promoted=True)], ids=["pre-lab", "promoted"]
+)
+def test_a_pre_lab_or_promoted_hypothesis_spends(lab: LabState) -> None:
+    decision = _decide_lab(HOLDOUT, lab)
+    assert (decision.outcome, decision.kind, decision.holdout_repeat) == ("run", "holdout", False)
+
+
+def test_the_spend_gate_does_not_touch_an_in_sample_run() -> None:
+    decision = _decide_lab(IN_SAMPLE, _lab(is_pre_lab=False, max_family_holdout_spends=1))
+    assert (decision.outcome, decision.kind) == ("run", "in_sample")
+
+
+def test_the_family_cap_refuses_a_spend_naming_the_prior_spends() -> None:
+    prior = (_spend(HYPOTHESIS_ID + 1, trial_id=4),)
+    decision = _decide_lab(HOLDOUT, _lab(max_family_holdout_spends=1), prior_spends=prior)
+    assert (decision.outcome, decision.kind) == ("refused_holdout", None)
+    assert "cap of 1 holdout spends" in decision.message
+    assert "h8 (trial 4, ok)" in decision.message
+
+
+def test_below_the_cap_a_family_repeat_runs_marked_holdout_repeat() -> None:
+    prior = (_spend(HYPOTHESIS_ID + 1, trial_id=4),)
+    decision = _decide_lab(HOLDOUT, _lab(max_family_holdout_spends=2), prior_spends=prior)
+    assert (decision.outcome, decision.kind, decision.holdout_repeat) == ("run", "holdout", True)
+
+
+def test_a_research_spend_counts_against_the_family_cap() -> None:
+    decision = _decide_lab(
+        HOLDOUT, _lab(max_family_holdout_spends=1), prior_spends=(_research_spend(),)
+    )
+    assert decision.outcome == "refused_holdout"
+    assert "exp-1 (research run 9, ok)" in decision.message
+
+
+def test_the_cap_counts_spends_of_any_outcome() -> None:
+    failed = replace(_spend(HYPOTHESIS_ID + 1, trial_id=4), status="refused_gap")
+    decision = _decide_lab(HOLDOUT, _lab(max_family_holdout_spends=1), prior_spends=(failed,))
+    assert decision.outcome == "refused_holdout"
+    assert "(trial 4, refused_gap)" in decision.message
+
+
+def test_lab_state_refuses_a_cap_below_one() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        _lab(max_family_holdout_spends=0)

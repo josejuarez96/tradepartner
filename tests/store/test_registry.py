@@ -26,7 +26,7 @@ from typing import Any
 import duckdb
 import pytest
 
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.db import insert_row
 
@@ -945,6 +945,71 @@ def test_frozen_sets_differing_only_in_a_default_schedule_key_share_one_pair(
     _ok_trial(conn, settings, tmp_path, 0.2, 0.02, slug="tighter")
     result = registry.family_sharpes(conn, "momentum")
     assert (result.n_trials, result.raw) == (3, _annual(0.3, 0.2))
+
+
+@pytest.mark.parametrize(
+    ("day", "cadence", "expected"),
+    [
+        (date(2024, 3, 1), "month_end", date(2024, 3, 28)),  # Good Friday: March ends Thu
+        (date(2024, 3, 29), "month_end", date(2024, 4, 30)),
+        (date(2024, 3, 25), "week_end", date(2024, 3, 28)),  # the Good Friday week
+        (date(2024, 3, 29), "week_end", date(2024, 4, 5)),  # the holiday itself: next week
+        (date(2025, 6, 30), "week_end", date(2025, 7, 3)),  # Independence Day week
+        (date(2024, 3, 22), "week_end", date(2024, 3, 22)),  # a week end is its own key
+        (date(2024, 3, 29), "daily", date(2024, 4, 1)),  # a holiday: the next session
+        (date(2024, 3, 30), "daily", date(2024, 4, 1)),  # a Saturday
+        (date(2024, 3, 26), "daily", date(2024, 3, 26)),
+    ],
+)
+def test_the_window_key_is_the_first_rebalance_session_at_the_cadence(
+    day: date, cadence: Cadence, expected: date
+) -> None:
+    assert registry._first_rebalance_on_or_after(day, cadence) == expected
+
+
+@pytest.mark.parametrize(
+    ("cadence", "same_pair", "next_pair"),
+    [
+        # Tue 2018-01-02 and Fri 2018-01-05 share the first ISO week's key; Mon 01-08 does not.
+        ("week_end", date(2018, 1, 5), date(2018, 1, 8)),
+        # Sat 2018-01-06 resolves to Mon 01-08; Tue 01-09 is its own key.
+        ("daily", date(2018, 1, 6), date(2018, 1, 9)),
+    ],
+)
+def test_family_sharpes_keys_a_window_by_the_first_rebalance_at_its_cadence(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    cadence: str,
+    same_pair: date,
+    next_pair: date,
+) -> None:
+    """Strategy-lab spec req 6 (plan T110): the V pair's window is the first rebalance
+    session **at the hypothesis's frozen cadence** on or after the requested start.
+    Under the month key all three starts would be one January pair."""
+    first = {"week_end": date(2018, 1, 2), "daily": date(2018, 1, 8)}[cadence]
+    end = _W1[1]
+    _register(conn, settings, params=_params(**{"schedule.rebalance_cadence": cadence}))
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, ppy=52.0, window=(first, end))
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, ppy=52.0, window=(same_pair, end))
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, len(result.raw)) == (2, 1)
+    _ok_trial(conn, settings, tmp_path, 0.2, 0.02, ppy=52.0, window=(next_pair, end))
+    result = registry.family_sharpes(conn, "momentum")
+    assert result.n_trials == 3
+    assert result.raw == pytest.approx((0.3 * math.sqrt(52), 0.2 * math.sqrt(52)), rel=1e-12)
+
+
+def test_a_pre_lab_registration_keys_its_window_by_month(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A registration with no stored `schedule.*` reads `month_end` through
+    `frozen_values`: starts in one month are one pair, as in Phase 3."""
+    _register(conn, settings)
+    assert not any(k.startswith("schedule.") for k in registry.get_hypothesis(conn, "h1").params)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, window=(date(2018, 1, 2), _W1[1]))
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, window=(date(2018, 1, 9), _W1[1]))
+    assert registry.family_sharpes(conn, "momentum").raw == _annual(0.3)
 
 
 @pytest.mark.parametrize("ppy", [None, 0.0, float("nan")])
