@@ -24,7 +24,8 @@ the caller's write transaction and only through `store.registry`:
    initial buy.
 3. **Detail rows**: metrics, equity per level, weights at the base level only (targets
    are the same at every level), rebalances per level.
-4. **Result row** (req 8, 15; strategy-lab spec req 9): N from `family_n` and the
+4. **Result row** (req 8, 15; strategy-lab spec req 9): N from `family_n_split` (its
+   research part stored as `n_research`, below) and the
    per-basis annualised pair Sharpes from `family_sharpes`, both with this trial as
    `pending`, so an `ok` in-sample, non-synthetic run counts itself and any other run
    (synthetic, holdout, tracking) is deflated against the family as it stands without
@@ -39,11 +40,23 @@ the caller's write transaction and only through `store.registry`:
 **One N function** (strategy-lab plan, approach). `family_n(conn, family)` is the one
 place the family's N is computed: `write_results` stores it, and the backtest page and
 every lab module call it rather than counting trial rows themselves.
+
+**Research runs raise N, never V** (research-registry spec req 9; backtest spec req 8 as
+amended 2026-10-07, #901, T83b). N = the family's counted backtest trials plus
+`store.research.family_run_count` (Σ `n_configurations` over its `ok`, non-synthetic,
+non-holdout-spending research runs that touch returns); `family_n_split` returns the
+two parts, `write_results` stores the research part in `trial_results.n_research` and
+the sum in `n_trials`. V and the pair Sharpes stay the backtest pairs' alone (a
+regression has no Sharpe). A store without the research tables (one a read-only
+connection opened before version 12) reads the research part as None and N as the
+backtest count; `write_results` refuses such a store before any write, since every
+writing command migrates first.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import pairwise
 
@@ -61,7 +74,7 @@ from tradepartner.backtest.metrics import (
 )
 from tradepartner.backtest.schedule import periods_per_year, rebalance_sessions
 from tradepartner.config import Cadence, Settings
-from tradepartner.store import registry
+from tradepartner.store import registry, research, schema
 from tradepartner.store.registry import (
     EquityRow,
     FamilySharpes,
@@ -84,14 +97,50 @@ FamilySharpesFn = Callable[..., FamilySharpes]
 CADENCE_KEY = "schedule.rebalance_cadence"
 
 
+@dataclass(frozen=True)
+class FamilyN:
+    """A family's N in its two parts: `trials`, the counted backtest trials, and
+    `research`, `family_run_count` (None on a store without the research registry)."""
+
+    trials: int
+    research: int | None
+
+    @property
+    def total(self) -> int:
+        """N: the backtest trials plus the research runs' configurations."""
+        return self.trials + (self.research or 0)
+
+
+@dataclass(frozen=True)
+class _StatisticsWithResearch(ResultStatistics):
+    """`ResultStatistics` plus `trial_results.n_research` (research-registry spec req
+    9): `registry.write_result` writes every field of the statistics it is given."""
+
+    n_research: int | None = None
+
+
+def family_n_split(
+    conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
+) -> FamilyN:
+    """`family`'s N in its two parts (module docstring, "Research runs raise N"):
+    its `ok`, non-synthetic, in-sample trials, reruns and every variant's included
+    (backtest spec req 8; strategy-lab spec req 3), with `pending` counted as
+    `registry.family_sharpes` does; and `research.family_run_count`, None when the
+    store has no research tables."""
+    trials = registry.count_counted_trials(conn, family, pending)
+    try:
+        runs: int | None = research.family_run_count(conn, family)
+    except schema.ResearchNotInitialised:
+        runs = None
+    return FamilyN(trials=trials, research=runs)
+
+
 def family_n(
     conn: duckdb.DuckDBPyConnection, family: str, *, pending: TrialHandle | None = None
 ) -> int:
-    """N of `family`: its `ok`, non-synthetic, in-sample trials, reruns and every
-    variant's included (backtest spec req 8; strategy-lab spec req 3). `pending` counts
-    a trial still being written as `registry.family_sharpes` does. The one place N is
-    computed (module docstring, "One N function")."""
-    return registry.count_counted_trials(conn, family, pending)
+    """N of `family`: `family_n_split(...).total`. The one place N is computed (module
+    docstring, "One N function")."""
+    return family_n_split(conn, family, pending=pending).total
 
 
 def hypothesis_cadence(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> Cadence:
@@ -248,10 +297,12 @@ def write_results(
 
     `results` is the engine's output keyed by per-side bps; `params` is the trial's
     frozen `Settings`. Raises `ValueError` before any write when `params` are not those
-    frozen settings, or a level or benchmark is missing. Runs in the caller's write
-    transaction.
+    frozen settings, or a level or benchmark is missing, and `ResearchNotInitialised`
+    when the store has no research tables (module docstring, "Research runs raise N").
+    Runs in the caller's write transaction.
     """
     _check_frozen(handle, params)
+    schema.require_research(conn)
     cadence = hypothesis_cadence(conn, handle)
     rows = metric_rows(results, params, cadence=cadence)
     base_level = params.costs.per_side_bps
@@ -267,8 +318,10 @@ def write_results(
         if row.series == STRATEGY_SERIES and row.cost_per_side_bps == base_level
     }
     family = family_sharpes(conn, handle.family, pending=handle)
-    n = family_n(conn, handle.family, pending=handle)
+    n = family_n_split(conn, handle.family, pending=handle)
     stats = result_statistics(
-        base_metrics, base.rebalances, family, params, n_trials=n, cadence=cadence
+        base_metrics, base.rebalances, family, params, n_trials=n.total, cadence=cadence
     )
-    return registry.write_result(conn, handle, stats)
+    return registry.write_result(
+        conn, handle, _StatisticsWithResearch(**asdict(stats), n_research=n.research)
+    )
