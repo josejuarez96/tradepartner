@@ -46,6 +46,7 @@ import pytest
 from conftest import load_universe_fixtures
 
 from tradepartner.store.db import configure_connection
+from tradepartner.store.lab_schema import apply_lab_schema
 from tradepartner.store.schema import (
     JOURNAL_TABLE_NAMES,
     LATER_JOURNAL_TABLE_NAMES,
@@ -724,6 +725,13 @@ def test_d_snapshot_catches_the_planted_write(tmp_path: Path) -> None:
 def test_d_store_tables_cover_every_named_table(tmp_path: Path) -> None:
     store = tmp_path / "store.duckdb"
     _fixture_store(store)
+    # A fresh store has no lab table (strategy-lab plan choice 2); the lab
+    # migration (T113, #1195) lists them in `REGISTRY_TABLE_NAMES`.
+    conn = duckdb.connect(str(store))
+    try:
+        apply_lab_schema(conn)
+    finally:
+        conn.close()
     named = set(
         TABLE_NAMES + JOURNAL_TABLE_NAMES + LATER_JOURNAL_TABLE_NAMES + MASTER_CHECK_TABLE_NAMES
     )
