@@ -2,7 +2,7 @@
 
 Each test registers a hypothesis on `fixture_store_path`, opens a trial, runs the engine
 on the fake provider at every cost level and hands the results to `write_results`.
-Prices are a seeded random walk: constant growth would make every monthly return equal,
+Prices are a seeded random walk: constant growth would make every period return equal,
 and `series_metrics` refuses a zero-variance series.
 """
 
@@ -32,7 +32,7 @@ from tradepartner.backtest.metrics import (
     series_metrics,
 )
 from tradepartner.backtest.provider import GapReading
-from tradepartner.backtest.results import write_results
+from tradepartner.backtest.results import family_n, hypothesis_cadence, metric_rows, write_results
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import Settings
@@ -194,6 +194,13 @@ def _metrics(
     )
 
 
+def _annual(metrics: dict[str, float | None], key: str) -> float:
+    """A stored period Sharpe annualised with the trial's own periods per year."""
+    sharpe, ppy = metrics[key], metrics["periods_per_year"]
+    assert sharpe is not None and ppy is not None
+    return sharpe * math.sqrt(ppy)
+
+
 def _monthly(result: BacktestResult, series: str) -> list[float]:
     equity = {row.session: row.equity for row in result.equity if row.series == series}
     ends = rebalance_sessions(START, END)
@@ -289,12 +296,13 @@ class TestMetrics:
         base = results[BASE]
         expected = series_metrics(
             "strategy",
-            monthly=_monthly(base, "strategy"),
-            gross_monthly=_monthly(results[0.0], "strategy"),
+            period_returns=_monthly(base, "strategy"),
+            gross_period_returns=_monthly(results[0.0], "strategy"),
             daily_equity=[r.equity for r in base.equity if r.series == "strategy"],
             turnover=[r.turnover for r in base.rebalances],
-            spy_monthly=_monthly(base, "SPY"),
-            mtum_monthly=_monthly(base, "MTUM"),
+            spy_period_returns=_monthly(base, "SPY"),
+            mtum_period_returns=_monthly(base, "MTUM"),
+            periods_per_year=12,
             risk_free_rate=settings.metrics.risk_free_rate,
         )
         assert _metrics(conn, handle.trial_id, "strategy", BASE) == pytest.approx(expected)
@@ -320,7 +328,7 @@ class TestMetrics:
         _register(conn, settings)
         handle, _, _ = _trial(conn, settings, tmp_path)
         for series in ("SPY", "MTUM"):
-            assert _metrics(conn, handle.trial_id, series, BASE)["turnover_monthly"] == 0.0
+            assert _metrics(conn, handle.trial_id, series, BASE)["turnover_period"] == 0.0
 
 
 class TestResultRow:
@@ -332,12 +340,19 @@ class TestResultRow:
         handle, _, _ = _trial(conn, settings, tmp_path)
         row = _result_row(conn, handle.trial_id)
         base = _metrics(conn, handle.trial_id, "strategy", BASE)
-        raw = deflated_sharpe(base, "raw", n_trials=1, pair_sharpes=[base["sharpe_monthly"]])  # type: ignore[list-item]
+        raw = deflated_sharpe(
+            base,
+            "raw",
+            n_trials=1,
+            pair_sharpes=[_annual(base, "sharpe_period")],
+            periods_per_year=12,
+        )
         excess = deflated_sharpe(
             base,
             "excess_spy",
             n_trials=1,
-            pair_sharpes=[base["sharpe_monthly_excess_spy"]],  # type: ignore[list-item]
+            pair_sharpes=[_annual(base, "sharpe_period_excess_spy")],
+            periods_per_year=12,
         )
         assert row["status"] == "ok"
         assert row["n_trials"] == 1
@@ -435,15 +450,21 @@ class TestTrialCount:
         second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
         row = _result_row(conn, second.trial_id)
         sharpes = {
-            basis: [_metrics(conn, h.trial_id, "strategy", BASE)[key] for h in (first, second)]
+            basis: [
+                _annual(_metrics(conn, h.trial_id, "strategy", BASE), key) for h in (first, second)
+            ]
             for basis, key in (
-                ("raw", "sharpe_monthly"),
-                ("excess_spy", "sharpe_monthly_excess_spy"),
+                ("raw", "sharpe_period"),
+                ("excess_spy", "sharpe_period_excess_spy"),
             )
         }
         base = _metrics(conn, second.trial_id, "strategy", BASE)
-        raw = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=sharpes["raw"])  # type: ignore[arg-type]
-        excess = deflated_sharpe(base, "excess_spy", n_trials=2, pair_sharpes=sharpes["excess_spy"])  # type: ignore[arg-type]
+        raw = deflated_sharpe(
+            base, "raw", n_trials=2, pair_sharpes=sharpes["raw"], periods_per_year=12
+        )
+        excess = deflated_sharpe(
+            base, "excess_spy", n_trials=2, pair_sharpes=sharpes["excess_spy"], periods_per_year=12
+        )
         assert row["n_trials"] == 2
         assert row["dsr_basis"] == "dsr"
         assert row["sharpe_variance"] == pytest.approx(raw.sharpe_variance)
@@ -496,15 +517,181 @@ class TestTrialCount:
         second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
         holdout, _, _ = _trial(conn, settings, tmp_path, seed=11, kind="holdout")
         pairs = [
-            _metrics(conn, h.trial_id, "strategy", BASE)["sharpe_monthly"] for h in (first, second)
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
         ]
         base = _metrics(conn, holdout.trial_id, "strategy", BASE)
-        expected = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=pairs)  # type: ignore[arg-type]
+        expected = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=pairs, periods_per_year=12)
         row = _result_row(conn, holdout.trial_id)
         assert row["n_trials"] == 2
         assert row["dsr_basis"] == "dsr"
         assert row["sr_star"] == pytest.approx(expected.sr_star)
         assert row["dsr"] == pytest.approx(expected.dsr)
+
+
+class TestFamilyN:
+    """`family_n` is the one place N is computed; `write_results` stores what it
+    returns (strategy-lab plan, "One N function")."""
+
+    def test_family_n_equals_the_n_write_results_stores(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        assert family_n(conn, "momentum") == 0
+        stored = []
+        for kwargs in ({}, {"start": LATER_START}, {"synthetic": True}, {"kind": "holdout"}, {}):
+            handle, _, _ = _trial(conn, settings, tmp_path, **kwargs)  # type: ignore[arg-type]
+            counts = kwargs.get("synthetic") is None and kwargs.get("kind") is None
+            stored.append(_result_row(conn, handle.trial_id)["n_trials"])
+            if counts:
+                assert stored[-1] == family_n(conn, "momentum")
+        assert stored == [1, 2, 2, 2, 3]
+        assert family_n(conn, "momentum") == 3
+        assert family_n(conn, "momentum") == registry.family_sharpes(conn, "momentum").n_trials
+
+    def test_family_n_counts_a_pending_trial_once(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        pending = _open(conn, settings, tmp_path)
+        assert family_n(conn, "momentum") == 1
+        assert family_n(conn, "momentum", pending=pending) == 2
+        write_results(conn, pending, _run(settings, pending), settings)
+        assert family_n(conn, "momentum") == 2 == _result_row(conn, pending.trial_id)["n_trials"]
+
+
+class TestVersionPColumns:
+    """Every trial records `detail_level`, `data_vintage` and `code_tree_sha256`, and
+    every result row `sharpe_unit = annual` (strategy-lab spec reqs 8, 9, Vintage)."""
+
+    def test_the_four_columns_are_written(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        checkout = Path(__file__).resolve().parent
+        handle = registry.open_trial(
+            conn,
+            hypothesis_id=registry.get_hypothesis(conn, "h1").hypothesis_id,
+            kind="in_sample",
+            start_session=START,
+            end_session=END,
+            data_cutoff=_CUTOFF,
+            synthetic=False,
+            run_by="test",
+            settings=settings,
+            repo_dir=checkout,
+        )
+        assert write_results(conn, handle, _run(settings, handle), settings) == "ok"
+        detail, vintage, tree = conn.execute(  # type: ignore[misc]
+            "SELECT detail_level, data_vintage, code_tree_sha256 FROM trials WHERE trial_id = ?",
+            [handle.trial_id],
+        ).fetchone()
+        assert detail == "full"
+        assert vintage is not None and vintage == registry.data_vintage(conn, _CUTOFF)
+        assert tree == registry.code_tree_sha256(checkout)
+        assert tree is not None and len(tree) == 64
+        assert _result_row(conn, handle.trial_id)["sharpe_unit"] == "annual"
+
+    def test_v_and_sr_star_are_stored_in_annual_units(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """With two pairs, the stored V is the variance of the annualised Sharpes and
+        SR* is SR*_annual; the DSR uses SR*_annual / sqrt(12)."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        first, _, _ = _trial(conn, settings, tmp_path)
+        second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        annual = [
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
+        ]
+        row = _result_row(conn, second.trial_id)
+        assert row["sharpe_unit"] == "annual"
+        assert row["sharpe_variance"] == pytest.approx(float(np.var(annual, ddof=1)), rel=1e-12)
+        monthly_v = float(np.var([a / math.sqrt(12) for a in annual], ddof=1))
+        assert row["sharpe_variance"] == pytest.approx(12 * monthly_v, rel=1e-12)
+
+    def test_a_refused_trial_row_carries_the_unit_too(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        registry.close_trial(conn, handle, "refused_window", "test")
+        assert _result_row(conn, handle.trial_id)["sharpe_unit"] == "annual"
+
+
+class TestCadence:
+    """Period ends come from `schedule.rebalance_sessions` at the hypothesis's cadence,
+    read through `frozen_values` (strategy-lab plan T97)."""
+
+    def test_a_registration_without_schedule_keys_reads_month_end(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        params = {
+            k: v
+            for k, v in frozen_params_of(settings, family="momentum").items()
+            if not k.startswith("schedule.")
+        }
+        registry.register_hypothesis(
+            conn,
+            slug="h1",
+            family="momentum",
+            title="h1 title",
+            doc_path="docs/hypotheses/h1.md",
+            doc_sha256="d" * 64,
+            params=params,
+            in_sample_start=START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="owner",
+            settings=settings,
+        )
+        handle = _open(conn, settings, tmp_path)
+        assert hypothesis_cadence(conn, handle) == "month_end"
+
+    def test_a_week_end_registration_is_read_at_week_end(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        weekly = _settings(tmp_path, schedule={"rebalance_cadence": "week_end"})
+        _register(conn, weekly)
+        handle = _open(conn, weekly, tmp_path)
+        assert hypothesis_cadence(conn, handle) == "week_end"
+
+    def test_metric_rows_at_week_end_use_weekly_period_ends(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """The same daily equity read at week ends: one period per ISO week, 52 per
+        year, the period return between consecutive week-end sessions."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        rows = metric_rows(results, settings, cadence="week_end")
+        base = {
+            r.metric: r.value
+            for r in rows
+            if r.series == "strategy" and r.cost_per_side_bps == BASE
+        }
+        sessions = sorted({r.session for r in results[BASE].equity})
+        weeks = rebalance_sessions(sessions[0], sessions[-1], "week_end")
+        assert base["periods_per_year"] == 52.0
+        assert base["n_periods"] == len(weeks) - 1
+        equity = {r.session: r.equity for r in results[BASE].equity if r.series == "strategy"}
+        net = [equity[b] / equity[a] - 1 for a, b in pairwise(weeks)]
+        growth = math.prod(1 + v for v in net)
+        assert base["cagr"] == pytest.approx(growth ** (52 / len(net)) - 1, rel=1e-9)
+        monthly = metric_rows(results, settings, cadence="month_end")
+        assert {
+            r.metric: r.value
+            for r in monthly
+            if r.series == "strategy" and r.cost_per_side_bps == BASE
+        }["periods_per_year"] == 12.0
 
 
 class TestRefusals:

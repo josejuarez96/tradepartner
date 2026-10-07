@@ -60,6 +60,7 @@ from tradepartner.ingest import (
     StatementKey,
     StatementVintage,
     _add_rows,
+    _build_filings,
     _fetched,
     _ingest_filings,
     _may_count,
@@ -1090,6 +1091,65 @@ def test_a_later_cover_title_never_names_an_earlier_facts_class(settings: Settin
     without = _fact_rows(settings, _filings(extra_facts=[early]))
     assert early in with_later[1] and early in without[1]
     assert with_later == without
+
+
+def test_an_owner_override_sends_the_named_member_to_the_sole_common_class(
+    settings: Settings,
+) -> None:
+    # #1169: DKS/TR/VMEO title their one listed class "Common Stock" but tag
+    # its shares CommonClassA (Class B unlisted). Only an owner-reviewed
+    # per-CIK override matches them; Class B stays unmatched.
+    class_a = _fact(ACME, "CommonClassA", 7, f"{ACME}-19-2", _at(2019, 3, 1))
+    class_b = _fact(ACME, "CommonClassB", 2, f"{ACME}-19-2", _at(2019, 3, 1))
+    source = _filings(extra_facts=[class_a, class_b])
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    records = list(source.facts(ACME, list(FACT_NAMES)))
+    _, unmatched = fact_rows(records, master, classes, ingested_at=NOW)
+    assert class_a in unmatched and class_b in unmatched
+    rows, unmatched = fact_rows(
+        records,
+        master,
+        classes,
+        ingested_at=NOW,
+        class_member_overrides={ACME: "CommonClassA"},
+    )
+    assert (ACME, "CommonClassA", 7) in {
+        (r["security_id"], r["class_member"], r["value"]) for r in rows
+    }
+    assert unmatched == (class_b,)
+
+
+def test_an_override_never_picks_between_several_common_classes(settings: Settings) -> None:
+    # The override acts like an undimensioned fact: a CIK with two common
+    # classes and no title naming the letter leaves the fact unmatched.
+    both = (
+        CoverListing("Common Stock", "DUA", "NASDAQ"),
+        CoverListing("Common Stock, Series 2", "DUB", "NASDAQ"),
+    )
+    member = _fact(DUAL, "CommonClassC", 3, f"{DUAL}-19-2", _at(2019, 3, 5))
+    source = _filings(dual_listings=both, extra_facts=[member])
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    _, unmatched = fact_rows(
+        [member], master, classes, ingested_at=NOW, class_member_overrides={DUAL: "CommonClassC"}
+    )
+    assert unmatched == (member,)
+
+
+def test_the_edgar_run_applies_the_configured_overrides(settings: Settings) -> None:
+    # The ingest path passes `edgar.class_member_overrides` to fact_rows.
+    class_a = _fact(ACME, "CommonClassA", 7, f"{ACME}-19-2", _at(2019, 3, 1))
+    configured = settings.model_copy(
+        update={
+            "edgar": settings.edgar.model_copy(
+                update={"class_member_overrides": {ACME: "CommonClassA"}}
+            )
+        }
+    )
+    *_, facts, unmatched = _build_filings(_filings(extra_facts=[class_a]), configured, NOW)
+    assert (ACME, 7) in {(r["security_id"], r["value"]) for r in facts}
+    assert class_a not in unmatched
 
 
 def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:

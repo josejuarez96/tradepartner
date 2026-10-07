@@ -134,7 +134,7 @@ def test_write_open_of_a_version_7_store_keeps_every_resume_row_without_the_flag
     assert [row[0] for row in after] == list(ids)
     assert flags == [(False,)] * len(ids)
     assert acceptances == (0,)
-    assert versions == [7, 8, 9, 10, 11, 12, 13, 14]
+    assert versions == [7, 8, 9, 10, 11, 12, 13, 14, 15]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
 
@@ -146,7 +146,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [7, 8, 9, 10, 11, 12, 13, 14]
+        assert _versions(conn) == [7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 
 def test_read_only_open_of_a_version_7_store_passes(tmp_path: Path) -> None:

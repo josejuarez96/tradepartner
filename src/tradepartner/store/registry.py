@@ -41,16 +41,32 @@ It returns rather than raises so the row survives the caller's commit.
 Detail rows (`write_metrics`, `write_equity`, `write_weights`,
 `write_rebalances`) are refused once a trial has its result row.
 
-**Deflated Sharpe inputs** (spec req 8). `family_sharpes` counts N over the
-`ok`, non-synthetic, `in_sample` trials of a family and returns, per basis,
-the monthly Sharpe of the latest such trial (highest id) per distinct
-(parameter hash, window) pair, read from the base-level `strategy` rows of
-`trial_metrics`. The window is the **resolved** one: the first rebalance
-session (last XNYS session of a month, ADR 0006) on or after the requested
-start, and `data_cutoff`, so requested dates that resolve to the same
-sessions are one pair and cannot shrink V. Only `sharpe_monthly` and `sharpe_monthly_excess_spy` are
-read. A trial still being written can be counted as the latest of its pair
-with `pending=`, so a run's own N and V include it.
+**Deflated Sharpe inputs** (spec req 8; strategy-lab spec reqs 3, 9).
+`family_sharpes` takes the `ok`, non-synthetic, `in_sample` trials of a
+family and returns, per basis, the **annualised** Sharpe (`sharpe_period`
+or `sharpe_period_excess_spy` times the square root of the trial's own
+`periods_per_year`) of the latest such trial (highest id) per distinct
+(canonical frozen set hash, window) pair, read from the base-level
+`strategy` rows of `trial_metrics` in one set-based query per basis. The
+pair key hashes `frozen.canonical_frozen_set` of the stored parameters, so
+two registrations whose stored sets differ only in a default-valued table
+key (`schedule.*`, say) are one pair. The window is the **resolved** one:
+the first rebalance session (last XNYS session of a month, ADR 0006) on or
+after the requested start, and `data_cutoff`, so requested dates that
+resolve to the same sessions are one pair and cannot shrink V. Only the
+period keys and `periods_per_year` are read, never a `*_monthly` key. A
+trial still being written can be counted as the latest of its pair with
+`pending=`, so a run's own V includes it. N itself is
+`backtest.results.family_n`, the one place it is computed.
+
+**Vintages** (strategy-lab spec, Definitions "Vintage"). `open_trial`
+records on every trial its `data_vintage` (`data_vintage(conn, cutoff)`,
+the latest `ingested_at` over fact rows known at its data cutoff),
+`code_tree_sha256` (`code_tree_sha256(repo_dir)`, over the git-tracked
+`*.py` files under `src/tradepartner/` and `uv.lock`) and `detail_level =
+full`; every result row records `sharpe_unit = annual` (V and SR* in
+annual units, req 9; NULL on rows written before schema version 15 means
+`monthly`). These two functions are the vintages' one home.
 """
 
 from __future__ import annotations
@@ -70,6 +86,7 @@ from typing import Any, Final, Literal
 import duckdb
 import pyarrow as pa
 
+from tradepartner.backtest.frozen import canonical_frozen_set
 from tradepartner.calendar import last_session_of_month
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
@@ -91,9 +108,22 @@ Basis = Literal["raw", "excess_spy"]
 CLOSE_STATUSES: Final = frozenset({"failed", "refused_window", "refused_holdout", "refused_gap"})
 
 _BASIS_METRICS: Final[dict[Basis, str]] = {
-    "raw": "sharpe_monthly",
-    "excess_spy": "sharpe_monthly_excess_spy",
+    "raw": "sharpe_period",
+    "excess_spy": "sharpe_period_excess_spy",
 }
+
+#: The metric row each trial's annualisation reads (strategy-lab spec req 8).
+PERIODS_PER_YEAR_METRIC: Final = "periods_per_year"
+
+#: `trials.detail_level` until `summary` lands (strategy-lab spec, "Detail level").
+DETAIL_LEVEL_FULL: Final = "full"
+
+#: `trial_results.sharpe_unit` on every row written from schema version 15 on.
+SHARPE_UNIT_ANNUAL: Final = "annual"
+
+#: What `code_tree_sha256` hashes besides the package's `*.py` files.
+_CODE_TREE_PACKAGE: Final = "src/tradepartner/"
+_CODE_TREE_LOCK: Final = "uv.lock"
 
 
 class RegistryError(RuntimeError):
@@ -263,7 +293,8 @@ class RebalanceRow:
 
 @dataclass(frozen=True)
 class FamilySharpes:
-    """N and the per-basis monthly Sharpes V is taken over (spec req 8)."""
+    """The count of the family's counted trials and the per-basis annualised Sharpes
+    V is taken over (strategy-lab spec req 9). The DSR's N is `results.family_n`."""
 
     n_trials: int
     raw: tuple[float, ...]
@@ -347,6 +378,78 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout
 
 
+def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
+    """The code vintage (strategy-lab spec, Definitions "Vintage"): SHA-256 over the
+    git-tracked `*.py` files under `src/tradepartner/` plus `uv.lock` of the checkout
+    holding `repo_dir` (default: this module's own), each as its path and the SHA-256
+    of its working-tree bytes, in path order. A docs or test change, or an untracked
+    `__pycache__` file, leaves it unchanged; any change to a tracked source file under
+    the package, committed or not, or a dependency bump changes it. An untracked `.py`
+    file is outside the hash (the spec's git-tracked set); `code_dirty` flags it. None
+    outside a checkout."""
+    cwd = repo_dir if repo_dir is not None else Path(__file__).resolve().parent
+    try:
+        root = Path(_git(cwd, "rev-parse", "--show-toplevel").strip())
+        listed = _git(root, "ls-files", "-z", "--", _CODE_TREE_PACKAGE, _CODE_TREE_LOCK)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    paths = sorted(
+        path
+        for path in listed.split("\0")
+        if path == _CODE_TREE_LOCK or (path.startswith(_CODE_TREE_PACKAGE) and path.endswith(".py"))
+    )
+    lines = []
+    for path in paths:
+        file = root / path
+        content = sha256(file.read_bytes()).hexdigest() if file.is_file() else "missing"
+        lines.append(f"{path}\0{content}\n")
+    return sha256("".join(lines).encode()).hexdigest()
+
+
+def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
+    """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
+    latest `ingested_at` over every fact table's rows with `known_at <= cutoff`; None
+    when there is none. A nightly ingest that only adds later sessions leaves it
+    unchanged; a late fact for an in-window session changes it. Guarded against an
+    absent table as `store_max_ingested_at` is."""
+    if cutoff.tzinfo is None:
+        raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
+    tables = _present_fact_tables(conn)
+    if not tables:
+        return None
+    union = " UNION ALL ".join(
+        f"SELECT MAX(ingested_at) AS m FROM {table} WHERE known_at <= $cutoff" for table in tables
+    )
+    row = conn.execute(f"SELECT MAX(m) FROM ({union})", {"cutoff": cutoff}).fetchone()
+    return row[0] if row is not None else None
+
+
+#: The columns schema version 15 adds (`schema._PERIOD_COLUMNS`), by table.
+_VERSION_15_COLUMNS: Final[dict[str, frozenset[str]]] = {
+    "trials": frozenset({"detail_level", "data_vintage", "code_tree_sha256"}),
+    "trial_results": frozenset({"sharpe_unit"}),
+}
+
+
+def _version_15_present(
+    conn: duckdb.DuckDBPyConnection, table: str, row: dict[str, Any]
+) -> dict[str, Any]:
+    """`row` without the version-15 columns `table` does not have yet. Every writing
+    command migrates the store first (`schema.init_schema`), so the real store always
+    has them; only a store written through the registry without that step (a test's
+    version-4 store) lacks them, and its rows then carry none."""
+    present = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    absent = _VERSION_15_COLUMNS[table] - present
+    return {key: value for key, value in row.items() if key not in absent}
+
+
+def _present_fact_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    present = {
+        name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    }
+    return [table for table in TABLE_PROVENANCE_VALUES if table in present]
+
+
 def store_max_ingested_at(conn: duckdb.DuckDBPyConnection) -> datetime | None:
     """The latest `ingested_at` over every fact table; None on an empty store.
 
@@ -358,10 +461,7 @@ def store_max_ingested_at(conn: duckdb.DuckDBPyConnection) -> datetime | None:
     #660's `statement_facts`), rather than relying on every future caller
     continuing to migrate first.
     """
-    present = {
-        name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
-    }
-    tables = [table for table in TABLE_PROVENANCE_VALUES if table in present]
+    tables = _present_fact_tables(conn)
     if not tables:
         return None
     union = " UNION ALL ".join(f"SELECT MAX(ingested_at) AS m FROM {table}" for table in tables)
@@ -602,8 +702,10 @@ def open_trial(
     `start_session`/`end_session` are the requested window as given, and
     `data_cutoff` may be None when the requested end has no session close;
     the window rules are checked afterwards (spec req 11), so a refusal is
-    still a trial. Captures the code version (`repo_dir`, default this
-    checkout) and the store's latest `ingested_at`. Refuses
+    still a trial. Captures the code version and the code vintage
+    (`repo_dir`, default this checkout), the store's latest `ingested_at`
+    and the data vintage at `data_cutoff`, and records `detail_level =
+    full` (module docstring, "Vintages"). Refuses
     `synthetic=True` on the real store. Commit it in its own write chunk
     (module docstring, "Trial handle").
     """
@@ -613,6 +715,7 @@ def open_trial(
         raise RealStoreRefused("a synthetic trial is refused on the real store")
     version, dirty = code_version(repo_dir)
     max_ingested = store_max_ingested_at(conn)
+    vintage = data_vintage(conn, data_cutoff) if data_cutoff is not None else None
     trial_id = max(
         _next_id(conn, "trials", "trial_id"), _next_id(conn, "trial_results", "trial_id")
     )
@@ -620,24 +723,31 @@ def open_trial(
     insert_row(
         conn,
         "trials",
-        {
-            "trial_id": trial_id,
-            "hypothesis_id": hypothesis.hypothesis_id,
-            "kind": kind,
-            "started_at": started_at,
-            "start_session": start_session,
-            "end_session": end_session,
-            "data_cutoff": data_cutoff,
-            "store_max_ingested_at": max_ingested,
-            "code_version": version,
-            "code_dirty": dirty,
-            "synthetic": synthetic,
-            "holdout_repeat": holdout_repeat,
-            "holdout_reason": holdout_reason,
-            "gap_override_reason": gap_override_reason,
-            "run_by": run_by,
-            "note": note,
-        },
+        _version_15_present(
+            conn,
+            "trials",
+            {
+                "trial_id": trial_id,
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "kind": kind,
+                "started_at": started_at,
+                "start_session": start_session,
+                "end_session": end_session,
+                "data_cutoff": data_cutoff,
+                "store_max_ingested_at": max_ingested,
+                "code_version": version,
+                "code_dirty": dirty,
+                "synthetic": synthetic,
+                "holdout_repeat": holdout_repeat,
+                "holdout_reason": holdout_reason,
+                "gap_override_reason": gap_override_reason,
+                "run_by": run_by,
+                "note": note,
+                "detail_level": DETAIL_LEVEL_FULL,
+                "data_vintage": vintage,
+                "code_tree_sha256": code_tree_sha256(repo_dir),
+            },
+        ),
     )
     return _issue_handle(
         trial_id=trial_id,
@@ -705,9 +815,10 @@ def _insert_result(
         "finished_at": utc_now(),
         "status": status,
         "message": message,
+        "sharpe_unit": SHARPE_UNIT_ANNUAL,
         **{f.name: getattr(stats, f.name) for f in fields(stats)},
     }
-    insert_row(conn, "trial_results", row)
+    insert_row(conn, "trial_results", _version_15_present(conn, "trial_results", row))
 
 
 # --- detail rows -----------------------------------------------------------
@@ -895,50 +1006,99 @@ def record_decision(
 def family_sharpes(
     conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None = None
 ) -> FamilySharpes:
-    """N and the per-basis Sharpes for V over `family` (module docstring).
+    """The counted trials and the per-basis annualised Sharpes for V over `family`
+    (module docstring, "Deflated Sharpe inputs").
 
     `pending` counts a trial that has its metrics but no result row yet as
     `ok`, when it is itself a non-synthetic `in_sample` trial of `family`
     and its `trials` row is in this store. Raises `RegistryError` when a
-    counted trial lacks a finite base-level Sharpe.
+    pair's latest trial lacks a finite base-level period Sharpe or a positive
+    `periods_per_year`.
     """
     if pending is not None:
         _check_trial_row(conn, pending)
     counted = conn.execute(
-        "SELECT t.trial_id, h.params_json, h.params_sha256, t.start_session, t.data_cutoff "
-        "FROM trials t JOIN hypotheses h USING (hypothesis_id) "
-        "LEFT JOIN trial_results r USING (trial_id) "
-        "WHERE h.family = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
-        "AND (r.status = 'ok' OR (r.trial_id IS NULL AND t.trial_id = ?)) "
+        f"SELECT t.trial_id, h.params_json, t.start_session, t.data_cutoff {_COUNTED_FROM} "
         "ORDER BY t.trial_id",
         [family, pending.trial_id if pending is not None else None],
     ).fetchall()
     latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
-    for trial_id, params_json, params_hash, start, cutoff in counted:
-        base = float(json.loads(params_json)[BASE_COST_KEY])
-        latest[(params_hash, _first_rebalance_on_or_after(start), cutoff)] = (trial_id, base)
+    for trial_id, params_json, start, cutoff in counted:
+        params = json.loads(params_json)
+        pair = (_canonical_set_hash(params, family), _first_rebalance_on_or_after(start), cutoff)
+        latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
     chosen = sorted(latest.values())
     return FamilySharpes(
         n_trials=len(counted),
-        raw=_base_sharpes(conn, chosen, "raw"),
-        excess_spy=_base_sharpes(conn, chosen, "excess_spy"),
+        raw=_annual_sharpes(conn, chosen, "raw"),
+        excess_spy=_annual_sharpes(conn, chosen, "excess_spy"),
     )
 
 
-def _base_sharpes(
+#: The trials N counts and V draws from: `ok` (or the pending trial), in-sample,
+#: non-synthetic, of one family. Parameters: the family, then the pending trial id.
+_COUNTED_FROM: Final = (
+    "FROM trials t JOIN hypotheses h USING (hypothesis_id) "
+    "LEFT JOIN trial_results r USING (trial_id) "
+    "WHERE h.family = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
+    "AND (r.status = 'ok' OR (r.trial_id IS NULL AND t.trial_id = ?))"
+)
+
+
+def count_counted_trials(
+    conn: duckdb.DuckDBPyConnection, family: str, pending: TrialHandle | None = None
+) -> int:
+    """How many trials `family_sharpes` counts (same rows, same `pending` rule). The
+    DSR's N is `backtest.results.family_n`, which calls this; nothing else should."""
+    if pending is not None:
+        _check_trial_row(conn, pending)
+    row = conn.execute(
+        f"SELECT COUNT(*) {_COUNTED_FROM}",
+        [family, pending.trial_id if pending is not None else None],
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _canonical_set_hash(params: Mapping[str, Any], family: str) -> str:
+    """The V pair's parameter key: the hash of the canonical frozen set (strategy-lab
+    spec req 3, amendment 6), never the raw `params_sha256`."""
+    return params_sha256(canonical_frozen_set(params, family))
+
+
+def _annual_sharpes(
     conn: duckdb.DuckDBPyConnection, trials: Sequence[tuple[int, float]], basis: Basis
 ) -> tuple[float, ...]:
+    """Each trial's base-level `strategy` period Sharpe on `basis` times the square
+    root of its own `periods_per_year`, in `trials` order, in one query."""
     metric = _BASIS_METRICS[basis]
+    if not trials:
+        return ()
+    rows = conn.execute(
+        "SELECT c.trial_id, s.value, p.value "
+        "FROM (SELECT UNNEST($ids::BIGINT[]) AS trial_id, UNNEST($bases::DOUBLE[]) AS base) c "
+        "LEFT JOIN trial_metrics s ON s.trial_id = c.trial_id AND s.series = 'strategy' "
+        "AND s.cost_per_side_bps = c.base AND s.metric = $metric "
+        "LEFT JOIN trial_metrics p ON p.trial_id = c.trial_id AND p.series = 'strategy' "
+        "AND p.cost_per_side_bps = c.base AND p.metric = $ppy",
+        {
+            "ids": [trial_id for trial_id, _ in trials],
+            "bases": [base for _, base in trials],
+            "metric": metric,
+            "ppy": PERIODS_PER_YEAR_METRIC,
+        },
+    ).fetchall()
+    found = {trial_id: (sharpe, ppy) for trial_id, sharpe, ppy in rows}
     values: list[float] = []
-    for trial_id, base in trials:
-        row = conn.execute(
-            "SELECT value FROM trial_metrics WHERE trial_id = ? AND series = 'strategy' "
-            "AND metric = ? AND cost_per_side_bps = ?",
-            [trial_id, metric, base],
-        ).fetchone()
-        if row is None or row[0] is None or not math.isfinite(row[0]):
+    for trial_id, _base in trials:
+        sharpe, ppy = found.get(trial_id, (None, None))
+        if sharpe is None or not math.isfinite(sharpe):
             raise RegistryError(f"trial {trial_id} has no finite base-level {metric} for strategy")
-        values.append(float(row[0]))
+        if ppy is None or not math.isfinite(ppy) or ppy <= 0:
+            raise RegistryError(
+                f"trial {trial_id} has no positive base-level {PERIODS_PER_YEAR_METRIC} "
+                "for strategy"
+            )
+        values.append(float(sharpe) * math.sqrt(ppy))
     return tuple(values)
 
 

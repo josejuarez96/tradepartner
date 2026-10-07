@@ -269,6 +269,38 @@ def test_edgar_statement_lists_must_not_be_empty(edgar: dict[str, object]) -> No
         Settings(_env_file=None, edgar=edgar)
 
 
+def test_edgar_class_member_overrides_default_names_exactly_the_three_owner_cases() -> None:
+    """#1169 (owner decision, option 3): DKS, TR and VMEO, nothing else."""
+    assert Settings(_env_file=None).edgar.class_member_overrides == {
+        "0001089063": "CommonClassA",
+        "0000098677": "CommonClassA",
+        "0001837686": "CommonClassA",
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"1089063": "CommonClassA"}, "10-digit CIK"),
+        ({"DKS": "CommonClassA"}, "10-digit CIK"),
+        ({"0001089063": "ClassA"}, "CommonClass<A-Z>"),
+        ({"0001089063": "us-gaap:CommonClassAMember"}, "CommonClass<A-Z>"),
+        ({"0001089063": "CommonClassAB"}, "CommonClass<A-Z>"),
+        ({"0001089063": "CommonClassa"}, "CommonClass<A-Z>"),
+    ],
+)
+def test_edgar_class_member_overrides_refuse_malformed_entries(
+    overrides: dict[str, str], match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        Settings(_env_file=None, edgar={"class_member_overrides": overrides})
+
+
+def test_edgar_class_member_overrides_may_be_emptied() -> None:
+    s = Settings(_env_file=None, edgar={"class_member_overrides": {}})
+    assert s.edgar.class_member_overrides == {}
+
+
 def test_edgar_unknown_key_is_refused() -> None:
     """#1037: a mistyped nested key fails instead of being silently ignored."""
     with pytest.raises(ValidationError, match="statement_unit"):

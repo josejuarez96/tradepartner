@@ -389,7 +389,6 @@ def test_profitability_hash_and_fingerprint_ignore_live_strategy(settings: Setti
 # `load_frozen`. T97, T98, T100 and T111 each remove their files from this list.
 PARAMS_READERS_ALLOWLIST = {
     "cli.py",
-    "dashboard/backtest_page.py",
 }
 #: `.params` attributes that are not a `HypothesisRecord` (a plan-read bundle's `Settings`).
 NOT_A_RECORD = {"execution/planning.py"}
