@@ -93,7 +93,7 @@ def store(fixture_store_path: Path) -> Path:
             title="run orchestration",
             doc_path=f"docs/hypotheses/{SLUG}.md",
             doc_sha256="0" * 64,
-            params=frozen_params_of(frozen),
+            params=frozen_params_of(frozen, family="momentum"),
             in_sample_start=IN_SAMPLE_START,
             holdout_start=HOLDOUT[0],
             holdout_end=HOLDOUT[1],
@@ -513,7 +513,7 @@ def tracking_store(store: Path) -> Path:
             title="tracking run",
             doc_path=f"docs/hypotheses/{TRACKING_SLUG}.md",
             doc_sha256="1" * 64,
-            params=frozen_params_of(frozen),
+            params=frozen_params_of(frozen, family="momentum"),
             in_sample_start=IN_SAMPLE_START,
             holdout_start=HOLDOUT[0],
             holdout_end=TRACKING_SLUG_HOLDOUT_END,
@@ -603,7 +603,8 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     owner's store) goes through `load_frozen` → backtest → `record_results` at
     `month_end`, and its stored hash is untouched (strategy-lab T96)."""
     frozen = _frozen()
-    params = {k: v for k, v in frozen_params_of(frozen).items() if not k.startswith("schedule.")}
+    all_params = frozen_params_of(frozen, family="momentum")
+    params = {k: v for k, v in all_params.items() if not k.startswith("schedule.")}
     hashed = sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with open_for_write(_store(fixture_store_path)) as conn:
         record = registry.register_hypothesis(

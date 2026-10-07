@@ -11,7 +11,7 @@ import polars as pl
 
 from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.signals import anchor_sessions, gross_profitability, momentum
-from tradepartner.config import HypothesisFamily, Settings
+from tradepartner.config import FAMILIES, HypothesisFamily, Settings
 
 
 @dataclass(frozen=True)
@@ -134,41 +134,32 @@ def _profitability_signal(
     )
 
 
-_PROFITABILITY_COUNTS = (
-    "n_ranked",
-    "n_excluded_no_facts",
-    "n_excluded_stale_facts",
-    "n_excluded_sector",
-    "n_excluded_malformed",
-    "n_derived",
-)
-
-_SIGNALS: Mapping[HypothesisFamily, Strategy] = {
-    "momentum": Strategy(
-        ("adjusted_prices",),
-        _momentum_read,
-        _momentum_signal,
-        ("no_history",),
-        ("n_excluded_no_history",),
-        "strategy",
-    ),
-    "oracle": Strategy(
-        ("adjusted_prices",),
-        _momentum_read,
-        _momentum_signal,
-        ("no_history",),
-        ("n_excluded_no_history",),
-        "strategy",
-    ),
-    "profitability": Strategy(
-        ("statement_facts", "sics"),
-        _profitability_read,
-        _profitability_signal,
-        ("sector", "no_facts", "stale_facts", "malformed"),
-        _PROFITABILITY_COUNTS,
-        "profitability",
-    ),
+# The reads and the (reader, signal) pair are family-specific code; `exclusion_reasons`,
+# `count_names` and `section` derive from `config.FAMILIES` (ADR 0014 point 2, T128), so
+# `Plan.exclusions` and `Plan.counts` carry exactly the names each family declares.
+_FAMILY_IO: Mapping[HypothesisFamily, tuple[tuple[str, ...], _Reader, _Signal]] = {
+    "momentum": (("adjusted_prices",), _momentum_read, _momentum_signal),
+    "oracle": (("adjusted_prices",), _momentum_read, _momentum_signal),
+    "profitability": (("statement_facts", "sics"), _profitability_read, _profitability_signal),
 }
+
+
+def _build_signals() -> Mapping[HypothesisFamily, Strategy]:
+    out: dict[HypothesisFamily, Strategy] = {}
+    for family, (reads, reader, signal) in _FAMILY_IO.items():
+        spec = FAMILIES[family]
+        out[family] = Strategy(
+            reads=reads,
+            reader=reader,
+            signal=signal,
+            exclusion_reasons=spec.exclusion_reasons,
+            count_names=spec.count_names,
+            section=spec.sections[0],
+        )
+    return out
+
+
+_SIGNALS: Mapping[HypothesisFamily, Strategy] = _build_signals()
 
 
 def signal_for(family: HypothesisFamily) -> Strategy:

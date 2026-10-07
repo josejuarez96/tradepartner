@@ -147,7 +147,7 @@ class Env:
                 title="tracking run marks test",
                 doc_path="docs/hypotheses/h-run-marks.md",
                 doc_sha256="0" * 64,
-                params=frozen_params_of(params),
+                params=frozen_params_of(params, family="momentum"),
                 in_sample_start=IN_SAMPLE_START,
                 holdout_start=HOLDOUT_START,
                 holdout_end=HOLDOUT_END,

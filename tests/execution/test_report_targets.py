@@ -277,7 +277,7 @@ def test_report_appends_a_paper_reports_row_naming_the_trial_and_through_session
             title="paper report",
             doc_path=f"docs/hypotheses/{TRACKING_SLUG}.md",
             doc_sha256="2" * 64,
-            params=frozen_params_of(frozen),
+            params=frozen_params_of(frozen, family="momentum"),
             in_sample_start=IN_SAMPLE_START,
             holdout_start=HOLDOUT_START,
             holdout_end=HOLDOUT_END,

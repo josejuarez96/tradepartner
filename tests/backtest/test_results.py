@@ -115,7 +115,7 @@ def _register(
         title=f"{slug} title",
         doc_path=f"docs/hypotheses/{slug}.md",
         doc_sha256="d" * 64,
-        params=frozen_params_of(settings),
+        params=frozen_params_of(settings, family="momentum"),
         in_sample_start=START,
         holdout_start=HOLDOUT[0],
         holdout_end=HOLDOUT[1],
@@ -545,9 +545,8 @@ class TestRefusals:
         """A registration stored without `schedule.*` (before T96) runs through
         `load_frozen` and its results are recorded (strategy-lab T96)."""
         settings = _settings(tmp_path)
-        params = {
-            k: v for k, v in frozen_params_of(settings).items() if not k.startswith("schedule.")
-        }
+        all_params = frozen_params_of(settings, family="momentum")
+        params = {k: v for k, v in all_params.items() if not k.startswith("schedule.")}
         registry.register_hypothesis(
             conn,
             slug="h1",

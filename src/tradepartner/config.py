@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal, get_args
@@ -653,35 +654,15 @@ class GapConfig(_ClosedConfig):
 
 # The enumerated hypothesis families (spec "Config keys"). Trials are counted per family
 # for the deflated Sharpe, so a family cannot be invented by config: adding one is a
-# reviewed code change here. `oracle` is refused on the real store (registry, T31b).
+# reviewed code change here. `oracle` is refused on the real store (registry, T31b). A
+# test pins `get_args(HypothesisFamily) == tuple(FAMILIES)` (ADR 0014 point 2).
 HypothesisFamily = Literal["momentum", "oracle", "profitability"]
-_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle", "profitability")
 
 # Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
 # ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
 # `HypothesisFamily` since both are the enumerations a hypothesis file pins.
 Cadence = Literal["month_end", "week_end", "daily"]
 SignalAnchor = Literal["month_end", "offset"]
-
-# A family's lineage (strategy-lab spec open question 11): every non-`oracle` family in
-# `HypothesisFamily` has an entry here, either a parent family or `None` for a **root**
-# family whose signal is unrelated to momentum's. Adding a family is one reviewed code
-# change to the literal and this table together, whose PR states why it is a child or a
-# root; a child's holdout may only start after its parent's `holdout.end` and only once
-# the parent has spent its holdout or reached its spend cap (`store/registry.py`).
-# `profitability` (backtest spec amendment #720) is a root: gross profitability over
-# assets is a statement-fact signal unrelated to momentum's price returns.
-FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
-    "momentum": None,
-    "profitability": None,
-}
-
-# The families the engine can run today (#1053, folded into T85 by owner decision
-# 2026-10-06): `backtest run` enforces ENGINE_FAMILIES. Paper retains a smaller gate,
-# PAPER_FAMILIES, enforced by `paper start` and paper planning, until its journal
-# supports arbitrary signal exclusions (ADR 0014 point 5).
-ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle", "profitability")
-PAPER_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
@@ -769,6 +750,128 @@ class ProfitabilityConfig(BaseModel):
             if start > end:
                 raise ValueError(f"exclude_sic_ranges entry {start, end} has start > end")
         return self
+
+
+# --- The family registry (ADR 0014; T128) ------------------------------------
+#
+# One table from which every per-family table derives. Each entry pins:
+#
+# * `sections`: the family's own parameter section first, then any other family's
+#   section its signal reads. Every listed section is frozen, required and hashed for
+#   this family; sections it does not list are inert (never stored, overlaid or
+#   fingerprinted) so that live changes to another family's keys do not move its
+#   registration (`backtest/frozen.py`, `backtest/hypothesis.py`).
+# * `params_model`: the pydantic model for the family's own section.
+# * `parent`: `None` for a root family, else the family whose holdout gates this one.
+# * `engine_ready` / `paper_ready`: the gates for `ENGINE_FAMILIES` and `PAPER_FAMILIES`.
+# * `exclusion_reasons` / `count_names`: the reasons and count names the family's signal
+#   may report, read by `backtest/strategies.py` and the generic `Plan` fields.
+# * `benchmark`: an additive comparison benchmark (`backtest/results.py`); SPY and MTUM
+#   stay mandatory for every family (charter, ADR 0005). `None` adds none.
+# * `sweepable_keys`: the family's own `strategy.*`/`profitability.*` keys that may be
+#   swept; `_DEFAULT_SWEEPABLE_KEYS` and `ALLOWED_AXIS_PREFIXES` derive from them.
+#
+# `oracle` is a test-only entry that reads momentum's `strategy` section (as today), so
+# it is left out of `FAMILY_PARENTS` and `FAMILY_SIGNAL_SECTIONS` as it is today.
+
+
+@dataclass(frozen=True)
+class FamilySpec:
+    """One hypothesis family's registration (ADR 0014 point 2)."""
+
+    sections: tuple[str, ...]
+    params_model: type[BaseModel]
+    parent: HypothesisFamily | None
+    engine_ready: bool
+    paper_ready: bool
+    exclusion_reasons: tuple[str, ...]
+    count_names: tuple[str, ...]
+    benchmark: str | None
+    sweepable_keys: tuple[str, ...]
+
+
+FAMILIES: dict[HypothesisFamily, FamilySpec] = {
+    "momentum": FamilySpec(
+        sections=("strategy",),
+        params_model=StrategyConfig,
+        parent=None,
+        engine_ready=True,
+        paper_ready=True,
+        exclusion_reasons=("no_history",),
+        count_names=("n_excluded_no_history",),
+        benchmark="MTUM",
+        sweepable_keys=(
+            "strategy.formation_months",
+            "strategy.skip_months",
+            "strategy.top_fraction",
+            "strategy.weighting",
+            "strategy.signal_total_return",
+        ),
+    ),
+    "oracle": FamilySpec(
+        sections=("strategy",),
+        params_model=StrategyConfig,
+        parent=None,
+        engine_ready=True,
+        paper_ready=True,
+        exclusion_reasons=("no_history",),
+        count_names=("n_excluded_no_history",),
+        benchmark="MTUM",
+        sweepable_keys=(),
+    ),
+    "profitability": FamilySpec(
+        sections=("profitability",),
+        params_model=ProfitabilityConfig,
+        parent=None,
+        engine_ready=True,
+        paper_ready=False,
+        # The four reasons `gross_profitability` may report (`backtest/signals.py:225`).
+        exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed"),
+        # The six count names of spec amendment #720 (T85d).
+        count_names=(
+            "n_ranked",
+            "n_excluded_no_facts",
+            "n_excluded_stale_facts",
+            "n_excluded_sector",
+            "n_excluded_malformed",
+            "n_derived",
+        ),
+        benchmark="MTUM",
+        sweepable_keys=(),
+    ),
+}
+
+
+# The hypothesis family enumeration tuple derived from `FAMILIES`. The `HypothesisFamily`
+# literal above must agree with it; a test pins the equality (mypy strict needs the
+# literal explicit).
+_HYPOTHESIS_FAMILIES: tuple[HypothesisFamily, ...] = tuple(FAMILIES)
+
+# A family's lineage (strategy-lab spec open question 11): every non-`oracle` family has
+# an entry here, either a parent family or `None` for a **root** family whose signal is
+# unrelated to momentum's. `oracle` is test-only, no entry (as today). A child's holdout
+# may only start after its parent's `holdout.end` and only once the parent has spent its
+# holdout or reached its spend cap (`store/registry.py`).
+FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
+    family: spec.parent for family, spec in FAMILIES.items() if family != "oracle"
+}
+
+# Each family's own signal section (first of its listed sections). `oracle` reads
+# momentum's `strategy` section, so it is left out as today (`backtest/frozen.py`).
+FAMILY_SIGNAL_SECTIONS: dict[HypothesisFamily, str] = {
+    family: spec.sections[0] for family, spec in FAMILIES.items() if family != "oracle"
+}
+
+# The families the engine can run today (#1053, folded into T85 by owner decision
+# 2026-10-06): `backtest run` enforces `ENGINE_FAMILIES`. Paper retains a smaller gate,
+# `PAPER_FAMILIES`, enforced by `paper start` and paper planning, until its journal
+# supports arbitrary signal exclusions (ADR 0014 point 5).
+ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = tuple(
+    family for family, spec in FAMILIES.items() if spec.engine_ready
+)
+PAPER_FAMILIES: tuple[HypothesisFamily, ...] = tuple(
+    family for family, spec in FAMILIES.items() if spec.paper_ready
+)
 
 
 class CostsConfig(BaseModel):
@@ -907,16 +1010,16 @@ FORBIDDEN_AXIS_PREFIXES: tuple[str, ...] = (
 # and `schedule.*` rather than relying on `FORBIDDEN_AXIS_PREFIXES` alone (a deny-list
 # that, unamended, let `risk.*`, `paper.*` and `alerts.*` through, #955). A new axis
 # family needs a reviewed code change here, because `lab.sweepable_keys` itself comes
-# from config, which is set from the unreviewed `.env`. Pinned by value in
-# tests/test_config.py.
-ALLOWED_AXIS_PREFIXES: tuple[str, ...] = ("strategy.", "schedule.")
+# from config, which is set from the unreviewed `.env`. Derived from `FAMILIES`
+# (ADR 0014 point 2): schedule plus every family's own signal section with sweepable
+# keys. Pinned by value in tests/test_config.py.
+ALLOWED_AXIS_PREFIXES: tuple[str, ...] = (
+    *sorted({f"{spec.sections[0]}." for spec in FAMILIES.values() if spec.sweepable_keys}),
+    "schedule.",
+)
 
 _DEFAULT_SWEEPABLE_KEYS: tuple[str, ...] = (
-    "strategy.formation_months",
-    "strategy.skip_months",
-    "strategy.top_fraction",
-    "strategy.weighting",
-    "strategy.signal_total_return",
+    *(key for spec in FAMILIES.values() for key in spec.sweepable_keys),
     "schedule.rebalance_cadence",
     "schedule.signal_anchor",
 )

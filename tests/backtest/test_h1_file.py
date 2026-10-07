@@ -37,7 +37,7 @@ def test_h1_file_parses_with_slug_family_and_dates() -> None:
 
 def test_h1_file_names_every_required_key() -> None:
     parsed = hypothesis.parse_file(H1_PATH)
-    assert hypothesis.required_keys() <= set(parsed.file_params)
+    assert hypothesis.required_keys("momentum") <= set(parsed.file_params)
     assert set(parsed.file_params) <= set(hypothesis.frozen_keys())
 
 
