@@ -1051,6 +1051,15 @@ def test_a_series_letter_in_the_title_names_the_class(settings: Settings) -> Non
     assert [u.class_member for u in unmatched] == ["us-gaap:CommonClassBMember"]  # unlisted
 
 
+def test_a_series_in_a_rights_clause_names_no_class(settings: Settings) -> None:
+    # code-review on #1168: a plain common title mentioning a preferred
+    # series' purchase rights must not let an unlisted Class A take its place.
+    title = "Common Stock, and Series A Junior Participating Preferred Stock Purchase Rights"
+    member = _fact(ACME, "us-gaap:CommonClassAMember", 7, f"{ACME}-19-2", _at(2019, 3, 1))
+    _, unmatched = _fact_rows(settings, _filings(acme_title=title, extra_facts=[member]))
+    assert member in unmatched
+
+
 #: A later cover page retitles ACME's one listed class "Class A" (#1166: SAM,
 #: PBF, OPY, GOCO, WEBR): same pair, so no new listing row.
 _RETITLED_AT = _at(2019, 5, 1)

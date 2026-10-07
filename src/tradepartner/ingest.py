@@ -1110,9 +1110,17 @@ def insert_statement_frame(conn: duckdb.DuckDBPyConnection, frame: pa.Table) -> 
 
 
 _MEMBER_CLASS = re.compile(r"Class([A-Z])(?![a-z])")
-#: A title naming its class by letter: "Class B Common Stock", or "Series C
-#: common stock" (Liberty Broadband, Liberty TripAdvisor; #1166).
-_TITLE_CLASS = re.compile(r"\b(?:class|series) ([a-z])\b")
+#: A title naming its class by letter: "Class B Common Stock", or one that
+#: starts "Series C" ("Series C common stock": Liberty Broadband, Liberty
+#: TripAdvisor; #1166). "Series" only leads, so a common title that mentions
+#: "Series A Junior Participating Preferred Stock Purchase Rights" names no class.
+_TITLE_CLASS = re.compile(r"\bclass ([a-z])\b|^\s*series ([a-z])\b")
+
+
+def _title_letter(title: str) -> str | None:
+    """The class letter `title` names (`_TITLE_CLASS`), upper case, or `None`."""
+    match = _TITLE_CLASS.search(title.lower())
+    return (match.group(1) or match.group(2)).upper() if match else None
 
 
 def fact_rows(
@@ -1162,14 +1170,14 @@ def fact_rows(
 
     letters: dict[str, set[str]] = defaultdict(set)
     for row in master.listings:
-        match = _TITLE_CLASS.search((row["class_title"] or "").lower())
-        if match:
-            letters[row["security_id"]].add(match.group(1).upper())
+        letter = _title_letter(row["class_title"] or "")
+        if letter:
+            letters[row["security_id"]].add(letter)
     titled: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for title in master.class_titles:
-        match = _TITLE_CLASS.search(title.title.lower())
-        if match:
-            titled[title.security_id].append((title.known_at, match.group(1).upper()))
+        letter = _title_letter(title.title)
+        if letter:
+            titled[title.security_id].append((title.known_at, letter))
 
     def letters_at(sid: str, t: datetime) -> set[str]:
         """The letters `sid`'s listing titles name, plus those its cover-page
