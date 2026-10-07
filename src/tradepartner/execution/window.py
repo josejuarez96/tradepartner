@@ -590,7 +590,7 @@ def start(
             if hyp.family not in PAPER_FAMILIES:
                 raise StartRefusedError(
                     "family_not_runnable",
-                    f"{slug!r} is in family {hyp.family!r}, which the engine cannot run "
+                    f"{slug!r} is in family {hyp.family!r}, which paper trading cannot run "
                     f"yet (paper families: {', '.join(PAPER_FAMILIES)})",
                 )
             if not _gap_signoff_ok(conn, hyp.hypothesis_id):

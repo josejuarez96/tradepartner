@@ -450,8 +450,8 @@ def _frozen_params(
     record = registry.get_hypothesis_by_id(conn, hypothesis_id)
     if record.family not in PAPER_FAMILIES:
         raise ValueError(
-            f"hypothesis {record.slug!r} is in family {record.family!r}, which the engine "
-            f"cannot run yet (paper families: {', '.join(PAPER_FAMILIES)})"
+            f"hypothesis {record.slug!r} is in family {record.family!r}, which paper "
+            f"trading cannot run yet (paper families: {', '.join(PAPER_FAMILIES)})"
         )
     latest = registry.get_hypothesis(conn, record.slug)
     if latest.hypothesis_id != hypothesis_id:

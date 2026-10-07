@@ -664,8 +664,9 @@ FAMILY_PARENTS: dict[HypothesisFamily, HypothesisFamily | None] = {
 }
 
 # The families the engine can run today (#1053, folded into T85 by owner decision
-# 2026-10-06). Paper retains a smaller gate until its journal supports arbitrary
-# signal exclusions (ADR 0014 point 5).
+# 2026-10-06): `backtest run` enforces ENGINE_FAMILIES. Paper retains a smaller gate,
+# PAPER_FAMILIES, enforced by `paper start` and paper planning, until its journal
+# supports arbitrary signal exclusions (ADR 0014 point 5).
 ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle", "profitability")
 PAPER_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 
