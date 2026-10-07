@@ -436,23 +436,25 @@ def test_vintage_is_measured_at_the_trials_own_cutoff(
     )
     trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
     assert trial is not None and lab_queries.is_current(lab_store, trial)
-    # A fact known after the cutoff does not move the vintage at the cutoff.
+    # A fact known after the cutoff does not move the vintage at the cutoff,
+    # even though its ingested_at (later than the current max) raises the
+    # store-wide vintage: only an own-cutoff comparison stays current here.
     _insert_price_fact(
         lab_store,
         security_id="SEC_AFTER",
         session=date(2024, 1, 2),
         known_at=datetime(2024, 1, 2, 21, 0, tzinfo=UTC),
-        ingested_at=datetime(2024, 1, 2, 21, 10, tzinfo=UTC),
+        ingested_at=vintage + timedelta(days=1),
     )
     trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
     assert trial is not None and lab_queries.is_current(lab_store, trial)
-    # A late fact for an in-window session moves the vintage: stale.
+    # A late fact for an in-window session moves the vintage at the cutoff: stale.
     _insert_price_fact(
         lab_store,
         security_id="SEC_LATE",
         session=date(2020, 6, 30),
         known_at=datetime(2020, 6, 30, 20, 0, tzinfo=UTC),
-        ingested_at=vintage + timedelta(days=1),
+        ingested_at=vintage + timedelta(days=2),
     )
     trial = lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id)
     assert trial is not None and lab_queries.is_stale(lab_store, trial)
@@ -579,6 +581,22 @@ def test_no_failures_is_not_terminal(
 ) -> None:
     sweep, record = _one_variant(lab_store, settings)
     assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, _checkout())
+
+
+def test_terminal_failed_reads_the_counted_ok_at_the_passed_code_vintage(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """`terminal_failed`'s counted `ok` is judged at the caller's code vintage:
+    an older `ok` at vintage X clears the state even though a newer `ok` is
+    current only at the checkout's vintage."""
+    sweep, record = _one_variant(lab_store, settings)
+    vintage = "x" * 64
+    run_id = _open_run(lab_store, sweep, tmp_path)
+    for _ in range(2):
+        _record_failure(lab_store, record.hypothesis_id, run_id, code_tree_sha256_value=vintage)
+    _insert_trial(lab_store, record.hypothesis_id, code_tree_sha256_value=vintage)
+    _insert_trial(lab_store, record.hypothesis_id)
+    assert not lab_queries.terminal_failed(lab_store, record.hypothesis_id, sweep, vintage)
 
 
 # --- sweep_state ---------------------------------------------------------------

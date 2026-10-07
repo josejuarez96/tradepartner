@@ -188,13 +188,19 @@ def _default_window(conn: duckdb.DuckDBPyConnection, hypothesis_id: int, sweep_i
 
 
 def _counted_trial(
-    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, window: Window
+    conn: duckdb.DuckDBPyConnection,
+    hypothesis_id: int,
+    window: Window,
+    code_vintage: str | None,
+    vintages: dict[datetime, datetime | None],
 ) -> TrialRow | None:
     """The counted trial over `window`: the latest **current** `ok`,
     non-synthetic, `in_sample` trial, or, when none is current, the latest `ok`
     trial (stale), or None. The spec defines the counted trial as "the latest
     `ok` ... that is current" (Definitions "Selection statistic"); the stale
-    latest is still returned so a caller can tell stale from unrun."""
+    latest is still returned so a caller can tell stale from unrun. Currentness
+    is read against the caller's `code_vintage` and `vintages` memo, so a caller
+    that already holds them computes nothing twice."""
     rows = conn.execute(
         _TRIAL_SELECT + "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
         "AND r.status = 'ok' AND t.start_session = ? AND t.end_session = ? "
@@ -203,8 +209,6 @@ def _counted_trial(
     ).fetchall()
     if not rows:
         return None
-    code_vintage = code_tree_sha256()
-    vintages: dict[datetime, datetime | None] = {}
     for row in rows:
         trial = TrialRow(*row)
         if _is_current(conn, trial, code_vintage, vintages):
@@ -221,7 +225,8 @@ def counted_trial(
     when none is current (stale), or None. Call `is_current`/`is_stale` on the
     result. Raises `LabRegistryError` for an unknown sweep."""
     require_lab(conn)
-    return _counted_trial(conn, hypothesis_id, _default_window(conn, hypothesis_id, sweep_id))
+    window = _default_window(conn, hypothesis_id, sweep_id)
+    return _counted_trial(conn, hypothesis_id, window, code_tree_sha256(), {})
 
 
 def is_current(conn: duckdb.DuckDBPyConnection, trial: TrialRow) -> bool:
@@ -274,7 +279,7 @@ def terminal_failed(
     blocks."""
     require_lab(conn)
     window = _default_window(conn, hypothesis_id, sweep.sweep_id)
-    counted = _counted_trial(conn, hypothesis_id, window)
+    counted = _counted_trial(conn, hypothesis_id, window, code_vintage, {})
     if counted is not None and _is_current(conn, counted, code_vintage, {}):
         return False
     return _has_terminal_failures(
@@ -333,7 +338,7 @@ def seconds_per_variant_by_cadence(
 ) -> dict[Cadence, float]:
     """The measured seconds one variant takes, per cadence, over the sweep's
     `sweep_trials` rows joined to their variants' frozen cadence (spec req 2,
-    quiet intervals)    : the mean of every `ok` trial's recorded `seconds` at that
+    quiet intervals): the mean of every `ok` trial's recorded `seconds` at that
     cadence (a failed or refused trial's seconds are not a run time and are
     ignored). A cadence with no `ok` trial is absent, so
     `quiet.seconds_per_variant` falls back to `lab.seconds_per_variant_default`.
@@ -397,7 +402,7 @@ def plan_run(conn: duckdb.DuckDBPyConnection, sweep_id: int, rerun: bool = False
         for variant in group:
             if not rerun:
                 window = _default_window(conn, variant.hypothesis_id, sweep_id)
-                counted = _counted_trial(conn, variant.hypothesis_id, window)
+                counted = _counted_trial(conn, variant.hypothesis_id, window, code_vintage, {})
                 if counted is not None and _is_current(conn, counted, code_vintage, {}):
                     continue
                 if _has_terminal_failures(
@@ -429,7 +434,7 @@ def sweep_state(conn: duckdb.DuckDBPyConnection, sweep_id: int) -> SweepState:
     vintages: dict[datetime, datetime | None] = {}
     for variant in lab_registry.sweep_variants(conn, sweep_id):
         window = _default_window(conn, variant.hypothesis_id, sweep_id)
-        counted = _counted_trial(conn, variant.hypothesis_id, window)
+        counted = _counted_trial(conn, variant.hypothesis_id, window, code_vintage, vintages)
         if counted is not None and _is_current(conn, counted, code_vintage, vintages):
             continue
         if _has_terminal_failures(
