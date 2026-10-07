@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol, cast
+from typing import cast
 
 import polars as pl
 
+from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.signals import anchor_sessions, gross_profitability, momentum
 from tradepartner.config import HypothesisFamily, Settings
 
@@ -36,22 +37,7 @@ class _ProfitabilityRead:
 _Read = _MomentumRead | _ProfitabilityRead
 
 
-class _ProviderReads(Protocol):
-    def adjusted_prices(
-        self,
-        t: datetime,
-        ids: Sequence[str],
-        include_dividends: bool,
-        *,
-        sessions_from: date | None = None,
-    ) -> pl.DataFrame: ...
-
-    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame: ...
-
-    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]: ...
-
-
-_Reader = Callable[[object, Settings, date, datetime, Sequence[str]], _Read]
+_Reader = Callable[[DataProvider, Settings, date, datetime, Sequence[str]], _Read]
 _Signal = Callable[[_Read, Settings, date, datetime, Sequence[str]], SignalResult]
 
 
@@ -68,7 +54,7 @@ class Strategy:
 
 
 def _momentum_read(
-    provider: object,
+    provider: DataProvider,
     params: Settings,
     session: date,
     t: datetime,
@@ -79,7 +65,7 @@ def _momentum_read(
         session, strategy.formation_months, strategy.skip_months, schedule.signal_anchor
     )
     return _MomentumRead(
-        cast(_ProviderReads, provider).adjusted_prices(
+        provider.adjusted_prices(
             t,
             members,
             strategy.signal_total_return,
@@ -114,14 +100,13 @@ def _momentum_signal(
 
 
 def _profitability_read(
-    provider: object,
+    provider: DataProvider,
     params: Settings,
     session: date,
     t: datetime,
     members: Sequence[str],
 ) -> _Read:
-    facts = cast(_ProviderReads, provider)
-    return _ProfitabilityRead(facts.statement_facts(t, members), facts.sics(t, members))
+    return _ProfitabilityRead(provider.statement_facts(t, members), provider.sics(t, members))
 
 
 def _profitability_signal(
