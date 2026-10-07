@@ -16,11 +16,15 @@ on:
   push:
     branches: [main, 'train/**']
 
-# PR branches cancel superseded runs. Main and merge-train branches (`train/**`) never do,
-# so every merge and every train batch gets a completed run (#198; merge-train spec req 4):
-# one group per commit, since a shared group would still drop a pending run.
+# PR branches cancel superseded runs. Main and merge-train branches (`train/**`) never
+# cancel a run in progress, so a red main is always seen (#198). Main pushes share ONE
+# group (#1222): the run in progress completes, and of the commits that land meanwhile
+# GitHub keeps only the newest pending run, which tests the cumulative tree, so a burst of
+# merges costs one full run, not one per commit, and PR runs stop queueing behind them. A
+# red newest run is bisected by re-running CI on the burst's earlier commits. `train/**`
+# keeps one group per commit, so every train batch gets a completed run (merge-train spec req 4).
 concurrency:
-  group: ci-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/train/')) && github.sha || github.ref }}
+  group: ci-${{ github.ref == 'refs/heads/main' && 'main' || (startsWith(github.ref, 'refs/heads/train/') && github.sha || github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/train/') }}
 
 # Pytest shard count (#1112): tests/conftest.py's `pytest_collection_modifyitems` buckets
