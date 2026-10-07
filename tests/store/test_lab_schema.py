@@ -310,6 +310,33 @@ def test_rebuild_keeps_a_value_another_version_added() -> None:
     )
 
 
+def test_rebuild_leaves_another_columns_check_alone() -> None:
+    """A later version's `CHECK` on another column (T97's `sharpe_unit`, say)
+    neither blocks the widening nor is lost by it."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    conn.execute(
+        "CREATE TABLE trial_results (trial_id BIGINT PRIMARY KEY, status VARCHAR NOT NULL, "
+        "sharpe_unit VARCHAR, CHECK (status IN ('ok')), "
+        "CHECK (sharpe_unit IN ('monthly', 'annual')))"
+    )
+    conn.execute("CREATE TABLE owner_decisions (decision_id BIGINT, kind VARCHAR)")
+    conn.execute("ALTER TABLE owner_decisions ADD COLUMN x INTEGER")
+    with pytest.raises(schema.SchemaVersionError):
+        lab_schema.apply_lab_schema(conn)
+    conn.execute("DROP TABLE owner_decisions")
+    conn.execute(
+        "CREATE TABLE owner_decisions (decision_id BIGINT, kind VARCHAR, "
+        "CHECK (kind IN ('gap_signoff')))"
+    )
+    conn.execute("INSERT INTO trial_results VALUES (1, 'ok', 'annual')")
+    lab_schema.apply_lab_schema(conn)
+    conn.execute("INSERT INTO trial_results VALUES (2, 'refused_variant', 'monthly')")
+    with pytest.raises(duckdb.ConstraintException):
+        conn.execute("INSERT INTO trial_results VALUES (3, 'ok', 'weekly')")
+    assert _rows_in_order(conn, "trial_results")[0] == (1, "ok", "annual")
+
+
 def test_rebuild_refuses_an_unknown_check_shape() -> None:
     conn = duckdb.connect(":memory:")
     configure_connection(conn)

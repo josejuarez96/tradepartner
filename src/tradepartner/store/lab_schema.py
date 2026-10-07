@@ -326,27 +326,29 @@ _IN_LIST = re.compile(r"^\((?P<column>\w+) IN \((?P<values>'[^']*'(?:, '[^']*')*
 
 def _current_enum(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> tuple[str, str]:
     """The `CHECK` on `table.column` as DuckDB prints it in the table's DDL, and
-    its quoted value list (`'a', 'b'`). Raises `SchemaVersionError` unless there is exactly one
-    `CHECK` on the table and it is a plain `column IN (...)` list: any other
-    shape is a store this module does not know and will not rebuild."""
+    its quoted value list (`'a', 'b'`). Other `CHECK`s on the table (a later
+    version's, on another column) are left alone. Raises `SchemaVersionError`
+    unless exactly one `CHECK` on the table is a plain `column IN (...)` list
+    on `column`: any other shape is a store this module does not know and will
+    not rebuild."""
     rows = conn.execute(
         "SELECT constraint_text, expression FROM duckdb_constraints() "
         "WHERE database_name = current_database() AND schema_name = current_schema() "
         "AND table_name = ? AND constraint_type = 'CHECK'",
         [table],
     ).fetchall()
-    if len(rows) != 1:
+    found = [
+        (str(text), match)
+        for text, expression in rows
+        if (match := _IN_LIST.fullmatch(expression)) is not None and match["column"] == column
+    ]
+    if len(found) != 1:
         raise SchemaVersionError(
-            f"{table} has {len(rows)} CHECK constraints, expected one on {column}; "
+            f"{table} has {len(found)} CHECK constraints of the form {column} IN (...), "
+            f"expected one (CHECKs: {[expression for _, expression in rows]!r}); "
             "the lab schema does not rebuild a table it does not know"
         )
-    constraint_text, expression = rows[0]
-    match = _IN_LIST.fullmatch(expression)
-    if match is None or match["column"] != column:
-        raise SchemaVersionError(
-            f"{table}'s CHECK is {expression!r}, expected a {column} IN (...) list; "
-            "the lab schema does not rebuild a table it does not know"
-        )
+    constraint_text, match = found[0]
     return str(constraint_text), match["values"]
 
 
