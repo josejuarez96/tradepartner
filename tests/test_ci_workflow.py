@@ -57,12 +57,19 @@ def test_train_branches_run_on_push_per_commit_and_are_never_cancelled() -> None
 
 
 def test_the_checks_job_token_is_read_only() -> None:
-    """T73: the `checks` job runs a train batch's code on a push event, so its token only
-    reads; the `claims` job stays PR-only."""
+    """T73: every job that can run a train batch's code on a push event (`checks-fast`,
+    `pytest-shard`, and the `checks` aggregator — #1112 split the old single `checks`
+    job into these) only reads; the `claims` job stays PR-only.
+
+    Sliced from `checks-fast` (not `checks`): with the #1112 split, the literal
+    substring `"  checks:\n"` matches the thin aggregator job first, which has no
+    checkout step and runs no repository code — asserting read-only permissions on it
+    alone would miss a `write` added to `checks-fast` or `pytest-shard`, the jobs that
+    actually execute the diff (code-review finding on PR #1113)."""
     text = CI.read_text()
-    checks = text[text.index("  checks:\n") : text.index("  claims:\n")]
-    assert "    permissions:\n      contents: read\n" in checks
-    assert "write" not in checks
+    jobs = text[text.index("  checks-fast:\n") : text.index("  claims:\n")]
+    assert jobs.count("    permissions:\n      contents: read\n") >= 3  # fast, shard, checks
+    assert "write" not in jobs
     claims = text[text.index("  claims:\n") :]
     assert "if: github.event_name == 'pull_request'" in claims
 
