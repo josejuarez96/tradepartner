@@ -252,6 +252,10 @@ from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
     DecisionRow,
+    DecisionWithEvents,
+    KillSwitchRow,
+    OrderedFill,
+    OrderEventRow,
     OrderRow,
     PaperRunResultRow,
     PaperRunRow,
@@ -283,6 +287,7 @@ __all__ = [
     "INVOKED_BY_ENV",
     "RunOutcome",
     "StepContext",
+    "WindowJournalInputs",
     "exits_step",
     "invoked_by",
     "stop_session",
@@ -290,6 +295,7 @@ __all__ = [
     "submit_window",
     "tracking_run",
     "trade_step",
+    "window_journal_inputs",
 ]
 
 #: The environment variable the scheduler's plist sets (spec "Env vars").
@@ -369,6 +375,23 @@ class StepContext:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class WindowJournalInputs:
+    """The window's journal inputs for derived-state computation, read the way the
+    tracking run reads them: every row the store holds, no `as_of` cut."""
+
+    decisions: list[DecisionWithEvents]
+    orders: list[OrderRow]
+    order_events: list[OrderEventRow]
+    fills: list[OrderedFill]
+    adjustments: list[AdjustmentRow]
+    rebalance_events: list[RebalanceEventRow]
+    runs: list[PaperRunRow]
+    results: list[PaperRunResultRow]
+    positions_daily: list[PositionDailyRow]
+    kill_switch_events: list[KillSwitchRow]
+
+
 def trade_step(context: StepContext) -> BatchOutcome | None:
     """Step 6's trading half on a rebalance or catch-up run (module
     docstring): inside the submit window, the plan's decisions and this
@@ -444,6 +467,38 @@ def submit_window(settings: Settings, session: date) -> tuple[datetime, datetime
     return (
         opening - timedelta(minutes=paper.submit_window_before_open_minutes),
         opening + timedelta(minutes=paper.submit_window_after_open_minutes),
+    )
+
+
+def window_journal_inputs(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+) -> WindowJournalInputs:
+    """The window's journal inputs for derived state (step 4, step 7b's
+    `decision_state`/`rebalance_state`, `_skipped`'s `switch.derive`), read the
+    way the tracking run reads them: every row the store holds for this window,
+    no `as_of` cut.
+
+    `_locked_run` does NOT use it: before its run row exists it reads only runs,
+    kill-switch events and rebalance events (the same readers), so a journal
+    integrity error in orders or fills is raised inside `_Run.execute`, which
+    alerts and writes the failed result.
+
+    `_exit_book` (step 7's forced-exit reads) is NOT included: it reads
+    `orders`, `order_events` and `fills` with `window_id=None` (across all
+    windows), so it cannot use this single-window loader."""
+    runs_with = runs_for(conn, window_id)
+    return WindowJournalInputs(
+        decisions=decisions_for(conn, window_id),
+        orders=orders_for(conn, window_id=window_id),
+        order_events=order_events_for(conn, window_id=window_id),
+        fills=fills_for(conn, window_id=window_id),
+        adjustments=adjustments_for(conn, window_id),
+        rebalance_events=rebalance_events_for(conn, window_id),
+        runs=[r.run for r in runs_with],
+        results=[r.result for r in runs_with if r.result is not None],
+        positions_daily=positions_daily_for(conn, window_id),
+        kill_switch_events=kill_switch_events_for(conn, window_id),
     )
 
 
@@ -905,6 +960,10 @@ def _locked_run(
         )
         raise SystemExit(WRITE_FAILED_EXIT_CODE)
 
+    # Only the three readers the switch and the rebalance kind need, not
+    # `window_journal_inputs`: an orders/fills integrity error must surface inside
+    # `_Run.execute`, whose `_fail` path alerts and writes the failed result, not
+    # here before the run row exists (#507 safety review).
     with open_read_only(settings) as conn:
         runs = runs_for(conn, window_id)
         rows = kill_switch_events_for(conn, window_id)
@@ -1054,13 +1113,12 @@ class _Run:
         `switch.derive`'s own `engaged_row`, so the alert and the derivation
         share one definition of "latest" (#699)."""
         with open_read_only(self.settings) as conn:
-            rows = kill_switch_events_for(conn, self.window_id)
-            runs = runs_for(conn, self.window_id)
+            inputs = window_journal_inputs(conn, self.window_id)
         state = switch.derive(
             self.window,
-            rows,
-            [r.run for r in runs],
-            [r.result for r in runs if r.result is not None],
+            inputs.kill_switch_events,
+            inputs.runs,
+            inputs.results,
             reading_run=self.run_id,
             lock_free=True,
         )
@@ -1372,20 +1430,15 @@ class _Run:
         if fill_session(self.window.first_rebalance_session) > self.session:
             return []
         with open_read_only(self.settings) as conn:
-            run_rows = [r.run for r in runs_for(conn, self.window_id)]
-            events = rebalance_events_for(conn, self.window_id)
-            decisions = decisions_for(conn, self.window_id)
-            orders = orders_for(conn, window_id=self.window_id)
-            order_events = order_events_for(conn, window_id=self.window_id)
-            fills = fills_for(conn, window_id=self.window_id)
-        settled = {e.rebalance_session for e in events}
+            inputs = window_journal_inputs(conn, self.window_id)
+        settled = {e.rebalance_session for e in inputs.rebalance_events}
         executed: list[date] = []
         for t_i in rebalance_sessions(self.window.first_rebalance_session, self.session):
             if fill_session(t_i) > self.session or t_i in settled:
                 continue
             mine = [
                 d
-                for d in decisions
+                for d in inputs.decisions
                 if d.decision.rebalance_session == t_i and d.decision.decision != _FORCED_EXIT
             ]
             if not mine:
@@ -1396,9 +1449,9 @@ class _Run:
                     decision_state(
                         d.decision,
                         list(d.events),
-                        orders,
-                        order_events,
-                        fills,
+                        inputs.orders,
+                        inputs.order_events,
+                        inputs.fills,
                         actions,
                         prices.__getitem__,
                         self.frozen,
@@ -1408,7 +1461,7 @@ class _Run:
                 for d in mine
             ]
             verdict = rebalance_state(
-                t_i, self.window, run_rows, events, states, session=self.session
+                t_i, self.window, inputs.runs, inputs.rebalance_events, states, session=self.session
             )
             if verdict is RebalanceState.EXECUTED:
                 executed.append(t_i)
