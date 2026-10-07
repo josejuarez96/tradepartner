@@ -85,14 +85,25 @@ def inference_path(settings: Settings, run_id: int) -> Path:
     return data_dir(settings) / "inferences" / TASK / _run_file(run_id)
 
 
+def is_run_id_stem(stem: str) -> bool:
+    """Whether `stem` is a records file name `inference_path` writes: a positive run
+    id with no sign, no padding and no other character."""
+    return stem.isascii() and stem.isdigit() and not stem.startswith("0")
+
+
 def inference_paths(settings: Settings) -> list[Path]:
-    """Every inference records file in the store, by run id (the spend check sums
-    over all of them, C4)."""
+    """Every `.jsonl` under `inferences/<task>/` (C4 as #1121 amends it): the run-id
+    files first in numeric order, then every other `.jsonl` by name. A name that is
+    not a run id is returned, never dropped, so the spend sum can refuse it by name
+    (a skipped records file is spend the check cannot see). Another suffix is not a
+    records file and is not listed."""
     folder = data_dir(settings) / "inferences" / TASK
     if not folder.is_dir():
         return []
-    found = [p for p in folder.glob("*.jsonl") if p.stem.isdigit()]
-    return sorted(found, key=lambda p: int(p.stem))
+    found = [p for p in folder.glob("*.jsonl") if p.is_file()]
+    runs = sorted((p for p in found if is_run_id_stem(p.stem)), key=lambda p: int(p.stem))
+    others = sorted((p for p in found if not is_run_id_stem(p.stem)), key=lambda p: p.name)
+    return runs + others
 
 
 def review_path(settings: Settings, run_id: int) -> Path:
