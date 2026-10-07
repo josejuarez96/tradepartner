@@ -655,6 +655,33 @@ def test_classwise_reliability_hand_worked() -> None:
         assert math.isclose(result[class_name], value, abs_tol=1e-9)
 
 
+def test_classwise_reliability_empty_is_zero_for_every_class() -> None:
+    """code-review follow-up on PR #1069: `classwise_reliability([])` must
+    return `0.0` for every class, consistent with `ece([])` and
+    `multiclass_brier([])`, not merely happen to by falling through an
+    empty loop."""
+    result = scoring.classwise_reliability([])
+    assert result.keys() == set(crosswalk.CLASSES)
+    assert all(value == 0.0 for value in result.values())
+
+
+def test_share_at_or_above_skips_an_empty_probability_vector() -> None:
+    items = [
+        scoring.CalibrationItem({}, "insolvency"),
+        scoring.CalibrationItem({"bankruptcy": 1.0}, "insolvency"),
+    ]
+    assert scoring.share_at_or_above(items) == 0.5  # only the second item is at or above 0.999
+
+
+def test_mean_abs_probability_shift_skips_an_empty_probability_vector() -> None:
+    comparisons = [
+        scoring.DriftComparison(
+            "a", "bankruptcy", "bankruptcy", probabilities={}, baseline_probabilities={"x": 1.0}
+        )
+    ]
+    assert scoring.mean_abs_probability_shift(comparisons) == 0.0
+
+
 # --- share_at_or_above and the agreement-by-bin table ----------------------------
 
 

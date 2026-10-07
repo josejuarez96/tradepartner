@@ -357,28 +357,24 @@ def per_option_precision_recall(
         ]
         gold_as = [i for i in items if i.in_random_draw and i.gold_label == option]
         precision_n, recall_n = len(predicted_as), len(gold_as)
-        precision = (
-            sum(1 for i in predicted_as if i.gold_label == option) / precision_n
-            if precision_n
-            else None
+        precision_correct = sum(1 for i in predicted_as if i.gold_label == option)
+        recall_correct = sum(
+            1 for i in gold_as if i.reason == "ok" and i.predicted_option == option
         )
-        recall = (
-            sum(1 for i in gold_as if i.reason == "ok" and i.predicted_option == option) / recall_n
-            if recall_n
-            else None
-        )
+        precision = precision_correct / precision_n if precision_n else None
+        recall = recall_correct / recall_n if recall_n else None
         result[option] = PrecisionRecall(
             option=option,
             precision=precision,
             precision_lower_bound=(
-                clopper_pearson_lower_bound(round(precision * precision_n), precision_n)
+                clopper_pearson_lower_bound(precision_correct, precision_n)
                 if precision is not None
                 else None
             ),
             precision_n=precision_n,
             recall=recall,
             recall_lower_bound=(
-                clopper_pearson_lower_bound(round(recall * recall_n), recall_n)
+                clopper_pearson_lower_bound(recall_correct, recall_n)
                 if recall is not None
                 else None
             ),
@@ -416,8 +412,10 @@ def rule_provision_arm_score(items: Sequence[ScoredItem]) -> ArmResult:
     covered = 0
     one_class_n, one_class_correct = 0, 0
     for item in scored:
-        gold_class = crosswalk.class_of(item.gold_label)  # type: ignore[arg-type]
-        arm_options = crosswalk.rule_provision_arm(item.rule_provision)  # type: ignore[arg-type]
+        assert item.gold_label is not None  # excluded above (not None, not UNRESOLVED)
+        assert item.rule_provision is not None  # excluded above (truthy)
+        gold_class = crosswalk.class_of(item.gold_label)
+        arm_options = crosswalk.rule_provision_arm(item.rule_provision)
         arm_classes = {crosswalk.class_of(o) for o in arm_options if o != UNRESOLVED}
         if gold_class in arm_classes:
             covered += 1
@@ -510,6 +508,27 @@ def _equal_mass_bins(values: Sequence[float], n_bins: int) -> list[tuple[int, in
     return ranges
 
 
+def _binned_calibration_error(pairs: Sequence[tuple[float, bool]], n_bins: int) -> float:
+    """The shared reduction behind `ece` and `classwise_reliability`: `pairs`
+    (confidence, is-correct) sorted by confidence ascending, split into
+    `n_bins` tie-aware equal-mass bins (`_equal_mass_bins`), each bin's
+    `|accuracy - mean confidence|` weighted by its share of `pairs`. `0.0`
+    for no pairs."""
+    n = len(pairs)
+    if n == 0:
+        return 0.0
+    values = [p for p, _ in pairs]
+    total = 0.0
+    for start, end in _equal_mass_bins(values, n_bins):
+        bucket = pairs[start:end]
+        if not bucket:
+            continue
+        confidence = sum(p for p, _ in bucket) / len(bucket)
+        accuracy = sum(1 for _, correct in bucket if correct) / len(bucket)
+        total += (len(bucket) / n) * abs(accuracy - confidence)
+    return total
+
+
 def ece(items: Sequence[CalibrationItem], *, n_bins: int = 15) -> float:
     """Expected calibration error with `n_bins` equal-mass bins (C6; req 10):
     items sorted by their predicted *class*'s aggregated probability
@@ -530,17 +549,7 @@ def ece(items: Sequence[CalibrationItem], *, n_bins: int = 15) -> float:
         ),
         key=lambda pair: pair[0],
     )
-    n = len(pairs)
-    total = 0.0
-    values = [p for p, _ in pairs]
-    for start, end in _equal_mass_bins(values, n_bins):
-        bucket = pairs[start:end]
-        if not bucket:
-            continue
-        confidence = sum(p for p, _ in bucket) / len(bucket)
-        accuracy = sum(1 for _, correct in bucket if correct) / len(bucket)
-        total += (len(bucket) / n) * abs(accuracy - confidence)
-    return total
+    return _binned_calibration_error(pairs, n_bins)
 
 
 def multiclass_brier(items: Sequence[CalibrationItem]) -> float:
@@ -570,34 +579,33 @@ def classwise_reliability(
     options' probabilities, as in `multiclass_brier`) and the outcome is
     whether `c` is the gold class, binned the same tie-aware equal-mass way
     as `ece` (ties kept in one bin, so the result does not depend on the
-    input order among ties)."""
+    input order among ties). `0.0` for every class when `items` is empty."""
     result: dict[str, float] = {}
     for target_class in sorted(crosswalk.CLASSES):
-        pairs = []
-        for item in items:
-            class_probability = _class_probabilities(item.probabilities).get(target_class, 0.0)
-            pairs.append((class_probability, item.gold_class == target_class))
-        pairs.sort(key=lambda pair: pair[0])
-        n = len(pairs)
-        total = 0.0
-        values = [p for p, _ in pairs]
-        for start, end in _equal_mass_bins(values, n_bins):
-            bucket = pairs[start:end]
-            if not bucket:
-                continue
-            confidence = sum(p for p, _ in bucket) / len(bucket)
-            accuracy = sum(1 for _, correct in bucket if correct) / len(bucket)
-            total += (len(bucket) / n) * abs(accuracy - confidence)
-        result[target_class] = total
+        pairs = sorted(
+            (
+                (
+                    _class_probabilities(item.probabilities).get(target_class, 0.0),
+                    item.gold_class == target_class,
+                )
+                for item in items
+            ),
+            key=lambda pair: pair[0],
+        )
+        result[target_class] = _binned_calibration_error(pairs, n_bins)
     return result
 
 
 def share_at_or_above(items: Sequence[CalibrationItem], threshold: float = 0.999) -> float:
     """The share of `items` whose chosen option's probability is at or above
-    `threshold` (C6: "the share of records with p(choice) >= 0.999")."""
+    `threshold` (C6: "the share of records with p(choice) >= 0.999"). An
+    item with an empty probability vector has no "chosen option" and never
+    counts (not a crash)."""
     if not items:
         return 0.0
-    at_or_above = sum(1 for item in items if max(item.probabilities.values()) >= threshold)
+    at_or_above = sum(
+        1 for item in items if item.probabilities and max(item.probabilities.values()) >= threshold
+    )
     return at_or_above / len(items)
 
 
@@ -671,11 +679,11 @@ def flip_rate(comparisons: Sequence[DriftComparison]) -> float:
 def mean_abs_probability_shift(comparisons: Sequence[DriftComparison]) -> float:
     """The mean absolute shift in the chosen option's top probability
     between a drift-probe comparison and its baseline (C5, reported, never
-    gating); a comparison missing either probability vector is skipped.
-    `0.0` when nothing is comparable."""
+    gating); a comparison missing either probability vector, or carrying an
+    empty one, is skipped. `0.0` when nothing is comparable."""
     shifts = [
         abs(max(c.probabilities.values()) - max(c.baseline_probabilities.values()))
         for c in comparisons
-        if c.probabilities is not None and c.baseline_probabilities is not None
+        if c.probabilities and c.baseline_probabilities
     ]
     return sum(shifts) / len(shifts) if shifts else 0.0

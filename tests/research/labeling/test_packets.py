@@ -241,6 +241,19 @@ def test_truncate_sentence_keeps_a_sentence_ending_exactly_at_the_limit() -> Non
     assert packets._truncate_sentence(text, 9) == "AAA. BBB."
 
 
+def test_truncate_sentence_ignores_an_early_abbreviation_boundary() -> None:
+    """code-review finding on PR #1069: an early abbreviation-like period
+    ("Mr.") must not make `_truncate_sentence` collapse the result to a
+    few characters when a much larger limit is available -- the module's
+    own docstring says it "duplicates the fetch's [sentence cut] in
+    miniature", and `tradepartner.corpus.departure_fetch.truncate_sentence`
+    only uses a boundary that keeps at least half the limit."""
+    text = "Mr. " + "x" * 5000
+    cut = packets._truncate_sentence(text, 4000)
+    assert len(cut) == 4000
+    assert cut != "Mr."
+
+
 def test_notice_is_cut_at_a_sentence_boundary_under_exhibit_max_chars() -> None:
     long_text = " ".join(f"Sentence number {i} is here." for i in range(50))
     documents = _klx_documents(
@@ -293,6 +306,39 @@ def test_eightk_items_are_cut_and_stop_once_the_budget_is_spent() -> None:
 
     assert "Item 3.01" in packet.text
     assert "Item 2.01" not in packet.text  # the eightk_max_chars budget was spent on 3.01
+
+
+def test_eightk_section_body_never_exceeds_eightk_max_chars() -> None:
+    """code-review finding on PR #1069: the per-item `budget -=` decrement
+    must count the "Item N" header and the blank-line join between items,
+    not just the truncated text, so the assembled body (everything joined
+    before the overall section header) never exceeds `limits.eightk_max_chars`
+    -- checked here with many short items against a small budget, which
+    would overshoot the cap before the fix."""
+    many_items = {str(i): "Short text here." for i in range(1, 30)}
+    documents = _klx_documents(
+        eightk={
+            "accession": "acc",
+            "form": "8-K",
+            "filed_on": "2026-09-20",
+            "accepted_at": "2026-09-20T16:00:00+00:00",
+            "index_items": list(many_items),
+            "items": many_items,
+            "body_head": None,
+            "sha256": "b" * 64,
+        }
+    )
+    tight_limits = packets.PacketLimits(
+        exhibit_max_chars=4000,
+        item_max_chars=4000,
+        eightk_max_chars=100,
+        max_packet_tokens=8000,
+        chars_per_token=2.5,
+    )
+    eightk_text, _ = packets._eightk_section(documents, tight_limits)
+    assert eightk_text is not None
+    body = eightk_text.split("\n", 1)[1]  # drop the overall section header line
+    assert len(body) <= tight_limits.eightk_max_chars
 
 
 # --- the max_packet_tokens refusal --------------------------------------------------

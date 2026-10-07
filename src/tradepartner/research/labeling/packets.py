@@ -50,6 +50,13 @@ DELIM_END = "=== FILING TEXT END ==="
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
 
+#: `_truncate_sentence` only uses a sentence boundary if it keeps at least
+#: this share of `limit` -- otherwise an early abbreviation-like period
+#: ("Mr.", "Inc.", "No.") would collapse the result to a few characters
+#: instead of using the character budget (mirrors
+#: `tradepartner.corpus.departure_fetch.truncate_sentence`'s own guard).
+_MIN_SENTENCE_SHARE = 0.5
+
 
 class PacketTooLarge(ValueError):
     """`build_packet` refuses a packet whose estimated tokens exceed
@@ -74,10 +81,11 @@ class PacketLimits:
 @dataclass(frozen=True)
 class Packet:
     """One built packet (req 3, C2; C8's per-call record fields): the exact
-    text sent as `state`, its SHA-256 (`passage_sha256`), the accessions it
-    carries (`document_ids`: the Form 25 and, for `B`, the one 8-K), and the
-    option set it was built for (`option_set_version`, `option_set_hash`), so
-    a caller writing the per-call record needs nothing else from this
+    text sent as `state`, its SHA-256 (`passage_sha256`), the documents it
+    carries (`document_ids`: the row's `listing_end_id` first, standing in
+    for the Form 25, then, for `B` with an 8-K, that 8-K's accession), and
+    the option set it was built for (`option_set_version`, `option_set_hash`),
+    so a caller writing the per-call record needs nothing else from this
     packet."""
 
     kind: Kind
@@ -123,11 +131,14 @@ def _truncate_sentence(text: str, limit: int) -> str:
     (`_SENTENCE_BOUNDARY`'s lookbehind), and that whitespace can start
     exactly at `limit` when a sentence ends right at the cut (e.g. `limit`
     lands just past "...here."), in which case the sentence still fits
-    and must not be dropped for want of its own trailing space."""
+    and must not be dropped for want of its own trailing space. A boundary
+    kept only when it is at or past `_MIN_SENTENCE_SHARE` of `limit`
+    (otherwise an early abbreviation-like period would collapse the result
+    to a few characters instead of using the budget)."""
     if len(text) <= limit:
         return text
     boundaries = [m for m in _SENTENCE_BOUNDARY.finditer(text) if m.start() <= limit]
-    if boundaries:
+    if boundaries and boundaries[-1].start() >= limit * _MIN_SENTENCE_SHARE:
         return text[: boundaries[-1].start()].rstrip()
     return text[:limit].rstrip()
 
@@ -173,9 +184,12 @@ def _eightk_section(
 ) -> tuple[str | None, tuple[str, ...]]:
     """Packet B's 8-K section (C2): its items in the fetch's own priority
     order, each cut at a sentence boundary, stopping once
-    `limits.eightk_max_chars` is spent; the body's head at the same cap when
-    none of the items segmented. Returns the rendered text (or `None` for no
-    8-K) and the accession it carries."""
+    `limits.eightk_max_chars` is spent on the rendered body -- the "Item
+    N" header and the blank-line join between items count against the
+    budget too, so the assembled body never exceeds `limits.eightk_max_chars`
+    characters; the body's head at the same cap when none of the items
+    segmented. Returns the rendered text (or `None` for no 8-K) and the
+    accession it carries."""
     eightk = documents.get("eightk")
     if not eightk:
         return None, ()
@@ -187,14 +201,19 @@ def _eightk_section(
     items: Mapping[str, str] = eightk.get("items") or {}
     if items:
         budget = limits.eightk_max_chars
-        pieces = []
+        pieces: list[str] = []
         for number, text in items.items():
-            if budget <= 0:
+            item_header = f"Item {number}\n"
+            separator = "\n\n" if pieces else ""
+            overhead = len(item_header) + len(separator)
+            remaining_for_text = min(limits.item_max_chars, budget - overhead)
+            if remaining_for_text <= 0:
                 break
-            piece = _truncate_sentence(text, min(limits.item_max_chars, budget))
-            pieces.append(f"Item {number}\n{piece}")
-            budget -= len(piece)
-        body = "\n\n".join(pieces)
+            piece = _truncate_sentence(text, remaining_for_text)
+            rendered = f"{separator}{item_header}{piece}"
+            pieces.append(rendered)
+            budget -= len(rendered)
+        body = "".join(pieces)
     else:
         head_limit = min(limits.item_max_chars, limits.eightk_max_chars)
         body = _truncate_sentence(eightk.get("body_head") or "", head_limit)
