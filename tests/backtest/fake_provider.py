@@ -7,6 +7,11 @@ restatement by adding a row with a later `known_at`. The fake does no adjustment
 test supplies adjusted bars directly (`prices`, and `dividend_prices` for
 `include_dividends=True` reads, defaulting to `prices`) and raw bars in `raw`
 (defaulting to `prices`).
+
+The statement reads (T85c) work the same way over `statement_rows` (keyed by
+`security_id`, as `statement_facts_as_of` returns them after its `cik` join) and
+`classification_rows` (`security_id`, `sic`, `known_at`). `statement_rows` holds first
+vintages only, as the table does, so two rows for one key are refused.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from typing import Any
 
 import polars as pl
 
-from tradepartner.backtest.provider import GapReading, check_t
+from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, GapReading, check_t
 from tradepartner.calendar import last_completed_session
 from tradepartner.universe import _EXCLUSION_SCHEMA, _MEMBER_SCHEMA, Universe
 
@@ -32,6 +37,23 @@ _DIVIDEND_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "ex_date": pl.Date,
     "ratio_or_amount": pl.Float64,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+_STATEMENT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "fact_name": pl.Utf8,
+    "period_start": pl.Date,
+    "period_end": pl.Date,
+    "period_days": pl.Int32,
+    "value": pl.Float64,
+    "basis": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+_STATEMENT_KEY = ["security_id", "fact_name", "period_end", "period_days"]
+_CLASSIFICATION_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "sic": pl.Int32,
     "known_at": pl.Datetime("us", "UTC"),
 }
 
@@ -71,6 +93,7 @@ class FakeProvider:
     `members` maps a rebalance session to the universe members at its close.
     `gaps` maps a read time to its gap reading (zero when absent). `static_listings`
     names the securities whose listing rests on `snapshot_static` rows.
+    `statement_rows` and `classification_rows` back `statement_facts` and `sics`.
     """
 
     prices: pl.DataFrame
@@ -85,6 +108,12 @@ class FakeProvider:
     dropped: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_DIVIDEND_SCHEMA))
     gaps: Mapping[datetime, GapReading] = field(default_factory=dict)
     static_listings: Collection[str] = ()
+    statement_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_STATEMENT_SCHEMA)
+    )
+    classification_rows: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=_CLASSIFICATION_SCHEMA)
+    )
     calls: list[Call] = field(default_factory=list)
 
     def _record(self, method: str, t: datetime, **kwargs: Any) -> datetime:
@@ -190,3 +219,16 @@ class FakeProvider:
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         self._record("static_listing_count", t, ids=ids)
         return len(set(ids) & set(self.static_listings))
+
+    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t = self._record("statement_facts", t, ids=ids)
+        if self.statement_rows.select(pl.struct(*_STATEMENT_KEY).is_duplicated().any()).item():
+            raise ValueError(f"two statement rows share one {_STATEMENT_KEY} (first vintage only)")
+        rows = _for_ids(_known(self.statement_rows, t), ids)
+        return rows.filter(pl.col("fact_name").is_in(STATEMENT_FACT_NAMES)).sort(_STATEMENT_KEY)
+
+    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
+        t = self._record("sics", t, ids=ids)
+        rows = _latest(_for_ids(_known(self.classification_rows, t), ids), ["security_id"])
+        known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
+        return {sid: known.get(sid) for sid in ids}

@@ -100,6 +100,33 @@ def test_max_dark_share_must_be_a_share(value: float) -> None:
         Settings(_env_file=None, ingest={"max_dark_share": value})
 
 
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("ingest", "max_missing_share"),
+        ("universe", "min_price"),
+        ("store", "lock_retry_initial_delay_seconds"),
+        ("store", "lock_retry_max_delay_seconds"),
+    ],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_early_config_sections_refuse_non_finite_floats(
+    section: str, field: str, value: float
+) -> None:
+    with pytest.raises(ValidationError, match=field):
+        Settings(_env_file=None, **{section: {field: value}})
+
+
+@pytest.mark.parametrize(
+    "section",
+    ["store", "ingest", "master", "universe", "adjust", "gap", "execution", "calendar"],
+)
+def test_early_config_sections_refuse_unknown_keys_without_echoing_values(section: str) -> None:
+    with pytest.raises(ValidationError, match="mistyped_key") as excinfo:
+        Settings(_env_file=None, **{section: {"mistyped_key": "MARKER-VALUE"}})
+    assert "MARKER-VALUE" not in str(excinfo.value)
+
+
 def test_edgar_defaults() -> None:
     s = _settings()
     # Anchored to the project root (T2 review round 2), not a bare relative
@@ -143,6 +170,13 @@ def test_edgar_header_forms_defaults() -> None:
     s = Settings(_env_file=None, edgar={"header_first_year": 2012})
     assert s.edgar.header_first_year == 2012
     assert s.edgar.header_start_year == 2012
+
+
+@pytest.mark.parametrize("field", ["cover_page_forms", "header_forms"])
+@pytest.mark.parametrize("value", [[], ["10-K", ""], [" ", "10-K"]])
+def test_edgar_filing_form_lists_refuse_empty_or_blank_items(field: str, value: list[str]) -> None:
+    with pytest.raises(ValidationError, match=field):
+        Settings(_env_file=None, edgar={field: value})
 
 
 def test_edgar_fsn_first_year_override() -> None:

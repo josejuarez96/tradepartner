@@ -189,7 +189,10 @@ def last_completed_session(as_of: datetime) -> date:
     # unless `ts` is itself a trading minute, in which case it returns the
     # session preceding the one in progress -- exactly "last completed
     # session" semantics, verified against the close boundary itself.
-    return _to_date(_get_calendar().minute_to_past_session(ts))
+    cal = _get_calendar()
+    if ts == cal.session_close(cal.last_session):
+        return _to_date(cal.last_session)
+    return _to_date(cal.minute_to_past_session(ts))
 
 
 def sessions_in_month_window(end_session: date, months: int) -> list[date]:
@@ -264,6 +267,11 @@ def rebalance_sessions_between(start: date, end: date, cadence: Cadence) -> list
     lo = bisect_left(sessions, start)
     hi = bisect_right(sessions, end + relativedelta(months=1))
     window = sessions[lo:hi]
+    if window and window[-1] == sessions[-1] and cadence != "daily":
+        # The configured bound may cut off a still-open week or month. Look at
+        # the next real session before treating the final configured one as its end.
+        extended = _calendar(lower, upper + relativedelta(months=1))
+        window = (*window, _to_date(extended.next_session(pd.Timestamp(window[-1]))))
     return [
         s
         for s, after in zip(window, (*window[1:], None), strict=True)
