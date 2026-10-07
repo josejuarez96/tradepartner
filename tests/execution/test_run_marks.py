@@ -30,8 +30,10 @@ from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
+from tradepartner.errors import SystemFaultError
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
+from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.run import RunOutcome, StepContext, tracking_run
 from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
@@ -471,6 +473,88 @@ def test_a_split_inside_the_back_filled_sessions_marks_each_on_its_own_basis(
         assert equity == pytest.approx(env.expected_equity(cash, day_quantities, day)), day
         assert not switch.drawdown_check(equity, FAKE_CASH, FROZEN.max_drawdown, armed=True), day
     assert env.query("SELECT count(*) FROM kill_switch") == [(0,)]
+
+
+# --- a name held only on a back-filled session (#892 item 1, #1116) -------------------------
+
+
+PHANTOM = "SEC_DUAL_A"  # ticker DUALA; never bought by the rebalance window
+
+
+def test_a_name_held_only_on_a_back_filled_session_gets_its_own_assets_read(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger holds DUALA on 05-01 only (sold before S = 05-06), and DUALA
+    has no bar from 05-01 through 05-03, the last marked session: it looks
+    like a delisting. The broker says DUALA is tradable, so the missing bar is
+    an ingest gap and the mark raises. Before #1116 the run read `assets`
+    only for names held at S, so DUALA got no flag and was carried at its
+    04-30 close without a word."""
+    bought(env, tmp_path)
+    with open_for_write(env.settings) as conn:
+        conn.execute(
+            "DELETE FROM prices_daily WHERE security_id = ? AND session BETWEEN ? AND ?",
+            [PHANTOM, F_0, date(2019, 5, 3)],
+        )
+    original = run_module._Run._ledger_for
+
+    def ledger_for(self: run_module._Run, actions: Any) -> Callable[[date], Ledger]:
+        ledger = original(self, actions)
+
+        def with_phantom(through: date) -> Ledger:
+            book = ledger(through)
+            if through != F_0:
+                return book
+            return replace(book, positions={**book.positions, PHANTOM: 1.0})
+
+        return with_phantom
+
+    monkeypatch.setattr(run_module._Run, "_ledger_for", ledger_for)
+    with pytest.raises(ValueError, match=f"no price for {PHANTOM}"):
+        env.run(at(date(2019, 5, 6)))
+    status, fault_type, _ = env.result(env.latest_run())
+    assert (status, fault_type) == ("failed", "ValueError")
+    assert any(c.method == "assets" and "DUALA" in c.args[0] for c in env.fake.calls), (
+        "DUALA was never read from the broker"
+    )
+    assert env.query("SELECT count(*) FROM positions_daily WHERE security_id = ?", [PHANTOM]) == [
+        (0,)
+    ]
+
+
+# --- an unreadable mark faults the drawdown check (#713 (ii)(a), #1116) ---------------------
+
+
+def test_an_unreadable_earlier_mark_halts_the_run(env: Env, tmp_path: Path) -> None:
+    """T_0's marks (written by F_0's run) gain a row with no cash; the next
+    run's drawdown check selects T_0 (no release yet) and cannot read it.
+    Before #1116 the check skipped it and the run went on; now the run
+    halts and the switch is engaged."""
+    outcome = bought(env, tmp_path)
+    stamp = at(F_0, 13, 0)
+    with open_for_write(env.settings) as conn:
+        insert_row(
+            conn,
+            "positions_daily",
+            {
+                "run_id": outcome.run_id,
+                "session": T_0,
+                "security_id": "SEC_SPY",
+                "quantity": 1.0,
+                "mark_price": 1.0,
+                "value": 1.0,
+                "cash": None,
+                "known_at": stamp,
+                "ingested_at": stamp,
+            },
+        )
+    with pytest.raises(SystemFaultError, match="cannot read a mark"):
+        env.run(at(date(2019, 5, 2)))
+    status, fault_type, message = env.result(env.latest_run())
+    assert (status, fault_type) == ("halted", "SystemFaultError")
+    assert message is not None and T_0.isoformat() in message
+    assert [e[0] for e in env.engaged()] == ["fault"]
+    assert env.alerts("drawdown") == []
 
 
 # --- the drawdown check -----------------------------------------------------------------------

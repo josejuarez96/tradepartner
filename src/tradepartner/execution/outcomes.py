@@ -80,6 +80,7 @@ from tradepartner.execution.lots import (
     WashSaleFlag,
     rebuild,
 )
+from tradepartner.execution.marks import equity_at
 from tradepartner.store import journal
 from tradepartner.store.journal import (
     DecisionRow,
@@ -266,19 +267,18 @@ def _horizon(
 
 
 def _equity_before(marks: Sequence[PositionDailyRow], session: date) -> float | None:
-    """Equity at the last mark before `session`: the cash of its row without a
-    `security_id` plus every name's value, or None when either is missing."""
+    """Equity at the last mark before `session` (`execution.marks.equity_at`:
+    its cash, carried on every row, plus every held name's value), or None
+    when nothing is marked before `session`. A mark that cannot state it
+    raises `marks.UnreadableMarkError`, and an equity that is not positive
+    raises too: a contribution is never built from it."""
     earlier = [m.session for m in marks if m.session < session]
     if not earlier:
         return None
-    rows = [m for m in marks if m.session == max(earlier)]
-    cash = [m.cash for m in rows if m.security_id is None]
-    values = [m.value for m in rows if m.security_id is not None]
-    if len(cash) != 1 or cash[0] is None or any(v is None for v in values):
-        return None
-    equity = cash[0] + sum(v for v in values if v is not None)
-    if not (math.isfinite(equity) and equity > 0):
-        raise ValueError(f"equity on {max(earlier)} must be finite and positive: {equity!r}")
+    last = max(earlier)
+    equity = equity_at(marks, last)
+    if not equity > 0:
+        raise ValueError(f"equity on {last} must be finite and positive: {equity!r}")
     return equity
 
 

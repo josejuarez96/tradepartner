@@ -19,6 +19,7 @@ import pytest
 
 from tradepartner.calendar import previous_session
 from tradepartner.execution.lots import LedgerAccount, rebuild
+from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.execution.outcomes import (
     Outcome,
     OutcomeWindow,
@@ -318,7 +319,7 @@ def test_a_bad_equity_is_refused(bad: float) -> None:
     book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
     book.mark("SEC_A", T_NEXT, 110.0, 10.0)
     book.marks[0] = replace(book.marks[0], cash=bad)
-    with pytest.raises(ValueError, match="equity"):
+    with pytest.raises(ValueError, match=r"equity|cash"):
         book.due(DUE)
 
 
@@ -588,15 +589,32 @@ def test_prices_after_the_horizon_change_nothing() -> None:
     assert book.due(DUE) == before
 
 
-def test_equity_without_a_cash_row_leaves_the_contribution_empty() -> None:
+def test_a_held_session_gives_the_contribution_from_its_position_rows_cash() -> None:
+    """#649 / #1116: `marks_for` writes no `security_id IS NULL` row once
+    anything is held, only position rows each carrying the ledger's cash.
+    The equity before the order is read from them: 9,990 cash + 1 x 10.0 =
+    10,000, so the contribution is 10 x 10 / 10,000 = 0.01, not None."""
     book = Book()
     book.marks = []
     book.mark("SEC_Z", T_I, 10.0)
+    book.marks[0] = replace(book.marks[0], cash=9_990.0)
     book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
     book.mark("SEC_A", T_NEXT, 110.0, 10.0)
     [outcome] = book.due(DUE)
     assert outcome.value == pytest.approx(0.10)
-    assert outcome.contribution is None
+    assert outcome.contribution == pytest.approx(0.01)
+
+
+def test_a_held_row_with_no_cash_refuses_the_contribution() -> None:
+    """A mark row with no cash cannot state the equity: refused, never a
+    silently empty contribution (#665, #1116)."""
+    book = Book()
+    book.marks = []
+    book.mark("SEC_Z", T_I, 10.0)  # cash None
+    book.order("SEC_A", "buy", "filled", [(10.0, 100.0)])
+    book.mark("SEC_A", T_NEXT, 110.0, 10.0)
+    with pytest.raises(UnreadableMarkError, match="no cash"):
+        book.due(DUE)
 
 
 # --- the writer ------------------------------------------------------------------

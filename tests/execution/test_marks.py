@@ -18,7 +18,15 @@ from tradepartner.calendar import next_session, previous_session, session_close,
 from tradepartner.execution import ledger as ledger_module
 from tradepartner.execution.ids import client_order_id
 from tradepartner.execution.ledger import Ledger
-from tradepartner.execution.marks import Mark, Missed, lapses, marks_for, missed_run
+from tradepartner.execution.marks import (
+    Mark,
+    Missed,
+    UnreadableMarkError,
+    equity_at,
+    lapses,
+    marks_for,
+    missed_run,
+)
 from tradepartner.store import schema
 from tradepartner.store.db import insert_row
 from tradepartner.store.journal import (
@@ -29,6 +37,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    PositionDailyRow,
     RebalanceEventRow,
 )
 
@@ -36,6 +45,15 @@ WINDOW = 1
 A = "SEC_A"
 B = "SEC_B"
 TOLERANCE = 1e-6
+#: An empty `actions_as_of` frame: no split among the marked sessions.
+NO_ACTIONS = pl.DataFrame(
+    schema={
+        "security_id": pl.Utf8,
+        "action_type": pl.Utf8,
+        "ex_date": pl.Date,
+        "ratio_or_amount": pl.Float64,
+    }
+)
 
 
 def _stamp(at: datetime) -> dict[str, datetime]:
@@ -179,7 +197,7 @@ def test_back_fills_two_sessions_without_a_run(tmp_path) -> None:
     try:
         window = _window()
         ledger = _ledger_for({d1: {A: 50.0}, d2: {A: 50.0}})
-        marks = marks_for(conn, window, ledger, [d1, d2], {A: True})
+        marks = marks_for(conn, window, ledger, [d1, d2], {A: True}, actions=NO_ACTIONS)
     finally:
         conn.close()
 
@@ -209,7 +227,7 @@ def test_flat_session_gets_one_cash_only_row(tmp_path) -> None:
     conn = duckdb.connect(str(tmp_path / "store.duckdb"))
     schema.init_schema(conn)
     ledger = _ledger_for({})  # nothing held on d1
-    marks = marks_for(conn, _window(), ledger, [d1], {})
+    marks = marks_for(conn, _window(), ledger, [d1], {}, actions=NO_ACTIONS)
     conn.close()
 
     assert marks == [
@@ -298,7 +316,7 @@ def test_split_on_session_marks_pre_split_quantity_and_raw_close(tmp_path) -> No
             quantity_tolerance=TOLERANCE,
         )
 
-    marks = marks_for(conn, _window(), ledger, [s_minus_1], {A: True})
+    marks = marks_for(conn, _window(), ledger, [s_minus_1], {A: True}, actions=actions_as_of)
     conn.close()
 
     # Cash: started at 2000.0, minus 100 * 18.0 for the buy = 200.0.
@@ -322,7 +340,7 @@ def test_tradable_carried_from_flags(tmp_path) -> None:
     _bar(conn, A, d1, 10.0)
     _bar(conn, B, d1, 5.0)
     ledger = _ledger_for({d1: {A: 1.0, B: 1.0}})
-    marks = marks_for(conn, _window(), ledger, [d1], {A: False})
+    marks = marks_for(conn, _window(), ledger, [d1], {A: False}, actions=NO_ACTIONS)
     conn.close()
 
     by_name = {m.security_id: m for m in marks}
@@ -336,7 +354,7 @@ def test_missing_price_raises(tmp_path) -> None:
     schema.init_schema(conn)
     ledger = _ledger_for({d1: {A: 1.0}})
     with pytest.raises(ValueError, match="no price"):
-        marks_for(conn, _window(), ledger, [d1], {})
+        marks_for(conn, _window(), ledger, [d1], {}, actions=NO_ACTIONS)
     conn.close()
 
 
@@ -355,7 +373,7 @@ def test_a_stale_earlier_bar_never_stands_in_for_a_missing_one(tmp_path) -> None
     _bar(conn, A, d1, 10.0)  # d2 gets no bar at all
     ledger = _ledger_for({d2: {A: 1.0}})
     with pytest.raises(ValueError, match="no price"):
-        marks_for(conn, _window(), ledger, [d2], {A: True})
+        marks_for(conn, _window(), ledger, [d2], {A: True}, actions=NO_ACTIONS)
     conn.close()
 
 
@@ -386,7 +404,7 @@ def test_an_untradable_name_past_its_last_bar_is_marked_at_its_last_close(
     _bar(conn, A, D0, 10.0)  # its last bar; D1 and D2 get none
     ledger = _ledger_for({D1: {A: 4.0}, D2: {A: 4.0}})
     with caplog.at_level("WARNING", logger="tradepartner.execution.marks"):
-        marks = marks_for(conn, _window(), ledger, [D1, D2], flags)
+        marks = marks_for(conn, _window(), ledger, [D1, D2], flags, actions=NO_ACTIONS)
     conn.close()
 
     assert [(m.session, m.mark_price, m.value) for m in marks] == [
@@ -408,7 +426,7 @@ def test_a_gap_before_the_names_last_bar_still_raises(tmp_path) -> None:
     _bar(conn, A, D2, 12.0)  # D1 has no bar, but D2 does
     ledger = _ledger_for({D1: {A: 1.0}, D2: {A: 1.0}})
     with pytest.raises(ValueError, match="no price"):
-        marks_for(conn, _window(), ledger, [D1, D2], {A: False})
+        marks_for(conn, _window(), ledger, [D1, D2], {A: False}, actions=NO_ACTIONS)
     conn.close()
 
 
@@ -423,7 +441,7 @@ def test_a_gap_on_a_name_sold_before_the_last_session_still_raises(tmp_path) -> 
     _bar(conn, A, D2, 12.0)
     ledger = _ledger_for({D1: {A: 1.0}})  # flat on D2
     with pytest.raises(ValueError, match="no price"):
-        marks_for(conn, _window(), ledger, [D1, D2], {})
+        marks_for(conn, _window(), ledger, [D1, D2], {}, actions=NO_ACTIONS)
     conn.close()
 
 
@@ -433,7 +451,7 @@ def test_a_name_with_no_bar_at_all_still_raises_when_untradable(tmp_path) -> Non
     schema.init_schema(conn)
     ledger = _ledger_for({D1: {A: 1.0}})
     with pytest.raises(ValueError, match="no price"):
-        marks_for(conn, _window(), ledger, [D1], {A: False})
+        marks_for(conn, _window(), ledger, [D1], {A: False}, actions=NO_ACTIONS)
     conn.close()
 
 
@@ -447,10 +465,169 @@ def test_the_carried_close_reads_no_bar_after_the_session(tmp_path) -> None:
     _bar(conn, A, D0, 11.0, known_at=session_close(D1) + timedelta(minutes=1))
     _bar(conn, A, D3, 99.0)  # after every marked session: never read
     ledger = _ledger_for({D1: {A: 1.0}, D2: {A: 1.0}})
-    marks = marks_for(conn, _window(), ledger, [D1, D2], {A: False})
+    marks = marks_for(conn, _window(), ledger, [D1, D2], {A: False}, actions=NO_ACTIONS)
     conn.close()
 
     assert [(m.session, m.mark_price) for m in marks] == [(D1, 10.0), (D2, 11.0)]
+
+
+def test_a_split_inside_the_carried_gap_adjusts_the_carried_close(tmp_path) -> None:
+    """#892 item 4 / #1116: an untradable name past its last bar (D0, close
+    10.0) with a 2:1 split whose ex-date (D2) falls inside the carried gap.
+    The ledger's quantity doubles on D2 (4 -> 8 shares), so the carried raw
+    close is divided by the ratio there: D1 4 x 10.0 = 40.0, D2 8 x 5.0 =
+    40.0. Carrying the raw 10.0 would mark D2 at 80.0, a fake gain of the
+    split ratio. A split before the last bar (D0) or after the marked
+    session is not counted."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    ledger = _ledger_for({D1: {A: 4.0}, D2: {A: 8.0}})
+    actions = pl.DataFrame(
+        {
+            "security_id": [A, A, A, B],
+            "action_type": ["split", "split", "split", "split"],
+            "ex_date": [D0, D2, D3, D2],
+            "ratio_or_amount": [3.0, 2.0, 5.0, 7.0],
+        }
+    )
+    marks = marks_for(conn, _window(), ledger, [D1, D2], {A: False}, actions=actions)
+    conn.close()
+
+    assert [(m.session, m.quantity, m.mark_price, m.value) for m in marks] == [
+        (D1, 4.0, 10.0, 40.0),
+        (D2, 8.0, 5.0, 40.0),
+    ]
+
+
+@pytest.mark.parametrize("ratio", [0.0, -2.0, float("nan"), float("inf")])
+def test_a_bad_split_ratio_inside_the_carried_gap_raises(tmp_path, ratio: float) -> None:
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    ledger = _ledger_for({D1: {A: 4.0}})
+    actions = pl.DataFrame(
+        {
+            "security_id": [A],
+            "action_type": ["split"],
+            "ex_date": [D1],
+            "ratio_or_amount": [ratio],
+        }
+    )
+    with pytest.raises(ValueError, match="ratio"):
+        marks_for(conn, _window(), ledger, [D1], {A: False}, actions=actions)
+    conn.close()
+
+
+# --- equity_at ----------------------------------------------------------------------
+
+
+def _row(
+    session: date,
+    security_id: str | None,
+    *,
+    cash: float | None,
+    value: float | None = None,
+) -> PositionDailyRow:
+    at = session_close(session)
+    return PositionDailyRow(
+        run_id=1,
+        session=session,
+        security_id=security_id,
+        quantity=0.0 if security_id is None else 1.0,
+        mark_price=value,
+        value=value,
+        cash=cash,
+        known_at=at,
+        ingested_at=at,
+    )
+
+
+def test_equity_at_reads_a_held_sessions_cash_from_its_position_rows() -> None:
+    """#665 / #649: once anything is held `marks_for` writes no cash-only
+    row, only position rows each carrying the ledger's cash. 500 + 40 + 60 =
+    600; another session's rows are never read."""
+    rows = [
+        _row(D1, A, cash=500.0, value=40.0),
+        _row(D1, B, cash=500.0, value=60.0),
+        _row(D2, A, cash=1.0, value=1.0),
+    ]
+    assert equity_at(rows, D1) == 600.0
+
+
+def test_equity_at_reads_a_flat_sessions_cash_only_row() -> None:
+    assert equity_at([_row(D1, None, cash=750.0)], D1) == 750.0
+
+
+def test_equity_at_reads_the_marks_for_rows_it_is_given(tmp_path) -> None:
+    """Round trip with the writer's own row shape: two held names on D1."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D1, 10.0)
+    _bar(conn, B, D1, 5.0)
+    marks = marks_for(
+        conn, _window(), _ledger_for({D1: {A: 2.0, B: 4.0}}), [D1], {}, actions=NO_ACTIONS
+    )
+    conn.close()
+    rows = [
+        PositionDailyRow(
+            run_id=1,
+            session=m.session,
+            security_id=m.security_id,
+            quantity=m.quantity,
+            mark_price=m.mark_price,
+            value=m.value,
+            cash=m.cash,
+            known_at=session_close(D1),
+            ingested_at=session_close(D1),
+        )
+        for m in marks
+    ]
+    assert all(r.security_id is not None for r in rows)  # no cash-only row
+    assert equity_at(rows, D1) == 500.0 + 20.0 + 20.0
+
+
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        pytest.param([], "no mark rows", id="no-rows"),
+        pytest.param(
+            [_row(D1, A, cash=500.0, value=40.0), _row(D1, B, cash=None, value=60.0)],
+            "no cash",
+            id="a-none-cash-next-to-valued-rows",
+        ),
+        pytest.param([_row(D1, None, cash=None)], "no cash", id="flat-none-cash"),
+        pytest.param(
+            [_row(D1, A, cash=500.0, value=40.0), _row(D1, B, cash=400.0, value=60.0)],
+            "disagree",
+            id="two-cash-values",
+        ),
+        pytest.param([_row(D1, A, cash=500.0, value=None)], "has value None", id="no-value"),
+        pytest.param([_row(D1, None, cash=float("nan"))], "cash", id="nan-cash"),
+        pytest.param([_row(D1, None, cash=float("inf"))], "cash", id="inf-cash"),
+        pytest.param(
+            [_row(D1, A, cash=500.0, value=float("nan"))], "has value nan", id="nan-value"
+        ),
+        pytest.param(
+            [
+                _row(D1, A, cash=500.0, value=float("inf")),
+                _row(D1, B, cash=500.0, value=float("-inf")),
+            ],
+            "has value inf",
+            id="inf-and-minus-inf",  # math.fsum would raise its own ValueError
+        ),
+        pytest.param(
+            [_row(D1, A, cash=1e308, value=1e308)], "equity marked", id="overflowing-total"
+        ),
+    ],
+)
+def test_equity_at_refuses_a_session_it_cannot_read(
+    rows: list[PositionDailyRow], match: str
+) -> None:
+    """A row that cannot state the equity is refused, never skipped (#665,
+    #713 (ii)(a), #1116)."""
+    with pytest.raises(UnreadableMarkError, match=match):
+        equity_at(rows, D1)
 
 
 # --- missed_run -----------------------------------------------------------------
@@ -864,7 +1041,7 @@ def test_marks_for_works_through_a_read_only_connection(tmp_path) -> None:
     conn = duckdb.connect(str(tmp_path / "store.duckdb"), read_only=True)
     try:
         ledger = _ledger_for({d1: {A: 1.0}})
-        marks = marks_for(conn, _window(), ledger, [d1], {})
+        marks = marks_for(conn, _window(), ledger, [d1], {}, actions=NO_ACTIONS)
     finally:
         conn.close()
     assert marks[0].mark_price == 10.0

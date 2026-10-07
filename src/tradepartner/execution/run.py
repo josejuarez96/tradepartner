@@ -55,11 +55,13 @@ reading taken just before the call, so step 3's collected rows are in it.
 Then one `assets` read for every name the ledger holds at S, kept for the
 marks, the lot ledger, the exits and the planning step; the planning step's
 `assets_read` answers from it and reads the broker through the same path for
-any symbol it lacks.
+any symbol it lacks, as do the marks for a name held only on a back-filled
+session (#1116).
 
 **Step 5.** `marks.marks_for` rows for every session after the window's last
 mark (or from the window's start date) through S-1; the drawdown check (T59,
-`_drawdown`) on every marked session whose mark is known after the window's
+`_drawdown`; a mark it cannot read is a `SystemFaultError`, never skipped,
+#713 (ii)(a)) on every marked session whose mark is known after the window's
 last release (all of them when there is none), plus the sessions this run
 marks and the last marked session, so neither a back-filled crossing nor one
 left unchecked by a run that failed between writing its marks and this check
@@ -1600,12 +1602,17 @@ class _Run:
                 if held
                 else {}
             )
-            flags = {
-                name: self.assets[symbol].tradable
-                for name, symbol in symbols.items()
-                if symbol in self.assets
-            }
-            rows = marks.marks_for(conn, self.window, ledger, sessions, flags)
+        # Every name held on any marked session, not only those held at S
+        # (#892 item 1, #1116): a name sold before S but held on a back-filled
+        # session gets its own tradable flag, so a tradable name's missing bar
+        # raises in `marks_for` instead of being carried at a stale close.
+        # Read after the connection closes: none is held across a broker call.
+        assets = self.assets_read(sorted(set(symbols.values())))
+        flags = {
+            name: assets[symbol].tradable for name, symbol in symbols.items() if symbol in assets
+        }
+        with open_read_only(self.settings) as conn:
+            rows = marks.marks_for(conn, self.window, ledger, sessions, flags, actions=actions)
         if rows:
             stamp = self.gate.read_clock()
             with self.connect() as conn:
@@ -1657,9 +1664,14 @@ class _Run:
         with open_read_only(self.settings) as conn:
             marks_rows = positions_daily_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
-        crossing = drawdown.check(
-            self.window, marks_rows, rows, self.frozen.max_drawdown, marked, self.session
-        )
+        try:
+            crossing = drawdown.check(
+                self.window, marks_rows, rows, self.frozen.max_drawdown, marked, self.session
+            )
+        except marks.UnreadableMarkError as exc:
+            # A check that cannot read its input does not pass (#713 (ii)(a)):
+            # the halt path engages the switch, never a silent skip.
+            raise SystemFaultError(f"the drawdown check cannot read a mark: {exc}") from exc
         if crossing is None:
             return
         engaged = switch.engage(

@@ -47,8 +47,9 @@ The only way the kill switch is released. In the req 5 order:
 7. Release (`switch.release`) with the `resume_id`, that reconciliation's id
    and the drawdown peak: the ledger equity at the window's last mark (its
    `cash`, carried on every row at that session, plus every name's value),
-   or the current peak when nothing is marked yet; a peak that is not
-   positive refuses. The reconciliation cited
+   or the current peak when nothing is marked yet (`marks.equity_at`); a
+   last mark whose rows cannot state it, or a peak that is not positive,
+   refuses. The reconciliation cited
    is the window's highest id, the one this resume wrote. A switch that is
    not engaged has nothing to release: the outcome is `not_engaged`, after
    the same settlement and reconciliation. Before the peak is computed, the
@@ -57,7 +58,9 @@ The only way the kill switch is released. In the req 5 order:
    drawdown check and this release would otherwise widen past them
    unchecked, so this step checks them first. A crossing engages the switch
    (source `drawdown`, no `run_id`) and refuses, without computing the peak
-   or releasing; `drawdown_armed` is then False, so the owner's *next*
+   or releasing; a selected mark the check cannot read refuses too
+   (#713 (ii)(a)), with nothing engaged or released. `drawdown_armed` is
+   then False after a crossing, so the owner's *next*
    `resume` releases normally, resetting the peak to the last mark's
    equity, exactly as after a run's own drawdown engagement. A
    `switch.ReleaseRefused` (one of `release`'s own checks, such as a
@@ -123,7 +126,7 @@ from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, Unkno
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
-from tradepartner.execution import drawdown, switch
+from tradepartner.execution import drawdown, marks, switch
 from tradepartner.execution.collect import (
     Connect,
     OrderReading,
@@ -141,7 +144,6 @@ from tradepartner.store.journal import (
     OrderRow,
     PaperRunResultRow,
     PaperWindowRow,
-    PositionDailyRow,
     ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
@@ -444,29 +446,6 @@ def _lag(
     return reasons, fills
 
 
-def _mark_equity(marks: Sequence[PositionDailyRow]) -> float | None:
-    """Ledger equity at the last marked session: its cash plus every name's
-    value, or None when that session's rows cannot give it.
-
-    `marks_for` (the only writer of `positions_daily`) carries `cash` on
-    every row, not only a dedicated `security_id IS NULL` row: that cash-only
-    row is written only when the window holds nothing. So cash is read from
-    any row at the session, requiring exactly one distinct non-None value
-    across them, mirroring `execution.drawdown.mark_equity` -- the drawdown
-    check's own read of the same table.
-    """
-    if not marks:
-        return None
-    last = max(m.session for m in marks)
-    rows = [m for m in marks if m.session == last]
-    cash = {r.cash for r in rows if r.cash is not None}
-    values = [r.value for r in rows if r.security_id is not None]
-    if len(cash) != 1 or any(v is None for v in values):
-        return None
-    equity = cash.pop() + math.fsum(v for v in values if v is not None)
-    return equity if math.isfinite(equity) else None
-
-
 def _faulted_run_breaches(
     connect: Connect, window: PaperWindowRow, frozen: RiskConfig
 ) -> tuple[RejectionBreach, ...]:
@@ -676,7 +655,7 @@ def resume(
                 r.reconciliation_id or 0 for r in reconciliations_for(conn, window_id)
             )
             events = kill_switch_events_for(conn, window_id)
-            marks = positions_daily_for(conn, window_id)
+            mark_rows = positions_daily_for(conn, window_id)
         if result.status != OK:
             return outcome(
                 REFUSED,
@@ -685,7 +664,17 @@ def resume(
             )
         if not _switch(connect, window).engaged:
             return outcome(NOT_ENGAGED, reconciliation_id=reconciliation_id)
-        crossing = drawdown.check(window, marks, events, frozen.max_drawdown, set(), session)
+        try:
+            crossing = drawdown.check(
+                window, mark_rows, events, frozen.max_drawdown, set(), session
+            )
+        except marks.UnreadableMarkError as exc:
+            # A check that cannot read its input does not pass (#713 (ii)(a)).
+            return outcome(
+                REFUSED,
+                f"drawdown: the check cannot read a mark: {exc}",
+                reconciliation_id=reconciliation_id,
+            )
         if crossing is not None:
             # The window's marks before this release, checked the same way a
             # run checks its own (#648): a crashed run's marks are not
@@ -709,8 +698,19 @@ def resume(
                     f"the drawdown kill-switch row could not be written: {engaged.error}"
                 )
             return outcome(REFUSED, *refusal, reconciliation_id=reconciliation_id)
-        peak = _mark_equity(marks) if marks else switch.drawdown_peak(window, events)
-        if peak is None or not (math.isfinite(peak) and peak > 0):
+        try:
+            peak = (
+                marks.equity_at(mark_rows, max(m.session for m in mark_rows))
+                if mark_rows
+                else switch.drawdown_peak(window, events)
+            )
+        except marks.UnreadableMarkError as exc:
+            return outcome(
+                REFUSED,
+                f"the last mark gives no equity for the drawdown peak: {exc}",
+                reconciliation_id=reconciliation_id,
+            )
+        if not (math.isfinite(peak) and peak > 0):
             return outcome(
                 REFUSED,
                 f"the last mark gives no positive equity for the drawdown peak: {peak!r}",

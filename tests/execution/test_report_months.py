@@ -108,7 +108,10 @@ def _position_mark(
     *,
     run_id: int = 1,
     tradable: bool | None = True,
+    cash: float | None = None,
 ) -> PositionDailyRow:
+    """A held name's row; `cash` is the ledger's cash, which `marks_for`
+    carries on every row of a held session (it writes no cash-only row then)."""
     return PositionDailyRow(
         run_id=run_id,
         session=session,
@@ -116,6 +119,7 @@ def _position_mark(
         quantity=quantity,
         mark_price=price,
         value=quantity * price,
+        cash=cash,
         tradable=tradable,
         known_at=_utc(session),
         ingested_at=_utc(session),
@@ -579,10 +583,11 @@ def test_residue_term_hand_computed_and_split_adjusted() -> None:
     # A carried residue of 10 shares held at T0, no decisions, no splits. Cash
     # is reduced by the position's value so total equity at T0 is exactly
     # 100_000, matching `equity` and the hand-computed expectation below.
+    # T0 is held, so (as `marks_for` writes it) it has no cash-only row: its
+    # cash is read from the position row (#665, #1116).
     marks = [
-        _cash_mark(T0, 100_000.0 - 10.0 * close_i),
+        _position_mark(T0, A, 10.0, close_i, cash=100_000.0 - 10.0 * close_i),
         _cash_mark(T1, 100_000.0),
-        _position_mark(T0, A, 10.0, close_i),
     ]
     adjustments = [
         AdjustmentRow(
@@ -633,10 +638,10 @@ def test_residue_term_no_look_ahead_on_later_decision() -> None:
     close_i, close_next = 50.0, 55.0
     closes = _prices({(A, T0): close_i, (A, T1): close_next})
     marks = [
-        _cash_mark(T0, 100_000.0 - 10.0 * close_i),
-        _cash_mark(T1, 100_000.0 - 10.0 * close_i),
-        _position_mark(T0, A, 10.0, close_i, run_id=1),
-        _position_mark(T1, A, 10.0, close_next, run_id=2, tradable=False),
+        _position_mark(T0, A, 10.0, close_i, run_id=1, cash=100_000.0 - 10.0 * close_i),
+        _position_mark(
+            T1, A, 10.0, close_next, run_id=2, tradable=False, cash=100_000.0 - 10.0 * close_i
+        ),
     ]
     future_decision_id = next(_IDS)
     decisions = [
@@ -698,10 +703,11 @@ def test_residue_term_uses_close_even_when_fill_price_is_open() -> None:
     closes = _prices({(A, T0): close_i, (A, T1): close_next})
     open_prices = _prices({(A, T0): open_i, (A, T1): open_next})
 
+    # T0 is held, so (as `marks_for` writes it) it has no cash-only row: its
+    # cash is read from the position row (#665, #1116).
     marks = [
-        _cash_mark(T0, 100_000.0 - 10.0 * close_i),
+        _position_mark(T0, A, 10.0, close_i, cash=100_000.0 - 10.0 * close_i),
         _cash_mark(T1, 100_000.0),
-        _position_mark(T0, A, 10.0, close_i),
     ]
     adjustments = [
         AdjustmentRow(

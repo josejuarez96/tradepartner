@@ -31,14 +31,13 @@ returns; this module writes nothing.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
 from tradepartner import calendar
 from tradepartner.calendar import previous_session
-from tradepartner.execution import switch
+from tradepartner.execution import marks, switch
 from tradepartner.store.journal import KillSwitchRow, PaperWindowRow, PositionDailyRow
 
 
@@ -58,18 +57,6 @@ def _window_id(window: PaperWindowRow) -> int:
     return window.window_id
 
 
-def mark_equity(rows: Sequence[PositionDailyRow], day: date) -> float | None:
-    """Ledger equity at the marked session `day`: its cash row plus every
-    name's value, or None when that session's rows cannot give it."""
-    today = [r for r in rows if r.session == day]
-    cash = {r.cash for r in today if r.cash is not None}
-    values = [r.value for r in today if r.security_id is not None]
-    if len(cash) != 1 or any(v is None for v in values):
-        return None
-    equity = cash.pop() + math.fsum(v for v in values if v is not None)
-    return equity if math.isfinite(equity) else None
-
-
 def check(
     window: PaperWindowRow,
     marks_rows: Sequence[PositionDailyRow],
@@ -81,7 +68,12 @@ def check(
     """The first drawdown crossing among the sessions selected (module
     docstring), or `None`. `session` is the caller's run or resume command's
     session S, used only for the back-filled label's `previous_session(S)`
-    boundary."""
+    boundary.
+
+    A selected session whose rows cannot state its equity raises
+    `marks.UnreadableMarkError` (`marks.equity_at`); it is never skipped, since
+    a check that cannot read its input does not pass (#713 (ii)(a)). The run
+    faults on it and `paper resume` refuses."""
     if not marks_rows:
         return None
     peak = switch.drawdown_peak(window, kill_switch_rows)
@@ -105,8 +97,8 @@ def check(
     to_check |= marked | {max(r.session for r in marks_rows)}
     crossed: tuple[date, float] | None = None
     for day in sorted(to_check):
-        equity = mark_equity(marks_rows, day)
-        if equity is not None and switch.drawdown_check(equity, peak, max_drawdown, armed=armed):
+        equity = marks.equity_at(marks_rows, day)
+        if switch.drawdown_check(equity, peak, max_drawdown, armed=armed):
             crossed = day, equity
             break
     if crossed is None:
