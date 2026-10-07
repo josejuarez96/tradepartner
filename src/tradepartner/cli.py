@@ -74,6 +74,33 @@ Phase 3 (T42):
   `gap_signoff` owner decision for an `ok` trial, with its gap maxima and the
   frozen threshold (spec req 12, ADR 0003 rule 8).
 
+Research registry (research-registry spec req 11 and req 14; plan T83):
+
+- `tradepartner experiment register <file>` registers an experiment file from
+  `research.experiments_dir` and prints its registration id and hashes.
+- `tradepartner experiment open <slug> --dataset <id> --split <split> --config
+  <json file> [--configurations <n>] [--spend-holdout --holdout-reason]
+  [--holdout-repeat] [--note]` opens a run on `settings.store.path` and prints
+  its id: exit 0 when it opens, 2 on a gate's refusal, which is recorded as the
+  run's result. `--spend-holdout` without a non-blank reason, a reason without
+  its flag, `--holdout-repeat` without `--spend-holdout`, `--configurations`
+  under 1 and a config that is not a JSON object are refused before anything is
+  written, as are an unknown slug or dataset.
+- `tradepartner experiment abandon --run <id> --reason` appends the run's
+  `abandoned` result.
+- `tradepartner experiments [--registration] [--family] [--kind]
+  [--include-synthetic]` lists runs newest first with outcome, verdict,
+  confirmatory, split, holdout flags and unfinished rows.
+- `tradepartner dataset register --name --version --path --event-start
+  --event-end [--event-column] [--split-json] [--sealed <split>]...
+  [--sealed-period <start> <end>]... [--locked] [--seed] [--note]` hashes the
+  export, checks the declared span against the event column and every sealed
+  split's rows against the sealed periods, and records the version.
+
+There is no `--synthetic` flag, no store-path option, and no edit, delete,
+unseal, reopen or import command: every run the CLI opens is a non-synthetic
+run on the store it is configured for.
+
 Text that can carry an exception's words (run messages and tracebacks) is
 passed through the `cli_record` fixture scrub before it is printed.
 
@@ -104,6 +131,7 @@ from typing import Annotated, Any
 
 import duckdb
 import httpx
+import polars as pl
 import typer
 
 from tradepartner.adapters import alpaca_raw
@@ -120,13 +148,33 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
+from tradepartner.research import EVERY_ROW_SPLITS
+from tradepartner.research.experiment import (
+    SPLITS,
+    ExperimentFileError,
+    _read_tabular,
+    check_declared_event_span,
+    check_sealed_split_has_period,
+    effective_sealed_splits,
+    event_span,
+    hash_export,
+    hash_file,
+    load_split_assignment,
+    parse_experiment_file,
+    read_event_column,
+    split_event_spans,
+)
+from tradepartner.research.gates import Flags as ResearchFlags
+from tradepartner.research.gates import Reasons as ResearchReasons
 from tradepartner.retract import RetractRefused, master_retract
-from tradepartner.store import registry, schema
+from tradepartner.store import registry, research, schema
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
 DASHBOARD_APP = Path(__file__).resolve().parent / "dashboard" / "app.py"
+#: Relative path-shaped settings resolve against the project root (config.py).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 #: The T11h count `ingest` appends to an EDGAR run message.
 _QUARANTINED = re.compile(r"\bquarantined: (\d+)\b")
@@ -477,6 +525,72 @@ def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings:
     ):
         if trial.get(key):
             typer.echo(f"{label}: {_scrubbed(str(trial[key]), settings)}")
+
+
+# --- Research registry: experiment, experiments, dataset (plan T83) ----------------
+
+#: Export formats `dataset register` counts rows of (spec req 11: "where tabular").
+_TABULAR_SUFFIXES = frozenset({".csv", ".tsv", ".parquet"})
+#: Errors a research command reports as a refusal (exit 2): nothing was written.
+_RESEARCH_REFUSALS = (ExperimentFileError, registry.RegistryError, ValueError)
+#: `dataset register` also refuses an export or split file it cannot read or parse.
+_DATASET_REFUSALS = (*_RESEARCH_REFUSALS, OSError, pl.exceptions.PolarsError)
+
+
+def _experiments_dir(settings: Settings) -> Path:
+    """`research.experiments_dir`, relative to the project root unless absolute."""
+    configured = Path(settings.research.experiments_dir)
+    return configured if configured.is_absolute() else PROJECT_ROOT / configured
+
+
+def _refusal(exc: BaseException, settings: Settings) -> typer.Exit:
+    return _fail(_scrubbed(f"refused: {exc}", settings), USAGE_ERROR)
+
+
+def _read_config(path: Path, settings: Settings) -> dict[str, Any]:
+    """`--config`'s JSON object, refused (exit 2) before anything is written."""
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        message = f"--config {path}: not a readable JSON file ({exc})"
+        raise _fail(_scrubbed(message, settings), USAGE_ERROR) from None
+    if not isinstance(config, dict):
+        raise _fail(f"--config {path}: must be a JSON object", USAGE_ERROR)
+    return config
+
+
+def _sealed_periods(extra: Sequence[str]) -> list[tuple[date, date]]:
+    """The `--sealed-period <start> <end>` pairs from the command's extra
+    arguments (Typer cannot declare a repeated two-value option). Any other
+    extra argument, such as an unknown flag, is a usage error."""
+    periods: list[tuple[date, date]] = []
+    rest = list(extra)
+    while rest:
+        flag = rest.pop(0)
+        if flag != "--sealed-period":
+            raise _fail(f"no such option or argument: {flag}", USAGE_ERROR)
+        if len(rest) < 2 or any(v.startswith("--") for v in rest[:2]):
+            raise _fail("--sealed-period takes two dates, <start> <end>", USAGE_ERROR)
+        start = _parse_day("--sealed-period", rest.pop(0))
+        end = _parse_day("--sealed-period", rest.pop(0))
+        assert start is not None and end is not None
+        if end < start:
+            raise _fail(f"--sealed-period end {end} is before its start {start}", USAGE_ERROR)
+        periods.append((start, end))
+    return periods
+
+
+def _flag_names(run: research.RunSummary) -> str:
+    flags = [
+        name
+        for name, on in (
+            ("synthetic", run.synthetic),
+            ("spent", run.holdout_spent),
+            ("repeat", run.holdout_repeat),
+        )
+        if on
+    ]
+    return ",".join(flags) or "-"
 
 
 def make_app(
@@ -985,6 +1099,284 @@ def make_app(
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         typer.echo(f"decision {decision_id}: gap_signoff for trial {trial} ({record.slug})")
+
+    experiment_app = typer.Typer(no_args_is_help=True, help="Pre-register and run experiments.")
+    app.add_typer(experiment_app, name="experiment")
+
+    @experiment_app.command("register")
+    def experiment_register(
+        file: Annotated[Path, typer.Argument(help="the experiment file (docs/experiments/*.md)")],
+    ) -> None:
+        """Register an experiment file and print its registration and hashes."""
+        s = settings()
+        if not file.is_file():
+            raise _fail(f"no experiment file at {file}", USAGE_ERROR)
+        try:
+            parsed = parse_experiment_file(file, _experiments_dir(s), settings=s)
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                record = research.register_experiment(conn, parsed, _REGISTERED_BY)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except _RESEARCH_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+        basis = "confirmatory" if record.confirmatory else "exploratory"
+        typer.echo(
+            f"registration {record.registration_id}: {record.slug} ({record.kind}, stage "
+            f"{record.stage}, {basis}, family {_fmt(record.family)})"
+        )
+        if record.amends_registration_id is not None:
+            typer.echo(f"  amends registration {record.amends_registration_id}")
+        typer.echo(
+            f"  dataset {record.dataset_name}, window {record.window_start} to "
+            f"{record.window_end}, splits {','.join(record.splits)}"
+        )
+        typer.echo(
+            f"  budget {record.budget_runs} runs, {record.budget_configurations} configurations"
+        )
+        typer.echo(f"  params sha256 {record.params_sha256}")
+        typer.echo(f"  doc sha256 {record.doc_sha256}")
+
+    @experiment_app.command("open")
+    def experiment_open(
+        slug: Annotated[str, typer.Argument(help="the registered experiment slug")],
+        dataset: Annotated[int, typer.Option(help="the dataset version id to bind")],
+        split: Annotated[str, typer.Option(help="the split to bind")],
+        config: Annotated[Path, typer.Option(help="the run's config, a JSON object file")],
+        configurations: Annotated[
+            int, typer.Option(help="configurations this run will evaluate")
+        ] = 1,
+        spend_holdout: Annotated[
+            bool, typer.Option(help="open a run touching a protected window (needs a reason)")
+        ] = False,
+        holdout_reason: Annotated[str | None, typer.Option(help="why the window is spent")] = None,
+        holdout_repeat: Annotated[
+            bool, typer.Option(help="spend an already-spent protected window again")
+        ] = False,
+        note: Annotated[str | None, typer.Option(help="a note stored with the run")] = None,
+    ) -> None:
+        """Open a run of a registered experiment and print its id."""
+        if spend_holdout and _blank_text(holdout_reason):
+            raise _fail("--spend-holdout needs a non-blank --holdout-reason", USAGE_ERROR)
+        if holdout_reason is not None and not spend_holdout:
+            raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
+        if holdout_repeat and not spend_holdout:
+            raise _fail("--holdout-repeat goes with --spend-holdout", USAGE_ERROR)
+        if configurations < 1:
+            raise _fail("--configurations must be at least 1", USAGE_ERROR)
+        s = settings()
+        run_config = _read_config(config, s)
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                handle = research.open_run(
+                    conn,
+                    slug,
+                    dataset,
+                    split,
+                    run_config,
+                    _REGISTERED_BY,
+                    note,
+                    flags=ResearchFlags(spend_holdout=spend_holdout, holdout_repeat=holdout_repeat),
+                    reasons=ResearchReasons(holdout_reason=holdout_reason),
+                    configurations=configurations,
+                    settings=s,
+                )
+                listed = research.list_runs(conn, registration=handle.slug)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except _RESEARCH_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+        if handle.refusal is not None:
+            typer.echo(f"run {handle.run_id}: {handle.refusal}")
+            if handle.message:
+                typer.echo(f"  {_scrubbed(handle.message, s)}")
+            raise typer.Exit(USAGE_ERROR)
+        run = next(r for r in listed if r.run_id == handle.run_id)
+        typer.echo(
+            f"run {handle.run_id}: open ({handle.slug}, dataset {handle.dataset.dataset_id}, "
+            f"split {handle.split}, {handle.n_configurations_declared} configurations, "
+            f"confirmatory basis {run.confirmatory_basis})"
+        )
+        if run.holdout_spent:
+            typer.echo(f"  holdout spent{' (repeat)' if run.holdout_repeat else ''}")
+
+    @experiment_app.command("abandon")
+    def experiment_abandon(
+        run: Annotated[int, typer.Option(help="the unfinished run to abandon")],
+        reason: Annotated[str, typer.Option(help="why the run is abandoned")],
+    ) -> None:
+        """Close an unfinished run as `abandoned`."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                handle = research.attach_run(conn, run, settings=s)
+                research.close_run(conn, handle, "abandoned", reason)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except _RESEARCH_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+        typer.echo(f"run {run}: abandoned ({handle.slug})")
+
+    @app.command()
+    def experiments(
+        registration: Annotated[str | None, typer.Option(help="only this slug")] = None,
+        family: Annotated[str | None, typer.Option(help="only this family")] = None,
+        kind: Annotated[str | None, typer.Option(help="only this kind")] = None,
+        include_synthetic: Annotated[bool, typer.Option(help="list synthetic runs too")] = False,
+    ) -> None:
+        """List research runs newest first, with refused, failed and unfinished ones."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
+                listed = research.list_runs(conn, registration, family, kind, include_synthetic)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (schema.ResearchNotInitialised, schema.RegistryNotInitialised):
+            raise _fail("research registry not initialised", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        typer.echo("id  experiment  kind  split  outcome  verdict  basis  flags  message")
+        for r in listed:
+            basis = "confirmatory" if r.confirmatory else "exploratory"
+            message = _scrubbed(r.message, s).strip() if r.message else ""
+            typer.echo(
+                f"{r.run_id}  {r.slug}  {r.kind}  {r.split}  {r.outcome}  {_fmt(r.verdict)}  "
+                f"{basis}  {_flag_names(r)}  {message}"
+            )
+
+    dataset_app = typer.Typer(no_args_is_help=True, help="Register research datasets.")
+    app.add_typer(dataset_app, name="dataset")
+
+    @dataset_app.command(
+        "register",
+        context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    )
+    def dataset_register(
+        ctx: typer.Context,
+        name: Annotated[str, typer.Option(help="the dataset name")],
+        version: Annotated[str, typer.Option(help="the version label")],
+        path: Annotated[Path, typer.Option(help="the export: a tabular file or a directory")],
+        event_start: Annotated[str, typer.Option(help="earliest source event, YYYY-MM-DD")],
+        event_end: Annotated[str, typer.Option(help="latest source event, YYYY-MM-DD")],
+        event_column: Annotated[
+            str | None, typer.Option(help="the export's event-date column")
+        ] = None,
+        split_json: Annotated[
+            Path | None, typer.Option(help='the split file, {"splits": [...]} per row')
+        ] = None,
+        sealed: Annotated[
+            list[str] | None, typer.Option(help="a sealed split name (repeatable)")
+        ] = None,
+        locked: Annotated[bool, typer.Option(help="the export is a locked label set")] = False,
+        seed: Annotated[
+            int | None, typer.Option(help="the seed the splits were drawn with")
+        ] = None,
+        note: Annotated[str | None, typer.Option(help="a note stored with the version")] = None,
+    ) -> None:
+        """Register a dataset version. `--sealed-period <start> <end>` (repeatable)
+        seals a period of source events."""
+        periods = _sealed_periods(ctx.args)
+        start = _parse_day("--event-start", event_start)
+        end = _parse_day("--event-end", event_end)
+        assert start is not None and end is not None
+        s = settings()
+        explicit_sealed = tuple(sealed or ())
+        try:
+            if not path.exists():
+                raise ExperimentFileError(f"no export at {path}")
+            if split_json is not None and event_column is None:
+                raise ExperimentFileError(
+                    "split without event column: --split-json needs --event-column"
+                )
+            unknown = sorted(set(explicit_sealed) - set(SPLITS))
+            if unknown:
+                raise ExperimentFileError(f"--sealed {unknown}: not among the splits {SPLITS}")
+            if path.is_dir() and explicit_sealed:
+                raise ExperimentFileError(
+                    "sealed split without period: a directory export has no event column, "
+                    "so it cannot seal a split"
+                )
+            if path.is_dir() and event_column is not None:
+                raise ExperimentFileError(
+                    "--event-column needs a tabular export; a directory export has no rows"
+                )
+            sha = hash_export(path)
+            values = read_event_column(path, event_column) if event_column is not None else None
+            n_rows: int | None = None
+            if values is not None:
+                n_rows = len(values)
+                check_declared_event_span(start, end, *event_span(values), path=path)
+            elif path.is_file() and path.suffix in _TABULAR_SUFFIXES:
+                n_rows = _read_tabular(path).height
+            assignment = load_split_assignment(split_json) if split_json is not None else None
+            spans = (
+                split_event_spans(values, assignment)
+                if values is not None and assignment is not None
+                else None
+            )
+            all_sealed = effective_sealed_splits(explicit_sealed, assignment or ())
+            for split in sorted(all_sealed):
+                if values is None:
+                    raise ExperimentFileError(
+                        f"sealed split without period: {split!r} is sealed, which needs "
+                        "--event-column and a sealed period holding its rows"
+                    )
+                # `full` and `none` bind every row (req 3), so sealing one
+                # seals every row, whatever the split file labels them.
+                rows = (
+                    list(values)
+                    if split in EVERY_ROW_SPLITS or assignment is None
+                    else [v for v, a in zip(values, assignment, strict=True) if a == split]
+                )
+                check_sealed_split_has_period(split, rows, periods)
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                record = research.register_dataset(
+                    conn,
+                    name=name,
+                    version=version,
+                    path=str(path.resolve()),
+                    sha256=sha,
+                    event_start=start,
+                    event_end=end,
+                    n_rows=n_rows,
+                    event_column=event_column,
+                    split_path=str(split_json.resolve()) if split_json is not None else None,
+                    split_sha256=hash_file(split_json) if split_json is not None else None,
+                    split_spans=spans,
+                    sealed_splits=sorted(all_sealed),
+                    sealed_periods=periods,
+                    locked=locked,
+                    seed=seed,
+                    note=note,
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except _DATASET_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+        typer.echo(
+            f"dataset {record.dataset_id}: {record.name} {record.version}, "
+            f"{_fmt(record.n_rows)} rows, events {record.event_start} to {record.event_end}"
+        )
+        typer.echo(f"  sha256 {record.sha256}")
+        if record.split_sha256 is not None:
+            typer.echo(f"  split file sha256 {record.split_sha256}")
+        for split_name, (first, last) in sorted(record.split_spans.items()):
+            typer.echo(f"  split {split_name}: {first} to {last}")
+        typer.echo(
+            f"  sealed splits {','.join(record.sealed_splits) or '-'}, sealed periods "
+            + (", ".join(f"{a} to {b}" for a, b in record.sealed_periods) or "-")
+        )
+        typer.echo(f"  locked {_fmt(record.locked)}, seed {_fmt(record.seed)}")
 
     return app
 
