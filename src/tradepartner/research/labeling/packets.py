@@ -116,14 +116,20 @@ def _truncate_sentence(text: str, limit: int) -> str:
     """`text` cut to at most `limit` characters, at the latest sentence
     boundary at or before the cut (C2: "each cut at a sentence boundary").
     The whole text, unchanged, when it already fits; the raw head, right-
-    trimmed, when no boundary falls inside the limit."""
+    trimmed, when no boundary falls inside the limit.
+
+    Boundaries are found over the whole of `text`, not just `text[:limit]`:
+    a boundary is the whitespace run right after a sentence-ending mark
+    (`_SENTENCE_BOUNDARY`'s lookbehind), and that whitespace can start
+    exactly at `limit` when a sentence ends right at the cut (e.g. `limit`
+    lands just past "...here."), in which case the sentence still fits
+    and must not be dropped for want of its own trailing space."""
     if len(text) <= limit:
         return text
-    head = text[:limit]
-    boundaries = list(_SENTENCE_BOUNDARY.finditer(head))
+    boundaries = [m for m in _SENTENCE_BOUNDARY.finditer(text) if m.start() <= limit]
     if boundaries:
-        return head[: boundaries[-1].start()].rstrip()
-    return head.rstrip()
+        return text[: boundaries[-1].start()].rstrip()
+    return text[:limit].rstrip()
 
 
 def _field(label: str, value: str | None) -> str | None:

@@ -231,6 +231,16 @@ def test_truncate_sentence_with_no_boundary_cuts_the_raw_head() -> None:
     assert packets._truncate_sentence(text, 10) == "a" * 10
 
 
+def test_truncate_sentence_keeps_a_sentence_ending_exactly_at_the_limit() -> None:
+    """code-review finding on PR #1069: when the cut lands exactly at a
+    sentence's own trailing whitespace (the boundary that follows "BBB."
+    starts at index 9, equal to `limit`), that sentence must not be
+    dropped for want of a boundary match *inside* `text[:limit]` -- it
+    fits in the budget and belongs in the result."""
+    text = "AAA. BBB. CCC."
+    assert packets._truncate_sentence(text, 9) == "AAA. BBB."
+
+
 def test_notice_is_cut_at_a_sentence_boundary_under_exhibit_max_chars() -> None:
     long_text = " ".join(f"Sentence number {i} is here." for i in range(50))
     documents = _klx_documents(
