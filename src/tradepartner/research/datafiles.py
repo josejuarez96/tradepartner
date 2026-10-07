@@ -12,7 +12,9 @@ Layout (`<task>` is `departure-reason`, the one pilot):
 - `frames/<task>/<sha256>/frame.parquet` and `counts.json`
 - `gold/<task>/working.jsonl` (the session file) and
   `gold/<task>/<sha256>/gold.parquet` and `splits.json` (the locked export)
-- `inferences/<task>/<run_id>.jsonl`
+- `inferences/<task>/<run_id>.jsonl` (and `inferences/<task>/.lock`, the labeling
+  job's one-run-at-a-time lock, which is not a records file)
+- `shortlists/<task>/<run_id>.json` (a frame batch's shortlist, written once)
 - `reviews/<task>/<run_id>.jsonl`
 
 JSONL files are append-only (`append_jsonl`): a write opens the file for append and
@@ -104,6 +106,18 @@ def inference_paths(settings: Settings) -> list[Path]:
     runs = sorted((p for p in found if is_run_id_stem(p.stem)), key=lambda p: int(p.stem))
     others = sorted((p for p in found if not is_run_id_stem(p.stem)), key=lambda p: p.name)
     return runs + others
+
+
+def inference_lock_path(settings: Settings) -> Path:
+    """The lock the labeling job holds for a whole run, so two runs never spend
+    against the same ceilings at once (not a `.jsonl`, so never a records file)."""
+    return data_dir(settings) / "inferences" / TASK / ".lock"
+
+
+def shortlist_path(settings: Settings, run_id: int) -> Path:
+    """Run `run_id`'s shortlist, written once by the labeling job at the end of a
+    frame batch and read by the review."""
+    return data_dir(settings) / "shortlists" / TASK / f"{_run_file(run_id)[: -len('.jsonl')]}.json"
 
 
 def review_path(settings: Settings, run_id: int) -> Path:

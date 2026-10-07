@@ -27,8 +27,11 @@ from the one requested (`failed`, `model id mismatch`), after writing that reply
 record. A timeout after send is recorded `unresolved` / `timeout` and never re-sent.
 At the end the records are registered as a `departure-reason-inferences` version; a
 gold split (`dev`, `pilot`) is scored (`scoring`) and its result written, and a frame
-batch computes the shortlist (`crosswalk.shortlist`) and is left unfinished for the
-review to finish.
+batch computes the shortlist (`crosswalk.shortlist`), writes it once to
+`datafiles.shortlist_path` (`shortlists/departure-reason/<run_id>.json`: the seed,
+sample size, cap, the records' SHA-256 and dataset id, and the items in acceptance
+order with their stratum, sampling rate and `deferred` flag), which is where the
+review reads it, and is left unfinished for the review to finish.
 
 **Spend** (C4) is computed from records, never configured: `spend_records` reads every
 `.jsonl` `datafiles.inference_paths` lists and refuses, naming it, a file whose stem
@@ -36,10 +39,15 @@ is not a run id (`unexpected inference file: <name>`), since a skipped records f
 is spend the check cannot see. A call's estimate is the characters of the packet,
 the instructions and the criteria divided by `chars_per_token`, at the price
 snapshot; each record carries the returned `usage.input_tokens` instead (a timeout,
-which may have been billed, keeps its estimate; a refusal with no usage costs 0).
+which may have been billed, and a 200 whose body lacks the usage keep their estimate;
+any other refusal with no usage costs 0).
 Within a run the sums are carried forward in memory from the files read before the
-first call plus every record this run writes. The two ceilings are `0.0` by default,
-so with the defaults every call is refused here as well as by the client.
+first call plus every record this run writes (a record in a later UTC month starts
+that month's sum); `run_batch` holds an exclusive lock
+(`datafiles.inference_lock_path`) for the whole run, drift run included, so no other
+run spends against the same ceilings meanwhile (`RunInProgress`, opening nothing).
+The two ceilings are `0.0` by default, so with the defaults every call is refused
+here as well as by the client.
 
 **`dry_run`** reads a registered frame or gold export by the path it is given,
 refuses it unless its SHA-256 is the dataset row's, and reports the estimate over
@@ -52,11 +60,13 @@ No batch is ever scheduled (ADR 0013 point 8): the job runs when a person runs i
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import io
 import json
 import random
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -135,6 +145,10 @@ class UnexpectedInferenceFile(RuntimeError):
     record the spend sum cannot read."""
 
 
+class RunInProgress(RuntimeError):
+    """Another labeling run holds the research store's run lock."""
+
+
 class _Stop(Exception):
     """Ends a run `failed` with `message` (internal)."""
 
@@ -148,18 +162,22 @@ class _Stop(Exception):
 
 @dataclass(frozen=True)
 class SpendSums:
-    """Cumulative and month-to-date spend in USD over inference records."""
+    """Cumulative and month-to-date spend in USD over inference records; `month` is
+    the UTC `(year, month)` the month-to-date sum is for."""
 
     cumulative_usd: float
     month_to_date_usd: float
+    month: tuple[int, int]
 
-    def plus(self, cost_usd: float, known_at: datetime, now: datetime) -> SpendSums:
-        """These sums with one more record of `cost_usd` known at `known_at`."""
-        same_month = _month(known_at) == _month(now)
-        return SpendSums(
-            self.cumulative_usd + cost_usd,
-            self.month_to_date_usd + (cost_usd if same_month else 0.0),
-        )
+    def plus(self, cost_usd: float, known_at: datetime) -> SpendSums:
+        """These sums with one more record of `cost_usd` known at `known_at`. A record
+        in a later month starts that month's sum (a batch that runs past midnight at
+        a month's end); a record in an earlier month adds to the total only."""
+        month = _month(known_at)
+        if month > self.month:
+            return SpendSums(self.cumulative_usd + cost_usd, cost_usd, month)
+        same = cost_usd if month == self.month else 0.0
+        return SpendSums(self.cumulative_usd + cost_usd, self.month_to_date_usd + same, self.month)
 
 
 def _month(value: datetime) -> tuple[int, int]:
@@ -199,10 +217,13 @@ def spend_records(settings: Settings) -> list[dict[str, Any]]:
 
 def spend_sums(records: Iterable[Mapping[str, Any]], now: datetime) -> SpendSums:
     """Cumulative and month-to-date (the UTC month of `now`) spend over `records`."""
-    sums = SpendSums(0.0, 0.0)
+    month = _month(now)
+    total = mtd = 0.0
     for record in records:
-        sums = sums.plus(float(record["cost_usd"]), _known_at(record["known_at"]), now)
-    return sums
+        cost = float(record["cost_usd"])
+        total += cost
+        mtd += cost if _month(_known_at(record["known_at"])) == month else 0.0
+    return SpendSums(total, mtd, month)
 
 
 def _check_sums(sums: SpendSums, estimate_usd: float, settings: Settings) -> None:
@@ -246,11 +267,11 @@ def estimate_usd(request: ModelRequest, labeling: ResearchLabelingConfig) -> flo
 
 def record_cost(response: ModelResponse, estimate: float, price: float) -> float:
     """A record's `cost_usd`: the returned input tokens at the price snapshot; a
-    timeout (sent, maybe billed, no usage) keeps its estimate; a refusal with no usage
-    costs nothing."""
+    timeout (sent, maybe billed) or a 200 whose body lacks the usage (billed) keeps
+    its estimate; any other refusal with no usage costs nothing."""
     if response.input_tokens is not None:
         return response.input_tokens * price / 1_000_000
-    return estimate if response.reason == "timeout" else 0.0
+    return estimate if response.reason == "timeout" or response.http_status == 200 else 0.0
 
 
 # --- records (C8) ----------------------------------------------------------------------
@@ -261,7 +282,9 @@ def redact(text: str, settings: Settings) -> str:
     `config.clean_message`'s substitution without its cut or control-character pass,
     because a record is evidence (C8, #1121)."""
     for value in secret_values(settings):
-        text = text.replace(value, REDACTED)
+        # The value as JSON would escape it too, since both texts are JSON bodies.
+        for form in dict.fromkeys((value, json.dumps(value)[1:-1])):
+            text = text.replace(form, REDACTED)
     return text
 
 
@@ -373,18 +396,19 @@ def model_request(packet: Packet, model: str, option_set: OptionSet) -> ModelReq
 def _first_packets(
     rows: Sequence[Mapping[str, Any]], option_set: OptionSet, limits: PacketLimits
 ) -> list[tuple[str, Packet]]:
-    """Every row's first packet (C2's call order); a packet over the cap is not a
-    call, so it is left out."""
+    """Every row's first packet that will be sent (C2's call order): a packet over the
+    cap is not a call, so the kind after it (as after an `unresolved`) stands in."""
     packets: list[tuple[str, Packet]] = []
     for row in rows:
         kind = next_kind(row, None)
-        assert kind is not None
-        try:
-            packets.append(
-                (str(row["listing_end_id"]), build_packet(row, option_set, limits, kind))
-            )
-        except PacketTooLarge:
-            continue
+        while kind is not None:
+            try:
+                packet = build_packet(row, option_set, limits, kind)
+            except PacketTooLarge:
+                kind = next_kind(row, Answer(kind, UNRESOLVED))
+                continue
+            packets.append((str(row["listing_end_id"]), packet))
+            break
     return packets
 
 
@@ -560,7 +584,6 @@ class _Caller:
     option_set: OptionSet
     pacer: _Pacer
     sums: SpendSums
-    now: datetime
     sequence: int = 0
 
     @property
@@ -584,7 +607,13 @@ class _Caller:
             settings=self.settings,
         )
         datafiles.append_jsonl(self.path, [record])
-        self.sums = self.sums.plus(cost, response.known_at, self.now)
+        self.sums = self.sums.plus(cost, response.known_at)
+
+    def close(self) -> None:
+        """Close the client's connection pool, if it has one."""
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     def call(self, listing_end_id: str, packet: Packet) -> ModelResponse:
         """Send `packet` after the mid-batch spend check, write its record, and stop
@@ -632,6 +661,27 @@ def _label_row(caller: _Caller, row: Mapping[str, Any], limits: PacketLimits) ->
         answered = response.selected_option if response.reason == "ok" else None
         kind = next_kind(row, Answer(kind, answered or UNRESOLVED))
     return refused
+
+
+@contextmanager
+def _run_lock(settings: Settings) -> Iterator[None]:
+    """Hold the one-run-at-a-time lock for a whole run (drift run included), so two
+    runs never spend against the same ceilings at once: each reads the records once
+    and carries its own spend forward. Raises `RunInProgress`, opening nothing, when
+    another process holds it. Released when the process exits, whatever happens."""
+    path = datafiles.inference_lock_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RunInProgress(
+                f"another labeling run holds {path.name}; run one at a time"
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _file_sha256(path: Path) -> str:
@@ -725,17 +775,20 @@ def _run_drift(
             packets.append((lid, packet))
         caller = _start_caller(settings, handle, client_factory, caller_args, packets)
         comparisons = []
-        for lid, packet in packets:
-            response = caller.call(lid, packet)
-            comparisons.append(
-                scoring.DriftComparison(
-                    listing_end_id=lid,
-                    option=response.selected_option if response.reason == "ok" else None,
-                    baseline_option=baseline[lid]["selected_option"],
-                    probabilities=dict(response.probabilities) or None,
-                    baseline_probabilities=baseline[lid]["probabilities"] or None,
+        try:
+            for lid, packet in packets:
+                response = caller.call(lid, packet)
+                comparisons.append(
+                    scoring.DriftComparison(
+                        listing_end_id=lid,
+                        option=response.selected_option if response.reason == "ok" else None,
+                        baseline_option=baseline[lid]["selected_option"],
+                        probabilities=dict(response.probabilities) or None,
+                        baseline_probabilities=baseline[lid]["probabilities"] or None,
+                    )
                 )
-            )
+        finally:
+            caller.close()
         rate = scoring.flip_rate(comparisons)
         path = caller.path
         outcome = write_result(
@@ -797,7 +850,6 @@ def _start_caller(
         option_set=option_set,
         pacer=_Pacer(labeling.requests_per_second, caller_args["sleep"], caller_args["monotonic"]),
         sums=sums,
-        now=now,
     )
 
 
@@ -865,63 +917,64 @@ def run_batch(
         "max_items": max_items,
         "drift": dataclasses.asdict(drift) if drift else None,
     }
-    handle = open_run(
-        conn,
-        slug,
-        dataset_id,
-        split,
-        config,
-        run_by,
-        synthetic=synthetic,
-        flags=flags,
-        reasons=reasons,
-        configurations=configurations,
-        settings=settings,
-    )
-    if handle.refusal is not None:
-        return BatchResult(handle.run_id, handle.refusal, handle.message)
-    caller_args = {
-        "model": model,
-        "option_set": option_set,
-        "clock": clock,
-        "sleep": sleep,
-        "monotonic": monotonic,
-    }
-    try:
-        if drift is not None:
-            verdict = _run_drift(
+    with _run_lock(settings):
+        handle = open_run(
+            conn,
+            slug,
+            dataset_id,
+            split,
+            config,
+            run_by,
+            synthetic=synthetic,
+            flags=flags,
+            reasons=reasons,
+            configurations=configurations,
+            settings=settings,
+        )
+        if handle.refusal is not None:
+            return BatchResult(handle.run_id, handle.refusal, handle.message)
+        caller_args = {
+            "model": model,
+            "option_set": option_set,
+            "clock": clock,
+            "sleep": sleep,
+            "monotonic": monotonic,
+        }
+        try:
+            if drift is not None:
+                verdict = _run_drift(
+                    conn,
+                    settings,
+                    client_factory,
+                    drift,
+                    caller_args,
+                    run_by=run_by,
+                    synthetic=synthetic,
+                )
+                if verdict != "pass":
+                    raise _Stop(DRIFT_NOT_PASSED)
+            return _label_batch(
                 conn,
                 settings,
                 client_factory,
-                drift,
+                handle,
                 caller_args,
-                run_by=run_by,
-                synthetic=synthetic,
+                rows=select_rows(
+                    load_dataset(handle),
+                    accepted_from=accepted_from,
+                    accepted_to=accepted_to,
+                    limit=limit,
+                ),
+                configurations=configurations,
+                agreement_sample_size=agreement_sample_size,
+                max_items=max_items,
             )
-            if verdict != "pass":
-                raise _Stop(DRIFT_NOT_PASSED)
-        return _label_batch(
-            conn,
-            settings,
-            client_factory,
-            handle,
-            caller_args,
-            rows=select_rows(
-                load_dataset(handle),
-                accepted_from=accepted_from,
-                accepted_to=accepted_to,
-                limit=limit,
-            ),
-            configurations=configurations,
-            agreement_sample_size=agreement_sample_size,
-            max_items=max_items,
-        )
-    except _Stop as stop:
-        close_run(conn, handle, "failed", stop.message)
-        return BatchResult(handle.run_id, "failed", stop.message)
-    except Exception as exc:
-        close_run(conn, handle, "failed", f"{type(exc).__name__}: {redact(str(exc), settings)}")
-        raise
+        except _Stop as stop:
+            close_run(conn, handle, "failed", stop.message)
+            return BatchResult(handle.run_id, "failed", stop.message)
+        except Exception as exc:
+            close_run(conn, handle, "failed", f"{type(exc).__name__}: {redact(str(exc), settings)}")
+            raise
 
 
 def _label_batch(
@@ -943,8 +996,11 @@ def _label_batch(
         settings, handle, client_factory, caller_args, _first_packets(rows, option_set, limits)
     )
     refused: list[str] = []
-    for row in rows:
-        refused += [f"{row['listing_end_id']}:{k}" for k in _label_row(caller, row, limits)]
+    try:
+        for row in rows:
+            refused += [f"{row['listing_end_id']}:{k}" for k in _label_row(caller, row, limits)]
+    finally:
+        caller.close()
     path = caller.path
     records = datafiles.read_jsonl(path) if path.is_file() else []
     inferences_id = _register_records(conn, handle, path, rows, len(records)) if records else None
@@ -965,6 +1021,18 @@ def _label_batch(
             agreement_sample_size=agreement_sample_size,
             max_items=max_items,
         )
+        _write_shortlist(
+            settings,
+            handle.run_id,
+            listed,
+            {
+                **exploratory,
+                "seed": seed,
+                "agreement_sample_size": agreement_sample_size,
+                "max_items": max_items,
+                "records_sha256": artifact_sha,
+            },
+        )
         return BatchResult(handle.run_id, "unfinished", None, inferences_id, listed, tuple(refused))
     primary, metrics = gold_metrics(scored_items(rows, records))
     declared = set(get_registration(conn, handle.slug).secondary)
@@ -983,6 +1051,24 @@ def _label_batch(
         exploratory={**exploratory, **{k: v for k, v in metrics.items() if k not in declared}},
     )
     return BatchResult(handle.run_id, outcome, None, inferences_id, None, tuple(refused))
+
+
+def _write_shortlist(
+    settings: Settings, run_id: int, listed: crosswalk.Shortlist, meta: Mapping[str, Any]
+) -> None:
+    """Write a frame batch's shortlist once to `datafiles.shortlist_path` (where the
+    review reads it): `meta` (the seed, the sample size, the cap, the records' hash and
+    dataset id, the counts) and the items in acceptance order. Never overwritten."""
+    path = datafiles.shortlist_path(settings, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "run_id": run_id,
+        **meta,
+        "n_deferred": listed.n_deferred,
+        "items": [dataclasses.asdict(item) for item in listed.items],
+    }
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(document, sort_keys=True, ensure_ascii=False, indent=1) + "\n")
 
 
 def _register_records(

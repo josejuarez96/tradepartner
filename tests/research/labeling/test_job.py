@@ -620,12 +620,15 @@ class _EchoingClient:
         return dataclasses.replace(
             response,
             raw_request=response.raw_request.replace("FILING TEXT", f"FILING {self._secret} TEXT"),
-            raw_response=f"{response.raw_response}\t\x01{self._secret}{'z' * self._padding}",
+            raw_response=(
+                f"{response.raw_response}\t\x01{self._secret}"
+                f"{json.dumps(self._secret)[1:-1]}{'z' * self._padding}"
+            ),
         )
 
 
 def test_a_planted_key_is_redacted_at_full_length(world: World) -> None:
-    key = "planted" + "-key" * 4  # a synthetic value, never a real key
+    key = 'planted"' + "-key" * 4  # a synthetic value with a JSON-escaped form
     keyed = world.settings.model_copy(update={"typesafe_api_key": SecretStr(key)})
     gold_id = world.gold(_dev(1), _pilot(1))
     padding = keyed.ingest.max_message_chars * 2
@@ -634,7 +637,7 @@ def test_a_planted_key_is_redacted_at_full_length(world: World) -> None:
     (record,) = _records(keyed, result.run_id)
     assert key not in record["raw_request"] and key not in record["raw_response"]
     assert "FILING [redacted] TEXT" in record["raw_request"]
-    assert record["raw_response"].endswith("\t\x01[redacted]" + "z" * padding)
+    assert record["raw_response"].endswith("\t\x01[redacted][redacted]" + "z" * padding)
     assert len(record["raw_response"]) > keyed.ingest.max_message_chars
     assert record["selected_option"] == MERGER and record["reason"] == "ok"
 
@@ -714,9 +717,82 @@ def test_one_drift_flip_passes_and_the_batch_is_left_unfinished(world: World) ->
     assert result.shortlist is not None
     strata = {item.listing_end_id: item.stratum for item in result.shortlist.items}
     assert strata["F2"] == "unresolved"
+    written = json.loads(datafiles.shortlist_path(world.settings, result.run_id).read_text())
+    assert written["items"] == [dataclasses.asdict(i) for i in result.shortlist.items]
+    assert (written["seed"], written["inferences_dataset_id"]) == (11, result.inferences_dataset_id)
     dataset = research.get_dataset(world.conn, result.inferences_dataset_id or 0)
     assert dataset.name == job.INFERENCES_DATASET
     assert (
         dataset.sha256
         == sha256(datafiles.inference_path(world.settings, result.run_id).read_bytes()).hexdigest()
     )
+
+
+# --- review fixes: the run lock, the month rollover, billed refusals, the estimate --------
+
+
+def test_a_second_run_is_refused_while_one_holds_the_lock(world: World) -> None:
+    import fcntl
+
+    gold_id = world.gold(_dev(1), _pilot(1))
+    path = datafiles.inference_lock_path(world.settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(job.RunInProgress):
+            world.run(ScriptedModelClient([Answer(MERGER)]), gold_id, "dev")
+        fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+    assert world.conn.execute("SELECT count(*) FROM research_runs").fetchone() == (0,)
+    assert world.run(ScriptedModelClient([Answer(MERGER)]), gold_id, "dev").outcome == "ok"
+    assert datafiles.inference_paths(world.settings) == [
+        datafiles.inference_path(world.settings, 1)
+    ]
+
+
+def test_a_record_in_a_new_month_starts_that_months_sum() -> None:
+    october = job.SpendSums(5.0, 2.0, (2026, 10))
+    november = october.plus(0.5, datetime(2026, 11, 1, 0, 1, tzinfo=UTC))
+    assert (november.cumulative_usd, november.month_to_date_usd) == (5.5, 0.5)
+    assert november.plus(0.25, datetime(2026, 11, 2, tzinfo=UTC)).month_to_date_usd == 0.75
+    late = november.plus(1.0, datetime(2026, 10, 31, 23, tzinfo=UTC))
+    assert (late.cumulative_usd, late.month_to_date_usd) == (6.5, 0.5)
+
+
+def _response(**changes: Any) -> ModelResponse:
+    client = ScriptedModelClient([Answer(MERGER)])
+    request = job.model_request(dataclasses.replace(_A_PACKET, text="x"), MODEL, DEFAULT_OPTION_SET)
+    return dataclasses.replace(client.label(request), **changes)
+
+
+def test_a_billed_reply_without_usage_keeps_its_estimate() -> None:
+    no_usage = {"input_tokens": None, "output_tokens": None, "selected_option": None}
+    malformed = _response(reason="refused", http_status=200, **no_usage)
+    assert job.record_cost(malformed, 0.5, 0.042) == 0.5
+    timeout = _response(reason="timeout", http_status=None, **no_usage)
+    assert job.record_cost(timeout, 0.5, 0.042) == 0.5
+    rate_limited = _response(reason="refused", http_status=429, **no_usage)
+    assert job.record_cost(rate_limited, 0.5, 0.042) == 0.0
+    assert job.record_cost(_response(input_tokens=2_000_000), 0.5, 0.042) == pytest.approx(0.084)
+
+
+_A_PACKET = job.Packet(
+    kind="A",
+    text="",
+    sha256="0" * 64,
+    document_ids=(),
+    option_set_version=DEFAULT_OPTION_SET.version,
+    option_set_hash=DEFAULT_OPTION_SET.hash,
+)
+
+
+def test_the_estimate_counts_the_fallback_when_the_first_packet_is_over_the_cap(
+    jsettings: Settings,
+) -> None:
+    row = job._parsed(_row("F1", datetime(2019, 1, 2, 15, tzinfo=UTC), eightk=True))
+    row["documents"]["eightk"]["items"] = {"2.01": "Completion of the merger. " * 400}
+    labeling = jsettings.research.labeling
+    a_packet = job.build_packet(row, DEFAULT_OPTION_SET, job.packet_limits(labeling), "A")
+    cap = int(len(a_packet.text) / labeling.chars_per_token) + 1
+    limits = dataclasses.replace(job.packet_limits(labeling), max_packet_tokens=cap)
+    packets = job._first_packets([row], DEFAULT_OPTION_SET, limits)
+    assert [(lid, p.kind) for lid, p in packets] == [("F1", "A")]
