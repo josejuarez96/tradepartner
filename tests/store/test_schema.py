@@ -579,7 +579,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (13,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
     finally:
         conn.close()
 
@@ -669,7 +669,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (13,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
     finally:
         conn.close()
 
@@ -707,6 +707,189 @@ def test_read_only_open_of_a_genuine_version_12_store_passes(tmp_path: Path) -> 
         assert set(_columns(conn, "trial_rebalances")).isdisjoint(
             schema.PROFITABILITY_REBALANCE_COLUMNS
         )
+
+
+# --- version 14 (#1153, T127): generic rebalance counts, signals prefix CHECK ----
+
+#: `signals.reason`'s closed `CHECK` before version 14.
+_V13_SIGNALS_CHECK = "CHECK (reason IN ('selected', 'below_cut', 'excluded_no_history'))"
+
+#: `trial_rebalances` columns before `PROFITABILITY_REBALANCE_COLUMNS`, in order.
+_V12_REBALANCE_COLUMNS = (
+    "trial_id, cost_per_side_bps, session, fill_session, n_universe, n_static_listings, "
+    "n_targets, turnover, cost_paid, gap_count_share, gap_size_share, n_missing_fill, "
+    "n_delisting_exits, n_stale_exits, n_excluded_no_history, n_dropped_dividends, "
+    "n_late_dividends"
+)
+
+#: (trial, cost, session, n_excluded_no_history, the six profitability counts): a
+#: `momentum` trial 1 at two levels, and a `profitability` trial 3 at three levels
+#: (written with `n_excluded_no_history = 0`, as the engine did before version
+#: 14), whose 2018-02-28 `n_derived` is NULL.
+_V13_REBALANCES: tuple[tuple[object, ...], ...] = (
+    (1, 0.0, "2018-01-31", 2, None, None, None, None, None, None),
+    (1, 15.0, "2018-01-31", 2, None, None, None, None, None, None),
+    (3, 0.0, "2018-01-31", 0, 58, 12, 3, 2, 1, 4),
+    (3, 15.0, "2018-01-31", 0, 58, 12, 3, 2, 1, 4),
+    (3, 30.0, "2018-01-31", 0, 58, 12, 3, 2, 1, 4),
+    (3, 0.0, "2018-02-28", 0, 60, 10, 0, 2, 0, None),
+    (3, 15.0, "2018-02-28", 0, 60, 10, 0, 2, 0, None),
+)
+
+_V13_SIGNALS = (
+    (1, "SEC_A", 1.5, 1, "selected"),
+    (1, "SEC_B", 0.5, 2, "below_cut"),
+    (1, "SEC_C", None, None, "excluded_no_history"),
+)
+
+
+def _version_13_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store shaped as version 13 left it: no `trial_rebalance_counts`, a NOT
+    NULL `n_excluded_no_history`, `signals.reason`'s closed `CHECK`, the
+    `_V13_REBALANCES` rows and three `signals` rows, and a version-13 row."""
+    _version_12_store(conn)
+    conn.execute("DROP TABLE signals")
+    conn.execute(schema._CREATE_SIGNALS.replace(schema._SIGNALS_REASON_CHECK, _V13_SIGNALS_CHECK))
+    schema._migrate_profitability_rebalance_counts(conn)
+    six = ", ".join(schema.PROFITABILITY_REBALANCE_COLUMNS)
+    for trial, cost, session, no_history, *counts in _V13_REBALANCES:
+        conn.execute(
+            f"INSERT INTO trial_rebalances ({_V12_REBALANCE_COLUMNS}, {six}) VALUES "
+            "(?, ?, ?, '2018-02-01', 10, 1, 2, 0.5, 0.001, 0.01, 0.001, 0, 0, 0, ?, 0, 0, "
+            "?, ?, ?, ?, ?, ?)",
+            [trial, cost, session, no_history, *counts],
+        )
+    for run_id, security_id, score, rank, reason in _V13_SIGNALS:
+        conn.execute(
+            "INSERT INTO signals (run_id, rebalance_session, security_id, score, rank, reason, "
+            "known_at, ingested_at) VALUES (?, '2018-01-31', ?, ?, ?, ?, ?, ?)",
+            [run_id, security_id, score, rank, reason, _now(), _now()],
+        )
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (13, TIMESTAMPTZ "
+        "'2026-10-06 12:00:00+00')"
+    )
+
+
+def _signals(conn: duckdb.DuckDBPyConnection) -> list[tuple[object, ...]]:
+    return conn.execute(
+        "SELECT run_id, security_id, score, rank, reason FROM signals ORDER BY rowid"
+    ).fetchall()
+
+
+def _versions(conn: duckdb.DuckDBPyConnection) -> list[int]:
+    return [v for (v,) in conn.execute("SELECT version FROM schema_version ORDER BY 1").fetchall()]
+
+
+def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> None:
+    """The counts table holds, once per `(trial, session)`, every existing
+    row's `n_excluded_no_history` and each non-NULL profitability count (the
+    owner's B3 trial included); a NULL gives no row; `trial_rebalances` keeps
+    every row and value, its `n_excluded_no_history` now nullable."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_13_store(conn)
+        before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
+        schema.init_schema(conn)
+        assert _versions(conn) == [12, 13, 14]
+        assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
+        assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
+        rows = conn.execute(
+            "SELECT trial_id, session, name, value FROM trial_rebalance_counts ORDER BY ALL"
+        ).fetchall()
+        jan, feb = date(2018, 1, 31), date(2018, 2, 28)
+        jan_six = dict(
+            zip(schema.PROFITABILITY_REBALANCE_COLUMNS, (58, 12, 3, 2, 1, 4), strict=True)
+        )
+        feb_five = dict(
+            zip(schema.PROFITABILITY_REBALANCE_COLUMNS[:5], (60, 10, 0, 2, 0), strict=True)
+        )
+        assert rows == sorted(
+            [
+                (1, jan, "n_excluded_no_history", 2),
+                (3, jan, "n_excluded_no_history", 0),
+                *((3, jan, name, value) for name, value in jan_six.items()),
+                (3, feb, "n_excluded_no_history", 0),
+                *((3, feb, name, value) for name, value in feb_five.items()),
+            ]
+        )
+    finally:
+        conn.close()
+
+
+def test_migrating_a_version_13_store_keeps_every_signal_and_widens_the_check() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_13_store(conn)
+        with pytest.raises(duckdb.ConstraintException):  # the version-13 closed set
+            conn.execute(
+                "INSERT INTO signals SELECT * REPLACE ('excluded_sector' AS reason) "
+                "FROM signals LIMIT 1"
+            )
+        schema.init_schema(conn)
+        assert _signals(conn) == list(_V13_SIGNALS)
+        conn.execute(
+            "INSERT INTO signals SELECT * REPLACE ('excluded_sector' AS reason) "
+            "FROM signals LIMIT 1"
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO signals SELECT * REPLACE ('foo' AS reason) FROM signals LIMIT 1"
+            )
+    finally:
+        conn.close()
+
+
+def test_a_failed_signals_rebuild_leaves_the_store_at_version_13(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rebuild runs in `init_schema`'s one transaction: made to fail (its
+    staging table's name is taken), nothing of version 14 is left behind."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_13_store(conn)
+        before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
+        monkeypatch.setattr(schema, "_SIGNALS_STAGING_TABLE", "decisions")
+        with pytest.raises(duckdb.CatalogException):
+            schema.init_schema(conn)
+        assert _versions(conn) == [12, 13]
+        assert _signals(conn) == list(_V13_SIGNALS)
+        assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
+        assert _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
+        tables = {t for (t,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()}
+        assert schema.REBALANCE_COUNTS_TABLE_NAME not in tables
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_13_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "v13.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        _version_13_store(conn)
+    finally:
+        conn.close()
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [12, 13]
+        assert _signals(conn) == list(_V13_SIGNALS)
+
+
+def test_a_fresh_store_has_the_counts_table_and_a_nullable_no_history_count() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        assert _columns(conn, schema.REBALANCE_COUNTS_TABLE_NAME) == {
+            "trial_id": ("BIGINT", True),
+            "session": ("DATE", True),
+            "name": ("VARCHAR", True),
+            "value": ("INTEGER", True),
+        }
+        assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
+        want = ("n_excluded_no_history", *schema.PROFITABILITY_REBALANCE_COLUMNS)
+        assert want == schema.REBALANCE_COUNT_COLUMNS
+    finally:
+        conn.close()
 
 
 # --- lock-error detection -----------------------------------------------
@@ -1101,8 +1284,9 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     (T76) is version 10 (renumbered from 9 at ready time, T84/#714 landed
     version 9 first); #859's retraction is version 11; the research registry
     (#926, T80) is version 12; the profitability rebalance columns (#720,
-    #1033, T85d) is version 13."""
-    assert schema.CURRENT_SCHEMA_VERSION == 13
+    #1033, T85d) is version 13; the generic rebalance counts and the
+    `signals.reason` prefix `CHECK` (#1153, T127) is version 14."""
+    assert schema.CURRENT_SCHEMA_VERSION == 14
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------

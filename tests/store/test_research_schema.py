@@ -33,6 +33,9 @@ _V11_DDL_SHA256 = {
         "fbbd9f7cb4ebb13b9a20bda2be5e55e70182813d53bde1b73bcf4f31c7d93de5"
     ),
 }
+#: `signals.reason`'s `CHECK` text in `_JOURNAL_TABLE_DDL` before version 14 (#1153,
+#: T127), which widened it and moved nothing else of the blob.
+_V13_SIGNALS_CHECK = "CHECK (reason IN ('selected', 'below_cut', 'excluded_no_history'))"
 _V11_RETRACTION_DDL_SHA256 = "d976e81c40b6b212eab80165bb570ca5c23a835b7dc0efcf9a87d7167dd4a4eb"
 
 
@@ -207,7 +210,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
     """Every pre-version-12 table's rows in insertion order (`trial_results`
     without `n_research` when it has the column)."""
     out = {}
-    for table in _tables(c) - set(schema.RESEARCH_TABLE_NAMES):
+    later = {*schema.RESEARCH_TABLE_NAMES, schema.REBALANCE_COUNTS_TABLE_NAME}
+    for table in _tables(c) - later:
         if table == "schema_version":
             continue
         exclude = (
@@ -222,8 +226,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_13() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 13
+def test_current_schema_version_is_14() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 14
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -293,6 +297,8 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
     master DDL text moves (`n_research` arrives by `ALTER TABLE`)."""
     for name, digest in _V11_DDL_SHA256.items():
         blob = "".join(getattr(schema, name))
+        if name == "_JOURNAL_TABLE_DDL":
+            blob = blob.replace(schema._SIGNALS_REASON_CHECK, _V13_SIGNALS_CHECK, 1)
         assert hashlib.sha256(blob.encode()).hexdigest() == digest, name
     retraction = "".join(schema._RETRACTION_TABLE_DDL[t] for t in ("securities", "listings"))
     assert hashlib.sha256(retraction.encode()).hexdigest() == _V11_RETRACTION_DDL_SHA256
@@ -301,20 +307,20 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
 # --- fresh store ---------------------------------------------------------------------
 
 
-def test_a_fresh_store_has_every_research_table_at_version_13(
+def test_a_fresh_store_has_every_research_table_at_version_14(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [13]
+    assert _versions(conn) == [14]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
 
-def test_init_schema_is_idempotent_on_version_13(conn: duckdb.DuckDBPyConnection) -> None:
+def test_init_schema_is_idempotent_on_version_14(conn: duckdb.DuckDBPyConnection) -> None:
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [13]
+    assert _versions(conn) == [14]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -595,7 +601,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12, 13]
+        assert _versions(c) == [10, 11, 12, 13, 14]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]
@@ -665,8 +671,8 @@ def test_a_read_only_open_of_a_version_11_store_serves_every_other_read(
         assert _versions(c) == [10, 11]
 
 
-def test_a_read_only_open_of_a_version_13_store_passes(tmp_path: Path) -> None:
-    path = tmp_path / "v13.duckdb"
+def test_a_read_only_open_of_a_version_14_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "v14.duckdb"
     with duckdb.connect(str(path)) as c:
         schema.init_schema(c)
     with duckdb.connect(str(path), read_only=True) as c:
