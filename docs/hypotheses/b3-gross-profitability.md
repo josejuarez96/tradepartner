@@ -1,16 +1,17 @@
 # Hypothesis: B3, long-only gross profitability (GP/A) tilt, monthly
 
-**Family:** profitability (proposed; not in `hypotheses.families` yet)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 recorded 2026-10-04 (#811)  ·  **Date:** 2026-10-03  ·  **Amended:** 2026-10-04 (#851, `in_sample_start` follows H1's #842 amendment); 2026-10-04 (#811, B3-3 to B3-8 decided as recommended: no parameter value changes, B4 goes to a third family `combined`, the spanning diagnostic stays outside the retirement rule); 2026-10-06 (#1033, from the owner's decisions of 2026-10-06 on #720 and the read-only coverage spike: `in_sample_start` follows H1's #975 re-pin to 2020-08-31, closing #1002; the portfolio is about 60 names; what is scored and its tilt are disclosed; the stale-facts baseline is restated; the family amendment is accepted and its tasks T85 to T85f are in the backtest plan)  ·  **Status:** draft, not registrable until plan tasks T85 to T85e and T78 land (T85f registers and runs it)
+**Family:** profitability (in `hypotheses.families` since T85)  ·  **Author:** team grossprof (agent draft on Fable 5.1, #720); owner answers B3-1 and B3-2 recorded 2026-10-03, B3-3 to B3-8 recorded 2026-10-04 (#811)  ·  **Date:** 2026-10-03  ·  **Amended:** 2026-10-04 (#851, `in_sample_start` follows H1's #842 amendment); 2026-10-04 (#811, B3-3 to B3-8 decided as recommended: no parameter value changes, B4 goes to a third family `combined`, the spanning diagnostic stays outside the retirement rule); 2026-10-06 (#1033, from the owner's decisions of 2026-10-06 on #720 and the read-only coverage spike: `in_sample_start` follows H1's #975 re-pin to 2020-08-31, closing #1002; the portfolio is about 60 names; what is scored and its tilt are disclosed; the stale-facts baseline is restated; the family amendment is accepted and its tasks T85 to T85f are in the backtest plan); 2026-10-07 (#1143, status text and the prior-evidence disclosure brought up to date before registration; no parameter, rule or count changed)  ·  **Status:** draft, registrable: T85 to T85e and T78 are merged (T85f registers and runs it)
 
-Merging this file does not register it, and today it **cannot** be registered: the
-`profitability` family, its frozen keys and its signal are not built yet (the
+Merging this file does not register it. Everything it needs is now on `main`: the
+`profitability` family, its frozen keys and its signal (the
 [backtest spec amendment of 2026-10-03, #720](../specs/backtest.md#amendment-2026-10-03-720-the-profitability-family-accepted-2026-10-06),
-accepted 2026-10-06, says what must be built; plan tasks T85 to T85e in
-[docs/plans/backtest.md](../plans/backtest.md) build it), and the statement facts it
-reads reach the owner's store only with plan task T78 ([data-foundation
-spec](../specs/data-foundation.md), amendment #660). The owner runs
-`tradepartner hypothesis register docs/hypotheses/b3-gross-profitability.md` after both
-(plan task T85f), on or after a date at which `holdout.end` is a completed month-end.
+accepted 2026-10-06, built by plan tasks T85 to T85e in
+[docs/plans/backtest.md](../plans/backtest.md), the last of them merged 2026-10-07 in
+#1105), and the statement facts it reads, which reached the owner's store with plan task
+T78 ([data-foundation spec](../specs/data-foundation.md), amendment #660; 2,134,064 rows,
+on by default since #1139, 2026-10-07). The owner runs
+`tradepartner hypothesis register docs/hypotheses/b3-gross-profitability.md` (plan task
+T85f), on or after a date at which `holdout.end` is a completed month-end.
 Before registering, the owner (who has answered every question at the end of this file:
 B3-1 and B3-2 on #720, B3-3 to B3-8 on #811) confirms that `in_sample_start` and the
 counts below still equal H1's file as registered (H1 registers first; this file followed
@@ -573,14 +574,25 @@ performance of quality and profitability factor products over the period; no fig
 from that memory is written here, because none can be cited, and nothing in the design
 was tuned on it. The holdout is not unseen in that sense.
 
-**Not seen.** No TradePartner trial of this family has run as of this draft; the
-registry holds H1's in-sample trials only (T45b, 2026-10-06), no holdout spend of any
-family. The 2026-10-06 coverage spike opened the store read-only, read no price after
+**Not seen.** No TradePartner trial of this family has run in the owner's store as of
+2026-10-07; the registry holds H1's in-sample trials only (T45b, 2026-10-06), no holdout
+spend of any family (H1's holdout waits on gates #1017 and #1018). The 2026-10-06 coverage spike opened the store read-only, read no price after
 any rebalance T and computed no return, so it is coverage data, not a result. The 2024–2025 entries in the Alpaca depth report are
 corporate-action probe facts, not returns. T78's real-store evidence (coverage at a
 month-end T, one hand-checked issuer's FY revenue, cost of revenue, gross profit and
-total assets against its 10-K) is data, not a result, and will have been seen; the owner
-names the issuer here once T78 lands.
+total assets against its 10-K) is data, not a result, and has been seen: coverage of
+968 to 971 of 1,008 at 2021-10-29, 2022-11-30 and 2023-10-31, and Apple's FY2022 10-K
+(revenue 394,328M, cost of revenue 223,546M, gross profit 170,782M, total assets
+352,755M), both in PR #1139.
+
+**Dry run on a scratch copy, 2026-10-07.** To check that registration and the in-sample
+run work end to end before the owner's T85f, an agent session copied the owner's store
+to a scratch file and ran `hypothesis register` and `backtest b3-gross-profitability
+--start 2020-08-31 --end 2023-12-29` against the copy, this file unchanged. That trial
+exists only in the copy's registry, not the owner's. It is an in-sample result over
+this file's own window, not a holdout one; treat its output as seen. No parameter,
+rule, count or threshold in this file changed after it: #1143's edits are the status
+text and this disclosure only.
 
 **What this means.** A holdout spend that shows a positive excess over SPY and a large
 shortfall against MTUM confirms what the period's benchmark facts already suggest and is

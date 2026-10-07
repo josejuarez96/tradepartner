@@ -261,18 +261,34 @@ def _match_delisting(
     security_ids: Sequence[str],
     exchange: str,
     accepted_at: datetime,
+    class_title: str | None,
 ) -> str | None:
     """The one `security_id` whose `delistings` row joins `(exchange,
-    accepted_at)` among `security_ids` (a CIK's candidates), or `None`."""
+    accepted_at)` among `security_ids` (a CIK's candidates), or `None`.
+
+    Two share classes of one CIK can file separate Form 25s accepted on the
+    same exchange in the same second (#1138); when more than one candidate
+    joins, the corpus record's own `class_title` -- the same Form 25
+    notification field each `delistings` row was built from -- picks the one
+    it names, resolved per corpus record instead of raising. Only when that
+    still leaves more than one (or none) is it reported ambiguous."""
     if not security_ids:
         return None
     rows = delistings_as_of(conn, t, list(security_ids))
     matches = rows.filter((pl.col("exchange") == exchange) & (pl.col("filed_at") == accepted_at))
     ids = matches["security_id"].unique().to_list()
     if len(ids) > 1:
+        title_filter = (
+            pl.col("class_title").is_null()
+            if class_title is None
+            else pl.col("class_title") == class_title
+        )
+        by_title = matches.filter(title_filter)["security_id"].unique().to_list()
+        if len(by_title) == 1:
+            return str(by_title[0])
         raise ValueError(
             f"{exchange} {accepted_at.isoformat()}: more than one security's delistings row "
-            f"matches ({sorted(ids)}); the master's resolution is ambiguous"
+            f"matches ({sorted(ids)}); class_title {class_title!r} does not resolve it"
         )
     return ids[0] if ids else None
 
@@ -472,7 +488,12 @@ def build_frame(corpus_path: Path, as_of: datetime, settings: Settings) -> Frame
         for record in kept:
             accepted_at = _parse_utc(record["form25_accepted_at"])
             sid = _match_delisting(
-                conn, t, ids_by_cik[record["cik"]], record["exchange"], accepted_at
+                conn,
+                t,
+                ids_by_cik[record["cik"]],
+                record["exchange"],
+                accepted_at,
+                record["class_title"],
             )
             resolved[record["listing_end_id"]] = sid
             if sid is None:

@@ -368,6 +368,11 @@ def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, Submission
                 columns["isInlineXBRL"],
                 strict=True,
             )
+            # #1138: a blank `acceptanceDateTime` leaves its accession out of
+            # `times` (#1055); skip it here too rather than aborting the
+            # whole payload's reduce on `KeyError`. The caller treats a
+            # missing accession as unstamped, same as one it never asked for.
+            if accession in times
         }
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError(f"submissions payload: malformed: {error!r}") from error
