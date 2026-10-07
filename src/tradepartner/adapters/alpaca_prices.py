@@ -1068,6 +1068,16 @@ class ListingResolver:
         """True for any security with a listing row, assigned or not."""
         return security_id in self._by_security
 
+    def first_span_lead(self, security_id: str) -> FirstSpanLead | None:
+        """`security_id`'s recorded `FirstSpanLead` (#974), or `None` when
+        it has none: no first session, its first span refused for a reused
+        ticker, an ambiguous or contested first span, or
+        `alpaca.first_span_lead` off (no `first_sessions` at all, #1122:
+        the resolver, not a raw listing row, decides which row the first
+        span is -- an unreadable ticker (#844) or a same-day typo dropped
+        (#819) can move it)."""
+        return self._first_lead_of.get(security_id)
+
 
 def _company(security_id: str) -> str:
     """The CIK of a `<cik>` or `<cik>:<class>` id; any other id is its own."""

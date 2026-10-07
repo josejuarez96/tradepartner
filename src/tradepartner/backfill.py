@@ -139,11 +139,7 @@ from typing import Any
 
 import duckdb
 
-from tradepartner.adapters.alpaca_prices import (
-    ListingResolver,
-    alpaca_symbol,
-    is_placeholder_ticker,
-)
+from tradepartner.adapters.alpaca_prices import ListingResolver, alpaca_symbol
 from tradepartner.adapters.filings import FilingSource
 from tradepartner.adapters.prices import PriceSource
 from tradepartner.calendar import is_session, next_session
@@ -901,25 +897,32 @@ def _led(
 ) -> set[str]:
     """The securities not in `ids` that a first-span lead (#974) assigns a
     session of `window` under an Alpaca symbol, before the start of their
-    first ticker-bearing listing row (`rows`, `listing_ends_as_of`), when
-    that row passes `_fetched`. A rename lead (#843) runs only after a
-    security's first span, so a session before that row is the first-span
-    lead's."""
-    firsts: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if is_placeholder_ticker(str(row["ticker"])):
-            continue
-        held = firsts.get(row["security_id"])
-        if held is None or row["valid_from"] < held["valid_from"]:
-            firsts[row["security_id"]] = row
+    first span (`resolver.first_span_lead`, #1122: the resolver's own
+    span, never a raw listing row recomputed here -- an unreadable ticker
+    read as another string (#844) or a same-day typo dropped (#819) can
+    move which row the resolver treats as the first, so recomputing it
+    from `rows` directly could disagree with the resolver and either miss
+    or wrongly grant a lead), when the listing row at that start passes
+    `_fetched`. A rename lead (#843) runs only after a security's first
+    span, so a session before its start is the first-span lead's."""
+    by_security: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for listing_row in rows:
+        by_security[listing_row["security_id"]].append(listing_row)
     sessions = _sessions_in(window)
     out: set[str] = set()
-    for sid, row in firsts.items():
-        if sid in ids or not _fetched(sid, row, benchmarks, types, settings):
+    for sid, sid_rows in by_security.items():
+        if sid in ids:
             continue
-        before = [day for day in sessions if day < row["valid_from"]]
-        tickers = [tk for tk in resolver.symbols(sid, *window) if alpaca_symbol(tk) is not None]
-        if any(resolver.lead(tk, day) == sid for tk in tickers for day in before):
+        lead = resolver.first_span_lead(sid)
+        if lead is None:
+            continue
+        row: dict[str, Any] | None = next(
+            (r for r in sid_rows if r["valid_from"] == lead.end), None
+        )
+        if row is None or not _fetched(sid, row, benchmarks, types, settings):
+            continue
+        before = [day for day in sessions if day < lead.end]
+        if any(resolver.lead(lead.ticker, day) == sid for day in before):
             out.add(sid)
     return out
 

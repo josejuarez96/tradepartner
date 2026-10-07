@@ -33,10 +33,12 @@ from tradepartner.adapters.filings import (
     FilingIndexEntry,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
-from tradepartner.backfill import _window_names, fill_holes
+from tradepartner.backfill import _price_chunk, _window_names, fill_holes
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, _read
 from tradepartner.repair import store_resolver
+from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.schema import init_schema
 
 SPAC = "0000000005"  # SIC 6770: every class id of it is typed spac
 SPAC_WARRANTS = f"{SPAC}:redeemable-warrants"
@@ -239,3 +241,93 @@ def test_a_led_id_is_fetched_only_once_its_cover_page_is_known(settings: Setting
     assert LED not in before
     after, _ = _window(settings, JUNE_2017, at=_at(2019, 3, 16))
     assert LED in after
+
+
+def test_price_chunk_builds_its_resolver_at_the_clock_when_the_month_starts(
+    settings: Settings,
+) -> None:
+    """#1122 item 3 (#990.4): `_price_chunk` must read the store's
+    resolver at the clock it calls when the month starts (`started`), not
+    at a later `clock()` call within the same chunk (`ingested_at`,
+    stamped once the fetch returns). The store is built directly (not via
+    `backfill()`) so every row's `known_at` is under this test's control:
+    the reference symbol is known well before either probe, and LEDX's
+    cover page is known at `_at(2019, 3, 15)`, between them. A clock
+    landing just before that cover page on the first call and just after
+    it on the second would wrongly fetch LED here if the resolver read
+    the later value instead of `started`."""
+    filed = _at(2016, 3, 1)
+    cover = _at(2019, 3, 15)
+    filing_common = {"ingested_at": filed, "source": "edgar", "provenance": "filing"}
+    ref_known = _at(2010, 1, 1)
+    ref_common = {"ingested_at": ref_known, "source": "edgar", "provenance": "filing"}
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(
+            conn,
+            "securities",
+            {"security_id": LED, "cik": LED, "name": "Led Co", "known_at": filed} | filing_common,
+        )
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": LED,
+                "sic": 3571,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": filed,
+            }
+            | filing_common,
+        )
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": LED,
+                "ticker": "LEDX",
+                "exchange": "NYSE",
+                "class_title": "Common Stock",
+                "valid_from": date(2019, 3, 15),
+                "known_at": cover,
+                "ingested_at": cover,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        insert_row(
+            conn,
+            "securities",
+            {"security_id": SPY, "cik": "0000884394", "name": "SPY Trust", "known_at": ref_known}
+            | ref_common,
+        )
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": SPY,
+                "sic": None,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": ref_known,
+            }
+            | ref_common,
+        )
+        insert_row(
+            conn,
+            "listings",
+            {
+                "security_id": SPY,
+                "ticker": "SPY",
+                "exchange": "NYSE",
+                "class_title": "Common Stock",
+                "valid_from": date(2010, 1, 1),
+                "known_at": ref_known,
+            }
+            | ref_common,
+        )
+    ticks = iter([_at(2019, 3, 14), _at(2019, 3, 16), _at(2019, 3, 17)])
+    prices = _History()
+    chunk = _price_chunk(settings, prices, SINCE, JUNE_2017, lambda: next(ticks))
+    assert chunk is not None and chunk.status == OK, chunk
+    assert LED not in prices.fetched[date(2017, 6, 1)]
