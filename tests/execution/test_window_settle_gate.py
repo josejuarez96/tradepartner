@@ -113,6 +113,17 @@ def test_a_buys_name_held_above_the_ledger_is_refused(s: Settle) -> None:
     s.refused(UNEXPLAINED_POSITION, "tp-a")
 
 
+def test_an_unmapped_name_is_refused_even_without_a_quantity_mismatch(s: Settle) -> None:
+    s.place("tp-a")
+    # A second journal name claiming SPY makes the symbol reconciliation
+    # ambiguous; the target's terminal broker reading still requires the gate.
+    s.place("tp-other", security_id="SEC_OTHER", symbol="SPY", acknowledged=False)
+    s.fake.apply("tp-a", Expire())
+    s.engage()
+    message = s.refused(UNEXPLAINED_POSITION, "tp-a")
+    assert "maps to no broker symbol" in message
+
+
 def test_a_buys_name_within_the_tolerance_is_accepted(s: Settle) -> None:
     s.place("tp-a")
     s.fake.apply("tp-a", Expire())
