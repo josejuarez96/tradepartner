@@ -25,7 +25,6 @@ All instants are tz-aware UTC.
 from __future__ import annotations
 
 import math
-import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -36,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 from exchange_calendars.exchange_calendar_xnys import XNYSExchangeCalendar
 
-from tradepartner.config import Cadence, Settings
+from tradepartner.config import _HHMM_RE, Cadence, Settings
 
 __all__ = [
     "QuietInterval",
@@ -70,8 +69,6 @@ _REGULAR_OPEN: Final = XNYSExchangeCalendar.open_times[-1][1]
 # weekly one.
 _HORIZON_DAYS: Final = 14
 
-_HHMM = re.compile(r"\A([01]\d|2[0-3]):([0-5]\d)\Z")
-
 # Instants `system_timezone_matches` compares UTC offsets at: every six hours from a
 # year before the check to two years after it, so both DST transitions of each year,
 # and the rules in force now and next, are covered.
@@ -103,7 +100,7 @@ def _require_aware(value: datetime, name: str) -> None:
 
 
 def _parse_hhmm(text: str) -> tuple[int, int]:
-    match = _HHMM.match(text)
+    match = _HHMM_RE.match(text)
     if match is None:
         raise ValueError(f"lab.quiet_intervals time {text!r} is not HH:MM (00:00 to 23:59)")
     return int(match.group(1)), int(match.group(2))

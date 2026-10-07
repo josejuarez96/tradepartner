@@ -37,7 +37,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -192,7 +192,8 @@ def task_brief(task: Task, tasks: Sequence[Task]) -> str:
 
 
 def is_ready(task: Task, by_id: dict[str, Task]) -> bool:
-    """A task is ready when it is not done and every dependency is ticked in the plan."""
+    """A task is ready when it is not done and every dependency is done: ticked in the
+    plan, or (from a ref) its code PR merged there (`load_tasks`, #1130)."""
     if task.done:
         return False
     return all(dep in by_id and by_id[dep].done for dep in task.depends_on)
@@ -756,11 +757,29 @@ def read_plans(root: Path, ref: str | None) -> dict[str, str]:
         ) from None
 
 
+# A squash-merged code PR's subject on main: `feat(scope): title (Tn) (#pr)`. Plan, spec and
+# process edits (`docs`, `chore(process)` ...) name task ids too, so only code types count.
+MERGED_TASK_RE = re.compile(
+    r"^(?:feat|fix|test|refactor|perf)(?:\([^)]*\))?!?: .* \((T\d+[a-z]?)\) \(#\d+\)$"
+)
+
+
+def merged_task_ids(subjects: Iterable[str]) -> frozenset[str]:
+    """Task ids whose code PR is squash-merged, from commit subjects on the plan ref (#1130)."""
+    return frozenset(m.group(1) for s in subjects if (m := MERGED_TASK_RE.match(s)))
+
+
 def load_tasks(root: Path, ref: str | None) -> list[Task]:
+    """Plan tasks from `ref` (or the working tree). On a ref, a task whose code PR is merged
+    there counts as done even before a fold ticks its box (#1130), so its dependants are
+    ready and the task itself is not offered again."""
     tasks: list[Task] = []
     for name, text in read_plans(root, ref).items():
         tasks.extend(parse_plan(text, name))
-    return tasks
+    if ref is None:
+        return tasks
+    merged = merged_task_ids(_git(root, "log", "--format=%s", ref).splitlines())
+    return [replace(t, done=True) if t.id in merged and not t.done else t for t in tasks]
 
 
 def plan_ref_from_env() -> str | None:
@@ -875,7 +894,9 @@ def _check_task_claimable(
     task: Task, tasks: Sequence[Task], allow_unready: bool, owner_task: bool
 ) -> None:
     if task.done:
-        raise SystemExit(f"{task.id} is already ticked in {task.plan} on the merged plan")
+        raise SystemExit(
+            f"{task.id} is already ticked in {task.plan}, or its PR is merged, on the merged plan"
+        )
     if task.owner and not owner_task:
         raise SystemExit(
             f"{task.id} needs the owner's keys (.env). Claim it only from the window Jose is "
@@ -1073,7 +1094,9 @@ def cmd_status(gh: GitHub, root: Path, *, ref: str | None = None) -> int:
         print("  none")
 
     claimed_tasks = {t for i in issues for t in tasks_of(i.labels) if team_of(i.labels)}
-    print("\nREADY AND UNCLAIMED (plan tasks whose dependencies are merged on the plan ref)")
+    print(
+        "\nREADY AND UNCLAIMED (plan tasks whose dependencies are ticked or merged on the plan ref)"
+    )
     frontier = [t for t in ready_tasks(tasks) if t.id not in claimed_tasks]
     for t in frontier:
         who = "owner" if t.owner else "agent"

@@ -83,6 +83,10 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
 }
 _QUALIFIED_TAG = re.compile(r"[A-Za-z][A-Za-z0-9-]*:[A-Za-z_][A-Za-z0-9_]*")
 
+# Shared zero-padded 24h HH:MM pattern used by both the config validator and
+# `backtest/quiet.py`'s runtime check.
+_HHMM_RE = re.compile(r"\A([01]\d|2[0-3]):([0-5]\d)\Z")
+
 
 def _default_env_file() -> Path:
     """Resolve the `.env` path fresh on every `Settings()` construction.
@@ -989,6 +993,24 @@ class LabConfig(BaseModel):
         bad = [day for day in value if day < 0 or day > 6]
         if bad:
             raise ValueError(f"lab.quiet_weekdays entries must be 0-6 (Monday-Sunday), got {bad}")
+        return value
+
+    @field_validator("quiet_intervals")
+    @classmethod
+    def _validate_quiet_intervals(cls, value: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Refuse a pair whose times are not zero-padded `HH:MM` or whose end
+        is not after its start."""
+        for start_text, end_text in value:
+            for text in (start_text, end_text):
+                if not _HHMM_RE.match(text):
+                    raise ValueError(
+                        f"lab.quiet_intervals time {text!r} is not HH:MM (00:00 to 23:59)"
+                    )
+            if end_text <= start_text:
+                raise ValueError(
+                    f"lab.quiet_intervals pair [{start_text!r}, {end_text!r}] must end after it "
+                    "starts on the same day"
+                )
         return value
 
     @field_validator("seconds_per_variant_default")
