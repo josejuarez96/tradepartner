@@ -63,6 +63,7 @@ def _listing(
     exchange: str,
     valid_from: date,
     known_at: datetime,
+    class_title: str = "Common Stock",
 ) -> None:
     insert_row(
         conn,
@@ -71,7 +72,7 @@ def _listing(
             "security_id": security_id,
             "ticker": ticker,
             "exchange": exchange,
-            "class_title": "Common Stock",
+            "class_title": class_title,
             "valid_from": valid_from,
             "known_at": known_at,
             "ingested_at": known_at,
@@ -87,6 +88,7 @@ def _delisting(
     exchange: str,
     filed_at: datetime,
     effective_on: date,
+    class_title: str = "Common Stock",
 ) -> None:
     insert_row(
         conn,
@@ -94,7 +96,7 @@ def _delisting(
         {
             "security_id": security_id,
             "form": "25",
-            "class_title": "Common Stock",
+            "class_title": class_title,
             "exchange": exchange,
             "filed_at": filed_at,
             "effective_on": effective_on,
@@ -535,6 +537,49 @@ def test_a_successor_known_only_after_t_does_not_count(settings: Settings, tmp_p
 
     df = pl.read_parquet(result.frame_path)
     assert _row(df, "LES")["rule_successor_id"] is None
+
+
+def test_two_share_classes_delisting_at_the_same_second_resolve_by_class_title(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#1138: two share classes of one CIK can each file a Form 25 accepted
+    on the same exchange in the same second. `_match_delisting` must resolve
+    each corpus record to its own security by `class_title` instead of
+    raising on the ambiguous `(exchange, filed_at)` match."""
+    research = settings.research.model_copy(update={"data_dir": str(tmp_path / "research")})
+    out = settings.model_copy(update={"research": research})
+    cik = "0004000001"
+    accepted = datetime(2026, 6, 1, 14, tzinfo=UTC)
+
+    conn = duckdb.connect(out.store.path)
+    configure_connection(conn)
+    schema.init_schema(conn)
+    _security(conn, "0004000001-A", cik, EARLY)
+    _listing(
+        conn, "0004000001-A", "AAA.A", "NASDAQ", date(2020, 1, 1), EARLY, "Class A Common Stock"
+    )
+    _delisting(conn, "0004000001-A", "NASDAQ", accepted, date(2026, 6, 11), "Class A Common Stock")
+    _security(conn, "0004000001-B", cik, EARLY)
+    _listing(
+        conn, "0004000001-B", "AAA.B", "NASDAQ", date(2020, 1, 1), EARLY, "Class B Common Stock"
+    )
+    _delisting(conn, "0004000001-B", "NASDAQ", accepted, date(2026, 6, 11), "Class B Common Stock")
+    conn.commit()
+    conn.close()
+
+    record_a = _minimal_record("LEA", cik, "NASDAQ", accepted)
+    record_a["class_title"] = "Class A Common Stock"
+    record_b = _minimal_record("LEB", cik, "NASDAQ", accepted)
+    record_b["class_title"] = "Class B Common Stock"
+    corpus_path = tmp_path / "corpus.jsonl"
+    corpus_path.write_text(json.dumps(record_a) + "\n" + json.dumps(record_b) + "\n")
+
+    result = frame_mod.build_frame(corpus_path, T, out)
+
+    df = pl.read_parquet(result.frame_path)
+    assert _row(df, "LEA")["rule_status"] == "delisted"
+    assert _row(df, "LEB")["rule_status"] == "delisted"
+    assert result.unmatched_delistings == ()
 
 
 def test_a_form15_marker_outside_the_window_does_not_veto(
