@@ -285,6 +285,7 @@ def test_page_is_in_the_shell_navigation(
         "Data health",
         "Backtest",
         _PAGE,
+        "Research",
         "Operations",
         "Override",
     ]
