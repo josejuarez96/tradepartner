@@ -146,8 +146,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_13() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 13
+def test_current_schema_version_is_14() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 14
 
 
 def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
@@ -164,9 +164,9 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 # --- fresh store and migration --------------------------------------------------------
 
 
-def test_fresh_init_creates_the_journal_at_version_13(journal: duckdb.DuckDBPyConnection) -> None:
+def test_fresh_init_creates_the_journal_at_version_14(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [13]
+    assert _versions(journal) == [14]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -177,7 +177,9 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
     # (`tests/store/test_retraction_schema.py`); version 12 (#926) adds
     # `trial_results.n_research` (`tests/store/test_research_schema.py`);
     # version 13 (#720, #1033, T85d) adds `trial_rebalances`'s six
-    # `PROFITABILITY_REBALANCE_COLUMNS` (`tests/store/test_schema.py`).
+    # `PROFITABILITY_REBALANCE_COLUMNS` (`tests/store/test_schema.py`);
+    # version 14 (#1153, T127) makes its `n_excluded_no_history` nullable and
+    # adds `trial_rebalance_counts`.
     kept_without_versions = tuple(
         name
         for name in kept
@@ -198,10 +200,10 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         conn.close()
     assert after == before
     assert versions[:1] == applied_before
-    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
         schema.MASTER_CHECK_TABLE_NAMES
-    ) | set(schema.RESEARCH_TABLE_NAMES)
+    ) | set(schema.RESEARCH_TABLE_NAMES) | {schema.REBALANCE_COUNTS_TABLE_NAME}
 
 
 def test_migrated_journal_matches_a_fresh_store(
@@ -223,7 +225,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
         conn.close()
     with duckdb.connect(str(v4_path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 
 
 def test_an_unknown_later_version_is_refused(tmp_path: Path) -> None:
@@ -335,6 +337,12 @@ def _row(table: str, **values: object) -> dict[str, object]:
             "kind": "no_window",
             "message": "m",
             "at": _NOW,
+        },
+        "signals": {
+            "run_id": 1,
+            "rebalance_session": _NOW.date(),
+            "security_id": "SEC_A",
+            "reason": "selected",
         },
     }
     return {**base[table], "known_at": _NOW, "ingested_at": _NOW, **values}
@@ -464,6 +472,21 @@ def test_window_stop_states_include_abandoned(journal: duckdb.DuckDBPyConnection
         _insert(journal, "paper_window_stops", _row("paper_window_stops", state=state))
     with pytest.raises(duckdb.ConstraintException):
         _insert(journal, "paper_window_stops", _row("paper_window_stops", state="paused"))
+
+
+def test_signal_reasons_are_checked_by_prefix_not_by_closed_set(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    """`signals.reason` is no closed enum since version 14 (#1153, T127; ADR 0014
+    point 3): its own `CHECK` accepts `selected`, `below_cut` and any
+    `excluded_<reason>`, refuses anything else and NULL."""
+    assert ("signals", "reason") not in schema.JOURNAL_ENUMS
+    assert schema.SIGNAL_REASONS == ("selected", "below_cut")
+    for reason in ("selected", "below_cut", "excluded_no_history", "excluded_sector"):
+        _insert(journal, "signals", _row("signals", reason=reason))
+    for reason in ("foo", "excluded", "Excluded_sector", None):
+        with pytest.raises(duckdb.ConstraintException):
+            _insert(journal, "signals", _row("signals", reason=reason))
 
 
 @pytest.mark.parametrize(("table", "column"), sorted(schema.JOURNAL_ENUMS))

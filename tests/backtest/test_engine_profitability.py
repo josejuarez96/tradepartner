@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import date, datetime, timedelta
 from typing import Any
 
+import duckdb
 import polars as pl
 import pytest
 
 from backtest.fake_provider import FakeProvider
 from backtest.test_engine import T0, T1, _handle, _params, _provider
+from tradepartner.backtest import engine
 from tradepartner.backtest.engine import plan, run
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.calendar import session_close
+from tradepartner.config import Settings
+from tradepartner.store import registry, schema
 
 
 def _facts() -> pl.DataFrame:
@@ -51,6 +56,36 @@ def _facts() -> pl.DataFrame:
     )
 
 
+def _registered_handle(conn: duckdb.DuckDBPyConnection, params: Settings) -> registry.TrialHandle:
+    """A synthetic `profitability` trial on a scratch store, base level 15 bps."""
+    settings = Settings(_env_file=None)
+    hypothesis = registry.register_hypothesis(
+        conn,
+        slug="b3-fixture",
+        family="profitability",
+        title="B3 fixture",
+        doc_path="docs/hypotheses/b3.md",
+        doc_sha256="0" * 64,
+        params={registry.BASE_COST_KEY: params.costs.per_side_bps},
+        in_sample_start=date(2010, 1, 1),
+        holdout_start=date(2025, 1, 1),
+        holdout_end=date(2025, 12, 31),
+        registered_by="test",
+        settings=settings,
+    )
+    return registry.open_trial(
+        conn,
+        hypothesis_id=hypothesis.hypothesis_id,
+        kind="in_sample",
+        start_session=T0,
+        end_session=T1,
+        data_cutoff=None,
+        synthetic=True,
+        run_by="test",
+        settings=settings,
+    )
+
+
 class _Provider(FakeProvider):
     facts_override: pl.DataFrame | None = None
 
@@ -83,6 +118,12 @@ def test_family_reads_and_counts() -> None:
         "n_derived": 0,
     }
     assert planned.n_excluded_no_history == 0
+    assert planned.exclusions == {
+        "sector": (),
+        "no_facts": (),
+        "stale_facts": (),
+        "malformed": (),
+    }
     assert [c.method for c in provider.calls] == [
         "universe",
         "statement_facts",
@@ -94,8 +135,15 @@ def test_family_reads_and_counts() -> None:
 
     result = run(params, _provider_with_facts(), T0, T1, _handle(), [15.0], family="profitability")
     row = result[15.0].rebalances[0]
-    assert (row.n_ranked, row.n_excluded_no_facts, row.n_derived) == (4, 0, 0)
-    assert row.n_excluded_no_history == 0
+    assert row.counts == planned.counts
+    columns = row.columns()
+    assert (columns["n_ranked"], columns["n_excluded_no_facts"], columns["n_derived"]) == (4, 0, 0)
+    assert columns["n_excluded_no_history"] is None  # not a profitability count
+    with duckdb.connect(":memory:") as conn:
+        schema.init_schema(conn)
+        handle = _registered_handle(conn, params)
+        registry.write_rebalances(conn, handle, result[15.0].rebalances)
+        assert registry.rebalance_counts(conn, handle.trial_id) == {row.session: planned.counts}
 
 
 def test_momentum_never_reads_facts_and_keeps_profitability_counts_null() -> None:
@@ -103,7 +151,12 @@ def test_momentum_never_reads_facts_and_keeps_profitability_counts_null() -> Non
     result = run(_params(), provider, T0, T1, _handle(), [15.0], family="momentum")
     assert not {"statement_facts", "sics"} & {call.method for call in provider.calls}
     row = result[15.0].rebalances[0]
-    assert (row.n_ranked, row.n_excluded_no_facts, row.n_derived) == (None, None, None)
+    columns = row.columns()
+    assert (columns["n_ranked"], columns["n_excluded_no_facts"], columns["n_derived"]) == (
+        None,
+        None,
+        None,
+    )
 
 
 def test_fact_accepted_after_close_first_enters_the_next_plan() -> None:
@@ -137,3 +190,14 @@ def test_table_has_the_declared_reads_and_construction_sections() -> None:
     assert signal_for("profitability").reads == ("statement_facts", "sics")
     assert signal_for("profitability").section == "profitability"
     assert signal_for("momentum").reads == ("adjusted_prices",)
+
+
+def test_a_plan_refuses_an_exclusion_reason_its_family_does_not_declare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Plan.exclusions` holds exactly the declared reasons (#1153, T127): a signal
+    reporting another one is refused, not dropped."""
+    undeclared = dataclasses.replace(signal_for("momentum"), exclusion_reasons=())
+    monkeypatch.setattr(engine, "signal_for", lambda family: undeclared)
+    with pytest.raises(ValueError, match="no_history"):
+        plan(_provider(), _params(), T0, family="momentum")

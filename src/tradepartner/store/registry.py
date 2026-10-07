@@ -61,7 +61,7 @@ import os
 import statistics
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import astuple, dataclass, fields
+from dataclasses import astuple, dataclass, field, fields
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -73,7 +73,11 @@ import pyarrow as pa
 from tradepartner.calendar import last_session_of_month
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
-from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
+from tradepartner.store.schema import (
+    REBALANCE_COUNT_COLUMNS,
+    REBALANCE_COUNTS_TABLE_NAME,
+    TABLE_PROVENANCE_VALUES,
+)
 
 BASE_COST_KEY: Final = "costs.per_side_bps"
 ORACLE_FAMILY: Final = "oracle"
@@ -222,14 +226,15 @@ class WeightRow:
 
 @dataclass(frozen=True)
 class RebalanceRow:
-    """One `trial_rebalances` row (spec req 5 counts).
+    """One `trial_rebalances` row (spec req 5 counts) and its plan's counts.
 
-    The six `profitability`-family counts (#720, #1033, T85d:
-    `schema.PROFITABILITY_REBALANCE_COLUMNS`) are optional keyword fields,
-    defaulting to `None` (written as `NULL`), so a `momentum` row — which
-    never ranks or excludes by `statement_facts`/`sics` — is built the same
-    way it is today, and a later generic refactor can pass them all as one
-    mapping unchanged."""
+    `counts` is the plan's count mapping, name to value, whole (ADR 0014
+    point 3; #1153, T127): `write_rebalances` writes it to
+    `trial_rebalance_counts` once per rebalance, at the trial's base cost
+    level, and fills each fixed count column (`schema.REBALANCE_COUNT_COLUMNS`:
+    `n_excluded_no_history` and T85d's six `profitability` columns) from it by
+    name on every level's row, NULL when absent, so both reads agree
+    (`columns`)."""
 
     cost_per_side_bps: float
     session: date
@@ -244,15 +249,16 @@ class RebalanceRow:
     n_missing_fill: int
     n_delisting_exits: int
     n_stale_exits: int
-    n_excluded_no_history: int
     n_dropped_dividends: int
     n_late_dividends: int
-    n_ranked: int | None = None
-    n_excluded_no_facts: int | None = None
-    n_excluded_stale_facts: int | None = None
-    n_excluded_sector: int | None = None
-    n_excluded_malformed: int | None = None
-    n_derived: int | None = None
+    counts: Mapping[str, int] = field(default_factory=dict)
+
+    def columns(self) -> dict[str, Any]:
+        """The `trial_rebalances` row this writes: every field but `counts`, then
+        each `schema.REBALANCE_COUNT_COLUMNS` column from `counts` by name, None
+        (NULL) when the plan does not report it."""
+        values = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "counts"}
+        return values | {name: self.counts.get(name) for name in REBALANCE_COUNT_COLUMNS}
 
 
 @dataclass(frozen=True)
@@ -731,8 +737,74 @@ def write_weights(
 def write_rebalances(
     conn: duckdb.DuckDBPyConnection, handle: TrialHandle, rows: Iterable[RebalanceRow]
 ) -> None:
-    """Append `trial_rebalances` rows for an open trial."""
-    _write_rows(conn, handle, "trial_rebalances", RebalanceRow, rows)
+    """Append `trial_rebalances` rows for an open trial (`RebalanceRow.columns`
+    each), and, for the rows at the trial's base cost level (its hypothesis's
+    `costs.per_side_bps`), one `trial_rebalance_counts` row per count name: a
+    plan's counts are the same at every level, so they are stored once per
+    rebalance, as `trial_weights` is (#1153, T127). Refuses a count that is
+    not an integer."""
+    rows = list(rows)
+    for row in rows:
+        for name, value in row.counts.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"rebalance count {name!r} must be an int, got {value!r}")
+    _write_values(
+        conn,
+        handle,
+        "trial_rebalances",
+        _REBALANCE_COLUMNS,
+        _date_fields(RebalanceRow),
+        (tuple(row.columns().values()) for row in rows),
+    )
+    base = _base_level(conn, handle.hypothesis_id)
+    _write_values(
+        conn,
+        handle,
+        REBALANCE_COUNTS_TABLE_NAME,
+        ("session", "name", "value"),
+        {"session"},
+        (
+            (row.session, name, value)
+            for row in rows
+            if row.cost_per_side_bps == base
+            for name, value in sorted(row.counts.items())
+        ),
+    )
+
+
+def rebalance_counts(conn: duckdb.DuckDBPyConnection, trial_id: int) -> dict[date, dict[str, int]]:
+    """`trial_id`'s `trial_rebalance_counts`, rebalance session to count name to
+    value, sessions ascending and names sorted; empty for a trial with none
+    (version 14, #1153, T127)."""
+    counts: dict[date, dict[str, int]] = {}
+    for session, name, value in conn.execute(
+        f"SELECT session, name, value FROM {REBALANCE_COUNTS_TABLE_NAME} "
+        "WHERE trial_id = ? ORDER BY session, name",
+        [trial_id],
+    ).fetchall():
+        counts.setdefault(session, {})[name] = value
+    return counts
+
+
+def _base_level(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> float:
+    """The hypothesis's base cost level, read as `family_sharpes` reads it."""
+    row = conn.execute(
+        "SELECT params_json FROM hypotheses WHERE hypothesis_id = ?", [hypothesis_id]
+    ).fetchone()
+    if row is None:
+        raise RegistryError(f"hypothesis {hypothesis_id} does not exist")
+    return float(json.loads(row[0])[BASE_COST_KEY])
+
+
+#: `trial_rebalances`' columns in `RebalanceRow.columns` order.
+_REBALANCE_COLUMNS: Final = (
+    *(f.name for f in fields(RebalanceRow) if f.name != "counts"),
+    *REBALANCE_COUNT_COLUMNS,
+)
+
+
+def _date_fields(row_type: type[Any]) -> set[str]:
+    return {f.name for f in fields(row_type) if f.type == "date"}
 
 
 def _write_rows(
@@ -742,15 +814,26 @@ def _write_rows(
     row_type: type[Any],
     rows: Iterable[Any],
 ) -> None:
-    """Bulk-append typed rows through one Arrow table (thousands of equity
-    rows per trial). Date fields must be dates, not datetimes, which DuckDB
-    would silently truncate."""
+    """Bulk-append typed rows (`_write_values`, one tuple per dataclass row)."""
+    names = tuple(f.name for f in fields(row_type))
+    _write_values(conn, handle, table, names, _date_fields(row_type), map(astuple, rows))
+
+
+def _write_values(
+    conn: duckdb.DuckDBPyConnection,
+    handle: TrialHandle,
+    table: str,
+    names: Sequence[str],
+    date_names: set[str],
+    rows: Iterable[tuple[Any, ...]],
+) -> None:
+    """Bulk-append rows of `names`' values through one Arrow table (thousands
+    of equity rows per trial). Date columns must be dates, not datetimes,
+    which DuckDB would silently truncate."""
     _check_open(conn, handle)
-    names = [f.name for f in fields(row_type)]
-    date_names = {f.name for f in fields(row_type) if f.type == "date"}
     columns: dict[str, list[Any]] = {name: [] for name in ["trial_id", *names]}
     for row in rows:
-        for name, value in zip(names, astuple(row), strict=True):
+        for name, value in zip(names, row, strict=True):
             if name in date_names and (not isinstance(value, date) or isinstance(value, datetime)):
                 raise TypeError(f"{table}.{name} must be a date, got {value!r}")
             columns[name].append(value)
