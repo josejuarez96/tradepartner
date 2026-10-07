@@ -902,9 +902,11 @@ def _led(
     read as another string (#844) or a same-day typo dropped (#819) can
     move which row the resolver treats as the first, so recomputing it
     from `rows` directly could disagree with the resolver and either miss
-    or wrongly grant a lead), when the listing row at that start passes
-    `_fetched`. A rename lead (#843) runs only after a security's first
-    span, so a session before its start is the first-span lead's."""
+    or wrongly grant a lead), when that ticker is an Alpaca symbol (else
+    the fetch never sends it, as `_assignable` checks for an ordinary
+    span) and the listing row at that start passes `_fetched`. A rename
+    lead (#843) runs only after a security's first span, so a session
+    before its start is the first-span lead's."""
     by_security: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for listing_row in rows:
         by_security[listing_row["security_id"]].append(listing_row)
@@ -914,7 +916,7 @@ def _led(
         if sid in ids:
             continue
         lead = resolver.first_span_lead(sid)
-        if lead is None:
+        if lead is None or alpaca_symbol(lead.ticker) is None:
             continue
         row: dict[str, Any] | None = next(
             (r for r in sid_rows if r["valid_from"] == lead.end), None

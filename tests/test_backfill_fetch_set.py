@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
+import duckdb
 import pytest
 from test_backfill import (
     JUNE_WINDOW,
@@ -243,19 +246,64 @@ def test_a_led_id_is_fetched_only_once_its_cover_page_is_known(settings: Setting
     assert LED in after
 
 
+UNREADABLE_LED = "0000000025"  # first filing 2016; first span's ticker reads as junk (#844)
+
+
+def _with_unreadable_first_span(**kwargs: object) -> FixtureFilingSource:
+    """`_filings` plus a company whose first span's only row has an
+    unreadable ticker (#844: `alpaca_prices._unreadable`) -- kept "as
+    written" since it is the security's first row (no earlier readable
+    ticker to read it as, `_clean_rows`'s docstring), so the resolver
+    still records a `FirstSpanLead` for it, under that unreadable
+    string."""
+    cik = UNREADABLE_LED
+    accession = f"{cik}-19-000001"
+    cover = _at(2019, 3, 15)
+    index = [
+        FilingIndexEntry(cik, f"Co {cik}", "10-K", f"{cik}-16-000001", _at(2016, 3, 1)),
+        FilingIndexEntry(cik, f"Co {cik}", "10-K", accession, cover),
+    ]
+    headers = [FilingHeader(cik, accession, "10-K", 3571, cover)]
+    covers = [CoverPage(cik, accession, cover, (CoverListing("Common Stock", "F&G", "NYSE"),))]
+    return _filings(
+        extra_index=index,
+        extra_headers=headers,
+        extra_covers=covers,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_an_unreadable_first_span_ticker_is_never_fetched(settings: Settings) -> None:
+    """quant-auditor (PR #1132): `_led` must still check the first-span
+    lead's ticker is an Alpaca symbol before admitting it. An unreadable
+    ticker on a security's only (first) row is kept as written, never
+    dropped (#844's "as written" rule), so the resolver records a
+    `FirstSpanLead` for it anyway -- the fetch must not send that
+    ticker, the same guard `_assignable` applies to an ordinary span."""
+    assert _backfill(settings, _History(), filings=_with_unreadable_first_span()).ok
+    ids, _ = _window(settings, JUNE_2017)
+    assert UNREADABLE_LED not in ids
+    with _read(settings) as conn:
+        resolver = store_resolver(conn, LATER, settings)
+    lead = resolver.first_span_lead(UNREADABLE_LED)
+    assert lead is not None and lead.ticker == "F&G"  # recorded, but unreadable
+
+
 def test_price_chunk_builds_its_resolver_at_the_clock_when_the_month_starts(
     settings: Settings,
 ) -> None:
     """#1122 item 3 (#990.4): `_price_chunk` must read the store's
     resolver at the clock it calls when the month starts (`started`), not
-    at a later `clock()` call within the same chunk (`ingested_at`,
-    stamped once the fetch returns). The store is built directly (not via
+    at any later `clock()` call within the same chunk (`ingested_at`, the
+    write's `finished_at`, ...). The store is built directly (not via
     `backfill()`) so every row's `known_at` is under this test's control:
     the reference symbol is known well before either probe, and LEDX's
-    cover page is known at `_at(2019, 3, 15)`, between them. A clock
-    landing just before that cover page on the first call and just after
-    it on the second would wrongly fetch LED here if the resolver read
-    the later value instead of `started`."""
+    cover page is known at `_at(2019, 3, 15)`. The fake clock returns a
+    value just before that cover page on its *first* call only, and a
+    value well after it on every call after that (never running out, so
+    a wrong call reads "after" regardless of how many times `_price_
+    chunk` calls `clock()`) -- it would wrongly fetch LED here if the
+    resolver read anything but the very first call."""
     filed = _at(2016, 3, 1)
     cover = _at(2019, 3, 15)
     filing_common = {"ingested_at": filed, "source": "edgar", "provenance": "filing"}
@@ -326,8 +374,23 @@ def test_price_chunk_builds_its_resolver_at_the_clock_when_the_month_starts(
             }
             | ref_common,
         )
-    ticks = iter([_at(2019, 3, 14), _at(2019, 3, 16), _at(2019, 3, 17)])
+    first_call = iter([_at(2019, 3, 14)])
+
+    def clock() -> datetime:
+        return next(first_call, _at(2019, 3, 16))
+
+    calls: list[datetime] = []
+
+    def spy(conn: duckdb.DuckDBPyConnection, at: datetime, settings: Settings) -> Any:
+        calls.append(at)
+        return store_resolver(conn, at, settings)
+
     prices = _History()
-    chunk = _price_chunk(settings, prices, SINCE, JUNE_2017, lambda: next(ticks))
+    with patch("tradepartner.backfill.store_resolver", side_effect=spy):
+        chunk = _price_chunk(settings, prices, SINCE, JUNE_2017, clock)
     assert chunk is not None and chunk.status == OK, chunk
+    # Pinned directly, not just inferred from an admission boundary: the
+    # resolver is built at the very first clock() call ("started"), never
+    # at `ingested_at` or the write's `finished_at` (both later calls).
+    assert calls == [_at(2019, 3, 14)]
     assert LED not in prices.fetched[date(2017, 6, 1)]
