@@ -15,12 +15,19 @@ concurrency:
 # Pytest shard count (#1112): tests/conftest.py's `pytest_collection_modifyitems` buckets
 # test FILES (not individual tests, so a file's module/session fixtures build once per
 # shard, never once per shard that happens to draw one of its tests) across this many
-# shards by a static, duration-weighted assignment. Raise it (and the matrix list below,
-# kept in sync by hand) if the suite grows enough to push shards back over the wall-clock
-# target; `scripts/ready_pr.py`'s targeted runs and local `uv run pytest` never set the
-# shard env vars, so they always see the whole suite.
+# shards by a static, duration-weighted assignment. 8, not the original 4: a real CI run
+# at 4 put tests/lookahead/test_backtest_invariance.py's shard at 24.6 min (the other three
+# shards, each with no single file anywhere near as heavy, ran 7-11 min) — the weight table
+# predicts additive cost well for ordinary files, but badly for this one outlier, which is
+# slower on a shared 4-core CI runner than the sum of its own measured seconds suggests. At
+# 8 shards the bin-packer isolates it alone (weight 373, nothing else fits beside it without
+# pushing some other shard over), and every other shard's weight roughly halves (~306
+# instead of ~628) with it. Raise this (and the matrix list below, kept in sync by hand) if
+# the suite grows enough to push shards back over the wall-clock target; `scripts/ready_pr.py`'s
+# targeted runs and local `uv run pytest` never set the shard env vars, so they always see
+# the whole suite.
 env:
-  PYTEST_SHARD_COUNT: 4
+  PYTEST_SHARD_COUNT: 8
 
 jobs:
   checks-fast:
@@ -82,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
       PYTEST_SHARD_INDEX: ${{ matrix.shard }}
     steps:

@@ -99,7 +99,7 @@ def test_pytest_shard_matrix_sets_the_index_and_count_env() -> None:
     """Each shard tells `tests/conftest.py`'s bucketing hook which slice it is."""
     text = CI.read_text()
     shard = text[text.index("\n  pytest-shard:\n") : text.index("\n  checks:\n")]
-    assert "matrix:\n        shard: [0, 1, 2, 3]" in shard
+    assert "matrix:\n        shard: [0, 1, 2, 3, 4, 5, 6, 7]" in shard
     assert "PYTEST_SHARD_INDEX: ${{ matrix.shard }}" in shard
     assert "fail-fast: false" in shard
 
