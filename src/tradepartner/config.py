@@ -82,6 +82,9 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
     ),
 }
+#: A CIK as the store keys it, and a lettered common-class member (#1169).
+_CIK = re.compile(r"\d{10}")
+_CLASS_MEMBER = re.compile(r"CommonClass[A-Z]")
 _QUALIFIED_TAG = re.compile(r"[A-Za-z][A-Za-z0-9-]*:[A-Za-z_][A-Za-z0-9_]*")
 
 # Shared zero-padded 24h HH:MM pattern used by both the config validator and
@@ -312,6 +315,30 @@ class EdgarConfig(BaseModel):
         min_length=1,
     )
     statement_units: list[str] = Field(default_factory=lambda: ["USD"], min_length=1)
+    # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
+    # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
+    # class although no title of that class names the letter. Owner-reviewed,
+    # never a general rule: DICK'S (DKS), Tootsie Roll (TR) and Vimeo (VMEO)
+    # title their one listed class "Common Stock" and tag its shares
+    # `CommonClassA` (Class B is unlisted). Keys are 10-digit CIKs.
+    class_member_overrides: dict[str, str] = Field(
+        default_factory=lambda: {
+            "0001089063": "CommonClassA",  # DKS
+            "0000098677": "CommonClassA",  # TR
+            "0001837686": "CommonClassA",  # VMEO
+        }
+    )
+
+    @field_validator("class_member_overrides")
+    @classmethod
+    def _class_member_overrides_are_well_formed(cls, value: dict[str, str]) -> dict[str, str]:
+        """Each key is a 10-digit CIK and each value `CommonClass<A-Z>` (#1169)."""
+        for cik, member in value.items():
+            if not _CIK.fullmatch(cik):
+                raise ValueError("edgar.class_member_overrides: a key is not a 10-digit CIK")
+            if not _CLASS_MEMBER.fullmatch(member):
+                raise ValueError(f"edgar.class_member_overrides[{cik!r}] is not `CommonClass<A-Z>`")
+        return value
 
     @field_validator("statement_tags")
     @classmethod

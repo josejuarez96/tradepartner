@@ -769,7 +769,13 @@ def _build_filings(
     if fetch and settings.edgar.statement_facts_enabled:
         for cik in ciks:
             filings.statement_facts(cik)
-    facts, unmatched = fact_rows(records, master, classes, ingested_at=ingested_at)
+    facts, unmatched = fact_rows(
+        records,
+        master,
+        classes,
+        ingested_at=ingested_at,
+        class_member_overrides=settings.edgar.class_member_overrides,
+    )
     return master, delistings, classes, facts, unmatched
 
 
@@ -1129,6 +1135,7 @@ def fact_rows(
     classes: ClassificationBuild,
     *,
     ingested_at: datetime,
+    class_member_overrides: Mapping[str, str] | None = None,
 ) -> tuple[tuple[Row, ...], tuple[FactRecord, ...]]:
     """`facts` rows for `records`, and the records no security could take.
 
@@ -1144,8 +1151,11 @@ def fact_rows(
     is unmatched if none does (an unlisted class). Any other
     fact (undimensioned, or a member with no letter) goes to the sole common
     class, and is unmatched when there are several: a total is no one
-    class's shares. Raises `ValueError` for a record accepted after
-    `ingested_at`.
+    class's shares. `class_member_overrides` (`edgar.class_member_overrides`,
+    #1169) names, per CIK, a member whose facts go to the sole common class
+    like an undimensioned fact, although no title names its letter (an
+    owner-reviewed exception, never a general rule). Raises `ValueError` for a
+    record accepted after `ingested_at`.
     """
     kinds: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for row in sorted(classes.classifications, key=lambda r: r["known_at"]):
@@ -1194,6 +1204,9 @@ def fact_rows(
             )
         ids = common_at(record.cik, record.accepted_at)
         member = _MEMBER_CLASS.search(record.class_member)
+        override = _MEMBER_CLASS.search((class_member_overrides or {}).get(record.cik, ""))
+        if member and override and member.group(1) == override.group(1):
+            member = None  # the owner named this member the sole common class's
         if member:
             ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
         if record.fact_name not in FACT_NAMES or len(ids) != 1:
