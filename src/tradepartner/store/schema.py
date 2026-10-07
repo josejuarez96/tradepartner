@@ -242,7 +242,30 @@ registry; #83 took version 2 first, so the registry is version 3):
   stay (append-only) and nothing reads them afterwards. No other table
   changes. A read-only connection accepts a version-14 store without
   migrating it: every read but the four columns and the period rows works.
-- **A later DDL change goes to version 16**, with its own migration and a
+- **Version 16** (#1195, strategy-lab plan T113, version "L"; strategy-lab
+  spec "Data / interfaces" > Tables, Definitions "Frozen-key defaults" and
+  "Family rules"): the lab migration. A store migrating from version 15 (or
+  any earlier migratable version, after its steps) gets
+  `lab_schema.apply_lab_schema` (the eight `LAB_TABLE_NAMES` tables, and
+  `trial_results.status` and `owner_decisions.kind` rebuilt with the lab's
+  values, every row kept byte-identical), then, from the `hypotheses` rows
+  that exist at that moment: one `pre_lab_hypotheses` row for **every** one
+  (whatever keys its `params` hold), one `hypothesis_fingerprints` row for
+  every one (`frozen.fingerprint` over `frozen.frozen_values`; duplicates
+  kept, `lab_registry.fingerprint_registered` returns the earliest), and one
+  `family_rules` row per family from its earliest (lowest id) hypothesis:
+  its window, every frozen value under `FORBIDDEN_AXIS_PREFIXES`, the live
+  caps, `min_sharpe_variance_annual` and `axis_lattice` from `Settings`,
+  `FAMILY_PARENTS`' parent and a NULL `sr_star_seed_annual`. No hypothesis
+  is registered and no other table changes. A **fresh** store is created at
+  version 16 **without** the lab tables (strategy-lab plan choice 2: a
+  store without them keeps the Phase 3 rules; the `lab_store` test fixture
+  applies them), so `is_lab_initialised` stays the test, never the version.
+  `REGISTRY_TABLE_NAMES` lists the lab tables after the eight Phase 3 ones.
+  A read-only connection accepts a version-15 store without migrating it:
+  every read but the lab tables works (`lab_schema.require_lab` raises
+  `LabNotInitialised`).
+- **A later DDL change goes to version 17**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -436,9 +459,15 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `trials.data_vintage`, `trials.code_tree_sha256` and
 #:   `trial_results.sharpe_unit`, and the period-key rows inserted for every
 #:   existing trial (module docstring, "Schema versions").
-#: - A later DDL change goes to version 16, with its own migration and a
+#: - 16 (#1195, strategy-lab plan T113, version "L"): the lab migration:
+#:   the lab tables and the two widened enumerations
+#:   (`lab_schema.apply_lab_schema`) and the `pre_lab_hypotheses`,
+#:   `hypothesis_fingerprints` and `family_rules` rows for every existing
+#:   hypothesis and family, on a migrating store only (module docstring,
+#:   "Schema versions").
+#: - A later DDL change goes to version 17, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -499,6 +528,10 @@ _PRE_REBALANCE_COUNTS_VERSION = 13
 #: `trial_results.sharpe_unit` (#1179, T97): read-only connections serve every
 #: read but those columns and the `*_period` metric rows.
 _PRE_PERIOD_KEYS_VERSION = 14
+
+#: The last version without the strategy-lab tables (#1195, T113; version
+#: "P"): read-only connections serve every read but the lab tables.
+_PRE_LAB_VERSION = 15
 
 
 class SchemaVersionError(RuntimeError):
@@ -989,8 +1022,25 @@ CREATE TABLE IF NOT EXISTS owner_decisions (
 )
 """
 
-#: The trial-registry tables added at schema version 3, disjoint from
-#: `TABLE_NAMES` so the look-ahead harness never sees them.
+#: The strategy-lab tables (`lab_schema.LAB_TABLE_NAMES`, which imports this
+#: module, so the names are repeated here; a test pins the equality). Created
+#: by the version-16 migration on a migrating store only, never on a fresh one
+#: (module docstring, "Schema versions").
+_LAB_TABLE_NAMES: tuple[str, ...] = (
+    "family_rules",
+    "sweeps",
+    "sweep_variants",
+    "hypothesis_fingerprints",
+    "pre_lab_hypotheses",
+    "sweep_runs",
+    "sweep_trials",
+    "store_markers",
+)
+
+#: The trial-registry tables: the eight added at schema version 3, then the
+#: lab tables (version 16, strategy-lab spec "Data / interfaces" > Tables),
+#: disjoint from `TABLE_NAMES` so the look-ahead harness never sees them. A
+#: fresh store has the first eight only (no lab tables, plan choice 2).
 REGISTRY_TABLE_NAMES: tuple[str, ...] = (
     "hypotheses",
     "trials",
@@ -1000,6 +1050,7 @@ REGISTRY_TABLE_NAMES: tuple[str, ...] = (
     "trial_equity",
     "trial_weights",
     "owner_decisions",
+    *_LAB_TABLE_NAMES,
 )
 
 _REGISTRY_TABLE_DDL: tuple[str, ...] = (
@@ -2079,6 +2130,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_PROFITABILITY_VERSION,
         _PRE_REBALANCE_COUNTS_VERSION,
         _PRE_PERIOD_KEYS_VERSION,
+        _PRE_LAB_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2090,7 +2142,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `ResearchNotInitialised`) and `trial_results.n_research`; version 12
         # every read but `trial_rebalances`'s six `PROFITABILITY_REBALANCE_COLUMNS`;
         # version 13 every read but `trial_rebalance_counts`; version 14 every
-        # read but the version-15 columns and the `*_period` metric rows.
+        # read but the version-15 columns and the `*_period` metric rows;
+        # version 15 every read but the lab tables (`lab_schema.require_lab`
+        # raises `LabNotInitialised`).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2530,9 +2584,72 @@ def _migrate_period_metrics(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _migrate_lab(conn: duckdb.DuckDBPyConnection) -> None:
+    """The lab migration (module docstring, "Schema versions", version 16):
+    `lab_schema.apply_lab_schema`, then, from the `hypotheses` rows that exist
+    now, one `pre_lab_hypotheses` row per hypothesis, one
+    `hypothesis_fingerprints` row per hypothesis (`frozen.fingerprint` over
+    `frozen.frozen_values`, duplicates kept) and one `family_rules` row per
+    family from its earliest hypothesis, with the live `Settings` caps
+    (`config.get_settings`, read only when a hypothesis exists), the
+    `FAMILY_PARENTS` parent and a NULL SR* seed. Registers no hypothesis.
+    Runs inside `init_schema`'s transaction, only on a store migrating from
+    version 15 or earlier, so a failure leaves the store at its old version.
+
+    The lab modules import this one, so they are imported here, at call
+    time."""
+    from tradepartner import config
+    from tradepartner.backtest import frozen
+    from tradepartner.store import lab_registry, lab_schema, registry
+
+    lab_schema.apply_lab_schema(conn)
+    ids = [
+        hypothesis_id
+        for (hypothesis_id,) in conn.execute(
+            "SELECT hypothesis_id FROM hypotheses ORDER BY hypothesis_id"
+        ).fetchall()
+    ]
+    if not ids:
+        return
+    marked_at = utc_now()
+    conn.executemany(
+        "INSERT INTO pre_lab_hypotheses (hypothesis_id, marked_at) VALUES (?, ?)",
+        [[hypothesis_id, marked_at] for hypothesis_id in ids],
+    )
+    earliest: dict[str, registry.HypothesisRecord] = {}
+    for hypothesis_id in ids:
+        record = registry.get_hypothesis_by_id(conn, hypothesis_id)
+        fingerprint = frozen.fingerprint(
+            record.family, frozen.frozen_values(record), record.in_sample_start
+        )
+        lab_registry.write_fingerprint(conn, hypothesis_id, fingerprint)
+        earliest.setdefault(record.family, record)
+    settings = config.get_settings()
+    parents: dict[str, str | None] = {
+        str(family): parent for family, parent in config.FAMILY_PARENTS.items()
+    }
+    for family, record in earliest.items():
+        lab_registry.write_family_rules(
+            conn,
+            family=family,
+            first_hypothesis_id=record.hypothesis_id,
+            parent_family=parents.get(family),
+            holdout_start=record.holdout_start,
+            holdout_end=record.holdout_end,
+            in_sample_start=record.in_sample_start,
+            fixed_params={
+                key: value
+                for key, value in frozen.frozen_values(record).items()
+                if key.startswith(config.FORBIDDEN_AXIS_PREFIXES)
+            },
+            sr_star_seed_annual=None,
+            settings=settings,
+        )
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 14 store to version 15.
+    version-2 to 15 store to version 16.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2544,7 +2661,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION`; every store gets the version-15 columns
+    `CURRENT_SCHEMA_VERSION` and no lab table; a version-2 to 15 store gets,
+    last, the lab tables, the two widened enumerations and the
+    `pre_lab_hypotheses`, `hypothesis_fingerprints` and `family_rules` rows
+    for its existing hypotheses and families (#1195, T113); every store gets
+    the version-15 columns
     (`trials.detail_level`, `full` on existing rows, `data_vintage`,
     `code_tree_sha256`; `trial_results.sharpe_unit`), and a version-2 to 14
     store the period-key `trial_metrics` rows for every existing trial and a
@@ -2577,7 +2698,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-15, 14 (every read but
+    On a read-only connection no DDL runs: a version-16, 15 (every read but
+    the lab tables, which `lab_schema.require_lab` reports as
+    `LabNotInitialised`), 14 (every read but
     the version-15 columns and period rows), 13 (every read but
     `trial_rebalance_counts`), 12, 11, 10, 9, 8, 7,
     6 or 5 store passes (a version-12 store serves every read but
@@ -2616,6 +2739,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_PROFITABILITY_VERSION,
         _PRE_REBALANCE_COUNTS_VERSION,
         _PRE_PERIOD_KEYS_VERSION,
+        _PRE_LAB_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2664,6 +2788,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         if max_version is not None and max_version <= _PRE_PERIOD_KEYS_VERSION:
             _migrate_period_metrics(conn)
         forget_column_types(conn)
+        if max_version is not None and max_version <= _PRE_LAB_VERSION:
+            _migrate_lab(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

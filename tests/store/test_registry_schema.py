@@ -26,7 +26,7 @@ import duckdb
 import pytest
 from conftest import load_universe_fixtures
 
-from tradepartner.store import schema
+from tradepartner.store import lab_schema, schema
 from tradepartner.store.db import configure_connection
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "universe"
@@ -40,7 +40,15 @@ _EXPECTED_REGISTRY_TABLES = {
     "trial_equity",
     "trial_weights",
     "owner_decisions",
+    # The lab tables (version 16, #1195, T113; `tests/store/test_lab_migration.py`).
+    *lab_schema.LAB_TABLE_NAMES,
 }
+
+#: The eight Phase 3 registry tables: a fresh store has them and no lab table
+#: (strategy-lab plan choice 2); a migrating store gets the lab tables too.
+_PHASE3_REGISTRY = tuple(
+    t for t in schema.REGISTRY_TABLE_NAMES if t not in lab_schema.LAB_TABLE_NAMES
+)
 
 #: Every fact table the version-4 migration leaves alone: all but
 #: `corporate_actions` (rebuilt) and `schema_version` (appended to).
@@ -196,7 +204,7 @@ def version_3_store(tmp_path: Path) -> Path:
     return path
 
 
-def test_registry_table_names_are_the_eight_spec_tables() -> None:
+def test_registry_table_names_are_the_spec_tables() -> None:
     assert set(schema.REGISTRY_TABLE_NAMES) == _EXPECTED_REGISTRY_TABLES
     assert len(schema.REGISTRY_TABLE_NAMES) == len(_EXPECTED_REGISTRY_TABLES)
 
@@ -205,35 +213,36 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
     assert set(schema.REGISTRY_TABLE_NAMES) & set(schema.TABLE_NAMES) == set()
 
 
-def test_current_schema_version_is_15() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 15
+def test_current_schema_version_is_16() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 16
 
 
-def test_fresh_init_creates_every_table_at_version_15() -> None:
+def test_fresh_init_creates_every_table_at_version_16() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     assert _table_names(conn) == (
         set(schema.TABLE_NAMES)
-        | set(schema.REGISTRY_TABLE_NAMES)
+        | set(_PHASE3_REGISTRY)
         | set(schema.JOURNAL_TABLE_NAMES)
         | set(schema.MASTER_CHECK_TABLE_NAMES)
         | set(schema.RESEARCH_TABLE_NAMES)
         | {schema.REBALANCE_COUNTS_TABLE_NAME}
     )
-    assert [version for version, _ in _versions(conn)] == [15]
+    assert [version for version, _ in _versions(conn)] == [16]
 
 
 def test_fresh_init_twice_keeps_one_version_row() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     schema.init_schema(conn)
-    assert [version for version, _ in _versions(conn)] == [15]
+    assert [version for version, _ in _versions(conn)] == [16]
 
 
 def test_registry_tables_carry_no_fact_columns() -> None:
     """Like `ingestion_runs`: registry rows are not point-in-time facts."""
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
+    lab_schema.apply_lab_schema(conn)  # a fresh store has no lab table
     for table in schema.REGISTRY_TABLE_NAMES:
         columns = {
             row[0]
@@ -246,22 +255,38 @@ def test_registry_tables_carry_no_fact_columns() -> None:
         assert columns.isdisjoint({"known_at", "ingested_at", "provenance"}), table
 
 
-def test_write_open_of_version_2_store_migrates_to_version_15(version_2_store: Path) -> None:
+def test_write_open_of_version_2_store_migrates_to_version_16(version_2_store: Path) -> None:
     conn = duckdb.connect(str(version_2_store))
     try:
-        assert _table_names(conn).isdisjoint(schema.REGISTRY_TABLE_NAMES)
+        assert _table_names(conn).isdisjoint(_PHASE3_REGISTRY)
         schema.init_schema(conn)
         assert set(schema.REGISTRY_TABLE_NAMES) <= _table_names(conn)
         versions = _versions(conn)
     finally:
         conn.close()
-    assert [version for version, _ in versions] == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert [version for version, _ in versions] == [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+    ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
     assert versions[3][1] == versions[2][1] == versions[1][1]
 
 
-def test_write_open_of_version_3_store_migrates_to_version_15(version_3_store: Path) -> None:
+def test_write_open_of_version_3_store_migrates_to_version_16(version_3_store: Path) -> None:
     conn = duckdb.connect(str(version_3_store))
     try:
         # Version 12 (#926) adds `trial_results.n_research`; version 13
@@ -269,9 +294,11 @@ def test_write_open_of_version_3_store_migrates_to_version_15(version_3_store: P
         # `PROFITABILITY_REBALANCE_COLUMNS`; version 15 (#1179, T97) adds
         # `trials`' vintage and detail columns; every row kept
         # (`tests/store/test_research_schema.py`, `tests/store/test_schema.py`,
-        # `tests/store/test_schema_period.py`).
-        moved = ("trial_results", "trial_rebalances", "trials")
-        kept = tuple(t for t in schema.REGISTRY_TABLE_NAMES if t not in moved)
+        # `tests/store/test_schema_period.py`); version 16 (#1195, T113) adds
+        # the lab tables and rebuilds `owner_decisions`, every row kept
+        # (`tests/store/test_lab_migration.py`).
+        moved = ("trial_results", "trial_rebalances", "trials", "owner_decisions")
+        kept = tuple(t for t in _PHASE3_REGISTRY if t not in moved)
         before = _table_snapshot(conn, kept)
         assert before["hypotheses"][3], "the version-3 store should hold a registry row"
         schema.init_schema(conn)
@@ -280,7 +307,7 @@ def test_write_open_of_version_3_store_migrates_to_version_15(version_3_store: P
     finally:
         conn.close()
     assert after == before
-    assert [version for version, _ in versions] == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert [version for version, _ in versions] == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
 
@@ -413,7 +440,7 @@ def test_read_only_open_of_version_2_store_raises_and_changes_nothing(
         conn.close()
     conn = duckdb.connect(str(version_2_store), read_only=True)
     try:
-        assert _table_names(conn).isdisjoint(schema.REGISTRY_TABLE_NAMES)
+        assert _table_names(conn).isdisjoint(_PHASE3_REGISTRY)
         assert [version for version, _ in _versions(conn)] == [2]
     finally:
         conn.close()
@@ -433,15 +460,15 @@ def test_read_only_open_of_version_3_store_raises_and_changes_nothing(
         conn.close()
 
 
-def test_read_only_open_of_version_15_store_passes(tmp_path: Path) -> None:
-    path = tmp_path / "store_v15.duckdb"
+def test_read_only_open_of_version_16_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "store_v16.duckdb"
     conn = duckdb.connect(str(path))
     schema.init_schema(conn)
     conn.close()
     conn = duckdb.connect(str(path), read_only=True)
     try:
         schema.init_schema(conn)
-        assert [version for version, _ in _versions(conn)] == [15]
+        assert [version for version, _ in _versions(conn)] == [16]
     finally:
         conn.close()
 
