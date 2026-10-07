@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -295,6 +296,46 @@ def test_no_disposals_in_the_tax_year_is_refused(export_file: Path, live: Path) 
 
     assert out.exit_code == EXIT["no_disposals"], out.output
     assert "no disposal in tax year 2025" in out.output
+
+
+def test_only_the_latest_ledger_set_is_compared(export_file: Path, live: Path) -> None:
+    """An older set that disagrees (another basis, and a flag) is never read:
+    the latest set, stamped later and flagless, is the one compared."""
+    _seed(live)
+    later = SET_STAMP + timedelta(hours=1)
+    with open_for_write(_settings()) as conn:
+        lot_ids = [
+            journal.append(
+                conn,
+                replace(_lot(0, day, 10.0, basis), lot_id=None, known_at=later, ingested_at=later),
+            )
+            for day, basis in ((date(2026, 1, 5), 1000.0), (date(2026, 3, 20), 960.0))
+        ]
+        for lot_id, day, proceeds, pnl in (
+            (lot_ids[0], date(2026, 2, 2), 900.0, -100.0),
+            (lot_ids[1], date(2026, 6, 1), 1100.0, 140.0),
+        ):
+            assert lot_id is not None
+            journal.append(
+                conn,
+                replace(
+                    _disposal(0, lot_id, day, proceeds, pnl),
+                    disposal_id=None,
+                    known_at=later,
+                    ingested_at=later,
+                ),
+            )
+    rows = [
+        _row(date(2026, 2, 2), "900.00", "1000.00"),
+        _row(date(2026, 6, 1), "1100.00", "960.00"),
+    ]
+
+    out = _reconcile(export_file, rows=rows)
+
+    assert out.exit_code == 0, out.output
+    assert "matched: 2" in out.stdout
+    # The older set's rows (basis 950, the 100.00 flag) would differ on both.
+    assert _reconcile(export_file, rows=AGREEING).exit_code == cli.LOTS_RECONCILE_DIFFERENCE_EXIT
 
 
 # --- results ----------------------------------------------------------------------

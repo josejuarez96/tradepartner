@@ -8,13 +8,15 @@ wrote them (no as-of: the comparison is of the ledger as journaled). It takes no
 connection and writes nothing; nothing is adjusted automatically and the ledger
 stays append-only.
 
-- **Matching.** Each export row, in its order, is matched to one unused
+- **Matching.** Each export row is matched to at most one
   disposal whose lot is the same security, whose exchange-local trade date is
   the row's trade date and whose quantity equals the row's exactly. The same
   security means equal CUSIPs when both sides carry one, else equal broker
   symbols. When more than one disposal qualifies (one sale closing two equal
-  lots) the first, in disposal order, whose figures all agree is taken, else
-  the first.
+  lots), rows whose figures all agree with a disposal take it first; each
+  remaining row then takes the leftover disposal with the fewest differing
+  figures, the first in disposal order on a tie. A row that agrees nowhere
+  never takes the disposal another row matches exactly.
 - **Figures.** Proceeds, cost basis (the disposal's proceeds less its realised
   gain or loss, before any adjustment) and the box 1g disallowed loss (the sum
   of the disposal's `wash_sale_flags`), each in `Decimal` from the stored
@@ -176,26 +178,40 @@ def compare(
     disallowed = disallowed_by_disposal(flags)
     replacements = frozenset(flag.replacement_lot_id for flag in flags)
     used: set[int] = set()
-    matched: list[MatchedRow] = []
-    unmatched_rows: list[BrokerLotRow] = []
-    for row in rows:
-        candidates = [
-            d
+    chosen: dict[int, tuple[DisposalRow, tuple[FigureDifference, ...]]] = {}
+
+    def scored(row: BrokerLotRow) -> list[tuple[DisposalRow, tuple[FigureDifference, ...]]]:
+        return [
+            (d, _differences(row, d, disallowed))
             for d in ordered
             if d.disposal_id not in used and _same_sale(row, d, lot_by_id[d.lot_id])
         ]
-        if not candidates:
-            unmatched_rows.append(row)
+
+    # Pass 1: every row with a disposal whose figures all agree takes it, so a
+    # row that agrees nowhere cannot take a disposal another row matches exactly.
+    for index, row in enumerate(rows):
+        exact = next(((d, diffs) for d, diffs in scored(row) if not diffs), None)
+        if exact is not None:
+            chosen[index] = exact
+            used.add(exact[0].disposal_id or 0)
+    # Pass 2: each remaining row takes the leftover candidate with the fewest
+    # differing figures, the first in disposal order on a tie.
+    for index, row in enumerate(rows):
+        if index in chosen:
             continue
-        scored = [(d, _differences(row, d, disallowed)) for d in candidates]
-        disposal, differences = next(((d, diffs) for d, diffs in scored if not diffs), scored[0])
-        disposal_id = disposal.disposal_id
-        assert disposal_id is not None
-        used.add(disposal_id)
+        candidates = scored(row)
+        if candidates:
+            best = min(candidates, key=lambda pair: len(pair[1]))
+            chosen[index] = best
+            used.add(best[0].disposal_id or 0)
+    matched: list[MatchedRow] = []
+    for index in sorted(chosen):
+        disposal, differences = chosen[index]
+        assert disposal.disposal_id is not None
         matched.append(
             MatchedRow(
-                row=row,
-                disposal_id=disposal_id,
+                row=rows[index],
+                disposal_id=disposal.disposal_id,
                 lot_id=disposal.lot_id,
                 differences=differences,
                 replacement_lot=disposal.lot_id in replacements,
@@ -203,7 +219,7 @@ def compare(
         )
     return Report(
         matched=tuple(matched),
-        unmatched_rows=tuple(unmatched_rows),
+        unmatched_rows=tuple(row for index, row in enumerate(rows) if index not in chosen),
         unmatched_disposals=tuple(d for d in ordered if d.disposal_id not in used),
     )
 

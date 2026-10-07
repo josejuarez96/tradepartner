@@ -284,6 +284,30 @@ def test_two_equal_disposals_of_one_sale_pair_by_agreeing_figures() -> None:
     assert report.clean
 
 
+def test_a_row_agreeing_nowhere_never_takes_another_rows_exact_match() -> None:
+    # One sale closes two equal lots: disposal 1 (basis 100) and 2 (basis 110).
+    # The first row has disposal 2's basis but proceeds a cent off; the second
+    # row agrees exactly with disposal 1, so it keeps it.
+    lots = [
+        _lot(1, "ABC", None, date(2026, 1, 5), 5.0, 100.0),
+        _lot(2, "ABC", None, date(2026, 1, 6), 5.0, 110.0),
+    ]
+    disposals = [
+        _disposal(1, 1, date(2026, 3, 2), 5.0, 125.0, 25.0),
+        _disposal(2, 2, date(2026, 3, 2), 5.0, 125.0, 15.0),
+    ]
+    off_by_a_cent = _row("ABC", date(2026, 3, 2), "5", "125.01", "110.00")
+    exact = _row("ABC", date(2026, 3, 2), "5", "125.00", "100.00")
+
+    report = compare([off_by_a_cent, exact], disposals, lots, [])
+
+    assert [(m.row, m.disposal_id) for m in report.matched] == [(off_by_a_cent, 2), (exact, 1)]
+    assert report.matched[0].differences == (
+        FigureDifference(PROCEEDS, Decimal("125.01"), Decimal("125.00")),
+    )
+    assert report.matched[1].differences == ()
+
+
 def test_ledger_figures_round_to_the_cent() -> None:
     lots = [_lot(1, "ABC", None, date(2026, 1, 5), 3.0, 100.0)]
     disposals = [_disposal(1, 1, date(2026, 3, 2), 1.0, 33.335, 0.0016666)]
