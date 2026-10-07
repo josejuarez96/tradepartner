@@ -769,7 +769,8 @@ def _existing_registration(
     # Canonical frozen sets, never raw hashes (Definitions, Fingerprint): a stored set
     # that lacks a table key at its default is the same set.
     stored = sorted(
-        _canonical_json(frozen.canonical_frozen_set(r.params, r.family)) for r in records
+        _canonical_json(frozen.canonical_frozen_set(frozen.frozen_values(r), r.family))
+        for r in records
     )
     ours = sorted(
         _canonical_json(frozen.canonical_frozen_set(v.frozen_set, file.family)) for v in variants
