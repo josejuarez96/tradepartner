@@ -19,6 +19,9 @@ Get the diff (`gh pr diff <n>`, or `git diff origin/main...HEAD`). Read the surr
 7. **Numbers from code.** Does any decision-relevant number come from LLM output?
 8. **Tests.** Is there a test that would fail if look-ahead were introduced (e.g., "a signal at t is unchanged when data after t is removed")?
 
+## Tests
+CI runs the full suite, sharded, on every PR; don't repeat it. Run only the test files the diff adds or changes, and, for each new test that guards a fix, the same test against the merge-base code (`git show $(git merge-base origin/main HEAD):<path>` into a scratch copy) to show it fails without the fix. Never run the whole suite or a whole directory such as `tests/lookahead/`: the cadence-parametrised invariance cases take minutes each. Use a private basetemp (`PYTEST_ADDOPTS=--basetemp=<scratchpad>/pytest`). If a check needs no test (a reading-only question, a docstring), run none and say so.
+
 ## Output
 Findings with severity (BLOCKER / SHOULD FIX / NIT), `file:line`, the concrete failure scenario, and a fix. Then a verdict: `PASS`, `PASS WITH FIXES` (only SHOULD FIX or NIT findings remain, which the implementer must address before re-running you; `ready_pr` counts only a `PASS`, so the re-run must end in `PASS`), or `FAIL` (any BLOCKER). Don't pad the list. If the diff doesn't touch any of these areas, say "Not in scope" and stop.
 
