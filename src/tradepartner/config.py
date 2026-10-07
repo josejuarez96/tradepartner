@@ -34,12 +34,21 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The only value `universe.exclude_sic_ranges` may take (ADR 0006): the full
@@ -212,13 +221,18 @@ class EdgarConfig(BaseModel):
 
     An unknown key is refused when the model is validated (#1037), so a
     mistyped `EDGAR__...` override fails instead of being silently ignored
-    (`model_copy(update=...)` does not validate).
+    (`model_copy(update=...)` does not validate). A non-finite float is
+    refused too (#1093): `inf` passes `gt=0`, and `requests_per_second=inf`
+    would turn `edgar_raw`'s throttle off. Errors never echo the input value.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
     cache_dir: str = Field(default_factory=_default_edgar_cache_dir)
-    requests_per_second: float = Field(default=9.0, gt=0)
+    # `le=10` (#1108): SEC's ceiling is policy, not a tunable; a larger value would
+    # shrink `edgar_raw`'s minimum interval toward 0. Tests that need no throttle
+    # raise it with `model_copy(update=...)`, which does not validate.
+    requests_per_second: float = Field(default=9.0, gt=0, le=10)
     retry_backoff_seconds: float = Field(default=1.0, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     header_bytes: int = Field(default=4096, gt=0)
@@ -419,7 +433,9 @@ class AlpacaConfig(BaseModel):
     the trading client (T48) passes the literal `paper=True` and never forwards this field.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", allow_inf_nan=False, hide_input_in_errors=True
+    )
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
@@ -656,8 +672,10 @@ PAPER_FAMILIES: tuple[HypothesisFamily, ...] = ("momentum", "oracle")
 # Every Phase 3 section rejects unknown keys and non-finite floats. A hypothesis file pins
 # `strategy.*` and `costs.*` (spec req 10), so a misspelt key must fail rather than fall back
 # silently to the default, and a NaN or infinite value must fail rather than turn a
-# result into NaN.
-_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False)
+# result into NaN. Errors hide the input value by default (#1093), as `Settings` does:
+# a caller that knows its input holds no secret (`execution/`'s frozen costs and risk)
+# puts it back with `render_validation_errors`.
+_PHASE3_MODEL_CONFIG = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class HypothesesConfig(BaseModel):
@@ -1385,6 +1403,21 @@ def get_settings() -> Settings:
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def render_validation_errors(exc: ValidationError, *, show_input: Callable[[str], bool]) -> str:
+    """`exc`'s errors as `key = <input>: <rule>` (#1093). The config models hide input
+    values in their own error text so a secret is never echoed; a caller whose input
+    holds no secret (a frozen section, a hypothesis file's frozen keys) uses this to
+    put the offending value back. `show_input(key)` decides per dotted location; a
+    location it refuses is shown without a value. `show_input` has no default so every
+    caller decides: a `Settings` error's input holds the secrets."""
+    parts = []
+    for error in exc.errors():
+        key = ".".join(str(part) for part in error["loc"])
+        shown = f"{key} = {error['input']!r}" if show_input(key) else key
+        parts.append(f"{shown}: {error['msg']}")
+    return "; ".join(parts)
 
 
 def clean_message(message: str, settings: Settings) -> str:

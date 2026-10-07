@@ -197,6 +197,7 @@ from tradepartner.config import (
     CostsConfig,
     RiskConfig,
     Settings,
+    render_validation_errors,
     secret_values,
 )
 from tradepartner.errors import (
@@ -1467,7 +1468,9 @@ def _frozen_costs(window: PaperWindowRow) -> BuyCosts:
             {k: parsed[f"{_COSTS_PREFIX}{k}"] for k in FROZEN_COSTS_KEYS}
         )
     except ValidationError as exc:
-        raise ValueError(f"window {window.window_id} frozen costs: {exc}") from exc
+        # Costs hold no secret: put the stored value back in the message (#1093).
+        detail = render_validation_errors(exc, show_input=lambda _key: True)
+        raise ValueError(f"window {window.window_id} frozen costs: {detail}") from exc
     return BuyCosts(costs.per_side_bps, Commissions.from_config(costs))
 
 

@@ -17,7 +17,12 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   rename lead's gap inside a month with stored bars is a hole too (#891).
   `--security ID` (repeatable, or comma-separated) limits both to the named
   securities; a named id with no hole fetched is listed with why, not an
-  error.
+  error. `--bulk-from-cache` (#660) builds the EDGAR source with
+  `reuse_cached`: company facts come from the cached `companyfacts.zip`
+  with no request for it. `--rebuild-statement-facts` deletes and
+  re-ingests `statement_facts` in the EDGAR chunk's transaction and needs
+  `edgar.statement_facts_enabled`. Both are off by default and refused with
+  `--backfill` or `--source alpaca` (usage error, 2).
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -509,6 +514,20 @@ def make_app(
                 help="with --fill-holes: only this security_id's holes (repeatable, or ID,ID)",
             ),
         ] = None,
+        bulk_from_cache: Annotated[
+            bool,
+            typer.Option(
+                "--bulk-from-cache",
+                help="company facts from the cached companyfacts.zip, no request for it (#660)",
+            ),
+        ] = False,
+        rebuild_statement_facts: Annotated[
+            bool,
+            typer.Option(
+                "--rebuild-statement-facts",
+                help="delete and re-ingest statement_facts in the EDGAR chunk (#660)",
+            ),
+        ] = False,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
@@ -523,6 +542,12 @@ def make_app(
             raise _fail("--fill-holes refetches prices only: pass --source alpaca", USAGE_ERROR)
         if backfill_ and dry_run and not fill_holes_:
             raise _fail("--dry-run is not available with --backfill", USAGE_ERROR)
+        for flag, given in (
+            ("--bulk-from-cache", bulk_from_cache),
+            ("--rebuild-statement-facts", rebuild_statement_facts),
+        ):
+            if given and (backfill_ or source == "alpaca"):
+                raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
         named: list[str] | None = None
         if security is not None:
             if not fill_holes_:
@@ -537,6 +562,10 @@ def make_app(
             except ValueError:
                 raise _fail(f"--since must be YYYY-MM-DD, got {since!r}", USAGE_ERROR) from None
         s = settings()
+        if rebuild_statement_facts and not s.edgar.statement_facts_enabled:
+            raise _fail(
+                "--rebuild-statement-facts needs edgar.statement_facts_enabled", USAGE_ERROR
+            )
         if fill_holes_ and start is not None:
             if (absent := _store_missing(s)) is not None:
                 raise absent
@@ -558,7 +587,9 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
-        filings = EdgarFilingSource(s, client=edgar_client, clock=clock)
+        filings = EdgarFilingSource(
+            s, client=edgar_client, clock=clock, reuse_cached=bulk_from_cache
+        )
         prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
         if fill_holes_ and start is not None:
             filled = fill_holes(s, prices=prices, since=start, clock=clock, securities=named)
@@ -570,7 +601,13 @@ def make_app(
             )
         else:
             result = ingest_session(
-                s, prices=prices, filings=filings, source=source, clock=clock, dry_run=dry_run
+                s,
+                prices=prices,
+                filings=filings,
+                source=source,
+                clock=clock,
+                dry_run=dry_run,
+                rebuild_statement_facts=rebuild_statement_facts,
             )
         _print_result(result)
         raise typer.Exit(result.exit_code)
