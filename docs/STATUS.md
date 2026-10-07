@@ -1,33 +1,31 @@
 # Status
 
-**Updated:** 2026-10-06 · **Phase:** 1, Backtest (closed pending merge); 2, Data foundation (30/32) and 4, Paper trading (44/55) in build · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
+**Updated:** 2026-10-07 · **Phase:** 1 closed; 2 Data foundation (30/32) and 3 Strategy lab (22/29) in build · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Recently done
 Phase 1 backtest closed: T45b real-store H1 run (in-sample 2020-08-31..2023-12-29, 40 monthly returns); trial 2 PASS (DSR 0.7262 psr basis, costs 1.25% at 15 bps); trial 1 FAIL on #853 disclosed; quant-auditor verdicts linked in PR. What's next: open holdout gates #1017/#1018 (gap coverage, RVTY/FI), Phase 2 data tasks, T116c evidence, strategy lab, research labeling. Pending follow-up issues: S1 (listing ends 78 Form 25 re-opens), S3 (PerkinElmer/Revvity, WTW bars).
+- T98 (#1072, PR #1075): engine, holdout and run path at cadence: engine.run at the frozen rebalance_cadence, signal frame read from A_form, holdout window and gap gate at cadence; H1 at month_end byte-identical.
+- #1073 trial_rebalances gains the six profitability rebalance counts (schema v13, T85d)
+- ADR 0014 and the strategy-interface plan (#1074): strategies as registered objects; T85e amended into the one dispatch seam with the PAPER_FAMILIES gate; T127 to T130 (generic exclusions and counts, registry, benchmarks, B4 proof).
+- T106 quiet intervals (pure) in review (#1078)
+- #1084: signals.gross_profitability raises ValueError when t is not a session close (mid-session, after close, weekend, holiday); half-day closes pass.
+- #1093: EdgarConfig refuses inf/NaN and caps requests_per_second at 10 (no config can drop the SEC throttle); config sections hide input values in errors; hypothesis-file errors show key = file value.
+- T98b (#1094): look-ahead suites (truncation, prefix, revisions, plan-read timing) and the bt oracle parametrised over month_end, week_end and daily; month_end walk unchanged; asof tie-order follow-up #1099.
+- T102 sweep file parser and grid (pure) in review (#1096)
+- Rule 7: a PR that only ticks and collapses its own plan task line stays class A (#1110)
+- Follow-up rule (#1123): review follow-ups are fixed in the PR (<15 min), dropped (nits) or filed as one size:S issue only for a real defect or owner decision; the 2026-10-07 triage closed 70 issues into bundles #1116-#1122.
 
 ## Teams
-New session: `uv run python scripts/team.py start <name>`, then work only in the directory it prints (`../tradepartner-teams/<name>`). (#40)
-Live board: `uv run python scripts/team.py status`. Snapshot 2026-10-02: orchestrator **tradepartner-9c** (atlas, main checkout); it runs background teams in retired directories (plover #554, atlas-6a this fold #583). tradepartner-9d is retiring and holds only #577 (#573, team kite). tradepartner-61 holds T45b (#503). Other claims: ibis #535, pelican #409/#410, tamarind #510, tern #527, wren #517. Dead claims for the owner's `release --force`: `meridian` #258, `eclipse` #182.
+Active: orchestrator tradepartner-fd (atlas); profreads #1071 (T85c), codexseam #1103 (T85e), cishard #1112 (CI), kilo #1107 (config). Parked PRs: #305 (T258), #299 (T298), #297 (T294).
 
 ## In progress
-- **Merged 2026-10-06:** Phase 1 T45b real-store run (trial 2 PASS; trial 1 FAIL on #853 disclosed).
-- **PRs pending owner merge:** #503 (T45b phase-close, trial evidence + STATUS/CHANGELOG fold + plan tick).
-- **PRs:** #574 (#534 frozen costs) in ready_pr; #577 (#573) in ready_pr; #554 being built (plover).
-- **Owner's merges:** #521 (T72b) → #528 (T74), #520 (spec), then #445 last; after #503: Phase 2 data tasks resume.
+B3 path running (orch tradepartner-fd): T85c #1115 → T85e #1105 → T78 #1127 (re-ingest). Draft PRs: CI #1113, config #1125/#1109. Parked: #299, #297 (owner task gates).
 
-## Ready frontier snapshot (not a claim; only doc-keeper edits this)
-Worked out from the plan after this fold's ticks (T60e, T63d, T64b, T69); `team.py status` shows it once the fold merges. Claim through the tool, never from this list; read each task line for "waits for" gates.
-1. ready plan tasks: T63f, T63i, T66, T69b; T70 (#297 parked, gated on Probe 3); T22, T45b, T48b (owner).
-2. parked PRs: #305 (#258), #299 (T48b), #297 (T70).
-3. queued issues: #578 (after #577), #526 (before T71), #507/#560/#563 (run.py, one team), #551/#552, #435, #518 (after #534).
+## Ready frontier snapshot
+Claim through `team.py claim`, read task lines for gates. Ready: T22, T77c, T116c, T75b (owner); T48b, T70 (parked); T121, T125 (owner); T83–T106 (phase 3/4). Queued: #1122–#1126, #1017–#1018 (holdout gates).
 
 ## Blocked
-- T71 waits on #503 merge, then T63h, T63f, T66, T48c, T63i, T67, T69b, T70; T71b on T71; T23 on T22's evidence; T48c on T48b recording.
-- Merge train: T72c on #521, T75 on T72c, T75b on #528 and T75.
+T85e blocks T85f, T78, T23; T78 blocks T77c, phase 2 data close; holdout gates #1017/#1018 hold T45b's next run; parked #299 blocks T48c; #297 blocks T70. Triaged #1116–#1122.
 
 ## Decisions needed from owner
-- **Merge #503 (T45b phase-close):** trial evidence, quant-auditor PASS on trial 2.
-- **Then:** #521 → #528, #520, #445.
-- **After merge:** open holdout gates #1017/#1018, phase 2 data tasks resume.
-- Other: #554 filing-header policy; Probe 3 session for #182; #470, #411/#412, #473; #281 strategy-lab Qs; `release --force` #258/#182; `gap_signoff` H1.
-- Phase 6: activate `main` ruleset, run first train (T75b), account/compliance checks.
+Open gates #1017/#1018 (holdout runs), re-run #1127 (T78), merge T85c/T85e/T85f. Then: #521 (T72b) → #528 (T74), #520, #445. Questions: #649, #821, #828, #878, #969, #987, #1011, #1016, #1034, #1060, #1085, #1116, #1119.
