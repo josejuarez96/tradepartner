@@ -49,6 +49,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from tradepartner.calendar import (
     is_half_day,
@@ -1853,6 +1854,272 @@ def _statement_facts_no_securities_row_yet(rows: Rows) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Profitability statement facts (backtest spec amendment #720, plan T85c):
+# a scored baseline on existing issuers plus the point-in-time cases.
+# ---------------------------------------------------------------------------
+
+_NEW_YORK = ZoneInfo("America/New_York")
+_GROSS_PROFIT_TAG = "us-gaap:GrossProfit"
+_ASSETS_TAG = "us-gaap:Assets"
+
+#: Every non-benchmark issuer in `securities.csv`, with the month its fiscal
+#: year ends (12 unless a case needs a filing in another month). The index
+#: in this tuple sets the issuer's baseline values.
+_PROFITABILITY_ISSUERS: tuple[tuple[str, int], ...] = tuple(
+    (f"CIK{1000000 + n:010d}", {12: 8, 16: 9, 20: 8}.get(n, 12)) for n in range(1, 23)
+)
+#: The baseline's fiscal years: FY2015's filings make every fixture
+#: rebalance from 2017-01-31 on see a fresh annual pair.
+_PROFITABILITY_YEARS = (2015, 2016, 2017, 2018, 2019)
+
+#: Acceptance stamps (spec acceptance, amendment #720): three on an ordinary
+#: month-end and two on the fixture window's half-day month-end.
+_STAMP_MONTH_END = date(2019, 1, 31)
+_STAMP_HALF_DAY = date(2019, 11, 29)
+#: The rebalance whose close the late 10-K crosses (T_i).
+_CROSSING_SESSION = date(2019, 2, 28)
+
+_CROSSING_CIK = "CIK0001000007"  # SEC_TRANSFER, a universe member 2018-04 to 2019-04
+_RESTATED_CIK = "CIK0001000005"  # the T76 restated-FY issuer
+_ASSETS_LATER_CIK = "CIK0001000016"  # SEC_FACTS_RESTATED, a member 2019-12 and 2020-01
+_DUAL_CIK = "CIK0001000006"
+_LOW_BP, _HIGH_BP = 500, 9500  # the crossing issuer's GP/A before and after, basis points
+
+
+def _new_york(day: date, hour: int, minute: int = 0) -> datetime:
+    """`hour:minute` New York time on `day`, as a UTC instant."""
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=_NEW_YORK).astimezone(UTC)
+
+
+def _fiscal_period(fiscal_year: int, end_month: int) -> tuple[date, date]:
+    """`(period_start, period_end)` of the fiscal year ending in `end_month` of
+    `fiscal_year`: from the day after the previous year's end to the month's last day."""
+    end = date(fiscal_year + (end_month == 12), end_month % 12 + 1, 1) - timedelta(days=1)
+    start = date(fiscal_year - 1 + (end_month == 12), end_month % 12 + 1, 1)
+    return start, end
+
+
+def _default_acceptance(fiscal_year: int, end_month: int, index: int) -> datetime:
+    """A baseline 10-K's acceptance: about six weeks after the fiscal year ends, on
+    one of four sessions (so the store gains few distinct `known_at`s), mid-month."""
+    first = {12: date(fiscal_year + 1, 2, 12), 8: date(fiscal_year, 11, 12)}.get(
+        end_month, date(fiscal_year, 12, 10)
+    )
+    return _filing_acceptance(nth_session_after(_session_on_or_after(first), index % 4))
+
+
+def _profitability_row(
+    rows: Rows,
+    cik: str,
+    fact_name: str,
+    period: tuple[date, date],
+    value: float,
+    known_at: datetime,
+    accession: str,
+    form: str = "10-K",
+) -> None:
+    start, end = period
+    if fact_name == "gross_profit":
+        rows.statement_fact(
+            cik,
+            fact_name,
+            _GROSS_PROFIT_TAG,
+            end,
+            value,
+            known_at,
+            accession,
+            period_start=start,
+            form=form,
+        )
+    else:
+        rows.statement_fact(cik, fact_name, _ASSETS_TAG, end, value, known_at, accession, form=form)
+
+
+def _statement_facts_profitability(rows: Rows) -> None:
+    """The `profitability` family's fixture (plan T85c): annual `gross_profit`
+    (duration) and `total_assets` (instant, same `period_end`) pairs for every
+    non-benchmark issuer, FY2015 to FY2019, then the point-in-time cases on
+    existing issuers (no new security, so no momentum fixture result moves).
+
+    Values are `assets` and `assets * bp / 10000` with integer basis points, so
+    every value is exact. Where an earlier case already owns a filing (the plain
+    issuer's FY2019 10-K, the derived-gross-profit 10-K, the restated issuer's
+    FY2018 10-K, the no-securities-row-yet 10-K) the pair joins that filing at
+    its `known_at`; where a case already stores a key (CIK0001000003's derived
+    FY2019 `gross_profit`, CIK0001000005's 10-K/A FY2019 `total_assets`) the
+    baseline does not repeat it.
+    """
+    overrides: dict[tuple[str, int], tuple[datetime, str]] = {
+        # The 10-K accepted after close(T_i): crosses the cut at T_i.
+        (_CROSSING_CIK, 2018): (
+            _new_york(_CROSSING_SESSION, 16, 30),
+            _statement_accession(_CROSSING_CIK, 2019, 101),
+        ),
+        # Ordinary month-end stamps: 15:00, 16:00 (= session_close), 17:30 New York.
+        ("CIK0001000002", 2018): (
+            _new_york(_STAMP_MONTH_END, 15),
+            _statement_accession("CIK0001000002", 2019, 101),
+        ),
+        ("CIK0001000013", 2018): (
+            session_close(_STAMP_MONTH_END),
+            _statement_accession("CIK0001000013", 2019, 101),
+        ),
+        (_DUAL_CIK, 2018): (
+            _new_york(_STAMP_MONTH_END, 17, 30),
+            _statement_accession(_DUAL_CIK, 2019, 101),
+        ),
+        # Half-day month-end stamps: 12:30 and 14:00 New York (close 13:00).
+        ("CIK0001000012", 2019): (
+            _new_york(_STAMP_HALF_DAY, 12, 30),
+            _statement_accession("CIK0001000012", 2019, 101),
+        ),
+        ("CIK0001000020", 2019): (
+            _new_york(_STAMP_HALF_DAY, 14),
+            _statement_accession("CIK0001000020", 2019, 101),
+        ),
+        # Filings an earlier case already owns.
+        ("CIK0001000001", 2016): (
+            _filing_acceptance(_session_on_or_after(date(2017, 6, 15))),
+            _statement_accession("CIK0001000001", 2017, 1),
+        ),
+        ("CIK0001000002", 2019): (
+            _filing_acceptance(_session_on_or_after(date(2020, 2, 15))),
+            _statement_accession("CIK0001000002", 2020, 1),
+        ),
+        ("CIK0001000003", 2019): (
+            _filing_acceptance(_session_on_or_after(date(2020, 2, 20))),
+            _statement_accession("CIK0001000003", 2020, 1),
+        ),
+        (_RESTATED_CIK, 2018): (
+            _filing_acceptance(_session_on_or_after(date(2019, 2, 10))),
+            _statement_accession(_RESTATED_CIK, 2019, 1),
+        ),
+        (_RESTATED_CIK, 2019): (
+            _filing_acceptance(_session_on_or_after(date(2020, 2, 10))),
+            _statement_accession(_RESTATED_CIK, 2020, 1),
+        ),
+    }
+    # Keys an earlier case already stores, or a case leaves out on purpose.
+    skipped = {
+        ("CIK0001000003", 2019, "gross_profit"),  # the derived row
+        (_RESTATED_CIK, 2019, "total_assets"),  # first carried by the 10-K/A
+        (_ASSETS_LATER_CIK, 2019, "total_assets"),  # carried by the later 10-K/A below
+    }
+    stamps: dict[str, datetime] = {}
+    for index, (cik, end_month) in enumerate(_PROFITABILITY_ISSUERS):
+        for fiscal_year in _PROFITABILITY_YEARS:
+            # The dual-class issuer files from FY2018 only: an earlier pair would
+            # be fresh at the health tests' 2018-12-17 probe of this cik.
+            if cik == _DUAL_CIK and fiscal_year != 2018:
+                continue
+            period = _fiscal_period(fiscal_year, end_month)
+            known_at, accession = overrides.get(
+                (cik, fiscal_year),
+                (
+                    _default_acceptance(fiscal_year, end_month, index),
+                    _statement_accession(cik, fiscal_year + (end_month == 12), 100 + index),
+                ),
+            )
+            assets = 1_000_000 + 50_000 * index + 10_000 * (fiscal_year - 2015)
+            bp = 2_000 + 200 * index + 50 * (fiscal_year - 2015)
+            if cik == _CROSSING_CIK:
+                bp = _LOW_BP if fiscal_year < 2018 else _HIGH_BP
+            values = {"gross_profit": assets * bp / 10_000, "total_assets": float(assets)}
+            for fact_name, value in values.items():
+                if (cik, fiscal_year, fact_name) not in skipped:
+                    _profitability_row(rows, cik, fact_name, period, value, known_at, accession)
+            stamps[f"{cik} FY{fiscal_year}"] = known_at
+
+    # total_assets accepted after its gross-profit filing: the FY2019 10-K
+    # carries gross_profit only; a 10-K/A in the next month carries the assets.
+    later_period = _fiscal_period(2019, 9)
+    later_index = [c for c, _ in _PROFITABILITY_ISSUERS].index(_ASSETS_LATER_CIK)
+    later_known = _filing_acceptance(_session_on_or_after(date(2020, 1, 15)))
+    later_accession = _statement_accession(_ASSETS_LATER_CIK, 2020, 102)
+    _profitability_row(
+        rows,
+        _ASSETS_LATER_CIK,
+        "total_assets",
+        later_period,
+        float(1_000_000 + 50_000 * later_index + 10_000 * (2019 - 2015)),
+        later_known,
+        later_accession,
+        form="10-K/A",
+    )
+
+    rows.statement_case(
+        "Profitability baseline: an annual gross_profit (duration) and total_assets "
+        "(instant, same period_end) pair per fiscal year for every non-benchmark issuer",
+        "CIK0001000001 to CIK0001000022 (22 issuers)",
+        "gross_profit, total_assets: FY2015-FY2019 (CIK0001000006: FY2018 only); fiscal "
+        "years end in December except CIK0001000012 and CIK0001000020 (August) and "
+        "CIK0001000016 (September)",
+        "each 10-K about six weeks after its fiscal year end, on one of four sessions, "
+        "unless a case below sets it",
+        "at least 15 issuers have a fresh pair (annual_period_days, max_fact_age_days "
+        "of ProfitabilityConfig) known at every month-end close 2017-01-31 to 2020-06-30, "
+        "by cik; the engine scores only universe members (at most six names on this "
+        "fixture), so a fixture book is one or two names",
+    )
+    rows.statement_case(
+        "10-K accepted after close(T_i): its annual row moves the issuer across the cut at T_i",
+        _CROSSING_CIK,
+        f"gross_profit/total_assets {_LOW_BP / 100:.0f}% through FY2017, "
+        f"{_HIGH_BP / 100:.0f}% from FY2018 (the lowest, then the highest, of any issuer)",
+        f"FY2018 10-K known_at {stamps[f'{_CROSSING_CIK} FY2018'].isoformat()} (16:30 New "
+        f"York), after close({_CROSSING_SESSION.isoformat()}) "
+        f"{session_close(_CROSSING_SESSION).isoformat()}",
+        "SEC_TRANSFER is a universe member at T_i and T_i+1 (2019-03-29): invisible at "
+        "T_i, so run(end=T_i) is unchanged and run(end=T_i+1) is not",
+    )
+    rows.statement_case(
+        "Restated FY (profitability): FY2018's original 10-K pair is the only one stored; "
+        "the FY2019 10-K's restated FY2018 comparative is never stored",
+        _RESTATED_CIK,
+        "gross_profit, total_assets FY2018 (original); gross_profit FY2019; total_assets "
+        "FY2019 from the 10-K/A",
+        f"FY2018 10-K known_at {stamps[f'{_RESTATED_CIK} FY2018'].isoformat()}; FY2019 "
+        f"10-K (the restating filing) known_at {stamps[f'{_RESTATED_CIK} FY2019'].isoformat()}",
+        "the T76 restated-revenue issuer; a read at any T sees the original FY2018 values",
+    )
+    rows.statement_case(
+        "total_assets accepted after its gross-profit filing: scored only from the later "
+        "acceptance",
+        _ASSETS_LATER_CIK,
+        "gross_profit FY2019 (10-K), total_assets FY2019 (10-K/A); fiscal year ends 2019-09-30",
+        f"10-K known_at {stamps[f'{_ASSETS_LATER_CIK} FY2019'].isoformat()}; 10-K/A "
+        f"known_at {later_known.isoformat()} ({later_accession})",
+        "SEC_FACTS_RESTATED is a universe member at 2019-12-31 (gross_profit without its "
+        "total_assets: no_facts) and 2020-01-31 (scored)",
+    )
+    month_end_close = session_close(_STAMP_MONTH_END)
+    rows.statement_case(
+        f"Acceptance stamps on an ordinary month-end ({_STAMP_MONTH_END.isoformat()}, "
+        "close 16:00 New York): 15:00, 16:00 and 17:30",
+        "CIK0001000002, CIK0001000013, CIK0001000006",
+        "gross_profit, total_assets FY2018",
+        f"15:00 {stamps['CIK0001000002 FY2018'].isoformat()} (CIK0001000002); 16:00 "
+        f"{stamps['CIK0001000013 FY2018'].isoformat()} = session_close "
+        f"{month_end_close.isoformat()} (CIK0001000013); 17:30 "
+        f"{stamps[f'{_DUAL_CIK} FY2018'].isoformat()} (CIK0001000006)",
+        "all three are universe members at that close: the 15:00 and 16:00 filings are "
+        "used at it, the 17:30 one first at 2019-02-28",
+    )
+    rows.statement_case(
+        f"Acceptance stamps on the half-day month-end ({_STAMP_HALF_DAY.isoformat()}, "
+        "close 13:00 New York): 12:30 and 14:00",
+        "CIK0001000012, CIK0001000020",
+        "gross_profit, total_assets FY2019 (fiscal years end 2019-08-31)",
+        f"12:30 {stamps['CIK0001000012 FY2019'].isoformat()} (CIK0001000012); 14:00 "
+        f"{stamps['CIK0001000020 FY2019'].isoformat()} (CIK0001000020); session_close "
+        f"{session_close(_STAMP_HALF_DAY).isoformat()}",
+        "the 12:30 filing is visible at that close and the 14:00 one is not; "
+        "SEC_SPLIT_BETWEEN (CIK0001000012) is that month-end's only universe member, "
+        "so the 14:00 issuer (SEC_SPLIT_REDATED) shows the cut at the provider read only",
+    )
+
+
+# ---------------------------------------------------------------------------
 # CSV / README writing.
 # ---------------------------------------------------------------------------
 
@@ -1986,6 +2253,7 @@ def build_rows() -> Rows:
     _statement_facts_10ka_first_carrier(rows)
     _statement_facts_dual_class(rows)
     _statement_facts_no_securities_row_yet(rows)
+    _statement_facts_profitability(rows)
     return rows
 
 

@@ -65,6 +65,10 @@ T_TRANSFER_PROBE = datetime(2018, 10, 25, 20, 0, tzinfo=UTC)
 #: unrelated exclusions.
 T_DUAL = datetime(2018, 12, 17, 21, 0, tzinfo=UTC)
 DUAL_CIK = "CIK0001000006"
+#: Reported `gross_profit` rows the fixture knows at T_END: the profitability
+#: baseline (backtest plan T85c), one per issuer and fiscal year whose issuer
+#: has a securities row by then (fixture README, "Statement facts").
+REPORTED_GROSS_PROFIT_AT_END = 105
 
 DELISTED_AT_END = (
     "SEC_25NSE",
@@ -1595,8 +1599,8 @@ def test_statement_coverage_derived_share_is_not_scoped_to_the_universe(
     # one (module docstring).
     cov = statement_coverage(fixture_store, T_END, _settings())
     assert cov.derived == 1
-    assert cov.reported == 0
-    assert cov.derived_share == 1.0
+    assert cov.reported == REPORTED_GROSS_PROFIT_AT_END
+    assert cov.derived_share == pytest.approx(1 / (1 + REPORTED_GROSS_PROFIT_AT_END))
 
 
 def test_statement_coverage_derived_share_counts_a_dual_class_row_once(
@@ -1620,7 +1624,7 @@ def test_statement_coverage_derived_share_counts_a_dual_class_row_once(
     )
     cov = statement_coverage(fixture_store, T_END, _settings())
     assert cov.derived == 2  # CIK0001000003's existing fixture row, plus this one
-    assert cov.reported == 0
+    assert cov.reported == REPORTED_GROSS_PROFIT_AT_END
 
 
 def test_statement_coverage_on_a_version_8_store_does_not_crash(

@@ -9,6 +9,11 @@ the trial's frozen `Settings`; tests use the in-memory fake in
 
 Frames are `polars` frames with the columns of the as-of function each method stands
 for, so the store provider can return them unchanged.
+
+The two statement reads (`statement_facts`, `sics`; backtest spec amendment #720, plan
+T85c) serve the `profitability` family: a statement fact is visible at `t` from its
+filing's acceptance (`known_at <= t`), and the engine passes `t = session_close(T)`, so a
+10-K accepted after the close of a rebalance session is first read at the next one.
 """
 
 from __future__ import annotations
@@ -16,12 +21,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 import polars as pl
 
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import Universe
+
+#: The `statement_facts` names `DataProvider.statement_facts` returns: the `profitability`
+#: family's numerator and denominator (`operating_cash_flow` joins with B3b).
+STATEMENT_FACT_NAMES: Final[tuple[str, ...]] = ("gross_profit", "total_assets")
 
 
 @dataclass(frozen=True)
@@ -103,4 +112,20 @@ class DataProvider(Protocol):
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:
         """How many of `ids` have a current listing at `t` that rests on
         `snapshot_static` rows (#35)."""
+        ...
+
+    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`statement_facts_as_of(t, ids)` restricted to `STATEMENT_FACT_NAMES`: the
+        first-vintage rows whose filing was accepted at or before `t` (`known_at <= t`),
+        joined to `ids` through the securities known at `t` on `cik`, so a multi-class
+        issuer's row appears once per listed class and a CIK with no securities row at
+        `t` contributes nothing. Columns: `security_id` then every `statement_facts`
+        column (`fact_name`, `period_start`, `period_end`, `period_days`, `value`,
+        `basis`, `known_at`, ...)."""
+        ...
+
+    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
+        """Each of `ids` mapped to the `sic` of its latest `classifications` row known at
+        `t` (`classifications_as_of(t, ids)`); `None` when it has no such row or the row
+        carries no SIC."""
         ...
