@@ -12,13 +12,32 @@ concurrency:
   group: ci-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/train/')) && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/train/') }}
 
+# Pytest shard count (#1112): tests/conftest.py's `pytest_collection_modifyitems` buckets
+# test FILES (not individual tests, so a file's module/session fixtures build once per
+# shard, never once per shard that happens to draw one of its tests) across this many
+# shards by a static, duration-weighted assignment. 8, not the original 4: a real CI run
+# at 4 put tests/lookahead/test_backtest_invariance.py's shard at 24.6 min (the other three
+# shards, each with no single file anywhere near as heavy, ran 7-11 min) — the weight table
+# predicts additive cost well for ordinary files, but badly for this one outlier, which is
+# slower on a shared 4-core CI runner than the sum of its own measured seconds suggests. At
+# 8 shards the bin-packer isolates it alone (weight 373, nothing else fits beside it without
+# pushing some other shard over), and every other shard's weight roughly halves (~306
+# instead of ~628) with it. Raise this (and the matrix list below, kept in sync by hand) if
+# the suite grows enough to push shards back over the wall-clock target; `scripts/ready_pr.py`'s
+# targeted runs and local `uv run pytest` never set the shard env vars, so they always see
+# the whole suite.
+env:
+  PYTEST_SHARD_COUNT: 8
+
 jobs:
-  checks:
+  checks-fast:
     runs-on: ubuntu-latest
     # Read-only: a `train/**` push runs batch code with the repository's token, and this job
     # only reads (merge-train spec, CI amendment; req 1 (0) is the first line of defence).
     permissions:
       contents: read
+    outputs:
+      tests-needed: ${{ steps.scope.outputs.needed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,8 +62,9 @@ jobs:
       - name: Types
         run: uv run mypy
       # A PR that touches no code, tests, scripts, deps or CI skips pytest (same rule as
-      # ready_pr.py). Gated per step, not with `paths:`, so `checks` still reports. Fails
-      # closed: a failed diff fails the step, an empty diff or anything but "no" runs tests.
+      # ready_pr.py), which skips every shard below too (their `if:` reads this output).
+      # Fails closed: a failed diff fails the step, an empty diff or anything but "no" runs
+      # tests.
       - name: Test scope
         id: scope
         env:
@@ -59,10 +79,68 @@ jobs:
           fi
           echo "Tests needed: $needed"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
-      - name: Tests
-        if: steps.scope.outputs.needed != 'no'
-        # xdist: one worker per core; each test already gets its own tmp_path (#581)
+
+  pytest-shard:
+    needs: checks-fast
+    if: needs.checks-fast.outputs.tests-needed != 'no'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      PYTEST_SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install
+        run: uv sync --locked
+      # Printed so a run's shard counts can be summed and compared against the unsharded
+      # `pytest --collect-only -q` count (verified by hand on this issue's PR).
+      - name: Collected count (this shard)
+        run: uv run pytest --collect-only -q | tail -1
+      # xdist: one worker per core; each test already gets its own tmp_path (#581)
+      - name: Tests (this shard)
         run: uv run pytest -n auto
+
+  # Required check name every piece of merge tooling reads literally: the `protect-main`
+  # ruleset, scripts/ready_pr.py's `checks_state`, and scripts/merge_train.py's
+  # `_REQUIRED_CHECKS`. It must stay named exactly `checks` and must succeed if and only if
+  # checks-fast and (when tests ran) every pytest shard succeeded.
+  checks:
+    needs: [checks-fast, pytest-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify checks-fast and every pytest shard passed
+        run: |
+          echo "checks-fast: ${{ needs.checks-fast.result }}"
+          echo "pytest-shard: ${{ needs.pytest-shard.result }} (tests-needed: ${{ needs.checks-fast.outputs.tests-needed }})"
+          if [ "${{ needs.checks-fast.result }}" != "success" ]; then
+            echo "checks-fast did not succeed" >&2
+            exit 1
+          fi
+          if [ "${{ needs.checks-fast.outputs.tests-needed }}" = "no" ]; then
+            # No shard ran (job-level `if:` skipped the whole matrix): that is the
+            # expected, successful outcome for a docs-only PR, not a failure.
+            if [ "${{ needs.pytest-shard.result }}" != "skipped" ]; then
+              echo "tests-needed was 'no' but pytest-shard did not report skipped" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          if [ "${{ needs.pytest-shard.result }}" != "success" ]; then
+            echo "a pytest shard failed or was cancelled" >&2
+            exit 1
+          fi
 
   claims:
     if: github.event_name == 'pull_request'

@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import csv
 import errno
+import os
 import re
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,85 @@ from tradepartner.store import schema
 from tradepartner.store.db import configure_connection
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
+
+# CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
+# one process, just split into N invocations with no new dependency. Weight is each
+# unit's own total seconds (`call` + `setup` + `teardown`, summed when a unit covers
+# several items) read off a local `uv run pytest -n auto --durations=0` full-suite run
+# (2026-10-06); only units far above the pack are listed, everything else defaults to
+# `_DEFAULT_TEST_FILE_WEIGHT` (chosen near the median file's total). A stale weight
+# still balances fine — it only shifts which shard a unit lands on, never which tests
+# run — so this table does not need to be kept in lockstep with the suite; re-measure
+# and update it only if a shard's wall clock drifts noticeably from the others.
+#
+# A unit is normally a whole file (see `_shard_unit`): a file's module/session-scoped
+# fixtures then build at most once per shard. tests/lookahead/test_backtest_invariance.py
+# is the one exception (`_SPLIT_BY_TEST` below): a real CI run at file-granularity put it
+# alone in its own shard and it still took 17-18 min (3-5x its next-heaviest sibling),
+# because its few parametrized cases don't share fixtures across cadences anyway (each
+# `[month_end]`/`[daily]`/`[week_end]` variant pays its own ~60-200s setup — confirmed
+# from this same profiling run) and xdist's scheduler happened to stack several of them
+# on one worker. Splitting it by test, keyed by nodeid below, loses nothing a whole-file
+# bucket would have saved and lets those cases land on different shards.
+_HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[month_end]": 200.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[daily]": 71.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[week_end]": 62.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[month_end]": 24.0,
+    "tests/lookahead/test_asof_invariance.py": 200.0,
+    "tests/lookahead/test_gap_invariance.py": 169.0,
+    "tests/execution/test_run_exits.py": 159.0,
+    "tests/lookahead/test_backtest_plan_timing.py": 128.0,
+    "tests/execution/test_crash_resume.py": 112.0,
+    "tests/lookahead/test_universe_invariance.py": 103.0,
+    "tests/execution/test_run_trade.py": 100.0,
+    "tests/test_cli_backtest.py": 86.0,
+    "tests/test_health.py": 82.0,
+    "tests/backtest/test_results.py": 75.0,
+    "tests/oracle/test_bt_oracle.py": 66.0,
+    "tests/execution/test_run_core.py": 65.0,
+    "tests/execution/test_run_stop.py": 62.0,
+    "tests/test_llm_boundary.py": 55.0,
+    "tests/test_backfill.py": 51.0,
+    "tests/execution/test_resume.py": 51.0,
+    "tests/backtest/test_run.py": 50.0,
+    "tests/execution/test_wrapper_phases.py": 48.0,
+    "tests/backtest/test_engine.py": 46.0,
+    "tests/execution/test_window_settle_gate.py": 36.0,
+    "tests/execution/test_window_stop.py": 35.0,
+    "tests/execution/test_planning.py": 26.0,
+    "tests/execution/test_run_marks.py": 24.0,
+    "tests/execution/test_wrapper_core.py": 21.0,
+    "tests/execution/test_window_settle.py": 20.0,
+    "tests/test_ingest.py": 20.0,
+    "tests/execution/test_window_start.py": 19.0,
+    "tests/test_fixture_universe.py": 18.0,
+    "tests/store/test_schema.py": 18.0,
+    "tests/execution/test_collect.py": 18.0,
+    "tests/execution/test_ops.py": 16.0,
+    "tests/store/test_delistings.py": 15.0,
+    "tests/adapters/test_fixture_prices.py": 15.0,
+    "tests/execution/test_reconcile_run.py": 14.0,
+    "tests/execution/test_wrapper_reattempts.py": 14.0,
+    "tests/dashboard/test_backtest_page.py": 14.0,
+    "tests/execution/test_run_plan.py": 13.0,
+    "tests/dashboard/test_health_page.py": 13.0,
+    "tests/test_universe.py": 12.0,
+}
+_DEFAULT_TEST_FILE_WEIGHT = 0.4
+
+# Files bucketed by individual test (nodeid) rather than as a whole file — see the
+# comment on `_HEAVY_TEST_FILE_WEIGHTS` above. Keep this list short: splitting a file
+# that *does* share an expensive module/session fixture across its tests would make
+# that fixture rebuild once per shard its tests land in, instead of once overall.
+_SPLIT_BY_TEST: frozenset[str] = frozenset({"tests/lookahead/test_backtest_invariance.py"})
+
+_SHARD_INDEX_ENV = "PYTEST_SHARD_INDEX"
+_SHARD_COUNT_ENV = "PYTEST_SHARD_COUNT"
 
 # An ISO-8601 UTC offset ("+00:00", "+0000", "-05:00") or a literal "Z"
 # suffix. Deliberately strict: a fixture author who forgets the offset
@@ -63,6 +143,79 @@ _BARE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
 _DATE_TYPE = "DATE"
+
+
+def shard_assignment(units: Iterable[str], shard_count: int) -> dict[str, int]:
+    """Deterministically bucket shard units into ``shard_count`` shards (#1112).
+
+    A unit is normally a whole file path; for the few files in `_SPLIT_BY_TEST` it's
+    one test's nodeid instead (see `_shard_unit`) — this function doesn't care which,
+    it just balances whatever strings it's given by weight.
+
+    Greedy longest-processing-time bin packing: units are sorted heaviest-first (ties
+    broken by the unit string itself, for a result that doesn't depend on set/hash
+    iteration order) from `_HEAVY_TEST_FILE_WEIGHTS` (default weight for everything
+    else) and each goes to the shard currently holding the least weight, lowest index
+    breaking ties.
+
+    Pure and total: every unit gets exactly one shard index in ``[0, shard_count)``,
+    and the mapping depends only on the input set, not on the order items were
+    collected in.
+    """
+    if shard_count < 1:
+        raise ValueError(f"shard_count must be >= 1, got {shard_count}")
+    loads = [0.0] * shard_count
+    assignment: dict[str, int] = {}
+    ordered = sorted(
+        set(units),
+        key=lambda u: (-_HEAVY_TEST_FILE_WEIGHTS.get(u, _DEFAULT_TEST_FILE_WEIGHT), u),
+    )
+    for unit in ordered:
+        weight = _HEAVY_TEST_FILE_WEIGHTS.get(unit, _DEFAULT_TEST_FILE_WEIGHT)
+        shard = min(range(shard_count), key=lambda i: (loads[i], i))
+        assignment[unit] = shard
+        loads[shard] += weight
+    return assignment
+
+
+def _shard_unit(item: pytest.Item, rootdir: Path) -> str:
+    """This item's bucketing key: its file, or its own nodeid for `_SPLIT_BY_TEST`."""
+    rel = item.path.relative_to(rootdir).as_posix()
+    return item.nodeid if rel in _SPLIT_BY_TEST else rel
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keep only this shard's items, when CI sets `PYTEST_SHARD_INDEX`/`_COUNT` (#1112).
+
+    No-op when either is unset, so a local `uv run pytest` and `ready_pr.py`'s
+    targeted runs are unaffected. Bucketing is by test file (`shard_assignment`) for
+    all but a short, explicit list of files (`_SPLIT_BY_TEST`) confirmed not to share
+    expensive fixtures across their own tests; every other file's fixtures still build
+    at most once per shard.
+    """
+    count_raw = os.environ.get(_SHARD_COUNT_ENV)
+    index_raw = os.environ.get(_SHARD_INDEX_ENV)
+    if not count_raw or not index_raw:
+        return
+    shard_count = int(count_raw)
+    shard_index = int(index_raw)
+    if shard_count <= 1:
+        return
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"{_SHARD_INDEX_ENV}={shard_index} out of range for {_SHARD_COUNT_ENV}={shard_count}"
+        )
+    rootdir = config.rootpath
+    units = {_shard_unit(item, rootdir) for item in items}
+    assignment = shard_assignment(units, shard_count)
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        unit = _shard_unit(item, rootdir)
+        (kept if assignment[unit] == shard_index else deselected).append(item)
+    items[:] = kept
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
 
 
 def _blocked_connect(*_args: object, **_kwargs: object) -> None:
