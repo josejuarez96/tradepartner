@@ -662,18 +662,11 @@ class SweepRegistration:
     created: bool
 
 
-_HOLDOUT_PREFIX: Final = "holdout."
-
-
 def family_rule_params(params: Mapping[str, Any]) -> dict[str, Any]:
     """The keys of a frozen set the family rules fix as values (Definitions, Family
-    rules): every key under `FORBIDDEN_AXIS_PREFIXES` except `holdout.*`, which the
-    rules hold in their own date columns."""
-    return {
-        key: value
-        for key, value in params.items()
-        if key.startswith(FORBIDDEN_AXIS_PREFIXES) and not key.startswith(_HOLDOUT_PREFIX)
-    }
+    rules): every key under `FORBIDDEN_AXIS_PREFIXES`, `holdout.*` included, as the lab
+    migration writes them for an existing family."""
+    return {key: value for key, value in params.items() if key.startswith(FORBIDDEN_AXIS_PREFIXES)}
 
 
 def _rule_differences(
@@ -689,6 +682,8 @@ def _rule_differences(
         )
         if ours != theirs
     ]
+    if file.parent_family is not None and file.parent_family != rules.parent_family:
+        differences.append(f"parent_family (the family's is {rules.parent_family!r})")
     for key, rule in sorted(rules.fixed_params.items()):
         value = params.get(key)
         if key == registry.BASE_COST_KEY:
@@ -764,13 +759,22 @@ def _anchor_refusal(file: SweepFile, variant: Variant, first_session: date | Non
 def _existing_registration(
     conn: duckdb.DuckDBPyConnection, file: SweepFile, variants: Sequence[Variant]
 ) -> SweepRegistration | None:
-    """The slug's latest registration when it is this file with these frozen sets."""
+    """The slug's latest registration when it is this file (doc hash) with these
+    canonical frozen sets."""
     latest = lab_registry.sweep_by_slug(conn, file.slug)
     if latest is None or latest.doc_sha256 != file.doc_sha256:
         return None
     rows = lab_registry.sweep_variants(conn, latest.sweep_id)
     records = [registry.get_hypothesis_by_id(conn, row.hypothesis_id) for row in rows]
-    if [r.params_sha256 for r in records] != [v.params_sha256 for v in variants]:
+    # Canonical frozen sets, never raw hashes (Definitions, Fingerprint): a stored set
+    # that lacks a table key at its default is the same set.
+    stored = sorted(
+        _canonical_json(frozen.canonical_frozen_set(r.params, r.family)) for r in records
+    )
+    ours = sorted(
+        _canonical_json(frozen.canonical_frozen_set(v.frozen_set, file.family)) for v in variants
+    )
+    if stored != ours:
         return None
     return SweepRegistration(
         sweep=latest, variants=tuple(rows), hypotheses=tuple(records), created=False
@@ -847,6 +851,10 @@ def register(
         step = rules.axis_lattice.get(axis)
         if step is None:
             continue
+        if not step > 0:
+            raise FamilyLatticeError(
+                f"{file}: the family rules' lattice step for {axis} is {step}, not > 0"
+            )
         for value in values:
             numeric = isinstance(value, int | float) and not isinstance(value, bool)
             if numeric and _lattice_index(float(value), step) is None:

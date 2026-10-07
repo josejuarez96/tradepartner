@@ -248,6 +248,32 @@ def test_register_is_idempotent_for_an_unchanged_file(
     assert _counts(ready) == before
 
 
+def test_idempotence_compares_canonical_frozen_sets_not_raw_hashes(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A stored variant whose set lacks a `FROZEN_KEY_DEFAULTS` key at its default (a
+    registration from before the key landed) is the same frozen set."""
+    path = _copy(tmp_path, SWEEP_SOURCE)
+    first = register(ready, path, settings, registered_by="test")
+    for record in first.hypotheses:
+        params = {k: v for k, v in record.params.items() if k != "schedule.signal_anchor"}
+        ready.execute(
+            "UPDATE hypotheses SET params_json = ?, params_sha256 = ? WHERE hypothesis_id = ?",
+            [
+                registry.canonical_params_json(params),
+                registry.params_sha256(params),
+                record.hypothesis_id,
+            ],
+        )
+    before = _counts(ready)
+
+    again = register(ready, path, settings, registered_by="test")
+
+    assert not again.created
+    assert again.sweep == first.sweep
+    assert _counts(ready) == before
+
+
 def test_a_changed_file_is_a_new_registration_whose_unchanged_variants_are_refused(
     ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
@@ -340,6 +366,18 @@ def test_a_file_off_the_family_rules_is_refused_naming_the_rule(
     rule: str,
 ) -> None:
     _refused(ready, _copy(tmp_path, SWEEP_SOURCE, edit), settings, FamilyRuleError, rule)
+
+
+def test_a_file_naming_another_parent_family_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    path = _copy(
+        tmp_path,
+        SWEEP_SOURCE,
+        ('family = "momentum"', 'family = "momentum"\nparent_family = "profitability"'),
+    )
+
+    _refused(ready, path, settings, FamilyRuleError, "parent_family")
 
 
 def test_raising_the_base_cost_is_accepted(
@@ -471,6 +509,19 @@ def test_a_grid_value_off_the_family_rules_lattice_is_refused(
     _refused(lab_store, path, settings, FamilyLatticeError, "0.12")
 
 
+def test_a_non_positive_family_lattice_step_is_refused_not_divided_by(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _twin(
+        lab_store,
+        settings,
+        tmp_path,
+        rules_settings=_settings(axis_lattice={"strategy.top_fraction": 0.0}),
+    )
+
+    _refused(lab_store, _copy(tmp_path, SWEEP_SOURCE), settings, FamilyLatticeError, "not > 0")
+
+
 @pytest.mark.parametrize("source", sorted(REFUSALS.glob("*.md")), ids=lambda p: p.stem)
 def test_a_file_level_refusal_writes_nothing(
     ready: duckdb.DuckDBPyConnection, settings: Settings, source: Path
@@ -478,7 +529,7 @@ def test_a_file_level_refusal_writes_nothing(
     _refused(ready, source, _settings(max_variants_per_sweep=3), SweepFileError, None)
 
 
-def test_family_rule_params_are_the_forbidden_prefix_keys_but_the_holdout() -> None:
+def test_family_rule_params_are_the_forbidden_prefix_keys() -> None:
     params = {
         "strategy.top_fraction": 0.1,
         "schedule.rebalance_cadence": "month_end",
@@ -492,6 +543,7 @@ def test_family_rule_params_are_the_forbidden_prefix_keys_but_the_holdout() -> N
     assert sweep.family_rule_params(params) == {
         "costs.per_side_bps": 15.0,
         "universe.top_n_by_cap": 1000,
+        "holdout.start": "2023-01-03",
         "execution.fill_price": "close",
         "benchmarks": ["SPY"],
         "alpaca.historical_feed": "sip",
