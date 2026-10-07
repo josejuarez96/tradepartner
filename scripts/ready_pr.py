@@ -34,10 +34,10 @@ Steps, in order (each one stops the run with a reason on failure):
    ``PASS WITH FIXES`` needs a re-review after the fixes that posts ``PASS``.
 6. Push, wait for CI on **that exact commit**, then ``gh pr ready``. A draft PR's own CI
    runs ``checks-fast`` only (#1192) and never reports the required ``checks``, so for a
-   draft this step first adds the ``ci:full`` label (before the push): the push's run, or
-   the label's own run when the push changes nothing, then shards the suite like a ready
-   PR's, and the PR is marked ready only once a ``checks`` on this commit is green. Marking
-   ready does not start another run.
+   draft this step, once the PR's head is the pushed commit, adds the ``ci:full`` label:
+   the label's run shards the suite on that head like a ready PR's (superseding the
+   push's draft run), and the PR is marked ready only once a ``checks`` on this commit is
+   green. Marking ready does not start another run.
 
 Usage::
 
@@ -635,14 +635,18 @@ def ready(
 
     # 6. push, wait for CI on this commit, mark ready
     sha = r.git("rev-parse", "HEAD")
-    if pr.draft and FULL_CI_LABEL not in pr.labels:
-        # A draft's run skips the shards and never reports `checks` (#1192). With the label
-        # on before the push, the push's run (or, if the push is a no-op, the label's own
-        # run on this head) is the full one.
-        r.add_label(number, FULL_CI_LABEL)
-        say(f"draft PR: added {FULL_CI_LABEL} so CI runs every shard on this head")
     r.git("push", "origin", f"HEAD:{pr.branch}")
     say(f"pushed {sha[:7]}")
+    if pr.draft and FULL_CI_LABEL not in pr.labels:
+        # A draft's run skips the shards and never reports `checks` (#1192). Labelled only
+        # once GitHub shows the pushed head on the PR, the label's run is on this head and
+        # comes after the push's draft run (which it cancels; `checks_state` reads that as
+        # superseded). Labelling before the push could let the label's run on the old head
+        # start last and cancel the full run on this one (code review on #1196).
+        if not _wait_for_head(r, number, sha, timeout_s, poll_s):
+            raise ReadyError(f"PR #{number} head is not {sha[:7]} on GitHub yet; run again")
+        r.add_label(number, FULL_CI_LABEL)
+        say(f"draft PR: added {FULL_CI_LABEL} so CI runs every shard on {sha[:7]}")
     if not wait:
         say("not waiting for CI (--no-wait); PR left as is")
         return 0
@@ -692,6 +696,16 @@ def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
         r.git("add", path)
         say(f"resolved append conflict in {path} (kept both sides)")
     r.git("commit", "--no-edit")
+
+
+def _wait_for_head(r: Runner, number: int, sha: str, timeout_s: int, poll_s: int) -> bool:
+    """Wait until GitHub reports ``sha`` as the PR's head; False on timeout."""
+    deadline = time.monotonic() + timeout_s
+    while r.head_checks(number).sha != sha:
+        if time.monotonic() >= deadline:
+            return False
+        r.sleep(poll_s)
+    return True
 
 
 def _wait_for_ci(

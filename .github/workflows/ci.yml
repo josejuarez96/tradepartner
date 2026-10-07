@@ -2,8 +2,8 @@ name: CI
 
 # A draft PR runs `checks-fast` only (#1192): the pytest shards run on a non-draft PR, on
 # a draft that carries the `ci:full` label, and on every push to main or `train/**`.
-# `scripts/ready_pr.py` adds `ci:full` to a draft before its push, so that head gets the full
-# run as a `pull_request` run (the only kind a PR's checks, and the `protect-main` ruleset's
+# `scripts/ready_pr.py` adds `ci:full` to a draft once its pushed head shows on the PR, so
+# that head gets the full run as a `pull_request` run (the only kind a PR's checks, and the `protect-main` ruleset's
 # required `checks`, are read from; a `workflow_dispatch` run on the branch does not show on
 # the PR), and marks the PR ready only once it is green. `labeled` starts a run for any
 # label; `ready_for_review` is deliberately not a trigger: marking ready after that green

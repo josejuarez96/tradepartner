@@ -449,16 +449,23 @@ def test_happy_path_pushes_waits_and_marks_ready() -> None:
 
 def test_a_draft_gets_the_full_ci_label_before_its_push_and_ready_after_green() -> None:
     # #1192: a draft's own CI skips the shards and never reports `checks`, so ready_pr
-    # labels it ci:full before pushing (the push's run, or the label's when the push is a
-    # no-op, is then the full one), waits for it, and only then marks the PR ready.
-    r = FakeRunner(checks_after=["pending", "success"])
+    # labels it ci:full once GitHub shows the pushed head (the label's run is then the full
+    # one on that head), waits for that run, and only then marks the PR ready.
+    r = FakeRunner(checks_after=["pending", "success", "pending", "success"])
     assert ready_pr.ready(r, 69, poll_s=0) == 0
     assert r.labelled == [(69, "ci:full")]
-    assert r.events == ["label", "push", "wait", "wait", "ready"]
+    assert r.events == ["push", "wait", "wait", "label", "wait", "wait", "ready"]
+
+
+def test_a_head_github_never_shows_gets_no_label() -> None:
+    r = FakeRunner(checks_after=["pending"] * 5)
+    with pytest.raises(ready_pr.ReadyError, match="head is not abc1234 on GitHub yet"):
+        ready_pr.ready(r, 69, poll_s=0, timeout_s=0)
+    assert r.labelled == [] and r.readied == []
 
 
 def test_a_failed_full_run_leaves_the_draft_a_draft() -> None:
-    r = FakeRunner(checks_after=["failure"])
+    r = FakeRunner(checks_after=["success", "failure"])
     with pytest.raises(ready_pr.ReadyError, match="CI failure"):
         ready_pr.ready(r, 69, poll_s=0)
     assert r.labelled == [(69, "ci:full")]
@@ -473,6 +480,7 @@ def test_no_label_on_a_ready_pr_or_a_draft_that_already_has_it() -> None:
     r._pr = ready_pr.Pr(69, "feat/69-x", "main", True, BODY_OK, r._pr.comments, ("ci:full",))
     assert ready_pr.ready(r, 69, poll_s=0) == 0
     assert r.labelled == [] and r.readied == [69]
+    assert r.events == ["push", "wait", "ready"]
 
 
 def test_dry_run_labels_nothing() -> None:
@@ -591,11 +599,12 @@ def test_redact_strips_credentials_from_urls() -> None:
 
 
 def test_ci_failure_leaves_the_pr_a_draft() -> None:
-    r = FakeRunner(checks_after=["failure"])
+    # the first answer is the draft's head check before labelling (#1192)
+    r = FakeRunner(checks_after=["success", "failure"])
     with pytest.raises(ready_pr.ReadyError, match="CI failure"):
         ready_pr.ready(r, 69, poll_s=0)
     assert r.readied == []
-    r = FakeRunner(checks_after=["pending", "pending"])
+    r = FakeRunner(checks_after=["success", "pending", "pending"])
     with pytest.raises(ready_pr.ReadyError, match="timeout"):
         ready_pr.ready(r, 69, poll_s=0, timeout_s=0)
 
