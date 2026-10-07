@@ -60,9 +60,10 @@ _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 # one process, just split into N invocations with no new dependency. Weight is each
 # unit's own total seconds (`call` + `setup` + `teardown`, summed when a unit covers
 # several items) read off the CI shards' `--durations=0 --durations-min=1.0` tables (ci.yml
-# prints them) in run 37679158243 (2026-10-07, #1192; the 2026-10-06 table came from a
-# local run and left new or CI-slow units at the default, so shards ran 3.7 to 11.8 min);
-# units at 3 s or more are listed, everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`.
+# prints them), averaged over runs 37679158243 and 37681698737 (2026-10-07, #1192; a unit
+# varies by up to a third between runs. The 2026-10-06 table came from a local run and
+# left new or CI-slow units at the default, so shards ran 3.7 to 11.8 min); units at 3 s
+# or more are listed, everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`.
 # A stale weight still balances fine — it only shifts which shard a unit lands on, never which tests
 # run — so this table does not need to be kept in lockstep with the suite; re-measure
 # and update it only if a shard's wall clock drifts noticeably from the others.
@@ -77,84 +78,84 @@ _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 # on one worker. Splitting it by test, keyed by nodeid below, loses nothing a whole-file
 # bucket would have saved and lets those cases land on different shards.
 _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
-    "tests/lookahead/test_asof_invariance.py": 433.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[week_end]": 404.0,
+    "test_truncation_invariance_at_every_rebalance[week_end]": 425.0,
+    "tests/lookahead/test_asof_invariance.py": 398.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[daily]": 375.0,
-    "tests/lookahead/test_universe_invariance.py": 278.0,
-    "tests/lookahead/test_backtest_plan_timing.py": 277.0,
-    "tests/lookahead/test_gap_invariance.py": 276.0,
+    "test_truncation_invariance_at_every_rebalance[daily]": 383.0,
+    "tests/lookahead/test_gap_invariance.py": 335.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[month_end]": 268.0,
+    "test_truncation_invariance_at_every_rebalance[month_end]": 307.0,
+    "tests/lookahead/test_universe_invariance.py": 267.0,
+    "tests/lookahead/test_backtest_plan_timing.py": 250.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[daily]": 236.0,
+    "test_prefix_invariance_at_every_rebalance[daily]": 225.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[month_end]": 220.0,
-    "tests/execution/test_run_stop.py": 201.0,
-    "tests/execution/test_crash_resume.py": 189.0,
+    "test_prefix_invariance_at_every_rebalance[month_end]": 221.0,
+    "tests/execution/test_run_exits.py": 209.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_truncation_invariance_at_every_rebalance[profitability]": 184.0,
-    "tests/execution/test_run_exits.py": 173.0,
-    "tests/execution/test_run_trade.py": 131.0,
-    "tests/backtest/test_results.py": 125.0,
-    "tests/test_backfill.py": 109.0,
+    "test_truncation_invariance_at_every_rebalance[profitability]": 204.0,
+    "tests/execution/test_crash_resume.py": 178.0,
+    "tests/execution/test_run_stop.py": 169.0,
+    "tests/execution/test_run_trade.py": 154.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[week_end]": 107.0,
-    "tests/oracle/test_bt_oracle.py": 106.0,
-    "tests/test_health.py": 96.0,
+    "test_prefix_invariance_at_every_rebalance[week_end]": 153.0,
+    "tests/backtest/test_results.py": 132.0,
+    "tests/oracle/test_bt_oracle.py": 121.0,
+    "tests/test_backfill.py": 102.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[month_end]": 78.0,
+    "test_prefix_invariance_at_every_rebalance[profitability]": 94.0,
+    "tests/test_health.py": 85.0,
+    "tests/execution/test_resume.py": 75.0,
+    "tests/test_cli_backtest.py": 74.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[daily]": 73.0,
-    "tests/execution/test_resume.py": 72.0,
+    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[month_end]": 67.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_prefix_invariance_at_every_rebalance[profitability]": 72.0,
-    "tests/test_cli_backtest.py": 72.0,
-    "tests/test_llm_boundary.py": 72.0,
-    "tests/execution/test_window_settle_gate.py": 62.0,
-    "tests/execution/test_run_core.py": 60.0,
-    "tests/execution/test_run_marks.py": 60.0,
+    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[week_end]": 65.0,
+    "tests/execution/test_run_marks.py": 63.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[week_end]": 60.0,
+    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[daily]": 62.0,
+    "tests/execution/test_run_core.py": 62.0,
+    "tests/test_llm_boundary.py": 61.0,
+    "tests/execution/test_window_settle_gate.py": 58.0,
+    "tests/backtest/test_run.py": 45.0,
     "tests/test_fixture_universe.py": 42.0,
     "tests/adapters/test_fixture_prices.py": 39.0,
     "tests/execution/test_window_settle.py": 36.0,
-    "tests/backtest/test_run.py": 35.0,
-    "tests/backtest/test_engine.py": 31.0,
+    "tests/backtest/test_engine.py": 36.0,
     "tests/lookahead/test_backtest_invariance.py::"
-    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[profitability]": 30.0,
-    "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[month_end]": 22.0,
+    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[profitability]": 25.0,
+    "tests/execution/test_run_plan.py": 24.0,
     "tests/store/test_delistings.py": 22.0,
-    "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[daily]": 20.0,
-    "tests/execution/test_window_stop.py": 18.0,
+    "tests/execution/test_window_stop.py": 20.0,
+    "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[month_end]": 19.0,
     "tests/lookahead/test_backtest_invariance.py::"
     "test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i[profitability]": 16.0,
-    "tests/execution/test_run_plan.py": 14.0,
-    "tests/store/test_master.py": 14.0,
+    "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[daily]": 16.0,
+    "tests/dashboard/test_health_page.py": 14.0,
+    "tests/store/test_master.py": 13.0,
+    "tests/execution/test_ops.py": 13.0,
+    "tests/execution/test_wrapper_phases.py": 12.0,
+    "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[week_end]": 11.0,
     "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[profitability]": 11.0,
-    "tests/test_cli.py": 11.0,
-    "tests/execution/test_wrapper_reattempts.py": 10.0,
-    "tests/dashboard/test_health_page.py": 9.0,
-    "tests/test_backfill_fetch_set.py": 8.0,
+    "tests/test_backfill_fetch_set.py": 10.0,
+    "tests/test_cli.py": 9.0,
     "tests/execution/test_planning.py": 8.0,
-    "tests/execution/test_ops.py": 7.0,
-    "tests/lookahead/test_backtest_invariance.py::test_the_run_is_not_vacuous[week_end]": 7.0,
+    "tests/test_ingest.py": 8.0,
+    "tests/execution/test_wrapper_reattempts.py": 8.0,
+    "tests/dashboard/test_backtest_page.py": 7.0,
     "tests/test_no_forbidden_imports.py": 7.0,
     "tests/execution/test_collect.py": 6.0,
-    "tests/test_ingest.py": 6.0,
-    "tests/backtest/test_engine_exits.py": 6.0,
+    "tests/dashboard/test_override_page.py": 6.0,
+    "tests/execution/test_sdk_boundary.py": 5.0,
+    "tests/execution/test_reconcile_run.py": 5.0,
     "tests/execution/test_boundaries.py": 5.0,
-    "tests/execution/test_risk.py": 4.0,
-    "tests/dashboard/test_backtest_page.py": 4.0,
-    "tests/execution/test_wrapper_phases.py": 4.0,
-    "tests/store/test_asof.py": 4.0,
+    "tests/backtest/test_engine_exits.py": 5.0,
+    "tests/test_calendar.py": 4.0,
+    "tests/test_shares_plausibility.py": 4.0,
     "tests/execution/test_accept_rejections_boundary.py": 4.0,
     "tests/store/test_classify.py": 4.0,
-    "tests/execution/test_sdk_boundary.py": 4.0,
-    "tests/test_shares_plausibility.py": 4.0,
-    "tests/lookahead/test_suite.py": 3.0,
-    "tests/execution/test_reconcile_run.py": 3.0,
+    "tests/store/test_asof.py": 4.0,
 }
 _DEFAULT_TEST_FILE_WEIGHT = 0.4
 
