@@ -20,13 +20,13 @@ Steps, in order (each one stops the run with a reason on failure):
    it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
 4. Local checks: ruff check, ruff format --check, mypy, the fragment check and
-   ``tests/test_docs_budget.py`` always; pytest only when the diff touches code, tests,
-   scripts, dependencies or CI (``src/``, ``tests/``, ``scripts/``, ``.github/``,
-   ``pyproject.toml``, ``uv.lock``, ``.python-version``), and then only the test files the
-   diff maps to (``targeted_tests``), or the full suite when the mapping is unclear (#456).
-   CI runs the full suite on such PRs (``--tests-needed``) and on every push to main.
-   ``--full-tests`` runs the full suite locally, ``--tests`` forces the local run,
-   ``--no-tests`` skips it.
+   ``tests/test_docs_budget.py`` always. No local pytest by default: CI runs the full suite
+   on every diff that touches code, tests, scripts, dependencies or CI (``src/``,
+   ``tests/``, ``scripts/``, ``.github/``, ``pyproject.toml``, ``uv.lock``,
+   ``.python-version``; ``--tests-needed``) and on every push to main, sharded (#1113,
+   #1130). ``--tests`` runs the test files the diff maps to (``targeted_tests``), or the
+   full suite when the mapping is unclear (#456); ``--full-tests`` runs the full suite
+   locally; ``--no-tests`` skips it.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
@@ -553,7 +553,11 @@ def ready(
         checks.append(PYTEST_CHECK)
     elif run_tests is False:
         say("skipping local pytest (--no-tests); CI still runs it if the diff touches code")
-    elif run_tests or tests_needed(touched):
+    elif run_tests is None and tests_needed(touched):
+        # CI runs the full suite on this diff in ~11 min (sharded, #1113); a local run of
+        # the mapped tests took 40+ min for a config.py diff on the owner's Mac (#1130)
+        say("skipping local pytest: CI runs the full suite on this diff (--tests forces it)")
+    elif run_tests:
         sources = {
             p: r.read(p)
             for p in r.git("ls-files", "tests").splitlines()
@@ -788,7 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=True,
         default=None,
-        help="run pytest locally even if the diff touches no code, tests, scripts or deps",
+        help="run the mapped tests locally (default: CI runs the full suite instead)",
     )
     tests.add_argument(
         "--no-tests",
