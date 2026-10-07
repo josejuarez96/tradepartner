@@ -50,15 +50,32 @@ _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 
 # CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
 # one process, just split into N invocations with no new dependency. Weight is each
-# file's own total seconds (`call` + `setup` + `teardown` summed per file) read off a
-# local `uv run pytest -n auto --durations=0` full-suite run (2026-10-06); only files
-# far above the pack are listed, everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`
-# (chosen near the median file's total). A stale weight still balances fine — it only
-# shifts which shard a slow file lands on, never which tests run — so this table does
-# not need to be kept in lockstep with the suite; re-measure and update it only if a
-# shard's wall clock drifts noticeably from the others.
+# unit's own total seconds (`call` + `setup` + `teardown`, summed when a unit covers
+# several items) read off a local `uv run pytest -n auto --durations=0` full-suite run
+# (2026-10-06); only units far above the pack are listed, everything else defaults to
+# `_DEFAULT_TEST_FILE_WEIGHT` (chosen near the median file's total). A stale weight
+# still balances fine — it only shifts which shard a unit lands on, never which tests
+# run — so this table does not need to be kept in lockstep with the suite; re-measure
+# and update it only if a shard's wall clock drifts noticeably from the others.
+#
+# A unit is normally a whole file (see `_shard_unit`): a file's module/session-scoped
+# fixtures then build at most once per shard. tests/lookahead/test_backtest_invariance.py
+# is the one exception (`_SPLIT_BY_TEST` below): a real CI run at file-granularity put it
+# alone in its own shard and it still took 17-18 min (3-5x its next-heaviest sibling),
+# because its few parametrized cases don't share fixtures across cadences anyway (each
+# `[month_end]`/`[daily]`/`[week_end]` variant pays its own ~60-200s setup — confirmed
+# from this same profiling run) and xdist's scheduler happened to stack several of them
+# on one worker. Splitting it by test, keyed by nodeid below, loses nothing a whole-file
+# bucket would have saved and lets those cases land on different shards.
 _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
-    "tests/lookahead/test_backtest_invariance.py": 373.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[month_end]": 200.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[daily]": 71.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_truncation_invariance_at_every_rebalance[week_end]": 62.0,
+    "tests/lookahead/test_backtest_invariance.py::"
+    "test_revisions_known_after_t_i_leave_run_to_t_i_unchanged[month_end]": 24.0,
     "tests/lookahead/test_asof_invariance.py": 200.0,
     "tests/lookahead/test_gap_invariance.py": 169.0,
     "tests/execution/test_run_exits.py": 159.0,
@@ -101,6 +118,12 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
 }
 _DEFAULT_TEST_FILE_WEIGHT = 0.4
 
+# Files bucketed by individual test (nodeid) rather than as a whole file — see the
+# comment on `_HEAVY_TEST_FILE_WEIGHTS` above. Keep this list short: splitting a file
+# that *does* share an expensive module/session fixture across its tests would make
+# that fixture rebuild once per shard its tests land in, instead of once overall.
+_SPLIT_BY_TEST: frozenset[str] = frozenset({"tests/lookahead/test_backtest_invariance.py"})
+
 _SHARD_INDEX_ENV = "PYTEST_SHARD_INDEX"
 _SHARD_COUNT_ENV = "PYTEST_SHARD_COUNT"
 
@@ -122,43 +145,53 @@ _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
 _DATE_TYPE = "DATE"
 
 
-def shard_assignment(file_paths: Iterable[str], shard_count: int) -> dict[str, int]:
-    """Deterministically bucket test files into ``shard_count`` shards (#1112).
+def shard_assignment(units: Iterable[str], shard_count: int) -> dict[str, int]:
+    """Deterministically bucket shard units into ``shard_count`` shards (#1112).
 
-    Greedy longest-processing-time bin packing: files are sorted heaviest-first
-    (ties broken by path, for a result that doesn't depend on set/hash
-    iteration order) from `_HEAVY_TEST_FILE_WEIGHTS` (default weight for
-    everything else) and each goes to the shard currently holding the least
-    weight, lowest index breaking ties. Bucketing is by file, not by test, so
-    a file's module/session-scoped fixtures are built at most once per shard
-    rather than once per shard that happens to get one of its tests.
+    A unit is normally a whole file path; for the few files in `_SPLIT_BY_TEST` it's
+    one test's nodeid instead (see `_shard_unit`) — this function doesn't care which,
+    it just balances whatever strings it's given by weight.
 
-    Pure and total: every path in `file_paths` gets exactly one shard index in
-    ``[0, shard_count)``, and the mapping depends only on the input set, not on
-    the order items were collected in.
+    Greedy longest-processing-time bin packing: units are sorted heaviest-first (ties
+    broken by the unit string itself, for a result that doesn't depend on set/hash
+    iteration order) from `_HEAVY_TEST_FILE_WEIGHTS` (default weight for everything
+    else) and each goes to the shard currently holding the least weight, lowest index
+    breaking ties.
+
+    Pure and total: every unit gets exactly one shard index in ``[0, shard_count)``,
+    and the mapping depends only on the input set, not on the order items were
+    collected in.
     """
     if shard_count < 1:
         raise ValueError(f"shard_count must be >= 1, got {shard_count}")
     loads = [0.0] * shard_count
     assignment: dict[str, int] = {}
     ordered = sorted(
-        set(file_paths),
-        key=lambda p: (-_HEAVY_TEST_FILE_WEIGHTS.get(p, _DEFAULT_TEST_FILE_WEIGHT), p),
+        set(units),
+        key=lambda u: (-_HEAVY_TEST_FILE_WEIGHTS.get(u, _DEFAULT_TEST_FILE_WEIGHT), u),
     )
-    for path in ordered:
-        weight = _HEAVY_TEST_FILE_WEIGHTS.get(path, _DEFAULT_TEST_FILE_WEIGHT)
+    for unit in ordered:
+        weight = _HEAVY_TEST_FILE_WEIGHTS.get(unit, _DEFAULT_TEST_FILE_WEIGHT)
         shard = min(range(shard_count), key=lambda i: (loads[i], i))
-        assignment[path] = shard
+        assignment[unit] = shard
         loads[shard] += weight
     return assignment
+
+
+def _shard_unit(item: pytest.Item, rootdir: Path) -> str:
+    """This item's bucketing key: its file, or its own nodeid for `_SPLIT_BY_TEST`."""
+    rel = item.path.relative_to(rootdir).as_posix()
+    return item.nodeid if rel in _SPLIT_BY_TEST else rel
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Keep only this shard's items, when CI sets `PYTEST_SHARD_INDEX`/`_COUNT` (#1112).
 
     No-op when either is unset, so a local `uv run pytest` and `ready_pr.py`'s
-    targeted runs are unaffected. Bucketing is by test file (`shard_assignment`),
-    never by individual test, so a file's fixtures aren't split across shards.
+    targeted runs are unaffected. Bucketing is by test file (`shard_assignment`) for
+    all but a short, explicit list of files (`_SPLIT_BY_TEST`) confirmed not to share
+    expensive fixtures across their own tests; every other file's fixtures still build
+    at most once per shard.
     """
     count_raw = os.environ.get(_SHARD_COUNT_ENV)
     index_raw = os.environ.get(_SHARD_INDEX_ENV)
@@ -173,13 +206,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             f"{_SHARD_INDEX_ENV}={shard_index} out of range for {_SHARD_COUNT_ENV}={shard_count}"
         )
     rootdir = config.rootpath
-    file_paths = {item.path.relative_to(rootdir).as_posix() for item in items}
-    assignment = shard_assignment(file_paths, shard_count)
+    units = {_shard_unit(item, rootdir) for item in items}
+    assignment = shard_assignment(units, shard_count)
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
-        rel = item.path.relative_to(rootdir).as_posix()
-        (kept if assignment[rel] == shard_index else deselected).append(item)
+        unit = _shard_unit(item, rootdir)
+        (kept if assignment[unit] == shard_index else deselected).append(item)
     items[:] = kept
     if deselected:
         config.hook.pytest_deselected(items=deselected)
