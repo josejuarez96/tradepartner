@@ -1198,6 +1198,18 @@ def test_a_class_shown_again_beside_the_new_one_is_a_candidate_again(
     assert rows == () and unmatched == (later,)
 
 
+def test_a_later_page_showing_the_old_class_again_never_revives_it_earlier(
+    settings: Settings,
+) -> None:
+    # No look-ahead (quant-auditor on #1178): a page showing the old class
+    # again, accepted after the fact, does not make it a candidate for it.
+    between = _spac_shares(326_000_000, "q2", datetime(2020, 8, 6, 20, 5, tzinfo=UTC))
+    rows, unmatched = _spac_rows(settings, [between], both_after=True)
+    assert [(r["security_id"], r["value"]) for r in rows] == [(_MERGED, 326_000_000)]
+    assert unmatched == ()
+    assert (rows, unmatched) == _spac_rows(settings, [between])
+
+
 def test_classes_shown_together_stay_candidates_when_a_later_page_drops_one(
     settings: Settings,
 ) -> None:
