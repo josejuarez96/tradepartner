@@ -138,8 +138,9 @@ def _required_run_session(now: datetime) -> date:
 @dataclass(frozen=True)
 class RankedSignal:
     """One security's place in the latest plan's ranking (spec req 12 hero):
-    its `signals` reason (`selected`, `below_cut`, `excluded_no_history`), None
-    for a held name the plan's universe pass never scored, and, when a
+    its `signals` reason (`selected`, `below_cut`, or an `excluded_<reason>` the
+    plan's family declares -- `excluded_no_history` for momentum, T127b #1209),
+    None for a held name the plan's universe pass never scored, and, when a
     `decisions` row names it, both the decision's own kind (`decision`, e.g.
     `trade`, `override`, `dust`, `skip_delisted`) and its `reason` (e.g.
     `left_universe`, `exclude_name`), kept separate so an override's kind and

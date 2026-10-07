@@ -115,6 +115,7 @@ from tradepartner.store.journal import (
 from tradepartner.store.schema import (
     DELISTED_REASON,
     EXCLUDE_NAME_REASON,
+    EXCLUDED_REASON_PREFIX,
     HALT_REASON,
     KEEP_NAME_REASON,
     LEFT_TARGETS_REASON,
@@ -172,7 +173,9 @@ _SKIP_ZERO = "skip_zero"
 #: `signals.reason` values.
 _SELECTED = "selected"
 _BELOW_CUT = "below_cut"
-_EXCLUDED_NO_HISTORY = "excluded_no_history"
+#: Momentum's one declared exclusion reason, kept so a momentum plan's `signals` rows
+#: stay byte-identical (T127b, #1209): still exactly `f"{EXCLUDED_REASON_PREFIX}no_history"`.
+_EXCLUDED_NO_HISTORY = f"{EXCLUDED_REASON_PREFIX}no_history"
 
 
 class RebalanceState(StrEnum):
@@ -925,11 +928,34 @@ def _ranked(scores: Mapping[str, float]) -> dict[str, int]:
 
 
 def _signals(plan: Plan) -> tuple[Signal, ...]:
+    """One `Signal` per universe member: `selected` or `below_cut` for a scored
+    member, `f"{EXCLUDED_REASON_PREFIX}{reason}"` for each reason `plan.exclusions`
+    declares (ADR 0014 point 3, #1153; T127b, #1209) -- `excluded_no_history` for
+    momentum, unchanged. `plan.exclusions` holds every reason the plan's family
+    declares, so its keys *are* the family's declared set; `excluded_no_history`
+    (kept on `Plan` for Phase 4's `decisions_from`) must agree with
+    `exclusions.get("no_history", ())`, else it names a reason -- `no_history` --
+    outside that set, and this raises rather than silently trusting the legacy
+    field. The database checks only that a `signals` reason starts with
+    `excluded_` (`EXCLUDED_REASON_PREFIX`); that its suffix is a reason the
+    family actually declares is enforced here."""
     for sid, score in plan.scores.items():
         _finite(score, f"score of {sid}")
     ranks = _ranked(plan.scores)
     members = set(plan.members)
-    excluded = set(plan.excluded_no_history)
+    declared = set(plan.exclusions)
+    if set(plan.excluded_no_history) != set(plan.exclusions.get("no_history", ())):
+        raise ValueError(
+            f"excluded_no_history disagrees with the plan's declared exclusion reasons "
+            f"{sorted(declared)}: no_history is outside the family's declared set"
+        )
+    reason_of: dict[str, str] = {}
+    for reason, ids in plan.exclusions.items():
+        for sid in ids:
+            if sid in reason_of:
+                raise ValueError(f"{sid} is excluded for both {reason_of[sid]!r} and {reason!r}")
+            reason_of[sid] = reason
+    excluded = set(reason_of)
     if set(plan.scores) | excluded != members or set(plan.scores) & excluded:
         raise ValueError("the plan's scores and exclusions do not partition its members")
     if not set(plan.targets) <= set(plan.scores):
@@ -945,7 +971,11 @@ def _signals(plan: Plan) -> tuple[Signal, ...]:
         for sid in sorted(ranks, key=ranks.__getitem__)
     ]
     unscored = [
-        Signal(security_id=sid, rebalance_session=plan.session, reason=_EXCLUDED_NO_HISTORY)
+        Signal(
+            security_id=sid,
+            rebalance_session=plan.session,
+            reason=f"{EXCLUDED_REASON_PREFIX}{reason_of[sid]}",
+        )
         for sid in sorted(excluded)
     ]
     return (*scored, *unscored)
