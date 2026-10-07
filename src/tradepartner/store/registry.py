@@ -51,8 +51,10 @@ or `sharpe_period_excess_spy` times the square root of the trial's own
 pair key hashes `frozen.canonical_frozen_set` of the stored parameters, so
 two registrations whose stored sets differ only in a default-valued table
 key (`schedule.*`, say) are one pair. The window is the **resolved** one:
-the first rebalance session (last XNYS session of a month, ADR 0006) on or
-after the requested start, and `data_cutoff`, so requested dates that
+the first rebalance session at the hypothesis's frozen cadence (read through
+`frozen.frozen_values`: the last XNYS session of a month, ADR 0006, of an ISO
+week, or every session; strategy-lab plan T110) on or after the requested
+start, and `data_cutoff`, so requested dates that
 resolve to the same sessions are one pair and cannot shrink V. Only the
 period keys and `periods_per_year` are read, never a `*_monthly` key. A
 trial still being written can be counted as the latest of its pair with
@@ -76,6 +78,7 @@ import math
 import os
 import statistics
 import subprocess
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import astuple, dataclass, field, fields
 from datetime import date, datetime
@@ -86,9 +89,9 @@ from typing import Any, Final, Literal
 import duckdb
 import pyarrow as pa
 
-from tradepartner.backtest.frozen import canonical_frozen_set
-from tradepartner.calendar import last_session_of_month
-from tradepartner.config import Settings, get_settings
+from tradepartner.backtest.frozen import canonical_frozen_set, frozen_values
+from tradepartner.calendar import all_sessions, last_session_of_month, last_session_of_week
+from tradepartner.config import Cadence, Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.schema import (
     REBALANCE_COUNT_COLUMNS,
@@ -105,12 +108,19 @@ TrialKind = Literal["in_sample", "holdout", "tracking"]
 Basis = Literal["raw", "excess_spy"]
 
 #: Outcomes `close_trial` records; `ok` goes through `write_result`.
-CLOSE_STATUSES: Final = frozenset({"failed", "refused_window", "refused_holdout", "refused_gap"})
+#: `refused_variant` (strategy-lab spec req 5(a)) is accepted only by a store whose
+#: `trial_results.status` CHECK the lab schema rebuilt; no other store has a variant.
+CLOSE_STATUSES: Final = frozenset(
+    {"failed", "refused_window", "refused_holdout", "refused_gap", "refused_variant"}
+)
 
 _BASIS_METRICS: Final[dict[Basis, str]] = {
     "raw": "sharpe_period",
     "excess_spy": "sharpe_period_excess_spy",
 }
+
+#: The frozen key the window key's rebalance schedule comes from (through `frozen_values`).
+CADENCE_KEY: Final = "schedule.rebalance_cadence"
 
 #: The metric row each trial's annualisation reads (strategy-lab spec req 8).
 PERIODS_PER_YEAR_METRIC: Final = "periods_per_year"
@@ -132,6 +142,12 @@ class RegistryError(RuntimeError):
 
 class RealStoreRefused(RegistryError):
     """An oracle hypothesis or synthetic trial aimed at `settings.store.path`."""
+
+
+class UnmarkedStoreRefused(RegistryError):
+    """A `store_path` run aimed at a store that is neither `settings.store.path` nor
+    carries the `store_markers` `fixture` row: a copy of the real store, which could
+    host an uncounted run (strategy-lab spec, Definitions, Fixture marker)."""
 
 
 class UnknownHypothesis(RegistryError):
@@ -488,6 +504,12 @@ def _is_real_store(conn: duckdb.DuckDBPyConnection, settings: Settings) -> bool:
     return path == str(real.resolve())
 
 
+def is_real_store(conn: duckdb.DuckDBPyConnection, settings: Settings) -> bool:
+    """Whether `conn`'s database file is `settings.store.path` (module docstring,
+    "Real store": file identity, so a hard link is still the real store)."""
+    return _is_real_store(conn, settings)
+
+
 def _next_id(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> int:
     row = conn.execute(f"SELECT COALESCE(MAX({column}), 0) + 1 FROM {table}").fetchone()
     assert row is not None
@@ -526,13 +548,26 @@ def _check_open(conn: duckdb.DuckDBPyConnection, handle: TrialHandle) -> None:
         raise TrialAlreadyClosed(f"trial {handle.trial_id} already has its result row")
 
 
-def _first_rebalance_on_or_after(day: date) -> date:
-    """The first last-session-of-month on or after `day` (ADR 0006)."""
-    month_end = last_session_of_month(day.year, day.month)
-    if month_end >= day:
-        return month_end
-    year, month = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
-    return last_session_of_month(year, month)
+def _first_rebalance_on_or_after(day: date, cadence: Cadence) -> date:
+    """The first rebalance session at `cadence` on or after `day`: the last session of
+    its month (`month_end`, ADR 0006, the Phase 3 rule unchanged), of its ISO week
+    (`week_end`) or the session itself (`daily`), all read from the XNYS calendar
+    (strategy-lab spec req 6). Raises `ValueError` past the configured calendar."""
+    if cadence == "month_end":
+        month_end = last_session_of_month(day.year, day.month)
+        if month_end >= day:
+            return month_end
+        year, month = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+        return last_session_of_month(year, month)
+    sessions = all_sessions()
+    i = bisect_left(sessions, day)
+    if i == len(sessions):
+        raise ValueError(f"no XNYS session on or after {day} in the configured calendar")
+    first = sessions[i]
+    if cadence == "daily":
+        return first
+    iso_year, iso_week, _ = first.isocalendar()
+    return last_session_of_week(iso_year, iso_week)
 
 
 # --- hypotheses ------------------------------------------------------------
@@ -1025,7 +1060,12 @@ def family_sharpes(
     latest: dict[tuple[str, date, datetime | None], tuple[int, float]] = {}
     for trial_id, params_json, start, cutoff in counted:
         params = json.loads(params_json)
-        pair = (_canonical_set_hash(params, family), _first_rebalance_on_or_after(start), cutoff)
+        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
+        pair = (
+            _canonical_set_hash(params, family),
+            _first_rebalance_on_or_after(start, cadence),
+            cutoff,
+        )
         latest[pair] = (trial_id, float(params[BASE_COST_KEY]))
     chosen = sorted(latest.values())
     return FamilySharpes(
@@ -1057,6 +1097,15 @@ def count_counted_trials(
         [family, pending.trial_id if pending is not None else None],
     ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+@dataclass(frozen=True)
+class _Stored:
+    """A stored parameter set and its family, the shape `frozen.frozen_values` reads,
+    so the window key reads a row's cadence through the one accessor."""
+
+    params: Mapping[str, Any]
+    family: str
 
 
 def _canonical_set_hash(params: Mapping[str, Any], family: str) -> str:
