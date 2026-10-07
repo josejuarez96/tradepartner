@@ -21,7 +21,7 @@ import duckdb
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from tradepartner.backtest.results import family_n
+from tradepartner.backtest.results import family_n_split
 from tradepartner.config import Settings
 from tradepartner.dashboard import research_page
 from tradepartner.research import RunHandle
@@ -530,7 +530,7 @@ def test_render_family_sums_beside_the_backtest_n(
     assert row["research configurations"] == 9
     conn = duckdb.connect(str(store_path), read_only=True)
     try:
-        assert row["backtest N"] == family_n(conn, "momentum") == 1
+        assert row["backtest N"] == family_n_split(conn, "momentum").trials == 1
     finally:
         conn.close()
 

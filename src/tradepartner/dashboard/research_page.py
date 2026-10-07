@@ -29,7 +29,7 @@ import duckdb
 import polars as pl
 import streamlit as st
 
-from tradepartner.backtest.results import family_n
+from tradepartner.backtest.results import family_n_split
 from tradepartner.dashboard import header
 from tradepartner.store import research, schema
 
@@ -276,7 +276,8 @@ def _families(
 ) -> tuple[FamilySummary, ...]:
     """Per family named by a registration, its non-synthetic research run and
     configuration sums beside the family's backtest N (req 6). The backtest N is
-    `backtest.results.family_n`, the one N function (never recomputed here)."""
+    the backtest-trial part of `backtest.results.family_n_split`, the one N function
+    (never recomputed here; the research part is the sums beside it)."""
     families = sorted({r.family for r in registrations if r.family is not None})
     out: list[FamilySummary] = []
     for family in families:
@@ -286,7 +287,7 @@ def _families(
                 family=family,
                 runs=len(counted),
                 configurations=sum(run.n_configurations_declared for run in counted),
-                backtest_n=family_n(conn, family),
+                backtest_n=family_n_split(conn, family).trials,
             )
         )
     return tuple(out)
