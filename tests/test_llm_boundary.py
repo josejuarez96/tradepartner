@@ -290,11 +290,36 @@ FACADES = (
     "tradepartner.backtest.results",
 )
 #: (ii): network clients only `research.models` may import under `tradepartner.research`
-#: (#1031: the standard library's and the common third-party ones, beside httpx).
-NETWORK_CLIENTS = ("httpx", "urllib.request", "http.client", "socket", "requests", "aiohttp")
+#: (#1031: the standard library's and the common third-party ones, beside httpx;
+#: widened by #1121 (C13, the recommended option on #1085) to the TLS, event-loop,
+#: other-protocol clients and `subprocess`, since a shell runs `curl`).
+NETWORK_CLIENTS = (
+    "httpx",
+    "urllib.request",
+    "http.client",
+    "socket",
+    "requests",
+    "aiohttp",
+    "ssl",
+    "asyncio",
+    "urllib3",
+    "httplib2",
+    "websockets",
+    "ftplib",
+    "smtplib",
+    "xmlrpc.client",
+    "subprocess",
+)
 #: (ii): parents of a listed client. `import urllib` or `import urllib.parse` binds
 #: `urllib`, and a `*` import too, so each reaches the client as an attribute.
-NETWORK_PARENTS = frozenset({"urllib", "http"})
+NETWORK_PARENTS = frozenset({"urllib", "http", "xmlrpc"})
+#: (ii): a listed client one named module may import, by name (C13, #1121): the frame
+#: build runs `git rev-parse` for its code version. `os.system`, `os.popen` and
+#: `os.exec*` are the same route and stay unbanned (`os` is imported throughout): a
+#: known gap that review catches and this test does not.
+NETWORK_CLIENT_ALLOWED: Mapping[str, frozenset[str]] = {
+    "subprocess": frozenset({"tradepartner.research.labeling.frame"}),
+}
 #: (iii): what `tradepartner.research` may never import, whatever the name.
 RESEARCH_FORBIDDEN = (
     "tradepartner.adapters",
@@ -471,7 +496,10 @@ def import_violations(tree: Mapping[str, str]) -> list[tuple[str, str]]:
                 report("i", "imports tradepartner.research from outside it and cli")
             parent = edge.target.split(".")[0] in NETWORK_PARENTS
             bare_parent = parent and (edge.name is None or edge.name == "*")
-            if in_research and src != MODELS and (bare_parent or any(map(hits, NETWORK_CLIENTS))):
+            banned = [
+                c for c in NETWORK_CLIENTS if src not in NETWORK_CLIENT_ALLOWED.get(c, frozenset())
+            ]
+            if in_research and src != MODELS and (bare_parent or any(map(hits, banned))):
                 report("ii", "imports a network client under tradepartner.research outside models")
             if hits(MODELS) and src not in (MODELS, MODELS_IMPORTER):
                 report("ii", f"imports research.models; only {MODELS_IMPORTER} may")
@@ -763,7 +791,8 @@ def _labeling_scenario(
     `departure-reason-batches` registration fixture, neither of which exists yet,
     so that same task writes `_register_two_row_frame`. The assertions in the tests
     below are this task's and do not change."""
-    job = pytest.importorskip("tradepartner.research.labeling.job", reason=PENDING)
+    from tradepartner.research.labeling import job
+
     review = pytest.importorskip("tradepartner.research.labeling.review", reason=PENDING)
     pytest.importorskip("tradepartner.research.models", reason=PENDING)
     from research.fake_model_client import ScriptedModelClient  # type: ignore[import-not-found]

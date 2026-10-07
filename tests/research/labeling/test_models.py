@@ -695,3 +695,18 @@ def test_inference_paths_lists_every_records_file(tmp_path: Path) -> None:
         datafiles.append_jsonl(datafiles.inference_path(settings, run_id), [{"r": run_id}])
     names = [p.name for p in datafiles.inference_paths(settings)]
     assert names == ["1.jsonl", "3.jsonl", "20.jsonl"]
+    # #1121 (C4): a `.jsonl` whose stem is not a run id is returned, never dropped,
+    # after the run ids in numeric order, the rest by name; another suffix is ignored.
+    folder = datafiles.inference_path(settings, 1).parent
+    for stray in ("notes.jsonl", "007.jsonl", "a-copy.jsonl", "readme.txt"):
+        (folder / stray).write_text("", encoding="utf-8")
+    names = [p.name for p in datafiles.inference_paths(settings)]
+    assert names == ["1.jsonl", "3.jsonl", "20.jsonl", "007.jsonl", "a-copy.jsonl", "notes.jsonl"]
+    assert [datafiles.is_run_id_stem(p.stem) for p in datafiles.inference_paths(settings)] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]

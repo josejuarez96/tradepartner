@@ -22,8 +22,13 @@ the caller's write transaction and only through `store.registry`:
    `cost_drag` leaves them out. A benchmark is bought once at F_0 and never
    rebalanced, so its turnover is 0; the strategy's first rebalance includes its
    initial buy.
-3. **Detail rows**: metrics, equity per level, weights at the base level only (targets
-   are the same at every level), rebalances per level.
+3. **Detail rows** at the trial's detail level (strategy-lab spec req 12): metrics and
+   rebalances per level at both. `full` (standalone hypotheses, the default): equity
+   per level for every session, weights at the base level only (targets are the same
+   at every level). `summary` (sweep variants): equity for every session at the base
+   level and at the rebalance sessions only at the other levels, no weights. Metrics,
+   `max_drawdown` per level included, come from the full in-memory results in step 2,
+   before the rows are chosen, so a summary trial's metrics equal a full trial's.
 4. **Result row** (req 8, 15; strategy-lab spec req 9): N from `family_n_split` (its
    research part stored as `n_research`, below) and the
    per-basis annualised pair Sharpes from `family_sharpes`, both with this trial as
@@ -59,6 +64,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import pairwise
+from typing import Literal
 
 import duckdb
 
@@ -92,6 +98,11 @@ SERIES: tuple[Series, ...] = ("strategy", SPY_SERIES, MTUM_SERIES)
 GROSS_LEVEL = 0.0
 
 FamilySharpesFn = Callable[..., FamilySharpes]
+
+#: What a trial stores beyond metrics and rebalance rows (strategy-lab spec,
+#: "Detail level"; `lab.sweep_detail_level` for sweep variants).
+DetailLevel = Literal["full", "summary"]
+DETAIL_LEVELS: tuple[DetailLevel, ...] = ("full", "summary")
 
 #: The frozen key the period ends are read from (strategy-lab spec, "Cadence").
 CADENCE_KEY = "schedule.rebalance_cadence"
@@ -285,33 +296,65 @@ def _basis_label(raw: DeflatedSharpe, excess: DeflatedSharpe) -> str:
     return raw.dsr_basis
 
 
+def detail_equity(
+    results: Mapping[float, BacktestResult],
+    base_level: float,
+    detail_level: DetailLevel,
+    *,
+    cadence: Cadence,
+) -> list[EquityRow]:
+    """The `trial_equity` rows a trial at `detail_level` stores (module docstring, step
+    3): every row at `full`; at `summary`, every row at `base_level` and, at the other
+    levels, the rows at the run's rebalance sessions at `cadence`."""
+    if detail_level not in DETAIL_LEVELS:
+        raise ValueError(f"detail level must be one of {DETAIL_LEVELS}, got {detail_level!r}")
+    rows: list[EquityRow] = []
+    for level in sorted(results):
+        result = results[level]
+        if detail_level == "full" or level == base_level:
+            rows.extend(result.equity)
+        else:
+            ends = set(_period_ends(result, cadence))
+            rows.extend(row for row in result.equity if row.session in ends)
+    return rows
+
+
 def write_results(
     conn: duckdb.DuckDBPyConnection,
     handle: TrialHandle,
     results: Mapping[float, BacktestResult],
     params: Settings,
     family_sharpes: FamilySharpesFn = registry.family_sharpes,
+    *,
+    detail_level: DetailLevel = "full",
 ) -> str:
-    """Write one run's rows for `handle` and its result row; return the recorded status,
-    `"ok"`, or `"failed"` when the store changed during the run (module docstring).
+    """Write one run's rows for `handle` at `detail_level` and its result row; return
+    the recorded status, `"ok"`, or `"failed"` when the store changed during the run
+    (module docstring).
 
     `results` is the engine's output keyed by per-side bps; `params` is the trial's
-    frozen `Settings`. Raises `ValueError` before any write when `params` are not those
-    frozen settings, or a level or benchmark is missing, and `ResearchNotInitialised`
-    when the store has no research tables (module docstring, "Research runs raise N").
-    Runs in the caller's write transaction.
+    frozen `Settings`; `detail_level` is `full` for a standalone hypothesis (the
+    default) and the sweep's level for a sweep variant (strategy-lab spec req 12).
+    Raises `ValueError` before any write when `params` are not those frozen settings,
+    a level or benchmark is missing or the detail level is unknown, and
+    `ResearchNotInitialised` when the store has no research tables (module docstring,
+    "Research runs raise N"). Runs in the caller's write transaction.
     """
+    if detail_level not in DETAIL_LEVELS:
+        raise ValueError(f"detail level must be one of {DETAIL_LEVELS}, got {detail_level!r}")
     _check_frozen(handle, params)
     schema.require_research(conn)
     cadence = hypothesis_cadence(conn, handle)
     rows = metric_rows(results, params, cadence=cadence)
     base_level = params.costs.per_side_bps
     base = results[base_level]
+    equity = detail_equity(results, base_level, detail_level, cadence=cadence)
     registry.write_metrics(conn, handle, rows)
+    registry.write_equity(conn, handle, equity)
     for level in sorted(results):
-        registry.write_equity(conn, handle, results[level].equity)
         registry.write_rebalances(conn, handle, results[level].rebalances)
-    registry.write_weights(conn, handle, base.weights)
+    if detail_level == "full":
+        registry.write_weights(conn, handle, base.weights)
     base_metrics = {
         row.metric: row.value
         for row in rows
