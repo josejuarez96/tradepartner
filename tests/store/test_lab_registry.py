@@ -567,6 +567,16 @@ def test_family_ready_for_sweep_false_before_and_true_after_the_twins_first_ok_t
     assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
 
 
+def test_family_ready_for_sweep_reads_only_the_latest_registration_of_a_slug(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(lab_store, settings)
+    newer = _register(lab_store, settings, "h1", doc_sha256="e" * 64)
+    assert not lab_registry.family_ready_for_sweep(lab_store, "momentum")
+    _trial(lab_store, settings, tmp_path, newer.hypothesis_id)
+    assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
+
+
 def test_is_pre_lab_by_the_marker_only(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
