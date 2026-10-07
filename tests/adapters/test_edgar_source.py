@@ -32,7 +32,7 @@ from edgar_transport import (
 
 from tradepartner.adapters.edgar import acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
-from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.edgar_source import EdgarFilingSource, reduce_submissions
 from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
 from tradepartner.config import Settings
 from tradepartner.store.master import build_master
@@ -119,6 +119,28 @@ def test_rows_carry_the_recorded_acceptance_instant_never_the_filing_date(
     [klx] = [e for e in entries if e.accession == KLX_25NSE]
     assert (klx.cik, klx.form) == (KLX, "25-NSE")
     assert klx.accepted_at == datetime(2026, 9, 24, 14, 8, 40, tzinfo=UTC)
+
+
+def test_reduce_submissions_skips_a_blank_acceptance_instead_of_raising() -> None:
+    # #1138, same bug class as #1055: since #1133 a blank `acceptanceDateTime`
+    # leaves its accession out of `acceptance_times`'s result, so the dict
+    # comprehension in `reduce_submissions` that indexed `times[accession]`
+    # for every accession raised `KeyError`, aborting the whole payload's
+    # reduce. The blank accession should simply stay out of `records`,
+    # leaving the other accession's record intact.
+    payload = _payload(
+        int(APPLE),
+        ("0000320193-26-000001", "10-Q", KLX_AT),
+        ("0000320193-26-000002", "8-K", KLX_AT),
+    )
+    columns = payload["filings"]["recent"]
+    columns["acceptanceDateTime"] = ["", columns["acceptanceDateTime"][1]]
+
+    records, pages = reduce_submissions(payload)
+
+    assert "0000320193-26-000001" not in records
+    assert "0000320193-26-000002" in records
+    assert pages == []
 
 
 def test_only_issuer_ciks_are_kept_with_all_their_forms(settings: Settings) -> None:

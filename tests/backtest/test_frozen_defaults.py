@@ -345,9 +345,6 @@ def test_profitability_hash_and_fingerprint_ignore_live_strategy(settings: Setti
 PARAMS_READERS_ALLOWLIST = {
     "cli.py",
     "dashboard/backtest_page.py",
-    "execution/check.py",
-    "execution/report.py",
-    "execution/window.py",
 }
 #: `.params` attributes that are not a `HypothesisRecord` (a plan-read bundle's `Settings`).
 NOT_A_RECORD = {"execution/planning.py"}

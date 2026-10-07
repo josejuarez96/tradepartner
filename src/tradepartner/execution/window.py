@@ -4,7 +4,11 @@ req 9, req 17 and open question 13; ADR 0009 point 3; plans T64, T64b and
 T84b).
 
 `start(settings, connect, broker, clock, slug)` is `paper start --hypothesis
-<slug>`. In order it refuses, before any write:
+<slug>`. First it refuses a family paper trading cannot run
+(`family_not_runnable`) and a hypothesis whose cadence, read through
+`backtest.frozen.frozen_values`, is not `month_end` (`refused_cadence`,
+strategy-lab spec req 11; a pre-lab registration, stored without `schedule.*`
+keys, reads as `month_end`). Then, in order, it refuses, before any write:
 
 1. **No `gap_signoff`.** `owner_decisions` must hold a row of kind
    `gap_signoff` for the hypothesis, referencing a trial that is `ok`,
@@ -191,6 +195,7 @@ import polars as pl
 from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.calendar import last_session_of_month, previous_session, session_close
 from tradepartner.config import (
     FROZEN_COSTS_KEYS,
@@ -263,6 +268,9 @@ _RISK_PREFIX = "risk."
 _PAPER_PREFIX = "paper."
 _COSTS_PREFIX = "costs."
 _EXECUTION_PREFIX = "execution."
+#: The one cadence a paper window accepts (strategy-lab spec req 11; ADR 0005).
+_CADENCE_KEY = "schedule.rebalance_cadence"
+_PAPER_CADENCE = "month_end"
 _ABANDONED = "abandoned"
 _DUST = "dust"
 _UNTRADABLE = "untradable"
@@ -593,6 +601,14 @@ def start(
                     f"{slug!r} is in family {hyp.family!r}, which paper trading cannot run "
                     f"yet (paper families: {', '.join(PAPER_FAMILIES)})",
                 )
+            registered = frozen_values(hyp)
+            cadence = registered.get(_CADENCE_KEY)
+            if cadence != _PAPER_CADENCE:
+                raise StartRefusedError(
+                    "refused_cadence",
+                    f"{slug!r} rebalances at cadence {cadence!r}; a paper window "
+                    f"accepts only {_PAPER_CADENCE!r} (strategy-lab spec req 11)",
+                )
             if not _gap_signoff_ok(conn, hyp.hypothesis_id):
                 raise StartRefusedError(
                     "gap_signoff",
@@ -641,7 +657,7 @@ def start(
 
         t_0 = _first_rebalance_session(hyp.holdout_end, today)
         commit, _dirty = registry.code_version()
-        params = _frozen_params(settings, hyp.params)
+        params = _frozen_params(settings, registered)
         frozen_json = registry.canonical_params_json(params)
         frozen_sha256 = registry.params_sha256(params)
 

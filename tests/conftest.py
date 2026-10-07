@@ -13,7 +13,15 @@
   by `tests/test_fixture_loader.py`) loads every `<table>.csv` under a
   fixtures directory into the store table of the same name — generic over
   `schema.TABLE_NAMES`, so `statement_facts.csv` (#660, T76) loads the
-  same way as every other fixture CSV, with no code change here.
+  same way as every other fixture CSV, with no code change here. It also
+  creates `store_markers` and writes the `fixture` marker row
+  (`lab_schema.write_fixture_marker`; strategy-lab spec, Definitions, Fixture
+  marker), so every fixture store and every temp-file copy built through it
+  (`fixture_store_path`, the `backtest-runner`'s) carries the marker the real
+  store never has.
+- `lab_store` is `fixture_store` with `lab_schema.apply_lab_schema` applied
+  (strategy-lab plan T101); `mark_pre_lab` is the one writer of
+  `pre_lab_hypotheses` outside the lab migration.
 - `fixture_store` builds a fresh in-memory DuckDB store, initializes the
   schema, and loads `tests/fixtures/universe/` this way — a no-op until T5
   populates that directory.
@@ -43,8 +51,8 @@ import pytest
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
-from tradepartner.store import schema
-from tradepartner.store.db import configure_connection
+from tradepartner.store import lab_schema, schema
+from tradepartner.store.db import configure_connection, utc_now
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 
@@ -396,9 +404,16 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
     `read_csv`'s `force_not_null` (`_not_null_varchar_columns`) so an
     empty cell for one of those columns loads as `''`, matching the
     schema's own sentinel convention, instead of `NULL`.
+
+    Then creates `store_markers` and writes the `fixture` marker row
+    (strategy-lab spec, Definitions, Fixture marker; plan T101), the store's
+    proof that it is a fixture store and not a copy of the real one. A missing
+    `fixtures_dir` writes nothing, marker included.
     """
     if not fixtures_dir.is_dir():
         return
+    lab_schema.create_store_markers(conn)
+    lab_schema.write_fixture_marker(conn, "tests/conftest.py:load_universe_fixtures")
     for csv_path in sorted(fixtures_dir.glob("*.csv")):
         table = csv_path.stem
         if table not in schema.TABLE_NAMES:
@@ -434,6 +449,31 @@ def fixture_store() -> Iterator[duckdb.DuckDBPyConnection]:
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def lab_store(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> duckdb.DuckDBPyConnection:
+    """`fixture_store` with the strategy-lab tables applied
+    (`lab_schema.apply_lab_schema`; plan T101, choice 2): the store every lab
+    task builds and tests on until the lab migration (T113) lands them in
+    `init_schema`. Carries the fixture marker like `fixture_store`."""
+    lab_schema.apply_lab_schema(fixture_store)
+    return fixture_store
+
+
+def mark_pre_lab(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> None:
+    """Mark `hypothesis_id` pre-lab on a fixture store (spec, Definitions,
+    Frozen-key defaults: "a fixture store ... gets its pre-lab twins from a test
+    helper that inserts the marker row"). The only writer of
+    `pre_lab_hypotheses` outside the lab migration (T113). Needs the lab tables
+    (`lab_store`)."""
+    lab_schema.require_lab(conn)
+    conn.execute(
+        "INSERT INTO pre_lab_hypotheses (hypothesis_id, marked_at) VALUES (?, ?)",
+        [hypothesis_id, utc_now()],
+    )
 
 
 @pytest.fixture
