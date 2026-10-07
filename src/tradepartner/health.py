@@ -35,8 +35,8 @@ here is this module's and is stated once:
   the survivorship gap report it. The history is not split at listing
   boundaries, so a security delisted and later relisted shows the break between
   its two listings as one gap.
-- **Survivorship gap** with its three side categories: `gap.survivorship_gap`
-  at `t`, unchanged.
+- **Survivorship gap** with its four side categories (the stale listings,
+  #1199, among them): `gap.survivorship_gap` at `t`, unchanged.
 - **Unclassifiable** (`unclassifiable`): securities known at `t` whose latest
   classification is `unclassifiable`, and those with no classification row at
   all (`unclassified`), the two missing-data reasons of universe rule 1.

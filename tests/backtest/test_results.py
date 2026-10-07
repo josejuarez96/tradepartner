@@ -826,7 +826,7 @@ class TestCadence:
         params = {
             k: v
             for k, v in frozen_params_of(settings, family="momentum").items()
-            if not k.startswith("schedule.")
+            if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
         }
         registry.register_hypothesis(
             conn,
@@ -923,7 +923,11 @@ class TestRefusals:
         `load_frozen` and its results are recorded (strategy-lab T96)."""
         settings = _settings(tmp_path)
         all_params = frozen_params_of(settings, family="momentum")
-        params = {k: v for k, v in all_params.items() if not k.startswith("schedule.")}
+        params = {
+            k: v
+            for k, v in all_params.items()
+            if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+        }
         registry.register_hypothesis(
             conn,
             slug="h1",

@@ -44,6 +44,10 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("profitability.include_derived", True, 12),
     ("profitability.top_fraction", 0.10, 12),
     ("profitability.weighting", "equal", 12),
+    # The stale-listing rule (ADR 0003 amendment #1199): a `gap.*` key that measures the
+    # store, not the strategy, enters at its real default, so H1 reads 63 too (owner,
+    # 2026-10-07; strategy-lab spec Definitions, "Frozen-key defaults").
+    ("gap.stale_listing_sessions", 63, 16),
 )
 
 #: The frozen key set before the lab (`frozen_keys()` on 2026-10-05, schema version 12).

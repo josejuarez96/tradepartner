@@ -17,6 +17,16 @@ not counted.
   listing is active from its `valid_from`; a delisted one through its
   Form 25's filing session, a transferred one through its end session, a
   listed one open-ended.
+- **Stale listings** (ADR 0003 amendment #1199): a security whose current
+  (latest) listing is still live at `session` but whose last traded bar
+  known at `t` is before W's first session and more than
+  `gap.stale_listing_sessions` sessions before `session` counts, for the
+  gap only, as ended at that bar: it is not in L on that listing's account
+  and never in M. Only another of its listings that ended inside W (a
+  Form 25 filed in W, a transfer) keeps it in L, judged on that listing.
+  A listing with no traded bar at all is never stale. The securities
+  removed are reported in `stale_listings` with their last bar and the
+  sessions dark, in no other side category.
 - **M** (`missing`): names in L whose current listing is still live at
   `session` with no bar at `session` (`no_bar_at_t`), plus names in L
   delisted (not transferred) by a Form 25 filed inside W whose last bar is
@@ -32,14 +42,14 @@ not counted.
   shares moved to the close's session by every split known at `t` between
   the two dates. A name with no close or no single shares value is worth
   zero and still counted. Both shares are 0.0 when L is empty.
-- **Side categories**, reported separately and never in M: universe
-  rule 1's `unclassified`/`unclassifiable`, rule 6 (`truncated_history`)
-  and rule 7 (`stale_shares`, any rule 7 reason) exclusions from
-  `universe_as_of(conn, t, settings)`, limited to names with a
-  non-benchmark listing on `universe.exchanges` active in W (so filers
-  never listed, or delisted long before, are not counted) and less the
-  names already in M (a listed name with no bar at T also fails rule 6),
-  so each name is counted once.
+- **Side categories**, reported separately and never in M: the stale
+  listings above, and universe rule 1's `unclassified`/`unclassifiable`,
+  rule 6 (`truncated_history`) and rule 7 (`stale_shares`, any rule 7
+  reason) exclusions from `universe_as_of(conn, t, settings)`, limited to
+  names with a non-benchmark listing on `universe.exchanges` active in W
+  (so filers never listed, delisted long before, or stale, are not
+  counted) and less the names already in M (a listed name with no bar at
+  T also fails rule 6), so each name is counted once.
 
 Every threshold comes from `settings`; this module holds no numeric
 literal but 0, 1 and -1 (spec; tested by AST in T14).
@@ -65,7 +75,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, get_settings
 from tradepartner.store.asof import _security_filter, _validate_t
-from tradepartner.store.classify import classifications_as_of
+from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
@@ -94,6 +104,13 @@ _MISSING_SCHEMA: dict[str, Any] = {
 }
 
 
+_STALE_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "last_bar": pl.Date,
+    "dark_sessions": pl.Int64,
+}
+
+
 @dataclass(frozen=True)
 class SurvivorshipGap:
     """`survivorship_gap`'s result (see the module docstring).
@@ -101,7 +118,9 @@ class SurvivorshipGap:
     `listed`: L's ids, sorted. `missing`: one row per name in M with its
     `reason`, `last_bar` (null if none), the `reference_session` and
     `tail_sessions` for a `truncated_tail`, and its `value`. `listed_value`
-    is the size share's denominator. `settings`: the `gap` and `universe`
+    is the size share's denominator. `stale_listings`: one row per stale
+    security (`security_id`, `last_bar`, `dark_sessions`), in neither L nor
+    M nor another side category. `settings`: the `gap` and `universe`
     config the result was built with.
     """
 
@@ -116,6 +135,7 @@ class SurvivorshipGap:
     unclassifiable: tuple[str, ...]
     truncated_history: tuple[str, ...]
     stale_shares: tuple[str, ...]
+    stale_listings: pl.DataFrame
     settings: dict[str, Any]
 
 
@@ -132,6 +152,25 @@ def _active_end(listing: dict[str, Any]) -> date | None:
         end: date | None = listing["end_session"]
         return end
     return None
+
+
+def _active_in(listing: dict[str, Any], low: date) -> bool:
+    """True when `listing` is active at some session from `low` on (W's first)."""
+    end = _active_end(listing)
+    return end is None or end >= low
+
+
+def _ended_in(listing: dict[str, Any], low: date) -> bool:
+    """True when `listing` has an end and it is on or after `low`."""
+    end = _active_end(listing)
+    return end is not None and end >= low
+
+
+def _live(listing: dict[str, Any], session: date) -> bool:
+    """True when `listing` is still live at `session`: listed, or transferred
+    with its end session on or after `session`."""
+    status, end = listing["status"], listing["end_session"]
+    return bool(status == LISTED or (status == TRANSFERRED and end is not None and end >= session))
 
 
 def _last_bars(
@@ -194,29 +233,52 @@ def survivorship_gap(
     securities = securities_as_of(conn, t).iter_rows(named=True)
     candidates = {r["security_id"] for r in securities if not r["benchmark"]}
     types = settings.universe.security_types
-    common = {
-        r["security_id"]
+    kinds = {
+        r["security_id"]: r["security_type"]
         for r in classifications_as_of(conn, t).iter_rows(named=True)
-        if r["security_type"] in types
+    }
+    common = {sid for sid, kind in kinds.items() if kind in types}
+    # The names L or the `unclassifiable` side category can count: the stale rule
+    # applies to all of them, so a stale name is in no side category either.
+    counted = {
+        sid
+        for sid in candidates
+        if sid in common or kinds.get(sid, UNCLASSIFIABLE) == UNCLASSIFIABLE
     }
     exchanges = settings.universe.exchanges
-    active: set[str] = set()
-    current: dict[str, dict[str, Any]] = {}
+    by_security: dict[str, list[dict[str, Any]]] = {}
     for listing in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         sid = listing["security_id"]
         if sid not in candidates or listing["exchange"] not in exchanges:
             continue
         if listing["valid_from"] > session:
             continue
-        end = _active_end(listing)
-        if end is None or end >= low:
+        by_security.setdefault(sid, []).append(listing)
+
+    bars = _last_bars(conn, t, session, sorted(by_security.keys() & counted))
+    dark_limit = settings.gap.stale_listing_sessions
+    active: set[str] = set()
+    current: dict[str, dict[str, Any]] = {}
+    stale: list[dict[str, Any]] = []
+    for sid, listings in by_security.items():
+        latest = max(listings, key=lambda listing: listing["valid_from"])
+        last_bar = bars[sid][0] if sid in bars else None  # only `counted` ids have bars
+        if last_bar is not None and last_bar < low and _live(latest, session):
+            dark = _sessions_after(last_bar, session)
+            if dark > dark_limit:
+                # Stale (ADR 0003 amendment #1199): ended at its last bar for
+                # the gap. An older open-ended row is the same live line under
+                # an earlier cover page, so only a listing that ended inside W
+                # (a Form 25 filed in W, a transfer) keeps the security in L.
+                listings = [listing for listing in listings if _ended_in(listing, low)]
+                if not listings:
+                    stale.append({"security_id": sid, "last_bar": last_bar, "dark_sessions": dark})
+                    continue
+        if any(_active_in(listing, low) for listing in listings):
             active.add(sid)
-        held = current.get(sid)
-        if held is None or listing["valid_from"] > held["valid_from"]:
-            current[sid] = listing
+            current[sid] = max(listings, key=lambda listing: listing["valid_from"])
     ids = sorted(active & common)
 
-    bars = _last_bars(conn, t, session, ids)
     shares, _ = latest_shares_as_of(conn, t, ids, settings)
     splits = _split_factors(conn, t, ids, session)
 
@@ -245,9 +307,8 @@ def survivorship_gap(
             "tail_sessions": None,
             "value": values[sid],
         }
-        status, end = listing["status"], listing["end_session"]
-        live = status == LISTED or (status == TRANSFERRED and end is not None and end >= session)
-        if live and last_bar != session:
+        status = listing["status"]
+        if _live(listing, session) and last_bar != session:
             missing.append({**row, "reason": NO_BAR_AT_T})
             continue
         if status != DELISTED:
@@ -285,6 +346,7 @@ def survivorship_gap(
         unclassifiable=tuple(sorted(side["unclassifiable"])),
         truncated_history=tuple(sorted(side["history"])),
         stale_shares=tuple(sorted(side["shares"])),
+        stale_listings=pl.DataFrame(stale, schema=_STALE_SCHEMA).sort("security_id"),
         settings={
             "gap": settings.gap.model_dump(mode="json"),
             "universe": settings.universe.model_dump(mode="json"),

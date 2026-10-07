@@ -606,7 +606,12 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     `month_end`, and its stored hash is untouched (strategy-lab T96)."""
     frozen = _frozen()
     all_params = frozen_params_of(frozen, family="momentum")
-    params = {k: v for k, v in all_params.items() if not k.startswith("schedule.")}
+    # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) landed.
+    params = {
+        k: v
+        for k, v in all_params.items()
+        if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+    }
     hashed = sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with open_for_write(_store(fixture_store_path)) as conn:
         record = registry.register_hypothesis(
@@ -693,7 +698,9 @@ def _register_more(
     frozen = Settings(_env_file=None, **overrides)
     params = frozen_params_of(frozen, family="momentum")
     if drop_schedule:
-        params = {k: v for k, v in params.items() if not k.startswith("schedule.")}
+        # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) landed.
+        later = ("schedule.", "gap.stale_listing_sessions")
+        params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
         record = registry.register_hypothesis(
             conn,

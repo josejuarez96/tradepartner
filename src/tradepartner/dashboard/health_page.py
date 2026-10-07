@@ -320,7 +320,8 @@ def _survivorship_card(report: HealthReport) -> None:
         st.markdown(
             f"Side categories: unclassifiable {len(gap.unclassifiable)} · "
             f"truncated history {len(gap.truncated_history)} · "
-            f"stale shares {len(gap.stale_shares)}"
+            f"stale shares {len(gap.stale_shares)} · "
+            f"stale listings {gap.stale_listings.height}"
         )
 
 
@@ -375,6 +376,8 @@ def _tables(report: HealthReport) -> None:
     st.dataframe(pl.DataFrame({"security_id": list(missing)}), hide_index=True)
     st.subheader(f"Survivorship missing ({report.survivorship.missing.height})")
     st.dataframe(report.survivorship.missing, hide_index=True)
+    st.subheader(f"Stale listings, out of the gap ({report.survivorship.stale_listings.height})")
+    st.dataframe(report.survivorship.stale_listings, hide_index=True)
 
 
 def render(conn: duckdb.DuckDBPyConnection) -> None:

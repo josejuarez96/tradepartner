@@ -245,6 +245,7 @@ def test_report_carries_every_metric(
     assert report.survivorship.unclassifiable == expected_gap.unclassifiable
     assert report.survivorship.truncated_history == expected_gap.truncated_history
     assert report.survivorship.stale_shares == expected_gap.stale_shares
+    assert report.survivorship.stale_listings.equals(expected_gap.stale_listings)
     assert report.settings == {"liquidity_rule_enabled": True, "fill_price": "close"}
 
 

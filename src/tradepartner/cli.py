@@ -375,7 +375,8 @@ def _print_report(report: HealthReport) -> None:
         f"{gap.count_share:.1%} by count, {gap.size_share:.1%} by size; "
         f"{len(gap.unclassifiable)} unclassifiable, "
         f"{len(gap.truncated_history)} truncated history, "
-        f"{len(gap.stale_shares)} stale shares"
+        f"{len(gap.stale_shares)} stale shares, "
+        f"{gap.stale_listings.height} stale listings"
     )
     u = report.unclassifiable
     echo(f"unclassifiable: {len(u.unclassifiable)}; unclassified: {len(u.unclassified)}")

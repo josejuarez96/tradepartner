@@ -323,23 +323,36 @@ def test_profitability_table_entries_are_pinned_by_value() -> None:
     assert frozen.FAMILY_SIGNAL_SECTIONS["profitability"] == "profitability"
 
 
+def test_stale_listing_entry_is_pinned_by_value() -> None:
+    """#1199: the key enters at its real default (strategy-lab spec, Frozen-key defaults)."""
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[9:10], (("gap.stale_listing_sessions", 63, 16),)
+    )
+
+
+#: Frozen keys that landed after the twin hashes were pinned: a registration made
+#: before them stores none, so the pinned hashes are over the set without them.
+LATER_KEYS = ("gap.stale_listing_sessions",)
+
+
 def test_h1_twin_canonical_set_fingerprint_and_hash_unchanged() -> None:
     from tradepartner.store import registry
 
     settings = _defaults_settings()
-    new = _new_params(settings)
-    pre_lab = _pre_lab_params(settings)
+    current = _new_params(settings)
+    new = {k: v for k, v in current.items() if k not in LATER_KEYS}
+    pre_lab = {k: v for k, v in _pre_lab_params(settings).items() if k not in LATER_KEYS}
     assert not any(k.startswith("profitability.") for k in new)
     assert registry.params_sha256(new) == TWIN_PARAMS_SHA256
     assert registry.params_sha256(pre_lab) == TWIN_PRE_LAB_PARAMS_SHA256
-    for params in (new, pre_lab):
+    for params in (current, new, pre_lab):
         assert frozen.fingerprint("momentum", params, date(2017, 1, 31)) == TWIN_FINGERPRINT
         canonical = frozen.canonical_frozen_set(params, "momentum")
         assert not any(k.startswith("profitability.") for k in canonical)
     # The real H1 file over default settings: its pre-lab stored set and fingerprint.
     parsed = hypothesis.parse_file(H1_FILE)
     h1 = hypothesis.frozen_params(parsed, settings)
-    h1_pre_lab = {k: v for k, v in h1.items() if k not in SCHEDULE_KEYS}
+    h1_pre_lab = {k: v for k, v in h1.items() if k not in (*SCHEDULE_KEYS, *LATER_KEYS)}
     assert registry.params_sha256(h1_pre_lab) == H1_PRE_LAB_PARAMS_SHA256
     assert frozen.fingerprint("momentum", h1, parsed.in_sample_start) == H1_FINGERPRINT
 
