@@ -856,3 +856,23 @@ def test_accept_rejections_is_a_plain_off_by_default_flag() -> None:
     assert param.default is False
     assert param.envvar is None
     assert param.callback is None
+    assert param.allow_from_autoenv is False
+
+
+def test_accept_rejections_ignores_an_auto_envvar_prefix(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    seen: list[Any] = []
+
+    def recording(*_args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return paper_resume.ResumeOutcome(paper_resume.RELEASED, 1)
+
+    monkeypatch.setattr(paper_resume, "resume", recording)
+    monkeypatch.setenv("TP_PAPER_RESUME_ACCEPT_REJECTIONS_FLAG", "1")
+    app = cli.make_app(clock=clock, broker=factory)
+    result = CliRunner().invoke(
+        app, ["paper", "resume", "--reason", LONG_REASON], auto_envvar_prefix="TP"
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == [{"accept_rejections": False}]

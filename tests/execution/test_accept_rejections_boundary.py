@@ -58,8 +58,10 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    value can come only from the owner's command line: the parameter belongs to
    the function decorated `@<app>.command("resume")`, whose name is never
    loaded (no direct call, alias or `partial`), its `Annotated` option is
-   exactly `typer.Option("--accept-rejections", help=...)` (no envvar,
-   callback, default or flag value), no keyword names `accept_rejections_flag`,
+   exactly `typer.Option("--accept-rejections", help=...,
+   allow_from_autoenv=False)` (no envvar, auto-envvar, callback, default or
+   flag value), the decorator takes no keyword (no `context_settings`), no
+   keyword names `accept_rejections_flag`,
    and no string in `cli.py` spells the flag except docstrings and that one
    option name (so the app cannot invoke itself with it). A second such pass, a
    literal or any other expression under the keyword, any other use or binding
@@ -336,6 +338,7 @@ def _is_resume_command(node: ast.AST | None) -> bool:
         isinstance(d, ast.Call)
         and isinstance(d.func, ast.Attribute)
         and d.func.attr == "command"
+        and not d.keywords
         and len(d.args) == 1
         and isinstance(d.args[0], ast.Constant)
         and d.args[0].value == "resume"
@@ -367,7 +370,14 @@ def _cli_option(arg: ast.arg) -> ast.Call | None:
         and len(option.args) == 1
         and isinstance(option.args[0], ast.Constant)
         and option.args[0].value == "--accept-rejections"
-        and all(k.arg == "help" for k in option.keywords)
+        and {k.arg for k in option.keywords} == {"help", "allow_from_autoenv"}
+        and len(option.keywords) == 2
+        and any(
+            k.arg == "allow_from_autoenv"
+            and isinstance(k.value, ast.Constant)
+            and k.value.value is False
+            for k in option.keywords
+        )
     ):
         return option
     return None
@@ -770,7 +780,8 @@ CLI_PASS = (
     "def paper_resume_(\n"
     "    reason: str,\n"
     "    accept_rejections_flag: Annotated[\n"
-    '        bool, typer.Option("--accept-rejections", help="accept verdicts")\n'
+    "        bool,\n"
+    '        typer.Option("--accept-rejections", help="h", allow_from_autoenv=False),\n'
     "    ] = False,\n"
     ") -> None:\n"
     "    paper_resume.resume(s, c, b, k, reason, False, accept_rejections=accept_rejections_flag)\n"
@@ -807,11 +818,14 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS + "app(['paper', 'resume', '--reason', 'r', '--accept-rejections'])\n",
         CLI_PASS + "ARGS = 'resume --accept-rejections'\n",
         # an envvar, callback, default or flag value on the option, or another option
-        CLI_PASS.replace('help="accept verdicts"', 'help="x", envvar="ACCEPT"'),
-        CLI_PASS.replace('help="accept verdicts"', 'help="x", callback=always_true'),
-        CLI_PASS.replace('help="accept verdicts"', 'help="x", flag_value=True'),
+        CLI_PASS.replace('help="h"', 'help="x", envvar="ACCEPT"'),
+        CLI_PASS.replace('help="h"', 'help="x", callback=always_true'),
+        CLI_PASS.replace('help="h"', 'help="x", flag_value=True'),
         CLI_PASS.replace('"--accept-rejections", help', '"--accept-rejections", "-a", help'),
         CLI_PASS.replace('"--accept-rejections"', '"--yes"'),
+        CLI_PASS.replace(", allow_from_autoenv=False", ""),
+        CLI_PASS.replace("allow_from_autoenv=False", "allow_from_autoenv=True"),
+        CLI_PASS.replace('command("resume")', 'command("resume", context_settings=c)'),
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),

@@ -2095,7 +2095,11 @@ def make_app(
         ] = False,
         accept_rejections_flag: Annotated[
             bool,
-            typer.Option("--accept-rejections", help="accept rejection-cap verdicts (req 5)"),
+            typer.Option(
+                "--accept-rejections",
+                help="accept rejection-cap verdicts (req 5)",
+                allow_from_autoenv=False,
+            ),
         ] = False,
     ) -> None:
         """Settle, collect, reconcile and release the kill switch (spec req 5)."""
