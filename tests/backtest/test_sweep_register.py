@@ -1,6 +1,7 @@
-"""`sweep register` in an existing family (strategy-lab spec req 1; the "Sweep
+"""`sweep register` (strategy-lab spec req 1): in an existing family (the "Sweep
 registration and guardrails" criterion's store-level part, the "Fingerprint" and
-"Family readiness" criteria; plan task T104).
+"Family readiness" criteria; plan task T104) and a new family's first registration (the
+"Family rules" criterion's new-family part; plan task T104b).
 
 Every case runs on `lab_store` with H1's fixture twin registered, given its
 `pre_lab_hypotheses` and `hypothesis_fingerprints` rows and the family rules the lab
@@ -9,6 +10,10 @@ trial over its default window) unless the case is about readiness. The twin and 
 sweep are the fixture files with `in_sample_start` moved to 2018-01-31, so that a
 12-month formation anchor at the first rebalance falls inside the fixture bars (first
 session 2017-01-03) and refusal 1(d) is exercised only where a case asks for it.
+
+The new-family cases register a `profitability` sweep written by `_profitability_sweep`.
+`profitability` is a root in the real `FAMILY_PARENTS`; the child cases make it
+momentum's child with a test-only `monkeypatch` of the table.
 """
 
 from __future__ import annotations
@@ -16,13 +21,14 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import duckdb
 import pytest
 from conftest import load_universe_fixtures, mark_pre_lab
 
-from tradepartner.backtest import frozen, hypothesis, sweep
+from tradepartner import config
+from tradepartner.backtest import frozen, hypothesis, results, sweep
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.sweep import (
     AnchorInfeasibleError,
@@ -30,6 +36,7 @@ from tradepartner.backtest.sweep import (
     FamilyNotReadyError,
     FamilyRuleError,
     FingerprintRegisteredError,
+    NewFamilyError,
     NoFamilyRulesError,
     SweepFileError,
     SweepRegistration,
@@ -101,7 +108,40 @@ def _run_ok(
         settings=settings,
         repo_dir=tmp_path,
     )
+    # The base-level metrics `registry.family_sharpes` reads for V on both bases.
+    registry.write_metrics(
+        conn,
+        handle,
+        [
+            registry.MetricRow("strategy", 15.0, "sharpe_period", 0.1),
+            registry.MetricRow("strategy", 15.0, "sharpe_period_excess_spy", 0.1),
+            registry.MetricRow("strategy", 15.0, "periods_per_year", 12.0),
+        ],
+    )
     assert registry.write_result(conn, handle, registry.ResultStatistics()) == "ok"
+
+
+def _spend_holdout(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    record: registry.HypothesisRecord,
+) -> None:
+    """A `holdout` trial of `record` (any outcome is a spend)."""
+    end = record.holdout_end
+    registry.open_trial(
+        conn,
+        hypothesis_id=record.hypothesis_id,
+        kind="holdout",
+        start_session=record.holdout_start,
+        end_session=end,
+        data_cutoff=datetime(end.year, end.month, end.day, 21, tzinfo=UTC),
+        synthetic=False,
+        run_by="test",
+        settings=settings,
+        repo_dir=tmp_path,
+        holdout_reason="test spend",
+    )
 
 
 def _twin(
@@ -111,6 +151,7 @@ def _twin(
     *,
     run: bool = True,
     rules_settings: Settings | None = None,
+    seed: float | None = None,
 ) -> registry.HypothesisRecord:
     """H1's fixture twin registered, marked pre-lab, fingerprinted, its family rules
     written as the lab migration would, and (with `run`) run once."""
@@ -132,7 +173,7 @@ def _twin(
         holdout_end=record.holdout_end,
         in_sample_start=record.in_sample_start,
         fixed_params=sweep.family_rule_params(frozen.frozen_values(record)),
-        sr_star_seed_annual=None,
+        sr_star_seed_annual=seed,
         settings=rules_settings or settings,
     )
     if run:
@@ -333,9 +374,14 @@ def test_oracle_is_refused_on_the_real_store(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_a_family_with_no_rules_is_refused(
+def test_a_family_with_hypotheses_but_no_rules_is_refused(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    # A store the lab migration did not populate: the twin registered, no rules row.
+    hypothesis.register(
+        lab_store, _copy(tmp_path, TWIN_SOURCE), registered_by="test", settings=settings
+    )
+
     _refused(
         lab_store, _copy(tmp_path, SWEEP_SOURCE), settings, NoFamilyRulesError, "no family rules"
     )
@@ -548,3 +594,296 @@ def test_family_rule_params_are_the_forbidden_prefix_keys() -> None:
         "benchmarks": ["SPY"],
         "alpaca.historical_feed": "sip",
     }
+
+
+# ── a new family's first registration (T104b) ───────────────────────────────────
+
+#: A holdout after the twin's (2023-01-03 to 2025-12-31), so no overlap.
+LATER_HOLDOUT = (date(2026, 1, 2), date(2026, 6, 30))
+
+
+def _profitability_sweep(
+    tmp_path: Path,
+    *,
+    slug: str = "profitability-sweep",
+    holdout: tuple[date, date] = LATER_HOLDOUT,
+    parent: str | None = None,
+    cadences: tuple[str, ...] = ("month_end", "week_end"),
+) -> Path:
+    """A `profitability` sweep file over `schedule.rebalance_cadence`."""
+    parent_line = f'parent_family = "{parent}"\n' if parent is not None else ""
+    grid = ", ".join(f'"{c}"' for c in cadences)
+    text = f"""# Sweep: fixture profitability sweep (test only)
+
+```toml sweep
+slug = "{slug}"
+family = "profitability"
+{parent_line}title = "Fixture profitability sweep"
+in_sample_start = 2018-01-31
+
+[holdout]
+start = {holdout[0].isoformat()}
+end = {holdout[1].isoformat()}
+
+[profitability]
+basis = "gross"
+annual_period_days = [350, 380]
+max_fact_age_days = 548
+exclude_sic_ranges = [[6000, 6999]]
+include_derived = true
+top_fraction = 0.2
+weighting = "equal"
+
+[costs]
+per_side_bps = 15.0
+commission_per_share = 0.0
+commission_per_order = 0.0
+sensitivity_per_side_bps = [0.0, 30.0, 60.0, 100.0]
+
+[gap]
+count_share_threshold = 0.05
+
+[grid]
+"schedule.rebalance_cadence" = [{grid}]
+
+[lab]
+selection_statistic = "sharpe_annual_excess_spy"
+expected_excess_cagr_spy_pp = 0.0
+expected_range_pp = [-2.0, 2.0]
+promote_at_least = 0.5
+retire_below = 0.0
+```
+
+Placeholder prose.
+"""
+    directory = tmp_path / "files"
+    directory.mkdir(exist_ok=True)
+    path = directory / f"{slug}.md"
+    path.write_text(text)
+    return path
+
+
+@pytest.fixture
+def child_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test-only: `profitability` as `momentum`'s child in `FAMILY_PARENTS`."""
+    monkeypatch.setitem(config.FAMILY_PARENTS, "profitability", "momentum")
+
+
+def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
+    families = set(get_args(config.HypothesisFamily))
+    assert set(config.FAMILY_PARENTS) == families - {"oracle"}
+    for parent in config.FAMILY_PARENTS.values():
+        assert parent is None or parent in families - {"oracle"}
+
+
+def test_a_root_familys_first_sweep_writes_its_rules_with_no_parent_and_its_own_mark(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    # The twin has spent nothing: a root needs no parent's spend.
+    assert config.FAMILY_PARENTS["profitability"] is None
+    assert lab_registry.family_rules(ready, "profitability") is None
+    before = _counts(ready)
+
+    result = register(ready, _profitability_sweep(tmp_path), settings, registered_by="test")
+
+    assert result.created
+    assert _counts(ready)["family_rules"] == before["family_rules"] + 1
+    rules = lab_registry.family_rules(ready, "profitability")
+    assert rules is not None
+    assert rules.parent_family is None
+    assert rules.sr_star_seed_annual is None
+    assert rules.first_hypothesis_id == result.hypotheses[0].hypothesis_id
+    assert (rules.holdout_start, rules.holdout_end) == LATER_HOLDOUT
+    assert rules.in_sample_start == date(2018, 1, 31)
+    assert rules.fixed_params == sweep.family_rule_params(result.hypotheses[0].params)
+    assert rules.fixed_params["costs.per_side_bps"] == 15.0
+    assert rules.fixed_params["holdout.start"] == "2026-01-02"
+    lab = settings.lab
+    assert (
+        rules.max_family_holdout_spends,
+        rules.max_family_promotions,
+        rules.min_sharpe_variance_annual,
+        rules.axis_lattice,
+    ) == (
+        lab.max_family_holdout_spends,
+        lab.max_family_promotions,
+        lab.min_sharpe_variance_annual,
+        lab.axis_lattice,
+    )
+
+
+def test_a_root_family_on_an_empty_lab_store_registers(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    result = register(lab_store, _profitability_sweep(tmp_path), settings, registered_by="test")
+
+    assert result.created
+    rules = lab_registry.family_rules(lab_store, "profitability")
+    assert rules is not None and rules.parent_family is None
+
+
+def test_a_new_familys_holdout_overlapping_an_existing_familys_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    path = _profitability_sweep(tmp_path, holdout=(date(2025, 6, 2), date(2026, 6, 30)))
+
+    _refused(ready, path, settings, NewFamilyError, "overlaps family 'momentum'")
+
+
+def test_an_oracle_familys_holdout_is_no_overlap(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    twin = registry.get_hypothesis(ready, "fixture-momentum")
+    lab_registry.write_family_rules(
+        ready,
+        family="oracle",
+        first_hypothesis_id=twin.hypothesis_id,
+        parent_family=None,
+        holdout_start=LATER_HOLDOUT[0],
+        holdout_end=LATER_HOLDOUT[1],
+        in_sample_start=date(2018, 1, 31),
+        fixed_params={},
+        sr_star_seed_annual=None,
+        settings=settings,
+    )
+
+    assert register(ready, _profitability_sweep(tmp_path), settings, registered_by="test").created
+
+
+def test_a_new_family_naming_another_parent_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    path = _profitability_sweep(tmp_path, parent="momentum")
+
+    _refused(ready, path, settings, FamilyRuleError, "parent_family 'momentum'")
+
+
+@pytest.mark.usefixtures("child_table")
+def test_a_child_naming_its_own_parent_is_accepted(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    twin = _twin(lab_store, settings, tmp_path)
+    _spend_holdout(lab_store, settings, tmp_path, twin)
+
+    path = _profitability_sweep(tmp_path, parent="momentum")
+
+    assert register(lab_store, path, settings, registered_by="test").created
+
+
+@pytest.mark.usefixtures("child_table")
+def test_a_child_whose_parent_has_no_rules_is_refused(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _refused(
+        lab_store,
+        _profitability_sweep(tmp_path),
+        settings,
+        NewFamilyError,
+        "parent 'momentum' has no family rules",
+    )
+
+
+@pytest.mark.usefixtures("child_table")
+def test_a_child_holding_out_before_the_parents_holdout_end_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    twin = registry.get_hypothesis(ready, "fixture-momentum")
+    _spend_holdout(ready, settings, tmp_path, twin)
+    # Before the parent's holdout, so no overlap: only the ordering rule refuses it.
+    path = _profitability_sweep(tmp_path, holdout=(date(2022, 1, 3), date(2022, 12, 30)))
+
+    _refused(ready, path, settings, NewFamilyError, "is not after parent family 'momentum'")
+
+
+@pytest.mark.usefixtures("child_table")
+def test_a_child_is_refused_until_the_parent_spends_and_its_mark_starts_at_the_parents(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    twin = _twin(lab_store, settings, tmp_path, seed=0.77)
+    path = _profitability_sweep(tmp_path)
+    _refused(lab_store, path, settings, NewFamilyError, "neither a holdout spend")
+
+    _spend_holdout(lab_store, settings, tmp_path, twin)
+    parent_mark = lab_registry.family_sr_star_high_water_mark(
+        lab_store,
+        "momentum",
+        n_trials_today=results.family_n(lab_store, "momentum"),
+        sharpe_variance_annual_today=registry.family_sharpes(lab_store, "momentum").variance(
+            "excess_spy"
+        ),
+    )
+    result = register(lab_store, path, settings, registered_by="test")
+
+    assert result.created
+    rules = lab_registry.family_rules(lab_store, "profitability")
+    assert rules is not None
+    assert rules.parent_family == "momentum"
+    assert rules.sr_star_seed_annual == parent_mark
+    assert parent_mark >= 0.77
+    # The child's own mark starts at the parent's.
+    assert (
+        lab_registry.family_sr_star_high_water_mark(
+            lab_store, "profitability", n_trials_today=0, sharpe_variance_annual_today=None
+        )
+        == parent_mark
+    )
+
+
+@pytest.mark.usefixtures("child_table")
+def test_a_child_is_accepted_when_the_parent_reached_its_spend_cap(
+    lab_store: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    # The cap path of `family_holdout_spent_or_capped`: one spend at a cap of one.
+    settings = _settings(max_family_holdout_spends=1)
+    twin = _twin(lab_store, settings, tmp_path)
+    _spend_holdout(lab_store, settings, tmp_path, twin)
+
+    assert register(
+        lab_store, _profitability_sweep(tmp_path), settings, registered_by="test"
+    ).created
+
+
+def test_the_rules_are_copied_once_and_a_later_config_change_changes_nothing(
+    ready: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    first_settings = _settings(
+        max_family_holdout_spends=2,
+        max_family_promotions=1,
+        min_sharpe_variance_annual=0.09,
+        axis_lattice={"strategy.top_fraction": 0.05},
+    )
+    register(ready, _profitability_sweep(tmp_path), first_settings, registered_by="test")
+    written = lab_registry.family_rules(ready, "profitability")
+    assert written is not None
+    assert (
+        written.max_family_holdout_spends,
+        written.max_family_promotions,
+        written.min_sharpe_variance_annual,
+        written.axis_lattice,
+    ) == (2, 1, 0.09, {"strategy.top_fraction": 0.05})
+    before = _counts(ready)
+
+    # A second sweep in the family under the live defaults: the existing family's path.
+    second = register(
+        ready,
+        _profitability_sweep(tmp_path, slug="profitability-daily", cadences=("daily",)),
+        _settings(),
+        registered_by="test",
+    )
+
+    assert second.created
+    assert _counts(ready)["family_rules"] == before["family_rules"]
+    assert lab_registry.family_rules(ready, "profitability") == written
+
+
+def test_a_non_oracle_family_missing_from_family_parents_is_refused(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(config.FAMILY_PARENTS, "profitability")
+
+    path = _profitability_sweep(tmp_path)
+
+    _refused(ready, path, settings, NewFamilyError, "no entry in FAMILY_PARENTS")

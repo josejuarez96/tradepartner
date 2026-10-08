@@ -20,6 +20,7 @@ from tradepartner.backtest.metrics import (
     DeflatedSharpe,
     deflated_sharpe,
     expected_max_sharpe,
+    metric_keys,
     probabilistic_sharpe,
     red_flag,
     series_metrics,
@@ -611,3 +612,52 @@ def test_red_flag_exactly_at_the_threshold_is_not_flagged() -> None:
     s = Settings(_env_file=None, metrics={"red_flag_excess_cagr_pp": 7.0})
     assert red_flag({"excess_cagr_spy": 0.07}, s) is False
     assert red_flag({"excess_cagr_spy": 0.0700001}, s) is True
+
+
+# --- per-family comparison benchmarks (T129) -------------------------------------------
+
+QUAL = [0.012, -0.018, 0.022, 0.001]
+
+
+def _with_family_benchmark(
+    benchmark: tuple[str, list[float]] | None,
+) -> dict[str, float | None]:
+    return series_metrics(
+        "strategy",
+        period_returns=NET,
+        gross_period_returns=GROSS,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=SPY,
+        mtum_period_returns=MTUM,
+        periods_per_year=12,
+        risk_free_rate=0.0,
+        family_benchmark=benchmark,
+    )
+
+
+def test_no_family_benchmark_changes_nothing() -> None:
+    """The H1 shape: keys and values byte-identical to the call without the argument."""
+    base = _metrics()
+    assert _with_family_benchmark(None) == base
+    assert list(_with_family_benchmark(None)) == list(base)
+    assert set(base) == set(METRIC_KEYS) == set(metric_keys(None))
+
+
+def test_family_benchmark_adds_two_keys_beside_the_mtum_keys() -> None:
+    base = _metrics()
+    out = _with_family_benchmark(("QUAL", QUAL))
+    assert set(out) == set(METRIC_KEYS) | {"excess_cagr_qual", "tracking_error_qual"}
+    assert set(out) == set(metric_keys("QUAL"))
+    assert {k: out[k] for k in base} == base
+    assert out["excess_cagr_qual"] == pytest.approx(_cagr(NET) - _cagr(QUAL), rel=1e-12)
+    assert out["tracking_error_qual"] == pytest.approx(
+        _sample_std(_diff(NET, QUAL)) * math.sqrt(12), rel=1e-12
+    )
+
+
+def test_family_benchmark_must_match_the_period_count_and_be_finite() -> None:
+    with pytest.raises(ValueError, match="QUAL"):
+        _with_family_benchmark(("QUAL", QUAL[:3]))
+    with pytest.raises(ValueError, match="finite"):
+        _with_family_benchmark(("QUAL", [0.01, float("nan"), 0.0, 0.0]))

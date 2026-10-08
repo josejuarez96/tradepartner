@@ -42,7 +42,9 @@ EULER_GAMMA = np.euler_gamma
 # `excess_cagr_spy` is a fraction; the red-flag threshold is in percentage points.
 PERCENT_POINTS_PER_UNIT = 100
 
-Series = Literal["strategy", "SPY", "MTUM"]
+#: A series name: `strategy`, `SPY`, `MTUM`, or a family's declared benchmark (ADR 0014
+#: point 4; `config.FAMILIES[family].benchmark`), so an open set.
+Series = str
 Basis = Literal["raw", "excess_spy"]
 
 #: The strategy-lab spec's req 8 keys, in its order. The Phase 3 `*_monthly` and
@@ -69,6 +71,21 @@ METRIC_KEYS: tuple[str, ...] = (
     "n_periods",
     "periods_per_year",
 )
+
+
+def family_benchmark_keys(name: str) -> tuple[str, str]:
+    """The two keys a family benchmark other than SPY and MTUM adds: its excess CAGR and
+    tracking error, with `name` lower-cased (`QUAL` -> `excess_cagr_qual`)."""
+    lower = name.lower()
+    return f"excess_cagr_{lower}", f"tracking_error_{lower}"
+
+
+def metric_keys(family_benchmark: str | None = None) -> tuple[str, ...]:
+    """`METRIC_KEYS`, plus a family benchmark's two keys when it declares one."""
+    if family_benchmark is None:
+        return METRIC_KEYS
+    return METRIC_KEYS + family_benchmark_keys(family_benchmark)
+
 
 # Stored as null for the SPY series: its excess over itself is identically zero (req 7).
 EXCESS_SPY_KEYS: tuple[str, ...] = (
@@ -151,6 +168,7 @@ def series_metrics(
     mtum_period_returns: Sequence[float],
     periods_per_year: int,
     risk_free_rate: float,
+    family_benchmark: tuple[str, Sequence[float]] | None = None,
 ) -> dict[str, float | None]:
     """Every req 8 key for one series at one cost level.
 
@@ -159,6 +177,10 @@ def series_metrics(
     cadence's constant (`schedule.periods_per_year`). `gross_period_returns` holds the
     same series at zero cost, for `cost_drag`. `spy_period_returns` and
     `mtum_period_returns` are the benchmarks' returns over the same periods.
+    `family_benchmark` is an optional `(name, period_returns)` for a family's declared
+    benchmark other than SPY and MTUM (ADR 0014 point 4); it adds `excess_cagr_<name>`
+    and `tracking_error_<name>` (name lower-cased, `family_benchmark_keys`), and `None`
+    adds nothing, so the key set and values of a family without one are unchanged.
     `daily_equity` is the equity on every session, for `max_drawdown`. `turnover` is the
     one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_rate` is
     annual, compounded to the period. The `*_excess_spy` keys are None when `series` is
@@ -182,6 +204,16 @@ def series_metrics(
     equity = _array(daily_equity)
     gross = _array(gross_period_returns)
     spy, mtum = _array(spy_period_returns), _array(mtum_period_returns)
+    extra = None
+    if family_benchmark is not None:
+        extra_name, extra_returns = family_benchmark
+        if len(extra_returns) != n:
+            raise ValueError(
+                f"{extra_name} period returns has {len(extra_returns)} periods, "
+                f"period_returns has {n}"
+            )
+        extra = _array(extra_returns)
+        _require_finite(f"{extra_name} period returns", extra)
     turnover_values = _array(turnover)
     for name, values in (
         ("period_returns", net),
@@ -234,6 +266,10 @@ def series_metrics(
         out["sharpe_annual_excess_spy"] = sharpe_excess * root_ppy
         out["skew_period_excess_spy"] = _skew(ex_spy)
         out["kurtosis_period_excess_spy"] = _kurtosis(ex_spy)
+    if family_benchmark is not None and extra is not None:
+        excess_key, tracking_key = family_benchmark_keys(family_benchmark[0])
+        out[excess_key] = cagr - _cagr(extra, ppy)
+        out[tracking_key] = _annualized_std(net - extra, ppy)
     return out
 
 

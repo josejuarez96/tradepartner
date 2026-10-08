@@ -26,8 +26,8 @@ from tradepartner.backtest.metrics import METRIC_KEYS, deflated_sharpe
 from tradepartner.config import Settings
 from tradepartner.dashboard import backtest_page, theme
 from tradepartner.research.experiment import hash_file, parse_experiment_file
-from tradepartner.store import registry, research, schema
-from tradepartner.store.db import open_for_write
+from tradepartner.store import lab_registry, lab_schema, registry, research, schema
+from tradepartner.store.db import insert_row, open_for_write
 
 _APP_PATH = str(
     Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "dashboard" / "app.py"
@@ -733,3 +733,137 @@ def test_a_pre_migration_store_renders_with_n_research_blank(
     assert list(dsr["today N"]) == [3, 3]
     assert dsr["today N research"].isna().all()
     assert dsr["stored N research"].isna().all()
+
+
+# --- detail level and the spend cap (strategy-lab spec req 12, amendment 12; T112) -----
+
+
+def _detail_store(tmp_path: Path, *, lab: bool) -> tuple[Path, int, int]:
+    """A store with one `full` trial carrying weights at two fill sessions and one
+    `summary` trial (detail rows written, then `detail_level` set as a sweep variant's
+    is), plus one holdout spend; with `lab`, the lab tables and the family rules."""
+    store_path = tmp_path / "detail.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        if lab:
+            lab_schema.apply_lab_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
+        full = _ok_trial(conn, seed_settings, h1, 0.20, 0.05, details=True)
+        # The result row is written, so the weights go in as rows (the writer refuses
+        # a closed trial).
+        for fill, security, weight, price, shares in (
+            (FILLS[0], "SEC-A", 0.5, 10.0, 5.0),
+            (FILLS[1], "SEC-A", 0.4, 11.0, 4.0),
+            (FILLS[1], "SEC-B", 0.6, 20.0, 3.0),
+        ):
+            insert_row(
+                conn,
+                "trial_weights",
+                {
+                    "trial_id": full.trial_id,
+                    "fill_session": fill,
+                    "security_id": security,
+                    "target_weight": weight,
+                    "fill_price": price,
+                    "shares": shares,
+                },
+            )
+        summary = _ok_trial(conn, seed_settings, h1, 0.10, 0.02, details=True)
+        conn.execute(
+            "UPDATE trials SET detail_level = 'summary' WHERE trial_id = ?", [summary.trial_id]
+        )
+        _ok_trial(conn, seed_settings, h1, 0.25, 0.07, kind="holdout", holdout_reason="spend")
+        if lab:
+            lab_registry.write_family_rules(
+                conn,
+                family="momentum",
+                first_hypothesis_id=h1,
+                parent_family=None,
+                holdout_start=date(2023, 1, 1),
+                holdout_end=date(2025, 12, 31),
+                in_sample_start=date(2017, 1, 31),
+                fixed_params={"costs.per_side_bps": BASE},
+                sr_star_seed_annual=None,
+                settings=seed_settings.model_copy(
+                    update={
+                        "lab": seed_settings.lab.model_copy(update={"max_family_holdout_spends": 2})
+                    }
+                ),
+            )
+    return store_path, full.trial_id, summary.trial_id
+
+
+def test_view_reads_the_detail_level_and_the_last_weights(tmp_path: Path) -> None:
+    store_path, full, summary = _detail_store(tmp_path, lab=False)
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        full_view = backtest_page.load_trial_view(conn, full)
+        summary_view = backtest_page.load_trial_view(conn, summary)
+    assert full_view.detail_level == "full"
+    assert full_view.weights is not None
+    assert [(w["security_id"], w["target_weight"]) for w in full_view.weights] == [
+        ("SEC-B", 0.6),
+        ("SEC-A", 0.4),
+    ]
+    assert summary_view.detail_level == "summary"
+    assert summary_view.weights is None
+    assert summary_view.equity  # its base-level equity is still shown
+    assert {r["series"] for r in summary_view.equity} == {"strategy", "SPY", "MTUM"}
+
+
+def test_render_full_trial_shows_weights_and_its_detail_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=False)
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    text = _text(at)
+    assert "Detail level `full`." in text
+    assert "Weights" in text
+    weights = next(df.value for df in at.dataframe if "target_weight" in df.value.columns)
+    assert list(weights["security_id"]) == ["SEC-B", "SEC-A"]
+
+
+def test_render_summary_trial_shows_equity_and_no_weights_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, _full, summary = _detail_store(tmp_path, lab=False)
+    at = _pick(_app(monkeypatch, store_path), summary)
+    assert not at.exception
+    text = _text(at)
+    assert "Detail level `summary`" in text
+    assert "no weights stored" in text
+    assert "Weights" not in [h.value for h in at.subheader]
+    assert not any("target_weight" in df.value.columns for df in at.dataframe)
+    equity_spec = json.loads(at.get("vega_lite_chart")[0].proto.spec)
+    assert equity_spec["encoding"]["y"]["scale"] == {"type": "log"}
+
+
+def test_render_spend_cap_from_the_family_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=True)
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    assert "Family `momentum`: 1 of 2 holdout spends (the family cap)." in _text(at)
+
+
+def test_render_spend_cap_live_for_a_family_without_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=True)
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        conn.execute("DELETE FROM family_rules")
+    live = Settings(_env_file=None).lab.max_family_holdout_spends
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    assert f"Family `momentum`: 1 of {live} holdout spends (the family cap)." in _text(at)
+
+
+def test_render_no_spend_cap_without_the_lab_tables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=False)
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    assert "1 holdout spends; no family cap" in _text(at)
