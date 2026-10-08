@@ -200,6 +200,8 @@ def test_a_legs_order_nests() -> None:
     assert order.legs[0].client_order_id == "leg-1"
     with pytest.raises(ValueError, match="legs"):
         _order(legs=("not-an-order",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="legs"):
+        _order(legs=[leg])  # type: ignore[arg-type]  # a list is not a tuple of Order
 
 
 @pytest.mark.parametrize(

@@ -25,8 +25,9 @@ the adapter are handed the same clock callable at composition time.
 `daytrade_count`, `shortable`, `easy_to_borrow`, `marginable` — that nothing
 in this system sends: `OrderRequest` is unchanged, so no request can carry a
 price, an order type or a leg (ADR 0015 seam 3). They are reserved so the
-Alpaca adapter maps a broker's response once; the risk wrapper refuses any
-non-default shape by name (`refused_order_shape`, T135b).
+Alpaca adapter maps a broker's response once; the risk wrapper does not yet
+refuse a non-default shape — that refusal (`refused_order_shape`) is T135b,
+not this task.
 
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
@@ -170,11 +171,12 @@ def _validate_optional_count(value: int | None, *, field_name: str) -> int | Non
 
 
 def _validate_legs(value: tuple[Order, ...], *, field_name: str) -> tuple[Order, ...]:
-    """A sequence of `Order` legs, stored as a tuple. Each leg was already
-    validated when it was built; this only pins the shape."""
-    if not isinstance(value, tuple | list) or not all(isinstance(leg, Order) for leg in value):
+    """A tuple of `Order` legs. Refuses any non-tuple (including a list),
+    so the frozen field stays hashable. Each leg was already validated when
+    it was built; this only pins the shape."""
+    if not isinstance(value, tuple) or not all(isinstance(leg, Order) for leg in value):
         raise ValueError(f"{field_name} must be a tuple of Order, got {value!r}")
-    return tuple(value)
+    return value
 
 
 def _validate_size(
