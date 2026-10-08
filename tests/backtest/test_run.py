@@ -148,21 +148,22 @@ def _spy(
 
 
 def _insert_mid_run(provider: StoreProvider, path: Path) -> None:
-    """A new bar after the window, ingested now, between two reads."""
+    """A late bar inside the window (known before its data cutoff), ingested now,
+    between two reads: it moves the data vintage at the cutoff (#1232)."""
     provider.end_step()
     with open_for_write(_store(path)) as conn:
         insert_row(
             conn,
             "prices_daily",
             {
-                "security_id": "SEC_SPY",
-                "session": date(2020, 7, 1),
+                "security_id": "SEC_LATE",
+                "session": date(2019, 5, 30),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
                 "close": 1.0,
                 "volume": 1,
-                "known_at": datetime(2020, 7, 1, 20, 0, tzinfo=UTC),
+                "known_at": datetime(2019, 5, 30, 20, 0, tzinfo=UTC),
                 "ingested_at": utc_now(),
                 "source": "alpaca",
                 "provenance": "bar",
