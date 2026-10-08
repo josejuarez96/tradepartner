@@ -187,3 +187,77 @@ Seen on 2026-10-08 unless noted. "Local" means this repository.
 - **S33** Lyle, M., Siano, F. and Yohn, T. L. (July 2024), "Re-Standardized Financial Statement Data", working paper: https://som.yale.edu/sites/default/files/2024-07/Re-Standardized%20Financial%20Statement%20Data.pdf (Tier 1; abstract via search summary, PDF not parsed)
 - **S34** Local code: `src/tradepartner/adapters/edgar.py` (`parse_cover_page` docstring, lines about 753 to 757; FSN listing path, about 1058 to 1063); `src/tradepartner/config.py:271` (Tier 1)
 - Fetch attempts that returned nothing usable (not counted as sources): QuantRocket Sharadar docs (no detail), the EDGAR Filer Manual vol. 2 v13 PDF (too large), the QuantConnect bulk-download page (404), the AmiBroker forum thread on Norgate fundamentals (HTTP 403).
+
+## Measurement, 2026-10-08 (Recommendation 1)
+
+**Brief:** [#1311](https://github.com/josejuarez96/tradepartner/issues/1311)  ·  **Team:** routeamsr, claude-opus-5-5  ·  read-only: SEC FSN downloads and Alpaca market-data GETs through the repo's own adapters, a copy of the owner's store, and the local EDGAR cache. No orders, no store writes.
+
+**In plain words.** Route A, built on `dei:TradingSymbol`, is not worth building as specified. Before mid-2019 only about half of universe-sized companies put their ticker in their XBRL at all, and the large banks and blue chips are often among those that don't (JPMorgan, J&J, Walmart, Visa, Coca-Cola). The same holds for companies that delisted in 2016 to 2018: 54% of those that filed a 10-K or 10-Q in the window have one. Prices are not the problem. Alpaca's free bars cover 47 of 48 sampled real exits, provided the request sets `asof` to a date before the delisting. Without `asof`, which is how the repo's adapter asks today, a ticker later reused by another company loses the dead company's bars (5 of 48), and in one case (VAL) serves the later company's prices on the dead company's dates. A free Route A would therefore need a second ticker source for the missing half (10-K cover text, 8-A12B, or ticker-from-bars inference) before it could produce an unbiased 2017 to 2019 universe. That is more build than #1303's two-to-four-task estimate.
+
+### Q1. Ticker coverage before mid-2019
+
+Source: every 10-K and 10-Q (and /A) in the SEC Financial Statement and Notes data sets 2016q1 to 2019q4 (16 zips, downloaded through `edgar_raw.fsn_zip` and read with the ingest's own `_fsn_rows`, `_fsn_class_member` and co-registrant filter, then deleted). This is the same listing-tag read the FSN path does, except that it keeps the dropped symbols. The local FSN cache keeps only complete listings plus a per-quarter `incomplete_listings` count, not the symbols. Its manifests agree with the counts below: 2,972 to 3,954 incomplete listings per quarter from 2016q1 to 2019q2, against 1,112 in 2019q3. The backfill logs' "FSN incomplete listings: 0" counts only fresh extractions, so it says nothing about the pre-2019 rate. Years are by filing date.
+
+| Filed | Issuers filing 10-K/10-Q | With a TradingSymbol | Symbol with no exchange (`incomplete_listings`) | Complete triple |
+|---|---|---|---|---|
+| 2016 | 6,900 | 3,442 (49.9%) | 3,443 | 0 |
+| 2017 | 6,568 | 3,563 (54.2%) | 3,563 | 0 |
+| 2018 | 6,322 | 3,484 (55.1%) | 3,484 | 0 |
+| 2019 H1 | 5,898 | 3,357 (56.9%) | 3,357 | 3 |
+| 2019 H2 | 5,849 | 3,206 | 1,119 | 2,651 |
+
+So before July 2019 essentially every symbol is "incomplete" in our parser's sense: no exchange, no title. These counts include OTC issuers, because the tag says nothing about the venue. "With a TradingSymbol" leaves out blank and `NONE` values, which the parser's count includes, so in 2016 the incomplete column is one higher.
+
+**Against the store's 2019-12-31 universe.** That is `universe_as_of` on the store copy at 2019-12-31: 1,000 members, 1,000 companies. "Existed" means the company filed a 10-K or 10-Q in that year.
+
+| Filed | Universe companies that existed | With a pre-2019 symbol | Symbol equals the 2019 ticker | Symbol differs (renames, other class, typos) |
+|---|---|---|---|---|
+| 2016 | 951 | 470 (49.4%) | 453 (47.6%) | 17 |
+| 2017 | 980 | 490 (50.0%) | 479 (48.9%) | 11 |
+| 2018 | 998 | 509 (51.0%) | 501 (50.2%) | 8 |
+| 2019 H1 | 999 | 537 (53.8%) | 531 (53.2%) | 6 |
+
+Two of the 1,000 filed nothing in 2016 to 2018. Coverage does not rise with size. Among the top 200, JPM, JNJ, WMT, V, BAC, UNH, INTC, KO, CVX, WFC, BA, C, ADBE, NVDA and NFLX carry no symbol in any 2016 to 2018 filing. Spot check: the JNJ and JPM 2017 10-K cover reports (R1) have no Trading Symbol row, so the gap is in the filings, not in FSN.
+
+**Survivor-free reference set.** This is the top 1,000 FSN filers each year by `dei:EntityPublicFloat` on a 10-K filed that year, from the local companyfacts bulk file. It is not built from the 2019 universe, so names that later died are included.
+
+| Filed | Top 1,000 by public float | With a symbol that year | Not in the 2019 universe | ... of those with a symbol |
+|---|---|---|---|---|
+| 2016 | 1,000 | 470 (47.0%) | 382 | 178 (46.6%) |
+| 2017 | 1,000 | 471 (47.1%) | 340 | 147 (43.2%) |
+| 2018 | 1,000 | 494 (49.4%) | 291 | 134 (46.0%) |
+
+By float rank, 2016 to 2018 pooled: ranks 1 to 200 have 51.8%, 201 to 500 have 47.0%, 501 to 1,000 have 46.7%.
+
+**Dual class.** 13 of the 2019 universe companies list two or more common tickers on their post-2019 cover pages. In 2016 to 2018 only 2 or 3 of them carry any symbol, and none carries both class tickers. Where a pre-2019 symbol exists it names one class only, and sometimes not the class the universe later holds: HEI.A against HEI, UA against UAA, NWS against NWSA. Across all filers before July 2019, 10 issuers tagged a symbol on a `ClassOfStock` member and 3 wrote several tickers in one value ("GOOG, GOOGL"). The "differs" column is mostly genuine renames dated by the filings (COH to TPR, KORS to CPRI, Q to IQV, HRS to LHX), which is useful, plus a few typos (`crspr`).
+
+### Q2. Alpaca SIP daily bars for names delisted 2016 to 2018
+
+**What the store holds.** The store's `delistings` table has only 54 rows filed in 2016 to 2018. The EDGAR delisting cache holds 939 first equity Form 25-NSE filings per company and exchange in that span, 938 companies, all with a CIK in `securities`. The rest are unmatched because a Form 25 is matched to a listing, and pre-2019 exits have none. Of the 939, 722 filed at least one 10-K or 10-Q in the FSN window (2016-01 onward) before their Form 25. The other 217 are mostly 2016 exits whose last filings fall before the window, plus 20-F and fund filers. Of the 722, **392 (54%)** have a `TradingSymbol`: 123 of 238 (52%) for 2016 exits, 136 of 261 (52%) for 2017, 133 of 223 (60%) for 2018. Over all 939, NYSE exits have the lowest share by exchange (28 to 35% a year, against 40 to 63% for Nasdaq). Without a ticker there is nothing to ask Alpaca for, so this, not the bars, is Route A's first limit on delisted names.
+
+**Sample.** 58 of the 392, drawn with seed 1311: 48 stratified, up to 6 per cell of "acquired or not" × "public float at least USD 500m or not" × "NYSE-family or Nasdaq". "Acquired" means the CIK had a DEFM14A, PREM14A, SC 14D9, SC TO-T, SC 13E3 or DEFM14C in the 400 days before its Form 25. Then 10 more from the 42 whose ticker the store's master shows on another company (reuse is therefore oversampled about three times). One `alpaca_raw.daily_bars` call per symbol (SIP, raw, no `asof`), from 120 days before the Form 25 to 2026-10-07. This is the #104 method. Bars with `v = 0` and `n = 0` are counted as placeholders, not trades.
+
+| Outcome | Names |
+|---|---|
+| Real exit, bars end at the last session (lag to the Form 25 filing: median -1 session, range -21 to 0) | 38: SFG ANAD CHEV NSPH GAS FUR FMD AMIC IMPR FLTX N VMEM AFCO ACAT CYNO MCZ FNBC MPSX SWFT KITE CACQ WBKC REXX FCRE SYNT XRM IMUC PERY OCLR ESRX, and with a clean gap before a later company reuses the ticker: POM ONE CBNK EAC SE EVER FGL PX |
+| Real exit, bars end 44 to 65 sessions before the Form 25 (suspension first, typical of failures; not checked against another source) | 3: AAPC BSTG SMLR |
+| Real exit, **no bars for the delisted company** (without `asof`) | 6: PVCT (none at all; moved to OTC); UPL (none until its 2017-04-13 relisting); TE, FTI, ARIS, RPRX (the symbol returns only the later company: first bars 2020-01-10, 2017-01-17 TechnipFMC, 2023-09-14, 2020-06-16) |
+| Real exit, **contaminated** (without `asof`) | 1: VAL. Valspar (acquired 2017-06) returns bars from 2017-02 at about USD 6, which are Ensco/Valaris prices copied back onto the symbol, not Valspar's (about USD 110). Same behaviour as FB/META in #104 |
+| Form 25 was not a company exit (holdco, redomicile, rename, bankruptcy re-issue): bars continue | 10: GBLI SWX ULTA TSRA CBPO SOHU TMHC WRK (smooth); VBIV (+96% on the switch day) and SGY (+274%, old equity cancelled, new equity under the same symbol) are spliced |
+
+- **Hit rate on real exits without `asof`: 41 of 48 (85%)** have the delisted company's bars up to its last session. 6 (12.5%) have none. 1 (2%) carries another company's prices.
+- **With `asof`.** The 16 reused or missed symbols were probed again through the same SDK client (`StockBarsRequest(..., asof=...)`), from 120 days before the Form 25 to 30 days after. With `asof` set to the Form 25 date, TE, ARIS, RPRX and VAL (Valspar at USD 110 to 113) return the delisted company's bars up to its last session. So does UPL, whose bars end on 2016-04-29, before the Form 25. With `asof` set 7 days earlier, FTI returns FMC Technologies from 2016-09-19 and continues as TechnipFMC. **So 47 of 48 real exits are recoverable; only PVCT (moved to OTC) has no bars.** The date matters, though. EVER and ONE return nothing with `asof` on the Form 25 date but full bars with `asof` 7 days earlier, and SMLR returns nothing with either (its bars come only without `asof`). An ingest would need a rule such as "`asof` a week before the Form 25, else no `asof`".
+- **By stratum (real exits):** acquired 26 of 31, not acquired 15 of 17; large 16 of 20, small 25 of 28; NYSE 17 of 21, Nasdaq 21 of 23, NYSE American 3 of 4.
+- **Without `asof`, ticker reuse is the failure mode.** Among real exits whose ticker a later company took, 8 are clean and 5 are missing or contaminated (TE, FTI, ARIS, RPRX, VAL). Among the rest, 33 of 35 are clean (PVCT and UPL miss). Reweighting for the oversampled reuse cells gives roughly 90% without `asof`.
+- **Gaps:** within every hit, every XNYS session has a bar. The only "missing" sessions are zero-volume placeholders on no-trade days of illiquid small caps (AMIC 12, AAPC 22). Placeholders also fill whole dead periods between a delisting and a ticker's reuse: 1,733 for FGL, 1,335 for EAC, 1,292 for SMLR.
+- **Plausibility:** last closes match the deal or failure in the cases checked (KITE 179.79, ESRX 92.33, PX 164.50, ANAD 0.85). NetSuite's last close, 90.34 on 2016-11-04, against a USD 109 tender, was not checked against another source.
+
+### Method notes and caveats
+- Scripts and intermediate files are in the orchestrator's scratch directory (`routeA/`), not in the repo: `fsn_symbols.py`, `q1.py`, `q1b.py`, `pubfloat.py`, `index.py`, `q2_sample.py`, `q2_probe.py`, `q2_analyse.py`, `q2_asof.py`, `q2_asof_shift.py`, `q2_cov.py`. The store copy was deleted after the run.
+- "Existed" and the reference set rely on FSN filers. A company whose 10-K is missing from FSN (FSN covers XBRL filers) is undercounted. Public float is a cap proxy, measured at the prior second quarter.
+- The acquired flag is a heuristic. POM, SWFT and PX were acquisitions it missed (the acquirer filed the proxy).
+- The Q2 sample is drawn from names that have an FSN symbol, so its hit rates are conditional on Route A having found a ticker. They say nothing about the 46% of delisted filers with none, or about the 217 with no 10-K or 10-Q in the window.
+- Judging reuse uses the store's later listings and today's symbol holders. That is fine for a measurement, but a build could not use either at T.
+- Reuse contamination was judged by hand from price level and seams, on this sample only. The #787 price-jump gate would catch the VBIV and SGY splices, but not VAL, whose served series is internally smooth. The repo's `alpaca_raw.daily_bars` sets no `asof` today, so the same risk applies to any post-2019 name whose ticker is reused later.
+- `asof` was probed only on the 16 reused or missed symbols, not on the 42 clean ones, and on only two dates per name.
+- Not measured: Form 8-A12B and pre-2019 10-K cover text as a second ticker or exchange source, or `name_change` corporate-action depth.
