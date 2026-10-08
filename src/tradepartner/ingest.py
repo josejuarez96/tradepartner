@@ -33,8 +33,9 @@ the previous session. The names so reported (dark plus snapshot-only) make
 the run stale when they are more than `ingest.max_dark_share` of the listed
 names (#796). Before both, a listed name with no bar that is a *stale
 listing* by the gap's rule (its last traded bar known at the read is more
-than `gap.stale_listing_sessions` sessions before the expected session,
-ADR 0003 amendment #1199) is named in the
+than `gap.stale_listing_sessions` sessions before the reference symbol's
+last traded bar so read, ADR 0003 amendment #1199, so a lapse in ingests
+makes nothing stale) is named in the
 message with its own count and left out of both shares and both sides
 (#1234); never a benchmark or the reference symbol. The backfill does not
 apply it.
@@ -1296,7 +1297,7 @@ def _fetch_prices(
     listed: set[str] = set()
     static_only: set[str] = set()
     may_count: set[str] | None = None
-    stale_ids: set[str] = set()
+    read_at = now
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
@@ -1305,22 +1306,23 @@ def _fetch_prices(
             fetch, listed, static_only, may_count, reference = _price_names(
                 conn, read_at, session, settings
             )
-            stale_ids = _stale_listed(conn, read_at, session, listed, reference, settings)
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
     action_window = (session.replace(day=1), session)
     actions = prices.corporate_actions(ids, *action_window)
+    have = {bar.security_id for bar in bars}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
+        stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
     actions, covered = _replay_actions(prices, actions, action_window, plan)
     ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
-    have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
     counted, missing, reported = _staleness(listed, have, static_only, may_count, stale_ids)
-    share, limit = len(missing) / len(counted), settings.ingest.max_missing_share
+    share = len(missing) / len(counted) if counted else 0.0
+    limit = settings.ingest.max_missing_share
     if share > limit:
         raise _Stale(
             f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
@@ -1517,14 +1519,12 @@ def _staleness(
     no bar."""
     absent = sorted(sid for sid in set(listed) if sid not in have)
     old = [sid for sid in absent if sid in stale]
-    static = [sid for sid in absent if sid in static_only and sid not in stale]
+    rest = [sid for sid in absent if sid not in stale]
+    static = [sid for sid in rest if sid in static_only]
     dark = [
         sid
-        for sid in absent
-        if sid not in static_only
-        and sid not in stale
-        and may_count is not None
-        and sid not in may_count
+        for sid in rest
+        if sid not in static_only and may_count is not None and sid not in may_count
     ]
     out = {*old, *static, *dark}
     counted = sorted(set(listed) - out)
@@ -1536,22 +1536,24 @@ def _stale_listed(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     session: date,
-    listed: Iterable[str],
-    reference: str | None,
+    absent: Iterable[str],
+    reference: str,
     settings: Settings,
 ) -> set[str]:
-    """The `listed` names that are stale listings at `session` by the gap's
-    rule (`gap.stale_listing_sessions`, ADR 0003 amendment #1199, applied to
-    the ingest by #1234): a traded bar known at `t`, the last more than that
-    many sessions before `session`. Never a benchmark or the reference
-    symbol's id. A name that trades again counts again (a read, no state)."""
+    """The `absent` listed names that are stale listings by the gap's rule
+    (`gap.stale_listing_sessions`, ADR 0003 amendment #1199, applied to the
+    ingest by #1234): a traded bar on or before `session` known at `t`, the
+    last more than that many sessions before the `reference` symbol's own
+    last traded bar so read (a store whose ingests lapsed as a whole has
+    none). Never a benchmark or the reference symbol's id. A name that
+    trades again counts again (a read, no state)."""
     benchmarks = {
         row["security_id"]
         for row in securities_as_of(conn, t).iter_rows(named=True)
         if row["benchmark"]
     }
-    ids = {sid for sid in listed if sid not in benchmarks and sid != reference}
-    return set(stale_listings_at(conn, t, session, ids, settings))
+    ids = {sid for sid in absent if sid not in benchmarks and sid != reference}
+    return set(stale_listings_at(conn, t, session, ids, settings, anchor=reference))
 
 
 def _dark_stale(

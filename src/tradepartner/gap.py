@@ -225,15 +225,30 @@ def stale_listings_at(
     session: date,
     ids: Iterable[str],
     settings: Settings,
+    *,
+    anchor: str | None = None,
 ) -> dict[str, tuple[date, int]]:
     """Of `ids`, those whose latest traded bar on or before `session` known
     at `t` (as `survivorship_gap` reads bars) is stale by
     `stale_dark_sessions`: id -> (last bar, sessions dark). An id with no
-    traded bar is never in it. The ingest's missing-share check (#1234)
-    reads it. A bare date `t` raises `TypeError`, a naive one `ValueError`."""
+    traded bar is never in it. With `anchor`, the sessions dark are counted
+    up to `anchor`'s own last traded bar instead of `session` (none: no id
+    is stale), so a store that stopped being updated as a whole has no stale
+    listings. The ingest's missing-share check (#1234) reads it with the
+    reference symbol as `anchor`. A bare date `t` raises `TypeError`, a
+    naive one `ValueError`."""
     t = _validate_t(t)
+    ids = set(ids)
+    wanted = ids | ({anchor} if anchor is not None else set())
+    bars = _last_bars(conn, t, session, sorted(wanted))
+    if anchor is not None:
+        if anchor not in bars:
+            return {}
+        session = bars[anchor][0]
     out: dict[str, tuple[date, int]] = {}
-    for sid, (last_bar, _) in _last_bars(conn, t, session, sorted(set(ids))).items():
+    for sid, (last_bar, _) in bars.items():
+        if sid == anchor or sid not in ids:
+            continue
         dark = stale_dark_sessions(last_bar, session, settings)
         if dark is not None:
             out[sid] = (last_bar, dark)
