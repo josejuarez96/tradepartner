@@ -515,6 +515,7 @@ def test_accepts_with_residues_carried_and_records_starting_values(
     assert result.window.starting_cash == account.cash
     assert result.window.starting_equity == account.equity
     assert result.window.account_id == ACCOUNT_ID
+    assert result.window.book_id == "main"
     assert result.abandoned_note is None
 
     with open_read_only(journal_settings) as conn:
@@ -525,6 +526,42 @@ def test_accepts_with_residues_carried_and_records_starting_values(
     assert carried[SPY].session == stop_at.date()
     assert carried[MTUM].quantity == 2.0
     assert carried[MTUM].origin == "untradable"
+    assert {a.book_id for a in adjustments} == {"main"}
+
+
+def test_a_non_default_book_id_flows_to_the_window_and_its_adjustments(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """ADR 0015 seam 1 (T133): `paper start` reads `settings.paper.book_id`
+    once into the window row, and the window's adjustments carry it. The live
+    key is not frozen (`frozen_json`/`frozen_sha256` unchanged)."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        paper={"book_id": "fx"},
+    )
+    stop_at = fixed_clock() - timedelta(days=1)
+    _write_closed_window(
+        settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (5.0, "dust")},
+    )
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 5.0
+
+    result = window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+    window_id = result.window.window_id
+    assert window_id is not None
+    assert result.window.book_id == "fx"
+    assert "paper.book_id" not in result.window.frozen_json
+
+    with open_read_only(settings) as conn:
+        adjustments = adjustments_for(conn, window_id=window_id)
+    carried = [a for a in adjustments if a.kind == "carried_residue"]
+    assert carried and {a.book_id for a in carried} == {"fx"}
 
 
 def test_accepted_window_s_first_reconciliation_passes(
@@ -575,9 +612,16 @@ def test_accepts_spinoff_child_of_a_residue(
     fixed_clock: FixedClock,
     ready_hypothesis: registry.HypothesisRecord,
 ) -> None:
+    """ADR 0015 seam 1 (T133): the spin-off receipt `AdjustmentRow` carries the
+    window's book. A non-default book makes a missing `book_id` fail."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        paper={"book_id": "fx"},
+    )
     stop_at = fixed_clock() - timedelta(days=10)
     _write_closed_window(
-        journal_settings,
+        settings,
         ready_hypothesis,
         at=stop_at,
         residues={SPY: (10.0, "dust")},
@@ -587,7 +631,7 @@ def test_accepts_spinoff_child_of_a_residue(
     ex_date = (stop_at + timedelta(days=2)).date()
     known_at = stop_at + timedelta(days=5)
     _insert_action(
-        journal_settings,
+        settings,
         security_id=CHILD,
         action_type="spinoff",
         ex_date=ex_date,
@@ -599,17 +643,18 @@ def test_accepts_spinoff_child_of_a_residue(
     fake.extra_quantity["SPY"] = 10.0
     fake.extra_quantity["SPLT"] = 2.0  # 10 * 0.2
 
-    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    result = window.start(settings, _connect(settings), fake, fixed_clock, "h1")
     window_id = result.window.window_id
     assert window_id is not None
 
-    with open_read_only(journal_settings) as conn:
+    with open_read_only(settings) as conn:
         adjustments = adjustments_for(conn, window_id=window_id)
     receipts = [a for a in adjustments if a.kind == "spinoff_receipt"]
     assert len(receipts) == 1
     assert receipts[0].security_id == CHILD
     assert receipts[0].quantity == pytest.approx(2.0)
     assert receipts[0].origin is None
+    assert receipts[0].book_id == "fx"
 
 
 def test_frozen_hash_stable_across_an_environment_override(

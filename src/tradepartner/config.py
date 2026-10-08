@@ -1285,10 +1285,18 @@ class PaperConfig(BaseModel):
     (#247 Q4). `poll_interval_seconds` never exceeds `accept_wait_seconds` (req 3(f)), or
     the acknowledgement poll could never run before its own deadline. `order_id_prefix`
     is one token with no whitespace, since it heads every `client_order_id`.
+    `book_id` names the book whose rows this window writes and whose token sits in
+    every `client_order_id` (ADR 0015 seam 1, plan T133): `paper start` reads it
+    once into `paper_windows.book_id`, the window's frozen copy, and every later
+    row is written with the window's book, never this live key. It matches
+    `^[A-Za-z0-9]+$` (no `-` or `:`, so the prefix and the book parse from the
+    left of the id, whose `security_id` may contain a `:`), is not in
+    `FROZEN_PAPER_KEYS`, and defaults to `store.schema.DEFAULT_BOOK_ID`'s `"main"`.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
+    book_id: str = Field(default="main", min_length=1, pattern=r"^[A-Za-z0-9]+$")
     min_rebalances: int = Field(default=6, gt=0)
     tracking_k: float = Field(default=2.0, ge=0)
     tracking_rule: Literal["raw", "residual"] = "raw"

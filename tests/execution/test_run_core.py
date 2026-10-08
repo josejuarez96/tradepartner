@@ -142,6 +142,7 @@ class Env:
         frozen: RiskConfig | None = None,
         hypothesis_id: int = 1,
         starting_equity: float = FAKE_CASH,
+        book_id: str = "main",
     ) -> PaperWindowRow:
         row = PaperWindowRow(
             hypothesis_id=hypothesis_id,
@@ -153,6 +154,7 @@ class Env:
             started_at=started,
             frozen_json=_frozen_json(frozen or RiskConfig()),
             frozen_sha256="0" * 64,
+            book_id=book_id,
             known_at=started,
             ingested_at=started,
         )
@@ -746,6 +748,38 @@ def test_a_lagging_order_past_the_bound_halts_once_then_reports_mismatch(env: En
     ]
     assert statuses[0] == "mismatch"
     assert TUE in {r[0] for r in env.query("SELECT session FROM positions_daily")}
+
+
+def test_the_lag_bound_mismatch_row_carries_a_non_default_book(env: Env) -> None:
+    """ADR 0015 seam 1 (T133): `run.py`'s lag-bound `MISMATCH`
+    `ReconciliationRow` carries the window's book, not the DDL default."""
+    window = env.window(book_id="fx")
+    env.ingest(_at(MON, 21))
+    earlier = env.past_run(window, _at(MON))
+    env.fake.lag_fills(None)
+    env.order(earlier, "tp-lag", _at(MON), quantity=2.0)
+    env.fake.apply("tp-lag", PartialFill(1.0, PRICE))
+    seen = _at(MON, 14)
+    env.append(
+        ReconciliationRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            run_id=earlier,
+            at=seen,
+            status="fills_lagging",
+            mismatches_json=json.dumps({"lagging": ["tp-lag"]}),
+            book_id="fx",
+            known_at=seen,
+            ingested_at=seen,
+        )
+    )
+    with pytest.raises(ReconciliationError, match="tp-lag"):
+        env.run(_at(TUE))
+    env.ingest(_at(TUE, 21))
+    second = env.run(_at(WED))
+    assert second.status == "skipped_kill_switch"
+    assert env.query(
+        "SELECT DISTINCT book_id FROM reconciliations WHERE run_id = ?", [second.run_id]
+    ) == [("fx",)]
 
 
 # --- step 4: reconciliation with a pending order -----------------------------------------------

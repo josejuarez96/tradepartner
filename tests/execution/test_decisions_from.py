@@ -256,7 +256,9 @@ def test_equal_scores_rank_by_security_id() -> None:
 def test_rows_carry_the_run_and_stamps() -> None:
     result = _run()
     stamp = datetime(2026, 10, 1, 12, tzinfo=UTC)
-    rows = [d.row(run_id=7, known_at=stamp, ingested_at=stamp) for d in result.decisions]
+    rows = [
+        d.row(run_id=7, known_at=stamp, ingested_at=stamp, book_id="main") for d in result.decisions
+    ]
     assert all(isinstance(r, DecisionRow) and r.run_id == 7 for r in rows)
     assert all(r.decision_id is None and r.known_at == stamp for r in rows)
     [c] = [r for r in rows if r.security_id == "C"]
@@ -642,7 +644,7 @@ def test_a_catch_up_split_inside_t_i_to_s_minus_1_round_trips_through_remainder(
     )
     c = _by_name(result)["C"]
     assert c.planned_quantity == pytest.approx(5.0)
-    row = replace(c.row(run_id=1, known_at=STAMP, ingested_at=STAMP), decision_id=1)
+    row = replace(c.row(run_id=1, known_at=STAMP, ingested_at=STAMP, book_id="main"), decision_id=1)
     left = remainder(row, [], [], [], actions, prices.__getitem__, session=catch_up)
     assert left.quantity == pytest.approx(15.0)
     assert left.notional == pytest.approx(500.0)
@@ -749,7 +751,7 @@ def test_is_full_exit_reads_every_sell_decisions_from_writes() -> None:
     seen = set()
     for result in runs:
         for d in result.decisions:
-            row = d.row(run_id=1, known_at=stamp, ingested_at=stamp)
+            row = d.row(run_id=1, known_at=stamp, ingested_at=stamp, book_id="main")
             full = is_full_exit(row)
             assert full == (d.side == "sell" and d.reason is not None), d
             seen.add((d.decision, d.side, d.reason, full))

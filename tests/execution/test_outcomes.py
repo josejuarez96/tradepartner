@@ -85,6 +85,7 @@ class Book:
         session: date = F_I,
         phase: str | None = None,
         implied_last: bool = False,
+        book_id: str = "main",
     ) -> str:
         coid = f"tp-{session:%Y%m%d}-{security_id}-{side}-{len(self.orders) + 1}"
         self.orders.append(
@@ -99,6 +100,7 @@ class Book:
                 symbol=security_id.removeprefix("SEC_"),
                 side=side,
                 quantity=10.0,
+                book_id=book_id,
                 sells_in_flight_at_submit=False,
                 known_at=_utc(session, 13),
                 ingested_at=_utc(session, 13),
@@ -714,6 +716,24 @@ def test_the_writer_appends_outcomes_and_lots_once(conn: duckdb.DuckDBPyConnecti
     )
     lot = conn.execute("SELECT quantity, cost_basis, fill_id FROM lots").fetchone()
     assert lot == (pytest.approx(10.0), pytest.approx(940.0), None)
+
+
+def test_the_written_lots_and_disposals_carry_the_orders_book(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """ADR 0015 seam 1 (T133): the ledger's `lots` and `disposals` carry the
+    book of the order whose fill opened or closed them, from the `OrderRow`
+    that `lots._trades` joins, never the DDL default."""
+    book = Book()
+    book.order("SEC_B", "buy", "filled", [(10.0, 50.0)], session=date(2026, 9, 1), book_id="fx")
+    book.order("SEC_B", "sell", "filled", [(10.0, 40.0)], book_id="fx")
+    _journal(conn, book)
+
+    write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print)
+
+    assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
+    assert conn.execute("SELECT DISTINCT book_id FROM lots").fetchall() == [("fx",)]
+    assert conn.execute("SELECT DISTINCT book_id FROM disposals").fetchall() == [("fx",)]
 
 
 def _changed_ledger(conn: duckdb.DuckDBPyConnection) -> Book:

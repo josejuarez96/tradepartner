@@ -100,7 +100,7 @@ def _order(
     stamp = _utc(session, 13)
     return OrderRow(
         client_order_id=client_order_id(
-            "tp", session, decision.security_id, decision.side, attempt
+            "tp", "main", session, decision.security_id, decision.side, attempt
         ),
         decision_id=decision.decision_id,
         run_id=1,

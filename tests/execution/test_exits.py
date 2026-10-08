@@ -184,7 +184,7 @@ def test_untradable_delisted_name_is_returned_closed_with_its_event() -> None:
     (exit_,) = exits
     assert exit_.reason == "delisted"
     assert exit_.skipped_reason == "untradable"
-    row = exit_.row(run_id=7, known_at=NOW, ingested_at=NOW)
+    row = exit_.row(run_id=7, known_at=NOW, ingested_at=NOW, book_id="main")
     assert row.decision == "forced_exit"
     assert row.rebalance_session is None
     event = exit_.event(decision_id=42, run_id=7, known_at=NOW, ingested_at=NOW)
@@ -248,7 +248,7 @@ def test_whole_share_flag_comes_from_assets() -> None:
     assert exit_.whole_share is True
     # A forced exit is sized to the whole holding; the phase applies the floor.
     assert exit_.planned_quantity == 2.4
-    assert exit_.row(run_id=1, known_at=NOW, ingested_at=NOW).whole_share is True
+    assert exit_.row(run_id=1, known_at=NOW, ingested_at=NOW, book_id="main").whole_share is True
 
 
 def test_receipt_journaled_after_s_is_not_seen() -> None:
@@ -419,7 +419,9 @@ def test_whole_share_dust_exit_blocks_for_the_next_three_sessions() -> None:
     exit_ = exits[0]
     assert (exit_.security_id, exit_.planned_quantity, exit_.whole_share) == ("AAA", 0.4, True)
 
-    decision = replace(exit_.row(run_id=1, known_at=NOW, ingested_at=NOW), decision_id=1)
+    decision = replace(
+        exit_.row(run_id=1, known_at=NOW, ingested_at=NOW, book_id="main"), decision_id=1
+    )
     dust_event = DecisionEventRow(
         decision_id=1, run_id=1, status="skipped", reason="dust", known_at=NOW, ingested_at=NOW
     )
@@ -708,7 +710,7 @@ def test_stop_exits_every_held_name() -> None:
         ExitDecision("AAA", "window_stop", 2.5, whole_share=False, session=S),
         ExitDecision("BBB", "window_stop", 4.0, whole_share=False, session=S),
     ]
-    row = exits[0].row(run_id=9, known_at=NOW, ingested_at=NOW)
+    row = exits[0].row(run_id=9, known_at=NOW, ingested_at=NOW, book_id="main")
     assert (row.decision, row.reason, row.side, row.planned_quantity) == (
         "forced_exit",
         "window_stop",
@@ -801,14 +803,19 @@ def test_row_refuses_known_at_on_another_new_york_date() -> None:
     (exit_,) = _forced({"AAA": 5.0}, listings_at={"AAA": PREVIOUS})
     # 02:00 UTC on S is still S-1 in New York.
     with pytest.raises(ValueError, match="New York date"):
-        exit_.row(run_id=1, known_at=datetime(2026, 10, 14, 2, 0, tzinfo=UTC), ingested_at=NOW)
+        exit_.row(
+            run_id=1,
+            known_at=datetime(2026, 10, 14, 2, 0, tzinfo=UTC),
+            ingested_at=NOW,
+            book_id="main",
+        )
 
 
 def test_exit_on_a_split_ex_date_round_trips_through_remainder() -> None:
     """A 2:1 split with ex-date S: the holding on S is post-split, and the
     journaled exit's remainder before any order is exactly that holding."""
     (exit_,) = _forced({"AAA": 20.0}, listings_at={"AAA": PREVIOUS})
-    row = replace(exit_.row(run_id=1, known_at=NOW, ingested_at=NOW), decision_id=1)
+    row = replace(exit_.row(run_id=1, known_at=NOW, ingested_at=NOW, book_id="main"), decision_id=1)
     actions = pl.DataFrame(
         {
             "security_id": ["AAA"],

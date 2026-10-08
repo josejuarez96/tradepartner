@@ -48,7 +48,14 @@ def _at(day: date, hour_utc: int = 20) -> datetime:
     return datetime(day.year, day.month, day.day, hour_utc, tzinfo=UTC)
 
 
-def _order(coid: str, side: str, security_id: str = "SEC_X", symbol: str = "XYZ") -> OrderRow:
+def _order(
+    coid: str,
+    side: str,
+    security_id: str = "SEC_X",
+    symbol: str = "XYZ",
+    *,
+    book_id: str = "main",
+) -> OrderRow:
     return OrderRow(
         client_order_id=coid,
         decision_id=1,
@@ -60,6 +67,7 @@ def _order(coid: str, side: str, security_id: str = "SEC_X", symbol: str = "XYZ"
         symbol=symbol,
         side=side,
         quantity=1.0,
+        book_id=book_id,
         sells_in_flight_at_submit=False,
         known_at=_STAMP,
         ingested_at=_STAMP,
@@ -106,8 +114,9 @@ class Book:
         *,
         security_id: str = "SEC_X",
         hour_utc: int = 20,
+        book_id: str = "main",
     ) -> str:
-        order = _order(f"o{len(self.orders) + 1}", side, security_id)
+        order = _order(f"o{len(self.orders) + 1}", side, security_id, book_id=book_id)
         self.orders.append(order)
         self.fills.append(_fill(order, quantity, price, _at(day, hour_utc)))
         return order.client_order_id
@@ -369,6 +378,19 @@ def test_cusip_is_none_when_assets_lack_it() -> None:
     book.trade("buy", 5, 10.0, date(2025, 1, 2))
     [lot], _, _ = book.run()
     assert lot.cusip is None
+
+
+def test_a_lot_and_a_disposal_carry_their_orders_book() -> None:
+    """ADR 0015 seam 1 (T133): `Lot` and `Disposal` carry the book of the order
+    whose fill opened or closed them, from the `OrderRow` `_trades` joins."""
+    book = Book()
+    book.trade("buy", 5, 10.0, date(2025, 1, 2), book_id="fx")
+    book.trade("sell", 2, 9.0, date(2025, 1, 3), book_id="fx")
+
+    [lot], [disposal], _ = book.run()
+
+    assert lot.book_id == "fx"
+    assert disposal.book_id == "fx"
 
 
 def test_an_order_with_an_implied_fill_merges_into_one_lot_at_its_average() -> None:

@@ -822,8 +822,16 @@ class Decision:
     reason: str | None = None
     override_id: int | None = None
 
-    def row(self, *, run_id: int, known_at: datetime, ingested_at: datetime) -> DecisionRow:
-        """The `decisions` row for run `run_id`; its id is assigned on insert."""
+    def row(
+        self,
+        *,
+        run_id: int,
+        known_at: datetime,
+        ingested_at: datetime,
+        book_id: str,
+    ) -> DecisionRow:
+        """The `decisions` row for run `run_id`; its id is assigned on insert.
+        `book_id` is the window's book (ADR 0015 seam 1, plan T133)."""
         return DecisionRow(
             run_id=run_id,
             rebalance_session=self.rebalance_session,
@@ -838,6 +846,7 @@ class Decision:
             decision=self.decision,
             reason=self.reason,
             override_id=self.override_id,
+            book_id=book_id,
             known_at=known_at,
             ingested_at=ingested_at,
         )

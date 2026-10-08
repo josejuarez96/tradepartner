@@ -688,7 +688,12 @@ def _journal_exits(
     stamp = context.gate.read_clock()
     with context.connect() as conn:
         for exit_ in new:
-            row = exit_.row(run_id=_run_id(context.run), known_at=stamp, ingested_at=stamp)
+            row = exit_.row(
+                run_id=_run_id(context.run),
+                known_at=stamp,
+                ingested_at=stamp,
+                book_id=context.window.book_id,
+            )
             decision_id = append(conn, row)
             assert decision_id is not None
             event = exit_.event(
@@ -1410,6 +1415,7 @@ class _Run:
                     at=stamp,
                     status=MISMATCH,
                     mismatches_json=report.mismatches_json,
+                    book_id=self.window.book_id,
                     known_at=stamp,
                     ingested_at=stamp,
                 ),
@@ -1681,6 +1687,7 @@ class _Run:
                             value=mark.value,
                             cash=mark.cash,
                             tradable=mark.tradable,
+                            book_id=self.window.book_id,
                             known_at=stamp,
                             ingested_at=stamp,
                         ),

@@ -678,6 +678,7 @@ def start(
             started_at=now,
             frozen_json=frozen_json,
             frozen_sha256=frozen_sha256,
+            book_id=settings.paper.book_id,
             known_at=now,
             ingested_at=now,
         )
@@ -701,6 +702,7 @@ def start(
                         security_id=residue.security_id,
                         quantity=residue.quantity,
                         cash=None,
+                        book_id=row.book_id,
                         known_at=now,
                         ingested_at=now,
                     ),
@@ -717,6 +719,7 @@ def start(
                         security_id=security_id,
                         quantity=quantity,
                         cash=None,
+                        book_id=row.book_id,
                         known_at=now,
                         ingested_at=now,
                     ),

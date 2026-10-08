@@ -53,7 +53,7 @@ def _utc(day: date, hour: int, minute: int = 0) -> datetime:
 def _order(security_id: str, side: str, session: date, attempt: int = 1) -> OrderRow:
     stamp = _utc(session, 13)
     return OrderRow(
-        client_order_id=client_order_id("tp", session, security_id, side, attempt),
+        client_order_id=client_order_id("tp", "main", session, security_id, side, attempt),
         decision_id=1,
         run_id=RUN,
         session=session,

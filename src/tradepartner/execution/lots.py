@@ -94,6 +94,7 @@ class Lot:
     cost_basis: float
     fill_id: int | None
     client_order_id: str  # the acquiring order (not a `lots` column; T62 attributes by it)
+    book_id: str  # the acquiring order's book (ADR 0015 seam 1, plan T133)
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ class Disposal:
     tax_year: int
     fill_id: int | None
     client_order_id: str  # the selling order (not a `disposals` column; T62 attributes by it)
+    book_id: str  # the selling order's book (ADR 0015 seam 1, plan T133)
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,7 @@ class _Trade:
     fill_id: int | None
     order_key: int  # the lowest fill_id, for a stable order within an instant
     client_order_id: str
+    book_id: str  # the order's book (ADR 0015 seam 1, plan T133)
 
 
 @dataclass
@@ -187,6 +190,7 @@ def rebuild(
                 cost_basis=float(trade.value),
                 fill_id=trade.fill_id,
                 client_order_id=trade.client_order_id,
+                book_id=trade.book_id,
             )
             lot_list.append(lot)
             open_lots.setdefault(trade.security_id, []).append(
@@ -209,6 +213,7 @@ def rebuild(
                 tax_year=local.year,
                 fill_id=trade.fill_id,
                 client_order_id=trade.client_order_id,
+                book_id=trade.book_id,
             )
             disposals.append(disposal)
             same_sale[disposal.disposal_id] = this_sale
@@ -218,7 +223,7 @@ def rebuild(
 def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_Trade]:
     """One `_Trade` per fill, or per order when any of its fills is implied,
     in trade order."""
-    known = {order.client_order_id for order in orders}
+    known = {order.client_order_id: order for order in orders}
     by_order: dict[str, list[OrderedFill]] = {}
     for item in fills:
         row = item.fill
@@ -254,6 +259,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                     fill_id=None,
                     order_key=min(_fill_key(item) for item in group),
                     client_order_id=first.fill.client_order_id,
+                    book_id=known[first.fill.client_order_id].book_id,
                 )
             )
             continue
@@ -268,6 +274,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                 fill_id=item.fill.fill_id,
                 order_key=_fill_key(item),
                 client_order_id=item.fill.client_order_id,
+                book_id=known[item.fill.client_order_id].book_id,
             )
             for item, quantity, price in parts
         )

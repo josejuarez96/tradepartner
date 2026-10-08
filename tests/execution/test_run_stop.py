@@ -90,12 +90,14 @@ def outcomes(env: Env, security_id: str) -> list[tuple[str, date, str, float | N
 
 def buy_id(env: Env, session: date, security_id: str, attempt: int = 1) -> str:
     prefix = env.settings.paper.order_id_prefix
-    return f"{prefix}-{session:%Y%m%d}-{security_id}-buy-{attempt}"
+    book = env.settings.paper.book_id
+    return f"{prefix}-{book}-{session:%Y%m%d}-{security_id}-buy-{attempt}"
 
 
 def sell_id(env: Env, session: date, security_id: str, attempt: int = 1) -> str:
     prefix = env.settings.paper.order_id_prefix
-    return f"{prefix}-{session:%Y%m%d}-{security_id}-sell-{attempt}"
+    book = env.settings.paper.book_id
+    return f"{prefix}-{book}-{session:%Y%m%d}-{security_id}-sell-{attempt}"
 
 
 def carry(env: Env, window: PaperWindowRow, security_id: str, symbol: str, quantity: float) -> None:
