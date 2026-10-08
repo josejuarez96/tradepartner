@@ -140,7 +140,7 @@ Signals, backtester, trial registry, cost model (Phase 3). Risk-gated broker wra
 - `ingestion_runs(run_id, started_at, finished_at, status, source, mode, rows_added, chunk_cursor, message)`
 - `master_underived(run_id, recorded_at, table_name, security_id, ticker, exchange, valid_from, known_at)` — not a fact table (#859): a master check's finding, read only by health
 
-**Instrument ids** ([ADR 0015](../decisions/0015-expansion-seams.md) seam 6; `master.py`, T138). Under that rule every `security_id` column in these tables, and in the backtest, is read as an *instrument id*; for a share the instrument id equals the security id, so today's rows need no change. By the same rule a future `instruments` table issues ids in the same namespace with a type prefix, as `BENCH:` already does for benchmarks, and `securities` stays the equity master.
+**Instrument ids** ([ADR 0015](../decisions/0015-expansion-seams.md) seam 6; `master.py`, T138). Under that rule every `security_id` column in the journal and the backtest is read as an *instrument id*; for a share the instrument id equals the security id, so today's rows need no change (a class id's `:` follows a CIK, never a type; see `master.py`). By the same rule a future `instruments` table issues ids in the same namespace with a type prefix, as `BENCH:` already does for benchmarks, and `securities` stays the equity master.
 
 **Master column sources and `known_at`**
 
