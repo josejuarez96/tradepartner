@@ -42,7 +42,7 @@ from tradepartner.research import datafiles
 from tradepartner.research.labeling import gold, review, review_page
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET
 from tradepartner.store import schema
-from tradepartner.store.db import configure_connection
+from tradepartner.store.db import StoreLockedError, configure_connection
 
 PAGE_FILE = Path(review_page.__file__)
 SCRIPT = "from tradepartner.research.labeling import review_page\nreview_page.main()\n"
@@ -545,6 +545,18 @@ def test_a_malformed_finish_marker_is_refused_not_a_traceback(
     assert any("finish marker" in str(e.value) for e in at.error)
 
 
+def test_a_complete_unlocked_session_stops_again_on_a_later_start(
+    monkeypatch: pytest.MonkeyPatch, gold_session: gold.GoldSession, stops: list[int]
+) -> None:
+    at = _gold_app(monkeypatch, gold_session, stops)
+    for _ in range(N):
+        _press(at, "opt-1")
+    stops.clear()
+    fresh = _gold_app(monkeypatch, gold_session, stops)
+    assert stops and not fresh.button
+    assert any(review_page.DONE_MESSAGE in str(s.value) for s in fresh.success)
+
+
 # --- review mode ------------------------------------------------------------------
 
 
@@ -565,18 +577,29 @@ def world(tmp_path: Path, settings: Settings) -> Iterator[World]:
 
 
 def _review_app(
-    monkeypatch: pytest.MonkeyPatch, world: World, run_id: int, stops: list[int]
+    monkeypatch: pytest.MonkeyPatch,
+    world: World,
+    run_id: int,
+    stops: list[int],
+    *,
+    rebuilt: bool = True,
 ) -> AppTest:
-    monkeypatch.setattr(
-        review_page, "open_read_only", lambda _s: contextlib.nullcontext(world.conn)
-    )
-    return _app(
+    def read_only(settings: Settings) -> Any:
+        opened.append(settings)
+        return contextlib.nullcontext(world.conn)
+
+    opened: list[Settings] = []
+    monkeypatch.setattr(review_page, "open_read_only", read_only)
+    at = _app(
         monkeypatch,
         world.settings,
         datafiles.review_path(world.settings, run_id),
         stops,
         ("--code-version", "abc123"),
     )
+    # the session is rebuilt on a read-only connection (a finished one is not rebuilt)
+    assert opened == ([world.settings] if rebuilt else [])
+    return at
 
 
 def _session(world: World, run_id: int) -> review.ReviewSession:
@@ -704,6 +727,26 @@ def test_a_finished_review_only_displays(
         "build_review_session",
         lambda *a, **k: pytest.fail("a finished run is not rebuilt"),
     )
-    at = _review_app(monkeypatch, world, run_id, stops)
+    at = _review_app(monkeypatch, world, run_id, stops, rebuilt=False)
     assert not at.button and not at.error
     assert "e" * 64 in _text(at) and "Items reviewed: 8" in _text(at)
+
+
+def test_review_mode_on_a_locked_store_shows_store_busy(
+    monkeypatch: pytest.MonkeyPatch, world: World, stops: list[int]
+) -> None:
+    run_id = _batch(world)
+
+    def locked(_settings: Settings) -> Any:
+        raise StoreLockedError("held by another process")
+
+    monkeypatch.setattr(review_page, "open_read_only", locked)
+    at = _app(
+        monkeypatch,
+        world.settings,
+        datafiles.review_path(world.settings, run_id),
+        stops,
+        ("--code-version", "abc"),
+    )
+    assert any("store busy" in str(e.value) for e in at.error)
+    assert not at.button
