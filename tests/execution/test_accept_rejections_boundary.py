@@ -61,6 +61,9 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    exactly `typer.Option("--accept-rejections", help=...,
    allow_from_autoenv=False)` (no envvar, auto-envvar, callback, default or
    flag value), the decorator takes no keyword (no `context_settings`), no
+   `Typer(...)`, `add_typer(...)` or `.callback(...)` call takes
+   `context_settings` or `**` (app-level settings reach `resume` too), nothing
+   names `default_map` as a keyword, attribute or string (#1309), no
    keyword names `accept_rejections_flag`,
    and no string in `cli.py` spells the flag except docstrings and that one
    option name (so the app cannot invoke itself with it). A second such pass, a
@@ -394,6 +397,41 @@ def _is_docstring(node: ast.Constant, parents: dict[int, ast.AST]) -> bool:
     )
 
 
+#: The Typer calls whose `context_settings` reach every command below them,
+#: `resume` included, so a `default_map` there could default the flag (#1309).
+_APP_LEVEL_CALLS = frozenset({"Typer", "add_typer", "callback"})
+DEFAULT_MAP = "default_map"
+
+
+def _app_default_misuses(node: ast.AST) -> list[str]:
+    """#1309: in `cli.py`, no app-level `context_settings` (or `**` into an
+    app-level call, which could carry them), and no `default_map` at all, as a
+    keyword, an attribute or a string, so no default map can set the flag
+    behind the option's back. A command's own `context_settings` reach only
+    that command, and `resume`'s decorator takes no keyword."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = (
+            func.attr
+            if isinstance(func, ast.Attribute)
+            else func.id
+            if isinstance(func, ast.Name)
+            else None
+        )
+        if name in _APP_LEVEL_CALLS:
+            if any(k.arg == "context_settings" for k in node.keywords):
+                return [f"{node.lineno}: app-level context_settings on {name}"]
+            if any(k.arg is None for k in node.keywords):
+                return [f"{node.lineno}: ** into the app-level call {name}"]
+    if isinstance(node, ast.keyword) and node.arg == DEFAULT_MAP:
+        return [f"{node.value.lineno}: passes a {DEFAULT_MAP}"]
+    if isinstance(node, ast.Attribute) and node.attr == DEFAULT_MAP:
+        return [f"{node.lineno}: names {DEFAULT_MAP} as an attribute"]
+    if isinstance(node, ast.Constant) and isinstance(node.value, str) and DEFAULT_MAP in node.value:
+        return [f"{node.lineno}: spells {DEFAULT_MAP}"]
+    return []
+
+
 def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
     """Rule 4's exception, fail closed: in `cli.py`, `CLI_FLAG` is bound exactly
     once, as a parameter whose default is the constant `False`, and loaded
@@ -449,6 +487,7 @@ def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str
                 found.append(f"{node.lineno}: unreviewed use of {CLI_FLAG}")
         elif isinstance(node, ast.Attribute) and node.attr == CLI_FLAG:
             found.append(f"{node.lineno}: names {CLI_FLAG} as an attribute")
+        found.extend(_app_default_misuses(node))
     if len(params) > 1:
         found.append(f"{CLI_FLAG} is bound as {len(params)} parameters, not one")
     if passes > 1:
@@ -792,6 +831,9 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
     assert misuses(ast.parse(CLI_PASS), CLI_MODULE) == []
     assert misuses(ast.parse(CLI_PASS))  # the same shape anywhere else is refused
     assert defaults(ast.parse(CLI_PASS)) == []
+    # a command's own context settings stay open to the other commands (#1309)
+    other = '@dataset_app.command("register", context_settings={"allow_extra_args": True})\n'
+    assert misuses(ast.parse(CLI_PASS + other + "def register() -> None: ...\n"), CLI_MODULE) == []
 
 
 @pytest.mark.parametrize(
@@ -826,6 +868,21 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS.replace(", allow_from_autoenv=False", ""),
         CLI_PASS.replace("allow_from_autoenv=False", "allow_from_autoenv=True"),
         CLI_PASS.replace('command("resume")', 'command("resume", context_settings=c)'),
+        # app-level context settings, or a default map from anywhere (#1309)
+        CLI_PASS + "paper_app = typer.Typer(context_settings={'default_map': m})\n",
+        CLI_PASS + "paper_app = typer.Typer(context_settings=SETTINGS)\n",
+        CLI_PASS + "paper_app = Typer(context_settings=SETTINGS)\n",
+        CLI_PASS + "paper_app = typer.Typer(**OPTIONS)\n",
+        CLI_PASS + "app.add_typer(paper_app, name='paper', context_settings=c)\n",
+        CLI_PASS + "app.add_typer(paper_app, **OPTIONS)\n",
+        CLI_PASS + "@paper_app.callback(context_settings=c)\ndef root() -> None: ...\n",
+        CLI_PASS + "@paper_app.callback(**OPTIONS)\ndef root() -> None: ...\n",
+        CLI_PASS + "@app.callback()\ndef root(ctx: typer.Context) -> None:\n"
+        "    ctx.default_map = load()\n",
+        CLI_PASS + "    ctx.default_map.update(m)\n",
+        CLI_PASS + "make_app()(default_map=m)\n",
+        CLI_PASS + "OPTIONS = {'default_map': m}\n",
+        CLI_PASS + "OPTIONS = dict(default_map=m)\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
