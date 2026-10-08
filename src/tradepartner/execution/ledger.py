@@ -251,8 +251,10 @@ def from_journal(
 
     by_id = {order.client_order_id: order for order in orders}
     splits = _splits_by_security(actions_as_of, through)
-    # Summed in `Decimal` from each number's shortest form, never `float`, so
-    # a full exit on a fine quantity grid leaves no float residue (#1296).
+    # Summed in `Decimal` from each split-adjusted row's shortest form, never
+    # `float`, so a full exit on a fine quantity grid leaves no float residue
+    # (#1296). The split product stays `float` first: 9 x 0.3333333333333333
+    # is 3.0 there, but 2.9999999999999997 in `Decimal`.
     positions: dict[str, Decimal] = defaultdict(Decimal)
 
     seen_fills: set[int] = set()
@@ -265,7 +267,7 @@ def from_journal(
             continue
         sign = 1 if fill.side == _BUY else -1
         factor = _split_factor(splits.get(fill.security_id, ()), stated_on)
-        positions[fill.security_id] += sign * _dec(row.quantity) * _dec(factor)
+        positions[fill.security_id] += sign * _dec(row.quantity * factor)
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
 
@@ -277,7 +279,7 @@ def from_journal(
             continue
         if adjustment.quantity is not None and adjustment.security_id is not None:
             factor = _split_factor(splits.get(adjustment.security_id, ()), adjustment.session)
-            positions[adjustment.security_id] += _dec(adjustment.quantity) * _dec(factor)
+            positions[adjustment.security_id] += _dec(adjustment.quantity * factor)
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
 

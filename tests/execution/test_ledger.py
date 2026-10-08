@@ -714,6 +714,9 @@ def test_the_recorded_ko_fills_exit_fully_on_the_nine_decimal_grid() -> None:
 
 
 def test_random_nine_decimal_fills_exit_exactly_and_never_oversell() -> None:
+    # Quantities stay under 1e4 shares, so each 9-decimal sum has at most 13
+    # significant digits and round-trips through `float` exactly (under ~4.5e6
+    # shares it would still).
     rng = random.Random(1296)
     step = Decimal(1).scaleb(-NINE)
     for _ in range(500):
@@ -738,3 +741,27 @@ def test_random_nine_decimal_fills_exit_exactly_and_never_oversell() -> None:
             [*orders, exit_order],
         )
         assert after.positions == {}
+
+
+@pytest.mark.parametrize(("bought", "ratio", "after_split"), [(9, 1 / 3, 3), (3, 2 / 3, 2)])
+def test_a_reverse_split_holding_exits_fully(bought: int, ratio: float, after_split: int) -> None:
+    sell = _order(A, "sell", D9)
+    fills = [_fill(BUY_A, bought, 50.0, fill_id=1)]
+    actions = _splits((A, D8, ratio))
+    held = from_journal(
+        fills, [BUY_A], (), actions, None, 1000.0, D8, window_id=WINDOW, quantity_tolerance=0.0
+    ).positions[A]
+    exit_quantity = round_down(held, NINE)
+    assert exit_quantity == after_split
+    after = from_journal(
+        [*fills, _fill(sell, exit_quantity, 50.0, fill_id=2)],
+        [BUY_A, sell],
+        (),
+        actions,
+        None,
+        1000.0,
+        D9,
+        window_id=WINDOW,
+        quantity_tolerance=0.0,
+    )
+    assert after.positions == {}
