@@ -27,7 +27,7 @@ Shape (development-process.md, "Plan shape"): slice by file, not by step; no ope
 - [x] **T81: Research registry API, run handle and the one reader.** (#993, PR #1007) · Files: `src/tradepartner/store/research.py`, `src/tradepartner/research/__init__.py`, `src/tradepartner/store/registry.py`, `docs/research/trial-registry.md` · Depends on: T80, T81a, T82
 - [x] **T83: CLI.** (#1140, PR #1148) · Files: `src/tradepartner/cli.py` · Depends on: T81
 - [x] **T83b: N integration and the backtest spec amendment.** (#1190, PR #1191) · Files: `src/tradepartner/backtest/results.py`, `src/tradepartner/dashboard/backtest_page.py`, `docs/specs/backtest.md` · Depends on: T81
-- [ ] **T83c: Research view.** Files: `src/tradepartner/dashboard/research_page.py` (new, read-only inside the shell's single read-only connection: registrations with chain budgets used and amendments, per-family run and configuration sums beside the backtest N, runs newest first with every req 15 state and synthetic hidden by default, datasets with sealed splits and periods and their spends, decisions; "research registry not initialised" on a pre-migration store, from `ResearchNotInitialised`), `src/tradepartner/dashboard/app.py` (the page entry) · Tests: `tests/dashboard/test_research_page.py` (headless render of every state in req 15 on a fixture store, the not-initialised state, reads only through the shell's connection) · Depends on: T81 · Review: quant-auditor (read-only; the not-initialised state).
+- [x] **T83c: Research view.** (#1189, PR #1193) · Files: `src/tradepartner/dashboard/research_page.py`, tests · Depends on: T81
 
 ## Chains (for team claims)
 
