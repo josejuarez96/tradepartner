@@ -5,8 +5,9 @@ Every order ends in exactly one outcome per kind it earns, **due** at the first
 run on a session after its horizon's last session:
 
 - **Horizon.** An order of rebalance i runs to close(T_{i+1}), T_i being its
-  decision's `rebalance_session` (the last month-end session before the order's
-  session when the decision has none or is not given); a forced exit
+  decision's `rebalance_session` (the last rebalance session at the window's
+  cadence before the order's session when the decision has none or is not
+  given); a forced exit
   (`phase = exit`) to its own session -- `outcome_horizon` is this rule, the
   one public helper `execution.check`'s `_order_due_threshold` calls so the
   two cannot drift (`execution.window`'s stop-closed check does not filter by
@@ -64,14 +65,16 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
 
 from tradepartner.adapters.broker import Asset
-from tradepartner.calendar import last_session_of_month, previous_session
+from tradepartner.backtest.schedule import rebalance_sessions
+from tradepartner.calendar import previous_session
+from tradepartner.config import Cadence
 from tradepartner.execution.lots import (
     Disposal,
     LedgerAccount,
@@ -108,6 +111,9 @@ _BUY = "buy"
 _SELL = "sell"
 _SPLIT = "split"
 _NEW_YORK = ZoneInfo("America/New_York")
+#: How far `_rebalance_before` and `_rebalance_after` search: the slowest cadence,
+#: `month_end`, has a rebalance session within two calendar months of any day.
+_REBALANCE_SEARCH = timedelta(days=62)
 
 
 @dataclass(frozen=True)
@@ -145,24 +151,19 @@ class WriteResult:
     lot_error: str | None
 
 
-def _rebalance_before(session: date) -> date:
-    """The last rebalance session (last session of a month) before `session`."""
-    candidate = last_session_of_month(session.year, session.month)
-    if candidate < session:
-        return candidate
-    year, month = (session.year, session.month - 1) if session.month > 1 else (session.year - 1, 12)
-    return last_session_of_month(year, month)
+def _rebalance_before(session: date, cadence: Cadence) -> date:
+    """The last rebalance session at `cadence` strictly before `session`."""
+    last = session - timedelta(days=1)
+    return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
-def _rebalance_after(rebalance: date) -> date:
-    """T_{i+1}: the last session of the month after `rebalance`'s."""
-    year, month = (
-        (rebalance.year, rebalance.month + 1) if rebalance.month < 12 else (rebalance.year + 1, 1)
-    )
-    return last_session_of_month(year, month)
+def _rebalance_after(rebalance: date, cadence: Cadence) -> date:
+    """T_{i+1}: the first rebalance session at `cadence` strictly after `rebalance`."""
+    first = rebalance + timedelta(days=1)
+    return rebalance_sessions(first, first + _REBALANCE_SEARCH, cadence)[0]
 
 
-def outcome_horizon(order: OrderRow, decision_rebalance: date | None) -> date:
+def outcome_horizon(order: OrderRow, decision_rebalance: date | None, cadence: Cadence) -> date:
     """An order's horizon before any stop pulls it in (`_horizon`'s `base`,
     module docstring's "Horizon"): for a forced exit (`phase = exit`) its own
     session; otherwise T_{i+1} of its rebalance (`decision_rebalance`, the
@@ -170,7 +171,9 @@ def outcome_horizon(order: OrderRow, decision_rebalance: date | None) -> date:
     rebalance session strictly before the order's own session, the same
     fallback a forced exit traded inside a rebalance batch takes, since it is
     submitted with phase `sell` and its decision carries no
-    `rebalance_session`, ADR 0010 amendment 2026-10-01).
+    `rebalance_session`, ADR 0010 amendment 2026-10-01). Rebalance sessions are
+    at `cadence`, the window's hypothesis's frozen `schedule.rebalance_cadence`
+    (ADR 0015 seam 4).
 
     `execution.check`'s `_order_due_threshold` calls this directly (it never
     sees a stop, so this *is* its due-date rule); this module's own `_horizon`
@@ -182,8 +185,8 @@ def outcome_horizon(order: OrderRow, decision_rebalance: date | None) -> date:
     #597)."""
     if order.phase == _EXIT:
         return order.session
-    rebalance = decision_rebalance or _rebalance_before(order.session)
-    return _rebalance_after(rebalance)
+    rebalance = decision_rebalance or _rebalance_before(order.session, cadence)
+    return _rebalance_after(rebalance, cadence)
 
 
 def _local(at: datetime) -> date:
@@ -246,10 +249,11 @@ def _horizon(
     window: OutcomeWindow,
     flattening: Mapping[str, tuple[date, float]],
     rebalance_of: Mapping[int, date],
+    cadence: Cadence,
 ) -> tuple[date, float | None]:
     """(the horizon's last session, the flattening fill's price when that fill
     ends it)."""
-    base = outcome_horizon(order, rebalance_of.get(order.decision_id))
+    base = outcome_horizon(order, rebalance_of.get(order.decision_id), cadence)
     if window.stop_requested is None:
         return base, None
     # Ties go to the earlier entry: the flattening fill, then close(T_{i+1}).
@@ -319,14 +323,15 @@ def due_outcomes(
     *,
     decisions: Sequence[DecisionRow] = (),
     actions: pl.DataFrame | None = None,
+    cadence: Cadence,
 ) -> list[Outcome]:
     """The outcomes due at a run on `session` and not yet written (module
     docstring). `fills` are `fills_for`'s live fills, `marks` the window's
     `positions_daily`, `lots` the `lots.rebuild` result over the same fills
     (None when it failed: `realised_pnl` then waits), `prices` the raw close of
     a name on a session (None when unknown), `decisions` the window's decisions
-    (for T_i) and `actions` a `live_actions_as_of(close(S-1))` frame (for
-    splits)."""
+    (for T_i), `actions` a `live_actions_as_of(close(S-1))` frame (for
+    splits) and `cadence` the window's frozen rebalance cadence (the horizon's)."""
     terminal = _terminal_status(events)
     flattening = _flattening(orders, terminal, fills, window.stop_requested)
     rebalance_of = {
@@ -349,7 +354,7 @@ def due_outcomes(
         status = terminal.get(order.client_order_id)
         if status is None:
             continue
-        through, fill_mark = _horizon(order, window, flattening, rebalance_of)
+        through, fill_mark = _horizon(order, window, flattening, rebalance_of, cadence)
         if not session > through:
             continue
         own = by_order.get(order.client_order_id, [])
@@ -443,12 +448,14 @@ def write_outcomes_and_lots(
     actions: pl.DataFrame | None = None,
     stop_requested: date | None = None,
     stop_flat: Mapping[str, date] | None = None,
+    cadence: Cadence,
 ) -> WriteResult:
     """Rebuild the lot ledger over the window's live fills, append the new set
     when it changed, and append the outcomes due at `session` (module
     docstring). `on_lot_error` receives a `LotLedgerError`'s message; the caller
     alerts. `actions` is the `live_actions_as_of(close(S-1))` frame and
-    `stop_flat` the per-name first flat `stop` run session (`OutcomeWindow`).
+    `stop_flat` the per-name first flat `stop` run session (`OutcomeWindow`);
+    `cadence` the window's frozen rebalance cadence (`due_outcomes`).
     Every row is stamped with one reading of `clock`. The reads and every
     append run in one transaction (the caller's when one is open, which it
     then commits or rolls back), so a failure part-way leaves the previous
@@ -493,6 +500,7 @@ def write_outcomes_and_lots(
             session,
             decisions=decisions,
             actions=actions,
+            cadence=cadence,
         )
         for outcome in outcomes:
             journal.append(

@@ -15,6 +15,7 @@ import polars as pl
 import pytest
 
 from tradepartner.calendar import next_session, previous_session, session_close, session_open
+from tradepartner.config import Cadence
 from tradepartner.execution import ledger as ledger_module
 from tradepartner.execution.ids import client_order_id
 from tradepartner.execution.ledger import Ledger
@@ -41,6 +42,8 @@ from tradepartner.store.journal import (
     RebalanceEventRow,
 )
 
+#: H1's window reads `month_end` through `frozen_values` (ADR 0015 seam 4).
+CADENCE: Cadence = "month_end"
 WINDOW = 1
 A = "SEC_A"
 B = "SEC_B"
@@ -666,7 +669,10 @@ def test_lapses_before_the_first_rebalance_session_is_empty() -> None:
     t0 = date(2026, 9, 30)
     window = _window(first_rebalance_session=t0)
     before = date(2026, 9, 29)
-    assert lapses(window, [], [], [], [], before, {"paper.max_catch_up_sessions": 1}) == []
+    assert (
+        lapses(window, [], [], [], [], before, {"paper.max_catch_up_sessions": 1}, cadence=CADENCE)
+        == []
+    )
 
 
 def test_lapses_computed_at_boundary_session_and_not_one_earlier() -> None:
@@ -682,11 +688,11 @@ def test_lapses_computed_at_boundary_session_and_not_one_earlier() -> None:
     frozen = {"paper.max_catch_up_sessions": max_catch_up}
 
     # Still inside the catch-up window: no lapse yet.
-    assert lapses(window, [], [], [], [], boundary, frozen) == []
+    assert lapses(window, [], [], [], [], boundary, frozen, cadence=CADENCE) == []
 
     # The first session past the boundary: lapsed.
     past = next_session(boundary)
-    assert lapses(window, [], [], [], [], past, frozen) == [
+    assert lapses(window, [], [], [], [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="catch_up_lapsed")
     ]
 
@@ -705,7 +711,7 @@ def test_lapses_reason_is_kill_switch_when_the_switch_is_engaged_at_the_checked_
     # still engaged at `past`.
     rows = [_kill_switch_row(1, session_close(boundary), "engaged")]
 
-    assert lapses(window, [], [], rows, [], past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -732,7 +738,7 @@ def test_lapses_reason_is_kill_switch_even_when_released_before_the_lapse() -> N
         _kill_switch_row(2, session_close(boundary), "released"),
     ]
 
-    assert lapses(window, [], [], rows, [], past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -752,7 +758,7 @@ def test_lapses_reason_is_catch_up_lapsed_when_engaged_only_after_the_period() -
     frozen = {"paper.max_catch_up_sessions": max_catch_up}
     rows = [_kill_switch_row(1, session_close(past), "engaged")]
 
-    assert lapses(window, [], [], rows, [], past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="catch_up_lapsed")
     ]
 
@@ -783,7 +789,7 @@ def test_lapses_reason_is_kill_switch_for_an_engage_and_release_within_one_sessi
         _kill_switch_row(2, released_at, "released"),
     ]
 
-    assert lapses(window, [], [], rows, [], past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -809,13 +815,13 @@ def test_lapses_reason_is_kill_switch_for_a_crashed_run_with_no_kill_switch_row(
     crashed = _run(1, boundary)
     halted = _result(1, _at(boundary), "halted")
 
-    assert lapses(window, [crashed], [], [], [halted], past, frozen) == [
+    assert lapses(window, [crashed], [], [], [halted], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
     # An unfinished run (no result row at all, e.g. a hard crash) counts too.
     unfinished = _run(2, boundary)
-    assert lapses(window, [unfinished], [], [], [], past, frozen) == [
+    assert lapses(window, [unfinished], [], [], [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -857,6 +863,7 @@ def test_lapses_reason_is_kill_switch_for_a_crash_from_before_the_period_unclear
         [halted, result_f0, result_boundary],
         past,
         frozen,
+        cadence=CADENCE,
     ) == [Missed(rebalance_session=t0, reason="kill_switch")]
 
     # A release before F_i clears the crash: the period then has nothing
@@ -875,6 +882,7 @@ def test_lapses_reason_is_kill_switch_for_a_crash_from_before_the_period_unclear
         [halted, ok_f0, ok_boundary],
         past,
         frozen,
+        cadence=CADENCE,
     ) == [Missed(rebalance_session=t0, reason="catch_up_lapsed")]
 
 
@@ -897,7 +905,7 @@ def test_lapses_ignores_kill_switch_rows_of_another_window() -> None:
         **_stamp(session_close(boundary)),
     )
 
-    assert lapses(window, [], [], [other_window_row], [], past, frozen) == [
+    assert lapses(window, [], [], [other_window_row], [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="catch_up_lapsed")
     ]
 
@@ -916,7 +924,7 @@ def test_lapses_reason_is_catch_up_lapsed_when_a_release_has_no_engage_before_it
     frozen = {"paper.max_catch_up_sessions": max_catch_up}
     rows = [_kill_switch_row(1, session_close(f0), "released")]
 
-    assert lapses(window, [], [], rows, [], past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="catch_up_lapsed")
     ]
 
@@ -937,7 +945,7 @@ def test_lapses_reason_is_kill_switch_when_engaged_before_f0_and_never_released(
     before_f0 = previous_session(f0)
     rows = [_kill_switch_row(1, session_close(before_f0), "engaged")]
 
-    assert lapses(window, [], [], rows, [], past, frozen) == [
+    assert lapses(window, [], [], rows, [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -961,9 +969,9 @@ def test_lapses_does_not_raise_on_a_null_session_run_before_the_period() -> None
     weekend_run = _null_session_run(1, session_close(before_f0) - timedelta(hours=1))
     weekend_result = _result(1, session_close(before_f0) - timedelta(hours=1), "no_session")
 
-    assert lapses(window, [weekend_run], [], [], [weekend_result], past, frozen) == [
-        Missed(rebalance_session=t0, reason="catch_up_lapsed")
-    ]
+    assert lapses(
+        window, [weekend_run], [], [], [weekend_result], past, frozen, cadence=CADENCE
+    ) == [Missed(rebalance_session=t0, reason="catch_up_lapsed")]
 
 
 def test_lapses_reason_is_kill_switch_for_a_null_session_unfinished_run() -> None:
@@ -984,7 +992,7 @@ def test_lapses_reason_is_kill_switch_for_a_null_session_unfinished_run() -> Non
     before_f0 = previous_session(f0)
     crashed = _null_session_run(1, session_close(before_f0) - timedelta(hours=1))
 
-    assert lapses(window, [crashed], [], [], [], past, frozen) == [
+    assert lapses(window, [crashed], [], [], [], past, frozen, cadence=CADENCE) == [
         Missed(rebalance_session=t0, reason="kill_switch")
     ]
 
@@ -1012,7 +1020,7 @@ def test_lapses_skips_a_rebalance_already_journaled() -> None:
         rebalance_session=t0, run_id=1, status="executed", **_stamp(_at(t0))
     )
 
-    assert lapses(window, [run], [executed], [], [], past, frozen) == []
+    assert lapses(window, [run], [executed], [], [], past, frozen, cadence=CADENCE) == []
 
 
 def test_lapses_raises_for_an_event_whose_run_is_not_given() -> None:
@@ -1025,7 +1033,9 @@ def test_lapses_raises_for_an_event_whose_run_is_not_given() -> None:
     event = RebalanceEventRow(rebalance_session=t0, run_id=99, status="executed", **_stamp(_at(t0)))
 
     with pytest.raises(ValueError, match="not among the runs given"):
-        lapses(window, [], [event], [], [], past, {"paper.max_catch_up_sessions": 1})
+        lapses(
+            window, [], [event], [], [], past, {"paper.max_catch_up_sessions": 1}, cadence=CADENCE
+        )
 
 
 # --- read-only and no-write checks ------------------------------------------------

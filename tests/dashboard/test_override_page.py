@@ -23,9 +23,10 @@ import duckdb
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.config import Settings
 from tradepartner.dashboard import override_page
-from tradepartner.store import schema
+from tradepartner.store import registry, schema
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import PaperWindowRow, append
 
@@ -48,10 +49,30 @@ def _init(store_path: Path, *, with_window: bool) -> Path:
     with open_for_write(_settings(store_path)) as conn:
         schema.init_schema(conn)
         if with_window:
+            # The override writer reads the window's cadence from its hypothesis (T136).
+            holdout = (date(2025, 1, 2), date(2026, 8, 31))
+            params = Settings(
+                _env_file=None,
+                holdout={"start": holdout[0].isoformat(), "end": holdout[1].isoformat()},
+            )
+            hypothesis = registry.register_hypothesis(
+                conn,
+                slug="h-override-page",
+                family="momentum",
+                title="override page test",
+                doc_path="docs/hypotheses/h-override-page.md",
+                doc_sha256="0" * 64,
+                params=frozen_params_of(params, family="momentum"),
+                in_sample_start=date(2017, 1, 3),
+                holdout_start=holdout[0],
+                holdout_end=holdout[1],
+                registered_by="test",
+                settings=params,
+            )
             append(
                 conn,
                 PaperWindowRow(
-                    hypothesis_id=1,
+                    hypothesis_id=hypothesis.hypothesis_id,
                     first_rebalance_session=_T0,
                     account_id="PA1",
                     starting_cash=100_000.0,

@@ -201,7 +201,7 @@ from tradepartner import calendar
 from tradepartner.adapters.broker import Asset, Broker, canonical_symbol
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import all_sessions, is_session, next_session, previous_session
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import Cadence, RiskConfig, Settings
 from tradepartner.errors import (
     ClockError,
     ReconciliationError,
@@ -234,6 +234,7 @@ from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, 
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import frozen_risk, reconcile_now
 from tradepartner.execution.risk import OpenSell, unfilled_sells
+from tradepartner.execution.window import window_cadence
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
     WRITE_FAILED_EXIT_CODE,
@@ -974,6 +975,8 @@ def _locked_run(
         rows = kill_switch_events_for(conn, window_id)
         events = rebalance_events_for(conn, window_id)
         stops = window_stops_for(conn, window_id)
+        # Read once per run (ADR 0015 seam 4) and passed to every schedule call below.
+        cadence = window_cadence(conn, window)
     run_rows = [r.run for r in runs]
     state = switch.derive(
         window,
@@ -983,7 +986,7 @@ def _locked_run(
         reading_run=None,
         lock_free=True,
     )
-    due = _rebalance_kind(window, run_rows, events, day)
+    due = _rebalance_kind(window, run_rows, events, day, cadence)
     kind = _STOP if any(s.state == _REQUESTED for s in stops) else (due or _MARK)
 
     stamp = gate.read_clock()
@@ -1017,7 +1020,7 @@ def _locked_run(
                 )
     run = replace(row, run_id=run_id)
     return _Run(
-        settings, connect, broker, gate, alerter, window, frozen, run, state.engaged, sleep
+        settings, connect, broker, gate, alerter, window, frozen, run, state.engaged, sleep, cadence
     ).execute()
 
 
@@ -1036,6 +1039,7 @@ class _Run:
         run: PaperRunRow,
         engaged: bool,
         sleep: Callable[[float], None],
+        cadence: Cadence,
     ) -> None:
         assert run.run_id is not None and run.session is not None and run.kind is not None
         self.settings = settings
@@ -1055,6 +1059,7 @@ class _Run:
         self.write_offs: WriteOffContext | None = None
         self.assets: dict[str, Asset] = {}
         self.sleep = sleep
+        self.cadence = cadence
 
     # --- exits ---------------------------------------------------------------------
 
@@ -1268,14 +1273,15 @@ class _Run:
         """A `stop` run's `missed` rows (reason `window_stop`, spec req 14): every
         pending rebalance (F_i <= S, no `executed` or `missed` event), planned
         or not, after the `executed` test of step 3 and before the lapse rule."""
-        if fill_session(self.window.first_rebalance_session) > self.session:
+        first = self.window.first_rebalance_session
+        if fill_session(first, self.cadence) > self.session:
             return
         with open_read_only(self.settings) as conn:
             settled = {e.rebalance_session for e in rebalance_events_for(conn, self.window_id)}
         pending = [
             t_i
-            for t_i in rebalance_sessions(self.window.first_rebalance_session, self.session)
-            if fill_session(t_i) <= self.session and t_i not in settled
+            for t_i in rebalance_sessions(first, self.session, self.cadence)
+            if fill_session(t_i, self.cadence) <= self.session and t_i not in settled
         ]
         if not pending:
             return
@@ -1433,14 +1439,15 @@ class _Run:
     def _executed(self, actions: pl.DataFrame, prices: Mapping[str, float]) -> list[date]:
         """The `executed` test after step 3 and after step 7b (module
         docstring); returns the rebalances it wrote `executed` for."""
-        if fill_session(self.window.first_rebalance_session) > self.session:
+        first = self.window.first_rebalance_session
+        if fill_session(first, self.cadence) > self.session:
             return []
         with open_read_only(self.settings) as conn:
             inputs = window_journal_inputs(conn, self.window_id)
         settled = {e.rebalance_session for e in inputs.rebalance_events}
         executed: list[date] = []
-        for t_i in rebalance_sessions(self.window.first_rebalance_session, self.session):
-            if fill_session(t_i) > self.session or t_i in settled:
+        for t_i in rebalance_sessions(first, self.session, self.cadence):
+            if fill_session(t_i, self.cadence) > self.session or t_i in settled:
                 continue
             mine = [
                 d
@@ -1467,7 +1474,13 @@ class _Run:
                 for d in mine
             ]
             verdict = rebalance_state(
-                t_i, self.window, inputs.runs, inputs.rebalance_events, states, session=self.session
+                t_i,
+                self.window,
+                inputs.runs,
+                inputs.rebalance_events,
+                states,
+                session=self.session,
+                cadence=self.cadence,
             )
             if verdict is RebalanceState.EXECUTED:
                 executed.append(t_i)
@@ -1762,6 +1775,7 @@ class _Run:
             [r.result for r in runs if r.result is not None],
             self.session,
             frozen_values,
+            cadence=self.cadence,
         )
         if not missed:
             return
@@ -1823,6 +1837,7 @@ class _Run:
                 actions=actions,
                 stop_requested=requested,
                 stop_flat=flat,
+                cadence=self.cadence,
             )
         if errors:
             message = self.alerter.scrub("lot ledger not rebuilt: " + "; ".join(errors))
@@ -1888,7 +1903,7 @@ class _Run:
         with open_read_only(self.settings) as conn:
             run_rows = [r.run for r in runs_for(conn, self.window_id)]
             events = rebalance_events_for(conn, self.window_id)
-        return _rebalance_kind(self.window, run_rows, events, self.session)
+        return _rebalance_kind(self.window, run_rows, events, self.session, self.cadence)
 
     def _plan(self, lagging: bool) -> planning.PlanOutcome:
         now = self.gate.read_clock()
@@ -1904,6 +1919,7 @@ class _Run:
                 self.assets_read,
                 lagging,
                 now=now,
+                cadence=self.cadence,
             )
 
 
@@ -1912,14 +1928,20 @@ def _rebalance_kind(
     runs: Sequence[PaperRunRow],
     events: Sequence[RebalanceEventRow],
     session: date,
+    cadence: Cadence,
 ) -> planning.RebalanceKind | None:
-    """`planning.rebalance_kind` with the window's frozen catch-up bound; None
+    """`planning.rebalance_kind` with the window's frozen catch-up bound and cadence; None
     before the window's first rebalance session, a session that function
     refuses (its schedule needs a start on or before the session)."""
     if session < window.first_rebalance_session:
         return None
     return planning.rebalance_kind(
-        window, runs, events, session, planning.frozen_max_catch_up_sessions(window)
+        window,
+        runs,
+        events,
+        session,
+        planning.frozen_max_catch_up_sessions(window),
+        cadence=cadence,
     )
 
 

@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -62,8 +62,8 @@ import polars as pl
 
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import last_session_of_month, session_close
-from tradepartner.config import Settings
+from tradepartner.calendar import session_close
+from tradepartner.config import Cadence, Settings
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
     POSITION_RETURN,
@@ -72,6 +72,7 @@ from tradepartner.execution.outcomes import (
 )
 from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.report import Journal, PriceOf, TrialMonths, compare_months
+from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
@@ -79,6 +80,9 @@ from tradepartner.store.db import utc_now
 from tradepartner.store.journal import PaperWindowRow
 
 _NEW_YORK = ZoneInfo("America/New_York")
+#: How far back the rebalance-session searches look: the slowest cadence, `month_end`,
+#: has a rebalance session within two calendar months of any day.
+_REBALANCE_SEARCH = timedelta(days=62)
 _EXECUTED = "executed"
 _REQUESTED = "requested"
 _SCHEDULER = "scheduler"
@@ -132,31 +136,22 @@ def _local_date(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
 
 
-def _last_completed_rebalance_session(now: datetime) -> date:
-    """The latest rebalance session (last XNYS session of a month) whose close
-    is at or before `now` (`report._last_completed_rebalance_session`, spec
-    req 10's "last completed T", duplicated locally: plan T58's conftest
-    docstring reserves shared edits for the task that owns a file, and this
-    one is `report.py`'s)."""
+def _last_completed_rebalance_session(now: datetime, cadence: Cadence) -> date:
+    """The latest rebalance session at `cadence` whose close is at or before `now`
+    (`report._last_completed_rebalance_session`, spec req 10's "last completed T",
+    duplicated locally: plan T58's conftest docstring reserves shared edits for the
+    task that owns a file, and this one is `report.py`'s)."""
     today = _local_date(now)
-    year, month = today.year, today.month
-    while True:
-        candidate = last_session_of_month(year, month)
-        if candidate <= today and session_close(candidate) <= now:
-            return candidate
-        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
+    sessions = rebalance_sessions(today - _REBALANCE_SEARCH, today, cadence)
+    return next(t for t in reversed(sessions) if session_close(t) <= now)
 
 
-def _rebalance_session_before(session: date) -> date:
-    """The last rebalance session strictly before `session` (spec req 15: "a
-    closed window is checked through its last completed rebalance session
-    before the stop session"; `report._before`, duplicated locally)."""
-    year, month = session.year, session.month
-    while True:
-        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
-        candidate = last_session_of_month(year, month)
-        if candidate < session:
-            return candidate
+def _rebalance_session_before(session: date, cadence: Cadence) -> date:
+    """The last rebalance session at `cadence` strictly before `session` (spec req 15:
+    "a closed window is checked through its last completed rebalance session before
+    the stop session"; `report._before`, duplicated locally)."""
+    last = session - timedelta(days=1)
+    return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
 def _stop_session_of(stops: Sequence[store_journal.PaperWindowStopRow]) -> date | None:
@@ -325,16 +320,16 @@ def _tracking_line(
 
 
 def _order_due_threshold(
-    order: store_journal.OrderRow, decision: store_journal.DecisionRow | None
+    order: store_journal.OrderRow, decision: store_journal.DecisionRow | None, cadence: Cadence
 ) -> date:
     """The session an order's outcome becomes due strictly after: `outcomes.
     outcome_horizon`'s rule, read from the one place it is written (#597) so
     this and `outcomes._horizon`'s non-stop `base` cannot drift."""
     decision_rebalance = decision.rebalance_session if decision is not None else None
-    return outcome_horizon(order, decision_rebalance)
+    return outcome_horizon(order, decision_rebalance, cadence)
 
 
-def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
+def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int, cadence: Cadence) -> CheckLine:
     query = (
         "every order's chain (order -> terminal event -> outcome) once its "
         "outcome is due (spec req 8), and no live fill journaled after its "
@@ -376,7 +371,7 @@ def _chain_line(conn: duckdb.DuckDBPyConnection, window_id: int) -> CheckLine:
                 "journaled after its terminal event"
             )
         decision = decisions.get(order.decision_id)
-        threshold = _order_due_threshold(order, decision)
+        threshold = _order_due_threshold(order, decision, cadence)
         due = any(session > threshold for session in run_sessions)
         if not due:
             continue
@@ -429,17 +424,18 @@ def check(conn: duckdb.DuckDBPyConnection, settings: Settings) -> list[CheckLine
     if window_id is None:
         raise ValueError(f"the window in {settings.store.path} has no window_id")
 
+    cadence = window_cadence(conn, window)
     stops = store_journal.window_stops_for(conn, window_id)
     stop_session = _stop_session_of(stops)
-    last_t = _last_completed_rebalance_session(utc_now())
+    last_t = _last_completed_rebalance_session(utc_now(), cadence)
     while stop_session is not None and last_t >= stop_session:
-        last_t = _rebalance_session_before(last_t)
+        last_t = _rebalance_session_before(last_t, cadence)
 
     frozen = _frozen(window)
 
     return [
         _rebalance_count_line(conn, window, window_id, frozen),
         _tracking_line(conn, window, window_id, frozen, last_t, stop_session),
-        _chain_line(conn, window_id),
+        _chain_line(conn, window_id, cadence),
         _override_line(conn, window, window_id, frozen),
     ]

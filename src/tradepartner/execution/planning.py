@@ -76,7 +76,7 @@ from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, is_session, previous_session, session_close
-from tradepartner.config import PAPER_FAMILIES, HypothesisFamily, RiskConfig, Settings
+from tradepartner.config import PAPER_FAMILIES, Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import StaleDataError, SystemFaultError
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import (
@@ -187,12 +187,13 @@ def _sessions_after(first: date, last: date) -> int:
     return bisect.bisect_left(sessions, last) - bisect.bisect_left(sessions, first)
 
 
-def _latest_due(window: PaperWindowRow, session: date) -> date | None:
-    """The latest rebalance T_i of the window whose fill session is on or before S."""
+def _latest_due(window: PaperWindowRow, session: date, cadence: Cadence) -> date | None:
+    """The latest rebalance T_i at `cadence` of the window whose fill session is on or
+    before S."""
     due = [
         t
-        for t in rebalance_sessions(window.first_rebalance_session, session)
-        if fill_session(t) <= session
+        for t in rebalance_sessions(window.first_rebalance_session, session, cadence)
+        if fill_session(t, cadence) <= session
     ]
     return due[-1] if due else None
 
@@ -203,6 +204,8 @@ def due_rebalance(
     rebalance_events: Sequence[RebalanceEventRow],
     session: date,
     max_catch_up_sessions: int,
+    *,
+    cadence: Cadence,
 ) -> tuple[RebalanceKind, date] | None:
     """The run's planning kind on S with its T_i, or None (module docstring). A
     T_i with an `executed` or `missed` event has no kind, on its F_i too, so a
@@ -211,14 +214,15 @@ def due_rebalance(
     Only the latest rebalance due by S can be planned: an earlier one has a
     later rebalance's fill session between it and S, by which time it lapsed.
     `runs` places the events in the window (`run_id` -> `window_id`); an event
-    of a run not among them raises, so a short run list cannot hide one."""
+    of a run not among them raises, so a short run list cannot hide one. `cadence` is
+    the window's hypothesis's frozen `schedule.rebalance_cadence` (ADR 0015 seam 4)."""
     _check_session(session)
     if isinstance(max_catch_up_sessions, bool) or max_catch_up_sessions < 0:
         raise ValueError(f"max_catch_up_sessions is {max_catch_up_sessions!r}")
-    t_i = _latest_due(window, session)
+    t_i = _latest_due(window, session, cadence)
     if t_i is None:
         return None
-    f_i = fill_session(t_i)
+    f_i = fill_session(t_i, cadence)
     windows = {run.run_id: run.window_id for run in runs}
     for event in rebalance_events:
         if event.run_id not in windows:
@@ -238,9 +242,13 @@ def rebalance_kind(
     rebalance_events: Sequence[RebalanceEventRow],
     session: date,
     max_catch_up_sessions: int,
+    *,
+    cadence: Cadence,
 ) -> RebalanceKind | None:
     """`rebalance`, `catch_up` or None on session S (`due_rebalance`'s kind)."""
-    due = due_rebalance(window, runs, rebalance_events, session, max_catch_up_sessions)
+    due = due_rebalance(
+        window, runs, rebalance_events, session, max_catch_up_sessions, cadence=cadence
+    )
     return None if due is None else due[0]
 
 
@@ -507,6 +515,7 @@ def _open_trial(
     reads: _Reads,
     t_i: date,
     settings: Settings,
+    cadence: Cadence,
 ) -> registry.TrialHandle:
     window = Window(t_i, t_i)
     verdict = decide(
@@ -517,6 +526,7 @@ def _open_trial(
         None,
         (),
         tracking=True,
+        cadence=cadence,
     )
     if verdict.outcome != _RUN:
         raise ValueError(verdict.message)
@@ -526,7 +536,7 @@ def _open_trial(
         kind=_TRACKING,
         start_session=t_i,
         end_session=t_i,
-        data_cutoff=read_time(t_i),
+        data_cutoff=read_time(t_i, cadence),
         synthetic=False,
         run_by=_RUN_BY,
         settings=settings,
@@ -598,6 +608,7 @@ def plan_rebalance(
     lagging: bool,
     *,
     now: datetime,
+    cadence: Cadence,
 ) -> PlanOutcome:
     """Plan the rebalance due on S = `session` (module docstring).
 
@@ -606,7 +617,8 @@ def plan_rebalance(
     planning run (its `run_id` keys every row); `settings` the live settings,
     which the hypothesis's frozen parameters overlay for the plan; `frozen`
     the window's frozen `risk.*` section; `lagging` true while any order is
-    `fills_lagging`; `now` the run's clock reading, stamped on every row.
+    `fills_lagging`; `now` the run's clock reading, stamped on every row; `cadence`
+    the window's hypothesis's frozen `schedule.rebalance_cadence` (ADR 0015 seam 4).
     Raises `PlanTrialError`, or re-raises a fault or an `assets_read` error
     unchanged, after rolling back (module docstring)."""
     _check_session(session)
@@ -618,7 +630,7 @@ def plan_rebalance(
         raise ValueError(f"now must be tz-aware, got {now!r}")
     if frozen != frozen_risk(window):
         raise ValueError(f"frozen is not window {window.window_id}'s frozen risk section")
-    t_i = _latest_due(window, session)
+    t_i = _latest_due(window, session, cadence)
     if t_i is None:
         raise ValueError(f"no rebalance of window {window.window_id} is due on {session}")
     journaled = store_journal.decisions_for(conn, window.window_id, rebalance_session=t_i)
@@ -634,7 +646,7 @@ def plan_rebalance(
     reads = _read(conn, window, window.window_id, session, settings, frozen, assets_read)
     conn.begin()
     try:
-        handle = _trial(lambda: _open_trial(conn, reads, t_i, settings), "its open")
+        handle = _trial(lambda: _open_trial(conn, reads, t_i, settings, cadence), "its open")
         plan = _trial(
             lambda: _plan_at(
                 conn, handle, reads.params, t_i, cast(HypothesisFamily, reads.hypothesis.family)

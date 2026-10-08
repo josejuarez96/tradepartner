@@ -756,6 +756,7 @@ def _derived(fixture: Fixture, conn: duckdb.DuckDBPyConnection, as_of: datetime 
             rebalance_events,
             [(d, states[d.decision_id]) for d in decisions if d.decision_id is not None],
             session=S,
+            cadence="month_end",
         ),
         switch=switch.derive(
             fixture.window,
@@ -819,6 +820,7 @@ def _outcomes_for(
         S,
         decisions=decisions,
         actions=actions,
+        cadence="month_end",
     )
 
 
@@ -1069,6 +1071,7 @@ def test_a_stop_run_s_outcomes_and_exits_are_unchanged_on_the_cut(
         S,
         decisions=[d.decision for d in journal.decisions_for(fixture.full, fixture.window_id)],
         actions=live_actions_as_of(fixture.full, LATER),
+        cadence="month_end",
     )
     late_by_security = {
         security_of[o.client_order_id]: o

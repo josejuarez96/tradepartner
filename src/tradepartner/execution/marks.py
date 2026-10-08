@@ -48,6 +48,7 @@ import polars as pl
 
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import next_session, previous_session, session_close
+from tradepartner.config import Cadence
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
 from tradepartner.store.asof import prices_as_of
@@ -371,11 +372,13 @@ def _is_pending(
     return not statuses
 
 
-def _catch_up_boundary(rebalance_session: date, max_catch_up_sessions: int) -> date:
+def _catch_up_boundary(
+    rebalance_session: date, max_catch_up_sessions: int, cadence: Cadence
+) -> date:
     """F_i advanced `max_catch_up_sessions` sessions: the last session a
     `catch_up` run may still trade T_i on (spec req 7: "S <= F_i + the frozen
     `paper.max_catch_up_sessions`")."""
-    boundary = fill_session(rebalance_session)
+    boundary = fill_session(rebalance_session, cadence)
     for _ in range(max_catch_up_sessions):
         boundary = next_session(boundary)
     return boundary
@@ -511,10 +514,13 @@ def lapses(
     results: Sequence[PaperRunResultRow],
     session: date,
     frozen: Mapping[str, object],
+    *,
+    cadence: Cadence,
 ) -> list[Missed]:
     """Every rebalance of `window` whose catch-up window has run out as of
     `session` = S, with no `rebalance_events` row of its own yet (Definitions
-    > Rebalance state; spec req 7, req 5).
+    > Rebalance state; spec req 7, req 5). `cadence` is the window's hypothesis's
+    frozen `schedule.rebalance_cadence` (ADR 0015 seam 4).
 
     A rebalance T_i is due once `fill_session(T_i) <= session`. It has
     lapsed once `session` is past T_i's catch-up boundary (F_i advanced by
@@ -541,13 +547,13 @@ def lapses(
     max_catch_up_sessions = _frozen_int(frozen, _PAPER_MAX_CATCH_UP)
     windows = _run_windows(runs)
     missed: list[Missed] = []
-    for rebalance_session in rebalance_sessions(window.first_rebalance_session, session):
-        fill = fill_session(rebalance_session)
+    for rebalance_session in rebalance_sessions(window.first_rebalance_session, session, cadence):
+        fill = fill_session(rebalance_session, cadence)
         if fill > session:
             continue
         if not _is_pending(rebalance_session, rebalance_events, windows, window.window_id):
             continue
-        boundary = _catch_up_boundary(rebalance_session, max_catch_up_sessions)
+        boundary = _catch_up_boundary(rebalance_session, max_catch_up_sessions, cadence)
         if session <= boundary:
             continue
         period = _period_sessions(fill, boundary)

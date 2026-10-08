@@ -95,6 +95,7 @@ def test_a_run_writes_its_windows_book_through_every_table_it_fills(
             F_0,
             fx_env.clock,
             on_lot_error=lambda message: pytest.fail(message),
+            cadence="month_end",
         )
 
     for table in RUN_TABLES:

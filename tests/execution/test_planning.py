@@ -13,6 +13,7 @@ ledger holds `SEC_SPY` (never a member: a `left_universe` exit) and
 from __future__ import annotations
 
 import ast
+import functools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -30,7 +31,7 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.schedule import fill_session, read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, session_close
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import Cadence, RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
 from tradepartner.execution import planning, reconcile_run, wrapper
 from tradepartner.execution import window as window_module
@@ -61,6 +62,8 @@ PLANNING_PY = (
     Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "execution" / "planning.py"
 )
 
+#: H1's window reads `month_end` through `frozen_values` (ADR 0015 seam 4).
+CADENCE: Cadence = "month_end"
 T_I = date(2019, 4, 30)
 F_I = fill_session(T_I)  # 2019-05-01
 T_NEXT = date(2019, 5, 31)
@@ -159,6 +162,7 @@ class Env:
             assets_read or AssetsRead(),
             lagging,
             now=_utc(session, 12),
+            cadence=CADENCE,
         )
 
     def counts(self) -> dict[str, int]:
@@ -684,7 +688,7 @@ def _sessions_after(day: date, count: int) -> date:
 
 def test_each_kind_at_its_boundary_session(env: Env) -> None:
     runs = [env.run]
-    kind = rebalance_kind
+    kind = functools.partial(rebalance_kind, cadence=CADENCE)
     assert kind(env.window, runs, [], T_I, MAX_CATCH_UP) is None
     assert kind(env.window, runs, [], F_I, MAX_CATCH_UP) == "rebalance"
     assert kind(env.window, runs, [], _sessions_after(F_I, 1), MAX_CATCH_UP) == "catch_up"
@@ -692,7 +696,10 @@ def test_each_kind_at_its_boundary_session(env: Env) -> None:
     assert kind(env.window, runs, [], last, MAX_CATCH_UP) == "catch_up"
     assert kind(env.window, runs, [], next_session(last), MAX_CATCH_UP) is None
     assert kind(env.window, runs, [], _sessions_after(F_I, 1), 0) is None
-    assert due_rebalance(env.window, runs, [], last, MAX_CATCH_UP) == ("catch_up", T_I)
+    assert due_rebalance(env.window, runs, [], last, MAX_CATCH_UP, cadence=CADENCE) == (
+        "catch_up",
+        T_I,
+    )
     # The next month's fill session is a rebalance again.
     assert kind(env.window, runs, [], fill_session(T_NEXT), MAX_CATCH_UP) == "rebalance"
 
@@ -702,23 +709,27 @@ def test_an_executed_or_missed_rebalance_is_not_caught_up(env: Env, status: str)
     runs = [env.run]
     events = [_event(env, status)]
     catch_up = _sessions_after(F_I, 1)
-    assert rebalance_kind(env.window, runs, events, catch_up, MAX_CATCH_UP) is None
+    assert rebalance_kind(env.window, runs, events, catch_up, MAX_CATCH_UP, cadence=CADENCE) is None
     # Not on its own fill session either: a same-session re-run trades nothing.
-    assert rebalance_kind(env.window, runs, events, F_I, MAX_CATCH_UP) is None
+    assert rebalance_kind(env.window, runs, events, F_I, MAX_CATCH_UP, cadence=CADENCE) is None
 
 
 def test_an_event_of_another_window_does_not_count(env: Env) -> None:
     other = replace(env.run, run_id=999, window_id=999)
     event = replace(_event(env, "executed"), run_id=999)
     catch_up = _sessions_after(F_I, 1)
-    kind = rebalance_kind(env.window, [env.run, other], [event], catch_up, MAX_CATCH_UP)
+    kind = rebalance_kind(
+        env.window, [env.run, other], [event], catch_up, MAX_CATCH_UP, cadence=CADENCE
+    )
     assert kind == "catch_up"
 
 
 def test_an_event_of_an_unknown_run_raises(env: Env) -> None:
     event = replace(_event(env, "executed"), run_id=12345)
     with pytest.raises(ValueError, match="not among the runs"):
-        rebalance_kind(env.window, [env.run], [event], next_session(F_I), MAX_CATCH_UP)
+        rebalance_kind(
+            env.window, [env.run], [event], next_session(F_I), MAX_CATCH_UP, cadence=CADENCE
+        )
 
 
 def test_the_frozen_catch_up_window_is_read_from_the_window(env: Env) -> None:
@@ -898,6 +909,7 @@ def test_frozen_risk_must_be_the_windows(env: Env) -> None:
             AssetsRead(),
             False,
             now=_utc(F_I, 12),
+            cadence=CADENCE,
         )
 
 
@@ -914,6 +926,7 @@ def test_a_naive_now_is_refused(env: Env) -> None:
             AssetsRead(),
             False,
             now=datetime(2019, 5, 1, 12),  # noqa: DTZ001 - naive on purpose
+            cadence=CADENCE,
         )
 
 

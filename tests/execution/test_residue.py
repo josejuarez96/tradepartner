@@ -476,7 +476,9 @@ def _rebalance(
     runs: Sequence[PaperRunRow] = RUNS,
     session: date = date(2026, 11, 3),
 ) -> RebalanceState:
-    return rebalance_state(t, _window(), runs, events, decision_states, session=session)
+    return rebalance_state(
+        t, _window(), runs, events, decision_states, session=session, cadence="month_end"
+    )
 
 
 def test_a_rebalance_with_no_plan_at_all_is_pending() -> None:

@@ -55,8 +55,9 @@ Rebalance sessions are those of the hypothesis's frozen `schedule.rebalance_cade
 none of its rebalance sessions" rule, the gap gate's sessions (`gap_sessions`) and the
 default in-sample window's end (`default_in_sample_window`) take it. The caller passes
 it from the frozen `Settings` (`hypothesis.load_frozen`, through
-`frozen.frozen_values`). Tracking windows stay monthly (Phase 4, strategy-lab spec
-req 11): `first_tracking_session` is a month end.
+`frozen.frozen_values`). The tracking rule's first session (`first_tracking_session`)
+is at the same cadence (ADR 0015 seam 4); `paper start` still refuses any cadence but
+`month_end` (strategy-lab spec req 11), so a paper window's is a month end.
 """
 
 from __future__ import annotations
@@ -69,7 +70,6 @@ from typing import Literal
 
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import last_session_of_month
 from tradepartner.config import Cadence
 from tradepartner.store.registry import HoldoutSpend, HypothesisRecord
 
@@ -194,8 +194,9 @@ def _has_text(reason: str | None) -> bool:
     return reason is not None and reason.strip() != ""
 
 
-def _next_month(day: date) -> tuple[int, int]:
-    return (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+#: How far past `holdout.end` `first_tracking_session` looks: the slowest cadence,
+#: `month_end`, has its next rebalance session within two calendar months.
+_TRACKING_SEARCH = timedelta(days=62)
 
 
 def gap_sessions(window: Window, cadence: Cadence = "month_end") -> tuple[date, ...]:
@@ -211,18 +212,26 @@ def window_touches_holdout(window: Window, frozen: Frozen) -> bool:
     return window.start <= frozen.holdout_end and window.end >= frozen.holdout_start
 
 
-def first_tracking_session(frozen: Frozen) -> date:
-    """The first rebalance session strictly after the frozen `holdout.end`: where a
-    `kind=tracking` window may start (Phase 4 spec req 10)."""
-    end = frozen.holdout_end
-    first = last_session_of_month(end.year, end.month)
-    if first <= end:
-        first = last_session_of_month(*_next_month(end))
-    return first
+def first_tracking_session(frozen: Frozen, cadence: Cadence) -> date:
+    """The first rebalance session at `cadence` strictly after the frozen `holdout.end`:
+    where a `kind=tracking` window may start (Phase 4 spec req 10; ADR 0015 seam 4).
+
+    `cadence` is the hypothesis's frozen `schedule.rebalance_cadence`; the sessions come
+    from `schedule.rebalance_sessions`, so a week end before Good Friday or a session
+    after a holiday is found by the calendar, never by weekday arithmetic.
+    """
+    start = frozen.holdout_end + timedelta(days=1)
+    sessions = rebalance_sessions(start, start + _TRACKING_SEARCH, cadence)
+    if not sessions:
+        raise ValueError(
+            f"no rebalance session at {cadence} within {_TRACKING_SEARCH.days} days "
+            f"after holdout.end {frozen.holdout_end}"
+        )
+    return sessions[0]
 
 
-def _tracking(window: Window, frozen: Frozen) -> Decision:
-    first = first_tracking_session(frozen)
+def _tracking(window: Window, frozen: Frozen, cadence: Cadence) -> Decision:
+    first = first_tracking_session(frozen, cadence)
     if window.end < window.start:
         return Decision(
             "refused_window", None, f"window end {window.end} is before its start {window.start}"
@@ -319,7 +328,7 @@ def decide(
             "this hypothesis is a sweep variant: variants run only through `sweep run`",
         )
     if tracking:
-        return _tracking(window, frozen)
+        return _tracking(window, frozen, cadence)
     refusal = _window_refusal(window, frozen)
     if refusal is not None:
         return Decision("refused_window", None, refusal)

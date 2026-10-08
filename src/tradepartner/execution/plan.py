@@ -96,7 +96,7 @@ from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
 from tradepartner.backtest.engine import Plan
 from tradepartner.backtest.schedule import fill_session
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
-from tradepartner.config import RiskConfig, Settings
+from tradepartner.config import Cadence, RiskConfig, Settings
 from tradepartner.execution.ledger import Ledger
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
@@ -731,9 +731,11 @@ def rebalance_state(
     decision_states: Sequence[tuple[DecisionRow, DecisionState]],
     *,
     session: date,
+    cadence: Cadence,
 ) -> RebalanceState:
     """The state of rebalance T_i = `rebalance_session` of the open `window` on
-    session S = `session` (module docstring; spec Definitions > Rebalance state).
+    session S = `session` (module docstring; spec Definitions > Rebalance state), at the
+    window's hypothesis's frozen `cadence` (ADR 0015 seam 4).
 
     `runs` places events and decisions in the window (`run_id` ->
     `paper_runs.window_id`): rows of another window or rebalance are ignored,
@@ -755,7 +757,7 @@ def rebalance_state(
             f"rebalance {rebalance_session} is before the window's first rebalance "
             f"{window.first_rebalance_session}"
         )
-    if fill_session(rebalance_session) > session:
+    if fill_session(rebalance_session, cadence) > session:
         raise ValueError(f"rebalance {rebalance_session} is not due on {session}")
     windows = _run_windows(runs)
     statuses = {
