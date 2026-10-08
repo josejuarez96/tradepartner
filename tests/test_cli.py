@@ -518,6 +518,27 @@ def test_store_price_source_resolves_tickers_from_the_listings_known_when_first_
     assert symbols == ["SPY"]
 
 
+def test_store_price_source_default_fetch_passes_asof_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1314: the default bars fetcher hands `asof` to `alpaca_raw`."""
+    settings = _settings(tmp_path)
+    sent: list[date | None] = []
+
+    def daily_bars(
+        symbols: list[str], start: date, end: date, *, asof: date | None = None, **_: Any
+    ) -> dict[str, Any]:
+        sent.append(asof)
+        return {"feed": "sip", "bars": {}}
+
+    monkeypatch.setattr(cli.alpaca_raw, "daily_bars", daily_bars)
+    source = cli.StorePriceSource(settings, clock=lambda: T_END)
+    day = date(2017, 6, 1)
+    source._fetch_bars(["VAL"], day, day, asof=day)
+    source._fetch_bars(["VAL"], day, day)
+    assert sent == [day, None]
+
+
 def test_store_price_source_reports_what_its_resolver_left_out(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

@@ -490,6 +490,11 @@ class AlpacaConfig(BaseModel):
     # `repair.store_resolver`), bars and corporate actions. Owner decision on #979:
     # on by default; `false` is the kill switch and leaves every mapping as before.
     first_span_lead: bool = True
+    # #1314: a security whose span of a ticker is not the ticker's latest open span is
+    # asked for bars with Alpaca's `asof` this many days after that span starts, so a
+    # reused symbol names the old company, not today's holder. 7 is the offset the
+    # 2026-10-08 read-only check verified on all 511 reused-ticker segments (#1314).
+    asof_offset_days: int = Field(default=7, ge=0)
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.

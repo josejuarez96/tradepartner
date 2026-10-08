@@ -211,7 +211,7 @@ import polars as pl
 import typer
 
 from tradepartner.adapters import alpaca_raw
-from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
+from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
@@ -300,14 +300,14 @@ class StorePriceSource(PriceSource):
         settings: Settings,
         *,
         clock: Clock = utc_now,
-        fetch_bars: Callable[[list[str], date, date], Any] | None = None,
+        fetch_bars: FetchBars | None = None,
         fetch_actions: Callable[[list[str], date, date], Any] | None = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
         self._fetch_bars = fetch_bars or (
-            lambda symbols, start, end: alpaca_raw.daily_bars(
-                symbols, start, end, settings=settings
+            lambda symbols, start, end, *, asof=None: alpaca_raw.daily_bars(
+                symbols, start, end, asof=asof, settings=settings
             )
         )
         self._fetch_actions = fetch_actions or (

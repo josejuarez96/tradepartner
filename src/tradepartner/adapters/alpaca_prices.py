@@ -145,6 +145,27 @@ identity is the master's at the run, the same back-dating a
 `snapshot_static` row gives a survivor, and `universe_as_of` still
 excludes the name (rule 2, `not_listed`) until its listing is known.
 
+**Asof per span (#1314).** Without `asof`, Alpaca maps a symbol to the
+company that holds it today, so a reused ticker serves the later company's
+history on the old company's sessions (VAL: Valspar's 2017 sessions priced
+as Valaris), a smooth series the #787 jump gate cannot see. A security
+asked for bars under a ticker whose latest span (of any company, shadowing
+spans included) is its own and has no end shares one request without
+`asof`, as before. Any other (its span ended, or another company's span of
+the ticker started on or after it) is asked with `asof` set
+`alpaca.asof_offset_days` after its first span of the ticker starts, kept
+inside that span (`ListingResolver.asof`); securities with one `asof` day
+share a request. Every request keeps only the rows on the sessions of the
+securities it was made for, so today's holder's copied history never fills
+an old holder's sessions. When an `asof` request has no row for a symbol,
+one more `asof` request from the security's first day under it to the
+window's end asks whether Alpaca knows the company at all: if it does, the
+empty window stands (the company had stopped trading, a span that ends
+late); if not (DAVE, AMCI, MBC, STRN, SMLR in #1314 and #1311), the symbol
+falls back to the request without `asof`, as before the fix, and is named
+on `resolution_summary`. The `asof` day only picks the company; a bar's
+`known_at` stays its session's close.
+
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
 
@@ -228,7 +249,7 @@ from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from tradepartner.adapters.prices import (
@@ -1079,6 +1100,58 @@ class ListingResolver:
             out.insert(0, first.ticker)
         return out
 
+    def asof(self, security_id: str, ticker: str, offset_days: int) -> date | None:
+        """The `asof` day to ask Alpaca for `security_id`'s bars under
+        `ticker` (#1314), or `None` when a request without one names it:
+        its last assigned span of `ticker` has no end and no other
+        company's span of the ticker (assigned or shadowing) starts on or
+        after it. Otherwise `offset_days` after its first assigned span of
+        `ticker` starts, kept inside that span (before its end and before
+        another company's next span of the ticker starts): Alpaca maps the
+        symbol to the company that held it that day, not today's holder.
+        `None` too for a ticker the security has no assigned span of."""
+        own = sorted(
+            (
+                span
+                for span in self._by_security.get(security_id, [])
+                if span.ticker == ticker and self._assigned(span)
+            ),
+            key=lambda span: span.start,
+        )
+        if not own:
+            return None
+        rivals = [
+            span.start
+            for span in (*self._by_ticker.get(ticker, []), *self._blockers.get(ticker, []))
+            if _company(span.security_id) != _company(security_id)
+        ]
+        last = own[-1]
+        if last.end is None and not any(start >= last.start for start in rivals):
+            return None
+        first = own[0]
+        bounds = [start for start in rivals if start > first.start]
+        if first.end is not None:
+            bounds.append(first.end)
+        day = first.start + timedelta(days=offset_days)
+        if bounds and day >= min(bounds):
+            day = max(first.start, min(bounds) - timedelta(days=1))
+        return day
+
+    def since(self, security_id: str, ticker: str) -> date | None:
+        """The first day `ticker` resolves or leads to `security_id`: the
+        start of its first span of the ticker, or of a rename lead (#843)
+        or first-span lead (#974) under it, if earlier; `None` when none."""
+        starts = [
+            span.start
+            for span in self._by_security.get(security_id, [])
+            if span.ticker == ticker and self._assigned(span)
+        ]
+        starts += [lead.start for lead in self._leads_of.get(security_id, []) if lead.new == ticker]
+        first = self._first_lead_of.get(security_id)
+        if first is not None and first.ticker == ticker:
+            starts.append(first.start)
+        return min(starts, default=None)
+
     def _assigned(self, span: TickerSpan) -> bool:
         return span in self._assigned_spans
 
@@ -1439,16 +1512,59 @@ def parse_corporate_actions(
     return ActionsParse(tuple(actions), tuple(unresolved), tuple(unsupported))
 
 
+@_fail_closed
+def _own_rows(
+    fetched: Sequence[tuple[Mapping[str, Any], Mapping[str, set[str]]]],
+    resolve: Resolve,
+    lead: Resolve,
+) -> dict[str, Any]:
+    """One `daily_bars` payload from several requests (#1314), each with
+    the ids it was made for per symbol: a row is kept only from the request
+    made for the security it resolves (or leads) to, so a request without
+    `asof` never fills an old holder's sessions with today's holder's
+    bars, nor an `asof` request a later holder's. A row resolving to no
+    security is kept once, for `parse_bars` to report. Every payload must
+    carry one feed."""
+    feeds = {feed_source(payload) for payload, _ in fetched}
+    if len(feeds) != 1:
+        raise ValueError(f"bar requests disagree on the feed: {sorted(feeds)}")
+    merged: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    nobody: set[tuple[str, date]] = set()
+    for payload, owners in fetched:
+        for symbol, rows in payload["bars"].items():
+            asked = owners.get(symbol, set())
+            for row in rows:
+                session = _session_of(row["t"])
+                owner = resolve(symbol, session) or lead(symbol, session)
+                if owner is None and (symbol, session) not in nobody:
+                    nobody.add((symbol, session))
+                    merged[symbol].append(row)
+                elif owner is not None and owner in asked:
+                    merged[symbol].append(row)
+    return {"feed": fetched[0][0]["feed"], "bars": dict(merged)}
+
+
 # --- the adapter -----------------------------------------------------------------
 
-FetchBars = Callable[[list[str], date, date], Mapping[str, Any]]
+
+class FetchBars(Protocol):
+    """`alpaca_raw.daily_bars`' shape: `asof` (#1314) is passed only when
+    set, so a fetcher that never needs one may leave it out."""
+
+    def __call__(
+        self, symbols: list[str], start: date, end: date, *, asof: date | None = ...
+    ) -> Mapping[str, Any]: ...
+
+
 FetchActions = Callable[[list[str], date, date], Mapping[str, Any]]
 
 
-def _default_fetch_bars(symbols: list[str], start: date, end: date) -> Mapping[str, Any]:
+def _default_fetch_bars(
+    symbols: list[str], start: date, end: date, *, asof: date | None = None
+) -> Mapping[str, Any]:
     from tradepartner.adapters import alpaca_raw
 
-    return alpaca_raw.daily_bars(symbols, start, end)
+    return alpaca_raw.daily_bars(symbols, start, end, asof=asof)
 
 
 def _default_fetch_actions(symbols: list[str], start: date, end: date) -> Mapping[str, Any]:
@@ -1484,10 +1600,14 @@ class AlpacaPriceSource(PriceSource):
         self._resolver = resolver
         self._fetch_bars = fetch_bars
         self._fetch_actions = fetch_actions
-        self._lag = timedelta(days=(settings or get_settings()).alpaca.actions_process_lag_days)
+        settings = settings or get_settings()
+        self._lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+        self._asof_offset = settings.alpaca.asof_offset_days
+        self._asof_served: set[tuple[str, str]] = set()  # (security, symbol) asof found
         self.last_bars_report: BarsParse | None = None
         self.last_actions_report: ActionsParse | None = None
         self.last_excluded_symbols: tuple[str, ...] = ()
+        self.last_asof_fallbacks: tuple[str, ...] = ()
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
@@ -1516,15 +1636,71 @@ class AlpacaPriceSource(PriceSource):
         )
 
     def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+        """Bars of `security_ids` over `[start, end]` (#1314): a security
+        holding a ticker's latest open span shares one request without
+        `asof`; any other is asked with `ListingResolver.asof`, one request
+        per `asof` day, and keeps only the rows on its own sessions. A
+        symbol Alpaca names for no company at that `asof` falls back to
+        the request without one (`last_asof_fallbacks`)."""
         self.last_bars_report = None
+        self.last_asof_fallbacks = ()
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
             return []
+        plain: dict[str, set[str]] = defaultdict(set)  # symbol -> ids asked without asof
+        dated: dict[date, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        since: dict[tuple[str, str], date] = {}
+        for security_id in sorted(ids):
+            for ticker in self._resolver.symbols(security_id, start, end):
+                symbol = alpaca_symbol(ticker)
+                if symbol is None:
+                    continue
+                day = self._resolver.asof(security_id, ticker, self._asof_offset)
+                if day is None:
+                    plain[symbol].add(security_id)
+                    continue
+                dated[day][symbol].add(security_id)
+                first = self._resolver.since(security_id, ticker) or start
+                since[(security_id, symbol)] = min(first, start)
+        fetched: list[tuple[Mapping[str, Any], Mapping[str, set[str]]]] = []
+        fallbacks: set[str] = set()
+        for day, owners in sorted(dated.items()):
+            payload = self._fetch_bars(sorted(owners), start, end, asof=day)
+            fetched.append((payload, owners))
+            for symbol, asked in owners.items():
+                for security_id in asked:
+                    if payload["bars"].get(symbol) or self._asof_serves(
+                        security_id, symbol, since[(security_id, symbol)], end, day
+                    ):
+                        continue
+                    plain[symbol].add(security_id)
+                    fallbacks.add(symbol)
+        if plain:
+            fetched.append((self._fetch_bars(sorted(plain), start, end), plain))
+        self.last_asof_fallbacks = tuple(sorted(fallbacks))
         parsed = parse_bars(
-            self._fetch_bars(symbols, start, end), self._resolver.resolve, self._resolver.lead
+            _own_rows(fetched, self._resolver.resolve, self._resolver.lead),
+            self._resolver.resolve,
+            self._resolver.lead,
         )
         self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
+
+    def _asof_serves(
+        self, security_id: str, symbol: str, since: date, end: date, asof: date
+    ) -> bool:
+        """True when Alpaca, at `asof`, serves `symbol` with any row from
+        `since` (the security's first day under it) to `end`: it knows the
+        company, and an empty window is the company not trading (a span
+        that ends late, #1314), never a cue to ask today's holder. Asked
+        once per security and symbol while the answer is yes; never past
+        `end`."""
+        key = (security_id, symbol)
+        if key not in self._asof_served and self._fetch_bars([symbol], since, end, asof=asof)[
+            "bars"
+        ].get(symbol):
+            self._asof_served.add(key)
+        return key in self._asof_served
 
     def resolution_summary(self) -> str:
         """The resolver's `ResolverReport` line, plus the rows of the latest
@@ -1533,6 +1709,9 @@ class AlpacaPriceSource(PriceSource):
         line = self._resolver.report.summary()
         if self.last_bars_report is not None:
             line += f"; {len(self.last_bars_report.unresolved)} bar rows unresolved"
+        if self.last_asof_fallbacks:
+            named = ", ".join(self.last_asof_fallbacks)
+            line += f"; {len(self.last_asof_fallbacks)} symbol(s) asked without asof: {named}"
         if self.last_actions_report is not None:
             line += f"; {len(self.last_actions_report.unresolved)} action rows unresolved"
         if symbols := self.symbol_summary():
