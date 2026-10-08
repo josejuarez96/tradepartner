@@ -743,8 +743,11 @@ def test_random_nine_decimal_fills_exit_exactly_and_never_oversell() -> None:
         assert after.positions == {}
 
 
-@pytest.mark.parametrize(("bought", "ratio", "after_split"), [(9, 1 / 3, 3), (3, 2 / 3, 2)])
-def test_a_reverse_split_holding_exits_fully(bought: int, ratio: float, after_split: int) -> None:
+@pytest.mark.parametrize(
+    ("bought", "ratio", "after_split"),
+    [(9, 1 / 3, 3), (3, 2 / 3, 2), (0.7, 3.0, 2.1), (0.3, 1.5, 0.45)],
+)
+def test_a_split_holding_exits_fully(bought: float, ratio: float, after_split: float) -> None:
     sell = _order(A, "sell", D9)
     fills = [_fill(BUY_A, bought, 50.0, fill_id=1)]
     actions = _splits((A, D8, ratio))
@@ -765,3 +768,8 @@ def test_a_reverse_split_holding_exits_fully(bought: int, ratio: float, after_sp
         quantity_tolerance=0.0,
     )
     assert after.positions == {}
+
+
+def test_a_tiny_split_ratio_is_not_rounded_to_zero() -> None:
+    held = _ledger([_fill(BUY_A, 10**8, 50.0)], [BUY_A], actions=_splits((A, D8, 1e-7))).positions
+    assert held == {A: pytest.approx(10.0)}

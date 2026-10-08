@@ -48,9 +48,11 @@ A row's own date for the split test is its `session` (an adjustment) or the
 New York date of `filled_at` (a fill): a fill on the ex-date is already in
 post-split shares. Quantities within `quantity_tolerance` of zero
 (`risk.reconcile_quantity_tolerance` from the frozen window) are dropped.
-Positions are summed in `Decimal` from each quantity's shortest form, so
-fills on the broker's quantity grid add up exactly and a full exit's
-`risk.round_down` sells the whole holding, not one grid step less (#1296).
+Positions are summed exactly, as `Fraction`s: each quantity from its shortest
+decimal form and each split ratio as the nearest small fraction (1/3, not
+0.3333333333333333). So fills on the broker's quantity grid add up exactly,
+before or after a split, and a full exit's `risk.round_down` sells the whole
+holding, not one grid step less (#1296).
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -138,18 +140,28 @@ def _splits_by_security(
     return splits
 
 
-def _split_factor(splits: Iterable[tuple[date, float]], stated_on: date) -> float:
-    """The product of the ratios of splits that took effect after `stated_on`."""
-    factor = 1.0
+def _split_factor(splits: Iterable[tuple[date, float]], stated_on: date) -> Fraction:
+    """The exact product of the ratios of splits that took effect after
+    `stated_on` (`_split_ratio`)."""
+    factor = Fraction(1)
     for ex_date, ratio in splits:
         if stated_on < ex_date:
-            factor *= ratio
+            factor *= _split_ratio(ratio)
     return factor
 
 
-def _dec(value: float) -> Decimal:
-    """`value` as the `Decimal` of its shortest decimal form."""
-    return Decimal(repr(value))
+def _split_ratio(ratio: float) -> Fraction:
+    """`ratio` as the small fraction it stores: the nearest fraction with a
+    denominator up to `Fraction.limit_denominator`'s default, when that
+    fraction is the same `float` (a 1:3 split's 0.3333333333333333 is 1/3),
+    else its shortest decimal form."""
+    small = Fraction(ratio).limit_denominator()
+    return small if float(small) == ratio else _exact(ratio)
+
+
+def _exact(value: float) -> Fraction:
+    """`value` as the exact `Fraction` of its shortest decimal form."""
+    return Fraction(repr(value))
 
 
 def _check_window(kind: str, row_window: int, window_id: int) -> None:
@@ -251,11 +263,9 @@ def from_journal(
 
     by_id = {order.client_order_id: order for order in orders}
     splits = _splits_by_security(actions_as_of, through)
-    # Summed in `Decimal` from each split-adjusted row's shortest form, never
-    # `float`, so a full exit on a fine quantity grid leaves no float residue
-    # (#1296). The split product stays `float` first: 9 x 0.3333333333333333
-    # is 3.0 there, but 2.9999999999999997 in `Decimal`.
-    positions: dict[str, Decimal] = defaultdict(Decimal)
+    # Summed exactly, never in `float`, so a full exit on a fine quantity grid
+    # leaves no float residue, with or without a split (#1296).
+    positions: dict[str, Fraction] = defaultdict(Fraction)
 
     seen_fills: set[int] = set()
     for fill in fills:
@@ -267,7 +277,7 @@ def from_journal(
             continue
         sign = 1 if fill.side == _BUY else -1
         factor = _split_factor(splits.get(fill.security_id, ()), stated_on)
-        positions[fill.security_id] += sign * _dec(row.quantity * factor)
+        positions[fill.security_id] += sign * _exact(row.quantity) * factor
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
 
@@ -279,9 +289,9 @@ def from_journal(
             continue
         if adjustment.quantity is not None and adjustment.security_id is not None:
             factor = _split_factor(splits.get(adjustment.security_id, ()), adjustment.session)
-            positions[adjustment.security_id] += _dec(adjustment.quantity * factor)
+            positions[adjustment.security_id] += _exact(adjustment.quantity) * factor
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
 
-    held = {name: float(q) for name, q in positions.items() if abs(q) > _dec(quantity_tolerance)}
+    held = {name: float(q) for name, q in positions.items() if abs(q) > _exact(quantity_tolerance)}
     return Ledger(positions=held, cash=cash, through=through)
