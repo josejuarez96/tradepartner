@@ -61,6 +61,21 @@ orders left to submit). In order:
      wrapper read), whose `position_side` is not `schema.LONG`, one violation
      per such order or row. Structural, like the two above: no short, ever,
      until the shorting ADR (ADR 0015 seam 2, amending ADR 0010 point 1).
+   - `refused_order_shape`: an `orders` row of `rows_on_session` that
+     `order_shape_violation` refuses, one violation per such row. Structural,
+     like `refused_position_side` (ADR 0015 seam 3).
+
+`order_shape_violation` is the one order-shape predicate (ADR 0015 seam 3,
+plan T135b): an `Order` the broker returned, or an `orders` row, whose
+(`order_type`, `time_in_force`, `asset_class`, `order_class`, `multiplier`) is
+not `schema.ORDER_SHAPE_DEFAULTS`' (`market`, `day`, `us_equity`, `simple`,
+`1`), or whose `limit_price`, `stop_price` or `parent_order_id` is set, or whose
+`legs` is non-empty, is a `limit_breach` `Violation` named
+`refused_order_shape`. `multiplier` and `parent_order_id` are read on rows
+only and `legs` on `Order`s only: neither type has the other's fields. The
+wrapper applies it to every `Order` from `submit` and `get_order` after
+journaling it (a post-submit fault), and `reconcile.compare` to every own open
+order.
 
 Equity is the ledger's at `price_of` (the reference price, close(S-1)).
 
@@ -94,7 +109,7 @@ from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal
 
 import polars as pl
 
-from tradepartner.adapters.broker import Account, Asset
+from tradepartner.adapters.broker import Account, Asset, Order
 from tradepartner.backtest.costs import BPS_PER_UNIT
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
@@ -120,6 +135,7 @@ __all__ = [
     "Violations",
     "check_phase",
     "open_sold",
+    "order_shape_violation",
     "round_down",
     "size_buys",
     "unfilled_sells",
@@ -132,6 +148,9 @@ _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
 #: The structural rule refusing any position side but long (ADR 0015 seam 2).
 _REFUSED_POSITION_SIDE = "refused_position_side"
+#: The structural rule refusing any order but a market day order of one share
+#: class (ADR 0015 seam 3).
+_REFUSED_ORDER_SHAPE = "refused_order_shape"
 #: Cash is compared in cents (spec req 3 (c)).
 _CENT = Decimal(1).scaleb(-2)
 #: Skips exempt from `risk.max_skips_per_run` (spec req 3).
@@ -450,6 +469,48 @@ def _skip_reason(
     return None
 
 
+def order_shape_violation(order_or_row: Order | OrderRow) -> Violation | None:
+    """`refused_order_shape` when `order_or_row` is not a market, day,
+    `us_equity`, `simple`, multiplier-1 order with no limit price, stop price,
+    parent or legs (module docstring); `None` when it is. Every offending field
+    is named in the detail."""
+    shape = schema.ORDER_SHAPE_DEFAULTS
+    offending = [
+        f"{name} {value!r}"
+        for name, value, default in (
+            ("order_type", order_or_row.order_type, shape["order_type"]),
+            ("time_in_force", order_or_row.time_in_force, shape["time_in_force"]),
+            ("asset_class", order_or_row.asset_class, shape["asset_class"]),
+            ("order_class", order_or_row.order_class, shape["order_class"]),
+        )
+        if value != default
+    ]
+    offending += [
+        f"{name} {value!r}"
+        for name, value in (
+            ("limit_price", order_or_row.limit_price),
+            ("stop_price", order_or_row.stop_price),
+        )
+        if value is not None
+    ]
+    if isinstance(order_or_row, OrderRow):
+        # `!=`, never `>`: a NaN multiplier is refused too.
+        if order_or_row.multiplier != shape["multiplier"]:
+            offending.append(f"multiplier {order_or_row.multiplier!r}")
+        if order_or_row.parent_order_id is not None:
+            offending.append(f"parent_order_id {order_or_row.parent_order_id!r}")
+    elif order_or_row.legs:
+        offending.append(f"{len(order_or_row.legs)} legs")
+    if not offending:
+        return None
+    return Violation(
+        _LIMIT_BREACH,
+        _REFUSED_ORDER_SHAPE,
+        f"order {order_or_row.client_order_id} for {order_or_row.symbol} has "
+        + ", ".join(offending),
+    )
+
+
 def check_phase(
     orders: Sequence[PhaseOrder],
     ledger: Ledger,
@@ -469,7 +530,8 @@ def check_phase(
     `security_id`; `open_sells` are the non-terminal own sells from any session
     (`unfilled_sells`); `prior_orders` and `prior_skips` are this run's earlier
     phases' counts; `rows_on_session` are the session's `decisions` and
-    `orders` rows, read only for `refused_position_side`."""
+    `orders` rows, read only for `refused_position_side` and (its `orders`
+    rows) `refused_order_shape`."""
     for order in orders:
         if order.side not in (_BUY, _SELL):
             raise ValueError(f"order of decision {order.decision_id} has side {order.side!r}")
@@ -511,6 +573,10 @@ def check_phase(
                 _REFUSED_POSITION_SIDE,
                 f"{what} for {row.security_id} has position_side {row.position_side!r}",
             )
+        if isinstance(row, OrderRow):
+            shape = order_shape_violation(row)
+            if shape is not None:
+                violations.append(shape)
 
     skips: list[Skip] = []
     left: list[PhaseOrder] = []

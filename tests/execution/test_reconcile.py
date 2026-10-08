@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
 
 import polars as pl
@@ -841,6 +842,42 @@ def test_an_own_open_order_for_another_symbol_differs_from_its_row() -> None:
         ],
     )
     assert _kinds(result) == ["open_order_differs"]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [{"order_type": "limit", "limit_price": 99.0}, {"time_in_force": "gtc"}],
+    ids=["limit", "gtc"],
+)
+def test_an_own_open_order_of_another_shape_differs_from_its_row(shape: dict[str, object]) -> None:
+    """ADR 0015 seam 3 (T135b): the journal holds the order open, for its
+    symbol and side, but the broker's open order is not the market day order:
+    `open_order_differs`, never reconciled; the default shape passes."""
+    row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", notional=100.0)
+    reading = _reading(row, OrderStatus.ACCEPTED)
+
+    def run(open_order: Order) -> Reconciliation:
+        return _run(
+            _ledger(SEC_A=1.0),
+            _positions(AAA=1.0),
+            1_000.0,
+            open_orders=[open_order],
+            journal_open=[
+                JournalOpenOrder(
+                    row,
+                    pending=False,
+                    journaled_quantity=0.0,
+                    journaled_notional=0.0,
+                    reading=reading,
+                )
+            ],
+        )
+
+    assert _kinds(run(reading)) == []
+    result = run(replace(reading, **shape))  # type: ignore[arg-type]
+    assert _kinds(result) == ["open_order_differs"]
+    (mismatch,) = result.mismatches
+    assert mismatch.detail.startswith("refused_order_shape: ")
 
 
 def test_inputs_that_cannot_be_compared_raise() -> None:

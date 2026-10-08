@@ -35,8 +35,8 @@ import requests
 from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest, OrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, OrderRequest
 from pydantic import SecretStr
 from requests.adapters import HTTPAdapter
 
@@ -99,6 +99,8 @@ class TradingClientLike(Protocol):
     def cancel_order_by_id(self, order_id: str) -> Any: ...
 
     def get_order_by_client_id(self, client_id: str) -> Any: ...
+
+    def get_order_by_id(self, order_id: str) -> Any: ...
 
     def get_orders(self, filter: GetOrdersRequest | None = None) -> Any: ...
 
@@ -169,6 +171,27 @@ def _describe(error: APIError | requests.RequestException) -> tuple[int | None, 
     if isinstance(error, APIError):
         return error.status_code, str(error)
     return None, type(error).__name__
+
+
+def market_day_order(
+    symbol: str,
+    side: str,
+    client_order_id: str,
+    *,
+    notional: float | None,
+    qty: float | None,
+) -> OrderRequest:
+    """The one order shape the adapter sends (spec req 2, ADR 0015 seam 3): a
+    market DAY order by `notional` or `qty`. Built here because only this module
+    may import `alpaca.trading.requests` (#296); `side` is `"buy"` or `"sell"`."""
+    return MarketOrderRequest(
+        symbol=symbol,
+        side=OrderSide(side),
+        time_in_force=TimeInForce.DAY,
+        client_order_id=client_order_id,
+        notional=notional,
+        qty=qty,
+    )
 
 
 class AlpacaTradingRaw:
@@ -247,6 +270,11 @@ class AlpacaTradingRaw:
     def get_order_by_client_id(self, client_order_id: str) -> Any:
         """`GET /v2/orders:by_client_order_id`."""
         return self._call(self._client.get_order_by_client_id, client_order_id)
+
+    def get_order_by_id(self, broker_order_id: str) -> Any:
+        """`GET /v2/orders/{id}`: the order by the broker's own id (a fill
+        activity carries only that id, so `fills()` resolves it here, #1298)."""
+        return self._call(self._client.get_order_by_id, broker_order_id)
 
     def list_open_orders(self) -> list[Any]:
         """Every open order; raises rather than return a list the API may have cut."""

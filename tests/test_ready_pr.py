@@ -157,7 +157,6 @@ def test_pass_with_fixes_counts_only_once_a_later_pass_follows() -> None:
 REPO = Path(__file__).resolve().parents[1]
 # Listed on purpose before the module exists; drop an entry once its module lands.
 PLANNED_PREFIXES = {
-    "src/tradepartner/adapters/alpaca_broker",  # T48c
     "src/tradepartner/llm/",  # Phase 5, ADR 0008
 }
 

@@ -87,6 +87,24 @@ side, notional, quantity) adopt it, journaled as a non-terminal `replay` event
 carrying the broker's order id; any difference, or a failed fetch, raises
 `SystemFaultError`, which halts.
 
+**The order shape** (ADR 0015 seam 3, plan T135b). Every `Order` the broker
+returns from `get_order` on the submit path (the acknowledgement poll and the
+replay fetch) is journaled as its event first (`accepted` or `replay`,
+`raw_json` included), and every `Order` from `submit` follows its
+acknowledgement's `accepted` event (no event carries `submit`'s own reply); each
+is then passed `risk.order_shape_violation`: an
+order that is not a market, day, `us_equity`, `simple` order with no limit or
+stop price and no legs raises `SystemFaultError` naming `refused_order_shape`,
+and nothing further is submitted. It is a fault after a submit, never a
+pre-submit `LimitBreachError`, so the zero-submit contract of step 6 below is
+untouched: the run's halt path writes the `kill_switch` row with that reason
+and cancels the open orders (ADR 0007), and `paper resume` settles the order
+as any other halted one. `submit`'s own `Order` is checked after the
+`accepted` event its acknowledgement journals (the detail names its offending
+fields). So an order of another kind on the account, however it got there,
+halts rather than reconciles. Every `orders` row this module writes carries
+the shape columns at `schema.ORDER_SHAPE_DEFAULTS` explicitly.
+
 Every message journaled or sent is scrubbed of the configured secrets first.
 
 **The two-phase driver** (`execute`, spec req 3, plan T60b) trades one batch:
@@ -226,6 +244,7 @@ from tradepartner.execution.risk import (
     Violations,
     _buy_cash,
     check_phase,
+    order_shape_violation,
     unfilled_sells,
 )
 from tradepartner.store.asof import listings_as_of, live_actions_as_of
@@ -256,7 +275,7 @@ from tradepartner.store.journal import (
     reconciliations_for,
     runs_for,
 )
-from tradepartner.store.schema import HALT_REASON, LONG
+from tradepartner.store.schema import HALT_REASON, LONG, ORDER_SHAPE_DEFAULTS
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
@@ -625,6 +644,7 @@ class RiskGatedBroker:
                     ingested_at=stamp,
                 ),
             )
+        _refuse_shape(order, Broker.get_order.__name__)
         return order
 
     # --- the two-phase driver -------------------------------------------------------
@@ -919,6 +939,18 @@ class RiskGatedBroker:
                     # default (ADR 0015 seam 2; `check_phase` refused any
                     # other side above).
                     position_side=LONG,
+                    # The market day order, always, written explicitly from
+                    # the one defaults mapping (ADR 0015 seam 3): `OrderRequest`
+                    # has no other shape, and `check_phase` refused any session
+                    # row of another above.
+                    order_type=ORDER_SHAPE_DEFAULTS["order_type"],
+                    time_in_force=ORDER_SHAPE_DEFAULTS["time_in_force"],
+                    limit_price=None,
+                    stop_price=None,
+                    asset_class=ORDER_SHAPE_DEFAULTS["asset_class"],
+                    order_class=ORDER_SHAPE_DEFAULTS["order_class"],
+                    multiplier=ORDER_SHAPE_DEFAULTS["multiplier"],
+                    parent_order_id=None,
                     sells_in_flight_at_submit=True if order.side == _SELL else in_flight,
                     known_at=stamp,
                     ingested_at=stamp,
@@ -1149,21 +1181,25 @@ class RiskGatedBroker:
         )
 
     def _submit_all(self, pairs: Sequence[tuple[OrderRow, OrderRequest]]) -> list[str]:
-        """Submit each journaled request in order and await its acknowledgement."""
+        """Submit each journaled request in order and await its acknowledgement;
+        `submit`'s `Order` passes the shape check after the acknowledgement's
+        `accepted` event is journaled (module docstring)."""
         submitted = []
         for _, request in pairs:
             try:
-                self._broker.submit(request)
+                placed = self._broker.submit(request)
             except DuplicateClientOrderIdError as duplicate:
                 self.replay(request, duplicate)
             else:
                 self._acknowledge(request.client_order_id)
+                _refuse_shape(placed, Broker.submit.__name__)
             submitted.append(request.client_order_id)
         return submitted
 
     def _acknowledge(self, coid: str) -> None:
         """Poll `get_order` until the broker knows the order, then journal its
-        `accepted` event; `AcknowledgementTimeoutError` at the deadline."""
+        `accepted` event and check its shape (module docstring);
+        `AcknowledgementTimeoutError` at the deadline."""
         paper = self._settings.paper
         deadline = self.read_clock() + timedelta(seconds=paper.accept_wait_seconds)
         while True:
@@ -1191,6 +1227,7 @@ class RiskGatedBroker:
                         ingested_at=stamp,
                     ),
                 )
+            _refuse_shape(order, Broker.get_order.__name__)
             return
 
     def _await_sells(self, run: PaperRunRow, sells: Sequence[OrderRow]) -> None:
@@ -1457,6 +1494,15 @@ class RiskGatedBroker:
         for form in sorted(forms, key=len, reverse=True):
             text = re.sub(re.escape(form), _MASK, text, flags=re.IGNORECASE)
         return text
+
+
+def _refuse_shape(order: Order, method: str) -> None:
+    """Raise `SystemFaultError` naming `refused_order_shape` when the `Order`
+    `method` returned is not the default shape (module docstring). Called only
+    after the order's event is journaled."""
+    violation = order_shape_violation(order)
+    if violation is not None:
+        raise SystemFaultError(f"{violation.rule}: {method} returned {violation.detail}")
 
 
 def _frozen_costs(window: PaperWindowRow) -> BuyCosts:

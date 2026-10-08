@@ -79,6 +79,10 @@ class FakeClient:
         self._hit("get_order_by_client_id", client_id)
         return {"client_order_id": client_id}
 
+    def get_order_by_id(self, order_id: str) -> Any:
+        self._hit("get_order_by_id", order_id)
+        return {"id": order_id}
+
     def get_orders(self, filter: Any = None) -> Any:
         self._hit("get_orders", filter)
         return [{"id": "o1"}]
@@ -368,3 +372,31 @@ def test_fill_activities_raise_when_paging_does_not_advance() -> None:
 def test_fill_activities_refuse_a_naive_instant() -> None:
     with pytest.raises(ValueError):
         _raw().list_fill_activities(datetime(2026, 9, 28, 13, 30))  # noqa: DTZ001
+
+
+def test_get_order_by_id_is_paced_and_retried_like_every_call() -> None:
+    clock = FakeClock()
+    client = FakeClient(fail_with=[requests.Timeout("slow")])
+    raw = AlpacaTradingRaw(_settings(trading_requests_per_minute=30), client=client, clock=clock)
+
+    assert raw.get_order_by_id("o9") == {"id": "o9"}
+    assert client.calls == [("get_order_by_id", ("o9",))] * 2
+    assert clock.sleeps == [pytest.approx(2.0)]
+
+
+@pytest.mark.parametrize(
+    ("side", "notional", "qty"), [("buy", 5.0, None), ("sell", None, 0.557436865)]
+)
+def test_market_day_order_builds_the_one_shape_the_adapter_sends(
+    side: str, notional: float | None, qty: float | None
+) -> None:
+    request = raw_mod.market_day_order("KO", side, "rec-1", notional=notional, qty=qty)
+    fields = request.to_request_fields()
+    assert fields.pop("side") == side
+    assert fields == {
+        "symbol": "KO",
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": "rec-1",
+        **({"notional": notional} if notional is not None else {"qty": qty}),
+    }

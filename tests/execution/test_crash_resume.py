@@ -22,6 +22,7 @@ clock, and is not reproduced as a test here.)
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -434,6 +435,61 @@ def test_a_submit_transport_error_never_received_is_settled_by_resume(
         assert attempts[-1][2] == "filled"
     attempts = _attempts(env, "SEC_TRANSFER")
     assert attempts[0][0] == coid
+
+
+# --- the order shape: a post-submit fault, settled like any other (ADR 0015 seam 3) ---------
+
+
+def test_resume_settles_a_limit_order_halt_as_after_any_post_submit_fault(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The broker answers the batch's first submit with a limit order (which
+    `FakeBroker` never does): the run halts after that order's `accepted`
+    event, the `kill_switch` row naming `refused_order_shape`, the halt's
+    cancel settles the limit order and the batch's other orders stay
+    `pending`, unsubmitted. `paper resume` settles those `not_received` and
+    releases, as after any fault after a submit (T135b)."""
+    original_submit = env.fake.submit
+    shaped: list[str] = []
+
+    def limit_first(request: OrderRequest) -> object:
+        order = original_submit(request)
+        if shaped:
+            return order
+        shaped.append(request.client_order_id)
+        return replace(order, order_type="limit", limit_price=1.0)
+
+    monkeypatch.setattr(env.fake, "submit", limit_first)
+    with pytest.raises(Exception, match="refused_order_shape"):
+        env.run(at(F_0))
+    env.fake.submit = original_submit  # not monkeypatch.undo() (see above)
+    halted = env.latest_run()
+    # A fault after a submit (`SystemFaultError`), not the pre-submit
+    # `LimitBreachError`: no `missed` row.
+    assert env.result(halted)[:2] == ("halted", "SystemFaultError")
+    assert [e for e in env.rebalance_events() if e[1] == "missed"] == []
+    [(reason,)] = env.query("SELECT reason FROM kill_switch WHERE run_id = ?", [halted])
+    assert "refused_order_shape" in reason
+    (coid,) = shaped
+    statuses = env.query(
+        "SELECT status FROM order_events WHERE client_order_id = ? ORDER BY known_at", [coid]
+    )
+    assert [s for (s,) in statuses] == ["pending", "accepted", "cancel_requested", "cancelled"]
+    others = [c for (c,) in env.query("SELECT client_order_id FROM orders") if c != coid]
+    assert others  # the batch's other buys: journaled, never submitted
+    assert {r.client_order_id for r in env.submits()} == {coid}
+    assert _engaged(env, window)
+
+    released = _resume(env)
+    assert released.status == RELEASED, released.reasons
+    assert not _engaged(env, window)
+    for other in others:
+        last = env.query(
+            "SELECT status, reason FROM order_events WHERE client_order_id = ? "
+            "ORDER BY known_at DESC LIMIT 1",
+            [other],
+        )
+        assert last == [("cancelled", "not_received")]
 
 
 # --- the "Two phases" criterion's resume half -------------------------------------------------
