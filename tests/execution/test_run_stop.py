@@ -569,7 +569,7 @@ def test_an_unset_quantity_precision_fails_the_stop_run_before_any_exit(
     env.settings = Settings(
         _env_file=None,
         store={"path": env.settings.store.path},
-        alpaca={"client_order_id_max_length": 48},
+        alpaca={"client_order_id_max_length": 48, "quantity_decimals": None},
     )
     assert env.settings.alpaca.quantity_decimals is None
     with pytest.raises(ValueError, match="quantity_decimals"):

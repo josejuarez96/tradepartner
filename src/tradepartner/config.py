@@ -523,11 +523,15 @@ class AlpacaConfig(BaseModel):
     trading_requests_per_minute: float = Field(default=150.0, gt=0)
     trading_request_timeout_seconds: float = Field(default=30.0, gt=0)
     trading_max_retries: int = Field(default=3, ge=0)
-    # Broker facts with no default, set by the recording task (T48b): the accepted
-    # fractional quantity precision and the `client_order_id` length limit. The
-    # adapter (T48c) refuses to construct while either is `None`.
-    quantity_decimals: int | None = Field(default=None, ge=0)
-    client_order_id_max_length: int | None = Field(default=None, gt=0)
+    # Broker facts set by the recording task (T48b, docs/research/
+    # 2026-10-08-alpaca-paper-facts.md). Precision: paper accepted and filled
+    # 9-decimal quantities (tests/fixtures/alpaca/paper/buy_fractional.json filled
+    # 0.057436865, flatten.json sold 0.557436865), as Alpaca's fractional docs state.
+    # Id length: Alpaca's documented 128-character limit; the recorded ids were 19
+    # characters, so the limit itself is documented, not observed. `None` stays
+    # allowed and the adapter (T48c) refuses to construct while either is `None`.
+    quantity_decimals: int | None = Field(default=9, ge=0)
+    client_order_id_max_length: int | None = Field(default=128, gt=0)
 
     @field_validator("accepted_relistings")
     @classmethod
@@ -1304,7 +1308,13 @@ class RiskConfig(BaseModel):
     (`max_gross_exposure`, the charter's rule) or a meaningless threshold.
     `max_fill_lag_sessions` is at least 1 (spec req 8). Defaults are the spec's
     reasoning for H1 at paper scale, not measurements; `min_order_notional` and the two
-    reconciliation tolerances are confirmed by the recording task (T48b), and after the
+    reconciliation tolerances were kept by the recording task (T48b, 2026-10-08,
+    docs/research/2026-10-08-alpaca-paper-facts.md): a $5 notional buy and a $0.98
+    whole-share sell were accepted (`min_order_notional`, Alpaca's documented $1);
+    position quantities equalled the summed 9-decimal fills exactly
+    (`reconcile_quantity_tolerance`); `cash` is reported in cents and moved within
+    $0.0022 of the six fills' exact value (`reconcile_cash_tolerance`; its scaling with
+    the fill count is the owner's question in #1290). After the
     first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
     """
 

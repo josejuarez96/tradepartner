@@ -1,0 +1,45 @@
+[
+  {
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "NYSE",
+    "fractionable": true,
+    "id": "3795cafe-fd54-4f66-a31e-66774be875ca",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "Coca-Cola Company",
+    "shortable": true,
+    "status": "active",
+    "symbol": "KO",
+    "tradable": true
+  },
+  {
+    "attributes": [
+      "has_options",
+      "overnight_tradable"
+    ],
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": true,
+    "exchange": "NASDAQ",
+    "fractionable": false,
+    "id": "3e59f0bd-a197-4e69-995a-733be53ecb0f",
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "marginable": true,
+    "name": "Ocugen, Inc. Common Stock",
+    "shortable": true,
+    "status": "active",
+    "symbol": "OCGN",
+    "tradable": true
+  }
+]

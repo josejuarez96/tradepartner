@@ -1,0 +1,6 @@
+{
+  "error": {
+    "body": "{\"code\":40310000,\"message\":\"asset \\\"OCGN\\\" is not fractionable\"}",
+    "status_code": 403
+  }
+}
