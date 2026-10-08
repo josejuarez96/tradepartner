@@ -66,7 +66,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import pairwise
-from typing import Literal, cast
+from typing import cast
 
 import duckdb
 
@@ -117,9 +117,10 @@ GROSS_LEVEL = 0.0
 FamilySharpesFn = Callable[..., FamilySharpes]
 
 #: What a trial stores beyond metrics and rebalance rows (strategy-lab spec,
-#: "Detail level"; `lab.sweep_detail_level` for sweep variants).
-DetailLevel = Literal["full", "summary"]
-DETAIL_LEVELS: tuple[DetailLevel, ...] = ("full", "summary")
+#: "Detail level"; `lab.sweep_detail_level` for sweep variants). One list, the
+#: registry's, so `open_trial` and `write_results` accept the same levels.
+DetailLevel = registry.DetailLevel
+DETAIL_LEVELS: tuple[DetailLevel, ...] = registry.DETAIL_LEVELS
 
 #: The frozen key the period ends are read from (strategy-lab spec, "Cadence").
 CADENCE_KEY = "schedule.rebalance_cadence"
