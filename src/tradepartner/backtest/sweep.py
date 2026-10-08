@@ -28,9 +28,18 @@ written, in a sweep's existing family: `oracle` on the real store, the family ru
 rise), a fingerprint already registered anywhere, family readiness, the anchor check
 against the store's first session and the family rules' own lattice. It then writes the
 `sweeps` row, one `hypotheses`, `sweep_variants` and `hypothesis_fingerprints` row per
-variant, and leaves the transaction to the caller. A family with no `family_rules` row
-is refused here; its first registration is T104b's. Every function above `register`
-reads a file and `Settings` only.
+variant, and leaves the transaction to the caller.
+
+A family with no `family_rules` row and no registered hypothesis is a **new family**
+(T104b; Definitions, Family rules): its first sweep fixes the rules. Its parent is
+`config.FAMILY_PARENTS`' entry (a file naming another is refused); its holdout may not
+overlap any existing non-oracle family's; a child (a parent in the table) must hold out
+only after the parent's `holdout.end` and register only once the parent has spent its
+holdout or reached its spend cap, and its SR* high-water mark is seeded from the
+parent's; a root (`None`) has no parent, its own mark and the overlap rule only. The
+`family_rules` row is written once, with the live caps, `min_sharpe_variance_annual`
+and lattice, and never read live afterwards. A family with hypotheses but no rules row
+is refused. Every function above `register` reads a file and `Settings` only.
 """
 
 from __future__ import annotations
@@ -51,7 +60,8 @@ from typing import Annotated, Any, Final, Literal, get_args
 import duckdb
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
-from tradepartner.backtest import frozen, hypothesis
+from tradepartner import config
+from tradepartner.backtest import frozen, hypothesis, results
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.backtest.signals import check_anchor_feasible
@@ -75,6 +85,7 @@ __all__ = [
     "InvalidVariantError",
     "LabBlockError",
     "MissingRequiredKeyError",
+    "NewFamilyError",
     "NoFamilyRulesError",
     "OffLatticeError",
     "SelectionStatistic",
@@ -622,8 +633,16 @@ class SweepRegistrationError(ValueError):
 
 
 class NoFamilyRulesError(SweepRegistrationError):
-    """The sweep's family has no `family_rules` row: its first registration (a new
-    family) is not this path's."""
+    """The sweep's family has registered hypotheses but no `family_rules` row: a store
+    the lab migration did not populate. A family with neither is a new family."""
+
+
+class NewFamilyError(SweepRegistrationError):
+    """A new family's first registration that breaks a lineage rule (Definitions,
+    Family rules): its family has no `FAMILY_PARENTS` entry (oracle aside), its holdout
+    overlaps an existing non-oracle family's, or, for a
+    child, starts on or before the parent's `holdout.end`, or the parent has neither
+    a holdout spend nor a reached spend cap (or no rules at all)."""
 
 
 class FamilyRuleError(SweepRegistrationError):
@@ -756,6 +775,66 @@ def _anchor_refusal(file: SweepFile, variant: Variant, first_session: date | Non
     )
 
 
+def _new_family_seed(
+    conn: duckdb.DuckDBPyConnection, file: SweepFile, path: Path
+) -> tuple[str | None, float | None]:
+    """The lineage refusals of a new family's first registration, before any row is
+    written, and its `(parent_family, sr_star_seed_annual)`: the parent from
+    `config.FAMILY_PARENTS` (read at call time) and, for a child, the parent's SR*
+    high-water mark today (N from `results.family_n`, V on the excess basis from
+    `registry.family_sharpes`, floored by the parent's rules); a root's seed is None."""
+    parents: dict[str, str | None] = {
+        str(family): parent for family, parent in config.FAMILY_PARENTS.items()
+    }
+    if file.family not in parents and file.family != registry.ORACLE_FAMILY:
+        raise NewFamilyError(
+            f"{path}: family {file.family!r} has no entry in FAMILY_PARENTS (a parent or "
+            "None), so its lineage is unknown"
+        )
+    parent = parents.get(file.family)
+    if file.parent_family is not None and file.parent_family != parent:
+        raise FamilyRuleError(
+            f"{path}: parent_family {file.parent_family!r} differs from family "
+            f"{file.family!r}'s entry in FAMILY_PARENTS ({parent!r})"
+        )
+    others = conn.execute(
+        "SELECT family, holdout_start, holdout_end FROM family_rules WHERE family <> ? "
+        "ORDER BY family",
+        [registry.ORACLE_FAMILY],
+    ).fetchall()
+    for other, start, end in others:
+        if file.holdout_start <= end and start <= file.holdout_end:
+            raise NewFamilyError(
+                f"{path}: the holdout [{file.holdout_start}, {file.holdout_end}] overlaps "
+                f"family {other!r}'s [{start}, {end}]"
+            )
+    if parent is None:
+        return None, None
+    parent_rules = lab_registry.family_rules(conn, parent)
+    if parent_rules is None:
+        raise NewFamilyError(
+            f"{path}: family {file.family!r}'s parent {parent!r} has no family rules, so it "
+            "has neither a holdout spend nor a reached spend cap"
+        )
+    if file.holdout_start <= parent_rules.holdout_end:
+        raise NewFamilyError(
+            f"{path}: holdout.start {file.holdout_start} is not after parent family "
+            f"{parent!r}'s holdout.end {parent_rules.holdout_end}"
+        )
+    if not lab_registry.family_holdout_spent_or_capped(conn, parent):
+        raise NewFamilyError(
+            f"{path}: parent family {parent!r} has neither a holdout spend nor reached its "
+            f"spend cap ({parent_rules.max_family_holdout_spends})"
+        )
+    seed = lab_registry.family_sr_star_high_water_mark(
+        conn,
+        parent,
+        n_trials_today=results.family_n(conn, parent),
+        sharpe_variance_annual_today=registry.family_sharpes(conn, parent).variance("excess_spy"),
+    )
+    return parent, seed
+
+
 def _existing_registration(
     conn: duckdb.DuckDBPyConnection, file: SweepFile, variants: Sequence[Variant]
 ) -> SweepRegistration | None:
@@ -789,12 +868,14 @@ def register(
     *,
     registered_by: str,
 ) -> SweepRegistration:
-    """Register the sweep in `file` in its existing family (req 1) and return it.
+    """Register the sweep in `file` (req 1) and return it.
 
     `LabNotInitialised` first, on a store without the lab tables. Then the file-level
     refusals (`parse_sweep_file`, `expand_grid`) and every store-level one, before any
     row is written: `oracle` on the real store (`registry.RealStoreRefused`), a family
-    with no rules (`NoFamilyRulesError`), (a) `FamilyRuleError`, (b)
+    with hypotheses but no rules (`NoFamilyRulesError`), a new family's lineage
+    (`FamilyRuleError` for another `parent_family`, `NewFamilyError`), (a)
+    `FamilyRuleError` in an existing family, (b)
     `FingerprintRegisteredError` naming the registration that holds it, (c)
     `FamilyNotReadyError` naming the unrun hypothesis, (d) `AnchorInfeasibleError`
     against `lab_registry.first_session`, (e) `FamilyLatticeError`. An unchanged file
@@ -803,7 +884,9 @@ def register(
     refused by (b). Writes the `sweeps` row (copying the lab caps), then per variant in
     canonical order its `hypotheses` row through `registry.register_hypothesis` (the
     sweep file as `doc_path`), one `sweep_variants` and one `hypothesis_fingerprints`
-    row. The transaction is the caller's.
+    row; for a new family, last, its one `family_rules` row (first hypothesis: the
+    canonical first variant; its fixed values: `family_rule_params` of that variant's
+    frozen set). The transaction is the caller's.
     """
     require_lab(conn)
     settings = settings if settings is not None else get_settings()
@@ -818,16 +901,25 @@ def register(
         return existing
 
     rules = lab_registry.family_rules(conn, parsed.family)
+    new_family: tuple[str | None, float | None] | None = None
     if rules is None:
-        raise NoFamilyRulesError(
-            f"{file}: family {parsed.family!r} has no family rules; a new family's first "
-            "registration is not supported by this command yet"
+        registered = conn.execute(
+            "SELECT 1 FROM hypotheses WHERE family = ? LIMIT 1", [parsed.family]
+        ).fetchone()
+        if registered is not None:
+            raise NoFamilyRulesError(
+                f"{file}: family {parsed.family!r} has registered hypotheses but no family "
+                "rules; the lab migration writes them"
+            )
+        new_family = _new_family_seed(conn, parsed, file)
+    else:
+        broken = sorted(
+            {d for v in variants for d in _rule_differences(parsed, v.frozen_set, rules)}
         )
-    broken = sorted({d for v in variants for d in _rule_differences(parsed, v.frozen_set, rules)})
-    if broken:
-        raise FamilyRuleError(
-            f"{file}: differs from family {parsed.family!r}'s rules: {', '.join(broken)}"
-        )
+        if broken:
+            raise FamilyRuleError(
+                f"{file}: differs from family {parsed.family!r}'s rules: {', '.join(broken)}"
+            )
     for variant in variants:
         holder = lab_registry.fingerprint_registered(conn, variant.fingerprint)
         if holder is not None:
@@ -848,8 +940,10 @@ def register(
         reason = _anchor_refusal(parsed, variant, first)
         if reason is not None:
             raise AnchorInfeasibleError(f"{file}: variant {variant.values}: {reason}")
+    # A new family's lattice is the live one `parse_sweep_file` already applied.
+    lattice = rules.axis_lattice if rules is not None else {}
     for axis, values in parsed.grid.items():
-        step = rules.axis_lattice.get(axis)
+        step = lattice.get(axis)
         if step is None:
             continue
         if not step > 0:
@@ -910,6 +1004,20 @@ def register(
         )
         lab_registry.write_fingerprint(conn, record.hypothesis_id, variant.fingerprint)
         records.append(record)
+    if new_family is not None:
+        parent, seed = new_family
+        lab_registry.write_family_rules(
+            conn,
+            family=parsed.family,
+            first_hypothesis_id=records[0].hypothesis_id,
+            parent_family=parent,
+            holdout_start=parsed.holdout_start,
+            holdout_end=parsed.holdout_end,
+            in_sample_start=parsed.in_sample_start,
+            fixed_params=family_rule_params(variants[0].frozen_set),
+            sr_star_seed_annual=seed,
+            settings=settings,
+        )
     return SweepRegistration(
         sweep=sweep,
         variants=tuple(lab_registry.sweep_variants(conn, sweep.sweep_id)),
