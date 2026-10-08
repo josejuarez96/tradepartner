@@ -11,6 +11,7 @@ one is written once the owner's first export exists.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -24,20 +25,26 @@ import typer
 from typer.testing import CliRunner
 
 from tradepartner import cli
-from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.adapters.broker import OrderRequest, Side
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, SetPosition, Vanish
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
-from tradepartner.execution import switch
+from tradepartner.execution import switch, window
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import journal, registry
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
+    DecisionRow,
     DisposalRow,
     LotRow,
+    OrderEventRow,
+    OrderRow,
+    PaperRunResultRow,
+    PaperRunRow,
     PaperWindowRow,
     PaperWindowStopRow,
     WashSaleFlagRow,
@@ -499,16 +506,22 @@ PAPER_OPTIONS = {
     "check": set(),
     "status": set(),
     "abandon": {"--reason"},
+    "settle": {"--order", "--reason"},
     "override": {"--kind", "--session", "--name", "--reason"},
     "lots-reconcile": {"--export", "--tax-year"},
 }
 
 
 class _Clock:
+    """The test's clock; `step` moves it on every reading (a real clock does),
+    which `paper settle`'s later stamp needs."""
+
     def __init__(self, now: datetime) -> None:
         self.now = now
+        self.step = timedelta(0)
 
     def __call__(self) -> datetime:
+        self.now += self.step
         return self.now
 
 
@@ -876,3 +889,320 @@ def test_accept_rejections_ignores_an_auto_envvar_prefix(
     )
     assert result.exit_code == 0, result.output
     assert seen == [{"accept_rejections": False}]
+
+
+# --- `paper settle` (plan T84c; spec req 17, #571) ---------------------------------------
+#
+# The orders are journaled on window 1 (opened by `paper start`) the way a run
+# writes them, the fake submits the acknowledged ones, and `paper kill` engages
+# the switch the settlement needs.
+
+#: The broker reads `paper settle` may make; never `submit` or `cancel`.
+SETTLE_READS = {"account", "get_order", "open_orders", "fills", "positions"}
+PLACED_AT = SESSION_CLOCK + timedelta(minutes=1)
+SETTLE_CLOCK = SESSION_CLOCK + timedelta(minutes=5)
+
+
+def _place(fake: FakeBroker, coid: str, *, acknowledged: bool = True) -> None:
+    """A run, its decision, the order and its `pending` event on window 1;
+    when `acknowledged`, the fake's submit (it stays accepted) and the
+    `accepted` event with the broker's id."""
+    with open_for_write(_settings()) as conn:
+        run_id = journal.append(
+            conn,
+            PaperRunRow(
+                window_id=1,
+                session=PLACED_AT.date(),
+                kind="rebalance",
+                started_at=PLACED_AT,
+                invoked_by="scheduler",
+                code_version="test",
+                known_at=PLACED_AT,
+                ingested_at=PLACED_AT,
+            ),
+        )
+        assert run_id is not None
+        journal.append(
+            conn,
+            PaperRunResultRow(
+                run_id=run_id,
+                finished_at=PLACED_AT,
+                status="ok",
+                clock_fault=False,
+                known_at=PLACED_AT,
+                ingested_at=PLACED_AT,
+            ),
+        )
+        decision_id = journal.append(
+            conn,
+            DecisionRow(
+                run_id=run_id,
+                rebalance_session=HOLDOUT_END,
+                security_id="SEC_SPY",
+                side="buy",
+                planned_quantity=10.0,
+                whole_share=False,
+                decision="trade",
+                reason=None,
+                known_at=PLACED_AT,
+                ingested_at=PLACED_AT,
+            ),
+        )
+        assert decision_id is not None
+        journal.append(
+            conn,
+            OrderRow(
+                client_order_id=coid,
+                decision_id=decision_id,
+                run_id=run_id,
+                session=PLACED_AT.date(),
+                attempt=1,
+                phase="buy",
+                security_id="SEC_SPY",
+                symbol="SPY",
+                side="buy",
+                quantity=10.0,
+                sells_in_flight_at_submit=False,
+                known_at=PLACED_AT,
+                ingested_at=PLACED_AT,
+            ),
+        )
+        journal.append(
+            conn,
+            OrderEventRow(
+                client_order_id=coid, status="pending", known_at=PLACED_AT, ingested_at=PLACED_AT
+            ),
+        )
+        if acknowledged:
+            placed = fake.submit(OrderRequest(coid, "SPY", Side.BUY, quantity=10.0))
+            journal.append(
+                conn,
+                OrderEventRow(
+                    client_order_id=coid,
+                    status="accepted",
+                    broker_order_id=placed.broker_order_id,
+                    known_at=PLACED_AT,
+                    ingested_at=PLACED_AT,
+                ),
+            )
+
+
+def _engage(clock: _Clock, factory: _Factory) -> None:
+    clock.now = SETTLE_CLOCK
+    assert _paper(clock, factory, "kill", "--reason", LONG_REASON).exit_code == 0
+
+
+def _settle(clock: _Clock, factory: _Factory, *args: str) -> Out:
+    clock.step = timedelta(microseconds=1)
+    return _paper(clock, factory, "settle", *args)
+
+
+@pytest.mark.parametrize(
+    ("args", "says"),
+    [
+        (("--reason", LONG_REASON), "Missing option '--order'"),
+        (("--order", "tp-a"), "Missing option '--reason'"),
+        (
+            ("--order", "tp-a", "--order", "tp-b", "--reason", LONG_REASON),
+            "--order is given exactly once",
+        ),
+        (("--order", "tp-a", "--reason", "   "), "--reason must be non-blank"),
+        (("--order", "  ", "--reason", LONG_REASON), "--order must be non-blank"),
+    ],
+)
+def test_settle_without_one_order_and_a_reason_is_a_usage_error_before_any_broker(
+    args: tuple[str, ...], says: str, clock: _Clock, factory: _Factory
+) -> None:
+    out = _settle(clock, factory, *args)
+    assert out.exit_code == cli.USAGE_ERROR, out.output
+    assert says in re.sub(r"\x1b\[[0-9;]*m", "", out.output)  # rich colours it in CI
+    assert factory.clocks == []
+
+
+def test_settle_with_no_window_exits_no_window(clock: _Clock, factory: _Factory) -> None:
+    out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == NO_WINDOW, out.output
+    assert "refused: no_window" in out.output
+    assert factory.fake.calls == ()
+
+
+def _vanished(fake: FakeBroker) -> None:
+    _place(fake, "tp-a")
+    fake.apply("tp-a", Vanish())
+
+
+def _expired_with_position(fake: FakeBroker) -> None:
+    _place(fake, "tp-a")
+    fake.apply("tp-a", Expire())
+    fake.apply_account(SetPosition("SPY", 0.5))
+
+
+def _unjournaled_fill(fake: FakeBroker) -> None:
+    _place(fake, "tp-a")
+    fake.apply("tp-a", PartialFill(4, 100.0))
+    fake.apply("tp-a", Expire())
+    fake.apply_account(SetPosition("SPY", None))
+
+
+def _other_open_order(fake: FakeBroker) -> None:
+    _place(fake, "tp-a")
+    _place(fake, "tp-b")
+    fake.apply("tp-a", Expire())
+
+
+def _terminal(fake: FakeBroker) -> None:
+    _place(fake, "tp-a")
+    with open_for_write(_settings()) as conn:
+        journal.append(
+            conn,
+            OrderEventRow(
+                client_order_id="tp-a",
+                status="expired",
+                known_at=PLACED_AT,
+                ingested_at=PLACED_AT,
+            ),
+        )
+
+
+#: Each refusal of `window.settle_order`, the state that makes it, whether the
+#: switch is engaged, and the reason; every one exits `refused`.
+SETTLE_REFUSALS: list[tuple[str, Callable[[FakeBroker], None], bool, str, str]] = [
+    ("unknown_order", lambda fake: None, True, LONG_REASON, "tp-none"),
+    ("already_terminal", _terminal, True, LONG_REASON, "tp-a"),
+    (
+        "pending_order",
+        lambda fake: _place(fake, "tp-a", acknowledged=False),
+        True,
+        LONG_REASON,
+        "tp-a",
+    ),
+    ("reason", lambda fake: _place(fake, "tp-a"), True, "short", "tp-a"),
+    ("not_engaged", lambda fake: _place(fake, "tp-a"), False, LONG_REASON, "tp-a"),
+    ("broker_open", lambda fake: _place(fake, "tp-a"), True, LONG_REASON, "tp-a"),
+    ("unjournaled_fill", _unjournaled_fill, True, LONG_REASON, "tp-a"),
+    ("unexplained_position", _expired_with_position, True, LONG_REASON, "tp-a"),
+    ("other_open_order", _other_open_order, True, LONG_REASON, "tp-a"),
+]
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize(
+    ("code", "arrange", "engaged", "reason", "coid"),
+    SETTLE_REFUSALS,
+    ids=[r[0] for r in SETTLE_REFUSALS],
+)
+def test_each_settle_refusal_exits_refused_and_writes_nothing(
+    clock: _Clock,
+    factory: _Factory,
+    code: str,
+    arrange: Callable[[FakeBroker], None],
+    engaged: bool,
+    reason: str,
+    coid: str,
+) -> None:
+    arrange(factory.fake)
+    if engaged:
+        _engage(clock, factory)
+    else:
+        clock.now = SETTLE_CLOCK
+    mark = len(factory.fake.calls)
+    out = _settle(clock, factory, "--order", coid, "--reason", reason)
+    assert out.exit_code == REFUSED, out.output
+    assert f"refused: {code}:" in out.output
+    assert _count("overrides") == 0
+    assert {c.method for c in factory.fake.calls[mark:]} <= SETTLE_READS
+
+
+@pytest.mark.usefixtures("started")
+def test_settle_on_another_account_exits_refused(clock: _Clock, factory: _Factory) -> None:
+    _place(factory.fake, "tp-a")
+    factory.fake.apply("tp-a", Vanish())
+    _engage(clock, factory)
+    factory.fake = FakeBroker(
+        clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA2"
+    )
+    out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == REFUSED, out.output
+    assert "refused: account_mismatch:" in out.output
+    assert _count("overrides") == 0
+
+
+@pytest.mark.usefixtures("started")
+def test_settle_under_a_held_run_lock_exits_locked(clock: _Clock, factory: _Factory) -> None:
+    _vanished(factory.fake)
+    _engage(clock, factory)
+    before = factory.fake.calls
+    with run_lock(_settings()):
+        out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == cli.PAPER_REFUSAL_EXIT["locked"], out.output
+    assert "refused: locked" in out.output
+    assert factory.fake.calls == before
+    assert _count("overrides") == 0
+
+
+@pytest.mark.usefixtures("started")
+def test_settle_journals_an_order_the_broker_forgot(clock: _Clock, factory: _Factory) -> None:
+    _vanished(factory.fake)
+    _engage(clock, factory)
+    factory.clocks.clear()
+    mark = len(factory.fake.calls)
+    out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert "paper settle: tp-a settled (override 1" in out.output
+    assert "reset" in out.output
+    assert {c.method for c in factory.fake.calls[mark:]} <= SETTLE_READS
+    assert factory.clocks == [clock]
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        assert conn.execute("SELECT kind, client_order_id FROM overrides").fetchall() == [
+            ("settle_order", "tp-a")
+        ]
+        assert conn.execute(
+            "SELECT status, reason FROM order_events WHERE client_order_id = 'tp-a' "
+            "AND reason = 'owner_settled_unknown'"
+        ).fetchall() == [("cancelled", "owner_settled_unknown")]
+
+
+@pytest.mark.usefixtures("started")
+def test_settle_journals_an_order_the_broker_reports_finished(
+    clock: _Clock, factory: _Factory
+) -> None:
+    """Not the reset case: the broker knows the order expired, holds nothing."""
+    _place(factory.fake, "tp-a")
+    factory.fake.apply("tp-a", Expire())
+    _engage(clock, factory)
+    mark = len(factory.fake.calls)
+    out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert "paper settle: tp-a settled (override 1" in out.output
+    assert "reset" not in out.output
+    assert {c.method for c in factory.fake.calls[mark:]} <= SETTLE_READS
+    assert _count("overrides") == 1
+
+
+@pytest.mark.usefixtures("started")
+def test_settle_hands_the_writer_the_built_broker_and_the_one_clock(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    seen: list[tuple[Any, ...]] = []
+
+    def recording(*args: Any) -> window.SettleResult:
+        seen.append(args)
+        return window.SettleResult(7, args[4], SETTLE_CLOCK, reset=False)
+
+    monkeypatch.setattr(window, "settle_order", recording)
+    factory.clocks.clear()
+    out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    ((settings, _connect, broker, settle_clock, coid, reason),) = seen
+    assert broker is factory.fake
+    assert settle_clock is clock is factory.clocks[0]
+    assert (coid, reason) == ("tp-a", LONG_REASON)
+    assert settings.store.path == _settings().store.path
+
+
+def test_settle_order_is_never_read_from_an_auto_envvar() -> None:
+    group: Any = typer.main.get_command(cli.make_app())
+    settle = group.commands["paper"].commands["settle"]
+    (param,) = [p for p in settle.params if "--order" in p.opts]
+    assert param.envvar is None
+    assert param.allow_from_autoenv is False

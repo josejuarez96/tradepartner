@@ -102,12 +102,15 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
 
 - `tradepartner paper start --hypothesis <slug>`, `stop --reason`, `run`,
   `reconcile`, `kill --reason`, `resume --reason [--accept-broker-fills]
-  [--accept-rejections]`, `report`, `check`, `status`, `abandon --reason` and
-  `override --kind [--session --name] --reason` (T67) each call the one
+  [--accept-rejections]`, `report`, `check`, `status`, `abandon --reason`,
+  `override --kind [--session --name] --reason` (T67) and `settle --order
+  <client_order_id> --reason` (T84c; `--order` exactly once) each call the one
   `execution` function of that name (`window.start`, `window.stop`,
   `run.tracking_run`, `reconcile_run.reconcile_command`, `window.kill`,
   `resume.resume`, `report.report`, `check.check`, `ops.page_data`,
-  `window.abandon`, `window.override`, the page's own writer). The broker comes
+  `window.abandon`, `window.override`, the page's own writer,
+  `window.settle_order`; `settle` refuses each of req 17's gates by its reason
+  code, and a `ClockError` or a broker error is a failure). The broker comes
   from `execution.brokers.build_broker` (a test injects one through `make_app`'s
   `broker`), built with the command's one clock object, which the command also
   hands to the function, so the wrapper `run` builds holds the same clock as the
@@ -802,7 +805,7 @@ PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
 )
 
 
-#: `--reason`, required by `stop`, `kill`, `resume`, `abandon` and `override`.
+#: `--reason`, required by `stop`, `kill`, `resume`, `abandon`, `override` and `settle`.
 _REASON_OPTION = typer.Option("--reason", help="why, in words (journaled)")
 
 
@@ -2217,6 +2220,35 @@ def make_app(
         s = paper_settings(reason)
         override_id = _paper_call(s, lambda: window.override(s, clock, kind, day, name, reason))
         _echo_scrubbed(f"paper override: override {override_id} written ({kind})", s)
+
+    @paper_app.command("settle")
+    def paper_settle(
+        order: Annotated[
+            list[str],
+            typer.Option(
+                "--order", help="the order's client_order_id, once", allow_from_autoenv=False
+            ),
+        ],
+        reason: Annotated[str, _REASON_OPTION],
+    ) -> None:
+        """Settle one order no collector can close, owner-only (spec req 17)."""
+        if len(order) != 1:
+            raise _fail("--order is given exactly once", USAGE_ERROR)
+        if _blank_text(order[0]):
+            raise _fail("--order must be non-blank", USAGE_ERROR)
+        (client_order_id,) = order
+        s = paper_settings(reason)
+        result = _paper_call(
+            s,
+            lambda: window.settle_order(
+                s, write_chunk(s), broker(s, clock), clock, client_order_id, reason
+            ),
+        )
+        _echo_scrubbed(
+            f"paper settle: {result.client_order_id} settled (override {result.override_id}, "
+            f"at {_fmt(result.known_at)}{', reset' if result.reset else ''})",
+            s,
+        )
 
     @paper_app.command("lots-reconcile")
     def lots_reconcile_(
